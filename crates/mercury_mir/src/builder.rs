@@ -96,6 +96,15 @@ impl Builder {
         self.push(None, op);
     }
 
+    /// Allocate a stack slot in the entry block, returning the pointer value. Putting allocas in
+    /// the entry block keeps them dominating all uses and out of loop bodies.
+    pub fn alloca(&mut self, ty: MirType) -> ValueId {
+        let v = self.new_value(MirType::Ptr);
+        let entry = self.entry.0 as usize;
+        self.blocks[entry].insts.push(Inst { result: Some(v), op: Op::Alloca(ty) });
+        v
+    }
+
     pub fn set_term(&mut self, term: Terminator) {
         let cur = self.current;
         self.block_mut(cur).term = term;

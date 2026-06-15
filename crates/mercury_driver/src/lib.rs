@@ -115,18 +115,34 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- Semantic analysis (name resolution, type checking, shape checking) ---
-    let (_sema, sema_diags) = mercury_sema::check(&module, &interner);
+    let (sema, sema_diags) = mercury_sema::check(&module, &interner);
     for d in &sema_diags {
         eprintln!("{}", renderer.render(d, &sm));
     }
-    let sema_errors = sema_diags.iter().filter(|d| d.is_error()).count();
-    if sema_errors > 0 {
+    if sema_diags.iter().any(|d| d.is_error()) {
         return exit::COMPILE_ERROR;
     }
 
+    // --- MIR construction ---
+    let (program, lower_diags) = mercury_mir_build::lower_program(&module, &sema, &interner);
+    for d in &lower_diags {
+        eprintln!("{}", renderer.render(d, &sm));
+    }
+
+    if matches!(opts.emit, EmitStage::MirHigh | EmitStage::Mir) {
+        // Until optimization passes land, the high and low forms are the same.
+        for f in &program.funcs {
+            for ice in mercury_mir::verify::verify_function(f) {
+                eprintln!("internal compiler error (MIR verify): {ice}");
+            }
+        }
+        print!("{}", mercury_mir::print::print_program(&program, &interner));
+        return exit::OK;
+    }
+
     eprintln!(
-        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches semantic \
-         analysis; try `--emit=tokens` or `--emit=ast`)",
+        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches MIR; \
+         try `--emit=tokens`, `--emit=ast`, or `--emit=mir`)",
         opts.emit
     );
     exit::UNIMPLEMENTED

@@ -1,0 +1,13 @@
+module examples.fib
+
+/// Classic recursive Fibonacci — exercises calls, branches, and arithmetic end to end.
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i32 {
+    return fib(10);
+}

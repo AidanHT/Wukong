@@ -1,6 +1,6 @@
 [package]
-name = "mercury_driver"
-description = "Pipeline orchestration for the Mercury compiler (Session, options, --emit)."
+name = "mercury_mir_build"
+description = "Lowers the type-checked Mercury AST into MIR."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,9 +10,10 @@ rust-version.workspace = true
 [dependencies]
 mercury_span = { workspace = true }
 mercury_diag = { workspace = true }
-mercury_lexer = { workspace = true }
 mercury_ast = { workspace = true }
-mercury_parser = { workspace = true }
-mercury_sema = { workspace = true }
+mercury_types = { workspace = true }
 mercury_mir = { workspace = true }
-mercury_mir_build = { workspace = true }
+mercury_sema = { workspace = true }
+
+[dev-dependencies]
+mercury_parser = { workspace = true }

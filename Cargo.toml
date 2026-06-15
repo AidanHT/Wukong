@@ -27,6 +27,7 @@ mercury_parser = { path = "crates/mercury_parser" }
 mercury_types = { path = "crates/mercury_types" }
 mercury_sema = { path = "crates/mercury_sema" }
 mercury_mir = { path = "crates/mercury_mir" }
+mercury_mir_build = { path = "crates/mercury_mir_build" }
 
 [profile.release]
 opt-level = 3

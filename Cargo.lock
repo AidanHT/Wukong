@@ -23,6 +23,8 @@ dependencies = [
  "mercury_ast",
  "mercury_diag",
  "mercury_lexer",
+ "mercury_mir",
+ "mercury_mir_build",
  "mercury_parser",
  "mercury_sema",
  "mercury_span",
@@ -40,6 +42,19 @@ dependencies = [
 name = "mercury_mir"
 version = "0.1.0"
 dependencies = [
+ "mercury_span",
+ "mercury_types",
+]
+
+[[package]]
+name = "mercury_mir_build"
+version = "0.1.0"
+dependencies = [
+ "mercury_ast",
+ "mercury_diag",
+ "mercury_mir",
+ "mercury_parser",
+ "mercury_sema",
  "mercury_span",
  "mercury_types",
 ]

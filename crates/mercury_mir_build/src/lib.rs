@@ -1,0 +1,746 @@
+//! `mercury_mir_build` — lowers the type-checked AST into MIR.
+//!
+//! Strategy: every local (and every parameter) gets a stack slot via `alloca`; reads `load` and
+//! writes `store`. This keeps lowering simple and non-recursive in its SSA reasoning — a later
+//! `mem2reg` pass promotes the slots to SSA registers. Control flow is lowered directly to a CFG
+//! of basic blocks with `br`/`cond_br`.
+//!
+//! The lowerer covers the scalar + pointer + control-flow + direct-call core end to end. Tensor,
+//! SIMD-method, and parallel-loop constructs are not yet lowered; encountering one records a
+//! diagnostic and substitutes a placeholder so the rest of the function still lowers.
+
+use std::collections::HashMap;
+
+use mercury_ast::{self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind};
+use mercury_diag::Diagnostic;
+use mercury_mir::{BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, ValueId};
+use mercury_sema::{DefKind, SemaResult};
+use mercury_span::{Interner, Span, Symbol};
+use mercury_types::Ty;
+
+/// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered.
+pub fn lower_program(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> (Program, Vec<Diagnostic>) {
+    let mut diags = Vec::new();
+    let mut program = Program::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                let func = lower_fn(f, body, sema, interner, &mut diags);
+                program.funcs.push(func);
+            }
+        }
+    }
+    (program, diags)
+}
+
+fn lower_fn(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) -> Function {
+    // Recover the resolved signature for parameter/return types.
+    let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
+        _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
+    };
+    let ret_mir = mir_ty(&ret_ty);
+
+    let mut fl = FnLowerer {
+        builder: Builder::new(f.name.sym, ret_mir.clone()),
+        sema,
+        interner,
+        diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+    };
+
+    // Materialize parameters into stack slots.
+    for (p, pty) in f.params.iter().zip(&param_tys) {
+        let mty = mir_ty(pty);
+        let val = fl.builder.add_param(mty.clone());
+        let slot = fl.builder.alloca(mty.clone());
+        fl.builder.build_void(Op::Store { ptr: slot, value: val });
+        fl.bind(p.name.sym, slot, mty);
+    }
+
+    let tail = fl.lower_block(body);
+    if !fl.terminated {
+        match (&ret_mir, tail) {
+            (MirType::Void, _) => fl.builder.ret(None),
+            (_, Some(v)) => fl.builder.ret(Some(v)),
+            (_, None) => fl.builder.set_term(mercury_mir::Terminator::Unreachable),
+        }
+    }
+    fl.builder.finish()
+}
+
+struct FnLowerer<'a> {
+    builder: Builder,
+    sema: &'a SemaResult,
+    interner: &'a Interner,
+    diags: &'a mut Vec<Diagnostic>,
+    scopes: Vec<HashMap<Symbol, (ValueId, MirType)>>,
+    terminated: bool,
+    /// (continue target, break target) for the innermost loops.
+    loops: Vec<(mercury_mir::BlockId, mercury_mir::BlockId)>,
+}
+
+impl FnLowerer<'_> {
+    fn unsupported(&mut self, span: Span, what: &str) {
+        self.diags.push(
+            Diagnostic::warning(format!("`{what}` is not yet supported by codegen"))
+                .with_code("C0001")
+                .primary(span, ""),
+        );
+    }
+
+    // ---- scopes ----
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind(&mut self, name: Symbol, slot: ValueId, ty: MirType) {
+        self.scopes.last_mut().unwrap().insert(name, (slot, ty));
+    }
+
+    fn lookup(&self, name: Symbol) -> Option<(ValueId, MirType)> {
+        for s in self.scopes.iter().rev() {
+            if let Some(v) = s.get(&name) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    // ---- type helpers ----
+
+    fn expr_ty(&self, e: &Expr) -> Ty {
+        self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown)
+    }
+
+    fn expr_mir(&self, e: &Expr) -> MirType {
+        mir_ty(&self.expr_ty(e))
+    }
+
+    fn signed(&self, e: &Expr) -> bool {
+        matches!(self.expr_ty(e), Ty::Scalar(s) if s.is_signed())
+    }
+
+    fn const_zero(&mut self, ty: MirType) -> ValueId {
+        if ty.is_float() {
+            self.builder.build(ty.clone(), Op::ConstFloat(0.0, ty))
+        } else if ty.is_int() {
+            self.builder.build(ty.clone(), Op::ConstInt(0, ty))
+        } else {
+            self.builder.build(MirType::I32, Op::ConstInt(0, MirType::I32))
+        }
+    }
+
+    // ---- blocks & statements ----
+
+    fn lower_block(&mut self, b: &Block) -> Option<ValueId> {
+        self.push_scope();
+        for s in &b.stmts {
+            if self.terminated {
+                break;
+            }
+            self.lower_stmt(s);
+        }
+        let tail = match &b.tail {
+            Some(e) if !self.terminated => Some(self.lower_expr(e)),
+            _ => None,
+        };
+        self.pop_scope();
+        tail
+    }
+
+    fn lower_stmt(&mut self, s: &Stmt) {
+        match &s.kind {
+            StmtKind::Let { pat, ty, init, .. } => {
+                let mty = match ty {
+                    Some(t) => mir_ty_of_ast(t, self.interner),
+                    None => init.as_ref().map(|e| self.expr_mir(e)).unwrap_or(MirType::I32),
+                };
+                let slot = self.builder.alloca(mty.clone());
+                if let Some(e) = init {
+                    let v = self.lower_expr(e);
+                    self.builder.build_void(Op::Store { ptr: slot, value: v });
+                }
+                if let Pattern { kind: ast::PatKind::Ident(name), .. } = pat {
+                    self.bind(*name, slot, mty);
+                }
+            }
+            StmtKind::Assign { target, op, value } => {
+                let rhs = self.lower_expr(value);
+                let (ptr, elem) = self.lower_place(target);
+                let store_val = match op {
+                    ast::AssignOp::Assign => rhs,
+                    _ => {
+                        let cur = self.builder.build(elem.clone(), Op::Load(ptr, elem.clone()));
+                        let bin = compound_binop(*op, elem.is_float(), self.signed(target));
+                        self.builder.build(elem.clone(), Op::Bin(bin, cur, rhs))
+                    }
+                };
+                self.builder.build_void(Op::Store { ptr, value: store_val });
+            }
+            StmtKind::Expr(e) => {
+                self.lower_expr_stmt(e);
+            }
+            StmtKind::Return(opt) => {
+                let v = opt.as_ref().map(|e| self.lower_expr(e));
+                self.builder.ret(v);
+                self.terminated = true;
+            }
+            StmtKind::While { cond, body, .. } => self.lower_while(cond, body),
+            StmtKind::For { pat, iter, body, .. } => self.lower_for(pat, iter, body),
+            StmtKind::Loop { body, .. } => self.lower_loop(body),
+            StmtKind::Break(_) => {
+                if let Some((_, brk)) = self.loops.last().copied() {
+                    self.builder.br(brk, vec![]);
+                }
+                self.terminated = true;
+            }
+            StmtKind::Continue(_) => {
+                if let Some((cont, _)) = self.loops.last().copied() {
+                    self.builder.br(cont, vec![]);
+                }
+                self.terminated = true;
+            }
+            StmtKind::Defer(e) => {
+                // Defer semantics (run at scope exit) are not modeled yet; lower for effects.
+                self.unsupported(e.span, "defer");
+                self.lower_expr_stmt(e);
+            }
+        }
+    }
+
+    /// Lower an expression used in statement position (control-flow expressions handled here).
+    fn lower_expr_stmt(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::If { cond, then_branch, else_branch } => {
+                self.lower_if(cond, then_branch, else_branch.as_deref());
+            }
+            ExprKind::Block(b) => {
+                self.lower_block(b);
+            }
+            _ => {
+                self.lower_expr(e);
+            }
+        }
+    }
+
+    fn lower_while(&mut self, cond: &Expr, body: &Block) {
+        let header = self.builder.new_block();
+        let body_bb = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+
+        self.builder.switch_to(header);
+        self.terminated = false;
+        let c = self.lower_expr(cond);
+        self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
+
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
+        self.loops.push((header, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            self.builder.br(header, vec![]);
+        }
+
+        self.builder.switch_to(exit);
+        self.terminated = false;
+    }
+
+    fn lower_loop(&mut self, body: &Block) {
+        let header = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+        self.builder.switch_to(header);
+        self.terminated = false;
+        self.loops.push((header, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            self.builder.br(header, vec![]);
+        }
+        self.builder.switch_to(exit);
+        self.terminated = false;
+    }
+
+    fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
+        let (start, end, inclusive, step) = match iter {
+            ForIter::Range { start, end: Some(end), inclusive, step } => {
+                (start, end, *inclusive, step)
+            }
+            _ => {
+                self.unsupported(body.span, "for over a non-range iterator");
+                return;
+            }
+        };
+
+        let ity = self.expr_mir(start);
+        let signed = self.signed(start);
+
+        // i = start
+        let slot = self.builder.alloca(ity.clone());
+        let s0 = self.lower_expr(start);
+        self.builder.build_void(Op::Store { ptr: slot, value: s0 });
+
+        self.push_scope();
+        if let Pattern { kind: ast::PatKind::Ident(name), .. } = pat {
+            self.bind(*name, slot, ity.clone());
+        }
+
+        let header = self.builder.new_block();
+        let body_bb = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+
+        // header: i < end (or <=)
+        self.builder.switch_to(header);
+        self.terminated = false;
+        let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let end_val = self.lower_expr(end);
+        let pred = match (inclusive, signed) {
+            (false, true) => CmpOp::Slt,
+            (true, true) => CmpOp::Sle,
+            (false, false) => CmpOp::Ult,
+            (true, false) => CmpOp::Ule,
+        };
+        let c = self.builder.build(MirType::I1, Op::Cmp(pred, i_val, end_val));
+        self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
+
+        // body; i += step
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
+        self.loops.push((header, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+            let step_val = match step {
+                Some(st) => self.lower_expr(st),
+                None => self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone())),
+            };
+            let next = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
+            self.builder.build_void(Op::Store { ptr: slot, value: next });
+            self.builder.br(header, vec![]);
+        }
+
+        self.pop_scope();
+        self.builder.switch_to(exit);
+        self.terminated = false;
+    }
+
+    fn lower_if(&mut self, cond: &Expr, then_branch: &Block, else_branch: Option<&Expr>) {
+        let c = self.lower_expr(cond);
+        let then_bb = self.builder.new_block();
+        let merge = self.builder.new_block();
+        let else_bb = if else_branch.is_some() { self.builder.new_block() } else { merge };
+        self.builder.cond_br(c, then_bb, vec![], else_bb, vec![]);
+
+        self.builder.switch_to(then_bb);
+        self.terminated = false;
+        self.lower_block(then_branch);
+        if !self.terminated {
+            self.builder.br(merge, vec![]);
+        }
+
+        if let Some(e) = else_branch {
+            self.builder.switch_to(else_bb);
+            self.terminated = false;
+            self.lower_expr_stmt(e);
+            if !self.terminated {
+                self.builder.br(merge, vec![]);
+            }
+        }
+
+        self.builder.switch_to(merge);
+        self.terminated = false;
+    }
+
+    // ---- places (lvalues) ----
+
+    fn lower_place(&mut self, e: &Expr) -> (ValueId, MirType) {
+        match &e.kind {
+            ExprKind::Path(p) if p.is_single() => {
+                if let Some((slot, ty)) = self.lookup(p.first().sym) {
+                    return (slot, ty);
+                }
+                self.unsupported(p.span, "assignment to this name");
+                let ty = self.expr_mir(e);
+                (self.builder.alloca(ty.clone()), ty)
+            }
+            ExprKind::Unary { op: ast::UnOp::Deref, expr } => {
+                let ptr = self.lower_expr(expr);
+                (ptr, self.expr_mir(e))
+            }
+            ExprKind::Index { base, indices } if indices.len() == 1 => {
+                let base_ptr = self.lower_expr(base);
+                let idx = self.lower_expr(&indices[0]);
+                let elem = self.expr_mir(e);
+                let p = self.builder.build(MirType::Ptr, Op::Gep { ptr: base_ptr, index: idx, elem: elem.clone() });
+                (p, elem)
+            }
+            _ => {
+                self.unsupported(e.span, "assignment target");
+                let ty = self.expr_mir(e);
+                (self.builder.alloca(ty.clone()), ty)
+            }
+        }
+    }
+
+    // ---- expressions ----
+
+    fn lower_expr(&mut self, e: &Expr) -> ValueId {
+        match &e.kind {
+            ExprKind::Int(s) => {
+                let ty = self.expr_mir(e);
+                let v = parse_int(self.interner.resolve(*s));
+                let ty = if ty.is_int() { ty } else { MirType::I32 };
+                self.builder.build(ty.clone(), Op::ConstInt(v, ty))
+            }
+            ExprKind::Float(s) => {
+                let ty = self.expr_mir(e);
+                let v = parse_float(self.interner.resolve(*s));
+                let ty = if ty.is_float() { ty } else { MirType::F32 };
+                self.builder.build(ty.clone(), Op::ConstFloat(v, ty))
+            }
+            ExprKind::Bool(b) => self.builder.build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1)),
+            ExprKind::Path(p) if p.is_single() => {
+                if let Some((slot, ty)) = self.lookup(p.first().sym) {
+                    self.builder.build(ty.clone(), Op::Load(slot, ty))
+                } else {
+                    self.unsupported(p.span, "value reference");
+                    let t = self.expr_mir(e);
+                    self.const_zero(t)
+                }
+            }
+            ExprKind::Unary { op, expr } => self.lower_unary(*op, expr, e),
+            ExprKind::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs, e),
+            ExprKind::Call { callee, args, .. } => self.lower_call(callee, args, e),
+            ExprKind::Index { base, indices } if indices.len() == 1 => {
+                let (ptr, elem) = self.lower_place(e);
+                let _ = (base, indices);
+                self.builder.build(elem.clone(), Op::Load(ptr, elem))
+            }
+            ExprKind::Cast { expr, .. } => self.lower_cast(expr, e),
+            ExprKind::Block(b) => match self.lower_block(b) {
+                Some(v) => v,
+                None => {
+                    let t = self.expr_mir(e);
+                    self.const_zero(t)
+                }
+            },
+            _ => {
+                self.unsupported(e.span, "expression");
+                let t = self.expr_mir(e);
+                self.const_zero(t)
+            }
+        }
+    }
+
+    fn lower_unary(&mut self, op: ast::UnOp, operand: &Expr, e: &Expr) -> ValueId {
+        match op {
+            ast::UnOp::Neg => {
+                let v = self.lower_expr(operand);
+                let ty = self.expr_mir(e);
+                self.builder.build(ty, Op::Neg(v))
+            }
+            ast::UnOp::Not => {
+                let v = self.lower_expr(operand);
+                let ty = self.expr_mir(e);
+                self.builder.build(ty, Op::Not(v))
+            }
+            ast::UnOp::Deref => {
+                let ptr = self.lower_expr(operand);
+                let ty = self.expr_mir(e);
+                self.builder.build(ty.clone(), Op::Load(ptr, ty))
+            }
+            ast::UnOp::Ref | ast::UnOp::RefMut => {
+                let (ptr, _) = self.lower_place(operand);
+                ptr
+            }
+        }
+    }
+
+    fn lower_binary(&mut self, op: ast::BinOp, lhs: &Expr, rhs: &Expr, e: &Expr) -> ValueId {
+        use ast::BinOp::*;
+        match op {
+            Eq | Ne | Lt | Le | Gt | Ge => {
+                let l = self.lower_expr(lhs);
+                let r = self.lower_expr(rhs);
+                let float = self.expr_mir(lhs).is_float();
+                let signed = self.signed(lhs);
+                let pred = cmp_pred(op, float, signed);
+                self.builder.build(MirType::I1, Op::Cmp(pred, l, r))
+            }
+            And => {
+                let l = self.lower_expr(lhs);
+                let r = self.lower_expr(rhs);
+                self.builder.build(MirType::I1, Op::Bin(BinOp::And, l, r))
+            }
+            Or => {
+                let l = self.lower_expr(lhs);
+                let r = self.lower_expr(rhs);
+                self.builder.build(MirType::I1, Op::Bin(BinOp::Or, l, r))
+            }
+            _ => {
+                let l = self.lower_expr(lhs);
+                let r = self.lower_expr(rhs);
+                let ty = self.expr_mir(e);
+                let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
+                self.builder.build(ty, Op::Bin(bin, l, r))
+            }
+        }
+    }
+
+    fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
+        if let ExprKind::Path(p) = &callee.kind {
+            if p.is_single() {
+                let name = p.first().sym;
+                if matches!(self.sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+                    let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
+                    let ret = self.expr_mir(e);
+                    if ret == MirType::Void {
+                        self.builder.build_void(Op::Call { func: name, args: argvals });
+                        return self.const_zero(MirType::I32);
+                    }
+                    return self.builder.build(ret, Op::Call { func: name, args: argvals });
+                }
+            }
+        }
+        // Unmodeled builtin/method call.
+        for a in args {
+            self.lower_expr(a);
+        }
+        self.unsupported(e.span, "call");
+        let t = self.expr_mir(e);
+        self.const_zero(t)
+    }
+
+    fn lower_cast(&mut self, operand: &Expr, e: &Expr) -> ValueId {
+        let v = self.lower_expr(operand);
+        let from = self.expr_mir(operand);
+        let to = self.expr_mir(e);
+        if from == to {
+            return v;
+        }
+        let kind = cast_kind(&from, &to, self.signed(operand));
+        self.builder.build(to.clone(), Op::Cast(kind, v, to))
+    }
+}
+
+// ---- free helpers ----
+
+fn mir_ty(ty: &Ty) -> MirType {
+    match ty {
+        Ty::Scalar(s) => MirType::from_scalar(*s),
+        Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) | Ty::Array { .. } => {
+            MirType::Ptr
+        }
+        Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
+        Ty::Unit => MirType::Void,
+        _ => MirType::I32,
+    }
+}
+
+fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
+    use ast::TypeKind::*;
+    match &t.kind {
+        Path(p) => {
+            let name = interner.resolve(p.segments.last().unwrap().sym);
+            match mercury_types::Scalar::from_name(name) {
+                Some(s) => MirType::from_scalar(s),
+                None => MirType::I32,
+            }
+        }
+        Pointer { .. } | Ref { .. } | Slice(_) | Array { .. } | Tensor { .. } => MirType::Ptr,
+        Vector { elem, lanes } => {
+            let e = mir_ty_of_ast(elem, interner);
+            MirType::Vec(Box::new(e), *lanes)
+        }
+        Unit => MirType::Void,
+        _ => MirType::I32,
+    }
+}
+
+fn arith_binop(op: ast::BinOp, float: bool, signed: bool) -> BinOp {
+    use ast::BinOp as A;
+    match op {
+        A::Add => if float { BinOp::FAdd } else { BinOp::Add },
+        A::Sub => if float { BinOp::FSub } else { BinOp::Sub },
+        A::Mul => if float { BinOp::FMul } else { BinOp::Mul },
+        A::Div => {
+            if float {
+                BinOp::FDiv
+            } else if signed {
+                BinOp::SDiv
+            } else {
+                BinOp::UDiv
+            }
+        }
+        A::Rem => if signed { BinOp::SRem } else { BinOp::URem },
+        A::BitAnd => BinOp::And,
+        A::BitOr => BinOp::Or,
+        A::BitXor => BinOp::Xor,
+        A::Shl => BinOp::Shl,
+        A::Shr => if signed { BinOp::AShr } else { BinOp::LShr },
+        _ => BinOp::Add,
+    }
+}
+
+fn compound_binop(op: ast::AssignOp, float: bool, signed: bool) -> BinOp {
+    use ast::AssignOp as A;
+    let bin = match op {
+        A::Add => ast::BinOp::Add,
+        A::Sub => ast::BinOp::Sub,
+        A::Mul => ast::BinOp::Mul,
+        A::Div => ast::BinOp::Div,
+        A::Rem => ast::BinOp::Rem,
+        A::BitAnd => ast::BinOp::BitAnd,
+        A::BitOr => ast::BinOp::BitOr,
+        A::BitXor => ast::BinOp::BitXor,
+        A::Shl => ast::BinOp::Shl,
+        A::Shr => ast::BinOp::Shr,
+        A::Assign => ast::BinOp::Add,
+    };
+    arith_binop(bin, float, signed)
+}
+
+fn cmp_pred(op: ast::BinOp, float: bool, signed: bool) -> CmpOp {
+    use ast::BinOp as A;
+    match op {
+        A::Eq => if float { CmpOp::Foeq } else { CmpOp::Eq },
+        A::Ne => if float { CmpOp::Fone } else { CmpOp::Ne },
+        A::Lt => float_or(float, CmpOp::Folt, signed, CmpOp::Slt, CmpOp::Ult),
+        A::Le => float_or(float, CmpOp::Fole, signed, CmpOp::Sle, CmpOp::Ule),
+        A::Gt => float_or(float, CmpOp::Fogt, signed, CmpOp::Sgt, CmpOp::Ugt),
+        A::Ge => float_or(float, CmpOp::Foge, signed, CmpOp::Sge, CmpOp::Uge),
+        _ => CmpOp::Eq,
+    }
+}
+
+fn float_or(float: bool, f: CmpOp, signed: bool, s: CmpOp, u: CmpOp) -> CmpOp {
+    if float {
+        f
+    } else if signed {
+        s
+    } else {
+        u
+    }
+}
+
+fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
+    let isz = |t: &MirType| match t {
+        MirType::I1 => 1,
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        _ => 0,
+    };
+    let fsz = |t: &MirType| match t {
+        MirType::F16 | MirType::BF16 => 16,
+        MirType::F32 => 32,
+        MirType::F64 => 64,
+        _ => 0,
+    };
+    match (from.is_int(), to.is_int(), from.is_float(), to.is_float()) {
+        (true, true, _, _) => {
+            if isz(to) > isz(from) {
+                if signed {
+                    CastKind::SExt
+                } else {
+                    CastKind::ZExt
+                }
+            } else {
+                CastKind::Trunc
+            }
+        }
+        (true, _, _, true) => if signed { CastKind::SiToFp } else { CastKind::UiToFp },
+        (_, true, true, _) => if signed { CastKind::FpToSi } else { CastKind::FpToUi },
+        (_, _, true, true) => {
+            if fsz(to) > fsz(from) {
+                CastKind::FpExt
+            } else {
+                CastKind::FpTrunc
+            }
+        }
+        _ if matches!(from, MirType::Ptr) && to.is_int() => CastKind::PtrToInt,
+        _ if from.is_int() && matches!(to, MirType::Ptr) => CastKind::IntToPtr,
+        _ => CastKind::Bitcast,
+    }
+}
+
+fn parse_int(text: &str) -> i128 {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit() || *c == '_').collect();
+    digits.replace('_', "").parse().unwrap_or(0)
+}
+
+fn parse_float(text: &str) -> f64 {
+    // Strip a trailing type suffix (bf16/f16/f32/f64) before parsing.
+    let mut core = text;
+    for suf in ["bf16", "f16", "f32", "f64"] {
+        if let Some(stripped) = core.strip_suffix(suf) {
+            core = stripped;
+            break;
+        }
+    }
+    core.parse().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mercury_mir::verify::verify_function;
+    use mercury_span::SourceId;
+
+    fn lower(src: &str) -> (Program, Vec<Diagnostic>, Interner) {
+        let mut interner = Interner::new();
+        let (module, pdiags) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = mercury_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (prog, diags) = lower_program(&module, &sema, &interner);
+        (prog, diags, interner)
+    }
+
+    #[test]
+    fn lowers_and_verifies_loop_sum() {
+        let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
+                   while i < 10 { s += i; i += 1; } return s; }";
+        let (prog, diags, _) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "verify: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn lowers_and_verifies_recursive_fib() {
+        let src = "fn fib(n: i32) -> i32 { if n < 2 { return n; } \
+                   return fib(n - 1) + fib(n - 2); } \
+                   fn main() -> i32 { return fib(10); }";
+        let (prog, _diags, _) = lower(src);
+        assert_eq!(prog.funcs.len(), 2);
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "verify failed for a function");
+        }
+    }
+}
