@@ -9,6 +9,7 @@
 mod builder;
 mod inst;
 pub mod print;
+pub mod verify;
 
 pub use builder::Builder;
 pub use inst::{BinOp, CastKind, CmpOp, Inst, Op, Terminator};
