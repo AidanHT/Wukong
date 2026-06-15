@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+**/target
+**/*.rs.bk
+
+# Mercury / native build outputs
+*.exe
+*.obj
+*.o
+*.ll
+*.s
+*.pdb
+a.out
+
+# Local LLVM install (if placed inside the repo)
+/llvm
+/.llvm
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

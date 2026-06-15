@@ -1,0 +1,26 @@
+# Mercury — virtual cargo workspace.
+#
+# Crates are added under `crates/` as each compiler stage is implemented. The default build
+# (interpreter backend) has zero external dependencies; LLVM (inkwell) is opt-in behind a feature.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Aidan <aidantran120@gmail.com>"]
+rust-version = "1.94"
+repository = "https://github.com/aidan/mercury"
+
+[workspace.dependencies]
+# Internal crates are registered here as they are created, so members can depend on them
+# with `{ workspace = true }`.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
