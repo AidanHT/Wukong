@@ -1,0 +1,12 @@
+[package]
+name = "mercury_lexer"
+description = "The Mercury lexer: source text into a token stream."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mercury_span = { workspace = true }
+mercury_diag = { workspace = true }

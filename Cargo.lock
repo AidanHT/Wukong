@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_lexer"
+version = "0.1.0"
+dependencies = [
+ "mercury_diag",
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_span"
 version = "0.1.0"
 

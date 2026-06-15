@@ -20,6 +20,7 @@ repository = "https://github.com/aidan/mercury"
 # with `{ workspace = true }`.
 mercury_span = { path = "crates/mercury_span" }
 mercury_diag = { path = "crates/mercury_diag" }
+mercury_lexer = { path = "crates/mercury_lexer" }
 
 [profile.release]
 opt-level = 3
