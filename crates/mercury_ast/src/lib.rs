@@ -10,6 +10,8 @@ mod item;
 mod stmt;
 mod ty;
 
+pub mod print;
+
 pub use expr::*;
 pub use item::*;
 pub use stmt::*;
