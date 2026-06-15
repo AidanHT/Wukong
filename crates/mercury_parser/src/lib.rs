@@ -12,6 +12,9 @@ use mercury_span::{Interner, SourceId, Span, Symbol};
 
 use TokenKind as T;
 
+mod items;
+pub use items::{parse_module, parse_module_tokens};
+
 /// Parse a standalone expression (for tests and a future REPL).
 pub fn parse_expr_str(
     src: &str,
@@ -133,6 +136,19 @@ impl<'a> Parser<'a> {
             let span = self.span();
             self.error(span, "E0201", format!("expected identifier, found {}", self.kind().describe()));
             Ident { sym: self.interner.intern("«error»"), span }
+        }
+    }
+
+    /// Like [`ident`], but also accepts keyword tokens by their text. Used for attribute names
+    /// such as `@extern` where the name collides with a keyword.
+    fn ident_like(&mut self) -> Ident {
+        if self.at(T::Ident) || self.kind().is_keyword() {
+            let span = self.span();
+            self.bump();
+            let sym = self.intern_span(span);
+            Ident { sym, span }
+        } else {
+            self.ident()
         }
     }
 
@@ -630,6 +646,19 @@ impl<'a> Parser<'a> {
                     let k = self.parse_let();
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
+                T::Const => {
+                    // A local `const X: T = v;` is parsed as an immutable binding.
+                    self.bump();
+                    let name = self.ident();
+                    let pat = Pattern { id: self.nid(), kind: PatKind::Ident(name.sym), span: name.span };
+                    self.expect(T::Colon);
+                    let ty = Some(self.parse_type());
+                    self.expect(T::Eq);
+                    let init = Some(self.parse_expr());
+                    self.eat(T::Semi);
+                    let k = StmtKind::Let { pat, mutable: false, ty, init };
+                    stmts.push(self.mk_stmt(attrs, k, stmt_start));
+                }
                 T::Return => {
                     self.bump();
                     let e = if self.at(T::Semi) || self.at(T::RBrace) {
@@ -795,7 +824,7 @@ impl<'a> Parser<'a> {
     fn parse_attr(&mut self) -> Attr {
         let start = self.span();
         self.bump(); // @
-        let name = self.ident();
+        let name = self.ident_like();
         let mut args = Vec::new();
         if self.eat(T::LParen) {
             while !self.at(T::RParen) && !self.at(T::Eof) {

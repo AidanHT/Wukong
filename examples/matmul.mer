@@ -1,0 +1,54 @@
+module examples.matmul
+
+/// C[M,N] += A[M,K] * B[K,N], single precision.
+///
+/// Shape types prove M, N, K agree across A, B, C at COMPILE TIME (no runtime shape check).
+/// Cache tiling (MT/NT/KT) + 8-wide SIMD over N + parallel over row-tiles.
+fn matmul<M, N, K>(
+    a: Tensor[f32, M, K],
+    b: Tensor[f32, K, N],
+    c: Tensor[f32, M, N],
+) {
+    const MT: usize = 64;
+    const NT: usize = 64;
+    const KT: usize = 256;
+    const VL: usize = 8;
+
+    @parallel(grain = 1)
+    for it in 0..((M + MT - 1) / MT) {
+        let i0 = it * MT;
+        let i1 = min(i0 + MT, M);
+
+        for jt in 0..((N + NT - 1) / NT) {
+            let j0 = jt * NT;
+            let j1 = min(j0 + NT, N);
+
+            for kt in 0..((K + KT - 1) / KT) {
+                let k0 = kt * KT;
+                let k1 = min(k0 + KT, K);
+
+                for i in i0..i1 {
+                    let mut j = j0;
+                    while j + VL <= j1 {
+                        let mut acc = f32x8::load(c.row_ptr(i).offset(j as isize));
+                        for k in k0..k1 {
+                            let av = f32x8::splat(a[i, k]);
+                            let bv = f32x8::load(b.row_ptr(k).offset(j as isize));
+                            acc = av.fma(bv, acc);
+                        }
+                        acc.store(c.row_ptr(i).offset(j as isize));
+                        j += VL;
+                    }
+                    while j < j1 {
+                        let mut s = c[i, j];
+                        for k in k0..k1 {
+                            s += a[i, k] * b[k, j];
+                        }
+                        c[i, j] = s;
+                        j += 1;
+                    }
+                }
+            }
+        }
+    }
+}

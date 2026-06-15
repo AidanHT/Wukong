@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use mercury_diag::{DiagnosticSink, Renderer};
-use mercury_span::SourceMap;
+use mercury_span::{Interner, SourceMap};
 
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,13 +90,23 @@ pub fn compile(opts: &Options) -> i32 {
         sink.emit(d);
     }
 
-    // Emit diagnostics collected so far.
-    for d in sink.diagnostics() {
-        eprintln!("{}", renderer.render(d, &sm));
+    if opts.emit == EmitStage::Tokens {
+        render_all(&renderer, &sink, &sm);
+        print!("{}", mercury_lexer::dump(&tokens, sm.source(id)));
+        return if sink.has_errors() { exit::COMPILE_ERROR } else { exit::OK };
     }
 
-    if opts.emit == EmitStage::Tokens {
-        print!("{}", mercury_lexer::dump(&tokens, sm.source(id)));
+    // --- Parsing ---
+    let mut interner = Interner::new();
+    let (module, parse_diags) =
+        mercury_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+    for d in parse_diags {
+        sink.emit(d);
+    }
+    render_all(&renderer, &sink, &sm);
+
+    if opts.emit == EmitStage::Ast {
+        print!("{}", mercury_ast::print::print_module(&module, &interner));
         return if sink.has_errors() { exit::COMPILE_ERROR } else { exit::OK };
     }
 
@@ -105,9 +115,15 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     eprintln!(
-        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches the lexer; \
-         try `--emit=tokens`)",
+        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches the parser; \
+         try `--emit=tokens` or `--emit=ast`)",
         opts.emit
     );
     exit::UNIMPLEMENTED
+}
+
+fn render_all(renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
+    for d in sink.diagnostics() {
+        eprintln!("{}", renderer.render(d, sm));
+    }
 }

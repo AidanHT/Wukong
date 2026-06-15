@@ -20,8 +20,10 @@ dependencies = [
 name = "mercury_driver"
 version = "0.1.0"
 dependencies = [
+ "mercury_ast",
  "mercury_diag",
  "mercury_lexer",
+ "mercury_parser",
  "mercury_span",
 ]
 
