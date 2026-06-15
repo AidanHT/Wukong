@@ -1,0 +1,193 @@
+//! MIR instructions, operations, and terminators.
+
+use crate::{BlockId, MirType, ValueId};
+use mercury_span::Symbol;
+
+/// A binary arithmetic/bitwise operation. Signedness is explicit (`SDiv` vs `UDiv`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    SDiv,
+    UDiv,
+    SRem,
+    URem,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
+}
+
+impl BinOp {
+    pub fn name(self) -> &'static str {
+        use BinOp::*;
+        match self {
+            Add => "add",
+            Sub => "sub",
+            Mul => "mul",
+            SDiv => "sdiv",
+            UDiv => "udiv",
+            SRem => "srem",
+            URem => "urem",
+            FAdd => "fadd",
+            FSub => "fsub",
+            FMul => "fmul",
+            FDiv => "fdiv",
+            And => "and",
+            Or => "or",
+            Xor => "xor",
+            Shl => "shl",
+            LShr => "lshr",
+            AShr => "ashr",
+        }
+    }
+
+    pub fn is_float(self) -> bool {
+        use BinOp::*;
+        matches!(self, FAdd | FSub | FMul | FDiv)
+    }
+}
+
+/// A comparison predicate (integer signed/unsigned, or ordered float). Result is `i1`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Slt,
+    Sle,
+    Sgt,
+    Sge,
+    Ult,
+    Ule,
+    Ugt,
+    Uge,
+    Foeq,
+    Fone,
+    Folt,
+    Fole,
+    Fogt,
+    Foge,
+}
+
+impl CmpOp {
+    pub fn name(self) -> &'static str {
+        use CmpOp::*;
+        match self {
+            Eq => "eq",
+            Ne => "ne",
+            Slt => "slt",
+            Sle => "sle",
+            Sgt => "sgt",
+            Sge => "sge",
+            Ult => "ult",
+            Ule => "ule",
+            Ugt => "ugt",
+            Uge => "uge",
+            Foeq => "foeq",
+            Fone => "fone",
+            Folt => "folt",
+            Fole => "fole",
+            Fogt => "fogt",
+            Foge => "foge",
+        }
+    }
+
+    pub fn is_float(self) -> bool {
+        use CmpOp::*;
+        matches!(self, Foeq | Fone | Folt | Fole | Fogt | Foge)
+    }
+}
+
+/// A type conversion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CastKind {
+    SExt,
+    ZExt,
+    Trunc,
+    FpToSi,
+    FpToUi,
+    SiToFp,
+    UiToFp,
+    FpExt,
+    FpTrunc,
+    Bitcast,
+    IntToPtr,
+    PtrToInt,
+}
+
+impl CastKind {
+    pub fn name(self) -> &'static str {
+        use CastKind::*;
+        match self {
+            SExt => "sext",
+            ZExt => "zext",
+            Trunc => "trunc",
+            FpToSi => "fptosi",
+            FpToUi => "fptoui",
+            SiToFp => "sitofp",
+            UiToFp => "uitofp",
+            FpExt => "fpext",
+            FpTrunc => "fptrunc",
+            Bitcast => "bitcast",
+            IntToPtr => "inttoptr",
+            PtrToInt => "ptrtoint",
+        }
+    }
+}
+
+/// An operation that may produce a value.
+#[derive(Clone, Debug)]
+pub enum Op {
+    ConstInt(i128, MirType),
+    ConstFloat(f64, MirType),
+    Bin(BinOp, ValueId, ValueId),
+    Cmp(CmpOp, ValueId, ValueId),
+    /// Arithmetic negation (`-x`); `FNeg` for floats is folded here by result type.
+    Neg(ValueId),
+    /// Bitwise/boolean complement.
+    Not(ValueId),
+    Cast(CastKind, ValueId, MirType),
+    Select(ValueId, ValueId, ValueId),
+    /// A stack slot; result is a pointer.
+    Alloca(MirType),
+    /// Load a value of the given type from a pointer.
+    Load(ValueId, MirType),
+    /// Store `value` to `ptr` (no result).
+    Store { ptr: ValueId, value: ValueId },
+    /// `ptr + index * sizeof(elem)`; result is a pointer.
+    Gep { ptr: ValueId, index: ValueId, elem: MirType },
+    /// A direct call to a function by name.
+    Call { func: Symbol, args: Vec<ValueId> },
+}
+
+/// One instruction: an optional result value plus its operation.
+#[derive(Clone, Debug)]
+pub struct Inst {
+    pub result: Option<ValueId>,
+    pub op: Op,
+}
+
+/// How a basic block ends. Exactly one per block.
+#[derive(Clone, Debug)]
+pub enum Terminator {
+    Ret(Option<ValueId>),
+    Br {
+        target: BlockId,
+        args: Vec<ValueId>,
+    },
+    CondBr {
+        cond: ValueId,
+        then_blk: BlockId,
+        then_args: Vec<ValueId>,
+        else_blk: BlockId,
+        else_args: Vec<ValueId>,
+    },
+    Unreachable,
+}

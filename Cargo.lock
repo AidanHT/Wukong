@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_mir"
+version = "0.1.0"
+dependencies = [
+ "mercury_span",
+ "mercury_types",
+]
+
+[[package]]
 name = "mercury_parser"
 version = "0.1.0"
 dependencies = [
