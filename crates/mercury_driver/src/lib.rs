@@ -129,6 +129,25 @@ pub fn compile(opts: &Options) -> i32 {
         eprintln!("{}", renderer.render(d, &sm));
     }
 
+    // --- Run via the interpreter ---
+    if opts.run {
+        use mercury_backend::{Artifact, Backend};
+        let main = interner.intern("main");
+        let backend = mercury_interp::Interpreter;
+        return match backend.compile(&program, main, &interner) {
+            Ok(Artifact::Executed { exit_code, stdout }) => {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&stdout);
+                exit_code as i32
+            }
+            Ok(_) => exit::OK,
+            Err(e) => {
+                eprintln!("error: {e}");
+                exit::COMPILE_ERROR
+            }
+        };
+    }
+
     if matches!(opts.emit, EmitStage::MirHigh | EmitStage::Mir) {
         // Until optimization passes land, the high and low forms are the same.
         for f in &program.funcs {

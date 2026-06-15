@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_backend"
+version = "0.1.0"
+dependencies = [
+ "mercury_mir",
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_diag"
 version = "0.1.0"
 dependencies = [
@@ -21,8 +29,22 @@ name = "mercury_driver"
 version = "0.1.0"
 dependencies = [
  "mercury_ast",
+ "mercury_backend",
  "mercury_diag",
+ "mercury_interp",
  "mercury_lexer",
+ "mercury_mir",
+ "mercury_mir_build",
+ "mercury_parser",
+ "mercury_sema",
+ "mercury_span",
+]
+
+[[package]]
+name = "mercury_interp"
+version = "0.1.0"
+dependencies = [
+ "mercury_backend",
  "mercury_mir",
  "mercury_mir_build",
  "mercury_parser",

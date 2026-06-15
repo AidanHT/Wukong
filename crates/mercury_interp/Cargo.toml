@@ -1,0 +1,18 @@
+[package]
+name = "mercury_interp"
+description = "A from-scratch MIR interpreter: reference execution and differential-testing oracle."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mercury_span = { workspace = true }
+mercury_mir = { workspace = true }
+mercury_backend = { workspace = true }
+
+[dev-dependencies]
+mercury_parser = { workspace = true }
+mercury_sema = { workspace = true }
+mercury_mir_build = { workspace = true }

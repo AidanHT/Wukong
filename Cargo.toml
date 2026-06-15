@@ -28,6 +28,8 @@ mercury_types = { path = "crates/mercury_types" }
 mercury_sema = { path = "crates/mercury_sema" }
 mercury_mir = { path = "crates/mercury_mir" }
 mercury_mir_build = { path = "crates/mercury_mir_build" }
+mercury_backend = { path = "crates/mercury_backend" }
+mercury_interp = { path = "crates/mercury_interp" }
 
 [profile.release]
 opt-level = 3
