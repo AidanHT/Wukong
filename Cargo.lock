@@ -50,6 +50,13 @@ name = "mercury_span"
 version = "0.1.0"
 
 [[package]]
+name = "mercury_types"
+version = "0.1.0"
+dependencies = [
+ "mercury_span",
+]
+
+[[package]]
 name = "mercuryc"
 version = "0.1.0"
 dependencies = [
