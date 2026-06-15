@@ -23,6 +23,7 @@ mercury_diag = { path = "crates/mercury_diag" }
 mercury_lexer = { path = "crates/mercury_lexer" }
 mercury_driver = { path = "crates/mercury_driver" }
 mercury_ast = { path = "crates/mercury_ast" }
+mercury_parser = { path = "crates/mercury_parser" }
 
 [profile.release]
 opt-level = 3

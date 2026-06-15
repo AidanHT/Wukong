@@ -14,6 +14,19 @@ pub fn print_module(m: &Module, interner: &Interner) -> String {
     p.out
 }
 
+/// Render a single expression as an indented tree (used by parser tests).
+pub fn print_expr(e: &Expr, interner: &Interner) -> String {
+    let mut p = AstPrinter { interner, out: String::new(), depth: 0 };
+    p.expr(e);
+    p.out
+}
+
+/// Render a single type to its inline source-like form (used by parser tests).
+pub fn print_type(t: &TypeExpr, interner: &Interner) -> String {
+    let p = AstPrinter { interner, out: String::new(), depth: 0 };
+    p.type_str(t)
+}
+
 struct AstPrinter<'a> {
     interner: &'a Interner,
     out: String,

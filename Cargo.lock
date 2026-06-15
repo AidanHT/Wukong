@@ -34,6 +34,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_parser"
+version = "0.1.0"
+dependencies = [
+ "mercury_ast",
+ "mercury_diag",
+ "mercury_lexer",
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_span"
 version = "0.1.0"
 
