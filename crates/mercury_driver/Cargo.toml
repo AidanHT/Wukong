@@ -1,0 +1,13 @@
+[package]
+name = "mercury_driver"
+description = "Pipeline orchestration for the Mercury compiler (Session, options, --emit)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mercury_span = { workspace = true }
+mercury_diag = { workspace = true }
+mercury_lexer = { workspace = true }

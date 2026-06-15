@@ -21,6 +21,7 @@ repository = "https://github.com/aidan/mercury"
 mercury_span = { path = "crates/mercury_span" }
 mercury_diag = { path = "crates/mercury_diag" }
 mercury_lexer = { path = "crates/mercury_lexer" }
+mercury_driver = { path = "crates/mercury_driver" }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,22 @@
+module examples.vadd
+
+/// out[i] = a[i] + b[i], hand-vectorized with explicit 8-wide SIMD + a scalar tail.
+@export("vadd_f32")
+@extern("C")
+fn vadd(a: *f32, b: *f32, out: *mut f32, n: usize) {
+    let lanes: usize = 8;
+    let nv = n - (n % lanes);
+
+    let mut i: usize = 0;
+    while i < nv {
+        let va = f32x8::load(a.offset(i as isize));
+        let vb = f32x8::load(b.offset(i as isize));
+        (va + vb).store(out.offset(i as isize));
+        i += lanes;
+    }
+    // explicit scalar remainder — nothing magic
+    while i < n {
+        out[i] = a[i] + b[i];
+        i += 1;
+    }
+}

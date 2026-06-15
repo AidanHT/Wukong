@@ -12,3 +12,4 @@ name = "mercuryc"
 path = "src/main.rs"
 
 [dependencies]
+mercury_driver = { workspace = true }

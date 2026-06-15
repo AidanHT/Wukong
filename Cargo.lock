@@ -10,6 +10,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_driver"
+version = "0.1.0"
+dependencies = [
+ "mercury_diag",
+ "mercury_lexer",
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_lexer"
 version = "0.1.0"
 dependencies = [
@@ -24,3 +33,6 @@ version = "0.1.0"
 [[package]]
 name = "mercuryc"
 version = "0.1.0"
+dependencies = [
+ "mercury_driver",
+]
