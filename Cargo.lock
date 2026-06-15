@@ -24,6 +24,7 @@ dependencies = [
  "mercury_diag",
  "mercury_lexer",
  "mercury_parser",
+ "mercury_sema",
  "mercury_span",
 ]
 
@@ -43,6 +44,17 @@ dependencies = [
  "mercury_diag",
  "mercury_lexer",
  "mercury_span",
+]
+
+[[package]]
+name = "mercury_sema"
+version = "0.1.0"
+dependencies = [
+ "mercury_ast",
+ "mercury_diag",
+ "mercury_parser",
+ "mercury_span",
+ "mercury_types",
 ]
 
 [[package]]

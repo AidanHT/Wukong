@@ -114,9 +114,19 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
 
+    // --- Semantic analysis (name resolution, type checking, shape checking) ---
+    let (_sema, sema_diags) = mercury_sema::check(&module, &interner);
+    for d in &sema_diags {
+        eprintln!("{}", renderer.render(d, &sm));
+    }
+    let sema_errors = sema_diags.iter().filter(|d| d.is_error()).count();
+    if sema_errors > 0 {
+        return exit::COMPILE_ERROR;
+    }
+
     eprintln!(
-        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches the parser; \
-         try `--emit=tokens` or `--emit=ast`)",
+        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches semantic \
+         analysis; try `--emit=tokens` or `--emit=ast`)",
         opts.emit
     );
     exit::UNIMPLEMENTED
