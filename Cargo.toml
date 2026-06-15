@@ -19,6 +19,7 @@ repository = "https://github.com/aidan/mercury"
 # Internal crates are registered here as they are created, so members can depend on them
 # with `{ workspace = true }`.
 mercury_span = { path = "crates/mercury_span" }
+mercury_diag = { path = "crates/mercury_diag" }
 
 [profile.release]
 opt-level = 3

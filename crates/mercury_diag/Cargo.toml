@@ -1,0 +1,11 @@
+[package]
+name = "mercury_diag"
+description = "Compiler diagnostics and a rustc-style terminal renderer for Mercury."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mercury_span = { workspace = true }
