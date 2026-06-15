@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "mercury_ast"
+version = "0.1.0"
+dependencies = [
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_diag"
 version = "0.1.0"
 dependencies = [
