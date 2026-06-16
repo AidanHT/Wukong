@@ -5,7 +5,9 @@
 //! keeping a per-call register file and a shared flat memory for `alloca`/`load`/`store`/`gep`.
 
 use mercury_backend::{Artifact, Backend};
-use mercury_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId};
+use mercury_mir::{
+    BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
+};
 use mercury_span::{Interner, Symbol};
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
@@ -79,6 +81,8 @@ pub fn run_with_output(
         interner,
         memory: Vec::new(),
         stdout: Vec::new(),
+        frames: Vec::new(),
+        scratch: Vec::with_capacity(8),
     };
     let result = interp.run_function(func, Vec::new())?;
     Ok((result.as_int() as i64, interp.stdout))
@@ -89,15 +93,29 @@ struct Interp<'a> {
     interner: &'a Interner,
     memory: Vec<Value>,
     stdout: Vec<u8>,
+    /// Recycled register files, one per active call depth. Pooling them keeps recursion and
+    /// call-heavy code from allocating a fresh vector on every call.
+    frames: Vec<Vec<Value>>,
+    /// Scratch buffer reused when passing block-parameter arguments across an edge.
+    scratch: Vec<Value>,
 }
 
 impl<'a> Interp<'a> {
     fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
-        let mut regs: Vec<Option<Value>> = vec![None; func.value_types.len()];
+        // Take a recycled register file (or a fresh one) and size it for this function. Values
+        // start as `Unit`, the interpreter's "undefined"; well-formed MIR writes before it reads.
+        let mut regs = self.frames.pop().unwrap_or_default();
+        regs.clear();
+        regs.resize(func.value_types.len(), Value::Unit);
         for (p, a) in func.params.iter().zip(args) {
-            regs[p.0 as usize] = Some(a);
+            regs[p.0 as usize] = a;
         }
+        let result = self.exec(func, &mut regs);
+        self.frames.push(regs);
+        result
+    }
 
+    fn exec(&mut self, func: &Function, regs: &mut [Value]) -> Result<Value, String> {
         let mut cur = func.entry;
         let mut steps = 0u64;
         loop {
@@ -107,7 +125,7 @@ impl<'a> Interp<'a> {
             }
             let block = func.block(cur);
             for inst in &block.insts {
-                let v = self.eval(&inst.op, &regs)?;
+                let v = self.eval(&inst.op, regs)?;
                 if let Some(r) = inst.result {
                     // Normalize integer results to their declared width: this gives correct
                     // two's-complement wrapping and keeps booleans (`i1`) as 0/1 (so e.g. `!true`
@@ -117,18 +135,14 @@ impl<'a> Interp<'a> {
                         Value::Int(i) if rty.is_int() => Value::Int(mask(i, rty)),
                         other => other,
                     };
-                    regs[r.0 as usize] = Some(v);
+                    regs[r.0 as usize] = v;
                 }
             }
             match &block.term {
                 Terminator::Ret(None) => return Ok(Value::Unit),
-                Terminator::Ret(Some(v)) => return Ok(reg(&regs, *v)),
+                Terminator::Ret(Some(v)) => return Ok(reg(regs, *v)),
                 Terminator::Br { target, args } => {
-                    let vals: Vec<Value> = args.iter().map(|a| reg(&regs, *a)).collect();
-                    let tb = func.block(*target);
-                    for (p, val) in tb.params.iter().zip(vals) {
-                        regs[p.0 as usize] = Some(val);
-                    }
+                    pass_args(regs, &mut self.scratch, func.block(*target), args);
                     cur = *target;
                 }
                 Terminator::CondBr {
@@ -138,16 +152,12 @@ impl<'a> Interp<'a> {
                     else_blk,
                     else_args,
                 } => {
-                    let (tgt, bargs) = if reg(&regs, *cond).truthy() {
+                    let (tgt, bargs) = if reg(regs, *cond).truthy() {
                         (*then_blk, then_args)
                     } else {
                         (*else_blk, else_args)
                     };
-                    let vals: Vec<Value> = bargs.iter().map(|a| reg(&regs, *a)).collect();
-                    let tb = func.block(tgt);
-                    for (p, val) in tb.params.iter().zip(vals) {
-                        regs[p.0 as usize] = Some(val);
-                    }
+                    pass_args(regs, &mut self.scratch, func.block(tgt), bargs);
                     cur = tgt;
                 }
                 Terminator::Unreachable => return Err("execution reached `unreachable`".into()),
@@ -155,7 +165,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn eval(&mut self, op: &Op, regs: &[Option<Value>]) -> Result<Value, String> {
+    fn eval(&mut self, op: &Op, regs: &[Value]) -> Result<Value, String> {
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
             Op::ConstFloat(v, _) => Value::Float(*v),
@@ -249,8 +259,24 @@ impl<'a> Interp<'a> {
     }
 }
 
-fn reg(regs: &[Option<Value>], v: ValueId) -> Value {
-    regs[v.0 as usize].unwrap_or(Value::Unit)
+fn reg(regs: &[Value], v: ValueId) -> Value {
+    regs[v.0 as usize]
+}
+
+/// Pass `args` to `target`'s block parameters, using `scratch` (cleared and reused) so no
+/// allocation happens per edge. All argument values are snapshotted before any parameter is
+/// written, in case an argument names a value the target also defines.
+fn pass_args(regs: &mut [Value], scratch: &mut Vec<Value>, target: &BasicBlock, args: &[ValueId]) {
+    if args.is_empty() {
+        return;
+    }
+    scratch.clear();
+    for a in args {
+        scratch.push(reg(regs, *a));
+    }
+    for (p, val) in target.params.iter().zip(scratch.iter()) {
+        regs[p.0 as usize] = *val;
+    }
 }
 
 fn ptr(v: Value) -> Result<usize, String> {
@@ -454,6 +480,15 @@ mod tests {
                    while j < 4 { s = s + xs[j]; j = j + 1; } return s; }";
         // 0 + 1 + 4 + 9 = 14
         assert_eq!(run_main(src), 14);
+    }
+
+    #[test]
+    fn runs_large_array_repeat_fill() {
+        // A large `[v; n]` initializer lowers to a fill loop rather than n unrolled stores; every
+        // slot must still hold the value.
+        let src = "fn main() -> i32 { let a: [i32; 100] = [7; 100]; \
+                   return a[0] + a[50] + a[99]; }";
+        assert_eq!(run_main(src), 21);
     }
 
     #[test]

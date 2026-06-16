@@ -20,6 +20,10 @@ use mercury_sema::{DefKind, SemaResult};
 use mercury_span::{Interner, Span, Symbol};
 use mercury_types::Ty;
 
+/// Array-repeat initializers (`[v; n]`) with at most this many elements are unrolled to
+/// straight-line stores; larger ones lower to a fill loop to keep the IR compact.
+const REPEAT_UNROLL_LIMIT: u32 = 8;
+
 /// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered.
 pub fn lower_program(
     module: &Module,
@@ -450,16 +454,81 @@ impl FnLowerer<'_> {
                 }
             }
             ExprKind::ArrayRepeat { value, .. } => {
-                // `[value; n]` — evaluate `value` once per slot (values here are pure literals).
-                for i in 0..n as i128 {
-                    let v = self.lower_expr(value);
-                    self.store_element(base, elem, i, v);
+                // `[value; n]` evaluates `value` once and fills every slot with it. Small arrays
+                // unroll to straight-line stores; large ones lower to a fill loop so that, e.g.,
+                // `[0; 1_000_000]` does not generate a million instructions.
+                let v = self.lower_expr(value);
+                if n <= REPEAT_UNROLL_LIMIT {
+                    for i in 0..n as i128 {
+                        self.store_element(base, elem, i, v);
+                    }
+                } else {
+                    self.lower_fill_loop(base, elem, n, v);
                 }
             }
             _ => {
                 self.unsupported(init.span, "array initializer (expected `[..]` or `[v; n]`)");
             }
         }
+    }
+
+    /// Emit `for i in 0..n { base[i] = v }` as a CFG loop. Used for large array-repeat initializers
+    /// so the IR stays compact; mem2reg later promotes the loop counter to a register.
+    fn lower_fill_loop(&mut self, base: ValueId, elem: &MirType, n: u32, v: ValueId) {
+        let i64t = MirType::I64;
+        let slot = self.builder.alloca(i64t.clone());
+        let zero = self
+            .builder
+            .build(i64t.clone(), Op::ConstInt(0, i64t.clone()));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: zero,
+        });
+
+        let header = self.builder.new_block();
+        let body = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+
+        self.builder.switch_to(header);
+        let i_val = self
+            .builder
+            .build(i64t.clone(), Op::Load(slot, i64t.clone()));
+        let nconst = self
+            .builder
+            .build(i64t.clone(), Op::ConstInt(n as i128, i64t.clone()));
+        let cond = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, nconst));
+        self.builder.cond_br(cond, body, vec![], exit, vec![]);
+
+        self.builder.switch_to(body);
+        let i_cur = self
+            .builder
+            .build(i64t.clone(), Op::Load(slot, i64t.clone()));
+        let p = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: i_cur,
+                elem: elem.clone(),
+            },
+        );
+        self.builder.build_void(Op::Store { ptr: p, value: v });
+        let one = self
+            .builder
+            .build(i64t.clone(), Op::ConstInt(1, i64t.clone()));
+        let next = self
+            .builder
+            .build(i64t.clone(), Op::Bin(BinOp::Add, i_cur, one));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
+
+        self.builder.switch_to(exit);
+        self.terminated = false;
     }
 
     /// Store `value` into `base[index]` for an array element of type `elem`.
