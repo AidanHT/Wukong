@@ -332,24 +332,28 @@ unsafe fn pack_b(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) 
     }
 }
 
-/// Pack a `KC×NC` slice of Bᵀ — i.e. read B as `[nc rows × kc cols]` (leading dim `ldb`) and write
-/// the same `[kc][NR]`-per-panel form the microkernel expects (a transpose during packing).
+/// Pack a `KC×NC` slice of Bᵀ — read B as `[nc rows × kc cols]` (leading dim `ldb`) and write the
+/// `[kc][NR]`-per-panel form the microkernel expects. Reads run *contiguously* down each B row (the
+/// `p` loop is innermost) and scatter into the small, L1-resident packed panel; the naive transpose
+/// order (strided B reads) thrashes cache and dominates runtime, so this order is essential.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pack_b_trans(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) {
-    let mut dst = bp;
     let npanels = nc.div_ceil(NR);
     for jp in 0..npanels {
         let j0 = jp * NR;
         let ncols = (nc - j0).min(NR);
-        for p in 0..kc {
-            for r in 0..ncols {
-                *dst.add(r) = *b.add((j0 + r) * ldb + p);
+        let panel = bp.add(jp * kc * NR);
+        for r in 0..ncols {
+            let src = b.add((j0 + r) * ldb); // row (j0+r) of B, contiguous over the contraction
+            for p in 0..kc {
+                *panel.add(p * NR + r) = *src.add(p);
             }
-            for r in ncols..NR {
-                *dst.add(r) = 0.0;
+        }
+        for r in ncols..NR {
+            for p in 0..kc {
+                *panel.add(p * NR + r) = 0.0;
             }
-            dst = dst.add(NR);
         }
     }
 }
@@ -609,6 +613,12 @@ mod tests {
         });
         bench("sgemm (parallel)", &|| unsafe {
             mercury_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+        });
+        bench("sgemm_nt (1 core)", &|| unsafe {
+            mercury_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+        });
+        bench("sgemm_nt (parallel)", &|| unsafe {
+            mercury_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
         });
     }
 

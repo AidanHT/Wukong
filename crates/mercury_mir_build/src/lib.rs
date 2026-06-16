@@ -665,7 +665,7 @@ impl FnLowerer<'_> {
     fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
         // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
         // whole-function `@parallel` form is handled earlier in `lower_program`).
-        if let Some(nest) = match_matmul(pat, iter, body, self.sema, self.interner) {
+        if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
             if self.emit_sgemm(&nest, false) {
                 return;
             }
@@ -2609,6 +2609,170 @@ fn match_zero_init(
     Some((cbase, stride, n))
 }
 
+/// Classify a `Mul` product as `A·B`, returning `(a, sa, b, sb, transposed)`. `aik` carries an
+/// optional pre-bound `let aik = A[row*sa+k]` (the `ikj` form); otherwise A is found inline. B is
+/// `B[k*N+j]` (normal) or `B[j*K+k]` (transposed — the nn.Linear `A·Bᵀ`). Either factor order.
+fn match_product_ab(
+    prod: &Expr,
+    row: Symbol,
+    kvar: Symbol,
+    jvar: Symbol,
+    aik: Option<(Symbol, Symbol, i64)>,
+    interner: &Interner,
+) -> Option<(Symbol, i64, Symbol, i64, bool)> {
+    let ExprKind::Binary { op: ast::BinOp::Mul, lhs: f1, rhs: f2 } = &prod.kind else {
+        return None;
+    };
+    let is_a = |f: &Expr| -> Option<(Symbol, i64)> {
+        if let Some((aik_sym, asym, sa)) = aik {
+            if single_path(f) == Some(aik_sym) {
+                return Some((asym, sa));
+            }
+        }
+        let (abase, aidx) = as_index1(f)?;
+        let (ar, asa, ak) = match_row_col(aidx, interner)?;
+        (ar == row && ak == kvar).then_some((abase, asa))
+    };
+    let is_b = |f: &Expr| -> Option<(Symbol, i64, bool)> {
+        let (bbase, bidx) = as_index1(f)?;
+        let (br, sb, bc) = match_row_col(bidx, interner)?;
+        if br == kvar && bc == jvar {
+            Some((bbase, sb, false))
+        } else if br == jvar && bc == kvar {
+            Some((bbase, sb, true))
+        } else {
+            None
+        }
+    };
+    let pair = |fa: &Expr, fb: &Expr| match (is_a(fa), is_b(fb)) {
+        (Some((a, sa)), Some((b, sb, t))) => Some((a, sa, b, sb, t)),
+        _ => None,
+    };
+    pair(f1, f2).or_else(|| pair(f2, f1))
+}
+
+/// Try both recognized matmul spellings: the `ikj` accumulate form and the `ijk` dot-product form.
+fn recognize_matmul(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest> {
+    match_matmul(pat, iter, body, sema, interner)
+        .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
+}
+
+/// Recognize the textbook `ijk` dot-product matmul:
+/// `for i { for j { let s = 0.0; for k { s = s + A[i,k]*B[..]; } c[i*N+j] = s; } }`. This is the
+/// natural way to write `C = A·Bᵀ` (both A and B read contiguously). Always `beta = 0` (s overwrites
+/// c). See [`MatmulNest`].
+fn match_matmul_ijk(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_int_lit(end, interner)?;
+    // Outer body is a single `for j` loop.
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_int_lit(je, interner)?;
+    // j body: [ let s = 0.0; for k {...}; c[i*N+j] = s ].
+    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let { pat: sp, init: Some(s0), .. } = &jbody.stmts[0].kind else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    // The K loop: `for k in 0..K { s = s + A*B; }`.
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_int_lit(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            // s = s + A*B
+            let ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs } = &value.kind else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let (a_sym, sa, b_sym, sb, transposed) =
+        match_product_ab(prod, row, kvar, jvar, None, interner)?;
+    // Final store: c[i*N + j] = s.
+    let StmtKind::Assign { target: ct, op: ast::AssignOp::Assign, value: cv } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(cv) != Some(s_sym) {
+        return None;
+    }
+    let (cbase, cidx) = as_index1(ct)?;
+    let (cr, sc, cj) = match_row_col(cidx, interner)?;
+    if cr != row || cj != jvar {
+        return None;
+    }
+    let sb_ok = if transposed { sb == kdim } else { sb == n };
+    if sa != kdim || !sb_ok || sc != n {
+        return None;
+    }
+    if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    Some(MatmulNest { a: a_sym, b: b_sym, c: cbase, m, k: kdim, n, beta: 0, transposed })
+}
+
 /// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
 fn match_matmul(
     pat: &Pattern,
@@ -2713,44 +2877,12 @@ fn match_matmul(
     if !is_f32_expr(prod, sema) {
         return None;
     }
-    let ExprKind::Binary { op: ast::BinOp::Mul, lhs: f1, rhs: f2 } = &prod.kind else {
-        return None;
+    let aik_info = match (aik, a_sym, sa) {
+        (Some(s), Some(b), Some(st)) => Some((s, b, st)),
+        _ => None,
     };
-
-    // Classify each factor as the A term or the B term.
-    let is_a = |f: &Expr| -> Option<(Symbol, i64)> {
-        if let (Some(aik), Some(asym), Some(sa)) = (aik, a_sym, sa) {
-            if single_path(f) == Some(aik) {
-                return Some((asym, sa));
-            }
-        }
-        let (abase, aidx) = as_index1(f)?;
-        let (ar, asa, ak) = match_row_col(aidx, interner)?;
-        if ar == row && ak == kvar {
-            Some((abase, asa))
-        } else {
-            None
-        }
-    };
-    // B is either `B[k*N + j]` (normal, C=A·B) or `B[j*K + k]` (transposed, the nn.Linear C=A·Bᵀ).
-    let is_b = |f: &Expr| -> Option<(Symbol, i64, bool)> {
-        let (bbase, bidx) = as_index1(f)?;
-        let (br, sb, bc) = match_row_col(bidx, interner)?;
-        if br == kvar && bc == jvar {
-            Some((bbase, sb, false))
-        } else if br == jvar && bc == kvar {
-            Some((bbase, sb, true))
-        } else {
-            None
-        }
-    };
-    let ((a_sym, sa), (b_sym, sb, transposed)) = match (is_a(f1), is_b(f2)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => match (is_a(f2), is_b(f1)) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return None,
-        },
-    };
+    let (a_sym, sa, b_sym, sb, transposed) =
+        match_product_ab(prod, row, kvar, jvar, aik_info, interner)?;
 
     // Strides must describe contiguous row-major A[m,k] and C[m,n], and B[k,n] (normal) or B[n,k]
     // (transposed) — i.e. B's contraction stride is N normally, K when transposed.
@@ -2778,7 +2910,7 @@ fn matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<Mat
     let StmtKind::For { pat, iter, body: lb, .. } = &body.stmts[0].kind else {
         return None;
     };
-    match_matmul(pat, iter, lb, sema, interner)
+    recognize_matmul(pat, iter, lb, sema, interner)
 }
 
 /// Lower a recognized matmul function to a thin wrapper that binds its array params to base

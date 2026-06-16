@@ -742,6 +742,36 @@ fn linear_nt_matmul_lowers_and_runs() {
     assert_eq!(jit(src, 3).expect("jit"), interp(src, 3).expect("interp"));
 }
 
+/// The textbook `ijk` dot-product matmul (`let s=0; for k s+=a*b; c=s`) must be recognized too —
+/// both `C=A·B` and the `C=A·Bᵀ` (nn.Linear) spelling — and stay native==interp.
+#[test]
+fn ijk_dot_product_matmul_recognized() {
+    // C = A·Bᵀ (b[j*K+k]) — the natural nn.Linear spelling.
+    let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+        for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
+        for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }";
+    assert!(lowered_calls(nt, "mercury_sgemm_nt"), "ijk A·Bᵀ -> sgemm_nt");
+    // C = A·B (b[k*N+j]).
+    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+        for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
+        for k in 0..8 { s = s + a[i*8+k] * b[k*4+j]; } c[i*4+j] = s; } } }";
+    assert!(lowered_calls(normal, "mercury_sgemm"), "ijk A·B -> sgemm");
+    assert!(!lowered_calls(normal, "mercury_sgemm_nt"));
+
+    // End to end (A·Bᵀ): native must equal interp.
+    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+        for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
+        for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }\n\
+        fn main() -> i32 { let mut a:[f32;48]=[0.0;48]; let mut b:[f32;32]=[0.0;32]; \
+        let mut c:[f32;24]=[0.0;24]; let mut i: i32 = 0; \
+        while i < 48 { a[i] = ((i % 5) as f32) * 0.25; i += 1; } \
+        let mut j: i32 = 0; while j < 32 { b[j] = ((j % 7) as f32) - 2.0; j += 1; } \
+        lin(a, b, c); let mut s: f32 = 0.0; let mut t: i32 = 0; \
+        while t < 24 { s = s + c[t]; t += 1; } return (s * 1000.0) as i32; }";
+    assert!(lowered_calls(src, "mercury_sgemm_nt"));
+    assert_eq!(jit(src, 3).expect("jit"), interp(src, 3).expect("interp"));
+}
+
 /// The zero-init (beta = 0) matmul, end to end: native and interpreter agree bit-for-bit (both run
 /// the same kernel) and match an independent reference.
 #[test]

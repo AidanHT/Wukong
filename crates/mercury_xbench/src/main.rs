@@ -113,6 +113,7 @@ fn main() {
 
     println!();
     bench_matmul(&cc, &dir);
+    bench_linear(&cc, &dir);
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -247,6 +248,82 @@ fn rust_matmul(ns: usize) -> String {
          \x20     for j in 0..NS {{ *c.add(i*NS+j)+=aik* *b.add(k*NS+j); }}\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
+    )
+}
+
+/// `nn.Linear`: `C = A·Bᵀ` (A is `[M,K]`, B is `[N,K]`), the matmul every Dense layer runs. Mercury
+/// recognizes the transposed-B nest and dispatches to its tuned GEMM; idiomatic C/Rust write the
+/// naive nest. Square M=K=N for the harness's shared-buffer ABI.
+fn bench_linear(cc: &str, dir: &Path) {
+    for ns in [512usize, 1024] {
+        let n2 = ns * ns;
+        let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+        let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
+        let mut c = vec![0.0f32; n2];
+        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+        let flops = 2.0 * (ns as f64).powi(3);
+        let gflops = |m: &Option<Measure>| {
+            m.as_ref().map(|x| format!("{:.1}", flops / x.ns_per_call)).unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== linear (nn.Linear C=A·Bᵀ) {ns}x{ns} (GFLOP/s, higher is better) ===");
+        let mer = bench_mercury(&mer_linear(ns, false), &mut c, ap, bp, cp);
+        let mer_par = bench_mercury(&mer_linear(ns, true), &mut c, ap, bp, cp);
+        let cm = bench_external("c", &c_linear(ns), dir, "linear", cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"], &mut c, ap, bp, cp);
+        let rm = bench_external("rs", &rust_linear(ns), dir, "linear", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut c, ap, bp, cp);
+        println!("  {:<18} {:>12} {:>12} {:>12} {:>12}", "", "Mer(1core)", "Mer(parallel)", "C (gcc)", "Rust");
+        println!("  {:<18} {:>12} {:>12} {:>12} {:>12}", "GFLOP/s",
+            gflops(&mer), gflops(&mer_par), gflops(&cm), gflops(&rm));
+        if let (Some(mp), Some(c)) = (&mer_par, &cm) {
+            let r = (flops / mp.ns_per_call) / (flops / c.ns_per_call);
+            println!("  -> Mercury @parallel is {:.2}x faster than idiomatic single-threaded C", r);
+        }
+        if let (Some(ms), Some(c)) = (&mer, &cm) {
+            let r = (flops / ms.ns_per_call) / (flops / c.ns_per_call);
+            println!("  -> Mercury single-core is {:.2}x {} than C single-threaded",
+                if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+        }
+        println!();
+    }
+}
+
+/// `nn.Linear` source, written the *idiomatic* way for `C = A·Bᵀ`: the `ijk` dot-product form, where
+/// each `C[i,j]` is the dot product of A's row i and B's row j — both read contiguously (cache
+/// friendly for all three languages). Mercury recognizes this and dispatches to its tiled GEMM;
+/// gcc/rustc vectorize the inner reduction but never tile/pack, so Mercury wins on cache behavior.
+fn mer_linear(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{\n\
+         \x20           let mut s: f32 = 0.0;\n\
+         \x20           for k in 0..{ns} {{ s = s + a[i * {ns} + k] * b[j * {ns} + k]; }}\n\
+         \x20           c[i * {ns} + j] = s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_linear(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
+         \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
+         \x20     c[i*NS+j]=s; }}\n}}\n"
+    )
+}
+
+fn rust_linear(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
+         \x20     for k in 0..NS {{ s+=*a.add(i*NS+k)* *b.add(j*NS+k); }}\n\
+         \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
     )
 }
 
