@@ -551,15 +551,23 @@ mod tests {
 
     #[test]
     fn sgemm_matches_naive_various_sizes() {
-        // Includes sizes that exercise the MR/NR/MC/KC/NC remainders.
-        check(1, 1, 1);
-        check(6, 16, 1);
-        check(7, 17, 13);
-        check(64, 64, 64);
-        check(72, 256, 80);
-        check(100, 100, 100);
-        check(128, 256, 512);
-        check(200, 200, 200);
+        // Sizes that exercise every MR=6 / NR=16 / MC=72 / KC=256 remainder, incl. 1-wide dims.
+        for &(m, k, n) in &[
+            (1, 1, 1),
+            (1, 256, 1),
+            (5, 5, 5),
+            (6, 16, 1),
+            (7, 17, 13),
+            (15, 31, 17),
+            (64, 64, 64),
+            (72, 256, 80),
+            (73, 257, 15),
+            (100, 100, 100),
+            (128, 256, 512),
+            (200, 200, 200),
+        ] {
+            check(m, k, n);
+        }
     }
 
     #[test]

@@ -636,7 +636,8 @@ fn matmul_is_correct() {
         )
     };
 
-    for ns in [8usize, 10] {
+    // Sizes that exercise the microkernel's MR=6 / NR=16 remainders and small macro-blocks.
+    for ns in [6usize, 7, 16, 17, 32] {
         for parallel in [false, true] {
             let src = kernel(ns, parallel);
             let native = jit(&src, 3).expect("jit");
