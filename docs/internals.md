@@ -33,8 +33,8 @@ mercury_types     Ty, Scalar, Shape/Dim/Layout — the shared semantic type voca
 mercury_sema      name resolution + type checking + SHAPE checking
 mercury_mir       MIR data, builder, pretty-printer, verifier, MirLevel
 mercury_mir_build typed AST -> MIR (alloca-per-local lowering)
-mercury_opt       pass manager + analyses (cfg, dominators) + transforms
-                  (mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
+mercury_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
+                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
 mercury_backend   `Backend` trait + `Artifact`
 mercury_interp    zero-dependency MIR interpreter backend (+ oracle)
 mercury_codegen_llvm  textual LLVM IR backend
@@ -87,14 +87,15 @@ consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled 
 
 ## Optimizer
 
-`mercury_opt::PassManager` runs a list of function-level `Pass`es to a per-function fixpoint. Two
-shared analyses back them: `cfg` (successors/predecessors, reverse postorder, reachability,
-unreachable-block pruning) and `dom` (Cooper–Harvey–Kennedy immediate dominators, dominance
-frontiers, and the dominator tree).
+`mercury_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
+list of function-level `Pass`es to a per-function fixpoint. Two shared analyses back them: `cfg`
+(successors/predecessors, reverse postorder, reachability, unreachable-block pruning) and `dom`
+(Cooper–Harvey–Kennedy immediate dominators, dominance frontiers, and the dominator tree).
 
-| Pass          | Level | What it does |
-|---------------|-------|--------------|
-| `Mem2Reg`     | -O1   | promote scalar int/float `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename |
+| Pass            | Level | What it does |
+|-----------------|-------|--------------|
+| `inline_program`| -O2   | inline small, non-recursive **leaf** functions (whole-program), then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
+| `Mem2Reg`       | -O1   | promote scalar int/float `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
@@ -116,8 +117,8 @@ The opt pipeline is guarded by a **differential test**: every end-to-end program
 -O1/-O2/-O3 and must produce identical stdout and exit code. The `mercury_bench` crate reports, per
 program, the IR-op reduction and the -O0-vs--O3 interpreter speedup, and exits non-zero if any
 program that lowers cleanly disagrees across optimization levels — a soundness gate over every
-benchmark kernel. On the heavy kernels in `bench/kernels`, -O3 removes ~45% of IR ops and runs
-~1.5–2x faster than -O0.
+benchmark kernel. Across the run suite and kernels, -O3 removes ~48% of IR ops (54–60% on the heavy
+kernels) and runs ~1.5–2.5x faster than -O0 under the interpreter.
 
 ## Interpreter
 

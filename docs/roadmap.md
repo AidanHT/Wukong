@@ -14,11 +14,12 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
   by base pointer (out-params). Real kernels run: dot product, SAXPY, flat GEMM, transpose, sort.
 - Intrinsics `print`/`println`/`assert`.
-- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: **mem2reg** (alloca → SSA),
-  constant folding, algebraic simplification, CFG cleanup with block merging, dead/trivial
-  block-parameter elimination, DCE, CSE with load forwarding, DSE, and **loop-invariant code
-  motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential test; on the benchmark kernels it removes
-  ~45% of IR ops and runs ~1.5–2x faster than `-O0`.
+- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining** of
+  leaf functions, **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
+  with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
+  forwarding, DSE, and **loop-invariant code motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential
+  test and post-pass MIR verification; across the run suite and kernels it removes ~48% of IR ops
+  (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0`.
 
 ## Checked but not yet executed
 

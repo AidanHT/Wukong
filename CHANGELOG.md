@@ -14,13 +14,14 @@ All notable changes to Mercury are documented here. The format is loosely based 
 - **Middle-end**: block-parameter SSA MIR, a builder, a pretty-printer, and a verifier with a
   `MirLevel` invariant; AST → MIR lowering (alloca-per-local).
 - **Optimizer**: a fixpoint pass manager backed by CFG and dominator analyses (Cooper–Harvey–Kennedy
-  immediate dominators + dominance frontiers), with `mem2reg` (promote scalar slots to
-  block-parameter SSA), `simplify` (constant folding + algebraic identities + self-comparison
-  folding), `simplify-cfg` (constant-branch folding + straight-line block merging + unreachable-block
-  pruning), `simplify-phis` (dead/trivial block-parameter elimination), `dce`, `cse` (local value
-  numbering with load forwarding), `dse` (dead-store elimination), and `licm` (loop-invariant code
-  motion), wired across `-O0..-O3`. On the benchmark kernels, `-O3` removes ~45% of IR ops and runs
-  ~1.5–2x faster than `-O0` under the interpreter.
+  immediate dominators + dominance frontiers), with whole-program leaf-function `inlining`, `mem2reg`
+  (promote scalar slots to block-parameter SSA), `simplify` (constant folding + algebraic identities
+  + self-comparison folding), `simplify-cfg` (constant-branch folding + straight-line block merging +
+  unreachable-block pruning), `simplify-phis` (dead/trivial block-parameter elimination), `dce`,
+  `cse` (dominator-tree value numbering with load forwarding), `dse` (dead-store elimination), and
+  `licm` (loop-invariant code motion), wired across `-O0..-O3`. In debug builds the pass manager
+  verifies the MIR after every pass. Across the run suite and kernels, `-O3` removes ~48% of IR ops
+  (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0` under the interpreter.
 - **Back-ends**: a zero-dependency MIR interpreter (`--run`) and a textual LLVM-IR emitter
   (`--emit=llvm-ir`, plus `--emit=obj|exe` via `clang` when present).
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store

@@ -25,8 +25,9 @@ Native code emitted by Mercury goes through the same LLVM backend that Clang and
 - **Domain-aware optimization.** Mercury keeps tensor and loop operations *structured* in its IR so
   the compiler can do elementwise **fusion**, cache **tiling**, and **vectorization** a
   general-purpose C compiler can't see through. Those tensor-level passes are planned; the SSA
-  scalar/loop optimizer that backs them — mem2reg, constant folding, CSE, DSE, DCE, and loop-invariant
-  code motion — runs today and removes ~45% of IR ops on the benchmark kernels.
+  scalar/loop optimizer that backs them — inlining, mem2reg, constant folding, CSE, DSE, DCE, and
+  loop-invariant code motion — runs today and removes ~48% of IR ops on the benchmark kernels (54–60%
+  on the heavy ones), making them ~1.5–2.5x faster under the interpreter.
 - **Seamless interop.** A clean C ABI (`@extern("C")` / `@export`) calls into BLAS/cuBLAS and lets
   Mercury kernels be embedded in existing C/C++/CUDA stacks.
 
