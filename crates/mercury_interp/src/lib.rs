@@ -200,7 +200,19 @@ impl<'a> Interp<'a> {
                     apply_bin(*b, reg(regs, *l), reg(regs, *r), rty)
                 }
             }
-            Op::Cmp(c, l, r) => Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128),
+            Op::Cmp(c, l, r) => {
+                if let Some(MirType::Vec(_, n)) = rty {
+                    // Lane-wise compare → a mask vector of 1/0 lanes.
+                    let av = self.vec_lanes(reg(regs, *l));
+                    let bv = self.vec_lanes(reg(regs, *r));
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| Value::Int(apply_cmp(*c, av[i], bv[i]) as i128))
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128)
+                }
+            }
             Op::Neg(v) => match reg(regs, *v) {
                 Value::Float(f) => Value::Float(-f),
                 other => Value::Int(-other.as_int()),
@@ -211,7 +223,16 @@ impl<'a> Interp<'a> {
             },
             Op::Cast(kind, v, to) => apply_cast(*kind, reg(regs, *v), to),
             Op::Select(c, a, b) => {
-                if reg(regs, *c).truthy() {
+                if let Some(MirType::Vec(_, n)) = rty {
+                    // Lane-wise blend by a mask vector.
+                    let m = self.vec_lanes(reg(regs, *c));
+                    let av = self.vec_lanes(reg(regs, *a));
+                    let bv = self.vec_lanes(reg(regs, *b));
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| if m[i].truthy() { av[i] } else { bv[i] })
+                        .collect();
+                    self.push_vec(lanes)
+                } else if reg(regs, *c).truthy() {
                     reg(regs, *a)
                 } else {
                     reg(regs, *b)

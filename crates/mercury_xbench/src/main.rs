@@ -458,7 +458,7 @@ fn kernels() -> Vec<Kernel> {
             bytes_per_call: 2 * N * 4,
             note: "out = max(x,0), memory-bound + branch",
             mer: mer_kernel(&format!(
-                "for i in 0..{nlit} {{ let v: f32 = x[i]; if v > 0.0 {{ out[i] = v; }} else {{ out[i] = 0.0; }} }}"
+                "for i in 0..{nlit} {{ out[i] = if x[i] > 0.0 {{ x[i] }} else {{ 0.0 }}; }}"
             )),
             c: c_kernel("for(long i=0;i<N;i++){ float v=x[i]; out[i] = v>0.0f? v:0.0f; }"),
             rust: rust_kernel(

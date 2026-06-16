@@ -214,6 +214,36 @@ fn vectorized_saxpy_is_correct_across_sizes() {
     }
 }
 
+/// ReLU via if-conversion: `out[i] = if x[i] > 0 { x[i] } else { 0 }` must vectorize to a vector
+/// compare + blend, agree between interpreter and native, and match the scalar reference across
+/// sizes that exercise the vector body and the remainder. x[i] = i - n/2 spans negatives/positives.
+#[test]
+fn vectorized_relu_is_correct() {
+    let kernel = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut o: [f32; {n}] = [0.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i - {n}/2) as f32); i += 1; }} \
+             for k in 0..{n} {{ o[k] = if x[k] > 0.0 {{ x[k] }} else {{ 0.0 }}; }} \
+             let mut s: f32 = 0.0; let mut j: i32 = 0; while j < {n} {{ s = s + o[j]; j += 1; }} \
+             return s as i32; }}"
+        )
+    };
+    // Reference: sum of max(i - n/2, 0) for i in 0..n.
+    let reference = |n: i64| -> i64 { (0..n).map(|i| (i - n / 2).max(0)).sum() };
+
+    let (prog, interner) = lowered(&kernel(64), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(mir.contains("select") && mir.contains("x f32>"), "relu should vectorize");
+
+    for n in [3usize, 4, 8, 13, 64, 257] {
+        let src = kernel(n);
+        let native = jit(&src, 3).expect("jit");
+        let interp = interp(&src, 3).expect("interp");
+        assert_eq!(native, interp, "relu native vs interp at n={n}");
+        assert_eq!(native.0, reference(n as i64), "relu wrong at n={n}");
+    }
+}
+
 /// Matmul (the headline ML kernel): its vectorized inner loop must agree between interpreter and
 /// native AND match an independent scalar reference, for both the serial and `@parallel` forms, at
 /// a side length that is a multiple of the vector width (8) and one that is not (10, exercising the
