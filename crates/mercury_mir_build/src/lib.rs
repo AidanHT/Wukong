@@ -683,9 +683,14 @@ impl FnLowerer<'_> {
             Eq | Ne | Lt | Le | Gt | Ge => {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
-                let float = self.expr_mir(lhs).is_float();
-                let signed = self.signed(lhs);
-                let pred = cmp_pred(op, float, signed);
+                // Compare in a common type: the front-end's loose literal typing can leave the two
+                // sides at different widths, but a `Cmp`'s operands must agree.
+                let lty = self.expr_mir(lhs);
+                let rty = self.expr_mir(rhs);
+                let common = numeric_join(&lty, &rty);
+                let l = self.coerce_to(l, &lty, &common, self.signed(lhs));
+                let r = self.coerce_to(r, &rty, &common, self.signed(rhs));
+                let pred = cmp_pred(op, common.is_float(), self.signed(lhs));
                 self.builder.build(MirType::I1, Op::Cmp(pred, l, r))
             }
             And => {
@@ -702,10 +707,26 @@ impl FnLowerer<'_> {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
                 let ty = self.expr_mir(e);
+                // Coerce both operands to the result type so the `Bin` is well-typed (e.g. an
+                // `f32` literal added to an `f64` is promoted), matching the verifier's contract.
+                let lty = self.expr_mir(lhs);
+                let rty = self.expr_mir(rhs);
+                let l = self.coerce_to(l, &lty, &ty, self.signed(lhs));
+                let r = self.coerce_to(r, &rty, &ty, self.signed(rhs));
                 let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
                 self.builder.build(ty, Op::Bin(bin, l, r))
             }
         }
+    }
+
+    /// Insert a numeric cast so `v` (currently `from`) has type `to`. Non-numeric operands and
+    /// equal types pass through unchanged.
+    fn coerce_to(&mut self, v: ValueId, from: &MirType, to: &MirType, signed: bool) -> ValueId {
+        if from == to || !is_numeric(from) || !is_numeric(to) {
+            return v;
+        }
+        let kind = cast_kind(from, to, signed);
+        self.builder.build(to.clone(), Op::Cast(kind, v, to.clone()))
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
@@ -924,6 +945,36 @@ fn float_or(float: bool, f: CmpOp, signed: bool, s: CmpOp, u: CmpOp) -> CmpOp {
         s
     } else {
         u
+    }
+}
+
+fn is_numeric(t: &MirType) -> bool {
+    t.is_int() || t.is_float()
+}
+
+/// The wider of two numeric MIR types (float beats int), used to pick a common comparison type.
+/// Non-numeric or equal types yield the left type.
+fn numeric_join(a: &MirType, b: &MirType) -> MirType {
+    if a == b || !is_numeric(a) || !is_numeric(b) {
+        return a.clone();
+    }
+    let bits = |t: &MirType| match t {
+        MirType::I1 => 1,
+        MirType::I8 => 8,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 16,
+        MirType::I32 | MirType::F32 => 32,
+        _ => 64,
+    };
+    match (a.is_float(), b.is_float()) {
+        (true, false) => a.clone(),
+        (false, true) => b.clone(),
+        _ => {
+            if bits(a) >= bits(b) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
     }
 }
 

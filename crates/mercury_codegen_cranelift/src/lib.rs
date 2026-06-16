@@ -285,12 +285,25 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().f32const(*v as f32)
                 }
             }
-            Op::Bin(op, l, r) => self.lower_bin(*op, *l, *r),
+            Op::Bin(op, l, r) => {
+                let rt = self.ty_of(inst.result.unwrap()).clone();
+                self.lower_bin(*op, *l, *r, &rt)
+            }
             Op::Cmp(op, l, r) => {
-                let (a, b) = (self.val(*l), self.val(*r));
                 if op.is_float() {
+                    // The front-end's float literals are loosely typed, so operands may differ in
+                    // width; compare in the wider type (the interpreter compares in f64).
+                    let (a0, b0) = (self.val(*l), self.val(*r));
+                    let common = if self.dfg_ty(a0) == types::F64 || self.dfg_ty(b0) == types::F64 {
+                        types::F64
+                    } else {
+                        types::F32
+                    };
+                    let a = self.coerce_float(a0, common);
+                    let b = self.coerce_float(b0, common);
                     self.builder.ins().fcmp(float_cc(*op), a, b)
                 } else {
+                    let (a, b) = (self.val(*l), self.val(*r));
                     self.builder.ins().icmp(int_cc(*op), a, b)
                 }
             }
@@ -308,7 +321,21 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to),
             Op::Select(c, a, b) => {
-                let (cc, av, bv) = (self.val(*c), self.val(*a), self.val(*b));
+                let cc = self.val(*c);
+                let av0 = self.val(*a);
+                let bv0 = self.val(*b);
+                // Cranelift requires both arms to share a type; unify mismatched float widths.
+                let (av, bv) = if self.dfg_ty(av0).is_float() || self.dfg_ty(bv0).is_float() {
+                    let common = if self.dfg_ty(av0) == types::F64 || self.dfg_ty(bv0) == types::F64
+                    {
+                        types::F64
+                    } else {
+                        types::F32
+                    };
+                    (self.coerce_float(av0, common), self.coerce_float(bv0, common))
+                } else {
+                    (av0, bv0)
+                };
                 self.builder.ins().select(cc, av, bv)
             }
             Op::Alloca(ty) => {
@@ -342,9 +369,15 @@ impl<'a> FnTranslator<'a> {
             },
         };
         if let Some(r) = res {
-            // Normalise `i1` results to their low bit, matching the interpreter's masking.
-            let cv = if matches!(self.ty_of(r), MirType::I1) {
+            // Normalise the result to its declared type so `vmap[r]` always has the MIR type's
+            // Cranelift type: `i1` -> low bit, and narrow floats rounded to width — both matching
+            // the interpreter's per-result normalisation.
+            let rty = self.ty_of(r).clone();
+            let cv = if matches!(rty, MirType::I1) {
                 self.builder.ins().band_imm(cv, 1)
+            } else if rty.is_float() {
+                let want = cl_type(&rty, self.ptr_ty).unwrap_or(types::F64);
+                self.coerce_float(cv, want)
             } else {
                 cv
             };
@@ -352,17 +385,30 @@ impl<'a> FnTranslator<'a> {
         }
     }
 
-    fn lower_bin(&mut self, op: BinOp, l: ValueId, r: ValueId) -> Value {
-        let (a, b) = (self.val(l), self.val(r));
+    fn lower_bin(&mut self, op: BinOp, l: ValueId, r: ValueId, res_ty: &MirType) -> Value {
         use BinOp::*;
+        // Float ops compute in their result type with operands coerced to it (the front-end's
+        // float literals are loosely typed); this mirrors the interpreter, keeping the two exact.
+        if op.is_float() {
+            let target = cl_type(res_ty, self.ptr_ty).unwrap_or(types::F64);
+            let a0 = self.val(l);
+            let b0 = self.val(r);
+            let a = self.coerce_float(a0, target);
+            let b = self.coerce_float(b0, target);
+            return match op {
+                FAdd => self.builder.ins().fadd(a, b),
+                FSub => self.builder.ins().fsub(a, b),
+                FMul => self.builder.ins().fmul(a, b),
+                FDiv => self.builder.ins().fdiv(a, b),
+                _ => unreachable!(),
+            };
+        }
+        let (a, b) = (self.val(l), self.val(r));
         match op {
             Add => self.builder.ins().iadd(a, b),
             Sub => self.builder.ins().isub(a, b),
             Mul => self.builder.ins().imul(a, b),
-            FAdd => self.builder.ins().fadd(a, b),
-            FSub => self.builder.ins().fsub(a, b),
-            FMul => self.builder.ins().fmul(a, b),
-            FDiv => self.builder.ins().fdiv(a, b),
+            FAdd | FSub | FMul | FDiv => unreachable!("handled above"),
             And => self.builder.ins().band(a, b),
             Or => self.builder.ins().bor(a, b),
             Xor => self.builder.ins().bxor(a, b),
@@ -437,6 +483,19 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             std::cmp::Ordering::Less => self.builder.ins().ireduce(to, x),
+        }
+    }
+
+    /// Promote/demote a float value to a target float width (no-op if already that width).
+    fn coerce_float(&mut self, x: Value, to: Type) -> Value {
+        let from = self.dfg_ty(x);
+        if from == to || !from.is_float() || !to.is_float() {
+            return x;
+        }
+        if to.bits() > from.bits() {
+            self.builder.ins().fpromote(to, x)
+        } else {
+            self.builder.ins().fdemote(to, x)
         }
     }
 
@@ -655,7 +714,7 @@ fn populate_module<M: Module>(
         let fid = ids[&f.name];
         module
             .define_function(fid, &mut ctx)
-            .map_err(|e| format!("cranelift define `{}`: {e}", interner.resolve(f.name)))?;
+            .map_err(|e| format!("cranelift define `{}`: {e:?}", interner.resolve(f.name)))?;
         module.clear_context(&mut ctx);
     }
     Ok(ids)
