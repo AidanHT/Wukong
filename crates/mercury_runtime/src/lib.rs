@@ -96,4 +96,31 @@ mod tests {
         parallel_for(0, 10, 2, |i| sum += i);
         assert_eq!(sum, 2 + 4 + 6 + 8);
     }
+
+    #[test]
+    fn parallel_for_edge_cases() {
+        // Empty range and non-positive step do nothing.
+        let mut n = 0;
+        parallel_for(5, 5, 1, |_| n += 1);
+        parallel_for(0, 10, 0, |_| n += 1);
+        parallel_for(0, 10, -2, |_| n += 1);
+        assert_eq!(n, 0);
+
+        // A step larger than the range runs exactly once (the lo iteration).
+        let mut hits = Vec::new();
+        parallel_for(3, 10, 100, |i| hits.push(i));
+        assert_eq!(hits, vec![3]);
+    }
+
+    #[test]
+    fn arena_reset_reuses_storage() {
+        let mut a = Arena::with_capacity(32);
+        let first = a.alloc(16, 8).unwrap();
+        a.slice_mut(first, 16).fill(0xAB);
+        a.reset();
+        // After reset, the same offset is handed out again (storage reused, not grown).
+        let second = a.alloc(16, 8).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(a.capacity(), 32);
+    }
 }
