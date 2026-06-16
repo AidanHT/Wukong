@@ -87,6 +87,17 @@ impl PassManager {
             let mut changed = false;
             for p in &self.passes {
                 changed |= p.run_function(f);
+                // verify-each: in debug builds (tests, CI) confirm every pass leaves the MIR
+                // well-formed, naming the culprit immediately. Compiled out of release builds.
+                #[cfg(debug_assertions)]
+                {
+                    let errs = mercury_mir::verify::verify_function(f);
+                    assert!(
+                        errs.is_empty(),
+                        "pass `{}` produced invalid MIR: {errs:?}",
+                        p.name()
+                    );
+                }
             }
             iterations += 1;
             if !changed || iterations > 100 {

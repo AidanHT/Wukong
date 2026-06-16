@@ -1,25 +1,24 @@
-//! Local value numbering (LVN) with alloca-aware load forwarding.
+//! Common-subexpression elimination: dominator-tree value numbering with load forwarding.
 //!
-//! The front-end emits one `alloca` per local and `load`/`store` on every use (mem2reg is left to
-//! LLVM). Pure common-subexpression elimination alone is therefore weak here: two textually equal
-//! expressions read their operands through *separate* `load` instructions, so their operand value
-//! ids differ. To make CSE bite, this pass also forwards loads.
+//! Pure operations are value-numbered over the **dominator tree**: a computation in a block is
+//! reused by any block it dominates, since the dominating definition reaches all those uses. Walking
+//! the tree with a scoped table (entries added on entry to a block, removed on exit) keeps reuse
+//! legal without re-checking dominance per candidate. This catches redundancy across blocks, not
+//! just within one.
 //!
-//! Within a single basic block we track, per `alloca` slot, the value it currently holds:
-//!   * a `store slot, v` makes `v` the current value of `slot`;
-//!   * the first `load slot` becomes the current value; later `load slot` reuse it;
-//!   * a store through an *unknown* pointer (e.g. a `gep` result) or any `call` conservatively
-//!     forgets all slot contents, since it may alias anything.
+//! Loads are forwarded **within a block**: per `alloca` slot we track the value it currently holds —
+//! a `store slot, v` makes `v` current, the first `load slot` becomes current and later loads reuse
+//! it. A store through an unknown pointer or any call conservatively forgets all slots (they may
+//! alias). Cross-block memory forwarding needs memory SSA and is left to DSE/the LLVM backend.
 //!
-//! With loads forwarded to a common value, ordinary value numbering then collapses the redundant
-//! pure ops built on top of them. We stay intra-block, so the earlier (canonical) definition always
-//! dominates the uses we redirect — no dominator analysis required. DCE deletes the dead remains.
+//! Forwarding loads to a common value lets the pure value-numbering then collapse the expressions
+//! built on top of them. DCE deletes the dead remains.
 
 use std::collections::{HashMap, HashSet};
 
 use mercury_mir::{Function, Op, ValueId};
 
-use crate::{map_op_uses, map_term_uses, Pass};
+use crate::{cfg, dom, map_op_uses, map_term_uses, Pass};
 
 pub struct Cse;
 
@@ -29,72 +28,33 @@ impl Pass for Cse {
     }
 
     fn run_function(&self, f: &mut Function) -> bool {
-        let mut rewrite: HashMap<u32, u32> = HashMap::new();
+        cfg::prune_unreachable(f); // dominance requires a clean CFG
+        let idom = dom::idoms(f);
+        let children = dom::dom_children(f, &idom);
 
+        // Alloca base pointers are function-global value ids; collect them once.
+        let mut allocas: HashSet<u32> = HashSet::new();
         for b in &f.blocks {
-            // Value-number table for pure ops, current value per alloca slot, and the set of
-            // value ids that name an alloca's base pointer.
-            let mut vn: HashMap<String, u32> = HashMap::new();
-            let mut slot_val: HashMap<u32, u32> = HashMap::new();
-            let mut allocas: HashSet<u32> = HashSet::new();
-
             for inst in &b.insts {
-                match &inst.op {
-                    Op::Alloca(_) => {
-                        if let Some(res) = inst.result {
-                            allocas.insert(res.0);
-                        }
-                    }
-                    Op::Load(ptr, _) => {
-                        let p = resolve(&rewrite, ptr.0);
-                        let Some(res) = inst.result else { continue };
-                        if allocas.contains(&p) {
-                            match slot_val.get(&p) {
-                                Some(&v) => {
-                                    rewrite.insert(res.0, v);
-                                }
-                                None => {
-                                    slot_val.insert(p, res.0);
-                                }
-                            }
-                        }
-                    }
-                    Op::Store { ptr, value } => {
-                        let p = resolve(&rewrite, ptr.0);
-                        let v = resolve(&rewrite, value.0);
-                        if allocas.contains(&p) {
-                            slot_val.insert(p, v);
-                        } else {
-                            // Unknown pointer: may alias any slot.
-                            slot_val.clear();
-                        }
-                    }
-                    Op::Call { .. } => {
-                        // A call may store through pointers it was given.
-                        slot_val.clear();
-                    }
-                    _ => {
-                        let Some(res) = inst.result else { continue };
-                        let Some(key) = pure_key(&inst.op, &rewrite) else {
-                            continue;
-                        };
-                        match vn.get(&key) {
-                            Some(&canon) => {
-                                rewrite.insert(res.0, canon);
-                            }
-                            None => {
-                                vn.insert(key, res.0);
-                            }
-                        }
-                    }
+                if let (Some(r), Op::Alloca(_)) = (inst.result, &inst.op) {
+                    allocas.insert(r.0);
                 }
             }
         }
 
+        let mut cx = Numbering {
+            f,
+            children: &children,
+            allocas: &allocas,
+            vn: HashMap::new(),
+            rewrite: HashMap::new(),
+        };
+        cx.visit(f.entry.0);
+        let rewrite = cx.rewrite;
+
         if rewrite.is_empty() {
             return false;
         }
-
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 map_op_uses(&mut inst.op, |v| ValueId(resolve(&rewrite, v.0)));
@@ -102,6 +62,81 @@ impl Pass for Cse {
             map_term_uses(&mut b.term, |v| ValueId(resolve(&rewrite, v.0)));
         }
         true
+    }
+}
+
+struct Numbering<'a> {
+    f: &'a Function,
+    children: &'a [Vec<u32>],
+    allocas: &'a HashSet<u32>,
+    /// pure-op key -> canonical value id, scoped to the current dominator-tree path.
+    vn: HashMap<String, u32>,
+    /// value id -> the value it is replaced by (load forwards and CSE rewrites).
+    rewrite: HashMap<u32, u32>,
+}
+
+impl Numbering<'_> {
+    fn visit(&mut self, blk: u32) {
+        // Keys this block introduced into `vn`, to remove when we leave its subtree.
+        let mut added: Vec<String> = Vec::new();
+        // Load forwarding is intra-block: the current value of each slot, reset per block.
+        let mut slot_val: HashMap<u32, u32> = HashMap::new();
+
+        for inst in &self.f.blocks[blk as usize].insts {
+            match &inst.op {
+                Op::Alloca(_) => {}
+                Op::Load(ptr, _) => {
+                    let p = resolve(&self.rewrite, ptr.0);
+                    let Some(res) = inst.result else { continue };
+                    if self.allocas.contains(&p) {
+                        match slot_val.get(&p) {
+                            Some(&v) => {
+                                self.rewrite.insert(res.0, v);
+                            }
+                            None => {
+                                slot_val.insert(p, res.0);
+                            }
+                        }
+                    }
+                }
+                Op::Store { ptr, value } => {
+                    let p = resolve(&self.rewrite, ptr.0);
+                    let v = resolve(&self.rewrite, value.0);
+                    if self.allocas.contains(&p) {
+                        slot_val.insert(p, v);
+                    } else {
+                        slot_val.clear(); // unknown pointer may alias any slot
+                    }
+                }
+                Op::Call { .. } => {
+                    slot_val.clear(); // a call may store through pointers it was given
+                }
+                _ => {
+                    let Some(res) = inst.result else { continue };
+                    let Some(key) = pure_key(&inst.op, &self.rewrite) else {
+                        continue;
+                    };
+                    match self.vn.get(&key) {
+                        Some(&canon) => {
+                            self.rewrite.insert(res.0, canon);
+                        }
+                        None => {
+                            self.vn.insert(key.clone(), res.0);
+                            added.push(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in 0..self.children[blk as usize].len() {
+            let c = self.children[blk as usize][i];
+            self.visit(c);
+        }
+
+        for k in added {
+            self.vn.remove(&k);
+        }
     }
 }
 
