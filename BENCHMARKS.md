@@ -66,6 +66,7 @@ developer time — this is the most important and most robust result.
 | poly   | ~1.0–1.05× (tie/slight win) | compute-bound; was **5.9× slower** before vectorization+FMA |
 | fused linear→relu | ~1.1–1.15× faster | two source loops; Mercury **fuses** them, C/Rust two-pass |
 | dot    | **~2.6–2.7× faster** | reduction vectorized to lane accumulators + horizontal reduce |
+| ssd (Σ(x−y)²) | **~2.6× faster** | same — an L2-loss reduction, vectorized; gcc/rustc stay serial |
 
 `fused linear→relu` writes a linear map to a scratch array then ReLUs it — two loops in every
 language. Mercury's compiler fuses them into one pass and keeps the intermediate in registers; the
@@ -76,7 +77,9 @@ to RAM). The point is the *automatic* fusion of naively-written ops.
 per element down a single dependency chain (~4 cycles each). Mercury splits the accumulator across
 `W` vector lanes × 4 unrolled copies, so independent FMA chains overlap (throughput-bound), then
 reduces the lanes at the end. gcc/rustc keep the sum strictly serial without `-ffast-math`, so
-Mercury runs it ~2.6–2.7× faster (~32–35 vs ~12–13 GB/s).
+Mercury runs it ~2.6–2.7× faster (~32–35 vs ~12–13 GB/s). The same machinery vectorizes any
+reduction whose per-element term is vectorizable — `ssd = Σ(x−y)²` (an L2 loss) wins ~2.6× the same
+way (~16 vs ~6.5 GB/s).
 
 Mercury's vectorizer lifts straight-line elementwise loops to 128-bit SIMD and unrolls 4× so
 independent vector chains issue across the core's FP units (recovering AVX-class throughput from SSE
