@@ -63,20 +63,26 @@ fn lower_fn(
         loops: Vec::new(),
     };
 
-    // Declare all parameters first (so their value ids are contiguous), then materialize each
-    // into a stack slot.
+    // Declare all parameters first (so their value ids are contiguous), then materialize each.
+    // Arrays are passed by base pointer (ABI type `Ptr`); scalars by value.
     let param_vals: Vec<ValueId> = param_tys
         .iter()
-        .map(|pty| fl.builder.add_param(mir_ty(pty)))
+        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         let mty = mir_ty(pty);
-        let slot = fl.builder.alloca(mty.clone());
-        fl.builder.build_void(Op::Store {
-            ptr: slot,
-            value: val,
-        });
-        fl.bind(p.name.sym, slot, mty);
+        if matches!(mty, MirType::Array(..)) {
+            // The parameter value *is* the array's base pointer; bind it directly so indexing
+            // geps off it (no copy into a local slot).
+            fl.bind(p.name.sym, val, mty);
+        } else {
+            let slot = fl.builder.alloca(mty.clone());
+            fl.builder.build_void(Op::Store {
+                ptr: slot,
+                value: val,
+            });
+            fl.bind(p.name.sym, slot, mty);
+        }
     }
 
     let tail = fl.lower_block(body);
@@ -688,6 +694,14 @@ impl FnLowerer<'_> {
 
 // ---- free helpers ----
 
+/// The MIR type a parameter is passed as at the call boundary. Arrays decay to a base pointer.
+fn param_abi_ty(ty: &Ty) -> MirType {
+    match mir_ty(ty) {
+        MirType::Array(..) => MirType::Ptr,
+        t => t,
+    }
+}
+
 fn mir_ty(ty: &Ty) -> MirType {
     match ty {
         Ty::Scalar(s) => MirType::from_scalar(*s),
@@ -957,13 +971,40 @@ mod tests {
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let main = &prog.funcs[0];
         assert!(
-            main.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
-                &i.op,
-                Op::Alloca(MirType::Array(_, 3))
-            )),
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(&i.op, Op::Alloca(MirType::Array(_, 3)))),
             "expected an array alloca"
         );
         assert!(verify_function(main).is_empty(), "verify failed");
+    }
+
+    #[test]
+    fn array_parameter_passes_by_pointer() {
+        // An array parameter has ABI type Ptr (passed by base pointer), not an array alloca.
+        let src = "fn dot(x: [i32; 2], y: [i32; 2]) -> i32 { return x[0]*y[0] + x[1]*y[1]; } \
+                   fn main() -> i32 { let a: [i32;2] = [1,2]; let b: [i32;2] = [3,4]; \
+                   return dot(a, b); }";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let dot = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "dot")
+            .unwrap();
+        // Both params are pointers; no array alloca inside `dot`.
+        for &p in &dot.params {
+            assert_eq!(dot.value_type(p), &MirType::Ptr);
+        }
+        assert!(
+            !dot.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(&i.op, Op::Alloca(MirType::Array(..)))),
+            "array params must not alloca array storage in the callee"
+        );
+        assert!(verify_function(dot).is_empty());
     }
 
     #[test]

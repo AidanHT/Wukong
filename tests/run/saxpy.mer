@@ -1,0 +1,44 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 12
+// EXPECT-OUT: 24
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+// EXPECT-OUT: 20
+module tests.run.saxpy
+
+/// A reusable kernel with array parameters: `out` is mutated through its base pointer (arrays pass
+/// by reference), and a separate `dot` returns a scalar. Confirms array params work both ways.
+fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], out: [f32; 4]) {
+    let mut i: i32 = 0;
+    while i < 4 {
+        out[i] = a * x[i] + y[i];
+        i = i + 1;
+    }
+}
+
+fn dot(x: [i32; 4], y: [i32; 4]) -> i32 {
+    let mut acc: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 4 {
+        acc = acc + x[i] * y[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let y: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    saxpy(2.0, x, y, out);
+    print(out[0]); // 12
+    print(out[1]); // 24
+    print(out[2]); // 36
+    print(out[3]); // 48
+
+    let a: [i32; 4] = [1, 2, 3, 4];
+    let b: [i32; 4] = [4, 3, 2, 1];
+    print(dot(a, b)); // 20
+    return 0;
+}
