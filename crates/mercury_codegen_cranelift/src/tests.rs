@@ -276,6 +276,39 @@ fn vectorized_reductions_are_correct() {
     }
 }
 
+/// The reduction vectorizer generalizes past dot: any vectorizable addend works. A sum of squared
+/// differences `s += (x[k]-y[k])*(x[k]-y[k])` (the core of an L2 loss) must vectorize to a vector
+/// fma over the squared term and stay correct + differentially equal.
+#[test]
+fn vectorized_ssd_reduction() {
+    // x[k]=k+1, y[k]=1  =>  (x-y)^2 = k^2; sum_{k<n} k^2 = (n-1)n(2n-1)/6. Exact in f32 for our n.
+    let kernel = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [1.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i + 1) as f32); i += 1; }} \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s += (x[k] - y[k]) * (x[k] - y[k]); }} \
+             return s as i32; }}"
+        )
+    };
+    let (prog, interner) = lowered(&kernel(64), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("fma") && mir.contains("x f32>"),
+        "ssd reduction should vectorize to a vector fma:\n{mir}"
+    );
+    for n in [1usize, 4, 7, 8, 16, 31, 64, 128] {
+        let src = kernel(n);
+        let nn = n as i64;
+        let expect = (nn - 1) * nn * (2 * nn - 1) / 6; // sum of squares 0..n-1
+        for opt in [0u8, 2, 3] {
+            let native = jit(&src, opt).expect("jit");
+            let interpd = interp(&src, opt).expect("interp");
+            assert_eq!(native, interpd, "ssd native vs interp at n={n} -O{opt}");
+            assert_eq!(native.0, expect, "ssd wrong at n={n} -O{opt}");
+        }
+    }
+}
+
 /// ReLU via if-conversion: `out[i] = if x[i] > 0 { x[i] } else { 0 }` must vectorize to a vector
 /// compare + blend, agree between interpreter and native, and match the scalar reference across
 /// sizes that exercise the vector body and the remainder. x[i] = i - n/2 spans negatives/positives.
