@@ -49,9 +49,10 @@ fn main() {
     let (mut tot0, mut tot3) = (0usize, 0usize);
     let mut log_speedup_sum = 0.0f64;
     let mut speedup_n = 0u32;
+    let mut failures: Vec<String> = Vec::new();
     for f in &files {
         match bench_one(f) {
-            Some(r) => {
+            Outcome::Ran(r) => {
                 tot0 += r.ops0;
                 tot3 += r.ops3;
                 let pct = reduction(r.ops0, r.ops3);
@@ -69,11 +70,13 @@ fn main() {
                     speedup,
                 );
             }
-            None => println!(
-                "{:<20} {:>7}",
-                short_name(f),
-                "(skipped: does not lower / run / agree)"
-            ),
+            Outcome::Skipped(why) => {
+                println!("{:<20} (skipped: {why})", short_name(f))
+            }
+            Outcome::Failed(why) => {
+                println!("{:<20} *** FAILED: {why} ***", short_name(f));
+                failures.push(format!("{}: {why}", short_name(f)));
+            }
         }
     }
 
@@ -94,6 +97,30 @@ fn main() {
         "",
         geo,
     );
+
+    // The harness doubles as a correctness gate: any program that lowers but misbehaves under
+    // optimization fails the process so CI catches the regression.
+    if !failures.is_empty() {
+        eprintln!(
+            "\n{} program(s) failed optimization equivalence:",
+            failures.len()
+        );
+        for f in &failures {
+            eprintln!("  - {f}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// The result of benchmarking one program.
+enum Outcome {
+    /// Lowered, optimized, verified, and produced identical results at -O0 and -O3.
+    Ran(Res),
+    /// Did not lower to runnable MIR (e.g. uses tensor/SIMD constructs codegen doesn't support),
+    /// or fails identically at both levels (e.g. a deliberate runtime assertion). Not a regression.
+    Skipped(String),
+    /// Lowered but the optimizer changed behavior or produced invalid MIR — a real bug.
+    Failed(String),
 }
 
 struct Res {
@@ -111,47 +138,49 @@ fn reduction(a: usize, b: usize) -> f64 {
     }
 }
 
-fn bench_one(path: &Path) -> Option<Res> {
-    let src = std::fs::read_to_string(path).ok()?;
+fn bench_one(path: &Path) -> Outcome {
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return Outcome::Skipped("cannot read file".into());
+    };
     let mut interner = Interner::new();
     let (module, pd) = mercury_parser::parse_module(&src, SourceId(0), &mut interner);
     if pd.iter().any(|d| d.is_error()) {
-        return None;
+        return Outcome::Skipped("parse error".into());
     }
     let (sema, sd) = mercury_sema::check(&module, &interner);
     if sd.iter().any(|d| d.is_error()) {
-        return None;
+        return Outcome::Skipped("type/shape error".into());
     }
-
     let (mut p0, ld) = mercury_mir_build::lower_program(&module, &sema, &interner);
     if ld.iter().any(|d| d.is_error()) {
-        return None;
+        return Outcome::Skipped("uses constructs codegen does not support yet".into());
     }
     let mut p3 = p0.clone();
     mercury_opt::optimize(&mut p0, 0);
     mercury_opt::optimize(&mut p3, 3);
 
-    // The optimizer must preserve well-formedness and behavior.
+    // From here a discrepancy is a real bug: the program lowered cleanly, so optimization must
+    // preserve both well-formedness and behavior.
     for f in p0.funcs.iter().chain(p3.funcs.iter()) {
         if !mercury_mir::verify::verify_function(f).is_empty() {
-            eprintln!("warning: {} fails MIR verification", short_name(path));
-            return None;
+            return Outcome::Failed("MIR fails verification after optimization".into());
         }
     }
     let main = interner.intern("main");
-    let r0 = mercury_interp::run(&p0, main, &interner).ok()?;
-    let r3 = mercury_interp::run(&p3, main, &interner).ok()?;
-    if r0 != r3 {
-        eprintln!("warning: {} differs O0 vs O3", short_name(path));
-        return None;
+    let r0 = mercury_interp::run(&p0, main, &interner);
+    let r3 = mercury_interp::run(&p3, main, &interner);
+    match (r0, r3) {
+        // Both fail identically (e.g. a deliberate runtime assertion) — consistent, not a bug.
+        (Err(_), Err(_)) => Outcome::Skipped("runtime error at both -O0 and -O3".into()),
+        (Ok(a), Ok(b)) if a == b => Outcome::Ran(Res {
+            ops0: count_ops(&p0),
+            ops3: count_ops(&p3),
+            t0: time_run(&p0, main, &interner),
+            t3: time_run(&p3, main, &interner),
+        }),
+        (Ok(a), Ok(b)) => Outcome::Failed(format!("result differs: -O0 = {a}, -O3 = {b}")),
+        _ => Outcome::Failed("runs at one optimization level but not the other".into()),
     }
-
-    Some(Res {
-        ops0: count_ops(&p0),
-        ops3: count_ops(&p3),
-        t0: time_run(&p0, main, &interner),
-        t3: time_run(&p3, main, &interner),
-    })
 }
 
 /// Time one full execution, adaptively batching until at least 50 ms has elapsed so even fast

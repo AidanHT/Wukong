@@ -150,10 +150,21 @@ pub fn compile(opts: &Options) -> i32 {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
 
-    // High MIR is the pre-optimization form.
+    // High MIR is the pre-optimization form. It is still dumped for debugging even when lowering
+    // failed, since seeing the partial MIR is useful.
     if opts.emit == EmitStage::MirHigh {
         emit_mir(&program, &interner);
-        return exit::OK;
+        return if lower_diags.iter().any(|d| d.is_error()) {
+            exit::COMPILE_ERROR
+        } else {
+            exit::OK
+        };
+    }
+
+    // A construct codegen could not lower leaves the MIR invalid, so do not optimize, run, or hand
+    // it to a backend — that would crash or miscompile. Stop with a clear error instead.
+    if lower_diags.iter().any(|d| d.is_error()) {
+        return exit::COMPILE_ERROR;
     }
 
     // --- Optimization ---

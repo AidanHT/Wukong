@@ -113,10 +113,14 @@ struct FnLowerer<'a> {
 
 impl FnLowerer<'_> {
     fn unsupported(&mut self, span: Span, what: &str) {
+        // A construct codegen cannot lower yields incomplete/invalid MIR, so this is a hard error:
+        // the compiler refuses to emit a broken program rather than silently producing one. The
+        // front end (parsing, type and shape checking) still accepts these constructs — only
+        // lowering to runnable code is unsupported so far.
         self.diags.push(
-            Diagnostic::warning(format!("`{what}` is not yet supported by codegen"))
+            Diagnostic::error(format!("`{what}` is not yet supported by codegen"))
                 .with_code("C0001")
-                .primary(span, ""),
+                .primary(span, "this construct cannot be lowered yet"),
         );
     }
 
