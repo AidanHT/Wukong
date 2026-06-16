@@ -88,6 +88,19 @@ impl MirType {
         )
     }
 
+    /// For a SIMD `Vec`, the per-lane scalar type; for anything else, the type itself. Used to
+    /// classify vector arithmetic (a `<4 x f32>` `fadd` is a float op on its `f32` lanes).
+    pub fn lane_type(&self) -> &MirType {
+        match self {
+            MirType::Vec(elem, _) => elem,
+            other => other,
+        }
+    }
+
+    pub fn is_vector(&self) -> bool {
+        matches!(self, MirType::Vec(..))
+    }
+
     pub fn display(&self) -> String {
         match self {
             MirType::I1 => "i1".into(),

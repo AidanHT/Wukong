@@ -169,6 +169,71 @@ fn if_as_expression() {
     }
 }
 
+/// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
+/// identically on the interpreter (lane-wise over its side arena) and the native backend (real
+/// SSE vectors). This is the contract the loop vectorizer relies on.
+#[test]
+fn vector_ops_interp_matches_native() {
+    use mercury_mir::{BinOp, Builder, CastKind, MirLevel, Op, Program};
+
+    let mut interner = Interner::new();
+    let mut b = Builder::new(interner.intern("main"), mercury_mir::MirType::I32);
+    use mercury_mir::MirType;
+    let f32t = MirType::F32;
+    let vty = MirType::Vec(Box::new(MirType::F32), 4);
+
+    // arr: [f32; 4] = [1, 2, 3, 4]
+    let arr = b.alloca(MirType::Array(Box::new(f32t.clone()), 4));
+    for i in 0..4i128 {
+        let idx = b.build(MirType::I64, Op::ConstInt(i, MirType::I64));
+        let slot = b.build(
+            MirType::Ptr,
+            Op::Gep { ptr: arr, index: idx, elem: f32t.clone() },
+        );
+        let v = b.build(f32t.clone(), Op::ConstFloat((i + 1) as f64, f32t.clone()));
+        b.build_void(Op::Store { ptr: slot, value: v });
+    }
+
+    // base = &arr[0]; v = load <4 x f32>; v += splat(10.0); store back
+    let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+    let base = b.build(
+        MirType::Ptr,
+        Op::Gep { ptr: arr, index: zero, elem: f32t.clone() },
+    );
+    let v = b.build(vty.clone(), Op::Load(base, vty.clone()));
+    let ten = b.build(f32t.clone(), Op::ConstFloat(10.0, f32t.clone()));
+    let sp = b.build(vty.clone(), Op::Splat(ten));
+    let sum = b.build(vty.clone(), Op::Bin(BinOp::FAdd, v, sp));
+    b.build_void(Op::Store { ptr: base, value: sum });
+
+    // return (i32) arr[2]  ==  3 + 10  ==  13
+    let two = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
+    let slot2 = b.build(
+        MirType::Ptr,
+        Op::Gep { ptr: arr, index: two, elem: f32t.clone() },
+    );
+    let e2 = b.build(f32t.clone(), Op::Load(slot2, f32t.clone()));
+    let r = b.build(MirType::I32, Op::Cast(CastKind::FpToSi, e2, MirType::I32));
+    b.ret(Some(r));
+
+    let prog = Program {
+        funcs: vec![b.finish()],
+        level: MirLevel::Low,
+    };
+    for f in &prog.funcs {
+        assert!(
+            mercury_mir::verify::verify_function(f).is_empty(),
+            "vector MIR should verify: {:?}",
+            mercury_mir::verify::verify_function(f)
+        );
+    }
+    let main = interner.intern("main");
+    let native = crate::jit_run(&prog, main, &interner).expect("jit");
+    let interp = mercury_interp::run_with_output(&prog, main, &interner).expect("interp");
+    assert_eq!(native, interp, "vector native vs interp mismatch");
+    assert_eq!(native.0, 13);
+}
+
 /// A `@parallel for` kernel: the native backend runs it across CPU cores via the runtime, the
 /// interpreter runs the whole range sequentially, and the observable result must be identical.
 #[test]

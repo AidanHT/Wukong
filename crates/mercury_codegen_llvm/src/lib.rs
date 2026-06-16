@@ -288,6 +288,24 @@ impl Emitter<'_> {
                     self.interner.resolve(*func)
                 )
             }
+            Op::Splat(v) => {
+                // Broadcast a scalar into every lane: insert at lane 0, then shuffle with an
+                // all-zero mask. (The native vectorizer is Cranelift-only, so this path is for
+                // completeness/round-tripping rather than the hot path.)
+                let r = inst.result.unwrap();
+                let vty = self.ty(r);
+                let lane = self.ty(*v);
+                let width = match self.f.value_type(r) {
+                    MirType::Vec(_, n) => *n,
+                    _ => 1,
+                };
+                format!(
+                    "%v{0}.s = insertelement {vty} poison, {lane} {1}, i32 0\n  \
+                     {res}shufflevector {vty} %v{0}.s, {vty} poison, <{width} x i32> zeroinitializer",
+                    r.0,
+                    self.operand(*v),
+                )
+            }
         };
         let _ = writeln!(out, "  {line}");
     }

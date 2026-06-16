@@ -17,6 +17,9 @@ pub enum Value {
     Int(i128),
     Float(f64),
     Ptr(usize),
+    /// A SIMD vector value: an index into the interpreter's `vecs` side arena (keeps `Value` cheap
+    /// and `Copy`). Produced by `Splat`/vector `Load`/vector `Bin`; consumed by vector `Store`.
+    VecRef(u32),
     Unit,
 }
 
@@ -26,7 +29,7 @@ impl Value {
             Value::Int(i) => i,
             Value::Ptr(p) => p as i128,
             Value::Float(f) => f as i128,
-            Value::Unit => 0,
+            Value::VecRef(_) | Value::Unit => 0,
         }
     }
 
@@ -88,6 +91,7 @@ pub fn run_with_output(
         stdout: Vec::new(),
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
+        vecs: Vec::new(),
     };
     let result = interp.run_function(func, Vec::new())?;
     Ok((result.as_int() as i64, interp.stdout))
@@ -103,6 +107,9 @@ struct Interp<'a> {
     frames: Vec<Vec<Value>>,
     /// Scratch buffer reused when passing block-parameter arguments across an edge.
     scratch: Vec<Value>,
+    /// Backing store for SIMD vector values; `Value::VecRef(i)` indexes this. Vectors only live in
+    /// registers (never in `memory`, which stays scalar), so this grows but is never aliased.
+    vecs: Vec<Vec<Value>>,
 }
 
 impl<'a> Interp<'a> {
@@ -178,7 +185,21 @@ impl<'a> Interp<'a> {
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
             Op::ConstFloat(v, _) => Value::Float(*v),
-            Op::Bin(b, l, r) => apply_bin(*b, reg(regs, *l), reg(regs, *r), rty),
+            // Vector arithmetic is lane-wise, each lane rounded to the lane type (so `<n x f32>`
+            // ops round at f32, matching the native backend). Scalar bins go the fast path.
+            Op::Bin(b, l, r) => {
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    let av = self.vec_lanes(reg(regs, *l));
+                    let bv = self.vec_lanes(reg(regs, *r));
+                    let lane = (**lane).clone();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| apply_bin(*b, av[i], bv[i], Some(&lane)))
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    apply_bin(*b, reg(regs, *l), reg(regs, *r), rty)
+                }
+            }
             Op::Cmp(c, l, r) => Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128),
             Op::Neg(v) => match reg(regs, *v) {
                 Value::Float(f) => Value::Float(-f),
@@ -210,14 +231,35 @@ impl<'a> Interp<'a> {
                 }
                 Value::Ptr(idx)
             }
-            Op::Load(p, _) => {
+            // A vector load gathers `n` contiguous scalar slots (memory stays scalar); a scalar
+            // load reads one. Both `gep` to the element address first.
+            Op::Load(p, ty) => {
                 let idx = ptr(reg(regs, *p))?;
-                *self.memory.get(idx).ok_or("load out of bounds")?
+                if let MirType::Vec(_, n) = ty {
+                    let mut lanes = Vec::with_capacity(*n as usize);
+                    for i in 0..*n as usize {
+                        lanes.push(*self.memory.get(idx + i).ok_or("vector load out of bounds")?);
+                    }
+                    self.push_vec(lanes)
+                } else {
+                    *self.memory.get(idx).ok_or("load out of bounds")?
+                }
             }
             Op::Store { ptr: p, value } => {
                 let idx = ptr(reg(regs, *p))?;
-                let val = reg(regs, *value);
-                *self.memory.get_mut(idx).ok_or("store out of bounds")? = val;
+                match reg(regs, *value) {
+                    // A vector store scatters its lanes across contiguous scalar slots.
+                    Value::VecRef(vi) => {
+                        let lanes = self.vecs[vi as usize].clone();
+                        for (i, lane) in lanes.iter().enumerate() {
+                            *self
+                                .memory
+                                .get_mut(idx + i)
+                                .ok_or("vector store out of bounds")? = *lane;
+                        }
+                    }
+                    val => *self.memory.get_mut(idx).ok_or("store out of bounds")? = val,
+                }
                 Value::Unit
             }
             Op::Gep { ptr: p, index, .. } => {
@@ -246,7 +288,32 @@ impl<'a> Interp<'a> {
                     .ok_or("func_addr of unknown function")?;
                 Value::Ptr(FUNC_TAG + idx)
             }
+            // Broadcast a scalar to every lane.
+            Op::Splat(v) => {
+                let n = match rty {
+                    Some(MirType::Vec(_, n)) => *n as usize,
+                    _ => 1,
+                };
+                let s = reg(regs, *v);
+                self.push_vec(vec![s; n])
+            }
         })
+    }
+
+    /// Intern a freshly-computed vector value into the side arena, returning its handle.
+    fn push_vec(&mut self, lanes: Vec<Value>) -> Value {
+        let i = self.vecs.len() as u32;
+        self.vecs.push(lanes);
+        Value::VecRef(i)
+    }
+
+    /// The lanes behind a `VecRef` (cloned out so callers can borrow `self` mutably afterwards).
+    fn vec_lanes(&self, v: Value) -> Vec<Value> {
+        match v {
+            Value::VecRef(i) => self.vecs[i as usize].clone(),
+            // A non-vector reaching a vector op is a lowering bug; treat as a single lane.
+            other => vec![other],
+        }
     }
 
     fn intrinsic(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -256,6 +323,7 @@ impl<'a> Interp<'a> {
                     Value::Int(i) => format!("{i}\n"),
                     Value::Float(f) => format!("{f}\n"),
                     Value::Ptr(p) => format!("{p}\n"),
+                    Value::VecRef(_) => "<vector>\n".to_string(),
                     Value::Unit => "\n".to_string(),
                 };
                 self.stdout.extend_from_slice(text.as_bytes());
@@ -266,7 +334,7 @@ impl<'a> Interp<'a> {
                     Value::Int(i) => i != 0,
                     Value::Float(f) => f != 0.0,
                     Value::Ptr(p) => p != 0,
-                    Value::Unit => false,
+                    Value::VecRef(_) | Value::Unit => false,
                 };
                 if ok {
                     Ok(Value::Unit)

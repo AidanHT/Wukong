@@ -168,6 +168,7 @@ fn pure_key(op: &Op, rewrite: &HashMap<u32, u32>) -> Option<String> {
         Op::Select(c, a, b) => format!("sel:{}:{}:{}", m(*c), m(*a), m(*b)),
         Op::Gep { ptr, index, elem } => format!("gep:{}:{}:{elem:?}", m(*ptr), m(*index)),
         Op::FuncAddr(s) => format!("faddr:{s:?}"),
+        Op::Splat(a) => format!("splat:{}", m(*a)),
         Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::Alloca(..) => return None,
     })
 }

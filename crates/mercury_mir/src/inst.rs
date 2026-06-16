@@ -178,6 +178,10 @@ pub enum Op {
     /// The machine address of a function (a `Ptr`), for passing it to a runtime that calls it back
     /// — e.g. the outlined body of a `@parallel for`. Pure and side-effect-free.
     FuncAddr(Symbol),
+    /// Broadcast a scalar across every lane of a SIMD vector. The result is a `Vec(elem, n)` whose
+    /// lane type matches the operand; the vectorizer uses it to lift loop-invariant scalars into
+    /// vector form. Pure and side-effect-free.
+    Splat(ValueId),
 }
 
 /// One instruction: an optional result value plus its operation.
