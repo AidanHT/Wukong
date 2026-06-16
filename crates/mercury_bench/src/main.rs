@@ -41,10 +41,10 @@ fn main() {
     files.sort();
 
     println!(
-        "{:<20} {:>7} {:>7} {:>9}  {:>11} {:>11} {:>8}",
-        "program", "O0 ops", "O3 ops", "reduction", "O0 time", "O3 time", "speedup"
+        "{:<20} {:>7} {:>7} {:>9}  {:>11} {:>11} {:>9}",
+        "program", "O0 ops", "O3 ops", "reduction", "interp O3", "native O3", "nat:intp"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(82));
 
     let (mut tot0, mut tot3) = (0usize, 0usize);
     let mut log_speedup_sum = 0.0f64;
@@ -56,17 +56,17 @@ fn main() {
                 tot0 += r.ops0;
                 tot3 += r.ops3;
                 let pct = reduction(r.ops0, r.ops3);
-                let speedup = r.t0.as_secs_f64() / r.t3.as_secs_f64().max(1e-12);
+                let speedup = r.t_interp.as_secs_f64() / r.t_native.as_secs_f64().max(1e-12);
                 log_speedup_sum += speedup.ln();
                 speedup_n += 1;
                 println!(
-                    "{:<20} {:>7} {:>7} {:>8.1}%  {:>11} {:>11} {:>7.2}x",
+                    "{:<20} {:>7} {:>7} {:>8.1}%  {:>11} {:>11} {:>8.1}x",
                     short_name(f),
                     r.ops0,
                     r.ops3,
                     pct,
-                    fmt_dur(r.t0),
-                    fmt_dur(r.t3),
+                    fmt_dur(r.t_interp),
+                    fmt_dur(r.t_native),
                     speedup,
                 );
             }
@@ -80,15 +80,16 @@ fn main() {
         }
     }
 
-    println!("{}", "-".repeat(80));
-    // Geometric mean of the per-program speedups (the right average for ratios).
+    println!("{}", "-".repeat(82));
+    // Geometric mean of the per-program native-vs-interpreter speedups (the right average for
+    // ratios).
     let geo = if speedup_n > 0 {
         (log_speedup_sum / speedup_n as f64).exp()
     } else {
         0.0
     };
     println!(
-        "{:<20} {:>7} {:>7} {:>8.1}%  {:>11} {:>11} {:>7.2}x",
+        "{:<20} {:>7} {:>7} {:>8.1}%  {:>11} {:>11} {:>8.1}x",
         "TOTAL / geomean",
         tot0,
         tot3,
@@ -126,8 +127,10 @@ enum Outcome {
 struct Res {
     ops0: usize,
     ops3: usize,
-    t0: Duration,
-    t3: Duration,
+    /// Per-run interpreter time at -O3.
+    t_interp: Duration,
+    /// Per-run native (Cranelift JIT) time at -O3.
+    t_native: Duration,
 }
 
 fn reduction(a: usize, b: usize) -> f64 {
@@ -168,18 +171,63 @@ fn bench_one(path: &Path) -> Outcome {
     }
     let main = interner.intern("main");
     let r0 = mercury_interp::run(&p0, main, &interner);
-    let r3 = mercury_interp::run(&p3, main, &interner);
-    match (r0, r3) {
+    let r3 = mercury_interp::run_with_output(&p3, main, &interner);
+    let interp3 = match (r0, r3) {
         // Both fail identically (e.g. a deliberate runtime assertion) — consistent, not a bug.
-        (Err(_), Err(_)) => Outcome::Skipped("runtime error at both -O0 and -O3".into()),
-        (Ok(a), Ok(b)) if a == b => Outcome::Ran(Res {
-            ops0: count_ops(&p0),
-            ops3: count_ops(&p3),
-            t0: time_run(&p0, main, &interner),
-            t3: time_run(&p3, main, &interner),
-        }),
-        (Ok(a), Ok(b)) => Outcome::Failed(format!("result differs: -O0 = {a}, -O3 = {b}")),
-        _ => Outcome::Failed("runs at one optimization level but not the other".into()),
+        (Err(_), Err(_)) => return Outcome::Skipped("runtime error at both -O0 and -O3".into()),
+        (Ok(a), Ok(out3)) if a == out3.0 => out3,
+        (Ok(a), Ok(out3)) => {
+            return Outcome::Failed(format!("result differs: -O0 = {a}, -O3 = {}", out3.0))
+        }
+        _ => return Outcome::Failed("runs at one optimization level but not the other".into()),
+    };
+
+    // Second soundness gate: the native (Cranelift) backend at -O3 must match the interpreter at
+    // -O3 on both exit code and stdout. This makes the native path a checked peer of the oracle.
+    match mercury_codegen_cranelift::jit_run(&p3, main, &interner) {
+        Ok(native3) if native3 == interp3 => {}
+        Ok(native3) => {
+            return Outcome::Failed(format!(
+                "native != interpreter at -O3 (interp exit={}, native exit={})",
+                interp3.0, native3.0
+            ))
+        }
+        Err(e) => return Outcome::Failed(format!("native backend failed at -O3: {e}")),
+    }
+
+    Outcome::Ran(Res {
+        ops0: count_ops(&p0),
+        ops3: count_ops(&p3),
+        t_interp: time_run(&p3, main, &interner),
+        t_native: time_native(&p3, main, &interner),
+    })
+}
+
+/// Time one native execution at -O3: compile once, warm up, then batch raw calls until at least
+/// 50 ms has elapsed. Returns the per-run duration (or zero if it does not compile).
+fn time_native(
+    p: &mercury_mir::Program,
+    entry: mercury_span::Symbol,
+    interner: &Interner,
+) -> Duration {
+    let prog = match mercury_codegen_cranelift::jit_compile(p, entry, interner) {
+        Ok(prog) => prog,
+        Err(_) => return Duration::ZERO,
+    };
+    for _ in 0..2 {
+        let _ = prog.call();
+    }
+    let mut reps: u32 = 1;
+    loop {
+        let start = Instant::now();
+        for _ in 0..reps {
+            let _ = prog.call();
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= Duration::from_millis(50) || reps >= 1 << 22 {
+            return elapsed / reps;
+        }
+        reps *= 2;
     }
 }
 

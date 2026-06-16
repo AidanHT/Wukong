@@ -720,17 +720,79 @@ fn populate_module<M: Module>(
     Ok(ids)
 }
 
-/// JIT-compile `program` and execute `entry`, returning its exit code and captured stdout — the
-/// native counterpart to the interpreter's `run_with_output`.
-pub fn jit_run(
+/// A JIT-compiled program: holds the executable memory and a pointer to the entry point. Compile
+/// once with [`jit_compile`], then [`JitProgram::run`] (capturing output, for correctness) or
+/// [`JitProgram::call`] (raw, for timing) as many times as needed.
+pub struct JitProgram {
+    module: Option<cranelift_jit::JITModule>,
+    code: *const u8,
+    ret: MirType,
+}
+
+impl JitProgram {
+    /// Invoke the entry point, transmuting to the right ABI for its return type. Caller must hold
+    /// the run lock (so the shared capture buffer isn't raced).
+    unsafe fn invoke(&self) -> i64 {
+        match &self.ret {
+            MirType::Void => {
+                let f: extern "C" fn() = std::mem::transmute(self.code);
+                f();
+                0
+            }
+            t if t.is_float() => {
+                let f: extern "C" fn() -> f64 = std::mem::transmute(self.code);
+                f() as i64
+            }
+            MirType::I64 => {
+                let f: extern "C" fn() -> i64 = std::mem::transmute(self.code);
+                f()
+            }
+            _ => {
+                let f: extern "C" fn() -> i32 = std::mem::transmute(self.code);
+                f() as i64
+            }
+        }
+    }
+
+    /// Run once, returning the exit code and captured stdout (the native counterpart to the
+    /// interpreter's `run_with_output`).
+    pub fn run(&self) -> Result<(i64, Vec<u8>), String> {
+        let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        ASSERT_FAILED.store(false, Ordering::SeqCst);
+        let exit_code = unsafe { self.invoke() };
+        let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if ASSERT_FAILED.load(Ordering::SeqCst) {
+            return Err("assertion failed".into());
+        }
+        Ok((exit_code, out))
+    }
+
+    /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
+    /// grow memory, and returns just the exit code.
+    pub fn call(&self) -> i64 {
+        let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        unsafe { self.invoke() }
+    }
+}
+
+impl Drop for JitProgram {
+    fn drop(&mut self) {
+        if let Some(m) = self.module.take() {
+            // SAFETY: no JIT'd code from this module runs after the handle is dropped.
+            unsafe { m.free_memory() };
+        }
+    }
+}
+
+/// JIT-compile `program`, returning a callable handle to `entry`.
+pub fn jit_compile(
     program: &Program,
     entry: Symbol,
     interner: &Interner,
-) -> Result<(i64, Vec<u8>), String> {
+) -> Result<JitProgram, String> {
     use cranelift_jit::{JITBuilder, JITModule};
-
-    // Tolerate poisoning: a prior panic mid-run shouldn't wedge every later run.
-    let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -742,50 +804,30 @@ pub fn jit_run(
     let ids = populate_module(&mut module, program, interner)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
 
-    let entry_id = *ids
-        .get(&entry)
+    let entry_fn = program
+        .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let code = module.get_finalized_function(entry_id);
-
-    let entry_fn = program.function(entry).unwrap();
     if !entry_fn.params.is_empty() {
         unsafe { module.free_memory() };
         return Err("native entry point must take no parameters".into());
     }
+    let entry_id = ids[&entry];
+    let code = module.get_finalized_function(entry_id);
 
-    OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    ASSERT_FAILED.store(false, Ordering::SeqCst);
+    Ok(JitProgram {
+        module: Some(module),
+        code,
+        ret: entry_fn.ret.clone(),
+    })
+}
 
-    let exit_code: i64 = unsafe {
-        match &entry_fn.ret {
-            MirType::Void => {
-                let f: extern "C" fn() = std::mem::transmute(code);
-                f();
-                0
-            }
-            t if t.is_float() => {
-                let f: extern "C" fn() -> f64 = std::mem::transmute(code);
-                f() as i64
-            }
-            MirType::I64 => {
-                let f: extern "C" fn() -> i64 = std::mem::transmute(code);
-                f()
-            }
-            _ => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(code);
-                f() as i64
-            }
-        }
-    };
-
-    let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let failed = ASSERT_FAILED.load(Ordering::SeqCst);
-    unsafe { module.free_memory() };
-
-    if failed {
-        return Err("assertion failed".into());
-    }
-    Ok((exit_code, out))
+/// JIT-compile and execute `entry`, returning its exit code and captured stdout.
+pub fn jit_run(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    jit_compile(program, entry, interner)?.run()
 }
 
 /// Compile `program` to a native object file (bytes) for the host target. The runtime symbols are
