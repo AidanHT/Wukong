@@ -18,6 +18,7 @@ OPTIONS:
     -o <path>          Write output to <path>
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
+    --explain <CODE>   Print the extended explanation for an error code, then exit
     -h, --help         Print this help
     -V, --version      Print version
 
@@ -39,6 +40,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Print the extended explanation for an error code to stdout.
+fn print_explanation(code: &str) -> Result<(), String> {
+    match mercury_driver::explain(code) {
+        Some(e) => {
+            println!("{}: {}\n", e.code, e.title);
+            println!("{}", e.body);
+            Ok(())
+        }
+        None => Err(format!(
+            "unknown error code `{code}`. Run `mercuryc --explain E0502` for an example."
+        )),
+    }
+}
+
 /// Parse CLI arguments. `Ok(None)` means a help/version message was printed and we should exit
 /// successfully without compiling.
 fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
@@ -56,6 +71,12 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "-V" | "--version" => {
                 println!("mercuryc {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--explain" => {
+                i += 1;
+                let code = args.get(i).ok_or("`--explain` requires an error code, e.g. E0502")?;
+                print_explanation(code)?;
                 return Ok(None);
             }
             "--run" => opts.run = true,

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use mercury_diag::{DiagnosticSink, Renderer};
 use mercury_span::{Interner, SourceMap};
 
+pub use mercury_diag::{all_explanations, explain, Explanation};
+
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EmitStage {

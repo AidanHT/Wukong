@@ -6,7 +6,9 @@
 //! [`DiagnosticSink`]; the [`Renderer`] turns them into the familiar `error[E0501]: ...`
 //! terminal output.
 
+mod catalog;
 mod render;
+pub use catalog::{all as all_explanations, explain, Explanation};
 pub use render::Renderer;
 
 use mercury_span::Span;
