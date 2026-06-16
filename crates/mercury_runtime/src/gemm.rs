@@ -360,22 +360,27 @@ unsafe fn pack_b_trans(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut
 
 /// Pack an `MC×KC` slice of A (row-major, leading dim `lda`) into `MR`-wide row panels: panel `ip`
 /// is `[kc][MR]` contiguous (so the microkernel broadcasts each row with unit stride), zero-padded.
+/// Reads each A row *contiguously* over the contraction (`p` innermost) and scatters into the small
+/// L1-resident panel; the transposed order (strided A reads, one cache line per element) thrashes
+/// cache, so this order matters as much as it does for `pack_b_trans`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pack_a(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) {
-    let mut dst = ap;
     let mpanels = mc.div_ceil(MR);
     for ip in 0..mpanels {
         let i0 = ip * MR;
         let nrows = (mc - i0).min(MR);
-        for p in 0..kc {
-            for r in 0..nrows {
-                *dst.add(r) = *a.add((i0 + r) * lda + p);
+        let panel = ap.add(ip * kc * MR);
+        for r in 0..nrows {
+            let src = a.add((i0 + r) * lda); // row (i0+r) of A, contiguous over the contraction
+            for p in 0..kc {
+                *panel.add(p * MR + r) = *src.add(p);
             }
-            for r in nrows..MR {
-                *dst.add(r) = 0.0;
+        }
+        for r in nrows..MR {
+            for p in 0..kc {
+                *panel.add(p * MR + r) = 0.0;
             }
-            dst = dst.add(MR);
         }
     }
 }
