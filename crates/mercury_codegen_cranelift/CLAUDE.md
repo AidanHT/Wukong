@@ -46,7 +46,12 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   or 128-bit vector). The front-end contracts float `x + y*z` into it; the interpreter mirrors it
   with `mul_add`, and the two agree bit-for-bit (gated by `fma_contraction_is_bit_exact`). This is
   why `mercury_xbench` gives gcc `-ffp-contract=fast` — both sides fuse.
-- Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`) are bound to Rust
-  fns in the JIT and left as imports in the object (resolved by the driver's C runtime). A global run
-  lock serialises JIT runs that share the stdout-capture buffer.
+- Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`, and the GEMM
+  microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`) are bound to Rust fns in the JIT and
+  left as imports in the object (resolved by the driver's C runtime). A global run lock serialises JIT
+  runs that share the stdout-capture buffer.
+- **GEMM calls.** The matmul recognizer in `mercury_mir_build` emits `Op::Call` to a `mercury_sgemm*`
+  symbol with `(a,b,c,m,k,n,beta)`; `lower_call` recognizes those names (`RT_SGEMM*`) and emits a
+  direct call to the declared import (signature `(ptr,ptr,ptr,i64,i64,i64,i64)`). Register the symbol
+  in *both* `jit_compile` and `jit_module` when adding more.
 - Div-by-zero is guarded to yield 0 (no trap), matching the interpreter oracle.
