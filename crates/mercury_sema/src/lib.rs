@@ -363,8 +363,9 @@ impl Sema<'_> {
                     (Some(a), Some(i)) => {
                         let init_expr = init.as_ref().unwrap();
                         if self.let_compatible(a, init_expr, i) {
-                            // An untyped literal adopts the annotated type.
-                            self.types.insert(init_expr.id, a.clone());
+                            // An untyped literal adopts the annotated type, top to bottom (so a
+                            // negated literal like `-1.5` re-stamps the inner literal too).
+                            self.retype_adapted_literal(init_expr, a);
                         } else {
                             self.error(
                                 s.span,
@@ -469,12 +470,32 @@ impl Sema<'_> {
         if compatible(ann, init_ty) {
             return true;
         }
+        self.literal_adapts(ann, init)
+    }
+
+    /// Whether an *unsuffixed* numeric literal — optionally wrapped in a unary minus, e.g.
+    /// `let x: f64 = -1.5;` — adapts to the integer/float annotation `ann`. A leading `-`
+    /// does not change a literal's kind, so we peel `Neg` and re-check the inner literal.
+    fn literal_adapts(&self, ann: &Ty, init: &Expr) -> bool {
         match (&init.kind, ann) {
             (ExprKind::Int(s), Ty::Scalar(sc)) => sc.is_int() && !has_int_suffix(self.sym_str(*s)),
             (ExprKind::Float(s), Ty::Scalar(sc)) => {
                 sc.is_float() && !has_float_suffix(self.sym_str(*s))
             }
+            (ExprKind::Unary { op: UnOp::Neg, expr }, Ty::Scalar(_)) => {
+                self.literal_adapts(ann, expr)
+            }
             _ => false,
+        }
+    }
+
+    /// Re-stamp an adapted numeric literal — and the literal inside any unary minus — with the
+    /// `let`'s annotated type, so MIR lowering sees one consistent width (e.g. `-1.5` becomes
+    /// `f64` end to end, not `-(1.5: f32)` widened to `f64` at the `Neg`).
+    fn retype_adapted_literal(&mut self, e: &Expr, ann: &Ty) {
+        self.types.insert(e.id, ann.clone());
+        if let ExprKind::Unary { op: UnOp::Neg, expr } = &e.kind {
+            self.retype_adapted_literal(expr, ann);
         }
     }
 
@@ -785,6 +806,23 @@ mod tests {
     #[test]
     fn let_annotation_mismatch_errors() {
         let (diags, _) = analyze("fn f() { let x: f32 = true; }");
+        assert!(diags.iter().any(|d| d.code == Some("E0401")));
+    }
+
+    #[test]
+    fn negated_literal_adapts_to_let_annotation() {
+        // A leading `-` does not change a literal's kind, so an unsuffixed negated literal must
+        // still adopt the annotation (`f64`/`i64` here), not stay at the default `f32`/`i32`.
+        for src in [
+            "fn f() { let x: f64 = -1.5; }",
+            "fn f() { let x: i64 = -7; }",
+            "fn f() { let x: f64 = 2.0; }",
+        ] {
+            let (diags, _) = analyze(src);
+            assert!(diags.is_empty(), "unexpected for {src:?}: {diags:?}");
+        }
+        // A *suffixed* literal still pins its type and must conflict.
+        let (diags, _) = analyze("fn f() { let x: f64 = -1.5f32; }");
         assert!(diags.iter().any(|d| d.code == Some("E0401")));
     }
 
