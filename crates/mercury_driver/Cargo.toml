@@ -20,3 +20,4 @@ mercury_backend = { workspace = true }
 mercury_interp = { workspace = true }
 mercury_opt = { workspace = true }
 mercury_codegen_llvm = { workspace = true }
+mercury_codegen_cranelift = { workspace = true }

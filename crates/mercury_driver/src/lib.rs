@@ -47,6 +47,15 @@ pub enum ErrorFormat {
     Json,
 }
 
+/// Which backend executes (`--run`) or emits native code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendKind {
+    /// The tree-walking MIR interpreter (zero dependencies, the reference oracle).
+    Interp,
+    /// Cranelift native codegen — JIT for `--run`, object/exe for `--emit`.
+    Native,
+}
+
 /// Compiler invocation options, normally produced by the CLI.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -57,6 +66,9 @@ pub struct Options {
     pub opt_level: u8,
     pub color: bool,
     pub error_format: ErrorFormat,
+    /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
+    /// native object/exe emission always uses Cranelift.
+    pub backend: BackendKind,
 }
 
 impl Default for Options {
@@ -69,6 +81,7 @@ impl Default for Options {
             opt_level: 0,
             color: true,
             error_format: ErrorFormat::Human,
+            backend: BackendKind::Interp,
         }
     }
 }
@@ -170,18 +183,21 @@ pub fn compile(opts: &Options) -> i32 {
     // --- Optimization ---
     mercury_opt::optimize(&mut program, opts.opt_level);
 
-    // --- Run via the interpreter ---
+    // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
     if opts.run {
-        use mercury_backend::{Artifact, Backend};
         let main = interner.intern("main");
-        let backend = mercury_interp::Interpreter;
-        return match backend.compile(&program, main, &interner) {
-            Ok(Artifact::Executed { exit_code, stdout }) => {
+        let result = match opts.backend {
+            BackendKind::Interp => mercury_interp::run_with_output(&program, main, &interner),
+            BackendKind::Native => {
+                mercury_codegen_cranelift::jit_run(&program, main, &interner)
+            }
+        };
+        return match result {
+            Ok((exit_code, stdout)) => {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&stdout);
                 exit_code as i32
             }
-            Ok(_) => exit::OK,
             Err(e) => {
                 eprintln!("error: {e}");
                 exit::COMPILE_ERROR
@@ -209,59 +225,84 @@ pub fn compile(opts: &Options) -> i32 {
     exit::OK
 }
 
-/// Emit LLVM IR to a `.ll` file and compile it natively with `clang` (the only common driver that
-/// consumes textual IR). Falls back to a clear message if no LLVM toolchain is installed.
+/// The C runtime linked into native executables: it backs the `print`/`assert` intrinsics that the
+/// Cranelift object leaves as undefined imports. The JIT path binds the same symbols to Rust
+/// functions instead, so the two stay in lockstep.
+const MERCURY_RT_C: &str = "#include <stdio.h>\n\
+#include <stdlib.h>\n\
+void mercury_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
+void mercury_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
+void mercury_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(101); } }\n";
+
+/// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it with a small C
+/// runtime using the system C compiler. `CC` overrides the compiler (default `cc`).
 fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Options) -> i32 {
     use std::process::Command;
 
-    let ir = mercury_codegen_llvm::emit_llvm_ir(program, interner);
+    let obj = match mercury_codegen_cranelift::emit_object(program, interner) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: cranelift codegen failed: {e}");
+            return exit::COMPILE_ERROR;
+        }
+    };
+
     let stem = opts
         .input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "out".to_string());
-    let ll_path = std::path::PathBuf::from(format!("{stem}.ll"));
-    if let Err(e) = std::fs::write(&ll_path, ir) {
-        eprintln!("error: could not write `{}`: {e}", ll_path.display());
-        return exit::IO_ERROR;
-    }
 
     let is_obj = opts.emit == EmitStage::Obj;
-    let default_out = if is_obj {
-        format!("{stem}.o")
+    let obj_path = if is_obj {
+        opts.output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("{stem}.o")))
     } else {
-        format!("{stem}.exe")
+        PathBuf::from(format!("{stem}.o"))
     };
+    if let Err(e) = std::fs::write(&obj_path, &obj) {
+        eprintln!("error: could not write `{}`: {e}", obj_path.display());
+        return exit::IO_ERROR;
+    }
+    if is_obj {
+        eprintln!("wrote {}", obj_path.display());
+        return exit::OK;
+    }
+
+    // exe: emit the C runtime next to the object and link them.
+    let rt_path = PathBuf::from(format!("{stem}_rt.c"));
+    if let Err(e) = std::fs::write(&rt_path, MERCURY_RT_C) {
+        eprintln!("error: could not write `{}`: {e}", rt_path.display());
+        return exit::IO_ERROR;
+    }
     let out = opts
         .output
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from(default_out));
-
-    let mut cmd = Command::new("clang");
-    if is_obj {
-        cmd.arg("-c");
-    }
-    cmd.arg(&ll_path)
+        .unwrap_or_else(|| PathBuf::from(format!("{stem}.exe")));
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = Command::new(&cc)
+        .arg(&obj_path)
+        .arg(&rt_path)
         .arg("-o")
         .arg(&out)
-        .arg(format!("-O{}", opts.opt_level));
-
-    match cmd.status() {
+        .arg("-O2")
+        .status();
+    match status {
         Ok(s) if s.success() => {
             eprintln!("wrote {}", out.display());
             exit::OK
         }
         Ok(_) => {
-            eprintln!("error: clang failed to compile `{}`", ll_path.display());
+            eprintln!("error: `{cc}` failed to link the native object `{}`", obj_path.display());
             exit::COMPILE_ERROR
         }
         Err(_) => {
             eprintln!(
-                "error: could not run `clang` to compile LLVM IR.\n\
-                 note: the textual IR was written to `{}`.\n\
-                 help: install an LLVM toolchain (see docs/llvm-setup.md), or use `--emit=llvm-ir` \
-                 to inspect the IR, or `--run` to execute via the interpreter.",
-                ll_path.display()
+                "error: could not run `{cc}` to link.\n\
+                 note: the native object was written to `{}`.\n\
+                 help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to execute.",
+                obj_path.display()
             );
             exit::UNIMPLEMENTED
         }

@@ -393,6 +393,7 @@ version = "0.1.0"
 dependencies = [
  "mercury_ast",
  "mercury_backend",
+ "mercury_codegen_cranelift",
  "mercury_codegen_llvm",
  "mercury_diag",
  "mercury_interp",
