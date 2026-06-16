@@ -327,6 +327,40 @@ mod tests {
     }
 
     #[test]
+    fn scalar_from_name_round_trips() {
+        for s in [
+            Scalar::Bool,
+            Scalar::I8,
+            Scalar::U8,
+            Scalar::I32,
+            Scalar::U64,
+            Scalar::Usize,
+            Scalar::F16,
+            Scalar::Bf16,
+            Scalar::F32,
+            Scalar::F64,
+        ] {
+            let name = s.name();
+            assert_eq!(Scalar::from_name(name), Some(s), "round-trip {name}");
+        }
+        assert_eq!(Scalar::from_name("not_a_type"), None);
+    }
+
+    #[test]
+    fn nested_array_size_and_pointer_layout() {
+        // [[i32; 4]; 3] -> 3 * (4 * 4) = 48 bytes.
+        let inner = Ty::Array {
+            elem: Box::new(Ty::Scalar(Scalar::I32)),
+            len: 4,
+        };
+        let outer = Ty::Array {
+            elem: Box::new(inner),
+            len: 3,
+        };
+        assert_eq!(outer.size_of(), Some(48));
+    }
+
+    #[test]
     fn display_tensor() {
         let mut i = Interner::new();
         let m = i.intern("M");
