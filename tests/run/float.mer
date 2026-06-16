@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+module tests.run.float
+
+/// Floating-point arithmetic end to end: a loop-carried sum, a scalar saxpy (a*x + y), and a
+/// float comparison driving control flow.
+fn main() -> i32 {
+    let mut sum: f32 = 0.0;
+    let mut i: i32 = 0;
+    while i < 5 {
+        sum = sum + 1.5;
+        i = i + 1;
+    }
+    print(sum); // 5 * 1.5 = 7.5
+
+    let a: f32 = 2.0;
+    let x: f32 = 3.0;
+    let y: f32 = 1.0;
+    print(a * x + y); // 7
+
+    if sum > 7.0 {
+        print(1);
+    } else {
+        print(0);
+    }
+    return 0;
+}
