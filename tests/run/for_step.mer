@@ -1,0 +1,24 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 35
+module tests.run.for_step
+
+/// `for ... in a..b step s` — sum of 0,2,4,6,8 and of 0..10 inclusive-ish via two ranges.
+fn main() -> i32 {
+    let mut even: i32 = 0;
+    for k in 0..10 step 2 {
+        even = even + k;
+    }
+    print(even);
+
+    let mut total: i32 = 0;
+    for k in 1..6 {
+        total = total + k;
+    }
+    for k in 6..1 {
+        total = total + k; // empty range: never runs
+    }
+    print(total + even);
+    return 0;
+}

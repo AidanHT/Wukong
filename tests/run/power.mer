@@ -1,0 +1,26 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 19683
+module tests.run.power
+
+/// Exponentiation by squaring — exercises `%`, integer `/`, and a loop-carried accumulator.
+fn ipow(base: i32, exp: i32) -> i32 {
+    let mut result: i32 = 1;
+    let mut b: i32 = base;
+    let mut e: i32 = exp;
+    while e > 0 {
+        if e % 2 == 1 {
+            result = result * b;
+        }
+        b = b * b;
+        e = e / 2;
+    }
+    return result;
+}
+
+fn main() -> i32 {
+    print(ipow(2, 10));
+    print(ipow(3, 9));
+    return 0;
+}

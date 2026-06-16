@@ -1,0 +1,23 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 21
+// EXPECT-OUT: 1
+module tests.run.gcd
+
+/// Euclid's algorithm — exercises `while`, `%`, and reassignment via a temporary.
+fn gcd(a: i32, b: i32) -> i32 {
+    let mut x: i32 = a;
+    let mut y: i32 = b;
+    while y != 0 {
+        let t: i32 = y;
+        y = x % y;
+        x = t;
+    }
+    return x;
+}
+
+fn main() -> i32 {
+    print(gcd(1071, 462));
+    print(gcd(17, 5));
+    return 0;
+}

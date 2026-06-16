@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 100
+// EXPECT-OUT: 8
+// EXPECT-OUT: 14
+// EXPECT-OUT: 6
+// EXPECT-OUT: 1
+module tests.run.nested
+
+/// Nested loops, bitwise operators, and short-circuit boolean logic.
+fn main() -> i32 {
+    let mut acc: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 5 {
+        let mut j: i32 = 0;
+        while j < 5 {
+            acc = acc + i * j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    print(acc);
+
+    let a: i32 = 12;
+    let b: i32 = 10;
+    print(a & b);
+    print(a | b);
+    print(a ^ b);
+    if true && (a > b) { print(1); } else { print(0); }
+    return 0;
+}
