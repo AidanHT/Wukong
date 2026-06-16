@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: 130
+module tests.run.linear_f32
+
+/// nn.Linear `C[2,2] = A[2,3]·B[2,3]ᵀ`, written the idiomatic `ijk` dot-product way. The compiler
+/// recognizes it as a transposed-B matmul and dispatches to `mercury_sgemm_nt`; `--run` executes the
+/// same kernel via the interpreter. Each `C[i,j]` is the dot product of A's row i and B's row j.
+fn main() -> i32 {
+    let mut a: [f32; 6] = [0.0; 6];
+    let mut b: [f32; 6] = [0.0; 6];
+    let mut c: [f32; 4] = [0.0; 4];
+    let mut i: i32 = 0;
+    while i < 6 { a[i] = (i as f32) * 0.5; i = i + 1; }
+    let mut j: i32 = 0;
+    while j < 6 { b[j] = (j as f32) - 2.0; j = j + 1; }
+
+    for ii in 0..2 {
+        for jj in 0..2 {
+            let mut s: f32 = 0.0;
+            for kk in 0..3 { s = s + a[ii * 3 + kk] * b[jj * 3 + kk]; }
+            c[ii * 2 + jj] = s;
+        }
+    }
+
+    print((c[0] * 10.0) as i32);
+    print((c[3] * 10.0) as i32);
+    return 0;
+}
