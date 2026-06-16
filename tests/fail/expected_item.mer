@@ -1,0 +1,5 @@
+// EXPECT-CODE: E0208
+module tests.fail.expected_item
+
+// A statement at module scope is not an item; only fn/struct/enum/const/import/extern are.
+return 0;

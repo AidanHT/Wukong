@@ -1,0 +1,8 @@
+// EXPECT-CODE: E0101
+module tests.fail.unexpected_char
+
+/// A stray character the lexer cannot tokenize.
+fn main() -> i32 {
+    let x: i32 = 1 $ 2;
+    return x;
+}

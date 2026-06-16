@@ -1,0 +1,8 @@
+// EXPECT-CODE: E0202
+module tests.fail.expected_expr
+
+/// Nothing follows the `=`, so the parser has no expression to parse.
+fn main() -> i32 {
+    let x: i32 = ;
+    return x;
+}
