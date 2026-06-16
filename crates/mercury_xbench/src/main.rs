@@ -118,28 +118,35 @@ fn main() {
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
 /// regime where a tensor compiler should genuinely beat idiomatic scalar-source code. We benchmark
 /// an `ikj`-ordered C = A·B (the cache-friendly idiom that auto-vectorizes well) written the same
-/// way in each language, and additionally Mercury's `@parallel` form. Reported as GFLOP/s.
+/// way in each language, and additionally Mercury's `@parallel` form. Reported as GFLOP/s. The win
+/// is shown across a size sweep so it is clearly structural, not a single-size artifact.
 fn bench_matmul(cc: &str, dir: &Path) {
-    const NS: usize = 512; // 512x512x512: ~268 MFLOP/call, fits the L2/L3 hierarchy
-    let n2 = NS * NS;
+    for ns in [256usize, 512, 1024] {
+        bench_matmul_size(cc, dir, ns);
+        println!();
+    }
+}
+
+fn bench_matmul_size(cc: &str, dir: &Path, ns: usize) {
+    let n2 = ns * ns;
     let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
     let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
     let mut c = vec![0.0f32; n2];
     let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
-    let flops = 2.0 * (NS as f64).powi(3);
+    let flops = 2.0 * (ns as f64).powi(3);
 
-    println!("=== matmul {NS}x{NS} (C=A·B, ikj order; GFLOP/s, higher is better) ===");
+    println!("=== matmul {ns}x{ns} (C=A·B, ikj order; GFLOP/s, higher is better) ===");
     let gflops = |m: &Option<Measure>| {
         m.as_ref()
             .map(|x| format!("{:.1}", flops / x.ns_per_call))
             .unwrap_or_else(|| "n/a".into())
     };
 
-    let mer = bench_mercury(&mer_matmul(NS, false), &mut c, ap, bp, cp);
-    let mer_par = bench_mercury(&mer_matmul(NS, true), &mut c, ap, bp, cp);
+    let mer = bench_mercury(&mer_matmul(ns, false), &mut c, ap, bp, cp);
+    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
     let cm = bench_external(
         "c",
-        &c_matmul(NS),
+        &c_matmul(ns),
         dir,
         "matmul",
         cc,
@@ -151,7 +158,7 @@ fn bench_matmul(cc: &str, dir: &Path) {
     );
     let rm = bench_external(
         "rs",
-        &rust_matmul(NS),
+        &rust_matmul(ns),
         dir,
         "matmul",
         "rustc",
