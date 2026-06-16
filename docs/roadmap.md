@@ -14,8 +14,11 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
   by base pointer (out-params). Real kernels run: dot product, SAXPY, flat GEMM, transpose, sort.
 - Intrinsics `print`/`println`/`assert`.
-- The optimizer (`-O0..-O3`): constant folding, algebraic simplification, CFG cleanup, DCE, CSE with
-  load forwarding, and DSE. Guarded by an `-O0`-vs-`-O{1,2,3}` differential test.
+- The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: **mem2reg** (alloca → SSA),
+  constant folding, algebraic simplification, CFG cleanup with block merging, dead/trivial
+  block-parameter elimination, DCE, CSE with load forwarding, DSE, and **loop-invariant code
+  motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential test; on the benchmark kernels it removes
+  ~45% of IR ops and runs ~1.5–2x faster than `-O0`.
 
 ## Checked but not yet executed
 
@@ -42,4 +45,5 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 - Array length must be an integer literal; symbolic/`const`-expression lengths fall back to an opaque
   pointer.
 - No bounds checking on array indexing (manual memory is a decided constraint).
-- `mem2reg` is intentionally left to LLVM; the interpreter runs the alloca-based IR directly.
+- `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
+  stay in memory (the interpreter and `cse`/`dse` handle those directly).

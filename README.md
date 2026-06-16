@@ -22,9 +22,11 @@ Native code emitted by Mercury goes through the same LLVM backend that Clang and
   strides, tiling), alignment, arenas, and parallel schedules are first-class — not a soup of
   intrinsics and `#pragma`s.
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
-- **Domain-aware optimization.** Mercury keeps tensor and loop operations *structured* in its IR long
-  enough to do elementwise **fusion**, cache **tiling**, and **vectorization** that a general-purpose
-  C compiler can't see through — then lowers them to tight scalar+SIMD loops.
+- **Domain-aware optimization.** Mercury keeps tensor and loop operations *structured* in its IR so
+  the compiler can do elementwise **fusion**, cache **tiling**, and **vectorization** a
+  general-purpose C compiler can't see through. Those tensor-level passes are planned; the SSA
+  scalar/loop optimizer that backs them — mem2reg, constant folding, CSE, DSE, DCE, and loop-invariant
+  code motion — runs today and removes ~45% of IR ops on the benchmark kernels.
 - **Seamless interop.** A clean C ABI (`@extern("C")` / `@export`) calls into BLAS/cuBLAS and lets
   Mercury kernels be embedded in existing C/C++/CUDA stacks.
 
@@ -66,7 +68,8 @@ source.mer
    │  sema  (name resolution, type inference, COMPILE-TIME SHAPE CHECKING)
    ▼
 Mercury IR (MIR)         one SSA IR that lowers progressively from "High" to "Low"
-   │  optimization passes (fusion, tiling, vectorization, inlining, DCE/CSE, ...)
+   │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
+   │                       tensor fusion / tiling / vectorization are planned)
    ▼
 MIR (Low)
    ├──────────────► interpreter   (always available, zero external deps; the reference oracle)
@@ -95,7 +98,7 @@ cargo build                 # the compiler (interpreter backend, no LLVM needed)
 cargo test                  # unit + golden + end-to-end tests
 cargo run -p mercuryc -- --help
 cargo run -p mercuryc -- --run examples/fib.mer
-cargo run -p mercury_bench --release -- tests/run   # optimizer-effectiveness report
+cargo run -p mercury_bench --release -- tests/run examples bench/kernels   # optimizer report
 ```
 
 Native codegen (optional, requires an LLVM 19 install — see `docs/llvm-setup.md`):

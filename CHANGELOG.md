@@ -13,10 +13,14 @@ All notable changes to Mercury are documented here. The format is loosely based 
   dims), with errors `E0501`/`E0502`.
 - **Middle-end**: block-parameter SSA MIR, a builder, a pretty-printer, and a verifier with a
   `MirLevel` invariant; AST → MIR lowering (alloca-per-local).
-- **Optimizer**: a fixpoint pass manager with `simplify` (constant folding + algebraic identities +
-  self-comparison folding), `simplify-cfg` (constant-branch folding + unreachable-block pruning),
-  `dce`, `cse` (local value numbering with load forwarding), and `dse` (dead-store elimination),
-  wired across `-O0..-O3`.
+- **Optimizer**: a fixpoint pass manager backed by CFG and dominator analyses (Cooper–Harvey–Kennedy
+  immediate dominators + dominance frontiers), with `mem2reg` (promote scalar slots to
+  block-parameter SSA), `simplify` (constant folding + algebraic identities + self-comparison
+  folding), `simplify-cfg` (constant-branch folding + straight-line block merging + unreachable-block
+  pruning), `simplify-phis` (dead/trivial block-parameter elimination), `dce`, `cse` (local value
+  numbering with load forwarding), `dse` (dead-store elimination), and `licm` (loop-invariant code
+  motion), wired across `-O0..-O3`. On the benchmark kernels, `-O3` removes ~45% of IR ops and runs
+  ~1.5–2x faster than `-O0` under the interpreter.
 - **Back-ends**: a zero-dependency MIR interpreter (`--run`) and a textual LLVM-IR emitter
   (`--emit=llvm-ir`, plus `--emit=obj|exe` via `clang` when present).
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
@@ -27,9 +31,18 @@ All notable changes to Mercury are documented here. The format is loosely based 
 - **Diagnostics**: rustc-style renderer, a stable error-code catalog with `--explain <CODE>`, and
   `--error-format=json` (JSON Lines).
 - **Tooling & tests**: end-to-end run-suite with `// EXPECT-*` directives, an opt-level differential
-  test (`-O0` vs `-O1/-O2/-O3`), per-stage `--emit` smoke tests, the `mercury_bench` optimizer
-  report, a GitHub Actions CI (fmt + clippy + test on Linux & Windows), and the language guide and
-  internals docs.
+  test (`-O0` vs `-O1/-O2/-O3`), per-stage `--emit` smoke tests, the `mercury_bench` harness (IR-op
+  reduction + `-O0`-vs-`-O3` interpreter speedup, doubling as an optimizer-equivalence gate over
+  heavy kernels in `bench/kernels`), a GitHub Actions CI (fmt + clippy + test on Linux & Windows),
+  and the language guide and internals docs.
+- **Performance**: the interpreter pools per-call register files and passes block-parameter arguments
+  through a reused buffer, roughly halving its wall-clock; large `[v; n]` array initializers lower to
+  a fill loop instead of unrolled stores.
+
+### Changed
+- A construct lowering cannot yet handle (tensors, SIMD methods, generics, parallel loops) is now a
+  hard `error[C0001]` instead of a warning, and the driver refuses to optimize, run, or codegen a
+  module whose lowering failed — so the compiler never emits or executes invalid MIR.
 
 ### Notes
 - Tensors, SIMD vectors, and the parallel/GPU surface parse and type/shape-check today; full

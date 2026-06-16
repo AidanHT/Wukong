@@ -33,7 +33,8 @@ mercury_types     Ty, Scalar, Shape/Dim/Layout — the shared semantic type voca
 mercury_sema      name resolution + type checking + SHAPE checking
 mercury_mir       MIR data, builder, pretty-printer, verifier, MirLevel
 mercury_mir_build typed AST -> MIR (alloca-per-local lowering)
-mercury_opt       pass manager + transforms (simplify, simplify-cfg, dce, cse)
+mercury_opt       pass manager + analyses (cfg, dominators) + transforms
+                  (mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
 mercury_backend   `Backend` trait + `Artifact`
 mercury_interp    zero-dependency MIR interpreter backend (+ oracle)
 mercury_codegen_llvm  textual LLVM IR backend
@@ -78,32 +79,45 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` spans 
 comparison/cast ops, `Select`, memory (`Alloca`/`Load`/`Store`/`Gep`), and `Call`.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
-This keeps lowering simple and correct; promoting allocas to registers (mem2reg) is deferred to the
-optimizer and to LLVM.
+This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
+SSA registers (see below), which is what makes the value-based passes effective.
 
 The **verifier** (`mercury_mir::verify`) checks that every used value is defined, types are
 consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled after every pass.
 
 ## Optimizer
 
-`mercury_opt::PassManager` runs a list of function-level `Pass`es to a per-function fixpoint.
+`mercury_opt::PassManager` runs a list of function-level `Pass`es to a per-function fixpoint. Two
+shared analyses back them: `cfg` (successors/predecessors, reverse postorder, reachability,
+unreachable-block pruning) and `dom` (Cooper–Harvey–Kennedy immediate dominators, dominance
+frontiers, and the dominator tree).
 
 | Pass          | Level | What it does |
 |---------------|-------|--------------|
+| `Mem2Reg`     | -O1   | promote scalar int/float `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
-| `SimplifyCfg` | -O1   | constant-branch folding + unreachable-block pruning (with renumbering) |
+| `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
+| `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
 | `Cse`         | -O2   | local value numbering with alloca-aware load forwarding |
 | `Dse`         | -O2   | dead-store elimination (overwritten stores to a slot with no intervening read) |
+| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader |
 
-Because the front-end emits alloca-based IR, `Cse` forwards loads (tracking the current value of
-each alloca slot, invalidated by unknown-pointer stores or calls) so that redundant pure ops built
-on reloaded values actually collapse; `Dse` is its dual, removing stores that are overwritten before
-being read. Float predicates are never folded on self-comparison (NaN != NaN).
+`Mem2Reg` is the keystone: the front-end's memory traffic hides constants, common subexpressions,
+and induction variables, so promoting slots to SSA is what lets the rest of the pipeline fire. It
+leaves arrays, address-taken, and pointer slots in memory; a read before any write becomes a zero
+constant, matching the interpreter's zero-initialized memory. `Cse`/`Dse` still handle the residual
+memory (load forwarding and its dual) for the slots that stay in memory. `Licm` uses the dominator
+analysis to find natural loops and only hoists into loops that already have a preheader, so it is
+always legal; loads, stores, calls, and integer division are never moved. Float predicates are never
+folded on self-comparison (NaN != NaN).
 
 The opt pipeline is guarded by a **differential test**: every end-to-end program is run at -O0 and at
--O1/-O2/-O3 and must produce identical stdout and exit code. The `mercury_bench` crate reports the
-instruction-count reduction the optimizer achieves per program.
+-O1/-O2/-O3 and must produce identical stdout and exit code. The `mercury_bench` crate reports, per
+program, the IR-op reduction and the -O0-vs--O3 interpreter speedup, and exits non-zero if any
+program that lowers cleanly disagrees across optimization levels — a soundness gate over every
+benchmark kernel. On the heavy kernels in `bench/kernels`, -O3 removes ~45% of IR ops and runs
+~1.5–2x faster than -O0.
 
 ## Interpreter
 

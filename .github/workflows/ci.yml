@@ -49,5 +49,7 @@ jobs:
           cargo run -p mercuryc -- --run examples/dot.mer
           cargo run -p mercuryc -- --run examples/saxpy_array.mer
 
-      - name: Optimizer-effectiveness report
-        run: cargo run -p mercury_bench -- tests/run examples
+      - name: Optimizer effectiveness + equivalence gate
+        # Release build so the heavy kernels run quickly; the harness exits non-zero if any program
+        # that lowers cleanly disagrees between -O0 and -O3, so this also guards optimizer soundness.
+        run: cargo run -p mercury_bench --release -- tests/run examples bench/kernels
