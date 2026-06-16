@@ -42,6 +42,10 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
 - **Float typing must be consistent in the incoming MIR.** Cranelift's verifier rejects `fadd` on
   mismatched widths; the front-end coerces operands to the result type and the interpreter rounds
   `f32` in `f32`, so the two backends stay bit-identical. Don't emit loosely-typed float MIR.
+- **FMA is real here.** `Op::Fma` lowers to `ins().fma` (a hardware `vfmadd` on FMA3 hosts, scalar
+  or 128-bit vector). The front-end contracts float `x + y*z` into it; the interpreter mirrors it
+  with `mul_add`, and the two agree bit-for-bit (gated by `fma_contraction_is_bit_exact`). This is
+  why `mercury_xbench` gives gcc `-ffp-contract=fast` — both sides fuse.
 - Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`) are bound to Rust
   fns in the JIT and left as imports in the object (resolved by the driver's C runtime). A global run
   lock serialises JIT runs that share the stdout-capture buffer.

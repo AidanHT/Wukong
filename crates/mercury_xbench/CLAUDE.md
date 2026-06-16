@@ -27,9 +27,11 @@ Upstream: `mercury_span`, `mercury_parser`, `mercury_sema`, `mercury_mir_build`,
 depends on it.
 
 ## Gotchas
-- **Fairness:** gcc gets `-ffp-contract=off` (Cranelift forms no FMAs; Rust doesn't contract), so
-  every backend does the same scalar float ops. The `@parallel` rows compare Mercury's automatic
-  SIMD+multicore lowering against *idiomatic single-threaded* C/Rust — called out in the labels.
+- **Fairness:** Mercury now contracts `x + y*z` to a fused multiply-add, so gcc gets its *default*
+  `-ffp-contract=fast` (the old `-ffp-contract=off` suppressed C's natural FMA). Both Mercury and C
+  fuse; idiomatic Rust does not contract unless written with `f32::mul_add`, so the Rust column shows
+  rustc's default — a real defaults difference, not a handicap. The `@parallel` rows compare
+  Mercury's automatic SIMD+multicore lowering against *idiomatic single-threaded* C/Rust.
 - **Variance:** the all-core kernels (and matmul) vary a lot on a busy box. `time_ns` takes the min
   of many batches (least-interfered estimate); run the built exe directly (`target/release/
   mercury-xbench.exe`) and several times. Report ranges, not single numbers.
