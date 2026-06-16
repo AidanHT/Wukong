@@ -68,7 +68,8 @@ value must match its annotation exactly (see error `E0401`).
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
 | Boolean     | `bool`                                               | ✅     |
 | Pointers    | `*T`, `*mut T`, references `&T`                       | 🟡     |
-| Aggregates  | arrays `[T; N]`, slices `[]T`, tuples, `struct`, `enum` | 🟡  |
+| Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
+| Aggregates  | slices `[]T`, tuples, `struct`, `enum`               | 🟡  |
 | SIMD vectors| `f32x8`, `i32x4`, generic `vec[T, N]`                | 🟡     |
 | Tensors     | `Tensor[f32, M, N]` with optional layout suffix      | 🟡 (shape-checked) |
 

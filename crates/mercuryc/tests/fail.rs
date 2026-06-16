@@ -47,7 +47,10 @@ fn compile_fail_suite() {
             .expect("spawn mercuryc");
 
         let name = p.file_name().unwrap().to_string_lossy();
-        assert!(!out.status.success(), "{name}: expected a compile error but it succeeded");
+        assert!(
+            !out.status.success(),
+            "{name}: expected a compile error but it succeeded"
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains(&format!("\"code\":\"{want}\"")),

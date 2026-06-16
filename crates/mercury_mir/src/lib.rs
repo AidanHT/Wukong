@@ -52,6 +52,9 @@ pub enum MirType {
     F64,
     Ptr,
     Vec(Box<MirType>, u32),
+    /// A fixed-size array of `count` elements, laid out contiguously. Used as the operand type of
+    /// an `alloca` for an array local; the alloca's *result* is still a `Ptr` to the first element.
+    Array(Box<MirType>, u32),
     Void,
 }
 
@@ -98,6 +101,7 @@ impl MirType {
             MirType::F64 => "f64".into(),
             MirType::Ptr => "ptr".into(),
             MirType::Vec(e, n) => format!("<{} x {}>", n, e.display()),
+            MirType::Array(e, n) => format!("[{} x {}]", n, e.display()),
             MirType::Void => "void".into(),
         }
     }

@@ -188,11 +188,15 @@ impl FnLowerer<'_> {
                 };
                 let slot = self.builder.alloca(mty.clone());
                 if let Some(e) = init {
-                    let v = self.lower_expr(e);
-                    self.builder.build_void(Op::Store {
-                        ptr: slot,
-                        value: v,
-                    });
+                    if let MirType::Array(elem, n) = &mty {
+                        self.lower_array_init(slot, elem, *n, e);
+                    } else {
+                        let v = self.lower_expr(e);
+                        self.builder.build_void(Op::Store {
+                            ptr: slot,
+                            value: v,
+                        });
+                    }
                 }
                 if let Pattern {
                     kind: ast::PatKind::Ident(name),
@@ -429,6 +433,45 @@ impl FnLowerer<'_> {
 
     // ---- places (lvalues) ----
 
+    /// Initialize an array alloca (`base`) of `n` elements of type `elem` from an array-literal or
+    /// array-repeat initializer, storing each element through a `gep`.
+    fn lower_array_init(&mut self, base: ValueId, elem: &MirType, n: u32, init: &Expr) {
+        match &init.kind {
+            ExprKind::ArrayLit(elems) => {
+                for (i, el) in elems.iter().enumerate() {
+                    let v = self.lower_expr(el);
+                    self.store_element(base, elem, i as i128, v);
+                }
+            }
+            ExprKind::ArrayRepeat { value, .. } => {
+                // `[value; n]` — evaluate `value` once per slot (values here are pure literals).
+                for i in 0..n as i128 {
+                    let v = self.lower_expr(value);
+                    self.store_element(base, elem, i, v);
+                }
+            }
+            _ => {
+                self.unsupported(init.span, "array initializer (expected `[..]` or `[v; n]`)");
+            }
+        }
+    }
+
+    /// Store `value` into `base[index]` for an array element of type `elem`.
+    fn store_element(&mut self, base: ValueId, elem: &MirType, index: i128, value: ValueId) {
+        let idx = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(index, MirType::I64));
+        let p = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: elem.clone(),
+            },
+        );
+        self.builder.build_void(Op::Store { ptr: p, value });
+    }
+
     fn lower_place(&mut self, e: &Expr) -> (ValueId, MirType) {
         match &e.kind {
             ExprKind::Path(p) if p.is_single() => {
@@ -449,7 +492,12 @@ impl FnLowerer<'_> {
             ExprKind::Index { base, indices } if indices.len() == 1 => {
                 let base_ptr = self.lower_expr(base);
                 let idx = self.lower_expr(&indices[0]);
-                let elem = self.expr_mir(e);
+                // Prefer the element type from the base's array type; fall back to the indexed
+                // expression's own type (slices/tensors/pointers).
+                let elem = match self.expr_ty(base) {
+                    Ty::Array { elem, .. } => mir_ty(&elem),
+                    _ => self.expr_mir(e),
+                };
                 let p = self.builder.build(
                     MirType::Ptr,
                     Op::Gep {
@@ -489,7 +537,13 @@ impl FnLowerer<'_> {
                 .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1)),
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
-                    self.builder.build(ty.clone(), Op::Load(slot, ty))
+                    // An array variable *is* its storage: its value is the base pointer, so reads
+                    // don't load — indexing geps off this pointer.
+                    if matches!(ty, MirType::Array(..)) {
+                        slot
+                    } else {
+                        self.builder.build(ty.clone(), Op::Load(slot, ty))
+                    }
                 } else {
                     self.unsupported(p.span, "value reference");
                     let t = self.expr_mir(e);
@@ -637,9 +691,8 @@ impl FnLowerer<'_> {
 fn mir_ty(ty: &Ty) -> MirType {
     match ty {
         Ty::Scalar(s) => MirType::from_scalar(*s),
-        Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) | Ty::Array { .. } => {
-            MirType::Ptr
-        }
+        Ty::Array { elem, len } => MirType::Array(Box::new(mir_ty(elem)), *len as u32),
+        Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) => MirType::Ptr,
         Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
         Ty::Unit => MirType::Void,
         _ => MirType::I32,
@@ -656,13 +709,26 @@ fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
                 None => MirType::I32,
             }
         }
-        Pointer { .. } | Ref { .. } | Slice(_) | Array { .. } | Tensor { .. } => MirType::Ptr,
+        Array { elem, len } => match const_usize_expr(len, interner) {
+            // A literal-length array lowers to an array type; otherwise fall back to an opaque ptr.
+            Some(n) => MirType::Array(Box::new(mir_ty_of_ast(elem, interner)), n),
+            None => MirType::Ptr,
+        },
+        Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
         Vector { elem, lanes } => {
             let e = mir_ty_of_ast(elem, interner);
             MirType::Vec(Box::new(e), *lanes)
         }
         Unit => MirType::Void,
         _ => MirType::I32,
+    }
+}
+
+/// Evaluate a compile-time array length that is a plain integer literal.
+fn const_usize_expr(e: &Expr, interner: &Interner) -> Option<u32> {
+    match &e.kind {
+        ExprKind::Int(s) => Some(parse_int(interner.resolve(*s)) as u32),
+        _ => None,
     }
 }
 
@@ -879,6 +945,25 @@ mod tests {
             let errs = verify_function(f);
             assert!(errs.is_empty(), "verify: {errs:?}");
         }
+    }
+
+    #[test]
+    fn lowers_and_verifies_array_ops() {
+        // Array literal init, indexed store, and indexed load must lower to a verifiable function
+        // with an array alloca.
+        let src = "fn main() -> i32 { let mut xs: [i32; 3] = [1, 2, 3]; \
+                   xs[1] = 9; return xs[1]; }";
+        let (prog, diags, _) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let main = &prog.funcs[0];
+        assert!(
+            main.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                &i.op,
+                Op::Alloca(MirType::Array(_, 3))
+            )),
+            "expected an array alloca"
+        );
+        assert!(verify_function(main).is_empty(), "verify failed");
     }
 
     #[test]

@@ -1,0 +1,22 @@
+module examples.saxpy_array
+
+/// SAXPY over fixed-size arrays: out = a*x + y, computed elementwise.
+/// Run: mercuryc --run examples/saxpy_array.mer   (prints out[0..4])
+fn main() -> i32 {
+    let a: f32 = 2.0;
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let y: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
+    let mut i: i32 = 0;
+    while i < 4 {
+        out[i] = a * x[i] + y[i];
+        i = i + 1;
+    }
+
+    print(out[0]); // 12
+    print(out[1]); // 24
+    print(out[2]); // 36
+    print(out[3]); // 48
+    return 0;
+}

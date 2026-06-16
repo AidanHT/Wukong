@@ -171,7 +171,16 @@ impl<'a> Interp<'a> {
             }
             Op::Alloca(ty) => {
                 let idx = self.memory.len();
-                self.memory.push(default_value(ty));
+                // An array alloca reserves `count` contiguous element slots; its result points at
+                // the first. `gep` then computes `base + index` into this run.
+                if let MirType::Array(elem, count) = ty {
+                    let d = default_value(elem);
+                    for _ in 0..*count {
+                        self.memory.push(d);
+                    }
+                } else {
+                    self.memory.push(default_value(ty));
+                }
                 Value::Ptr(idx)
             }
             Op::Load(p, _) => {

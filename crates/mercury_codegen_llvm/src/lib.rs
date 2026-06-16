@@ -253,6 +253,7 @@ fn llvm_ty(t: &MirType) -> String {
         MirType::F64 => "double".into(),
         MirType::Ptr => "ptr".into(),
         MirType::Vec(e, n) => format!("<{} x {}>", n, llvm_ty(e)),
+        MirType::Array(e, n) => format!("[{} x {}]", n, llvm_ty(e)),
         MirType::Void => "void".into(),
     }
 }

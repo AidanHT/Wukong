@@ -1,0 +1,37 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 14
+// EXPECT-OUT: 4
+module tests.run.array
+
+/// Fixed-size arrays: literal init, indexed store with a runtime index, indexed load, a reduction,
+/// and a float array. Exercised at every optimization level by the invariance test.
+fn main() -> i32 {
+    let mut xs: [i32; 4] = [0, 0, 0, 0];
+    let mut i: i32 = 0;
+    while i < 4 {
+        xs[i] = i * i;
+        i = i + 1;
+    }
+    print(xs[0]);
+    print(xs[1]);
+    print(xs[2]);
+    print(xs[3]);
+
+    let mut sum: i32 = 0;
+    let mut j: i32 = 0;
+    while j < 4 {
+        sum = sum + xs[j];
+        j = j + 1;
+    }
+    print(sum); // 0 + 1 + 4 + 9 = 14
+
+    let mut v: [f32; 3] = [1.0, 2.0, 3.0];
+    v[1] = v[0] + v[2];
+    print(v[1]); // 4
+    return 0;
+}
