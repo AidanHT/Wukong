@@ -1,0 +1,22 @@
+[package]
+name = "mercury_xbench"
+description = "Cross-language benchmark: Mercury (native) vs C (gcc) vs Rust (rustc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mercury-xbench"
+path = "src/main.rs"
+
+[dependencies]
+mercury_span = { workspace = true }
+mercury_parser = { workspace = true }
+mercury_sema = { workspace = true }
+mercury_mir = { workspace = true }
+mercury_mir_build = { workspace = true }
+mercury_opt = { workspace = true }
+mercury_codegen_cranelift = { workspace = true }
+libloading = "0.8"
