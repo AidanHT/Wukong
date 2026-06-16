@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5050
+// EXPECT-OUT: 10100
+// EXPECT-OUT: 328350
+module tests.run.reduce
+
+/// End-to-end coverage of the reduction vectorizer through the real binary: an integer sum, a
+/// float dot product (contracts to a vector FMA), and a float sum-of-squares. Inputs are chosen so
+/// every partial sum is an exact integer, so the lane-parallel (reassociated) order the vectorizer
+/// produces prints identically at every optimization level (checked by the opt-invariance test).
+fn main() -> i32 {
+    // Integer sum: a[k] = k + 1, sum over 0..100 = 5050.
+    let mut a: [i32; 100] = [0; 100];
+    let mut i: i32 = 0;
+    while i < 100 {
+        a[i] = i + 1;
+        i = i + 1;
+    }
+    let mut isum: i32 = 0;
+    for k in 0..100 {
+        isum = isum + a[k];
+    }
+    print(isum); // 5050
+
+    // Float dot: x[k] = k + 1, y[k] = 2  =>  sum 2*(k+1) = 2 * 5050 = 10100.
+    let mut x: [f32; 100] = [0.0; 100];
+    let mut y: [f32; 100] = [2.0; 100];
+    let mut j: i32 = 0;
+    while j < 100 {
+        x[j] = ((j + 1) as f32);
+        j = j + 1;
+    }
+    let mut d: f32 = 0.0;
+    for k in 0..100 {
+        d = d + x[k] * y[k];
+    }
+    print(d); // 10100
+
+    // Float sum of squares: (x[k] - 1)^2 = k^2, sum over 0..100 of k^2 = 328350.
+    let mut s: f32 = 0.0;
+    for k in 0..100 {
+        s += (x[k] - 1.0) * (x[k] - 1.0);
+    }
+    print(s); // 328350
+    return 0;
+}
