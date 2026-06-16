@@ -647,10 +647,33 @@ impl FnLowerer<'_> {
         if !ity.is_int() {
             return false;
         }
+        if self.vectorizable(body, j).is_none() {
+            return false;
+        }
+        // Lower the bounds (coerced to the index type) and hand off to the shared emitter.
+        let start_ty = self.expr_mir(start);
+        let s0 = self.lower_expr(start);
+        let s0 = self.coerce_to(s0, &start_ty, &ity, true);
+        let end_ty = self.expr_mir(end);
+        let e0 = self.lower_expr(end);
+        let e0 = self.coerce_to(e0, &end_ty, &ity, true);
+        self.try_vectorize_ranged(j, s0, e0, &ity, body)
+    }
+
+    /// Attempt SIMD lowering of a loop whose bounds are already lowered to `ity` values (the form
+    /// the `@parallel` outliner produces). Returns true on success.
+    fn try_vectorize_ranged(
+        &mut self,
+        j: Symbol,
+        start_val: ValueId,
+        end_val: ValueId,
+        ity: &MirType,
+        body: &Block,
+    ) -> bool {
         let Some((lane, w)) = self.vectorizable(body, j) else {
             return false;
         };
-        self.emit_vectorized_for(j, start, end, &ity, &lane, w, body);
+        self.emit_vectorized_for(j, start_val, end_val, ity, &lane, w, body);
         true
     }
 
@@ -797,12 +820,13 @@ impl FnLowerer<'_> {
     }
 
     /// Emit the vector main loop + scalar remainder. Both share one index slot `j`: the vector loop
-    /// steps by `W` while a full vector fits, then the remainder steps by 1 to `end`.
+    /// steps by `W` while a full vector fits, then the remainder steps by 1 to `end`. The bounds are
+    /// already-lowered `ity` values.
     fn emit_vectorized_for(
         &mut self,
         j: Symbol,
-        start: &Expr,
-        end: &Expr,
+        s0: ValueId,
+        end_v: ValueId,
         ity: &MirType,
         lane: &MirType,
         w: u32,
@@ -811,14 +835,8 @@ impl FnLowerer<'_> {
         let vty = MirType::Vec(Box::new(lane.clone()), w);
 
         // j = start; compute the vector-loop limit `end - (W-1)` once (invariant).
-        let start_ty = self.expr_mir(start);
-        let s0 = self.lower_expr(start);
-        let s0 = self.coerce_to(s0, &start_ty, ity, true);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store { ptr: slot, value: s0 });
-        let end_ty = self.expr_mir(end);
-        let end_raw = self.lower_expr(end);
-        let end_v = self.coerce_to(end_raw, &end_ty, ity, true);
         let wm1 = self
             .builder
             .build(ity.clone(), Op::ConstInt((w - 1) as i128, ity.clone()));
@@ -1017,6 +1035,13 @@ impl FnLowerer<'_> {
         // The runtime hands us `[start, end)` as i64; narrow to the index type the body expects.
         let start = self.coerce_to(start, &MirType::I64, &ity, true);
         let end = self.coerce_to(end, &MirType::I64, &ity, true);
+
+        // SIMD-vectorize the per-thread chunk too, so `@parallel` kernels run vectorized on every
+        // core (parallelism × SIMD), not scalar-per-core.
+        if self.try_vectorize_ranged(idx, start, end, &ity, body) {
+            return;
+        }
+
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
             ptr: slot,
