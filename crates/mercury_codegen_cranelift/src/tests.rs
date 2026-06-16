@@ -33,6 +33,62 @@ fn jit_ok(src: &str) -> (i64, String) {
     (code, String::from_utf8(out).unwrap())
 }
 
+/// Tripwire documenting *why* the vectorizer caps at 128-bit (`VEC_REG_BYTES = 16`): Cranelift
+/// 0.124 cannot legalize a 256-bit `f32x8` value and rejects it at `define_function`. We therefore
+/// get true 256-bit AVX throughput on the width-sensitive kernels (GEMM, etc.) via runtime
+/// microkernels, not via wider CLIF vectors. If a future Cranelift starts accepting `f32x8`, this
+/// test flips to passing — a signal to widen `VEC_REG_BYTES` and revisit the dispatch story.
+#[test]
+fn cranelift_still_rejects_f32x8() {
+    use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_jit::{JITBuilder, JITModule};
+    use cranelift_module::{Linkage, Module};
+
+    let isa = crate::make_isa(false).expect("isa");
+    let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut module = JITModule::new(builder);
+    let ptr = module.target_config().pointer_type();
+    let mut sig = Signature::new(module.target_config().default_call_conv);
+    sig.params.push(AbiParam::new(ptr));
+    sig.params.push(AbiParam::new(ptr));
+    sig.params.push(AbiParam::new(ptr));
+    let fid = module.declare_function("probe", Linkage::Export, &sig).unwrap();
+    let mut ctx = module.make_context();
+    ctx.func.signature = sig;
+    let mut fbctx = FunctionBuilderContext::new();
+    let f32x8 = types::F32.by(8).expect("f32x8 type exists");
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+        let blk = b.create_block();
+        b.append_block_params_for_function_params(blk);
+        b.switch_to_block(blk);
+        let a = b.block_params(blk)[0];
+        let bb = b.block_params(blk)[1];
+        let out = b.block_params(blk)[2];
+        let va = b.ins().load(f32x8, MemFlags::trusted(), a, 0);
+        let vb = b.ins().load(f32x8, MemFlags::trusted(), bb, 0);
+        let s = b.ins().fadd(va, vb);
+        b.ins().store(MemFlags::trusted(), s, out, 0);
+        b.ins().return_(&[]);
+        b.seal_all_blocks();
+        b.finalize();
+    }
+    let define = module.define_function(fid, &mut ctx);
+    let finalize = define.and_then(|_| {
+        module.finalize_definitions().map_err(|e| {
+            cranelift_module::ModuleError::Compilation(
+                cranelift_codegen::CodegenError::Unsupported(e.to_string()),
+            )
+        })
+    });
+    assert!(
+        finalize.is_err(),
+        "Cranelift now accepts f32x8 — widen VEC_REG_BYTES and revisit the AVX dispatch"
+    );
+    unsafe { module.free_memory() };
+}
+
 #[test]
 fn loop_sum() {
     let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
