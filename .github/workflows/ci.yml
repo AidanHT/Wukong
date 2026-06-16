@@ -43,5 +43,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Smoke-run an example
-        run: cargo run -p mercuryc -- --run examples/fib.mer
+      - name: Smoke-run examples
+        run: |
+          cargo run -p mercuryc -- --run examples/fib.mer
+          cargo run -p mercuryc -- --run examples/dot.mer
+          cargo run -p mercuryc -- --run examples/saxpy_array.mer
+
+      - name: Optimizer-effectiveness report
+        run: cargo run -p mercury_bench -- tests/run examples
