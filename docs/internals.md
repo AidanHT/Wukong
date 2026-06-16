@@ -163,6 +163,31 @@ standard reduction optimization) — sound because both backends execute the sam
 the differential oracle still holds bit-for-bit. Reductions vectorize only on the sequential path,
 never the `@parallel` one (folding into a shared accumulator across threads would race).
 
+## Matmul recognition → tuned GEMM microkernel
+
+The width that matters most for ML is the matmul inner product, and it is exactly where a 128-bit
+general vectorizer leaves performance on the table. So matmul gets a dedicated path: `mercury_mir_build`
+**recognizes a matmul loop nest** at the AST level — the `ikj` accumulate form (`c[i*N+j] +=
+a[i*K+k]*b[k*N+j]`, with or without a per-row zero-init or a `let aik` binding) and the textbook `ijk`
+dot-product form (`for j { let s=0; for k s+=a[i,k]*b[..]; c[i*N+j]=s }`), including the `C = A·Bᵀ`
+(`nn.Linear`) spelling where B is indexed `[j*K+k]`. The recognizer (`recognize_matmul`) verifies the
+strides describe contiguous row-major operands, then lowers the *whole nest* to a single call:
+`mercury_sgemm` / `mercury_sgemm_nt` (serial) or their `_parallel` variants, chosen by the `@parallel`
+attribute and the transpose flag.
+
+The kernel itself (`mercury_runtime::gemm`) is a classic BLIS-style GEMM: a **6×16 register tile**
+(12 live `__m256` accumulators, 12 FMAs per K-step), `MC/KC/NC` **cache blocking**, and **packed**
+A/B panels streamed with unit stride — true **256-bit AVX2 + FMA** (the width Cranelift's IR cannot
+express), runtime-detected with a scalar fallback. The parallel variant packs A and B once per K
+block and runs the C tile grid across cores. This is the same shape XLA/TVM/oneDNN lower a matmul op
+to, and it is why the win over gcc/rustc's naive nest *grows* with size (their version falls out of
+cache; the packed kernel does not).
+
+Crucially this stays inside the differential oracle: the interpreter, on a `mercury_sgemm*` call,
+**marshals its abstract `Value` memory into real f32 buffers and calls the identical kernel**, then
+marshals the result back — so native and interpreter agree bit-for-bit despite the reassociated
+accumulation (the parallel kernel is bit-identical to the serial one by construction).
+
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).

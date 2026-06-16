@@ -18,9 +18,15 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
   by base pointer (out-params). Real kernels run: dot, SAXPY, GEMM, matmul, ReLU, clamp, transpose.
+- **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
+  `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
+  to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
+  the way XLA/TVM/oneDNN lower a matmul op. Serial and `@parallel`. Beats gcc/rustc's naive nest
+  ~2–5× single-thread and ~2.4–15× parallel, the lead growing with size. The interpreter calls the
+  identical kernel (marshalling its memory), so the two stay bit-exact.
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
-  on the native backend. saxpy/poly/relu/relu6/matmul-inner vectorize.
+  on the native backend. saxpy/poly/relu/relu6 vectorize.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.
@@ -51,19 +57,23 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## Planned
 
-- Cache tiling for matmul/GEMM, and fusing chains *under* `@parallel` (fusion and `@parallel`
-  compose only loosely today).
-- 256-bit AVX codegen (Cranelift is 128-bit only today; AVX throughput is approximated via unrolling).
-- Execution of explicit `f32x8`-typed values; tensor-op lowering with fusion/tiling.
+- Fusing chains *under* `@parallel`, and GEMM **epilogue fusion** (bias + activation folded into the
+  microkernel's write-back), so a `linear → bias → relu` runs in one pass.
+- 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
+  value (verified — pinned as a tripwire test), so the elementwise vectorizer is 128-bit + unrolling;
+  the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
+  needs a raw-AVX emitter or a future Cranelift.
+- Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
 - Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
 - GPU device codegen (PTX/AMDGPU), autodiff — designed-for, explicitly deferred.
 
 ## Known limitations / sharp edges
 
 - `f16`/`bf16` are storage types promoted to `f32` at runtime, not yet reduced precision.
-- Native SIMD is 128-bit (Cranelift's vector ISA); compute-bound kernels trail gcc's 256-bit AVX on
-  a single thread (4× unrolling narrows but does not erase the gap). Auto-parallelism more than makes
-  up for it across cores. The loop vectorizer assumes distinct array parameters do not alias.
+- The *general* vectorizer emits 128-bit SIMD (Cranelift's vector ISA rejects 256-bit `f32x8`), so
+  compute-bound *elementwise* kernels tie gcc's 256-bit AVX single-thread (4× unrolling narrows the
+  gap; auto-parallelism more than erases it). The **GEMM family is exempt** — it dispatches to a true
+  AVX2/FMA runtime microkernel. The loop vectorizer assumes distinct array parameters do not alias.
 - Array length must be an integer literal; symbolic/`const`-expression lengths fall back to an opaque
   pointer.
 - No bounds checking on array indexing (manual memory is a decided constraint).
