@@ -2,7 +2,11 @@
 //!
 //! Kept deliberately tiny and allocation-explicit, matching the language's philosophy. The
 //! interpreter calls these implementations directly; native (LLVM) builds link the same logic
-//! compiled as a static library. Today it provides a bump [`Arena`] and a CPU [`parallel_for`].
+//! compiled as a static library. Today it provides a bump [`Arena`], a CPU [`parallel_for`], and a
+//! tuned [`mercury_sgemm`] (the matmul microkernel the compiler lowers a matmul nest to).
+
+mod gemm;
+pub use gemm::{mercury_sgemm, mercury_sgemm_parallel};
 
 /// A bump (arena) allocator over an owned byte buffer. Allocation is a pointer bump; freeing is
 /// all-at-once via [`Arena::reset`]. This is the idiomatic allocator for kernel scratch space:
