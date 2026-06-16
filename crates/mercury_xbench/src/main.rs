@@ -454,7 +454,7 @@ fn kernels() -> Vec<Kernel> {
         Kernel {
             name: "dot",
             bytes_per_call: 2 * N * 4,
-            note: "sum(x*y), strict f32 reduction (no auto-vectorization)",
+            note: "sum(x*y) reduction — Mercury vectorizes it; gcc/rustc keep it serial",
             mer: mer_kernel(&format!(
                 "let mut s: f32 = 0.0; for i in 0..{nlit} {{ s = s + x[i] * y[i]; }} out[0] = s;"
             )),
