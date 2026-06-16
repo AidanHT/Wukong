@@ -7,9 +7,13 @@
 //! JIT-compiled in process. It also reports each toolchain's compile time.
 //!
 //! Fairness notes:
-//!  * FMA contraction is disabled for gcc (`-ffp-contract=off`) so every backend performs the same
-//!    scalar float ops — Cranelift does not form FMAs, and Rust does not contract by default.
-//!  * Reductions (dot) are strict left-to-right f32, so none of the three auto-vectorize them.
+//!  * FMA: Mercury now contracts `x + y*z` to a fused multiply-add, so gcc is given its *default*
+//!    `-ffp-contract=fast` (the old `-ffp-contract=off` was actually suppressing C's natural FMA).
+//!    Both Mercury and gcc-compiled C therefore fuse. Idiomatic Rust does *not* contract unless the
+//!    author writes `f32::mul_add`, so the Rust column reflects rustc's default (two rounded ops) —
+//!    a real toolchain-defaults difference, not a handicap.
+//!  * Reductions (dot) are strict left-to-right f32, so none of the three auto-vectorize them
+//!    (though both Mercury and C may use a *scalar* FMA for the `s + x*y` step).
 //!  * The comparison basis is *idiomatic, single-threaded* code at the given flags. Where Mercury
 //!    later auto-parallelizes/vectorizes, that is called out explicitly.
 
@@ -67,7 +71,7 @@ fn main() {
             &dir,
             k.name,
             &cc,
-            &["-O3", "-march=native", "-ffp-contract=off", "-shared"],
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
             &mut out,
             xp,
             yp,
@@ -139,7 +143,7 @@ fn bench_matmul(cc: &str, dir: &Path) {
         dir,
         "matmul",
         cc,
-        &["-O3", "-march=native", "-ffp-contract=off", "-shared"],
+        &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
         &mut c,
         ap,
         bp,
@@ -333,8 +337,14 @@ fn bench_external(
     yp: *const f32,
     op: *mut f32,
 ) -> Option<Measure> {
-    let src_path = dir.join(format!("{name}.{ext}"));
-    let dll: PathBuf = dir.join(format!("{name}_{ext}.dll"));
+    // Sanitize the kernel name for use as a filename: rustc derives the crate name from the source
+    // file stem and rejects characters like `@` (e.g. `saxpy@parallel`).
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let src_path = dir.join(format!("{safe}.{ext}"));
+    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
     if std::fs::write(&src_path, src).is_err() {
         return None;
     }
