@@ -1,0 +1,156 @@
+# The Mercury Language Guide
+
+This guide describes the Mercury language as it exists today. Mercury is built incrementally; where
+a feature parses and type-checks but does not yet execute end-to-end, that is called out explicitly.
+
+> **Maturity legend**
+> - ✅ **runs** — lexes, parses, type/shape-checks, lowers to MIR, and executes via the interpreter.
+> - 🟡 **checked** — parses and type/shape-checks; not yet lowered/executed.
+> - 🔵 **planned** — designed for, syntax may be accepted, semantics not implemented.
+
+## A first program
+
+```mercury
+module hello
+
+fn main() -> i32 {
+    print(42);
+    print(7 * 6);
+    return 0;
+}
+```
+
+```sh
+mercuryc --run hello.mer       # prints 42 then 42; exits with main's return value
+```
+
+Every file begins with a `module` declaration. Execution starts at `fn main() -> i32`, and the
+integer it returns becomes the process exit code.
+
+## Modules
+
+```mercury
+module examples.matmul
+import std.mem
+```
+
+A module path is dotted. `import` brings another module's items into scope. 🟡
+
+## Functions ✅
+
+```mercury
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+```
+
+Functions take typed parameters and declare a return type after `->`. A function with no `->`
+returns nothing. Recursion is fully supported. Calls use ordinary `f(x, y)` syntax; generic
+functions may be called with a turbofish `f::<512, 512, 513>(a, b, c)`.
+
+## Bindings ✅
+
+```mercury
+let x: i32 = 10;        // immutable
+let mut acc: i32 = 0;   // mutable
+acc = acc + x;          // reassignment requires `mut`
+const TILE: usize = 64; // compile-time constant
+```
+
+An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine. A typed
+value must match its annotation exactly (see error `E0401`).
+
+## Types
+
+| Category    | Examples                                            | Status |
+|-------------|-----------------------------------------------------|--------|
+| Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize`    | ✅     |
+| Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
+| Boolean     | `bool`                                               | ✅     |
+| Pointers    | `*T`, `*mut T`, references `&T`                       | 🟡     |
+| Aggregates  | arrays `[T; N]`, slices `[]T`, tuples, `struct`, `enum` | 🟡  |
+| SIMD vectors| `f32x8`, `i32x4`, generic `vec[T, N]`                | 🟡     |
+| Tensors     | `Tensor[f32, M, N]` with optional layout suffix      | 🟡 (shape-checked) |
+
+## Operators ✅
+
+Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, boolean `&& ||` (short-
+circuit), unary `-` and `!`. Precedence is the usual C/Rust ordering, resolved by a Pratt parser.
+Compound assignment (`+=`, `*=`, …) is supported.
+
+## Control flow ✅
+
+```mercury
+if cond { ... } else { ... }
+while cond { ... }
+for i in 0..n { ... }
+for i in 0..n step 2 { ... }   // strided range; empty if lo >= hi
+loop { ... }                    // 🟡 infinite loop
+return expr;
+```
+
+Blocks are expressions: the trailing expression of a block (no semicolon) is its value.
+
+## Tensors and compile-time shape checking 🟡 (the headline feature)
+
+```mercury
+fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) { ... }
+```
+
+Tensor dimensions are part of the type. The semantic analyzer unifies dimensions across a call:
+the shared `K` above must agree on both operands. Mismatches are **compile errors**, not runtime
+faults:
+
+- `E0501` — rank mismatch (different number of dimensions).
+- `E0502` — dimension mismatch (e.g. calling `matmul::<512, 512, 513>` with `Tensor[f32, 512, 512]`),
+  including conflicting bindings of a symbolic dimension.
+
+Run `mercuryc --explain E0502` for a worked example. Dimensions may be integer literals, symbolic
+generic names, or `?` for a runtime dimension. Tensor element types must be scalars (`E0302`).
+
+## Attributes 🟡
+
+```mercury
+@inline
+@simd
+@tile(64, 64)
+@parallel(grain = 1)
+@align(32)
+@extern("C")
+@export("mercury_saxpy")
+```
+
+Attributes attach to functions, loops, and declarations. They parse and validate today; the
+optimizer's fusion/tiling/vectorization consumers are under construction.
+
+## Built-in intrinsics ✅
+
+- `print(x)` — print an integer/float followed by a newline.
+- `println(x)` — alias of `print`.
+
+These are recognized by the MIR builder and implemented directly by the interpreter (and, with the
+LLVM backend, by the runtime).
+
+## Memory and parallelism 🔵
+
+No garbage collector and no hidden allocations: every heap byte comes from an allocator you name
+(`System`, `Arena`, `Scratch`, `Pool`). Cleanup is via `defer`. Parallel loops (`@parallel for` /
+`@parallel reduce`) run on a CPU thread pool. The runtime crate (`mercury_runtime`) already provides
+an arena allocator and a deterministic `parallel_for`; the language surface is being wired to it.
+
+## Command-line interface
+
+```
+mercuryc [OPTIONS] <input.mer>
+
+--run                 compile and execute via the built-in interpreter
+--emit=<stage>        tokens | ast | mir-high | mir | llvm-ir | obj | exe
+-O0|-O1|-O2|-O3       optimization level
+-o <path>             output path
+--error-format=<f>    human | json
+--explain <CODE>      print an extended explanation for an error code
+--color=<when>        auto | always | never
+```
+
+Use `--emit` to inspect any stage of the pipeline, e.g. `mercuryc --emit=mir -O2 kernel.mer` to see
+the optimized IR, or `mercuryc --emit=ast kernel.mer` to see the parse tree.
