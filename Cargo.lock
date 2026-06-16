@@ -293,6 +293,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -338,6 +348,7 @@ dependencies = [
 name = "mercury_bench"
 version = "0.1.0"
 dependencies = [
+ "mercury_codegen_cranelift",
  "mercury_interp",
  "mercury_mir",
  "mercury_mir_build",
@@ -492,6 +503,20 @@ version = "0.1.0"
 name = "mercury_types"
 version = "0.1.0"
 dependencies = [
+ "mercury_span",
+]
+
+[[package]]
+name = "mercury_xbench"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "mercury_codegen_cranelift",
+ "mercury_mir",
+ "mercury_mir_build",
+ "mercury_opt",
+ "mercury_parser",
+ "mercury_sema",
  "mercury_span",
 ]
 
