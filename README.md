@@ -85,6 +85,7 @@ progressively. See the docs:
 
 - [Language guide](docs/language-guide.md) — the language surface, with an honest maturity legend.
 - [Compiler internals](docs/internals.md) — architecture, MIR, optimizer, and testing.
+- [Roadmap & limitations](docs/roadmap.md) — what runs, what's checked-only, what's planned.
 - [LLVM setup](docs/llvm-setup.md) — optional native-codegen toolchain.
 
 ## Building
