@@ -18,6 +18,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_bench"
+version = "0.1.0"
+dependencies = [
+ "mercury_interp",
+ "mercury_mir",
+ "mercury_mir_build",
+ "mercury_opt",
+ "mercury_parser",
+ "mercury_sema",
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_codegen_llvm"
 version = "0.1.0"
 dependencies = [
