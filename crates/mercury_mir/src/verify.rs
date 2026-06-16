@@ -254,6 +254,19 @@ impl Verifier<'_> {
             Op::FuncAddr(_) => {
                 self.check_result_is(result, &MirType::Ptr);
             }
+            Op::Fma(a, b, c) => {
+                let ok = self.use_val(*a) & self.use_val(*b) & self.use_val(*c);
+                if let Some(res) = self.result_ty(result) {
+                    if !res.lane_type().is_float() {
+                        self.err(format!("fma on non-float type {}", res.display()));
+                    }
+                    if ok {
+                        self.expect_ty(*a, &res, "fma");
+                        self.expect_ty(*b, &res, "fma");
+                        self.expect_ty(*c, &res, "fma");
+                    }
+                }
+            }
             Op::Splat(v) => {
                 if self.use_val(*v) {
                     if let (Some(vt), Some(res)) = (self.ty(*v).cloned(), self.result_ty(result)) {

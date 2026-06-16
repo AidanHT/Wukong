@@ -318,6 +318,22 @@ impl<'a> Interp<'a> {
                 let s = reg(regs, *v);
                 self.push_vec(vec![s; n])
             }
+            // Fused multiply-add `a*b + c`, single-rounded via `mul_add` so it stays bit-identical
+            // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
+            Op::Fma(a, b, c) => {
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    let av = self.vec_lanes(reg(regs, *a));
+                    let bv = self.vec_lanes(reg(regs, *b));
+                    let cv = self.vec_lanes(reg(regs, *c));
+                    let lane = (**lane).clone();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| apply_fma(av[i], bv[i], cv[i], Some(&lane)))
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    apply_fma(reg(regs, *a), reg(regs, *b), reg(regs, *c), rty)
+                }
+            }
         })
     }
 
@@ -453,6 +469,17 @@ fn mask(v: i128, ty: &MirType) -> i128 {
 /// storage types to `f32`); `f64` keeps full precision.
 fn is_narrow_float(ty: &MirType) -> bool {
     matches!(ty, MirType::F16 | MirType::BF16 | MirType::F32)
+}
+
+/// `a * b + c` with a *single* rounding, matching the native `fma` and the front-end's float
+/// contraction of `x + y*z`. Narrow (`f32`) operands round in `f32`, like `apply_bin`.
+fn apply_fma(a: Value, b: Value, c: Value, rty: Option<&MirType>) -> Value {
+    if rty.is_some_and(is_narrow_float) {
+        let r = (a.as_float() as f32).mul_add(b.as_float() as f32, c.as_float() as f32);
+        Value::Float(r as f64)
+    } else {
+        Value::Float(a.as_float().mul_add(b.as_float(), c.as_float()))
+    }
 }
 
 fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {

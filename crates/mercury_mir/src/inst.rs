@@ -184,6 +184,11 @@ pub enum Op {
     /// lane type matches the operand; the vectorizer uses it to lift loop-invariant scalars into
     /// vector form. Pure and side-effect-free.
     Splat(ValueId),
+    /// Fused multiply-add: `a * b + c` with a *single* rounding. The front-end contracts a float
+    /// `x + y*z` into this; it is faster (one instruction) and more accurate than separate
+    /// `FMul`+`FAdd`. All three operands and the result share one float type (scalar or `Vec`).
+    /// The interpreter evaluates it with `mul_add` so it stays bit-identical to the native `fma`.
+    Fma(ValueId, ValueId, ValueId),
 }
 
 /// One instruction: an optional result value plus its operation.
