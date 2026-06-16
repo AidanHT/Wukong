@@ -214,6 +214,58 @@ fn vectorized_saxpy_is_correct_across_sizes() {
     }
 }
 
+/// Matmul (the headline ML kernel): its vectorized inner loop must agree between interpreter and
+/// native AND match an independent scalar reference, for both the serial and `@parallel` forms, at
+/// a side length that is a multiple of the vector width (8) and one that is not (10, exercising the
+/// remainder). A[i]=i%3, B[i]=i%2 keep every product exact in f32.
+#[test]
+fn matmul_is_correct() {
+    fn reference(ns: usize) -> i64 {
+        let a: Vec<f32> = (0..ns * ns).map(|i| (i % 3) as f32).collect();
+        let b: Vec<f32> = (0..ns * ns).map(|i| (i % 2) as f32).collect();
+        let mut sum = 0.0f32;
+        for i in 0..ns {
+            for j in 0..ns {
+                let mut acc = 0.0f32;
+                for k in 0..ns {
+                    acc += a[i * ns + k] * b[k * ns + j];
+                }
+                sum += acc;
+            }
+        }
+        sum as i64
+    }
+
+    let kernel = |ns: usize, parallel: bool| {
+        let attr = if parallel { "@parallel\n" } else { "" };
+        let n2 = ns * ns;
+        format!(
+            "module m\n{attr}fn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+             for i in 0..{ns} {{ for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
+             for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
+             fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
+             let mut c: [f32; {n2}] = [0.0; {n2}]; let mut i: i32 = 0; \
+             while i < {n2} {{ a[i] = ((i % 3) as f32); b[i] = ((i % 2) as f32); i += 1; }} \
+             mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+             while j < {n2} {{ s = s + c[j]; j += 1; }} return s as i32; }}"
+        )
+    };
+
+    for ns in [8usize, 10] {
+        for parallel in [false, true] {
+            let src = kernel(ns, parallel);
+            let native = jit(&src, 3).expect("jit");
+            let interp = interp(&src, 3).expect("interp");
+            assert_eq!(native, interp, "matmul native vs interp (ns={ns}, par={parallel})");
+            assert_eq!(
+                native.0,
+                reference(ns),
+                "matmul wrong result (ns={ns}, par={parallel})"
+            );
+        }
+    }
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.
