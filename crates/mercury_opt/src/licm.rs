@@ -129,7 +129,8 @@ fn safe_to_hoist(op: &Op) -> bool {
         | Op::Cast(..)
         | Op::Select(..)
         | Op::Gep { .. }
-        | Op::FuncAddr(..) => true,
+        | Op::FuncAddr(..)
+        | Op::Splat(..) => true,
         // Integer division/remainder can trap on a zero divisor, so they are not speculatable.
         Op::Bin(b, ..) => !matches!(b, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem),
         Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::Alloca(..) => false,

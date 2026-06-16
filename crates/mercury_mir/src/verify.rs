@@ -124,8 +124,11 @@ impl Verifier<'_> {
                     if let Some(res) = self.result_ty(result) {
                         self.expect_ty(*l, &res, b.name());
                         self.expect_ty(*r, &res, b.name());
+                        // Classify by lane type so vector arithmetic (`<4 x f32> fadd`) is checked
+                        // against its `f32` lanes, not the aggregate `Vec` type.
+                        let lane = res.lane_type();
                         let float_op = b.is_float();
-                        if float_op && !res.is_float() {
+                        if float_op && !lane.is_float() {
                             self.err(format!(
                                 "float op {} on non-float type {}",
                                 b.name(),
@@ -133,7 +136,7 @@ impl Verifier<'_> {
                             ));
                         }
                         if !float_op
-                            && !res.is_int()
+                            && !lane.is_int()
                             && !matches!(b, BinOp::Xor | BinOp::And | BinOp::Or)
                         {
                             self.err(format!(
@@ -221,6 +224,24 @@ impl Verifier<'_> {
             }
             Op::FuncAddr(_) => {
                 self.check_result_is(result, &MirType::Ptr);
+            }
+            Op::Splat(v) => {
+                if self.use_val(*v) {
+                    if let (Some(vt), Some(res)) = (self.ty(*v).cloned(), self.result_ty(result)) {
+                        match &res {
+                            MirType::Vec(lane, _) if **lane == vt => {}
+                            MirType::Vec(lane, _) => self.err(format!(
+                                "splat: operand {} does not match result lane type {}",
+                                vt.display(),
+                                lane.display()
+                            )),
+                            _ => self.err(format!(
+                                "splat result must be a vector, got {}",
+                                res.display()
+                            )),
+                        }
+                    }
+                }
             }
         }
     }

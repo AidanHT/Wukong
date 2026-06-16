@@ -372,6 +372,12 @@ impl<'a> FnTranslator<'a> {
                 let fref = self.func_refs[sym];
                 self.builder.ins().func_addr(self.ptr_ty, fref)
             }
+            Op::Splat(v) => {
+                let rty = self.ty_of(inst.result.unwrap()).clone();
+                let vec_ty = cl_type(&rty, self.ptr_ty).unwrap_or(self.ptr_ty);
+                let x = self.val(*v);
+                self.builder.ins().splat(vec_ty, x)
+            }
         };
         if let Some(r) = res {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's
