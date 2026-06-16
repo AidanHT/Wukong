@@ -433,4 +433,47 @@ mod tests {
         // 0 + 2 + 4 + 6 + 8 = 20
         assert_eq!(run_main(src), 20);
     }
+
+    #[test]
+    fn runs_array_index_and_reduction() {
+        let src = "fn main() -> i32 { let mut xs: [i32; 4] = [0,0,0,0]; \
+                   let mut i: i32 = 0; while i < 4 { xs[i] = i * i; i = i + 1; } \
+                   let mut s: i32 = 0; let mut j: i32 = 0; \
+                   while j < 4 { s = s + xs[j]; j = j + 1; } return s; }";
+        // 0 + 1 + 4 + 9 = 14
+        assert_eq!(run_main(src), 14);
+    }
+
+    #[test]
+    fn runs_array_parameter_by_reference() {
+        let src = "fn fill(a: [i32; 3]) { a[0] = 7; a[1] = 8; a[2] = 9; } \
+                   fn main() -> i32 { let mut a: [i32;3] = [0,0,0]; fill(a); \
+                   return a[0] + a[1] + a[2]; }";
+        assert_eq!(run_main(src), 24);
+    }
+
+    #[test]
+    fn runs_casts_and_signed_modulo() {
+        // -7 % 3 == -1, i64->i32 cast, f32->i32 truncation.
+        assert_eq!(run_main("fn main() -> i32 { return -7 % 3; }"), -1);
+        assert_eq!(
+            run_main("fn main() -> i32 { let a: i64 = 300; return a as i32; }"),
+            300
+        );
+        assert_eq!(
+            run_main("fn main() -> i32 { let f: f32 = 9.9; return f as i32; }"),
+            9
+        );
+    }
+
+    #[test]
+    fn failed_assert_is_an_error() {
+        let mut interner = Interner::new();
+        let src = "fn main() -> i32 { assert(1 > 2); return 0; }";
+        let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = mercury_sema::check(&module, &interner);
+        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let main = interner.intern("main");
+        assert!(run(&program, main, &interner).is_err());
+    }
 }
