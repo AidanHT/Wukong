@@ -192,7 +192,7 @@ fn fold_int(b: BinOp, x: i128, y: i128, ty: &MirType) -> Option<i128> {
         Shl => x.wrapping_shl(y as u32),
         LShr => ((x as u128) >> (y as u32)) as i128,
         AShr => x >> (y as u32),
-        FAdd | FSub | FMul | FDiv => return None,
+        FAdd | FSub | FMul | FDiv | FRem => return None,
     };
     Some(mask(r, ty))
 }
@@ -204,6 +204,7 @@ fn fold_float(b: BinOp, x: f64, y: f64) -> f64 {
         FSub => x - y,
         FMul => x * y,
         FDiv => x / y,
+        FRem => x % y,
         _ => 0.0,
     }
 }

@@ -424,6 +424,14 @@ impl<'a> FnTranslator<'a> {
                 FSub => self.builder.ins().fsub(a, b),
                 FMul => self.builder.ins().fmul(a, b),
                 FDiv => self.builder.ins().fdiv(a, b),
+                // `x % y == x - trunc(x/y)*y` (truncated remainder, matching Rust's `%` and C fmod
+                // for finite values; y == 0 yields NaN, as in the interpreter). No libcall needed.
+                FRem => {
+                    let q = self.builder.ins().fdiv(a, b);
+                    let t = self.builder.ins().trunc(q);
+                    let p = self.builder.ins().fmul(t, b);
+                    self.builder.ins().fsub(a, p)
+                }
                 _ => unreachable!(),
             };
         }
@@ -432,7 +440,7 @@ impl<'a> FnTranslator<'a> {
             Add => self.builder.ins().iadd(a, b),
             Sub => self.builder.ins().isub(a, b),
             Mul => self.builder.ins().imul(a, b),
-            FAdd | FSub | FMul | FDiv => unreachable!("handled above"),
+            FAdd | FSub | FMul | FDiv | FRem => unreachable!("handled above"),
             And => self.builder.ins().band(a, b),
             Or => self.builder.ins().bor(a, b),
             Xor => self.builder.ins().bxor(a, b),

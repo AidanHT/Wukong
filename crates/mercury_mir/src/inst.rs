@@ -17,6 +17,7 @@ pub enum BinOp {
     FSub,
     FMul,
     FDiv,
+    FRem,
     And,
     Or,
     Xor,
@@ -40,6 +41,7 @@ impl BinOp {
             FSub => "fsub",
             FMul => "fmul",
             FDiv => "fdiv",
+            FRem => "frem",
             And => "and",
             Or => "or",
             Xor => "xor",
@@ -51,7 +53,7 @@ impl BinOp {
 
     pub fn is_float(self) -> bool {
         use BinOp::*;
-        matches!(self, FAdd | FSub | FMul | FDiv)
+        matches!(self, FAdd | FSub | FMul | FDiv | FRem)
     }
 }
 

@@ -467,6 +467,7 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
                 FSub => x - y,
                 FMul => x * y,
                 FDiv => x / y,
+                FRem => x % y,
                 _ => unreachable!(),
             };
             return Value::Float(r as f64);
@@ -477,6 +478,7 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
             FSub => x - y,
             FMul => x * y,
             FDiv => x / y,
+            FRem => x % y,
             _ => unreachable!(),
         });
     }
@@ -519,7 +521,7 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
         Shl => x.wrapping_shl(y as u32),
         LShr => ((x as u128) >> (y as u32)) as i128,
         AShr => x >> (y as u32),
-        FAdd | FSub | FMul | FDiv => unreachable!(),
+        FAdd | FSub | FMul | FDiv | FRem => unreachable!(),
     })
 }
 
