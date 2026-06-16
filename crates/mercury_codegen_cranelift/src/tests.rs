@@ -276,6 +276,34 @@ fn vectorized_reductions_are_correct() {
     }
 }
 
+/// The hard case for reduction vectorization: *fractional* inputs, where the lane-parallel
+/// (reassociated) sum genuinely differs in the low bits from a strict left-to-right sum. There is no
+/// clean closed-form expected value — the contract is only that the interpreter and the native
+/// backend, both executing the same reassociated MIR, agree *bit-for-bit*, at every opt level and
+/// across sizes that hit the unrolled body, the single-vector cleanup, and the scalar remainder.
+#[test]
+fn reduction_reassociation_is_backend_consistent() {
+    let dot = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [0.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i % 17) as f32) * 0.5 + 1.0; \
+             y[i] = ((i % 13) as f32) * 0.25 - 0.5; i += 1; }} \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k] * y[k]; }} \
+             print(s); return 0; }}"
+        )
+    };
+    for n in [5usize, 16, 17, 33, 50, 257, 1000, 4096] {
+        let src = dot(n);
+        for opt in [0u8, 1, 2, 3] {
+            assert_eq!(
+                jit(&src, opt).unwrap(),
+                interp(&src, opt).unwrap(),
+                "fractional dot interp vs native mismatch at n={n} -O{opt}"
+            );
+        }
+    }
+}
+
 /// Integer reductions vectorize too, and (unlike float) integer addition is associative, so the
 /// lane-parallel form is bit-identical to the strict scalar one — no reassociation caveat at all.
 #[test]
