@@ -15,6 +15,7 @@ mod cse;
 mod dce;
 mod dom;
 mod dse;
+mod licm;
 mod mem2reg;
 mod phi;
 mod simplify;
@@ -23,6 +24,7 @@ mod simplify_cfg;
 pub use cse::Cse;
 pub use dce::Dce;
 pub use dse::Dse;
+pub use licm::Licm;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
@@ -66,6 +68,9 @@ impl PassManager {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
             pm.add(Box::new(Cse));
             pm.add(Box::new(Dse));
+            // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
+            // can expose further invariants (e.g. across nested loops).
+            pm.add(Box::new(Licm));
         }
         pm
     }
@@ -412,10 +417,13 @@ mod tests {
     }
 
     fn count_muls(f: &mercury_mir::Function) -> usize {
+        f.blocks.iter().map(muls_in_block).sum()
+    }
+
+    fn muls_in_block(b: &mercury_mir::BasicBlock) -> usize {
         use mercury_mir::{BinOp, Op};
-        f.blocks
+        b.insts
             .iter()
-            .flat_map(|b| &b.insts)
             .filter(|i| matches!(i.op, Op::Bin(BinOp::Mul, _, _)))
             .count()
     }
@@ -492,6 +500,33 @@ mod tests {
         }
         let main = interner.intern("main");
         assert_eq!(mercury_interp::run(&prog, main, &interner).unwrap(), 4);
+    }
+
+    #[test]
+    fn licm_hoists_invariant_out_of_loop() {
+        // `x * y` does not change across the loop, so LICM should compute it once in the preheader
+        // (the entry block here) rather than every iteration.
+        let src = "fn f(x: i32, y: i32, n: i32) -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
+                   while i < n { s = s + x * y; i = i + 1; } return s; } \
+                   fn main() -> i32 { return f(3, 4, 5); }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let f = find_fn(&prog, &interner, "f");
+        assert_eq!(
+            count_muls(f),
+            1,
+            "x*y must be computed once, not duplicated"
+        );
+        let entry_muls = muls_in_block(&f.blocks[f.entry.0 as usize]);
+        assert_eq!(
+            entry_muls, 1,
+            "the invariant multiply should be hoisted into the preheader"
+        );
+        for f in &prog.funcs {
+            assert!(mercury_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(mercury_interp::run(&prog, main, &interner).unwrap(), 60);
     }
 
     #[test]
