@@ -22,8 +22,22 @@ All notable changes to Mercury are documented here. The format is loosely based 
   `licm` (loop-invariant code motion), wired across `-O0..-O3`. In debug builds the pass manager
   verifies the MIR after every pass. Across the run suite and kernels, `-O3` removes ~48% of IR ops
   (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0` under the interpreter.
-- **Back-ends**: a zero-dependency MIR interpreter (`--run`) and a textual LLVM-IR emitter
-  (`--emit=llvm-ir`, plus `--emit=obj|exe` via `clang` when present).
+- **Back-ends**: a zero-dependency MIR interpreter (`--run`), a from-scratch **native Cranelift
+  backend** (JIT + host object, no LLVM toolchain), and a textual LLVM-IR emitter (`--emit=llvm-ir`,
+  plus `--emit=obj|exe` via `clang` when present). The native backend is differentially tested
+  against the interpreter bit-for-bit.
+- **Matmul → tuned GEMM dispatch**: the compiler recognizes a matmul loop nest — the `ikj` accumulate
+  and `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling — and lowers the whole
+  nest to a register-blocked (6×16), cache-tiled, packed **AVX2/FMA** GEMM microkernel in the runtime
+  (`mercury_sgemm` / `_nt` / `_parallel`). On a Meteor Lake laptop this beats `gcc -O3 -march=native`
+  on the naive nest by **~2–5× single-thread and ~2.4–15× parallel**, the lead growing with matrix
+  size. The interpreter calls the identical kernel (marshalling its memory) so the oracle stays exact.
+- **Auto-vectorization**: straight-line elementwise loops (incl. branchy ones via if-conversion) and
+  float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
+  `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
+  run ~2.3–3.7× faster than serial C.
+- **`@parallel`**: loops execute across CPU cores via a rayon runtime, each per-core chunk itself
+  vectorized — ~3.5–12× faster than idiomatic single-threaded C on the elementwise kernels.
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
   with a runtime index, and array parameters passed by base pointer (out-params work). Real kernels
   (dot product, SAXPY, a flat GEMM) run on the interpreter.
