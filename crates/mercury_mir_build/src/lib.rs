@@ -844,9 +844,9 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Emit the vector main loop + scalar remainder. Both share one index slot `j`: the vector loop
-    /// steps by `W` while a full vector fits, then the remainder steps by 1 to `end`. The bounds are
-    /// already-lowered `ity` values.
+    /// Emit the vectorized loop as three strips that share one index slot `j`: an unrolled vector
+    /// loop (`VEC_UNROLL` independent vector groups per iteration), then a single-vector loop, then
+    /// a scalar remainder. The bounds are already-lowered `ity` values.
     fn emit_vectorized_for(
         &mut self,
         j: Symbol,
@@ -858,58 +858,115 @@ impl FnLowerer<'_> {
         body: &Block,
     ) {
         let vty = MirType::Vec(Box::new(lane.clone()), w);
-
-        // j = start; compute the vector-loop limit `end - (W-1)` once (invariant).
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store { ptr: slot, value: s0 });
-        let wm1 = self
-            .builder
-            .build(ity.clone(), Op::ConstInt((w - 1) as i128, ity.clone()));
-        let vlimit = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, end_v, wm1));
+        // A scratch slot holding the per-unroll-copy index (`jbase + u*W`), so unit-stride accesses
+        // pick up the lane offset with no per-access arithmetic.
+        let jtmp = self.builder.alloca(ity.clone());
 
         self.push_scope();
         self.bind(j, slot, ity.clone());
 
-        let vhdr = self.builder.new_block();
-        let vbody = self.builder.new_block();
-        let rhdr = self.builder.new_block();
-        let rbody = self.builder.new_block();
-        let exit = self.builder.new_block();
-        self.builder.br(vhdr, vec![]);
+        self.emit_vector_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, body);
+        self.emit_vector_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, 1, body);
+        self.emit_scalar_tail(j, slot, end_v, ity, body);
 
-        // vector header: while j < end-(W-1)
-        self.builder.switch_to(vhdr);
+        self.pop_scope();
+    }
+
+    /// One strip-mined vector loop: while a full `unroll * W` block fits, emit `unroll` independent
+    /// vector groups (fresh `vlocals` each, so their dependency chains overlap on the FP units),
+    /// then advance `j` by `unroll * W`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_vector_strip(
+        &mut self,
+        j: Symbol,
+        slot: ValueId,
+        jtmp: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        unroll: u32,
+        body: &Block,
+    ) {
+        let span = (unroll * w) as i128;
+        let off = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
+        let vlimit = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
+
+        let hdr = self.builder.new_block();
+        let bb = self.builder.new_block();
+        let done = self.builder.new_block();
+        self.builder.br(hdr, vec![]);
+
+        // header: while j < end - (unroll*W - 1)
+        self.builder.switch_to(hdr);
         self.terminated = false;
+        self.bind(j, slot, ity.clone());
         let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
         let c = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
-        self.builder.cond_br(c, vbody, vec![], rhdr, vec![]);
+        self.builder.cond_br(c, bb, vec![], done, vec![]);
 
-        // vector body: W lanes per iteration, then j += W
-        self.builder.switch_to(vbody);
+        // body: `unroll` vector groups at offsets 0, W, 2W, …; then j += unroll*W
+        self.builder.switch_to(bb);
         self.terminated = false;
-        let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
-        for s in &body.stmts {
-            self.vec_lower_stmt(s, j, lane, &vty, w, &mut vlocals);
+        let jbase = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        for u in 0..unroll {
+            let ju = if u == 0 {
+                jbase
+            } else {
+                let o = self
+                    .builder
+                    .build(ity.clone(), Op::ConstInt((u * w) as i128, ity.clone()));
+                self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jbase, o))
+            };
+            self.builder.build_void(Op::Store { ptr: jtmp, value: ju });
+            self.bind(j, jtmp, ity.clone());
+            let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+            for s in &body.stmts {
+                self.vec_lower_stmt(s, j, lane, vty, w, &mut vlocals);
+            }
         }
+        self.bind(j, slot, ity.clone());
         let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let wv = self
+        let stepc = self
             .builder
-            .build(ity.clone(), Op::ConstInt(w as i128, ity.clone()));
-        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, wv));
+            .build(ity.clone(), Op::ConstInt(span, ity.clone()));
+        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, stepc));
         self.builder.build_void(Op::Store { ptr: slot, value: jn });
-        self.builder.br(vhdr, vec![]);
+        self.builder.br(hdr, vec![]);
 
-        // remainder header: while j < end
-        self.builder.switch_to(rhdr);
+        self.builder.switch_to(done);
+        self.terminated = false;
+    }
+
+    /// The scalar remainder: the original body lowered normally, stepping `j` by 1 to `end`.
+    fn emit_scalar_tail(
+        &mut self,
+        j: Symbol,
+        slot: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        body: &Block,
+    ) {
+        self.bind(j, slot, ity.clone());
+        let hdr = self.builder.new_block();
+        let bb = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(hdr, vec![]);
+
+        self.builder.switch_to(hdr);
         self.terminated = false;
         let jr = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
         let rc = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
-        self.builder.cond_br(rc, rbody, vec![], exit, vec![]);
+        self.builder.cond_br(rc, bb, vec![], exit, vec![]);
 
-        // remainder body: the original scalar body (reuses the full scalar lowering), then j += 1
-        self.builder.switch_to(rbody);
+        self.builder.switch_to(bb);
         self.terminated = false;
-        self.loops.push((rhdr, exit));
+        self.loops.push((hdr, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -917,10 +974,8 @@ impl FnLowerer<'_> {
             let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
             let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
             self.builder.build_void(Op::Store { ptr: slot, value: jn });
-            self.builder.br(rhdr, vec![]);
+            self.builder.br(hdr, vec![]);
         }
-
-        self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
     }
@@ -1838,8 +1893,13 @@ fn vector_width(lane: &MirType) -> Option<u32> {
 
 /// SIMD register width in bytes. Cranelift's vector ISA is 128-bit (16 bytes); wider types such as
 /// `f32x8` are not legalized ("Unexpected SSA-value type"), so we pack one 128-bit register and
-/// recover AVX-class throughput via unrolling (see `UNROLL`) rather than a wider lane type.
+/// recover AVX-class throughput via unrolling (see `VEC_UNROLL`) rather than a wider lane type.
 const VEC_REG_BYTES: u32 = 16;
+
+/// Vector groups processed per iteration of the unrolled main loop. Independent 128-bit chains
+/// issue across the core's multiple FP units (≈ AVX throughput from SSE ops) and hide FP latency in
+/// reduction-style bodies (Horner, matmul accumulate). 4×f32x4 = 16 f32/iteration.
+const VEC_UNROLL: u32 = 4;
 
 /// Default signedness for a lane type (only affects integer div/rem op selection).
 fn lane_signed(lane: &MirType) -> bool {
