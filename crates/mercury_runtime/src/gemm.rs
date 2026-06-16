@@ -43,6 +43,42 @@ pub unsafe extern "C" fn mercury_sgemm(
     n: i64,
     beta: i64,
 ) {
+    gemm_dispatch(a, b, c, m, k, n, beta, false, false);
+}
+
+/// `C = A·Bᵀ` (B is row-major `[n, k]`), the `nn.Linear` / `x @ Wᵀ` form — the most common matmul
+/// in deep learning. Same `beta` rule, single-threaded.
+///
+/// # Safety
+/// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32` elements respectively.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_nt(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    gemm_dispatch(a, b, c, m, k, n, beta, true, false);
+}
+
+/// Pick AVX2 vs scalar and serial vs parallel; `bt` selects `C = A·Bᵀ`.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm`] / [`mercury_sgemm_nt`].
+unsafe fn gemm_dispatch(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bt: bool,
+    par: bool,
+) {
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
@@ -52,11 +88,17 @@ pub unsafe extern "C" fn mercury_sgemm(
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
-            unsafe { sgemm_avx2(a, b, c, m, k, n, beta) };
+            unsafe {
+                if par {
+                    sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt);
+                } else {
+                    sgemm_avx2(a, b, c, m, k, n, beta, bt);
+                }
+            }
             return;
         }
     }
-    sgemm_scalar(a, b, c, m, k, n, beta);
+    sgemm_scalar(a, b, c, m, k, n, beta, bt);
 }
 
 /// Multi-threaded `C = A·B`. For each `KC` contraction block it packs the *whole* A column-panel and
@@ -77,24 +119,29 @@ pub unsafe extern "C" fn mercury_sgemm_parallel(
     n: i64,
     beta: i64,
 ) {
-    if m <= 0 || k <= 0 || n <= 0 {
-        return;
-    }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
-    let beta = beta as f32;
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // SAFETY: features checked; dims validated.
-            unsafe { sgemm_avx2_parallel(a, b, c, m, k, n, beta) };
-            return;
-        }
-    }
-    sgemm_scalar(a, b, c, m, k, n, beta);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true);
+}
+
+/// Multi-threaded `C = A·Bᵀ` (the `nn.Linear` form).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm_nt`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_nt_parallel(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    gemm_dispatch(a, b, c, m, k, n, beta, true, true);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn sgemm_avx2_parallel(
     a: *const f32,
     b: *const f32,
@@ -103,6 +150,7 @@ unsafe fn sgemm_avx2_parallel(
     k: usize,
     n: usize,
     beta: f32,
+    bt: bool,
 ) {
     use rayon::prelude::*;
     let mut jc = 0;
@@ -116,7 +164,7 @@ unsafe fn sgemm_avx2_parallel(
             let mut ap = vec![0.0f32; round_up(m, MR) * kc];
             let mut bp = vec![0.0f32; round_up(nc, NR) * kc];
             pack_a(a.add(pc), k, m, kc, ap.as_mut_ptr());
-            pack_b(b.add(pc * n + jc), n, kc, nc, bp.as_mut_ptr());
+            pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
 
             let mpanels = m.div_ceil(MR);
             let npanels = nc.div_ceil(NR);
@@ -150,10 +198,20 @@ unsafe fn sgemm_avx2_parallel(
     }
 }
 
-/// Portable reference: a straight `ikj` triple loop. Correct for any target; also the small-/odd-
-/// size fallback. Accumulation order differs from the blocked kernel, so it is only used where the
-/// AVX path is unavailable (the two are validated to agree within f32 tolerance in tests).
-fn sgemm_scalar(a: *const f32, b: *const f32, c: *mut f32, m: usize, k: usize, n: usize, beta: f32) {
+/// Portable reference: a straight triple loop (`C = A·B`, or `C = A·Bᵀ` when `bt`). Correct for any
+/// target; also the no-AVX fallback. Accumulation order differs from the blocked kernel, so it is
+/// only used where the AVX path is unavailable (the two agree within f32 tolerance in tests).
+#[allow(clippy::too_many_arguments)]
+fn sgemm_scalar(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+    bt: bool,
+) {
     unsafe {
         for i in 0..m {
             let crow = c.add(i * n);
@@ -162,12 +220,13 @@ fn sgemm_scalar(a: *const f32, b: *const f32, c: *mut f32, m: usize, k: usize, n
                     *crow.add(j) = 0.0;
                 }
             }
-            for p in 0..k {
-                let aik = *a.add(i * k + p);
-                let brow = b.add(p * n);
-                for j in 0..n {
-                    *crow.add(j) += aik * *brow.add(j);
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    let bjp = if bt { *b.add(j * k + p) } else { *b.add(p * n + j) };
+                    acc += *a.add(i * k + p) * bjp;
                 }
+                *crow.add(j) += acc;
             }
         }
     }
@@ -177,6 +236,7 @@ fn sgemm_scalar(a: *const f32, b: *const f32, c: *mut f32, m: usize, k: usize, n
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn sgemm_avx2(
     a: *const f32,
     b: *const f32,
@@ -185,6 +245,7 @@ unsafe fn sgemm_avx2(
     k: usize,
     n: usize,
     beta: f32,
+    bt: bool,
 ) {
     // Pack scratch, sized to the actual blocks needed (never larger than the cache-block caps).
     let kc_max = k.min(KC);
@@ -201,7 +262,7 @@ unsafe fn sgemm_avx2(
             let kc = (k - pc).min(KC);
             // First K-block honors the caller's beta; later blocks must accumulate the partial sums.
             let beta_eff = if pc == 0 { beta } else { 1.0 };
-            pack_b(b.add(pc * n + jc), n, kc, nc, bp.as_mut_ptr());
+            pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
             let mut ic = 0;
             while ic < m {
                 let mc = (m - ic).min(MC);
@@ -224,6 +285,30 @@ unsafe fn sgemm_avx2(
     }
 }
 
+/// Pack the B panel for cache block `(pc, jc)` into `bp`, honoring the `C = A·Bᵀ` layout when `bt`.
+/// Both layouts produce the same `[kc][NR]`-per-panel packed form, so the microkernel is unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_b_block(
+    b: *const f32,
+    k: usize,
+    n: usize,
+    pc: usize,
+    jc: usize,
+    kc: usize,
+    nc: usize,
+    bt: bool,
+    bp: *mut f32,
+) {
+    if bt {
+        // B is [n, k] row-major; column j of Bᵀ is row j of B (stride k).
+        pack_b_trans(b.add(jc * k + pc), k, kc, nc, bp);
+    } else {
+        pack_b(b.add(pc * n + jc), n, kc, nc, bp);
+    }
+}
+
 /// Pack a `KC×NC` slice of B (row-major, leading dim `ldb`) into `NR`-wide column panels: panel `jp`
 /// is `[kc][NR]` contiguous, zero-padded if the slice's last panel is partial.
 #[cfg(target_arch = "x86_64")]
@@ -241,6 +326,28 @@ unsafe fn pack_b(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) 
             }
             for j in ncols..NR {
                 *dst.add(j) = 0.0;
+            }
+            dst = dst.add(NR);
+        }
+    }
+}
+
+/// Pack a `KC×NC` slice of Bᵀ — i.e. read B as `[nc rows × kc cols]` (leading dim `ldb`) and write
+/// the same `[kc][NR]`-per-panel form the microkernel expects (a transpose during packing).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn pack_b_trans(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) {
+    let mut dst = bp;
+    let npanels = nc.div_ceil(NR);
+    for jp in 0..npanels {
+        let j0 = jp * NR;
+        let ncols = (nc - j0).min(NR);
+        for p in 0..kc {
+            for r in 0..ncols {
+                *dst.add(r) = *b.add((j0 + r) * ldb + p);
+            }
+            for r in ncols..NR {
+                *dst.add(r) = 0.0;
             }
             dst = dst.add(NR);
         }
@@ -503,6 +610,46 @@ mod tests {
         bench("sgemm (parallel)", &|| unsafe {
             mercury_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
         });
+    }
+
+    /// `naive` for `C = A·Bᵀ` (B is `[n, k]`).
+    fn naive_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += a[i * k + p] * b[j * k + p];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn sgemm_nt_matches_naive() {
+        for (m, k, n) in [(1, 1, 1), (7, 17, 13), (64, 64, 64), (100, 130, 96), (128, 256, 512)] {
+            let a = fill(11, m * k);
+            let b = fill(12, n * k);
+            let want = naive_nt(&a, &b, m, k, n);
+            let mut got = vec![0.0f32; m * n];
+            let mut got_par = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+                mercury_sgemm_nt_parallel(a.as_ptr(), b.as_ptr(), got_par.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+            }
+            let tol = 1e-3 * (k as f32).sqrt();
+            for i in 0..m * n {
+                assert!(
+                    (got[i] - want[i]).abs() <= tol + 1e-4 * want[i].abs(),
+                    "nt ({m}x{k}x{n}) idx {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
+            assert_eq!(got, got_par, "nt serial vs parallel ({m}x{k}x{n})");
+        }
     }
 
     #[test]

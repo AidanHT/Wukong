@@ -398,12 +398,16 @@ impl<'a> Interp<'a> {
                 self.run_function(func, vec![Value::Int(0), Value::Int(n), env])?;
                 Ok(Value::Unit)
             }
-            // `mercury_sgemm(a, b, c, m, k, n, beta)` — the matmul microkernel the compiler lowers a
-            // matmul nest to. The interpreter marshals its abstract (tagged-`Value`) memory into real
-            // f32 buffers and calls the *identical* runtime kernel the native backend calls, then
-            // marshals the result back, so the differential oracle stays bit-for-bit exact. The
-            // serial kernel is used for both names (the parallel variant is numerically identical).
-            "mercury_sgemm" | "mercury_sgemm_parallel" => {
+            // `mercury_sgemm(a, b, c, m, k, n, beta)` (and the parallel / transposed `nn.Linear`
+            // variants) — the GEMM microkernels the compiler lowers a matmul nest to. The interpreter
+            // marshals its abstract (tagged-`Value`) memory into real f32 buffers and calls the
+            // *identical* runtime kernel the native backend calls, then marshals the result back, so
+            // the differential oracle stays bit-for-bit exact. The serial kernel is used for both
+            // serial and parallel names (numerically identical).
+            "mercury_sgemm"
+            | "mercury_sgemm_parallel"
+            | "mercury_sgemm_nt"
+            | "mercury_sgemm_nt_parallel" => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -421,17 +425,20 @@ impl<'a> Interp<'a> {
                 let abuf = read(&self.memory, a, m * k)?;
                 let bbuf = read(&self.memory, b, k * n)?;
                 let mut cbuf = read(&self.memory, c, m * n)?;
-                // SAFETY: buffers are exactly m*k, k*n, m*n long — the kernel's read/write contract.
+                let transposed = name.contains("_nt");
+                // SAFETY: buffers are exactly m*k, k*n (= n*k), m*n long — the kernel's contract.
                 unsafe {
-                    mercury_runtime::mercury_sgemm(
-                        abuf.as_ptr(),
-                        bbuf.as_ptr(),
-                        cbuf.as_mut_ptr(),
-                        m as i64,
-                        k as i64,
-                        n as i64,
-                        beta,
-                    );
+                    if transposed {
+                        mercury_runtime::mercury_sgemm_nt(
+                            abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr(),
+                            m as i64, k as i64, n as i64, beta,
+                        );
+                    } else {
+                        mercury_runtime::mercury_sgemm(
+                            abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr(),
+                            m as i64, k as i64, n as i64, beta,
+                        );
+                    }
                 }
                 for t in 0..m * n {
                     *self.memory.get_mut(c + t).ok_or("sgemm output out of bounds")? =

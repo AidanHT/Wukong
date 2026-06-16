@@ -66,6 +66,8 @@ const RT_ASSERT: &str = "mercury_rt_assert";
 const RT_PARALLEL_FOR: &str = "mercury_parallel_for";
 const RT_SGEMM: &str = "mercury_sgemm";
 const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
+const RT_SGEMM_NT: &str = "mercury_sgemm_nt";
+const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
 
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
@@ -564,8 +566,13 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[n, body, env]);
             return None;
         }
-        // The GEMM microkernel: mercury_sgemm(a, b, c, m, k, n, beta) (and the parallel variant).
-        if (name == RT_SGEMM || name == RT_SGEMM_PARALLEL) && args.len() == 7 {
+        // The GEMM microkernel: mercury_sgemm(a, b, c, m, k, n, beta) and its parallel / transposed
+        // (nn.Linear, C = A·Bᵀ) variants — all share the (ptr,ptr,ptr,i64,i64,i64,i64) signature.
+        if matches!(
+            name,
+            RT_SGEMM | RT_SGEMM_PARALLEL | RT_SGEMM_NT | RT_SGEMM_NT_PARALLEL
+        ) && args.len() == 7
+        {
             let a = self.val(args[0]);
             let b = self.val(args[1]);
             let c = self.val(args[2]);
@@ -676,6 +683,8 @@ struct RtFuncs {
     parallel_for: FuncId,
     sgemm: FuncId,
     sgemm_parallel: FuncId,
+    sgemm_nt: FuncId,
+    sgemm_nt_parallel: FuncId,
 }
 
 fn signature_of(
@@ -755,6 +764,12 @@ fn populate_module<M: Module>(
         sgemm_parallel: module
             .declare_function(RT_SGEMM_PARALLEL, Linkage::Import, &sig_gemm)
             .map_err(|e| e.to_string())?,
+        sgemm_nt: module
+            .declare_function(RT_SGEMM_NT, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
+        sgemm_nt_parallel: module
+            .declare_function(RT_SGEMM_NT_PARALLEL, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
     };
 
     // Declare all user functions first so calls resolve regardless of definition order.
@@ -793,6 +808,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_PARALLEL,
                 module.declare_func_in_func(rt.sgemm_parallel, builder.func),
+            );
+            rt_refs.insert(RT_SGEMM_NT, module.declare_func_in_func(rt.sgemm_nt, builder.func));
+            rt_refs.insert(
+                RT_SGEMM_NT_PARALLEL,
+                module.declare_func_in_func(rt.sgemm_nt_parallel, builder.func),
             );
 
             let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
@@ -900,6 +920,8 @@ pub fn jit_compile(
     builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
     builder.symbol(RT_SGEMM, mercury_runtime::mercury_sgemm as *const u8);
     builder.symbol(RT_SGEMM_PARALLEL, mercury_runtime::mercury_sgemm_parallel as *const u8);
+    builder.symbol(RT_SGEMM_NT, mercury_runtime::mercury_sgemm_nt as *const u8);
+    builder.symbol(RT_SGEMM_NT_PARALLEL, mercury_runtime::mercury_sgemm_nt_parallel as *const u8);
     let mut module = JITModule::new(builder);
 
     let ids = populate_module(&mut module, program, interner)?;
@@ -967,6 +989,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
     builder.symbol(RT_SGEMM, mercury_runtime::mercury_sgemm as *const u8);
     builder.symbol(RT_SGEMM_PARALLEL, mercury_runtime::mercury_sgemm_parallel as *const u8);
+    builder.symbol(RT_SGEMM_NT, mercury_runtime::mercury_sgemm_nt as *const u8);
+    builder.symbol(RT_SGEMM_NT_PARALLEL, mercury_runtime::mercury_sgemm_nt_parallel as *const u8);
     let mut module = JITModule::new(builder);
     let ids = populate_module(&mut module, program, interner)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
