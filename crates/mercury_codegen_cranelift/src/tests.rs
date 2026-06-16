@@ -10,7 +10,7 @@ fn jit(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
     let (sema, sd) = mercury_sema::check(&module, &interner);
     assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &interner);
+    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
     assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
     mercury_opt::optimize(&mut program, opt);
     let main = interner.intern("main");
@@ -22,7 +22,7 @@ fn interp(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     let mut interner = Interner::new();
     let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
     let (sema, _) = mercury_sema::check(&module, &interner);
-    let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+    let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
     mercury_opt::optimize(&mut program, opt);
     let main = interner.intern("main");
     mercury_interp::run_with_output(&program, main, &interner)
@@ -166,5 +166,25 @@ fn if_as_expression() {
         for opt in [0u8, 1, 2, 3] {
             assert_eq!(jit(src, opt).unwrap(), interp(src, opt).unwrap());
         }
+    }
+}
+
+/// A `@parallel for` kernel: the native backend runs it across CPU cores via the runtime, the
+/// interpreter runs the whole range sequentially, and the observable result must be identical.
+#[test]
+fn parallel_for_matches_interpreter() {
+    let src = "@parallel fn scale(x: [i32; 4096], out: [i32; 4096]) { \
+               for i in 0..4096 { out[i] = x[i] * 3; } } \
+               fn main() -> i32 { let x: [i32; 4096] = [2; 4096]; let out: [i32; 4096] = [0; 4096]; \
+               scale(x, out); let mut s: i32 = 0; let mut i: i32 = 0; \
+               while i < 4096 { s += out[i]; i += 1; } return s % 100000; }";
+    // 4096 * (2*3) = 24576
+    assert_eq!(jit_ok(src).0, 24576);
+    for opt in [0u8, 1, 2, 3] {
+        assert_eq!(
+            jit(src, opt).unwrap(),
+            interp(src, opt).unwrap(),
+            "parallel native vs interp mismatch at -O{opt}"
+        );
     }
 }

@@ -63,6 +63,7 @@ extern "C" fn rt_assert(cond: i64) {
 const RT_PRINT_I64: &str = "mercury_rt_print_i64";
 const RT_PRINT_F64: &str = "mercury_rt_print_f64";
 const RT_ASSERT: &str = "mercury_rt_assert";
+const RT_PARALLEL_FOR: &str = "mercury_parallel_for";
 
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
@@ -367,6 +368,10 @@ impl<'a> FnTranslator<'a> {
                 Some(v) => v,
                 None => return,
             },
+            Op::FuncAddr(sym) => {
+                let fref = self.func_refs[sym];
+                self.builder.ins().func_addr(self.ptr_ty, fref)
+            }
         };
         if let Some(r) = res {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's
@@ -513,6 +518,15 @@ impl<'a> FnTranslator<'a> {
             return self.builder.inst_results(call).first().copied();
         }
         let name = self.interner.resolve(func);
+        // The parallel-for runtime entry: mercury_parallel_for(n, body_ptr, env_ptr).
+        if name == RT_PARALLEL_FOR && args.len() == 3 {
+            let n = self.coerce_to_i64(args[0]);
+            let body = self.val(args[1]);
+            let env = self.val(args[2]);
+            let fref = self.rt_refs[RT_PARALLEL_FOR];
+            self.builder.ins().call(fref, &[n, body, env]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -609,6 +623,7 @@ struct RtFuncs {
     print_i64: FuncId,
     print_f64: FuncId,
     assert: FuncId,
+    parallel_for: FuncId,
 }
 
 fn signature_of(
@@ -656,6 +671,11 @@ fn populate_module<M: Module>(
     sig_i.params.push(AbiParam::new(types::I64));
     let mut sig_f = Signature::new(call_conv);
     sig_f.params.push(AbiParam::new(types::F64));
+    // mercury_parallel_for(n: i64, body: ptr, env: ptr)
+    let mut sig_par = Signature::new(call_conv);
+    sig_par.params.push(AbiParam::new(types::I64));
+    sig_par.params.push(AbiParam::new(ptr_ty));
+    sig_par.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -665,6 +685,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         assert: module
             .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
+        parallel_for: module
+            .declare_function(RT_PARALLEL_FOR, Linkage::Import, &sig_par)
             .map_err(|e| e.to_string())?,
     };
 
@@ -696,6 +719,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(RT_PRINT_I64, module.declare_func_in_func(rt.print_i64, builder.func));
             rt_refs.insert(RT_PRINT_F64, module.declare_func_in_func(rt.print_f64, builder.func));
             rt_refs.insert(RT_ASSERT, module.declare_func_in_func(rt.assert, builder.func));
+            rt_refs.insert(
+                RT_PARALLEL_FOR,
+                module.declare_func_in_func(rt.parallel_for, builder.func),
+            );
 
             let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
             let mut t = FnTranslator {
@@ -799,6 +826,7 @@ pub fn jit_compile(
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
     let mut module = JITModule::new(builder);
 
     let ids = populate_module(&mut module, program, interner)?;
@@ -828,6 +856,49 @@ pub fn jit_run(
     interner: &Interner,
 ) -> Result<(i64, Vec<u8>), String> {
     jit_compile(program, entry, interner)?.run()
+}
+
+/// A JIT-compiled module exposing raw pointers to any of its functions, for callers that know a
+/// function's ABI and want to invoke it directly (e.g. timing a kernel `(*const f32, …)`).
+pub struct JitModuleHandle {
+    module: Option<cranelift_jit::JITModule>,
+    ids: HashMap<Symbol, FuncId>,
+}
+
+impl JitModuleHandle {
+    /// The finalized machine-code pointer for `sym`, if the module defines it. The caller must
+    /// transmute it to the correct ABI; the pointer is valid until this handle is dropped.
+    pub fn func_ptr(&self, sym: Symbol) -> Option<*const u8> {
+        let id = *self.ids.get(&sym)?;
+        Some(self.module.as_ref().unwrap().get_finalized_function(id))
+    }
+}
+
+impl Drop for JitModuleHandle {
+    fn drop(&mut self) {
+        if let Some(m) = self.module.take() {
+            unsafe { m.free_memory() };
+        }
+    }
+}
+
+/// JIT-compile every function in `program`, returning a handle for fetching their code pointers.
+pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHandle, String> {
+    use cranelift_jit::{JITBuilder, JITModule};
+
+    let isa = make_isa(false)?;
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
+    builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
+    builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
+    let mut module = JITModule::new(builder);
+    let ids = populate_module(&mut module, program, interner)?;
+    module.finalize_definitions().map_err(|e| e.to_string())?;
+    Ok(JitModuleHandle {
+        module: Some(module),
+        ids,
+    })
 }
 
 /// Compile `program` to a native object file (bytes) for the host target. The runtime symbols are

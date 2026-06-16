@@ -8,3 +8,4 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rayon = "1"

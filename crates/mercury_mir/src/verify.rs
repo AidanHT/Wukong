@@ -219,6 +219,9 @@ impl Verifier<'_> {
                     self.use_val(*a);
                 }
             }
+            Op::FuncAddr(_) => {
+                self.check_result_is(result, &MirType::Ptr);
+            }
         }
     }
 

@@ -155,7 +155,7 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
                 *a = f(*a);
             }
         }
-        Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) => {}
+        Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) | Op::FuncAddr(..) => {}
     }
 }
 
@@ -212,7 +212,7 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
                 f(*a);
             }
         }
-        Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) => {}
+        Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) | Op::FuncAddr(..) => {}
     }
 }
 
@@ -250,7 +250,7 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         optimize(&mut program, opt);
         // verify still well-formed
         for f in &program.funcs {
@@ -305,7 +305,7 @@ mod tests {
         let mut interner = Interner::new();
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, _) = mercury_sema::check(&module, &interner);
-        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         let before: usize = program.funcs.iter().map(count_insts).sum();
         optimize(&mut program, 2);
         let after: usize = program.funcs.iter().map(count_insts).sum();
@@ -332,7 +332,7 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
 
         // Count `x*x` multiplies in `sq2` before and after CSE+DCE. Run the pass pipeline directly
         // (not the `optimize` wrapper) so whole-program inlining does not fold `sq2` into main.
@@ -379,7 +379,7 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         let blocks_before = find_fn(&program, &interner, "main").blocks.len();
         optimize(&mut program, 1);
         let main_fn = find_fn(&program, &interner, "main");
@@ -408,7 +408,7 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         let stores_before = count_stores(find_fn(&program, &interner, "main"));
         optimize(&mut program, 2);
         let stores_after = count_stores(find_fn(&program, &interner, "main"));
@@ -461,7 +461,7 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         (program, interner)
     }
 

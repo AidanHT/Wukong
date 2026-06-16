@@ -70,9 +70,67 @@ pub fn parallel_for(lo: i64, hi: i64, step: i64, mut body: impl FnMut(i64)) {
     }
 }
 
+/// A raw `env` address shuttled across worker threads. Sending the address is sound here: the
+/// pointee outlives the (blocking) `mercury_parallel_for` call, and worker chunks touch disjoint
+/// output indices, so there is no data race.
+#[derive(Clone, Copy)]
+struct EnvAddr(usize);
+unsafe impl Send for EnvAddr {}
+unsafe impl Sync for EnvAddr {}
+
+/// The C-ABI parallel-for the native backend lowers `@parallel for` to. Splits `[0, n)` into one
+/// contiguous chunk per host CPU and runs `body(start, end, env)` on each concurrently (via a
+/// persistent thread pool), returning only once every chunk has completed.
+///
+/// Bodies must be data-parallel: each index is processed exactly once and the chunks must not have
+/// cross-iteration dependencies (the interpreter runs the whole range sequentially and must agree).
+///
+/// # Safety
+/// `body` must be a valid `extern "C" fn(i64, i64, *const u8)` and `env` valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_parallel_for(
+    n: i64,
+    body: extern "C" fn(i64, i64, *const u8),
+    env: *const u8,
+) {
+    use rayon::prelude::*;
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    let workers = rayon::current_num_threads().max(1).min(n);
+    let chunk = n.div_ceil(workers);
+    let env = EnvAddr(env as usize);
+    (0..workers).into_par_iter().for_each(|w| {
+        let start = w * chunk;
+        if start >= n {
+            return;
+        }
+        let end = (start + chunk).min(n);
+        body(start as i64, end as i64, env.0 as *const u8);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    extern "C" fn fill_squares(start: i64, end: i64, env: *const u8) {
+        let out = env as *mut i64;
+        for i in start..end {
+            unsafe { *out.add(i as usize) = i * i };
+        }
+    }
+
+    #[test]
+    fn parallel_for_covers_every_index_once() {
+        let n = 10_000usize;
+        let mut buf = vec![0i64; n];
+        unsafe {
+            mercury_parallel_for(n as i64, fill_squares, buf.as_mut_ptr() as *const u8);
+        }
+        assert!(buf.iter().enumerate().all(|(i, &v)| v == (i as i64) * (i as i64)));
+    }
 
     #[test]
     fn arena_alignment_and_exhaustion() {

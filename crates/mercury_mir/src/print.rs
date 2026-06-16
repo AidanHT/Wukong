@@ -79,6 +79,7 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
             let a: Vec<String> = args.iter().map(|v| val(*v)).collect();
             format!("call {}({})", interner.resolve(*func), a.join(", "))
         }
+        Op::FuncAddr(func) => format!("func_addr {}", interner.resolve(*func)),
     }
 }
 
