@@ -199,16 +199,15 @@ impl Emitter<'_> {
                 )
             }
             Op::Call { func, args } => {
-                let ret = self.ty(inst.result.unwrap_or(ValueId(u32::MAX)));
+                // A void call (e.g. the `print` intrinsic) has no result value to type.
+                let ret_ty = match inst.result {
+                    Some(r) => self.ty(r),
+                    None => "void".to_string(),
+                };
                 let argstr: Vec<String> = args
                     .iter()
                     .map(|a| format!("{} {}", self.ty(*a), self.operand(*a)))
                     .collect();
-                let ret_ty = if inst.result.is_some() {
-                    ret
-                } else {
-                    "void".to_string()
-                };
                 format!(
                     "{res}call {ret_ty} @{}({})",
                     self.interner.resolve(*func),
@@ -359,5 +358,13 @@ mod tests {
         assert!(out.contains("br i1"), "{out}");
         assert!(out.contains("call i32 @fib"), "{out}");
         assert!(out.contains("alloca i32"), "{out}");
+    }
+
+    #[test]
+    fn emits_void_call_for_print_intrinsic() {
+        // A void call (no result) must emit `call void @print(...)`, not panic on a missing
+        // result type (regression for indexing value_types with a dummy id).
+        let out = ir("fn main() -> i32 { print(42); return 0; }");
+        assert!(out.contains("call void @print(i32 42)"), "{out}");
     }
 }

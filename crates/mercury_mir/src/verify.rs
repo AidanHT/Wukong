@@ -96,11 +96,13 @@ impl Verifier<'_> {
     }
 
     fn check_op(&mut self, op: &Op, result: Option<ValueId>) {
-        let produces = !matches!(op, Op::Store { .. });
-        if produces && result.is_none() {
+        // `Store` never produces a result; `Call` may be void (e.g. the `print` intrinsic) or
+        // value-producing. Every other op must produce exactly one result.
+        let must_produce = !matches!(op, Op::Store { .. } | Op::Call { .. });
+        if must_produce && result.is_none() {
             self.err(format!("operation {op:?} must produce a result value"));
         }
-        if !produces && result.is_some() {
+        if matches!(op, Op::Store { .. }) && result.is_some() {
             self.err("Store must not produce a result value".to_string());
         }
 
