@@ -77,8 +77,7 @@ fn check_program(path: &Path) {
     }
 }
 
-#[test]
-fn run_suite() {
+fn collect_programs() -> Vec<PathBuf> {
     let dir = run_dir();
     let mut programs: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
@@ -87,9 +86,42 @@ fn run_suite() {
         .collect();
     programs.sort();
     assert!(!programs.is_empty(), "no .mer programs found in {}", dir.display());
+    programs
+}
 
+#[test]
+fn run_suite() {
+    let programs = collect_programs();
     for p in &programs {
         check_program(p);
     }
     eprintln!("ran {} e2e program(s)", programs.len());
+}
+
+/// Differential hardening: optimization must never change observable behavior. For every program,
+/// running at -O0 and at -O1/-O2/-O3 must produce identical stdout and exit code.
+#[test]
+fn optimization_is_observationally_invariant() {
+    for p in &collect_programs() {
+        let base = run_at(p, "-O0");
+        for level in ["-O1", "-O2", "-O3"] {
+            let other = run_at(p, level);
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert_eq!(
+                base, other,
+                "{name}: {level} output differs from -O0\n-O0: {base:?}\n{level}: {other:?}"
+            );
+        }
+    }
+}
+
+/// Run a program at a given optimization level, returning (exit_code, stdout).
+fn run_at(path: &Path, opt: &str) -> (Option<i32>, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_mercuryc"))
+        .arg("--run")
+        .arg(opt)
+        .arg(path)
+        .output()
+        .expect("failed to spawn mercuryc");
+    (output.status.code(), String::from_utf8_lossy(&output.stdout).into_owned())
 }
