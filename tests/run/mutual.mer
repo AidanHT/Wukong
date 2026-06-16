@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+module tests.run.mutual
+
+/// Mutually recursive functions — `is_even`/`is_odd` call each other. Exercises forward references
+/// and deep call chains.
+fn is_even(n: i32) -> i32 {
+    if n == 0 {
+        return 1;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i32) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    return is_even(n - 1);
+}
+
+fn main() -> i32 {
+    print(is_even(10)); // 1
+    print(is_even(7)); // 0
+    print(is_odd(13)); // 1
+    return 0;
+}
