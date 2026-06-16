@@ -1602,9 +1602,14 @@ impl FnLowerer<'_> {
                 self.builder.build(MirType::I1, Op::Bin(BinOp::Or, l, r))
             }
             _ => {
+                let ty = self.expr_mir(e);
+                // Contract a float `x + y*z` into one fused multiply-add before falling back to a
+                // plain `Bin`.
+                if let Some(v) = self.try_contract_fma(op, lhs, rhs, &ty) {
+                    return v;
+                }
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
-                let ty = self.expr_mir(e);
                 // Coerce both operands to the result type so the `Bin` is well-typed (e.g. an
                 // `f32` literal added to an `f64` is promoted), matching the verifier's contract.
                 let lty = self.expr_mir(lhs);
@@ -1615,6 +1620,55 @@ impl FnLowerer<'_> {
                 self.builder.build(ty, Op::Bin(bin, l, r))
             }
         }
+    }
+
+    /// Contract a float `x + y*z` (or `y*z + x`) into one fused multiply-add. FMA rounds once
+    /// instead of twice — faster (a single `vfmadd`) and more accurate — and the interpreter
+    /// mirrors it with `mul_add`, so the native and interpreter backends stay bit-identical.
+    /// Returns `None` when the shape or types don't permit it; the caller then emits a plain add.
+    fn try_contract_fma(
+        &mut self,
+        op: ast::BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        ty: &MirType,
+    ) -> Option<ValueId> {
+        if op != ast::BinOp::Add || !ty.is_float() {
+            return None;
+        }
+        // A local `fn` (not a closure) so the borrow of the returned sub-exprs ties to the
+        // argument's lifetime rather than a single inferred one.
+        fn as_fmul(e: &Expr) -> Option<(&Expr, &Expr)> {
+            match &e.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Mul,
+                    lhs,
+                    rhs,
+                } => Some((lhs.as_ref(), rhs.as_ref())),
+                _ => None,
+            }
+        }
+        // Lower operands in source order so any side effects keep their original sequencing.
+        if let Some((y, z)) = as_fmul(lhs) {
+            let yv = self.lower_fma_operand(y, ty);
+            let zv = self.lower_fma_operand(z, ty);
+            let xv = self.lower_fma_operand(rhs, ty);
+            return Some(self.builder.build(ty.clone(), Op::Fma(yv, zv, xv)));
+        }
+        if let Some((y, z)) = as_fmul(rhs) {
+            let xv = self.lower_fma_operand(lhs, ty);
+            let yv = self.lower_fma_operand(y, ty);
+            let zv = self.lower_fma_operand(z, ty);
+            return Some(self.builder.build(ty.clone(), Op::Fma(yv, zv, xv)));
+        }
+        None
+    }
+
+    /// Lower an FMA operand and coerce it to the (float) result type.
+    fn lower_fma_operand(&mut self, e: &Expr, ty: &MirType) -> ValueId {
+        let v = self.lower_expr(e);
+        let ety = self.expr_mir(e);
+        self.coerce_to(v, &ety, ty, self.signed(e))
     }
 
     /// Insert a numeric cast so `v` (currently `from`) has type `to`. Non-numeric operands and

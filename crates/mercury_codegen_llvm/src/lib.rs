@@ -306,6 +306,21 @@ impl Emitter<'_> {
                     self.operand(*v),
                 )
             }
+            Op::Fma(a, b, c) => {
+                // `a*b + c`. Emitted as a `contract`-flagged mul/add pair so llc fuses it into a
+                // hardware FMA under `-ffp-contract=fast` — no module-level intrinsic `declare`
+                // needed. (This text-IR path is not the differential oracle; Cranelift is.)
+                let r = inst.result.unwrap();
+                let ty = self.ty(r);
+                format!(
+                    "%v{0}.m = fmul contract {ty} {1}, {2}\n  \
+                     {res}fadd contract {ty} %v{0}.m, {3}",
+                    r.0,
+                    self.operand(*a),
+                    self.operand(*b),
+                    self.operand(*c),
+                )
+            }
         };
         let _ = writeln!(out, "  {line}");
     }

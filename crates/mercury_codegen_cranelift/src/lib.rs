@@ -391,6 +391,14 @@ impl<'a> FnTranslator<'a> {
                 let x = self.val(*v);
                 self.builder.ins().splat(vec_ty, x)
             }
+            // Fused multiply-add: Cranelift `fma(a, b, c)` is `a*b + c` with one rounding, lowering
+            // to a hardware `vfmadd` (scalar or 128-bit vector) on FMA3 hosts.
+            Op::Fma(a, b, c) => {
+                let av = self.val(*a);
+                let bv = self.val(*b);
+                let cvv = self.val(*c);
+                self.builder.ins().fma(av, bv, cvv)
+            }
         };
         if let Some(r) = res {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's

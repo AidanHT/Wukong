@@ -262,6 +262,45 @@ fn float_modulo() {
     }
 }
 
+/// Float `x + y*z` contracts to a fused multiply-add. This is the go/no-go check that the native
+/// `fma` and the interpreter's `mul_add` agree *bit for bit* on this host (true only with hardware
+/// FMA3) — the whole contraction rests on it. Also confirms the contraction actually fired in MIR
+/// and that a rounding-sensitive case (where one rounding ≠ two roundings) still matches.
+#[test]
+fn fma_contraction_is_bit_exact() {
+    // (a) The front-end emitted an `fma`, not a separate `fmul`/`fadd`.
+    let (prog, interner) = lowered(
+        "fn main() -> i32 { let a: f32 = 2.0; let b: f32 = 3.0; let c: f32 = 4.0; \
+         return (a + b * c) as i32; }",
+        0,
+    );
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(mir.contains("fma "), "x + y*z should contract to fma:\n{mir}");
+    // 2 + 3*4 = 14.
+    assert_eq!(
+        jit_ok("fn main() -> i32 { let a: f32 = 2.0; let b: f32 = 3.0; let c: f32 = 4.0; return (a + b * c) as i32; }").0,
+        14
+    );
+
+    // (b) Differential interp-vs-native across opt levels, including a rounding-sensitive f32 case:
+    // 16777217 = 2^24 + 1 is not representable in f32, so `huge*huge` rounds; the fused form keeps
+    // the residual that the unfused form drops. Both backends must still produce identical bytes.
+    for src in [
+        "fn main() -> i32 { let a: f32 = 1.0; let b: f32 = 0.1; let c: f32 = 0.2; print(a + b * c); return 0; }",
+        "fn main() -> i32 { let h: f32 = 16777217.0; let n: f32 = -281474976710656.0; print(n + h * h); return 0; }",
+        "fn main() -> i32 { let a: f64 = 1.0; let b: f64 = 0.1; let c: f64 = 0.2; print(b * c + a); return 0; }",
+        "fn main() -> i32 { let a: f64 = 3.0; let b: f64 = 7.0; let c: f64 = 11.0; print(a * b + c); return 0; }",
+    ] {
+        for opt in [0u8, 1, 2, 3] {
+            assert_eq!(
+                jit(src, opt).unwrap(),
+                interp(src, opt).unwrap(),
+                "fma mismatch at -O{opt} for {src:?}"
+            );
+        }
+    }
+}
+
 /// Operator fusion: two adjacent same-range elementwise loops (a linear map then ReLU) must fuse
 /// into one loop. Since fusion concatenates the exact statements, the two-loop form lowers to the
 /// *same* MIR as the hand-written single loop — an exact structural check — and stays correct.
