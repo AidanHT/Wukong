@@ -163,6 +163,7 @@ fn lower_fn(
         loops: Vec::new(),
         sgemm,
         sgemm_par,
+        vec_loads: HashMap::new(),
     };
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
@@ -239,6 +240,7 @@ fn lower_parallel(
             loops: Vec::new(),
             sgemm,
             sgemm_par,
+            vec_loads: HashMap::new(),
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -283,6 +285,7 @@ fn lower_parallel(
             loops: Vec::new(),
             sgemm,
             sgemm_par,
+            vec_loads: HashMap::new(),
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -343,6 +346,10 @@ struct FnLowerer<'a> {
     /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
     sgemm: Symbol,
     sgemm_par: Symbol,
+    /// Within one vectorized loop-body copy, the vector already loaded for an index expression
+    /// (keyed by its canonical text), so `x[i]` read twice (e.g. relu's `if x[i]>0 {x[i]}`) loads
+    /// once. Cleared between unroll copies (addresses differ) and after any store (avoid staleness).
+    vec_loads: HashMap<String, ValueId>,
 }
 
 impl FnLowerer<'_> {
@@ -1111,6 +1118,8 @@ impl FnLowerer<'_> {
             self.builder.build_void(Op::Store { ptr: jtmp, value: ju });
             self.bind(j, jtmp, ity.clone());
             let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+            // Each unroll copy reads different addresses (jbase + u*W), so the load cache is per-copy.
+            self.vec_loads.clear();
             for s in &body.stmts {
                 self.vec_lower_stmt(s, j, lane, vty, w, &mut vlocals);
             }
@@ -1308,6 +1317,8 @@ impl FnLowerer<'_> {
             let acc_slot = accs[u as usize];
             let cur = self.builder.build(vty.clone(), Op::Load(acc_slot, vty.clone()));
             let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+            // Per-copy load cache (so `(x[i]-y[i])*(x[i]-y[i])` loads x[i],y[i] once each).
+            self.vec_loads.clear();
             let nv = self.vec_accumulate(cur, addend, j, lane, vty, w, &mut vlocals);
             self.builder.build_void(Op::Store {
                 ptr: acc_slot,
@@ -1479,6 +1490,8 @@ impl FnLowerer<'_> {
                             ptr: addr,
                             value: stored,
                         });
+                        // A store may invalidate any cached load (conservatively, all of them).
+                        self.vec_loads.clear();
                     }
                     _ => unreachable!("vec_lower_stmt on unvalidated target"),
                 }
@@ -1503,14 +1516,27 @@ impl FnLowerer<'_> {
                 vlocals[&p.first().sym]
             }
             ExprKind::Index { base, indices } if indices.len() == 1 => {
+                // Reuse a vector already loaded for this exact index in the current body copy: a
+                // body like relu's `if x[i] > 0 { x[i] } else { 0 }` reads x[i] twice; without this
+                // it loads twice (50% extra memory traffic), since loads aren't CSE'd (alias-unsafe).
+                let key = load_key(base, &indices[0], self.interner);
+                if let Some(k) = &key {
+                    if let Some(&cached) = self.vec_loads.get(k) {
+                        return cached;
+                    }
+                }
                 let addr = self.vec_elem_addr(base, &indices[0], lane);
-                if affine_stride(&indices[0], j) == Some(1) {
+                let v = if affine_stride(&indices[0], j) == Some(1) {
                     self.builder.build(vty.clone(), Op::Load(addr, vty.clone()))
                 } else {
                     // invariant in j: load one scalar and broadcast.
                     let scalar = self.builder.build(lane.clone(), Op::Load(addr, lane.clone()));
                     self.builder.build(vty.clone(), Op::Splat(scalar))
+                };
+                if let Some(k) = key {
+                    self.vec_loads.insert(k, v);
                 }
+                v
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 // Contract a float `x + y*z` into one lane-wise fused multiply-add — this is the
@@ -2452,6 +2478,32 @@ struct MatmulNest {
     beta: i64,
 }
 
+/// Canonical text of an affine index/base expression (paths, ints, `+`/`-`/`*`, casts), used to key
+/// the vectorizer's per-body load cache. `None` for anything outside that subset (not cached).
+fn index_canon(e: &Expr, interner: &Interner) -> Option<String> {
+    match &e.kind {
+        ExprKind::Path(p) if p.is_single() => Some(interner.resolve(p.first().sym).to_string()),
+        ExprKind::Int(s) => Some(interner.resolve(*s).to_string()),
+        ExprKind::Binary { op, lhs, rhs } => Some(format!(
+            "({} {} {})",
+            index_canon(lhs, interner)?,
+            op.glyph(),
+            index_canon(rhs, interner)?
+        )),
+        ExprKind::Cast { expr, .. } => index_canon(expr, interner),
+        _ => None,
+    }
+}
+
+/// A cache key identifying the memory a `base[index]` read touches (`base` is a single path).
+fn load_key(base: &Expr, index: &Expr, interner: &Interner) -> Option<String> {
+    Some(format!(
+        "{}[{}]",
+        index_canon(base, interner)?,
+        index_canon(index, interner)?
+    ))
+}
+
 /// A non-negative integer literal.
 fn as_int_lit(e: &Expr, interner: &Interner) -> Option<i64> {
     match &e.kind {
@@ -2737,6 +2789,7 @@ fn lower_matmul_fn(
         loops: Vec::new(),
         sgemm,
         sgemm_par,
+        vec_loads: HashMap::new(),
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
