@@ -244,6 +244,58 @@ fn vectorized_relu_is_correct() {
     }
 }
 
+/// Operator fusion: two adjacent same-range elementwise loops (a linear map then ReLU) must fuse
+/// into one loop. Since fusion concatenates the exact statements, the two-loop form lowers to the
+/// *same* MIR as the hand-written single loop — an exact structural check — and stays correct.
+#[test]
+fn fusion_collapses_adjacent_loops() {
+    let prelude = |n: usize| {
+        format!(
+            "let mut x: [f32; {n}] = [0.0; {n}]; let mut t: [f32; {n}] = [0.0; {n}]; \
+             let mut o: [f32; {n}] = [0.0; {n}]; let mut i: i32 = 0; \
+             while i < {n} {{ x[i] = ((i - {n}/2) as f32); i += 1; }} "
+        )
+    };
+    let epilogue = |n: usize| {
+        format!(
+            " let mut s: f32 = 0.0; let mut j: i32 = 0; while j < {n} {{ s = s + o[j]; j += 1; }} return s as i32;"
+        )
+    };
+    let n = 100usize;
+    let two = format!(
+        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = 2.0 * x[k] + 1.0; }} \
+         for k in 0..{n} {{ o[k] = if t[k] > 0.0 {{ t[k] }} else {{ 0.0 }}; }}{} }}",
+        prelude(n),
+        epilogue(n)
+    );
+    let one = format!(
+        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = 2.0 * x[k] + 1.0; \
+         o[k] = if t[k] > 0.0 {{ t[k] }} else {{ 0.0 }}; }}{} }}",
+        prelude(n),
+        epilogue(n)
+    );
+
+    let count_ops = |src: &str| -> usize {
+        let (p, _) = lowered(src, 3);
+        p.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .map(|b| b.insts.len() + 1)
+            .sum()
+    };
+    // Fusion rewrites the two-loop form into the one-loop form before lowering ⇒ identical MIR.
+    assert_eq!(
+        count_ops(&two),
+        count_ops(&one),
+        "two adjacent loops should fuse to the same MIR as one combined loop"
+    );
+
+    // sum of relu(2*(k-50)+1) over k in 0..100 = sum of the first 50 positive odd numbers = 2500.
+    let native = jit(&two, 3).expect("jit");
+    assert_eq!(native, interp(&two, 3).expect("interp"), "fused native vs interp");
+    assert_eq!(native.0, 2500);
+}
+
 /// Nested if-conversion: relu6 `clamp(x, 0, 6)` written as nested value-ifs must vectorize (nested
 /// vector blends) and stay correct. Exercises the recursive `else`/`then` handling in the vectorizer.
 #[test]

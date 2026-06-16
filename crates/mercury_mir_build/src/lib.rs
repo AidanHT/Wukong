@@ -382,11 +382,21 @@ impl FnLowerer<'_> {
 
     fn lower_block(&mut self, b: &Block) -> Option<ValueId> {
         self.push_scope();
-        for s in &b.stmts {
+        let mut i = 0;
+        while i < b.stmts.len() {
             if self.terminated {
                 break;
             }
-            self.lower_stmt(s);
+            // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
+            // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
+            // intermediate array through registers, cutting its memory traffic).
+            match self.try_fuse_run(&b.stmts[i..]) {
+                Some(n) => i += n,
+                None => {
+                    self.lower_stmt(&b.stmts[i]);
+                    i += 1;
+                }
+            }
         }
         let tail = match &b.tail {
             Some(e) if !self.terminated => Some(self.lower_expr(e)),
@@ -394,6 +404,51 @@ impl FnLowerer<'_> {
         };
         self.pop_scope();
         tail
+    }
+
+    /// If `stmts` begins with two or more adjacent `for` loops over the *identical* range whose
+    /// concatenated body the vectorizer accepts, lower them as a single fused loop and return how
+    /// many statements were consumed. The vectorizer's "no written array touched at a second index"
+    /// rule, applied to the fused body, is exactly the condition that makes fusion dependence-safe,
+    /// so a successful check both authorizes and SIMD-accelerates the fusion. Returns `None`
+    /// otherwise (and the caller lowers the first statement normally).
+    fn try_fuse_run(&mut self, stmts: &[Stmt]) -> Option<usize> {
+        let (pat0, iter0, _) = fusable_for(&stmts[0])?;
+        let var = match &pat0.kind {
+            ast::PatKind::Ident(s) => *s,
+            _ => return None,
+        };
+        let (start0, end0) = range_bounds(iter0)?;
+        // Maximal run of for-loops over the identical (var, start, end).
+        let mut run = 1;
+        while run < stmts.len() {
+            match fusable_for(&stmts[run]) {
+                Some((p, it, _)) => {
+                    let same = matches!(&p.kind, ast::PatKind::Ident(s) if *s == var)
+                        && range_bounds(it).is_some_and(|(s, e)| {
+                            exprs_struct_eq(s, start0) && exprs_struct_eq(e, end0)
+                        });
+                    if same {
+                        run += 1;
+                    } else {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if run < 2 {
+            return None;
+        }
+        // Fuse the longest dependence-safe (vectorizable) prefix of length >= 2.
+        for m in (2..=run).rev() {
+            let fused = fuse_for_bodies(&stmts[..m]);
+            if self.vectorizable(&fused, var).is_some() {
+                self.lower_for(pat0, iter0, &fused);
+                return Some(m);
+            }
+        }
+        None
     }
 
     fn lower_stmt(&mut self, s: &Stmt) {
@@ -1930,6 +1985,63 @@ fn mask_lane_type(lane: &MirType) -> MirType {
     match lane {
         MirType::F64 | MirType::I64 => MirType::I64,
         _ => MirType::I32,
+    }
+}
+
+/// A `for v in a..b { body }` over a half-open, unit-step range with an identifier binding — the
+/// shape eligible for fusion. Returns `(pattern, iter, body)`.
+fn fusable_for(s: &Stmt) -> Option<(&Pattern, &ForIter, &Block)> {
+    if let StmtKind::For { pat, iter, body, .. } = &s.kind {
+        if matches!(&pat.kind, ast::PatKind::Ident(_))
+            && matches!(
+                iter,
+                ForIter::Range {
+                    end: Some(_),
+                    inclusive: false,
+                    step: None,
+                    ..
+                }
+            )
+        {
+            return Some((pat, iter, body));
+        }
+    }
+    None
+}
+
+/// The `(start, end)` expressions of a half-open range iterator.
+fn range_bounds(iter: &ForIter) -> Option<(&Expr, &Expr)> {
+    match iter {
+        ForIter::Range {
+            start,
+            end: Some(end),
+            ..
+        } => Some((start, end)),
+        _ => None,
+    }
+}
+
+/// Concatenate the bodies of a run of `for` statements into one block (statements cloned; their
+/// `NodeId`s are preserved so sema type lookups still resolve). The wrapper block reuses the first
+/// body's id/span, which are not used for typing.
+fn fuse_for_bodies(stmts: &[Stmt]) -> Block {
+    let mut fused = Vec::new();
+    let mut id = None;
+    let mut span = None;
+    for s in stmts {
+        if let StmtKind::For { body, .. } = &s.kind {
+            if id.is_none() {
+                id = Some(body.id);
+                span = Some(body.span);
+            }
+            fused.extend(body.stmts.iter().cloned());
+        }
+    }
+    Block {
+        id: id.unwrap(),
+        stmts: fused,
+        tail: None,
+        span: span.unwrap(),
     }
 }
 
