@@ -14,7 +14,8 @@ USAGE:
 OPTIONS:
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, mir-high, mir, llvm-ir, obj, exe  (default: exe)
-    --run              Compile and run via the built-in interpreter
+    --run              Compile and run (interpreter by default; see --backend)
+    --backend=<b>      Execution backend: interp, native  (default: interp)
     -o <path>          Write output to <path>
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
@@ -83,6 +84,18 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "--run" => opts.run = true,
+            _ if arg.starts_with("--backend=") => {
+                let b = &arg["--backend=".len()..];
+                opts.backend = match b {
+                    "interp" | "interpreter" => mercury_driver::BackendKind::Interp,
+                    "native" | "cranelift" => mercury_driver::BackendKind::Native,
+                    other => {
+                        return Err(format!(
+                            "unknown --backend value `{other}` (expected interp or native)"
+                        ))
+                    }
+                };
+            }
             "-O0" => opts.opt_level = 0,
             "-O1" => opts.opt_level = 1,
             "-O2" => opts.opt_level = 2,
