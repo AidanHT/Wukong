@@ -59,9 +59,11 @@ pub unsafe extern "C" fn mercury_sgemm(
     sgemm_scalar(a, b, c, m, k, n, beta);
 }
 
-/// Multi-threaded `C = A·B`: split the M dimension into row bands, each band an independent GEMM
-/// over the shared `B`. Embarrassingly parallel (disjoint C rows), good locality (B reused within a
-/// band's own cache blocking). Pack scratch is per-thread.
+/// Multi-threaded `C = A·B`. For each `KC` contraction block it packs the *whole* A column-panel and
+/// B row-panel once (shared, read-only), then runs every `MR×NR` register tile of the C grid in
+/// parallel. Per-(i,j) accumulation order is identical to [`mercury_sgemm`], so the two agree
+/// bit-for-bit (the interpreter oracle calls the serial one for both). Packing is shared, not
+/// re-done per worker, so it scales to high core counts.
 ///
 /// # Safety
 /// Same contract as [`mercury_sgemm`].
@@ -75,39 +77,77 @@ pub unsafe extern "C" fn mercury_sgemm_parallel(
     n: i64,
     beta: i64,
 ) {
-    use rayon::prelude::*;
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
-    // One band per worker (at least MR rows so the microkernel stays full), capped at the row count.
-    let workers = rayon::current_num_threads().max(1);
-    let band = round_up(mu.div_ceil(workers).max(MR), MR);
-    let nbands = mu.div_ceil(band);
-    let a_addr = a as usize;
-    let b_addr = b as usize;
-    let c_addr = c as usize;
-    (0..nbands).into_par_iter().for_each(|w| {
-        let i0 = w * band;
-        if i0 >= mu {
+    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let beta = beta as f32;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: features checked; dims validated.
+            unsafe { sgemm_avx2_parallel(a, b, c, m, k, n, beta) };
             return;
         }
-        let rows = (mu - i0).min(band);
-        // SAFETY: bands address disjoint A/C row ranges; B is shared read-only.
-        unsafe {
-            let a_sub = (a_addr as *const f32).add(i0 * ku);
-            let c_sub = (c_addr as *mut f32).add(i0 * nu);
-            mercury_sgemm(
-                a_sub,
-                b_addr as *const f32,
-                c_sub,
-                rows as i64,
-                k,
-                n,
-                beta,
-            );
+    }
+    sgemm_scalar(a, b, c, m, k, n, beta);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sgemm_avx2_parallel(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+) {
+    use rayon::prelude::*;
+    let mut jc = 0;
+    while jc < n {
+        let nc = (n - jc).min(NC);
+        let mut pc = 0;
+        while pc < k {
+            let kc = (k - pc).min(KC);
+            let beta_eff = if pc == 0 { beta } else { 1.0 };
+            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) once.
+            let mut ap = vec![0.0f32; round_up(m, MR) * kc];
+            let mut bp = vec![0.0f32; round_up(nc, NR) * kc];
+            pack_a(a.add(pc), k, m, kc, ap.as_mut_ptr());
+            pack_b(b.add(pc * n + jc), n, kc, nc, bp.as_mut_ptr());
+
+            let mpanels = m.div_ceil(MR);
+            let npanels = nc.div_ceil(NR);
+            let (ap_addr, bp_addr, c_addr) =
+                (ap.as_ptr() as usize, bp.as_ptr() as usize, c as usize);
+            // Run every C register tile in parallel; tiles write disjoint C, read shared packs.
+            (0..mpanels * npanels).into_par_iter().for_each(|t| {
+                let ip = t / npanels;
+                let jp = t % npanels;
+                let i0 = ip * MR;
+                let j0 = jp * NR;
+                let mrv = (m - i0).min(MR);
+                let nrv = (nc - j0).min(NR);
+                // SAFETY: disjoint C tile; shared read-only packed panels; avx2 verified above.
+                unsafe {
+                    micro_6x16(
+                        kc,
+                        (ap_addr as *const f32).add(ip * kc * MR),
+                        (bp_addr as *const f32).add(jp * kc * NR),
+                        (c_addr as *mut f32).add(i0 * n + (jc + j0)),
+                        n,
+                        beta_eff,
+                        mrv,
+                        nrv,
+                    );
+                }
+            });
+            pc += KC;
         }
-    });
+        jc += NC;
+    }
 }
 
 /// Portable reference: a straight `ikj` triple loop. Correct for any target; also the small-/odd-
