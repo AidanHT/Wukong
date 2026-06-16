@@ -703,6 +703,45 @@ fn matmul_nest_lowers_to_sgemm() {
     assert!(!lowered_calls(not_mm, "mercury_sgemm"), "transposed-B is not a row-major matmul");
 }
 
+/// The nn.Linear form `C = A·Bᵀ` (B indexed `[j*K+k]`) must lower to `mercury_sgemm_nt`, run
+/// correctly, and stay native==interp. A plain `C = A·B` must NOT pick the transposed kernel.
+#[test]
+fn linear_nt_matmul_lowers_and_runs() {
+    let nt = |attr: &str| {
+        format!(
+            "module m\n{attr}fn lin(a:[f32;48],b:[f32;32],c:[f32;24]) {{ \
+             for i in 0..6 {{ for j0 in 0..4 {{ c[i*4+j0] = 0.0; }} \
+             for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
+             for j in 0..4 {{ c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; }} }} }} }}"
+        )
+    };
+    assert!(lowered_calls(&nt(""), "mercury_sgemm_nt"), "A·Bᵀ -> sgemm_nt");
+    assert!(
+        lowered_calls(&nt("@parallel\n"), "mercury_sgemm_nt_parallel"),
+        "@parallel A·Bᵀ -> sgemm_nt_parallel"
+    );
+    // C=A·B (b indexed [k*4+j]) must use the non-transposed kernel, never the nt one.
+    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+        for i in 0..6 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
+        for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[k*4+j]; } } } }";
+    assert!(lowered_calls(normal, "mercury_sgemm"), "C=A·B -> sgemm");
+    assert!(!lowered_calls(normal, "mercury_sgemm_nt"), "C=A·B is not transposed");
+
+    // End to end: A is 6x8, B is 4x8 (so Bᵀ is 8x4), C is 6x4. Native must equal interp.
+    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+        for i in 0..6 { for j0 in 0..4 { c[i*4+j0] = 0.0; } \
+        for k in 0..8 { let aik: f32 = a[i*8+k]; \
+        for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; } } } }\n\
+        fn main() -> i32 { let mut a:[f32;48]=[0.0;48]; let mut b:[f32;32]=[0.0;32]; \
+        let mut c:[f32;24]=[0.0;24]; let mut i: i32 = 0; \
+        while i < 48 { a[i] = ((i % 5) as f32) * 0.25; i += 1; } \
+        let mut j: i32 = 0; while j < 32 { b[j] = ((j % 7) as f32) - 2.0; j += 1; } \
+        lin(a, b, c); let mut s: f32 = 0.0; let mut t: i32 = 0; \
+        while t < 24 { s = s + c[t]; t += 1; } return (s * 1000.0) as i32; }";
+    assert!(lowered_calls(src, "mercury_sgemm_nt"));
+    assert_eq!(jit(src, 3).expect("jit"), interp(src, 3).expect("interp"));
+}
+
 /// The zero-init (beta = 0) matmul, end to end: native and interpreter agree bit-for-bit (both run
 /// the same kernel) and match an independent reference.
 #[test]

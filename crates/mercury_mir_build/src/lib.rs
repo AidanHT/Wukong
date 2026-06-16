@@ -33,8 +33,12 @@ pub fn lower_program(
     let mut diags = Vec::new();
     let mut program = Program::new();
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
-    let sgemm = interner.intern("mercury_sgemm");
-    let sgemm_par = interner.intern("mercury_sgemm_parallel");
+    let gemm = GemmSyms {
+        mm: interner.intern("mercury_sgemm"),
+        mm_par: interner.intern("mercury_sgemm_parallel"),
+        nt: interner.intern("mercury_sgemm_nt"),
+        nt_par: interner.intern("mercury_sgemm_nt_parallel"),
+    };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -42,9 +46,8 @@ pub fn lower_program(
                 // `mercury_sgemm` call — the tuned 256-bit AVX2/FMA microkernel.
                 if let Some(nest) = matmul_fn(body, sema, interner) {
                     let parallel = has_parallel_attr(item, interner);
-                    let func = lower_matmul_fn(
-                        f, &nest, parallel, sema, interner, sgemm, sgemm_par, &mut diags,
-                    );
+                    let func =
+                        lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -58,15 +61,15 @@ pub fn lower_program(
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("mercury_parallel_for");
                         let (outlined, wrapper) = lower_parallel(
-                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, sgemm,
-                            sgemm_par, &mut diags,
+                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, gemm,
+                            &mut diags,
                         );
                         program.funcs.push(outlined);
                         program.funcs.push(wrapper);
                         continue;
                     }
                 }
-                let func = lower_fn(f, body, sema, interner, sgemm, sgemm_par, &mut diags);
+                let func = lower_fn(f, body, sema, interner, gemm, &mut diags);
                 program.funcs.push(func);
             }
         }
@@ -142,8 +145,7 @@ fn lower_fn(
     body: &Block,
     sema: &SemaResult,
     interner: &Interner,
-    sgemm: Symbol,
-    sgemm_par: Symbol,
+    gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
 ) -> Function {
     // Recover the resolved signature for parameter/return types.
@@ -161,8 +163,7 @@ fn lower_fn(
         scopes: vec![HashMap::new()],
         terminated: false,
         loops: Vec::new(),
-        sgemm,
-        sgemm_par,
+        gemm,
         vec_loads: HashMap::new(),
     };
 
@@ -214,8 +215,7 @@ fn lower_parallel(
     loop_body: &Block,
     sema: &SemaResult,
     interner: &Interner,
-    sgemm: Symbol,
-    sgemm_par: Symbol,
+    gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
 ) -> (Function, Function) {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -238,8 +238,7 @@ fn lower_parallel(
             scopes: vec![HashMap::new()],
             terminated: false,
             loops: Vec::new(),
-            sgemm,
-            sgemm_par,
+            gemm,
             vec_loads: HashMap::new(),
         };
         let start = fl.builder.add_param(MirType::I64);
@@ -283,8 +282,7 @@ fn lower_parallel(
             scopes: vec![HashMap::new()],
             terminated: false,
             loops: Vec::new(),
-            sgemm,
-            sgemm_par,
+            gemm,
             vec_loads: HashMap::new(),
         };
         let param_vals: Vec<ValueId> = param_tys
@@ -334,6 +332,16 @@ fn lower_parallel(
     (outlined, wrapper)
 }
 
+/// The four GEMM runtime entry points the matmul recognizer dispatches to: `C = A·B` and the
+/// `nn.Linear` form `C = A·Bᵀ`, each serial or `@parallel`.
+#[derive(Clone, Copy)]
+struct GemmSyms {
+    mm: Symbol,
+    mm_par: Symbol,
+    nt: Symbol,
+    nt_par: Symbol,
+}
+
 struct FnLowerer<'a> {
     builder: Builder,
     sema: &'a SemaResult,
@@ -344,8 +352,7 @@ struct FnLowerer<'a> {
     /// (continue target, break target) for the innermost loops.
     loops: Vec<(mercury_mir::BlockId, mercury_mir::BlockId)>,
     /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
-    sgemm: Symbol,
-    sgemm_par: Symbol,
+    gemm: GemmSyms,
     /// Within one vectorized loop-body copy, the vector already loaded for an index expression
     /// (keyed by its canonical text), so `x[i]` read twice (e.g. relu's `if x[i]>0 {x[i]}`) loads
     /// once. Cleared between unroll copies (addresses differ) and after any store (avoid staleness).
@@ -642,7 +649,12 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
-        let func = if parallel { self.sgemm_par } else { self.sgemm };
+        let func = match (parallel, nest.transposed) {
+            (false, false) => self.gemm.mm,
+            (true, false) => self.gemm.mm_par,
+            (false, true) => self.gemm.nt,
+            (true, true) => self.gemm.nt_par,
+        };
         self.builder.build_void(Op::Call {
             func,
             args: vec![a, b, c, m, k, n, beta],
@@ -2466,7 +2478,8 @@ fn set_or_check(slot: &mut Option<MirType>, t: &MirType) -> Option<()> {
 // the tuned `mercury_sgemm` microkernel (true 256-bit AVX2/FMA) — exactly how XLA/TVM/oneDNN lower a
 // matmul op. The interpreter runs the identical kernel via marshalling, so the two stay bit-exact.
 
-/// A recognized GEMM nest computing `C[m,n] = A[m,k]·B[k,n]` (row-major, contiguous, f32).
+/// A recognized GEMM nest computing `C[m,n] = A[m,k]·B[k,n]` (row-major, contiguous, f32), or its
+/// `nn.Linear` transpose `C[m,n] = A[m,k]·B[n,k]ᵀ` when `transposed`.
 struct MatmulNest {
     a: Symbol,
     b: Symbol,
@@ -2476,6 +2489,8 @@ struct MatmulNest {
     n: i64,
     /// 0 = overwrite C (a zero-init loop was present), 1 = accumulate into C.
     beta: i64,
+    /// `true` for `C = A·Bᵀ` (B indexed `[j,k]` instead of `[k,j]`).
+    transposed: bool,
 }
 
 /// Canonical text of an affine index/base expression (paths, ints, `+`/`-`/`*`, casts), used to key
@@ -2717,16 +2732,19 @@ fn match_matmul(
             None
         }
     };
-    let is_b = |f: &Expr| -> Option<(Symbol, i64)> {
+    // B is either `B[k*N + j]` (normal, C=A·B) or `B[j*K + k]` (transposed, the nn.Linear C=A·Bᵀ).
+    let is_b = |f: &Expr| -> Option<(Symbol, i64, bool)> {
         let (bbase, bidx) = as_index1(f)?;
-        let (br, sb, bj) = match_row_col(bidx, interner)?;
-        if br == kvar && bj == jvar {
-            Some((bbase, sb))
+        let (br, sb, bc) = match_row_col(bidx, interner)?;
+        if br == kvar && bc == jvar {
+            Some((bbase, sb, false))
+        } else if br == jvar && bc == kvar {
+            Some((bbase, sb, true))
         } else {
             None
         }
     };
-    let ((a_sym, sa), (b_sym, sb)) = match (is_a(f1), is_b(f2)) {
+    let ((a_sym, sa), (b_sym, sb, transposed)) = match (is_a(f1), is_b(f2)) {
         (Some(a), Some(b)) => (a, b),
         _ => match (is_a(f2), is_b(f1)) {
             (Some(a), Some(b)) => (a, b),
@@ -2734,8 +2752,10 @@ fn match_matmul(
         },
     };
 
-    // Strides must describe contiguous row-major C[m,n], A[m,k], B[k,n].
-    if sa != kdim || sb != n || sc != n {
+    // Strides must describe contiguous row-major A[m,k] and C[m,n], and B[k,n] (normal) or B[n,k]
+    // (transposed) — i.e. B's contraction stride is N normally, K when transposed.
+    let sb_ok = if transposed { sb == kdim } else { sb == n };
+    if sa != kdim || !sb_ok || sc != n {
         return None;
     }
     if beta == 0 {
@@ -2747,7 +2767,7 @@ fn match_matmul(
     if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
         return None;
     }
-    Some(MatmulNest { a: a_sym, b: b_sym, c: cbase, m, k: kdim, n, beta })
+    Some(MatmulNest { a: a_sym, b: b_sym, c: cbase, m, k: kdim, n, beta, transposed })
 }
 
 /// Recognize a function whose entire body is a matmul nest (`{ for i in 0..M { … } }`).
@@ -2770,8 +2790,7 @@ fn lower_matmul_fn(
     parallel: bool,
     sema: &SemaResult,
     interner: &Interner,
-    sgemm: Symbol,
-    sgemm_par: Symbol,
+    gemm: GemmSyms,
     diags: &mut Vec<Diagnostic>,
 ) -> Function {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -2787,8 +2806,7 @@ fn lower_matmul_fn(
         scopes: vec![HashMap::new()],
         terminated: false,
         loops: Vec::new(),
-        sgemm,
-        sgemm_par,
+        gemm,
         vec_loads: HashMap::new(),
     };
     let param_vals: Vec<ValueId> = param_tys

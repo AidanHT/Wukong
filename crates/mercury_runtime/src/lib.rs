@@ -6,7 +6,9 @@
 //! tuned [`mercury_sgemm`] (the matmul microkernel the compiler lowers a matmul nest to).
 
 mod gemm;
-pub use gemm::{mercury_sgemm, mercury_sgemm_parallel};
+pub use gemm::{
+    mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_parallel, mercury_sgemm_parallel,
+};
 
 /// A bump (arena) allocator over an owned byte buffer. Allocation is a pointer bump; freeing is
 /// all-at-once via [`Arena::reset`]. This is the idiomatic allocator for kernel scratch space:
