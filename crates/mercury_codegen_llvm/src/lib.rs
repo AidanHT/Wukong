@@ -7,8 +7,10 @@
 //! inkwell builder; this implementation sits behind the shared [`Backend`] seam so it can be
 //! swapped later without touching the driver.
 //!
-//! Because the front-end emits alloca-based MIR (no block parameters), there are no phi nodes to
-//! generate — LLVM's own `mem2reg` promotes the slots during optimization.
+//! Mercury MIR uses block-parameter SSA (à la Cranelift/MLIR); LLVM uses phi nodes. The emitter
+//! bridges the two: each non-entry block parameter becomes a `phi` whose incoming values are the
+//! arguments each predecessor passes on its edge to that block. At `-O0` the front-end emits no
+//! block parameters, so no phis are generated; after `mem2reg` they appear and are lowered here.
 
 use std::fmt::Write as _;
 
@@ -18,6 +20,44 @@ use mercury_mir::{
 };
 use mercury_span::{Interner, Symbol};
 use std::collections::HashMap;
+
+/// For each block, the incoming edges as `(predecessor block id, arguments passed)`. Used to build
+/// phi nodes for block parameters.
+type EdgeArgs = HashMap<u32, Vec<(u32, Vec<ValueId>)>>;
+
+/// Collect, per target block, the arguments each predecessor passes along its edge.
+fn edge_args(f: &Function) -> EdgeArgs {
+    let mut map: EdgeArgs = HashMap::new();
+    for b in &f.blocks {
+        match &b.term {
+            Terminator::Br { target, args } => {
+                map.entry(target.0)
+                    .or_default()
+                    .push((b.id.0, args.clone()));
+            }
+            Terminator::CondBr {
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+                ..
+            } => {
+                map.entry(then_blk.0)
+                    .or_default()
+                    .push((b.id.0, then_args.clone()));
+                // A conditional branch with both arms to the same block is one LLVM predecessor;
+                // don't record a second, conflicting phi entry for it.
+                if else_blk.0 != then_blk.0 {
+                    map.entry(else_blk.0)
+                        .or_default()
+                        .push((b.id.0, else_args.clone()));
+                }
+            }
+            Terminator::Ret(_) | Terminator::Unreachable => {}
+        }
+    }
+    map
+}
 
 /// The LLVM backend. `compile` returns the emitted IR text in [`Artifact::Emitted`].
 pub struct LlvmBackend;
@@ -83,10 +123,12 @@ fn emit_function(out: &mut String, f: &Function, interner: &Interner) {
         params.join(", ")
     );
 
+    let edges = edge_args(f);
     let e = Emitter {
         f,
         interner,
         consts: &consts,
+        edges: &edges,
     };
     for b in &f.blocks {
         e.emit_block(out, b);
@@ -98,6 +140,7 @@ struct Emitter<'a> {
     f: &'a Function,
     interner: &'a Interner,
     consts: &'a HashMap<u32, String>,
+    edges: &'a EdgeArgs,
 }
 
 impl Emitter<'_> {
@@ -114,6 +157,11 @@ impl Emitter<'_> {
 
     fn emit_block(&self, out: &mut String, b: &BasicBlock) {
         let _ = writeln!(out, "bb{}:", b.id.0);
+        // Non-entry block parameters become phi nodes (entry parameters are the function's
+        // arguments, declared in the signature). Phis must lead the block.
+        if b.id != self.f.entry {
+            self.emit_phis(out, b);
+        }
         for inst in &b.insts {
             // Constants are inlined as operands; they emit no instruction.
             if matches!(inst.op, Op::ConstInt(..) | Op::ConstFloat(..)) {
@@ -122,6 +170,25 @@ impl Emitter<'_> {
             self.emit_inst(out, inst);
         }
         self.emit_term(out, &b.term);
+    }
+
+    fn emit_phis(&self, out: &mut String, b: &BasicBlock) {
+        if b.params.is_empty() {
+            return;
+        }
+        let preds = self.edges.get(&b.id.0);
+        for (k, param) in b.params.iter().enumerate() {
+            let ty = self.ty(*param);
+            let mut entries: Vec<String> = Vec::new();
+            if let Some(preds) = preds {
+                for (pred, args) in preds {
+                    if let Some(arg) = args.get(k) {
+                        entries.push(format!("[ {}, %bb{} ]", self.operand(*arg), pred));
+                    }
+                }
+            }
+            let _ = writeln!(out, "  %v{} = phi {ty} {}", param.0, entries.join(", "));
+        }
     }
 
     fn emit_inst(&self, out: &mut String, inst: &mercury_mir::Inst) {
@@ -335,11 +402,16 @@ mod tests {
     use mercury_span::SourceId;
 
     fn ir(src: &str) -> String {
+        ir_opt(src, 0)
+    }
+
+    fn ir_opt(src: &str, opt: u8) -> String {
         let mut interner = Interner::new();
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        mercury_opt::optimize(&mut program, opt);
         emit_llvm_ir(&program, &interner)
     }
 
@@ -367,5 +439,24 @@ mod tests {
         // result type (regression for indexing value_types with a dummy id).
         let out = ir("fn main() -> i32 { print(42); return 0; }");
         assert!(out.contains("call void @print(i32 42)"), "{out}");
+    }
+
+    #[test]
+    fn emits_phi_nodes_for_optimized_loops() {
+        // After mem2reg the loop carries its counter/accumulator as block parameters; the emitter
+        // must lower those to phi nodes with one entry per predecessor edge.
+        let out = ir_opt(
+            "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
+             while i < 10 { s = s + i; i = i + 1; } return s; }",
+            2,
+        );
+        assert!(out.contains("phi i32"), "expected phi nodes:\n{out}");
+        // Every phi should name its predecessor blocks.
+        assert!(out.contains("phi i32 [") && out.contains(", %bb"), "{out}");
+        // No leftover alloca: mem2reg promoted the scalars.
+        assert!(
+            !out.contains("alloca"),
+            "scalars should be promoted:\n{out}"
+        );
     }
 }

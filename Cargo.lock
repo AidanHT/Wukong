@@ -37,6 +37,7 @@ dependencies = [
  "mercury_backend",
  "mercury_mir",
  "mercury_mir_build",
+ "mercury_opt",
  "mercury_parser",
  "mercury_sema",
  "mercury_span",

@@ -23,8 +23,13 @@ fn mer_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn emit(path: &Path, stage: &str) -> (bool, String, String) {
+    emit_opt(path, stage, 0)
+}
+
+fn emit_opt(path: &Path, stage: &str, opt: u8) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_mercuryc"))
         .arg(format!("--emit={stage}"))
+        .arg(format!("-O{opt}"))
         .arg(path)
         .output()
         .expect("spawn mercuryc");
@@ -58,20 +63,25 @@ fn frontend_stages_succeed_for_all_sources() {
 #[test]
 fn lowering_stages_succeed_for_run_suite() {
     let dir = repo_root().join("tests").join("run");
+    // Exercise both unoptimized and fully optimized output: -O2 turns on mem2reg/LICM, so the MIR
+    // verifier (run under --emit=mir) and the phi-emitting LLVM-IR backend are checked on the
+    // optimized, block-parameter form too — not just the alloca-based -O0 form.
     for f in &mer_files(&dir) {
-        for stage in ["mir-high", "mir", "llvm-ir"] {
-            let (ok, stdout, stderr) = emit(f, stage);
-            let name = f.file_name().unwrap().to_string_lossy();
-            assert!(ok, "{name}: --emit={stage} failed:\n{stderr}");
-            assert!(
-                !stdout.trim().is_empty(),
-                "{name}: --emit={stage} produced no output"
-            );
-            // The MIR verifier prints internal-compiler-error lines to stderr; there must be none.
-            assert!(
-                !stderr.contains("internal compiler error"),
-                "{name}: --emit={stage} reported a verifier ICE:\n{stderr}"
-            );
+        for opt in [0u8, 2] {
+            for stage in ["mir-high", "mir", "llvm-ir"] {
+                let (ok, stdout, stderr) = emit_opt(f, stage, opt);
+                let name = f.file_name().unwrap().to_string_lossy();
+                assert!(ok, "{name}: --emit={stage} -O{opt} failed:\n{stderr}");
+                assert!(
+                    !stdout.trim().is_empty(),
+                    "{name}: --emit={stage} -O{opt} produced no output"
+                );
+                // The MIR verifier prints internal-compiler-error lines to stderr; there must be none.
+                assert!(
+                    !stderr.contains("internal compiler error"),
+                    "{name}: --emit={stage} -O{opt} reported a verifier ICE:\n{stderr}"
+                );
+            }
         }
     }
 }

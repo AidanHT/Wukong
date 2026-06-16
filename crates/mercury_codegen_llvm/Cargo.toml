@@ -16,3 +16,4 @@ mercury_backend = { workspace = true }
 mercury_parser = { workspace = true }
 mercury_sema = { workspace = true }
 mercury_mir_build = { workspace = true }
+mercury_opt = { workspace = true }
