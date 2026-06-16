@@ -143,3 +143,28 @@ fn differential_floats() {
         }
     }
 }
+
+/// `if`/`else` used as a value (block tail and `let`-bound), including a branchy ReLU loop.
+#[test]
+fn if_as_expression() {
+    // `let m = if a > b { a } else { b }` — value-producing if.
+    let max = "fn main() -> i32 { let a: i32 = 7; let b: i32 = 12; \
+               let m: i32 = if a > b { a } else { b }; return m; }";
+    assert_eq!(jit_ok(max).0, 12);
+
+    // if as the tail of a loop body (the relu shape that previously failed to lower).
+    let relu = "fn main() -> i32 { let mut xs: [i32; 6] = [-2, 5, -1, 3, 0, -4]; \
+                let mut i: i32 = 0; \
+                while i < 6 { let v: i32 = xs[i]; if v > 0 { xs[i] = v; } else { xs[i] = 0; } i += 1; } \
+                let mut s: i32 = 0; let mut j: i32 = 0; \
+                while j < 6 { s += xs[j]; j += 1; } return s; }";
+    // max(-2,0)+max(5,0)+... = 0+5+0+3+0+0 = 8
+    assert_eq!(jit_ok(relu).0, 8);
+
+    // Differential vs interpreter.
+    for src in [max, relu] {
+        for opt in [0u8, 1, 2, 3] {
+            assert_eq!(jit(src, opt).unwrap(), interp(src, opt).unwrap());
+        }
+    }
+}
