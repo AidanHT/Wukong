@@ -1,0 +1,28 @@
+module bench.primes
+
+/// Count primes below N by trial division — nested scalar loops with an early return. A classic
+/// branch-heavy integer workload.
+fn is_prime(x: i32) -> i32 {
+    if x < 2 {
+        return 0;
+    }
+    let mut d: i32 = 2;
+    while d * d <= x {
+        if x % d == 0 {
+            return 0;
+        }
+        d = d + 1;
+    }
+    return 1;
+}
+
+fn main() -> i32 {
+    let n: i32 = 40000;
+    let mut count: i32 = 0;
+    let mut i: i32 = 2;
+    while i < n {
+        count = count + is_prime(i);
+        i = i + 1;
+    }
+    return count;
+}

@@ -1,0 +1,27 @@
+module bench.collatz
+
+/// Sum of Collatz stopping times for 1..N. A data-dependent loop whose trip count is unknown to
+/// the compiler — pure scalar arithmetic and branching.
+fn steps(n0: i32) -> i32 {
+    let mut n: i32 = n0;
+    let mut c: i32 = 0;
+    while n > 1 {
+        if n % 2 == 0 {
+            n = n / 2;
+        } else {
+            n = 3 * n + 1;
+        }
+        c = c + 1;
+    }
+    return c;
+}
+
+fn main() -> i32 {
+    let mut total: i32 = 0;
+    let mut i: i32 = 1;
+    while i < 60000 {
+        total = total + steps(i);
+        i = i + 1;
+    }
+    return total;
+}

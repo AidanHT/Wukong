@@ -1,0 +1,49 @@
+module bench.matmul
+
+/// Dense 32x32 integer matrix multiply over flat arrays — the canonical kernel. The inner `k`
+/// loop recomputes the row/column base addresses `a[i*n + k]` and `b[k*n + j]`; the `i*n` term is
+/// loop-invariant in the inner loops, which is exactly what LICM hoists. Returns a checksum.
+fn main() -> i32 {
+    let n: i32 = 32;
+    let mut a: [i32; 1024] = [0; 1024];
+    let mut b: [i32; 1024] = [0; 1024];
+    let mut c: [i32; 1024] = [0; 1024];
+
+    // Fill the inputs with a cheap deterministic pattern.
+    let mut i: i32 = 0;
+    while i < n {
+        let mut j: i32 = 0;
+        while j < n {
+            a[i * n + j] = (i + j) % 7;
+            b[i * n + j] = (i * 2 + j) % 5;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // c = a * b
+    i = 0;
+    while i < n {
+        let mut j: i32 = 0;
+        while j < n {
+            let mut acc: i32 = 0;
+            let mut k: i32 = 0;
+            while k < n {
+                acc = acc + a[i * n + k] * b[k * n + j];
+                k = k + 1;
+            }
+            c[i * n + j] = acc;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Checksum the result.
+    let mut s: i32 = 0;
+    let mut t: i32 = 0;
+    while t < n * n {
+        s = s + c[t];
+        t = t + 1;
+    }
+    return s;
+}

@@ -1,0 +1,15 @@
+module bench.fib_rec
+
+/// Naive recursive Fibonacci — stresses the call/return path rather than loops, so it is a useful
+/// contrast: mem2reg still removes the per-call argument/local memory traffic, but there is no
+/// loop to vectorize or hoist out of.
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i32 {
+    return fib(30);
+}

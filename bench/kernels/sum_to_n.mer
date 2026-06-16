@@ -1,0 +1,15 @@
+module bench.sum_to_n
+
+/// Tight scalar reduction: sum of 0..N. Stresses induction-variable and accumulator promotion —
+/// at -O0 every iteration loads and stores both `s` and `i` through memory; mem2reg turns the
+/// whole loop into register-only SSA. Result wraps mod 2^32 (deterministic checksum).
+fn main() -> i32 {
+    let n: i32 = 3000000;
+    let mut s: i32 = 0;
+    let mut i: i32 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
