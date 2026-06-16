@@ -31,6 +31,7 @@ mercury_mir_build = { path = "crates/mercury_mir_build" }
 mercury_backend = { path = "crates/mercury_backend" }
 mercury_interp = { path = "crates/mercury_interp" }
 mercury_opt = { path = "crates/mercury_opt" }
+mercury_codegen_llvm = { path = "crates/mercury_codegen_llvm" }
 
 [profile.release]
 opt-level = 3

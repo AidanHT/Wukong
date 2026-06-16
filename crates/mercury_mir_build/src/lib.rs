@@ -61,10 +61,12 @@ fn lower_fn(
         loops: Vec::new(),
     };
 
-    // Materialize parameters into stack slots.
-    for (p, pty) in f.params.iter().zip(&param_tys) {
+    // Declare all parameters first (so their value ids are contiguous), then materialize each
+    // into a stack slot.
+    let param_vals: Vec<ValueId> =
+        param_tys.iter().map(|pty| fl.builder.add_param(mir_ty(pty))).collect();
+    for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         let mty = mir_ty(pty);
-        let val = fl.builder.add_param(mty.clone());
         let slot = fl.builder.alloca(mty.clone());
         fl.builder.build_void(Op::Store { ptr: slot, value: val });
         fl.bind(p.name.sym, slot, mty);

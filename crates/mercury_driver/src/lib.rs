@@ -162,12 +162,65 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::OK;
     }
 
-    eprintln!(
-        "error: `--emit={:?}` is not implemented yet (the pipeline currently reaches MIR; \
-         try `--emit=tokens`, `--emit=ast`, `--emit=mir-high`, or `--emit=mir`)",
-        opts.emit
-    );
-    exit::UNIMPLEMENTED
+    // --- LLVM backend ---
+    if opts.emit == EmitStage::LlvmIr {
+        print!("{}", mercury_codegen_llvm::emit_llvm_ir(&program, &interner));
+        return exit::OK;
+    }
+    if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
+        return emit_native(&program, &interner, opts);
+    }
+
+    exit::OK
+}
+
+/// Emit LLVM IR to a `.ll` file and compile it natively with `clang` (the only common driver that
+/// consumes textual IR). Falls back to a clear message if no LLVM toolchain is installed.
+fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Options) -> i32 {
+    use std::process::Command;
+
+    let ir = mercury_codegen_llvm::emit_llvm_ir(program, interner);
+    let stem = opts
+        .input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    let ll_path = std::path::PathBuf::from(format!("{stem}.ll"));
+    if let Err(e) = std::fs::write(&ll_path, ir) {
+        eprintln!("error: could not write `{}`: {e}", ll_path.display());
+        return exit::IO_ERROR;
+    }
+
+    let is_obj = opts.emit == EmitStage::Obj;
+    let default_out = if is_obj { format!("{stem}.o") } else { format!("{stem}.exe") };
+    let out = opts.output.clone().unwrap_or_else(|| std::path::PathBuf::from(default_out));
+
+    let mut cmd = Command::new("clang");
+    if is_obj {
+        cmd.arg("-c");
+    }
+    cmd.arg(&ll_path).arg("-o").arg(&out).arg(format!("-O{}", opts.opt_level));
+
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            eprintln!("wrote {}", out.display());
+            exit::OK
+        }
+        Ok(_) => {
+            eprintln!("error: clang failed to compile `{}`", ll_path.display());
+            exit::COMPILE_ERROR
+        }
+        Err(_) => {
+            eprintln!(
+                "error: could not run `clang` to compile LLVM IR.\n\
+                 note: the textual IR was written to `{}`.\n\
+                 help: install an LLVM toolchain (see docs/llvm-setup.md), or use `--emit=llvm-ir` \
+                 to inspect the IR, or `--run` to execute via the interpreter.",
+                ll_path.display()
+            );
+            exit::UNIMPLEMENTED
+        }
+    }
 }
 
 fn emit_mir(program: &mercury_mir::Program, interner: &Interner) {
