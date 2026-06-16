@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
-use mercury_ast::{self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind};
+use mercury_ast::{
+    self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind,
+};
 use mercury_diag::Diagnostic;
 use mercury_mir::{BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, ValueId};
 use mercury_sema::{DefKind, SemaResult};
@@ -63,12 +65,17 @@ fn lower_fn(
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each
     // into a stack slot.
-    let param_vals: Vec<ValueId> =
-        param_tys.iter().map(|pty| fl.builder.add_param(mir_ty(pty))).collect();
+    let param_vals: Vec<ValueId> = param_tys
+        .iter()
+        .map(|pty| fl.builder.add_param(mir_ty(pty)))
+        .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         let mty = mir_ty(pty);
         let slot = fl.builder.alloca(mty.clone());
-        fl.builder.build_void(Op::Store { ptr: slot, value: val });
+        fl.builder.build_void(Op::Store {
+            ptr: slot,
+            value: val,
+        });
         fl.bind(p.name.sym, slot, mty);
     }
 
@@ -146,7 +153,8 @@ impl FnLowerer<'_> {
         } else if ty.is_int() {
             self.builder.build(ty.clone(), Op::ConstInt(0, ty))
         } else {
-            self.builder.build(MirType::I32, Op::ConstInt(0, MirType::I32))
+            self.builder
+                .build(MirType::I32, Op::ConstInt(0, MirType::I32))
         }
     }
 
@@ -173,14 +181,24 @@ impl FnLowerer<'_> {
             StmtKind::Let { pat, ty, init, .. } => {
                 let mty = match ty {
                     Some(t) => mir_ty_of_ast(t, self.interner),
-                    None => init.as_ref().map(|e| self.expr_mir(e)).unwrap_or(MirType::I32),
+                    None => init
+                        .as_ref()
+                        .map(|e| self.expr_mir(e))
+                        .unwrap_or(MirType::I32),
                 };
                 let slot = self.builder.alloca(mty.clone());
                 if let Some(e) = init {
                     let v = self.lower_expr(e);
-                    self.builder.build_void(Op::Store { ptr: slot, value: v });
+                    self.builder.build_void(Op::Store {
+                        ptr: slot,
+                        value: v,
+                    });
                 }
-                if let Pattern { kind: ast::PatKind::Ident(name), .. } = pat {
+                if let Pattern {
+                    kind: ast::PatKind::Ident(name),
+                    ..
+                } = pat
+                {
                     self.bind(*name, slot, mty);
                 }
             }
@@ -190,12 +208,17 @@ impl FnLowerer<'_> {
                 let store_val = match op {
                     ast::AssignOp::Assign => rhs,
                     _ => {
-                        let cur = self.builder.build(elem.clone(), Op::Load(ptr, elem.clone()));
+                        let cur = self
+                            .builder
+                            .build(elem.clone(), Op::Load(ptr, elem.clone()));
                         let bin = compound_binop(*op, elem.is_float(), self.signed(target));
                         self.builder.build(elem.clone(), Op::Bin(bin, cur, rhs))
                     }
                 };
-                self.builder.build_void(Op::Store { ptr, value: store_val });
+                self.builder.build_void(Op::Store {
+                    ptr,
+                    value: store_val,
+                });
             }
             StmtKind::Expr(e) => {
                 self.lower_expr_stmt(e);
@@ -206,7 +229,9 @@ impl FnLowerer<'_> {
                 self.terminated = true;
             }
             StmtKind::While { cond, body, .. } => self.lower_while(cond, body),
-            StmtKind::For { pat, iter, body, .. } => self.lower_for(pat, iter, body),
+            StmtKind::For {
+                pat, iter, body, ..
+            } => self.lower_for(pat, iter, body),
             StmtKind::Loop { body, .. } => self.lower_loop(body),
             StmtKind::Break(_) => {
                 if let Some((_, brk)) = self.loops.last().copied() {
@@ -231,7 +256,11 @@ impl FnLowerer<'_> {
     /// Lower an expression used in statement position (control-flow expressions handled here).
     fn lower_expr_stmt(&mut self, e: &Expr) {
         match &e.kind {
-            ExprKind::If { cond, then_branch, else_branch } => {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.lower_if(cond, then_branch, else_branch.as_deref());
             }
             ExprKind::Block(b) => {
@@ -285,9 +314,12 @@ impl FnLowerer<'_> {
 
     fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
         let (start, end, inclusive, step) = match iter {
-            ForIter::Range { start, end: Some(end), inclusive, step } => {
-                (start, end, *inclusive, step)
-            }
+            ForIter::Range {
+                start,
+                end: Some(end),
+                inclusive,
+                step,
+            } => (start, end, *inclusive, step),
             _ => {
                 self.unsupported(body.span, "for over a non-range iterator");
                 return;
@@ -300,10 +332,17 @@ impl FnLowerer<'_> {
         // i = start
         let slot = self.builder.alloca(ity.clone());
         let s0 = self.lower_expr(start);
-        self.builder.build_void(Op::Store { ptr: slot, value: s0 });
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: s0,
+        });
 
         self.push_scope();
-        if let Pattern { kind: ast::PatKind::Ident(name), .. } = pat {
+        if let Pattern {
+            kind: ast::PatKind::Ident(name),
+            ..
+        } = pat
+        {
             self.bind(*name, slot, ity.clone());
         }
 
@@ -323,7 +362,9 @@ impl FnLowerer<'_> {
             (false, false) => CmpOp::Ult,
             (true, false) => CmpOp::Ule,
         };
-        let c = self.builder.build(MirType::I1, Op::Cmp(pred, i_val, end_val));
+        let c = self
+            .builder
+            .build(MirType::I1, Op::Cmp(pred, i_val, end_val));
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
         // body; i += step
@@ -336,10 +377,17 @@ impl FnLowerer<'_> {
             let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
             let step_val = match step {
                 Some(st) => self.lower_expr(st),
-                None => self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone())),
+                None => self
+                    .builder
+                    .build(ity.clone(), Op::ConstInt(1, ity.clone())),
             };
-            let next = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
-            self.builder.build_void(Op::Store { ptr: slot, value: next });
+            let next = self
+                .builder
+                .build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: next,
+            });
             self.builder.br(header, vec![]);
         }
 
@@ -352,7 +400,11 @@ impl FnLowerer<'_> {
         let c = self.lower_expr(cond);
         let then_bb = self.builder.new_block();
         let merge = self.builder.new_block();
-        let else_bb = if else_branch.is_some() { self.builder.new_block() } else { merge };
+        let else_bb = if else_branch.is_some() {
+            self.builder.new_block()
+        } else {
+            merge
+        };
         self.builder.cond_br(c, then_bb, vec![], else_bb, vec![]);
 
         self.builder.switch_to(then_bb);
@@ -387,7 +439,10 @@ impl FnLowerer<'_> {
                 let ty = self.expr_mir(e);
                 (self.builder.alloca(ty.clone()), ty)
             }
-            ExprKind::Unary { op: ast::UnOp::Deref, expr } => {
+            ExprKind::Unary {
+                op: ast::UnOp::Deref,
+                expr,
+            } => {
                 let ptr = self.lower_expr(expr);
                 (ptr, self.expr_mir(e))
             }
@@ -395,7 +450,14 @@ impl FnLowerer<'_> {
                 let base_ptr = self.lower_expr(base);
                 let idx = self.lower_expr(&indices[0]);
                 let elem = self.expr_mir(e);
-                let p = self.builder.build(MirType::Ptr, Op::Gep { ptr: base_ptr, index: idx, elem: elem.clone() });
+                let p = self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: base_ptr,
+                        index: idx,
+                        elem: elem.clone(),
+                    },
+                );
                 (p, elem)
             }
             _ => {
@@ -422,7 +484,9 @@ impl FnLowerer<'_> {
                 let ty = if ty.is_float() { ty } else { MirType::F32 };
                 self.builder.build(ty.clone(), Op::ConstFloat(v, ty))
             }
-            ExprKind::Bool(b) => self.builder.build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1)),
+            ExprKind::Bool(b) => self
+                .builder
+                .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1)),
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
                     self.builder.build(ty.clone(), Op::Load(slot, ty))
@@ -515,19 +579,34 @@ impl FnLowerer<'_> {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
                 let name = p.first().sym;
-                if matches!(self.sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+                if matches!(
+                    self.sema.defs.lookup(name).map(|d| &d.kind),
+                    Some(DefKind::Fn(_))
+                ) {
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
                     let ret = self.expr_mir(e);
                     if ret == MirType::Void {
-                        self.builder.build_void(Op::Call { func: name, args: argvals });
+                        self.builder.build_void(Op::Call {
+                            func: name,
+                            args: argvals,
+                        });
                         return self.const_zero(MirType::I32);
                     }
-                    return self.builder.build(ret, Op::Call { func: name, args: argvals });
+                    return self.builder.build(
+                        ret,
+                        Op::Call {
+                            func: name,
+                            args: argvals,
+                        },
+                    );
                 }
                 // Built-in intrinsics (print, ...) lower to a void call the interpreter handles.
                 if is_intrinsic(self.interner.resolve(name)) {
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
-                    self.builder.build_void(Op::Call { func: name, args: argvals });
+                    self.builder.build_void(Op::Call {
+                        func: name,
+                        args: argvals,
+                    });
                     return self.const_zero(MirType::I32);
                 }
             }
@@ -590,9 +669,27 @@ fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
 fn arith_binop(op: ast::BinOp, float: bool, signed: bool) -> BinOp {
     use ast::BinOp as A;
     match op {
-        A::Add => if float { BinOp::FAdd } else { BinOp::Add },
-        A::Sub => if float { BinOp::FSub } else { BinOp::Sub },
-        A::Mul => if float { BinOp::FMul } else { BinOp::Mul },
+        A::Add => {
+            if float {
+                BinOp::FAdd
+            } else {
+                BinOp::Add
+            }
+        }
+        A::Sub => {
+            if float {
+                BinOp::FSub
+            } else {
+                BinOp::Sub
+            }
+        }
+        A::Mul => {
+            if float {
+                BinOp::FMul
+            } else {
+                BinOp::Mul
+            }
+        }
         A::Div => {
             if float {
                 BinOp::FDiv
@@ -602,12 +699,24 @@ fn arith_binop(op: ast::BinOp, float: bool, signed: bool) -> BinOp {
                 BinOp::UDiv
             }
         }
-        A::Rem => if signed { BinOp::SRem } else { BinOp::URem },
+        A::Rem => {
+            if signed {
+                BinOp::SRem
+            } else {
+                BinOp::URem
+            }
+        }
         A::BitAnd => BinOp::And,
         A::BitOr => BinOp::Or,
         A::BitXor => BinOp::Xor,
         A::Shl => BinOp::Shl,
-        A::Shr => if signed { BinOp::AShr } else { BinOp::LShr },
+        A::Shr => {
+            if signed {
+                BinOp::AShr
+            } else {
+                BinOp::LShr
+            }
+        }
         _ => BinOp::Add,
     }
 }
@@ -633,8 +742,20 @@ fn compound_binop(op: ast::AssignOp, float: bool, signed: bool) -> BinOp {
 fn cmp_pred(op: ast::BinOp, float: bool, signed: bool) -> CmpOp {
     use ast::BinOp as A;
     match op {
-        A::Eq => if float { CmpOp::Foeq } else { CmpOp::Eq },
-        A::Ne => if float { CmpOp::Fone } else { CmpOp::Ne },
+        A::Eq => {
+            if float {
+                CmpOp::Foeq
+            } else {
+                CmpOp::Eq
+            }
+        }
+        A::Ne => {
+            if float {
+                CmpOp::Fone
+            } else {
+                CmpOp::Ne
+            }
+        }
         A::Lt => float_or(float, CmpOp::Folt, signed, CmpOp::Slt, CmpOp::Ult),
         A::Le => float_or(float, CmpOp::Fole, signed, CmpOp::Sle, CmpOp::Ule),
         A::Gt => float_or(float, CmpOp::Fogt, signed, CmpOp::Sgt, CmpOp::Ugt),
@@ -680,8 +801,20 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
                 CastKind::Trunc
             }
         }
-        (true, _, _, true) => if signed { CastKind::SiToFp } else { CastKind::UiToFp },
-        (_, true, true, _) => if signed { CastKind::FpToSi } else { CastKind::FpToUi },
+        (true, _, _, true) => {
+            if signed {
+                CastKind::SiToFp
+            } else {
+                CastKind::UiToFp
+            }
+        }
+        (_, true, true, _) => {
+            if signed {
+                CastKind::FpToSi
+            } else {
+                CastKind::FpToUi
+            }
+        }
         (_, _, true, true) => {
             if fsz(to) > fsz(from) {
                 CastKind::FpExt
@@ -701,7 +834,10 @@ pub fn is_intrinsic(name: &str) -> bool {
 }
 
 fn parse_int(text: &str) -> i128 {
-    let digits: String = text.chars().take_while(|c| c.is_ascii_digit() || *c == '_').collect();
+    let digits: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '_')
+        .collect();
     digits.replace('_', "").parse().unwrap_or(0)
 }
 
@@ -753,7 +889,10 @@ mod tests {
         let (prog, _diags, _) = lower(src);
         assert_eq!(prog.funcs.len(), 2);
         for f in &prog.funcs {
-            assert!(verify_function(f).is_empty(), "verify failed for a function");
+            assert!(
+                verify_function(f).is_empty(),
+                "verify failed for a function"
+            );
         }
     }
 }

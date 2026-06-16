@@ -15,7 +15,10 @@ pub enum Artifact {
     /// The program was run directly (interpreter): an exit code and captured stdout.
     Executed { exit_code: i64, stdout: Vec<u8> },
     /// Native artifacts were emitted (LLVM): textual IR and/or an object/executable path.
-    Emitted { llvm_ir: Option<String>, object: Option<PathBuf> },
+    Emitted {
+        llvm_ir: Option<String>,
+        object: Option<PathBuf>,
+    },
 }
 
 /// A consumer of fully-lowered (Low) MIR.

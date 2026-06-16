@@ -33,7 +33,10 @@ impl Sema<'_> {
                         let sig = sig.clone();
                         self.types.insert(
                             callee.id,
-                            Ty::Fn { params: sig.params.clone(), ret: Box::new(sig.ret.clone()) },
+                            Ty::Fn {
+                                params: sig.params.clone(),
+                                ret: Box::new(sig.ret.clone()),
+                            },
                         );
                         return self.check_fn_call(&sig, generic_args, &arg_tys, span);
                     }
@@ -122,14 +125,26 @@ impl Sema<'_> {
         }
         match (param, arg) {
             (
-                Ty::Tensor { elem: pe, shape: ps, .. },
-                Ty::Tensor { elem: ae, shape: as_, .. },
+                Ty::Tensor {
+                    elem: pe,
+                    shape: ps,
+                    ..
+                },
+                Ty::Tensor {
+                    elem: ae,
+                    shape: as_,
+                    ..
+                },
             ) => {
                 if pe != ae {
                     self.error(
                         span,
                         "E0502",
-                        format!("tensor element type mismatch: expected `{}`, found `{}`", pe.name(), ae.name()),
+                        format!(
+                            "tensor element type mismatch: expected `{}`, found `{}`",
+                            pe.name(),
+                            ae.name()
+                        ),
                     );
                 }
                 if ps.rank() != as_.rank() {
@@ -152,12 +167,27 @@ impl Sema<'_> {
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
                 self.unify(pp, ap, dims, span)
             }
-            (Ty::Vector { elem: pe, lanes: pl }, Ty::Vector { elem: ae, lanes: al }) => {
+            (
+                Ty::Vector {
+                    elem: pe,
+                    lanes: pl,
+                },
+                Ty::Vector {
+                    elem: ae,
+                    lanes: al,
+                },
+            ) => {
                 if pe != ae || pl != al {
                     self.error(
                         span,
                         "E0401",
-                        format!("vector type mismatch: expected `{}x{}`, found `{}x{}`", pe.name(), pl, ae.name(), al),
+                        format!(
+                            "vector type mismatch: expected `{}x{}`, found `{}x{}`",
+                            pe.name(),
+                            pl,
+                            ae.name(),
+                            al
+                        ),
                     );
                 }
             }
@@ -166,7 +196,11 @@ impl Sema<'_> {
                     self.error(
                         span,
                         "E0401",
-                        format!("type mismatch: expected `{}`, found `{}`", a.name(), b.name()),
+                        format!(
+                            "type mismatch: expected `{}`, found `{}`",
+                            a.name(),
+                            b.name()
+                        ),
                     );
                 }
             }
@@ -226,7 +260,11 @@ impl Sema<'_> {
                             "this tensor has rank {} but is indexed with {} {}",
                             shape.rank(),
                             indices.len(),
-                            if indices.len() == 1 { "index" } else { "indices" }
+                            if indices.len() == 1 {
+                                "index"
+                            } else {
+                                "indices"
+                            }
                         ),
                     );
                 }
@@ -256,13 +294,21 @@ fn dims_equal(a: Dim, b: Dim) -> bool {
 }
 
 fn parse_dim_text(text: &str) -> u64 {
-    text.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)
+    text.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }
 
 fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
     match ty {
         Ty::Named(v) => tys.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Ty::Tensor { elem, shape, layout } => {
+        Ty::Tensor {
+            elem,
+            shape,
+            layout,
+        } => {
             let new = shape
                 .0
                 .iter()
@@ -271,16 +317,25 @@ fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) 
                     other => *other,
                 })
                 .collect();
-            Ty::Tensor { elem: *elem, shape: Shape(new), layout: layout.clone() }
+            Ty::Tensor {
+                elem: *elem,
+                shape: Shape(new),
+                layout: layout.clone(),
+            }
         }
-        Ty::Ptr { mutable, pointee } => {
-            Ty::Ptr { mutable: *mutable, pointee: Box::new(apply_subst(pointee, dims, tys)) }
-        }
-        Ty::Ref { mutable, pointee } => {
-            Ty::Ref { mutable: *mutable, pointee: Box::new(apply_subst(pointee, dims, tys)) }
-        }
+        Ty::Ptr { mutable, pointee } => Ty::Ptr {
+            mutable: *mutable,
+            pointee: Box::new(apply_subst(pointee, dims, tys)),
+        },
+        Ty::Ref { mutable, pointee } => Ty::Ref {
+            mutable: *mutable,
+            pointee: Box::new(apply_subst(pointee, dims, tys)),
+        },
         Ty::Slice(e) => Ty::Slice(Box::new(apply_subst(e, dims, tys))),
-        Ty::Array { elem, len } => Ty::Array { elem: Box::new(apply_subst(elem, dims, tys)), len: *len },
+        Ty::Array { elem, len } => Ty::Array {
+            elem: Box::new(apply_subst(elem, dims, tys)),
+            len: *len,
+        },
         Ty::Tuple(items) => Ty::Tuple(items.iter().map(|i| apply_subst(i, dims, tys)).collect()),
         other => other.clone(),
     }

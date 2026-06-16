@@ -75,7 +75,9 @@ impl Pass for Cse {
                     }
                     _ => {
                         let Some(res) = inst.result else { continue };
-                        let Some(key) = pure_key(&inst.op, &rewrite) else { continue };
+                        let Some(key) = pure_key(&inst.op, &rewrite) else {
+                            continue;
+                        };
                         match vn.get(&key) {
                             Some(&canon) => {
                                 rewrite.insert(res.0, canon);

@@ -56,7 +56,11 @@ impl Parser<'_> {
                 self.bump();
             }
         }
-        Module { name, items, span: start.to(self.prev_span()) }
+        Module {
+            name,
+            items,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn parse_item(&mut self) -> Option<Item> {
@@ -84,13 +88,25 @@ impl Parser<'_> {
                 return None;
             }
         };
-        Some(Item { id: self.nid(), attrs, kind, span: start.to(self.prev_span()) })
+        Some(Item {
+            id: self.nid(),
+            attrs,
+            kind,
+            span: start.to(self.prev_span()),
+        })
     }
 
     fn recover_item(&mut self) {
         loop {
             match self.kind() {
-                T::Eof | T::Fn | T::Struct | T::Enum | T::Const | T::Import | T::Extern | T::Pub
+                T::Eof
+                | T::Fn
+                | T::Struct
+                | T::Enum
+                | T::Const
+                | T::Import
+                | T::Extern
+                | T::Pub
                 | T::At => break,
                 _ => {
                     self.bump();
@@ -114,7 +130,10 @@ impl Parser<'_> {
             } else {
                 GenericParamKind::Type(self.ident())
             };
-            gs.push(GenericParam { kind, span: start.to(self.prev_span()) });
+            gs.push(GenericParam {
+                kind,
+                span: start.to(self.prev_span()),
+            });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -132,7 +151,13 @@ impl Parser<'_> {
             let name = self.ident();
             self.expect(T::Colon);
             let ty = self.parse_type();
-            params.push(Param { id: self.nid(), attrs, name, ty, span: start.to(self.prev_span()) });
+            params.push(Param {
+                id: self.nid(),
+                attrs,
+                name,
+                ty,
+                span: start.to(self.prev_span()),
+            });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -146,7 +171,11 @@ impl Parser<'_> {
         let name = self.ident();
         let generics = self.parse_generics();
         let params = self.parse_params();
-        let ret = if self.eat(T::Arrow) { Some(self.parse_type()) } else { None };
+        let ret = if self.eat(T::Arrow) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
         // `where` bounds are accepted but not yet enforced.
         if self.at(T::Where) {
             while !matches!(self.kind(), T::LBrace | T::Semi | T::Eq | T::Eof) {
@@ -159,12 +188,24 @@ impl Parser<'_> {
             let e = self.parse_expr();
             let sp = e.span;
             self.eat(T::Semi);
-            Some(Block { id: self.nid(), stmts: Vec::new(), tail: Some(Box::new(e)), span: sp })
+            Some(Block {
+                id: self.nid(),
+                stmts: Vec::new(),
+                tail: Some(Box::new(e)),
+                span: sp,
+            })
         } else {
             self.eat(T::Semi);
             None
         };
-        FnDecl { name, is_pub, generics, params, ret, body }
+        FnDecl {
+            name,
+            is_pub,
+            generics,
+            params,
+            ret,
+            body,
+        }
     }
 
     fn parse_struct(&mut self, is_pub: bool) -> StructDecl {
@@ -180,13 +221,23 @@ impl Parser<'_> {
             let fname = self.ident();
             self.expect(T::Colon);
             let ty = self.parse_type();
-            fields.push(Field { name: fname, is_pub, ty, span: fstart.to(self.prev_span()) });
+            fields.push(Field {
+                name: fname,
+                is_pub,
+                ty,
+                span: fstart.to(self.prev_span()),
+            });
             if !self.eat(T::Comma) {
                 break;
             }
         }
         self.expect(T::RBrace);
-        StructDecl { name, is_pub, generics, fields }
+        StructDecl {
+            name,
+            is_pub,
+            generics,
+            fields,
+        }
     }
 
     fn parse_enum(&mut self, is_pub: bool) -> EnumDecl {
@@ -221,7 +272,12 @@ impl Parser<'_> {
                     let fname = self.ident();
                     self.expect(T::Colon);
                     let ty = self.parse_type();
-                    fs.push(Field { name: fname, is_pub, ty, span: fstart.to(self.prev_span()) });
+                    fs.push(Field {
+                        name: fname,
+                        is_pub,
+                        ty,
+                        span: fstart.to(self.prev_span()),
+                    });
                     if !self.eat(T::Comma) {
                         break;
                     }
@@ -231,14 +287,28 @@ impl Parser<'_> {
             } else {
                 VariantData::Unit
             };
-            let discriminant = if self.eat(T::Eq) { Some(self.parse_expr()) } else { None };
-            variants.push(Variant { name: vname, data, discriminant, span: vstart.to(self.prev_span()) });
+            let discriminant = if self.eat(T::Eq) {
+                Some(self.parse_expr())
+            } else {
+                None
+            };
+            variants.push(Variant {
+                name: vname,
+                data,
+                discriminant,
+                span: vstart.to(self.prev_span()),
+            });
             if !self.eat(T::Comma) {
                 break;
             }
         }
         self.expect(T::RBrace);
-        EnumDecl { name, is_pub, generics, variants }
+        EnumDecl {
+            name,
+            is_pub,
+            generics,
+            variants,
+        }
     }
 
     fn parse_const(&mut self, is_pub: bool) -> ConstDecl {
@@ -249,7 +319,12 @@ impl Parser<'_> {
         self.expect(T::Eq);
         let value = self.parse_expr();
         self.eat(T::Semi);
-        ConstDecl { name, is_pub, ty, value }
+        ConstDecl {
+            name,
+            is_pub,
+            ty,
+            value,
+        }
     }
 
     fn parse_import(&mut self) -> Import {

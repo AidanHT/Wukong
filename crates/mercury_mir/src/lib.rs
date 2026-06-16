@@ -72,11 +72,17 @@ impl MirType {
     }
 
     pub fn is_int(&self) -> bool {
-        matches!(self, MirType::I1 | MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64)
+        matches!(
+            self,
+            MirType::I1 | MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+        )
     }
 
     pub fn is_float(&self) -> bool {
-        matches!(self, MirType::F16 | MirType::BF16 | MirType::F32 | MirType::F64)
+        matches!(
+            self,
+            MirType::F16 | MirType::BF16 | MirType::F32 | MirType::F64
+        )
     }
 
     pub fn display(&self) -> String {
@@ -143,7 +149,10 @@ pub struct Program {
 
 impl Program {
     pub fn new() -> Program {
-        Program { funcs: Vec::new(), level: MirLevel::Low }
+        Program {
+            funcs: Vec::new(),
+            level: MirLevel::Low,
+        }
     }
 
     pub fn function(&self, name: Symbol) -> Option<&Function> {

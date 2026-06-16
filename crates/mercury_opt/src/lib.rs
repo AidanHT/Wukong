@@ -5,8 +5,8 @@
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 
-mod dce;
 mod cse;
+mod dce;
 mod simplify;
 mod simplify_cfg;
 
@@ -127,7 +127,12 @@ pub(crate) fn map_term_uses(t: &mut Terminator, mut f: impl FnMut(ValueId) -> Va
                 *a = f(*a);
             }
         }
-        Terminator::CondBr { cond, then_args, else_args, .. } => {
+        Terminator::CondBr {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
             *cond = f(*cond);
             for a in then_args {
                 *a = f(*a);
@@ -175,7 +180,12 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
     match t {
         Terminator::Ret(Some(v)) => f(*v),
         Terminator::Br { args, .. } => args.iter().for_each(|a| f(*a)),
-        Terminator::CondBr { cond, then_args, else_args, .. } => {
+        Terminator::CondBr {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
             f(*cond);
             then_args.iter().for_each(|a| f(*a));
             else_args.iter().for_each(|a| f(*a));
@@ -203,7 +213,10 @@ mod tests {
         optimize(&mut program, opt);
         // verify still well-formed
         for f in &program.funcs {
-            assert!(mercury_mir::verify::verify_function(f).is_empty(), "verify after opt");
+            assert!(
+                mercury_mir::verify::verify_function(f).is_empty(),
+                "verify after opt"
+            );
         }
         let main = interner.intern("main");
         mercury_interp::run(&program, main, &interner).unwrap()
@@ -232,7 +245,10 @@ mod tests {
         let before: usize = program.funcs.iter().map(|f| count_insts(f)).sum();
         optimize(&mut program, 2);
         let after: usize = program.funcs.iter().map(|f| count_insts(f)).sum();
-        assert!(after < before, "expected fewer insts after opt ({before} -> {after})");
+        assert!(
+            after < before,
+            "expected fewer insts after opt ({before} -> {after})"
+        );
         let main = interner.intern("main");
         assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 10);
     }
@@ -245,7 +261,8 @@ mod tests {
     fn cse_eliminates_redundant_expression() {
         // `a*a` is computed twice in the same block; CSE should collapse it without changing the
         // result. Use distinct params so the multiply is not itself const-folded away.
-        let src = "fn sq2(x: i32) -> i32 { let a: i32 = x * x; let b: i32 = x * x; return a + b; } \
+        let src =
+            "fn sq2(x: i32) -> i32 { let a: i32 = x * x; let b: i32 = x * x; return a + b; } \
                    fn main() -> i32 { return sq2(7); }";
         let mut interner = Interner::new();
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
@@ -257,11 +274,20 @@ mod tests {
         let muls_before = count_muls(find_fn(&program, &interner, "sq2"));
         optimize(&mut program, 2);
         let muls_after = count_muls(find_fn(&program, &interner, "sq2"));
-        assert!(muls_before >= 2, "expected two multiplies before opt, saw {muls_before}");
-        assert!(muls_after < muls_before, "CSE should remove a redundant multiply");
+        assert!(
+            muls_before >= 2,
+            "expected two multiplies before opt, saw {muls_before}"
+        );
+        assert!(
+            muls_after < muls_before,
+            "CSE should remove a redundant multiply"
+        );
 
         for f in &program.funcs {
-            assert!(mercury_mir::verify::verify_function(f).is_empty(), "verify after opt");
+            assert!(
+                mercury_mir::verify::verify_function(f).is_empty(),
+                "verify after opt"
+            );
         }
         let main = interner.intern("main");
         assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 98);
@@ -272,14 +298,18 @@ mod tests {
         interner: &Interner,
         name: &str,
     ) -> &'a mercury_mir::Function {
-        p.funcs.iter().find(|f| interner.resolve(f.name) == name).expect("function present")
+        p.funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == name)
+            .expect("function present")
     }
 
     #[test]
     fn simplify_cfg_folds_constant_branch_and_prunes() {
         // The `if` condition is a compile-time constant, so one arm is dead. After -O1 the dead
         // block should be pruned and the result must be unchanged.
-        let src = "fn main() -> i32 { let x: i32 = 0; if 1 < 2 { x = 10; } else { x = 20; } return x; }";
+        let src =
+            "fn main() -> i32 { let x: i32 = 0; if 1 < 2 { x = 10; } else { x = 20; } return x; }";
         let mut interner = Interner::new();
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
@@ -295,7 +325,10 @@ mod tests {
         );
         // No CondBr should remain referencing the constant condition.
         for f in &program.funcs {
-            assert!(mercury_mir::verify::verify_function(f).is_empty(), "verify after opt");
+            assert!(
+                mercury_mir::verify::verify_function(f).is_empty(),
+                "verify after opt"
+            );
         }
         let main = interner.intern("main");
         assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 10);

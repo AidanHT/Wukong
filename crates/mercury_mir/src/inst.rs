@@ -160,11 +160,21 @@ pub enum Op {
     /// Load a value of the given type from a pointer.
     Load(ValueId, MirType),
     /// Store `value` to `ptr` (no result).
-    Store { ptr: ValueId, value: ValueId },
+    Store {
+        ptr: ValueId,
+        value: ValueId,
+    },
     /// `ptr + index * sizeof(elem)`; result is a pointer.
-    Gep { ptr: ValueId, index: ValueId, elem: MirType },
+    Gep {
+        ptr: ValueId,
+        index: ValueId,
+        elem: MirType,
+    },
     /// A direct call to a function by name.
-    Call { func: Symbol, args: Vec<ValueId> },
+    Call {
+        func: Symbol,
+        args: Vec<ValueId>,
+    },
 }
 
 /// One instruction: an optional result value plus its operation.

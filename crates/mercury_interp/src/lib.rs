@@ -5,9 +5,7 @@
 //! keeping a per-call register file and a shared flat memory for `alloca`/`load`/`store`/`gep`.
 
 use mercury_backend::{Artifact, Backend};
-use mercury_mir::{
-    BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
-};
+use mercury_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId};
 use mercury_span::{Interner, Symbol};
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
@@ -76,7 +74,12 @@ pub fn run_with_output(
     let func = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let mut interp = Interp { program, interner, memory: Vec::new(), stdout: Vec::new() };
+    let mut interp = Interp {
+        program,
+        interner,
+        memory: Vec::new(),
+        stdout: Vec::new(),
+    };
     let result = interp.run_function(func, Vec::new())?;
     Ok((result.as_int() as i64, interp.stdout))
 }
@@ -120,7 +123,13 @@ impl<'a> Interp<'a> {
                     }
                     cur = *target;
                 }
-                Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args } => {
+                Terminator::CondBr {
+                    cond,
+                    then_blk,
+                    then_args,
+                    else_blk,
+                    else_args,
+                } => {
                     let (tgt, bargs) = if reg(&regs, *cond).truthy() {
                         (*then_blk, then_args)
                     } else {
@@ -133,9 +142,7 @@ impl<'a> Interp<'a> {
                     }
                     cur = tgt;
                 }
-                Terminator::Unreachable => {
-                    return Err("execution reached `unreachable`".into())
-                }
+                Terminator::Unreachable => return Err("execution reached `unreachable`".into()),
             }
         }
     }
@@ -145,9 +152,7 @@ impl<'a> Interp<'a> {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
             Op::ConstFloat(v, _) => Value::Float(*v),
             Op::Bin(b, l, r) => apply_bin(*b, reg(regs, *l), reg(regs, *r)),
-            Op::Cmp(c, l, r) => {
-                Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128)
-            }
+            Op::Cmp(c, l, r) => Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128),
             Op::Neg(v) => match reg(regs, *v) {
                 Value::Float(f) => Value::Float(-f),
                 other => Value::Int(-other.as_int()),

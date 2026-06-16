@@ -33,7 +33,11 @@ pub fn all() -> &'static [Explanation] {
 
 macro_rules! entry {
     ($code:literal, $title:literal, $body:literal) => {
-        Explanation { code: $code, title: $title, body: $body }
+        Explanation {
+            code: $code,
+            title: $title,
+            body: $body,
+        }
     };
 }
 
@@ -102,7 +106,11 @@ static CATALOG: &[Explanation] = &[
         "malformed turbofish",
         "A turbofish `::<...>` generic-argument list must be followed by a call `(...)`."
     ),
-    entry!("E0206", "expected a pattern", "A binding pattern was required here, e.g. in `let`."),
+    entry!(
+        "E0206",
+        "expected a pattern",
+        "A binding pattern was required here, e.g. in `let`."
+    ),
     entry!(
         "E0207",
         "expected an attribute argument",

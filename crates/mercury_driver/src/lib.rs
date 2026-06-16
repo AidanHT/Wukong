@@ -106,7 +106,11 @@ pub fn compile(opts: &Options) -> i32 {
     if opts.emit == EmitStage::Tokens {
         render_all(opts.error_format, &renderer, &sink, &sm);
         print!("{}", mercury_lexer::dump(&tokens, sm.source(id)));
-        return if sink.has_errors() { exit::COMPILE_ERROR } else { exit::OK };
+        return if sink.has_errors() {
+            exit::COMPILE_ERROR
+        } else {
+            exit::OK
+        };
     }
 
     // --- Parsing ---
@@ -120,7 +124,11 @@ pub fn compile(opts: &Options) -> i32 {
 
     if opts.emit == EmitStage::Ast {
         print!("{}", mercury_ast::print::print_module(&module, &interner));
-        return if sink.has_errors() { exit::COMPILE_ERROR } else { exit::OK };
+        return if sink.has_errors() {
+            exit::COMPILE_ERROR
+        } else {
+            exit::OK
+        };
     }
 
     if sink.has_errors() {
@@ -177,7 +185,10 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- LLVM backend ---
     if opts.emit == EmitStage::LlvmIr {
-        print!("{}", mercury_codegen_llvm::emit_llvm_ir(&program, &interner));
+        print!(
+            "{}",
+            mercury_codegen_llvm::emit_llvm_ir(&program, &interner)
+        );
         return exit::OK;
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
@@ -205,14 +216,24 @@ fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Optio
     }
 
     let is_obj = opts.emit == EmitStage::Obj;
-    let default_out = if is_obj { format!("{stem}.o") } else { format!("{stem}.exe") };
-    let out = opts.output.clone().unwrap_or_else(|| std::path::PathBuf::from(default_out));
+    let default_out = if is_obj {
+        format!("{stem}.o")
+    } else {
+        format!("{stem}.exe")
+    };
+    let out = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(default_out));
 
     let mut cmd = Command::new("clang");
     if is_obj {
         cmd.arg("-c");
     }
-    cmd.arg(&ll_path).arg("-o").arg(&out).arg(format!("-O{}", opts.opt_level));
+    cmd.arg(&ll_path)
+        .arg("-o")
+        .arg(&out)
+        .arg(format!("-O{}", opts.opt_level));
 
     match cmd.status() {
         Ok(s) if s.success() => {

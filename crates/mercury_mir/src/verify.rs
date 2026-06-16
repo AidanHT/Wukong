@@ -21,7 +21,11 @@ pub fn verify_program(p: &Program) -> Vec<String> {
 
 /// Verify a single function.
 pub fn verify_function(f: &Function) -> Vec<String> {
-    let mut v = Verifier { f, errors: Vec::new(), defined: HashSet::new() };
+    let mut v = Verifier {
+        f,
+        errors: Vec::new(),
+        defined: HashSet::new(),
+    };
     v.run();
     v.errors
 }
@@ -78,7 +82,11 @@ impl Verifier<'_> {
     fn expect_ty(&mut self, v: ValueId, want: &MirType, ctx: &str) {
         if let Some(t) = self.ty(v) {
             if t != want {
-                self.err(format!("{ctx}: {v:?} has type {} but expected {}", t.display(), want.display()));
+                self.err(format!(
+                    "{ctx}: {v:?} has type {} but expected {}",
+                    t.display(),
+                    want.display()
+                ));
             }
         }
     }
@@ -116,10 +124,21 @@ impl Verifier<'_> {
                         self.expect_ty(*r, &res, b.name());
                         let float_op = b.is_float();
                         if float_op && !res.is_float() {
-                            self.err(format!("float op {} on non-float type {}", b.name(), res.display()));
+                            self.err(format!(
+                                "float op {} on non-float type {}",
+                                b.name(),
+                                res.display()
+                            ));
                         }
-                        if !float_op && !res.is_int() && !matches!(b, BinOp::Xor | BinOp::And | BinOp::Or) {
-                            self.err(format!("int op {} on non-int type {}", b.name(), res.display()));
+                        if !float_op
+                            && !res.is_int()
+                            && !matches!(b, BinOp::Xor | BinOp::And | BinOp::Or)
+                        {
+                            self.err(format!(
+                                "int op {} on non-int type {}",
+                                b.name(),
+                                res.display()
+                            ));
                         }
                     }
                 }
@@ -128,10 +147,18 @@ impl Verifier<'_> {
                 if self.use_val(*l) & self.use_val(*r) {
                     if let (Some(lt), Some(rt)) = (self.ty(*l).cloned(), self.ty(*r).cloned()) {
                         if lt != rt {
-                            self.err(format!("cmp operands differ: {} vs {}", lt.display(), rt.display()));
+                            self.err(format!(
+                                "cmp operands differ: {} vs {}",
+                                lt.display(),
+                                rt.display()
+                            ));
                         }
                         if c.is_float() != lt.is_float() {
-                            self.err(format!("cmp predicate {} mismatches operand type {}", c.name(), lt.display()));
+                            self.err(format!(
+                                "cmp predicate {} mismatches operand type {}",
+                                c.name(),
+                                lt.display()
+                            ));
                         }
                     }
                 }
@@ -216,13 +243,22 @@ impl Verifier<'_> {
             }
             Terminator::Ret(None) => {
                 if self.f.ret != MirType::Void {
-                    self.err(format!("`ret` with no value but function returns {}", self.f.ret.display()));
+                    self.err(format!(
+                        "`ret` with no value but function returns {}",
+                        self.f.ret.display()
+                    ));
                 }
             }
             Terminator::Br { target, args } => {
                 self.check_edge(*target, args, nblocks);
             }
-            Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args } => {
+            Terminator::CondBr {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => {
                 if self.use_val(*cond) {
                     self.expect_ty(*cond, &MirType::I1, "cond_br condition");
                 }

@@ -101,7 +101,10 @@ impl Builder {
     pub fn alloca(&mut self, ty: MirType) -> ValueId {
         let v = self.new_value(MirType::Ptr);
         let entry = self.entry.0 as usize;
-        self.blocks[entry].insts.push(Inst { result: Some(v), op: Op::Alloca(ty) });
+        self.blocks[entry].insts.push(Inst {
+            result: Some(v),
+            op: Op::Alloca(ty),
+        });
         v
     }
 
@@ -126,7 +129,13 @@ impl Builder {
         else_blk: BlockId,
         else_args: Vec<ValueId>,
     ) {
-        self.set_term(Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args });
+        self.set_term(Terminator::CondBr {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        });
     }
 
     pub fn finish(self) -> Function {

@@ -33,7 +33,10 @@ impl Backend for LlvmBackend {
         _entry: Symbol,
         interner: &Interner,
     ) -> Result<Artifact, String> {
-        Ok(Artifact::Emitted { llvm_ir: Some(emit_llvm_ir(program, interner)), object: None })
+        Ok(Artifact::Emitted {
+            llvm_ir: Some(emit_llvm_ir(program, interner)),
+            object: None,
+        })
     }
 }
 
@@ -80,7 +83,11 @@ fn emit_function(out: &mut String, f: &Function, interner: &Interner) {
         params.join(", ")
     );
 
-    let e = Emitter { f, interner, consts: &consts };
+    let e = Emitter {
+        f,
+        interner,
+        consts: &consts,
+    };
     for b in &f.blocks {
         e.emit_block(out, b);
     }
@@ -118,17 +125,29 @@ impl Emitter<'_> {
     }
 
     fn emit_inst(&self, out: &mut String, inst: &mercury_mir::Inst) {
-        let res = inst.result.map(|r| format!("%v{} = ", r.0)).unwrap_or_default();
+        let res = inst
+            .result
+            .map(|r| format!("%v{} = ", r.0))
+            .unwrap_or_default();
         let line = match &inst.op {
             Op::ConstInt(..) | Op::ConstFloat(..) => return,
             Op::Bin(op, l, r) => {
                 let ty = self.ty(inst.result.unwrap());
-                format!("{res}{} {ty} {}, {}", bin_name(*op), self.operand(*l), self.operand(*r))
+                format!(
+                    "{res}{} {ty} {}, {}",
+                    bin_name(*op),
+                    self.operand(*l),
+                    self.operand(*r)
+                )
             }
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);
                 let (instr, pred) = cmp_instr(*op);
-                format!("{res}{instr} {pred} {opty} {}, {}", self.operand(*l), self.operand(*r))
+                format!(
+                    "{res}{instr} {pred} {opty} {}, {}",
+                    self.operand(*l),
+                    self.operand(*r)
+                )
             }
             Op::Neg(v) => {
                 let ty = self.ty(inst.result.unwrap());
@@ -144,7 +163,12 @@ impl Emitter<'_> {
             }
             Op::Cast(kind, v, to) => {
                 let from = self.ty(*v);
-                format!("{res}{} {from} {} to {}", cast_name(*kind), self.operand(*v), llvm_ty(to))
+                format!(
+                    "{res}{} {from} {} to {}",
+                    cast_name(*kind),
+                    self.operand(*v),
+                    llvm_ty(to)
+                )
             }
             Op::Select(c, a, b) => {
                 let ty = self.ty(inst.result.unwrap());
@@ -159,7 +183,11 @@ impl Emitter<'_> {
             Op::Load(p, ty) => format!("{res}load {}, ptr {}", llvm_ty(ty), self.operand(*p)),
             Op::Store { ptr, value } => {
                 let ty = self.ty(*value);
-                format!("store {ty} {}, ptr {}", self.operand(*value), self.operand(*ptr))
+                format!(
+                    "store {ty} {}, ptr {}",
+                    self.operand(*value),
+                    self.operand(*ptr)
+                )
             }
             Op::Gep { ptr, index, elem } => {
                 let idxty = self.ty(*index);
@@ -176,8 +204,16 @@ impl Emitter<'_> {
                     .iter()
                     .map(|a| format!("{} {}", self.ty(*a), self.operand(*a)))
                     .collect();
-                let ret_ty = if inst.result.is_some() { ret } else { "void".to_string() };
-                format!("{res}call {ret_ty} @{}({})", self.interner.resolve(*func), argstr.join(", "))
+                let ret_ty = if inst.result.is_some() {
+                    ret
+                } else {
+                    "void".to_string()
+                };
+                format!(
+                    "{res}call {ret_ty} @{}({})",
+                    self.interner.resolve(*func),
+                    argstr.join(", ")
+                )
             }
         };
         let _ = writeln!(out, "  {line}");
@@ -188,7 +224,12 @@ impl Emitter<'_> {
             Terminator::Ret(None) => "ret void".to_string(),
             Terminator::Ret(Some(v)) => format!("ret {} {}", self.ty(*v), self.operand(*v)),
             Terminator::Br { target, .. } => format!("br label %bb{}", target.0),
-            Terminator::CondBr { cond, then_blk, else_blk, .. } => format!(
+            Terminator::CondBr {
+                cond,
+                then_blk,
+                else_blk,
+                ..
+            } => format!(
                 "br i1 {}, label %bb{}, label %bb{}",
                 self.operand(*cond),
                 then_blk.0,

@@ -48,7 +48,14 @@ fn fold_constant_branches(f: &mut Function) -> bool {
     let consts = const_ints(f);
     let mut changed = false;
     for b in &mut f.blocks {
-        if let Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args } = &b.term {
+        if let Terminator::CondBr {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } = &b.term
+        {
             // Same destination and arguments on both arms: unconditional.
             let identical = then_blk == else_blk && then_args == else_args;
             let folded = match consts.get(&cond.0) {
@@ -72,7 +79,9 @@ fn fold_constant_branches(f: &mut Function) -> bool {
 fn successors(t: &Terminator) -> Vec<BlockId> {
     match t {
         Terminator::Br { target, .. } => vec![*target],
-        Terminator::CondBr { then_blk, else_blk, .. } => vec![*then_blk, *else_blk],
+        Terminator::CondBr {
+            then_blk, else_blk, ..
+        } => vec![*then_blk, *else_blk],
         Terminator::Ret(_) | Terminator::Unreachable => vec![],
     }
 }
@@ -123,7 +132,9 @@ fn prune_unreachable(f: &mut Function) -> bool {
 fn remap_term(t: &mut Terminator, remap: &HashMap<u32, u32>) {
     match t {
         Terminator::Br { target, .. } => target.0 = remap[&target.0],
-        Terminator::CondBr { then_blk, else_blk, .. } => {
+        Terminator::CondBr {
+            then_blk, else_blk, ..
+        } => {
             then_blk.0 = remap[&then_blk.0];
             else_blk.0 = remap[&else_blk.0];
         }

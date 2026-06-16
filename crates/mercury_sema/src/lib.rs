@@ -74,7 +74,10 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     };
     s.collect(module);
     s.check_bodies(module);
-    let result = SemaResult { types: s.types, defs: s.defs };
+    let result = SemaResult {
+        types: s.types,
+        defs: s.defs,
+    };
     (result, s.diags)
 }
 
@@ -90,7 +93,8 @@ struct Sema<'a> {
 
 impl Sema<'_> {
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
-        self.diags.push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+        self.diags
+            .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
     }
 
     fn sym_str(&self, s: Symbol) -> &str {
@@ -137,7 +141,15 @@ impl Sema<'_> {
         };
         let generics = self.generics.iter().copied().collect();
         self.generics.clear();
-        self.register(f.name, DefKind::Fn(FnSig { generics, params, ret }), f.name.span);
+        self.register(
+            f.name,
+            DefKind::Fn(FnSig {
+                generics,
+                params,
+                ret,
+            }),
+            f.name.span,
+        );
     }
 
     fn register(&mut self, name: Ident, kind: DefKind, span: Span) {
@@ -145,12 +157,19 @@ impl Sema<'_> {
             self.error(
                 span,
                 "E0300",
-                format!("the name `{}` is defined more than once", self.sym_str(name.sym)),
+                format!(
+                    "the name `{}` is defined more than once",
+                    self.sym_str(name.sym)
+                ),
             );
             return;
         }
         let idx = self.defs.defs.len();
-        self.defs.defs.push(Def { name: name.sym, kind, span });
+        self.defs.defs.push(Def {
+            name: name.sym,
+            kind,
+            span,
+        });
         self.defs.by_name.insert(name.sym, idx);
     }
 
@@ -170,21 +189,31 @@ impl Sema<'_> {
             }
             TypeKind::Int(_) => Ty::Error,
             TypeKind::Unit => Ty::Unit,
-            TypeKind::Pointer { mutable, pointee } => {
-                Ty::Ptr { mutable: *mutable, pointee: Box::new(self.lower_type(pointee)) }
-            }
-            TypeKind::Ref { mutable, pointee } => {
-                Ty::Ref { mutable: *mutable, pointee: Box::new(self.lower_type(pointee)) }
-            }
+            TypeKind::Pointer { mutable, pointee } => Ty::Ptr {
+                mutable: *mutable,
+                pointee: Box::new(self.lower_type(pointee)),
+            },
+            TypeKind::Ref { mutable, pointee } => Ty::Ref {
+                mutable: *mutable,
+                pointee: Box::new(self.lower_type(pointee)),
+            },
             TypeKind::Slice(e) => Ty::Slice(Box::new(self.lower_type(e))),
-            TypeKind::Array { elem, len } => {
-                Ty::Array { elem: Box::new(self.lower_type(elem)), len: self.eval_usize(len) }
-            }
+            TypeKind::Array { elem, len } => Ty::Array {
+                elem: Box::new(self.lower_type(elem)),
+                len: self.eval_usize(len),
+            },
             TypeKind::Tuple(items) => Ty::Tuple(items.iter().map(|i| self.lower_type(i)).collect()),
             TypeKind::Vector { elem, lanes } => match self.lower_type(elem) {
-                Ty::Scalar(s) => Ty::Vector { elem: s, lanes: *lanes },
+                Ty::Scalar(s) => Ty::Vector {
+                    elem: s,
+                    lanes: *lanes,
+                },
                 _ => {
-                    self.error(t.span, "E0302", "a SIMD vector element must be a scalar type");
+                    self.error(
+                        t.span,
+                        "E0302",
+                        "a SIMD vector element must be a scalar type",
+                    );
                     Ty::Error
                 }
             },
@@ -203,7 +232,11 @@ impl Sema<'_> {
                     Some(mercury_ast::Layout::Tiled(v)) => Layout::Tiled(v.clone()),
                     _ => Layout::Contiguous,
                 };
-                Ty::Tensor { elem: elem_ty, shape, layout }
+                Ty::Tensor {
+                    elem: elem_ty,
+                    shape,
+                    layout,
+                }
             }
         }
     }
@@ -220,7 +253,11 @@ impl Sema<'_> {
         match &e.kind {
             ExprKind::Int(s) => {
                 let text = self.sym_str(*s);
-                text.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)
+                text.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
             }
             _ => 0,
         }
@@ -288,9 +325,10 @@ impl Sema<'_> {
         }
         if let Some(def) = self.defs.lookup(name) {
             return Some(match &def.kind {
-                DefKind::Fn(sig) => {
-                    Ty::Fn { params: sig.params.clone(), ret: Box::new(sig.ret.clone()) }
-                }
+                DefKind::Fn(sig) => Ty::Fn {
+                    params: sig.params.clone(),
+                    ret: Box::new(sig.ret.clone()),
+                },
                 DefKind::Const(t) => t.clone(),
                 DefKind::Struct(_) | DefKind::Enum => Ty::Unknown, // used as a namespace
             });
@@ -366,7 +404,9 @@ impl Sema<'_> {
                 self.type_expr(cond);
                 self.type_block(body);
             }
-            StmtKind::For { pat, iter, body, .. } => {
+            StmtKind::For {
+                pat, iter, body, ..
+            } => {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
@@ -381,7 +421,9 @@ impl Sema<'_> {
 
     fn type_for_iter(&mut self, iter: &ForIter) -> Ty {
         match iter {
-            ForIter::Range { start, end, step, .. } => {
+            ForIter::Range {
+                start, end, step, ..
+            } => {
                 let t = self.type_expr(start);
                 if let Some(e) = end {
                     self.type_expr(e);
@@ -389,7 +431,11 @@ impl Sema<'_> {
                 if let Some(st) = step {
                     self.type_expr(st);
                 }
-                if t.is_unknown() { Ty::Scalar(Scalar::Usize) } else { t }
+                if t.is_unknown() {
+                    Ty::Scalar(Scalar::Usize)
+                } else {
+                    t
+                }
             }
             ForIter::Expr(e) => {
                 self.type_expr(e);
@@ -443,7 +489,10 @@ impl Sema<'_> {
             ExprKind::Int(s) => Ty::Scalar(int_lit_scalar(self.sym_str(*s))),
             ExprKind::Float(s) => Ty::Scalar(float_lit_scalar(self.sym_str(*s))),
             ExprKind::Bool(_) => Ty::Scalar(Scalar::Bool),
-            ExprKind::Str(_) => Ty::Ptr { mutable: false, pointee: Box::new(Ty::Scalar(Scalar::U8)) },
+            ExprKind::Str(_) => Ty::Ptr {
+                mutable: false,
+                pointee: Box::new(Ty::Scalar(Scalar::U8)),
+            },
             ExprKind::Char(_) => Ty::Scalar(Scalar::U32),
             ExprKind::Path(p) => {
                 if p.is_single() {
@@ -453,7 +502,10 @@ impl Sema<'_> {
                             self.error(
                                 p.span,
                                 "E0301",
-                                format!("cannot find `{}` in this scope", self.sym_str(p.first().sym)),
+                                format!(
+                                    "cannot find `{}` in this scope",
+                                    self.sym_str(p.first().sym)
+                                ),
                             );
                             Ty::Error
                         }
@@ -469,8 +521,14 @@ impl Sema<'_> {
                         Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => *pointee,
                         _ => Ty::Unknown,
                     },
-                    UnOp::Ref => Ty::Ptr { mutable: false, pointee: Box::new(t) },
-                    UnOp::RefMut => Ty::Ptr { mutable: true, pointee: Box::new(t) },
+                    UnOp::Ref => Ty::Ptr {
+                        mutable: false,
+                        pointee: Box::new(t),
+                    },
+                    UnOp::RefMut => Ty::Ptr {
+                        mutable: true,
+                        pointee: Box::new(t),
+                    },
                     UnOp::Neg | UnOp::Not => t,
                 }
             }
@@ -483,9 +541,11 @@ impl Sema<'_> {
                     _ => join(l, r),
                 }
             }
-            ExprKind::Call { callee, generic_args, args } => {
-                self.type_call(callee, generic_args, args, e.span)
-            }
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => self.type_call(callee, generic_args, args, e.span),
             ExprKind::Index { base, indices } => self.type_index(base, indices, e.span),
             ExprKind::Field { base, .. } => {
                 self.type_expr(base);
@@ -511,13 +571,19 @@ impl Sema<'_> {
                         elem = t;
                     }
                 }
-                Ty::Array { elem: Box::new(elem), len: items.len() as u64 }
+                Ty::Array {
+                    elem: Box::new(elem),
+                    len: items.len() as u64,
+                }
             }
             ExprKind::ArrayRepeat { value, count } => {
                 let elem = self.type_expr(value);
                 let len = self.eval_usize(count);
                 self.type_expr(count);
-                Ty::Array { elem: Box::new(elem), len }
+                Ty::Array {
+                    elem: Box::new(elem),
+                    len,
+                }
             }
             ExprKind::TupleLit(items) => {
                 if items.is_empty() {
@@ -527,7 +593,11 @@ impl Sema<'_> {
                 }
             }
             ExprKind::Block(b) => self.type_block(b),
-            ExprKind::If { cond, then_branch, else_branch } => {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.type_expr(cond);
                 let then_ty = self.type_block(then_branch);
                 if let Some(e) = else_branch {
@@ -622,13 +692,17 @@ fn float_lit_scalar(text: &str) -> Scalar {
 }
 
 fn has_int_suffix(text: &str) -> bool {
-    ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize"]
-        .iter()
-        .any(|s| text.ends_with(s))
+    [
+        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize",
+    ]
+    .iter()
+    .any(|s| text.ends_with(s))
 }
 
 fn has_float_suffix(text: &str) -> bool {
-    ["f16", "bf16", "f32", "f64"].iter().any(|s| text.ends_with(s))
+    ["f16", "bf16", "f32", "f64"]
+        .iter()
+        .any(|s| text.ends_with(s))
 }
 
 #[cfg(test)]
@@ -698,7 +772,11 @@ mod tests {
             "{MATMUL}\nfn driver(a: Tensor[f32, 512, 512], b: Tensor[f32, 512, 512], \
              c: Tensor[f32, 512, 513]) {{ matmul::<512, 512, 512>(a, b, c); }}"
         );
-        assert!(errors(&src).contains(&"E0502"), "expected a dimension mismatch: {:?}", errors(&src));
+        assert!(
+            errors(&src).contains(&"E0502"),
+            "expected a dimension mismatch: {:?}",
+            errors(&src)
+        );
     }
 
     #[test]
@@ -708,13 +786,21 @@ mod tests {
             "{MATMUL}\nfn driver(a: Tensor[f32, 512, 512], b: Tensor[f32, 500, 512], \
              c: Tensor[f32, 512, 512]) {{ matmul(a, b, c); }}"
         );
-        assert!(errors(&src).contains(&"E0502"), "expected a K conflict: {:?}", errors(&src));
+        assert!(
+            errors(&src).contains(&"E0502"),
+            "expected a K conflict: {:?}",
+            errors(&src)
+        );
     }
 
     #[test]
     fn tensor_index_rank_mismatch_errors() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
-        assert!(errors(src).contains(&"E0501"), "expected a rank mismatch: {:?}", errors(src));
+        assert!(
+            errors(src).contains(&"E0501"),
+            "expected a rank mismatch: {:?}",
+            errors(src)
+        );
     }
 
     #[test]

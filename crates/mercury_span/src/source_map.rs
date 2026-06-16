@@ -25,7 +25,11 @@ impl SourceFile {
                 line_starts.push((i + 1) as u32);
             }
         }
-        SourceFile { name, src, line_starts }
+        SourceFile {
+            name,
+            src,
+            line_starts,
+        }
     }
 
     /// 0-based index of the line containing `offset`.
@@ -85,7 +89,10 @@ impl SourceMap {
         let line_idx = f.line_index(offset);
         let line_start = f.line_starts[line_idx] as usize;
         let col = f.src[line_start..offset as usize].chars().count() as u32;
-        Location { line: line_idx as u32 + 1, col: col + 1 }
+        Location {
+            line: line_idx as u32 + 1,
+            col: col + 1,
+        }
     }
 
     /// The start location of a span (its `lo`).

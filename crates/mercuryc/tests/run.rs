@@ -32,7 +32,11 @@ fn parse_directives(src: &str) -> Expect {
             out_lines.push(rest.trim().to_string());
         }
     }
-    Expect { run_args, exit, out_lines }
+    Expect {
+        run_args,
+        exit,
+        out_lines,
+    }
 }
 
 fn run_dir() -> PathBuf {
@@ -70,7 +74,8 @@ fn check_program(path: &Path) {
     if !expect.out_lines.is_empty() {
         let actual: Vec<&str> = stdout.lines().collect();
         assert_eq!(
-            actual, expect.out_lines,
+            actual,
+            expect.out_lines,
             "{name}: stdout mismatch\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -85,7 +90,11 @@ fn collect_programs() -> Vec<PathBuf> {
         .filter(|p| p.extension().map(|x| x == "mer").unwrap_or(false))
         .collect();
     programs.sort();
-    assert!(!programs.is_empty(), "no .mer programs found in {}", dir.display());
+    assert!(
+        !programs.is_empty(),
+        "no .mer programs found in {}",
+        dir.display()
+    );
     programs
 }
 
@@ -123,5 +132,8 @@ fn run_at(path: &Path, opt: &str) -> (Option<i32>, String) {
         .arg(path)
         .output()
         .expect("failed to spawn mercuryc");
-    (output.status.code(), String::from_utf8_lossy(&output.stdout).into_owned())
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
 }

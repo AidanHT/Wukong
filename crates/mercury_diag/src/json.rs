@@ -79,7 +79,16 @@ pub fn to_json(d: &Diagnostic, sm: &SourceMap) -> String {
             out.push(',');
         }
         out.push('{');
-        field_str(&mut out, "kind", if matches!(kind, NoteKind::Note) { "note" } else { "help" }, false);
+        field_str(
+            &mut out,
+            "kind",
+            if matches!(kind, NoteKind::Note) {
+                "note"
+            } else {
+                "help"
+            },
+            false,
+        );
         field_str(&mut out, "message", msg, true);
         out.push('}');
     }

@@ -23,25 +23,62 @@ pub enum ExprKind {
     Bool(bool),
     /// A variable, function, or namespaced item reference (`x`, `f32x8::splat`).
     Path(Path),
-    Unary { op: UnOp, expr: Box<Expr> },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// `callee::<generic_args>(args)`.
-    Call { callee: Box<Expr>, generic_args: Vec<TypeExpr>, args: Vec<Expr> },
+    Call {
+        callee: Box<Expr>,
+        generic_args: Vec<TypeExpr>,
+        args: Vec<Expr>,
+    },
     /// Multi-dimensional index: `a[i, j]`.
-    Index { base: Box<Expr>, indices: Vec<Expr> },
+    Index {
+        base: Box<Expr>,
+        indices: Vec<Expr>,
+    },
     /// `base.name` field access.
-    Field { base: Box<Expr>, name: Ident },
+    Field {
+        base: Box<Expr>,
+        name: Ident,
+    },
     /// `base.0` tuple field access.
-    TupleField { base: Box<Expr>, index: u32 },
-    Cast { expr: Box<Expr>, ty: TypeExpr },
-    StructLit { path: Path, fields: Vec<FieldInit>, rest: Option<Box<Expr>> },
+    TupleField {
+        base: Box<Expr>,
+        index: u32,
+    },
+    Cast {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+    },
+    StructLit {
+        path: Path,
+        fields: Vec<FieldInit>,
+        rest: Option<Box<Expr>>,
+    },
     ArrayLit(Vec<Expr>),
     /// `[value; count]`.
-    ArrayRepeat { value: Box<Expr>, count: Box<Expr> },
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: Box<Expr>,
+    },
     TupleLit(Vec<Expr>),
     Block(Block),
-    If { cond: Box<Expr>, then_branch: Block, else_branch: Option<Box<Expr>> },
-    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
+    If {
+        cond: Box<Expr>,
+        then_branch: Block,
+        else_branch: Option<Box<Expr>>,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     SizeOf(TypeExpr),
     AlignOf(TypeExpr),
 }

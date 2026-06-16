@@ -114,7 +114,11 @@ impl Renderer {
             (line_chars + 1).saturating_sub(lo.col).max(1)
         };
 
-        let (mark, mark_color) = if l.primary { ("^", span_color(true)) } else { ("-", span_color(false)) };
+        let (mark, mark_color) = if l.primary {
+            ("^", span_color(true))
+        } else {
+            ("-", span_color(false))
+        };
         let underline = mark.repeat(caret_len as usize);
         let spaces = " ".repeat((lo.col - 1) as usize);
 
@@ -129,7 +133,10 @@ impl Renderer {
             format!(" {}", l.message)
         };
         let underline_painted = self.paint(mark_color, &format!("{underline}{msg}"));
-        out.push_str(&format!("{} {bar} {spaces}{underline_painted}", " ".repeat(width)));
+        out.push_str(&format!(
+            "{} {bar} {spaces}{underline_painted}",
+            " ".repeat(width)
+        ));
     }
 }
 
@@ -145,7 +152,7 @@ fn span_color(primary: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::Diagnostic;
-    use mercury_span::{Span, SourceMap};
+    use mercury_span::{SourceMap, Span};
 
     fn sm_with(src: &str) -> (SourceMap, mercury_span::SourceId) {
         let mut sm = SourceMap::new();
@@ -179,7 +186,10 @@ error[E0501]: shape mismatch
         let (sm, _id) = sm_with("x");
         let d = Diagnostic::error("could not find input file").note("check the path");
         let r = Renderer::new(false).render(&d, &sm);
-        assert_eq!(r, "error: could not find input file\n  = note: check the path");
+        assert_eq!(
+            r,
+            "error: could not find input file\n  = note: check the path"
+        );
     }
 
     #[test]

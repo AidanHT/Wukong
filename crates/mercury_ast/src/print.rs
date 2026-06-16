@@ -9,21 +9,33 @@ use mercury_span::{Interner, Symbol};
 
 /// Render a whole module to a string.
 pub fn print_module(m: &Module, interner: &Interner) -> String {
-    let mut p = AstPrinter { interner, out: String::new(), depth: 0 };
+    let mut p = AstPrinter {
+        interner,
+        out: String::new(),
+        depth: 0,
+    };
     p.module(m);
     p.out
 }
 
 /// Render a single expression as an indented tree (used by parser tests).
 pub fn print_expr(e: &Expr, interner: &Interner) -> String {
-    let mut p = AstPrinter { interner, out: String::new(), depth: 0 };
+    let mut p = AstPrinter {
+        interner,
+        out: String::new(),
+        depth: 0,
+    };
     p.expr(e);
     p.out
 }
 
 /// Render a single type to its inline source-like form (used by parser tests).
 pub fn print_type(t: &TypeExpr, interner: &Interner) -> String {
-    let p = AstPrinter { interner, out: String::new(), depth: 0 };
+    let p = AstPrinter {
+        interner,
+        out: String::new(),
+        depth: 0,
+    };
     p.type_str(t)
 }
 
@@ -68,10 +80,18 @@ impl AstPrinter<'_> {
             TypeKind::Int(s) => self.sym(*s).to_string(),
             TypeKind::Unit => "()".to_string(),
             TypeKind::Pointer { mutable, pointee } => {
-                format!("*{}{}", if *mutable { "mut " } else { "" }, self.type_str(pointee))
+                format!(
+                    "*{}{}",
+                    if *mutable { "mut " } else { "" },
+                    self.type_str(pointee)
+                )
             }
             TypeKind::Ref { mutable, pointee } => {
-                format!("&{}{}", if *mutable { "mut " } else { "" }, self.type_str(pointee))
+                format!(
+                    "&{}{}",
+                    if *mutable { "mut " } else { "" },
+                    self.type_str(pointee)
+                )
             }
             TypeKind::Slice(e) => format!("[]{}", self.type_str(e)),
             TypeKind::Array { elem, len } => {
@@ -112,9 +132,16 @@ impl AstPrinter<'_> {
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Path(p) => self.path_str(p, "::"),
             ExprKind::Binary { op, lhs, rhs } => {
-                format!("({} {} {})", self.expr_inline(lhs), op.glyph(), self.expr_inline(rhs))
+                format!(
+                    "({} {} {})",
+                    self.expr_inline(lhs),
+                    op.glyph(),
+                    self.expr_inline(rhs)
+                )
             }
-            ExprKind::Unary { op, expr } => format!("{}{}", op.glyph().trim(), self.expr_inline(expr)),
+            ExprKind::Unary { op, expr } => {
+                format!("{}{}", op.glyph().trim(), self.expr_inline(expr))
+            }
             _ => "<expr>".to_string(),
         }
     }
@@ -132,7 +159,9 @@ impl AstPrinter<'_> {
                 }
                 AttrArg::KeyValue { key, value } => {
                     let v = match value {
-                        AttrVal::Int(s) | AttrVal::Str(s) | AttrVal::Word(s) => self.sym(*s).to_string(),
+                        AttrVal::Int(s) | AttrVal::Str(s) | AttrVal::Word(s) => {
+                            self.sym(*s).to_string()
+                        }
                         AttrVal::Bool(b) => b.to_string(),
                     };
                     format!("{} = {}", self.sym(key.sym), v)
@@ -180,7 +209,11 @@ impl AstPrinter<'_> {
                 self.indented(|p| {
                     p.generics(&s.generics);
                     for field in &s.fields {
-                        p.line(format!("field {}: {}", p.sym(field.name.sym), p.type_str(&field.ty)));
+                        p.line(format!(
+                            "field {}: {}",
+                            p.sym(field.name.sym),
+                            p.type_str(&field.ty)
+                        ));
                     }
                 });
             }
@@ -193,7 +226,11 @@ impl AstPrinter<'_> {
                 });
             }
             ItemKind::Const(c) => {
-                self.line(format!("const {}: {}", self.sym(c.name.sym), self.type_str(&c.ty)));
+                self.line(format!(
+                    "const {}: {}",
+                    self.sym(c.name.sym),
+                    self.type_str(&c.ty)
+                ));
                 self.indented(|p| p.expr(&c.value));
             }
             ItemKind::Import(i) => {
@@ -219,9 +256,11 @@ impl AstPrinter<'_> {
             for g in gs {
                 match &g.kind {
                     GenericParamKind::Type(id) => p.line(format!("type-param {}", p.sym(id.sym))),
-                    GenericParamKind::Const { name, ty } => {
-                        p.line(format!("const-param {}: {}", p.sym(name.sym), p.type_str(ty)))
-                    }
+                    GenericParamKind::Const { name, ty } => p.line(format!(
+                        "const-param {}: {}",
+                        p.sym(name.sym),
+                        p.type_str(ty)
+                    )),
                 }
             }
         });
@@ -231,7 +270,11 @@ impl AstPrinter<'_> {
         for a in &param.attrs {
             self.line(self.attr_str(a));
         }
-        self.line(format!("param {}: {}", self.sym(param.name.sym), self.type_str(&param.ty)));
+        self.line(format!(
+            "param {}: {}",
+            self.sym(param.name.sym),
+            self.type_str(&param.ty)
+        ));
     }
 
     // --- Statements & blocks ---
@@ -261,7 +304,12 @@ impl AstPrinter<'_> {
             self.line(self.attr_str(a));
         }
         match &s.kind {
-            StmtKind::Let { pat, mutable, ty, init } => {
+            StmtKind::Let {
+                pat,
+                mutable,
+                ty,
+                init,
+            } => {
                 self.line(format!("let{}", if *mutable { " mut" } else { "" }));
                 self.indented(|p| {
                     p.pattern(pat);
@@ -302,7 +350,12 @@ impl AstPrinter<'_> {
                     p.block(body);
                 });
             }
-            StmtKind::For { label, pat, iter, body } => {
+            StmtKind::For {
+                label,
+                pat,
+                iter,
+                body,
+            } => {
                 self.line(format!("for{}", self.label(label)));
                 self.indented(|p| {
                     p.pattern(pat);
@@ -319,7 +372,12 @@ impl AstPrinter<'_> {
 
     fn for_iter(&mut self, iter: &ForIter) {
         match iter {
-            ForIter::Range { start, end, inclusive, step } => {
+            ForIter::Range {
+                start,
+                end,
+                inclusive,
+                step,
+            } => {
                 self.line(format!("range{}", if *inclusive { "=" } else { "" }));
                 self.indented(|p| {
                     p.line("start");
@@ -378,7 +436,11 @@ impl AstPrinter<'_> {
                     p.expr(rhs);
                 });
             }
-            ExprKind::Call { callee, generic_args, args } => {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
                 self.line("call");
                 self.indented(|p| {
                     p.expr(callee);
@@ -448,7 +510,11 @@ impl AstPrinter<'_> {
                 });
             }
             ExprKind::Block(b) => self.block(b),
-            ExprKind::If { cond, then_branch, else_branch } => {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.line("if");
                 self.indented(|p| {
                     p.line("cond");
@@ -489,8 +555,18 @@ mod tests {
     fn empty_module_with_name() {
         let mut i = Interner::new();
         let a = i.intern("demo");
-        let path = Path { segments: vec![Ident { sym: a, span: Span::dummy() }], span: Span::dummy() };
-        let m = Module { name: Some(path), items: vec![], span: Span::dummy() };
+        let path = Path {
+            segments: vec![Ident {
+                sym: a,
+                span: Span::dummy(),
+            }],
+            span: Span::dummy(),
+        };
+        let m = Module {
+            name: Some(path),
+            items: vec![],
+            span: Span::dummy(),
+        };
         assert_eq!(print_module(&m, &i), "module demo\n");
     }
 }

@@ -40,7 +40,11 @@ impl Span {
 
     /// A placeholder span for compiler-synthesized nodes that have no backing source text.
     pub const fn dummy() -> Self {
-        Span { source: SourceId(u32::MAX), lo: 0, hi: 0 }
+        Span {
+            source: SourceId(u32::MAX),
+            lo: 0,
+            hi: 0,
+        }
     }
 
     pub const fn is_dummy(&self) -> bool {
@@ -57,7 +61,10 @@ impl Span {
 
     /// The smallest span covering both `self` and `other`. They must share a source.
     pub fn to(self, other: Span) -> Span {
-        debug_assert_eq!(self.source, other.source, "cannot merge spans from different sources");
+        debug_assert_eq!(
+            self.source, other.source,
+            "cannot merge spans from different sources"
+        );
         Span {
             source: self.source,
             lo: self.lo.min(other.lo),
@@ -67,12 +74,20 @@ impl Span {
 
     /// A zero-width span at this span's start — useful for "expected token here" diagnostics.
     pub const fn shrink_to_lo(self) -> Span {
-        Span { source: self.source, lo: self.lo, hi: self.lo }
+        Span {
+            source: self.source,
+            lo: self.lo,
+            hi: self.lo,
+        }
     }
 
     /// A zero-width span at this span's end.
     pub const fn shrink_to_hi(self) -> Span {
-        Span { source: self.source, lo: self.hi, hi: self.hi }
+        Span {
+            source: self.source,
+            lo: self.hi,
+            hi: self.hi,
+        }
     }
 }
 

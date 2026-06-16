@@ -133,18 +133,37 @@ pub enum Layout {
 pub enum Ty {
     Scalar(Scalar),
     Unit,
-    Ptr { mutable: bool, pointee: Box<Ty> },
-    Ref { mutable: bool, pointee: Box<Ty> },
+    Ptr {
+        mutable: bool,
+        pointee: Box<Ty>,
+    },
+    Ref {
+        mutable: bool,
+        pointee: Box<Ty>,
+    },
     Slice(Box<Ty>),
-    Array { elem: Box<Ty>, len: u64 },
+    Array {
+        elem: Box<Ty>,
+        len: u64,
+    },
     Tuple(Vec<Ty>),
     /// A SIMD vector: a power-of-two count of scalar lanes.
-    Vector { elem: Scalar, lanes: u32 },
+    Vector {
+        elem: Scalar,
+        lanes: u32,
+    },
     /// A shape-typed tensor view.
-    Tensor { elem: Scalar, shape: Shape, layout: Layout },
+    Tensor {
+        elem: Scalar,
+        shape: Shape,
+        layout: Layout,
+    },
     /// A named (struct/enum) type, identified by its interned name.
     Named(Symbol),
-    Fn { params: Vec<Ty>, ret: Box<Ty> },
+    Fn {
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+    },
     /// An as-yet-undetermined type (lenient inference for unmodeled builtins). Does not error.
     Unknown,
     /// A type produced after an error; suppresses cascading diagnostics.
@@ -203,7 +222,9 @@ impl Ty {
             Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
             Ty::Vector { elem, lanes } => Some(elem.size() * *lanes as u64),
             Ty::Array { elem, .. } => elem.align_of(),
-            Ty::Tuple(fields) => fields.iter().try_fold(1u64, |a, f| Some(a.max(f.align_of()?))),
+            Ty::Tuple(fields) => fields
+                .iter()
+                .try_fold(1u64, |a, f| Some(a.max(f.align_of()?))),
             _ => None,
         }
     }
@@ -214,10 +235,18 @@ impl Ty {
             Ty::Scalar(s) => s.name().to_string(),
             Ty::Unit => "()".to_string(),
             Ty::Ptr { mutable, pointee } => {
-                format!("*{}{}", if *mutable { "mut " } else { "" }, pointee.display(interner))
+                format!(
+                    "*{}{}",
+                    if *mutable { "mut " } else { "" },
+                    pointee.display(interner)
+                )
             }
             Ty::Ref { mutable, pointee } => {
-                format!("&{}{}", if *mutable { "mut " } else { "" }, pointee.display(interner))
+                format!(
+                    "&{}{}",
+                    if *mutable { "mut " } else { "" },
+                    pointee.display(interner)
+                )
             }
             Ty::Slice(e) => format!("[]{}", e.display(interner)),
             Ty::Array { elem, len } => format!("[{}; {}]", elem.display(interner), len),
@@ -276,10 +305,16 @@ mod tests {
 
     #[test]
     fn vector_and_array_sizes() {
-        let v = Ty::Vector { elem: Scalar::F32, lanes: 8 };
+        let v = Ty::Vector {
+            elem: Scalar::F32,
+            lanes: 8,
+        };
         assert_eq!(v.size_of(), Some(32));
         assert_eq!(v.align_of(), Some(32));
-        let a = Ty::Array { elem: Box::new(Ty::Scalar(Scalar::I32)), len: 4 };
+        let a = Ty::Array {
+            elem: Box::new(Ty::Scalar(Scalar::I32)),
+            len: 4,
+        };
         assert_eq!(a.size_of(), Some(16));
     }
 

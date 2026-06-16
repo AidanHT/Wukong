@@ -47,7 +47,13 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str, source: SourceId) -> Lexer<'a> {
-        Lexer { src, bytes: src.as_bytes(), pos: 0, source, diags: Vec::new() }
+        Lexer {
+            src,
+            bytes: src.as_bytes(),
+            pos: 0,
+            source,
+            diags: Vec::new(),
+        }
     }
 
     fn peek_at(&self, off: usize) -> Option<u8> {
@@ -65,7 +71,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
-        self.diags.push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+        self.diags
+            .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
     }
 
     fn next_token(&mut self) -> Token {
@@ -175,7 +182,10 @@ impl<'a> Lexer<'a> {
 
         // Radix-prefixed integers: 0x.., 0b.., 0o..
         if self.peek_at(0) == Some(b'0')
-            && matches!(self.peek_at(1), Some(b'x' | b'X' | b'b' | b'B' | b'o' | b'O'))
+            && matches!(
+                self.peek_at(1),
+                Some(b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
+            )
         {
             self.bump();
             self.bump();
@@ -384,7 +394,10 @@ mod tests {
     fn keywords_and_identifiers() {
         use TokenKind::*;
         // `f32x8` must lex as a single identifier, not `f32` + `x8`.
-        assert_eq!(kinds("fn main let x f32x8 Tensor"), vec![Fn, Ident, Let, Ident, Ident, Ident]);
+        assert_eq!(
+            kinds("fn main let x f32x8 Tensor"),
+            vec![Fn, Ident, Let, Ident, Ident, Ident]
+        );
     }
 
     #[test]

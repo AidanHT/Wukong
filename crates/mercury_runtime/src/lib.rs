@@ -15,7 +15,10 @@ pub struct Arena {
 impl Arena {
     /// Create an arena with `capacity` bytes of backing store.
     pub fn with_capacity(capacity: usize) -> Arena {
-        Arena { buf: vec![0u8; capacity], offset: 0 }
+        Arena {
+            buf: vec![0u8; capacity],
+            offset: 0,
+        }
     }
 
     /// Bytes handed out so far.

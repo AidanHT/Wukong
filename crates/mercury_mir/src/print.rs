@@ -16,8 +16,11 @@ pub fn print_program(p: &Program, interner: &Interner) -> String {
 /// Render a single function.
 pub fn print_function(f: &Function, interner: &Interner) -> String {
     let mut out = String::new();
-    let params: Vec<String> =
-        f.params.iter().map(|v| format!("{} {}", val(*v), f.value_type(*v).display())).collect();
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|v| format!("{} {}", val(*v), f.value_type(*v).display()))
+        .collect();
     out.push_str(&format!(
         "fn {}({}) -> {} {{\n",
         interner.resolve(f.name),
@@ -25,8 +28,11 @@ pub fn print_function(f: &Function, interner: &Interner) -> String {
         f.ret.display()
     ));
     for b in &f.blocks {
-        let bparams: Vec<String> =
-            b.params.iter().map(|v| format!("{} {}", val(*v), f.value_type(*v).display())).collect();
+        let bparams: Vec<String> = b
+            .params
+            .iter()
+            .map(|v| format!("{} {}", val(*v), f.value_type(*v).display()))
+            .collect();
         if bparams.is_empty() {
             out.push_str(&format!("  bb{}:\n", b.id.0));
         } else {
@@ -81,7 +87,13 @@ fn fmt_term(t: &Terminator) -> String {
         Terminator::Ret(None) => "ret".to_string(),
         Terminator::Ret(Some(v)) => format!("ret {}", val(*v)),
         Terminator::Br { target, args } => format!("br bb{}{}", target.0, fmt_args(args)),
-        Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args } => format!(
+        Terminator::CondBr {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } => format!(
             "cond_br {}, bb{}{}, bb{}{}",
             val(*cond),
             then_blk.0,

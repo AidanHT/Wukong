@@ -76,7 +76,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--explain" => {
                 i += 1;
-                let code = args.get(i).ok_or("`--explain` requires an error code, e.g. E0502")?;
+                let code = args
+                    .get(i)
+                    .ok_or("`--explain` requires an error code, e.g. E0502")?;
                 print_explanation(code)?;
                 return Ok(None);
             }

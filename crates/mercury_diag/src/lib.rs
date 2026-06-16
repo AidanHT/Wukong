@@ -114,12 +114,20 @@ impl Diagnostic {
     }
 
     pub fn primary(mut self, span: Span, message: impl Into<String>) -> Diagnostic {
-        self.labels.push(Label { span, message: message.into(), primary: true });
+        self.labels.push(Label {
+            span,
+            message: message.into(),
+            primary: true,
+        });
         self
     }
 
     pub fn secondary(mut self, span: Span, message: impl Into<String>) -> Diagnostic {
-        self.labels.push(Label { span, message: message.into(), primary: false });
+        self.labels.push(Label {
+            span,
+            message: message.into(),
+            primary: false,
+        });
         self
     }
 

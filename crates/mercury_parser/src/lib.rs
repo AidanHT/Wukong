@@ -52,7 +52,14 @@ pub(crate) struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub(crate) fn new(tokens: &'a [Token], src: &'a str, interner: &'a mut Interner) -> Parser<'a> {
-        Parser { tokens, pos: 0, src, interner, next_node: 0, diags: Vec::new() }
+        Parser {
+            tokens,
+            pos: 0,
+            src,
+            interner,
+            next_node: 0,
+            diags: Vec::new(),
+        }
     }
 
     // ---- Cursor & helpers ----
@@ -66,7 +73,10 @@ impl<'a> Parser<'a> {
     }
 
     fn nth(&self, n: usize) -> TokenKind {
-        self.tokens.get(self.pos + n).map(|t| t.kind).unwrap_or(T::Eof)
+        self.tokens
+            .get(self.pos + n)
+            .map(|t| t.kind)
+            .unwrap_or(T::Eof)
     }
 
     fn at(&self, k: TokenKind) -> bool {
@@ -112,7 +122,8 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
-        self.diags.push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+        self.diags
+            .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
     }
 
     fn nid(&mut self) -> NodeId {
@@ -134,8 +145,15 @@ impl<'a> Parser<'a> {
             Ident { sym, span }
         } else {
             let span = self.span();
-            self.error(span, "E0201", format!("expected identifier, found {}", self.kind().describe()));
-            Ident { sym: self.interner.intern("«error»"), span }
+            self.error(
+                span,
+                "E0201",
+                format!("expected identifier, found {}", self.kind().describe()),
+            );
+            Ident {
+                sym: self.interner.intern("«error»"),
+                span,
+            }
         }
     }
 
@@ -153,11 +171,19 @@ impl<'a> Parser<'a> {
     }
 
     fn finish_expr(&mut self, start: Span, kind: ExprKind) -> Expr {
-        Expr { id: self.nid(), kind, span: start.to(self.prev_span()) }
+        Expr {
+            id: self.nid(),
+            kind,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn finish_type(&mut self, start: Span, kind: TypeKind) -> TypeExpr {
-        TypeExpr { id: self.nid(), kind, span: start.to(self.prev_span()) }
+        TypeExpr {
+            id: self.nid(),
+            kind,
+            span: start.to(self.prev_span()),
+        }
     }
 
     // ---- Types ----
@@ -168,12 +194,18 @@ impl<'a> Parser<'a> {
             T::Star => {
                 self.bump();
                 let mutable = self.eat(T::Mut);
-                TypeKind::Pointer { mutable, pointee: Box::new(self.parse_type()) }
+                TypeKind::Pointer {
+                    mutable,
+                    pointee: Box::new(self.parse_type()),
+                }
             }
             T::Amp => {
                 self.bump();
                 let mutable = self.eat(T::Mut);
-                TypeKind::Ref { mutable, pointee: Box::new(self.parse_type()) }
+                TypeKind::Ref {
+                    mutable,
+                    pointee: Box::new(self.parse_type()),
+                }
             }
             T::LBracket => {
                 self.bump();
@@ -217,7 +249,11 @@ impl<'a> Parser<'a> {
             T::Ident => self.parse_named_type(),
             _ => {
                 let sp = self.span();
-                self.error(sp, "E0203", format!("expected type, found {}", self.kind().describe()));
+                self.error(
+                    sp,
+                    "E0203",
+                    format!("expected type, found {}", self.kind().describe()),
+                );
                 self.bump();
                 TypeKind::Unit
             }
@@ -258,7 +294,10 @@ impl<'a> Parser<'a> {
             self.bump();
             let elem = Box::new(TypeExpr {
                 id: self.nid(),
-                kind: TypeKind::Path(Path { segments: vec![Ident { sym, span }], span }),
+                kind: TypeKind::Path(Path {
+                    segments: vec![Ident { sym, span }],
+                    span,
+                }),
                 span,
             });
             return TypeKind::Vector { elem, lanes };
@@ -273,7 +312,10 @@ impl<'a> Parser<'a> {
             self.bump();
             segments.push(self.ident());
         }
-        Path { segments, span: start.to(self.prev_span()) }
+        Path {
+            segments,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn parse_dim(&mut self) -> Dim {
@@ -293,12 +335,19 @@ impl<'a> Parser<'a> {
                 DimKind::Named(sym)
             }
             _ => {
-                self.error(span, "E0203", "expected a dimension (integer, name, or `?`)");
+                self.error(
+                    span,
+                    "E0203",
+                    "expected a dimension (integer, name, or `?`)",
+                );
                 self.bump();
                 DimKind::Dynamic
             }
         };
-        Dim { kind, span: span.to(self.prev_span()) }
+        Dim {
+            kind,
+            span: span.to(self.prev_span()),
+        }
     }
 
     fn parse_layout(&mut self) -> Layout {
@@ -328,7 +377,11 @@ impl<'a> Parser<'a> {
                 Layout::Tiled(sizes)
             }
             _ => {
-                self.error(name_span, "E0204", format!("unknown tensor layout `{text}`"));
+                self.error(
+                    name_span,
+                    "E0204",
+                    format!("unknown tensor layout `{text}`"),
+                );
                 Layout::Contiguous
             }
         }
@@ -340,7 +393,10 @@ impl<'a> Parser<'a> {
             return None;
         }
         let text = &self.src[self.span().lo as usize..self.span().hi as usize];
-        let digits: String = text.chars().take_while(|c| c.is_ascii_digit() || *c == '_').collect();
+        let digits: String = text
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '_')
+            .collect();
         let v = digits.replace('_', "").parse().ok();
         self.bump();
         v
@@ -355,7 +411,9 @@ impl<'a> Parser<'a> {
     fn parse_expr_bp(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
         loop {
-            let Some(op) = token_to_binop(self.kind()) else { break };
+            let Some(op) = token_to_binop(self.kind()) else {
+                break;
+            };
             let bp = binop_bp(op);
             if bp < min_bp {
                 break;
@@ -365,7 +423,11 @@ impl<'a> Parser<'a> {
             let span = lhs.span.to(rhs.span);
             lhs = Expr {
                 id: self.nid(),
-                kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                kind: ExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
                 span,
             };
         }
@@ -382,7 +444,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let mutable = self.eat(T::Mut);
                 let expr = Box::new(self.parse_prefix());
-                let kind = ExprKind::Unary { op: if mutable { UnOp::RefMut } else { UnOp::Ref }, expr };
+                let kind = ExprKind::Unary {
+                    op: if mutable { UnOp::RefMut } else { UnOp::Ref },
+                    expr,
+                };
                 return self.finish_expr(start, kind);
             }
             _ => None,
@@ -402,11 +467,14 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 T::LParen => {
                     let args = self.parse_args();
-                    lhs = self.finish_expr(start, ExprKind::Call {
-                        callee: Box::new(lhs),
-                        generic_args: Vec::new(),
-                        args,
-                    });
+                    lhs = self.finish_expr(
+                        start,
+                        ExprKind::Call {
+                            callee: Box::new(lhs),
+                            generic_args: Vec::new(),
+                            args,
+                        },
+                    );
                 }
                 T::LBracket => {
                     self.bump();
@@ -418,16 +486,34 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(T::RBracket);
-                    lhs = self.finish_expr(start, ExprKind::Index { base: Box::new(lhs), indices });
+                    lhs = self.finish_expr(
+                        start,
+                        ExprKind::Index {
+                            base: Box::new(lhs),
+                            indices,
+                        },
+                    );
                 }
                 T::Dot => {
                     self.bump();
                     if self.at(T::Int) {
                         let index = self.parse_int_value().unwrap_or(0) as u32;
-                        lhs = self.finish_expr(start, ExprKind::TupleField { base: Box::new(lhs), index });
+                        lhs = self.finish_expr(
+                            start,
+                            ExprKind::TupleField {
+                                base: Box::new(lhs),
+                                index,
+                            },
+                        );
                     } else {
                         let name = self.ident();
-                        lhs = self.finish_expr(start, ExprKind::Field { base: Box::new(lhs), name });
+                        lhs = self.finish_expr(
+                            start,
+                            ExprKind::Field {
+                                base: Box::new(lhs),
+                                name,
+                            },
+                        );
                     }
                 }
                 T::ColonColon if self.nth(1) == T::Lt => {
@@ -436,20 +522,43 @@ impl<'a> Parser<'a> {
                         self.parse_args()
                     } else {
                         let sp = self.span();
-                        self.error(sp, "E0205", "expected `(` after turbofish generic arguments");
+                        self.error(
+                            sp,
+                            "E0205",
+                            "expected `(` after turbofish generic arguments",
+                        );
                         Vec::new()
                     };
-                    lhs = self.finish_expr(start, ExprKind::Call { callee: Box::new(lhs), generic_args, args });
+                    lhs = self.finish_expr(
+                        start,
+                        ExprKind::Call {
+                            callee: Box::new(lhs),
+                            generic_args,
+                            args,
+                        },
+                    );
                 }
                 T::ColonColon => {
                     self.bump();
                     let name = self.ident();
-                    lhs = self.finish_expr(start, ExprKind::Field { base: Box::new(lhs), name });
+                    lhs = self.finish_expr(
+                        start,
+                        ExprKind::Field {
+                            base: Box::new(lhs),
+                            name,
+                        },
+                    );
                 }
                 T::As => {
                     self.bump();
                     let ty = self.parse_type();
-                    lhs = self.finish_expr(start, ExprKind::Cast { expr: Box::new(lhs), ty });
+                    lhs = self.finish_expr(
+                        start,
+                        ExprKind::Cast {
+                            expr: Box::new(lhs),
+                            ty,
+                        },
+                    );
                 }
                 _ => break,
             }
@@ -534,7 +643,11 @@ impl<'a> Parser<'a> {
                 } else {
                     self.expect(T::RParen);
                     // Parenthesized expression: keep the inner node but extend its span.
-                    Expr { id: first.id, kind: first.kind, span: start.to(self.prev_span()) }
+                    Expr {
+                        id: first.id,
+                        kind: first.kind,
+                        span: start.to(self.prev_span()),
+                    }
                 }
             }
             T::LBracket => {
@@ -546,7 +659,13 @@ impl<'a> Parser<'a> {
                 if self.eat(T::Semi) {
                     let count = Box::new(self.parse_expr());
                     self.expect(T::RBracket);
-                    self.finish_expr(start, ExprKind::ArrayRepeat { value: Box::new(first), count })
+                    self.finish_expr(
+                        start,
+                        ExprKind::ArrayRepeat {
+                            value: Box::new(first),
+                            count,
+                        },
+                    )
                 } else {
                     let mut items = vec![first];
                     while self.eat(T::Comma) {
@@ -582,11 +701,21 @@ impl<'a> Parser<'a> {
                     return self.finish_expr(start, ExprKind::AlignOf(ty));
                 }
                 let id = self.ident();
-                self.finish_expr(start, ExprKind::Path(Path { segments: vec![id], span: start }))
+                self.finish_expr(
+                    start,
+                    ExprKind::Path(Path {
+                        segments: vec![id],
+                        span: start,
+                    }),
+                )
             }
             _ => {
                 let sp = self.span();
-                self.error(sp, "E0202", format!("expected an expression, found {}", self.kind().describe()));
+                self.error(
+                    sp,
+                    "E0202",
+                    format!("expected an expression, found {}", self.kind().describe()),
+                );
                 self.bump();
                 self.finish_expr(start, ExprKind::TupleLit(Vec::new()))
             }
@@ -609,7 +738,14 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.finish_expr(start, ExprKind::If { cond, then_branch, else_branch })
+        self.finish_expr(
+            start,
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            },
+        )
     }
 
     fn parse_match(&mut self) -> Expr {
@@ -623,7 +759,11 @@ impl<'a> Parser<'a> {
             let pat = self.parse_pattern();
             self.expect(T::FatArrow);
             let body = self.parse_expr();
-            arms.push(MatchArm { pat, body, span: arm_start.to(self.prev_span()) });
+            arms.push(MatchArm {
+                pat,
+                body,
+                span: arm_start.to(self.prev_span()),
+            });
             self.eat(T::Comma);
         }
         self.expect(T::RBrace);
@@ -650,13 +790,22 @@ impl<'a> Parser<'a> {
                     // A local `const X: T = v;` is parsed as an immutable binding.
                     self.bump();
                     let name = self.ident();
-                    let pat = Pattern { id: self.nid(), kind: PatKind::Ident(name.sym), span: name.span };
+                    let pat = Pattern {
+                        id: self.nid(),
+                        kind: PatKind::Ident(name.sym),
+                        span: name.span,
+                    };
                     self.expect(T::Colon);
                     let ty = Some(self.parse_type());
                     self.expect(T::Eq);
                     let init = Some(self.parse_expr());
                     self.eat(T::Semi);
-                    let k = StmtKind::Let { pat, mutable: false, ty, init };
+                    let k = StmtKind::Let {
+                        pat,
+                        mutable: false,
+                        ty,
+                        init,
+                    };
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::Return => {
@@ -703,7 +852,15 @@ impl<'a> Parser<'a> {
                         self.bump();
                         let value = self.parse_expr();
                         self.eat(T::Semi);
-                        stmts.push(self.mk_stmt(attrs, StmtKind::Assign { target: e, op, value }, stmt_start));
+                        stmts.push(self.mk_stmt(
+                            attrs,
+                            StmtKind::Assign {
+                                target: e,
+                                op,
+                                value,
+                            },
+                            stmt_start,
+                        ));
                     } else if self.eat(T::Semi) {
                         stmts.push(self.mk_stmt(attrs, StmtKind::Expr(e), stmt_start));
                     } else if self.at(T::RBrace) {
@@ -716,28 +873,55 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(T::RBrace);
-        Block { id, stmts, tail, span: start.to(self.prev_span()) }
+        Block {
+            id,
+            stmts,
+            tail,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn mk_stmt(&mut self, attrs: Vec<Attr>, kind: StmtKind, start: Span) -> Stmt {
-        Stmt { id: self.nid(), attrs, kind, span: start.to(self.prev_span()) }
+        Stmt {
+            id: self.nid(),
+            attrs,
+            kind,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn parse_let(&mut self) -> StmtKind {
         self.bump(); // let
         let mutable = self.eat(T::Mut);
         let pat = self.parse_pattern();
-        let ty = if self.eat(T::Colon) { Some(self.parse_type()) } else { None };
-        let init = if self.eat(T::Eq) { Some(self.parse_expr()) } else { None };
+        let ty = if self.eat(T::Colon) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        let init = if self.eat(T::Eq) {
+            Some(self.parse_expr())
+        } else {
+            None
+        };
         self.eat(T::Semi);
-        StmtKind::Let { pat, mutable, ty, init }
+        StmtKind::Let {
+            pat,
+            mutable,
+            ty,
+            init,
+        }
     }
 
     fn parse_while(&mut self) -> StmtKind {
         self.bump(); // while
         let cond = self.parse_expr();
         let body = self.parse_block();
-        StmtKind::While { label: None, cond, body }
+        StmtKind::While {
+            label: None,
+            cond,
+            body,
+        }
     }
 
     fn parse_for(&mut self) -> StmtKind {
@@ -746,7 +930,12 @@ impl<'a> Parser<'a> {
         self.expect(T::In);
         let iter = self.parse_for_iter();
         let body = self.parse_block();
-        StmtKind::For { label: None, pat, iter, body }
+        StmtKind::For {
+            label: None,
+            pat,
+            iter,
+            body,
+        }
     }
 
     fn parse_loop(&mut self) -> StmtKind {
@@ -765,8 +954,17 @@ impl<'a> Parser<'a> {
             } else {
                 Some(self.parse_expr())
             };
-            let step = if self.eat(T::Step) { Some(self.parse_expr()) } else { None };
-            ForIter::Range { start, end, inclusive, step }
+            let step = if self.eat(T::Step) {
+                Some(self.parse_expr())
+            } else {
+                None
+            };
+            ForIter::Range {
+                start,
+                end,
+                inclusive,
+                step,
+            }
         } else {
             ForIter::Expr(start)
         }
@@ -803,12 +1001,20 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
-                self.error(start, "E0206", format!("expected a pattern, found {}", self.kind().describe()));
+                self.error(
+                    start,
+                    "E0206",
+                    format!("expected a pattern, found {}", self.kind().describe()),
+                );
                 self.bump();
                 PatKind::Wildcard
             }
         };
-        Pattern { id: self.nid(), kind, span: start.to(self.prev_span()) }
+        Pattern {
+            id: self.nid(),
+            kind,
+            span: start.to(self.prev_span()),
+        }
     }
 
     // ---- Attributes (also used by items in a later commit) ----
@@ -835,7 +1041,11 @@ impl<'a> Parser<'a> {
             }
             self.expect(T::RParen);
         }
-        Attr { name, args, span: start.to(self.prev_span()) }
+        Attr {
+            name,
+            args,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn parse_attr_arg(&mut self) -> AttrArg {
@@ -972,8 +1182,19 @@ fn split_vector_ident(s: &str) -> Option<(&str, u32)> {
 fn is_scalar_name(s: &str) -> bool {
     matches!(
         s,
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" | "f16"
-            | "bf16" | "f32" | "f64"
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "isize"
+            | "f16"
+            | "bf16"
+            | "f32"
+            | "f64"
     )
 }
 
@@ -1000,7 +1221,10 @@ mod tests {
     #[test]
     fn precedence_and_assoc() {
         // `*` binds tighter than `+`; both left-assoc.
-        assert_eq!(expr("1 + 2 * 3").trim(), "binary +\n  int 1\n  binary *\n    int 2\n    int 3");
+        assert_eq!(
+            expr("1 + 2 * 3").trim(),
+            "binary +\n  int 1\n  binary *\n    int 2\n    int 3"
+        );
     }
 
     #[test]
@@ -1030,7 +1254,10 @@ mod tests {
         assert_eq!(ty("*mut f32"), "*mut f32");
         assert_eq!(ty("f32x8"), "f32x8");
         assert_eq!(ty("Tensor[f32, M, N]"), "Tensor[f32, M, N]");
-        assert_eq!(ty("Tensor[f32, 512, 512, .col_major]"), "Tensor[f32, 512, 512, .col_major]");
+        assert_eq!(
+            ty("Tensor[f32, 512, 512, .col_major]"),
+            "Tensor[f32, 512, 512, .col_major]"
+        );
         assert_eq!(ty("[]f32"), "[]f32");
     }
 }

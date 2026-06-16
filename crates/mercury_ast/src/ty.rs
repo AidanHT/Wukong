@@ -21,9 +21,15 @@ pub enum TypeKind {
     /// The unit type `()`.
     Unit,
     /// `*T` / `*mut T`.
-    Pointer { mutable: bool, pointee: Box<TypeExpr> },
+    Pointer {
+        mutable: bool,
+        pointee: Box<TypeExpr>,
+    },
     /// `&T` / `&mut T`.
-    Ref { mutable: bool, pointee: Box<TypeExpr> },
+    Ref {
+        mutable: bool,
+        pointee: Box<TypeExpr>,
+    },
     /// `[]T`.
     Slice(Box<TypeExpr>),
     /// `[T; N]`.
@@ -33,7 +39,11 @@ pub enum TypeKind {
     /// A SIMD vector type: `f32x8` or `vec[T, N]`.
     Vector { elem: Box<TypeExpr>, lanes: u32 },
     /// A shape-typed tensor: `Tensor[f32, M, N]` with an optional layout.
-    Tensor { elem: Box<TypeExpr>, dims: Vec<Dim>, layout: Option<Layout> },
+    Tensor {
+        elem: Box<TypeExpr>,
+        dims: Vec<Dim>,
+        layout: Option<Layout>,
+    },
 }
 
 /// One dimension of a tensor type.

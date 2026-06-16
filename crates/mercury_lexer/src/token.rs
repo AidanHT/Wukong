@@ -144,9 +144,33 @@ impl TokenKind {
         use TokenKind::*;
         matches!(
             self,
-            Fn | Let | Mut | If | Else | While | For | In | Loop | Match | Return | Break
-                | Continue | Struct | Enum | Impl | Trait | Module | Import | As | Const | Defer
-                | Pub | Extern | Step | Where | True | False
+            Fn | Let
+                | Mut
+                | If
+                | Else
+                | While
+                | For
+                | In
+                | Loop
+                | Match
+                | Return
+                | Break
+                | Continue
+                | Struct
+                | Enum
+                | Impl
+                | Trait
+                | Module
+                | Import
+                | As
+                | Const
+                | Defer
+                | Pub
+                | Extern
+                | Step
+                | Where
+                | True
+                | False
         )
     }
 
