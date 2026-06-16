@@ -127,6 +127,7 @@ optimizer's fusion/tiling/vectorization consumers are under construction.
 
 - `print(x)` — print an integer/float followed by a newline.
 - `println(x)` — alias of `print`.
+- `assert(cond)` — trap with a nonzero exit code if `cond` is false (zero); a no-op otherwise.
 
 These are recognized by the MIR builder and implemented directly by the interpreter (and, with the
 LLVM backend, by the runtime).

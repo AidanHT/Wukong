@@ -1,0 +1,9 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+module tests.run.assert_fail
+
+/// A failing assertion traps with a nonzero exit code and no stdout.
+fn main() -> i32 {
+    assert(1 > 2);
+    return 0;
+}

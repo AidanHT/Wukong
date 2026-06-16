@@ -214,6 +214,19 @@ impl<'a> Interp<'a> {
                 self.stdout.extend_from_slice(text.as_bytes());
                 Ok(Value::Unit)
             }
+            "assert" => {
+                let ok = match args.first().copied().unwrap_or(Value::Unit) {
+                    Value::Int(i) => i != 0,
+                    Value::Float(f) => f != 0.0,
+                    Value::Ptr(p) => p != 0,
+                    Value::Unit => false,
+                };
+                if ok {
+                    Ok(Value::Unit)
+                } else {
+                    Err("assertion failed".to_string())
+                }
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }

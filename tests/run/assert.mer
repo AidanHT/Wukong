@@ -1,0 +1,14 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 42
+module tests.run.assert
+
+/// `assert(cond)` traps (nonzero exit) when cond is false; these all hold.
+fn main() -> i32 {
+    assert(1 < 2);
+    assert(2 + 2 == 4);
+    let x: i32 = 21;
+    assert(x * 2 == 42);
+    print(x * 2);
+    return 0;
+}

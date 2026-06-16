@@ -830,7 +830,7 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
 
 /// Names that lower to runtime/interpreter intrinsics rather than user functions.
 pub fn is_intrinsic(name: &str) -> bool {
-    matches!(name, "print" | "println")
+    matches!(name, "print" | "println" | "assert")
 }
 
 fn parse_int(text: &str) -> i128 {
