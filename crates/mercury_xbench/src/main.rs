@@ -349,12 +349,47 @@ fn kernels() -> Vec<Kernel> {
                  r=r*v+0.0001; r=r*v+0.001; r=r*v+0.01; r=r*v+0.1; *out.add(i)=r; }",
             ),
         },
+        // --- Mercury @parallel (multicore) vs idiomatic single-threaded C/Rust ---
+        Kernel {
+            name: "saxpy@parallel",
+            bytes_per_call: 3 * N * 4,
+            note: "Mercury auto-parallel across cores vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "for i in 0..{N} {{ out[i] = 2.0 * x[i] + y[i]; }}"
+            )),
+            c: c_kernel("float a=2.0f; for(long i=0;i<N;i++) out[i]=a*x[i]+y[i];"),
+            rust: rust_kernel("let a=2.0f32; for i in 0..N { *out.add(i)=a* *x.add(i)+ *y.add(i); }"),
+        },
+        Kernel {
+            name: "poly@parallel",
+            bytes_per_call: 2 * N * 4,
+            note: "Mercury auto-parallel across cores vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "for i in 0..{N} {{ let v: f32 = x[i]; let mut r: f32 = 0.00001; \
+                 r = r * v + 0.0001; r = r * v + 0.001; r = r * v + 0.01; r = r * v + 0.1; out[i] = r; }}"
+            )),
+            c: c_kernel(
+                "for(long i=0;i<N;i++){ float v=x[i]; float r=0.00001f; \
+                 r=r*v+0.0001f; r=r*v+0.001f; r=r*v+0.01f; r=r*v+0.1f; out[i]=r; }",
+            ),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); let mut r=0.00001f32; \
+                 r=r*v+0.0001; r=r*v+0.001; r=r*v+0.01; r=r*v+0.1; *out.add(i)=r; }",
+            ),
+        },
     ]
 }
 
 fn mer_kernel(body: &str) -> String {
     format!(
         "module bench\nfn kbench(x: [f32; {N}], y: [f32; {N}], out: [f32; {N}]) {{\n    {body}\n}}\n"
+    )
+}
+
+/// A `@parallel` Mercury kernel (whole body is one `for` loop, so it parallelizes).
+fn mer_par_kernel(loop_body: &str) -> String {
+    format!(
+        "module bench\n@parallel\nfn kbench(x: [f32; {N}], y: [f32; {N}], out: [f32; {N}]) {{\n    {loop_body}\n}}\n"
     )
 }
 
