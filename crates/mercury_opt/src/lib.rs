@@ -6,8 +6,10 @@
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 
 mod dce;
+mod cse;
 mod simplify;
 
+pub use cse::Cse;
 pub use dce::Dce;
 pub use simplify::Simplify;
 
@@ -39,6 +41,10 @@ impl PassManager {
         if opt_level >= 1 {
             pm.add(Box::new(Simplify));
             pm.add(Box::new(Dce));
+        }
+        if opt_level >= 2 {
+            // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
+            pm.add(Box::new(Cse));
         }
         pm
     }
@@ -230,5 +236,48 @@ mod tests {
 
     fn count_insts(f: &mercury_mir::Function) -> usize {
         f.blocks.iter().map(|b| b.insts.len()).sum()
+    }
+
+    #[test]
+    fn cse_eliminates_redundant_expression() {
+        // `a*a` is computed twice in the same block; CSE should collapse it without changing the
+        // result. Use distinct params so the multiply is not itself const-folded away.
+        let src = "fn sq2(x: i32) -> i32 { let a: i32 = x * x; let b: i32 = x * x; return a + b; } \
+                   fn main() -> i32 { return sq2(7); }";
+        let mut interner = Interner::new();
+        let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+
+        // Count `x*x` multiplies in `sq2` before and after CSE+DCE.
+        let muls_before = count_muls(find_fn(&program, &interner, "sq2"));
+        optimize(&mut program, 2);
+        let muls_after = count_muls(find_fn(&program, &interner, "sq2"));
+        assert!(muls_before >= 2, "expected two multiplies before opt, saw {muls_before}");
+        assert!(muls_after < muls_before, "CSE should remove a redundant multiply");
+
+        for f in &program.funcs {
+            assert!(mercury_mir::verify::verify_function(f).is_empty(), "verify after opt");
+        }
+        let main = interner.intern("main");
+        assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 98);
+    }
+
+    fn find_fn<'a>(
+        p: &'a mercury_mir::Program,
+        interner: &Interner,
+        name: &str,
+    ) -> &'a mercury_mir::Function {
+        p.funcs.iter().find(|f| interner.resolve(f.name) == name).expect("function present")
+    }
+
+    fn count_muls(f: &mercury_mir::Function) -> usize {
+        use mercury_mir::{BinOp, Op};
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, Op::Bin(BinOp::Mul, _, _)))
+            .count()
     }
 }
