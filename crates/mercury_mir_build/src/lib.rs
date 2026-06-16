@@ -445,6 +445,75 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
+    /// Lower an `if`/`else` used as a *value* (e.g. a block tail or `let x = if …`). When the
+    /// expression has a real (non-unit) type and both arms exist, the merge block takes a
+    /// parameter that each arm passes its value to; otherwise this behaves like the statement form
+    /// and yields a dummy zero (the value is unused).
+    fn lower_if_value(
+        &mut self,
+        cond: &Expr,
+        then_branch: &Block,
+        else_branch: Option<&Expr>,
+        e: &Expr,
+    ) -> ValueId {
+        let result_ty = self.expr_mir(e);
+        let produces_value = else_branch.is_some() && result_ty != MirType::Void;
+
+        let c = self.lower_expr(cond);
+        let then_bb = self.builder.new_block();
+        let merge = self.builder.new_block();
+        let else_bb = if else_branch.is_some() {
+            self.builder.new_block()
+        } else {
+            merge
+        };
+        let merge_param = if produces_value {
+            Some(self.builder.block_param(merge, result_ty.clone()))
+        } else {
+            None
+        };
+        self.builder.cond_br(c, then_bb, vec![], else_bb, vec![]);
+
+        // then arm
+        self.builder.switch_to(then_bb);
+        self.terminated = false;
+        let tv = self.lower_block(then_branch);
+        if !self.terminated {
+            let args = match (merge_param.is_some(), tv) {
+                (true, Some(v)) => vec![v],
+                (true, None) => vec![self.const_zero(result_ty.clone())],
+                (false, _) => vec![],
+            };
+            self.builder.br(merge, args);
+        }
+
+        // else arm
+        if let Some(els) = else_branch {
+            self.builder.switch_to(else_bb);
+            self.terminated = false;
+            let ev = self.lower_expr(els);
+            if !self.terminated {
+                let args = if merge_param.is_some() {
+                    vec![ev]
+                } else {
+                    vec![]
+                };
+                self.builder.br(merge, args);
+            }
+        }
+
+        self.builder.switch_to(merge);
+        self.terminated = false;
+        match merge_param {
+            Some(p) => p,
+            None => self.const_zero(if result_ty == MirType::Void {
+                MirType::I32
+            } else {
+                result_ty
+            }),
+        }
+    }
+
     // ---- places (lvalues) ----
 
     /// Initialize an array alloca (`base`) of `n` elements of type `elem` from an array-literal or
@@ -645,6 +714,11 @@ impl FnLowerer<'_> {
                     self.const_zero(t)
                 }
             },
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => self.lower_if_value(cond, then_branch, else_branch.as_deref(), e),
             _ => {
                 self.unsupported(e.span, "expression");
                 let t = self.expr_mir(e);
