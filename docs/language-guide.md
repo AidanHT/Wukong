@@ -4,7 +4,9 @@ This guide describes the Mercury language as it exists today. Mercury is built i
 a feature parses and type-checks but does not yet execute end-to-end, that is called out explicitly.
 
 > **Maturity legend**
-> - ✅ **runs** — lexes, parses, type/shape-checks, lowers to MIR, and executes via the interpreter.
+> - ✅ **runs** — lexes, parses, type/shape-checks, lowers to MIR, and executes — both via the
+>   interpreter *and* the native Cranelift backend (JIT/object), which are differentially tested to
+>   agree bit-for-bit.
 > - 🟡 **checked** — parses and type/shape-checks; not yet lowered/executed.
 > - 🔵 **planned** — designed for, syntax may be accepted, semantics not implemented.
 
@@ -121,8 +123,12 @@ generic names, or `?` for a runtime dimension. Tensor element types must be scal
 @export("mercury_saxpy")
 ```
 
-Attributes attach to functions, loops, and declarations. They parse and validate today; the
-optimizer's fusion/tiling/vectorization consumers are under construction.
+Attributes attach to functions, loops, and declarations, and parse/validate today. Several now have
+real consumers on the native backend: **`@parallel`** functions execute across CPU cores (✅), and
+loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically** (✅) — a
+plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop, and
+FMA-contracted with no annotation. `@tile` (cache tiling) and explicit `@simd`-typed vector values
+are still under construction (🔵).
 
 ## Built-in intrinsics ✅
 
@@ -133,12 +139,14 @@ optimizer's fusion/tiling/vectorization consumers are under construction.
 These are recognized by the MIR builder and implemented directly by the interpreter (and, with the
 LLVM backend, by the runtime).
 
-## Memory and parallelism 🔵
+## Memory and parallelism
 
 No garbage collector and no hidden allocations: every heap byte comes from an allocator you name
-(`System`, `Arena`, `Scratch`, `Pool`). Cleanup is via `defer`. Parallel loops (`@parallel for` /
-`@parallel reduce`) run on a CPU thread pool. The runtime crate (`mercury_runtime`) already provides
-an arena allocator and a deterministic `parallel_for`; the language surface is being wired to it.
+(`System`, `Arena`, `Scratch`, `Pool` — 🔵). Cleanup is via `defer` (🔵). **`@parallel` functions
+execute today** (✅): the native backend outlines the loop body and dispatches it across CPU cores
+via the `mercury_runtime` rayon-backed `parallel_for`, and each per-core chunk is itself
+auto-vectorized (parallelism × SIMD). The interpreter runs the same range sequentially, so results
+stay differentially equal. Allocator selection and `defer` are still being wired to the surface.
 
 ## Command-line interface
 
