@@ -30,6 +30,7 @@ mercury_mir = { path = "crates/mercury_mir" }
 mercury_mir_build = { path = "crates/mercury_mir_build" }
 mercury_backend = { path = "crates/mercury_backend" }
 mercury_interp = { path = "crates/mercury_interp" }
+mercury_opt = { path = "crates/mercury_opt" }
 
 [profile.release]
 opt-level = 3

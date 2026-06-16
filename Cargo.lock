@@ -35,6 +35,7 @@ dependencies = [
  "mercury_lexer",
  "mercury_mir",
  "mercury_mir_build",
+ "mercury_opt",
  "mercury_parser",
  "mercury_sema",
  "mercury_span",
@@ -79,6 +80,18 @@ dependencies = [
  "mercury_sema",
  "mercury_span",
  "mercury_types",
+]
+
+[[package]]
+name = "mercury_opt"
+version = "0.1.0"
+dependencies = [
+ "mercury_interp",
+ "mercury_mir",
+ "mercury_mir_build",
+ "mercury_parser",
+ "mercury_sema",
+ "mercury_span",
 ]
 
 [[package]]
