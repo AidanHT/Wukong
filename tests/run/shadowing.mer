@@ -1,0 +1,28 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 9
+// EXPECT-OUT: 7
+module tests.run.shadowing
+
+/// Variable shadowing and block-as-expression values.
+fn main() -> i32 {
+    let x: i32 = 5;
+    let x: i32 = x + 10; // shadows the previous x: 15
+    print(x);
+
+    let y: i32 = {
+        let a: i32 = 3;
+        a * a // trailing expression is the block's value: 9
+    };
+    print(y);
+
+    // Inner scope shadows, outer value restored after the block.
+    let z: i32 = 7;
+    {
+        let z: i32 = 99;
+        let _unused: i32 = z;
+    }
+    print(z); // 7
+    return 0;
+}
