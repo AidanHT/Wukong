@@ -8,10 +8,12 @@
 mod dce;
 mod cse;
 mod simplify;
+mod simplify_cfg;
 
 pub use cse::Cse;
 pub use dce::Dce;
 pub use simplify::Simplify;
+pub use simplify_cfg::SimplifyCfg;
 
 use mercury_mir::{Op, Program, Terminator, ValueId};
 
@@ -40,6 +42,7 @@ impl PassManager {
         let mut pm = PassManager::new();
         if opt_level >= 1 {
             pm.add(Box::new(Simplify));
+            pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(Dce));
         }
         if opt_level >= 2 {
@@ -270,6 +273,32 @@ mod tests {
         name: &str,
     ) -> &'a mercury_mir::Function {
         p.funcs.iter().find(|f| interner.resolve(f.name) == name).expect("function present")
+    }
+
+    #[test]
+    fn simplify_cfg_folds_constant_branch_and_prunes() {
+        // The `if` condition is a compile-time constant, so one arm is dead. After -O1 the dead
+        // block should be pruned and the result must be unchanged.
+        let src = "fn main() -> i32 { let x: i32 = 0; if 1 < 2 { x = 10; } else { x = 20; } return x; }";
+        let mut interner = Interner::new();
+        let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let blocks_before = find_fn(&program, &interner, "main").blocks.len();
+        optimize(&mut program, 1);
+        let main_fn = find_fn(&program, &interner, "main");
+        assert!(
+            main_fn.blocks.len() < blocks_before,
+            "expected fewer blocks after CFG cleanup ({blocks_before} -> {})",
+            main_fn.blocks.len()
+        );
+        // No CondBr should remain referencing the constant condition.
+        for f in &program.funcs {
+            assert!(mercury_mir::verify::verify_function(f).is_empty(), "verify after opt");
+        }
+        let main = interner.intern("main");
+        assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 10);
     }
 
     fn count_muls(f: &mercury_mir::Function) -> usize {
