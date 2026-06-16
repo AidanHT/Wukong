@@ -510,6 +510,20 @@ fn kernels() -> Vec<Kernel> {
                  r=r*v+0.0001; r=r*v+0.001; r=r*v+0.01; r=r*v+0.1; *out.add(i)=r; }",
             ),
         },
+        Kernel {
+            name: "relu6@parallel",
+            bytes_per_call: 2 * N * 4,
+            note: "clamp(x,0,6) — nested branch vectorization (if-conversion) × cores",
+            mer: mer_par_kernel(&format!(
+                "for i in 0..{N} {{ out[i] = if x[i] < 6.0 {{ if x[i] > 0.0 {{ x[i] }} else {{ 0.0 }} }} else {{ 6.0 }}; }}"
+            )),
+            c: c_kernel(
+                "for(long i=0;i<N;i++){ float v=x[i]; v = v<6.0f?v:6.0f; out[i] = v>0.0f?v:0.0f; }",
+            ),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); let v= if v<6.0 {v} else {6.0}; *out.add(i)= if v>0.0 {v} else {0.0}; }",
+            ),
+        },
     ]
 }
 
