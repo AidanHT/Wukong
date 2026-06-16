@@ -22,3 +22,6 @@ a.out
 *.swp
 .DS_Store
 Thumbs.db
+scratch_*.mer
+*.o
+*_rt.c
