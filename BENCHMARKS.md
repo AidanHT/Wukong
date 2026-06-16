@@ -23,10 +23,14 @@ languages, so a miscompiled kernel is caught, not silently mis-measured.
 
 ## Fairness notes
 
-- FP contraction is **off** for gcc (`-ffp-contract=off`); Cranelift forms no FMAs and Rust does not
-  contract by default, so every backend performs the same scalar float ops (no backend gets a free
-  fused-multiply-add the others don't).
-- The reduction (`dot`) is strict left-to-right f32, so none of the three auto-vectorize it.
+- **FMA:** Mercury contracts `x + y*z` to a fused multiply-add (one rounding, one `vfmadd`), so gcc
+  is given its **default** `-ffp-contract=fast` — the earlier `-ffp-contract=off` was actually
+  suppressing C's natural FMA. Both Mercury and gcc-compiled C now fuse. *Idiomatic* Rust does not
+  contract unless the author writes `f32::mul_add`, so the Rust column reflects rustc's default (two
+  rounded ops). That is a real toolchain-defaults difference, surfaced honestly rather than papered
+  over. Mercury and the interpreter agree on the FMA result bit-for-bit (gated in CI).
+- The reduction (`dot`) is a strict left-to-right f32 accumulation, so none of the three
+  auto-vectorize it (Mercury and C do use a *scalar* FMA per step).
 - The single-threaded kernels compare the *same algorithm* in each language (apples to apples).
 - The `@parallel` kernels compare Mercury's **automatic** multicore+SIMD lowering against
   *idiomatic, single-threaded* C/Rust — the value proposition of a tensor DSL compiler: you write
@@ -42,8 +46,8 @@ runs. Treat them as representative, not exact.
 
 | kernel        | Mercury | C (gcc)  | Rust     | Mercury speedup |
 |---------------|---------|----------|----------|-----------------|
-| saxpy         | ~2 ms   | ~170 ms  | ~300 ms  | **~80×**        |
-| relu          | ~2 ms   | ~360 ms  | ~330 ms  | **~170×**       |
+| saxpy         | ~1.7 ms | ~200 ms  | ~220 ms  | **~115×**       |
+| relu          | ~0.8 ms | ~150 ms  | ~200 ms  | **~175×**       |
 | matmul        | ~1 ms   | ~250 ms  | ~360 ms  | **~250×**       |
 
 Cranelift JIT compiling in-process vs spawning a full C/Rust+LLVM toolchain is a 1–2 order of
@@ -54,11 +58,11 @@ developer time — this is the most important and most robust result.
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
-| saxpy  | ~1.0–1.1× (tie) | memory-bandwidth bound; both saturate ~40–55 GB/s |
-| dot    | ~1.0–1.06× (tie) | strict f32 reduction; nobody vectorizes |
-| relu   | ~1.0–1.3× slower | memory-bound; vectorized via if-conversion |
-| poly   | ~1.0–1.4× slower | compute-bound; was **5.9× slower** before vectorization |
-| fused linear→relu | ~1.0–1.1× faster | two source loops; Mercury **fuses** them, C/Rust two-pass |
+| saxpy  | ~1.0–1.16× slower | memory-bandwidth bound; both ~55–58 GB/s |
+| relu   | ~1.0–1.01× (tie) | memory-bound; vectorized via if-conversion |
+| poly   | ~1.0–1.03× (tie) | compute-bound; was **5.9× slower** before vectorization+FMA |
+| fused linear→relu | ~1.05–1.1× faster | two source loops; Mercury **fuses** them, C/Rust two-pass |
+| dot    | ~2.1× slower | strict serial f32 reduction — see below |
 
 `fused linear→relu` writes a linear map to a scratch array then ReLUs it — two loops in every
 language. Mercury's compiler fuses them into one pass and keeps the intermediate in registers; the
@@ -67,37 +71,52 @@ to RAM). The point is the *automatic* fusion of naively-written ops.
 
 Mercury's vectorizer lifts straight-line elementwise loops to 128-bit SIMD and unrolls 4× so
 independent vector chains issue across the core's FP units (recovering AVX-class throughput from SSE
-ops). The residual gap on compute-bound kernels is Cranelift's 128-bit-only SIMD and fast-but-simple
-codegen vs gcc's 256-bit AVX and aggressive scheduling — the deliberate tradeoff for a zero-toolchain
-backend that compiles ~100× faster. Memory-bound kernels are at the bandwidth wall for everyone.
+ops), and contracts `a*x + y` to a hardware FMA. With FMA now enabled for both sides, gcc's 256-bit
+AVX FMA gives it a slight edge on compute-bound kernels; Mercury's 128-bit FMA + 4× unroll keeps it
+within ~1.0–1.16×. Memory-bound kernels are at the bandwidth wall for everyone.
+
+**`dot` is the one clear single-threaded loss (~2.1×).** It is a strict left-to-right f32 reduction:
+the accumulator dependency serializes one FMA per element (latency-bound, not throughput-bound), and
+Mercury's straight scalar loop sits right at that latency wall while gcc's is tighter. The standard
+fix — splitting the sum across several vector-lane accumulators and reducing horizontally at the end
+— reassociates the float sum (what every BLAS does); it is the natural next optimization but changes
+rounding, so it is intentionally not yet on by default.
 
 ### Auto-parallel runtime — Mercury heavily exceeds idiomatic C/Rust
 
 `@parallel` lowers the loop to a multicore (rayon) dispatch whose per-thread chunk is itself
 vectorized and unrolled. Versus the idiomatic single-threaded C/Rust kernel:
 
-| kernel          | Mercury    | C (gcc) single-thread | Mercury speedup |
-|-----------------|------------|-----------------------|-----------------|
-| saxpy@parallel  | ~60 GB/s   | ~19 GB/s              | **~3.4×**       |
-| poly@parallel   | ~58 GB/s   | ~17 GB/s              | **~2.7–3.4×**   |
-| relu6@parallel  | ~54–100 GB/s | ~7–12 GB/s          | **~8×**         |
-| matmul 512²     | ~47–74 GFLOP/s | ~11–35 GFLOP/s    | **~2.5–4×**     |
+| kernel          | Mercury        | C (gcc) single-thread | Mercury speedup vs C |
+|-----------------|----------------|-----------------------|----------------------|
+| saxpy@parallel  | ~126 GB/s      | ~55 GB/s              | **~2.3×**            |
+| poly@parallel   | ~101 GB/s      | ~57 GB/s              | **~1.8×**            |
+| relu6@parallel  | ~100 GB/s      | ~16 GB/s              | **~6.2×**            |
+| matmul 512²     | ~84 GFLOP/s    | ~44 GFLOP/s           | **~1.9×**            |
 
-`relu6 = clamp(x, 0, 6)` is the standout: its nested conditional defeats gcc's auto-vectorizer
-(scalar branches), while Mercury if-converts both branches to vector blends and parallelizes —
-exactly the branchy-elementwise pattern a tensor compiler should win on.
+`relu6 = clamp(x, 0, 6)` is the standout vs C: its nested conditional defeats gcc's auto-vectorizer
+(scalar branches, ~16 GB/s), while Mercury if-converts both branches to vector blends and
+parallelizes. (Note rustc *does* vectorize relu6 to ~58 GB/s, so vs Rust the parallel edge there is
+~1.7×, not 6×.) These rows compare Mercury's one-line `@parallel` annotation against the obvious
+single-threaded loop a C/Rust programmer writes.
 
 ## Honest summary
 
-- **Compile time:** Mercury is ~50–250× faster to compile. Robust, every run.
-- **Single-threaded runtime:** competitive (≈0.8–1.1× of C/Rust on the same algorithm) — strong for a
-  from-scratch, LLVM-free backend, not a blow-out.
+- **Compile time:** Mercury is ~115–250× faster to compile. Robust, every run, and the metric that
+  dominates real ML iteration time.
+- **Single-threaded runtime:** competitive on elementwise kernels (within ~1.0–1.16× of C on the same
+  algorithm; *faster* on auto-fused linear→relu) — strong for a from-scratch, LLVM-free backend. Two
+  honest losses: the strict serial `dot` reduction (~2.1×) and single-core matmul (~3.3×).
 - **Auto-parallel runtime:** Mercury's automatic SIMD+multicore lowering beats idiomatic
-  single-threaded C/Rust by ~2.5–8× on the kernels here.
+  single-threaded C/Rust by ~1.8–6.2× on the kernels here, and parallel matmul (~84 GFLOP/s) beats
+  single-threaded C/Rust matmul (~44–46 GFLOP/s) by ~1.9×.
 - **Safety:** Mercury checks tensor **shapes at compile time** (in the type system), catching a class
   of errors C/C++/Rust-with-raw-pointers cannot.
 
-Where Mercury does *not* beat C/C++ today: peak single-thread throughput on compute-bound kernels,
-because Cranelift emits 128-bit SSE (no 256-bit AVX legalization) and does less instruction
-scheduling than gcc/LLVM `-O3`. Closing that fully would require an AVX-capable backend; the project
-deliberately trades it for zero-dependency builds and ~100× faster compiles.
+Where Mercury does *not* beat C/C++ today: peak **single-thread** throughput on compute-bound kernels
+(matmul single-core ~3.3× behind; `dot` ~2.1×). Two causes, both deliberate tradeoffs: Cranelift
+emits 128-bit SSE (no 256-bit AVX legalization) and does less instruction scheduling than gcc/LLVM
+`-O3`; and strict-reduction semantics keep `dot` serial. Closing the SIMD gap fully would need an
+AVX-capable backend, which the project trades away for zero-dependency builds and ~100× faster
+compiles. Mercury's wins are where a tensor compiler should win: compile speed, automatic
+parallelism, automatic fusion, and shape safety.
