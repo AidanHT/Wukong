@@ -1,0 +1,747 @@
+//! `mercury_codegen_cranelift` — native code generation via Cranelift (no LLVM toolchain required).
+//!
+//! Lowers fully-lowered (Low) scalar MIR to Cranelift IR and either JIT-compiles and runs it in
+//! process (`jit_run`, the fast execution path and a differential oracle alongside the interpreter)
+//! or emits a native object file (`emit_object`, linked into an executable by the driver).
+//!
+//! The MIR maps onto Cranelift almost one-to-one: it is already block-parameter SSA (exactly
+//! Cranelift's model), integers are signless with signedness on the op, and memory is explicit
+//! `alloca`/`load`/`store`/`gep`. The only semantic gaps we bridge to stay bit-identical to the
+//! interpreter oracle are: divide-by-zero yields 0 (no trap), float→int casts saturate, and `i1`
+//! results are normalised to their low bit.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{
+    types, AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, StackSlotData,
+    StackSlotKind, Type, Value,
+};
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_module::{FuncId, Linkage, Module};
+
+use mercury_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId};
+use mercury_span::{Interner, Symbol};
+
+mod backend;
+pub use backend::CraneliftBackend;
+
+// --- The minimal runtime the generated code calls back into ---------------------------------
+//
+// `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust
+// functions registered with the module; output is captured into a process-global buffer so the
+// native path produces exactly the bytes the interpreter would, which is what the differential
+// gate compares. A global run lock serialises native runs sharing that buffer.
+
+static OUTPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static ASSERT_FAILED: AtomicBool = AtomicBool::new(false);
+static RUN_LOCK: Mutex<()> = Mutex::new(());
+
+extern "C" fn rt_print_i64(x: i64) {
+    if let Ok(mut o) = OUTPUT.lock() {
+        o.extend_from_slice(format!("{x}\n").as_bytes());
+    }
+}
+
+extern "C" fn rt_print_f64(x: f64) {
+    if let Ok(mut o) = OUTPUT.lock() {
+        o.extend_from_slice(format!("{x}\n").as_bytes());
+    }
+}
+
+extern "C" fn rt_assert(cond: i64) {
+    if cond == 0 {
+        ASSERT_FAILED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Names of the runtime symbols, shared by the JIT (which binds them to the `rt_*` functions) and
+/// the object emitter (which leaves them as undefined imports resolved at link time).
+const RT_PRINT_I64: &str = "mercury_rt_print_i64";
+const RT_PRINT_F64: &str = "mercury_rt_print_f64";
+const RT_ASSERT: &str = "mercury_rt_assert";
+
+/// The runtime function an intrinsic call lowers to.
+#[derive(Clone, Copy)]
+enum Intrinsic {
+    PrintInt,
+    PrintFloat,
+    Assert,
+}
+
+fn classify_intrinsic(name: &str, arg_is_float: bool) -> Option<Intrinsic> {
+    match name {
+        "print" | "println" => Some(if arg_is_float {
+            Intrinsic::PrintFloat
+        } else {
+            Intrinsic::PrintInt
+        }),
+        "assert" => Some(Intrinsic::Assert),
+        _ => None,
+    }
+}
+
+// --- Type and size mapping ------------------------------------------------------------------
+
+/// Map a MIR type to its Cranelift type, or `None` for `Void`. `i1` becomes `i8`; `f16`/`bf16` are
+/// computed as `f32` (matching the interpreter's promotion of sub-`f32` floats).
+fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
+    Some(match t {
+        MirType::I1 | MirType::I8 => types::I8,
+        MirType::I16 => types::I16,
+        MirType::I32 => types::I32,
+        MirType::I64 => types::I64,
+        MirType::F16 | MirType::BF16 | MirType::F32 => types::F32,
+        MirType::F64 => types::F64,
+        MirType::Ptr => ptr_ty,
+        MirType::Vec(elem, n) => {
+            let lane = cl_type(elem, ptr_ty)?;
+            lane.by(*n)?
+        }
+        MirType::Array(..) => ptr_ty,
+        MirType::Void => return None,
+    })
+}
+
+/// Size in bytes of a MIR type (for `gep` scaling and stack-slot sizing).
+fn size_of(t: &MirType) -> u32 {
+    match t {
+        MirType::I1 | MirType::I8 => 1,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 2,
+        MirType::I32 | MirType::F32 => 4,
+        MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e) * n,
+        MirType::Void => 0,
+    }
+}
+
+fn int_cc(op: CmpOp) -> IntCC {
+    use CmpOp::*;
+    match op {
+        Eq => IntCC::Equal,
+        Ne => IntCC::NotEqual,
+        Slt => IntCC::SignedLessThan,
+        Sle => IntCC::SignedLessThanOrEqual,
+        Sgt => IntCC::SignedGreaterThan,
+        Sge => IntCC::SignedGreaterThanOrEqual,
+        Ult => IntCC::UnsignedLessThan,
+        Ule => IntCC::UnsignedLessThanOrEqual,
+        Ugt => IntCC::UnsignedGreaterThan,
+        Uge => IntCC::UnsignedGreaterThanOrEqual,
+        _ => unreachable!("float predicate in int_cc"),
+    }
+}
+
+fn float_cc(op: CmpOp) -> FloatCC {
+    use CmpOp::*;
+    match op {
+        Foeq => FloatCC::Equal,
+        // The interpreter implements `!=` with Rust's `f64::ne` (unordered-or-not-equal), so match
+        // that rather than the ordered `one`.
+        Fone => FloatCC::NotEqual,
+        Folt => FloatCC::LessThan,
+        Fole => FloatCC::LessThanOrEqual,
+        Fogt => FloatCC::GreaterThan,
+        Foge => FloatCC::GreaterThanOrEqual,
+        _ => unreachable!("int predicate in float_cc"),
+    }
+}
+
+fn align_shift(bytes: u32) -> u8 {
+    // Align stack slots to their (rounded-up power-of-two) size, capped at 16 bytes.
+    let mut a = 1u32;
+    let mut shift = 0u8;
+    while a < bytes && a < 16 {
+        a <<= 1;
+        shift += 1;
+    }
+    shift
+}
+
+fn successors(t: &Terminator) -> Vec<u32> {
+    match t {
+        Terminator::Br { target, .. } => vec![target.0],
+        Terminator::CondBr {
+            then_blk, else_blk, ..
+        } => {
+            if then_blk == else_blk {
+                vec![then_blk.0]
+            } else {
+                vec![then_blk.0, else_blk.0]
+            }
+        }
+        Terminator::Ret(_) | Terminator::Unreachable => vec![],
+    }
+}
+
+// --- Per-function lowering ------------------------------------------------------------------
+
+/// Lowers one MIR `Function` into a Cranelift function body already attached to `builder`.
+struct FnTranslator<'a> {
+    builder: FunctionBuilder<'a>,
+    func: &'a Function,
+    interner: &'a Interner,
+    ptr_ty: Type,
+    /// MIR `ValueId` -> Cranelift value. Block params and instruction results fill this in.
+    vmap: Vec<Option<Value>>,
+    /// MIR block index -> Cranelift block.
+    blocks: Vec<Block>,
+    /// Pre-declared FuncRefs for callees and runtime imports in this function.
+    func_refs: &'a HashMap<Symbol, FuncRef>,
+    rt_refs: &'a HashMap<&'static str, FuncRef>,
+}
+
+impl<'a> FnTranslator<'a> {
+    fn val(&self, v: ValueId) -> Value {
+        self.vmap[v.0 as usize].expect("MIR value used before definition (non-SSA input?)")
+    }
+
+    fn set(&mut self, v: ValueId, cv: Value) {
+        self.vmap[v.0 as usize] = Some(cv);
+    }
+
+    fn ty_of(&self, v: ValueId) -> &MirType {
+        self.func.value_type(v)
+    }
+
+    fn dfg_ty(&self, v: Value) -> Type {
+        self.builder.func.dfg.value_type(v)
+    }
+
+    /// Reverse-postorder of blocks so every definition is emitted before its uses.
+    fn rpo(func: &Function) -> Vec<u32> {
+        let mut visited = vec![false; func.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(func.entry.0, 0usize)];
+        visited[func.entry.0 as usize] = true;
+        while let Some(&mut (b, ref mut i)) = stack.last_mut() {
+            let succs = successors(&func.blocks[b as usize].term);
+            if *i < succs.len() {
+                let s = succs[*i];
+                *i += 1;
+                if !visited[s as usize] {
+                    visited[s as usize] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(b);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    fn translate(&mut self) {
+        // Give each Cranelift block its params (the entry block's are the function params).
+        for (i, mb) in self.func.blocks.iter().enumerate() {
+            let cb = self.blocks[i];
+            if mb.id == self.func.entry {
+                self.builder.append_block_params_for_function_params(cb);
+                let cps: Vec<Value> = self.builder.block_params(cb).to_vec();
+                for (p, cv) in mb.params.iter().zip(cps) {
+                    self.set(*p, cv);
+                }
+            } else {
+                for p in &mb.params {
+                    let t = cl_type(self.ty_of(*p), self.ptr_ty).unwrap_or(self.ptr_ty);
+                    let cv = self.builder.append_block_param(cb, t);
+                    self.set(*p, cv);
+                }
+            }
+        }
+
+        let order = Self::rpo(self.func);
+        for &bi in &order {
+            let cb = self.blocks[bi as usize];
+            self.builder.switch_to_block(cb);
+            let mb = self.func.blocks[bi as usize].clone();
+            for inst in &mb.insts {
+                self.lower_inst(inst);
+            }
+            self.lower_term(&mb.term);
+        }
+        self.builder.seal_all_blocks();
+    }
+
+    fn lower_inst(&mut self, inst: &mercury_mir::Inst) {
+        let res = inst.result;
+        let cv = match &inst.op {
+            Op::ConstInt(v, ty) => {
+                if matches!(ty, MirType::I1) {
+                    self.builder.ins().iconst(types::I8, (*v as i64) & 1)
+                } else {
+                    let t = cl_type(ty, self.ptr_ty).unwrap_or(types::I64);
+                    self.builder.ins().iconst(t, *v as i64)
+                }
+            }
+            Op::ConstFloat(v, ty) => {
+                if matches!(ty, MirType::F64) {
+                    self.builder.ins().f64const(*v)
+                } else {
+                    self.builder.ins().f32const(*v as f32)
+                }
+            }
+            Op::Bin(op, l, r) => self.lower_bin(*op, *l, *r),
+            Op::Cmp(op, l, r) => {
+                let (a, b) = (self.val(*l), self.val(*r));
+                if op.is_float() {
+                    self.builder.ins().fcmp(float_cc(*op), a, b)
+                } else {
+                    self.builder.ins().icmp(int_cc(*op), a, b)
+                }
+            }
+            Op::Neg(v) => {
+                let x = self.val(*v);
+                if self.ty_of(*v).is_float() {
+                    self.builder.ins().fneg(x)
+                } else {
+                    self.builder.ins().ineg(x)
+                }
+            }
+            Op::Not(v) => {
+                let x = self.val(*v);
+                self.builder.ins().bnot(x)
+            }
+            Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to),
+            Op::Select(c, a, b) => {
+                let (cc, av, bv) = (self.val(*c), self.val(*a), self.val(*b));
+                self.builder.ins().select(cc, av, bv)
+            }
+            Op::Alloca(ty) => {
+                let bytes = size_of(ty).max(1);
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    bytes,
+                    align_shift(bytes),
+                ));
+                self.builder.ins().stack_addr(self.ptr_ty, slot, 0)
+            }
+            Op::Load(p, ty) => {
+                let addr = self.val(*p);
+                let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
+                self.builder.ins().load(t, MemFlags::trusted(), addr, 0)
+            }
+            Op::Store { ptr, value } => {
+                let (addr, v) = (self.val(*ptr), self.val(*value));
+                self.builder.ins().store(MemFlags::trusted(), v, addr, 0);
+                return;
+            }
+            Op::Gep { ptr, index, elem } => {
+                let base = self.val(*ptr);
+                let idx = self.to_ptr_int(*index);
+                let scaled = self.builder.ins().imul_imm(idx, size_of(elem) as i64);
+                self.builder.ins().iadd(base, scaled)
+            }
+            Op::Call { func, args } => match self.lower_call(*func, args) {
+                Some(v) => v,
+                None => return,
+            },
+        };
+        if let Some(r) = res {
+            // Normalise `i1` results to their low bit, matching the interpreter's masking.
+            let cv = if matches!(self.ty_of(r), MirType::I1) {
+                self.builder.ins().band_imm(cv, 1)
+            } else {
+                cv
+            };
+            self.set(r, cv);
+        }
+    }
+
+    fn lower_bin(&mut self, op: BinOp, l: ValueId, r: ValueId) -> Value {
+        let (a, b) = (self.val(l), self.val(r));
+        use BinOp::*;
+        match op {
+            Add => self.builder.ins().iadd(a, b),
+            Sub => self.builder.ins().isub(a, b),
+            Mul => self.builder.ins().imul(a, b),
+            FAdd => self.builder.ins().fadd(a, b),
+            FSub => self.builder.ins().fsub(a, b),
+            FMul => self.builder.ins().fmul(a, b),
+            FDiv => self.builder.ins().fdiv(a, b),
+            And => self.builder.ins().band(a, b),
+            Or => self.builder.ins().bor(a, b),
+            Xor => self.builder.ins().bxor(a, b),
+            Shl => self.builder.ins().ishl(a, b),
+            LShr => self.builder.ins().ushr(a, b),
+            AShr => self.builder.ins().sshr(a, b),
+            // Guard the divisor so a zero yields 0 instead of trapping, matching the interpreter.
+            SDiv | UDiv | SRem | URem => {
+                let ty = self.dfg_ty(a);
+                let zero = self.builder.ins().iconst(ty, 0);
+                let one = self.builder.ins().iconst(ty, 1);
+                let is_zero = self.builder.ins().icmp(IntCC::Equal, b, zero);
+                let safe = self.builder.ins().select(is_zero, one, b);
+                let q = match op {
+                    SDiv => self.builder.ins().sdiv(a, safe),
+                    UDiv => self.builder.ins().udiv(a, safe),
+                    SRem => self.builder.ins().srem(a, safe),
+                    URem => self.builder.ins().urem(a, safe),
+                    _ => unreachable!(),
+                };
+                self.builder.ins().select(is_zero, zero, q)
+            }
+        }
+    }
+
+    fn lower_cast(&mut self, kind: CastKind, v: ValueId, to: &MirType) -> Value {
+        let x = self.val(v);
+        let from_ty = self.dfg_ty(x);
+        let to_ty = cl_type(to, self.ptr_ty).unwrap_or(self.ptr_ty);
+        use CastKind::*;
+        match kind {
+            SExt => self.resize_int(x, from_ty, to_ty, true),
+            ZExt | Trunc => self.resize_int(x, from_ty, to_ty, false),
+            FpToSi => self.builder.ins().fcvt_to_sint_sat(to_ty, x),
+            FpToUi => self.builder.ins().fcvt_to_uint_sat(to_ty, x),
+            SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
+            UiToFp => self.builder.ins().fcvt_from_uint(to_ty, x),
+            FpExt => {
+                if to_ty == from_ty {
+                    x
+                } else {
+                    self.builder.ins().fpromote(to_ty, x)
+                }
+            }
+            FpTrunc => {
+                if to_ty == from_ty {
+                    x
+                } else {
+                    self.builder.ins().fdemote(to_ty, x)
+                }
+            }
+            Bitcast => {
+                if to_ty == from_ty {
+                    x
+                } else {
+                    self.builder.ins().bitcast(to_ty, MemFlags::new(), x)
+                }
+            }
+            IntToPtr | PtrToInt => self.resize_int(x, from_ty, to_ty, false),
+        }
+    }
+
+    /// Sign- or zero-extend, truncate, or pass through an integer to a target width.
+    fn resize_int(&mut self, x: Value, from: Type, to: Type, signed: bool) -> Value {
+        match to.bits().cmp(&from.bits()) {
+            std::cmp::Ordering::Equal => x,
+            std::cmp::Ordering::Greater => {
+                if signed {
+                    self.builder.ins().sextend(to, x)
+                } else {
+                    self.builder.ins().uextend(to, x)
+                }
+            }
+            std::cmp::Ordering::Less => self.builder.ins().ireduce(to, x),
+        }
+    }
+
+    /// Coerce an index value to the pointer-width integer used for address arithmetic.
+    fn to_ptr_int(&mut self, index: ValueId) -> Value {
+        let x = self.val(index);
+        let from = self.dfg_ty(x);
+        self.resize_int(x, from, self.ptr_ty, true)
+    }
+
+    fn lower_call(&mut self, func: Symbol, args: &[ValueId]) -> Option<Value> {
+        if let Some(&fref) = self.func_refs.get(&func) {
+            let argv: Vec<Value> = args.iter().map(|a| self.val(*a)).collect();
+            let call = self.builder.ins().call(fref, &argv);
+            return self.builder.inst_results(call).first().copied();
+        }
+        let name = self.interner.resolve(func);
+        let arg_is_float = args
+            .first()
+            .map(|a| self.ty_of(*a).is_float())
+            .unwrap_or(false);
+        let intr = classify_intrinsic(name, arg_is_float)?;
+        match intr {
+            Intrinsic::PrintInt => {
+                if let Some(&a) = args.first() {
+                    let v = self.coerce_to_i64(a);
+                    let fref = self.rt_refs[RT_PRINT_I64];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
+            Intrinsic::PrintFloat => {
+                if let Some(&a) = args.first() {
+                    let v = self.coerce_to_f64(a);
+                    let fref = self.rt_refs[RT_PRINT_F64];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
+            Intrinsic::Assert => {
+                if let Some(&a) = args.first() {
+                    let v = self.coerce_to_i64(a);
+                    let fref = self.rt_refs[RT_ASSERT];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
+        }
+        None
+    }
+
+    fn coerce_to_i64(&mut self, v: ValueId) -> Value {
+        let x = self.val(v);
+        let from = self.dfg_ty(x);
+        if from.is_int() {
+            self.resize_int(x, from, types::I64, true)
+        } else {
+            self.builder.ins().fcvt_to_sint_sat(types::I64, x)
+        }
+    }
+
+    fn coerce_to_f64(&mut self, v: ValueId) -> Value {
+        let x = self.val(v);
+        let from = self.dfg_ty(x);
+        if from == types::F64 {
+            x
+        } else {
+            self.builder.ins().fpromote(types::F64, x)
+        }
+    }
+
+    fn lower_term(&mut self, term: &Terminator) {
+        match term {
+            Terminator::Ret(None) => {
+                self.builder.ins().return_(&[]);
+            }
+            Terminator::Ret(Some(v)) => {
+                let x = self.val(*v);
+                self.builder.ins().return_(&[x]);
+            }
+            Terminator::Br { target, args } => {
+                let argv: Vec<BlockArg> =
+                    args.iter().map(|a| BlockArg::Value(self.val(*a))).collect();
+                let cb = self.blocks[target.0 as usize];
+                self.builder.ins().jump(cb, &argv);
+            }
+            Terminator::CondBr {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => {
+                let c = self.val(*cond);
+                let ta: Vec<BlockArg> =
+                    then_args.iter().map(|a| BlockArg::Value(self.val(*a))).collect();
+                let ea: Vec<BlockArg> =
+                    else_args.iter().map(|a| BlockArg::Value(self.val(*a))).collect();
+                let tb = self.blocks[then_blk.0 as usize];
+                let eb = self.blocks[else_blk.0 as usize];
+                self.builder.ins().brif(c, tb, &ta, eb, &ea);
+            }
+            Terminator::Unreachable => {
+                let tc = cranelift_codegen::ir::TrapCode::user(1).unwrap();
+                self.builder.ins().trap(tc);
+            }
+        }
+    }
+}
+
+// --- Module-level driving (shared by JIT and object emission) -------------------------------
+
+struct RtFuncs {
+    print_i64: FuncId,
+    print_f64: FuncId,
+    assert: FuncId,
+}
+
+fn signature_of(
+    f: &Function,
+    ptr_ty: Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    for p in &f.params {
+        if let Some(t) = cl_type(f.value_type(*p), ptr_ty) {
+            sig.params.push(AbiParam::new(t));
+        }
+    }
+    if let Some(t) = cl_type(&f.ret, ptr_ty) {
+        sig.returns.push(AbiParam::new(t));
+    }
+    sig
+}
+
+fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("opt_level", "speed")
+        .map_err(|e| e.to_string())?;
+    // The JIT requires non-PIC; the object emitter wants PIC. Configure per caller.
+    flag_builder
+        .set("is_pic", if pic { "true" } else { "false" })
+        .map_err(|e| e.to_string())?;
+    let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
+    isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .map_err(|e| e.to_string())
+}
+
+/// Declare every user function and the runtime imports into `module`, then define each body.
+fn populate_module<M: Module>(
+    module: &mut M,
+    program: &Program,
+    interner: &Interner,
+) -> Result<HashMap<Symbol, FuncId>, String> {
+    let ptr_ty = module.target_config().pointer_type();
+    let call_conv = module.target_config().default_call_conv;
+
+    let mut sig_i = Signature::new(call_conv);
+    sig_i.params.push(AbiParam::new(types::I64));
+    let mut sig_f = Signature::new(call_conv);
+    sig_f.params.push(AbiParam::new(types::F64));
+    let rt = RtFuncs {
+        print_i64: module
+            .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
+        print_f64: module
+            .declare_function(RT_PRINT_F64, Linkage::Import, &sig_f)
+            .map_err(|e| e.to_string())?,
+        assert: module
+            .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
+    };
+
+    // Declare all user functions first so calls resolve regardless of definition order.
+    let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
+    for f in &program.funcs {
+        let sig = signature_of(f, ptr_ty, call_conv);
+        let name = interner.resolve(f.name);
+        let id = module
+            .declare_function(name, Linkage::Export, &sig)
+            .map_err(|e| e.to_string())?;
+        ids.insert(f.name, id);
+    }
+
+    let mut ctx = module.make_context();
+    let mut fbctx = FunctionBuilderContext::new();
+    for f in &program.funcs {
+        ctx.func.signature = signature_of(f, ptr_ty, call_conv);
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+
+            // Pre-declare callee and runtime FuncRefs into this function's DFG.
+            let mut func_refs: HashMap<Symbol, FuncRef> = HashMap::new();
+            for (&sym, &fid) in &ids {
+                let r = module.declare_func_in_func(fid, builder.func);
+                func_refs.insert(sym, r);
+            }
+            let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
+            rt_refs.insert(RT_PRINT_I64, module.declare_func_in_func(rt.print_i64, builder.func));
+            rt_refs.insert(RT_PRINT_F64, module.declare_func_in_func(rt.print_f64, builder.func));
+            rt_refs.insert(RT_ASSERT, module.declare_func_in_func(rt.assert, builder.func));
+
+            let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
+            let mut t = FnTranslator {
+                builder,
+                func: f,
+                interner,
+                ptr_ty,
+                vmap: vec![None; f.value_types.len()],
+                blocks,
+                func_refs: &func_refs,
+                rt_refs: &rt_refs,
+            };
+            t.translate();
+            t.builder.finalize();
+        }
+        let fid = ids[&f.name];
+        module
+            .define_function(fid, &mut ctx)
+            .map_err(|e| format!("cranelift define `{}`: {e}", interner.resolve(f.name)))?;
+        module.clear_context(&mut ctx);
+    }
+    Ok(ids)
+}
+
+/// JIT-compile `program` and execute `entry`, returning its exit code and captured stdout — the
+/// native counterpart to the interpreter's `run_with_output`.
+pub fn jit_run(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    use cranelift_jit::{JITBuilder, JITModule};
+
+    // Tolerate poisoning: a prior panic mid-run shouldn't wedge every later run.
+    let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let isa = make_isa(false)?;
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
+    builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
+    builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    let mut module = JITModule::new(builder);
+
+    let ids = populate_module(&mut module, program, interner)?;
+    module.finalize_definitions().map_err(|e| e.to_string())?;
+
+    let entry_id = *ids
+        .get(&entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    let code = module.get_finalized_function(entry_id);
+
+    let entry_fn = program.function(entry).unwrap();
+    if !entry_fn.params.is_empty() {
+        unsafe { module.free_memory() };
+        return Err("native entry point must take no parameters".into());
+    }
+
+    OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    ASSERT_FAILED.store(false, Ordering::SeqCst);
+
+    let exit_code: i64 = unsafe {
+        match &entry_fn.ret {
+            MirType::Void => {
+                let f: extern "C" fn() = std::mem::transmute(code);
+                f();
+                0
+            }
+            t if t.is_float() => {
+                let f: extern "C" fn() -> f64 = std::mem::transmute(code);
+                f() as i64
+            }
+            MirType::I64 => {
+                let f: extern "C" fn() -> i64 = std::mem::transmute(code);
+                f()
+            }
+            _ => {
+                let f: extern "C" fn() -> i32 = std::mem::transmute(code);
+                f() as i64
+            }
+        }
+    };
+
+    let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let failed = ASSERT_FAILED.load(Ordering::SeqCst);
+    unsafe { module.free_memory() };
+
+    if failed {
+        return Err("assertion failed".into());
+    }
+    Ok((exit_code, out))
+}
+
+/// Compile `program` to a native object file (bytes) for the host target. The runtime symbols are
+/// left as undefined imports for the linker to resolve against a small C runtime.
+pub fn emit_object(program: &Program, interner: &Interner) -> Result<Vec<u8>, String> {
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+
+    let isa = make_isa(true)?;
+    let builder = ObjectBuilder::new(isa, "mercury", cranelift_module::default_libcall_names())
+        .map_err(|e| e.to_string())?;
+    let mut module = ObjectModule::new(builder);
+    populate_module(&mut module, program, interner)?;
+    let product = module.finish();
+    product.emit().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests;

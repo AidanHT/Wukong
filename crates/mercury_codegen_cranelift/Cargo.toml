@@ -1,0 +1,26 @@
+[package]
+name = "mercury_codegen_cranelift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mercury_mir = { workspace = true }
+mercury_span = { workspace = true }
+mercury_backend = { workspace = true }
+
+cranelift-codegen = "0.124"
+cranelift-frontend = "0.124"
+cranelift-module = "0.124"
+cranelift-jit = "0.124"
+cranelift-native = "0.124"
+cranelift-object = "0.124"
+
+[dev-dependencies]
+mercury_parser = { workspace = true }
+mercury_sema = { workspace = true }
+mercury_mir_build = { workspace = true }
+mercury_opt = { workspace = true }
+mercury_interp = { workspace = true }
