@@ -3,16 +3,26 @@
 Mercury is built openly and incrementally. This page is an honest snapshot of what works, what is
 checked-but-not-executed, and what is planned — so expectations match reality.
 
-## Works end to end (interpreter, `--run`)
+## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
+
+Two execution backends now run the full language and agree bit-for-bit (a differential gate proves
+it across opt levels): the zero-dependency tree-walking interpreter (the reference oracle) and a
+from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, object/exe via
+`--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
 - Modules, functions (including recursion and mutual recursion), and direct calls.
 - `let`/`let mut`/`const`, shadowing, block-as-expression values.
-- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats (`f16`/`bf16`/`f32`/`f64`,
-  computed in `f64`).
+- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
+  precision** (interpreter and native agree exactly); `f16`/`bf16` promote to `f32`; `f64` is full.
 - All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
-- `if`/`else`, `while`, `for … in a..b [step s]`.
+- `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
-  by base pointer (out-params). Real kernels run: dot product, SAXPY, flat GEMM, transpose, sort.
+  by base pointer (out-params). Real kernels run: dot, SAXPY, GEMM, matmul, ReLU, clamp, transpose.
+- **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
+  if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
+  on the native backend. saxpy/poly/relu/relu6/matmul-inner vectorize.
+- **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
+  vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
 - Intrinsics `print`/`println`/`assert`.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining** of
   leaf functions, **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
@@ -25,24 +35,26 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 
 - **Shape-typed tensors** `Tensor[f32, M, N]`: parse and pass compile-time shape checking
   (`E0501`/`E0502`), the headline feature — but tensor *operations* are not yet lowered/run.
-- **SIMD vectors** `f32x8` etc.: parse and type-check; vector ops are not yet executed.
-- **Attributes** `@simd`/`@tile`/`@parallel`/`@align`/`@extern`/`@export`: parse and validate; their
-  optimizer/runtime consumers are in progress.
+- **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector
+  values are not yet executed. (Loop auto-vectorization above is separate and *does* run.)
+- **Attributes** `@simd`/`@tile`/`@align`/`@extern`/`@export`: parse and validate; consumers in
+  progress. (`@parallel` now executes — see above.)
 
 ## Planned
 
-- Lowering and execution of tensor ops with fusion, tiling, and vectorization.
-- SIMD vector execution in the interpreter and via LLVM `<N x T>`.
-- `@parallel for`/`reduce` wired to the `mercury_runtime` thread pool.
-- Native linking of the LLVM backend (textual IR + `clang`) into runnable executables, and
-  interpreter-vs-LLVM differential tests.
+- Operator fusion (adjacent elementwise loops) and cache tiling for matmul/GEMM.
+- 256-bit AVX codegen (Cranelift is 128-bit only today; AVX throughput is approximated via unrolling).
+- Reduction vectorization (`dot` etc.) with horizontal reduce.
+- Execution of explicit `f32x8`-typed values; tensor-op lowering with fusion/tiling.
 - Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
 - GPU device codegen (PTX/AMDGPU), autodiff — designed-for, explicitly deferred.
 
 ## Known limitations / sharp edges
 
-- Floats are computed in `f64` in the interpreter; `f16`/`bf16` are storage types, not yet reduced
-  precision at runtime.
+- `f16`/`bf16` are storage types promoted to `f32` at runtime, not yet reduced precision.
+- Native SIMD is 128-bit (Cranelift's vector ISA); compute-bound kernels trail gcc's 256-bit AVX on
+  a single thread (4× unrolling narrows but does not erase the gap). Auto-parallelism more than makes
+  up for it across cores. The loop vectorizer assumes distinct array parameters do not alias.
 - Array length must be an integer literal; symbolic/`const`-expression lengths fall back to an opaque
   pointer.
 - No bounds checking on array indexing (manual memory is a decided constraint).
