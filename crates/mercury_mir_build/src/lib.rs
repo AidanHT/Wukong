@@ -524,6 +524,12 @@ impl FnLowerer<'_> {
                     }
                     return self.builder.build(ret, Op::Call { func: name, args: argvals });
                 }
+                // Built-in intrinsics (print, ...) lower to a void call the interpreter handles.
+                if is_intrinsic(self.interner.resolve(name)) {
+                    let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
+                    self.builder.build_void(Op::Call { func: name, args: argvals });
+                    return self.const_zero(MirType::I32);
+                }
             }
         }
         // Unmodeled builtin/method call.
@@ -687,6 +693,11 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
         _ if from.is_int() && matches!(to, MirType::Ptr) => CastKind::IntToPtr,
         _ => CastKind::Bitcast,
     }
+}
+
+/// Names that lower to runtime/interpreter intrinsics rather than user functions.
+pub fn is_intrinsic(name: &str) -> bool {
+    matches!(name, "print" | "println")
 }
 
 fn parse_int(text: &str) -> i128 {

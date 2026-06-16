@@ -57,24 +57,35 @@ impl Backend for Interpreter {
         entry: Symbol,
         interner: &Interner,
     ) -> Result<Artifact, String> {
-        let exit_code = run(program, entry, interner)?;
-        Ok(Artifact::Executed { exit_code, stdout: Vec::new() })
+        let (exit_code, stdout) = run_with_output(program, entry, interner)?;
+        Ok(Artifact::Executed { exit_code, stdout })
     }
 }
 
 /// Run `entry` (typically `main`) and return its integer result as a process exit code.
 pub fn run(program: &Program, entry: Symbol, interner: &Interner) -> Result<i64, String> {
+    Ok(run_with_output(program, entry, interner)?.0)
+}
+
+/// Run `entry` and return both its exit code and anything it printed.
+pub fn run_with_output(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
     let func = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let mut interp = Interp { program, memory: Vec::new() };
+    let mut interp = Interp { program, interner, memory: Vec::new(), stdout: Vec::new() };
     let result = interp.run_function(func, Vec::new())?;
-    Ok(result.as_int() as i64)
+    Ok((result.as_int() as i64, interp.stdout))
 }
 
 struct Interp<'a> {
     program: &'a Program,
+    interner: &'a Interner,
     memory: Vec<Value>,
+    stdout: Vec<u8>,
 }
 
 impl<'a> Interp<'a> {
@@ -174,14 +185,32 @@ impl<'a> Interp<'a> {
                 Value::Ptr((base as i128 + off) as usize)
             }
             Op::Call { func, args } => {
-                let prog = self.program;
-                let callee = prog
-                    .function(*func)
-                    .ok_or_else(|| format!("call to unknown function #{}", func.0))?;
                 let argv: Vec<Value> = args.iter().map(|a| reg(regs, *a)).collect();
-                self.run_function(callee, argv)?
+                let prog = self.program;
+                if let Some(callee) = prog.function(*func) {
+                    self.run_function(callee, argv)?
+                } else {
+                    let name = self.interner.resolve(*func).to_string();
+                    self.intrinsic(&name, &argv)?
+                }
             }
         })
+    }
+
+    fn intrinsic(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
+        match name {
+            "print" | "println" => {
+                let text = match args.first().copied().unwrap_or(Value::Unit) {
+                    Value::Int(i) => format!("{i}\n"),
+                    Value::Float(f) => format!("{f}\n"),
+                    Value::Ptr(p) => format!("{p}\n"),
+                    Value::Unit => "\n".to_string(),
+                };
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
+            other => Err(format!("call to unknown function or intrinsic `{other}`")),
+        }
     }
 }
 
@@ -355,6 +384,19 @@ mod tests {
                    return fib(n - 1) + fib(n - 2); } \
                    fn main() -> i32 { return fib(10); }";
         assert_eq!(run_main(src), 55);
+    }
+
+    #[test]
+    fn print_intrinsic_captures_stdout() {
+        let mut interner = Interner::new();
+        let src = "fn main() -> i32 { print(42); print(7 * 6); return 0; }";
+        let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, _) = mercury_sema::check(&module, &interner);
+        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let main = interner.intern("main");
+        let (code, out) = run_with_output(&program, main, &interner).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "42\n42\n");
     }
 
     #[test]
