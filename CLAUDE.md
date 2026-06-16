@@ -63,10 +63,24 @@ source.mer
 
 Dependencies flow strictly downward (no cycles); every crate is prefixed `mercury_` (binary is `mercuryc`).
 
-## Conventions & invariants
+## Mandate: performance first
 
-- **Interpreter-first, LLVM-quarantined.** The whole front-end + optimizer + interpreter build/test
-  with `cargo test`, no LLVM. The interpreter is the always-available path and the differential oracle.
+**The goal is to beat C, C++, and Rust on the metrics that matter for an ML/DL compiler** — generated
+kernel throughput (matmul/conv/attention GFLOP/s, elementwise/reduction GB/s), compile time, and
+shape safety. Performance wins override every *stylistic* convention below. You are free to: adopt
+wider SIMD (AVX2/AVX-512) by any means including raw machine-code microkernels, add a new backend or
+new dependencies, break "interpreter-first" primacy, add domain-aware passes (tiling, packing,
+register-blocking, op-graph fusion), and rewrite any documentation that is out of date. If something
+blocks a higher number, remove it.
+
+**The one hard invariant — correctness.** Every backend must agree with the interpreter oracle
+bit-for-bit on the differential gate, and `-O0` must match `-O{1,2,3}` on stdout/exit. A fast
+compiler that miscompiles is worthless; this gate is precisely what makes aggressive optimization
+*safe*, so it stays. (For reassociated float reductions, the documented exception is that the
+reassociated form is the oracle — all backends run the same reassociated IR and must still agree.)
+
+## Architecture conventions (change freely if they block performance)
+
 - **One progressively-lowered SSA MIR** (not separate HIR/MIR/LIR): born *High* (structured
   tensor/loop ops), rewritten down to *Low* (scalar SSA). A `MirLevel` invariant is verifier-enforced.
 - **Block-parameter SSA, not phi nodes.** Blocks take typed params; branches pass args. Maps to LLVM phis.
@@ -75,14 +89,21 @@ Dependencies flow strictly downward (no cycles); every crate is prefixed `mercur
   `E05xx` shapes, `C0xxx` codegen. `mercuryc --explain <CODE>` prints the extended explanation.
 - **Optimizer fixpoint passes** (`-O1`: mem2reg, simplify, simplify-cfg, simplify-phis, dce;
   `-O2` adds whole-program inlining, cse, dse, licm). `mem2reg` is the keystone (alloca → SSA).
-- Optimizer soundness is gated by a differential test: `-O0` must match `-O{1,2,3}` on stdout/exit.
+- The interpreter is retained as the **correctness oracle**, not as a performance ceiling. The native
+  (Cranelift) path is the fast path and the default for benchmarking.
 
 ## Environment gotchas
 
 - Development is on **Windows 11 with PowerShell** as the primary shell (a Bash tool is also available —
   use POSIX syntax there). Use absolute paths in agent threads.
-- **LLVM is NOT installed here.** The native `--features llvm` path cannot build/run in this environment.
-  Use the interpreter (`--run`) and `mercury_bench` instead. Plain `cargo test` needs no toolchain.
+- **LLVM is NOT installed here** (a physical fact, not a rule): `clang`/`llc` do not exist, so the
+  textual-LLVM `--features llvm` path cannot link/run. The native path is **Cranelift** (pure Rust,
+  builds and JITs here with zero external toolchain) plus any raw-codegen microkernels we add. Plain
+  `cargo test` needs no toolchain. `gcc`/`g++`/`rustc` (MSYS2) *are* present — that's what `mercury_xbench`
+  compiles the C/Rust baselines with.
+- Wider SIMD: Cranelift historically rejected `f32x8` types in CLIF. That ceiling is a target to break,
+  not a law — verify the current Cranelift's capability empirically, and where it can't reach, emit
+  AVX2/AVX-512 microkernels directly (the differential gate keeps any such path honest).
 - Test fixtures live at the **repo root** (`tests/run/*.mer`, `tests/fail/*.mer`, `examples/`,
   `bench/kernels/`), not under any crate; e2e tests spawn the real binary via `CARGO_BIN_EXE_mercuryc`.
 
