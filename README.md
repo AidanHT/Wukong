@@ -40,6 +40,24 @@ fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], out: Tensor[f32, N]) {
 }
 ```
 
+That tensor/`@parallel`/`@simd` form is the target surface (it type- and shape-checks today). The
+same kernel over fixed-size arrays **runs today** on the interpreter:
+
+```mercury
+fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], out: [f32; 4]) {
+    let mut i: i32 = 0;
+    while i < 4 {
+        out[i] = a * x[i] + y[i];   // arrays pass by reference; `out` is mutated in place
+        i = i + 1;
+    }
+}
+```
+
+```sh
+mercuryc --run examples/saxpy_array.mer   # 12 24 36 48
+mercuryc --run examples/dot.mer           # 120
+```
+
 ## Architecture
 
 ```

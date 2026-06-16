@@ -19,6 +19,9 @@ All notable changes to Mercury are documented here. The format is loosely based 
   wired across `-O0..-O3`.
 - **Back-ends**: a zero-dependency MIR interpreter (`--run`) and a textual LLVM-IR emitter
   (`--emit=llvm-ir`, plus `--emit=obj|exe` via `clang` when present).
+- **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
+  with a runtime index, and array parameters passed by base pointer (out-params work). Real kernels
+  (dot product, SAXPY, a flat GEMM) run on the interpreter.
 - **Intrinsics**: `print`/`println` (captured stdout) and `assert` (traps on false).
 - **Runtime**: a bump `Arena` allocator and a deterministic `parallel_for`.
 - **Diagnostics**: rustc-style renderer, a stable error-code catalog with `--explain <CODE>`, and
