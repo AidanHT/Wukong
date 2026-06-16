@@ -19,3 +19,4 @@ mercury_mir = { workspace = true }
 mercury_mir_build = { workspace = true }
 mercury_opt = { workspace = true }
 mercury_interp = { workspace = true }
+mercury_codegen_cranelift = { workspace = true }
