@@ -325,19 +325,32 @@ impl<'a> FnTranslator<'a> {
                 let cc = self.val(*c);
                 let av0 = self.val(*a);
                 let bv0 = self.val(*b);
-                // Cranelift requires both arms to share a type; unify mismatched float widths.
-                let (av, bv) = if self.dfg_ty(av0).is_float() || self.dfg_ty(bv0).is_float() {
-                    let common = if self.dfg_ty(av0) == types::F64 || self.dfg_ty(bv0) == types::F64
-                    {
-                        types::F64
+                let avty = self.dfg_ty(av0);
+                if avty.is_vector() {
+                    // Vector blend: the mask is a per-lane all-ones/all-zeros vector (from a vector
+                    // compare). Reinterpret it to the value vector type and select bitwise.
+                    let cty = self.dfg_ty(cc);
+                    let mask = if cty == avty {
+                        cc
                     } else {
-                        types::F32
+                        self.builder.ins().bitcast(avty, MemFlags::new(), cc)
                     };
-                    (self.coerce_float(av0, common), self.coerce_float(bv0, common))
+                    self.builder.ins().bitselect(mask, av0, bv0)
                 } else {
-                    (av0, bv0)
-                };
-                self.builder.ins().select(cc, av, bv)
+                    // Cranelift requires both arms to share a type; unify mismatched float widths.
+                    let (av, bv) = if self.dfg_ty(av0).is_float() || self.dfg_ty(bv0).is_float() {
+                        let common =
+                            if self.dfg_ty(av0) == types::F64 || self.dfg_ty(bv0) == types::F64 {
+                                types::F64
+                            } else {
+                                types::F32
+                            };
+                        (self.coerce_float(av0, common), self.coerce_float(bv0, common))
+                    } else {
+                        (av0, bv0)
+                    };
+                    self.builder.ins().select(cc, av, bv)
+                }
             }
             Op::Alloca(ty) => {
                 let bytes = size_of(ty).max(1);

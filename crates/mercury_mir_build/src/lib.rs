@@ -807,6 +807,31 @@ impl FnLowerer<'_> {
                 op: ast::UnOp::Neg,
                 expr,
             } => self.vec_check_value(expr, j, locals, lane, acc),
+            // `if cond { a } else { b }` if-converts to a vector compare + blend (e.g. ReLU).
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let (Some(else_e), Some(tv)) =
+                    (else_branch.as_deref(), block_value(then_branch))
+                else {
+                    return false;
+                };
+                let (Some(ev), ExprKind::Binary { op, lhs, rhs }) =
+                    (branch_value(else_e), &cond.kind)
+                else {
+                    return false;
+                };
+                use ast::BinOp::*;
+                if !matches!(op, Lt | Le | Gt | Ge | Eq | Ne) {
+                    return false;
+                }
+                self.vec_check_value(lhs, j, locals, lane, acc)
+                    && self.vec_check_value(rhs, j, locals, lane, acc)
+                    && self.vec_check_value(tv, j, locals, lane, acc)
+                    && self.vec_check_value(ev, j, locals, lane, acc)
+            }
             _ => false,
         }
     }
@@ -995,6 +1020,26 @@ impl FnLowerer<'_> {
             } => {
                 let v = self.vec_lower_value(expr, j, lane, vty, w, vlocals);
                 self.builder.build(vty.clone(), Op::Neg(v))
+            }
+            // if-conversion: `if a CMP b { t } else { e }` -> vector compare mask + lane-wise blend.
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+                    unreachable!("vec_lower_value on unvalidated if-condition");
+                };
+                let lv = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
+                let rv = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
+                let mask_ty = MirType::Vec(Box::new(mask_lane_type(lane)), w);
+                let pred = cmp_pred(*op, lane.is_float(), lane_signed(lane));
+                let mask = self.builder.build(mask_ty, Op::Cmp(pred, lv, rv));
+                let tv = block_value(then_branch).unwrap();
+                let ev = branch_value(else_branch.as_deref().unwrap()).unwrap();
+                let tvec = self.vec_lower_value(tv, j, lane, vty, w, vlocals);
+                let evec = self.vec_lower_value(ev, j, lane, vty, w, vlocals);
+                self.builder.build(vty.clone(), Op::Select(mask, tvec, evec))
             }
             // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
             _ => {
@@ -1780,7 +1825,7 @@ fn set_or_check(slot: &mut Option<MirType>, t: &MirType) -> Option<()> {
     }
 }
 
-/// SIMD width for a lane type: one 128-bit register holds `16 / sizeof(lane)` lanes (f32x4, f64x2).
+/// SIMD width for a lane type: lanes per `VEC_REG_BYTES`-wide register (f32x8, f64x4 at 256-bit).
 /// Returns `None` for lane types we don't vectorize.
 fn vector_width(lane: &MirType) -> Option<u32> {
     let bytes = match lane {
@@ -1788,12 +1833,44 @@ fn vector_width(lane: &MirType) -> Option<u32> {
         MirType::F64 | MirType::I64 => 8,
         _ => return None,
     };
-    Some(16 / bytes)
+    Some(VEC_REG_BYTES / bytes)
 }
+
+/// SIMD register width in bytes. Cranelift's vector ISA is 128-bit (16 bytes); wider types such as
+/// `f32x8` are not legalized ("Unexpected SSA-value type"), so we pack one 128-bit register and
+/// recover AVX-class throughput via unrolling (see `UNROLL`) rather than a wider lane type.
+const VEC_REG_BYTES: u32 = 16;
 
 /// Default signedness for a lane type (only affects integer div/rem op selection).
 fn lane_signed(lane: &MirType) -> bool {
     lane.is_int()
+}
+
+/// The pure tail value of a braces-only block (`{ e }`), or `None` if it has statements.
+fn block_value(b: &Block) -> Option<&Expr> {
+    if b.stmts.is_empty() {
+        b.tail.as_deref()
+    } else {
+        None
+    }
+}
+
+/// The value of an `if` branch: a braces-only block yields its tail; a non-block expression (e.g. a
+/// chained `else if`) yields itself.
+fn branch_value(e: &Expr) -> Option<&Expr> {
+    match &e.kind {
+        ExprKind::Block(b) => block_value(b),
+        _ => Some(e),
+    }
+}
+
+/// The integer lane type of a vector compare mask: same bit width as the value lane (so the mask
+/// reinterprets cleanly for a bitwise blend on the native side).
+fn mask_lane_type(lane: &MirType) -> MirType {
+    match lane {
+        MirType::F64 | MirType::I64 => MirType::I64,
+        _ => MirType::I32,
+    }
 }
 
 /// The wider of two numeric MIR types (float beats int), used to pick a common comparison type.

@@ -158,12 +158,25 @@ impl Verifier<'_> {
                                 rt.display()
                             ));
                         }
-                        if c.is_float() != lt.is_float() {
+                        // Classify by lane type so a `<4 x f32>` compare reads as a float compare.
+                        if c.is_float() != lt.lane_type().is_float() {
                             self.err(format!(
                                 "cmp predicate {} mismatches operand type {}",
                                 c.name(),
                                 lt.display()
                             ));
+                        }
+                        // A vector compare yields a same-width lane mask; a scalar compare yields i1.
+                        if let MirType::Vec(_, n) = lt {
+                            match self.result_ty(result) {
+                                Some(MirType::Vec(_, m)) if m == n => {}
+                                Some(other) => self.err(format!(
+                                    "vector cmp result must be an {n}-lane mask, got {}",
+                                    other.display()
+                                )),
+                                None => {}
+                            }
+                            return;
                         }
                     }
                 }
@@ -181,14 +194,30 @@ impl Verifier<'_> {
                 self.check_result_is(result, to);
             }
             Op::Select(c, a, b) => {
-                if self.use_val(*c) {
-                    self.expect_ty(*c, &MirType::I1, "select condition");
-                }
                 if self.use_val(*a) & self.use_val(*b) {
                     if let Some(res) = self.result_ty(result) {
                         self.expect_ty(*a, &res, "select");
                         self.expect_ty(*b, &res, "select");
+                        // A vector select takes a same-width lane mask; a scalar select takes i1.
+                        if let MirType::Vec(_, n) = &res {
+                            if self.use_val(*c) {
+                                match self.ty(*c) {
+                                    Some(MirType::Vec(_, m)) if m == n => {}
+                                    Some(other) => {
+                                        let other = other.display();
+                                        self.err(format!(
+                                            "vector select mask must be an {n}-lane vector, got {other}"
+                                        ));
+                                    }
+                                    None => {}
+                                }
+                            }
+                            return;
+                        }
                     }
+                }
+                if self.use_val(*c) {
+                    self.expect_ty(*c, &MirType::I1, "select condition");
                 }
             }
             Op::Alloca(_) => self.check_result_is(result, &MirType::Ptr),
