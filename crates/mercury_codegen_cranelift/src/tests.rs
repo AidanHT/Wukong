@@ -196,12 +196,17 @@ fn vectorized_saxpy_is_correct_across_sizes() {
         )
     };
 
-    // The vectorizer must have fired at least once on a representative size.
+    // The vectorizer must have fired at least once on a representative size, and `a*x[k] + y[k]`
+    // must have contracted to a lane-wise fused multiply-add.
     let (prog, interner) = lowered(&kernel(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
         mir.contains("splat") && mir.contains("x f32>"),
         "saxpy loop should have vectorized to SIMD ops"
+    );
+    assert!(
+        mir.contains("fma") && mir.contains("x f32>"),
+        "saxpy `a*x + y` should contract to a vector fma:\n{mir}"
     );
 
     // 2 (remainder only), 4 (one vector, no remainder), 7/13 (vector + remainder), 1024 (many).

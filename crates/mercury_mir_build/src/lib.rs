@@ -1119,6 +1119,13 @@ impl FnLowerer<'_> {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                // Contract a float `x + y*z` into one lane-wise fused multiply-add — this is the
+                // matmul/saxpy inner-loop win (one `vfmadd` per vector instead of mul+add).
+                if *op == ast::BinOp::Add && lane.is_float() {
+                    if let Some(v) = self.vec_try_fma(lhs, rhs, j, lane, vty, w, vlocals) {
+                        return v;
+                    }
+                }
                 let l = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
                 let r = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
                 let bin = arith_binop(*op, lane.is_float(), lane_signed(lane));
@@ -1159,6 +1166,46 @@ impl FnLowerer<'_> {
                 self.builder.build(vty.clone(), Op::Splat(scalar))
             }
         }
+    }
+
+    /// In a vectorized loop body, contract a float `x + y*z` (or `y*z + x`) into one lane-wise
+    /// `Fma`. Returns the fused vector value, or `None` if neither side is a multiply (the caller
+    /// then emits a plain vector add). The whole expression tree was already accepted by the
+    /// vectorizer's dependence check, so lowering its leaves here is sound.
+    #[allow(clippy::too_many_arguments)]
+    fn vec_try_fma(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        j: Symbol,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        vlocals: &mut HashMap<Symbol, ValueId>,
+    ) -> Option<ValueId> {
+        fn as_fmul(e: &Expr) -> Option<(&Expr, &Expr)> {
+            match &e.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Mul,
+                    lhs,
+                    rhs,
+                } => Some((lhs.as_ref(), rhs.as_ref())),
+                _ => None,
+            }
+        }
+        if let Some((y, z)) = as_fmul(lhs) {
+            let yv = self.vec_lower_value(y, j, lane, vty, w, vlocals);
+            let zv = self.vec_lower_value(z, j, lane, vty, w, vlocals);
+            let xv = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
+            return Some(self.builder.build(vty.clone(), Op::Fma(yv, zv, xv)));
+        }
+        if let Some((y, z)) = as_fmul(rhs) {
+            let xv = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
+            let yv = self.vec_lower_value(y, j, lane, vty, w, vlocals);
+            let zv = self.vec_lower_value(z, j, lane, vty, w, vlocals);
+            return Some(self.builder.build(vty.clone(), Op::Fma(yv, zv, xv)));
+        }
+        None
     }
 
     /// The element address `&base[index]` (a `gep` by the scalar index, reusing the loop index slot
