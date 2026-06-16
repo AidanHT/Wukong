@@ -61,10 +61,10 @@ developer time — this is the most important and most robust result.
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
-| saxpy  | ~1.0–1.1× (tie/slight win) | memory-bandwidth bound; both ~40–58 GB/s |
-| relu   | ~1.0–1.06× (tie/slight win) | memory-bound; vectorized via if-conversion |
-| poly   | ~1.0–1.05× (tie/slight win) | compute-bound; was **5.9× slower** before vectorization+FMA |
-| fused linear→relu | ~1.1–1.15× faster | two source loops; Mercury **fuses** them, C/Rust two-pass |
+| saxpy  | ≈tie (~1.0–1.15×, either way) | memory-bandwidth bound; both ~40–58 GB/s |
+| relu   | ≈tie (~1.0–1.1×, either way) | memory-bound; vectorized via if-conversion |
+| poly   | ≈tie (~1.0–1.2×, either way) | compute-bound; was **5.9× slower** before vectorization+FMA |
+| fused linear→relu | ~1.1× faster | two source loops; Mercury **fuses** them, C/Rust two-pass |
 | dot    | **~2.6–2.7× faster** | reduction vectorized to lane accumulators + horizontal reduce |
 | ssd (Σ(x−y)²) | **~2.6× faster** | same — an L2-loss reduction, vectorized; gcc/rustc stay serial |
 
@@ -84,9 +84,9 @@ way (~16 vs ~6.5 GB/s).
 Mercury's vectorizer lifts straight-line elementwise loops to 128-bit SIMD and unrolls 4× so
 independent vector chains issue across the core's FP units (recovering AVX-class throughput from SSE
 ops), and contracts `a*x + y` to a hardware FMA. With FMA enabled for both sides, the elementwise
-kernels land within ~1.0–1.15× of C (Mercury's 128-bit FMA + 4× unroll vs gcc's 256-bit AVX FMA);
-run-to-run noise on a busy desktop puts them at tie-or-slight-win. Memory-bound kernels are at the
-bandwidth wall for everyone.
+kernels land within ~1.0–1.2× of C **either way** — a genuine tie that run-to-run noise on a busy
+desktop tips to a slight win or a slight loss (Mercury's 128-bit FMA + 4× unroll vs gcc's 256-bit AVX
+FMA). Memory-bound kernels are at the bandwidth wall for everyone.
 
 ### Auto-parallel runtime — Mercury heavily exceeds idiomatic C/Rust
 
