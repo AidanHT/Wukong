@@ -237,7 +237,11 @@ fn lower_parallel(
             let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
             fl.bind(p.name.sym, base, mty);
         }
-        fl.lower_ranged_loop(idx, start, end, loop_body);
+        // The index variable's source type (the range's element type) drives the loop so the
+        // body's index arithmetic matches sema; the i64 runtime bounds are coerced into it.
+        let ity = fl.expr_mir(hi);
+        let ity = if ity.is_int() { ity } else { MirType::I64 };
+        fl.lower_ranged_loop(idx, start, end, ity, loop_body);
         if !fl.terminated {
             fl.builder.ret(None);
         }
@@ -617,9 +621,19 @@ impl FnLowerer<'_> {
     }
 
     /// Lower `for idx in start..end { body }` where `start`/`end` are already-lowered `i64` values
-    /// (used by parallel outlining). The index is `i64` and steps by 1.
-    fn lower_ranged_loop(&mut self, idx: Symbol, start: ValueId, end: ValueId, body: &Block) {
-        let ity = MirType::I64;
+    /// (used by parallel outlining). The loop runs in `ity` — the index variable's source type, so
+    /// the body's index arithmetic stays type-consistent — with the `i64` bounds coerced into it.
+    fn lower_ranged_loop(
+        &mut self,
+        idx: Symbol,
+        start: ValueId,
+        end: ValueId,
+        ity: MirType,
+        body: &Block,
+    ) {
+        // The runtime hands us `[start, end)` as i64; narrow to the index type the body expects.
+        let start = self.coerce_to(start, &MirType::I64, &ity, true);
+        let end = self.coerce_to(end, &MirType::I64, &ity, true);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
             ptr: slot,
