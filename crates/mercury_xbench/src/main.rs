@@ -464,6 +464,18 @@ fn kernels() -> Vec<Kernel> {
             ),
         },
         Kernel {
+            name: "ssd",
+            bytes_per_call: 2 * N * 4,
+            note: "sum((x-y)^2), an L2-loss reduction (Mercury vectorizes it)",
+            mer: mer_kernel(&format!(
+                "let mut s: f32 = 0.0; for i in 0..{nlit} {{ s += (x[i] - y[i]) * (x[i] - y[i]); }} out[0] = s;"
+            )),
+            c: c_kernel("float s=0.0f; for(long i=0;i<N;i++){ float d=x[i]-y[i]; s+=d*d; } out[0]=s;"),
+            rust: rust_kernel(
+                "let mut s=0.0f32; for i in 0..N { let d= *x.add(i)- *y.add(i); s+=d*d; } *out.add(0)=s;",
+            ),
+        },
+        Kernel {
             name: "relu",
             bytes_per_call: 2 * N * 4,
             note: "out = max(x,0), memory-bound + branch",
