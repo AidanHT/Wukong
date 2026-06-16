@@ -348,8 +348,11 @@ fn algebra(b: BinOp, l: ValueId, lc: Option<CV>, r: ValueId, rc: Option<CV>) -> 
 }
 
 fn mask(v: i128, ty: &MirType) -> i128 {
+    // `i1` is a boolean: keep the low bit unsigned (true == 1), never sign-extend to -1.
+    if matches!(ty, MirType::I1) {
+        return v & 1;
+    }
     let bits = match ty {
-        MirType::I1 => 1,
         MirType::I8 => 8,
         MirType::I16 => 16,
         MirType::I32 => 32,

@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 200
+module tests.run.operators
+
+/// All compound-assignment operators, the six comparison operators, and unary `!`.
+fn main() -> i32 {
+    let mut a: i32 = 20;
+    a += 5; // 25
+    a -= 3; // 22
+    a *= 2; // 44
+    a /= 4; // 11
+    a %= 7; // 4
+    print(a);
+
+    let mut b: i32 = 12;
+    b &= 10; // 8
+    b |= 1; // 9
+    b ^= 3; // 10
+    print(b);
+
+    print(1 == 1); // 1
+    print(1 != 2); // 1
+    print(2 < 3); // 1
+    print(3 <= 3); // 1
+    print(4 > 1); // 1
+    print(5 >= 9); // 0
+
+    let t: bool = true;
+    if !t { print(100); } else { print(200); }
+    return 0;
+}

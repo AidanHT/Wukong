@@ -109,6 +109,14 @@ impl<'a> Interp<'a> {
             for inst in &block.insts {
                 let v = self.eval(&inst.op, &regs)?;
                 if let Some(r) = inst.result {
+                    // Normalize integer results to their declared width: this gives correct
+                    // two's-complement wrapping and keeps booleans (`i1`) as 0/1 (so e.g. `!true`
+                    // is 0, not a sign-extended -2). Non-integer values pass through unchanged.
+                    let rty = func.value_type(r);
+                    let v = match v {
+                        Value::Int(i) if rty.is_int() => Value::Int(mask(i, rty)),
+                        other => other,
+                    };
                     regs[r.0 as usize] = Some(v);
                 }
             }
@@ -275,6 +283,10 @@ fn int_bits(ty: &MirType) -> u32 {
 
 /// Truncate an integer value to a result type's bit width (signed wrap).
 fn mask(v: i128, ty: &MirType) -> i128 {
+    // `i1` is a boolean: keep the low bit unsigned (true == 1, not a sign-extended -1).
+    if matches!(ty, MirType::I1) {
+        return v & 1;
+    }
     let bits = int_bits(ty);
     if bits >= 128 {
         return v;
