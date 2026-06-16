@@ -169,6 +169,51 @@ fn if_as_expression() {
     }
 }
 
+/// Compile `src` to MIR and return the optimized program plus interner (for inspecting whether the
+/// vectorizer fired).
+fn lowered(src: &str, opt: u8) -> (mercury_mir::Program, Interner) {
+    let mut interner = Interner::new();
+    let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    let (sema, _) = mercury_sema::check(&module, &interner);
+    let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    mercury_opt::optimize(&mut program, opt);
+    (program, interner)
+}
+
+/// The SIMD loop vectorizer: a saxpy `for` loop must (a) actually lower to vector ops, (b) agree
+/// between interpreter and native, and (c) compute the same result the scalar loop would — checked
+/// across sizes that hit the vector body only, the remainder only, and both. `sum(2*i+1) == N*N`.
+#[test]
+fn vectorized_saxpy_is_correct_across_sizes() {
+    let kernel = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [1.0; {n}]; \
+             let mut o: [f32; {n}] = [0.0; {n}]; let mut i: i32 = 0; \
+             while i < {n} {{ x[i] = (i as f32); i += 1; }} \
+             let a: f32 = 2.0; for k in 0..{n} {{ o[k] = a * x[k] + y[k]; }} \
+             let mut s: f32 = 0.0; let mut j: i32 = 0; while j < {n} {{ s = s + o[j]; j += 1; }} \
+             return s as i32; }}"
+        )
+    };
+
+    // The vectorizer must have fired at least once on a representative size.
+    let (prog, interner) = lowered(&kernel(64), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("splat") && mir.contains("x f32>"),
+        "saxpy loop should have vectorized to SIMD ops"
+    );
+
+    // 2 (remainder only), 4 (one vector, no remainder), 7/13 (vector + remainder), 1024 (many).
+    for n in [2usize, 4, 7, 8, 13, 64, 1024] {
+        let src = kernel(n);
+        let native = jit(&src, 3).expect("jit");
+        let interp = interp(&src, 3).expect("interp");
+        assert_eq!(native, interp, "vectorized native vs interp mismatch at n={n}");
+        assert_eq!(native.0, (n * n) as i64, "wrong saxpy result at n={n}");
+    }
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.

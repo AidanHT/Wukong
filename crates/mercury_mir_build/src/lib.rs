@@ -9,7 +9,7 @@
 //! SIMD-method, and parallel-loop constructs are not yet lowered; encountering one records a
 //! diagnostic and substitutes a placeholder so the rest of the function still lowers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mercury_ast::{
     self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind,
@@ -553,6 +553,12 @@ impl FnLowerer<'_> {
         let ity = self.expr_mir(start);
         let signed = self.signed(start);
 
+        // Straight-line elementwise loops lower to SIMD (vector main loop + scalar remainder); this
+        // is purely an optimization, so on any doubt it returns false and we lower scalar below.
+        if !inclusive && step.is_none() && self.try_vectorize_for(pat, start, end, body) {
+            return;
+        }
+
         // i = start
         let slot = self.builder.alloca(ity.clone());
         let s0 = self.lower_expr(start);
@@ -618,6 +624,383 @@ impl FnLowerer<'_> {
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    // ============================ SIMD loop vectorizer ============================
+    //
+    // Recognizes `for j in lo..hi { <straight-line elementwise body> }` and lowers it to a vector
+    // main loop processing `W` lanes per iteration plus a scalar remainder for the tail. It fires
+    // only when every array access is unit-stride in `j` (vector load/store) or invariant in `j`
+    // (splat), no written array is touched at a second index (no loop-carried dependence), the body
+    // is branch/call-free, and all lanes share one 32/64-bit scalar type. Lane `k` of the vector
+    // loop then computes exactly what scalar iteration `base+k` would, so the result is identical.
+    // Distinct array parameters are assumed not to alias (the usual kernel ABI). On any failure it
+    // returns `false` and the caller falls back to the scalar lowering.
+
+    /// Attempt SIMD lowering of `for j in start..end { body }`. Returns true on success.
+    fn try_vectorize_for(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
+        let j = match &pat.kind {
+            ast::PatKind::Ident(name) => *name,
+            _ => return false,
+        };
+        let ity = self.expr_mir(start);
+        if !ity.is_int() {
+            return false;
+        }
+        let Some((lane, w)) = self.vectorizable(body, j) else {
+            return false;
+        };
+        self.emit_vectorized_for(j, start, end, &ity, &lane, w, body);
+        true
+    }
+
+    /// Validate that `body` is vectorizable over loop variable `j`; return the shared lane type and
+    /// vector width, or `None` to bail. Pure analysis (emits no MIR).
+    fn vectorizable(&self, body: &Block, j: Symbol) -> Option<(MirType, u32)> {
+        if body.tail.is_some() || body.stmts.is_empty() {
+            return None;
+        }
+        // inner `let` names become vector temps; they may not appear inside index expressions.
+        let mut locals: HashSet<Symbol> = HashSet::new();
+        // every array access: (base, index expr, unit-stride?, is_write).
+        let mut acc: Vec<(Symbol, &Expr, bool, bool)> = Vec::new();
+        let mut lane: Option<MirType> = None;
+
+        for s in &body.stmts {
+            match &s.kind {
+                StmtKind::Let {
+                    pat:
+                        Pattern {
+                            kind: ast::PatKind::Ident(name),
+                            ..
+                        },
+                    init: Some(e),
+                    ..
+                } => {
+                    if !self.vec_check_value(e, j, &locals, &mut lane, &mut acc) {
+                        return None;
+                    }
+                    locals.insert(*name);
+                }
+                StmtKind::Assign { target, op, value } => {
+                    if !self.vec_check_value(value, j, &locals, &mut lane, &mut acc) {
+                        return None;
+                    }
+                    let _ = op; // compound vs plain handled identically for validation
+                    match &target.kind {
+                        // scalar reassignment of an inner vector temp (e.g. Horner `r = r*v + c`)
+                        ExprKind::Path(p) if p.is_single() && locals.contains(&p.first().sym) => {}
+                        // store to an array element at a unit-stride index
+                        ExprKind::Index { base, indices } if indices.len() == 1 => {
+                            let bsym = single_path(base)?;
+                            if uses_any(&indices[0], &locals) {
+                                return None; // index must not depend on inner temps
+                            }
+                            if affine_stride(&indices[0], j) != Some(1) {
+                                return None; // stores must be unit-stride
+                            }
+                            let elem = self.array_elem(base)?;
+                            set_or_check(&mut lane, &elem)?;
+                            acc.push((bsym, &indices[0], true, true));
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None, // no nested control flow / calls / returns in a vector body
+            }
+        }
+
+        // No array that is written may be accessed at a second (different) index: that would be a
+        // loop-carried dependence the lane-parallel form would break.
+        for &(base, idx, _unit, is_w) in &acc {
+            if is_w || acc.iter().any(|a| a.0 == base && a.3) {
+                // `base` is written somewhere; every access to it must be the identical index.
+                if acc
+                    .iter()
+                    .any(|a| a.0 == base && !exprs_struct_eq(a.1, idx))
+                {
+                    return None;
+                }
+            }
+        }
+
+        let lane = lane?;
+        let w = vector_width(&lane)?;
+        Some((lane, w))
+    }
+
+    /// Validate that `e` is a vectorizable value-expression (produces lane-typed vectors), recording
+    /// any array reads into `acc` and pinning the shared lane type. Returns false to bail.
+    fn vec_check_value<'b>(
+        &self,
+        e: &'b Expr,
+        j: Symbol,
+        locals: &HashSet<Symbol>,
+        lane: &mut Option<MirType>,
+        acc: &mut Vec<(Symbol, &'b Expr, bool, bool)>,
+    ) -> bool {
+        match &e.kind {
+            // an inner vector temp: lane-typed by construction.
+            ExprKind::Path(p) if p.is_single() && locals.contains(&p.first().sym) => true,
+            // an invariant scalar (param/outer local): must be the lane type, and must not be the
+            // loop variable used as a value (that would need an index vector, which we don't form).
+            ExprKind::Path(p) if p.is_single() => {
+                let t = self.expr_mir(e);
+                p.first().sym != j && is_numeric(&t) && set_or_check(lane, &t).is_some()
+            }
+            // a numeric literal: lane-typed (the splat rounds once, like the scalar path).
+            ExprKind::Int(_) | ExprKind::Float(_) => {
+                let t = self.expr_mir(e);
+                is_numeric(&t) && set_or_check(lane, &t).is_some()
+            }
+            ExprKind::Index { base, indices } if indices.len() == 1 => {
+                if single_path(base).is_none() || uses_any(&indices[0], locals) {
+                    return false;
+                }
+                match affine_stride(&indices[0], j) {
+                    Some(0) | Some(1) => {}
+                    _ => return false,
+                }
+                let Some(elem) = self.array_elem(base) else {
+                    return false;
+                };
+                if set_or_check(lane, &elem).is_none() {
+                    return false;
+                }
+                let bsym = single_path(base).unwrap();
+                let unit = affine_stride(&indices[0], j) == Some(1);
+                acc.push((bsym, &indices[0], unit, false));
+                true
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                use ast::BinOp::*;
+                if !matches!(op, Add | Sub | Mul | Div) {
+                    return false;
+                }
+                self.vec_check_value(lhs, j, locals, lane, acc)
+                    && self.vec_check_value(rhs, j, locals, lane, acc)
+            }
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => self.vec_check_value(expr, j, locals, lane, acc),
+            _ => false,
+        }
+    }
+
+    /// The element MIR type of an array-valued base expression, via sema.
+    fn array_elem(&self, base: &Expr) -> Option<MirType> {
+        match self.expr_ty(base) {
+            Ty::Array { elem, .. } => Some(mir_ty(&elem)),
+            _ => None,
+        }
+    }
+
+    /// Emit the vector main loop + scalar remainder. Both share one index slot `j`: the vector loop
+    /// steps by `W` while a full vector fits, then the remainder steps by 1 to `end`.
+    fn emit_vectorized_for(
+        &mut self,
+        j: Symbol,
+        start: &Expr,
+        end: &Expr,
+        ity: &MirType,
+        lane: &MirType,
+        w: u32,
+        body: &Block,
+    ) {
+        let vty = MirType::Vec(Box::new(lane.clone()), w);
+
+        // j = start; compute the vector-loop limit `end - (W-1)` once (invariant).
+        let start_ty = self.expr_mir(start);
+        let s0 = self.lower_expr(start);
+        let s0 = self.coerce_to(s0, &start_ty, ity, true);
+        let slot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store { ptr: slot, value: s0 });
+        let end_ty = self.expr_mir(end);
+        let end_raw = self.lower_expr(end);
+        let end_v = self.coerce_to(end_raw, &end_ty, ity, true);
+        let wm1 = self
+            .builder
+            .build(ity.clone(), Op::ConstInt((w - 1) as i128, ity.clone()));
+        let vlimit = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, end_v, wm1));
+
+        self.push_scope();
+        self.bind(j, slot, ity.clone());
+
+        let vhdr = self.builder.new_block();
+        let vbody = self.builder.new_block();
+        let rhdr = self.builder.new_block();
+        let rbody = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(vhdr, vec![]);
+
+        // vector header: while j < end-(W-1)
+        self.builder.switch_to(vhdr);
+        self.terminated = false;
+        let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let c = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
+        self.builder.cond_br(c, vbody, vec![], rhdr, vec![]);
+
+        // vector body: W lanes per iteration, then j += W
+        self.builder.switch_to(vbody);
+        self.terminated = false;
+        let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+        for s in &body.stmts {
+            self.vec_lower_stmt(s, j, lane, &vty, w, &mut vlocals);
+        }
+        let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let wv = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(w as i128, ity.clone()));
+        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, wv));
+        self.builder.build_void(Op::Store { ptr: slot, value: jn });
+        self.builder.br(vhdr, vec![]);
+
+        // remainder header: while j < end
+        self.builder.switch_to(rhdr);
+        self.terminated = false;
+        let jr = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let rc = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
+        self.builder.cond_br(rc, rbody, vec![], exit, vec![]);
+
+        // remainder body: the original scalar body (reuses the full scalar lowering), then j += 1
+        self.builder.switch_to(rbody);
+        self.terminated = false;
+        self.loops.push((rhdr, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+            let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
+            let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
+            self.builder.build_void(Op::Store { ptr: slot, value: jn });
+            self.builder.br(rhdr, vec![]);
+        }
+
+        self.pop_scope();
+        self.builder.switch_to(exit);
+        self.terminated = false;
+    }
+
+    /// Lower one statement of a vector-loop body. Mirrors the validated shapes in `vectorizable`.
+    fn vec_lower_stmt(
+        &mut self,
+        s: &Stmt,
+        j: Symbol,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        vlocals: &mut HashMap<Symbol, ValueId>,
+    ) {
+        match &s.kind {
+            StmtKind::Let {
+                pat:
+                    Pattern {
+                        kind: ast::PatKind::Ident(name),
+                        ..
+                    },
+                init: Some(e),
+                ..
+            } => {
+                let v = self.vec_lower_value(e, j, lane, vty, w, vlocals);
+                vlocals.insert(*name, v);
+            }
+            StmtKind::Assign { target, op, value } => {
+                let rhs = self.vec_lower_value(value, j, lane, vty, w, vlocals);
+                match &target.kind {
+                    ExprKind::Path(p) if p.is_single() && vlocals.contains_key(&p.first().sym) => {
+                        let name = p.first().sym;
+                        let stored = if matches!(op, ast::AssignOp::Assign) {
+                            rhs
+                        } else {
+                            let cur = vlocals[&name];
+                            let bin = compound_binop(*op, lane.is_float(), lane_signed(lane));
+                            self.builder.build(vty.clone(), Op::Bin(bin, cur, rhs))
+                        };
+                        vlocals.insert(name, stored);
+                    }
+                    ExprKind::Index { base, indices } => {
+                        let addr = self.vec_elem_addr(base, &indices[0], lane);
+                        let stored = if matches!(op, ast::AssignOp::Assign) {
+                            rhs
+                        } else {
+                            let cur = self.builder.build(vty.clone(), Op::Load(addr, vty.clone()));
+                            let bin = compound_binop(*op, lane.is_float(), lane_signed(lane));
+                            self.builder.build(vty.clone(), Op::Bin(bin, cur, rhs))
+                        };
+                        self.builder.build_void(Op::Store {
+                            ptr: addr,
+                            value: stored,
+                        });
+                    }
+                    _ => unreachable!("vec_lower_stmt on unvalidated target"),
+                }
+            }
+            _ => unreachable!("vec_lower_stmt on unvalidated statement"),
+        }
+    }
+
+    /// Lower a value-expression to a `vty` vector. Array reads become vector loads (unit-stride) or
+    /// scalar-load-then-splat (invariant); scalars splat; arithmetic is lane-wise.
+    fn vec_lower_value(
+        &mut self,
+        e: &Expr,
+        j: Symbol,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        vlocals: &mut HashMap<Symbol, ValueId>,
+    ) -> ValueId {
+        match &e.kind {
+            ExprKind::Path(p) if p.is_single() && vlocals.contains_key(&p.first().sym) => {
+                vlocals[&p.first().sym]
+            }
+            ExprKind::Index { base, indices } if indices.len() == 1 => {
+                let addr = self.vec_elem_addr(base, &indices[0], lane);
+                if affine_stride(&indices[0], j) == Some(1) {
+                    self.builder.build(vty.clone(), Op::Load(addr, vty.clone()))
+                } else {
+                    // invariant in j: load one scalar and broadcast.
+                    let scalar = self.builder.build(lane.clone(), Op::Load(addr, lane.clone()));
+                    self.builder.build(vty.clone(), Op::Splat(scalar))
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
+                let r = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
+                let bin = arith_binop(*op, lane.is_float(), lane_signed(lane));
+                self.builder.build(vty.clone(), Op::Bin(bin, l, r))
+            }
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => {
+                let v = self.vec_lower_value(expr, j, lane, vty, w, vlocals);
+                self.builder.build(vty.clone(), Op::Neg(v))
+            }
+            // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
+            _ => {
+                let from = self.expr_mir(e);
+                let scalar = self.lower_expr(e);
+                let scalar = self.coerce_to(scalar, &from, lane, true);
+                self.builder.build(vty.clone(), Op::Splat(scalar))
+            }
+        }
+    }
+
+    /// The element address `&base[index]` (a `gep` by the scalar index, reusing the loop index slot
+    /// bound for `j`), used as the base of a vector load/store.
+    fn vec_elem_addr(&mut self, base: &Expr, index: &Expr, lane: &MirType) -> ValueId {
+        let base_ptr = self.lower_expr(base);
+        let idx = self.lower_expr(index);
+        self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base_ptr,
+                index: idx,
+                elem: lane.clone(),
+            },
+        )
     }
 
     /// Lower `for idx in start..end { body }` where `start`/`end` are already-lowered `i64` values
@@ -1285,6 +1668,107 @@ fn float_or(float: bool, f: CmpOp, signed: bool, s: CmpOp, u: CmpOp) -> CmpOp {
 
 fn is_numeric(t: &MirType) -> bool {
     t.is_int() || t.is_float()
+}
+
+// ---- vectorizer analysis helpers (pure AST/type predicates) ----
+
+/// The symbol of a single-segment path expression, if `e` is one.
+fn single_path(e: &Expr) -> Option<Symbol> {
+    match &e.kind {
+        ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
+        _ => None,
+    }
+}
+
+/// Does `e` reference any symbol in `set`? (Used to keep inner vector temps out of index exprs.)
+fn uses_any(e: &Expr, set: &HashSet<Symbol>) -> bool {
+    match &e.kind {
+        ExprKind::Path(p) => p.is_single() && set.contains(&p.first().sym),
+        ExprKind::Binary { lhs, rhs, .. } => uses_any(lhs, set) || uses_any(rhs, set),
+        ExprKind::Unary { expr, .. } => uses_any(expr, set),
+        ExprKind::Index { base, indices } => {
+            uses_any(base, set) || indices.iter().any(|i| uses_any(i, set))
+        }
+        ExprKind::Cast { expr, .. } => uses_any(expr, set),
+        _ => false,
+    }
+}
+
+/// Does `e` mention the loop variable `sym`?
+fn expr_uses_sym(e: &Expr, sym: Symbol) -> bool {
+    match &e.kind {
+        ExprKind::Path(p) => p.is_single() && p.first().sym == sym,
+        ExprKind::Binary { lhs, rhs, .. } => expr_uses_sym(lhs, sym) || expr_uses_sym(rhs, sym),
+        ExprKind::Unary { expr, .. } => expr_uses_sym(expr, sym),
+        ExprKind::Index { base, indices } => {
+            expr_uses_sym(base, sym) || indices.iter().any(|i| expr_uses_sym(i, sym))
+        }
+        ExprKind::Cast { expr, .. } => expr_uses_sym(expr, sym),
+        _ => false,
+    }
+}
+
+/// The coefficient of `j` in an affine index expression: `Some(0)` invariant, `Some(1)` unit-stride,
+/// other constants for non-unit strides, `None` if not provably affine in `j`. Only `+`/`-` combine
+/// `j`; a `*` involving `j` is conservatively rejected (we don't constant-evaluate factors).
+fn affine_stride(e: &Expr, j: Symbol) -> Option<i64> {
+    if !expr_uses_sym(e, j) {
+        return Some(0);
+    }
+    match &e.kind {
+        ExprKind::Path(p) if p.is_single() && p.first().sym == j => Some(1),
+        ExprKind::Binary { op, lhs, rhs } => match op {
+            ast::BinOp::Add => affine_stride(lhs, j)?.checked_add(affine_stride(rhs, j)?),
+            ast::BinOp::Sub => affine_stride(lhs, j)?.checked_sub(affine_stride(rhs, j)?),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Structural equality over the index-expression subset (ints, single paths, `+`/`-`/`*`). Used to
+/// confirm a written array is touched at exactly one index (no loop-carried dependence).
+fn exprs_struct_eq(a: &Expr, b: &Expr) -> bool {
+    match (&a.kind, &b.kind) {
+        (ExprKind::Int(x), ExprKind::Int(y)) => x == y,
+        (ExprKind::Float(x), ExprKind::Float(y)) => x == y,
+        (ExprKind::Path(p), ExprKind::Path(q)) => {
+            p.is_single() && q.is_single() && p.first().sym == q.first().sym
+        }
+        (
+            ExprKind::Binary { op: o1, lhs: l1, rhs: r1 },
+            ExprKind::Binary { op: o2, lhs: l2, rhs: r2 },
+        ) => o1 == o2 && exprs_struct_eq(l1, l2) && exprs_struct_eq(r1, r2),
+        _ => false,
+    }
+}
+
+/// Pin a shared lane type: set it if unset, else require equality. `None` means a type clash (bail).
+fn set_or_check(slot: &mut Option<MirType>, t: &MirType) -> Option<()> {
+    match slot {
+        Some(existing) if existing == t => Some(()),
+        Some(_) => None,
+        None => {
+            *slot = Some(t.clone());
+            Some(())
+        }
+    }
+}
+
+/// SIMD width for a lane type: one 128-bit register holds `16 / sizeof(lane)` lanes (f32x4, f64x2).
+/// Returns `None` for lane types we don't vectorize.
+fn vector_width(lane: &MirType) -> Option<u32> {
+    let bytes = match lane {
+        MirType::F32 | MirType::I32 => 4,
+        MirType::F64 | MirType::I64 => 8,
+        _ => return None,
+    };
+    Some(16 / bytes)
+}
+
+/// Default signedness for a lane type (only affects integer div/rem op selection).
+fn lane_signed(lane: &MirType) -> bool {
+    lane.is_int()
 }
 
 /// The wider of two numeric MIR types (float beats int), used to pick a common comparison type.
