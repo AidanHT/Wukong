@@ -40,6 +40,7 @@ mercury_codegen_llvm  textual LLVM IR backend
 mercury_runtime   C-ABI arena allocator + deterministic parallel_for
 mercury_driver    Session + compile() pipeline + --emit handling
 mercuryc          thin CLI binary
+mercury_bench     optimizer-effectiveness + interpreter-timing harness
 ```
 
 `mercury_types` is shared by sema and MIR; `mercury_mir` is independent of the front-end; both
@@ -89,17 +90,20 @@ consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled 
 
 | Pass          | Level | What it does |
 |---------------|-------|--------------|
-| `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, …) |
+| `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding + unreachable-block pruning (with renumbering) |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
 | `Cse`         | -O2   | local value numbering with alloca-aware load forwarding |
+| `Dse`         | -O2   | dead-store elimination (overwritten stores to a slot with no intervening read) |
 
 Because the front-end emits alloca-based IR, `Cse` forwards loads (tracking the current value of
 each alloca slot, invalidated by unknown-pointer stores or calls) so that redundant pure ops built
-on reloaded values actually collapse.
+on reloaded values actually collapse; `Dse` is its dual, removing stores that are overwritten before
+being read. Float predicates are never folded on self-comparison (NaN != NaN).
 
 The opt pipeline is guarded by a **differential test**: every end-to-end program is run at -O0 and at
--O1/-O2/-O3 and must produce identical stdout and exit code.
+-O1/-O2/-O3 and must produce identical stdout and exit code. The `mercury_bench` crate reports the
+instruction-count reduction the optimizer achieves per program.
 
 ## Interpreter
 

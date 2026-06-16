@@ -61,8 +61,13 @@ codegen, so the whole compiler is buildable and testable without an LLVM install
 
 ## Status
 
-Early development — built incrementally and openly. See
-[`docs/`](docs/) for the language guide and compiler internals as they land.
+Early development — built incrementally and openly. The full front-end, optimizer, and interpreter
+work today; native LLVM codegen and the tensor/SIMD/parallel execution paths are landing
+progressively. See the docs:
+
+- [Language guide](docs/language-guide.md) — the language surface, with an honest maturity legend.
+- [Compiler internals](docs/internals.md) — architecture, MIR, optimizer, and testing.
+- [LLVM setup](docs/llvm-setup.md) — optional native-codegen toolchain.
 
 ## Building
 
@@ -70,6 +75,8 @@ Early development — built incrementally and openly. See
 cargo build                 # the compiler (interpreter backend, no LLVM needed)
 cargo test                  # unit + golden + end-to-end tests
 cargo run -p mercuryc -- --help
+cargo run -p mercuryc -- --run examples/fib.mer
+cargo run -p mercury_bench --release -- tests/run   # optimizer-effectiveness report
 ```
 
 Native codegen (optional, requires an LLVM 19 install — see `docs/llvm-setup.md`):
