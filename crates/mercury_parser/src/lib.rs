@@ -1260,4 +1260,30 @@ mod tests {
         );
         assert_eq!(ty("[]f32"), "[]f32");
     }
+
+    #[test]
+    fn recovers_after_a_bad_item() {
+        // A garbage token at module scope must not swallow the following valid functions: the
+        // parser should report an error and still recover to parse both `a` and `b`.
+        let mut i = Interner::new();
+        let src = "module t\nfn a() -> i32 { return 1; }\n@#$\nfn b() -> i32 { return 2; }";
+        let (module, diags) = parse_module(src, SourceId(0), &mut i);
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+        let fn_names: Vec<String> = module
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Fn(f) => Some(i.resolve(f.name.sym).to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fn_names.contains(&"a".to_string()),
+            "lost `a`: {fn_names:?}"
+        );
+        assert!(
+            fn_names.contains(&"b".to_string()),
+            "lost `b`: {fn_names:?}"
+        );
+    }
 }
