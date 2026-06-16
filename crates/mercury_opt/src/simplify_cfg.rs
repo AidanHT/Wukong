@@ -13,9 +13,9 @@
 
 use std::collections::HashMap;
 
-use mercury_mir::{BlockId, Function, Op, Terminator};
+use mercury_mir::{Function, Op, Terminator};
 
-use crate::Pass;
+use crate::{cfg, Pass};
 
 pub struct SimplifyCfg;
 
@@ -26,7 +26,7 @@ impl Pass for SimplifyCfg {
 
     fn run_function(&self, f: &mut Function) -> bool {
         let mut changed = fold_constant_branches(f);
-        changed |= prune_unreachable(f);
+        changed |= cfg::prune_unreachable(f);
         changed
     }
 }
@@ -74,70 +74,4 @@ fn fold_constant_branches(f: &mut Function) -> bool {
         }
     }
     changed
-}
-
-fn successors(t: &Terminator) -> Vec<BlockId> {
-    match t {
-        Terminator::Br { target, .. } => vec![*target],
-        Terminator::CondBr {
-            then_blk, else_blk, ..
-        } => vec![*then_blk, *else_blk],
-        Terminator::Ret(_) | Terminator::Unreachable => vec![],
-    }
-}
-
-fn prune_unreachable(f: &mut Function) -> bool {
-    // DFS from entry over CFG edges.
-    let mut reachable = vec![false; f.blocks.len()];
-    let mut stack = vec![f.entry];
-    while let Some(b) = stack.pop() {
-        let idx = b.0 as usize;
-        if idx >= reachable.len() || reachable[idx] {
-            continue;
-        }
-        reachable[idx] = true;
-        for s in successors(&f.blocks[idx].term) {
-            stack.push(s);
-        }
-    }
-    if reachable.iter().all(|&r| r) {
-        return false;
-    }
-
-    // Old block-id -> new block-id (compacted, order preserved).
-    let mut remap: HashMap<u32, u32> = HashMap::new();
-    let mut next = 0u32;
-    for (i, &live) in reachable.iter().enumerate() {
-        if live {
-            remap.insert(i as u32, next);
-            next += 1;
-        }
-    }
-
-    let mut new_blocks = Vec::with_capacity(next as usize);
-    for (i, b) in f.blocks.drain(..).enumerate() {
-        if !reachable[i] {
-            continue;
-        }
-        let mut b = b;
-        b.id = BlockId(remap[&(i as u32)]);
-        remap_term(&mut b.term, &remap);
-        new_blocks.push(b);
-    }
-    f.blocks = new_blocks;
-    f.entry = BlockId(remap[&f.entry.0]);
-    true
-}
-
-fn remap_term(t: &mut Terminator, remap: &HashMap<u32, u32>) {
-    match t {
-        Terminator::Br { target, .. } => target.0 = remap[&target.0],
-        Terminator::CondBr {
-            then_blk, else_blk, ..
-        } => {
-            then_blk.0 = remap[&then_blk.0];
-            else_blk.0 = remap[&else_blk.0];
-        }
-        Terminator::Ret(_) | Terminator::Unreachable => {}
-    }
 }

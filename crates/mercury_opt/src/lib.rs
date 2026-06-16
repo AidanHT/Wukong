@@ -1,19 +1,30 @@
 //! `mercury_opt` — the optimizer: a pass manager plus MIR transforms.
 //!
-//! Passes run to a fixpoint at `-O1` and above. The transforms here are correct on the
-//! alloca-based MIR the front-end emits (alloca promotion / mem2reg is left to LLVM's pipeline):
+//! Passes run to a fixpoint at `-O1` and above. The pipeline first promotes stack slots to SSA
+//! registers, which is what makes the value-based transforms bite:
+//!  * **mem2reg** — promote scalar `alloca`/`load`/`store` to block-parameter SSA.
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
+//!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
+//!  * **simplify-phis** — drop dead/trivial block parameters mem2reg introduced.
+//!  * **cse** — local value numbering with load forwarding (`-O2`).
+//!  * **dse** — dead-store elimination (`-O2`).
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 
+mod cfg;
 mod cse;
 mod dce;
+mod dom;
 mod dse;
+mod mem2reg;
+mod phi;
 mod simplify;
 mod simplify_cfg;
 
 pub use cse::Cse;
 pub use dce::Dce;
 pub use dse::Dse;
+pub use mem2reg::Mem2Reg;
+pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
 
@@ -43,8 +54,12 @@ impl PassManager {
     pub fn standard(opt_level: u8) -> PassManager {
         let mut pm = PassManager::new();
         if opt_level >= 1 {
+            // Promotion comes first: every later pass is far more effective on SSA values than on
+            // memory traffic. The whole list then runs to a fixpoint.
+            pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Simplify));
             pm.add(Box::new(SimplifyCfg));
+            pm.add(Box::new(SimplifyPhis));
             pm.add(Box::new(Dce));
         }
         if opt_level >= 2 {
@@ -403,5 +418,98 @@ mod tests {
             .flat_map(|b| &b.insts)
             .filter(|i| matches!(i.op, Op::Bin(BinOp::Mul, _, _)))
             .count()
+    }
+
+    fn count_allocas(f: &mercury_mir::Function) -> usize {
+        use mercury_mir::Op;
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, Op::Alloca(_)))
+            .count()
+    }
+
+    fn lower(src: &str) -> (mercury_mir::Program, Interner) {
+        let mut interner = Interner::new();
+        let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        (program, interner)
+    }
+
+    #[test]
+    fn mem2reg_promotes_all_scalar_slots() {
+        // A loop with scalar locals only: after -O1, every alloca should be gone and the function
+        // must still verify and compute the same answer.
+        let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
+                   while i < 10 { s = s + i; i = i + 1; } return s; }";
+        let (mut prog, mut interner) = lower(src);
+        assert!(
+            count_allocas(&prog.funcs[0]) > 0,
+            "front-end should alloca locals"
+        );
+        optimize(&mut prog, 1);
+        assert_eq!(
+            count_allocas(&prog.funcs[0]),
+            0,
+            "mem2reg should promote all scalar slots"
+        );
+        for f in &prog.funcs {
+            assert!(mercury_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(mercury_interp::run(&prog, main, &interner).unwrap(), 45);
+    }
+
+    #[test]
+    fn mem2reg_introduces_a_loop_phi() {
+        // The induction variable becomes a block parameter (phi) on the loop header.
+        let src = "fn main() -> i32 { let mut i: i32 = 0; while i < 5 { i = i + 1; } return i; }";
+        let (mut prog, _) = lower(src);
+        optimize(&mut prog, 1);
+        let has_block_param = prog.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| b.id != prog.funcs[0].entry && !b.params.is_empty());
+        assert!(has_block_param, "loop should have a phi block parameter");
+    }
+
+    #[test]
+    fn mem2reg_leaves_arrays_and_address_taken_in_memory() {
+        // Array locals are addressed by gep, so they must NOT be promoted; the program is still
+        // correct and the array alloca remains.
+        let src = "fn main() -> i32 { let mut xs: [i32; 3] = [1, 2, 3]; \
+                   xs[1] = xs[0] + xs[2]; return xs[1]; }";
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        assert!(
+            count_allocas(&prog.funcs[0]) >= 1,
+            "array slot must stay in memory"
+        );
+        for f in &prog.funcs {
+            assert!(mercury_mir::verify::verify_function(f).is_empty());
+        }
+        let main = interner.intern("main");
+        assert_eq!(mercury_interp::run(&prog, main, &interner).unwrap(), 4);
+    }
+
+    #[test]
+    fn mem2reg_preserves_branchy_dataflow() {
+        // A value defined on one path and merged: exercises dominance-frontier phi placement.
+        let cases = [
+            ("fn main() -> i32 { let mut x: i32 = 0; if 3 > 1 { x = 7; } else { x = 9; } return x; }", 7),
+            ("fn f(n: i32) -> i32 { let mut r: i32 = 1; let mut k: i32 = n; \
+              while k > 0 { r = r * k; k = k - 1; } return r; } \
+              fn main() -> i32 { return f(5); }", 120),
+            ("fn main() -> i32 { let mut a: i32 = 1; let mut b: i32 = 1; let mut n: i32 = 10; \
+              while n > 0 { let t: i32 = a + b; a = b; b = t; n = n - 1; } return a; }", 89),
+        ];
+        for (src, expect) in cases {
+            assert_eq!(run_main_opt(src, 0), expect, "O0: {src}");
+            assert_eq!(run_main_opt(src, 1), expect, "O1: {src}");
+            assert_eq!(run_main_opt(src, 2), expect, "O2: {src}");
+            assert_eq!(run_main_opt(src, 3), expect, "O3: {src}");
+        }
     }
 }
