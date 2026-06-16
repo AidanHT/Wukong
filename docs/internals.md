@@ -5,10 +5,13 @@ key design bets. It is aimed at contributors.
 
 ## Design bets
 
-1. **Interpreter-first, LLVM-quarantined.** The entire front-end, optimizer, and a from-scratch MIR
-   interpreter build and test with plain `cargo test` on any machine — no LLVM required. LLVM
-   (textual IR + `clang`) is only needed for native object/exe emission. The interpreter is both the
-   always-available execution path and the differential-testing oracle.
+1. **Interpreter-first, native code without LLVM.** The entire front-end, optimizer, and a
+   from-scratch MIR interpreter build and test with plain `cargo test` on any machine — no LLVM
+   required. Native code is produced by a **Cranelift** backend (`mercury_codegen_cranelift`): JIT
+   for `--run --backend=native` and object/exe for `--emit`, again with no LLVM toolchain. (A textual
+   LLVM IR backend also exists for `--emit=llvm-ir`.) The interpreter is the always-available
+   execution path and the differential-testing oracle; the native backend is validated bit-for-bit
+   against it (see Testing). See `BENCHMARKS.md` for the cross-language standing.
 2. **One progressively-lowered SSA MIR.** Instead of separate HIR/MIR/LIR, there is a single
    block-structured SSA IR that is born *High* (structured tensor/loop ops) and rewritten *down to
    Low* (scalar SSA, explicit loops, SIMD ops). A `MirLevel` invariant is enforced by a verifier.
@@ -32,19 +35,21 @@ mercury_parser    recursive-descent + Pratt expressions -> AST
 mercury_types     Ty, Scalar, Shape/Dim/Layout — the shared semantic type vocabulary
 mercury_sema      name resolution + type checking + SHAPE checking
 mercury_mir       MIR data, builder, pretty-printer, verifier, MirLevel
-mercury_mir_build typed AST -> MIR (alloca-per-local lowering)
+mercury_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 mercury_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
                   mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
 mercury_backend   `Backend` trait + `Artifact`
-mercury_interp    zero-dependency MIR interpreter backend (+ oracle)
+mercury_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
+mercury_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
 mercury_codegen_llvm  textual LLVM IR backend
-mercury_runtime   C-ABI arena allocator + deterministic parallel_for
-mercury_driver    Session + compile() pipeline + --emit handling
+mercury_runtime   C-ABI arena allocator + rayon-backed parallel_for
+mercury_driver    Session + compile() pipeline + --emit / --backend handling
 mercuryc          thin CLI binary
-mercury_bench     optimizer-effectiveness + interpreter-timing harness
+mercury_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
+mercury_xbench    cross-language benchmark (Mercury vs C vs Rust) — see BENCHMARKS.md
 ```
 
-`mercury_types` is shared by sema and MIR; `mercury_mir` is independent of the front-end; both
+`mercury_types` is shared by sema and MIR; `mercury_mir` is independent of the front-end; all
 backends sit behind the `Backend` trait in `mercury_backend`.
 
 ## Pipeline
@@ -56,7 +61,8 @@ source
   → sema         (mercury_sema::check)                  name res, types, SHAPE check
   → mir_build    (mercury_mir_build::lower_program)     -> MIR (High)
   → opt          (mercury_opt::optimize)                fixpoint passes
-  → backend      interpreter (--run) | LLVM (--emit=llvm-ir|obj|exe)
+  → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
+                 | textual LLVM IR (--emit=llvm-ir)
 ```
 
 `mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early and print the
@@ -123,16 +129,37 @@ kernels) and runs ~1.5–2.5x faster than -O0 under the interpreter.
 ## Interpreter
 
 `mercury_interp` is a zero-dependency CFG walker over MIR. `Value` is `Int(i128) | Float(f64) |
-Ptr(usize) | Unit`; a step limit guards against runaway loops. `run_with_output` returns
-`(exit_code, stdout)`; intrinsics like `print` format into the captured stdout buffer. The
-interpreter executes both High and (eventually) Low MIR identically, with deterministic floating
-point, so it is a sound oracle for differential testing against the LLVM backend.
+Ptr(usize) | VecRef(u32) | Unit`; a step limit guards against runaway loops. `run_with_output`
+returns `(exit_code, stdout)`; intrinsics like `print` format into the captured stdout buffer. `f32`
+ops are computed in `f32` (single rounding) so the interpreter matches native bit-for-bit. SIMD
+vectors are executed lane-wise via a side arena (`VecRef` indexes it, keeping `Value` `Copy`). The
+interpreter is the sound oracle for differential testing.
+
+## Native backend (Cranelift) and the vectorizer
+
+`mercury_codegen_cranelift` lowers Low MIR to Cranelift IR — an almost 1:1 map (block-parameter SSA,
+signless ints, explicit `alloca`/`load`/`store`/`gep`). It JIT-compiles in-process for
+`--backend=native` and emits a host object for `--emit=obj|exe` (linked with a tiny C runtime). The
+only semantic bridges to stay identical to the interpreter: divide-by-zero yields 0, float→int casts
+saturate, and `i1` results are masked to their low bit.
+
+SIMD **auto-vectorization** happens in `mercury_mir_build` while lowering a `for` loop: a
+straight-line elementwise body over unit-stride array accesses (plus loop-invariant splats, and
+`if`/`else` value-expressions via if-conversion to a vector compare + blend) lowers to vector
+`load`/`store`/`bin`/`cmp`/`select` and `Op::Splat`. The loop is strip-mined into an unrolled main
+loop (`VEC_UNROLL` independent 128-bit groups per iteration — recovering AVX-class throughput from
+SSE via dual-issue), a single-vector loop, and a scalar remainder, all sharing one index slot. It
+bails to scalar on any loop-carried dependence, non-unit stride, call, or mixed lane type, so lane
+`k` always computes exactly what scalar iteration `base+k` would. `@parallel` per-thread chunks go
+through the same vectorizer, so they run SIMD × cores.
 
 ## Testing strategy
 
-- **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter).
+- **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
 - **End-to-end** (`tests/run/*.mer`): the real `mercuryc` binary compiles and runs each program;
   stdout/exit are checked against `// EXPECT-*` directives embedded in the file.
-- **Differential**: opt-level invariance today; interpreter-vs-LLVM once native codegen is wired.
+- **Differential**: `-O0`-vs-`-O{1,2,3}` invariance, **interpreter-vs-native (Cranelift)** on stdout
+  and exit code (in `mercury_bench`'s equivalence gate and the cranelift unit tests), and vectorized
+  kernels checked against independent scalar references across remainder-exercising sizes.
 
-All of the above runs with `cargo test` and no external toolchain.
+All of the above runs with `cargo test` and no external toolchain (Cranelift is a pure-Rust crate).
