@@ -7,8 +7,10 @@
 //! terminal output.
 
 mod catalog;
+mod json;
 mod render;
 pub use catalog::{all as all_explanations, explain, Explanation};
+pub use json::to_json;
 pub use render::Renderer;
 
 use mercury_span::Span;

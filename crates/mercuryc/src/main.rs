@@ -18,6 +18,7 @@ OPTIONS:
     -o <path>          Write output to <path>
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
+    --error-format=<f> Diagnostic output format: human, json  (default: human)
     --explain <CODE>   Print the extended explanation for an error code, then exit
     -h, --help         Print this help
     -V, --version      Print version
@@ -94,6 +95,14 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 opts.emit = EmitStage::parse(stage)
                     .ok_or_else(|| format!("unknown --emit target `{stage}`"))?;
                 emit_explicit = true;
+            }
+            _ if arg.starts_with("--error-format=") => {
+                let fmt = &arg["--error-format=".len()..];
+                opts.error_format = match fmt {
+                    "human" => mercury_driver::ErrorFormat::Human,
+                    "json" => mercury_driver::ErrorFormat::Json,
+                    other => return Err(format!("unknown --error-format value `{other}`")),
+                };
             }
             _ if arg.starts_with("--color=") => {
                 let when = &arg["--color=".len()..];

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use mercury_diag::{DiagnosticSink, Renderer};
+use mercury_diag::{Diagnostic, DiagnosticSink, Renderer};
 use mercury_span::{Interner, SourceMap};
 
 pub use mercury_diag::{all_explanations, explain, Explanation};
@@ -38,6 +38,15 @@ impl EmitStage {
     }
 }
 
+/// How diagnostics are presented to the user.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ErrorFormat {
+    /// rustc-style annotated terminal output.
+    Human,
+    /// One JSON object per diagnostic, on its own line (JSON Lines).
+    Json,
+}
+
 /// Compiler invocation options, normally produced by the CLI.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -47,6 +56,7 @@ pub struct Options {
     pub run: bool,
     pub opt_level: u8,
     pub color: bool,
+    pub error_format: ErrorFormat,
 }
 
 impl Default for Options {
@@ -58,6 +68,7 @@ impl Default for Options {
             run: false,
             opt_level: 0,
             color: true,
+            error_format: ErrorFormat::Human,
         }
     }
 }
@@ -93,7 +104,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if opts.emit == EmitStage::Tokens {
-        render_all(&renderer, &sink, &sm);
+        render_all(opts.error_format, &renderer, &sink, &sm);
         print!("{}", mercury_lexer::dump(&tokens, sm.source(id)));
         return if sink.has_errors() { exit::COMPILE_ERROR } else { exit::OK };
     }
@@ -105,7 +116,7 @@ pub fn compile(opts: &Options) -> i32 {
     for d in parse_diags {
         sink.emit(d);
     }
-    render_all(&renderer, &sink, &sm);
+    render_all(opts.error_format, &renderer, &sink, &sm);
 
     if opts.emit == EmitStage::Ast {
         print!("{}", mercury_ast::print::print_module(&module, &interner));
@@ -119,7 +130,7 @@ pub fn compile(opts: &Options) -> i32 {
     // --- Semantic analysis (name resolution, type checking, shape checking) ---
     let (sema, sema_diags) = mercury_sema::check(&module, &interner);
     for d in &sema_diags {
-        eprintln!("{}", renderer.render(d, &sm));
+        emit_diag(d, opts.error_format, &renderer, &sm);
     }
     if sema_diags.iter().any(|d| d.is_error()) {
         return exit::COMPILE_ERROR;
@@ -128,7 +139,7 @@ pub fn compile(opts: &Options) -> i32 {
     // --- MIR construction ---
     let (mut program, lower_diags) = mercury_mir_build::lower_program(&module, &sema, &interner);
     for d in &lower_diags {
-        eprintln!("{}", renderer.render(d, &sm));
+        emit_diag(d, opts.error_format, &renderer, &sm);
     }
 
     // High MIR is the pre-optimization form.
@@ -234,8 +245,16 @@ fn emit_mir(program: &mercury_mir::Program, interner: &Interner) {
     print!("{}", mercury_mir::print::print_program(program, interner));
 }
 
-fn render_all(renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
+/// Emit a single diagnostic to stderr in the requested format.
+fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceMap) {
+    match fmt {
+        ErrorFormat::Human => eprintln!("{}", renderer.render(d, sm)),
+        ErrorFormat::Json => eprintln!("{}", mercury_diag::to_json(d, sm)),
+    }
+}
+
+fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
     for d in sink.diagnostics() {
-        eprintln!("{}", renderer.render(d, sm));
+        emit_diag(d, fmt, renderer, sm);
     }
 }
