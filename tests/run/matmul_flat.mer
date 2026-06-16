@@ -1,0 +1,38 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 22
+// EXPECT-OUT: 43
+// EXPECT-OUT: 50
+module tests.run.matmul_flat
+
+/// A 2x2 * 2x2 matrix multiply over flat row-major arrays — a real triple-nested GEMM kernel
+/// running end to end on the interpreter. [1 2; 3 4] * [5 6; 7 8] = [19 22; 43 50].
+fn main() -> i32 {
+    let a: [i32; 4] = [1, 2, 3, 4];
+    let b: [i32; 4] = [5, 6, 7, 8];
+    let mut c: [i32; 4] = [0, 0, 0, 0];
+    let n: i32 = 2;
+
+    let mut i: i32 = 0;
+    while i < n {
+        let mut j: i32 = 0;
+        while j < n {
+            let mut acc: i32 = 0;
+            let mut k: i32 = 0;
+            while k < n {
+                acc = acc + a[i * n + k] * b[k * n + j];
+                k = k + 1;
+            }
+            c[i * n + j] = acc;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    print(c[0]);
+    print(c[1]);
+    print(c[2]);
+    print(c[3]);
+    return 0;
+}
