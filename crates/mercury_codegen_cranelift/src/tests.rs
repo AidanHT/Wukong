@@ -219,6 +219,63 @@ fn vectorized_saxpy_is_correct_across_sizes() {
     }
 }
 
+/// Reduction vectorization: `s = s + x[k]*y[k]` (a dot product) and `s += x[k]` (a sum) must
+/// vectorize to lane accumulators + a horizontal reduce, agree between interpreter and native, and
+/// compute the right value. Inputs are chosen so every partial sum is an exact f32 integer, so the
+/// reassociated (lane-parallel) order gives the identical result as strict left-to-right.
+#[test]
+fn vectorized_reductions_are_correct() {
+    // dot: x[k]=k+1, y[k]=2  =>  sum 2*(k+1) = n*(n+1).
+    let dot = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [2.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i + 1) as f32); i += 1; }} \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k] * y[k]; }} \
+             return s as i32; }}"
+        )
+    };
+    // dot via `+=`, same result.
+    let dot_pluseq = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [2.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i + 1) as f32); i += 1; }} \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s += x[k] * y[k]; }} \
+             return s as i32; }}"
+        )
+    };
+    // sum: x[k]=1  =>  sum = n (non-product addend, so the FAdd path, not the fma path).
+    let sum = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [1.0; {n}]; \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k]; }} \
+             return s as i32; }}"
+        )
+    };
+
+    // The dot reduction must lower to a vector fma accumulator; the sum to a vector add.
+    let (prog, interner) = lowered(&dot(64), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("fma") && mir.contains("x f32>"),
+        "dot reduction should vectorize to a vector fma:\n{mir}"
+    );
+
+    for n in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 64, 100, 257, 1000] {
+        for (src, expect) in [
+            (dot(n), (n as i64) * (n as i64 + 1)),
+            (dot_pluseq(n), (n as i64) * (n as i64 + 1)),
+            (sum(n), n as i64),
+        ] {
+            for opt in [0u8, 2, 3] {
+                let native = jit(&src, opt).expect("jit");
+                let interpd = interp(&src, opt).expect("interp");
+                assert_eq!(native, interpd, "reduction native vs interp at n={n} -O{opt}");
+                assert_eq!(native.0, expect, "reduction wrong at n={n} -O{opt}");
+            }
+        }
+    }
+}
+
 /// ReLU via if-conversion: `out[i] = if x[i] > 0 { x[i] } else { 0 }` must vectorize to a vector
 /// compare + blend, agree between interpreter and native, and match the scalar reference across
 /// sizes that exercise the vector body and the remainder. x[i] = i - n/2 spans negatives/positives.
