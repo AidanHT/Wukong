@@ -7,11 +7,13 @@
 
 mod cse;
 mod dce;
+mod dse;
 mod simplify;
 mod simplify_cfg;
 
 pub use cse::Cse;
 pub use dce::Dce;
+pub use dse::Dse;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
 
@@ -48,6 +50,7 @@ impl PassManager {
         if opt_level >= 2 {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
             pm.add(Box::new(Cse));
+            pm.add(Box::new(Dse));
         }
         pm
     }
@@ -355,6 +358,42 @@ mod tests {
         }
         let main = interner.intern("main");
         assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 10);
+    }
+
+    #[test]
+    fn dse_removes_overwritten_store() {
+        // `x` is written, then immediately overwritten with no read in between: the first store is
+        // dead. The result must be unchanged.
+        let src = "fn main() -> i32 { let mut x: i32 = 1; x = 2; x = 3; return x; }";
+        let mut interner = Interner::new();
+        let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let stores_before = count_stores(find_fn(&program, &interner, "main"));
+        optimize(&mut program, 2);
+        let stores_after = count_stores(find_fn(&program, &interner, "main"));
+        assert!(
+            stores_after < stores_before,
+            "DSE should drop a dead store ({stores_before} -> {stores_after})"
+        );
+        for f in &program.funcs {
+            assert!(
+                mercury_mir::verify::verify_function(f).is_empty(),
+                "verify after opt"
+            );
+        }
+        let main = interner.intern("main");
+        assert_eq!(mercury_interp::run(&program, main, &interner).unwrap(), 3);
+    }
+
+    fn count_stores(f: &mercury_mir::Function) -> usize {
+        use mercury_mir::Op;
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, Op::Store { .. }))
+            .count()
     }
 
     fn count_muls(f: &mercury_mir::Function) -> usize {
