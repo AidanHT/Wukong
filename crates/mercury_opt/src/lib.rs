@@ -15,6 +15,7 @@ mod cse;
 mod dce;
 mod dom;
 mod dse;
+mod inline;
 mod licm;
 mod mem2reg;
 mod phi;
@@ -24,6 +25,7 @@ mod simplify_cfg;
 pub use cse::Cse;
 pub use dce::Dce;
 pub use dse::Dse;
+pub use inline::inline_program;
 pub use licm::Licm;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
@@ -115,6 +117,11 @@ impl Default for PassManager {
 
 /// Optimize a whole program at the given level.
 pub fn optimize(program: &mut Program, opt_level: u8) {
+    // Inlining is a whole-program transform (it needs callee bodies), so it runs before the
+    // function-level pipeline — which then optimizes the spliced-in code in context.
+    if opt_level >= 2 {
+        inline_program(program);
+    }
     PassManager::standard(opt_level).run(program);
 }
 
@@ -327,9 +334,10 @@ mod tests {
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
         let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
 
-        // Count `x*x` multiplies in `sq2` before and after CSE+DCE.
+        // Count `x*x` multiplies in `sq2` before and after CSE+DCE. Run the pass pipeline directly
+        // (not the `optimize` wrapper) so whole-program inlining does not fold `sq2` into main.
         let muls_before = count_muls(find_fn(&program, &interner, "sq2"));
-        optimize(&mut program, 2);
+        PassManager::standard(2).run(&mut program);
         let muls_after = count_muls(find_fn(&program, &interner, "sq2"));
         assert!(
             muls_before >= 2,
@@ -514,6 +522,55 @@ mod tests {
     }
 
     #[test]
+    fn inlining_removes_calls_and_preserves_results() {
+        // `sq` is a small leaf function. At -O2 it is inlined into main and then constant-folded
+        // away entirely, leaving no call. The result must be unchanged across all levels.
+        let src = "fn sq(x: i32) -> i32 { return x * x; } \
+                   fn main() -> i32 { return sq(6) + sq(7); }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 85, "level {lvl}");
+        }
+        let (mut prog, interner) = lower(src);
+        optimize(&mut prog, 2);
+        let main = find_fn(&prog, &interner, "main");
+        let has_call = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i.op, mercury_mir::Op::Call { .. }));
+        assert!(!has_call, "sq should be inlined into main");
+    }
+
+    #[test]
+    fn inlining_handles_callee_control_flow() {
+        // A leaf with branches (max) inlines correctly; results are preserved at every level.
+        let src = "fn max(a: i32, b: i32) -> i32 { if a > b { return a; } return b; } \
+                   fn main() -> i32 { return max(3, 9) + max(20, 5); } ";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 29, "level {lvl}");
+        }
+    }
+
+    #[test]
+    fn recursion_is_not_inlined() {
+        // A recursive function is not a leaf, so it must survive -O2 with its self-call intact and
+        // still compute correctly.
+        let src = "fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n-1) + fib(n-2); } \
+                   fn main() -> i32 { return fib(12); }";
+        assert_eq!(run_main_opt(src, 2), 144);
+        let (mut prog, interner) = lower(src);
+        optimize(&mut prog, 2);
+        let fib = find_fn(&prog, &interner, "fib");
+        let calls = fib
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, mercury_mir::Op::Call { .. }))
+            .count();
+        assert!(calls >= 2, "recursive fib should keep its self-calls");
+    }
+
+    #[test]
     fn licm_hoists_invariant_out_of_loop() {
         // `x * y` does not change across the loop, so LICM should compute it once in the preheader
         // (the entry block here) rather than every iteration.
@@ -521,7 +578,8 @@ mod tests {
                    while i < n { s = s + x * y; i = i + 1; } return s; } \
                    fn main() -> i32 { return f(3, 4, 5); }";
         let (mut prog, mut interner) = lower(src);
-        optimize(&mut prog, 2);
+        // Run the pipeline directly so inlining does not fold `f` into main before LICM is observed.
+        PassManager::standard(2).run(&mut prog);
         let f = find_fn(&prog, &interner, "f");
         assert_eq!(
             count_muls(f),

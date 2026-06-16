@@ -9,9 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 mercury_mir = { workspace = true }
+mercury_span = { workspace = true }
 
 [dev-dependencies]
-mercury_span = { workspace = true }
 mercury_parser = { workspace = true }
 mercury_sema = { workspace = true }
 mercury_mir_build = { workspace = true }
