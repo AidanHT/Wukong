@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0501
+module tests.fail.rank
+
+/// Passing a rank-3 tensor where a rank-2 tensor is expected is a rank mismatch.
+fn use2d<M, N>(a: Tensor[f32, M, N]) {}
+
+fn main() -> i32 {
+    let a: Tensor[f32, 4, 4, 4];
+    use2d(a);
+    return 0;
+}

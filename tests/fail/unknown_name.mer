@@ -1,0 +1,7 @@
+// EXPECT-CODE: E0301
+module tests.fail.unknown_name
+
+/// Referencing an undefined name is a name-resolution error.
+fn main() -> i32 {
+    return does_not_exist + 1;
+}

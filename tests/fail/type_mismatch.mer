@@ -1,0 +1,9 @@
+// EXPECT-CODE: E0401
+module tests.fail.type_mismatch
+
+/// A typed value must match its annotation exactly (an i64 value into an i32 binding).
+fn main() -> i32 {
+    let a: i64 = 5;
+    let b: i32 = a;
+    return b;
+}
