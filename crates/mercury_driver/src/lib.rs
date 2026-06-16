@@ -158,7 +158,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- MIR construction ---
-    let (mut program, lower_diags) = mercury_mir_build::lower_program(&module, &sema, &interner);
+    let (mut program, lower_diags) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }

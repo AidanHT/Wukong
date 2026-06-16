@@ -10,6 +10,7 @@ rust-version.workspace = true
 mercury_mir = { workspace = true }
 mercury_span = { workspace = true }
 mercury_backend = { workspace = true }
+mercury_runtime = { workspace = true }
 
 cranelift-codegen = "0.124"
 cranelift-frontend = "0.124"

@@ -43,6 +43,11 @@ impl Value {
     }
 }
 
+/// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
+/// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
+/// memory never grows near it.
+const FUNC_TAG: usize = 1 << 60;
+
 /// The interpreter backend.
 pub struct Interpreter;
 
@@ -230,6 +235,17 @@ impl<'a> Interp<'a> {
                     self.intrinsic(&name, &argv)?
                 }
             }
+            // A function address: a pointer the interpreter tags with the function's index so the
+            // `parallel_for` intrinsic can call it back. (The native backend uses a real address.)
+            Op::FuncAddr(sym) => {
+                let idx = self
+                    .program
+                    .funcs
+                    .iter()
+                    .position(|f| f.name == *sym)
+                    .ok_or("func_addr of unknown function")?;
+                Value::Ptr(FUNC_TAG + idx)
+            }
         })
     }
 
@@ -257,6 +273,25 @@ impl<'a> Interp<'a> {
                 } else {
                     Err("assertion failed".to_string())
                 }
+            }
+            // `mercury_parallel_for(n, body, env)` — run `body(start, end, env)` over the index
+            // range. The interpreter executes the whole range sequentially in one call; since
+            // parallel-for bodies have no cross-iteration dependencies this is exactly the result
+            // the multi-threaded native runtime produces (so the two stay differential-equal).
+            "mercury_parallel_for" => {
+                let n = args.first().copied().unwrap_or(Value::Unit).as_int();
+                let body = match args.get(1).copied() {
+                    Some(Value::Ptr(p)) if p >= FUNC_TAG => p - FUNC_TAG,
+                    _ => return Err("parallel_for body is not a function address".into()),
+                };
+                let env = args.get(2).copied().unwrap_or(Value::Ptr(0));
+                let prog = self.program;
+                let func = prog
+                    .funcs
+                    .get(body)
+                    .ok_or("parallel_for body index out of range")?;
+                self.run_function(func, vec![Value::Int(0), Value::Int(n), env])?;
+                Ok(Value::Unit)
             }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
@@ -454,7 +489,7 @@ mod tests {
         assert!(pd.is_empty(), "parse: {pd:?}");
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (program, _ld) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (program, _ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         let main = interner.intern("main");
         run(&program, main, &interner).unwrap()
     }
@@ -480,7 +515,7 @@ mod tests {
         let src = "fn main() -> i32 { print(42); print(7 * 6); return 0; }";
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, _) = mercury_sema::check(&module, &interner);
-        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         let main = interner.intern("main");
         let (code, out) = run_with_output(&program, main, &interner).unwrap();
         assert_eq!(code, 0);
@@ -542,7 +577,7 @@ mod tests {
         let src = "fn main() -> i32 { assert(1 > 2); return 0; }";
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, _) = mercury_sema::check(&module, &interner);
-        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         let main = interner.intern("main");
         assert!(run(&program, main, &interner).is_err());
     }

@@ -28,19 +28,98 @@ const REPEAT_UNROLL_LIMIT: u32 = 8;
 pub fn lower_program(
     module: &Module,
     sema: &SemaResult,
-    interner: &Interner,
+    interner: &mut Interner,
 ) -> (Program, Vec<Diagnostic>) {
     let mut diags = Vec::new();
     let mut program = Program::new();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
+                // `@parallel` on a function whose whole body is `for i in 0..n { … }` over array
+                // (pointer) parameters is lowered to a multi-threaded runtime dispatch: the loop
+                // body becomes a separate ranged function, and the original becomes a thin wrapper
+                // that hands chunks to `mercury_parallel_for`.
+                if has_parallel_attr(item, interner) {
+                    if let Some((idx, hi, loop_body)) = parallel_spec(f, body, sema, interner) {
+                        let base = interner.resolve(f.name.sym).to_string();
+                        let par_sym = interner.intern(&format!("{base}$par"));
+                        let pfor_sym = interner.intern("mercury_parallel_for");
+                        let (outlined, wrapper) = lower_parallel(
+                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, &mut diags,
+                        );
+                        program.funcs.push(outlined);
+                        program.funcs.push(wrapper);
+                        continue;
+                    }
+                }
                 let func = lower_fn(f, body, sema, interner, &mut diags);
                 program.funcs.push(func);
             }
         }
     }
     (program, diags)
+}
+
+/// Does this item carry a `@parallel` attribute?
+fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == "parallel")
+}
+
+/// Recognize a parallelizable function: its entire body is a single `for idx in 0..hi { … }` over
+/// pointer (array) parameters. Returns the index name, the upper-bound expression, and the loop
+/// body. Anything else falls back to ordinary sequential lowering.
+fn parallel_spec<'a>(
+    f: &'a FnDecl,
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, &'a Expr, &'a Block)> {
+    // Captures are exactly the parameters, so they must all be arrays (passed by pointer).
+    let param_tys: Vec<Ty> = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => sig.params.clone(),
+        _ => return None,
+    };
+    if param_tys.is_empty()
+        || !param_tys
+            .iter()
+            .all(|t| matches!(mir_ty(t), MirType::Array(..)))
+    {
+        return None;
+    }
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    let ForIter::Range {
+        start,
+        end: Some(end),
+        inclusive: false,
+        step: None,
+    } = iter
+    else {
+        return None;
+    };
+    // Require the range to start at literal 0 (the runtime iterates [0, hi)).
+    let ExprKind::Int(s) = &start.kind else {
+        return None;
+    };
+    if parse_int(interner.resolve(*s)) != 0 {
+        return None;
+    }
+    let ast::PatKind::Ident(name) = &pat.kind else {
+        return None;
+    };
+    Some((*name, end, lb))
 }
 
 fn lower_fn(
@@ -98,6 +177,129 @@ fn lower_fn(
         }
     }
     fl.builder.finish()
+}
+
+/// Lower a `@parallel for idx in 0..hi { body }` function into two MIR functions:
+///   * `par_sym(start: i64, end: i64, env: *ptr)` — the loop body over `[start, end)`, reading the
+///     array base pointers back from `env`;
+///   * the original `f.name(params…)` — a wrapper that packs the parameter pointers into a stack
+///     `env`, then calls `mercury_parallel_for(hi, &par, env)`.
+#[allow(clippy::too_many_arguments)]
+fn lower_parallel(
+    f: &FnDecl,
+    par_sym: Symbol,
+    pfor_sym: Symbol,
+    idx: Symbol,
+    hi: &Expr,
+    loop_body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) -> (Function, Function) {
+    let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
+        _ => (
+            f.params.iter().map(|_| Ty::Unknown).collect::<Vec<_>>(),
+            Ty::Unit,
+        ),
+    };
+    let ret_mir = mir_ty(&ret_ty);
+    let k = f.params.len();
+
+    // ---- outlined body: par_sym(start, end, env) ----
+    let outlined = {
+        let mut fl = FnLowerer {
+            builder: Builder::new(par_sym, MirType::Void),
+            sema,
+            interner,
+            diags: &mut *diags,
+            scopes: vec![HashMap::new()],
+            terminated: false,
+            loops: Vec::new(),
+        };
+        let start = fl.builder.add_param(MirType::I64);
+        let end = fl.builder.add_param(MirType::I64);
+        let env = fl.builder.add_param(MirType::Ptr);
+        // Recover each array base pointer from env[k] and bind it to the parameter name.
+        for (idx_k, (p, pty)) in f.params.iter().zip(&param_tys).enumerate() {
+            let mty = mir_ty(pty);
+            let kidx = fl
+                .builder
+                .build(MirType::I64, Op::ConstInt(idx_k as i128, MirType::I64));
+            let slot = fl.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
+            fl.bind(p.name.sym, base, mty);
+        }
+        fl.lower_ranged_loop(idx, start, end, loop_body);
+        if !fl.terminated {
+            fl.builder.ret(None);
+        }
+        fl.builder.finish()
+    };
+
+    // ---- wrapper: f.name(params…) ----
+    let wrapper = {
+        let mut fl = FnLowerer {
+            builder: Builder::new(f.name.sym, ret_mir.clone()),
+            sema,
+            interner,
+            diags: &mut *diags,
+            scopes: vec![HashMap::new()],
+            terminated: false,
+            loops: Vec::new(),
+        };
+        let param_vals: Vec<ValueId> = param_tys
+            .iter()
+            .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+            .collect();
+        let env = fl
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::Ptr), k as u32));
+        for (idx_k, pv) in param_vals.iter().enumerate() {
+            let kidx = fl
+                .builder
+                .build(MirType::I64, Op::ConstInt(idx_k as i128, MirType::I64));
+            let slot = fl.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            fl.builder.build_void(Op::Store {
+                ptr: slot,
+                value: *pv,
+            });
+        }
+        let n_raw = fl.lower_expr(hi);
+        let n_ty = fl.expr_mir(hi);
+        let n = fl.coerce_to(n_raw, &n_ty, &MirType::I64, true);
+        let bodyaddr = fl.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
+        fl.builder.build_void(Op::Call {
+            func: pfor_sym,
+            args: vec![n, bodyaddr, env],
+        });
+        if !fl.terminated {
+            match ret_mir {
+                MirType::Void => fl.builder.ret(None),
+                _ => {
+                    let z = fl.const_zero(ret_mir.clone());
+                    fl.builder.ret(Some(z));
+                }
+            }
+        }
+        fl.builder.finish()
+    };
+
+    (outlined, wrapper)
 }
 
 struct FnLowerer<'a> {
@@ -409,6 +611,51 @@ impl FnLowerer<'_> {
             self.builder.br(header, vec![]);
         }
 
+        self.pop_scope();
+        self.builder.switch_to(exit);
+        self.terminated = false;
+    }
+
+    /// Lower `for idx in start..end { body }` where `start`/`end` are already-lowered `i64` values
+    /// (used by parallel outlining). The index is `i64` and steps by 1.
+    fn lower_ranged_loop(&mut self, idx: Symbol, start: ValueId, end: ValueId, body: &Block) {
+        let ity = MirType::I64;
+        let slot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: start,
+        });
+        self.push_scope();
+        self.bind(idx, slot, ity.clone());
+
+        let header = self.builder.new_block();
+        let body_bb = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+
+        self.builder.switch_to(header);
+        self.terminated = false;
+        let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let c = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, end));
+        self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
+
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
+        self.loops.push((header, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+            let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
+            let next = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: next,
+            });
+            self.builder.br(header, vec![]);
+        }
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
@@ -1143,7 +1390,7 @@ mod tests {
         assert!(pdiags.is_empty(), "parse: {pdiags:?}");
         let (sema, sdiags) = mercury_sema::check(&module, &interner);
         assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
-        let (prog, diags) = lower_program(&module, &sema, &interner);
+        let (prog, diags) = lower_program(&module, &sema, &mut interner);
         (prog, diags, interner)
     }
 

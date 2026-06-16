@@ -159,7 +159,7 @@ fn bench_mercury(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32, op:
         eprintln!("mercury sema error: {sd:?}");
         return None;
     }
-    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &interner);
+    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
     if ld.iter().any(|d| d.is_error()) {
         eprintln!("mercury lower error: {ld:?}");
         return None;

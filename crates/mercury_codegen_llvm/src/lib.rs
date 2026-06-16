@@ -281,6 +281,13 @@ impl Emitter<'_> {
                     argstr.join(", ")
                 )
             }
+            Op::FuncAddr(func) => {
+                // The address of a function as a `ptr` (an identity GEP keeps it valid IR).
+                format!(
+                    "{res}getelementptr i8, ptr @{}, i64 0",
+                    self.interner.resolve(*func)
+                )
+            }
         };
         let _ = writeln!(out, "  {line}");
     }
@@ -410,7 +417,7 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);
         assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
-        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
+        let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
         mercury_opt::optimize(&mut program, opt);
         emit_llvm_ir(&program, &interner)
     }

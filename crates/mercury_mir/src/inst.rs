@@ -175,6 +175,9 @@ pub enum Op {
         func: Symbol,
         args: Vec<ValueId>,
     },
+    /// The machine address of a function (a `Ptr`), for passing it to a runtime that calls it back
+    /// — e.g. the outlined body of a `@parallel for`. Pure and side-effect-free.
+    FuncAddr(Symbol),
 }
 
 /// One instruction: an optional result value plus its operation.

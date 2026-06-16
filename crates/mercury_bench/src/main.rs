@@ -154,7 +154,7 @@ fn bench_one(path: &Path) -> Outcome {
     if sd.iter().any(|d| d.is_error()) {
         return Outcome::Skipped("type/shape error".into());
     }
-    let (mut p0, ld) = mercury_mir_build::lower_program(&module, &sema, &interner);
+    let (mut p0, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
     if ld.iter().any(|d| d.is_error()) {
         return Outcome::Skipped("uses constructs codegen does not support yet".into());
     }
