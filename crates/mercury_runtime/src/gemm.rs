@@ -325,24 +325,28 @@ unsafe fn micro_6x16(
     let mut ap = ap;
     let mut bp = bp;
     for _ in 0..kc {
+        // Prefetch a few K-steps ahead so the next B column / A row are warm in L1.
+        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
         let b0 = _mm256_loadu_ps(bp);
         let b1 = _mm256_loadu_ps(bp.add(8));
-        let a0 = _mm256_set1_ps(*ap);
+        // Load-broadcast each A element straight from the packed panel (vbroadcastss [mem], 1 uop)
+        // rather than a scalar load + register broadcast, freeing shuffle/ALU ports for the FMAs.
+        let a0 = _mm256_broadcast_ss(&*ap);
         c0 = _mm256_fmadd_ps(a0, b0, c0);
         c1 = _mm256_fmadd_ps(a0, b1, c1);
-        let a1 = _mm256_set1_ps(*ap.add(1));
+        let a1 = _mm256_broadcast_ss(&*ap.add(1));
         c2 = _mm256_fmadd_ps(a1, b0, c2);
         c3 = _mm256_fmadd_ps(a1, b1, c3);
-        let a2 = _mm256_set1_ps(*ap.add(2));
+        let a2 = _mm256_broadcast_ss(&*ap.add(2));
         c4 = _mm256_fmadd_ps(a2, b0, c4);
         c5 = _mm256_fmadd_ps(a2, b1, c5);
-        let a3 = _mm256_set1_ps(*ap.add(3));
+        let a3 = _mm256_broadcast_ss(&*ap.add(3));
         c6 = _mm256_fmadd_ps(a3, b0, c6);
         c7 = _mm256_fmadd_ps(a3, b1, c7);
-        let a4 = _mm256_set1_ps(*ap.add(4));
+        let a4 = _mm256_broadcast_ss(&*ap.add(4));
         c8 = _mm256_fmadd_ps(a4, b0, c8);
         c9 = _mm256_fmadd_ps(a4, b1, c9);
-        let a5 = _mm256_set1_ps(*ap.add(5));
+        let a5 = _mm256_broadcast_ss(&*ap.add(5));
         c10 = _mm256_fmadd_ps(a5, b0, c10);
         c11 = _mm256_fmadd_ps(a5, b1, c11);
         ap = ap.add(MR);
