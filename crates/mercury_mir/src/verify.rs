@@ -333,6 +333,22 @@ mod tests {
     }
 
     #[test]
+    fn void_call_verifies() {
+        // A result-less call (e.g. the `print` intrinsic) is valid and must not be flagged as
+        // "must produce a result" — regression for the void-call verifier rule.
+        use crate::Op;
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("main"), MirType::Void);
+        let arg = b.build(MirType::I32, Op::ConstInt(42, MirType::I32));
+        b.build_void(Op::Call {
+            func: i.intern("print"),
+            args: vec![arg],
+        });
+        b.ret(None);
+        assert!(verify_function(&b.finish()).is_empty());
+    }
+
+    #[test]
     fn detects_block_param_arity() {
         let mut i = Interner::new();
         let mut b = Builder::new(i.intern("f"), MirType::Void);
