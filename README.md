@@ -18,10 +18,11 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 
 - **compiles ~100–190× faster** than gcc/rustc (Cranelift JIT in-process vs spawning a full
   C/Rust+LLVM toolchain) — the metric that dominates real ML edit-run iteration;
-- is **faster than C on every single-threaded elementwise kernel** measured, including a **~2.6×** win
-  on `dot` from automatic reduction vectorization;
+- **ties or beats C** on the single-threaded elementwise kernels (a genuine tie within run-to-run
+  noise on memory-bound saxpy/relu/poly, and a **~2.6–3.7×** win on the `dot`/L2 reductions, which
+  Mercury auto-vectorizes and gcc/rustc leave serial);
 - is **~3–8× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and
-  vectorizes the loop, and **~2.6×** faster on parallel 512² matmul.
+  vectorizes the loop, and **~2.6–3×** faster on parallel 512² matmul.
 
 The one honest single-thread loss is dense matmul (~3.2×), because Cranelift emits 128-bit SSE rather
 than 256-bit AVX — a deliberate trade for zero-dependency builds and the compile-speed win above.
