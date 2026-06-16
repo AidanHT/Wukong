@@ -457,6 +457,7 @@ dependencies = [
  "mercury_mir",
  "mercury_mir_build",
  "mercury_parser",
+ "mercury_runtime",
  "mercury_sema",
  "mercury_span",
 ]

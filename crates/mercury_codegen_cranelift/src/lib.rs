@@ -64,6 +64,8 @@ const RT_PRINT_I64: &str = "mercury_rt_print_i64";
 const RT_PRINT_F64: &str = "mercury_rt_print_f64";
 const RT_ASSERT: &str = "mercury_rt_assert";
 const RT_PARALLEL_FOR: &str = "mercury_parallel_for";
+const RT_SGEMM: &str = "mercury_sgemm";
+const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
 
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
@@ -562,6 +564,19 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[n, body, env]);
             return None;
         }
+        // The GEMM microkernel: mercury_sgemm(a, b, c, m, k, n, beta) (and the parallel variant).
+        if (name == RT_SGEMM || name == RT_SGEMM_PARALLEL) && args.len() == 7 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let c = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let k = self.coerce_to_i64(args[4]);
+            let n = self.coerce_to_i64(args[5]);
+            let beta = self.coerce_to_i64(args[6]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, b, c, m, k, n, beta]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -659,6 +674,8 @@ struct RtFuncs {
     print_f64: FuncId,
     assert: FuncId,
     parallel_for: FuncId,
+    sgemm: FuncId,
+    sgemm_parallel: FuncId,
 }
 
 fn signature_of(
@@ -711,6 +728,14 @@ fn populate_module<M: Module>(
     sig_par.params.push(AbiParam::new(types::I64));
     sig_par.params.push(AbiParam::new(ptr_ty));
     sig_par.params.push(AbiParam::new(ptr_ty));
+    // mercury_sgemm(a: ptr, b: ptr, c: ptr, m: i64, k: i64, n: i64, beta: i64)
+    let mut sig_gemm = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_gemm.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..4 {
+        sig_gemm.params.push(AbiParam::new(types::I64));
+    }
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -723,6 +748,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         parallel_for: module
             .declare_function(RT_PARALLEL_FOR, Linkage::Import, &sig_par)
+            .map_err(|e| e.to_string())?,
+        sgemm: module
+            .declare_function(RT_SGEMM, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
+        sgemm_parallel: module
+            .declare_function(RT_SGEMM_PARALLEL, Linkage::Import, &sig_gemm)
             .map_err(|e| e.to_string())?,
     };
 
@@ -757,6 +788,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_PARALLEL_FOR,
                 module.declare_func_in_func(rt.parallel_for, builder.func),
+            );
+            rt_refs.insert(RT_SGEMM, module.declare_func_in_func(rt.sgemm, builder.func));
+            rt_refs.insert(
+                RT_SGEMM_PARALLEL,
+                module.declare_func_in_func(rt.sgemm_parallel, builder.func),
             );
 
             let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
@@ -862,6 +898,8 @@ pub fn jit_compile(
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
+    builder.symbol(RT_SGEMM, mercury_runtime::mercury_sgemm as *const u8);
+    builder.symbol(RT_SGEMM_PARALLEL, mercury_runtime::mercury_sgemm_parallel as *const u8);
     let mut module = JITModule::new(builder);
 
     let ids = populate_module(&mut module, program, interner)?;
@@ -927,6 +965,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
+    builder.symbol(RT_SGEMM, mercury_runtime::mercury_sgemm as *const u8);
+    builder.symbol(RT_SGEMM_PARALLEL, mercury_runtime::mercury_sgemm_parallel as *const u8);
     let mut module = JITModule::new(builder);
     let ids = populate_module(&mut module, program, interner)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;

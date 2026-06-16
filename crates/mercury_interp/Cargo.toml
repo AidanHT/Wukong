@@ -11,6 +11,9 @@ rust-version.workspace = true
 mercury_span = { workspace = true }
 mercury_mir = { workspace = true }
 mercury_backend = { workspace = true }
+# The interpreter calls the *same* tuned kernels the native backend does (e.g. mercury_sgemm),
+# marshalling its abstract memory through real buffers, so the differential oracle stays bit-exact.
+mercury_runtime = { workspace = true }
 
 [dev-dependencies]
 mercury_parser = { workspace = true }

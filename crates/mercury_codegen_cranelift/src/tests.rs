@@ -651,6 +651,81 @@ fn matmul_is_correct() {
     }
 }
 
+/// Lower `src` and report whether any function calls the named runtime symbol — used to prove the
+/// matmul recognizer fired (and picked the serial vs parallel variant), not merely that a scalar
+/// fallback happened to compute the right answer.
+fn lowered_calls(src: &str, callee: &str) -> bool {
+    let mut interner = Interner::new();
+    let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    let (sema, _) = mercury_sema::check(&module, &interner);
+    let (program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    let target = interner.intern(callee);
+    program.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|ins| {
+                matches!(&ins.op, mercury_mir::Op::Call { func, .. } if *func == target)
+            })
+        })
+    })
+}
+
+/// The canonical f32 matmul nest must lower to the tuned `mercury_sgemm` microkernel (and the
+/// `@parallel` form to the parallel variant), in both the accumulate and zero-init shapes.
+#[test]
+fn matmul_nest_lowers_to_sgemm() {
+    // Accumulate form (beta = 1): no per-row zero-init.
+    let acc = |attr: &str| {
+        format!(
+            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+             for i in 0..8 {{ for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
+             for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
+        )
+    };
+    // Overwrite form (beta = 0): a per-row zero-init loop precedes the K loop.
+    let ovr = |attr: &str| {
+        format!(
+            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+             for i in 0..8 {{ for j0 in 0..8 {{ c[i*8+j0] = 0.0; }} \
+             for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
+             for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
+        )
+    };
+    assert!(lowered_calls(&acc(""), "mercury_sgemm"), "accumulate -> sgemm");
+    assert!(lowered_calls(&ovr(""), "mercury_sgemm"), "overwrite -> sgemm");
+    assert!(
+        lowered_calls(&acc("@parallel\n"), "mercury_sgemm_parallel"),
+        "@parallel -> sgemm_parallel"
+    );
+    // A non-matmul triple loop (wrong B stride) must NOT be misrecognized.
+    let not_mm = "module m\nfn f(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+        for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
+        for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[j*8+k]; } } } }";
+    assert!(!lowered_calls(not_mm, "mercury_sgemm"), "transposed-B is not a row-major matmul");
+}
+
+/// The zero-init (beta = 0) matmul, end to end: native and interpreter agree bit-for-bit (both run
+/// the same kernel) and match an independent reference.
+#[test]
+fn matmul_overwrite_differential() {
+    let ns = 9usize; // not a multiple of MR/NR, exercises the microkernel remainders
+    let n2 = ns * ns;
+    let src = format!(
+        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{ \
+         for i in 0..{ns} {{ for j0 in 0..{ns} {{ c[i*{ns}+j0] = 0.0; }} \
+         for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
+         for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
+         fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
+         let mut c: [f32; {n2}] = [0.0; {n2}]; let mut i: i32 = 0; \
+         while i < {n2} {{ a[i] = ((i % 5) as f32) * 0.5; b[i] = ((i % 3) as f32) - 1.0; i += 1; }} \
+         mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+         while j < {n2} {{ s = s + c[j]; j += 1; }} return (s * 100.0) as i32; }}"
+    );
+    assert!(lowered_calls(&src, "mercury_sgemm"), "recognizer must fire");
+    let native = jit(&src, 3).expect("jit");
+    let interp = interp(&src, 3).expect("interp");
+    assert_eq!(native, interp, "overwrite matmul native vs interp");
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.

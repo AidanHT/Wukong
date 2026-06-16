@@ -398,6 +398,47 @@ impl<'a> Interp<'a> {
                 self.run_function(func, vec![Value::Int(0), Value::Int(n), env])?;
                 Ok(Value::Unit)
             }
+            // `mercury_sgemm(a, b, c, m, k, n, beta)` — the matmul microkernel the compiler lowers a
+            // matmul nest to. The interpreter marshals its abstract (tagged-`Value`) memory into real
+            // f32 buffers and calls the *identical* runtime kernel the native backend calls, then
+            // marshals the result back, so the differential oracle stays bit-for-bit exact. The
+            // serial kernel is used for both names (the parallel variant is numerically identical).
+            "mercury_sgemm" | "mercury_sgemm_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let c = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let beta = args[6].as_int() as i64;
+                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                    let mut v = Vec::with_capacity(len);
+                    for t in 0..len {
+                        v.push(mem.get(base + t).ok_or("sgemm operand out of bounds")?.as_float() as f32);
+                    }
+                    Ok(v)
+                };
+                let abuf = read(&self.memory, a, m * k)?;
+                let bbuf = read(&self.memory, b, k * n)?;
+                let mut cbuf = read(&self.memory, c, m * n)?;
+                // SAFETY: buffers are exactly m*k, k*n, m*n long — the kernel's read/write contract.
+                unsafe {
+                    mercury_runtime::mercury_sgemm(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        cbuf.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                        beta,
+                    );
+                }
+                for t in 0..m * n {
+                    *self.memory.get_mut(c + t).ok_or("sgemm output out of bounds")? =
+                        Value::Float(cbuf[t] as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }
