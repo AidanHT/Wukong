@@ -115,3 +115,31 @@ fn differential_against_interpreter() {
         }
     }
 }
+
+/// Float kernels must agree too: the interpreter computes `f32` ops in `f32`, so its printed
+/// results are bit-identical to native (including division, which would otherwise double-round).
+#[test]
+fn differential_floats() {
+    let programs = [
+        // f32 dot-product-ish reduction with a final divide (a mean).
+        "fn main() -> i32 { let mut xs: [f32; 16] = [0.0; 16]; let mut i: i32 = 0; \
+         while i < 16 { xs[i] = (i as f32) * 0.5; i += 1; } \
+         let mut s: f32 = 0.0; let mut j: i32 = 0; \
+         while j < 16 { s = s + xs[j] * xs[j]; j += 1; } \
+         print(s / 16.0); return 0; }",
+        // f32 SAXPY then print a few elements.
+        "fn main() -> i32 { let mut y: [f32; 8] = [1.0; 8]; let a: f32 = 2.5; \
+         let mut i: i32 = 0; while i < 8 { y[i] = a * (i as f32) + y[i]; i += 1; } \
+         print(y[0]); print(y[3]); print(y[7]); return 0; }",
+        // f64 path stays full precision.
+        "fn main() -> i32 { let mut s: f64 = 0.0; let mut i: i32 = 0; \
+         while i < 100 { s = s + 1.0 / ((i as f64) + 1.0); i += 1; } print(s); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "float native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}

@@ -632,11 +632,48 @@ fn generic_names(gs: &[GenericParam]) -> HashSet<Symbol> {
 
 /// Pick a "more concrete" type when joining two (used for arithmetic results and if/match arms).
 /// Leniently prefers a known type over Unknown/Error so we never invent false mismatches.
+/// The result type of a binary arithmetic op on `a` and `b`. Unknown/Error defer to the other
+/// side; two numeric scalars promote to the wider type (and float beats int), so a mixed-precision
+/// expression like `(i as f64) + 1.0` is `f64` rather than picking an operand arbitrarily. This
+/// keeps the lowered MIR well-typed once operands are coerced to the result.
 fn join(a: Ty, b: Ty) -> Ty {
     if a.is_unknown() || a.is_error() {
-        b
-    } else {
-        a
+        return b;
+    }
+    if b.is_unknown() || b.is_error() {
+        return a;
+    }
+    if let (Ty::Scalar(sa), Ty::Scalar(sb)) = (&a, &b) {
+        return Ty::Scalar(join_scalar(*sa, *sb));
+    }
+    a
+}
+
+fn scalar_bits(s: Scalar) -> u32 {
+    use Scalar::*;
+    match s {
+        Bool => 1,
+        I8 | U8 => 8,
+        I16 | U16 | F16 | Bf16 => 16,
+        I32 | U32 | F32 => 32,
+        I64 | U64 | Usize | Isize | F64 => 64,
+    }
+}
+
+fn join_scalar(a: Scalar, b: Scalar) -> Scalar {
+    if a == b {
+        return a;
+    }
+    match (a.is_float(), b.is_float()) {
+        (true, false) => a,
+        (false, true) => b,
+        _ => {
+            if scalar_bits(a) >= scalar_bits(b) {
+                a
+            } else {
+                b
+            }
+        }
     }
 }
 

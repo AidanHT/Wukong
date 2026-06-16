@@ -125,14 +125,18 @@ impl<'a> Interp<'a> {
             }
             let block = func.block(cur);
             for inst in &block.insts {
-                let v = self.eval(&inst.op, regs)?;
+                let rty = inst.result.map(|r| func.value_type(r));
+                let v = self.eval(&inst.op, regs, rty)?;
                 if let Some(r) = inst.result {
                     // Normalize integer results to their declared width: this gives correct
                     // two's-complement wrapping and keeps booleans (`i1`) as 0/1 (so e.g. `!true`
-                    // is 0, not a sign-extended -2). Non-integer values pass through unchanged.
+                    // is 0, not a sign-extended -2). Float results narrower than `f64` are rounded
+                    // to their declared precision so the interpreter matches the native backend
+                    // bit-for-bit (`f32` arithmetic must round at `f32`, not `f64`).
                     let rty = func.value_type(r);
                     let v = match v {
                         Value::Int(i) if rty.is_int() => Value::Int(mask(i, rty)),
+                        Value::Float(f) if is_narrow_float(rty) => Value::Float(f as f32 as f64),
                         other => other,
                     };
                     regs[r.0 as usize] = v;
@@ -165,11 +169,11 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn eval(&mut self, op: &Op, regs: &[Value]) -> Result<Value, String> {
+    fn eval(&mut self, op: &Op, regs: &[Value], rty: Option<&MirType>) -> Result<Value, String> {
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
             Op::ConstFloat(v, _) => Value::Float(*v),
-            Op::Bin(b, l, r) => apply_bin(*b, reg(regs, *l), reg(regs, *r)),
+            Op::Bin(b, l, r) => apply_bin(*b, reg(regs, *l), reg(regs, *r), rty),
             Op::Cmp(c, l, r) => Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128),
             Op::Neg(v) => match reg(regs, *v) {
                 Value::Float(f) => Value::Float(-f),
@@ -321,9 +325,28 @@ fn mask(v: i128, ty: &MirType) -> i128 {
     (v << shift) >> shift // sign-extend from `bits`
 }
 
-fn apply_bin(op: BinOp, a: Value, b: Value) -> Value {
+/// `f16`/`bf16`/`f32` results are rounded to `f32` precision (the interpreter promotes sub-`f32`
+/// storage types to `f32`); `f64` keeps full precision.
+fn is_narrow_float(ty: &MirType) -> bool {
+    matches!(ty, MirType::F16 | MirType::BF16 | MirType::F32)
+}
+
+fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
     use BinOp::*;
     if op.is_float() {
+        // Compute `f32`-typed operations in actual `f32` (single rounding), matching the native
+        // backend exactly; a single op on two exact `f32` values would otherwise double-round.
+        if rty.is_some_and(is_narrow_float) {
+            let (x, y) = (a.as_float() as f32, b.as_float() as f32);
+            let r = match op {
+                FAdd => x + y,
+                FSub => x - y,
+                FMul => x * y,
+                FDiv => x / y,
+                _ => unreachable!(),
+            };
+            return Value::Float(r as f64);
+        }
         let (x, y) = (a.as_float(), b.as_float());
         return Value::Float(match op {
             FAdd => x + y,
