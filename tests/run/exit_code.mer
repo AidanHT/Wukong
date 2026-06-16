@@ -1,0 +1,8 @@
+// RUN: --run
+// EXPECT-EXIT: 7
+module tests.run.exit_code
+
+/// The value returned from `main` becomes the process exit code.
+fn main() -> i32 {
+    return 3 + 4;
+}

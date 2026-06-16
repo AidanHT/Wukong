@@ -1,0 +1,23 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 45
+// EXPECT-OUT: 3628800
+module tests.run.control
+
+/// Sum 0..10 with a while loop, then 10! with a for loop.
+fn main() -> i32 {
+    let mut sum: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 10 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    print(sum);
+
+    let mut fact: i32 = 1;
+    for k in 1..11 {
+        fact = fact * k;
+    }
+    print(fact);
+    return 0;
+}
