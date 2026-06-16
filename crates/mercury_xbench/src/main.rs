@@ -482,6 +482,26 @@ fn kernels() -> Vec<Kernel> {
                  r=r*v+0.0001; r=r*v+0.001; r=r*v+0.01; r=r*v+0.1; *out.add(i)=r; }",
             ),
         },
+        // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
+        // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
+        // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
+        Kernel {
+            name: "fused_linear_relu",
+            bytes_per_call: 2 * N * 4,
+            note: "linear→relu: Mercury auto-fuses 2 loops; C/Rust as-written stream the intermediate",
+            mer: mer_kernel(&format!(
+                "for i in 0..{N} {{ y[i] = 2.0 * x[i] + 1.0; }} \
+                 for i in 0..{N} {{ out[i] = if y[i] > 0.0 {{ y[i] }} else {{ 0.0 }}; }}"
+            )),
+            c: c_kernel(
+                "float* t=(float*)y; for(long i=0;i<N;i++) t[i]=2.0f*x[i]+1.0f; \
+                 for(long i=0;i<N;i++){ float v=t[i]; out[i]= v>0.0f? v:0.0f; }",
+            ),
+            rust: rust_kernel(
+                "let t = y as *mut f32; for i in 0..N { *t.add(i)=2.0* *x.add(i)+1.0; } \
+                 for i in 0..N { let v= *t.add(i); *out.add(i)= if v>0.0 {v} else {0.0}; }",
+            ),
+        },
         // --- Mercury @parallel (multicore) vs idiomatic single-threaded C/Rust ---
         Kernel {
             name: "saxpy@parallel",
