@@ -118,6 +118,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_runtime"
+version = "0.1.0"
+
+[[package]]
 name = "mercury_sema"
 version = "0.1.0"
 dependencies = [

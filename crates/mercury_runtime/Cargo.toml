@@ -1,0 +1,10 @@
+[package]
+name = "mercury_runtime"
+description = "The Mercury runtime: arena allocation, parallel-for, and intrinsics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
