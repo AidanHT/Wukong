@@ -244,6 +244,24 @@ fn vectorized_relu_is_correct() {
     }
 }
 
+/// Float remainder (`%` on floats) used to lower to an integer `urem` and crash the MIR verifier.
+/// It now lowers to `FRem` (`x - trunc(x/y)*y` natively) and agrees with the interpreter.
+#[test]
+fn float_modulo() {
+    // 7.5 % 2.0 = 1.5, scaled to an int so the exit code carries it.
+    assert_eq!(jit_ok("fn main() -> i32 { let a: f32 = 7.5; let b: f32 = 2.0; return (a % b) as i32 * 10 + (a % b > 1.0) as i32; }").0, 11);
+    let prog = "fn main() -> i32 { let a: f64 = 10.0; let b: f64 = 3.0; return (a % b) as i32; }";
+    assert_eq!(jit_ok(prog).0, 1);
+    for src in [
+        "fn main() -> i32 { let a: f32 = 7.5; let b: f32 = 2.0; print(a % b); return 0; }",
+        "fn main() -> i32 { let a: f64 = -10.5; let b: f64 = 3.0; print(a % b); return 0; }",
+    ] {
+        for opt in [0u8, 2, 3] {
+            assert_eq!(jit(src, opt).unwrap(), interp(src, opt).unwrap(), "frem mismatch at -O{opt}");
+        }
+    }
+}
+
 /// Operator fusion: two adjacent same-range elementwise loops (a linear map then ReLU) must fuse
 /// into one loop. Since fusion concatenates the exact statements, the two-loop form lowers to the
 /// *same* MIR as the hand-written single loop — an exact structural check — and stays correct.

@@ -364,6 +364,7 @@ fn bin_name(op: BinOp) -> &'static str {
         FSub => "fsub",
         FMul => "fmul",
         FDiv => "fdiv",
+        FRem => "frem",
         And => "and",
         Or => "or",
         Xor => "xor",

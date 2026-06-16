@@ -1772,7 +1772,9 @@ fn arith_binop(op: ast::BinOp, float: bool, signed: bool) -> BinOp {
             }
         }
         A::Rem => {
-            if signed {
+            if float {
+                BinOp::FRem
+            } else if signed {
                 BinOp::SRem
             } else {
                 BinOp::URem
