@@ -58,6 +58,12 @@ developer time — this is the most important and most robust result.
 | dot    | ~1.0–1.06× (tie) | strict f32 reduction; nobody vectorizes |
 | relu   | ~1.0–1.3× slower | memory-bound; vectorized via if-conversion |
 | poly   | ~1.0–1.4× slower | compute-bound; was **5.9× slower** before vectorization |
+| fused linear→relu | ~1.0–1.1× faster | two source loops; Mercury **fuses** them, C/Rust two-pass |
+
+`fused linear→relu` writes a linear map to a scratch array then ReLUs it — two loops in every
+language. Mercury's compiler fuses them into one pass and keeps the intermediate in registers; the
+edge is modest here only because a 4 MiB intermediate still fits in L3 (the win grows when it spills
+to RAM). The point is the *automatic* fusion of naively-written ops.
 
 Mercury's vectorizer lifts straight-line elementwise loops to 128-bit SIMD and unrolls 4× so
 independent vector chains issue across the core's FP units (recovering AVX-class throughput from SSE
