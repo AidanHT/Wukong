@@ -751,6 +751,19 @@ mod tests {
         assert!(diags.iter().any(|d| d.code == Some("E0401")));
     }
 
+    #[test]
+    fn array_kernel_has_no_false_errors() {
+        // Array declaration, indexed store/load, casts, and a reduction must type-check cleanly.
+        let src = "fn main() -> i32 { \
+                   let mut xs: [i32; 4] = [0, 0, 0, 0]; \
+                   let mut i: i32 = 0; \
+                   while i < 4 { xs[i] = i * i; i = i + 1; } \
+                   let f: f32 = xs[2] as f32; let n: i32 = f as i32; \
+                   return xs[0] + n; }";
+        let (diags, _) = analyze(src);
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
     // ---- Shape checking (the headline feature) ----
 
     const MATMUL: &str = "fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], \
