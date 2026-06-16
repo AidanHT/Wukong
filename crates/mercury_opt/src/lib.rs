@@ -242,9 +242,9 @@ mod tests {
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, _) = mercury_sema::check(&module, &interner);
         let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &interner);
-        let before: usize = program.funcs.iter().map(|f| count_insts(f)).sum();
+        let before: usize = program.funcs.iter().map(count_insts).sum();
         optimize(&mut program, 2);
-        let after: usize = program.funcs.iter().map(|f| count_insts(f)).sum();
+        let after: usize = program.funcs.iter().map(count_insts).sum();
         assert!(
             after < before,
             "expected fewer insts after opt ({before} -> {after})"

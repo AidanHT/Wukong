@@ -75,9 +75,9 @@ fn emit_function(out: &mut String, f: &Function, interner: &Interner) {
         .iter()
         .map(|p| format!("{} %v{}", llvm_ty(f.value_type(*p)), p.0))
         .collect();
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "define {} @{}({}) {{\n",
+        "define {} @{}({}) {{",
         llvm_ty(&f.ret),
         interner.resolve(f.name),
         params.join(", ")
@@ -113,7 +113,7 @@ impl Emitter<'_> {
     }
 
     fn emit_block(&self, out: &mut String, b: &BasicBlock) {
-        let _ = write!(out, "bb{}:\n", b.id.0);
+        let _ = writeln!(out, "bb{}:", b.id.0);
         for inst in &b.insts {
             // Constants are inlined as operands; they emit no instruction.
             if matches!(inst.op, Op::ConstInt(..) | Op::ConstFloat(..)) {

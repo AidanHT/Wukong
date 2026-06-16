@@ -94,6 +94,6 @@ mod tests {
     fn parallel_for_sequential_reduction() {
         let mut sum = 0i64;
         parallel_for(0, 10, 2, |i| sum += i);
-        assert_eq!(sum, 0 + 2 + 4 + 6 + 8);
+        assert_eq!(sum, 2 + 4 + 6 + 8);
     }
 }
