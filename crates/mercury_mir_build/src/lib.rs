@@ -746,7 +746,7 @@ impl FnLowerer<'_> {
             return None;
         }
         let (_, sty) = self.lookup(s)?;
-        if !sty.is_float() {
+        if !(sty.is_float() || sty.is_int()) {
             return None;
         }
         // The addend: `s += addend`, or `s = s + addend` / `s = addend + s`.
@@ -777,7 +777,9 @@ impl FnLowerer<'_> {
             return None;
         }
         let lane = lane?;
-        if !lane.is_float() {
+        // Require the lane type to match the accumulator exactly, so the horizontal reduce
+        // (`s = s + lane`) is well-typed — bails on a mixed-width reduction (e.g. `f64 += f32`).
+        if lane != sty {
             return None;
         }
         let w = vector_width(&lane)?;
@@ -1149,13 +1151,17 @@ impl FnLowerer<'_> {
         self.emit_reduction_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend);
         self.emit_reduction_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, 1, &accs[..1], addend);
 
-        // Combine the accumulators, then horizontally reduce the lanes into `s`.
+        // Combine the accumulators, then horizontally reduce the lanes into `s`. Float reductions
+        // add with `FAdd`, integer ones with `Add`.
+        let add = if lane.is_float() {
+            BinOp::FAdd
+        } else {
+            BinOp::Add
+        };
         let mut total = self.builder.build(vty.clone(), Op::Load(accs[0], vty.clone()));
         for &a in &accs[1..] {
             let v = self.builder.build(vty.clone(), Op::Load(a, vty.clone()));
-            total = self
-                .builder
-                .build(vty.clone(), Op::Bin(BinOp::FAdd, total, v));
+            total = self.builder.build(vty.clone(), Op::Bin(add, total, v));
         }
         let scratch = self
             .builder
@@ -1179,9 +1185,7 @@ impl FnLowerer<'_> {
             );
             let lane_v = self.builder.build(lane.clone(), Op::Load(addr, lane.clone()));
             let sv = self.builder.build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
-            let sum = self
-                .builder
-                .build(s_ty.clone(), Op::Bin(BinOp::FAdd, sv, lane_v));
+            let sum = self.builder.build(s_ty.clone(), Op::Bin(add, sv, lane_v));
             self.builder.build_void(Op::Store {
                 ptr: s_slot,
                 value: sum,
@@ -1306,7 +1310,9 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
-    /// Fold `addend` into vector accumulator `acc`, fusing `acc + a*b` into one `Fma`.
+    /// Fold `addend` into vector accumulator `acc`. For a float reduction, `acc + a*b` fuses into one
+    /// `Fma`; integer reductions use a plain vector `Add` (no integer FMA, and reassociation is
+    /// exact so it needs none).
     #[allow(clippy::too_many_arguments)]
     fn vec_accumulate(
         &mut self,
@@ -1318,36 +1324,50 @@ impl FnLowerer<'_> {
         w: u32,
         vlocals: &mut HashMap<Symbol, ValueId>,
     ) -> ValueId {
-        if let ExprKind::Binary {
-            op: ast::BinOp::Mul,
-            lhs,
-            rhs,
-        } = &addend.kind
-        {
-            let a = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
-            let b = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
-            return self.builder.build(vty.clone(), Op::Fma(a, b, acc));
+        if lane.is_float() {
+            if let ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } = &addend.kind
+            {
+                let a = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
+                let b = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
+                return self.builder.build(vty.clone(), Op::Fma(a, b, acc));
+            }
         }
         let vx = self.vec_lower_value(addend, j, lane, vty, w, vlocals);
-        self.builder.build(vty.clone(), Op::Bin(BinOp::FAdd, acc, vx))
+        let add = if lane.is_float() {
+            BinOp::FAdd
+        } else {
+            BinOp::Add
+        };
+        self.builder.build(vty.clone(), Op::Bin(add, acc, vx))
     }
 
-    /// Scalar `acc + addend`, fusing `acc + a*b` into one `Fma`, with operands coerced to `ty`.
+    /// Scalar `acc + addend`, fusing `acc + a*b` into one `Fma` for floats; plain `Add` for ints.
     fn scalar_accumulate(&mut self, acc: ValueId, addend: &Expr, ty: &MirType) -> ValueId {
-        if let ExprKind::Binary {
-            op: ast::BinOp::Mul,
-            lhs,
-            rhs,
-        } = &addend.kind
-        {
-            let a = self.lower_fma_operand(lhs, ty);
-            let b = self.lower_fma_operand(rhs, ty);
-            return self.builder.build(ty.clone(), Op::Fma(a, b, acc));
+        if ty.is_float() {
+            if let ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } = &addend.kind
+            {
+                let a = self.lower_fma_operand(lhs, ty);
+                let b = self.lower_fma_operand(rhs, ty);
+                return self.builder.build(ty.clone(), Op::Fma(a, b, acc));
+            }
         }
         let v = self.lower_expr(addend);
         let vty = self.expr_mir(addend);
         let v = self.coerce_to(v, &vty, ty, true);
-        self.builder.build(ty.clone(), Op::Bin(BinOp::FAdd, acc, v))
+        let add = if ty.is_float() {
+            BinOp::FAdd
+        } else {
+            BinOp::Add
+        };
+        self.builder.build(ty.clone(), Op::Bin(add, acc, v))
     }
 
     /// Lower one statement of a vector-loop body. Mirrors the validated shapes in `vectorizable`.

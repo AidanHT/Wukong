@@ -276,6 +276,46 @@ fn vectorized_reductions_are_correct() {
     }
 }
 
+/// Integer reductions vectorize too, and (unlike float) integer addition is associative, so the
+/// lane-parallel form is bit-identical to the strict scalar one — no reassociation caveat at all.
+#[test]
+fn vectorized_int_reduction() {
+    // sum of a[k]=k+1 over 0..n = n(n+1)/2; int dot of a[k]=k+1, b[k]=2 = 2*sum = n(n+1).
+    let isum = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut a: [i32; {n}] = [0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ a[i] = i + 1; i += 1; }} \
+             let mut s: i32 = 0; for k in 0..{n} {{ s += a[k]; }} \
+             return s; }}"
+        )
+    };
+    let idot = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ let mut a: [i32; {n}] = [0; {n}]; let mut b: [i32; {n}] = [2; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ a[i] = i + 1; i += 1; }} \
+             let mut s: i32 = 0; for k in 0..{n} {{ s = s + a[k] * b[k]; }} \
+             return s; }}"
+        )
+    };
+    let (prog, interner) = lowered(&isum(64), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("x i32>") && mir.contains("add"),
+        "int sum reduction should vectorize to a vector add:\n{mir}"
+    );
+    for n in [1usize, 4, 7, 8, 16, 31, 64, 200] {
+        let nn = n as i64;
+        for (src, expect) in [(isum(n), nn * (nn + 1) / 2), (idot(n), nn * (nn + 1))] {
+            for opt in [0u8, 2, 3] {
+                let native = jit(&src, opt).expect("jit");
+                let interpd = interp(&src, opt).expect("interp");
+                assert_eq!(native, interpd, "int reduction native vs interp n={n} -O{opt}");
+                assert_eq!(native.0, expect, "int reduction wrong n={n} -O{opt}");
+            }
+        }
+    }
+}
+
 /// The reduction vectorizer generalizes past dot: any vectorizable addend works. A sum of squared
 /// differences `s += (x[k]-y[k])*(x[k]-y[k])` (the core of an L2 loss) must vectorize to a vector
 /// fma over the squared term and stay correct + differentially equal.
