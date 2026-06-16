@@ -702,17 +702,86 @@ impl FnLowerer<'_> {
         if !ity.is_int() {
             return false;
         }
-        if self.vectorizable(body, j).is_none() {
+        // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
+        // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
+        // only on this (sequential) path — not the `@parallel` per-thread path, where folding into
+        // a shared accumulator across threads would race.
+        let reduction = self.reduction_of(body, j);
+        if reduction.is_none() && self.vectorizable(body, j).is_none() {
             return false;
         }
-        // Lower the bounds (coerced to the index type) and hand off to the shared emitter.
+        // Lower the bounds (coerced to the index type) and hand off to the matching emitter.
         let start_ty = self.expr_mir(start);
         let s0 = self.lower_expr(start);
         let s0 = self.coerce_to(s0, &start_ty, &ity, true);
         let end_ty = self.expr_mir(end);
         let e0 = self.lower_expr(end);
         let e0 = self.coerce_to(e0, &end_ty, &ity, true);
-        self.try_vectorize_ranged(j, s0, e0, &ity, body)
+        if let Some((s_sym, addend, lane, w)) = reduction {
+            self.emit_reduction(j, s0, e0, &ity, s_sym, addend, &lane, w);
+            true
+        } else {
+            self.try_vectorize_ranged(j, s0, e0, &ity, body)
+        }
+    }
+
+    /// Recognise a vectorizable float reduction `for j in .. { s = s + <expr(j)> }` (or `s += ..`),
+    /// where `s` is an outer float scalar that the body otherwise does not touch and `<expr>` is an
+    /// elementwise value over `j` that does not read `s`. Returns `(s, addend, lane, width)`.
+    /// Vectorizing this reassociates the float sum (lane accumulators + a horizontal reduce) — the
+    /// standard reduction optimization. Pure analysis; emits no MIR.
+    fn reduction_of<'b>(
+        &self,
+        body: &'b Block,
+        j: Symbol,
+    ) -> Option<(Symbol, &'b Expr, MirType, u32)> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign { target, op, value } = &body.stmts[0].kind else {
+            return None;
+        };
+        let s = single_path(target)?;
+        if s == j {
+            return None;
+        }
+        let (_, sty) = self.lookup(s)?;
+        if !sty.is_float() {
+            return None;
+        }
+        // The addend: `s += addend`, or `s = s + addend` / `s = addend + s`.
+        let is_s = |e: &Expr| single_path(e) == Some(s);
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if is_s(lhs) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if is_s(rhs) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if expr_uses_sym(addend, s) {
+            return None;
+        }
+        let mut lane: Option<MirType> = None;
+        let mut acc: Vec<(Symbol, &Expr, bool, bool)> = Vec::new();
+        if !self.vec_check_value(addend, j, &HashSet::new(), &mut lane, &mut acc) {
+            return None;
+        }
+        let lane = lane?;
+        if !lane.is_float() {
+            return None;
+        }
+        let w = vector_width(&lane)?;
+        Some((s, addend, lane, w))
     }
 
     /// Attempt SIMD lowering of a loop whose bounds are already lowered to `ity` values (the form
@@ -1033,6 +1102,252 @@ impl FnLowerer<'_> {
         }
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    /// Emit a vectorized float reduction over `[s0, end)`: `VEC_UNROLL` independent vector-lane
+    /// accumulators summed in an unrolled main loop, a single-vector cleanup loop, then a horizontal
+    /// reduce of the lanes into `s`, then a scalar remainder. This reassociates the sum (vs strict
+    /// left-to-right), which is sound for a reduction and is what makes it fast — `w` lanes × unroll
+    /// independent FMA chains instead of one serial dependency.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_reduction(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        s_sym: Symbol,
+        addend: &Expr,
+        lane: &MirType,
+        w: u32,
+    ) {
+        let vty = MirType::Vec(Box::new(lane.clone()), w);
+        let slot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store { ptr: slot, value: s0 });
+        let jtmp = self.builder.alloca(ity.clone());
+
+        // `VEC_UNROLL` accumulators, each `w` contiguous lanes (an `Array` slot so the vector
+        // store/load address `w` real elements), initialised to a zero vector before the loop.
+        let zero = self.const_zero(lane.clone());
+        let vzero = self.builder.build(vty.clone(), Op::Splat(zero));
+        let accs: Vec<ValueId> = (0..VEC_UNROLL)
+            .map(|_| {
+                let a = self
+                    .builder
+                    .alloca(MirType::Array(Box::new(lane.clone()), w));
+                self.builder.build_void(Op::Store {
+                    ptr: a,
+                    value: vzero,
+                });
+                a
+            })
+            .collect();
+
+        self.push_scope();
+        self.bind(j, slot, ity.clone());
+
+        self.emit_reduction_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend);
+        self.emit_reduction_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, 1, &accs[..1], addend);
+
+        // Combine the accumulators, then horizontally reduce the lanes into `s`.
+        let mut total = self.builder.build(vty.clone(), Op::Load(accs[0], vty.clone()));
+        for &a in &accs[1..] {
+            let v = self.builder.build(vty.clone(), Op::Load(a, vty.clone()));
+            total = self
+                .builder
+                .build(vty.clone(), Op::Bin(BinOp::FAdd, total, v));
+        }
+        let scratch = self
+            .builder
+            .alloca(MirType::Array(Box::new(lane.clone()), w));
+        self.builder.build_void(Op::Store {
+            ptr: scratch,
+            value: total,
+        });
+        let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
+        for k in 0..w {
+            let idxk = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let addr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: scratch,
+                    index: idxk,
+                    elem: lane.clone(),
+                },
+            );
+            let lane_v = self.builder.build(lane.clone(), Op::Load(addr, lane.clone()));
+            let sv = self.builder.build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
+            let sum = self
+                .builder
+                .build(s_ty.clone(), Op::Bin(BinOp::FAdd, sv, lane_v));
+            self.builder.build_void(Op::Store {
+                ptr: s_slot,
+                value: sum,
+            });
+        }
+
+        self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend);
+        self.pop_scope();
+    }
+
+    /// One strip of the reduction main loop: while a full `unroll*W` block fits, fold `unroll`
+    /// independent vector groups into `accs[0..unroll]` (separate accumulators so their FMA chains
+    /// overlap), then advance `j` by `unroll*W`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_reduction_strip(
+        &mut self,
+        j: Symbol,
+        slot: ValueId,
+        jtmp: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        unroll: u32,
+        accs: &[ValueId],
+        addend: &Expr,
+    ) {
+        let span = (unroll * w) as i128;
+        let off = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
+        let vlimit = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
+
+        let hdr = self.builder.new_block();
+        let bb = self.builder.new_block();
+        let done = self.builder.new_block();
+        self.builder.br(hdr, vec![]);
+
+        self.builder.switch_to(hdr);
+        self.terminated = false;
+        self.bind(j, slot, ity.clone());
+        let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let c = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
+        self.builder.cond_br(c, bb, vec![], done, vec![]);
+
+        self.builder.switch_to(bb);
+        self.terminated = false;
+        let jbase = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        for u in 0..unroll {
+            let ju = if u == 0 {
+                jbase
+            } else {
+                let o = self
+                    .builder
+                    .build(ity.clone(), Op::ConstInt((u * w) as i128, ity.clone()));
+                self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jbase, o))
+            };
+            self.builder.build_void(Op::Store { ptr: jtmp, value: ju });
+            self.bind(j, jtmp, ity.clone());
+            let acc_slot = accs[u as usize];
+            let cur = self.builder.build(vty.clone(), Op::Load(acc_slot, vty.clone()));
+            let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+            let nv = self.vec_accumulate(cur, addend, j, lane, vty, w, &mut vlocals);
+            self.builder.build_void(Op::Store {
+                ptr: acc_slot,
+                value: nv,
+            });
+        }
+        self.bind(j, slot, ity.clone());
+        let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let stepc = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(span, ity.clone()));
+        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, stepc));
+        self.builder.build_void(Op::Store { ptr: slot, value: jn });
+        self.builder.br(hdr, vec![]);
+
+        self.builder.switch_to(done);
+        self.terminated = false;
+    }
+
+    /// The reduction's scalar remainder: `while j < end { s = s + addend; j += 1; }`.
+    fn emit_reduction_tail(
+        &mut self,
+        j: Symbol,
+        slot: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        s_sym: Symbol,
+        addend: &Expr,
+    ) {
+        self.bind(j, slot, ity.clone());
+        let hdr = self.builder.new_block();
+        let bb = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(hdr, vec![]);
+
+        self.builder.switch_to(hdr);
+        self.terminated = false;
+        let jr = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let rc = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
+        self.builder.cond_br(rc, bb, vec![], exit, vec![]);
+
+        self.builder.switch_to(bb);
+        self.terminated = false;
+        self.bind(j, slot, ity.clone());
+        let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
+        let sv = self.builder.build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
+        let sum = self.scalar_accumulate(sv, addend, &s_ty);
+        self.builder.build_void(Op::Store {
+            ptr: s_slot,
+            value: sum,
+        });
+        let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
+        self.builder.build_void(Op::Store { ptr: slot, value: jn });
+        self.builder.br(hdr, vec![]);
+
+        self.builder.switch_to(exit);
+        self.terminated = false;
+    }
+
+    /// Fold `addend` into vector accumulator `acc`, fusing `acc + a*b` into one `Fma`.
+    #[allow(clippy::too_many_arguments)]
+    fn vec_accumulate(
+        &mut self,
+        acc: ValueId,
+        addend: &Expr,
+        j: Symbol,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        vlocals: &mut HashMap<Symbol, ValueId>,
+    ) -> ValueId {
+        if let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &addend.kind
+        {
+            let a = self.vec_lower_value(lhs, j, lane, vty, w, vlocals);
+            let b = self.vec_lower_value(rhs, j, lane, vty, w, vlocals);
+            return self.builder.build(vty.clone(), Op::Fma(a, b, acc));
+        }
+        let vx = self.vec_lower_value(addend, j, lane, vty, w, vlocals);
+        self.builder.build(vty.clone(), Op::Bin(BinOp::FAdd, acc, vx))
+    }
+
+    /// Scalar `acc + addend`, fusing `acc + a*b` into one `Fma`, with operands coerced to `ty`.
+    fn scalar_accumulate(&mut self, acc: ValueId, addend: &Expr, ty: &MirType) -> ValueId {
+        if let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &addend.kind
+        {
+            let a = self.lower_fma_operand(lhs, ty);
+            let b = self.lower_fma_operand(rhs, ty);
+            return self.builder.build(ty.clone(), Op::Fma(a, b, acc));
+        }
+        let v = self.lower_expr(addend);
+        let vty = self.expr_mir(addend);
+        let v = self.coerce_to(v, &vty, ty, true);
+        self.builder.build(ty.clone(), Op::Bin(BinOp::FAdd, acc, v))
     }
 
     /// Lower one statement of a vector-loop body. Mirrors the validated shapes in `vectorizable`.
