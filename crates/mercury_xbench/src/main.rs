@@ -106,6 +106,137 @@ fn main() {
         );
         println!("  compile:  Mercury is {g_ct:.1}x faster to compile than C");
     }
+
+    println!();
+    bench_matmul(&cc, &dir);
+}
+
+/// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
+/// regime where a tensor compiler should genuinely beat idiomatic scalar-source code. We benchmark
+/// an `ikj`-ordered C = A·B (the cache-friendly idiom that auto-vectorizes well) written the same
+/// way in each language, and additionally Mercury's `@parallel` form. Reported as GFLOP/s.
+fn bench_matmul(cc: &str, dir: &Path) {
+    const NS: usize = 512; // 512x512x512: ~268 MFLOP/call, fits the L2/L3 hierarchy
+    let n2 = NS * NS;
+    let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+    let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
+    let mut c = vec![0.0f32; n2];
+    let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+    let flops = 2.0 * (NS as f64).powi(3);
+
+    println!("=== matmul {NS}x{NS} (C=A·B, ikj order; GFLOP/s, higher is better) ===");
+    let gflops = |m: &Option<Measure>| {
+        m.as_ref()
+            .map(|x| format!("{:.1}", flops / x.ns_per_call))
+            .unwrap_or_else(|| "n/a".into())
+    };
+
+    let mer = bench_mercury(&mer_matmul(NS, false), &mut c, ap, bp, cp);
+    let mer_par = bench_mercury(&mer_matmul(NS, true), &mut c, ap, bp, cp);
+    let cm = bench_external(
+        "c",
+        &c_matmul(NS),
+        dir,
+        "matmul",
+        cc,
+        &["-O3", "-march=native", "-ffp-contract=off", "-shared"],
+        &mut c,
+        ap,
+        bp,
+        cp,
+    );
+    let rm = bench_external(
+        "rs",
+        &rust_matmul(NS),
+        dir,
+        "matmul",
+        "rustc",
+        &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &mut c,
+        ap,
+        bp,
+        cp,
+    );
+
+    println!(
+        "  {:<18} {:>12} {:>12} {:>12} {:>12}",
+        "", "Mer(1core)", "Mer(parallel)", "C (gcc)", "Rust"
+    );
+    println!(
+        "  {:<18} {:>12} {:>12} {:>12} {:>12}",
+        "GFLOP/s",
+        gflops(&mer),
+        gflops(&mer_par),
+        gflops(&cm),
+        gflops(&rm)
+    );
+    // Cross-language correctness: every backend must compute the same C[0,0] (within f32 tol).
+    if let (Some(m), Some(c)) = (&mer_par, &cm) {
+        let rel = (m.checksum - c.checksum).abs() / c.checksum.abs().max(1e-6);
+        if rel > 1e-3 {
+            println!("  ! checksum mismatch Mercury={} C={}", m.checksum, c.checksum);
+        }
+    }
+    if let (Some(mp), Some(c)) = (&mer_par, &cm) {
+        let r = flops / mp.ns_per_call / (flops / c.ns_per_call);
+        println!(
+            "  -> Mercury @parallel is {:.2}x {} than idiomatic single-threaded C",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    if let (Some(ms), Some(c)) = (&mer, &cm) {
+        let r = flops / ms.ns_per_call / (flops / c.ns_per_call);
+        println!(
+            "  -> Mercury single-core (SIMD) is {:.2}x {} than C single-threaded",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+}
+
+/// `ikj`-ordered matmul, optionally `@parallel` (parallelizes the outer `i` loop across cores).
+fn mer_matmul(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j0 in 0..{ns} {{ c[i * {ns} + j0] = 0.0; }}\n\
+         \x20       for k in 0..{ns} {{\n\
+         \x20           let aik: f32 = a[i * {ns} + k];\n\
+         \x20           for j in 0..{ns} {{\n\
+         \x20               c[i * {ns} + j] = c[i * {ns} + j] + aik * b[k * {ns} + j];\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_matmul(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         \x20 for (long i=0;i<NS;i++){{\n\
+         \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
+         \x20   for (long k=0;k<NS;k++){{\n\
+         \x20     float aik=a[i*NS+k];\n\
+         \x20     for (long j=0;j<NS;j++) c[i*NS+j]+=aik*b[k*NS+j];\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
+    )
+}
+
+fn rust_matmul(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{ *c.add(i*NS+j)=0.0; }}\n\
+         \x20   for k in 0..NS {{\n\
+         \x20     let aik=*a.add(i*NS+k);\n\
+         \x20     for j in 0..NS {{ *c.add(i*NS+j)+=aik* *b.add(k*NS+j); }}\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
+    )
 }
 
 fn report(k: &Kernel, m: &Option<Measure>, c: &Option<Measure>, r: &Option<Measure>) {
@@ -254,12 +385,14 @@ fn bench_external(
     }
 }
 
-/// Best-of-many-batches timing: warm up, grow the batch until ~30 ms, then take the fastest batch.
+/// Best-of-many-batches timing: warm up, grow the batch until ~50 ms, then take the fastest of many
+/// batches. On a busy multicore box the *minimum* batch is the least-interfered estimate (the run
+/// that suffered the least scheduler/thermal noise), so more samples tighten the result.
 fn time_ns(mut run: impl FnMut()) -> f64 {
     for _ in 0..5 {
         run();
     }
-    let target = Duration::from_millis(30);
+    let target = Duration::from_millis(50);
     let mut reps = 1u64;
     loop {
         let t = Instant::now();
@@ -269,7 +402,7 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
         let e = t.elapsed();
         if e >= target || reps >= (1 << 26) {
             let mut best = e;
-            for _ in 0..6 {
+            for _ in 0..14 {
                 let t = Instant::now();
                 for _ in 0..reps {
                     run();
