@@ -235,6 +235,29 @@ mod tests {
     }
 
     #[test]
+    fn algebraic_identities_preserve_results() {
+        // x^x == 0, x|x == x, x&x == x, x%1 == 0, and a self-comparison.
+        let cases = [
+            ("fn main() -> i32 { let x: i32 = 9; return x ^ x; }", 0),
+            ("fn main() -> i32 { let x: i32 = 9; return x | x; }", 9),
+            ("fn main() -> i32 { let x: i32 = 9; return x & x; }", 9),
+            ("fn main() -> i32 { let x: i32 = 9; return x % 1; }", 0),
+            (
+                "fn main() -> i32 { let x: i32 = 9; if x <= x { return 1; } return 0; }",
+                1,
+            ),
+            (
+                "fn main() -> i32 { let x: i32 = 9; if x < x { return 1; } return 0; }",
+                0,
+            ),
+        ];
+        for (src, expect) in cases {
+            assert_eq!(run_main_opt(src, 0), expect as i64, "O0: {src}");
+            assert_eq!(run_main_opt(src, 2), expect as i64, "O2: {src}");
+        }
+    }
+
+    #[test]
     fn folds_and_dces_constants() {
         // main computes (2*3 + 4) entirely from constants; after -O2 the body should be tiny.
         let src = "fn main() -> i32 { let x: i32 = 2 * 3 + 4; return x; }";

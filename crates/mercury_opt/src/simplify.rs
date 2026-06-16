@@ -84,6 +84,14 @@ impl Pass for Simplify {
                             set_const(f, bi, ii, CV::Int(val), &MirType::I1);
                             consts.insert(res.0, CV::Int(val));
                             changed = true;
+                        } else if l == r {
+                            // Integer self-comparison is constant. Float self-comparison is NOT
+                            // (NaN != NaN), so only fold the integer predicates.
+                            if let Some(val) = fold_cmp_self(c) {
+                                set_const(f, bi, ii, CV::Int(val), &MirType::I1);
+                                consts.insert(res.0, CV::Int(val));
+                                changed = true;
+                            }
                         }
                     }
                     Op::Neg(v) => {
@@ -233,6 +241,18 @@ fn fold_cmp(c: CmpOp, a: CV, b: CV) -> i128 {
     res as i128
 }
 
+/// Fold `x <cmp> x` for integer predicates (reflexive comparisons). Returns `None` for the
+/// float predicates, where `x == x` is false when `x` is NaN.
+fn fold_cmp_self(c: CmpOp) -> Option<i128> {
+    use CmpOp::*;
+    Some(match c {
+        Eq | Sle | Sge | Ule | Uge => 1,
+        Ne | Slt | Sgt | Ult | Ugt => 0,
+        // Float predicates: not safe to fold on a possibly-NaN value.
+        Foeq | Fone | Folt | Fole | Fogt | Foge => return None,
+    })
+}
+
 fn algebra(b: BinOp, l: ValueId, lc: Option<CV>, r: ValueId, rc: Option<CV>) -> Option<Alg> {
     use BinOp::*;
     let is0 = |c: Option<CV>| matches!(c, Some(CV::Int(0)));
@@ -274,11 +294,34 @@ fn algebra(b: BinOp, l: ValueId, lc: Option<CV>, r: ValueId, rc: Option<CV>) -> 
                 return None;
             }
         }
-        Or | Xor => {
+        SRem | URem => {
+            // x % 1 == 0 for any x.
+            if is1(rc) {
+                Alg::Const(CV::Int(0))
+            } else {
+                return None;
+            }
+        }
+        Or => {
             if is0(rc) {
                 Alg::Replace(l)
             } else if is0(lc) {
                 Alg::Replace(r)
+            } else if l == r {
+                // x | x == x
+                Alg::Replace(l)
+            } else {
+                return None;
+            }
+        }
+        Xor => {
+            if is0(rc) {
+                Alg::Replace(l)
+            } else if is0(lc) {
+                Alg::Replace(r)
+            } else if l == r {
+                // x ^ x == 0
+                Alg::Const(CV::Int(0))
             } else {
                 return None;
             }
@@ -286,6 +329,9 @@ fn algebra(b: BinOp, l: ValueId, lc: Option<CV>, r: ValueId, rc: Option<CV>) -> 
         And => {
             if is0(rc) || is0(lc) {
                 Alg::Const(CV::Int(0))
+            } else if l == r {
+                // x & x == x
+                Alg::Replace(l)
             } else {
                 return None;
             }
