@@ -21,6 +21,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
   on the native backend. saxpy/poly/relu/relu6/matmul-inner vectorize.
+- **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
+  `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
+  two backends stay bit-identical.
+- **Reduction vectorization**: a float reduction `s = s + x[k]*y[k]` / `s += ..` lowers to
+  vector-lane accumulators (independent FMA chains) + a horizontal reduce + scalar remainder, turning
+  the latency-bound serial sum into a throughput-bound one. `dot` runs ~2.6× faster than serial C.
 - **Operator fusion**: adjacent same-range elementwise loops (e.g. a linear map then ReLU) fuse into
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
   registers rather than memory.
@@ -48,7 +54,6 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - Cache tiling for matmul/GEMM, and fusing chains *under* `@parallel` (fusion and `@parallel`
   compose only loosely today).
 - 256-bit AVX codegen (Cranelift is 128-bit only today; AVX throughput is approximated via unrolling).
-- Reduction vectorization (`dot` etc.) with horizontal reduce.
 - Execution of explicit `f32x8`-typed values; tensor-op lowering with fusion/tiling.
 - Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
 - GPU device codegen (PTX/AMDGPU), autodiff — designed-for, explicitly deferred.

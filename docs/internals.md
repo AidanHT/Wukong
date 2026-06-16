@@ -153,6 +153,16 @@ bails to scalar on any loop-carried dependence, non-unit stride, call, or mixed 
 `k` always computes exactly what scalar iteration `base+k` would. `@parallel` per-thread chunks go
 through the same vectorizer, so they run SIMD × cores.
 
+Two refinements target the dominant ML arithmetic. A float `x + y*z` **contracts to a fused
+multiply-add** (`Op::Fma`, one rounding, a hardware `vfmadd`) in both the scalar and vector lowering
+paths; the interpreter mirrors it with `mul_add`, so the two backends stay bit-identical. And a
+**float reduction** `for k in .. { s = s + x[k]*y[k] }` (or `s += ..`) is recognised and lowered to
+`VEC_UNROLL` independent vector-lane accumulators (each an FMA chain), a single-vector cleanup loop,
+a horizontal reduce of the lanes into `s`, and a scalar remainder. This reassociates the sum (the
+standard reduction optimization) — sound because both backends execute the same reassociated MIR, so
+the differential oracle still holds bit-for-bit. Reductions vectorize only on the sequential path,
+never the `@parallel` one (folding into a shared accumulator across threads would race).
+
 ## Testing strategy
 
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
