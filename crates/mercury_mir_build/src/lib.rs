@@ -32,9 +32,22 @@ pub fn lower_program(
 ) -> (Program, Vec<Diagnostic>) {
     let mut diags = Vec::new();
     let mut program = Program::new();
+    // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
+    let sgemm = interner.intern("mercury_sgemm");
+    let sgemm_par = interner.intern("mercury_sgemm_parallel");
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
+                // Whole-function matmul: lower the entire nest to a single (optionally parallel)
+                // `mercury_sgemm` call — the tuned 256-bit AVX2/FMA microkernel.
+                if let Some(nest) = matmul_fn(body, sema, interner) {
+                    let parallel = has_parallel_attr(item, interner);
+                    let func = lower_matmul_fn(
+                        f, &nest, parallel, sema, interner, sgemm, sgemm_par, &mut diags,
+                    );
+                    program.funcs.push(func);
+                    continue;
+                }
                 // `@parallel` on a function whose whole body is `for i in 0..n { … }` over array
                 // (pointer) parameters is lowered to a multi-threaded runtime dispatch: the loop
                 // body becomes a separate ranged function, and the original becomes a thin wrapper
@@ -45,14 +58,15 @@ pub fn lower_program(
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("mercury_parallel_for");
                         let (outlined, wrapper) = lower_parallel(
-                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, &mut diags,
+                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, sgemm,
+                            sgemm_par, &mut diags,
                         );
                         program.funcs.push(outlined);
                         program.funcs.push(wrapper);
                         continue;
                     }
                 }
-                let func = lower_fn(f, body, sema, interner, &mut diags);
+                let func = lower_fn(f, body, sema, interner, sgemm, sgemm_par, &mut diags);
                 program.funcs.push(func);
             }
         }
@@ -122,11 +136,14 @@ fn parallel_spec<'a>(
     Some((*name, end, lb))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_fn(
     f: &FnDecl,
     body: &Block,
     sema: &SemaResult,
     interner: &Interner,
+    sgemm: Symbol,
+    sgemm_par: Symbol,
     diags: &mut Vec<Diagnostic>,
 ) -> Function {
     // Recover the resolved signature for parameter/return types.
@@ -144,6 +161,8 @@ fn lower_fn(
         scopes: vec![HashMap::new()],
         terminated: false,
         loops: Vec::new(),
+        sgemm,
+        sgemm_par,
     };
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
@@ -194,6 +213,8 @@ fn lower_parallel(
     loop_body: &Block,
     sema: &SemaResult,
     interner: &Interner,
+    sgemm: Symbol,
+    sgemm_par: Symbol,
     diags: &mut Vec<Diagnostic>,
 ) -> (Function, Function) {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -216,6 +237,8 @@ fn lower_parallel(
             scopes: vec![HashMap::new()],
             terminated: false,
             loops: Vec::new(),
+            sgemm,
+            sgemm_par,
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -258,6 +281,8 @@ fn lower_parallel(
             scopes: vec![HashMap::new()],
             terminated: false,
             loops: Vec::new(),
+            sgemm,
+            sgemm_par,
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -315,6 +340,9 @@ struct FnLowerer<'a> {
     terminated: bool,
     /// (continue target, break target) for the innermost loops.
     loops: Vec<(mercury_mir::BlockId, mercury_mir::BlockId)>,
+    /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
+    sgemm: Symbol,
+    sgemm_par: Symbol,
 }
 
 impl FnLowerer<'_> {
@@ -591,7 +619,38 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
+    /// Emit a call to the GEMM microkernel for a recognized nest. Returns `false` (and emits
+    /// nothing) if any operand array is not a pointer in scope, so the caller lowers it normally.
+    fn emit_sgemm(&mut self, nest: &MatmulNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.b),
+            self.lookup(nest.c),
+        ) else {
+            return false;
+        };
+        let m = self.builder.build(MirType::I64, Op::ConstInt(nest.m as i128, MirType::I64));
+        let k = self.builder.build(MirType::I64, Op::ConstInt(nest.k as i128, MirType::I64));
+        let n = self.builder.build(MirType::I64, Op::ConstInt(nest.n as i128, MirType::I64));
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        let func = if parallel { self.sgemm_par } else { self.sgemm };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, c, m, k, n, beta],
+        });
+        true
+    }
+
     fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
+        // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
+        // whole-function `@parallel` form is handled earlier in `lower_program`).
+        if let Some(nest) = match_matmul(pat, iter, body, self.sema, self.interner) {
+            if self.emit_sgemm(&nest, false) {
+                return;
+            }
+        }
         let (start, end, inclusive, step) = match iter {
             ForIter::Range {
                 start,
@@ -2371,6 +2430,339 @@ fn set_or_check(slot: &mut Option<MirType>, t: &MirType) -> Option<()> {
             Some(())
         }
     }
+}
+
+// --- matmul recognition ---------------------------------------------------------------------
+//
+// A naive matmul loop nest is the single most important ML kernel and the one a general C/Rust
+// compiler optimizes least (it vectorizes the inner loop but never register-blocks, cache-tiles, or
+// packs). Mercury recognizes the canonical f32 `ikj` nest and lowers the *whole nest* to a call into
+// the tuned `mercury_sgemm` microkernel (true 256-bit AVX2/FMA) — exactly how XLA/TVM/oneDNN lower a
+// matmul op. The interpreter runs the identical kernel via marshalling, so the two stay bit-exact.
+
+/// A recognized GEMM nest computing `C[m,n] = A[m,k]·B[k,n]` (row-major, contiguous, f32).
+struct MatmulNest {
+    a: Symbol,
+    b: Symbol,
+    c: Symbol,
+    m: i64,
+    k: i64,
+    n: i64,
+    /// 0 = overwrite C (a zero-init loop was present), 1 = accumulate into C.
+    beta: i64,
+}
+
+/// A non-negative integer literal.
+fn as_int_lit(e: &Expr, interner: &Interner) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Int(s) => i64::try_from(parse_int(interner.resolve(*s))).ok(),
+        _ => None,
+    }
+}
+
+/// `row * stride` or `stride * row` with a single-path `row` and a literal `stride`.
+fn as_mul_stride(e: &Expr, interner: &Interner) -> Option<(Symbol, i64)> {
+    let ExprKind::Binary { op: ast::BinOp::Mul, lhs, rhs } = &e.kind else {
+        return None;
+    };
+    if let (Some(r), Some(s)) = (single_path(lhs), as_int_lit(rhs, interner)) {
+        return Some((r, s));
+    }
+    if let (Some(s), Some(r)) = (as_int_lit(lhs, interner), single_path(rhs)) {
+        return Some((r, s));
+    }
+    None
+}
+
+/// A flattened 2-D index `row * stride + col` (either addend order). Returns `(row, stride, col)`.
+fn match_row_col(idx: &Expr, interner: &Interner) -> Option<(Symbol, i64, Symbol)> {
+    let ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs } = &idx.kind else {
+        return None;
+    };
+    if let (Some((row, stride)), Some(col)) = (as_mul_stride(lhs, interner), single_path(rhs)) {
+        return Some((row, stride, col));
+    }
+    if let (Some(col), Some((row, stride))) = (single_path(lhs), as_mul_stride(rhs, interner)) {
+        return Some((row, stride, col));
+    }
+    None
+}
+
+/// `base[index]` with a single-segment `base` path and exactly one index. Returns `(base, index)`.
+fn as_index1(e: &Expr) -> Option<(Symbol, &Expr)> {
+    match &e.kind {
+        ExprKind::Index { base, indices } if indices.len() == 1 => {
+            Some((single_path(base)?, &indices[0]))
+        }
+        _ => None,
+    }
+}
+
+/// Is `e` the float literal `0.0` (any spelling)?
+fn is_float_zero(e: &Expr, interner: &Interner) -> bool {
+    matches!(&e.kind, ExprKind::Float(s) if parse_float(interner.resolve(*s)) == 0.0)
+}
+
+/// Is `e`'s sema type `f32`? (matmul lowering is f32-only — that's what `mercury_sgemm` computes.)
+fn is_f32_expr(e: &Expr, sema: &SemaResult) -> bool {
+    matches!(sema.types.get(&e.id), Some(t) if mir_ty(t) == MirType::F32)
+}
+
+/// `for col in 0..n { c[row*stride + col] = 0.0; }` — the per-row zero-init of a beta-0 matmul.
+/// Returns `(c, stride, n)` with the outer row variable `row`.
+fn match_zero_init(
+    s: &Stmt,
+    row: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, i64, i64)> {
+    let (pat, iter, body) = fusable_for(s)?;
+    let col = match &pat.kind {
+        ast::PatKind::Ident(c) => *c,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let n = as_int_lit(end, interner)?;
+    if body.stmts.len() != 1 || body.tail.is_some() {
+        return None;
+    }
+    let StmtKind::Assign { target, op: ast::AssignOp::Assign, value } = &body.stmts[0].kind else {
+        return None;
+    };
+    if !is_float_zero(value, interner) {
+        return None;
+    }
+    let (cbase, cidx) = as_index1(target)?;
+    let (r, stride, cc) = match_row_col(cidx, interner)?;
+    if r != row || cc != col {
+        return None;
+    }
+    Some((cbase, stride, n))
+}
+
+/// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
+fn match_matmul(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_int_lit(end, interner)?;
+    if body.tail.is_some() {
+        return None;
+    }
+
+    // Body is either [k-loop] (accumulate) or [zero-init, k-loop] (overwrite).
+    let (beta, czero, k_stmt) = match body.stmts.as_slice() {
+        [k] => (1i64, None, k),
+        [z, k] => (0i64, Some(z), k),
+        _ => return None,
+    };
+
+    // The K loop: `for k in 0..K { [let aik = a[row*sa + k];] for j in 0..N { … } }`.
+    let (kpat, kiter, kbody) = fusable_for(k_stmt)?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (kstart, kend) = range_bounds(kiter)?;
+    if as_int_lit(kstart, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_int_lit(kend, interner)?;
+
+    // Optional `let aik = a[row*sa + k];` binding, then the inner J loop.
+    let (aik, a_sym, sa, j_stmt) = match kbody.stmts.as_slice() {
+        [j] if kbody.tail.is_none() => (None, None, None, j),
+        [let_s, j] if kbody.tail.is_none() => {
+            let StmtKind::Let { pat: lp, init: Some(init), .. } = &let_s.kind else {
+                return None;
+            };
+            let aik_sym = match &lp.kind {
+                ast::PatKind::Ident(s) => *s,
+                _ => return None,
+            };
+            let (abase, aidx) = as_index1(init)?;
+            let (ar, asa, ak) = match_row_col(aidx, interner)?;
+            if ar != row || ak != kvar {
+                return None;
+            }
+            (Some(aik_sym), Some(abase), Some(asa), j)
+        }
+        _ => return None,
+    };
+
+    // Inner J loop: `for j in 0..N { c[row*sc + j] (=|+=) … a … * … b[k*sb + j] … }`.
+    let (jpat, jiter, jbody) = fusable_for(j_stmt)?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (jstart, jend) = range_bounds(jiter)?;
+    if as_int_lit(jstart, interner)? != 0 {
+        return None;
+    }
+    let n = as_int_lit(jend, interner)?;
+    if jbody.stmts.len() != 1 || jbody.tail.is_some() {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &jbody.stmts[0].kind else {
+        return None;
+    };
+    let (cbase, cidx) = as_index1(target)?;
+    let (cr, sc, cj) = match_row_col(cidx, interner)?;
+    if cr != row || cj != jvar {
+        return None;
+    }
+
+    // The product `a_term * b_term`, possibly read-add'd into c.
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            // value must be `c[row*sc + j] + (a*b)`.
+            let ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs } = &value.kind else {
+                return None;
+            };
+            let (clhs, clidx) = as_index1(lhs)?;
+            let (clr, clsc, clj) = match_row_col(clidx, interner)?;
+            if clhs != cbase || clr != row || clsc != sc || clj != jvar {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let ExprKind::Binary { op: ast::BinOp::Mul, lhs: f1, rhs: f2 } = &prod.kind else {
+        return None;
+    };
+
+    // Classify each factor as the A term or the B term.
+    let is_a = |f: &Expr| -> Option<(Symbol, i64)> {
+        if let (Some(aik), Some(asym), Some(sa)) = (aik, a_sym, sa) {
+            if single_path(f) == Some(aik) {
+                return Some((asym, sa));
+            }
+        }
+        let (abase, aidx) = as_index1(f)?;
+        let (ar, asa, ak) = match_row_col(aidx, interner)?;
+        if ar == row && ak == kvar {
+            Some((abase, asa))
+        } else {
+            None
+        }
+    };
+    let is_b = |f: &Expr| -> Option<(Symbol, i64)> {
+        let (bbase, bidx) = as_index1(f)?;
+        let (br, sb, bj) = match_row_col(bidx, interner)?;
+        if br == kvar && bj == jvar {
+            Some((bbase, sb))
+        } else {
+            None
+        }
+    };
+    let ((a_sym, sa), (b_sym, sb)) = match (is_a(f1), is_b(f2)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => match (is_a(f2), is_b(f1)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return None,
+        },
+    };
+
+    // Strides must describe contiguous row-major C[m,n], A[m,k], B[k,n].
+    if sa != kdim || sb != n || sc != n {
+        return None;
+    }
+    if beta == 0 {
+        let (cz, scz, nz) = match_zero_init(czero?, row, interner)?;
+        if cz != cbase || scz != n || nz != n {
+            return None;
+        }
+    }
+    if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    Some(MatmulNest { a: a_sym, b: b_sym, c: cbase, m, k: kdim, n, beta })
+}
+
+/// Recognize a function whose entire body is a matmul nest (`{ for i in 0..M { … } }`).
+fn matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<MatmulNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For { pat, iter, body: lb, .. } = &body.stmts[0].kind else {
+        return None;
+    };
+    match_matmul(pat, iter, lb, sema, interner)
+}
+
+/// Lower a recognized matmul function to a thin wrapper that binds its array params to base
+/// pointers and tail-calls `mercury_sgemm`/`mercury_sgemm_parallel`.
+#[allow(clippy::too_many_arguments)]
+fn lower_matmul_fn(
+    f: &FnDecl,
+    nest: &MatmulNest,
+    parallel: bool,
+    sema: &SemaResult,
+    interner: &Interner,
+    sgemm: Symbol,
+    sgemm_par: Symbol,
+    diags: &mut Vec<Diagnostic>,
+) -> Function {
+    let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
+        _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
+    };
+    let ret_mir = mir_ty(&ret_ty);
+    let mut fl = FnLowerer {
+        builder: Builder::new(f.name.sym, ret_mir.clone()),
+        sema,
+        interner,
+        diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        sgemm,
+        sgemm_par,
+    };
+    let param_vals: Vec<ValueId> = param_tys
+        .iter()
+        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+        .collect();
+    for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+        let mty = mir_ty(pty);
+        if matches!(mty, MirType::Array(..)) {
+            fl.bind(p.name.sym, val, mty);
+        } else {
+            let slot = fl.builder.alloca(mty.clone());
+            fl.builder.build_void(Op::Store { ptr: slot, value: val });
+            fl.bind(p.name.sym, slot, mty);
+        }
+    }
+    fl.emit_sgemm(nest, parallel);
+    if !fl.terminated {
+        match ret_mir {
+            MirType::Void => fl.builder.ret(None),
+            _ => {
+                let z = fl.const_zero(ret_mir.clone());
+                fl.builder.ret(Some(z));
+            }
+        }
+    }
+    fl.builder.finish()
 }
 
 /// SIMD width for a lane type: lanes per `VEC_REG_BYTES`-wide register (f32x8, f64x4 at 256-bit).
