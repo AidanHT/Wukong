@@ -21,6 +21,7 @@ cargo run -p mercuryc -- --emit=mir -O3 examples/dot.mer
 | `dot.mer`           | dot product over a fixed-size array             | `120`             |
 | `saxpy_array.mer`   | SAXPY `out = a*x + y` over arrays                | `12 24 36 48`     |
 | `relu.mer`          | ReLU over an array with an out-parameter        | `0 5 0 0 8 0`     |
+| `gemm.mer`          | f32 matmul recognized + dispatched to the tuned AVX2 GEMM | `4 5 10 11` |
 
 The end-to-end test programs under [`../tests/run`](../tests/run) are also runnable and cover
 arrays, a flat GEMM, transpose, bubble sort, gcd, casts, floats, and more. Heavier programs for
