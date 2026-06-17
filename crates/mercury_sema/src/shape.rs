@@ -15,6 +15,25 @@ use mercury_types::{Dim, Scalar, Shape, Ty};
 
 use crate::{DefKind, FnSig, Sema};
 
+/// Result types for the math intrinsics the backends lower directly (`sqrt`, `rsqrt`, `exp`,
+/// `fmax`, `fmin`). The result is the float type of the first argument, defaulting to `f32` so a
+/// bare `exp(x)` is still typed when the argument's type is unknown. Returns `None` for any other
+/// callee — that keeps `type_call` lenient on the unmodeled-builtin path (`min`, `f32x8::load`, …).
+fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
+    let float_ty = match args.first() {
+        Some(Ty::Scalar(s)) if s.is_float() => Ty::Scalar(*s),
+        Some(Ty::Vector { elem, lanes }) if elem.is_float() => Ty::Vector {
+            elem: *elem,
+            lanes: *lanes,
+        },
+        _ => Ty::Scalar(Scalar::F32),
+    };
+    match name {
+        "sqrt" | "rsqrt" | "exp" | "fmax" | "fmin" => Some(float_ty),
+        _ => None,
+    }
+}
+
 impl Sema<'_> {
     pub(crate) fn type_call(
         &mut self,
@@ -41,7 +60,15 @@ impl Sema<'_> {
                         return self.check_fn_call(&sig, generic_args, &arg_tys, span);
                     }
                 }
-                // Unresolved or non-function callee: lenient (builtins like `min`, `exp`).
+                // A few math builtins are lowered directly by the backends, so their *result*
+                // type is real rather than `Unknown` — this lets `let e = exp(x)` infer `f32`
+                // and the lowerer pick the right result type. The callee path itself stays
+                // unmodeled (`Unknown`).
+                if let Some(ret) = intrinsic_ret_ty(self.sym_str(name), &arg_tys) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return ret;
+                }
+                // Unresolved or non-function callee: lenient (builtins like `min`).
                 self.types.insert(callee.id, Ty::Unknown);
                 return Ty::Unknown;
             }
