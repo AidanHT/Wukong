@@ -51,9 +51,16 @@ All notable changes to Mercury are documented here. The format is loosely based 
   `@parallel` activation dispatches each thread's chunk — so it runs multicore × 256-bit. Versus C's
   scalar `libm` (which can't vectorize a loop with a call), the activation family runs **~5–7.5×
   faster** single-thread, ~28× `@parallel`.
+- **`@parallel` reduction → multicore reduction kernel**: a reduction loop in a `@parallel` function
+  (`s += x[k]*y[k]`, `(x[k]-y[k])²`, or `x[k]`) lowers to a **deterministic multicore reduction
+  kernel** (`mercury_sreduce_f32_parallel`: dot/ssd/sum/sumsq) instead of a sequential per-thread
+  accumulation. The parallel result is bit-identical to the serial one regardless of core count
+  (fixed-size chunks, ascending partial combine), and the interpreter calls the serial form, so the
+  differential oracle stays exact. Spreads the stream across cores to aggregate memory bandwidth:
+  **dot ~7.9×, ssd ~8.6× faster** than single-threaded C (which stays serial & latency-bound).
 - **`@parallel`**: loops execute across CPU cores via a rayon runtime, each per-core chunk itself
-  vectorized — ~1.8–7.6× faster than idiomatic single-threaded C on the (memory-bound) elementwise
-  kernels.
+  vectorized — ~2.2–8× faster than idiomatic single-threaded C on the (memory-bound) elementwise and
+  reduction kernels.
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
   with a runtime index, and array parameters passed by base pointer (out-params work). Real kernels
   (dot product, SAXPY, a flat GEMM) run on the interpreter.
