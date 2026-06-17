@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1073741824
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3000000000
+// EXPECT-OUT: 3221225472
+module tests.run.unsigned
+
+/// Unsigned ops with the high bit of the width set: division, remainder, u32->f32, and
+/// zero-extension. Regression test: the interpreter once read these off a sign-extended i128 and
+/// diverged from the native backend (which operates on the true machine width). The optimizer
+/// invariance + native-vs-interp differential gate now pin all four equal.
+fn main() -> i32 {
+    let a: u32 = 2147483648; // 0x80000000
+    let b: u32 = 2;
+    print((a / b) as i64); // 1073741824 (unsigned divide)
+
+    let c: u32 = 2147483649; // 0x80000001
+    let d: u32 = 4;
+    print((c % d) as i64); // 1 (unsigned remainder)
+
+    let e: u32 = 3000000000; // 0xB2D05E00, exactly representable in f32
+    let f: f32 = e as f32; // unsigned -> float
+    print(f as i64); // 3000000000
+
+    let g: u32 = 3221225472; // 0xC0000000
+    print(g as i64); // 3221225472 (zero-extend, not sign-extend)
+    return 0;
+}
