@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 333
+// EXPECT-OUT: 1
+// EXPECT-OUT: 25
+// EXPECT-OUT: 35
+// EXPECT-OUT: 1000
+module tests.run.bf16
+
+// Real bf16 storage: `[bf16; N]` holds 2-byte values rounded to bf16 (round-to-nearest-even).
+// Casts and array load/store all round through the single shared conversion, so the interpreter
+// and native backend agree bit-for-bit (the mercury_bench gate proves it).
+fn main() -> i32 {
+    // scalar cast rounds to the bf16 grid.
+    let third: bf16 = 0.333333 as bf16;
+    print((third as f32 * 1000.0) as i32); // bf16(1/3) * 1000
+
+    // bf16-exact values are unchanged.
+    let one: bf16 = 1.0 as bf16;
+    print((one as f32) as i32); // 1
+
+    // array store then load round-trips at bf16 precision.
+    let mut a: [bf16; 8] = [0.0 as bf16; 8];
+    for i in 0..8 {
+        a[i] = ((i as f32) * 0.5) as bf16; // 0, 0.5, 1.0, ... all bf16-exact
+    }
+    print((a[5] as f32 * 10.0) as i32); // 2.5 * 10 = 25
+    print((a[7] as f32 * 10.0) as i32); // 3.5 * 10 = 35
+
+    // a value below bf16's resolution at 1.0 (mantissa step 1/128) rounds away: 1 + 1/256 -> 1.0.
+    let mut b: [bf16; 4] = [0.0 as bf16; 4];
+    b[0] = (1.0 + 0.00390625) as bf16;
+    print((b[0] as f32 * 1000.0) as i32); // 1000 (rounds to 1.0)
+    return 0;
+}

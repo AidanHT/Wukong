@@ -10,6 +10,35 @@ pub use gemm::{
     mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_parallel, mercury_sgemm_parallel,
 };
 
+/// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
+/// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
+/// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
+/// all use, so every path agrees bit-for-bit. Matches the rounding TensorFlow/PyTorch use.
+#[inline]
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if x.is_nan() {
+        // Keep NaN a NaN (rounding could otherwise carry it to inf); force the quiet bit.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    // Round to nearest even: bias by 0x7fff plus the lsb of the surviving mantissa, then truncate.
+    let rounding_bias = 0x0000_7fff + ((bits >> 16) & 1);
+    ((bits + rounding_bias) >> 16) as u16
+}
+
+/// Widen `bf16` stored bits back to the `f32` they represent (exact: the low 16 bits are zero).
+#[inline]
+pub fn bf16_bits_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// `x` rounded to `bf16` precision, as the `f32` an `f32 -> bf16 -> f32` round-trip yields. The
+/// value `[bf16; N]` storage observes; the native backend computes the identical result.
+#[inline]
+pub fn round_bf16(x: f32) -> f32 {
+    bf16_bits_to_f32(f32_to_bf16_bits(x))
+}
+
 /// A bump (arena) allocator over an owned byte buffer. Allocation is a pointer bump; freeing is
 /// all-at-once via [`Arena::reset`]. This is the idiomatic allocator for kernel scratch space:
 /// no per-object bookkeeping, no fragmentation.
@@ -120,6 +149,34 @@ pub unsafe extern "C" fn mercury_parallel_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_exact_values_roundtrip() {
+        // Values exactly representable in bf16 survive a round-trip unchanged.
+        for &x in &[0.0f32, 1.0, -2.0, 0.5, 256.0, -0.015625] {
+            assert_eq!(round_bf16(x), x, "{x} should be bf16-exact");
+        }
+    }
+
+    #[test]
+    fn bf16_rounds_to_nearest_even() {
+        // 1 + 2^-8 sits exactly between two bf16 values (mantissa step is 2^-7); RNE picks the even
+        // one, which is 1.0 (mantissa bits 0). 1 + 2^-7 is exact.
+        assert_eq!(round_bf16(1.0 + 2f32.powi(-8)), 1.0);
+        assert_eq!(round_bf16(1.0 + 2f32.powi(-7)), 1.0 + 2f32.powi(-7));
+        // 1/3 rounds to the nearest of the two surrounding bf16 grid points.
+        let third = round_bf16(1.0 / 3.0);
+        assert_eq!(third.to_bits() & 0xffff, 0, "low 16 bits must be zero");
+        assert!((third - 1.0 / 3.0).abs() < 2f32.powi(-7));
+    }
+
+    #[test]
+    fn bf16_specials() {
+        assert_eq!(round_bf16(f32::INFINITY), f32::INFINITY);
+        assert_eq!(round_bf16(f32::NEG_INFINITY), f32::NEG_INFINITY);
+        assert!(round_bf16(f32::NAN).is_nan());
+        assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(0.0)), 0.0);
+    }
 
     extern "C" fn fill_squares(start: i64, end: i64, env: *const u8) {
         let out = env as *mut i64;
