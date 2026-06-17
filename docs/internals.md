@@ -179,9 +179,13 @@ The kernel itself (`mercury_runtime::gemm`) is a classic BLIS-style GEMM: a **6�
 (12 live `__m256` accumulators, 12 FMAs per K-step), `MC/KC/NC` **cache blocking**, and **packed**
 A/B panels streamed with unit stride — true **256-bit AVX2 + FMA** (the width Cranelift's IR cannot
 express), runtime-detected with a scalar fallback. The parallel variant packs A and B once per K
-block and runs the C tile grid across cores. This is the same shape XLA/TVM/oneDNN lower a matmul op
-to, and it is why the win over gcc/rustc's naive nest *grows* with size (their version falls out of
-cache; the packed kernel does not).
+block — the packing itself **fanned across cores** (each `MR`-row / `NR`-col panel is independent),
+since with the C compute spread over ~14 cores a serial pack would be the Amdahl bottleneck — then
+runs the C tile grid across cores. It also **falls back to the serial kernel below a work threshold**
+(`m·n·k < 2²⁶`): on this P+E hybrid, cross-core wake/sync costs more than it saves for small matrices
+(256³ measured *faster* on one core). This is the same shape XLA/TVM/oneDNN lower a matmul op to, and
+it is why the win over gcc/rustc's naive nest *grows* with size (their version falls out of cache; the
+packed kernel does not).
 
 Crucially this stays inside the differential oracle: the interpreter, on a `mercury_sgemm*` call,
 **marshals its abstract `Value` memory into real f32 buffers and calls the identical kernel**, then
