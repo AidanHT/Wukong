@@ -30,14 +30,18 @@ All notable changes to Mercury are documented here. The format is loosely based 
   and `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling — and lowers the whole
   nest to a register-blocked (6×16), cache-tiled, packed **AVX2/FMA** GEMM microkernel in the runtime
   (`mercury_sgemm` / `_nt` / `_parallel`). On a Meteor Lake laptop this beats `gcc -O3 -march=native`
-  on the naive nest by **~2–5× single-thread and ~2.4–15× parallel**, the lead growing with matrix
-  size. The interpreter calls the identical kernel (marshalling its memory) so the oracle stays exact.
+  on the naive nest by **~2.4–3.5× single-thread and up to ~10× parallel** on `C = A·B` (and
+  **~19–70× on `nn.Linear`**, where naive C stays latency-bound), the lead growing with matrix size.
+  The serial kernel holds ~100 GFLOP/s (~80% of one P-core's AVX2-FMA peak); the parallel one packs
+  panels across cores and skips threading below a work threshold. The interpreter calls the identical
+  kernel (marshalling its memory) so the oracle stays exact.
 - **Auto-vectorization**: straight-line elementwise loops (incl. branchy ones via if-conversion) and
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
-  run ~2.3–3.7× faster than serial C.
+  run ~2.6–2.8× faster than serial C.
 - **`@parallel`**: loops execute across CPU cores via a rayon runtime, each per-core chunk itself
-  vectorized — ~3.5–12× faster than idiomatic single-threaded C on the elementwise kernels.
+  vectorized — ~1.8–7.6× faster than idiomatic single-threaded C on the (memory-bound) elementwise
+  kernels.
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
   with a runtime index, and array parameters passed by base pointer (out-params work). Real kernels
   (dot product, SAXPY, a flat GEMM) run on the interpreter.

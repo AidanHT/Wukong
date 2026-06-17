@@ -22,8 +22,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
   the way XLA/TVM/oneDNN lower a matmul op. Serial and `@parallel`. Beats gcc/rustc's naive nest
-  ~2–5× single-thread and ~2.4–15× parallel, the lead growing with size. The interpreter calls the
-  identical kernel (marshalling its memory), so the two stay bit-exact.
+  ~2.4–3.5× single-thread and up to ~10× parallel on `C = A·B` (~19–70× on `nn.Linear`), the lead
+  growing with size. The interpreter calls the identical kernel (marshalling its memory), so the two
+  stay bit-exact.
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
   on the native backend. saxpy/poly/relu/relu6 vectorize.

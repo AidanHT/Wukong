@@ -16,17 +16,17 @@ Mercury compiles to native code through a **from-scratch [Cranelift](https://cra
 no LLVM, no external toolchain**. In a head-to-head cross-language benchmark (same kernel in each
 language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 
-- **compiles ~120–230× faster** than gcc/rustc (Cranelift JIT in-process vs spawning a full
+- **compiles ~100–260× faster** than gcc/rustc (Cranelift JIT in-process vs spawning a full
   C/Rust+LLVM toolchain) — the metric that dominates real ML edit-run iteration;
 - **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
   `nn.Linear` `A·Bᵀ` form) and dispatches it to a tuned register-blocked, cache-tiled, packed
-  **AVX2/FMA** microkernel — **~2–5× faster single-thread and ~2.4–15× faster parallel** than
-  gcc/rustc on the naive nest, the lead *growing with matrix size* as their version falls out of
-  cache;
-- **wins reductions ~2.3–3.7×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
+  **AVX2/FMA** microkernel — **~2.4–3.5× faster single-thread and up to ~10× parallel** on plain
+  `C = A·B`, and **~19–70× on `nn.Linear`** (where naive C leaves the reduction latency-bound), the
+  lead *growing with matrix size* as their version falls out of cache;
+- **wins reductions ~2.6–2.8×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
   which gcc/rustc leave serial;
-- is **~3.5–12× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and
-  vectorizes the loop.
+- is **~1.8–7.6× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and
+  vectorizes the loop (bounded by aggregate memory bandwidth on these memory-bound kernels).
 
 Where Mercury *ties* is single-thread, memory-bandwidth-bound elementwise (saxpy/relu/poly) — the
 DRAM/cache wall every compiler hits. The general (non-GEMM) vectorizer emits 128-bit SSE (Cranelift
