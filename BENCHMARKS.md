@@ -43,11 +43,13 @@ naively-written source:
   accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without `-ffast-math`.
 - **Auto-vectorization + fusion** of elementwise loops (incl. branchy ones via if-conversion), `x +
   y*z` → FMA contraction, and adjacent-loop fusion.
-- **Vectorized transcendentals.** `exp` and `log` lower to ≈1-ULP `f32` minimax polynomials (and
-  `tanh`/`sigmoid` build on `exp`) made of primitive ops, so they **vectorize** in an elementwise
-  loop. gcc/rustc call scalar `libm` `expf`/`logf`/`tanhf` and cannot vectorize a loop with a call —
-  so the activation family (GELU/SiLU/tanh/sigmoid/softmax) and log-softmax/cross-entropy run
-  ~2.5–3.5× faster.
+- **Vectorized transcendentals → 256-bit AVX2 dispatch.** A pure `out[i] = f(x[i])` loop for
+  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` lowers to a tuned **256-bit AVX2/FMA runtime kernel**
+  (`mercury_vmath_f32`) running a ≈1-ULP Cephes minimax poly 8 lanes at a time — the width Cranelift's
+  general vectorizer cannot emit (it caps at 128-bit SSE). gcc/rustc call scalar `libm`
+  `expf`/`logf`/`tanhf` and cannot vectorize a loop containing a call, so the activation family
+  (GELU/SiLU/tanh/sigmoid + softmax/log-softmax/cross-entropy) runs **~5–7.5× faster**, and an
+  `@parallel` activation dispatches each thread's chunk to the kernel (multicore × 256-bit).
 - **Convolution via im2col + GEMM.** A conv expressed as im2col + matmul has its matmul recognized
   and dispatched to the GEMM microkernel — so Mercury beats hand-written direct convolution ~5.8×,
   the same way XLA/cuDNN lower conv.
@@ -91,13 +93,15 @@ GFLOP/s (higher is better), naive `ikj` nest in each language:
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
-| 256³ | 90–100 | 90–99 † | 29–41 | 29–42 | **~2.7–3.5×** | **~2.8–3.4×** |
-| 512³ | 97–106 | 263–297 | 40–41 | 44–45 | **~2.4–2.6×** | **~6.6–7.2×** |
-| 1024³| 98–100 | 297–299 | 28–29 | 29–31 | **~3.5×** | **~10.3–10.8×** |
+| 256³ | 90–100 | 86–99 † | 21–41 | 21–42 | **~3.3–4.3×** | **~4.1×** |
+| 512³ | 92–106 | 269–360 | 30–41 | 38–45 | **~2.4–3.0×** | **~8.7×** |
+| 1024³| 76–100 | 395–434 | 22–29 | 25–31 | **~3.4–3.5×** | **~17.9×** |
 
-The single-core kernel holds ~100 GFLOP/s across all sizes (≈80% of one P-core's AVX2-FMA peak),
-while gcc's naive nest falls from ~40 to ~28 GFLOP/s as 1024² spills out of cache — so the
-**single-thread lead widens with size** (2.4× → 3.5×) and parallel reaches **~10× at 1024³**.
+The single-core kernel holds ~90–105 GFLOP/s (≈80% of one P-core's AVX2-FMA peak; pinned to one
+P-core it is a stable ~105 at 512³), while gcc's naive nest falls from ~40 to ~22 GFLOP/s as 1024²
+spills out of cache — so the **single-thread lead widens with size**. The parallel kernel, after the
+pack-scratch is reused across cache blocks instead of re-allocated per K-block, reaches **~395–434
+GFLOP/s at 1024³ (~18× C)** and ~500 at 2048³.
 
 † At 256³ the parallel kernel deliberately falls back to the serial one: ~17M MACs is below the
 work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
@@ -107,8 +111,8 @@ there (a measured fix — naive threading at that size was a net *loss*).
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
-| 512² | 94–104 | 251–261 | ~5.0 | ~4.7 | **~19–21×** | **~49–52×** |
-| 1024²| 97–100 | 303–311 | ~4.5 | ~4.2 | **~22×** | **~66–70×** |
+| 512² | 81–104 | 251–302 | ~4.0 | ~3.4 | **~19–25×** | **~52–76×** |
+| 1024²| 88–100 | 258–311 | ~3.5 | ~3.4 | **~22–26×** | **~67–75×** |
 
 C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 GFLOP/s, latency-bound),
 while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
@@ -130,32 +134,41 @@ the large-matmul peak, but it still beats hand-written direct convolution ~6–7
 is cheap data movement and the GEMM microkernel does the FLOPs. So Mercury accelerates conv *for
 free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 
-### Transcendentals / activations — Mercury vectorizes the poly; C calls scalar `libm`
+### Transcendentals / activations — Mercury dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
-The activation family every transformer runs. Mercury lowers `exp` to a ≈1-ULP `f32` minimax
-polynomial (and `log`, `pow`, `erf`, `sin`/`cos`, `tanh`/`sigmoid` on top of it or by the same
-technique) built from primitive ops, and **auto-vectorizes** it; gcc/rustc call scalar `libm`
-`expf`/`logf`/`tanhf`/`erff`/`sinf` and cannot vectorize a loop containing a call (no `libmvec` on this
-mingw toolchain), so it stays serial. The `erf` poly gives the **exact** (erf-based) GELU of
-BERT/GPT-2/ViT (alongside the tanh approximation), and `sin`/`cos` give **RoPE** rotary embeddings.
+The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
+Mercury recognizes a pure `out[i] = f(x[i])` loop for `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` and
+lowers the whole loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same
+domain-aware dispatch as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a
+time; gcc/rustc call scalar `libm` `expf`/`logf`/`tanhf` and **cannot vectorize a loop containing a
+call** (no `libmvec` on this mingw toolchain), so they stay serial. `silu` (Llama/SwiGLU) and `gelu`
+(BERT/GPT-2/ViT, tanh approximation) are first-class intrinsics dispatched to fused kernels. The
+interpreter marshals through the *identical* kernel, so the differential oracle stays exact.
+
+This is the change that took the activations from a ~128-bit ~2.5–3.5× win to the ~5–7.5× range —
+**roughly double**, because they are compute-bound (~20 flops/element) and the missing 256 bits were
+the ceiling. (Composed/scalar `exp`/`erf`/`sin`/`cos` still lower to the inlined ≈1-ULP poly and
+auto-vectorize at 128-bit; `erf` gives the exact erf-GELU and `sin`/`cos` give RoPE.)
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
-| `exp`  | **~2.5–2.6× faster** | `out=exp(x)`; Mercury's vectorized poly vs scalar `expf` |
-| `log`  | **~3.5× faster** | `out=log(x)`; vectorized Cephes poly vs scalar `logf` — the largest margin (libm `logf` is slower than `expf`) |
-| `gelu` | **~2.9–3.0× faster** | tanh-GELU, the **identical** exp-based algorithm in all three — only Mercury vectorizes the exp |
-| `silu` (swish) | **~2.4–2.5× faster** | `x*sigmoid(x)`; C/Rust write `1/(1+expf(-x))` |
-| `tanh` | **~2.7–2.9× faster** | identical exp-based algorithm everywhere; Mercury vectorizes it |
+| `exp`  | **~5.9–6.8× faster** | `out=exp(x)`; 256-bit AVX2 poly vs scalar `expf` |
+| `log`  | **~4.6–7.5× faster** | `out=log(x)`; 256-bit Cephes poly vs scalar `logf` (libm `logf` timing varies run-to-run) |
+| `tanh` | **~4.5–6.1× faster** | exp-based, identical algorithm everywhere; only Mercury vectorizes (256-bit) |
+| `gelu` | **~5.0–6.5× faster** | tanh-GELU intrinsic → fused 256-bit kernel; C/Rust the same math, scalar |
+| `silu` (swish) | **~5.2–5.8× faster** | `silu()` intrinsic (`x·sigmoid(x)`) → fused 256-bit kernel; C/Rust scalar |
+| `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
 The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
-`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all vectorize. Every kernel passes the
-cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and compiles ~45–150×
-faster. These are compute-bound (the poly is ~20 flops/element), so the win is real SIMD throughput,
-not bandwidth. `softmax`/`layernorm`/`gelu` and **log-softmax / cross-entropy** (`exp` + `log`) run as
-fused vectorized-loop chains (`tests/run/`); a transformer FFN block (two `nn.Linear` matmuls + GELU)
-composes the GEMM and transcendental wins in one function (`tests/run/ffn_block.mer`). All
-transcendentals are bit-identical across both backends by construction (built from primitives the
-differential gate already proves equal).
+`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`, and `fmax`/`fmin` — all vectorize. Every
+kernel passes the cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and
+compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
+bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
+multicore × 256-bit. `softmax`/`layernorm` and **log-softmax / cross-entropy** (`exp` + `log`) run as
+fused vectorized chains (`tests/run/`); a transformer FFN block (two `nn.Linear` matmuls + GELU)
+composes the GEMM and activation wins in one function (`tests/run/ffn_block.mer`). All paths are
+bit-identical across backends — the dispatched kernel by marshalling, the inlined polys by
+construction.
 
 ### Single-threaded elementwise & reductions
 
@@ -190,11 +203,13 @@ core count — still a clear win over single-threaded C:
   GFLOP/s (≈80% of one P-core's AVX2-FMA peak). This is a reversal of the previous honest loss
   (single-core matmul used to be ~3× *behind*). The dispatch also fires on **runtime dimensions**, so
   the win applies to general matmul functions, not only fixed-size kernels.
-- **Transcendentals / activations (exp, log, GELU, SiLU, tanh):** **~2.5–3.5× faster** than C's
-  scalar `libm` — Mercury vectorizes the ≈1-ULP polynomial, where gcc/rustc cannot vectorize a loop
-  with an `expf`/`logf`/`tanhf` call. `log` shows the largest margin (~3.5×). This is the transformer
-  activation family and the cleanest compute-bound elementwise win; softmax/layernorm/GELU and
-  log-softmax/cross-entropy run as fused vectorized-loop chains.
+- **Transcendentals / activations (exp, log, GELU, SiLU, tanh):** **~5–7.5× faster** than C's scalar
+  `libm` — Mercury dispatches the loop to a **256-bit AVX2 ≈1-ULP poly kernel** (`mercury_vmath_f32`),
+  where gcc/rustc cannot vectorize a loop with an `expf`/`logf`/`tanhf` call. This is the transformer
+  activation family and the cleanest compute-bound win (it roughly doubled when the kernel moved from
+  the 128-bit vectorizer to 256-bit). `gelu`/`silu` are first-class intrinsics; an `@parallel`
+  activation runs multicore × 256-bit (~28×); softmax/layernorm/log-softmax/cross-entropy compose
+  the exp/log win.
 - **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Mercury runs a 3×3 conv
   **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
   recognizer accelerates conv for free.
@@ -206,8 +221,9 @@ core count — still a clear win over single-threaded C:
   these are at the DRAM/cache bandwidth wall, where no compiler "heavily exceeds" another. The
   general (non-GEMM) vectorizer emits 128-bit SSE because Cranelift cannot legalize a 256-bit
   `f32x8` value (verified, pinned as a tripwire test); at N=2²⁰ these kernels are memory-bound, so
-  the SIMD width is moot and matching gcc's AVX is the bandwidth ceiling anyway. The width that
-  matters most — the GEMM family — gets true 256-bit AVX2/FMA via the runtime microkernel.
+  the SIMD width is moot and matching gcc's AVX is the bandwidth ceiling anyway. The widths that
+  matter most — the GEMM family and the activation family — get true 256-bit AVX2/FMA via runtime
+  kernels (`mercury_sgemm*` and `mercury_vmath_f32`), the two compute-bound regimes where width pays.
 - **Storage:** `bf16` is real 2-byte storage at bf16 precision (round-to-nearest-even), bit-exact
   across backends. On this AVX2 box (no bf16 FMA) a bf16 GEMM would widen to f32 and match f32
   throughput — a memory-footprint feature, not a FLOP/s win — so it is held at the correctness path.
