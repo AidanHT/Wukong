@@ -648,15 +648,16 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
-        let m = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(nest.m as i128, MirType::I64));
-        let k = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(nest.k as i128, MirType::I64));
-        let n = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(nest.n as i128, MirType::I64));
+        // Materialize each dimension as an i64 value — a constant for a literal dim, or a load of
+        // the runtime dimension variable (a function param/local). Bails to the scalar nest if a
+        // variable dim is somehow out of scope at the call site.
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
@@ -671,6 +672,22 @@ impl FnLowerer<'_> {
             args: vec![a, b, c, m, k, n, beta],
         });
         true
+    }
+
+    /// Materialize a matmul dimension as an `i64` MIR value: a constant for a literal, or a load
+    /// (coerced to i64) of the runtime dimension variable.
+    fn dim_value(&mut self, dim: Dim) -> Option<ValueId> {
+        match dim {
+            Dim::Lit(v) => Some(
+                self.builder
+                    .build(MirType::I64, Op::ConstInt(v as i128, MirType::I64)),
+            ),
+            Dim::Var(sym) => {
+                let (slot, ty) = self.lookup(sym)?;
+                let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
+                Some(self.coerce_to(v, &ty, &MirType::I64, true))
+            }
+        }
     }
 
     fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
@@ -2998,9 +3015,9 @@ struct MatmulNest {
     a: Symbol,
     b: Symbol,
     c: Symbol,
-    m: i64,
-    k: i64,
-    n: i64,
+    m: Dim,
+    k: Dim,
+    n: Dim,
     /// 0 = overwrite C (a zero-init loop was present), 1 = accumulate into C.
     beta: i64,
     /// `true` for `C = A·Bᵀ` (B indexed `[j,k]` instead of `[k,j]`).
@@ -3041,8 +3058,28 @@ fn as_int_lit(e: &Expr, interner: &Interner) -> Option<i64> {
     }
 }
 
-/// `row * stride` or `stride * row` with a single-path `row` and a literal `stride`.
-fn as_mul_stride(e: &Expr, interner: &Interner) -> Option<(Symbol, i64)> {
+/// A matmul dimension or stride: a compile-time literal, or a runtime variable (function param or
+/// local). Two `Var`s compare equal iff they name the same binding, so the recognizer's stride/bound
+/// consistency checks (`sa == k`, `sc == n`, …) hold symbolically — which is what lets a matmul with
+/// runtime dimensions dispatch to the tuned GEMM kernel instead of falling back to a scalar nest.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dim {
+    Lit(i64),
+    Var(Symbol),
+}
+
+/// A non-negative dimension/stride expression: an integer literal or a single variable path.
+fn as_dim(e: &Expr, interner: &Interner) -> Option<Dim> {
+    if let Some(v) = as_int_lit(e, interner) {
+        return Some(Dim::Lit(v));
+    }
+    single_path(e).map(Dim::Var)
+}
+
+/// `e == row * stride` (either factor order) for the *known* row variable; returns the stride. The
+/// known row resolves the otherwise-ambiguous `i * N` form (both factors are paths under symbolic
+/// dims) — the factor that is `row` is the index, the other is the stride.
+fn mul_with_row(e: &Expr, row: Symbol, interner: &Interner) -> Option<Dim> {
     let ExprKind::Binary {
         op: ast::BinOp::Mul,
         lhs,
@@ -3051,17 +3088,18 @@ fn as_mul_stride(e: &Expr, interner: &Interner) -> Option<(Symbol, i64)> {
     else {
         return None;
     };
-    if let (Some(r), Some(s)) = (single_path(lhs), as_int_lit(rhs, interner)) {
-        return Some((r, s));
+    if single_path(lhs) == Some(row) {
+        return as_dim(rhs, interner);
     }
-    if let (Some(s), Some(r)) = (as_int_lit(lhs, interner), single_path(rhs)) {
-        return Some((r, s));
+    if single_path(rhs) == Some(row) {
+        return as_dim(lhs, interner);
     }
     None
 }
 
-/// A flattened 2-D index `row * stride + col` (either addend order). Returns `(row, stride, col)`.
-fn match_row_col(idx: &Expr, interner: &Interner) -> Option<(Symbol, i64, Symbol)> {
+/// A flattened 2-D index `row * stride + col` (either addend order) for a known `row`. Returns
+/// `(stride, col)`.
+fn match_row_col(idx: &Expr, row: Symbol, interner: &Interner) -> Option<(Dim, Symbol)> {
     let ExprKind::Binary {
         op: ast::BinOp::Add,
         lhs,
@@ -3070,11 +3108,11 @@ fn match_row_col(idx: &Expr, interner: &Interner) -> Option<(Symbol, i64, Symbol
     else {
         return None;
     };
-    if let (Some((row, stride)), Some(col)) = (as_mul_stride(lhs, interner), single_path(rhs)) {
-        return Some((row, stride, col));
+    if let (Some(stride), Some(col)) = (mul_with_row(lhs, row, interner), single_path(rhs)) {
+        return Some((stride, col));
     }
-    if let (Some(col), Some((row, stride))) = (single_path(lhs), as_mul_stride(rhs, interner)) {
-        return Some((row, stride, col));
+    if let (Some(col), Some(stride)) = (single_path(lhs), mul_with_row(rhs, row, interner)) {
+        return Some((stride, col));
     }
     None
 }
@@ -3101,7 +3139,7 @@ fn is_f32_expr(e: &Expr, sema: &SemaResult) -> bool {
 
 /// `for col in 0..n { c[row*stride + col] = 0.0; }` — the per-row zero-init of a beta-0 matmul.
 /// Returns `(c, stride, n)` with the outer row variable `row`.
-fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol, i64, i64)> {
+fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol, Dim, Dim)> {
     let (pat, iter, body) = fusable_for(s)?;
     let col = match &pat.kind {
         ast::PatKind::Ident(c) => *c,
@@ -3111,7 +3149,7 @@ fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol
     if as_int_lit(start, interner)? != 0 {
         return None;
     }
-    let n = as_int_lit(end, interner)?;
+    let n = as_dim(end, interner)?;
     if body.stmts.len() != 1 || body.tail.is_some() {
         return None;
     }
@@ -3127,8 +3165,8 @@ fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol
         return None;
     }
     let (cbase, cidx) = as_index1(target)?;
-    let (r, stride, cc) = match_row_col(cidx, interner)?;
-    if r != row || cc != col {
+    let (stride, cc) = match_row_col(cidx, row, interner)?;
+    if cc != col {
         return None;
     }
     Some((cbase, stride, n))
@@ -3142,9 +3180,9 @@ fn match_product_ab(
     row: Symbol,
     kvar: Symbol,
     jvar: Symbol,
-    aik: Option<(Symbol, Symbol, i64)>,
+    aik: Option<(Symbol, Symbol, Dim)>,
     interner: &Interner,
-) -> Option<(Symbol, i64, Symbol, i64, bool)> {
+) -> Option<(Symbol, Dim, Symbol, Dim, bool)> {
     let ExprKind::Binary {
         op: ast::BinOp::Mul,
         lhs: f1,
@@ -3153,26 +3191,30 @@ fn match_product_ab(
     else {
         return None;
     };
-    let is_a = |f: &Expr| -> Option<(Symbol, i64)> {
+    let is_a = |f: &Expr| -> Option<(Symbol, Dim)> {
         if let Some((aik_sym, asym, sa)) = aik {
             if single_path(f) == Some(aik_sym) {
                 return Some((asym, sa));
             }
         }
         let (abase, aidx) = as_index1(f)?;
-        let (ar, asa, ak) = match_row_col(aidx, interner)?;
-        (ar == row && ak == kvar).then_some((abase, asa))
+        let (asa, ak) = match_row_col(aidx, row, interner)?;
+        (ak == kvar).then_some((abase, asa))
     };
-    let is_b = |f: &Expr| -> Option<(Symbol, i64, bool)> {
+    let is_b = |f: &Expr| -> Option<(Symbol, Dim, bool)> {
         let (bbase, bidx) = as_index1(f)?;
-        let (br, sb, bc) = match_row_col(bidx, interner)?;
-        if br == kvar && bc == jvar {
-            Some((bbase, sb, false))
-        } else if br == jvar && bc == kvar {
-            Some((bbase, sb, true))
-        } else {
-            None
+        // normal `B[k*N+j]`: row is k, col is j; transposed `B[j*K+k]`: row is j, col is k.
+        if let Some((sb, bc)) = match_row_col(bidx, kvar, interner) {
+            if bc == jvar {
+                return Some((bbase, sb, false));
+            }
         }
+        if let Some((sb, bc)) = match_row_col(bidx, jvar, interner) {
+            if bc == kvar {
+                return Some((bbase, sb, true));
+            }
+        }
+        None
     };
     let pair = |fa: &Expr, fb: &Expr| match (is_a(fa), is_b(fb)) {
         (Some((a, sa)), Some((b, sb, t))) => Some((a, sa, b, sb, t)),
@@ -3212,7 +3254,7 @@ fn match_matmul_ijk(
     if as_int_lit(start, interner)? != 0 {
         return None;
     }
-    let m = as_int_lit(end, interner)?;
+    let m = as_dim(end, interner)?;
     // Outer body is a single `for j` loop.
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
@@ -3226,7 +3268,7 @@ fn match_matmul_ijk(
     if as_int_lit(js, interner)? != 0 {
         return None;
     }
-    let n = as_int_lit(je, interner)?;
+    let n = as_dim(je, interner)?;
     // j body: [ let s = 0.0; for k {...}; c[i*N+j] = s ].
     if jbody.tail.is_some() || jbody.stmts.len() != 3 {
         return None;
@@ -3256,7 +3298,7 @@ fn match_matmul_ijk(
     if as_int_lit(ks, interner)? != 0 {
         return None;
     }
-    let kdim = as_int_lit(ke, interner)?;
+    let kdim = as_dim(ke, interner)?;
     if kbody.tail.is_some() || kbody.stmts.len() != 1 {
         return None;
     }
@@ -3303,8 +3345,8 @@ fn match_matmul_ijk(
         return None;
     }
     let (cbase, cidx) = as_index1(ct)?;
-    let (cr, sc, cj) = match_row_col(cidx, interner)?;
-    if cr != row || cj != jvar {
+    let (sc, cj) = match_row_col(cidx, row, interner)?;
+    if cj != jvar {
         return None;
     }
     let sb_ok = if transposed { sb == kdim } else { sb == n };
@@ -3342,7 +3384,7 @@ fn match_matmul(
     if as_int_lit(start, interner)? != 0 {
         return None;
     }
-    let m = as_int_lit(end, interner)?;
+    let m = as_dim(end, interner)?;
     if body.tail.is_some() {
         return None;
     }
@@ -3364,7 +3406,7 @@ fn match_matmul(
     if as_int_lit(kstart, interner)? != 0 {
         return None;
     }
-    let kdim = as_int_lit(kend, interner)?;
+    let kdim = as_dim(kend, interner)?;
 
     // Optional `let aik = a[row*sa + k];` binding, then the inner J loop.
     let (aik, a_sym, sa, j_stmt) = match kbody.stmts.as_slice() {
@@ -3383,8 +3425,8 @@ fn match_matmul(
                 _ => return None,
             };
             let (abase, aidx) = as_index1(init)?;
-            let (ar, asa, ak) = match_row_col(aidx, interner)?;
-            if ar != row || ak != kvar {
+            let (asa, ak) = match_row_col(aidx, row, interner)?;
+            if ak != kvar {
                 return None;
             }
             (Some(aik_sym), Some(abase), Some(asa), j)
@@ -3402,7 +3444,7 @@ fn match_matmul(
     if as_int_lit(jstart, interner)? != 0 {
         return None;
     }
-    let n = as_int_lit(jend, interner)?;
+    let n = as_dim(jend, interner)?;
     if jbody.stmts.len() != 1 || jbody.tail.is_some() {
         return None;
     }
@@ -3410,8 +3452,8 @@ fn match_matmul(
         return None;
     };
     let (cbase, cidx) = as_index1(target)?;
-    let (cr, sc, cj) = match_row_col(cidx, interner)?;
-    if cr != row || cj != jvar {
+    let (sc, cj) = match_row_col(cidx, row, interner)?;
+    if cj != jvar {
         return None;
     }
 
@@ -3429,8 +3471,8 @@ fn match_matmul(
                 return None;
             };
             let (clhs, clidx) = as_index1(lhs)?;
-            let (clr, clsc, clj) = match_row_col(clidx, interner)?;
-            if clhs != cbase || clr != row || clsc != sc || clj != jvar {
+            let (clsc, clj) = match_row_col(clidx, row, interner)?;
+            if clhs != cbase || clsc != sc || clj != jvar {
                 return None;
             }
             rhs
