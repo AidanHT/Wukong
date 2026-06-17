@@ -657,7 +657,30 @@ fn apply_cast(kind: CastKind, v: Value, to: &MirType) -> Value {
     match kind {
         SExt | ZExt | Trunc => Value::Int(mask(v.as_int(), to)),
         SiToFp | UiToFp => Value::Float(v.as_int() as f64),
-        FpToSi | FpToUi => Value::Int(mask(v.as_float() as i128, to)),
+        // Saturating fp→int, matching the native backend's `fcvt_to_{sint,uint}_sat` (NaN→0, clamp to
+        // the target range, negatives→0 for unsigned). Rust's `as` has exactly these semantics; the
+        // old bit-mask of an `i128` cast diverged from native for out-of-range / negative-to-unsigned
+        // values (a latent differential-oracle break — `u`-typed targets make `FpToUi` reachable).
+        FpToSi => {
+            let f = v.as_float();
+            let i = match to {
+                MirType::I8 => f as i8 as i128,
+                MirType::I16 => f as i16 as i128,
+                MirType::I64 => f as i64 as i128,
+                _ => f as i32 as i128, // I32 (and the I1 fallback)
+            };
+            Value::Int(mask(i, to))
+        }
+        FpToUi => {
+            let f = v.as_float();
+            let i = match to {
+                MirType::I8 => f as u8 as i128,
+                MirType::I16 => f as u16 as i128,
+                MirType::I64 => f as u64 as i128,
+                _ => f as u32 as i128, // I32 (and the I1 fallback)
+            };
+            Value::Int(mask(i, to))
+        }
         FpExt | FpTrunc => Value::Float(v.as_float()),
         Bitcast => v,
         IntToPtr => Value::Ptr(v.as_int() as usize),
