@@ -5,7 +5,9 @@
 //! compiled as a static library. Today it provides a bump [`Arena`], a CPU [`parallel_for`], and a
 //! tuned [`mercury_sgemm`] (the matmul microkernel the compiler lowers a matmul nest to).
 
+mod attention;
 mod gemm;
+pub use attention::mercury_attention_f32;
 pub use gemm::{
     mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_parallel, mercury_sgemm_parallel,
 };
