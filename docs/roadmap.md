@@ -55,13 +55,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP `f32` minimax
   polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
   `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
-  position embeddings), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all
-  built from primitive ops
-  both backends already agree on bit-for-bit, and all **vectorize** in elementwise loops. So softmax,
-  layernorm, GELU (both the tanh approximation and the exact erf form), SiLU/swish, tanh activations,
-  RoPE, and **log-softmax / cross-entropy** lower to SIMD
-  instead of scalar `libm` calls and run **~2.5–3.5× faster** than gcc/rustc's scalar
-  `expf`/`logf`/`tanhf`/`sinf` (`log` shows the largest margin). See
+  position embeddings), `tanh`/`sigmoid`/`silu`/`gelu` (built on `exp`; `silu`/`gelu` first-class),
+  and `fmax`/`fmin` — all built from primitive ops both backends agree on bit-for-bit. A pure
+  `out[i] = f(x[i])` loop for `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` is **dispatched to a tuned
+  256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit) vectorizer
+  can't reach; the rest auto-vectorize the inlined poly at 128-bit. So softmax, layernorm, GELU (tanh
+  and exact erf), SiLU/swish, tanh, RoPE, and **log-softmax / cross-entropy** run on SIMD instead of
+  scalar `libm` — **~5–7.5× faster** than gcc/rustc's scalar `expf`/`logf`/`tanhf` (~28× across cores
+  under `@parallel`). See
   `tests/run/{transcendental,softmax,layernorm,gelu,activations,log,erf,trig,log_softmax,ffn_block}.mer`.
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
