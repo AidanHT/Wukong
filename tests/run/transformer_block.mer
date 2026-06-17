@@ -8,14 +8,11 @@ module tests.run.transformer_block
 // A full pre-norm (Llama-style) transformer block in one function:
 //   h   = x + Attention(RMSNorm(x))
 //   out = h + FFN(RMSNorm(h))
-// composing every Mercury win — three of the four matmul nests dispatch to the GEMM kernel (P·V and
-// the two FFN linears), two RMSNorm reductions (sum-of-squares + rsqrt + scale), a row softmax
-// (fmax reduction + vectorized exp + sum + normalize), a vectorized GELU, and residual adds. S=8
-// tokens, D=8 model dim, H=16 FFN hidden. Self-attention here uses the normed input directly as
-// Q/K/V, so the Q·Kᵀ nest has the *same* array on both sides — which the recognizer leaves as a
-// plain loop (real attention projects Q/K/V to distinct tensors and dispatches all of them). Every
-// path still runs, and the gate proves the whole block is bit-identical between the interpreter and
-// native backends.
+// composing every Mercury win — all four matmul nests dispatch to the GEMM kernel (the self-attention
+// Q·Kᵀ, which here shares one array as both Q and K; P·V; and the two FFN linears), two RMSNorm
+// reductions (sum-of-squares + rsqrt + scale), a row softmax (fmax reduction + vectorized exp + sum +
+// normalize), a vectorized GELU, and residual adds. S=8 tokens, D=8 model dim, H=16 FFN hidden. The
+// gate proves the whole block is bit-identical between the interpreter and native backends.
 fn block(x: [f32; 64], w1: [f32; 128], w2: [f32; 128], out: [f32; 64]) {
     let mut n1: [f32; 64] = [0.0; 64];
     let mut scores: [f32; 64] = [0.0; 64];

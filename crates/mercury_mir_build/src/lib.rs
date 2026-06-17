@@ -3507,7 +3507,11 @@ fn match_matmul_ijk(
     if sa != kdim || !sb_ok || sc != n {
         return None;
     }
-    if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
+    // A and B may be the *same* array (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` with a shared
+    // operand): both sides are read-only, which the kernel packs into separate scratch panels, so it
+    // is safe. Only an input aliasing the output C is a hazard (the blocked kernel writes C in a
+    // different order than the scalar nest reads it).
+    if a_sym == cbase || b_sym == cbase {
         return None;
     }
     Some(MatmulNest {
@@ -3655,7 +3659,11 @@ fn match_matmul(
             return None;
         }
     }
-    if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
+    // A and B may be the *same* array (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` with a shared
+    // operand): both sides are read-only, which the kernel packs into separate scratch panels, so it
+    // is safe. Only an input aliasing the output C is a hazard (the blocked kernel writes C in a
+    // different order than the scalar nest reads it).
+    if a_sym == cbase || b_sym == cbase {
         return None;
     }
     Some(MatmulNest {
