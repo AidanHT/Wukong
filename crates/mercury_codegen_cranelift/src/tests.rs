@@ -904,6 +904,25 @@ fn matmul_accumulate_differential() {
     );
 }
 
+/// Regression: `(negative float) as iN` must lower to a *signed* fp→int conversion (fptosi), not
+/// fptoui. With fptoui the native backend saturates a negative to 0 while the interpreter keeps the
+/// signed value, so the two diverged — exactly what broke the `linear_f32` differential gate, where
+/// `C[0,0] = -0.5` printed as 0 on native and -5 on the interpreter. Check native == interp == the
+/// signed value, for both an i32 and an i64 target and a negative literal-ish operand.
+#[test]
+fn negative_float_to_signed_int_cast_is_signed() {
+    // a = (1.0 - 3.5) * 4.0 = -10.0 -> -10 ; b = (0.0 - 7.0) -> -7 ; stdout "-10\n-7\n", ret -17.
+    let src = "module m\nfn main() -> i32 { \
+        let mut x: f32 = 1.0; x = x - 3.5; let a: i32 = (x * 4.0) as i32; \
+        let mut y: f32 = 0.0; y = y - 7.0; let b: i32 = y as i32; \
+        print(a); print(b); return a + b; }";
+    let native = jit(src, 3).expect("jit");
+    let interp = interp(src, 3).expect("interp");
+    assert_eq!(native, interp, "negative float->int cast: native vs interp");
+    assert_eq!(native.0, -17, "negative float->int cast value");
+    assert_eq!(String::from_utf8(native.1).unwrap(), "-10\n-7\n");
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.
