@@ -13,7 +13,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - Modules, functions (including recursion and mutual recursion), and direct calls.
 - `let`/`let mut`/`const`, shadowing, block-as-expression values.
 - Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
-  precision** (interpreter and native agree exactly); `f16`/`bf16` promote to `f32`; `f64` is full.
+  precision** (interpreter and native agree exactly); **`bf16` is real 2-byte storage** rounded to
+  bf16 (round-to-nearest-even) on store and on `as bf16`, with `f32` compute; `f16` still promotes to
+  `f32`; `f64` is full.
 - All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
@@ -22,9 +24,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
   the way XLA/TVM/oneDNN lower a matmul op. Serial and `@parallel`. Beats gcc/rustc's naive nest
-  ~2.4–3.5× single-thread and up to ~10× parallel on `C = A·B` (~19–70× on `nn.Linear`), the lead
-  growing with size. The interpreter calls the identical kernel (marshalling its memory), so the two
-  stay bit-exact.
+  ~2.4–3.5× single-thread and up to ~13× parallel on `C = A·B` (~19–70× on `nn.Linear`), the lead
+  growing with size. Dimensions may be compile-time literals **or runtime values** (function
+  params/locals): the recognizer checks strides symbolically, so a general matmul function dispatches
+  to the kernel, not just fixed-size benchmark kernels. The interpreter calls the identical kernel
+  (marshalling its memory), so the two stay bit-exact.
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
   on the native backend. saxpy/poly/relu/relu6 vectorize.
@@ -34,6 +38,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Reduction vectorization**: a float reduction `s = s + x[k]*y[k]` / `s += ..` lowers to
   vector-lane accumulators (independent FMA chains) + a horizontal reduce + scalar remainder, turning
   the latency-bound serial sum into a throughput-bound one. `dot` runs ~2.6× faster than serial C.
+  `fmax`/`fmin` reductions (`m = fmax(m, x[i])`, softmax's row-max) vectorize the same way.
+- **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp` (a ≈1-ULP `f32` minimax
+  polynomial), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all built from primitive ops
+  both backends already agree on bit-for-bit, and all **vectorize** in elementwise loops. So softmax,
+  layernorm, GELU, SiLU/swish and tanh activations lower to SIMD instead of scalar `libm` calls and
+  run **~2.5–3× faster** than gcc/rustc's scalar `expf`/`tanhf`. See
+  `tests/run/{transcendental,softmax,layernorm,gelu,activations}.mer`.
 - **Operator fusion**: adjacent same-range elementwise loops (e.g. a linear map then ReLU) fuse into
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
   registers rather than memory.
@@ -70,13 +81,19 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## Known limitations / sharp edges
 
-- `f16`/`bf16` are storage types promoted to `f32` at runtime, not yet reduced precision.
-- The *general* vectorizer emits 128-bit SIMD (Cranelift's vector ISA rejects 256-bit `f32x8`), so
-  compute-bound *elementwise* kernels tie gcc's 256-bit AVX single-thread (4× unrolling narrows the
-  gap; auto-parallelism more than erases it). The **GEMM family is exempt** — it dispatches to a true
-  AVX2/FMA runtime microkernel. The loop vectorizer assumes distinct array parameters do not alias.
-- Array length must be an integer literal; symbolic/`const`-expression lengths fall back to an opaque
-  pointer.
+- `bf16` is now real 2-byte storage at bf16 precision (round-to-nearest-even), f32 compute; `f16`
+  still promotes to `f32`. On this AVX2 box (no AVX-512-BF16) a bf16 *GEMM* would widen to f32 and
+  match f32 throughput — a memory-footprint feature, not a FLOP/s win — so it is left at the proven
+  correctness path (`tests/run/matmul_bf16.mer`), not a tuned bf16 kernel.
+- The *general* vectorizer emits 128-bit SIMD (Cranelift's vector ISA rejects 256-bit `f32x8` —
+  verified empirically on Cranelift 0.124). Compute-bound *elementwise* kernels therefore use 2× the
+  FMA ports they could; 4× unrolling and auto-parallelism recover throughput, and the vectorized
+  **transcendentals still beat scalar `libm` ~2.5–3×**. Breaking 256-bit needs a hand-written AVX2
+  path (how the GEMM family already gets 256-bit — a true AVX2/FMA runtime microkernel). The loop
+  vectorizer assumes distinct array parameters do not alias.
+- Array *length* in a type must be an integer literal (symbolic/`const`-expression lengths fall back
+  to an opaque pointer), but matmul *dimensions* may be runtime values — a runtime-dimension matmul
+  still dispatches to the GEMM kernel.
 - No bounds checking on array indexing (manual memory is a decided constraint).
 - `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
   stay in memory (the interpreter and `cse`/`dse` handle those directly).
