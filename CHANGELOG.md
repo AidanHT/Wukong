@@ -30,15 +30,27 @@ All notable changes to Mercury are documented here. The format is loosely based 
   and `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling — and lowers the whole
   nest to a register-blocked (6×16), cache-tiled, packed **AVX2/FMA** GEMM microkernel in the runtime
   (`mercury_sgemm` / `_nt` / `_parallel`). On a Meteor Lake laptop this beats `gcc -O3 -march=native`
-  on the naive nest by **~2.4–3.5× single-thread and up to ~10× parallel** on `C = A·B` (and
-  **~19–70× on `nn.Linear`**, where naive C stays latency-bound), the lead growing with matrix size.
-  The serial kernel holds ~100 GFLOP/s (~80% of one P-core's AVX2-FMA peak); the parallel one packs
-  panels across cores and skips threading below a work threshold. The interpreter calls the identical
+  on the naive nest by **~2.4–3.5× single-thread and ~18× parallel** on `C = A·B` (and **~20–75× on
+  `nn.Linear`**, where naive C stays latency-bound), the lead growing with matrix size. The serial
+  kernel holds ~90–105 GFLOP/s (~80% of one P-core's AVX2-FMA peak; ~105 pinned at 512³); the parallel
+  one packs panels across cores — reusing one pack-scratch allocation across all cache blocks instead
+  of re-allocating per K-block (≈+45% at 1024³, ~395–434 GFLOP/s) — and skips threading below a work
+  threshold. The 6×16 microkernel stores full tiles straight to C and unrolls the K loop ×4. The interpreter calls the identical
   kernel (marshalling its memory) so the oracle stays exact.
 - **Auto-vectorization**: straight-line elementwise loops (incl. branchy ones via if-conversion) and
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
   run ~2.6–2.8× faster than serial C.
+- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for
+  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` (over f32) lowers to a tuned **256-bit AVX2/FMA runtime
+  kernel** (`mercury_vmath_f32`) — the width Cranelift's general vectorizer can't emit (it caps at
+  128-bit SSE). `silu` (Llama/SwiGLU) and `gelu` (BERT/GPT-2/ViT) are first-class intrinsics; the
+  kernel's per-element op sequence mirrors the inlined Cephes polynomial, and the interpreter marshals
+  through the identical kernel, so the differential oracle stays exact and dispatched/composed forms
+  agree. A multi-statement (fusion-merged) body dispatches one kernel call per activation, and an
+  `@parallel` activation dispatches each thread's chunk — so it runs multicore × 256-bit. Versus C's
+  scalar `libm` (which can't vectorize a loop with a call), the activation family runs **~5–7.5×
+  faster** single-thread, ~28× `@parallel`.
 - **`@parallel`**: loops execute across CPU cores via a rayon runtime, each per-core chunk itself
   vectorized — ~1.8–7.6× faster than idiomatic single-threaded C on the (memory-bound) elementwise
   kernels.
