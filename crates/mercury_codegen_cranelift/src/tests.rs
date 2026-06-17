@@ -358,6 +358,62 @@ fn differential_parallel_vmath() {
     }
 }
 
+/// A `@parallel` reduction (`s += f(x[k], y[k])`) dispatches to the multicore reduction kernel
+/// (`mercury_sreduce_f32_parallel`). The native run accumulates across cores; the interpreter calls
+/// the *serial* kernel — both are bit-identical by construction (fixed chunking, ascending combine),
+/// so native and interp must agree at every opt level. Covers dot, ssd, and the unary sum.
+#[test]
+fn differential_parallel_reduce() {
+    let programs = [
+        // dot product Σ x·y
+        "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s = s + x[k] * y[k]; } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 2.0; } dotp(x, y, o); \
+         print((o[0] * 100.0) as i32); return 0; }",
+        // sum of squared differences Σ (x−y)² (an L2 loss)
+        "@parallel fn ssd(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += (x[k] - y[k]) * (x[k] - y[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 1.0; } ssd(x, y, o); \
+         print((o[0] * 10.0) as i32); return 0; }",
+        // unary sum Σ x (LayerNorm-style accumulation; the recognizer passes y == x)
+        "@parallel fn sumv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += x[k]; } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.01; } sumv(x, o); \
+         print((o[0]) as i32); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "parallel reduce native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+    // Golden, using f32-exact values so the reassociated sum is unambiguous: dot = 2·3·4096 = 24576,
+    // sum = 2·4096 = 8192.
+    let golden = "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s = s + x[k] * y[k]; } o[0] = s; } \
+         @parallel fn sumv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += x[k]; } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [2.0; 4096]; \
+         let mut y: [f32; 4096] = [3.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         dotp(x, y, o); print((o[0]) as i32); sumv(x, o); print((o[0]) as i32); return 0; }";
+    let (_, out) = jit(golden, 3).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "24576\n8192\n",
+        "parallel reduction produced the wrong value"
+    );
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
