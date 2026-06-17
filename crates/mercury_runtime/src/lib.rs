@@ -11,6 +11,9 @@ pub use gemm::{
     mercury_sgemm_parallel,
 };
 
+mod vmath;
+pub use vmath::{mercury_vmath_f32, VM_EXP, VM_LOG, VM_RELU, VM_SIGMOID, VM_TANH};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
