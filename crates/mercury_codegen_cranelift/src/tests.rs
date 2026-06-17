@@ -271,6 +271,54 @@ fn differential_transcendentals() {
     }
 }
 
+/// A pure elementwise `out[i] = f(x[i])` loop for f(∈ exp/log/tanh/sigmoid) is dispatched to the
+/// 256-bit AVX2 `mercury_vmath_f32` kernel (the width Cranelift can't emit). The interpreter marshals
+/// through the identical kernel, so native and interp must agree across opt levels — and the result
+/// must stay ≈1 ULP of the true function (golden checks below catch an accuracy regression that the
+/// native-vs-interp comparison alone would not, since both call the same kernel).
+#[test]
+fn differential_vmath_dispatch() {
+    let programs = [
+        // tanh over [-4, 3.75] — saturates toward ±1 at the ends.
+        "fn main() -> i32 { let mut xs: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { xs[i] = (i as f32) * 0.25 - 4.0; } \
+         let mut ys: [f32; 32] = [0.0; 32]; for i in 0..32 { ys[i] = tanh(xs[i]); } \
+         print((ys[0] * 1000.0) as i32); print((ys[20] * 1000.0) as i32); return 0; }",
+        // sigmoid over the same range.
+        "fn main() -> i32 { let mut xs: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { xs[i] = (i as f32) * 0.25 - 4.0; } \
+         let mut ys: [f32; 32] = [0.0; 32]; for i in 0..32 { ys[i] = sigmoid(xs[i]); } \
+         print((ys[0] * 1000.0) as i32); print((ys[31] * 1000.0) as i32); return 0; }",
+        // a length that is not a multiple of 8 exercises the kernel's scalar tail.
+        "fn main() -> i32 { let mut xs: [f32; 13] = [0.0; 13]; \
+         for i in 0..13 { xs[i] = (i as f32) * 0.5; } \
+         let mut ys: [f32; 13] = [0.0; 13]; for i in 0..13 { ys[i] = exp(xs[i]); } \
+         print((ys[12] * 100.0) as i32); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "vmath native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+    // Golden accuracy (≈1 ULP of libm, truncating `as i32`): exp(3.5)=33.1154→33115,
+    // tanh(1)=0.761594→76159, sigmoid(2)=0.880797→88079.
+    let golden = "fn main() -> i32 { \
+        let a: [f32; 4] = [3.5; 4]; let b: [f32; 4] = [1.0; 4]; let c: [f32; 4] = [2.0; 4]; \
+        let oa: [f32; 4] = [0.0; 4]; let ob: [f32; 4] = [0.0; 4]; let oc: [f32; 4] = [0.0; 4]; \
+        for i in 0..4 { oa[i] = exp(a[i]); } for i in 0..4 { ob[i] = tanh(b[i]); } \
+        for i in 0..4 { oc[i] = sigmoid(c[i]); } \
+        print((oa[0] * 1000.0) as i32); print((ob[0] * 100000.0) as i32); \
+        print((oc[0] * 100000.0) as i32); return 0; }";
+    let (_, out) = jit(golden, 3).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "33115\n76159\n88079\n",
+        "vmath kernel drifted from libm accuracy"
+    );
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.

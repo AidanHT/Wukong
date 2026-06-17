@@ -39,6 +39,7 @@ pub fn lower_program(
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
+        vmath: interner.intern("mercury_vmath_f32"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -333,8 +334,9 @@ fn lower_parallel(
     (outlined, wrapper)
 }
 
-/// The four GEMM runtime entry points the matmul recognizer dispatches to: `C = A·B` and the
-/// `nn.Linear` form `C = A·Bᵀ`, each serial or `@parallel`.
+/// The runtime entry points the recognizers dispatch to: the four GEMM kernels (`C = A·B` and the
+/// `nn.Linear` form `C = A·Bᵀ`, each serial or `@parallel`), the fused-epilogue Linear, and the
+/// vectorized elementwise-math kernel.
 #[derive(Clone, Copy)]
 struct GemmSyms {
     mm: Symbol,
@@ -344,7 +346,17 @@ struct GemmSyms {
     /// The fused-epilogue `nn.Linear` kernel (`mercury_sgemm_nt_epi`): `C = act(A·Bᵀ + bias)`. A
     /// matmul immediately followed by a bias-add / ReLU loop over its output lowers to this.
     nt_epi: Symbol,
+    /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
+    /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
+    vmath: Symbol,
 }
+
+// Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
+// on the runtime crate; same arrangement as the EPI_ACT_* codes mirroring the runtime's).
+const VMATH_EXP: u32 = 0;
+const VMATH_LOG: u32 = 1;
+const VMATH_TANH: u32 = 2;
+const VMATH_SIGMOID: u32 = 3;
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -917,6 +929,101 @@ impl FnLowerer<'_> {
     // Distinct array parameters are assumed not to alias (the usual kernel ABI). On any failure it
     // returns `false` and the caller falls back to the scalar lowering.
 
+    /// If `e` is `arr[j]` — a single-segment array path indexed by exactly the loop variable `j`
+    /// (unit stride, zero offset) — return the array's symbol. The shape the vmath kernel needs.
+    fn index_by_loopvar(&self, e: &Expr, j: Symbol) -> Option<Symbol> {
+        let ExprKind::Index { base, indices } = &e.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(j) {
+            return None;
+        }
+        single_path(base)
+    }
+
+    /// Recognize a pure elementwise transcendental loop `for j in lo..hi { out[j] = f(x[j]) }` for a
+    /// supported unary intrinsic `f` (exp/log/tanh/sigmoid) over `f32` arrays, and lower it to one
+    /// `mercury_vmath_f32(x+lo, out+lo, hi-lo, op)` call — the 256-bit AVX2 kernel (Cranelift's
+    /// vectorizer is capped at 128-bit). The interpreter marshals through the *identical* kernel, so
+    /// the differential oracle stays exact. `out` and `x` may be the same array (in-place). Returns
+    /// false on any mismatch, so the caller falls back to the generic 128-bit vectorizer. Pure checks
+    /// run before any MIR is emitted.
+    fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return false;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return false;
+        };
+        let Some(out_sym) = self.index_by_loopvar(target, j) else {
+            return false;
+        };
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return false;
+        };
+        if args.len() != 1 {
+            return false;
+        }
+        let opcode = match self.vectorizable_intrinsic(callee) {
+            Some(MathIntrinsic::Exp) => VMATH_EXP,
+            Some(MathIntrinsic::Log) => VMATH_LOG,
+            Some(MathIntrinsic::Tanh) => VMATH_TANH,
+            Some(MathIntrinsic::Sigmoid) => VMATH_SIGMOID,
+            _ => return false,
+        };
+        let Some(x_sym) = self.index_by_loopvar(&args[0], j) else {
+            return false;
+        };
+        // f32-only (the kernel computes f32); bail on f64 / unknown.
+        if self.expr_mir(value) != MirType::F32 || self.expr_mir(&args[0]) != MirType::F32 {
+            return false;
+        }
+        let (Some((out_base, _)), Some((x_base, _))) =
+            (self.lookup(out_sym), self.lookup(x_sym))
+        else {
+            return false;
+        };
+
+        // All checks passed — now emit. Lower the bounds to i64, GEP each base by the start index
+        // (so a loop from `lo` begins at element `lo`), and call the kernel for `hi-lo` elements.
+        let sty = self.expr_mir(start);
+        let s = self.lower_expr(start);
+        let s = self.coerce_to(s, &sty, &MirType::I64, true);
+        let ety = self.expr_mir(end);
+        let e = self.lower_expr(end);
+        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        let xp = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: x_base,
+                index: s,
+                elem: MirType::F32,
+            },
+        );
+        let outp = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: out_base,
+                index: s,
+                elem: MirType::F32,
+            },
+        );
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
+        self.builder.build_void(Op::Call {
+            func: self.gemm.vmath,
+            args: vec![xp, outp, n, opv],
+        });
+        true
+    }
+
     /// Attempt SIMD lowering of `for j in start..end { body }`. Returns true on success.
     fn try_vectorize_for(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         let j = match &pat.kind {
@@ -926,6 +1033,12 @@ impl FnLowerer<'_> {
         let ity = self.expr_mir(start);
         if !ity.is_int() {
             return false;
+        }
+        // A pure elementwise transcendental `out[j] = f(x[j])` (exp/log/tanh/sigmoid) lowers to the
+        // 256-bit AVX2 runtime kernel — the width Cranelift's 128-bit vectorizer can't reach. Tried
+        // before the generic (Cranelift-emitted) vectorizer, which would otherwise inline the poly.
+        if self.try_vmath_for(j, start, end, body) {
+            return true;
         }
         // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
         // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
