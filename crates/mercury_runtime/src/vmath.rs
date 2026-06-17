@@ -272,10 +272,7 @@ unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     // 1 - 2/(exp(2x)+1)
     let e = exp8(_mm256_mul_ps(x, _mm256_set1_ps(2.0)));
     let d = _mm256_add_ps(e, _mm256_set1_ps(1.0));
-    _mm256_sub_ps(
-        _mm256_set1_ps(1.0),
-        _mm256_div_ps(_mm256_set1_ps(2.0), d),
-    )
+    _mm256_sub_ps(_mm256_set1_ps(1.0), _mm256_div_ps(_mm256_set1_ps(2.0), d))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -335,9 +332,11 @@ mod tests {
             (VM_SIGMOID, |x| 1.0 / (1.0 + (-x).exp()), 2e-5),
             (VM_SILU, |x| x / (1.0 + (-x).exp()), 2e-5),
             // GELU tanh-approx reference, reusing the module's f32 constants (GELU_C0=√(2/π)).
-            (VM_GELU, |x| {
-                0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())
-            }, 5e-5),
+            (
+                VM_GELU,
+                |x| 0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh()),
+                5e-5,
+            ),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
@@ -373,7 +372,9 @@ mod tests {
     #[test]
     fn vmath_tail_matches_lanes() {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
-        for op in [VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU] {
+        for op in [
+            VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU,
+        ] {
             if op == VM_LOG {
                 continue; // negative inputs are out of log's domain
             }

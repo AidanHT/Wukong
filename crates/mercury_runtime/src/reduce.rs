@@ -250,11 +250,8 @@ mod tests {
                 } else {
                     y.as_ptr()
                 };
-                let s =
-                    unsafe { mercury_sreduce_f32(x.as_ptr(), yp, n as i64, op) };
-                let p = unsafe {
-                    mercury_sreduce_f32_parallel(x.as_ptr(), yp, n as i64, op)
-                };
+                let s = unsafe { mercury_sreduce_f32(x.as_ptr(), yp, n as i64, op) };
+                let p = unsafe { mercury_sreduce_f32_parallel(x.as_ptr(), yp, n as i64, op) };
                 assert_eq!(
                     s.to_bits(),
                     p.to_bits(),

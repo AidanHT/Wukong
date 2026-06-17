@@ -987,7 +987,9 @@ impl FnLowerer<'_> {
             },
         );
         // s = s + result — matches the loop's `s_final = s_init + Σ` (reassociated inside the kernel).
-        let cur = self.builder.build(MirType::F32, Op::Load(s_slot, MirType::F32));
+        let cur = self
+            .builder
+            .build(MirType::F32, Op::Load(s_slot, MirType::F32));
         let new_s = self
             .builder
             .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result));
