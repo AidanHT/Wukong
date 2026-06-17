@@ -636,9 +636,21 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
         And => x & y,
         Or => x | y,
         Xor => x ^ y,
-        Shl => x.wrapping_shl(y as u32),
-        LShr => ((x as u128) >> (y as u32)) as i128,
-        AShr => x >> (y as u32),
+        // Shift counts are masked to the result width (as x86/Cranelift do): `1i32 << 32 == 1`, not
+        // 0. `LShr` is logical, so it shifts the value's own unsigned width window, not the
+        // sign-extended i128 (else a high-bit-set operand shifts in 1s and diverges from native).
+        Shl => {
+            let bits = rty.map(int_bits).unwrap_or(64);
+            x.wrapping_shl((y as u32) & (bits - 1))
+        }
+        LShr => {
+            let bits = rty.map(int_bits).unwrap_or(64);
+            (uval(x, bits) >> ((y as u32) & (bits - 1))) as i128
+        }
+        AShr => {
+            let bits = rty.map(int_bits).unwrap_or(64);
+            x >> ((y as u32) & (bits - 1))
+        }
         FAdd | FSub | FMul | FDiv | FRem => unreachable!(),
     })
 }
