@@ -68,7 +68,7 @@ naively-written source:
 
 | | Mercury | C (gcc) | Rust | Mercury speedup |
 |---|---|---|---|---|
-| any kernel | ~1–3 ms | ~150–370 ms | ~290–340 ms | **~120–230×** |
+| any kernel | ~1–2 ms | ~125–245 ms | ~185–210 ms | **~100–260×** (geomean ~135–155×) |
 
 Cranelift JIT compiling in-process vs spawning a full C/Rust+LLVM toolchain is a 1–2 order-of-
 magnitude win, every build. For an ML compiler — where edit/recompile/run iteration dominates
@@ -80,57 +80,70 @@ GFLOP/s (higher is better), naive `ikj` nest in each language:
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
-| 256³ | 29–55 | 37–60 | 16–24 | 18–23 | **~1.9–2.3×** | **~2.4–2.6×** |
-| 512³ | 36–81 | 119–201 | 17–24 | 18–21 | **~2.0–3.3×** | **~6.8–8.3×** |
-| 1024³| 41–89 | 145–248 | 11–17 | 12–18 | **~3.9–5.4×** | **~13.6–15×** |
+| 256³ | 90–100 | 90–99 † | 29–41 | 29–42 | **~2.7–3.5×** | **~2.8–3.4×** |
+| 512³ | 97–106 | 263–297 | 40–41 | 44–45 | **~2.4–2.6×** | **~6.6–7.2×** |
+| 1024³| 98–100 | 297–299 | 28–29 | 29–31 | **~3.5×** | **~10.3–10.8×** |
 
-At 1024³ gcc's naive matmul thrashes cache (~11–17 GFLOP/s) while Mercury's packed, tiled kernel
-holds ~89 single-core / ~248 parallel — **~5× single-thread, ~15× parallel.**
+The single-core kernel holds ~100 GFLOP/s across all sizes (≈80% of one P-core's AVX2-FMA peak),
+while gcc's naive nest falls from ~40 to ~28 GFLOP/s as 1024² spills out of cache — so the
+**single-thread lead widens with size** (2.4× → 3.5×) and parallel reaches **~10× at 1024³**.
+
+† At 256³ the parallel kernel deliberately falls back to the serial one: ~17M MACs is below the
+work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
+there (a measured fix — naive threading at that size was a net *loss*).
 
 ### `nn.Linear` `C = A·Bᵀ` — Mercury dispatches to GEMM; naive C is latency-bound
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
-| 512² | 38–107 | 105–246 | ~1.9 | ~1.8 | **~20–40×** | **~55–93×** |
-| 1024²| 39–99 | 156–293 | ~1.5 | ~1.4 | **~26–44×** | **~100–130×** |
+| 512² | 94–104 | 251–261 | ~5.0 | ~4.7 | **~19–21×** | **~49–52×** |
+| 1024²| 97–100 | 303–311 | ~4.5 | ~4.2 | **~22×** | **~66–70×** |
+
+C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 GFLOP/s, latency-bound),
+while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
+magnitude gap (caused by C's serial reduction, not a strided-access strawman; see Fairness notes).
 
 ### Single-threaded elementwise & reductions
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
-| saxpy  | ≈tie (~1.0×) | memory-bandwidth bound; everyone is at the wall |
-| relu   | ≈tie (~1.0×) | memory-bound; vectorized via if-conversion (one load per element) |
-| poly   | ≈tie (~1.0×, ±) | compute-bound deg-4 Horner; 128-bit SSE vs gcc's 256-bit AVX |
-| fused linear→relu | ~1.2× faster | two source loops Mercury auto-fuses; C/Rust stream the intermediate |
-| dot    | **~2.3–2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
-| ssd (Σ(x−y)²) | **~2.9–3.7× faster** | same — an L2-loss reduction |
+| saxpy  | ≈tie (~0.95×) | memory-bandwidth bound; everyone is at the wall (~54 vs ~59 GB/s) |
+| relu   | ≈tie (~0.95×) | memory-bound; vectorized via if-conversion (one load per element) |
+| poly   | ≈tie (~1.0×, ±) | deg-4 Horner; memory-bound at N=2²⁰ (~1 FLOP/byte), so width is moot here |
+| fused linear→relu | ~1.0× faster | two source loops Mercury auto-fuses; C/Rust stream the intermediate |
+| dot    | **~2.6–2.8× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
+| ssd (Σ(x−y)²) | **~2.6–2.7× faster** | same — an L2-loss reduction |
 
 ### Auto-parallel runtime — Mercury heavily exceeds idiomatic single-threaded C/Rust
 
-`@parallel` lowers the loop to a multicore dispatch whose per-thread chunk is itself vectorized:
+`@parallel` lowers the loop to a multicore dispatch whose per-thread chunk is itself vectorized.
+These kernels are memory-bound, so the parallel speedup is limited by *aggregate* bandwidth, not
+core count — still a clear win over single-threaded C:
 
 | kernel | Mercury vs single-threaded C |
 |--------|------------------------------|
-| saxpy@parallel | **~4–5×** |
-| poly@parallel  | **~3.5–4×** |
-| relu6@parallel | **~10–12×** (nested branch defeats gcc's vectorizer; Mercury if-converts + parallelizes) |
+| saxpy@parallel | **~2.4×** (~147 GB/s, near the chip's memory-bandwidth ceiling) |
+| poly@parallel  | **~1.8–2.3×** |
+| relu6@parallel | **~6.7–7.6×** (nested branch defeats gcc's vectorizer; Mercury if-converts + parallelizes) |
 
 ## Honest summary
 
-- **Compile time:** ~120–230× faster than gcc/rustc. Robust every run; the metric that dominates ML
-  iteration.
-- **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~2–5×) and
-  dominates parallel (~2.4–130×)**, and the lead **grows with matrix size** — the compiler tiles,
-  packs, and register-blocks where gcc/rustc leave the naive nest. This is a reversal of the previous
-  honest loss (single-core matmul used to be ~3× *behind*).
-- **Reductions:** ~2.3–3.7× faster (lane-accumulator reassociation).
-- **Auto-parallel:** ~3.5–12× faster than idiomatic single-threaded C across elementwise kernels.
-- **Single-thread memory-bound elementwise (saxpy/relu/poly):** a genuine **tie** — these are at the
-  DRAM/cache bandwidth wall, where no compiler "heavily exceeds" another. The one structural cause
-  left is that the general (non-GEMM) vectorizer emits 128-bit SSE: Cranelift cannot legalize a
-  256-bit `f32x8` value (verified, pinned as a tripwire test), so the width-sensitive *general*
-  kernels match rather than beat gcc's AVX. The width that matters most — the GEMM family — gets true
-  256-bit AVX2/FMA via the runtime microkernel.
+- **Compile time:** ~100–260× faster than gcc/rustc (geomean ~135–155×). Robust every run; the metric
+  that dominates ML iteration.
+- **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~2.4–22×) and
+  dominates parallel (~2.8–70×)**, and the lead **grows with matrix size** — the compiler tiles,
+  packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds ~100
+  GFLOP/s (≈80% of one P-core's AVX2-FMA peak). This is a reversal of the previous honest loss
+  (single-core matmul used to be ~3× *behind*).
+- **Reductions:** ~2.6–2.8× faster (lane-accumulator reassociation).
+- **Auto-parallel:** ~1.8–7.6× faster than idiomatic single-threaded C across elementwise kernels —
+  bounded by aggregate memory bandwidth, not core count (these kernels are memory-bound).
+- **Single-thread memory-bound elementwise (saxpy/relu/poly):** a genuine **tie** (within ~5%) —
+  these are at the DRAM/cache bandwidth wall, where no compiler "heavily exceeds" another. The
+  general (non-GEMM) vectorizer emits 128-bit SSE because Cranelift cannot legalize a 256-bit
+  `f32x8` value (verified, pinned as a tripwire test); at N=2²⁰ these kernels are memory-bound, so
+  the SIMD width is moot and matching gcc's AVX is the bandwidth ceiling anyway. The width that
+  matters most — the GEMM family — gets true 256-bit AVX2/FMA via the runtime microkernel.
 - **Safety:** Mercury checks tensor **shapes at compile time** (in the type system), a class of bug
   C/C++/Rust-with-raw-pointers cannot catch.
 
