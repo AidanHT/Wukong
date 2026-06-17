@@ -58,6 +58,17 @@ extern "C" fn rt_assert(cond: i64) {
     }
 }
 
+// Float remainder. Cranelift has no `frem`; the interpreter uses Rust `%` (true fmod), so the native
+// backend calls these to stay bit-identical instead of the lossy `a - trunc(a/b)*b` identity (which
+// drifts once `a/b` exceeds the float's integer-precision range, e.g. `1e18 % 3`).
+extern "C" fn rt_fmod_f64(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+extern "C" fn rt_fmod_f32(a: f32, b: f32) -> f32 {
+    a % b
+}
+
 /// Names of the runtime symbols, shared by the JIT (which binds them to the `rt_*` functions) and
 /// the object emitter (which leaves them as undefined imports resolved at link time).
 const RT_PRINT_I64: &str = "mercury_rt_print_i64";
@@ -68,6 +79,8 @@ const RT_SGEMM: &str = "mercury_sgemm";
 const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
 const RT_SGEMM_NT: &str = "mercury_sgemm_nt";
 const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
+const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
+const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
@@ -439,13 +452,18 @@ impl<'a> FnTranslator<'a> {
                 FSub => self.builder.ins().fsub(a, b),
                 FMul => self.builder.ins().fmul(a, b),
                 FDiv => self.builder.ins().fdiv(a, b),
-                // `x % y == x - trunc(x/y)*y` (truncated remainder, matching Rust's `%` and C fmod
-                // for finite values; y == 0 yields NaN, as in the interpreter). No libcall needed.
+                // True fmod via a runtime call (Rust `%`), bit-identical to the interpreter. The old
+                // `a - trunc(a/b)*b` identity drifts once `a/b` exceeds the mantissa's integer range
+                // (e.g. `1e18 % 3` gave 0 instead of 1). y == 0 yields NaN in both, as before.
                 FRem => {
-                    let q = self.builder.ins().fdiv(a, b);
-                    let t = self.builder.ins().trunc(q);
-                    let p = self.builder.ins().fmul(t, b);
-                    self.builder.ins().fsub(a, p)
+                    let name = if target == types::F32 {
+                        RT_FMOD_F32
+                    } else {
+                        RT_FMOD_F64
+                    };
+                    let fref = self.rt_refs[name];
+                    let call = self.builder.ins().call(fref, &[a, b]);
+                    self.builder.inst_results(call)[0]
                 }
                 _ => unreachable!(),
             };
@@ -715,6 +733,8 @@ struct RtFuncs {
     sgemm_parallel: FuncId,
     sgemm_nt: FuncId,
     sgemm_nt_parallel: FuncId,
+    fmod_f64: FuncId,
+    fmod_f32: FuncId,
 }
 
 fn signature_of(
@@ -775,6 +795,15 @@ fn populate_module<M: Module>(
     for _ in 0..4 {
         sig_gemm.params.push(AbiParam::new(types::I64));
     }
+    // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
+    let mut sig_fmod_f64 = Signature::new(call_conv);
+    sig_fmod_f64.params.push(AbiParam::new(types::F64));
+    sig_fmod_f64.params.push(AbiParam::new(types::F64));
+    sig_fmod_f64.returns.push(AbiParam::new(types::F64));
+    let mut sig_fmod_f32 = Signature::new(call_conv);
+    sig_fmod_f32.params.push(AbiParam::new(types::F32));
+    sig_fmod_f32.params.push(AbiParam::new(types::F32));
+    sig_fmod_f32.returns.push(AbiParam::new(types::F32));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -799,6 +828,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sgemm_nt_parallel: module
             .declare_function(RT_SGEMM_NT_PARALLEL, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
+        fmod_f64: module
+            .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
+            .map_err(|e| e.to_string())?,
+        fmod_f32: module
+            .declare_function(RT_FMOD_F32, Linkage::Import, &sig_fmod_f32)
             .map_err(|e| e.to_string())?,
     };
 
@@ -858,6 +893,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_NT_PARALLEL,
                 module.declare_func_in_func(rt.sgemm_nt_parallel, builder.func),
+            );
+            rt_refs.insert(
+                RT_FMOD_F64,
+                module.declare_func_in_func(rt.fmod_f64, builder.func),
+            );
+            rt_refs.insert(
+                RT_FMOD_F32,
+                module.declare_func_in_func(rt.fmod_f32, builder.func),
             );
 
             let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
@@ -976,6 +1019,8 @@ pub fn jit_compile(
         RT_SGEMM_NT_PARALLEL,
         mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
     );
+    builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
+    builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
 
     let ids = populate_module(&mut module, program, interner)?;
@@ -1054,6 +1099,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_SGEMM_NT_PARALLEL,
         mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
     );
+    builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
+    builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
     let ids = populate_module(&mut module, program, interner)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;

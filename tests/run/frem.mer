@@ -1,0 +1,28 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 1
+module tests.run.frem
+
+/// Float remainder is true fmod (Rust `%`) on both backends. The native backend once used the
+/// identity `a - trunc(a/b)*b`, which loses precision past the mantissa's integer range
+/// (`1e18 % 3` gave 0 instead of 1); it now calls a runtime fmod. The optimizer-invariance and
+/// native-vs-interpreter differential gate pin the two equal.
+fn main() -> i32 {
+    let a: f64 = 1.0e18;
+    let b: f64 = 3.0;
+    print(a % b); // 1 (fmod, exact)
+
+    let c: f64 = 1.0e16;
+    let d: f64 = 7.0;
+    print(c % d); // 4
+
+    print(7.5 % 2.0); // 1.5
+
+    let e: f32 = 1000000.0;
+    let g: f32 = 7.0;
+    print(e % g); // 1
+    return 0;
+}
