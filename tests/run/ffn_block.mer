@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 20
+// EXPECT-OUT: 57
+module tests.run.ffn_block
+
+// A transformer feed-forward block: h = gelu(x · W1ᵀ), out = h · W2ᵀ — two nn.Linear matmuls with
+// a GELU between. Both matmul nests should dispatch to the tuned GEMM kernel; the GELU loop
+// vectorizes. M=2 tokens, D=4 model dim, H=8 hidden.
+fn ffn(x: [f32; 8], w1: [f32; 32], w2: [f32; 32], h: [f32; 16], out: [f32; 8]) {
+    // h = x · W1ᵀ   (x is [2,4], W1 is [8,4] → h is [2,8]); nn.Linear spelling.
+    for i in 0..2 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..4 {
+                s = s + x[i * 4 + p] * w1[j * 4 + p];
+            }
+            h[i * 8 + j] = s;
+        }
+    }
+    // gelu(h), elementwise (vectorizes).
+    for i in 0..16 {
+        let v: f32 = h[i];
+        let u: f32 = 0.7978845608 * (v + 0.044715 * v * v * v);
+        let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);
+        h[i] = 0.5 * v * (1.0 + t);
+    }
+    // out = h · W2ᵀ   (h is [2,8], W2 is [4,8] → out is [2,4]); nn.Linear spelling.
+    for i in 0..2 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 {
+                s = s + h[i * 8 + p] * w2[j * 8 + p];
+            }
+            out[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 8] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+    let w1: [f32; 32] = [0.05; 32];
+    let w2: [f32; 32] = [0.1; 32];
+    let mut h: [f32; 16] = [0.0; 16];
+    let mut out: [f32; 8] = [0.0; 8];
+    ffn(x, w1, w2, h, out);
+    print((out[0] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    print((out[7] * 1000.0) as i32);
+    return 0;
+}
