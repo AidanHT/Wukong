@@ -383,6 +383,38 @@ fn differential_batched_matmul() {
     }
 }
 
+/// Fused scaled-dot-product attention (`sdpa`): native ≡ interp, plus hand-computed values. The
+/// differential gate alone can't catch a recognizer bug here — both backends run the *same* fused
+/// kernel — so the values are computed independently (see `tests/run/sdpa.mer`).
+#[test]
+fn differential_sdpa() {
+    // S=2, D=2, Q=K=I, V=[[1,2],[3,4]], scale=1. Each non-causal row's weights are softmax([1,0]).
+    let body = "let q: [f32; 4] = [1.0,0.0,0.0,1.0]; let k: [f32; 4] = [1.0,0.0,0.0,1.0]; \
+        let v: [f32; 4] = [1.0,2.0,3.0,4.0]; let mut o: [f32; 4] = [0.0,0.0,0.0,0.0]; \
+        sdpa(q, k, v, o, 2, 2, 1.0, CAUSAL); \
+        print((o[0]*10000.0) as i32); print((o[1]*10000.0) as i32); \
+        print((o[2]*10000.0) as i32); print((o[3]*10000.0) as i32); return 0; }";
+    let full = format!("fn main() -> i32 {{ {} ", body.replace("CAUSAL", "0"));
+    let causal = format!("fn main() -> i32 {{ {} ", body.replace("CAUSAL", "1"));
+    for (src, expect) in [
+        // Full: out0 = 0.731·[1,2]+0.269·[3,4] = [1.5379,2.5379]; out1 = [2.4621,3.4621].
+        (&full, "15378\n25378\n24621\n34621\n"),
+        // Causal: query 0 attends only to key 0 (out0 = v0 = [1,2]); row 1 sees both keys.
+        (&causal, "10000\n20000\n24621\n34621\n"),
+    ] {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "sdpa native vs interp mismatch at -O{opt}");
+            assert_eq!(
+                String::from_utf8(n.1).unwrap(),
+                expect,
+                "sdpa value mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// `if`/`else` used as a value (block tail and `let`-bound), including a branchy ReLU loop.
 #[test]
 fn if_as_expression() {
