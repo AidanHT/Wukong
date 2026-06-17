@@ -139,6 +139,25 @@ are still under construction (🔵).
 These are recognized by the MIR builder and implemented directly by the interpreter (and, with the
 LLVM backend, by the runtime).
 
+### Math intrinsics ✅
+
+`f32` (scalar or in a loop), each a ≈1-ULP minimax polynomial built from primitive ops:
+
+- `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal).
+- `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`.
+- `erf(x)` — for the exact (erf-based) GELU of BERT/GPT-2.
+- `sin(x)` / `cos(x)` — for RoPE rotary position embeddings.
+- `tanh(x)` / `sigmoid(x)` / `silu(x)` / `gelu(x)` — the transformer activation family
+  (`silu(x) = x·sigmoid(x)`; `gelu` is the tanh approximation).
+- `fmax(a, b)` / `fmin(a, b)`.
+
+When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, `exp`/`log`/`tanh`/
+`sigmoid`/`silu`/`gelu` are **dispatched to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) —
+the same domain-aware lowering as matmul→GEMM — so the activation family runs ~5–7.5× faster than C's
+scalar `libm`, and ~28× across cores under `@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`)
+auto-vectorize the inlined poly at 128-bit. Every form is bit-identical across the interpreter and
+native backends.
+
 ## Memory and parallelism
 
 No garbage collector and no hidden allocations: every heap byte comes from an allocator you name
