@@ -1153,6 +1153,7 @@ impl FnLowerer<'_> {
                 Some(
                     MathIntrinsic::Exp
                     | MathIntrinsic::Log
+                    | MathIntrinsic::Erf
                     | MathIntrinsic::Tanh
                     | MathIntrinsic::Sigmoid,
                 ) => {
@@ -1924,6 +1925,10 @@ impl FnLowerer<'_> {
                     let ylx = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, y, lx));
                     self.emit_exp_f32(ylx, vty)
                 }
+                Some(MathIntrinsic::Erf) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_erf_f32(x, vty)
+                }
                 Some(MathIntrinsic::Tanh) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_tanh(x, vty)
@@ -2607,6 +2612,10 @@ impl FnLowerer<'_> {
                 let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
                 Some(self.emit_exp(ylx, &rty))
             }
+            MathIntrinsic::Erf => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_erf(x, &rty))
+            }
             MathIntrinsic::Tanh => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_tanh(x, &rty))
@@ -2686,6 +2695,80 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FDiv, two, denom));
         self.builder
             .build(rty.clone(), Op::Bin(BinOp::FSub, one, frac))
+    }
+
+    /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
+    /// in `f32`; an `f64` result is demoted/promoted like `exp`/`log`. Works on a scalar or a SIMD
+    /// vector; bit-identical across backends because every step is a primitive op (see `emit_erf_f32`).
+    fn emit_erf(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let want_f64 = matches!(rty.lane_type(), MirType::F64);
+        let f32ty = float_ty_like(rty, MirType::F32);
+        let xf = if want_f64 {
+            self.builder
+                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
+        } else {
+            x
+        };
+        let r = self.emit_erf_f32(xf, &f32ty);
+        if want_f64 {
+            self.builder
+                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
+        } else {
+            r
+        }
+    }
+
+    /// The erf approximation in `f32` (Abramowitz–Stegun 7.1.26, ~1.5e-7 error). `|x|` and the
+    /// odd-function sign are handled with compare/select (no IEEE bit surgery), and `e^(-x²)` reuses
+    /// the exp polynomial — so it vectorizes (`fty` may be a `Vec` of `f32`) and both backends agree.
+    fn emit_erf_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
+        let mty = mask_ty(fty);
+        let one = self.splat_const_f(1.0, fty);
+        let neg1 = self.splat_const_f(-1.0, fty);
+        // ax = |x| = max(x, -x), via compare + select.
+        let negx = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, x, neg1));
+        let gt = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Fogt, x, negx));
+        let ax = self.builder.build(fty.clone(), Op::Select(gt, x, negx));
+        // t = 1 / (1 + P*ax)
+        let p = self.splat_const_f(ERF_P, fty);
+        let denom = self.builder.build(fty.clone(), Op::Fma(p, ax, one));
+        let t = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FDiv, one, denom));
+        // poly(t) = t·(a₁ + t·(a₂ + t·(a₃ + t·(a₄ + t·a₅)))) by Horner with fmas.
+        let mut h = self.splat_const_f(ERF_A[4], fty);
+        for &c in ERF_A[..4].iter().rev() {
+            let cc = self.splat_const_f(c, fty);
+            h = self.builder.build(fty.clone(), Op::Fma(h, t, cc));
+        }
+        let poly = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, h, t));
+        // e = exp(-ax²)
+        let ax2 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, ax, ax));
+        let neg_ax2 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, ax2, neg1));
+        let e = self.emit_exp_f32(neg_ax2, fty);
+        // erf(|x|) = 1 - poly·e
+        let pe = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, poly, e));
+        let mag = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, one, pe));
+        // erf is odd: result = (x >= 0) ? mag : -mag.
+        let neg_mag = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, mag, neg1));
+        let zero = self.splat_const_f(0.0, fty);
+        let ge = self.builder.build(mty, Op::Cmp(CmpOp::Foge, x, zero));
+        self.builder
+            .build(fty.clone(), Op::Select(ge, mag, neg_mag))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
@@ -4145,6 +4228,7 @@ enum MathIntrinsic {
     Exp,
     Log,
     Pow,
+    Erf,
     Tanh,
     Sigmoid,
     Fmax,
@@ -4158,6 +4242,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "exp" => MathIntrinsic::Exp,
         "log" => MathIntrinsic::Log,
         "pow" => MathIntrinsic::Pow,
+        "erf" => MathIntrinsic::Erf,
         "tanh" => MathIntrinsic::Tanh,
         "sigmoid" => MathIntrinsic::Sigmoid,
         "fmax" => MathIntrinsic::Fmax,
@@ -4214,6 +4299,18 @@ const LOG_P: [f64; 9] = [
     2.0000714765e-1,
     -2.4999993993e-1,
     3.3333331174e-1,
+];
+
+// `erf` constants (Abramowitz–Stegun 7.1.26): erf(|x|) = 1 - (a₁t + a₂t² + … + a₅t⁵)·e^(-x²),
+// t = 1/(1 + P·|x|). Max error ~1.5e-7 — f32-grade — and bit-identical across backends since it is
+// built from primitive ops plus `exp`. Enables exact (erf-based) GELU, the original BERT/GPT-2 form.
+const ERF_P: f64 = 0.327_591_1;
+const ERF_A: [f64; 5] = [
+    0.254_829_592,
+    -0.284_496_736,
+    1.421_413_741,
+    -1.453_152_027,
+    1.061_405_429,
 ];
 
 /// Names that lower to runtime/interpreter intrinsics rather than user functions.
