@@ -40,10 +40,14 @@ naively-written source:
   accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without `-ffast-math`.
 - **Auto-vectorization + fusion** of elementwise loops (incl. branchy ones via if-conversion), `x +
   y*z` → FMA contraction, and adjacent-loop fusion.
-- **Vectorized transcendentals.** `exp` lowers to a ≈1-ULP `f32` minimax polynomial (and
-  `tanh`/`sigmoid` build on it) made of primitive ops, so it **vectorizes** in an elementwise loop.
-  gcc/rustc call scalar `libm` `expf`/`tanhf` and cannot vectorize a loop with a call — so the
-  activation family (GELU/SiLU/tanh/sigmoid/softmax) runs ~2.5–3× faster.
+- **Vectorized transcendentals.** `exp` and `log` lower to ≈1-ULP `f32` minimax polynomials (and
+  `tanh`/`sigmoid` build on `exp`) made of primitive ops, so they **vectorize** in an elementwise
+  loop. gcc/rustc call scalar `libm` `expf`/`logf`/`tanhf` and cannot vectorize a loop with a call —
+  so the activation family (GELU/SiLU/tanh/sigmoid/softmax) and log-softmax/cross-entropy run
+  ~2.5–3.5× faster.
+- **Convolution via im2col + GEMM.** A conv expressed as im2col + matmul has its matmul recognized
+  and dispatched to the GEMM microkernel — so Mercury beats hand-written direct convolution ~5.8×,
+  the same way XLA/cuDNN lower conv.
 - **Auto-parallelization** of `@parallel` loops across all cores, with each per-thread chunk itself
   vectorized.
 
@@ -107,6 +111,22 @@ C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 G
 while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
 magnitude gap (caused by C's serial reduction, not a strided-access strawman; see Fairness notes).
 
+### Convolution — im2col + GEMM vs idiomatic direct conv
+
+A 3×3 conv (Cin=16, 20×20 input → 64 filters → 18×18 output), the way XLA/cuDNN lower it: an im2col
+gather builds the `[Cin·K·K, OH·OW]` column matrix, then the conv is a matmul `Y = W · col` that the
+recognizer dispatches to the tuned GEMM. C and Rust run the idiomatic **six-deep direct-convolution
+nest** (the loop everyone writes by hand).
+
+| kernel | Mer (im2col+GEMM) | C (direct) | Rust (direct) | Mercury vs C |
+|--------|-------------------|------------|---------------|--------------|
+| conv2d 3×3 | ~21 GFLOP/s | ~3.6 | ~3.7 | **~5.8× faster** |
+
+Same result (checksum cross-checked). The conv's GEMM is small (M=64, K=144, N=324) so it runs below
+the large-matmul peak, but it still beats hand-written direct convolution ~5.8× — the im2col gather
+is cheap data movement and the GEMM microkernel does the FLOPs. So Mercury accelerates conv *for
+free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
+
 ### Transcendentals / activations — Mercury vectorizes the poly; C calls scalar `libm`
 
 The activation family every transformer runs. Mercury lowers `exp` to a ≈1-ULP `f32` minimax
@@ -117,15 +137,20 @@ gcc/rustc call scalar `libm` `expf`/`tanhf` and cannot vectorize a loop containi
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
 | `exp`  | **~2.5–2.6× faster** | `out=exp(x)`; Mercury's vectorized poly vs scalar `expf` |
-| `gelu` | **~3.0× faster** | tanh-GELU, the **identical** exp-based algorithm in all three — only Mercury vectorizes the exp |
-| `silu` (swish) | **~2.5× faster** | `x*sigmoid(x)`; C/Rust write `1/(1+expf(-x))` |
-| `tanh` | **~2.9× faster** | identical exp-based algorithm everywhere; Mercury vectorizes it |
+| `log`  | **~3.5× faster** | `out=log(x)`; vectorized Cephes poly vs scalar `logf` — the largest margin (libm `logf` is slower than `expf`) |
+| `gelu` | **~2.9–3.0× faster** | tanh-GELU, the **identical** exp-based algorithm in all three — only Mercury vectorizes the exp |
+| `silu` (swish) | **~2.4–2.5× faster** | `x*sigmoid(x)`; C/Rust write `1/(1+expf(-x))` |
+| `tanh` | **~2.7–2.9× faster** | identical exp-based algorithm everywhere; Mercury vectorizes it |
 
-All four pass the cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and
-compile ~45–150× faster. These are compute-bound (the poly is ~20 flops/element), so the win is real
-SIMD throughput, not bandwidth. `softmax`/`layernorm`/`gelu` also run as fused vectorized-loop chains
-(`tests/run/`). All transcendentals are bit-identical across both backends by construction (built
-from primitives the differential gate already proves equal).
+The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
+`tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all vectorize. Every kernel passes the
+cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and compiles ~45–150×
+faster. These are compute-bound (the poly is ~20 flops/element), so the win is real SIMD throughput,
+not bandwidth. `softmax`/`layernorm`/`gelu` and **log-softmax / cross-entropy** (`exp` + `log`) run as
+fused vectorized-loop chains (`tests/run/`); a transformer FFN block (two `nn.Linear` matmuls + GELU)
+composes the GEMM and transcendental wins in one function (`tests/run/ffn_block.mer`). All
+transcendentals are bit-identical across both backends by construction (built from primitives the
+differential gate already proves equal).
 
 ### Single-threaded elementwise & reductions
 
@@ -160,10 +185,14 @@ core count — still a clear win over single-threaded C:
   GFLOP/s (≈80% of one P-core's AVX2-FMA peak). This is a reversal of the previous honest loss
   (single-core matmul used to be ~3× *behind*). The dispatch also fires on **runtime dimensions**, so
   the win applies to general matmul functions, not only fixed-size kernels.
-- **Transcendentals / activations (exp, GELU, SiLU, tanh):** **~2.5–3× faster** than C's scalar
-  `libm` — Mercury vectorizes the ≈1-ULP polynomial, where gcc/rustc cannot vectorize a loop with an
-  `expf`/`tanhf` call. This is the transformer activation family and the cleanest compute-bound
-  elementwise win; softmax/layernorm/GELU run as fused vectorized-loop chains.
+- **Transcendentals / activations (exp, log, GELU, SiLU, tanh):** **~2.5–3.5× faster** than C's
+  scalar `libm` — Mercury vectorizes the ≈1-ULP polynomial, where gcc/rustc cannot vectorize a loop
+  with an `expf`/`logf`/`tanhf` call. `log` shows the largest margin (~3.5×). This is the transformer
+  activation family and the cleanest compute-bound elementwise win; softmax/layernorm/GELU and
+  log-softmax/cross-entropy run as fused vectorized-loop chains.
+- **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Mercury runs a 3×3 conv
+  **~5.8× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
+  recognizer accelerates conv for free.
 - **Reductions:** ~2.6–2.8× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
   row-max).
 - **Auto-parallel:** ~1.8–7.6× faster than idiomatic single-threaded C across elementwise kernels —
@@ -181,5 +210,6 @@ core count — still a clear win over single-threaded C:
   C/C++/Rust-with-raw-pointers cannot catch.
 
 Where Mercury wins is where a tensor compiler should: compile speed, matmul/GEMM throughput (now on
-runtime dimensions too), vectorized transcendentals (the transformer activation family), automatic
-parallelism, automatic vectorization (including reductions), automatic fusion, and shape safety.
+runtime dimensions too), convolution (im2col + GEMM), vectorized transcendentals (the transformer
+activation family, including `log` for log-softmax/cross-entropy), automatic parallelism, automatic
+vectorization (including reductions), automatic fusion, and shape safety.
