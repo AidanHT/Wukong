@@ -160,11 +160,12 @@ unsafe fn sgemm_avx2_parallel(
         while pc < k {
             let kc = (k - pc).min(KC);
             let beta_eff = if pc == 0 { beta } else { 1.0 };
-            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) once.
+            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) once — in parallel, since
+            // with the C compute spread across every core the serial pack would dominate (Amdahl).
             let mut ap = vec![0.0f32; round_up(m, MR) * kc];
             let mut bp = vec![0.0f32; round_up(nc, NR) * kc];
-            pack_a(a.add(pc), k, m, kc, ap.as_mut_ptr());
-            pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
+            pack_a_par(a.add(pc), k, m, kc, ap.as_mut_ptr());
+            pack_b_block_par(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
 
             let mpanels = m.div_ceil(MR);
             let npanels = nc.div_ceil(NR);
@@ -309,26 +310,33 @@ unsafe fn pack_b_block(
     }
 }
 
+/// Pack one `NR`-wide column panel `jp` of a row-major B slice into `[kc][NR]` contiguous form.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn pack_b_panel(b: *const f32, ldb: usize, kc: usize, nc: usize, jp: usize, panel: *mut f32) {
+    let j0 = jp * NR;
+    let ncols = (nc - j0).min(NR);
+    let mut dst = panel;
+    for p in 0..kc {
+        let src = b.add(p * ldb + j0);
+        for j in 0..ncols {
+            *dst.add(j) = *src.add(j);
+        }
+        for j in ncols..NR {
+            *dst.add(j) = 0.0;
+        }
+        dst = dst.add(NR);
+    }
+}
+
 /// Pack a `KC×NC` slice of B (row-major, leading dim `ldb`) into `NR`-wide column panels: panel `jp`
 /// is `[kc][NR]` contiguous, zero-padded if the slice's last panel is partial.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pack_b(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) {
-    let mut dst = bp;
     let npanels = nc.div_ceil(NR);
     for jp in 0..npanels {
-        let j0 = jp * NR;
-        let ncols = (nc - j0).min(NR);
-        for p in 0..kc {
-            let src = b.add(p * ldb + j0);
-            for j in 0..ncols {
-                *dst.add(j) = *src.add(j);
-            }
-            for j in ncols..NR {
-                *dst.add(j) = 0.0;
-            }
-            dst = dst.add(NR);
-        }
+        pack_b_panel(b, ldb, kc, nc, jp, bp.add(jp * kc * NR));
     }
 }
 
@@ -338,23 +346,35 @@ unsafe fn pack_b(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) 
 /// order (strided B reads) thrashes cache and dominates runtime, so this order is essential.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn pack_b_trans_panel(
+    b: *const f32,
+    ldb: usize,
+    kc: usize,
+    nc: usize,
+    jp: usize,
+    panel: *mut f32,
+) {
+    let j0 = jp * NR;
+    let ncols = (nc - j0).min(NR);
+    for r in 0..ncols {
+        let src = b.add((j0 + r) * ldb); // row (j0+r) of B, contiguous over the contraction
+        for p in 0..kc {
+            *panel.add(p * NR + r) = *src.add(p);
+        }
+    }
+    for r in ncols..NR {
+        for p in 0..kc {
+            *panel.add(p * NR + r) = 0.0;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn pack_b_trans(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) {
     let npanels = nc.div_ceil(NR);
     for jp in 0..npanels {
-        let j0 = jp * NR;
-        let ncols = (nc - j0).min(NR);
-        let panel = bp.add(jp * kc * NR);
-        for r in 0..ncols {
-            let src = b.add((j0 + r) * ldb); // row (j0+r) of B, contiguous over the contraction
-            for p in 0..kc {
-                *panel.add(p * NR + r) = *src.add(p);
-            }
-        }
-        for r in ncols..NR {
-            for p in 0..kc {
-                *panel.add(p * NR + r) = 0.0;
-            }
-        }
+        pack_b_trans_panel(b, ldb, kc, nc, jp, bp.add(jp * kc * NR));
     }
 }
 
@@ -365,24 +385,111 @@ unsafe fn pack_b_trans(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut
 /// cache, so this order matters as much as it does for `pack_b_trans`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn pack_a_panel(
+    a: *const f32,
+    lda: usize,
+    mc: usize,
+    kc: usize,
+    ip: usize,
+    panel: *mut f32,
+) {
+    let i0 = ip * MR;
+    let nrows = (mc - i0).min(MR);
+    for r in 0..nrows {
+        let src = a.add((i0 + r) * lda); // row (i0+r) of A, contiguous over the contraction
+        for p in 0..kc {
+            *panel.add(p * MR + r) = *src.add(p);
+        }
+    }
+    for r in nrows..MR {
+        for p in 0..kc {
+            *panel.add(p * MR + r) = 0.0;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn pack_a(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) {
     let mpanels = mc.div_ceil(MR);
     for ip in 0..mpanels {
-        let i0 = ip * MR;
-        let nrows = (mc - i0).min(MR);
-        let panel = ap.add(ip * kc * MR);
-        for r in 0..nrows {
-            let src = a.add((i0 + r) * lda); // row (i0+r) of A, contiguous over the contraction
-            for p in 0..kc {
-                *panel.add(p * MR + r) = *src.add(p);
-            }
-        }
-        for r in nrows..MR {
-            for p in 0..kc {
-                *panel.add(p * MR + r) = 0.0;
-            }
-        }
+        pack_a_panel(a, lda, mc, kc, ip, ap.add(ip * kc * MR));
     }
+}
+
+// Below ~this many panels, rayon's task overhead outweighs the copy; pack serially instead.
+const PACK_PAR_THRESHOLD: usize = 16;
+
+/// Parallel A pack: each `MR`-row panel writes a disjoint `[kc·MR]` region, so pack them across cores.
+/// Once the C compute is spread over every core, this serial-pack step is the Amdahl bottleneck.
+///
+/// # Safety
+/// Same operand contract as [`pack_a`]; `ap` must hold `round_up(mc, MR) * kc` f32.
+#[cfg(target_arch = "x86_64")]
+unsafe fn pack_a_par(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) {
+    use rayon::prelude::*;
+    let mpanels = mc.div_ceil(MR);
+    if mpanels < PACK_PAR_THRESHOLD {
+        pack_a(a, lda, mc, kc, ap);
+        return;
+    }
+    let (a_addr, ap_addr) = (a as usize, ap as usize);
+    (0..mpanels).into_par_iter().for_each(|ip| {
+        // SAFETY: disjoint output panel; avx2 verified by the caller; pointers re-derived per task.
+        unsafe {
+            pack_a_panel(
+                a_addr as *const f32,
+                lda,
+                mc,
+                kc,
+                ip,
+                (ap_addr as *mut f32).add(ip * kc * MR),
+            );
+        }
+    });
+}
+
+/// Parallel B-block pack (handles the `C = A·Bᵀ` layout); each `NR`-col panel is independent.
+///
+/// # Safety
+/// Same operand contract as [`pack_b_block`]; `bp` must hold `round_up(nc, NR) * kc` f32.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_b_block_par(
+    b: *const f32,
+    k: usize,
+    n: usize,
+    pc: usize,
+    jc: usize,
+    kc: usize,
+    nc: usize,
+    bt: bool,
+    bp: *mut f32,
+) {
+    use rayon::prelude::*;
+    let npanels = nc.div_ceil(NR);
+    if npanels < PACK_PAR_THRESHOLD {
+        pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp);
+        return;
+    }
+    // Resolve base pointer + leading dim once (mirrors pack_b_block's bt dispatch).
+    let (b_base, ldb) = if bt {
+        (b.add(jc * k + pc) as usize, k)
+    } else {
+        (b.add(pc * n + jc) as usize, n)
+    };
+    let bp_addr = bp as usize;
+    (0..npanels).into_par_iter().for_each(|jp| {
+        let panel = (bp_addr as *mut f32).add(jp * kc * NR);
+        // SAFETY: disjoint output panel; avx2 verified by the caller; pointers re-derived per task.
+        unsafe {
+            if bt {
+                pack_b_trans_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+            } else {
+                pack_b_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+            }
+        }
+    });
 }
 
 /// Run the `MR×NR` microkernel over every register tile of an `mc×nc` macro-block.
