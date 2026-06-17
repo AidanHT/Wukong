@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1536
+// EXPECT-OUT: 256
+// EXPECT-OUT: 512
+module tests.run.parallel_reduce
+
+// `@parallel` reduction loops dispatch to the multicore deterministic reduction kernel
+// (mercury_sreduce_f32_parallel): dot, sum-of-squared-differences, and the unary sum — the
+// reductions transformer math leans on (attention scores, L2 loss, LayerNorm sums). The mercury_bench
+// gate proves the interpreter and native backend agree bit-for-bit; this pins the values and
+// opt-invariance. Values are f32-exact so the reassociated sum is unambiguous.
+
+@parallel
+fn dotp(x: [f32; 256], y: [f32; 256], o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s = s + x[k] * y[k]; }
+    o[0] = s;
+}
+
+@parallel
+fn ssd(x: [f32; 256], y: [f32; 256], o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s += (x[k] - y[k]) * (x[k] - y[k]); }
+    o[0] = s;
+}
+
+@parallel
+fn sumv(x: [f32; 256], o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s += x[k]; }
+    o[0] = s;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 256] = [2.0; 256];
+    let mut y: [f32; 256] = [3.0; 256];
+    let mut o: [f32; 1] = [0.0; 1];
+    dotp(x, y, o); print((o[0]) as i32); // 2*3*256 = 1536
+    ssd(x, y, o);  print((o[0]) as i32); // (2-3)^2 * 256 = 256
+    sumv(x, o);    print((o[0]) as i32); // 2*256 = 512
+    return 0;
+}
