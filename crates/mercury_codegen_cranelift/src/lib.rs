@@ -79,6 +79,7 @@ const RT_SGEMM: &str = "mercury_sgemm";
 const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
 const RT_SGEMM_NT: &str = "mercury_sgemm_nt";
 const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
+const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -701,6 +702,24 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[a, b, c, m, k, n, beta]);
             return None;
         }
+        // The fused-epilogue Linear: mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act) —
+        // three pointers, four i64 (m,k,n,beta), a bias pointer, and an i64 activation code.
+        if name == RT_SGEMM_NT_EPI && args.len() == 9 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let c = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let k = self.coerce_to_i64(args[4]);
+            let n = self.coerce_to_i64(args[5]);
+            let beta = self.coerce_to_i64(args[6]);
+            let bias = self.val(args[7]);
+            let act = self.coerce_to_i64(args[8]);
+            let fref = self.rt_refs[RT_SGEMM_NT_EPI];
+            self.builder
+                .ins()
+                .call(fref, &[a, b, c, m, k, n, beta, bias, act]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -806,6 +825,7 @@ struct RtFuncs {
     sgemm_parallel: FuncId,
     sgemm_nt: FuncId,
     sgemm_nt_parallel: FuncId,
+    sgemm_nt_epi: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -879,7 +899,17 @@ fn populate_module<M: Module>(
     for _ in 0..4 {
         sig_gemm.params.push(AbiParam::new(types::I64));
     }
-    // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
+    // mercury_sgemm_nt_epi(a, b, c: ptr, m, k, n, beta: i64, bias: ptr, act: i64) — fused Linear.
+    let mut sig_gemm_epi = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_gemm_epi.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..4 {
+        sig_gemm_epi.params.push(AbiParam::new(types::I64));
+    }
+    sig_gemm_epi.params.push(AbiParam::new(ptr_ty)); // bias
+    sig_gemm_epi.params.push(AbiParam::new(types::I64)); // act
+                                                         // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
     let mut sig_fmod_f64 = Signature::new(call_conv);
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
@@ -912,6 +942,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sgemm_nt_parallel: module
             .declare_function(RT_SGEMM_NT_PARALLEL, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
+        sgemm_nt_epi: module
+            .declare_function(RT_SGEMM_NT_EPI, Linkage::Import, &sig_gemm_epi)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -977,6 +1010,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_NT_PARALLEL,
                 module.declare_func_in_func(rt.sgemm_nt_parallel, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_NT_EPI,
+                module.declare_func_in_func(rt.sgemm_nt_epi, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1103,6 +1140,10 @@ pub fn jit_compile(
         RT_SGEMM_NT_PARALLEL,
         mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
     );
+    builder.symbol(
+        RT_SGEMM_NT_EPI,
+        mercury_runtime::mercury_sgemm_nt_epi as *const u8,
+    );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -1182,6 +1223,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SGEMM_NT_PARALLEL,
         mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_NT_EPI,
+        mercury_runtime::mercury_sgemm_nt_epi as *const u8,
     );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);

@@ -511,6 +511,58 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)` — the fused-epilogue Linear
+            // (`C = act(A·Bᵀ + bias)`). Like the plain GEMM, the interpreter marshals operands into
+            // real f32 buffers, calls the *identical* runtime kernel the native backend calls (which
+            // folds the bias+activation into the C writeback), and writes the result back — so the
+            // two backends stay bit-for-bit exact.
+            "mercury_sgemm_nt_epi" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let c = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let beta = args[6].as_int() as i64;
+                let bias = ptr(args[7])?;
+                let act = args[8].as_int() as i64;
+                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                    let mut v = Vec::with_capacity(len);
+                    for t in 0..len {
+                        v.push(
+                            mem.get(base + t)
+                                .ok_or("sgemm_epi operand out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                    Ok(v)
+                };
+                let abuf = read(&self.memory, a, m * k)?;
+                let bbuf = read(&self.memory, b, n * k)?;
+                let mut cbuf = read(&self.memory, c, m * n)?;
+                let biasbuf = read(&self.memory, bias, n)?;
+                // SAFETY: buffers are exactly m*k, n*k, m*n, n long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_sgemm_nt_epi(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        cbuf.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                        beta,
+                        biasbuf.as_ptr(),
+                        act,
+                    );
+                }
+                for (t, &val) in cbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(c + t)
+                        .ok_or("sgemm_epi output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }

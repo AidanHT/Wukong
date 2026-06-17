@@ -7,7 +7,8 @@
 
 mod gemm;
 pub use gemm::{
-    mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_parallel, mercury_sgemm_parallel,
+    mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_epi, mercury_sgemm_nt_parallel,
+    mercury_sgemm_parallel,
 };
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
