@@ -383,6 +383,40 @@ fn differential_batched_matmul() {
     }
 }
 
+/// Fused `nn.Linear` epilogue (`out = act(x·Wᵀ + bias)`): native ≡ interp, plus hand-computed
+/// values. A matmul followed by a bias-add / ReLU loop folds to one `mercury_sgemm_nt_epi`; the
+/// differential gate can't catch a recognizer misfire (both backends run the fused kernel), so the
+/// values are computed independently. x=[[1,2],[3,4]], W=I, bias=[-10,-1] ⇒ pre-act [-9,1,-7,3].
+#[test]
+fn differential_linear_epilogue() {
+    let body = "fn lin(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) { \
+        for i in 0..2 { for j in 0..2 { let mut s: f32 = 0.0; \
+        for k in 0..2 { s = s + x[i*2+k] * w[j*2+k]; } out[i*2+j] = s; } } \
+        for i in 0..2 { for j in 0..2 { out[i*2+j] = EPI; } } } \
+        fn main() -> i32 { let x: [f32; 4] = [1.0,2.0,3.0,4.0]; \
+        let w: [f32; 4] = [1.0,0.0,0.0,1.0]; let bias: [f32; 2] = [-10.0,-1.0]; \
+        let mut out: [f32; 4] = [0.0,0.0,0.0,0.0]; lin(x, w, bias, out); \
+        print(out[0] as i32); print(out[1] as i32); print(out[2] as i32); print(out[3] as i32); \
+        return 0; }";
+    let relu = body.replace("EPI", "fmax(out[i*2+j] + bias[j], 0.0)");
+    let ident = body.replace("EPI", "out[i*2+j] + bias[j]");
+    for (src, expect) in [
+        (&relu, "0\n1\n0\n3\n"),    // relu([-9,1,-7,3])
+        (&ident, "-9\n1\n-7\n3\n"), // x·Wᵀ + bias
+    ] {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "linear-epilogue native vs interp at -O{opt}");
+            assert_eq!(
+                String::from_utf8(n.1).unwrap(),
+                expect,
+                "linear-epilogue value at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// `if`/`else` used as a value (block tail and `let`-bound), including a branchy ReLU loop.
 #[test]
 fn if_as_expression() {
