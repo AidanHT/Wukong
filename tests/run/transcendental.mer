@@ -1,0 +1,26 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1414
+// EXPECT-OUT: 500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2718
+// EXPECT-OUT: 7389
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+module tests.run.transcendental
+
+// Scalar transcendental intrinsics. exp is a polynomial (≈1 ULP), so values are scaled and
+// truncated to integers that are robust to the approximation. The mercury_bench gate separately
+// proves the interpreter and native backend agree bit-for-bit.
+fn main() -> i32 {
+    print(sqrt(16.0) as i32); // 4.0           -> 4
+    print((sqrt(2.0) * 1000.0) as i32); // 1.41421*1000 -> 1414
+    print((rsqrt(4.0) * 1000.0) as i32); // 0.5*1000     -> 500
+    print((exp(0.0) * 1000.0) as i32); // 1.0*1000     -> 1000
+    print((exp(1.0) * 1000.0) as i32); // 2.71828*1000 -> 2718
+    print((exp(2.0) * 1000.0) as i32); // 7.38906*1000 -> 7389
+    print(fmax(3.0, 5.0) as i32); // 5
+    print(fmin(3.0, 5.0) as i32); // 3
+    return 0;
+}

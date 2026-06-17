@@ -2273,6 +2273,11 @@ impl FnLowerer<'_> {
                         },
                     );
                 }
+                // Math builtins (sqrt/rsqrt/exp/fmax/fmin) lower to primitive ops. User functions
+                // shadow them (handled just above), so this catches only the genuine builtins.
+                if let Some(v) = self.lower_math_intrinsic(name, args, e) {
+                    return v;
+                }
                 // Built-in intrinsics (print, ...) lower to a void call the interpreter handles.
                 if is_intrinsic(self.interner.resolve(name)) {
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -2291,6 +2296,176 @@ impl FnLowerer<'_> {
         self.unsupported(e.span, "call");
         let t = self.expr_mir(e);
         self.const_zero(t)
+    }
+
+    /// Lower a math builtin (`sqrt`/`rsqrt`/`exp`/`fmax`/`fmin`) to primitive MIR ops, or `None`
+    /// for any other name. `sqrt` is one `Op::Sqrt`; `rsqrt` is its reciprocal; `fmax`/`fmin` are a
+    /// compare + select (NaN- and signed-zero-correct, identical in both backends); `exp` is a
+    /// polynomial (see `emit_exp`). Built only from already-bit-exact primitives, so the
+    /// interpreter and native backend agree with no separate hand-written implementation each.
+    fn lower_math_intrinsic(&mut self, name: Symbol, args: &[Expr], e: &Expr) -> Option<ValueId> {
+        let op = math_intrinsic(self.interner.resolve(name))?;
+        let rty = self.expr_mir(e);
+        match op {
+            MathIntrinsic::Sqrt => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.builder.build(rty.clone(), Op::Sqrt(x)))
+            }
+            MathIntrinsic::Rsqrt => {
+                let x = self.lower_expr(args.first()?);
+                let s = self.builder.build(rty.clone(), Op::Sqrt(x));
+                let one = self.splat_const_f(1.0, &rty);
+                Some(
+                    self.builder
+                        .build(rty.clone(), Op::Bin(BinOp::FDiv, one, s)),
+                )
+            }
+            MathIntrinsic::Exp => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_exp(x, &rty))
+            }
+            MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let pred = if matches!(op, MathIntrinsic::Fmax) {
+                    CmpOp::Fogt
+                } else {
+                    CmpOp::Folt
+                };
+                let c = self.builder.build(mask_ty(&rty), Op::Cmp(pred, a, b));
+                Some(self.builder.build(rty.clone(), Op::Select(c, a, b)))
+            }
+        }
+    }
+
+    /// `exp(x)` as a fast, deterministic polynomial (≈1 ULP of the true `exp`). Always computed in
+    /// `f32`; for an `f64` result the argument is demoted and the result promoted (exact in both
+    /// backends). Works on a scalar or a SIMD-vector `f32`.
+    fn emit_exp(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let want_f64 = matches!(rty.lane_type(), MirType::F64);
+        let f32ty = float_ty_like(rty, MirType::F32);
+        let xf = if want_f64 {
+            self.builder
+                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
+        } else {
+            x
+        };
+        let r = self.emit_exp_f32(xf, &f32ty);
+        if want_f64 {
+            self.builder
+                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
+        } else {
+            r
+        }
+    }
+
+    /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
+    /// `r = x - n*ln2`, evaluates a degree-5 minimax poly for `e^r`, then scales by `2^n` (assembled
+    /// from the IEEE-754 exponent bits). Every step is a primitive op the two backends already agree
+    /// on bit-for-bit, so `exp` does too.
+    fn emit_exp_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
+        let lanes = match fty {
+            MirType::Vec(_, n) => Some(*n),
+            _ => None,
+        };
+        let ity = match lanes {
+            Some(n) => MirType::Vec(Box::new(MirType::I32), n),
+            None => MirType::I32,
+        };
+        let mty = match lanes {
+            Some(n) => MirType::Vec(Box::new(MirType::I1), n),
+            None => MirType::I1,
+        };
+
+        // Clamp so 2^n stays representable (exp under/overflows to 0 / +inf outside this range).
+        let hi = self.splat_const_f(EXP_HI, fty);
+        let gt = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, x, hi));
+        let x = self.builder.build(fty.clone(), Op::Select(gt, hi, x));
+        let lo = self.splat_const_f(EXP_LO, fty);
+        let lt = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Folt, x, lo));
+        let x = self.builder.build(fty.clone(), Op::Select(lt, lo, x));
+
+        // n = round(x * log2(e)) via the add-magic / sub-magic trick: round-to-nearest-even in
+        // pure f32, so both backends agree and no rounding-mode instruction is needed.
+        let log2e = self.splat_const_f(LOG2EF, fty);
+        let magic = self.splat_const_f(EXP_MAGIC, fty);
+        let t = self.builder.build(fty.clone(), Op::Fma(x, log2e, magic));
+        let n = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, t, magic));
+
+        // r = x - n*ln2, with ln2 split into hi/lo parts for extra precision (two fmas).
+        let neg_c1 = self.splat_const_f(-EXP_C1, fty);
+        let neg_c2 = self.splat_const_f(-EXP_C2, fty);
+        let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c1, x));
+        let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c2, r));
+
+        // Degree-5 minimax polynomial for e^r on the reduced range, by Horner with fmas.
+        let mut p = self.splat_const_f(EXP_P[0], fty);
+        for &c in &EXP_P[1..] {
+            let cc = self.splat_const_f(c, fty);
+            p = self.builder.build(fty.clone(), Op::Fma(p, r, cc));
+        }
+        // e^r = p*r^2 + r + 1
+        let r2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, r, r));
+        let p = self.builder.build(fty.clone(), Op::Fma(p, r2, r));
+        let one = self.splat_const_f(1.0, fty);
+        let p = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, p, one));
+
+        // 2^n by assembling the IEEE-754 exponent field: bitcast((n + 127) << 23).
+        let ni = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::FpToSi, n, ity.clone()));
+        let bias = self.splat_const_i(127, &ity);
+        let biased = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, ni, bias));
+        let sh = self.splat_const_i(23, &ity);
+        let shifted = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Shl, biased, sh));
+        let pow2 = self.builder.build(
+            fty.clone(),
+            Op::Cast(CastKind::Bitcast, shifted, fty.clone()),
+        );
+
+        self.builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, p, pow2))
+    }
+
+    /// Build a float constant of type `fty` — a scalar `ConstFloat`, or one splatted to a vector.
+    fn splat_const_f(&mut self, val: f64, fty: &MirType) -> ValueId {
+        match fty {
+            MirType::Vec(lane, _) => {
+                let s = self
+                    .builder
+                    .build((**lane).clone(), Op::ConstFloat(val, (**lane).clone()));
+                self.builder.build(fty.clone(), Op::Splat(s))
+            }
+            _ => self
+                .builder
+                .build(fty.clone(), Op::ConstFloat(val, fty.clone())),
+        }
+    }
+
+    /// Build an int constant of type `ity` — a scalar `ConstInt`, or one splatted to a vector.
+    fn splat_const_i(&mut self, val: i128, ity: &MirType) -> ValueId {
+        match ity {
+            MirType::Vec(lane, _) => {
+                let s = self
+                    .builder
+                    .build((**lane).clone(), Op::ConstInt(val, (**lane).clone()));
+                self.builder.build(ity.clone(), Op::Splat(s))
+            }
+            _ => self
+                .builder
+                .build(ity.clone(), Op::ConstInt(val, ity.clone())),
+        }
     }
 
     fn lower_cast(&mut self, operand: &Expr, e: &Expr) -> ValueId {
@@ -3333,6 +3508,59 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
         _ => CastKind::Bitcast,
     }
 }
+
+/// The math builtins lowered directly to primitive MIR ops (not runtime calls).
+#[derive(Clone, Copy)]
+enum MathIntrinsic {
+    Sqrt,
+    Rsqrt,
+    Exp,
+    Fmax,
+    Fmin,
+}
+
+fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
+    Some(match name {
+        "sqrt" => MathIntrinsic::Sqrt,
+        "rsqrt" => MathIntrinsic::Rsqrt,
+        "exp" => MathIntrinsic::Exp,
+        "fmax" => MathIntrinsic::Fmax,
+        "fmin" => MathIntrinsic::Fmin,
+        _ => return None,
+    })
+}
+
+/// The same shape as `ty` (scalar or `Vec`) but with float lane `lane`.
+fn float_ty_like(ty: &MirType, lane: MirType) -> MirType {
+    match ty {
+        MirType::Vec(_, n) => MirType::Vec(Box::new(lane), *n),
+        _ => lane,
+    }
+}
+
+/// The boolean-mask type a compare on `ty` yields: `i1`, or a per-lane `Vec` of `i1`.
+fn mask_ty(ty: &MirType) -> MirType {
+    match ty {
+        MirType::Vec(_, n) => MirType::Vec(Box::new(MirType::I1), *n),
+        _ => MirType::I1,
+    }
+}
+
+// `exp` polynomial constants (Cephes single-precision `expf`), evaluated in f32 by both backends.
+const LOG2EF: f64 = std::f64::consts::LOG2_E;
+const EXP_MAGIC: f64 = 12582912.0; // 1.5 * 2^23 — round-to-nearest via add then sub
+const EXP_C1: f64 = 0.693359375; // ln2, high part
+const EXP_C2: f64 = -2.1219444e-4; // ln2, low correction
+const EXP_HI: f64 = 88.3762626647949;
+const EXP_LO: f64 = -88.3762626647949;
+const EXP_P: [f64; 6] = [
+    1.98756915e-4,
+    1.3981999507e-3,
+    8.3334519073e-3,
+    4.1665795894e-2,
+    1.6666665459e-1,
+    5.0000001201e-1,
+];
 
 /// Names that lower to runtime/interpreter intrinsics rather than user functions.
 pub fn is_intrinsic(name: &str) -> bool {
