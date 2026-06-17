@@ -271,6 +271,51 @@ fn differential_transcendentals() {
     }
 }
 
+/// A *batched* matmul — H independent matmuls over one buffer, each index carrying a per-head base
+/// offset `h*STRIDE`. This is the multi-head-attention shape (`scores[h] = Q[h]·K[h]ᵀ`). The
+/// recognizer peels the offset and GEPs each base pointer per head before the shared GEMM kernel.
+/// Asserts native == interp across opt levels *and* the hand-computed values — the value check is
+/// essential because a recognizer offset bug would be shared by both backends (both call the same
+/// dispatched kernel), so the differential gate alone could not catch it.
+#[test]
+fn differential_batched_matmul() {
+    // 2 heads of a 2x2 matmul. head0: [[1,2],[3,4]], head1: I=[[1,0],[0,1]];
+    // b head0: [[5,6],[7,8]], head1: [[9,10],[11,12]]. Prints c[0], c[3], c[4], c[7].
+    let head = "let a: [f32; 8] = [1.0,2.0,3.0,4.0,1.0,0.0,0.0,1.0]; \
+        let b: [f32; 8] = [5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0]; let mut c: [f32; 8] = [0.0; 8]; \
+        bmm(a, b, c); print(c[0] as i32); print(c[3] as i32); print(c[4] as i32); print(c[7] as i32); \
+        return 0; }";
+    // C[h] = A[h]·B[h]:    head0 [[19,22],[43,50]], head1 = I·B1 = [[9,10],[11,12]].
+    let normal = format!(
+        "fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {{ \
+        for h in 0..2 {{ for i in 0..2 {{ for j in 0..2 {{ let mut s: f32 = 0.0; \
+        for k in 0..2 {{ s = s + a[h*4 + i*2 + k] * b[h*4 + k*2 + j]; }} \
+        c[h*4 + i*2 + j] = s; }} }} }} }} fn main() -> i32 {{ {head}"
+    );
+    // C[h] = A[h]·B[h]ᵀ (attention Q·Kᵀ): head0 [[17,23],[39,53]], head1 = I·B1ᵀ = B1ᵀ [[9,11],[10,12]].
+    let transposed = format!(
+        "fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {{ \
+        for h in 0..2 {{ for i in 0..2 {{ for j in 0..2 {{ let mut s: f32 = 0.0; \
+        for k in 0..2 {{ s = s + a[h*4 + i*2 + k] * b[h*4 + j*2 + k]; }} \
+        c[h*4 + i*2 + j] = s; }} }} }} }} fn main() -> i32 {{ {head}"
+    );
+    for (src, expect) in [
+        (&normal, "19\n50\n9\n12\n"),
+        (&transposed, "17\n53\n9\n12\n"),
+    ] {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "batched-matmul native vs interp mismatch at -O{opt}");
+            assert_eq!(
+                String::from_utf8(n.1).unwrap(),
+                expect,
+                "batched-matmul value mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// `if`/`else` used as a value (block tail and `let`-bound), including a branchy ReLU loop.
 #[test]
 fn if_as_expression() {
