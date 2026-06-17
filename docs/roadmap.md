@@ -40,7 +40,8 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   the latency-bound serial sum into a throughput-bound one. `dot` runs ~2.6× faster than serial C.
   `fmax`/`fmin` reductions (`m = fmax(m, x[i])`, softmax's row-max) vectorize the same way.
 - **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP `f32` minimax
-  polynomials), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all built from primitive ops
+  polynomials), `pow` (= `exp(y·log(x))`), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all
+  built from primitive ops
   both backends already agree on bit-for-bit, and all **vectorize** in elementwise loops. So softmax,
   layernorm, GELU, SiLU/swish, tanh activations, and **log-softmax / cross-entropy** lower to SIMD
   instead of scalar `libm` calls and run **~2.5–3.5× faster** than gcc/rustc's scalar
@@ -48,7 +49,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `tests/run/{transcendental,softmax,layernorm,gelu,activations,log,log_softmax,ffn_block}.mer`.
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
-  runs a 3×3 conv **~5.8× faster** than idiomatic hand-written direct convolution in C. See
+  runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
   `tests/run/conv_im2col.mer`.
 - **Operator fusion**: adjacent same-range elementwise loops (e.g. a linear map then ReLU) fuse into
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
