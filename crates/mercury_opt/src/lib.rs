@@ -134,7 +134,12 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
             *a = f(*a);
             *b = f(*b);
         }
-        Op::Neg(a) | Op::Not(a) | Op::Cast(_, a, _) | Op::Load(a, _) | Op::Splat(a) => {
+        Op::Neg(a)
+        | Op::Not(a)
+        | Op::Cast(_, a, _)
+        | Op::Load(a, _)
+        | Op::Splat(a)
+        | Op::Sqrt(a) => {
             *a = f(*a);
         }
         Op::Select(c, a, b) | Op::Fma(c, a, b) => {
@@ -193,7 +198,12 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
             f(*a);
             f(*b);
         }
-        Op::Neg(a) | Op::Not(a) | Op::Cast(_, a, _) | Op::Load(a, _) | Op::Splat(a) => f(*a),
+        Op::Neg(a)
+        | Op::Not(a)
+        | Op::Cast(_, a, _)
+        | Op::Load(a, _)
+        | Op::Splat(a)
+        | Op::Sqrt(a) => f(*a),
         Op::Select(c, a, b) | Op::Fma(c, a, b) => {
             f(*c);
             f(*a);

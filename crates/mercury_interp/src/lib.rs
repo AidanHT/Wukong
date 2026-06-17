@@ -345,6 +345,20 @@ impl<'a> Interp<'a> {
                     apply_fma(reg(regs, *a), reg(regs, *b), reg(regs, *c), rty)
                 }
             }
+            // Square root, lane-wise for vectors; each lane rounded to its lane type so an `f32`
+            // sqrt stays bit-identical to the native `fsqrt`.
+            Op::Sqrt(v) => {
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    let xv = self.vec_lanes(reg(regs, *v));
+                    let lane = (**lane).clone();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| apply_sqrt(xv[i], Some(&lane)))
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    apply_sqrt(reg(regs, *v), rty)
+                }
+            }
         })
     }
 
@@ -566,6 +580,16 @@ fn apply_fma(a: Value, b: Value, c: Value, rty: Option<&MirType>) -> Value {
         Value::Float(r as f64)
     } else {
         Value::Float(a.as_float().mul_add(b.as_float(), c.as_float()))
+    }
+}
+
+/// Square root with the result rounded to its (`f32` or full `f64`) type, matching the native
+/// `sqrt`. Both backends use the hardware square root, so they agree bit-for-bit.
+fn apply_sqrt(v: Value, rty: Option<&MirType>) -> Value {
+    if rty.is_some_and(is_narrow_float) {
+        Value::Float((v.as_float() as f32).sqrt() as f64)
+    } else {
+        Value::Float(v.as_float().sqrt())
     }
 }
 

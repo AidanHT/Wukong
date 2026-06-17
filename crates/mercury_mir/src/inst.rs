@@ -189,6 +189,11 @@ pub enum Op {
     /// `FMul`+`FAdd`. All three operands and the result share one float type (scalar or `Vec`).
     /// The interpreter evaluates it with `mul_add` so it stays bit-identical to the native `fma`.
     Fma(ValueId, ValueId, ValueId),
+    /// Square root of a float (scalar or `Vec`); operand and result share one float type. Lowers
+    /// to a hardware `sqrt`; the interpreter mirrors it with `f32`/`f64::sqrt`, so the two stay
+    /// bit-identical. Pure and side-effect-free. (`rsqrt` and `exp` are built from primitive ops,
+    /// so they need no dedicated variant.)
+    Sqrt(ValueId),
 }
 
 /// One instruction: an optional result value plus its operation.

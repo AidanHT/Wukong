@@ -321,6 +321,26 @@ impl Emitter<'_> {
                     self.operand(*c),
                 )
             }
+            Op::Sqrt(a) => {
+                // `@llvm.sqrt` is the canonical square root; this text path is not the differential
+                // oracle (Cranelift is) and is not assembled here, so the matching intrinsic
+                // `declare` is left to an out-of-process step.
+                let r = inst.result.unwrap();
+                let ty = self.ty(r);
+                let suffix = match self.f.value_type(r) {
+                    MirType::F64 => "f64".to_string(),
+                    MirType::Vec(lane, n) => {
+                        let ls = if matches!(**lane, MirType::F64) {
+                            "f64"
+                        } else {
+                            "f32"
+                        };
+                        format!("v{n}{ls}")
+                    }
+                    _ => "f32".to_string(),
+                };
+                format!("call {ty} @llvm.sqrt.{suffix}({ty} {})", self.operand(*a))
+            }
         };
         let _ = writeln!(out, "  {line}");
     }
