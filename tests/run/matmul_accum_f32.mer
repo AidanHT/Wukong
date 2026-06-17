@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1050
+module tests.run.matmul_accum_f32
+
+/// Accumulate (beta = 1) matmul: `C += A·B` with `C` pre-initialized to a bias (1000). The nest has
+/// no per-row zero-init, so the recognizer reads it as the accumulate form and dispatches to
+/// `mercury_sgemm` with beta = 1; the interpreter runs the same kernel, marshalling `C`'s initial
+/// values in and the accumulated result back. This exercises the bias-initialized-output pattern
+/// (common in `Linear` layers) end to end through the real binary.
+fn main() -> i32 {
+    let mut a: [f32; 4] = [0.0; 4];
+    let mut b: [f32; 4] = [0.0; 4];
+    let mut c: [f32; 4] = [1000.0; 4]; // bias: C starts at 1000, matmul accumulates onto it
+    a[0] = 1.0; a[1] = 2.0; a[2] = 3.0; a[3] = 4.0;
+    b[0] = 5.0; b[1] = 6.0; b[2] = 7.0; b[3] = 8.0;
+
+    for ii in 0..2 {
+        for kk in 0..2 {
+            let aik: f32 = a[ii * 2 + kk];
+            for jj in 0..2 { c[ii * 2 + jj] = c[ii * 2 + jj] + aik * b[kk * 2 + jj]; }
+        }
+    }
+
+    print(c[0] as i32); // 1000 + (1*5 + 2*7) = 1019
+    print(c[3] as i32); // 1000 + (3*6 + 4*8) = 1050
+    return 0;
+}
