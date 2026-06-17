@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 50
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+module tests.run.batched_matmul
+
+// A *batched* matmul: H independent matmuls sharing one flat buffer, indexed `x[h*STRIDE + …]`.
+// This is the shape of multi-head attention (one `Q·Kᵀ` / `P·V` per head). The recognizer peels the
+// per-head base offset `h*4` off each flattened index and lowers the inner `i,j,k` nest to the tuned
+// GEMM microkernel, GEP-ing each base pointer by the offset per head — so every head dispatches, not
+// just a single 2-D matmul. The gate proves native == interp (both run the offset GEP + kernel).
+fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {
+    for h in 0..2 {
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut s: f32 = 0.0;
+                for k in 0..2 {
+                    s = s + a[h * 4 + i * 2 + k] * b[h * 4 + k * 2 + j];
+                }
+                c[h * 4 + i * 2 + j] = s;
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    // head 0: A=[[1,2],[3,4]], B=[[5,6],[7,8]];  head 1: A=I, B=[[9,10],[11,12]].
+    let a: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 1.0];
+    let b: [f32; 8] = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let mut c: [f32; 8] = [0.0; 8];
+    bmm(a, b, c);
+    // head 0 = A0·B0 = [[19,22],[43,50]]
+    print(c[0] as i32); // 19
+    print(c[3] as i32); // 50
+    // head 1 = I·B1 = B1 = [[9,10],[11,12]]
+    print(c[4] as i32); // 9
+    print(c[7] as i32); // 12
+    return 0;
+}
