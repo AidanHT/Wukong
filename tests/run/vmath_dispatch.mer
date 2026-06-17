@@ -1,0 +1,28 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2718
+// EXPECT-OUT: 1761
+// EXPECT-OUT: 1954
+// EXPECT-OUT: 841
+module tests.run.vmath_dispatch
+
+// Pure `out[i] = f(x[i])` activation loops for the intrinsics that dispatch to the 256-bit AVX2
+// kernel (mercury_vmath_f32): exp, silu (Llama), gelu (BERT/GPT-2). The mercury_bench gate proves
+// the interpreter and native backend agree bit-for-bit; this pins the values and opt-invariance.
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let mut e: [f32; 64] = [0.0; 64];
+    let mut s: [f32; 64] = [0.0; 64];
+    let mut g: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32 - 32.0) * 0.125; } // -4 .. 3.875
+
+    for i in 0..64 { e[i] = exp(x[i]); }
+    for i in 0..64 { s[i] = silu(x[i]); }
+    for i in 0..64 { g[i] = gelu(x[i]); }
+
+    print((e[40] * 1000.0) as i32);  // exp(1.0)
+    print((s[48] * 1000.0) as i32);  // silu(2.0)
+    print((g[48] * 1000.0) as i32);  // gelu(2.0)
+    print((g[40] * 1000.0) as i32);  // gelu(1.0)
+    return 0;
+}
