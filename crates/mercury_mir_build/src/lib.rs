@@ -964,6 +964,26 @@ impl FnLowerer<'_> {
 
     /// Validate that `e` is a vectorizable value-expression (produces lane-typed vectors), recording
     /// any array reads into `acc` and pinning the shared lane type. Returns false to bail.
+    /// The math intrinsic a callee names — if it is one and is *not* shadowed by a user function
+    /// (mirroring `lower_call`'s precedence). Lets the vectorizer decide which calls it can lower
+    /// per lane.
+    fn vectorizable_intrinsic(&self, callee: &Expr) -> Option<MathIntrinsic> {
+        let ExprKind::Path(p) = &callee.kind else {
+            return None;
+        };
+        if !p.is_single() {
+            return None;
+        }
+        let name = p.first().sym;
+        if matches!(
+            self.sema.defs.lookup(name).map(|d| &d.kind),
+            Some(DefKind::Fn(_))
+        ) {
+            return None;
+        }
+        math_intrinsic(self.interner.resolve(name))
+    }
+
     fn vec_check_value<'b>(
         &self,
         e: &'b Expr,
@@ -1041,6 +1061,19 @@ impl FnLowerer<'_> {
                     && self.vec_check_value(tv, j, locals, lane, acc)
                     && self.vec_check_value(ev, j, locals, lane, acc)
             }
+            // Element-wise math intrinsics over vectorizable args. sqrt/rsqrt are one lane op each;
+            // fmax/fmin are a lane compare + blend. (exp vectorization is added separately.)
+            ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
+                Some(MathIntrinsic::Sqrt | MathIntrinsic::Rsqrt) => {
+                    args.len() == 1 && self.vec_check_value(&args[0], j, locals, lane, acc)
+                }
+                Some(MathIntrinsic::Fmax | MathIntrinsic::Fmin) => {
+                    args.len() == 2
+                        && self.vec_check_value(&args[0], j, locals, lane, acc)
+                        && self.vec_check_value(&args[1], j, locals, lane, acc)
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -1673,6 +1706,33 @@ impl FnLowerer<'_> {
                 self.builder
                     .build(vty.clone(), Op::Select(mask, tvec, evec))
             }
+            // Element-wise math intrinsics, lowered per lane (see `vec_check_value`).
+            ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
+                Some(MathIntrinsic::Sqrt) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.builder.build(vty.clone(), Op::Sqrt(x))
+                }
+                Some(MathIntrinsic::Rsqrt) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let s = self.builder.build(vty.clone(), Op::Sqrt(x));
+                    let one = self.splat_const_f(1.0, vty);
+                    self.builder
+                        .build(vty.clone(), Op::Bin(BinOp::FDiv, one, s))
+                }
+                Some(op @ (MathIntrinsic::Fmax | MathIntrinsic::Fmin)) => {
+                    let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let b = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    let pred = if matches!(op, MathIntrinsic::Fmax) {
+                        CmpOp::Fogt
+                    } else {
+                        CmpOp::Folt
+                    };
+                    let mty = MirType::Vec(Box::new(mask_lane_type(lane)), w);
+                    let mask = self.builder.build(mty, Op::Cmp(pred, a, b));
+                    self.builder.build(vty.clone(), Op::Select(mask, a, b))
+                }
+                _ => unreachable!("vectorizer accepted a call it cannot lower"),
+            },
             // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
             _ => {
                 let from = self.expr_mir(e);

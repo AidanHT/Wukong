@@ -1,0 +1,45 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 12
+// EXPECT-OUT: 25
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 25
+// EXPECT-OUT: 10
+module tests.run.vec_math
+
+// Element-wise sqrt/rsqrt/fmax/fmin in unit-stride loops — these vectorize (128-bit x 4 unroll).
+// The mercury_bench gate proves the vectorized MIR matches the interpreter bit-for-bit.
+fn main() -> i32 {
+    let mut a: [f32; 64] = [0.0; 64];
+    let mut out: [f32; 64] = [0.0; 64];
+
+    // init is scalar (uses i as a value, so the vectorizer skips it).
+    for i in 0..64 {
+        a[i] = (i * i) as f32; // perfect squares
+    }
+
+    // vectorized: out[i] = sqrt(a[i]) = i
+    for i in 0..64 {
+        out[i] = sqrt(a[i]);
+    }
+    print(out[7] as i32); // sqrt(49)  = 7
+    print(out[12] as i32); // sqrt(144) = 12
+    print(out[25] as i32); // sqrt(625) = 25
+
+    // vectorized clamp: out[i] = min(max(a[i], 4), 9)
+    for i in 0..64 {
+        out[i] = fmin(fmax(a[i], 4.0), 9.0);
+    }
+    print(out[1] as i32); // a[1]=1  -> 4
+    print(out[3] as i32); // a[3]=9  -> 9
+
+    // vectorized: out[i] = rsqrt(a[i]) * 100 = 100/i
+    for i in 0..64 {
+        out[i] = rsqrt(a[i]) * 100.0;
+    }
+    print(out[4] as i32); // 100/4  = 25
+    print(out[10] as i32); // 100/10 = 10
+    return 0;
+}
