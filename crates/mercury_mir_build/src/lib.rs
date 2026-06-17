@@ -38,6 +38,7 @@ pub fn lower_program(
         mm_par: interner.intern("mercury_sgemm_parallel"),
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
+        nt_epi: interner.intern("mercury_sgemm_nt_epi"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -340,6 +341,9 @@ struct GemmSyms {
     mm_par: Symbol,
     nt: Symbol,
     nt_par: Symbol,
+    /// The fused-epilogue `nn.Linear` kernel (`mercury_sgemm_nt_epi`): `C = act(A·Bᵀ + bias)`. A
+    /// matmul immediately followed by a bias-add / ReLU loop over its output lowers to this.
+    nt_epi: Symbol,
 }
 
 struct FnLowerer<'a> {
@@ -428,6 +432,13 @@ impl FnLowerer<'_> {
         while i < b.stmts.len() {
             if self.terminated {
                 break;
+            }
+            // Epilogue fusion: a `nn.Linear` matmul immediately followed by its bias-add / ReLU loop
+            // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
+            // over C). Checked before the elementwise fusion below — they match disjoint shapes.
+            if let Some(n) = self.try_fuse_matmul_epilogue(&b.stmts[i..]) {
+                i += n;
+                continue;
             }
             // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
             // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
@@ -676,6 +687,77 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![a, b, c, m, k, n, beta],
+        });
+        true
+    }
+
+    /// Fuse a `nn.Linear` matmul immediately followed by its bias-add / activation epilogue into one
+    /// `mercury_sgemm_nt_epi` call (`C = act(A·Bᵀ + bias)`), folding the epilogue into the GEMM's C
+    /// writeback so C is written once instead of paying a separate read-modify-write pass. Fires only
+    /// for the plain 2-D `C = A·Bᵀ` form (no batch offsets) immediately followed by the recognized
+    /// epilogue loop over the same C; returns the number of statements consumed (always 2), else
+    /// `None`. The match is strict (dims/strides/output/column all verified) so it never misfires.
+    fn try_fuse_matmul_epilogue(&mut self, stmts: &[Stmt]) -> Option<usize> {
+        if stmts.len() < 2 {
+            return None;
+        }
+        let StmtKind::For {
+            pat, iter, body, ..
+        } = &stmts[0].kind
+        else {
+            return None;
+        };
+        let nest = recognize_matmul(pat, iter, body, self.sema, self.interner)?;
+        // Only the plain 2-D nn.Linear form `C = A·Bᵀ` — no batch/head offsets (the epilogue kernel
+        // is serial nt-only).
+        if !nest.transposed
+            || !nest.a_off.is_empty()
+            || !nest.b_off.is_empty()
+            || !nest.c_off.is_empty()
+        {
+            return None;
+        }
+        let (bias, act) = match_bias_act_epilogue(&stmts[1], &nest, self.interner)?;
+        if self.emit_sgemm_epi(&nest, bias, act) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// Emit the fused `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)` call for a recognized
+    /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
+    /// caller falls back to lowering the matmul and the epilogue loop separately.
+    fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Symbol, act: u32) -> bool {
+        let (
+            Some((a, _)),
+            Some((b, _)),
+            Some((c, _)),
+            Some((bias_ptr, _)),
+            Some(m),
+            Some(k),
+            Some(n),
+        ) = (
+            self.lookup(nest.a),
+            self.lookup(nest.b),
+            self.lookup(nest.c),
+            self.lookup(bias),
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        )
+        else {
+            return false;
+        };
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        let act_v = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(act as i128, MirType::I64));
+        self.builder.build_void(Op::Call {
+            func: self.gemm.nt_epi,
+            args: vec![a, b, c, m, k, n, beta, bias_ptr, act_v],
         });
         true
     }
@@ -3754,6 +3836,145 @@ fn recognize_matmul<'a>(
 ) -> Option<MatmulNest<'a>> {
     match_matmul(pat, iter, body, sema, interner)
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
+}
+
+// Fused-epilogue activation codes — must match `mercury_runtime`'s gemm kernel (ACT_IDENTITY/RELU).
+const EPI_ACT_IDENTITY: u32 = 0;
+const EPI_ACT_RELU: u32 = 1;
+
+/// If `e` is `base_sym[idx]` (single index off the path `base_sym`), return `idx`.
+fn index_of(e: &Expr, base_sym: Symbol) -> Option<&Expr> {
+    if let ExprKind::Index { base, indices } = &e.kind {
+        if indices.len() == 1 && single_path(base) == Some(base_sym) {
+            return Some(&indices[0]);
+        }
+    }
+    None
+}
+
+/// Is `e` the matmul output element `C[i*N+j]` (row `ivar`, col `jvar`, stride `n`)?
+fn is_c_elem(
+    e: &Expr,
+    c_sym: Symbol,
+    ivar: Symbol,
+    jvar: Symbol,
+    n: Dim,
+    interner: &Interner,
+) -> bool {
+    index_of(e, c_sym)
+        .and_then(|idx| match_row_col(idx, ivar, interner))
+        .is_some_and(|(stride, col)| stride == n && col == jvar)
+}
+
+/// Match `C[i*N+j] + bias[j]` (either addend order) over the matmul output; return the bias array.
+fn match_c_plus_bias(
+    e: &Expr,
+    c_sym: Symbol,
+    ivar: Symbol,
+    jvar: Symbol,
+    n: Dim,
+    interner: &Interner,
+) -> Option<Symbol> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    // The non-C addend must be `bias[j]` — a single-index access by the column variable.
+    let bias_of = |x: &Expr| -> Option<Symbol> {
+        if let ExprKind::Index { base, indices } = &x.kind {
+            if indices.len() == 1 && single_path(&indices[0]) == Some(jvar) {
+                return single_path(base);
+            }
+        }
+        None
+    };
+    if is_c_elem(lhs, c_sym, ivar, jvar, n, interner) {
+        return bias_of(rhs);
+    }
+    if is_c_elem(rhs, c_sym, ivar, jvar, n, interner) {
+        return bias_of(lhs);
+    }
+    None
+}
+
+/// Match the epilogue RHS: `C[i*N+j] + bias[j]` (identity) or `fmax(C[i*N+j] + bias[j], 0)` (ReLU).
+/// Bias is required (the common `act(x·Wᵀ + bias)` shape). Returns `(bias_array, act_code)`.
+fn match_epi_value(
+    e: &Expr,
+    c_sym: Symbol,
+    ivar: Symbol,
+    jvar: Symbol,
+    n: Dim,
+    interner: &Interner,
+) -> Option<(Symbol, u32)> {
+    // ReLU written as `fmax(inner, 0.0)`.
+    if let ExprKind::Call { callee, args, .. } = &e.kind {
+        if args.len() == 2
+            && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
+            && is_float_zero(&args[1], interner)
+        {
+            let bias = match_c_plus_bias(&args[0], c_sym, ivar, jvar, n, interner)?;
+            return Some((bias, EPI_ACT_RELU));
+        }
+    }
+    // Identity: just the bias add.
+    let bias = match_c_plus_bias(e, c_sym, ivar, jvar, n, interner)?;
+    Some((bias, EPI_ACT_IDENTITY))
+}
+
+/// Match the bias/activation epilogue loop following a recognized `nn.Linear` matmul:
+/// `for i in 0..M { for j in 0..N { C[i*N+j] = C[i*N+j] + bias[j] } }`, optionally wrapped in
+/// `fmax(_, 0)` (ReLU). `M`/`N`/the stride/the output array/the column index must all match `nest`,
+/// so it never misfires; bias is required. Returns `(bias_array, act_code)`, else `None` (the loop
+/// is then lowered normally as a separate pass).
+fn match_bias_act_epilogue(
+    stmt: &Stmt,
+    nest: &MatmulNest<'_>,
+    interner: &Interner,
+) -> Option<(Symbol, u32)> {
+    // for i in 0..M { <single nested loop> }
+    let (ipat, iiter, ibody) = fusable_for(stmt)?;
+    let ivar = match &ipat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (istart, iend) = range_bounds(iiter)?;
+    if as_int_lit(istart, interner)? != 0 || as_dim(iend, interner)? != nest.m {
+        return None;
+    }
+    if ibody.tail.is_some() || ibody.stmts.len() != 1 {
+        return None;
+    }
+    // for j in 0..N { <single assignment> }
+    let (jpat, jiter, jbody) = fusable_for(&ibody.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (jstart, jend) = range_bounds(jiter)?;
+    if as_int_lit(jstart, interner)? != 0 || as_dim(jend, interner)? != nest.n {
+        return None;
+    }
+    if jbody.tail.is_some() || jbody.stmts.len() != 1 {
+        return None;
+    }
+    // C[i*N+j] = <epilogue>   (plain assignment to the matmul's output element)
+    let StmtKind::Assign {
+        target,
+        op: ast::AssignOp::Assign,
+        value,
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    if !is_c_elem(target, nest.c, ivar, jvar, nest.n, interner) {
+        return None;
+    }
+    match_epi_value(value, nest.c, ivar, jvar, nest.n, interner)
 }
 
 /// Recognize the textbook `ijk` dot-product matmul:
