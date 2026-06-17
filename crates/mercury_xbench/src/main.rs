@@ -647,6 +647,44 @@ fn kernels() -> Vec<Kernel> {
                  r=r*v+0.0001; r=r*v+0.001; r=r*v+0.01; r=r*v+0.1; *out.add(i)=r; }",
             ),
         },
+        // Transcendentals: the regime a tensor compiler should dominate idiomatic scalar source.
+        // Mercury lowers `exp` to a ~1-ULP f32 polynomial and auto-vectorizes it (128-bit x 4);
+        // gcc/rustc call scalar libm `expf` per element and cannot vectorize a loop with a call
+        // (no libmvec on this mingw toolchain), so the loop stays serial.
+        Kernel {
+            name: "exp",
+            bytes_per_call: 2 * N * 4,
+            note: "out = exp(x): Mercury vectorizes a ~1-ULP poly; C/Rust call scalar libm expf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = exp(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=expf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).exp(); }"),
+        },
+        // GELU (tanh approximation) written with the *identical* algorithm in all three languages —
+        // tanh(z) built from exp as `1 - 2/(exp(2z)+1)`. The only difference is that Mercury
+        // auto-vectorizes the exp; C/Rust call scalar expf. The fairest transcendental comparison.
+        Kernel {
+            name: "gelu",
+            bytes_per_call: 2 * N * 4,
+            note: "GELU via exp-based tanh, same algorithm everywhere; Mercury vectorizes the exp",
+            mer: mer_kernel(&format!(
+                "for i in 0..{nlit} {{ let v: f32 = x[i]; \
+                 let u: f32 = 0.7978845608 * (v + 0.044715 * v * v * v); \
+                 let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0); \
+                 out[i] = 0.5 * v * (1.0 + t); }}"
+            )),
+            c: c_kernel(
+                "for(long i=0;i<N;i++){ float v=x[i]; \
+                 float u=0.7978845608f*(v+0.044715f*v*v*v); \
+                 float t=1.0f-2.0f/(expf(2.0f*u)+1.0f); \
+                 out[i]=0.5f*v*(1.0f+t); }",
+            ),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); \
+                 let u=0.7978845608f32*(v+0.044715*v*v*v); \
+                 let t=1.0f32-2.0/((2.0*u).exp()+1.0); \
+                 *out.add(i)=0.5*v*(1.0+t); }",
+            ),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
@@ -726,7 +764,7 @@ fn mer_par_kernel(loop_body: &str) -> String {
 }
 
 fn c_kernel(body: &str) -> String {
-    format!("#define N {N}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
+    format!("#include <math.h>\n#define N {N}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
 }
 
 fn rust_kernel(body: &str) -> String {
