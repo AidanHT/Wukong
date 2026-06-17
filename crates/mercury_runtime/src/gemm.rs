@@ -24,6 +24,11 @@ const MC: usize = 72;
 const KC: usize = 256;
 const NC: usize = 4080;
 
+// Minimum multiply-accumulate count (`m·n·k`) before the parallel kernel is worth its threading
+// overhead. 2^26 ≈ 67M MACs sits between 256^3 (~17M, faster serial) and 512^3 (~134M, ~2.4× on
+// threads) on this machine.
+const PAR_MIN_MACS: u64 = 1 << 26;
+
 #[inline]
 fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
@@ -84,6 +89,11 @@ unsafe fn gemm_dispatch(
     }
     let (m, k, n) = (m as usize, k as usize, n as usize);
     let beta = beta as f32;
+    // Multi-thread only above a work threshold: below it, cross-core wake/sync (worse on this
+    // P+E-core hybrid, where the E-cores are slow to spin up) costs more than it saves and the
+    // parallel path is a net loss — empirically ~256^3 runs faster on one core than across all of
+    // them. The serial AVX2 kernel is the fast path for everything smaller.
+    let par = par && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -706,40 +716,47 @@ mod tests {
     }
 
     /// Throughput probe (run: `cargo test -p mercury_runtime --release -- --ignored --nocapture`).
+    /// Sweeps square sizes so the parallel scaling (which improves with size, as the packs amortize
+    /// and each core gets more compute per K-block) is visible, not just the small-matrix corner.
     #[test]
     #[ignore]
     fn sgemm_throughput() {
         use std::time::Instant;
-        let n = 512usize;
-        let a = fill(1, n * n);
-        let b = fill(2, n * n);
-        let mut c = vec![0.0f32; n * n];
-        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
-        let flops = 2.0 * (n as f64).powi(3);
-        let bench = |label: &str, f: &dyn Fn()| {
-            for _ in 0..3 {
-                f();
-            }
-            let mut best = f64::INFINITY;
-            for _ in 0..20 {
-                let t = Instant::now();
-                f();
-                best = best.min(t.elapsed().as_secs_f64());
-            }
-            println!("{label}: {:.1} GFLOP/s ({:.3} ms)", flops / best / 1e9, best * 1e3);
-        };
-        bench("sgemm (1 core)", &|| unsafe {
-            mercury_sgemm(ap, bp, cp, n as i64, n as i64, n as i64, 0);
-        });
-        bench("sgemm (parallel)", &|| unsafe {
-            mercury_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
-        });
-        bench("sgemm_nt (1 core)", &|| unsafe {
-            mercury_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
-        });
-        bench("sgemm_nt (parallel)", &|| unsafe {
-            mercury_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
-        });
+        for &n in &[256usize, 512, 1024] {
+            let a = fill(1, n * n);
+            let b = fill(2, n * n);
+            let mut c = vec![0.0f32; n * n];
+            let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+            let flops = 2.0 * (n as f64).powi(3);
+            let bench = |label: &str, f: &dyn Fn()| {
+                for _ in 0..3 {
+                    f();
+                }
+                let mut best = f64::INFINITY;
+                for _ in 0..20 {
+                    let t = Instant::now();
+                    f();
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                println!(
+                    "n={n:<4} {label:<22}: {:6.1} GFLOP/s ({:.3} ms)",
+                    flops / best / 1e9,
+                    best * 1e3
+                );
+            };
+            bench("sgemm (1 core)", &|| unsafe {
+                mercury_sgemm(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+            });
+            bench("sgemm (parallel)", &|| unsafe {
+                mercury_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+            });
+            bench("sgemm_nt (1 core)", &|| unsafe {
+                mercury_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+            });
+            bench("sgemm_nt (parallel)", &|| unsafe {
+                mercury_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+            });
+        }
     }
 
     /// `naive` for `C = A·Bᵀ` (B is `[n, k]`).
