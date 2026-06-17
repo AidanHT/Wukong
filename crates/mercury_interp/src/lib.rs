@@ -600,6 +600,43 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32` — the deterministic reduction kernel
+            // a `@parallel` reduction loop lowers to (dot / ssd / sum). Marshal `n` f32 out of x and y
+            // and call the *serial* runtime kernel, which is bit-identical to the parallel one the
+            // native backend runs — so the differential oracle stays exact. The unary sum passes
+            // y == x (harmless redundant reads); the kernel ignores y for it.
+            "mercury_sreduce_f32" | "mercury_sreduce_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let y = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let op = args[3].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("reduce operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    ybuf.push(
+                        self.memory
+                            .get(y + t)
+                            .ok_or("reduce operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                // SAFETY: xbuf/ybuf are exactly n f32 long — the kernel's contract.
+                let r = unsafe {
+                    mercury_runtime::mercury_sreduce_f32(
+                        xbuf.as_ptr(),
+                        ybuf.as_ptr(),
+                        n as i64,
+                        op,
+                    )
+                };
+                Ok(Value::Float(r as f64))
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }
