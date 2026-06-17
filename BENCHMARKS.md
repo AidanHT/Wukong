@@ -38,9 +38,12 @@ naively-written source:
   recognizer also handles the **batched** form (a matmul nest under a batch loop, each index carrying
   a per-batch offset `x[h*S*D + …]`) — so **multi-head attention** dispatches one tuned GEMM per head,
   for both its `Q·Kᵀ` and `P·V` matmuls.
-- **Reduction vectorization.** A naive f32 reduction (`s += x[i]*y[i]`) is one FMA down a single
-  dependency chain — latency-bound. Mercury reassociates it across vector lanes × unrolled
-  accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without `-ffast-math`.
+- **Reduction vectorization + multicore dispatch.** A naive f32 reduction (`s += x[i]*y[i]`) is one
+  FMA down a single dependency chain — latency-bound. Mercury reassociates it across vector lanes ×
+  unrolled accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without
+  `-ffast-math`. A `@parallel` reduction goes further, lowering to a **deterministic multicore
+  reduction kernel** (`mercury_sreduce_f32_parallel`: dot/ssd/sum/sumsq) whose result is bit-identical
+  to the serial form regardless of core count (fixed-size chunks, ascending partial combine).
 - **Auto-vectorization + fusion** of elementwise loops (incl. branchy ones via if-conversion), `x +
   y*z` → FMA contraction, and adjacent-loop fusion.
 - **Vectorized transcendentals → 256-bit AVX2 dispatch.** A pure `out[i] = f(x[i])` loop for
@@ -179,20 +182,27 @@ construction.
 | relu   | ≈tie (~0.95×) | memory-bound; vectorized via if-conversion (one load per element) |
 | poly   | ≈tie (~1.0×, ±) | deg-4 Horner; memory-bound at N=2²⁰ (~1 FLOP/byte), so width is moot here |
 | fused linear→relu | ~1.0× faster | two source loops Mercury auto-fuses; C/Rust stream the intermediate |
-| dot    | **~2.6–2.8× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
+| dot    | **~2.7–2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
 | ssd (Σ(x−y)²) | **~2.6–2.7× faster** | same — an L2-loss reduction |
+
+A `@parallel` reduction goes further: it dispatches to a deterministic multicore reduction kernel
+(`mercury_sreduce_f32_parallel`), spreading the stream across cores to reach *aggregate* bandwidth —
+see the `dot@parallel`/`ssd@parallel` rows below.
 
 ### Auto-parallel runtime — Mercury heavily exceeds idiomatic single-threaded C/Rust
 
-`@parallel` lowers the loop to a multicore dispatch whose per-thread chunk is itself vectorized.
-These kernels are memory-bound, so the parallel speedup is limited by *aggregate* bandwidth, not
-core count — still a clear win over single-threaded C:
+`@parallel` lowers the loop to a multicore dispatch whose per-thread chunk is itself vectorized (or,
+for a reduction, dispatched to the multicore reduction kernel). These kernels are memory-bound, so the
+parallel speedup is limited by *aggregate* bandwidth, not core count — still a clear win over
+single-threaded C:
 
 | kernel | Mercury vs single-threaded C |
 |--------|------------------------------|
-| saxpy@parallel | **~2.4×** (~147 GB/s, near the chip's memory-bandwidth ceiling) |
-| poly@parallel  | **~1.8–2.3×** |
-| relu6@parallel | **~6.7–7.6×** (nested branch defeats gcc's vectorizer; Mercury if-converts + parallelizes) |
+| saxpy@parallel | **~2.4–2.7×** (~132 GB/s, near the chip's memory-bandwidth ceiling) |
+| poly@parallel  | **~2.2–2.4×** |
+| relu6@parallel | **~6.7–8.0×** (nested branch defeats gcc's vectorizer; Mercury if-converts + parallelizes) |
+| dot@parallel   | **~7.9×** (~135 GB/s) — reduction across cores; C/Rust keep it serial & latency-bound |
+| ssd@parallel   | **~8.6×** (~144 GB/s) — L2-loss reduction across cores |
 
 ## Honest summary
 
