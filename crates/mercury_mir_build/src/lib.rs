@@ -801,8 +801,8 @@ impl FnLowerer<'_> {
         let end_ty = self.expr_mir(end);
         let e0 = self.lower_expr(end);
         let e0 = self.coerce_to(e0, &end_ty, &ity, true);
-        if let Some((s_sym, addend, lane, w)) = reduction {
-            self.emit_reduction(j, s0, e0, &ity, s_sym, addend, &lane, w);
+        if let Some((s_sym, addend, lane, w, redop)) = reduction {
+            self.emit_reduction(j, s0, e0, &ity, s_sym, addend, &lane, w, redop);
             true
         } else {
             self.try_vectorize_ranged(j, s0, e0, &ity, body)
@@ -818,7 +818,7 @@ impl FnLowerer<'_> {
         &self,
         body: &'b Block,
         j: Symbol,
-    ) -> Option<(Symbol, &'b Expr, MirType, u32)> {
+    ) -> Option<(Symbol, &'b Expr, MirType, u32, RedOp)> {
         if body.tail.is_some() || body.stmts.len() != 1 {
             return None;
         }
@@ -833,21 +833,36 @@ impl FnLowerer<'_> {
         if !(sty.is_float() || sty.is_int()) {
             return None;
         }
-        // The addend: `s += addend`, or `s = s + addend` / `s = addend + s`.
+        // The addend and fold kind: `s += addend` / `s = s + addend` / `s = addend + s` (sum), or
+        // `m = fmax(m, addend)` / `m = fmin(m, addend)` (running max/min, either operand order).
         let is_s = |e: &Expr| single_path(e) == Some(s);
-        let addend: &Expr = match op {
-            ast::AssignOp::Add => value,
+        let (addend, redop): (&Expr, RedOp) = match op {
+            ast::AssignOp::Add => (value, RedOp::Add),
             ast::AssignOp::Assign => match &value.kind {
                 ExprKind::Binary {
                     op: ast::BinOp::Add,
                     lhs,
                     rhs,
-                } if is_s(lhs) => rhs,
+                } if is_s(lhs) => (rhs, RedOp::Add),
                 ExprKind::Binary {
                     op: ast::BinOp::Add,
                     lhs,
                     rhs,
-                } if is_s(rhs) => lhs,
+                } if is_s(rhs) => (lhs, RedOp::Add),
+                ExprKind::Call { callee, args, .. } if args.len() == 2 => {
+                    let red = match self.vectorizable_intrinsic(callee) {
+                        Some(MathIntrinsic::Fmax) => RedOp::Fmax,
+                        Some(MathIntrinsic::Fmin) => RedOp::Fmin,
+                        _ => return None,
+                    };
+                    if is_s(&args[0]) {
+                        (&args[1], red)
+                    } else if is_s(&args[1]) {
+                        (&args[0], red)
+                    } else {
+                        return None;
+                    }
+                }
                 _ => return None,
             },
             _ => return None,
@@ -866,8 +881,12 @@ impl FnLowerer<'_> {
         if lane != sty {
             return None;
         }
+        // fmax/fmin fold via a float compare + select; they need a float lane.
+        if matches!(redop, RedOp::Fmax | RedOp::Fmin) && !lane.is_float() {
+            return None;
+        }
         let w = vector_width(&lane)?;
-        Some((s, addend, lane, w))
+        Some((s, addend, lane, w, redop))
     }
 
     /// Attempt SIMD lowering of a loop whose bounds are already lowered to `ity` values (the form
@@ -1272,6 +1291,7 @@ impl FnLowerer<'_> {
         addend: &Expr,
         lane: &MirType,
         w: u32,
+        redop: RedOp,
     ) {
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
@@ -1282,18 +1302,22 @@ impl FnLowerer<'_> {
         let jtmp = self.builder.alloca(ity.clone());
 
         // `VEC_UNROLL` accumulators, each `w` contiguous lanes (an `Array` slot so the vector
-        // store/load address `w` real elements), initialised to a zero vector before the loop.
-        let zero = self.const_zero(lane.clone());
-        let vzero = self.builder.build(vty.clone(), Op::Splat(zero));
+        // store/load address `w` real elements), initialised to the fold's identity before the
+        // loop: 0 for a sum, -inf for `fmax`, +inf for `fmin` (so empty tail lanes never win).
+        let vid = match redop {
+            RedOp::Add => {
+                let zero = self.const_zero(lane.clone());
+                self.builder.build(vty.clone(), Op::Splat(zero))
+            }
+            RedOp::Fmax => self.splat_const_f(f64::NEG_INFINITY, &vty),
+            RedOp::Fmin => self.splat_const_f(f64::INFINITY, &vty),
+        };
         let accs: Vec<ValueId> = (0..VEC_UNROLL)
             .map(|_| {
                 let a = self
                     .builder
                     .alloca(MirType::Array(Box::new(lane.clone()), w));
-                self.builder.build_void(Op::Store {
-                    ptr: a,
-                    value: vzero,
-                });
+                self.builder.build_void(Op::Store { ptr: a, value: vid });
                 a
             })
             .collect();
@@ -1302,7 +1326,7 @@ impl FnLowerer<'_> {
         self.bind(j, slot, ity.clone());
 
         self.emit_reduction_strip(
-            j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend,
+            j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend, redop,
         );
         self.emit_reduction_strip(
             j,
@@ -1316,21 +1340,17 @@ impl FnLowerer<'_> {
             1,
             &accs[..1],
             addend,
+            redop,
         );
 
-        // Combine the accumulators, then horizontally reduce the lanes into `s`. Float reductions
-        // add with `FAdd`, integer ones with `Add`.
-        let add = if lane.is_float() {
-            BinOp::FAdd
-        } else {
-            BinOp::Add
-        };
+        // Combine the accumulators, then horizontally reduce the lanes into `s` with the same fold
+        // (sum / max / min) the loop body used.
         let mut total = self
             .builder
             .build(vty.clone(), Op::Load(accs[0], vty.clone()));
         for &a in &accs[1..] {
             let v = self.builder.build(vty.clone(), Op::Load(a, vty.clone()));
-            total = self.builder.build(vty.clone(), Op::Bin(add, total, v));
+            total = self.reduce_combine_vec(redop, lane, &vty, w, total, v);
         }
         let scratch = self
             .builder
@@ -1358,14 +1378,14 @@ impl FnLowerer<'_> {
             let sv = self
                 .builder
                 .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
-            let sum = self.builder.build(s_ty.clone(), Op::Bin(add, sv, lane_v));
+            let sum = self.reduce_combine_scalar(redop, &s_ty, sv, lane_v);
             self.builder.build_void(Op::Store {
                 ptr: s_slot,
                 value: sum,
             });
         }
 
-        self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend);
+        self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend, redop);
         self.pop_scope();
     }
 
@@ -1386,6 +1406,7 @@ impl FnLowerer<'_> {
         unroll: u32,
         accs: &[ValueId],
         addend: &Expr,
+        redop: RedOp,
     ) {
         let span = (unroll * w) as i128;
         let off = self
@@ -1434,7 +1455,13 @@ impl FnLowerer<'_> {
             let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
             // Per-copy load cache (so `(x[i]-y[i])*(x[i]-y[i])` loads x[i],y[i] once each).
             self.vec_loads.clear();
-            let nv = self.vec_accumulate(cur, addend, j, lane, vty, w, &mut vlocals);
+            let nv = match redop {
+                RedOp::Add => self.vec_accumulate(cur, addend, j, lane, vty, w, &mut vlocals),
+                RedOp::Fmax | RedOp::Fmin => {
+                    let vx = self.vec_lower_value(addend, j, lane, vty, w, &mut vlocals);
+                    self.reduce_combine_vec(redop, lane, vty, w, cur, vx)
+                }
+            };
             self.builder.build_void(Op::Store {
                 ptr: acc_slot,
                 value: nv,
@@ -1458,7 +1485,8 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
-    /// The reduction's scalar remainder: `while j < end { s = s + addend; j += 1; }`.
+    /// The reduction's scalar remainder: `while j < end { s = fold(s, addend); j += 1; }`.
+    #[allow(clippy::too_many_arguments)]
     fn emit_reduction_tail(
         &mut self,
         j: Symbol,
@@ -1467,6 +1495,7 @@ impl FnLowerer<'_> {
         ity: &MirType,
         s_sym: Symbol,
         addend: &Expr,
+        redop: RedOp,
     ) {
         self.bind(j, slot, ity.clone());
         let hdr = self.builder.new_block();
@@ -1489,7 +1518,15 @@ impl FnLowerer<'_> {
         let sv = self
             .builder
             .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
-        let sum = self.scalar_accumulate(sv, addend, &s_ty);
+        let sum = match redop {
+            RedOp::Add => self.scalar_accumulate(sv, addend, &s_ty),
+            RedOp::Fmax | RedOp::Fmin => {
+                let from = self.expr_mir(addend);
+                let a = self.lower_expr(addend);
+                let a = self.coerce_to(a, &from, &s_ty, true);
+                self.reduce_combine_scalar(redop, &s_ty, sv, a)
+            }
+        };
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: sum,
@@ -1509,6 +1546,69 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    /// Combine two vectors under the reduction's fold: lane-wise sum (`FAdd`/`Add`), or `fmax`/`fmin`
+    /// as the same compare + select the scalar intrinsic lowers to (so vector and scalar agree).
+    fn reduce_combine_vec(
+        &mut self,
+        redop: RedOp,
+        lane: &MirType,
+        vty: &MirType,
+        w: u32,
+        a: ValueId,
+        b: ValueId,
+    ) -> ValueId {
+        match redop {
+            RedOp::Add => {
+                let op = if lane.is_float() {
+                    BinOp::FAdd
+                } else {
+                    BinOp::Add
+                };
+                self.builder.build(vty.clone(), Op::Bin(op, a, b))
+            }
+            RedOp::Fmax | RedOp::Fmin => {
+                let pred = if redop == RedOp::Fmax {
+                    CmpOp::Fogt
+                } else {
+                    CmpOp::Folt
+                };
+                let mty = MirType::Vec(Box::new(mask_lane_type(lane)), w);
+                let mask = self.builder.build(mty, Op::Cmp(pred, a, b));
+                self.builder.build(vty.clone(), Op::Select(mask, a, b))
+            }
+        }
+    }
+
+    /// Scalar counterpart of `reduce_combine_vec`, used for the horizontal lane reduce and the
+    /// scalar remainder.
+    fn reduce_combine_scalar(
+        &mut self,
+        redop: RedOp,
+        ty: &MirType,
+        a: ValueId,
+        b: ValueId,
+    ) -> ValueId {
+        match redop {
+            RedOp::Add => {
+                let op = if ty.is_float() {
+                    BinOp::FAdd
+                } else {
+                    BinOp::Add
+                };
+                self.builder.build(ty.clone(), Op::Bin(op, a, b))
+            }
+            RedOp::Fmax | RedOp::Fmin => {
+                let pred = if redop == RedOp::Fmax {
+                    CmpOp::Fogt
+                } else {
+                    CmpOp::Folt
+                };
+                let mask = self.builder.build(mask_ty(ty), Op::Cmp(pred, a, b));
+                self.builder.build(ty.clone(), Op::Select(mask, a, b))
+            }
+        }
     }
 
     /// Fold `addend` into vector accumulator `acc`. For a float reduction, `acc + a*b` fuses into one
@@ -3577,6 +3677,17 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
         _ if from.is_int() && matches!(to, MirType::Ptr) => CastKind::IntToPtr,
         _ => CastKind::Bitcast,
     }
+}
+
+/// How a recognised float/int reduction folds its lanes: a sum, or a running `fmax`/`fmin`.
+/// `Add` covers `s += x` / `s = s + x` (float reassociated, int exact); `Fmax`/`Fmin` cover
+/// `m = fmax(m, x)` / `m = fmin(m, x)` (float only — exactly associative for finite, non-NaN
+/// inputs, so the vectorized fold is bit-identical to the scalar one).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedOp {
+    Add,
+    Fmax,
+    Fmin,
 }
 
 /// The math builtins lowered directly to primitive MIR ops (not runtime calls).
