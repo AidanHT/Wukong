@@ -133,10 +133,11 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 ### Transcendentals / activations — Mercury vectorizes the poly; C calls scalar `libm`
 
 The activation family every transformer runs. Mercury lowers `exp` to a ≈1-ULP `f32` minimax
-polynomial (and `log`, `pow`, `erf`, `tanh`/`sigmoid` on top of it) built from primitive ops, and
-**auto-vectorizes** it; gcc/rustc call scalar `libm` `expf`/`logf`/`tanhf`/`erff` and cannot vectorize
-a loop containing a call (no `libmvec` on this mingw toolchain), so it stays serial. The `erf` poly
-gives the **exact** (erf-based) GELU of BERT/GPT-2/ViT, in addition to the tanh approximation.
+polynomial (and `log`, `pow`, `erf`, `sin`/`cos`, `tanh`/`sigmoid` on top of it or by the same
+technique) built from primitive ops, and **auto-vectorizes** it; gcc/rustc call scalar `libm`
+`expf`/`logf`/`tanhf`/`erff`/`sinf` and cannot vectorize a loop containing a call (no `libmvec` on this
+mingw toolchain), so it stays serial. The `erf` poly gives the **exact** (erf-based) GELU of
+BERT/GPT-2/ViT (alongside the tanh approximation), and `sin`/`cos` give **RoPE** rotary embeddings.
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
