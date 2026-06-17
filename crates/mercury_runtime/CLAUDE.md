@@ -8,7 +8,10 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
 ## Layout
 - `src/lib.rs` — `Arena`, `parallel_for` / `mercury_parallel_for` (rayon), plus unit tests.
 - `src/gemm.rs` — f32 GEMM: `mercury_sgemm[_nt][_parallel]`, the 6×16 packed AVX2/FMA microkernel,
-  cache-block packing, and a scalar fallback.
+  cache-block packing, and a scalar fallback. Plus `mercury_sgemm_nt_epi` — the fused-epilogue
+  `nn.Linear` (`C = act(A·Bᵀ + bias)`): bias-add + activation (identity / ReLU) folded into the C-tile
+  writeback on the final K-block, so C is written once (serial-only; the fold lives in the serial
+  writeback).
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
