@@ -170,6 +170,7 @@ fn pure_key(op: &Op, rewrite: &HashMap<u32, u32>) -> Option<String> {
         Op::FuncAddr(s) => format!("faddr:{s:?}"),
         Op::Splat(a) => format!("splat:{}", m(*a)),
         Op::Fma(a, b, c) => format!("fma:{}:{}:{}", m(*a), m(*b), m(*c)),
+        Op::Sqrt(a) => format!("sqrt:{}", m(*a)),
         Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::Alloca(..) => return None,
     })
 }

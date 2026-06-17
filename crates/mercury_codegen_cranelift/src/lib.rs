@@ -419,6 +419,12 @@ impl<'a> FnTranslator<'a> {
                 let cvv = self.val(*c);
                 self.builder.ins().fma(av, bv, cvv)
             }
+            // Hardware square root (scalar or 128-bit vector); the interpreter mirrors it with
+            // `f32`/`f64::sqrt`, so the two agree bit-for-bit.
+            Op::Sqrt(v) => {
+                let x = self.val(*v);
+                self.builder.ins().sqrt(x)
+            }
         };
         if let Some(r) = res {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's
