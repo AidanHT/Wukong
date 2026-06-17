@@ -241,6 +241,15 @@ unsafe fn sgemm_avx2_parallel(
     bt: bool,
 ) {
     use rayon::prelude::*;
+    // Pack scratch allocated ONCE and reused across every cache block, instead of a fresh
+    // `vec![0.0; …]` (malloc + zero of ~2 MB) per K-block per call — pure overhead the old code paid
+    // on every block. Each block fully repacks its region (the pack writes real data *and* the
+    // edge-padding zeros for every element it owns), so reuse needs no re-zeroing. Sized to the
+    // largest block: full M rows × KC, and an NC-wide × KC B panel.
+    let ap_cap = round_up(m, MR) * k.min(KC);
+    let bp_cap = round_up(n.min(NC), NR) * k.min(KC);
+    let mut ap = vec![0.0f32; ap_cap];
+    let mut bp = vec![0.0f32; bp_cap];
     let mut jc = 0;
     while jc < n {
         let nc = (n - jc).min(NC);
@@ -248,10 +257,8 @@ unsafe fn sgemm_avx2_parallel(
         while pc < k {
             let kc = (k - pc).min(KC);
             let beta_eff = if pc == 0 { beta } else { 1.0 };
-            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) once — in parallel, since
-            // with the C compute spread across every core the serial pack would dominate (Amdahl).
-            let mut ap = vec![0.0f32; round_up(m, MR) * kc];
-            let mut bp = vec![0.0f32; round_up(nc, NR) * kc];
+            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) — in parallel, since with
+            // the C compute spread across every core the serial pack would dominate (Amdahl).
             pack_a_par(a.add(pc), k, m, kc, ap.as_mut_ptr());
             pack_b_block_par(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
 
