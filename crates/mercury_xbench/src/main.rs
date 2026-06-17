@@ -116,6 +116,7 @@ fn main() {
     println!();
     bench_matmul(&cc, &dir);
     bench_linear(&cc, &dir);
+    bench_conv(&cc, &dir);
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -366,6 +367,143 @@ fn rust_linear(ns: usize) -> String {
          \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
          \x20     for k in 0..NS {{ s+=*a.add(i*NS+k)* *b.add(j*NS+k); }}\n\
          \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+    )
+}
+
+/// 2D convolution — the other heavy ML kernel. Mercury lowers it the XLA/cuDNN way: an im2col gather
+/// builds a `[Cin·K·K, OH·OW]` column matrix, then the conv is a matmul `Y = W · col` that the
+/// recognizer dispatches to the tuned GEMM. C/Rust run the *idiomatic direct* convolution (the
+/// six-deep loop nest everyone writes). Same math, cross-checked by checksum; reported as GFLOP/s.
+/// Cin=16, 20×20 input, 64 filters of 3×3, stride 1, no pad → 18×18 output.
+fn bench_conv(cc: &str, dir: &Path) {
+    let (cin, h, cout, k) = (16usize, 20usize, 64usize, 3usize);
+    let oh = h - k + 1; // 18
+    let (hw, ohw, ckk) = (h * h, oh * oh, cin * k * k);
+    let input: Vec<f32> = (0..cin * hw).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+    let weight: Vec<f32> = (0..cout * ckk)
+        .map(|i| (i % 5) as f32 * 0.05 - 0.1)
+        .collect();
+    let mut output = vec![0.0f32; cout * ohw];
+    let (ip, wp, opp) = (input.as_ptr(), weight.as_ptr(), output.as_mut_ptr());
+    let flops = 2.0 * (cout * ckk * ohw) as f64;
+
+    println!(
+        "=== conv2d Cin{cin} {h}x{h} -> {cout}@{oh}x{oh} (3x3); Mercury im2col+GEMM vs direct conv; GFLOP/s ==="
+    );
+    let gflops = |m: &Option<Measure>| {
+        m.as_ref()
+            .map(|x| format!("{:.1}", flops / x.ns_per_call))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    let mer = bench_mercury(&mer_conv(cin, h, cout, k), &mut output, ip, wp, opp);
+    let cm = bench_external(
+        "c",
+        &c_conv(cin, h, cout, k),
+        dir,
+        "conv",
+        cc,
+        &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        &mut output,
+        ip,
+        wp,
+        opp,
+    );
+    let rm = bench_external(
+        "rs",
+        &rust_conv(cin, h, cout, k),
+        dir,
+        "conv",
+        "rustc",
+        &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &mut output,
+        ip,
+        wp,
+        opp,
+    );
+    println!(
+        "  {:<18} {:>14} {:>14} {:>14}",
+        "", "Mer im2col+GEMM", "C (direct)", "Rust (direct)"
+    );
+    println!(
+        "  {:<18} {:>14} {:>14} {:>14}",
+        "GFLOP/s",
+        gflops(&mer),
+        gflops(&cm),
+        gflops(&rm)
+    );
+    if let (Some(m), Some(c)) = (&mer, &cm) {
+        let rel = (m.checksum - c.checksum).abs() / c.checksum.abs().max(1e-6);
+        if rel > 1e-3 {
+            println!(
+                "  ! checksum mismatch Mercury={} C={}",
+                m.checksum, c.checksum
+            );
+        }
+        let r = (flops / m.ns_per_call) / (flops / c.ns_per_call);
+        println!(
+            "  -> Mercury (im2col+GEMM) is {:.2}x {} than idiomatic direct-convolution C",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    println!();
+}
+
+/// Mercury conv: im2col into a `[Cin·K·K, OH·OW]` scratch, then `Y = W · col` (the matmul recognizer
+/// dispatches the second nest to the GEMM kernel). `col` is a function-local array.
+fn mer_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
+    let oh = h - k + 1;
+    let (hw, ohw, ckk, kk) = (h * h, oh * oh, cin * k * k, k * k);
+    format!(
+        "module bench\nfn kbench(input: [f32; {inlen}], weight: [f32; {wlen}], output: [f32; {olen}]) {{\n\
+         \x20   let mut col: [f32; {collen}] = [0.0; {collen}];\n\
+         \x20   for oy in 0..{oh} {{ for ox in 0..{oh} {{\n\
+         \x20     for ic in 0..{cin} {{ for ky in 0..{k} {{ for kx in 0..{k} {{\n\
+         \x20       col[(ic * {kk} + ky * {k} + kx) * {ohw} + (oy * {oh} + ox)] = input[ic * {hw} + (oy + ky) * {h} + (ox + kx)];\n\
+         \x20     }} }} }}\n\
+         \x20   }} }}\n\
+         \x20   for i in 0..{cout} {{ for j in 0..{ohw} {{\n\
+         \x20     let mut s: f32 = 0.0;\n\
+         \x20     for p in 0..{ckk} {{ s = s + weight[i * {ckk} + p] * col[p * {ohw} + j]; }}\n\
+         \x20     output[i * {ohw} + j] = s;\n\
+         \x20   }} }}\n}}\n",
+        inlen = cin * hw,
+        wlen = cout * ckk,
+        olen = cout * ohw,
+        collen = ckk * ohw,
+    )
+}
+
+fn c_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
+    let oh = h - k + 1;
+    let (hw, ohw, ckk, kk) = (h * h, oh * oh, cin * k * k, k * k);
+    format!(
+        "__declspec(dllexport) void kbench(const float* input, const float* weight, float* output) {{\n\
+         \x20 for (long oc=0; oc<{cout}; oc++)\n\
+         \x20  for (long oy=0; oy<{oh}; oy++)\n\
+         \x20   for (long ox=0; ox<{oh}; ox++) {{\n\
+         \x20     float s=0.0f;\n\
+         \x20     for (long ic=0; ic<{cin}; ic++)\n\
+         \x20      for (long ky=0; ky<{k}; ky++)\n\
+         \x20       for (long kx=0; kx<{k}; kx++)\n\
+         \x20        s += input[ic*{hw} + (oy+ky)*{h} + (ox+kx)] * weight[oc*{ckk} + ic*{kk} + ky*{k} + kx];\n\
+         \x20     output[oc*{ohw} + oy*{oh} + ox] = s;\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn rust_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
+    let oh = h - k + 1;
+    let (hw, ohw, ckk, kk) = (h * h, oh * oh, cin * k * k, k * k);
+    format!(
+        "#[no_mangle]\npub unsafe extern \"C\" fn kbench(input:*const f32, weight:*const f32, output:*mut f32) {{\n\
+         \x20 for oc in 0..{cout} {{ for oy in 0..{oh} {{ for ox in 0..{oh} {{\n\
+         \x20   let mut s=0.0f32;\n\
+         \x20   for ic in 0..{cin} {{ for ky in 0..{k} {{ for kx in 0..{k} {{\n\
+         \x20     s += *input.add(ic*{hw} + (oy+ky)*{h} + (ox+kx)) * *weight.add(oc*{ckk} + ic*{kk} + ky*{k} + kx);\n\
+         \x20   }} }} }}\n\
+         \x20   *output.add(oc*{ohw} + oy*{oh} + ox) = s;\n\
+         \x20 }} }} }}\n}}\n"
     )
 }
 
