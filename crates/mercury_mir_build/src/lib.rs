@@ -1154,6 +1154,8 @@ impl FnLowerer<'_> {
                     MathIntrinsic::Exp
                     | MathIntrinsic::Log
                     | MathIntrinsic::Erf
+                    | MathIntrinsic::Sin
+                    | MathIntrinsic::Cos
                     | MathIntrinsic::Tanh
                     | MathIntrinsic::Sigmoid,
                 ) => {
@@ -1929,6 +1931,10 @@ impl FnLowerer<'_> {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_erf_f32(x, vty)
                 }
+                Some(op @ (MathIntrinsic::Sin | MathIntrinsic::Cos)) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_trig_f32(x, vty, matches!(op, MathIntrinsic::Cos))
+                }
                 Some(MathIntrinsic::Tanh) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_tanh(x, vty)
@@ -2616,6 +2622,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_erf(x, &rty))
             }
+            MathIntrinsic::Sin => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_trig(x, &rty, false))
+            }
+            MathIntrinsic::Cos => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_trig(x, &rty, true))
+            }
             MathIntrinsic::Tanh => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_tanh(x, &rty))
@@ -2769,6 +2783,118 @@ impl FnLowerer<'_> {
         let ge = self.builder.build(mty, Op::Cmp(CmpOp::Foge, x, zero));
         self.builder
             .build(fty.clone(), Op::Select(ge, mag, neg_mag))
+    }
+
+    /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`) as a fast, deterministic polynomial. Always
+    /// computed in `f32`; an `f64` result is demoted/promoted like `exp`. Works on a scalar or a SIMD
+    /// vector; bit-identical across backends. Enables rotary position embeddings (RoPE).
+    fn emit_trig(&mut self, x: ValueId, rty: &MirType, is_cos: bool) -> ValueId {
+        let want_f64 = matches!(rty.lane_type(), MirType::F64);
+        let f32ty = float_ty_like(rty, MirType::F32);
+        let xf = if want_f64 {
+            self.builder
+                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
+        } else {
+            x
+        };
+        let r = self.emit_trig_f32(xf, &f32ty, is_cos);
+        if want_f64 {
+            self.builder
+                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
+        } else {
+            r
+        }
+    }
+
+    /// The sin/cos polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Reduces `x` to
+    /// `r ∈ [-π/4, π/4]` by `q = round(x·2/π)` quadrants (round-to-nearest via the add-magic trick),
+    /// evaluates the Cephes `sinf`/`cosf` minimax polynomials on `r`, and selects ±sin/±cos by
+    /// `q mod 4`. The quadrant is reduced to an exact small float so every blend uses a float-compare
+    /// mask (the proven `select` path), and every step is a primitive op, so both backends agree.
+    fn emit_trig_f32(&mut self, x: ValueId, fty: &MirType, is_cos: bool) -> ValueId {
+        let ity = match fty {
+            MirType::Vec(_, n) => MirType::Vec(Box::new(MirType::I32), *n),
+            _ => MirType::I32,
+        };
+        let mty = mask_ty(fty);
+        // q = round(x · 2/π) via add-magic / sub-magic (round-to-nearest-even, pure f32).
+        let two_pi = self.splat_const_f(TWO_OVER_PI, fty);
+        let magic = self.splat_const_f(EXP_MAGIC, fty);
+        let tt = self.builder.build(fty.clone(), Op::Fma(x, two_pi, magic));
+        let qf = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, tt, magic));
+        // r = ((x - qf·PIO2_1) - qf·PIO2_2) - qf·PIO2_3   (3-part π/2 split keeps the reduction exact).
+        let n1 = self.splat_const_f(-PIO2_1, fty);
+        let n2 = self.splat_const_f(-PIO2_2, fty);
+        let n3 = self.splat_const_f(-PIO2_3, fty);
+        let r = self.builder.build(fty.clone(), Op::Fma(qf, n1, x));
+        let r = self.builder.build(fty.clone(), Op::Fma(qf, n2, r));
+        let r = self.builder.build(fty.clone(), Op::Fma(qf, n3, r));
+        let z = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, r, r));
+        // sin_p(r) = r·(1 + z·poly) with poly = ((s₀z + s₁)z + s₂).
+        let mut s = self.splat_const_f(SIN_P[0], fty);
+        for &c in &SIN_P[1..] {
+            let cc = self.splat_const_f(c, fty);
+            s = self.builder.build(fty.clone(), Op::Fma(s, z, cc));
+        }
+        let sz = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, s, z));
+        let sin_p = self.builder.build(fty.clone(), Op::Fma(sz, r, r));
+        // cos_p(r) = (1 - 0.5z) + z²·poly with poly = ((c₀z + c₁)z + c₂).
+        let mut cc0 = self.splat_const_f(COS_P[0], fty);
+        for &c in &COS_P[1..] {
+            let k = self.splat_const_f(c, fty);
+            cc0 = self.builder.build(fty.clone(), Op::Fma(cc0, z, k));
+        }
+        let z2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, z, z));
+        let cz2 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, cc0, z2));
+        let neg_half = self.splat_const_f(-0.5, fty);
+        let one = self.splat_const_f(1.0, fty);
+        let hz = self.builder.build(fty.clone(), Op::Fma(neg_half, z, one));
+        let cos_p = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, hz, cz2));
+        // ±variants for the quadrant blend.
+        let neg1 = self.splat_const_f(-1.0, fty);
+        let neg_sin = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, sin_p, neg1));
+        let neg_cos = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, cos_p, neg1));
+        // quad = (int)qf & 3, then back to an exact float (0/1/2/3) for float-mask selects. For
+        // negative q the two's-complement `& 3` is still the correct mod-4 quadrant.
+        let qi = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::FpToSi, qf, ity.clone()));
+        let three = self.splat_const_i(3, &ity);
+        let quad_i = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, qi, three));
+        let quad = self
+            .builder
+            .build(fty.clone(), Op::Cast(CastKind::SiToFp, quad_i, fty.clone()));
+        // sin: [sin, cos, -sin, -cos];  cos: [cos, -sin, -cos, sin], indexed by quad.
+        let (a0, a1, a2, a3) = if is_cos {
+            (cos_p, neg_sin, neg_cos, sin_p)
+        } else {
+            (sin_p, cos_p, neg_sin, neg_cos)
+        };
+        let k0 = self.splat_const_f(0.0, fty);
+        let k1 = self.splat_const_f(1.0, fty);
+        let k2 = self.splat_const_f(2.0, fty);
+        let eq0 = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, quad, k0));
+        let eq1 = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, quad, k1));
+        let eq2 = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, quad, k2));
+        let sel23 = self.builder.build(fty.clone(), Op::Select(eq2, a2, a3));
+        let sel123 = self.builder.build(fty.clone(), Op::Select(eq1, a1, sel23));
+        self.builder.build(fty.clone(), Op::Select(eq0, a0, sel123))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
@@ -4229,6 +4355,8 @@ enum MathIntrinsic {
     Log,
     Pow,
     Erf,
+    Sin,
+    Cos,
     Tanh,
     Sigmoid,
     Fmax,
@@ -4243,6 +4371,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "log" => MathIntrinsic::Log,
         "pow" => MathIntrinsic::Pow,
         "erf" => MathIntrinsic::Erf,
+        "sin" => MathIntrinsic::Sin,
+        "cos" => MathIntrinsic::Cos,
         "tanh" => MathIntrinsic::Tanh,
         "sigmoid" => MathIntrinsic::Sigmoid,
         "fmax" => MathIntrinsic::Fmax,
@@ -4311,6 +4441,21 @@ const ERF_A: [f64; 5] = [
     1.421_413_741,
     -1.453_152_027,
     1.061_405_429,
+];
+
+// `sin`/`cos` constants (Cephes single-precision `sinf`/`cosf`). Reduce `x` to `r ∈ [-π/4, π/4]` by
+// `q = round(x·2/π)` quadrants, then `r = x - q·(π/2)` with π/2 split into three parts (`PIO2_*`, the
+// Cephes π/4 `DP` constants doubled) so the cancellation stays accurate. `q mod 4` picks ±sin/±cos of
+// the reduced angle. All primitive ops + the proven round-to-nearest magic, so both backends agree.
+const TWO_OVER_PI: f64 = std::f64::consts::FRAC_2_PI; // 2/π — quadrant count = round(x·2/π)
+const PIO2_1: f64 = 1.5703125; // π/2 high (2 × Cephes DP1 = 2 × 0.78515625)
+const PIO2_2: f64 = 4.837_512_969_970_703e-4; // π/2 mid  (2 × DP2)
+const PIO2_3: f64 = 7.549_789_954_891_88e-8; // π/2 low  (2 × DP3)
+const SIN_P: [f64; 3] = [-1.9515295891e-4, 8.3321608736e-3, -1.6666654611e-1];
+const COS_P: [f64; 3] = [
+    2.443_315_711_809_948e-5,
+    -1.388_731_625_493_765e-3,
+    4.166_664_568_298_827e-2,
 ];
 
 /// Names that lower to runtime/interpreter intrinsics rather than user functions.
