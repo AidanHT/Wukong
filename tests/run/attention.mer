@@ -1,0 +1,70 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1372
+// EXPECT-OUT: 1443
+// EXPECT-OUT: 1758
+module tests.run.attention
+
+// Scaled dot-product attention — the core transformer op: O = softmax(Q·Kᵀ)·V. Both matmul nests
+// (Q·Kᵀ as nn.Linear, P·V as C=A·B) dispatch to the tuned GEMM kernel, with a per-row softmax
+// (fmax reduction + vectorized exp + sum reduction + normalize) between them. S=8 tokens, D=8 head
+// dim; scale folded out (temperature 1) to keep the proof about composition. The gate proves the
+// whole op is bit-identical between the interpreter and native backends.
+fn attention(q: [f32; 64], k: [f32; 64], v: [f32; 64], scores: [f32; 64], out: [f32; 64]) {
+    // scores = Q · Kᵀ   (nn.Linear spelling)
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 {
+                s = s + q[i * 8 + p] * k[j * 8 + p];
+            }
+            scores[i * 8 + j] = s;
+        }
+    }
+    // softmax each row of scores, in place
+    for i in 0..8 {
+        let mut m: f32 = scores[i * 8 + 0];
+        for j in 0..8 {
+            m = fmax(m, scores[i * 8 + j]);
+        }
+        let mut sum: f32 = 0.0;
+        for j in 0..8 {
+            let e: f32 = exp(scores[i * 8 + j] - m);
+            scores[i * 8 + j] = e;
+            sum = sum + e;
+        }
+        let inv: f32 = 1.0 / sum;
+        for j in 0..8 {
+            scores[i * 8 + j] = scores[i * 8 + j] * inv;
+        }
+    }
+    // out = P · V   (C = A·B)
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 {
+                s = s + scores[i * 8 + p] * v[p * 8 + j];
+            }
+            out[i * 8 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 64] = [0.0; 64];
+    let mut k: [f32; 64] = [0.0; 64];
+    let mut v: [f32; 64] = [0.0; 64];
+    let mut scores: [f32; 64] = [0.0; 64];
+    let mut out: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        q[i] = ((i % 5) as f32) * 0.1;
+        k[i] = ((i % 7) as f32) * 0.1;
+        v[i] = (i as f32) * 0.5;
+    }
+    attention(q, k, v, scores, out);
+    // Each output row is a convex combination of V rows, so values stay within V's range.
+    print((out[0] * 100.0) as i32);
+    print((out[8] * 100.0) as i32);
+    print((out[63] * 100.0) as i32);
+    return 0;
+}
