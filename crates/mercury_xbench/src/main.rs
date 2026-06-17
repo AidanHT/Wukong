@@ -50,7 +50,9 @@ fn main() {
     let dir = std::env::temp_dir().join("mercury_xbench");
     let _ = std::fs::create_dir_all(&dir);
 
-    println!("Cross-language kernel benchmark — Mercury (native) vs C (gcc -O3) vs Rust (rustc -O)");
+    println!(
+        "Cross-language kernel benchmark — Mercury (native) vs C (gcc -O3) vs Rust (rustc -O)"
+    );
     println!("N = {N} f32 elements, single-threaded, -march=native. Lower ns is better.\n");
 
     let kernels = kernels();
@@ -186,7 +188,10 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize) {
     if let (Some(m), Some(c)) = (&mer_par, &cm) {
         let rel = (m.checksum - c.checksum).abs() / c.checksum.abs().max(1e-6);
         if rel > 1e-3 {
-            println!("  ! checksum mismatch Mercury={} C={}", m.checksum, c.checksum);
+            println!(
+                "  ! checksum mismatch Mercury={} C={}",
+                m.checksum, c.checksum
+            );
         }
     }
     if let (Some(mp), Some(c)) = (&mer_par, &cm) {
@@ -263,26 +268,63 @@ fn bench_linear(cc: &str, dir: &Path) {
         let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
         let flops = 2.0 * (ns as f64).powi(3);
         let gflops = |m: &Option<Measure>| {
-            m.as_ref().map(|x| format!("{:.1}", flops / x.ns_per_call)).unwrap_or_else(|| "n/a".into())
+            m.as_ref()
+                .map(|x| format!("{:.1}", flops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
         };
         println!("=== linear (nn.Linear C=A·Bᵀ) {ns}x{ns} (GFLOP/s, higher is better) ===");
         let mer = bench_mercury(&mer_linear(ns, false), &mut c, ap, bp, cp);
         let mer_par = bench_mercury(&mer_linear(ns, true), &mut c, ap, bp, cp);
-        let cm = bench_external("c", &c_linear(ns), dir, "linear", cc,
-            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"], &mut c, ap, bp, cp);
-        let rm = bench_external("rs", &rust_linear(ns), dir, "linear", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut c, ap, bp, cp);
-        println!("  {:<18} {:>12} {:>12} {:>12} {:>12}", "", "Mer(1core)", "Mer(parallel)", "C (gcc)", "Rust");
-        println!("  {:<18} {:>12} {:>12} {:>12} {:>12}", "GFLOP/s",
-            gflops(&mer), gflops(&mer_par), gflops(&cm), gflops(&rm));
+        let cm = bench_external(
+            "c",
+            &c_linear(ns),
+            dir,
+            "linear",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_linear(ns),
+            dir,
+            "linear",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        println!(
+            "  {:<18} {:>12} {:>12} {:>12} {:>12}",
+            "", "Mer(1core)", "Mer(parallel)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<18} {:>12} {:>12} {:>12} {:>12}",
+            "GFLOP/s",
+            gflops(&mer),
+            gflops(&mer_par),
+            gflops(&cm),
+            gflops(&rm)
+        );
         if let (Some(mp), Some(c)) = (&mer_par, &cm) {
             let r = (flops / mp.ns_per_call) / (flops / c.ns_per_call);
-            println!("  -> Mercury @parallel is {:.2}x faster than idiomatic single-threaded C", r);
+            println!(
+                "  -> Mercury @parallel is {:.2}x faster than idiomatic single-threaded C",
+                r
+            );
         }
         if let (Some(ms), Some(c)) = (&mer, &cm) {
             let r = (flops / ms.ns_per_call) / (flops / c.ns_per_call);
-            println!("  -> Mercury single-core is {:.2}x {} than C single-threaded",
-                if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than C single-threaded",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
         }
         println!();
     }
@@ -332,13 +374,18 @@ fn report(k: &Kernel, m: &Option<Measure>, c: &Option<Measure>, r: &Option<Measu
         println!(
             "  {:<14} {:>14} {:>14} {:>14}",
             label,
-            m.as_ref().map(|x| f(x)).unwrap_or_else(|| "n/a".into()),
-            c.as_ref().map(|x| f(x)).unwrap_or_else(|| "n/a".into()),
-            r.as_ref().map(|x| f(x)).unwrap_or_else(|| "n/a".into()),
+            m.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
+            c.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
+            r.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
         );
     };
-    println!("  {:<14} {:>14} {:>14} {:>14}", "", "Mercury", "C (gcc)", "Rust");
-    row("compile (ms)", &|x| format!("{:.1}", x.compile.as_secs_f64() * 1e3));
+    println!(
+        "  {:<14} {:>14} {:>14} {:>14}",
+        "", "Mercury", "C (gcc)", "Rust"
+    );
+    row("compile (ms)", &|x| {
+        format!("{:.1}", x.compile.as_secs_f64() * 1e3)
+    });
     row("runtime (ns)", &|x| format!("{:.0}", x.ns_per_call));
     row("GB/s", &|x| {
         format!("{:.1}", k.bytes_per_call as f64 / x.ns_per_call)
@@ -365,7 +412,13 @@ fn report(k: &Kernel, m: &Option<Measure>, c: &Option<Measure>, r: &Option<Measu
 }
 
 /// Compile a Mercury kernel to native code (timed) and benchmark it.
-fn bench_mercury(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32, op: *mut f32) -> Option<Measure> {
+fn bench_mercury(
+    src: &str,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+    op: *mut f32,
+) -> Option<Measure> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
@@ -425,7 +478,13 @@ fn bench_external(
     // file stem and rejects characters like `@` (e.g. `saxpy@parallel`).
     let safe: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let src_path = dir.join(format!("{safe}.{ext}"));
     let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));

@@ -259,7 +259,12 @@ impl<'a> Interp<'a> {
                 if let MirType::Vec(_, n) = ty {
                     let mut lanes = Vec::with_capacity(*n as usize);
                     for i in 0..*n as usize {
-                        lanes.push(*self.memory.get(idx + i).ok_or("vector load out of bounds")?);
+                        lanes.push(
+                            *self
+                                .memory
+                                .get(idx + i)
+                                .ok_or("vector load out of bounds")?,
+                        );
                     }
                     self.push_vec(lanes)
                 } else {
@@ -418,7 +423,11 @@ impl<'a> Interp<'a> {
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
                     for t in 0..len {
-                        v.push(mem.get(base + t).ok_or("sgemm operand out of bounds")?.as_float() as f32);
+                        v.push(
+                            mem.get(base + t)
+                                .ok_or("sgemm operand out of bounds")?
+                                .as_float() as f32,
+                        );
                     }
                     Ok(v)
                 };
@@ -430,19 +439,31 @@ impl<'a> Interp<'a> {
                 unsafe {
                     if transposed {
                         mercury_runtime::mercury_sgemm_nt(
-                            abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr(),
-                            m as i64, k as i64, n as i64, beta,
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
                         );
                     } else {
                         mercury_runtime::mercury_sgemm(
-                            abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr(),
-                            m as i64, k as i64, n as i64, beta,
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
                         );
                     }
                 }
-                for t in 0..m * n {
-                    *self.memory.get_mut(c + t).ok_or("sgemm output out of bounds")? =
-                        Value::Float(cbuf[t] as f64);
+                for (t, &val) in cbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(c + t)
+                        .ok_or("sgemm output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }

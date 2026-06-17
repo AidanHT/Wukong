@@ -482,9 +482,13 @@ impl Sema<'_> {
             (ExprKind::Float(s), Ty::Scalar(sc)) => {
                 sc.is_float() && !has_float_suffix(self.sym_str(*s))
             }
-            (ExprKind::Unary { op: UnOp::Neg, expr }, Ty::Scalar(_)) => {
-                self.literal_adapts(ann, expr)
-            }
+            (
+                ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr,
+                },
+                Ty::Scalar(_),
+            ) => self.literal_adapts(ann, expr),
             _ => false,
         }
     }
@@ -494,7 +498,11 @@ impl Sema<'_> {
     /// `f64` end to end, not `-(1.5: f32)` widened to `f64` at the `Neg`).
     fn retype_adapted_literal(&mut self, e: &Expr, ann: &Ty) {
         self.types.insert(e.id, ann.clone());
-        if let ExprKind::Unary { op: UnOp::Neg, expr } = &e.kind {
+        if let ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } = &e.kind
+        {
             self.retype_adapted_literal(expr, ann);
         }
     }

@@ -73,6 +73,7 @@ pub unsafe extern "C" fn mercury_sgemm_nt(
 ///
 /// # Safety
 /// Operand-size contract of [`mercury_sgemm`] / [`mercury_sgemm_nt`].
+#[allow(clippy::too_many_arguments)]
 unsafe fn gemm_dispatch(
     a: *const f32,
     b: *const f32,
@@ -234,7 +235,11 @@ fn sgemm_scalar(
             for j in 0..n {
                 let mut acc = 0.0f32;
                 for p in 0..k {
-                    let bjp = if bt { *b.add(j * k + p) } else { *b.add(p * n + j) };
+                    let bjp = if bt {
+                        *b.add(j * k + p)
+                    } else {
+                        *b.add(p * n + j)
+                    };
                     acc += *a.add(i * k + p) * bjp;
                 }
                 *crow.add(j) += acc;
@@ -323,7 +328,14 @@ unsafe fn pack_b_block(
 /// Pack one `NR`-wide column panel `jp` of a row-major B slice into `[kc][NR]` contiguous form.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn pack_b_panel(b: *const f32, ldb: usize, kc: usize, nc: usize, jp: usize, panel: *mut f32) {
+unsafe fn pack_b_panel(
+    b: *const f32,
+    ldb: usize,
+    kc: usize,
+    nc: usize,
+    jp: usize,
+    panel: *mut f32,
+) {
     let j0 = jp * NR;
     let ncols = (nc - j0).min(NR);
     let mut dst = panel;
@@ -526,7 +538,16 @@ unsafe fn macro_kernel(
             let i0 = ip * MR;
             let mrv = (mc - i0).min(MR);
             let apanel = ap.add(ip * kc * MR);
-            micro_6x16(kc, apanel, bpanel, c.add(i0 * ldc + j0), ldc, beta, mrv, nrv);
+            micro_6x16(
+                kc,
+                apanel,
+                bpanel,
+                c.add(i0 * ldc + j0),
+                ldc,
+                beta,
+                mrv,
+                nrv,
+            );
         }
     }
 }
@@ -632,7 +653,9 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
             })
             .collect()
@@ -776,15 +799,37 @@ mod tests {
 
     #[test]
     fn sgemm_nt_matches_naive() {
-        for (m, k, n) in [(1, 1, 1), (7, 17, 13), (64, 64, 64), (100, 130, 96), (128, 256, 512)] {
+        for (m, k, n) in [
+            (1, 1, 1),
+            (7, 17, 13),
+            (64, 64, 64),
+            (100, 130, 96),
+            (128, 256, 512),
+        ] {
             let a = fill(11, m * k);
             let b = fill(12, n * k);
             let want = naive_nt(&a, &b, m, k, n);
             let mut got = vec![0.0f32; m * n];
             let mut got_par = vec![0.0f32; m * n];
             unsafe {
-                mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
-                mercury_sgemm_nt_parallel(a.as_ptr(), b.as_ptr(), got_par.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+                mercury_sgemm_nt(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                );
+                mercury_sgemm_nt_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                );
             }
             let tol = 1e-3 * (k as f32).sqrt();
             for i in 0..m * n {
@@ -805,14 +850,33 @@ mod tests {
         // kernel (the work threshold) and this would degenerate into a serial-vs-serial no-op. These
         // dims also straddle the MR=6 / NR=16 remainders so the cross-core packing + edge tiles run.
         let (m, k, n) = (520usize, 264, 540); // ~74M MACs > 2^26
-        assert!((m * k * n) as u64 >= PAR_MIN_MACS, "size must exercise the multi-core path");
+        assert!(
+            (m * k * n) as u64 >= PAR_MIN_MACS,
+            "size must exercise the multi-core path"
+        );
         let a = fill(6, m * k);
         let b = fill(7, k * n);
         let mut serial = vec![0.0f32; m * n];
         let mut par = vec![0.0f32; m * n];
         unsafe {
-            mercury_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
-            mercury_sgemm_parallel(a.as_ptr(), b.as_ptr(), par.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+            mercury_sgemm(
+                a.as_ptr(),
+                b.as_ptr(),
+                serial.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+                0,
+            );
+            mercury_sgemm_parallel(
+                a.as_ptr(),
+                b.as_ptr(),
+                par.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+                0,
+            );
         }
         // Identical per-(i,j) accumulation order ⇒ bit-for-bit identical results.
         assert_eq!(serial, par);
@@ -821,8 +885,24 @@ mod tests {
         let mut serial_nt = vec![0.0f32; m * n];
         let mut par_nt = vec![0.0f32; m * n];
         unsafe {
-            mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), serial_nt.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
-            mercury_sgemm_nt_parallel(a.as_ptr(), b.as_ptr(), par_nt.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+            mercury_sgemm_nt(
+                a.as_ptr(),
+                b.as_ptr(),
+                serial_nt.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+                0,
+            );
+            mercury_sgemm_nt_parallel(
+                a.as_ptr(),
+                b.as_ptr(),
+                par_nt.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+                0,
+            );
         }
         assert_eq!(serial_nt, par_nt);
     }
