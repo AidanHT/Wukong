@@ -628,12 +628,7 @@ impl<'a> Interp<'a> {
                 }
                 // SAFETY: xbuf/ybuf are exactly n f32 long — the kernel's contract.
                 let r = unsafe {
-                    mercury_runtime::mercury_sreduce_f32(
-                        xbuf.as_ptr(),
-                        ybuf.as_ptr(),
-                        n as i64,
-                        op,
-                    )
+                    mercury_runtime::mercury_sreduce_f32(xbuf.as_ptr(), ybuf.as_ptr(), n as i64, op)
                 };
                 Ok(Value::Float(r as f64))
             }

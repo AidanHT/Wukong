@@ -315,7 +315,10 @@ fn differential_vmath_dispatch() {
         for opt in [0u8, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "vmath native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "vmath native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
     // Golden accuracy (≈1 ULP of libm, truncating `as i32`): exp(3.5)=33.1154→33115,
