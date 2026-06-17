@@ -937,6 +937,35 @@ fn kernels() -> Vec<Kernel> {
                  *out.add(i)=0.5*v*(1.0+t); }",
             ),
         },
+        // Reductions across cores: a `@parallel` reduction loop dispatches to the multicore
+        // deterministic reduction kernel (mercury_sreduce_f32_parallel), so this is one core's
+        // memory bandwidth × all cores vs the single-threaded sequential C/Rust reduction (which
+        // gcc/rustc keep latency-bound on the dependent add chain). The transformer-relevant case:
+        // attention scores, L2 losses, LayerNorm sums over a large activation.
+        Kernel {
+            name: "dot@parallel",
+            bytes_per_call: 2 * N * 4,
+            note: "sum(x*y) across cores (multicore reduction kernel) vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "let mut s: f32 = 0.0; for k in 0..{N} {{ s = s + x[k] * y[k]; }} out[0] = s;"
+            )),
+            c: c_kernel("float s=0.0f; for(long i=0;i<N;i++) s+=x[i]*y[i]; out[0]=s;"),
+            rust: rust_kernel(
+                "let mut s=0.0f32; for i in 0..N { s+= *x.add(i)* *y.add(i); } *out.add(0)=s;",
+            ),
+        },
+        Kernel {
+            name: "ssd@parallel",
+            bytes_per_call: 2 * N * 4,
+            note: "sum((x-y)^2) across cores (multicore reduction kernel) vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "let mut s: f32 = 0.0; for k in 0..{N} {{ s += (x[k] - y[k]) * (x[k] - y[k]); }} out[0] = s;"
+            )),
+            c: c_kernel("float s=0.0f; for(long i=0;i<N;i++){ float d=x[i]-y[i]; s+=d*d; } out[0]=s;"),
+            rust: rust_kernel(
+                "let mut s=0.0f32; for i in 0..N { let d= *x.add(i)- *y.add(i); s+=d*d; } *out.add(0)=s;",
+            ),
+        },
     ]
 }
 
