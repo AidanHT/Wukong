@@ -1,0 +1,44 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+module tests.run.linear_bias_relu
+
+// A fused nn.Linear layer: out = relu(x · Wᵀ + bias). The matmul nest and the following bias+ReLU
+// loop fuse into one mercury_sgemm_nt_epi call (the epilogue folded into the GEMM C writeback).
+//
+// x = [[1,2],[3,4]], W = I (so x·Wᵀ = x), bias = [-10,-1]:
+//   row0: relu([1,2] + [-10,-1]) = relu([-9, 1]) = [0, 1]
+//   row1: relu([3,4] + [-10,-1]) = relu([-7, 3]) = [0, 3]
+// Hand-computed (independent of the fused kernel): 0 / 1 / 0 / 3.
+fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + x[i * 2 + k] * w[j * 2 + k];
+            }
+            out[i * 2 + j] = s;
+        }
+    }
+    for i in 0..2 {
+        for j in 0..2 {
+            out[i * 2 + j] = fmax(out[i * 2 + j] + bias[j], 0.0);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let w: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let bias: [f32; 2] = [-10.0, -1.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    linear(x, w, bias, out);
+    print(out[0] as i32);
+    print(out[1] as i32);
+    print(out[2] as i32);
+    print(out[3] as i32);
+    return 0;
+}
