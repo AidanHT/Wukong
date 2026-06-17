@@ -524,8 +524,13 @@ impl FnLowerer<'_> {
                 }
             }
             StmtKind::Assign { target, op, value } => {
-                let rhs = self.lower_expr(value);
+                let rhs0 = self.lower_expr(value);
+                let rhs_ty = self.expr_mir(value);
                 let (ptr, elem) = self.lower_place(target);
+                // Coerce the value to the place's type before storing, so a narrowing store (e.g.
+                // an `f32` value into a `[bf16; N]` slot) carries the element type — the backends
+                // then store the right width and round to bf16. A no-op when the types match.
+                let rhs = self.coerce_to(rhs0, &rhs_ty, &elem, self.signed(value));
                 let store_val = match op {
                     ast::AssignOp::Assign => rhs,
                     _ => {
@@ -2082,7 +2087,11 @@ impl FnLowerer<'_> {
         match &init.kind {
             ExprKind::ArrayLit(elems) => {
                 for (i, el) in elems.iter().enumerate() {
-                    let v = self.lower_expr(el);
+                    let v0 = self.lower_expr(el);
+                    let vty = self.expr_mir(el);
+                    // Coerce to the element type so e.g. a `[bf16; N]` literal stores bf16-rounded
+                    // 16-bit values, not raw f32. A no-op when the element already matches.
+                    let v = self.coerce_to(v0, &vty, elem, self.signed(el));
                     self.store_element(base, elem, i as i128, v);
                 }
             }
@@ -2090,7 +2099,9 @@ impl FnLowerer<'_> {
                 // `[value; n]` evaluates `value` once and fills every slot with it. Small arrays
                 // unroll to straight-line stores; large ones lower to a fill loop so that, e.g.,
                 // `[0; 1_000_000]` does not generate a million instructions.
-                let v = self.lower_expr(value);
+                let v0 = self.lower_expr(value);
+                let vty = self.expr_mir(value);
+                let v = self.coerce_to(v0, &vty, elem, self.signed(value));
                 if n <= REPEAT_UNROLL_LIMIT {
                     for i in 0..n as i128 {
                         self.store_element(base, elem, i, v);

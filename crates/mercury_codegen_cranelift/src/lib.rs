@@ -383,12 +383,40 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Load(p, ty) => {
                 let addr = self.val(*p);
-                let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
-                self.builder.ins().load(t, MemFlags::trusted(), addr, 0)
+                if matches!(ty, MirType::BF16) {
+                    // bf16 storage is 2 bytes; load the 16 bits and widen to f32 exactly (the bits
+                    // become the top half of the f32). Register type is f32 (see `cl_type`).
+                    let half = self
+                        .builder
+                        .ins()
+                        .load(types::I16, MemFlags::trusted(), addr, 0);
+                    let ext = self.builder.ins().uextend(types::I32, half);
+                    let shifted = self.builder.ins().ishl_imm(ext, 16);
+                    self.builder
+                        .ins()
+                        .bitcast(types::F32, MemFlags::new(), shifted)
+                } else {
+                    let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
+                    self.builder.ins().load(t, MemFlags::trusted(), addr, 0)
+                }
             }
             Op::Store { ptr, value } => {
-                let (addr, v) = (self.val(*ptr), self.val(*value));
-                self.builder.ins().store(MemFlags::trusted(), v, addr, 0);
+                let addr = self.val(*ptr);
+                if matches!(self.ty_of(*value), MirType::BF16) {
+                    // Round the f32 register to bf16 and store the top 16 bits (2 bytes).
+                    let v = self.val(*value);
+                    let rounded = self.round_to_bf16(v);
+                    let bits = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I32, MemFlags::new(), rounded);
+                    let hi = self.builder.ins().ushr_imm(bits, 16);
+                    let half = self.builder.ins().ireduce(types::I16, hi);
+                    self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
+                } else {
+                    let v = self.val(*value);
+                    self.builder.ins().store(MemFlags::trusted(), v, addr, 0);
+                }
                 return;
             }
             Op::Gep { ptr, index, elem } => {
@@ -548,7 +576,15 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             FpTrunc => {
-                if to_ty == from_ty {
+                if matches!(to, MirType::BF16) {
+                    // bf16's register type is f32; demote an f64 source first, then round to bf16.
+                    let f = if from_ty == types::F64 {
+                        self.builder.ins().fdemote(types::F32, x)
+                    } else {
+                        x
+                    };
+                    self.round_to_bf16(f)
+                } else if to_ty == from_ty {
                     x
                 } else {
                     self.builder.ins().fdemote(to_ty, x)
@@ -563,6 +599,37 @@ impl<'a> FnTranslator<'a> {
             }
             IntToPtr | PtrToInt => self.resize_int(x, from_ty, to_ty, false),
         }
+    }
+
+    /// Round an `f32` to bf16 precision and back to `f32`, emitting the *identical* integer
+    /// arithmetic as `mercury_runtime::round_bf16` so the native backend and the interpreter agree
+    /// bit-for-bit. Returns the rounded `f32` (its low 16 mantissa bits are zero).
+    fn round_to_bf16(&mut self, x: Value) -> Value {
+        let bits = self.builder.ins().bitcast(types::I32, MemFlags::new(), x);
+        // non-NaN, round to nearest even: (bits + 0x7fff + ((bits>>16)&1)) & 0xffff0000
+        let shr = self.builder.ins().ushr_imm(bits, 16);
+        let lsb = self.builder.ins().band_imm(shr, 1);
+        let bias = self.builder.ins().iadd_imm(lsb, 0x7fff);
+        let summed = self.builder.ins().iadd(bits, bias);
+        let nonnan = self
+            .builder
+            .ins()
+            .band_imm(summed, 0xffff_0000u32 as i32 as i64);
+        // NaN stays NaN (quiet): (bits & 0xffff0000) | 0x00400000
+        let masked = self
+            .builder
+            .ins()
+            .band_imm(bits, 0xffff_0000u32 as i32 as i64);
+        let nanres = self.builder.ins().bor_imm(masked, 0x0040_0000);
+        let absb = self.builder.ins().band_imm(bits, 0x7fff_ffff);
+        let isnan = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, absb, 0x7f80_0000);
+        let resbits = self.builder.ins().select(isnan, nanres, nonnan);
+        self.builder
+            .ins()
+            .bitcast(types::F32, MemFlags::new(), resbits)
     }
 
     /// Sign- or zero-extend, truncate, or pass through an integer to a target width.
