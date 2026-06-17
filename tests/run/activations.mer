@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 761
+// EXPECT-OUT: 500
+// EXPECT-OUT: 880
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1761
+// EXPECT-OUT: 761
+module tests.run.activations
+
+// tanh and sigmoid as first-class intrinsics (built on the exp polynomial). They vectorize, so
+// SiLU/swish (x*sigmoid(x)) and tanh activations lower to 128-bit x 4 SIMD; the mercury_bench gate
+// proves the interpreter and native backend agree bit-for-bit.
+fn main() -> i32 {
+    // scalar
+    print((tanh(0.0) * 1000.0) as i32); // 0
+    print((tanh(1.0) * 1000.0) as i32); // 0.7616 * 1000
+    print((sigmoid(0.0) * 1000.0) as i32); // 0.5 * 1000 = 500
+    print((sigmoid(2.0) * 1000.0) as i32); // 0.8808 * 1000
+
+    let mut a: [f32; 64] = [0.0; 64];
+    let mut out: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        a[i] = (i as f32 - 32.0) * 0.25; // -8 .. 7.75
+    }
+
+    // SiLU / swish: x * sigmoid(x), vectorized.
+    for i in 0..64 {
+        out[i] = a[i] * sigmoid(a[i]);
+    }
+    print((out[32] * 1000.0) as i32); // silu(0) = 0
+    print((out[40] * 1000.0) as i32); // silu(2) = 2*sigmoid(2)
+
+    // vectorized tanh.
+    for i in 0..64 {
+        out[i] = tanh(a[i]);
+    }
+    print((out[36] * 1000.0) as i32); // tanh(1)
+    return 0;
+}

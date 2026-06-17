@@ -1096,8 +1096,9 @@ impl FnLowerer<'_> {
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && self.vec_check_value(&args[1], j, locals, lane, acc)
                 }
-                Some(MathIntrinsic::Exp) => {
-                    // exp vectorizes only for an f32 lane (its 2^n reconstruction is f32-specific).
+                Some(MathIntrinsic::Exp | MathIntrinsic::Tanh | MathIntrinsic::Sigmoid) => {
+                    // These build on the exp polynomial, which vectorizes only for an f32 lane
+                    // (its 2^n reconstruction is f32-specific).
                     args.len() == 1
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && *lane == Some(MirType::F32)
@@ -1846,6 +1847,14 @@ impl FnLowerer<'_> {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_exp_f32(x, vty)
                 }
+                Some(MathIntrinsic::Tanh) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_tanh(x, vty)
+                }
+                Some(MathIntrinsic::Sigmoid) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_sigmoid(x, vty)
+                }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
             // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
@@ -2505,6 +2514,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_exp(x, &rty))
             }
+            MathIntrinsic::Tanh => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_tanh(x, &rty))
+            }
+            MathIntrinsic::Sigmoid => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_sigmoid(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -2541,6 +2558,41 @@ impl FnLowerer<'_> {
         } else {
             r
         }
+    }
+
+    /// `sigmoid(x) = 1 / (1 + exp(-x))`, built on the exp polynomial. Works on a scalar or a SIMD
+    /// vector; bit-identical across backends because every step is (see `emit_exp`).
+    fn emit_sigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let neg1 = self.splat_const_f(-1.0, rty);
+        let negx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, x, neg1));
+        let e = self.emit_exp(negx, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let denom = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, e));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FDiv, one, denom))
+    }
+
+    /// `tanh(x) = 1 - 2 / (exp(2x) + 1)`, built on the exp polynomial (same identity the GELU tanh
+    /// approximation uses). Works on a scalar or a SIMD vector; bit-identical across backends.
+    fn emit_tanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let two = self.splat_const_f(2.0, rty);
+        let twox = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, x, two));
+        let e = self.emit_exp(twox, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let denom = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, e, one));
+        let frac = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FDiv, two, denom));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, frac))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
@@ -3707,6 +3759,8 @@ enum MathIntrinsic {
     Sqrt,
     Rsqrt,
     Exp,
+    Tanh,
+    Sigmoid,
     Fmax,
     Fmin,
 }
@@ -3716,6 +3770,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "sqrt" => MathIntrinsic::Sqrt,
         "rsqrt" => MathIntrinsic::Rsqrt,
         "exp" => MathIntrinsic::Exp,
+        "tanh" => MathIntrinsic::Tanh,
+        "sigmoid" => MathIntrinsic::Sigmoid,
         "fmax" => MathIntrinsic::Fmax,
         "fmin" => MathIntrinsic::Fmin,
         _ => return None,
