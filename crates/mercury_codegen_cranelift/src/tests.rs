@@ -271,6 +271,38 @@ fn differential_transcendentals() {
     }
 }
 
+/// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
+/// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
+/// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
+#[test]
+fn differential_erf() {
+    let programs = [
+        // scalar erf across sign and magnitude (odd symmetry + saturation at |x|=4).
+        "fn main() -> i32 { print((erf(0.25) * 100000.0) as i32); \
+         print((erf(1.5) * 100000.0) as i32); print((erf(-2.0) * 100000.0) as i32); \
+         print((erf(4.0) * 100000.0) as i32); return 0; }",
+        // vectorized erf over [-4, 3.5] (the loop vectorizes; f32 lane).
+        "fn main() -> i32 { let mut xs: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { xs[i] = (i as f32) * 0.5 - 4.0; } \
+         let mut ys: [f32; 16] = [0.0; 16]; for i in 0..16 { ys[i] = erf(xs[i]); } \
+         print((ys[0] * 100000.0) as i32); print((ys[8] * 100000.0) as i32); \
+         print((ys[15] * 100000.0) as i32); return 0; }",
+        // exact GELU = 0.5·x·(1 + erf(x/√2)), vectorized.
+        "fn main() -> i32 { let mut xs: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { xs[i] = (i as f32) * 0.5 - 4.0; } \
+         let mut ys: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { ys[i] = 0.5 * xs[i] * (1.0 + erf(xs[i] * 0.70710678)); } \
+         print((ys[10] * 10000.0) as i32); print((ys[2] * 10000.0) as i32); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "erf native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// A *batched* matmul — H independent matmuls over one buffer, each index carrying a per-head base
 /// offset `h*STRIDE`. This is the multi-head-attention shape (`scores[h] = Q[h]·K[h]ᵀ`). The
 /// recognizer peels the offset and GEPs each base pointer per head before the shared GEMM kernel.
