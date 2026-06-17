@@ -1,0 +1,44 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -31
+// EXPECT-OUT: -100
+// EXPECT-OUT: 587
+module tests.run.vec_reduce_minmax
+
+// Max/min reductions vectorize (128-bit x 4 unroll) just like sum reductions: lane accumulators
+// seeded with -inf/+inf, folded with a compare+select, then reduced horizontally. The all-negative
+// array proves the -inf seed never lets an empty tail lane win. The mercury_bench gate proves the
+// vectorized fold matches the interpreter bit-for-bit.
+fn main() -> i32 {
+    // 70 elements exercises the 4x-unrolled main loop (64), the single-vector strip (4), and the
+    // scalar remainder (2). All values are negative, so a buggy 0-seed would corrupt the max.
+    let mut a: [f32; 70] = [0.0; 70];
+    for i in 0..70 {
+        a[i] = (i as f32) - 100.0; // -100 .. -31
+    }
+
+    let mut mx: f32 = a[0];
+    for i in 0..70 {
+        mx = fmax(mx, a[i]);
+    }
+    print(mx as i32); // -31  (proves the -inf seed, not 0)
+
+    let mut mn: f32 = a[0];
+    for i in 0..70 {
+        mn = fmin(mn, a[i]);
+    }
+    print(mn as i32); // -100
+
+    // a non-trivial addend: max over sqrt(b[i]) (exercises lowering the reduction's addend expr).
+    let mut b: [f32; 70] = [0.0; 70];
+    for i in 0..70 {
+        b[i] = (i as f32) * 0.5; // 0 .. 34.5
+    }
+    let mut mxs: f32 = 0.0;
+    for i in 0..70 {
+        mxs = fmax(mxs, sqrt(b[i]));
+    }
+    print((mxs * 100.0) as i32); // sqrt(34.5)*100 = 587
+
+    return 0;
+}
