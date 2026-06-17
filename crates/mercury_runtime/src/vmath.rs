@@ -23,36 +23,36 @@ pub const VM_SILU: i64 = 5;
 pub const VM_GELU: i64 = 6;
 
 // GELU (tanh approximation) constants: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
-const GELU_C0: f32 = 0.7978845608; // √(2/π)
+const GELU_C0: f32 = 0.797_884_6; // √(2/π)
 const GELU_C1: f32 = 0.044715;
 
 // --- Cephes single-precision constants (mirror mercury_mir_build's `exp`/`log` poly constants) ----
 const LOG2EF: f32 = std::f32::consts::LOG2_E;
 const EXP_MAGIC: f32 = 12582912.0; // 1.5 * 2^23 — round-to-nearest-even via add-then-subtract
-const EXP_C1: f32 = 0.693359375; // ln2, high part
+const EXP_C1: f32 = 0.693_359_4; // ln2, high part
 const EXP_C2: f32 = -2.1219444e-4; // ln2, low correction
-const EXP_HI: f32 = 88.3762626647949;
-const EXP_LO: f32 = -88.3762626647949;
+const EXP_HI: f32 = 88.376_26;
+const EXP_LO: f32 = -88.376_26;
 const EXP_P: [f32; 6] = [
-    1.98756915e-4,
-    1.3981999507e-3,
-    8.3334519073e-3,
-    4.1665795894e-2,
-    1.6666665459e-1,
-    5.0000001201e-1,
+    1.987_569_1e-4,
+    1.398_199_9e-3,
+    8.333_452e-3,
+    4.166_579_6e-2,
+    1.666_666_6e-1,
+    5e-1,
 ];
 const LOG_SQRTHF: f32 = std::f32::consts::FRAC_1_SQRT_2; // √0.5
 const INV_2P23: f32 = 1.0 / 8_388_608.0; // 2^-23 (exact)
 const LOG_P: [f32; 9] = [
-    7.0376836292e-2,
-    -1.1514610310e-1,
-    1.1676998740e-1,
-    -1.2420140846e-1,
-    1.4249322787e-1,
-    -1.6668057665e-1,
-    2.0000714765e-1,
-    -2.4999993993e-1,
-    3.3333331174e-1,
+    7.037_683_6e-2,
+    -1.151_461e-1,
+    1.167_699_84e-1,
+    -1.242_014_1e-1,
+    1.424_932_3e-1,
+    -1.666_805_7e-1,
+    2.000_071_4e-1,
+    -2.499_999_4e-1,
+    3.333_333e-1,
 ];
 
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback; mirror the MIR poly element-for-element) --
@@ -61,6 +61,9 @@ const LOG_P: [f32; 9] = [
 /// minimax poly for `e^r`, then scale by `2^n` assembled from the IEEE-754 exponent field.
 #[inline]
 fn exp1(x: f32) -> f32 {
+    // `min` then `max`, not `clamp`: this mirrors the AVX2 `_mm256_min_ps`/`_mm256_max_ps` order
+    // lane-for-lane (incl. their NaN behavior), which is what keeps the scalar tail bit-identical.
+    #[allow(clippy::manual_clamp)]
     let x = x.min(EXP_HI).max(EXP_LO);
     let t = x.mul_add(LOG2EF, EXP_MAGIC);
     let n = t - EXP_MAGIC;
@@ -320,7 +323,9 @@ mod tests {
 
     /// The dispatched kernel is ≈1 ULP of `libm` for exp/log/tanh/sigmoid over a representative
     /// range — the accuracy the cross-language checksum and the activation tests rely on.
+    // (op code, libm reference, tolerance) — a small table, so allow the tuple type.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn vmath_matches_libm() {
         let xs: Vec<f32> = (0..4096).map(|i| (i as f32 - 2048.0) * 0.01).collect();
         let mut out = vec![0.0f32; xs.len()];
@@ -329,8 +334,9 @@ mod tests {
             (VM_TANH, |x| x.tanh(), 2e-5),
             (VM_SIGMOID, |x| 1.0 / (1.0 + (-x).exp()), 2e-5),
             (VM_SILU, |x| x / (1.0 + (-x).exp()), 2e-5),
+            // GELU tanh-approx reference, reusing the module's f32 constants (GELU_C0=√(2/π)).
             (VM_GELU, |x| {
-                0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh())
+                0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())
             }, 5e-5),
         ];
         for &(op, libm, tol) in cases {
