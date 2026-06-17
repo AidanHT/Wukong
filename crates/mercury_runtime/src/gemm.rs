@@ -182,26 +182,31 @@ unsafe fn sgemm_avx2_parallel(
             let npanels = nc.div_ceil(NR);
             let (ap_addr, bp_addr, c_addr) =
                 (ap.as_ptr() as usize, bp.as_ptr() as usize, c as usize);
-            // Run every C register tile in parallel; tiles write disjoint C, read shared packs.
-            (0..mpanels * npanels).into_par_iter().for_each(|t| {
-                let ip = t / npanels;
-                let jp = t % npanels;
+            // Parallelize over C *row panels* (one task per MR rows), each sweeping all column
+            // panels. Coarser tasks than per-tile (e.g. ~170 vs ~10880 at 1024³) cut rayon's
+            // scheduling overhead, and a task reuses its A micro-panel (MR×kc, L1-resident) across
+            // every column while streaming B. The per-(i,j) k-accumulation order is unchanged, so
+            // serial, parallel, and the interpreter stay bit-identical (the differential gate).
+            // Many more tasks than cores lets work-stealing absorb this P+E hybrid's core imbalance.
+            (0..mpanels).into_par_iter().for_each(|ip| {
                 let i0 = ip * MR;
-                let j0 = jp * NR;
                 let mrv = (m - i0).min(MR);
-                let nrv = (nc - j0).min(NR);
-                // SAFETY: disjoint C tile; shared read-only packed panels; avx2 verified above.
-                unsafe {
-                    micro_6x16(
-                        kc,
-                        (ap_addr as *const f32).add(ip * kc * MR),
-                        (bp_addr as *const f32).add(jp * kc * NR),
-                        (c_addr as *mut f32).add(i0 * n + (jc + j0)),
-                        n,
-                        beta_eff,
-                        mrv,
-                        nrv,
-                    );
+                for jp in 0..npanels {
+                    let j0 = jp * NR;
+                    let nrv = (nc - j0).min(NR);
+                    // SAFETY: disjoint C rows; shared read-only packed panels; avx2 verified above.
+                    unsafe {
+                        micro_6x16(
+                            kc,
+                            (ap_addr as *const f32).add(ip * kc * MR),
+                            (bp_addr as *const f32).add(jp * kc * NR),
+                            (c_addr as *mut f32).add(i0 * n + (jc + j0)),
+                            n,
+                            beta_eff,
+                            mrv,
+                            nrv,
+                        );
+                    }
                 }
             });
             pc += KC;
