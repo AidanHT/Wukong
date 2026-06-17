@@ -643,9 +643,15 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
-        let m = self.builder.build(MirType::I64, Op::ConstInt(nest.m as i128, MirType::I64));
-        let k = self.builder.build(MirType::I64, Op::ConstInt(nest.k as i128, MirType::I64));
-        let n = self.builder.build(MirType::I64, Op::ConstInt(nest.n as i128, MirType::I64));
+        let m = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.m as i128, MirType::I64));
+        let k = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.k as i128, MirType::I64));
+        let n = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.n as i128, MirType::I64));
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
@@ -1017,8 +1023,7 @@ impl FnLowerer<'_> {
                 then_branch,
                 else_branch,
             } => {
-                let (Some(else_e), Some(tv)) =
-                    (else_branch.as_deref(), block_value(then_branch))
+                let (Some(else_e), Some(tv)) = (else_branch.as_deref(), block_value(then_branch))
                 else {
                     return false;
                 };
@@ -1051,6 +1056,7 @@ impl FnLowerer<'_> {
     /// Emit the vectorized loop as three strips that share one index slot `j`: an unrolled vector
     /// loop (`VEC_UNROLL` independent vector groups per iteration), then a single-vector loop, then
     /// a scalar remainder. The bounds are already-lowered `ity` values.
+    #[allow(clippy::too_many_arguments)]
     fn emit_vectorized_for(
         &mut self,
         j: Symbol,
@@ -1063,7 +1069,10 @@ impl FnLowerer<'_> {
     ) {
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
-        self.builder.build_void(Op::Store { ptr: slot, value: s0 });
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: s0,
+        });
         // A scratch slot holding the per-unroll-copy index (`jbase + u*W`), so unit-stride accesses
         // pick up the lane offset with no per-access arithmetic.
         let jtmp = self.builder.alloca(ity.clone());
@@ -1099,7 +1108,9 @@ impl FnLowerer<'_> {
         let off = self
             .builder
             .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
-        let vlimit = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
+        let vlimit = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
 
         let hdr = self.builder.new_block();
         let bb = self.builder.new_block();
@@ -1111,7 +1122,9 @@ impl FnLowerer<'_> {
         self.terminated = false;
         self.bind(j, slot, ity.clone());
         let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let c = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
+        let c = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
         self.builder.cond_br(c, bb, vec![], done, vec![]);
 
         // body: `unroll` vector groups at offsets 0, W, 2W, …; then j += unroll*W
@@ -1125,9 +1138,13 @@ impl FnLowerer<'_> {
                 let o = self
                     .builder
                     .build(ity.clone(), Op::ConstInt((u * w) as i128, ity.clone()));
-                self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jbase, o))
+                self.builder
+                    .build(ity.clone(), Op::Bin(BinOp::Add, jbase, o))
             };
-            self.builder.build_void(Op::Store { ptr: jtmp, value: ju });
+            self.builder.build_void(Op::Store {
+                ptr: jtmp,
+                value: ju,
+            });
             self.bind(j, jtmp, ity.clone());
             let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
             // Each unroll copy reads different addresses (jbase + u*W), so the load cache is per-copy.
@@ -1141,8 +1158,13 @@ impl FnLowerer<'_> {
         let stepc = self
             .builder
             .build(ity.clone(), Op::ConstInt(span, ity.clone()));
-        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, stepc));
-        self.builder.build_void(Op::Store { ptr: slot, value: jn });
+        let jn = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, jc, stepc));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: jn,
+        });
         self.builder.br(hdr, vec![]);
 
         self.builder.switch_to(done);
@@ -1167,7 +1189,9 @@ impl FnLowerer<'_> {
         self.builder.switch_to(hdr);
         self.terminated = false;
         let jr = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let rc = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
+        let rc = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
         self.builder.cond_br(rc, bb, vec![], exit, vec![]);
 
         self.builder.switch_to(bb);
@@ -1177,9 +1201,16 @@ impl FnLowerer<'_> {
         self.loops.pop();
         if !self.terminated {
             let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
-            let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
-            self.builder.build_void(Op::Store { ptr: slot, value: jn });
+            let one = self
+                .builder
+                .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+            let jn = self
+                .builder
+                .build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: jn,
+            });
             self.builder.br(hdr, vec![]);
         }
         self.builder.switch_to(exit);
@@ -1205,7 +1236,10 @@ impl FnLowerer<'_> {
     ) {
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
-        self.builder.build_void(Op::Store { ptr: slot, value: s0 });
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: s0,
+        });
         let jtmp = self.builder.alloca(ity.clone());
 
         // `VEC_UNROLL` accumulators, each `w` contiguous lanes (an `Array` slot so the vector
@@ -1228,8 +1262,22 @@ impl FnLowerer<'_> {
         self.push_scope();
         self.bind(j, slot, ity.clone());
 
-        self.emit_reduction_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend);
-        self.emit_reduction_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, 1, &accs[..1], addend);
+        self.emit_reduction_strip(
+            j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend,
+        );
+        self.emit_reduction_strip(
+            j,
+            slot,
+            jtmp,
+            end_v,
+            ity,
+            lane,
+            &vty,
+            w,
+            1,
+            &accs[..1],
+            addend,
+        );
 
         // Combine the accumulators, then horizontally reduce the lanes into `s`. Float reductions
         // add with `FAdd`, integer ones with `Add`.
@@ -1238,7 +1286,9 @@ impl FnLowerer<'_> {
         } else {
             BinOp::Add
         };
-        let mut total = self.builder.build(vty.clone(), Op::Load(accs[0], vty.clone()));
+        let mut total = self
+            .builder
+            .build(vty.clone(), Op::Load(accs[0], vty.clone()));
         for &a in &accs[1..] {
             let v = self.builder.build(vty.clone(), Op::Load(a, vty.clone()));
             total = self.builder.build(vty.clone(), Op::Bin(add, total, v));
@@ -1263,8 +1313,12 @@ impl FnLowerer<'_> {
                     elem: lane.clone(),
                 },
             );
-            let lane_v = self.builder.build(lane.clone(), Op::Load(addr, lane.clone()));
-            let sv = self.builder.build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
+            let lane_v = self
+                .builder
+                .build(lane.clone(), Op::Load(addr, lane.clone()));
+            let sv = self
+                .builder
+                .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
             let sum = self.builder.build(s_ty.clone(), Op::Bin(add, sv, lane_v));
             self.builder.build_void(Op::Store {
                 ptr: s_slot,
@@ -1298,7 +1352,9 @@ impl FnLowerer<'_> {
         let off = self
             .builder
             .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
-        let vlimit = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
+        let vlimit = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
 
         let hdr = self.builder.new_block();
         let bb = self.builder.new_block();
@@ -1309,7 +1365,9 @@ impl FnLowerer<'_> {
         self.terminated = false;
         self.bind(j, slot, ity.clone());
         let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let c = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
+        let c = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
         self.builder.cond_br(c, bb, vec![], done, vec![]);
 
         self.builder.switch_to(bb);
@@ -1322,12 +1380,18 @@ impl FnLowerer<'_> {
                 let o = self
                     .builder
                     .build(ity.clone(), Op::ConstInt((u * w) as i128, ity.clone()));
-                self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jbase, o))
+                self.builder
+                    .build(ity.clone(), Op::Bin(BinOp::Add, jbase, o))
             };
-            self.builder.build_void(Op::Store { ptr: jtmp, value: ju });
+            self.builder.build_void(Op::Store {
+                ptr: jtmp,
+                value: ju,
+            });
             self.bind(j, jtmp, ity.clone());
             let acc_slot = accs[u as usize];
-            let cur = self.builder.build(vty.clone(), Op::Load(acc_slot, vty.clone()));
+            let cur = self
+                .builder
+                .build(vty.clone(), Op::Load(acc_slot, vty.clone()));
             let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
             // Per-copy load cache (so `(x[i]-y[i])*(x[i]-y[i])` loads x[i],y[i] once each).
             self.vec_loads.clear();
@@ -1342,8 +1406,13 @@ impl FnLowerer<'_> {
         let stepc = self
             .builder
             .build(ity.clone(), Op::ConstInt(span, ity.clone()));
-        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, stepc));
-        self.builder.build_void(Op::Store { ptr: slot, value: jn });
+        let jn = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, jc, stepc));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: jn,
+        });
         self.builder.br(hdr, vec![]);
 
         self.builder.switch_to(done);
@@ -1369,23 +1438,34 @@ impl FnLowerer<'_> {
         self.builder.switch_to(hdr);
         self.terminated = false;
         let jr = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let rc = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
+        let rc = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jr, end_v));
         self.builder.cond_br(rc, bb, vec![], exit, vec![]);
 
         self.builder.switch_to(bb);
         self.terminated = false;
         self.bind(j, slot, ity.clone());
         let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
-        let sv = self.builder.build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
+        let sv = self
+            .builder
+            .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
         let sum = self.scalar_accumulate(sv, addend, &s_ty);
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: sum,
         });
         let jc = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
-        let jn = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
-        self.builder.build_void(Op::Store { ptr: slot, value: jn });
+        let one = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let jn = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, jc, one));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: jn,
+        });
         self.builder.br(hdr, vec![]);
 
         self.builder.switch_to(exit);
@@ -1542,7 +1622,9 @@ impl FnLowerer<'_> {
                     self.builder.build(vty.clone(), Op::Load(addr, vty.clone()))
                 } else {
                     // invariant in j: load one scalar and broadcast.
-                    let scalar = self.builder.build(lane.clone(), Op::Load(addr, lane.clone()));
+                    let scalar = self
+                        .builder
+                        .build(lane.clone(), Op::Load(addr, lane.clone()));
                     self.builder.build(vty.clone(), Op::Splat(scalar))
                 };
                 if let Some(k) = key {
@@ -1588,7 +1670,8 @@ impl FnLowerer<'_> {
                 let ev = branch_value(else_branch.as_deref().unwrap()).unwrap();
                 let tvec = self.vec_lower_value(tv, j, lane, vty, w, vlocals);
                 let evec = self.vec_lower_value(ev, j, lane, vty, w, vlocals);
-                self.builder.build(vty.clone(), Op::Select(mask, tvec, evec))
+                self.builder
+                    .build(vty.clone(), Op::Select(mask, tvec, evec))
             }
             // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
             _ => {
@@ -1704,8 +1787,12 @@ impl FnLowerer<'_> {
         self.loops.pop();
         if !self.terminated {
             let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let one = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
-            let next = self.builder.build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
+            let one = self
+                .builder
+                .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+            let next = self
+                .builder
+                .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
             self.builder.build_void(Op::Store {
                 ptr: slot,
                 value: next,
@@ -2157,7 +2244,8 @@ impl FnLowerer<'_> {
             return v;
         }
         let kind = cast_kind(from, to, signed);
-        self.builder.build(to.clone(), Op::Cast(kind, v, to.clone()))
+        self.builder
+            .build(to.clone(), Op::Cast(kind, v, to.clone()))
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
@@ -2451,8 +2539,16 @@ fn exprs_struct_eq(a: &Expr, b: &Expr) -> bool {
             p.is_single() && q.is_single() && p.first().sym == q.first().sym
         }
         (
-            ExprKind::Binary { op: o1, lhs: l1, rhs: r1 },
-            ExprKind::Binary { op: o2, lhs: l2, rhs: r2 },
+            ExprKind::Binary {
+                op: o1,
+                lhs: l1,
+                rhs: r1,
+            },
+            ExprKind::Binary {
+                op: o2,
+                lhs: l2,
+                rhs: r2,
+            },
         ) => o1 == o2 && exprs_struct_eq(l1, l2) && exprs_struct_eq(r1, r2),
         _ => false,
     }
@@ -2529,7 +2625,12 @@ fn as_int_lit(e: &Expr, interner: &Interner) -> Option<i64> {
 
 /// `row * stride` or `stride * row` with a single-path `row` and a literal `stride`.
 fn as_mul_stride(e: &Expr, interner: &Interner) -> Option<(Symbol, i64)> {
-    let ExprKind::Binary { op: ast::BinOp::Mul, lhs, rhs } = &e.kind else {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
         return None;
     };
     if let (Some(r), Some(s)) = (single_path(lhs), as_int_lit(rhs, interner)) {
@@ -2543,7 +2644,12 @@ fn as_mul_stride(e: &Expr, interner: &Interner) -> Option<(Symbol, i64)> {
 
 /// A flattened 2-D index `row * stride + col` (either addend order). Returns `(row, stride, col)`.
 fn match_row_col(idx: &Expr, interner: &Interner) -> Option<(Symbol, i64, Symbol)> {
-    let ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs } = &idx.kind else {
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &idx.kind
+    else {
         return None;
     };
     if let (Some((row, stride)), Some(col)) = (as_mul_stride(lhs, interner), single_path(rhs)) {
@@ -2577,11 +2683,7 @@ fn is_f32_expr(e: &Expr, sema: &SemaResult) -> bool {
 
 /// `for col in 0..n { c[row*stride + col] = 0.0; }` — the per-row zero-init of a beta-0 matmul.
 /// Returns `(c, stride, n)` with the outer row variable `row`.
-fn match_zero_init(
-    s: &Stmt,
-    row: Symbol,
-    interner: &Interner,
-) -> Option<(Symbol, i64, i64)> {
+fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol, i64, i64)> {
     let (pat, iter, body) = fusable_for(s)?;
     let col = match &pat.kind {
         ast::PatKind::Ident(c) => *c,
@@ -2595,7 +2697,12 @@ fn match_zero_init(
     if body.stmts.len() != 1 || body.tail.is_some() {
         return None;
     }
-    let StmtKind::Assign { target, op: ast::AssignOp::Assign, value } = &body.stmts[0].kind else {
+    let StmtKind::Assign {
+        target,
+        op: ast::AssignOp::Assign,
+        value,
+    } = &body.stmts[0].kind
+    else {
         return None;
     };
     if !is_float_zero(value, interner) {
@@ -2620,7 +2727,12 @@ fn match_product_ab(
     aik: Option<(Symbol, Symbol, i64)>,
     interner: &Interner,
 ) -> Option<(Symbol, i64, Symbol, i64, bool)> {
-    let ExprKind::Binary { op: ast::BinOp::Mul, lhs: f1, rhs: f2 } = &prod.kind else {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: f1,
+        rhs: f2,
+    } = &prod.kind
+    else {
         return None;
     };
     let is_a = |f: &Expr| -> Option<(Symbol, i64)> {
@@ -2701,7 +2813,12 @@ fn match_matmul_ijk(
     if jbody.tail.is_some() || jbody.stmts.len() != 3 {
         return None;
     }
-    let StmtKind::Let { pat: sp, init: Some(s0), .. } = &jbody.stmts[0].kind else {
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
         return None;
     };
     let s_sym = match &sp.kind {
@@ -2735,7 +2852,12 @@ fn match_matmul_ijk(
         ast::AssignOp::Add => value,
         ast::AssignOp::Assign => {
             // s = s + A*B
-            let ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs } = &value.kind else {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
                 return None;
             };
             if single_path(lhs) != Some(s_sym) {
@@ -2751,7 +2873,11 @@ fn match_matmul_ijk(
     let (a_sym, sa, b_sym, sb, transposed) =
         match_product_ab(prod, row, kvar, jvar, None, interner)?;
     // Final store: c[i*N + j] = s.
-    let StmtKind::Assign { target: ct, op: ast::AssignOp::Assign, value: cv } = &jbody.stmts[2].kind
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
     else {
         return None;
     };
@@ -2770,7 +2896,16 @@ fn match_matmul_ijk(
     if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
         return None;
     }
-    Some(MatmulNest { a: a_sym, b: b_sym, c: cbase, m, k: kdim, n, beta: 0, transposed })
+    Some(MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta: 0,
+        transposed,
+    })
 }
 
 /// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
@@ -2817,7 +2952,12 @@ fn match_matmul(
     let (aik, a_sym, sa, j_stmt) = match kbody.stmts.as_slice() {
         [j] if kbody.tail.is_none() => (None, None, None, j),
         [let_s, j] if kbody.tail.is_none() => {
-            let StmtKind::Let { pat: lp, init: Some(init), .. } = &let_s.kind else {
+            let StmtKind::Let {
+                pat: lp,
+                init: Some(init),
+                ..
+            } = &let_s.kind
+            else {
                 return None;
             };
             let aik_sym = match &lp.kind {
@@ -2862,7 +3002,12 @@ fn match_matmul(
         ast::AssignOp::Add => value,
         ast::AssignOp::Assign => {
             // value must be `c[row*sc + j] + (a*b)`.
-            let ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs } = &value.kind else {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
                 return None;
             };
             let (clhs, clidx) = as_index1(lhs)?;
@@ -2899,7 +3044,16 @@ fn match_matmul(
     if a_sym == b_sym || a_sym == cbase || b_sym == cbase {
         return None;
     }
-    Some(MatmulNest { a: a_sym, b: b_sym, c: cbase, m, k: kdim, n, beta, transposed })
+    Some(MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta,
+        transposed,
+    })
 }
 
 /// Recognize a function whose entire body is a matmul nest (`{ for i in 0..M { … } }`).
@@ -2907,7 +3061,13 @@ fn matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<Mat
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
     }
-    let StmtKind::For { pat, iter, body: lb, .. } = &body.stmts[0].kind else {
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
         return None;
     };
     recognize_matmul(pat, iter, lb, sema, interner)
@@ -2951,7 +3111,10 @@ fn lower_matmul_fn(
             fl.bind(p.name.sym, val, mty);
         } else {
             let slot = fl.builder.alloca(mty.clone());
-            fl.builder.build_void(Op::Store { ptr: slot, value: val });
+            fl.builder.build_void(Op::Store {
+                ptr: slot,
+                value: val,
+            });
             fl.bind(p.name.sym, slot, mty);
         }
     }
@@ -3024,7 +3187,10 @@ fn mask_lane_type(lane: &MirType) -> MirType {
 /// A `for v in a..b { body }` over a half-open, unit-step range with an identifier binding — the
 /// shape eligible for fusion. Returns `(pattern, iter, body)`.
 fn fusable_for(s: &Stmt) -> Option<(&Pattern, &ForIter, &Block)> {
-    if let StmtKind::For { pat, iter, body, .. } = &s.kind {
+    if let StmtKind::For {
+        pat, iter, body, ..
+    } = &s.kind
+    {
         if matches!(&pat.kind, ast::PatKind::Ident(_))
             && matches!(
                 iter,

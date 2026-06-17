@@ -349,7 +349,10 @@ impl<'a> FnTranslator<'a> {
                             } else {
                                 types::F32
                             };
-                        (self.coerce_float(av0, common), self.coerce_float(bv0, common))
+                        (
+                            self.coerce_float(av0, common),
+                            self.coerce_float(bv0, common),
+                        )
                     } else {
                         (av0, bv0)
                     };
@@ -377,7 +380,7 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Gep { ptr, index, elem } => {
                 let base = self.val(*ptr);
-                let idx = self.to_ptr_int(*index);
+                let idx = self.ptr_int(*index);
                 let scaled = self.builder.ins().imul_imm(idx, size_of(elem) as i64);
                 self.builder.ins().iadd(base, scaled)
             }
@@ -544,7 +547,7 @@ impl<'a> FnTranslator<'a> {
     }
 
     /// Coerce an index value to the pointer-width integer used for address arithmetic.
-    fn to_ptr_int(&mut self, index: ValueId) -> Value {
+    fn ptr_int(&mut self, index: ValueId) -> Value {
         let x = self.val(index);
         let from = self.dfg_ty(x);
         self.resize_int(x, from, self.ptr_ty, true)
@@ -658,10 +661,14 @@ impl<'a> FnTranslator<'a> {
                 else_args,
             } => {
                 let c = self.val(*cond);
-                let ta: Vec<BlockArg> =
-                    then_args.iter().map(|a| BlockArg::Value(self.val(*a))).collect();
-                let ea: Vec<BlockArg> =
-                    else_args.iter().map(|a| BlockArg::Value(self.val(*a))).collect();
+                let ta: Vec<BlockArg> = then_args
+                    .iter()
+                    .map(|a| BlockArg::Value(self.val(*a)))
+                    .collect();
+                let ea: Vec<BlockArg> = else_args
+                    .iter()
+                    .map(|a| BlockArg::Value(self.val(*a)))
+                    .collect();
                 let tb = self.blocks[then_blk.0 as usize];
                 let eb = self.blocks[else_blk.0 as usize];
                 self.builder.ins().brif(c, tb, &ta, eb, &ea);
@@ -797,19 +804,34 @@ fn populate_module<M: Module>(
                 func_refs.insert(sym, r);
             }
             let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
-            rt_refs.insert(RT_PRINT_I64, module.declare_func_in_func(rt.print_i64, builder.func));
-            rt_refs.insert(RT_PRINT_F64, module.declare_func_in_func(rt.print_f64, builder.func));
-            rt_refs.insert(RT_ASSERT, module.declare_func_in_func(rt.assert, builder.func));
+            rt_refs.insert(
+                RT_PRINT_I64,
+                module.declare_func_in_func(rt.print_i64, builder.func),
+            );
+            rt_refs.insert(
+                RT_PRINT_F64,
+                module.declare_func_in_func(rt.print_f64, builder.func),
+            );
+            rt_refs.insert(
+                RT_ASSERT,
+                module.declare_func_in_func(rt.assert, builder.func),
+            );
             rt_refs.insert(
                 RT_PARALLEL_FOR,
                 module.declare_func_in_func(rt.parallel_for, builder.func),
             );
-            rt_refs.insert(RT_SGEMM, module.declare_func_in_func(rt.sgemm, builder.func));
+            rt_refs.insert(
+                RT_SGEMM,
+                module.declare_func_in_func(rt.sgemm, builder.func),
+            );
             rt_refs.insert(
                 RT_SGEMM_PARALLEL,
                 module.declare_func_in_func(rt.sgemm_parallel, builder.func),
             );
-            rt_refs.insert(RT_SGEMM_NT, module.declare_func_in_func(rt.sgemm_nt, builder.func));
+            rt_refs.insert(
+                RT_SGEMM_NT,
+                module.declare_func_in_func(rt.sgemm_nt, builder.func),
+            );
             rt_refs.insert(
                 RT_SGEMM_NT_PARALLEL,
                 module.declare_func_in_func(rt.sgemm_nt_parallel, builder.func),
@@ -917,11 +939,20 @@ pub fn jit_compile(
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
-    builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
+    builder.symbol(
+        RT_PARALLEL_FOR,
+        mercury_runtime::mercury_parallel_for as *const u8,
+    );
     builder.symbol(RT_SGEMM, mercury_runtime::mercury_sgemm as *const u8);
-    builder.symbol(RT_SGEMM_PARALLEL, mercury_runtime::mercury_sgemm_parallel as *const u8);
+    builder.symbol(
+        RT_SGEMM_PARALLEL,
+        mercury_runtime::mercury_sgemm_parallel as *const u8,
+    );
     builder.symbol(RT_SGEMM_NT, mercury_runtime::mercury_sgemm_nt as *const u8);
-    builder.symbol(RT_SGEMM_NT_PARALLEL, mercury_runtime::mercury_sgemm_nt_parallel as *const u8);
+    builder.symbol(
+        RT_SGEMM_NT_PARALLEL,
+        mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
+    );
     let mut module = JITModule::new(builder);
 
     let ids = populate_module(&mut module, program, interner)?;
@@ -986,11 +1017,20 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
-    builder.symbol(RT_PARALLEL_FOR, mercury_runtime::mercury_parallel_for as *const u8);
+    builder.symbol(
+        RT_PARALLEL_FOR,
+        mercury_runtime::mercury_parallel_for as *const u8,
+    );
     builder.symbol(RT_SGEMM, mercury_runtime::mercury_sgemm as *const u8);
-    builder.symbol(RT_SGEMM_PARALLEL, mercury_runtime::mercury_sgemm_parallel as *const u8);
+    builder.symbol(
+        RT_SGEMM_PARALLEL,
+        mercury_runtime::mercury_sgemm_parallel as *const u8,
+    );
     builder.symbol(RT_SGEMM_NT, mercury_runtime::mercury_sgemm_nt as *const u8);
-    builder.symbol(RT_SGEMM_NT_PARALLEL, mercury_runtime::mercury_sgemm_nt_parallel as *const u8);
+    builder.symbol(
+        RT_SGEMM_NT_PARALLEL,
+        mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
+    );
     let mut module = JITModule::new(builder);
     let ids = populate_module(&mut module, program, interner)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;

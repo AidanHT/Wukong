@@ -39,6 +39,7 @@ fn jit_ok(src: &str) -> (i64, String) {
 /// microkernels, not via wider CLIF vectors. If a future Cranelift starts accepting `f32x8`, this
 /// test flips to passing — a signal to widen `VEC_REG_BYTES` and revisit the dispatch story.
 #[test]
+#[allow(clippy::result_large_err)] // Cranelift's ModuleError is large; irrelevant in a test.
 fn cranelift_still_rejects_f32x8() {
     use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -53,7 +54,9 @@ fn cranelift_still_rejects_f32x8() {
     sig.params.push(AbiParam::new(ptr));
     sig.params.push(AbiParam::new(ptr));
     sig.params.push(AbiParam::new(ptr));
-    let fid = module.declare_function("probe", Linkage::Export, &sig).unwrap();
+    let fid = module
+        .declare_function("probe", Linkage::Export, &sig)
+        .unwrap();
     let mut ctx = module.make_context();
     ctx.func.signature = sig;
     let mut fbctx = FunctionBuilderContext::new();
@@ -195,7 +198,10 @@ fn differential_floats() {
         for opt in [0u8, 2, 3] {
             let n = jit(src, opt).expect("jit");
             let i = interp(src, opt).expect("interp");
-            assert_eq!(n, i, "float native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                n, i,
+                "float native vs interp mismatch at -O{opt} for:\n{src}"
+            );
         }
     }
 }
@@ -270,7 +276,10 @@ fn vectorized_saxpy_is_correct_across_sizes() {
         let src = kernel(n);
         let native = jit(&src, 3).expect("jit");
         let interp = interp(&src, 3).expect("interp");
-        assert_eq!(native, interp, "vectorized native vs interp mismatch at n={n}");
+        assert_eq!(
+            native, interp,
+            "vectorized native vs interp mismatch at n={n}"
+        );
         assert_eq!(native.0, (n * n) as i64, "wrong saxpy result at n={n}");
     }
 }
@@ -325,7 +334,10 @@ fn vectorized_reductions_are_correct() {
             for opt in [0u8, 2, 3] {
                 let native = jit(&src, opt).expect("jit");
                 let interpd = interp(&src, opt).expect("interp");
-                assert_eq!(native, interpd, "reduction native vs interp at n={n} -O{opt}");
+                assert_eq!(
+                    native, interpd,
+                    "reduction native vs interp at n={n} -O{opt}"
+                );
                 assert_eq!(native.0, expect, "reduction wrong at n={n} -O{opt}");
             }
         }
@@ -393,7 +405,10 @@ fn vectorized_int_reduction() {
             for opt in [0u8, 2, 3] {
                 let native = jit(&src, opt).expect("jit");
                 let interpd = interp(&src, opt).expect("interp");
-                assert_eq!(native, interpd, "int reduction native vs interp n={n} -O{opt}");
+                assert_eq!(
+                    native, interpd,
+                    "int reduction native vs interp n={n} -O{opt}"
+                );
                 assert_eq!(native.0, expect, "int reduction wrong n={n} -O{opt}");
             }
         }
@@ -452,7 +467,10 @@ fn vectorized_relu_is_correct() {
 
     let (prog, interner) = lowered(&kernel(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
-    assert!(mir.contains("select") && mir.contains("x f32>"), "relu should vectorize");
+    assert!(
+        mir.contains("select") && mir.contains("x f32>"),
+        "relu should vectorize"
+    );
 
     for n in [3usize, 4, 8, 13, 64, 257] {
         let src = kernel(n);
@@ -476,7 +494,11 @@ fn float_modulo() {
         "fn main() -> i32 { let a: f64 = -10.5; let b: f64 = 3.0; print(a % b); return 0; }",
     ] {
         for opt in [0u8, 2, 3] {
-            assert_eq!(jit(src, opt).unwrap(), interp(src, opt).unwrap(), "frem mismatch at -O{opt}");
+            assert_eq!(
+                jit(src, opt).unwrap(),
+                interp(src, opt).unwrap(),
+                "frem mismatch at -O{opt}"
+            );
         }
     }
 }
@@ -494,7 +516,10 @@ fn fma_contraction_is_bit_exact() {
         0,
     );
     let mir = mercury_mir::print::print_program(&prog, &interner);
-    assert!(mir.contains("fma "), "x + y*z should contract to fma:\n{mir}");
+    assert!(
+        mir.contains("fma "),
+        "x + y*z should contract to fma:\n{mir}"
+    );
     // 2 + 3*4 = 14.
     assert_eq!(
         jit_ok("fn main() -> i32 { let a: f32 = 2.0; let b: f32 = 3.0; let c: f32 = 4.0; return (a + b * c) as i32; }").0,
@@ -568,7 +593,11 @@ fn fusion_collapses_adjacent_loops() {
 
     // sum of relu(2*(k-50)+1) over k in 0..100 = sum of the first 50 positive odd numbers = 2500.
     let native = jit(&two, 3).expect("jit");
-    assert_eq!(native, interp(&two, 3).expect("interp"), "fused native vs interp");
+    assert_eq!(
+        native,
+        interp(&two, 3).expect("interp"),
+        "fused native vs interp"
+    );
     assert_eq!(native.0, 2500);
 }
 
@@ -585,16 +614,21 @@ fn vectorized_relu6_nested_if() {
              return s as i32; }}"
         )
     };
-    let reference = |n: i64| -> i64 {
-        (0..n).map(|i| ((i % 11) - 2).clamp(0, 6)).sum::<i64>()
-    };
+    let reference = |n: i64| -> i64 { (0..n).map(|i| ((i % 11) - 2).clamp(0, 6)).sum::<i64>() };
     let (prog, interner) = lowered(&kernel(40), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
-    assert!(mir.contains("select"), "relu6 should vectorize via nested blends");
+    assert!(
+        mir.contains("select"),
+        "relu6 should vectorize via nested blends"
+    );
     for n in [5usize, 8, 13, 40] {
         let src = kernel(n);
         let native = jit(&src, 3).expect("jit");
-        assert_eq!(native, interp(&src, 3).expect("interp"), "relu6 native vs interp n={n}");
+        assert_eq!(
+            native,
+            interp(&src, 3).expect("interp"),
+            "relu6 native vs interp n={n}"
+        );
         assert_eq!(native.0, reference(n as i64), "relu6 wrong n={n}");
     }
 }
@@ -642,7 +676,10 @@ fn matmul_is_correct() {
             let src = kernel(ns, parallel);
             let native = jit(&src, 3).expect("jit");
             let interp = interp(&src, 3).expect("interp");
-            assert_eq!(native, interp, "matmul native vs interp (ns={ns}, par={parallel})");
+            assert_eq!(
+                native, interp,
+                "matmul native vs interp (ns={ns}, par={parallel})"
+            );
             assert_eq!(
                 native.0,
                 reference(ns),
@@ -663,9 +700,9 @@ fn lowered_calls(src: &str, callee: &str) -> bool {
     let target = interner.intern(callee);
     program.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
-            b.insts.iter().any(|ins| {
-                matches!(&ins.op, mercury_mir::Op::Call { func, .. } if *func == target)
-            })
+            b.insts
+                .iter()
+                .any(|ins| matches!(&ins.op, mercury_mir::Op::Call { func, .. } if *func == target))
         })
     })
 }
@@ -691,8 +728,14 @@ fn matmul_nest_lowers_to_sgemm() {
              for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
         )
     };
-    assert!(lowered_calls(&acc(""), "mercury_sgemm"), "accumulate -> sgemm");
-    assert!(lowered_calls(&ovr(""), "mercury_sgemm"), "overwrite -> sgemm");
+    assert!(
+        lowered_calls(&acc(""), "mercury_sgemm"),
+        "accumulate -> sgemm"
+    );
+    assert!(
+        lowered_calls(&ovr(""), "mercury_sgemm"),
+        "overwrite -> sgemm"
+    );
     assert!(
         lowered_calls(&acc("@parallel\n"), "mercury_sgemm_parallel"),
         "@parallel -> sgemm_parallel"
@@ -701,7 +744,10 @@ fn matmul_nest_lowers_to_sgemm() {
     let not_mm = "module m\nfn f(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
         for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[j*8+k]; } } } }";
-    assert!(!lowered_calls(not_mm, "mercury_sgemm"), "transposed-B is not a row-major matmul");
+    assert!(
+        !lowered_calls(not_mm, "mercury_sgemm"),
+        "transposed-B is not a row-major matmul"
+    );
 }
 
 /// The nn.Linear form `C = A·Bᵀ` (B indexed `[j*K+k]`) must lower to `mercury_sgemm_nt`, run
@@ -716,7 +762,10 @@ fn linear_nt_matmul_lowers_and_runs() {
              for j in 0..4 {{ c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; }} }} }} }}"
         )
     };
-    assert!(lowered_calls(&nt(""), "mercury_sgemm_nt"), "A·Bᵀ -> sgemm_nt");
+    assert!(
+        lowered_calls(&nt(""), "mercury_sgemm_nt"),
+        "A·Bᵀ -> sgemm_nt"
+    );
     assert!(
         lowered_calls(&nt("@parallel\n"), "mercury_sgemm_nt_parallel"),
         "@parallel A·Bᵀ -> sgemm_nt_parallel"
@@ -726,7 +775,10 @@ fn linear_nt_matmul_lowers_and_runs() {
         for i in 0..6 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[k*4+j]; } } } }";
     assert!(lowered_calls(normal, "mercury_sgemm"), "C=A·B -> sgemm");
-    assert!(!lowered_calls(normal, "mercury_sgemm_nt"), "C=A·B is not transposed");
+    assert!(
+        !lowered_calls(normal, "mercury_sgemm_nt"),
+        "C=A·B is not transposed"
+    );
 
     // End to end: A is 6x8, B is 4x8 (so Bᵀ is 8x4), C is 6x4. Native must equal interp.
     let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
@@ -751,7 +803,10 @@ fn ijk_dot_product_matmul_recognized() {
     let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }";
-    assert!(lowered_calls(nt, "mercury_sgemm_nt"), "ijk A·Bᵀ -> sgemm_nt");
+    assert!(
+        lowered_calls(nt, "mercury_sgemm_nt"),
+        "ijk A·Bᵀ -> sgemm_nt"
+    );
     // C = A·B (b[k*N+j]).
     let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
@@ -839,10 +894,14 @@ fn matmul_accumulate_differential() {
         }
     }
     let mut s = 0f32;
-    for j in 0..n2 {
-        s += c[j];
+    for &cj in &c {
+        s += cj;
     }
-    assert_eq!(native.0, (s * 100.0) as i32 as i64, "accumulate matmul value vs reference");
+    assert_eq!(
+        native.0,
+        (s * 100.0) as i32 as i64,
+        "accumulate matmul value vs reference"
+    );
 }
 
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
@@ -864,29 +923,47 @@ fn vector_ops_interp_matches_native() {
         let idx = b.build(MirType::I64, Op::ConstInt(i, MirType::I64));
         let slot = b.build(
             MirType::Ptr,
-            Op::Gep { ptr: arr, index: idx, elem: f32t.clone() },
+            Op::Gep {
+                ptr: arr,
+                index: idx,
+                elem: f32t.clone(),
+            },
         );
         let v = b.build(f32t.clone(), Op::ConstFloat((i + 1) as f64, f32t.clone()));
-        b.build_void(Op::Store { ptr: slot, value: v });
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: v,
+        });
     }
 
     // base = &arr[0]; v = load <4 x f32>; v += splat(10.0); store back
     let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
     let base = b.build(
         MirType::Ptr,
-        Op::Gep { ptr: arr, index: zero, elem: f32t.clone() },
+        Op::Gep {
+            ptr: arr,
+            index: zero,
+            elem: f32t.clone(),
+        },
     );
     let v = b.build(vty.clone(), Op::Load(base, vty.clone()));
     let ten = b.build(f32t.clone(), Op::ConstFloat(10.0, f32t.clone()));
     let sp = b.build(vty.clone(), Op::Splat(ten));
     let sum = b.build(vty.clone(), Op::Bin(BinOp::FAdd, v, sp));
-    b.build_void(Op::Store { ptr: base, value: sum });
+    b.build_void(Op::Store {
+        ptr: base,
+        value: sum,
+    });
 
     // return (i32) arr[2]  ==  3 + 10  ==  13
     let two = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
     let slot2 = b.build(
         MirType::Ptr,
-        Op::Gep { ptr: arr, index: two, elem: f32t.clone() },
+        Op::Gep {
+            ptr: arr,
+            index: two,
+            elem: f32t.clone(),
+        },
     );
     let e2 = b.build(f32t.clone(), Op::Load(slot2, f32t.clone()));
     let r = b.build(MirType::I32, Op::Cast(CastKind::FpToSi, e2, MirType::I32));

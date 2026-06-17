@@ -135,7 +135,10 @@ mod tests {
         unsafe {
             mercury_parallel_for(n as i64, fill_squares, buf.as_mut_ptr() as *const u8);
         }
-        assert!(buf.iter().enumerate().all(|(i, &v)| v == (i as i64) * (i as i64)));
+        assert!(buf
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| v == (i as i64) * (i as i64)));
     }
 
     #[test]

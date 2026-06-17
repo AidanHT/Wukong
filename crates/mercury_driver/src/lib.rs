@@ -158,7 +158,8 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- MIR construction ---
-    let (mut program, lower_diags) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    let (mut program, lower_diags) =
+        mercury_mir_build::lower_program(&module, &sema, &mut interner);
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
@@ -188,9 +189,7 @@ pub fn compile(opts: &Options) -> i32 {
         let main = interner.intern("main");
         let result = match opts.backend {
             BackendKind::Interp => mercury_interp::run_with_output(&program, main, &interner),
-            BackendKind::Native => {
-                mercury_codegen_cranelift::jit_run(&program, main, &interner)
-            }
+            BackendKind::Native => mercury_codegen_cranelift::jit_run(&program, main, &interner),
         };
         return match result {
             Ok((exit_code, stdout)) => {
@@ -294,7 +293,10 @@ fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Optio
             exit::OK
         }
         Ok(_) => {
-            eprintln!("error: `{cc}` failed to link the native object `{}`", obj_path.display());
+            eprintln!(
+                "error: `{cc}` failed to link the native object `{}`",
+                obj_path.display()
+            );
             exit::COMPILE_ERROR
         }
         Err(_) => {
