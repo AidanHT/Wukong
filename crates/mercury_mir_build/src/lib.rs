@@ -978,43 +978,28 @@ impl FnLowerer<'_> {
         Some((out_sym, x_sym, opcode))
     }
 
-    /// Recognize an elementwise transcendental loop `for j in lo..hi { ... }` whose body is one or
-    /// more independent `out[j] = f(x[j])` activations, and lower it to one `mercury_vmath_f32(x+lo,
-    /// out+lo, hi-lo, op)` call per statement — the 256-bit AVX2 kernel (Cranelift's vectorizer is
-    /// capped at 128-bit). Handles a multi-statement body (e.g. adjacent activation loops the fusion
-    /// pass merged): each kernel call is a full-range pass emitted in source order, which preserves
-    /// the fused loop's per-element semantics (any cross-statement read of an array a prior statement
-    /// wrote sees the same values, since that array is fully written before the next pass reads it).
-    /// `out` and `x` may be the same array (in-place). The interpreter marshals through the identical
-    /// kernel, so the differential oracle stays exact. Returns false (fall back to the generic
-    /// vectorizer) unless *every* statement matches. Pure checks run before any MIR is emitted.
-    fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+    /// Match a transcendental-activation loop body: every statement must be an independent
+    /// `out[j] = f(x[j])` over f32 (see [`match_vmath_stmt`]), with every array in scope. Returns the
+    /// resolved `(out_base, x_base, op)` per statement, or `None` if any statement fails. Pure — emits
+    /// no MIR — so it is safe to call before deciding whether to lower the loop bounds.
+    fn match_vmath_body(&self, j: Symbol, body: &Block) -> Option<Vec<(ValueId, ValueId, u32)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
-            return false;
+            return None;
         }
-        // Every statement must be an independent dispatchable activation, and every array must be in
-        // scope — collect (out_base, x_base, op) for all of them before emitting any MIR.
-        let mut calls: Vec<(ValueId, ValueId, u32)> = Vec::with_capacity(body.stmts.len());
+        let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
-            let Some((out_sym, x_sym, opcode)) = self.match_vmath_stmt(stmt, j) else {
-                return false;
-            };
-            let (Some((out_base, _)), Some((x_base, _))) =
-                (self.lookup(out_sym), self.lookup(x_sym))
-            else {
-                return false;
-            };
+            let (out_sym, x_sym, opcode) = self.match_vmath_stmt(stmt, j)?;
+            let (out_base, _) = self.lookup(out_sym)?;
+            let (x_base, _) = self.lookup(x_sym)?;
             calls.push((out_base, x_base, opcode));
         }
+        Some(calls)
+    }
 
-        // Lower the bounds once (GEP each base by the start index so a loop from `lo` begins at
-        // element `lo`), then emit one kernel call per statement over the `hi-lo` element range.
-        let sty = self.expr_mir(start);
-        let s = self.lower_expr(start);
-        let s = self.coerce_to(s, &sty, &MirType::I64, true);
-        let ety = self.expr_mir(end);
-        let e = self.lower_expr(end);
-        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+    /// Emit one `mercury_vmath_f32(x+s, out+s, e-s, op)` call per resolved statement over the i64
+    /// range `[s, e)`. Each is a full-range pass; in source order they preserve a fused multi-statement
+    /// body's per-element semantics (an array is fully written before a later pass reads it).
+    fn emit_vmath_calls(&mut self, s: ValueId, e: ValueId, calls: Vec<(ValueId, ValueId, u32)>) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         for (out_base, x_base, opcode) in calls {
             let xp = self.builder.build(
@@ -1041,6 +1026,26 @@ impl FnLowerer<'_> {
                 args: vec![xp, outp, n, opv],
             });
         }
+    }
+
+    /// Recognize an elementwise transcendental loop `for j in lo..hi { ... }` whose body is one or
+    /// more independent `out[j] = f(x[j])` activations (exp/log/tanh/sigmoid/silu/gelu over f32), and
+    /// lower it to one `mercury_vmath_f32` call per statement — the 256-bit AVX2 kernel (Cranelift's
+    /// vectorizer is capped at 128-bit). `out` and `x` may be the same array (in-place). The
+    /// interpreter marshals through the identical kernel, so the differential oracle stays exact.
+    /// Returns false (fall back to the generic vectorizer) unless every statement matches.
+    fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        let Some(calls) = self.match_vmath_body(j, body) else {
+            return false;
+        };
+        // Bounds GEP each base by the start index, so a loop from `lo` begins at element `lo`.
+        let sty = self.expr_mir(start);
+        let s = self.lower_expr(start);
+        let s = self.coerce_to(s, &sty, &MirType::I64, true);
+        let ety = self.expr_mir(end);
+        let e = self.lower_expr(end);
+        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        self.emit_vmath_calls(s, e, calls);
         true
     }
 
@@ -1173,6 +1178,15 @@ impl FnLowerer<'_> {
         ity: &MirType,
         body: &Block,
     ) -> bool {
+        // A transcendental-activation chunk dispatches to the 256-bit AVX2 kernel here too, so an
+        // `@parallel` activation runs multicore × 256-bit (each thread's chunk is one kernel call).
+        // Elementwise, so the interpreter's whole-range pass and the native per-chunk passes agree.
+        if let Some(calls) = self.match_vmath_body(j, body) {
+            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+            self.emit_vmath_calls(s, e, calls);
+            return true;
+        }
         let Some((lane, w)) = self.vectorizable(body, j) else {
             return false;
         };

@@ -339,6 +339,25 @@ fn differential_vmath_dispatch() {
     );
 }
 
+/// An `@parallel` activation dispatches each per-thread chunk to the AVX2 kernel (multicore ×
+/// 256-bit). The native run splits the range across cores; the interpreter runs the whole range in
+/// one pass — both must agree, since the kernel is elementwise (chunk boundaries don't change any
+/// per-element result). Exercised for gelu (a fused activation) at a size that spans many chunks.
+#[test]
+fn differential_parallel_vmath() {
+    let src = "@parallel fn act(x: [f32; 4096], out: [f32; 4096]) { \
+         for i in 0..4096 { out[i] = gelu(x[i]); } } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 4096] = [0.0; 4096]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } act(x, o); \
+         print((o[3000] * 100000.0) as i32); print((o[0] * 100000.0) as i32); return 0; }";
+    for opt in [0u8, 2, 3] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "parallel vmath native vs interp mismatch at -O{opt}");
+    }
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
