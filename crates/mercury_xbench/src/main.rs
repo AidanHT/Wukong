@@ -916,6 +916,27 @@ fn kernels() -> Vec<Kernel> {
                 "for i in 0..N { let v= *x.add(i); let v= if v<6.0 {v} else {6.0}; *out.add(i)= if v>0.0 {v} else {0.0}; }",
             ),
         },
+        // GELU across cores: each thread's chunk dispatches to the fused 256-bit AVX2 gelu kernel, so
+        // this is multicore × 256-bit vs single-threaded scalar C — the compute-bound activation
+        // sweep over a large tensor (e.g. a transformer FFN's hidden state) where it pays the most.
+        Kernel {
+            name: "gelu@parallel",
+            bytes_per_call: 2 * N * 4,
+            note: "GELU across cores (multicore × 256-bit AVX2) vs single-threaded scalar C/Rust",
+            mer: mer_par_kernel(&format!("for i in 0..{N} {{ out[i] = gelu(x[i]); }}")),
+            c: c_kernel(
+                "for(long i=0;i<N;i++){ float v=x[i]; \
+                 float u=0.7978845608f*(v+0.044715f*v*v*v); \
+                 float t=1.0f-2.0f/(expf(2.0f*u)+1.0f); \
+                 out[i]=0.5f*v*(1.0f+t); }",
+            ),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); \
+                 let u=0.7978845608f32*(v+0.044715*v*v*v); \
+                 let t=1.0f32-2.0/((2.0*u).exp()+1.0); \
+                 *out.add(i)=0.5*v*(1.0+t); }",
+            ),
+        },
     ]
 }
 
