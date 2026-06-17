@@ -127,7 +127,10 @@ Attributes attach to functions, loops, and declarations, and parse/validate toda
 real consumers on the native backend: **`@parallel`** functions execute across CPU cores (✅), and
 loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically** (✅) — a
 plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop, and
-FMA-contracted with no annotation. `@tile` (cache tiling) and explicit `@simd`-typed vector values
+FMA-contracted with no annotation. A **reduction** in a `@parallel` function — `let mut s = 0.0; for
+k in 0..n { s += x[k]*y[k] }` (also `(x[k]-y[k])²` and the plain sum) — dispatches to a deterministic
+multicore reduction kernel that reaches aggregate memory bandwidth (~8× single-threaded C), with a
+result independent of core count (✅). `@tile` (cache tiling) and explicit `@simd`-typed vector values
 are still under construction (🔵).
 
 ## Built-in intrinsics ✅
