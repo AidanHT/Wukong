@@ -640,7 +640,7 @@ impl FnLowerer<'_> {
 
     /// Emit a call to the GEMM microkernel for a recognized nest. Returns `false` (and emits
     /// nothing) if any operand array is not a pointer in scope, so the caller lowers it normally.
-    fn emit_sgemm(&mut self, nest: &MatmulNest, parallel: bool) -> bool {
+    fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
         let (Some((a, _)), Some((b, _)), Some((c, _))) = (
             self.lookup(nest.a),
             self.lookup(nest.b),
@@ -648,6 +648,12 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // Apply any per-operand base offset (the batch/head index of a batched matmul) as a pointer
+        // GEP; a plain 2-D matmul has empty offsets and passes the array base straight through. The
+        // inner matmul is identical under a constant base shift, so both backends stay bit-exact.
+        let a = self.offset_base(a, &nest.a_off);
+        let b = self.offset_base(b, &nest.b_off);
+        let c = self.offset_base(c, &nest.c_off);
         // Materialize each dimension as an i64 value — a constant for a literal dim, or a load of
         // the runtime dimension variable (a function param/local). Bails to the scalar nest if a
         // variable dim is somehow out of scope at the call site.
@@ -672,6 +678,37 @@ impl FnLowerer<'_> {
             args: vec![a, b, c, m, k, n, beta],
         });
         true
+    }
+
+    /// GEP `base` by the sum of the `offset` terms (element indices) — the batch/head base shift of
+    /// a batched matmul. Returns `base` unchanged when there is no offset (a plain 2-D matmul). Each
+    /// term is lowered in the current scope (the enclosing batch-loop variable and the dimensions are
+    /// all live) and coerced to `i64` before summing.
+    fn offset_base(&mut self, base: ValueId, offset: &[&Expr]) -> ValueId {
+        if offset.is_empty() {
+            return base;
+        }
+        let mut acc: Option<ValueId> = None;
+        for &t in offset {
+            let ty = self.expr_mir(t);
+            let v = self.lower_expr(t);
+            let v = self.coerce_to(v, &ty, &MirType::I64, true);
+            acc = Some(match acc {
+                None => v,
+                Some(prev) => self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Add, prev, v)),
+            });
+        }
+        let idx = acc.unwrap();
+        self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: MirType::F32,
+            },
+        )
     }
 
     /// Materialize a matmul dimension as an `i64` MIR value: a constant for a literal, or a load
@@ -3165,7 +3202,7 @@ fn set_or_check(slot: &mut Option<MirType>, t: &MirType) -> Option<()> {
 
 /// A recognized GEMM nest computing `C[m,n] = A[m,k]·B[k,n]` (row-major, contiguous, f32), or its
 /// `nn.Linear` transpose `C[m,n] = A[m,k]·B[n,k]ᵀ` when `transposed`.
-struct MatmulNest {
+struct MatmulNest<'a> {
     a: Symbol,
     b: Symbol,
     c: Symbol,
@@ -3176,6 +3213,15 @@ struct MatmulNest {
     beta: i64,
     /// `true` for `C = A·Bᵀ` (B indexed `[j,k]` instead of `[k,j]`).
     transposed: bool,
+    /// Per-operand base offsets: the additive index terms left over after the 2-D `row*stride + col`
+    /// is peeled off — e.g. the batch/head term `h*S*D` of a **batched** matmul (multi-head
+    /// attention is one matmul per head: `scores[h] = Q[h]·K[h]ᵀ`). Each term is verified invariant
+    /// in the matmul's `(i,j,k)`, so `emit_sgemm` simply GEPs the base pointer by their sum before
+    /// the kernel call — the inner matmul is identical regardless of the offset. Empty for a plain
+    /// 2-D matmul; only the `ijk` dot-product form populates these.
+    a_off: Vec<&'a Expr>,
+    b_off: Vec<&'a Expr>,
+    c_off: Vec<&'a Expr>,
 }
 
 /// Canonical text of an affine index/base expression (paths, ints, `+`/`-`/`*`, casts), used to key
@@ -3269,6 +3315,50 @@ fn match_row_col(idx: &Expr, row: Symbol, interner: &Interner) -> Option<(Dim, S
         return Some((stride, col));
     }
     None
+}
+
+/// Flatten the additive terms of `e`, recursing only through `+`. `i*K + k + h*S*D` yields the three
+/// terms `[i*K, k, h*S*D]` (left-association is irrelevant). Used to peel a batch/base offset off a
+/// flattened tensor index.
+fn flatten_add_terms<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &e.kind
+    {
+        flatten_add_terms(lhs, out);
+        flatten_add_terms(rhs, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// Like [`match_row_col`] but tolerant of a leading **base offset**: parses
+/// `idx == row*stride + col + offset_terms…` for a known `row` and a known expected `col` symbol
+/// (the matmul column that the caller already knows must appear). Returns `(stride, offset_terms)`,
+/// where `offset_terms` are the remaining addends (empty for a plain 2-D index). The caller must
+/// verify the offset is invariant in the matmul's bound variables. Passing the expected `col` is what
+/// disambiguates the bare column term from an offset that is itself a bare path.
+fn match_row_col_off<'a>(
+    idx: &'a Expr,
+    row: Symbol,
+    col: Symbol,
+    interner: &Interner,
+) -> Option<(Dim, Vec<&'a Expr>)> {
+    let mut terms = Vec::new();
+    flatten_add_terms(idx, &mut terms);
+    // The unique `row * stride` term.
+    let row_pos = terms
+        .iter()
+        .position(|t| mul_with_row(t, row, interner).is_some())?;
+    let stride = mul_with_row(terms[row_pos], row, interner)?;
+    terms.remove(row_pos);
+    // The bare column term `col` (must be present exactly as the expected symbol).
+    let col_pos = terms.iter().position(|t| single_path(t) == Some(col))?;
+    terms.remove(col_pos);
+    // Whatever is left is the base offset (a batch/head index for a batched matmul).
+    Some((stride, terms))
 }
 
 /// `base[index]` with a single-segment `base` path and exactly one index. Returns `(base, index)`.
@@ -3377,14 +3467,82 @@ fn match_product_ab(
     pair(f1, f2).or_else(|| pair(f2, f1))
 }
 
+/// An A factor `A[row*sa + k (+ off)]` of the inline `ijk` product. Returns `(base, sa, offset)`.
+fn match_a_factor<'a>(
+    f: &'a Expr,
+    row: Symbol,
+    kvar: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Vec<&'a Expr>)> {
+    let (abase, aidx) = as_index1(f)?;
+    let (sa, off) = match_row_col_off(aidx, row, kvar, interner)?;
+    Some((abase, sa, off))
+}
+
+/// A B factor of the inline `ijk` product: `B[k*sb + j (+ off)]` (normal) or `B[j*sb + k (+ off)]`
+/// (transposed — the `A·Bᵀ` spelling). Returns `(base, sb, offset, transposed)`.
+fn match_b_factor<'a>(
+    f: &'a Expr,
+    kvar: Symbol,
+    jvar: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Vec<&'a Expr>, bool)> {
+    let (bbase, bidx) = as_index1(f)?;
+    if let Some((sb, off)) = match_row_col_off(bidx, kvar, jvar, interner) {
+        return Some((bbase, sb, off, false));
+    }
+    if let Some((sb, off)) = match_row_col_off(bidx, jvar, kvar, interner) {
+        return Some((bbase, sb, off, true));
+    }
+    None
+}
+
+/// Like [`match_product_ab`] but for the inline `ijk` form (A read directly, never via an `aik`
+/// binding) and tolerant of a per-operand **base offset** (the batch/head index of a batched matmul).
+/// Returns `(a, sa, a_off, b, sb, b_off, transposed)`.
+#[allow(clippy::type_complexity)]
+fn match_product_ab_off<'a>(
+    prod: &'a Expr,
+    row: Symbol,
+    kvar: Symbol,
+    jvar: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Vec<&'a Expr>, Symbol, Dim, Vec<&'a Expr>, bool)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: f1,
+        rhs: f2,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    // Either factor order: `A*B` or `B*A`.
+    for (fa, fb) in [(f1, f2), (f2, f1)] {
+        if let (Some((a, sa, aoff)), Some((b, sb, boff, t))) = (
+            match_a_factor(fa, row, kvar, interner),
+            match_b_factor(fb, kvar, jvar, interner),
+        ) {
+            return Some((a, sa, aoff, b, sb, boff, t));
+        }
+    }
+    None
+}
+
+/// Every term of `off` is invariant in all of `vars` (the matmul's bound `i`/`j`/`k`). A base offset
+/// that mentioned a loop variable would not be a constant per-call pointer shift, so it is rejected.
+fn offset_invariant(off: &[&Expr], vars: &[Symbol]) -> bool {
+    off.iter()
+        .all(|t| vars.iter().all(|&v| !expr_uses_sym(t, v)))
+}
+
 /// Try both recognized matmul spellings: the `ikj` accumulate form and the `ijk` dot-product form.
-fn recognize_matmul(
+fn recognize_matmul<'a>(
     pat: &Pattern,
     iter: &ForIter,
-    body: &Block,
+    body: &'a Block,
     sema: &SemaResult,
     interner: &Interner,
-) -> Option<MatmulNest> {
+) -> Option<MatmulNest<'a>> {
     match_matmul(pat, iter, body, sema, interner)
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
 }
@@ -3393,13 +3551,13 @@ fn recognize_matmul(
 /// `for i { for j { let s = 0.0; for k { s = s + A[i,k]*B[..]; } c[i*N+j] = s; } }`. This is the
 /// natural way to write `C = A·Bᵀ` (both A and B read contiguously). Always `beta = 0` (s overwrites
 /// c). See [`MatmulNest`].
-fn match_matmul_ijk(
+fn match_matmul_ijk<'a>(
     pat: &Pattern,
     iter: &ForIter,
-    body: &Block,
+    body: &'a Block,
     sema: &SemaResult,
     interner: &Interner,
-) -> Option<MatmulNest> {
+) -> Option<MatmulNest<'a>> {
     let row = match &pat.kind {
         ast::PatKind::Ident(s) => *s,
         _ => return None,
@@ -3484,9 +3642,12 @@ fn match_matmul_ijk(
     if !is_f32_expr(prod, sema) {
         return None;
     }
-    let (a_sym, sa, b_sym, sb, transposed) =
-        match_product_ab(prod, row, kvar, jvar, None, interner)?;
-    // Final store: c[i*N + j] = s.
+    // The inline `ijk` form tolerates a per-operand base offset (a batch/head index): A, B and C may
+    // each be indexed `… + h*S*D`, the hallmark of a batched matmul (multi-head attention is one
+    // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed) =
+        match_product_ab_off(prod, row, kvar, jvar, interner)?;
+    // Final store: c[i*N + j (+ off)] = s.
     let StmtKind::Assign {
         target: ct,
         op: ast::AssignOp::Assign,
@@ -3499,12 +3660,19 @@ fn match_matmul_ijk(
         return None;
     }
     let (cbase, cidx) = as_index1(ct)?;
-    let (sc, cj) = match_row_col(cidx, row, interner)?;
-    if cj != jvar {
-        return None;
-    }
+    let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
     let sb_ok = if transposed { sb == kdim } else { sb == n };
     if sa != kdim || !sb_ok || sc != n {
+        return None;
+    }
+    // Every base offset must be invariant in the matmul's own `(i,j,k)` — otherwise it is not a
+    // constant per-call pointer shift and the nest is not a batched matmul. (A plain 2-D matmul has
+    // empty offsets and trivially passes.)
+    let bound = [row, jvar, kvar];
+    if !offset_invariant(&a_off, &bound)
+        || !offset_invariant(&b_off, &bound)
+        || !offset_invariant(&c_off, &bound)
+    {
         return None;
     }
     // A and B may be the *same* array (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` with a shared
@@ -3523,17 +3691,20 @@ fn match_matmul_ijk(
         n,
         beta: 0,
         transposed,
+        a_off,
+        b_off,
+        c_off,
     })
 }
 
 /// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
-fn match_matmul(
+fn match_matmul<'a>(
     pat: &Pattern,
     iter: &ForIter,
-    body: &Block,
+    body: &'a Block,
     sema: &SemaResult,
     interner: &Interner,
-) -> Option<MatmulNest> {
+) -> Option<MatmulNest<'a>> {
     let row = match &pat.kind {
         ast::PatKind::Ident(s) => *s,
         _ => return None,
@@ -3675,11 +3846,20 @@ fn match_matmul(
         n,
         beta,
         transposed,
+        // The `ikj` accumulate form parses its A/C indices with the 2-term `match_row_col`, so a
+        // batched (offset) index falls back to the scalar nest; offsets are always empty here.
+        a_off: Vec::new(),
+        b_off: Vec::new(),
+        c_off: Vec::new(),
     })
 }
 
 /// Recognize a function whose entire body is a matmul nest (`{ for i in 0..M { … } }`).
-fn matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<MatmulNest> {
+fn matmul_fn<'a>(
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest<'a>> {
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
     }
@@ -3700,7 +3880,7 @@ fn matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<Mat
 #[allow(clippy::too_many_arguments)]
 fn lower_matmul_fn(
     f: &FnDecl,
-    nest: &MatmulNest,
+    nest: &MatmulNest<'_>,
     parallel: bool,
     sema: &SemaResult,
     interner: &Interner,
