@@ -801,7 +801,11 @@ mod tests {
 
     #[test]
     fn sgemm_parallel_matches_serial() {
-        let (m, k, n) = (256, 192, 320);
+        // The size must exceed PAR_MIN_MACS, or mercury_sgemm_parallel falls back to the serial
+        // kernel (the work threshold) and this would degenerate into a serial-vs-serial no-op. These
+        // dims also straddle the MR=6 / NR=16 remainders so the cross-core packing + edge tiles run.
+        let (m, k, n) = (520usize, 264, 540); // ~74M MACs > 2^26
+        assert!((m * k * n) as u64 >= PAR_MIN_MACS, "size must exercise the multi-core path");
         let a = fill(6, m * k);
         let b = fill(7, k * n);
         let mut serial = vec![0.0f32; m * n];
@@ -810,7 +814,16 @@ mod tests {
             mercury_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
             mercury_sgemm_parallel(a.as_ptr(), b.as_ptr(), par.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
         }
-        // Same blocking per band ⇒ identical results.
+        // Identical per-(i,j) accumulation order ⇒ bit-for-bit identical results.
         assert_eq!(serial, par);
+
+        // Same for the nn.Linear (C = A·Bᵀ) parallel path, which otherwise has no correctness test.
+        let mut serial_nt = vec![0.0f32; m * n];
+        let mut par_nt = vec![0.0f32; m * n];
+        unsafe {
+            mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), serial_nt.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+            mercury_sgemm_nt_parallel(a.as_ptr(), b.as_ptr(), par_nt.as_mut_ptr(), m as i64, k as i64, n as i64, 0);
+        }
+        assert_eq!(serial_nt, par_nt);
     }
 }
