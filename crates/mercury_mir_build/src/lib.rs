@@ -2300,7 +2300,17 @@ impl FnLowerer<'_> {
         if from == to {
             return v;
         }
-        let kind = cast_kind(&from, &to, self.signed(operand));
+        // For a float→int cast the signed/unsigned choice comes from the TARGET integer (`x as i32`
+        // is signed → fptosi); for every other direction (int→float, int widening) it comes from the
+        // source operand. Using the operand's signedness for float→int picks fptoui, where the native
+        // backend saturates a negative float to 0 while the interpreter keeps the signed value — a
+        // native≠interpreter divergence (e.g. `(-0.5 * 10.0) as i32` gave 0 on native, −5 on interp).
+        let signed = if from.is_float() && to.is_int() {
+            self.signed(e)
+        } else {
+            self.signed(operand)
+        };
+        let kind = cast_kind(&from, &to, signed);
         self.builder.build(to.clone(), Op::Cast(kind, v, to))
     }
 }
