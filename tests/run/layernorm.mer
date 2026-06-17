@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1626
+// EXPECT-OUT: -1626
+// EXPECT-OUT: 108
+module tests.run.layernorm
+
+// LayerNorm over a fixed vector (gamma=1, beta=0, eps=1e-5), in the supported subset.
+// mean and variance are sum reductions (the variance addend (x-mean)^2 FMA-contracts); the
+// normalize pass vectorizes with rsqrt's reciprocal as an invariant splat. The mercury_bench
+// gate proves it matches the interpreter bit-for-bit.
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) - 8.0; // -8 .. 7, mean = -0.5
+    }
+
+    // mean
+    let mut s: f32 = 0.0;
+    for i in 0..16 {
+        s += x[i];
+    }
+    let mean: f32 = s * 0.0625; // / 16
+
+    // variance = mean of squared deviations
+    let mut v: f32 = 0.0;
+    for i in 0..16 {
+        v += (x[i] - mean) * (x[i] - mean);
+    }
+    let inv: f32 = rsqrt(v * 0.0625 + 0.00001);
+
+    // normalize (vectorized)
+    for i in 0..16 {
+        x[i] = (x[i] - mean) * inv;
+    }
+
+    print((mean * 1000.0) as i32); // -500
+    print((x[15] * 1000.0) as i32); // (7 - mean) * inv, scaled
+    print((x[0] * 1000.0) as i32); // (-8 - mean) * inv, scaled
+    print((x[8] * 1000.0) as i32); // near mean
+    return 0;
+}

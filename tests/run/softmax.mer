@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 632
+// EXPECT-OUT: 232
+// EXPECT-OUT: 85
+module tests.run.softmax
+
+// Numerically-stable softmax over a fixed vector, in the supported subset (fixed [f32; N]
+// arrays + literal `for` loops). Each pass is an elementwise/reduction loop: the exp pass and
+// the normalize pass vectorize (128-bit x 4); the max and sum passes are reductions. The
+// mercury_bench gate proves the whole thing matches the interpreter bit-for-bit.
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) - 8.0; // -8 .. 7
+    }
+
+    // 1) max for numerical stability
+    let mut m: f32 = x[0];
+    for i in 0..16 {
+        m = fmax(m, x[i]);
+    }
+
+    // 2) exp(x - m)  (vectorized)
+    for i in 0..16 {
+        x[i] = exp(x[i] - m);
+    }
+
+    // 3) sum (reduction)
+    let mut s: f32 = 0.0;
+    for i in 0..16 {
+        s += x[i];
+    }
+
+    // 4) normalize (vectorized; 1/s is an invariant splat)
+    let inv: f32 = 1.0 / s;
+    for i in 0..16 {
+        x[i] = x[i] * inv;
+    }
+
+    // total probability == 1, plus the top three probabilities (descending inputs).
+    let mut tot: f32 = 0.0;
+    for i in 0..16 {
+        tot += x[i];
+    }
+    print(((tot * 1000.0) + 0.5) as i32); // ~1000
+    print((x[15] * 1000.0) as i32); // p(max)
+    print((x[14] * 1000.0) as i32);
+    print((x[13] * 1000.0) as i32);
+    return 0;
+}
