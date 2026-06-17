@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15378
+// EXPECT-OUT: 25378
+// EXPECT-OUT: 24621
+// EXPECT-OUT: 34621
+module tests.run.sdpa
+
+// Fused scaled-dot-product attention: out = softmax(scale·Q·Kᵀ)·V, computed by the runtime
+// flash-attention kernel (no S×S score matrix). One head, S=2 tokens, D=2.
+//
+// With Q = K = I and scale = 1, the score rows are [1,0] and [0,1], so each row's weights are
+// softmax([1,0]) = [e/(e+1), 1/(e+1)] = [0.731059, 0.268941]:
+//   out0 = 0.731059·[1,2] + 0.268941·[3,4] = [1.53788, 2.53788]
+//   out1 = 0.268941·[1,2] + 0.731059·[3,4] = [2.46212, 3.46212]
+// Printed ×10000 (truncated): 15378 / 25378 / 24621 / 34621 — hand-computed, independent of the
+// kernel (the differential gate alone can't catch a recognizer bug, since both backends run it).
+fn main() -> i32 {
+    let q: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let k: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let v: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    sdpa(q, k, v, out, 2, 2, 1.0, 0);
+    print((out[0] * 10000.0) as i32);
+    print((out[1] * 10000.0) as i32);
+    print((out[2] * 10000.0) as i32);
+    print((out[3] * 10000.0) as i32);
+    return 0;
+}
