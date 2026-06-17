@@ -169,10 +169,12 @@ fn fold_int(b: BinOp, x: i128, y: i128, ty: &MirType) -> Option<i128> {
             x.wrapping_div(y)
         }
         UDiv => {
-            if y == 0 {
+            let w = int_bits(ty);
+            let (xu, yu) = (uval(x, w), uval(y, w));
+            if yu == 0 {
                 return None;
             }
-            ((x as u128) / (y as u128)) as i128
+            (xu / yu) as i128
         }
         SRem => {
             if y == 0 {
@@ -181,17 +183,31 @@ fn fold_int(b: BinOp, x: i128, y: i128, ty: &MirType) -> Option<i128> {
             x.wrapping_rem(y)
         }
         URem => {
-            if y == 0 {
+            let w = int_bits(ty);
+            let (xu, yu) = (uval(x, w), uval(y, w));
+            if yu == 0 {
                 return None;
             }
-            ((x as u128) % (y as u128)) as i128
+            (xu % yu) as i128
         }
         And => x & y,
         Or => x | y,
         Xor => x ^ y,
-        Shl => x.wrapping_shl(y as u32),
-        LShr => ((x as u128) >> (y as u32)) as i128,
-        AShr => x >> (y as u32),
+        // Shift count masked to the result width (x86/Cranelift + interpreter semantics):
+        // `1i32 << 32 == 1`. `LShr` is logical, so shift the value's own unsigned width window;
+        // `AShr` is arithmetic, so sign-extend the value to its width first. Mirrors the interpreter.
+        Shl => {
+            let w = int_bits(ty);
+            x.wrapping_shl((y as u32) & (w - 1))
+        }
+        LShr => {
+            let w = int_bits(ty);
+            (uval(x, w) >> ((y as u32) & (w - 1))) as i128
+        }
+        AShr => {
+            let w = int_bits(ty);
+            mask(x, ty) >> ((y as u32) & (w - 1))
+        }
         FAdd | FSub | FMul | FDiv | FRem => return None,
     };
     Some(mask(r, ty))
@@ -365,4 +381,26 @@ fn mask(v: i128, ty: &MirType) -> i128 {
     }
     let shift = 128 - bits;
     (v << shift) >> shift
+}
+
+fn int_bits(ty: &MirType) -> u32 {
+    match ty {
+        MirType::I1 => 1,
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        _ => 64,
+    }
+}
+
+/// Reinterpret the low `bits` of a (sign-extended) value as unsigned. Constants are folded in the
+/// same sign-extended `i128` the interpreter uses, so unsigned folds (`UDiv`/`URem`/`LShr`) must read
+/// only the value's own width as unsigned — matching `mercury_interp` so `-O1` equals `-O0`.
+fn uval(v: i128, bits: u32) -> u128 {
+    if bits >= 128 {
+        v as u128
+    } else {
+        (v as u128) & ((1u128 << bits) - 1)
+    }
 }
