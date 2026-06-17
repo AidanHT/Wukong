@@ -463,18 +463,41 @@ impl<'a> FnTranslator<'a> {
             LShr => self.builder.ins().ushr(a, b),
             AShr => self.builder.ins().sshr(a, b),
             // Guard the divisor so a zero yields 0 instead of trapping, matching the interpreter.
+            // Signed div/rem additionally trap the hardware on `INT_MIN / -1` (2's-complement
+            // overflow), so fold a -1 divisor into the guard and patch the result to the
+            // interpreter's wrapping value (`INT_MIN / -1 == INT_MIN`, `x % -1 == 0`). Unsigned
+            // division never overflows, so -1 there is just an ordinary large divisor.
             SDiv | UDiv | SRem | URem => {
                 let ty = self.dfg_ty(a);
                 let zero = self.builder.ins().iconst(ty, 0);
                 let one = self.builder.ins().iconst(ty, 1);
                 let is_zero = self.builder.ins().icmp(IntCC::Equal, b, zero);
-                let safe = self.builder.ins().select(is_zero, one, b);
+                let is_neg1 = if matches!(op, SDiv | SRem) {
+                    let neg1 = self.builder.ins().iconst(ty, -1);
+                    Some(self.builder.ins().icmp(IntCC::Equal, b, neg1))
+                } else {
+                    None
+                };
+                let danger = match is_neg1 {
+                    Some(n) => self.builder.ins().bor(is_zero, n),
+                    None => is_zero,
+                };
+                let safe = self.builder.ins().select(danger, one, b);
                 let q = match op {
                     SDiv => self.builder.ins().sdiv(a, safe),
                     UDiv => self.builder.ins().udiv(a, safe),
                     SRem => self.builder.ins().srem(a, safe),
                     URem => self.builder.ins().urem(a, safe),
                     _ => unreachable!(),
+                };
+                // `INT_MIN / -1`: the divisor was swapped to 1, so sdiv produced `a` — negate it to
+                // get `-a` (== INT_MIN for INT_MIN). `x % -1 == 0` already falls out of `srem(a, 1)`.
+                let q = match (op, is_neg1) {
+                    (SDiv, Some(n)) => {
+                        let nega = self.builder.ins().ineg(a);
+                        self.builder.ins().select(n, nega, q)
+                    }
+                    _ => q,
                 };
                 self.builder.ins().select(is_zero, zero, q)
             }
