@@ -93,15 +93,16 @@ GFLOP/s (higher is better), naive `ikj` nest in each language:
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
-| 256³ | 90–100 | 86–99 † | 21–41 | 21–42 | **~3.3–4.3×** | **~4.1×** |
-| 512³ | 92–106 | 269–360 | 30–41 | 38–45 | **~2.4–3.0×** | **~8.7×** |
-| 1024³| 76–100 | 395–434 | 22–29 | 25–31 | **~3.4–3.5×** | **~17.9×** |
+| 256³ | 80–100 | 86–99 † | 21–41 | 21–42 | **~2.8–4.3×** | **~3.4–4.1×** |
+| 512³ | 110–126 | 328–462 | 30–41 | 38–45 | **~3.0–3.1×** | **~9×** |
+| 1024³| 102–119 | 437–522 | 22–30 | 25–32 | **~3.4–3.6×** | **~14–18×** |
 
-The single-core kernel holds ~90–105 GFLOP/s (≈80% of one P-core's AVX2-FMA peak; pinned to one
-P-core it is a stable ~105 at 512³), while gcc's naive nest falls from ~40 to ~22 GFLOP/s as 1024²
-spills out of cache — so the **single-thread lead widens with size**. The parallel kernel, after the
-pack-scratch is reused across cache blocks instead of re-allocated per K-block, reaches **~395–434
-GFLOP/s at 1024³ (~18× C)** and ~500 at 2048³.
+The single-core kernel now holds **~110–120 GFLOP/s** at 512³–1024³ — ≈90% of one P-core's AVX2-FMA
+peak (pinned to a P-core it reaches a stable ~117–126) — while gcc's naive nest falls from ~40 to ~22
+GFLOP/s as 1024² spills out of cache, so the **single-thread lead widens with size**. The parallel
+kernel reaches **~437–522 GFLOP/s at 1024³** and **~690 at 2048³** (after the `MC=144` cache-block
+widening cut the B-panel's L3 re-streaming, and the pack-scratch is reused across blocks rather than
+re-allocated per K-block).
 
 † At 256³ the parallel kernel deliberately falls back to the serial one: ~17M MACs is below the
 work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
@@ -111,8 +112,8 @@ there (a measured fix — naive threading at that size was a net *loss*).
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
-| 512² | 81–104 | 251–302 | ~4.0 | ~3.4 | **~19–25×** | **~52–76×** |
-| 1024²| 88–100 | 258–311 | ~3.5 | ~3.4 | **~22–26×** | **~67–75×** |
+| 512² | 81–112 | 251–348 | ~4.0–4.8 | ~3.4–4.5 | **~19–25×** | **~52–76×** |
+| 1024²| 88–108 | 258–457 | ~3.5–4.4 | ~3.4–4.3 | **~22–26×** | **~67–104×** |
 
 C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 GFLOP/s, latency-bound),
 while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
@@ -127,7 +128,7 @@ nest** (the loop everyone writes by hand).
 
 | kernel | Mer (im2col+GEMM) | C (direct) | Rust (direct) | Mercury vs C |
 |--------|-------------------|------------|---------------|--------------|
-| conv2d 3×3 | ~21–32 GFLOP/s | ~3.6–4.4 | ~3.7–6.3 | **~5.8–7.4× faster** |
+| conv2d 3×3 | ~30–40 GFLOP/s | ~3.6–6.6 | ~3.7–6.5 | **~6–7× faster** |
 
 Same result (checksum cross-checked). The conv's GEMM is small (M=64, K=144, N=324) so it runs below
 the large-matmul peak, but it still beats hand-written direct convolution ~6–7× — the im2col gather
@@ -197,12 +198,13 @@ core count — still a clear win over single-threaded C:
 
 - **Compile time:** ~100–260× faster than gcc/rustc (geomean ~135–155×). Robust every run; the metric
   that dominates ML iteration.
-- **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~2.4–22×) and
-  dominates parallel (~2.8–70×)**, and the lead **grows with matrix size** — the compiler tiles,
-  packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds ~100
-  GFLOP/s (≈80% of one P-core's AVX2-FMA peak). This is a reversal of the previous honest loss
-  (single-core matmul used to be ~3× *behind*). The dispatch also fires on **runtime dimensions**, so
-  the win applies to general matmul functions, not only fixed-size kernels.
+- **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~3–26×) and
+  dominates parallel (~9–104×)**, and the lead **grows with matrix size** — the compiler tiles,
+  packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds
+  **~110–120 GFLOP/s** (≈90% of one P-core's AVX2-FMA peak); the parallel one reaches ~520 at 1024³
+  and ~690 at 2048³. This is a reversal of the previous honest loss (single-core matmul used to be ~3×
+  *behind*). The dispatch also fires on **runtime dimensions**, so the win applies to general matmul
+  functions, not only fixed-size kernels.
 - **Transcendentals / activations (exp, log, GELU, SiLU, tanh):** **~5–7.5× faster** than C's scalar
   `libm` — Mercury dispatches the loop to a **256-bit AVX2 ≈1-ULP poly kernel** (`mercury_vmath_f32`),
   where gcc/rustc cannot vectorize a loop with an `expf`/`logf`/`tanhf` call. This is the transformer
