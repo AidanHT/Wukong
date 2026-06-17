@@ -34,7 +34,10 @@ naively-written source:
   form and the textbook `ijk` dot-product form, including the `C = A·Bᵀ` (`nn.Linear`) spelling — and
   lowers the *whole nest* to a tuned **register-blocked, cache-tiled, packed AVX2+FMA GEMM
   microkernel**. This is exactly how XLA/TVM/oneDNN lower a matmul op. gcc/rustc vectorize the inner
-  loop but never tile, pack, or register-block, so they fall out of cache as the matrices grow.
+  loop but never tile, pack, or register-block, so they fall out of cache as the matrices grow. The
+  recognizer also handles the **batched** form (a matmul nest under a batch loop, each index carrying
+  a per-batch offset `x[h*S*D + …]`) — so **multi-head attention** dispatches one tuned GEMM per head,
+  for both its `Q·Kᵀ` and `P·V` matmuls.
 - **Reduction vectorization.** A naive f32 reduction (`s += x[i]*y[i]`) is one FMA down a single
   dependency chain — latency-bound. Mercury reassociates it across vector lanes × unrolled
   accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without `-ffast-math`.

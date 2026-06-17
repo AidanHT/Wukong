@@ -30,11 +30,18 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   to the kernel, not just fixed-size benchmark kernels. The two factors may even be the **same array**
   (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` sharing a buffer) — both sides are read-only. The
   interpreter calls the identical kernel (marshalling its memory), so the two stay bit-exact.
+- **Batched matmul → per-head GEMM dispatch**: a matmul nest wrapped in a batch loop, with each index
+  carrying a per-batch base offset (`x[h*S*D + i*K + k]` — the shape of **multi-head attention**, one
+  matmul per head), also dispatches. The recognizer peels the offset off each flattened index (it
+  must be invariant in the matmul's own `i,j,k`) and the kernel call GEPs each base pointer by it, so
+  every head runs the tuned microkernel instead of a scalar nest. Both the `Q·Kᵀ` and `P·V` matmuls of
+  an MHA forward dispatch (see `tests/run/{batched_matmul,multi_head_attention}.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
-  dot-product attention (`softmax(Q·Kᵀ)·V`), 2D convolution (im2col + matmul), and a full pre-norm
-  (Llama-style) transformer block all lower with their matmuls dispatched to the GEMM kernel and
-  their softmax/GELU/RMSNorm vectorized — and run bit-identically on both backends (see
-  `tests/run/{ffn_block,attention,conv_im2col,transformer_block,rmsnorm,log_softmax}.mer`).
+  dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
+  its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full
+  pre-norm (Llama-style) transformer block all lower with their matmuls dispatched to the GEMM kernel
+  and their softmax/GELU/RMSNorm vectorized — and run bit-identically on both backends (see
+  `tests/run/{ffn_block,attention,multi_head_attention,causal_attention,conv_im2col,transformer_block,rmsnorm,log_softmax}.mer`).
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
   on the native backend. saxpy/poly/relu/relu6 vectorize.
