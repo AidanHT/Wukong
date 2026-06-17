@@ -1,0 +1,335 @@
+//! Vectorized elementwise transcendentals — the **256-bit AVX2** path the Cranelift backend cannot
+//! emit (`f32x8` does not legalize, so the generic vectorizer is stuck at 128-bit SSE). These are the
+//! transformer activation family — `exp`, `log`, `tanh`, `sigmoid` — and they are *compute*-bound (a
+//! ~20-flop minimax polynomial per element), so doubling the SIMD width nearly doubles throughput.
+//!
+//! The compiler recognizes an elementwise `for i { out[i] = f(x[i]) }` loop and lowers it to one
+//! [`mercury_vmath_f32`] call (the same play as the matmul→GEMM dispatch). The interpreter marshals
+//! its abstract memory through the **identical** kernel, so the differential oracle stays bit-for-bit
+//! exact even though the kernel reassociates across lanes.
+//!
+//! The per-element op sequence mirrors the inlined MIR polynomials in `mercury_mir_build`
+//! (`emit_exp_f32` / `emit_log_f32`) — same Cephes constants, same FMA structure — so a dispatched
+//! `exp(x)` agrees with a composed/scalar `exp(x)`. The scalar tail and the no-AVX2 fallback use the
+//! scalar twins (`exp1`/`log1`), which share the constants, so every lane of every path agrees.
+
+// --- op codes (shared with the recognizer in mercury_mir_build) ------------------------------------
+pub const VM_EXP: i64 = 0;
+pub const VM_LOG: i64 = 1;
+pub const VM_TANH: i64 = 2;
+pub const VM_SIGMOID: i64 = 3;
+pub const VM_RELU: i64 = 4;
+
+// --- Cephes single-precision constants (mirror mercury_mir_build's `exp`/`log` poly constants) ----
+const LOG2EF: f32 = std::f32::consts::LOG2_E;
+const EXP_MAGIC: f32 = 12582912.0; // 1.5 * 2^23 — round-to-nearest-even via add-then-subtract
+const EXP_C1: f32 = 0.693359375; // ln2, high part
+const EXP_C2: f32 = -2.1219444e-4; // ln2, low correction
+const EXP_HI: f32 = 88.3762626647949;
+const EXP_LO: f32 = -88.3762626647949;
+const EXP_P: [f32; 6] = [
+    1.98756915e-4,
+    1.3981999507e-3,
+    8.3334519073e-3,
+    4.1665795894e-2,
+    1.6666665459e-1,
+    5.0000001201e-1,
+];
+const LOG_SQRTHF: f32 = std::f32::consts::FRAC_1_SQRT_2; // √0.5
+const INV_2P23: f32 = 1.0 / 8_388_608.0; // 2^-23 (exact)
+const LOG_P: [f32; 9] = [
+    7.0376836292e-2,
+    -1.1514610310e-1,
+    1.1676998740e-1,
+    -1.2420140846e-1,
+    1.4249322787e-1,
+    -1.6668057665e-1,
+    2.0000714765e-1,
+    -2.4999993993e-1,
+    3.3333331174e-1,
+];
+
+// --- scalar twins (the AVX2 tail + the no-AVX2 fallback; mirror the MIR poly element-for-element) --
+
+/// `e^x` (≈1 ULP), the Cephes single-precision algorithm: range-reduce `x = r + n·ln2`, a degree-5
+/// minimax poly for `e^r`, then scale by `2^n` assembled from the IEEE-754 exponent field.
+#[inline]
+fn exp1(x: f32) -> f32 {
+    let x = x.min(EXP_HI).max(EXP_LO);
+    let t = x.mul_add(LOG2EF, EXP_MAGIC);
+    let n = t - EXP_MAGIC;
+    let r = n.mul_add(-EXP_C1, x);
+    let r = n.mul_add(-EXP_C2, r);
+    let mut p = EXP_P[0];
+    p = p.mul_add(r, EXP_P[1]);
+    p = p.mul_add(r, EXP_P[2]);
+    p = p.mul_add(r, EXP_P[3]);
+    p = p.mul_add(r, EXP_P[4]);
+    p = p.mul_add(r, EXP_P[5]);
+    let r2 = r * r;
+    let p = p.mul_add(r2, r) + 1.0;
+    let pow2 = f32::from_bits((((n as i32) + 127) << 23) as u32);
+    p * pow2
+}
+
+/// `ln(x)` for `x > 0` (≈1 ULP), Cephes single-precision: decompose `x = m·2^e`, a degree-8 minimax
+/// poly for `log(m)`, add back `e·ln2` with the same hi/lo split `exp` uses.
+#[inline]
+fn log1(x: f32) -> f32 {
+    let bits = x.to_bits() as i32;
+    let epart = bits & 0x7F80_0000;
+    let efield = (epart as f32) * INV_2P23;
+    let mut e = efield - 126.0;
+    let mant = bits & 0x007F_FFFF;
+    let mbits = mant | 0x3F00_0000;
+    let mut m = f32::from_bits(mbits as u32);
+    let lt = m < LOG_SQRTHF;
+    let m_lt = (m + m) - 1.0;
+    let m_ge = m - 1.0;
+    m = if lt { m_lt } else { m_ge };
+    if lt {
+        e -= 1.0;
+    }
+    let z = m * m;
+    let mut p = LOG_P[0];
+    for &c in &LOG_P[1..] {
+        p = p.mul_add(m, c);
+    }
+    let pm = p * m;
+    let mut y = pm * z;
+    y = e.mul_add(EXP_C2, y);
+    y = z.mul_add(-0.5, y);
+    let r = m + y;
+    e.mul_add(EXP_C1, r)
+}
+
+/// `tanh(x) = 1 - 2/(e^{2x}+1)` — the exp-based form (the activation benchmarks and the MIR lowering
+/// both use it). The clamped `exp` keeps it finite and saturating at ±1 for large |x|.
+#[inline]
+fn tanh1(x: f32) -> f32 {
+    1.0 - 2.0 / (exp1(2.0 * x) + 1.0)
+}
+
+/// `sigmoid(x) = 1/(1 + e^{-x})`.
+#[inline]
+fn sigmoid1(x: f32) -> f32 {
+    1.0 / (1.0 + exp1(-x))
+}
+
+/// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
+#[inline]
+fn apply1(op: i64, x: f32) -> f32 {
+    match op {
+        VM_EXP => exp1(x),
+        VM_LOG => log1(x),
+        VM_TANH => tanh1(x),
+        VM_SIGMOID => sigmoid1(x),
+        VM_RELU => x.max(0.0),
+        _ => x,
+    }
+}
+
+/// `out[i] = f(x[i])` for `i in 0..n`, where `f` is selected by `op` (see the `VM_*` codes). Uses the
+/// 256-bit AVX2 kernels when available (8 lanes/step + a scalar tail), else the scalar fallback. `x`
+/// and `out` may alias (the recognizer allows in-place activations).
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_vmath_f32(x: *const f32, out: *mut f32, n: i64, op: i64) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: features detected; buffers valid for n by the caller contract.
+            unsafe { vmath_avx2(x, out, n, op) };
+            return;
+        }
+    }
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n.
+        unsafe { *out.add(i) = apply1(op, *x.add(i)) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
+    use std::arch::x86_64::*;
+    let f: unsafe fn(__m256) -> __m256 = match op {
+        VM_EXP => exp8,
+        VM_LOG => log8,
+        VM_TANH => tanh8,
+        VM_SIGMOID => sigmoid8,
+        VM_RELU => relu8,
+        _ => return,
+    };
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.add(i));
+        _mm256_storeu_ps(out.add(i), f(v));
+        i += 8;
+    }
+    // Scalar tail (same poly as the lanes, via the scalar twins) for the final < 8 elements.
+    while i < n {
+        *out.add(i) = apply1(op, *x.add(i));
+        i += 1;
+    }
+}
+
+// --- AVX2 kernels (mirror the scalar twins lane-for-lane) -----------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let x = _mm256_min_ps(x, _mm256_set1_ps(EXP_HI));
+    let x = _mm256_max_ps(x, _mm256_set1_ps(EXP_LO));
+    let t = _mm256_fmadd_ps(x, _mm256_set1_ps(LOG2EF), _mm256_set1_ps(EXP_MAGIC));
+    let n = _mm256_sub_ps(t, _mm256_set1_ps(EXP_MAGIC));
+    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_C1), x);
+    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_C2), r);
+    let mut p = _mm256_set1_ps(EXP_P[0]);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[1]));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[2]));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[3]));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[4]));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_P[5]));
+    let r2 = _mm256_mul_ps(r, r);
+    let p = _mm256_fmadd_ps(p, r2, r);
+    let p = _mm256_add_ps(p, _mm256_set1_ps(1.0));
+    // 2^n = bitcast((n + 127) << 23). n is an exact integer in f32, so the truncating convert is exact.
+    let ni = _mm256_cvttps_epi32(n);
+    let biased = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
+    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(biased));
+    _mm256_mul_ps(p, pow2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let bits = _mm256_castps_si256(x);
+    let epart = _mm256_and_si256(bits, _mm256_set1_epi32(0x7F80_0000));
+    let efield = _mm256_mul_ps(_mm256_cvtepi32_ps(epart), _mm256_set1_ps(INV_2P23));
+    let mut e = _mm256_sub_ps(efield, _mm256_set1_ps(126.0));
+    let mant = _mm256_and_si256(bits, _mm256_set1_epi32(0x007F_FFFF));
+    let mbits = _mm256_or_si256(mant, _mm256_set1_epi32(0x3F00_0000));
+    let mut m = _mm256_castsi256_ps(mbits);
+    let lt = _mm256_cmp_ps::<_CMP_LT_OQ>(m, _mm256_set1_ps(LOG_SQRTHF));
+    let one = _mm256_set1_ps(1.0);
+    let m_lt = _mm256_sub_ps(_mm256_add_ps(m, m), one);
+    let m_ge = _mm256_sub_ps(m, one);
+    m = _mm256_blendv_ps(m_ge, m_lt, lt);
+    e = _mm256_blendv_ps(e, _mm256_sub_ps(e, one), lt);
+    let z = _mm256_mul_ps(m, m);
+    let mut p = _mm256_set1_ps(LOG_P[0]);
+    for &c in &LOG_P[1..] {
+        p = _mm256_fmadd_ps(p, m, _mm256_set1_ps(c));
+    }
+    let pm = _mm256_mul_ps(p, m);
+    let mut y = _mm256_mul_ps(pm, z);
+    y = _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C2), y);
+    y = _mm256_fmadd_ps(z, _mm256_set1_ps(-0.5), y);
+    let r = _mm256_add_ps(m, y);
+    _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C1), r)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // 1 - 2/(exp(2x)+1)
+    let e = exp8(_mm256_mul_ps(x, _mm256_set1_ps(2.0)));
+    let d = _mm256_add_ps(e, _mm256_set1_ps(1.0));
+    _mm256_sub_ps(
+        _mm256_set1_ps(1.0),
+        _mm256_div_ps(_mm256_set1_ps(2.0), d),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // 1/(1+exp(-x))
+    let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    let d = _mm256_add_ps(_mm256_set1_ps(1.0), e);
+    _mm256_div_ps(_mm256_set1_ps(1.0), d)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn relu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    _mm256_max_ps(x, _mm256_setzero_ps())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dispatched kernel is ≈1 ULP of `libm` for exp/log/tanh/sigmoid over a representative
+    /// range — the accuracy the cross-language checksum and the activation tests rely on.
+    #[test]
+    fn vmath_matches_libm() {
+        let xs: Vec<f32> = (0..4096).map(|i| (i as f32 - 2048.0) * 0.01).collect();
+        let mut out = vec![0.0f32; xs.len()];
+        let cases: &[(i64, fn(f32) -> f32, f32)] = &[
+            (VM_EXP, |x| x.exp(), 2e-5),
+            (VM_TANH, |x| x.tanh(), 2e-5),
+            (VM_SIGMOID, |x| 1.0 / (1.0 + (-x).exp()), 2e-5),
+        ];
+        for &(op, libm, tol) in cases {
+            unsafe {
+                mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op);
+            }
+            for (i, &x) in xs.iter().enumerate() {
+                let want = libm(x);
+                let got = out[i];
+                assert!(
+                    (got - want).abs() <= tol + tol * want.abs(),
+                    "op {op} x={x}: got {got} want {want}"
+                );
+            }
+        }
+        // log over positive inputs only.
+        let xs: Vec<f32> = (1..4096).map(|i| i as f32 * 0.05).collect();
+        let mut out = vec![0.0f32; xs.len()];
+        unsafe {
+            mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_LOG);
+        }
+        for (i, &x) in xs.iter().enumerate() {
+            let want = x.ln();
+            assert!(
+                (out[i] - want).abs() <= 2e-5 + 2e-5 * want.abs(),
+                "log x={x}: got {} want {want}",
+                out[i]
+            );
+        }
+    }
+
+    /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
+    /// not a multiple of 8 produces a consistent result regardless of where the tail starts.
+    #[test]
+    fn vmath_tail_matches_lanes() {
+        let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
+        for op in [VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU] {
+            if op == VM_LOG {
+                continue; // negative inputs are out of log's domain
+            }
+            let mut full = vec![0.0f32; xs.len()];
+            unsafe {
+                mercury_vmath_f32(xs.as_ptr(), full.as_mut_ptr(), xs.len() as i64, op);
+            }
+            // Recompute each element scalar and require an exact match with the kernel output.
+            for (i, &x) in xs.iter().enumerate() {
+                let s = apply1(op, x);
+                assert_eq!(full[i].to_bits(), s.to_bits(), "op {op} i {i} x {x}");
+            }
+        }
+    }
+}
