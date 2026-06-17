@@ -43,8 +43,10 @@ programs (link as a static lib).
 - `parallel_for` (the closure form) is the **sequential** reference order; `mercury_parallel_for`
   (the C-ABI form) is the **rayon** multicore dispatch. They must agree on observable results for
   data-parallel bodies (the interpreter runs the sequential one, native the parallel one).
-- **GEMM block sizes** (`MR=6, NR=16, MC=72, KC=256, NC=4080`) are tuned for AVX2 + a typical
-  L1/L2/L3 hierarchy. The microkernel keeps 12 `__m256` accumulators (of 16 ymm). AVX-512 is **not**
+- **GEMM block sizes** (`MR=6, NR=16, MC=144, KC=256, NC=4080`) are tuned for AVX2 + a typical
+  L1/L2/L3 hierarchy. The microkernel keeps 12 `__m256` accumulators (of 16 ymm). `MC=144` (a ~144 KB
+  A-block) measured the sweet spot — bigger re-streams the B-panel from L3 fewer times, smaller leaves
+  L2 headroom for the streaming B-block; 216/288 both regressed. Re-measure if you change `KC`/`NR`. AVX-512 is **not**
   used (this CPU lacks it; Cranelift can't emit f32x8 either — `gemm.rs` and `vmath.rs` are the two
   hand-written AVX2 paths that give the compute-bound kernels their 256-bit width).
 - **`mercury_vmath_f32` is also a differential contract.** Like the GEMM, the interpreter marshals its
