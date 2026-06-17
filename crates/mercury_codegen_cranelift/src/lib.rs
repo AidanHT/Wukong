@@ -81,6 +81,8 @@ const RT_SGEMM_NT: &str = "mercury_sgemm_nt";
 const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_VMATH: &str = "mercury_vmath_f32";
+const RT_SREDUCE: &str = "mercury_sreduce_f32";
+const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -733,6 +735,18 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, out, n, op]);
             return None;
         }
+        // The deterministic reduction kernel: mercury_sreduce_f32[_parallel](x, y, n, op) -> f32 —
+        // two pointers, two i64, and an f32 scalar result (the dot/ssd/sum a `@parallel` reduction
+        // loop lowers to). Unlike the void kernels above, this returns the accumulated value.
+        if matches!(name, RT_SREDUCE | RT_SREDUCE_PARALLEL) && args.len() == 4 {
+            let x = self.val(args[0]);
+            let y = self.val(args[1]);
+            let n = self.coerce_to_i64(args[2]);
+            let op = self.coerce_to_i64(args[3]);
+            let fref = self.rt_refs[name];
+            let call = self.builder.ins().call(fref, &[x, y, n, op]);
+            return self.builder.inst_results(call).first().copied();
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -840,6 +854,8 @@ struct RtFuncs {
     sgemm_nt_parallel: FuncId,
     sgemm_nt_epi: FuncId,
     vmath: FuncId,
+    sred: FuncId,
+    sred_par: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -929,6 +945,13 @@ fn populate_module<M: Module>(
     sig_vmath.params.push(AbiParam::new(ptr_ty));
     sig_vmath.params.push(AbiParam::new(types::I64));
     sig_vmath.params.push(AbiParam::new(types::I64));
+    // mercury_sreduce_f32[_parallel](x, y: ptr, n, op: i64) -> f32 — deterministic reduction kernel.
+    let mut sig_sreduce = Signature::new(call_conv);
+    sig_sreduce.params.push(AbiParam::new(ptr_ty));
+    sig_sreduce.params.push(AbiParam::new(ptr_ty));
+    sig_sreduce.params.push(AbiParam::new(types::I64));
+    sig_sreduce.params.push(AbiParam::new(types::I64));
+    sig_sreduce.returns.push(AbiParam::new(types::F32));
     // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
     let mut sig_fmod_f64 = Signature::new(call_conv);
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
@@ -968,6 +991,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         vmath: module
             .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        sred: module
+            .declare_function(RT_SREDUCE, Linkage::Import, &sig_sreduce)
+            .map_err(|e| e.to_string())?,
+        sred_par: module
+            .declare_function(RT_SREDUCE_PARALLEL, Linkage::Import, &sig_sreduce)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -1041,6 +1070,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VMATH,
                 module.declare_func_in_func(rt.vmath, builder.func),
+            );
+            rt_refs.insert(
+                RT_SREDUCE,
+                module.declare_func_in_func(rt.sred, builder.func),
+            );
+            rt_refs.insert(
+                RT_SREDUCE_PARALLEL,
+                module.declare_func_in_func(rt.sred_par, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1172,6 +1209,14 @@ pub fn jit_compile(
         mercury_runtime::mercury_sgemm_nt_epi as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
+    builder.symbol(
+        RT_SREDUCE,
+        mercury_runtime::mercury_sreduce_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SREDUCE_PARALLEL,
+        mercury_runtime::mercury_sreduce_f32_parallel as *const u8,
+    );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -1257,6 +1302,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         mercury_runtime::mercury_sgemm_nt_epi as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
+    builder.symbol(
+        RT_SREDUCE,
+        mercury_runtime::mercury_sreduce_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SREDUCE_PARALLEL,
+        mercury_runtime::mercury_sreduce_f32_parallel as *const u8,
+    );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
