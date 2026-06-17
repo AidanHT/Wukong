@@ -40,6 +40,7 @@ pub fn lower_program(
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         vmath: interner.intern("mercury_vmath_f32"),
+        sred_par: interner.intern("mercury_sreduce_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -70,8 +71,14 @@ pub fn lower_program(
                         program.funcs.push(wrapper);
                         continue;
                     }
+                    // A `@parallel` function that is not a single elementwise loop — e.g. a reduction
+                    // (`let mut s = 0; for k { s += x[k]*y[k] }; …`). Lower it normally, but with any
+                    // recognized reduction loop dispatched to the multicore reduction kernel.
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
                 }
-                let func = lower_fn(f, body, sema, interner, gemm, &mut diags);
+                let func = lower_fn(f, body, sema, interner, gemm, false, &mut diags);
                 program.funcs.push(func);
             }
         }
@@ -148,6 +155,7 @@ fn lower_fn(
     sema: &SemaResult,
     interner: &Interner,
     gemm: GemmSyms,
+    parallel_fn: bool,
     diags: &mut Vec<Diagnostic>,
 ) -> Function {
     // Recover the resolved signature for parameter/return types.
@@ -166,6 +174,7 @@ fn lower_fn(
         terminated: false,
         loops: Vec::new(),
         gemm,
+        parallel_fn,
         vec_loads: HashMap::new(),
     };
 
@@ -241,6 +250,7 @@ fn lower_parallel(
             terminated: false,
             loops: Vec::new(),
             gemm,
+            parallel_fn: false,
             vec_loads: HashMap::new(),
         };
         let start = fl.builder.add_param(MirType::I64);
@@ -285,6 +295,7 @@ fn lower_parallel(
             terminated: false,
             loops: Vec::new(),
             gemm,
+            parallel_fn: false,
             vec_loads: HashMap::new(),
         };
         let param_vals: Vec<ValueId> = param_tys
@@ -349,6 +360,10 @@ struct GemmSyms {
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
+    /// The multicore deterministic f32 reduction kernel (`mercury_sreduce_f32_parallel(x, y, n, op)
+    /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
+    /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
+    sred_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -359,6 +374,12 @@ const VMATH_TANH: u32 = 2;
 const VMATH_SIGMOID: u32 = 3;
 const VMATH_SILU: u32 = 5;
 const VMATH_GELU: u32 = 6;
+
+// Reduction op codes — must match `mercury_runtime::reduce`'s `RED_*`. `x[k]*x[k]` recognizes as
+// `RED_DOT` with both bases equal (≡ sum-of-squares), so the recognizer needs only these three.
+const RED_DOT: i64 = 0; // sum(x[k] * y[k])
+const RED_SSD: i64 = 1; // sum((x[k] - y[k])^2)
+const RED_SUM: i64 = 2; // sum(x[k])
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -371,6 +392,9 @@ struct FnLowerer<'a> {
     loops: Vec<(mercury_mir::BlockId, mercury_mir::BlockId)>,
     /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
     gemm: GemmSyms,
+    /// True while lowering the body of a `@parallel` function: a recognized reduction loop dispatches
+    /// to the multicore `mercury_sreduce_f32_parallel` instead of the sequential vectorizer.
+    parallel_fn: bool,
     /// Within one vectorized loop-body copy, the vector already loaded for an index expression
     /// (keyed by its canonical text), so `x[i]` read twice (e.g. relu's `if x[i]>0 {x[i]}`) loads
     /// once. Cleared between unroll copies (addresses differ) and after any store (avoid staleness).
@@ -823,6 +847,157 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Recognize a kernel-dispatchable reduction body `s = s + f(x[k], y[k])` (or `s += …`) over the
+    /// loop variable `k`: dot `x[k]*y[k]`, ssd `(x[k]-y[k])*(x[k]-y[k])`, or sum `x[k]`. Returns the
+    /// accumulator symbol, the `RED_*` op code, and the two array bases (`y == x` for the unary sum).
+    /// Strict pure-AST match — single statement, index exactly `k`.
+    fn match_reduction_kernel(
+        &self,
+        body: &Block,
+        k: Symbol,
+    ) -> Option<(Symbol, i64, Symbol, Symbol)> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign { target, op, value } = &body.stmts[0].kind else {
+            return None;
+        };
+        let s = single_path(target)?;
+        if s == k {
+            return None;
+        }
+        // `s += addend`, or `s = s + addend` / `s = addend + s`.
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(s) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(s) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if expr_uses_sym(addend, s) {
+            return None;
+        }
+        // `base[k]` with the index exactly the loop variable → the base array symbol.
+        let idx_base = |e: &Expr| -> Option<Symbol> {
+            let ExprKind::Index { base, indices } = &e.kind else {
+                return None;
+            };
+            if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+                return None;
+            }
+            single_path(base)
+        };
+        match &addend.kind {
+            // dot `a[k]*b[k]` (a==b ≡ sum-of-squares), or ssd `(a[k]-b[k])*(a[k]-b[k])`.
+            ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } => {
+                if let (
+                    ExprKind::Binary {
+                        op: ast::BinOp::Sub,
+                        lhs: l1,
+                        rhs: r1,
+                    },
+                    ExprKind::Binary {
+                        op: ast::BinOp::Sub,
+                        lhs: l2,
+                        rhs: r2,
+                    },
+                ) = (&lhs.kind, &rhs.kind)
+                {
+                    let (a1, b1, a2, b2) =
+                        (idx_base(l1)?, idx_base(r1)?, idx_base(l2)?, idx_base(r2)?);
+                    return if a1 == a2 && b1 == b2 {
+                        Some((s, RED_SSD, a1, b1))
+                    } else {
+                        None
+                    };
+                }
+                Some((s, RED_DOT, idx_base(lhs)?, idx_base(rhs)?))
+            }
+            // sum `a[k]`.
+            ExprKind::Index { .. } => {
+                let a = idx_base(addend)?;
+                Some((s, RED_SUM, a, a))
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower a recognized `@parallel` reduction `for k in 0..n { s += f(x[k], y[k]) }` to one
+    /// `s = s + mercury_sreduce_f32_parallel(x, y, n, op)`. The kernel returns the same value the loop
+    /// would (a reassociation of the same terms), and the interpreter calls the identical *serial*
+    /// kernel — which is bit-equal to the parallel one — so native and interp agree. Returns false
+    /// (fall back to the scalar/vector loop) unless the range is `0..n`, the accumulator is an
+    /// in-scope f32 scalar, and both arrays are in scope.
+    fn try_emit_parallel_reduction(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        // Only `0..n`; a non-zero start would need a pointer/length shift the call does not do.
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((s, op, xb, yb)) = self.match_reduction_kernel(body, *k) else {
+            return false;
+        };
+        // Accumulator must be an in-scope f32 scalar; both arrays must be in scope (base pointers).
+        let Some((s_slot, MirType::F32)) = self.lookup(s) else {
+            return false;
+        };
+        let (Some((xv, _)), Some((yv, _))) = (self.lookup(xb), self.lookup(yb)) else {
+            return false;
+        };
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let result = self.builder.build(
+            MirType::F32,
+            Op::Call {
+                func: self.gemm.sred_par,
+                args: vec![xv, yv, n, opv],
+            },
+        );
+        // s = s + result — matches the loop's `s_final = s_init + Σ` (reassociated inside the kernel).
+        let cur = self.builder.build(MirType::F32, Op::Load(s_slot, MirType::F32));
+        let new_s = self
+            .builder
+            .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result));
+        self.builder.build_void(Op::Store {
+            ptr: s_slot,
+            value: new_s,
+        });
+        true
+    }
+
     fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
         // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
         // whole-function `@parallel` form is handled earlier in `lower_program`).
@@ -830,6 +1005,11 @@ impl FnLowerer<'_> {
             if self.emit_sgemm(&nest, false) {
                 return;
             }
+        }
+        // Inside a `@parallel` function, a recognized reduction loop (`s += x[k]*y[k]`, etc.) lowers
+        // to one multicore `mercury_sreduce_f32_parallel` call instead of the sequential vectorizer.
+        if self.parallel_fn && self.try_emit_parallel_reduction(pat, iter, body) {
+            return;
         }
         let (start, end, inclusive, step) = match iter {
             ForIter::Range {
@@ -4526,6 +4706,7 @@ fn lower_matmul_fn(
         terminated: false,
         loops: Vec::new(),
         gemm,
+        parallel_fn: false,
         vec_loads: HashMap::new(),
     };
     let param_vals: Vec<ValueId> = param_tys
