@@ -1125,6 +1125,13 @@ impl FnLowerer<'_> {
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && *lane == Some(MirType::F32)
                 }
+                Some(MathIntrinsic::Pow) => {
+                    // pow = exp(y·log(x)); two args, f32 lane only (same reason as exp/log).
+                    args.len() == 2
+                        && self.vec_check_value(&args[0], j, locals, lane, acc)
+                        && self.vec_check_value(&args[1], j, locals, lane, acc)
+                        && *lane == Some(MirType::F32)
+                }
                 None => false,
             },
             _ => false,
@@ -1873,6 +1880,13 @@ impl FnLowerer<'_> {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_log_f32(x, vty)
                 }
+                Some(MathIntrinsic::Pow) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let y = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    let lx = self.emit_log_f32(x, vty);
+                    let ylx = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, y, lx));
+                    self.emit_exp_f32(ylx, vty)
+                }
                 Some(MathIntrinsic::Tanh) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_tanh(x, vty)
@@ -2543,6 +2557,18 @@ impl FnLowerer<'_> {
             MathIntrinsic::Log => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_log(x, &rty))
+            }
+            MathIntrinsic::Pow => {
+                // pow(x, y) = exp(y * log(x)), reusing the two polynomials (so it vectorizes and is
+                // bit-exact across backends for free). Defined for x > 0, like the rest of the suite.
+                if args.len() != 2 {
+                    return None;
+                }
+                let x = self.lower_expr(&args[0]);
+                let y = self.lower_expr(&args[1]);
+                let lx = self.emit_log(x, &rty);
+                let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
+                Some(self.emit_exp(ylx, &rty))
             }
             MathIntrinsic::Tanh => {
                 let x = self.lower_expr(args.first()?);
@@ -3930,6 +3956,7 @@ enum MathIntrinsic {
     Rsqrt,
     Exp,
     Log,
+    Pow,
     Tanh,
     Sigmoid,
     Fmax,
@@ -3942,6 +3969,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "rsqrt" => MathIntrinsic::Rsqrt,
         "exp" => MathIntrinsic::Exp,
         "log" => MathIntrinsic::Log,
+        "pow" => MathIntrinsic::Pow,
         "tanh" => MathIntrinsic::Tanh,
         "sigmoid" => MathIntrinsic::Sigmoid,
         "fmax" => MathIntrinsic::Fmax,
