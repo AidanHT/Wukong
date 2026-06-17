@@ -120,10 +120,10 @@ nest** (the loop everyone writes by hand).
 
 | kernel | Mer (im2col+GEMM) | C (direct) | Rust (direct) | Mercury vs C |
 |--------|-------------------|------------|---------------|--------------|
-| conv2d 3×3 | ~21 GFLOP/s | ~3.6 | ~3.7 | **~5.8× faster** |
+| conv2d 3×3 | ~21–32 GFLOP/s | ~3.6–4.4 | ~3.7–6.3 | **~5.8–7.4× faster** |
 
 Same result (checksum cross-checked). The conv's GEMM is small (M=64, K=144, N=324) so it runs below
-the large-matmul peak, but it still beats hand-written direct convolution ~5.8× — the im2col gather
+the large-matmul peak, but it still beats hand-written direct convolution ~6–7× — the im2col gather
 is cheap data movement and the GEMM microkernel does the FLOPs. So Mercury accelerates conv *for
 free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 
@@ -143,7 +143,7 @@ gcc/rustc call scalar `libm` `expf`/`tanhf` and cannot vectorize a loop containi
 | `tanh` | **~2.7–2.9× faster** | identical exp-based algorithm everywhere; Mercury vectorizes it |
 
 The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
-`tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all vectorize. Every kernel passes the
+`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all vectorize. Every kernel passes the
 cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and compiles ~45–150×
 faster. These are compute-bound (the poly is ~20 flops/element), so the win is real SIMD throughput,
 not bandwidth. `softmax`/`layernorm`/`gelu` and **log-softmax / cross-entropy** (`exp` + `log`) run as
@@ -191,7 +191,7 @@ core count — still a clear win over single-threaded C:
   activation family and the cleanest compute-bound elementwise win; softmax/layernorm/GELU and
   log-softmax/cross-entropy run as fused vectorized-loop chains.
 - **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Mercury runs a 3×3 conv
-  **~5.8× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
+  **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
   recognizer accelerates conv for free.
 - **Reductions:** ~2.6–2.8× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
   row-max).
