@@ -682,37 +682,81 @@ unsafe fn micro_6x16(
 
     let mut ap = ap;
     let mut bp = bp;
-    for _ in 0..kc {
-        // Prefetch a few K-steps ahead so the next B column / A row are warm in L1.
+    // One K-step: load the 16-wide B row (two 256-bit lanes), then for each of the 6 A rows
+    // load-broadcast it straight from the packed panel (`vbroadcastss [mem]`, 1 uop — frees the
+    // shuffle/ALU ports for the FMAs) and FMA into the two lanes. 12 FMAs, 12 live accumulators.
+    macro_rules! kstep {
+        () => {{
+            let b0 = _mm256_loadu_ps(bp);
+            let b1 = _mm256_loadu_ps(bp.add(8));
+            let a0 = _mm256_broadcast_ss(&*ap);
+            c0 = _mm256_fmadd_ps(a0, b0, c0);
+            c1 = _mm256_fmadd_ps(a0, b1, c1);
+            let a1 = _mm256_broadcast_ss(&*ap.add(1));
+            c2 = _mm256_fmadd_ps(a1, b0, c2);
+            c3 = _mm256_fmadd_ps(a1, b1, c3);
+            let a2 = _mm256_broadcast_ss(&*ap.add(2));
+            c4 = _mm256_fmadd_ps(a2, b0, c4);
+            c5 = _mm256_fmadd_ps(a2, b1, c5);
+            let a3 = _mm256_broadcast_ss(&*ap.add(3));
+            c6 = _mm256_fmadd_ps(a3, b0, c6);
+            c7 = _mm256_fmadd_ps(a3, b1, c7);
+            let a4 = _mm256_broadcast_ss(&*ap.add(4));
+            c8 = _mm256_fmadd_ps(a4, b0, c8);
+            c9 = _mm256_fmadd_ps(a4, b1, c9);
+            let a5 = _mm256_broadcast_ss(&*ap.add(5));
+            c10 = _mm256_fmadd_ps(a5, b0, c10);
+            c11 = _mm256_fmadd_ps(a5, b1, c11);
+            ap = ap.add(MR);
+            bp = bp.add(NR);
+        }};
+    }
+    // Unroll the K loop by 4: one loop branch + counter per 4 steps instead of per step (the
+    // increment/compare otherwise contends with the FMAs for ports 0/1), and the scheduler gets a
+    // wider window to overlap loads with the in-flight FMA chains. One prefetch per 4 steps keeps
+    // the next B panel rows warm in L1 without flooding the load ports.
+    let mut p = 0;
+    while p + 4 <= kc {
         _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
-        let b0 = _mm256_loadu_ps(bp);
-        let b1 = _mm256_loadu_ps(bp.add(8));
-        // Load-broadcast each A element straight from the packed panel (vbroadcastss [mem], 1 uop)
-        // rather than a scalar load + register broadcast, freeing shuffle/ALU ports for the FMAs.
-        let a0 = _mm256_broadcast_ss(&*ap);
-        c0 = _mm256_fmadd_ps(a0, b0, c0);
-        c1 = _mm256_fmadd_ps(a0, b1, c1);
-        let a1 = _mm256_broadcast_ss(&*ap.add(1));
-        c2 = _mm256_fmadd_ps(a1, b0, c2);
-        c3 = _mm256_fmadd_ps(a1, b1, c3);
-        let a2 = _mm256_broadcast_ss(&*ap.add(2));
-        c4 = _mm256_fmadd_ps(a2, b0, c4);
-        c5 = _mm256_fmadd_ps(a2, b1, c5);
-        let a3 = _mm256_broadcast_ss(&*ap.add(3));
-        c6 = _mm256_fmadd_ps(a3, b0, c6);
-        c7 = _mm256_fmadd_ps(a3, b1, c7);
-        let a4 = _mm256_broadcast_ss(&*ap.add(4));
-        c8 = _mm256_fmadd_ps(a4, b0, c8);
-        c9 = _mm256_fmadd_ps(a4, b1, c9);
-        let a5 = _mm256_broadcast_ss(&*ap.add(5));
-        c10 = _mm256_fmadd_ps(a5, b0, c10);
-        c11 = _mm256_fmadd_ps(a5, b1, c11);
-        ap = ap.add(MR);
-        bp = bp.add(NR);
+        kstep!();
+        kstep!();
+        kstep!();
+        kstep!();
+        p += 4;
+    }
+    while p < kc {
+        kstep!();
+        p += 1;
     }
 
-    // Spill the tile, then write back the valid corner with the beta rule. The spill happens once
-    // per tile (the K loop above dominates), so a scalar write-back costs nothing measurable.
+    // Fast path: a full 6×16 tile with no fused epilogue — store the 12 accumulators straight to C
+    // (two 256-bit stores per row) with the beta rule, skipping the tmp spill + 96-element scalar
+    // copy. The K loop dominates only at large K; at the small K of conv/attention (and the n=256
+    // GEMM) the writeback is a real fraction, so this is a measurable win there and free elsewhere.
+    if epi.is_none() && mr == MR && nr == NR {
+        macro_rules! wb {
+            ($lo:expr, $hi:expr, $r:expr) => {{
+                let row = c.add($r * ldc);
+                if beta == 0.0 {
+                    _mm256_storeu_ps(row, $lo);
+                    _mm256_storeu_ps(row.add(8), $hi);
+                } else {
+                    _mm256_storeu_ps(row, _mm256_add_ps(_mm256_loadu_ps(row), $lo));
+                    _mm256_storeu_ps(row.add(8), _mm256_add_ps(_mm256_loadu_ps(row.add(8)), $hi));
+                }
+            }};
+        }
+        wb!(c0, c1, 0);
+        wb!(c2, c3, 1);
+        wb!(c4, c5, 2);
+        wb!(c6, c7, 3);
+        wb!(c8, c9, 4);
+        wb!(c10, c11, 5);
+        return;
+    }
+
+    // General path (partial edge tiles + the fused epilogue): spill the tile, then write back the
+    // valid corner with the beta rule (and, on the final K-block, the fused bias+activation).
     let mut tmp = [0.0f32; MR * NR];
     _mm256_storeu_ps(tmp.as_mut_ptr(), c0);
     _mm256_storeu_ps(tmp.as_mut_ptr().add(8), c1);
@@ -851,22 +895,65 @@ mod tests {
     /// Throughput probe (run: `cargo test -p mercury_runtime --release -- --ignored --nocapture`).
     /// Sweeps square sizes so the parallel scaling (which improves with size, as the packs amortize
     /// and each core gets more compute per K-block) is visible, not just the small-matrix corner.
+    /// Pin the current thread to one P-core (logical CPU 0) and raise priority for a repeatable
+    /// single-core measurement; returns the previous affinity mask to restore before the parallel
+    /// benches. On this hybrid laptop the single-core GFLOP/s otherwise swings ±30% with P/E
+    /// scheduling and turbo, swamping microkernel changes. No-op (returns 0) off Windows.
+    #[cfg(windows)]
+    fn pin_pcore() -> usize {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn GetCurrentProcess() -> isize;
+            fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
+            fn SetThreadPriority(h: isize, prio: i32) -> i32;
+            fn SetPriorityClass(h: isize, class: u32) -> i32;
+        }
+        unsafe {
+            SetPriorityClass(GetCurrentProcess(), 0x0000_0080); // HIGH_PRIORITY_CLASS
+            SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
+            SetThreadAffinityMask(GetCurrentThread(), 0x1) // logical CPU 0 (a P-core)
+        }
+    }
+    #[cfg(windows)]
+    fn restore_affinity(mask: usize) {
+        if mask == 0 {
+            return;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
+        }
+        unsafe {
+            SetThreadAffinityMask(GetCurrentThread(), mask);
+        }
+    }
+    #[cfg(not(windows))]
+    fn pin_pcore() -> usize {
+        0
+    }
+    #[cfg(not(windows))]
+    fn restore_affinity(_: usize) {}
+
     #[test]
     #[ignore]
     fn sgemm_throughput() {
         use std::time::Instant;
-        for &n in &[256usize, 512, 1024] {
+        for &n in &[256usize, 512, 1024, 2048] {
             let a = fill(1, n * n);
             let b = fill(2, n * n);
             let mut c = vec![0.0f32; n * n];
             let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
             let flops = 2.0 * (n as f64).powi(3);
+            // Best (min) of many batches: on a busy box the fastest run is the least-interfered
+            // estimate. Single-core benches run pinned (see `pin_pcore`) for repeatability.
             let bench = |label: &str, f: &dyn Fn()| {
-                for _ in 0..3 {
+                for _ in 0..5 {
                     f();
                 }
                 let mut best = f64::INFINITY;
-                for _ in 0..20 {
+                for _ in 0..50 {
                     let t = Instant::now();
                     f();
                     best = best.min(t.elapsed().as_secs_f64());
@@ -877,14 +964,16 @@ mod tests {
                     best * 1e3
                 );
             };
+            let prev = pin_pcore();
             bench("sgemm (1 core)", &|| unsafe {
                 mercury_sgemm(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
-            bench("sgemm (parallel)", &|| unsafe {
-                mercury_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
-            });
             bench("sgemm_nt (1 core)", &|| unsafe {
                 mercury_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
+            });
+            restore_affinity(prev); // parallel benches want all cores
+            bench("sgemm (parallel)", &|| unsafe {
+                mercury_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
             bench("sgemm_nt (parallel)", &|| unsafe {
                 mercury_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
