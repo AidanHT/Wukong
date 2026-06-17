@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5205
+// EXPECT-OUT: 8427
+// EXPECT-OUT: 9953
+// EXPECT-OUT: -8427
+// EXPECT-OUT: 8413
+// EXPECT-OUT: 19545
+// EXPECT-OUT: -1586
+// EXPECT-OUT: 8427
+module tests.run.erf
+
+// The Gauss error function `erf`, built from primitive ops + the `exp` polynomial (so both backends
+// agree bit-for-bit and it vectorizes in elementwise loops). Its headline use is **exact GELU**,
+// `0.5·x·(1 + erf(x/√2))` — the original BERT/GPT-2/ViT activation (vs the tanh approximation the
+// suite already had). Values below match true erf to f32 precision; erf is odd, so erf(-1) = -erf(1).
+fn main() -> i32 {
+    // scalar erf at known points (true: 0.5205, 0.8427, 0.9953, -0.8427).
+    print((erf(0.5) * 10000.0) as i32); // 5205
+    print((erf(1.0) * 10000.0) as i32); // 8427
+    print((erf(2.0) * 10000.0) as i32); // 9953
+    print((erf(-1.0) * 10000.0) as i32); // -8427  (odd-function sign)
+
+    // exact GELU(x) = 0.5·x·(1 + erf(x/√2)).  GELU(1)=0.8413, GELU(2)=1.9545, GELU(-1)=-0.1586.
+    let inv_sqrt2: f32 = 0.70710678;
+    let g1: f32 = 0.5 * 1.0 * (1.0 + erf(1.0 * inv_sqrt2));
+    let g2: f32 = 0.5 * 2.0 * (1.0 + erf(2.0 * inv_sqrt2));
+    let gm: f32 = 0.5 * (0.0 - 1.0) * (1.0 + erf((0.0 - 1.0) * inv_sqrt2));
+    print((g1 * 10000.0) as i32); // 8413
+    print((g2 * 10000.0) as i32); // 19545
+    print((gm * 10000.0) as i32); // -1586
+
+    // vectorized: erf over an array lowers to SIMD (f32 lane). Fill xs with 1.0 so each lane is
+    // erf(1.0) = 0.8427; read back lane 9 to prove the vector path agrees with the scalar one.
+    let mut xs: [f32; 16] = [1.0; 16];
+    let mut ys: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        ys[i] = erf(xs[i]);
+    }
+    print((ys[9] * 10000.0) as i32); // 8427
+    return 0;
+}
