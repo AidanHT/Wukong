@@ -685,6 +685,33 @@ fn kernels() -> Vec<Kernel> {
                  *out.add(i)=0.5*v*(1.0+t); }",
             ),
         },
+        // SiLU / swish: x * sigmoid(x), the activation in Llama/modern transformers. sigmoid is one
+        // intrinsic that vectorizes; C/Rust spell it 1/(1+exp(-x)) with a scalar libm expf.
+        Kernel {
+            name: "silu",
+            bytes_per_call: 2 * N * 4,
+            note: "x*sigmoid(x) (swish): Mercury vectorizes sigmoid; C/Rust call scalar expf",
+            mer: mer_kernel(&format!(
+                "for i in 0..{nlit} {{ out[i] = x[i] * sigmoid(x[i]); }}"
+            )),
+            c: c_kernel("for(long i=0;i<N;i++){ float v=x[i]; out[i]=v/(1.0f+expf(-v)); }"),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); *out.add(i)=v/(1.0f32+(-v).exp()); }",
+            ),
+        },
+        // tanh activation, the *identical* exp-based algorithm in all three (Mercury vectorizes it).
+        Kernel {
+            name: "tanh",
+            bytes_per_call: 2 * N * 4,
+            note: "tanh via exp, same algorithm everywhere; Mercury vectorizes the exp",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = tanh(x[i]); }}")),
+            c: c_kernel(
+                "for(long i=0;i<N;i++){ float v=x[i]; out[i]=1.0f-2.0f/(expf(2.0f*v)+1.0f); }",
+            ),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); *out.add(i)=1.0f32-2.0/((2.0*v).exp()+1.0); }",
+            ),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
