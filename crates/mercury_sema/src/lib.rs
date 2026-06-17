@@ -812,6 +812,24 @@ mod tests {
     }
 
     #[test]
+    fn math_intrinsics_are_typed_as_float() {
+        // sqrt/rsqrt/exp/fmax/fmin are lowered directly by the backends, so sema gives them a real
+        // float result type (not the lenient `Unknown`): kernels type-check and lowering knows the
+        // result is a float.
+        let ok = "fn f(x: f32, y: f32) -> f32 { \
+                  let a = sqrt(x); let b = exp(y); let c = fmax(a, b); return rsqrt(c); }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        // Because the result is `f32` (not `Unknown`), binding it to a non-float annotation must
+        // conflict — this distinguishes the modeled signature from the lenient fallback.
+        let bad = "fn f(x: f32) { let n: i64 = exp(x); }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a type mismatch: {:?}",
+            errors(bad)
+        );
+    }
+
+    #[test]
     fn let_annotation_mismatch_errors() {
         let (diags, _) = analyze("fn f() { let x: f32 = true; }");
         assert!(diags.iter().any(|d| d.code == Some("E0401")));
