@@ -54,14 +54,15 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `fmax`/`fmin` reductions (`m = fmax(m, x[i])`, softmax's row-max) vectorize the same way.
 - **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP `f32` minimax
   polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
-  `0.5·x·(1+erf(x/√2))`), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all
+  `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
+  position embeddings), `tanh`/`sigmoid` (built on `exp`), and `fmax`/`fmin` — all
   built from primitive ops
   both backends already agree on bit-for-bit, and all **vectorize** in elementwise loops. So softmax,
   layernorm, GELU (both the tanh approximation and the exact erf form), SiLU/swish, tanh activations,
-  and **log-softmax / cross-entropy** lower to SIMD
+  RoPE, and **log-softmax / cross-entropy** lower to SIMD
   instead of scalar `libm` calls and run **~2.5–3.5× faster** than gcc/rustc's scalar
-  `expf`/`logf`/`tanhf` (`log` shows the largest margin). See
-  `tests/run/{transcendental,softmax,layernorm,gelu,activations,log,erf,log_softmax,ffn_block}.mer`.
+  `expf`/`logf`/`tanhf`/`sinf` (`log` shows the largest margin). See
+  `tests/run/{transcendental,softmax,layernorm,gelu,activations,log,erf,trig,log_softmax,ffn_block}.mer`.
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
   runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
