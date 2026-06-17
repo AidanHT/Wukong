@@ -659,6 +659,17 @@ fn kernels() -> Vec<Kernel> {
             c: c_kernel("for(long i=0;i<N;i++) out[i]=expf(x[i]);"),
             rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).exp(); }"),
         },
+        // Natural log, the partner of exp (log-softmax / cross-entropy). The x buffer is all
+        // positive (≥1), so this is a clean domain. Mercury vectorizes a ~1-ULP Cephes poly; C/Rust
+        // call scalar libm logf.
+        Kernel {
+            name: "log",
+            bytes_per_call: 2 * N * 4,
+            note: "out = log(x): Mercury vectorizes a ~1-ULP poly; C/Rust call scalar libm logf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = log(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=logf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).ln(); }"),
+        },
         // GELU (tanh approximation) written with the *identical* algorithm in all three languages —
         // tanh(z) built from exp as `1 - 2/(exp(2z)+1)`. The only difference is that Mercury
         // auto-vectorizes the exp; C/Rust call scalar expf. The fairest transcendental comparison.
