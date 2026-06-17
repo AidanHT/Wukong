@@ -34,6 +34,54 @@ fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
 }
 
+// Fused-epilogue activation codes (shared with the compiler's recognizer in `mercury_mir_build`).
+// `ACT_IDENTITY` is the implicit passthrough (the kernel only branches on `ACT_RELU`), but it names
+// the protocol value 0 the compiler emits, so it is kept for clarity and used by the tests.
+#[allow(dead_code)]
+const ACT_IDENTITY: u32 = 0;
+const ACT_RELU: u32 = 1;
+
+/// A fused GEMM epilogue, applied to each `C` element **on the final K-block writeback only**:
+/// `c = act(c + bias[col])`. `bias` is null for no bias; `act` is [`ACT_IDENTITY`] or [`ACT_RELU`].
+/// Folding it here means `C` is written once with the bias+activation already applied, instead of a
+/// separate read-modify-write pass over `C` — the memory traffic a `linear → bias → act` otherwise
+/// pays. Both backends call the identical kernel, so the fused result stays bit-for-bit exact.
+#[derive(Clone, Copy)]
+struct Epilogue {
+    bias: *const f32,
+    act: u32,
+}
+
+impl Epilogue {
+    /// Apply the epilogue to value `x` at tile-local column `j` (relative to this epilogue's bias
+    /// base). `# Safety`: `bias`, when non-null, must be valid at index `j`.
+    #[inline]
+    unsafe fn apply(&self, x: f32, j: usize) -> f32 {
+        let mut y = x;
+        if !self.bias.is_null() {
+            y += *self.bias.add(j);
+        }
+        if self.act == ACT_RELU {
+            y = y.max(0.0);
+        }
+        y
+    }
+
+    /// This epilogue with its bias base advanced by `cols` columns (null stays null).
+    #[inline]
+    fn shift(&self, cols: usize) -> Epilogue {
+        Epilogue {
+            // SAFETY: callers shift only within the C column range the bias array covers.
+            bias: if self.bias.is_null() {
+                self.bias
+            } else {
+                unsafe { self.bias.add(cols) }
+            },
+            act: self.act,
+        }
+    }
+}
+
 /// `C = A·B` with `beta` (0 = overwrite, else accumulate). Single-threaded. Row-major.
 ///
 /// # Safety
@@ -48,7 +96,7 @@ pub unsafe extern "C" fn mercury_sgemm(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, false, false);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, false, None);
 }
 
 /// `C = A·Bᵀ` (B is row-major `[n, k]`), the `nn.Linear` / `x @ Wᵀ` form — the most common matmul
@@ -66,7 +114,34 @@ pub unsafe extern "C" fn mercury_sgemm_nt(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, true, false);
+    gemm_dispatch(a, b, c, m, k, n, beta, true, false, None);
+}
+
+/// `C = act(A·Bᵀ + bias)` — the `nn.Linear` form with a fused bias-add + activation epilogue, folded
+/// into the GEMM's C-tile writeback so `C` is written once (no separate read-modify-write pass). The
+/// compiler lowers a `matmul → bias-add → activation` chain to this. `bias` may be null (no bias) and
+/// must otherwise be valid for `n` `f32`; `act` is 0 (identity) or 1 (ReLU). `beta` rule as usual.
+/// Single-threaded (the epilogue folds into the serial writeback).
+///
+/// # Safety
+/// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32`; `bias` null or valid for `n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_nt_epi(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+) {
+    let epi = Epilogue {
+        bias,
+        act: act as u32,
+    };
+    gemm_dispatch(a, b, c, m, k, n, beta, true, false, Some(epi));
 }
 
 /// Pick AVX2 vs scalar and serial vs parallel; `bt` selects `C = A·Bᵀ`.
@@ -84,6 +159,7 @@ unsafe fn gemm_dispatch(
     beta: i64,
     bt: bool,
     par: bool,
+    epi: Option<Epilogue>,
 ) {
     if m <= 0 || k <= 0 || n <= 0 {
         return;
@@ -93,8 +169,9 @@ unsafe fn gemm_dispatch(
     // Multi-thread only above a work threshold: below it, cross-core wake/sync (worse on this
     // P+E-core hybrid, where the E-cores are slow to spin up) costs more than it saves and the
     // parallel path is a net loss — empirically ~256^3 runs faster on one core than across all of
-    // them. The serial AVX2 kernel is the fast path for everything smaller.
-    let par = par && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
+    // them. The serial AVX2 kernel is the fast path for everything smaller. The fused-epilogue path
+    // is serial-only (the epilogue folds into the serial writeback), so an epilogue forces serial.
+    let par = par && epi.is_none() && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -103,13 +180,13 @@ unsafe fn gemm_dispatch(
                 if par {
                     sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt);
                 } else {
-                    sgemm_avx2(a, b, c, m, k, n, beta, bt);
+                    sgemm_avx2(a, b, c, m, k, n, beta, bt, epi);
                 }
             }
             return;
         }
     }
-    sgemm_scalar(a, b, c, m, k, n, beta, bt);
+    sgemm_scalar(a, b, c, m, k, n, beta, bt, epi);
 }
 
 /// Multi-threaded `C = A·B`. For each `KC` contraction block it packs the *whole* A column-panel and
@@ -130,7 +207,7 @@ pub unsafe extern "C" fn mercury_sgemm_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, false, true);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, None);
 }
 
 /// Multi-threaded `C = A·Bᵀ` (the `nn.Linear` form).
@@ -147,7 +224,7 @@ pub unsafe extern "C" fn mercury_sgemm_nt_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, true, true);
+    gemm_dispatch(a, b, c, m, k, n, beta, true, true, None);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -205,6 +282,7 @@ unsafe fn sgemm_avx2_parallel(
                             beta_eff,
                             mrv,
                             nrv,
+                            None, // the parallel path is never the fused-epilogue path (serial only)
                         );
                     }
                 }
@@ -228,6 +306,7 @@ fn sgemm_scalar(
     n: usize,
     beta: f32,
     bt: bool,
+    epi: Option<Epilogue>,
 ) {
     unsafe {
         for i in 0..m {
@@ -247,7 +326,12 @@ fn sgemm_scalar(
                     };
                     acc += *a.add(i * k + p) * bjp;
                 }
-                *crow.add(j) += acc;
+                let mut val = *crow.add(j) + acc;
+                // No K-blocking here, so the sum is final: fold in the epilogue (j is the global col).
+                if let Some(e) = epi {
+                    val = e.apply(val, j);
+                }
+                *crow.add(j) = val;
             }
         }
     }
@@ -267,6 +351,7 @@ unsafe fn sgemm_avx2(
     n: usize,
     beta: f32,
     bt: bool,
+    epi: Option<Epilogue>,
 ) {
     // Pack scratch, sized to the actual blocks needed (never larger than the cache-block caps).
     let kc_max = k.min(KC);
@@ -283,6 +368,14 @@ unsafe fn sgemm_avx2(
             let kc = (k - pc).min(KC);
             // First K-block honors the caller's beta; later blocks must accumulate the partial sums.
             let beta_eff = if pc == 0 { beta } else { 1.0 };
+            // The fused epilogue applies only once the K reduction is complete — i.e. on the final
+            // K-block — and is shifted to this column block's bias entries.
+            let is_last_k = pc + kc == k;
+            let block_epi = if is_last_k {
+                epi.map(|e| e.shift(jc))
+            } else {
+                None
+            };
             pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
             let mut ic = 0;
             while ic < m {
@@ -297,6 +390,7 @@ unsafe fn sgemm_avx2(
                     c.add(ic * n + jc),
                     n,
                     beta_eff,
+                    block_epi,
                 );
                 ic += MC;
             }
@@ -532,6 +626,7 @@ unsafe fn macro_kernel(
     c: *mut f32,
     ldc: usize,
     beta: f32,
+    epi: Option<Epilogue>,
 ) {
     let mpanels = mc.div_ceil(MR);
     let npanels = nc.div_ceil(NR);
@@ -539,6 +634,8 @@ unsafe fn macro_kernel(
         let j0 = jp * NR;
         let nrv = (nc - j0).min(NR);
         let bpanel = bp.add(jp * kc * NR);
+        // Each column panel's bias starts `j0` columns into this macro-block's epilogue.
+        let panel_epi = epi.map(|e| e.shift(j0));
         for ip in 0..mpanels {
             let i0 = ip * MR;
             let mrv = (mc - i0).min(MR);
@@ -552,6 +649,7 @@ unsafe fn macro_kernel(
                 beta,
                 mrv,
                 nrv,
+                panel_epi,
             );
         }
     }
@@ -572,6 +670,7 @@ unsafe fn micro_6x16(
     beta: f32,
     mr: usize,
     nr: usize,
+    epi: Option<Epilogue>,
 ) {
     use std::arch::x86_64::*;
     let (mut c0, mut c1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
@@ -631,7 +730,13 @@ unsafe fn micro_6x16(
         for j in 0..nr {
             let cp = c.add(r * ldc + j);
             let v = tmp[r * NR + j];
-            *cp = if beta == 0.0 { v } else { *cp + v };
+            let acc = if beta == 0.0 { v } else { *cp + v };
+            // On the final K-block (epi present) fold bias + activation into this single store,
+            // so C is never read back for a separate epilogue pass. `j` is the tile-local column.
+            *cp = match epi {
+                Some(e) => e.apply(acc, j),
+                None => acc,
+            };
         }
     }
 }
@@ -910,5 +1015,116 @@ mod tests {
             );
         }
         assert_eq!(serial_nt, par_nt);
+    }
+
+    /// Probe (run: `cargo test -p mercury_runtime --release -- --ignored --nocapture epi_throughput`).
+    /// Fused `nt_epi` vs the unfused `nt` GEMM + a separate bias+ReLU pass over C — the traffic the
+    /// fold eliminates (C is written once instead of written, then read-modify-written). The win is a
+    /// fraction of the C-pass traffic, so it grows as K shrinks (the GEMM stops dominating).
+    #[test]
+    #[ignore]
+    fn epi_throughput() {
+        use std::time::Instant;
+        let bench = |f: &dyn Fn()| {
+            for _ in 0..3 {
+                f();
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..30 {
+                let t = Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best * 1e3
+        };
+        for &(m, k, n) in &[
+            (512usize, 512usize, 512usize),
+            (512, 64, 2048),
+            (512, 32, 4096),
+        ] {
+            let a = fill(1, m * k);
+            let b = fill(2, n * k);
+            let bias = fill(3, n);
+            let mut c = vec![0.0f32; m * n];
+            let (ap, bp, biasp, cp) = (a.as_ptr(), b.as_ptr(), bias.as_ptr(), c.as_mut_ptr());
+            let sep = bench(&|| unsafe {
+                mercury_sgemm_nt(ap, bp, cp, m as i64, k as i64, n as i64, 0);
+                // Separate bias+ReLU pass over C (what the compiler emits as a standalone loop).
+                for i in 0..m {
+                    for j in 0..n {
+                        let v = *cp.add(i * n + j) + *biasp.add(j);
+                        *cp.add(i * n + j) = v.max(0.0);
+                    }
+                }
+                std::hint::black_box(cp);
+            });
+            let fused = bench(&|| unsafe {
+                mercury_sgemm_nt_epi(ap, bp, cp, m as i64, k as i64, n as i64, 0, biasp, 1);
+                std::hint::black_box(cp);
+            });
+            println!(
+                "m{m} k{k} n{n}: separate {sep:7.3} ms | fused {fused:7.3} ms | {:.2}x",
+                sep / fused
+            );
+        }
+    }
+
+    /// Fused-epilogue `C = act(A·Bᵀ + bias)` matches computing the GEMM then applying the epilogue
+    /// separately, for {identity, ReLU} × {bias, no-bias}. The `k = 300`/`257` sizes exceed `KC=256`
+    /// so the K loop blocks — verifying the epilogue is applied exactly once, on the final K-block,
+    /// not per-block (a per-block bug would add the bias / clamp repeatedly).
+    #[test]
+    fn sgemm_nt_epi_matches_reference() {
+        for &(m, k, n) in &[(7, 17, 13), (64, 64, 64), (40, 300, 48), (50, 257, 80)] {
+            let a = fill(11, m * k);
+            let b = fill(12, n * k);
+            let bias = fill(13, n);
+            let base = naive_nt(&a, &b, m, k, n); // C = A·Bᵀ
+            for &act in &[ACT_IDENTITY, ACT_RELU] {
+                for use_bias in [false, true] {
+                    let mut want = base.clone();
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut v = want[i * n + j];
+                            if use_bias {
+                                v += bias[j];
+                            }
+                            if act == ACT_RELU {
+                                v = v.max(0.0);
+                            }
+                            want[i * n + j] = v;
+                        }
+                    }
+                    let mut got = vec![0.0f32; m * n];
+                    let bias_ptr = if use_bias {
+                        bias.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
+                    unsafe {
+                        mercury_sgemm_nt_epi(
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            got.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            0,
+                            bias_ptr,
+                            act as i64,
+                        );
+                    }
+                    let tol = 1e-3 * (k as f32).sqrt();
+                    for idx in 0..m * n {
+                        assert!(
+                            (got[idx] - want[idx]).abs() <= tol + 1e-4 * want[idx].abs(),
+                            "epi (m{m} k{k} n{n} act{act} bias{use_bias}) idx {idx}: got {} want {}",
+                            got[idx],
+                            want[idx]
+                        );
+                    }
+                }
+            }
+        }
     }
 }
