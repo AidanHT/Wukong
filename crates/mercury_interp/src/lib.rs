@@ -227,7 +227,23 @@ impl<'a> Interp<'a> {
                 Value::Int(i) => Value::Int(!i),
                 other => Value::Int(!other.as_int()),
             },
-            Op::Cast(kind, v, to) => apply_cast(*kind, reg(regs, *v), func.value_type(*v), to),
+            Op::Cast(kind, v, to) => {
+                if let Some(MirType::Vec(to_lane, n)) = rty {
+                    // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
+                    let xs = self.vec_lanes(reg(regs, *v));
+                    let from_lane = match func.value_type(*v) {
+                        MirType::Vec(l, _) => (**l).clone(),
+                        other => other.clone(),
+                    };
+                    let to_lane = (**to_lane).clone();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| apply_cast(*kind, xs[i], &from_lane, &to_lane))
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    apply_cast(*kind, reg(regs, *v), func.value_type(*v), to)
+                }
+            }
             Op::Select(c, a, b) => {
                 if let Some(MirType::Vec(_, n)) = rty {
                     // Lane-wise blend by a mask vector.

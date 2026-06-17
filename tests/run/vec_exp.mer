@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2718
+// EXPECT-OUT: 367
+// EXPECT-OUT: 135
+module tests.run.vec_exp
+
+// exp over a unit-stride loop vectorizes (the f32 polynomial, expanded per lane). The
+// mercury_bench gate proves the vectorized exp matches the interpreter bit-for-bit.
+fn main() -> i32 {
+    let mut a: [f32; 64] = [0.0; 64];
+    let mut out: [f32; 64] = [0.0; 64];
+
+    // scalar init: a[i] = (i - 32) / 16, spanning roughly [-2, 2].
+    for i in 0..64 {
+        a[i] = (i as f32 - 32.0) * 0.0625;
+    }
+
+    // vectorized exp.
+    for i in 0..64 {
+        out[i] = exp(a[i]) * 1000.0;
+    }
+    print(out[32] as i32); // exp(0)  * 1000 = 1000
+    print(out[48] as i32); // exp(1)  * 1000 = 2718
+    print(out[16] as i32); // exp(-1) * 1000 = 367
+    print(out[0] as i32); // exp(-2) * 1000 = 135
+    return 0;
+}
