@@ -20,7 +20,11 @@
 const MR: usize = 6;
 const NR: usize = 16;
 // Cache-block sizes: A panel (MC×KC) targets L2, B panel (KC×NC) targets L3. Multiples of MR/NR.
-const MC: usize = 72;
+// MC=144 (a 144×256 f32 A-block ≈ 144 KB) measured the sweet spot on this Meteor Lake P-core: large
+// enough that each A-block sweeps the B-panel fewer times (so B is re-streamed from L3 less — the
+// large-matrix bottleneck), small enough that the A-block + the live B micro-panel still sit in the
+// 2 MB L2 alongside the streaming B-block. 216/288 both regressed single-core (B-block contention).
+const MC: usize = 144;
 const KC: usize = 256;
 const NC: usize = 4080;
 
