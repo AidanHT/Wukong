@@ -70,6 +70,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Operator fusion**: adjacent same-range elementwise loops (e.g. a linear map then ReLU) fuse into
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
   registers rather than memory.
+- **GEMM epilogue fusion**: a recognized `nn.Linear` matmul (`C = A·Bᵀ`) immediately followed by a
+  bias-add / ReLU loop over `C` (`C[i,j] = relu(C[i,j] + bias[j])`) fuses into one
+  `mercury_sgemm_nt_epi` call that folds the bias + activation into the microkernel's C-tile
+  writeback — so `C` is written once instead of paying a separate read-modify-write pass over it. The
+  saving is a fraction of the C-pass traffic, so it grows as K shrinks: ~1.0× at 512³ (compute-bound,
+  no harm), ~1.34× at K=64/N=2048, ~1.65× at K=32/N=4096 — exactly the small-K/large-N projections
+  (attention-output, down-projection). Serial; identity (bias-only) and ReLU. Both backends call the
+  identical kernel, so it stays bit-exact. See `tests/run/linear_bias_relu.mer`.
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
 - Intrinsics `print`/`println`/`assert`.
@@ -91,8 +99,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## Planned
 
-- Fusing chains *under* `@parallel`, and GEMM **epilogue fusion** (bias + activation folded into the
-  microkernel's write-back), so a `linear → bias → relu` runs in one pass.
+- Fusing chains *under* `@parallel`; extending GEMM **epilogue fusion** to the transcendental
+  activations (the current fused epilogue folds bias-add + ReLU into the microkernel write-back —
+  GELU/SiLU folding and a parallel fused-epilogue kernel are the remaining steps).
+- A **GPU backend** (the next major frontier — where flash-attention and large-batch throughput
+  actually win). Scoped in `next-steps.md` at the repo root.
 - 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
   value (verified — pinned as a tripwire test), so the elementwise vectorizer is 128-bit + unrolling;
   the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
