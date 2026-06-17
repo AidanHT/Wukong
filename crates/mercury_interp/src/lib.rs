@@ -746,7 +746,18 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
             Value::Int(mask(i, to))
         }
         FpExt | FpTrunc => Value::Float(v.as_float()),
-        Bitcast => v,
+        // Reinterpret the raw bits between an int and a same-width float (matches the native
+        // `bitcast`); the `exp` polynomial reconstructs `2^n` this way. `cast_kind` never produces
+        // an int↔float bitcast from source, so this path is exercised only by hand-built MIR.
+        // Same-kind scalar bitcasts and vectors pass through (vector casts are handled lane-wise
+        // in `eval`).
+        Bitcast => match (from, to) {
+            (MirType::I32, MirType::F32) => Value::Float(f32::from_bits(v.as_int() as u32) as f64),
+            (MirType::I64, MirType::F64) => Value::Float(f64::from_bits(v.as_int() as u64)),
+            (MirType::F32, MirType::I32) => Value::Int((v.as_float() as f32).to_bits() as i128),
+            (MirType::F64, MirType::I64) => Value::Int(v.as_float().to_bits() as i128),
+            _ => v,
+        },
         IntToPtr => Value::Ptr(v.as_int() as usize),
         PtrToInt => Value::Int(v.as_int()),
     }
