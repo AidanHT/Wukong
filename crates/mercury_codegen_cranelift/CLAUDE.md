@@ -47,9 +47,14 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   with `mul_add`, and the two agree bit-for-bit (gated by `fma_contraction_is_bit_exact`). This is
   why `mercury_xbench` gives gcc `-ffp-contract=fast` — both sides fuse.
 - Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`, the GEMM
-  microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi`, and the 256-bit elementwise
-  `mercury_vmath_f32`) are bound to Rust fns in the JIT and left as imports in the object (resolved by
-  the driver's C runtime). A global run lock serialises JIT runs that share the stdout-capture buffer.
+  microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi`, the 256-bit elementwise
+  `mercury_vmath_f32`, and the reduction `mercury_sreduce_f32`/`_parallel`) are bound to Rust fns in
+  the JIT and left as imports in the object (resolved by the driver's C runtime). A global run lock
+  serialises JIT runs that share the stdout-capture buffer.
+- **A runtime call may return a value.** Most (`mercury_sgemm*`, `mercury_vmath_f32`) are void, but
+  `mercury_sreduce_f32[_parallel]` returns an **f32** — its `lower_call` arm binds the call result
+  (`inst_results(call).first().copied()`) instead of returning `None`, and its signature carries a
+  `returns` entry. Mirror that when adding any value-returning runtime symbol.
 - **GEMM / vmath calls.** The recognizers in `mercury_mir_build` emit `Op::Call` to a `mercury_sgemm*`
   symbol `(a,b,c,m,k,n,beta)` or to `mercury_vmath_f32 (x,out,n,op)`; `lower_call` recognizes those
   names (`RT_SGEMM*`, `RT_VMATH`) and emits a direct call to the declared import. When adding a runtime

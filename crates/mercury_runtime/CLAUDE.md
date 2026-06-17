@@ -18,6 +18,13 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   Cranelift can't emit. 8 lanes/step + a scalar tail; the per-element op sequence mirrors the inlined
   Cephes polys in `mercury_mir_build`, and the scalar twins (`exp1`/`log1`/…) back the tail and the
   no-AVX2 fallback, so every lane of every path agrees.
+- `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
+  reductions** (dot / ssd / sum / sumsq, by `RED_*` op code). A `@parallel` reduction loop lowers to
+  the `_parallel` one. The parallel result is **bit-identical** to the serial one: the array is cut
+  into fixed-size `RCHUNK` chunks (count independent of thread count), each reduced by the identical
+  per-chunk function, and partials summed in ascending chunk order (rayon's indexed `collect`). So
+  serial == parallel == interpreter on any machine. AVX2 single accumulator (memory-bound at N=2^20,
+  so one is enough) + a scalar tail/twin that matches lane-for-lane (`mul_add` == `fmadd`).
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
@@ -52,6 +59,12 @@ programs (link as a static lib).
 - **`mercury_vmath_f32` is also a differential contract.** Like the GEMM, the interpreter marshals its
   memory through this exact kernel, so any change to its math changes the oracle too. The AVX2 lanes
   and the scalar twins must stay bit-identical (a test pins this at a non-multiple-of-8 length).
+- **`mercury_sreduce_f32` parallel must equal serial bit-for-bit.** The interpreter calls the *serial*
+  form; native `@parallel` calls the *parallel* form — the differential gate compares them, so they
+  must agree exactly. That rests on the fixed `RCHUNK` decomposition and ascending partial combine
+  being independent of thread count: don't make chunk size depend on core count, don't reduce partials
+  in completion order, and keep the AVX2 path's store-then-tail identical to the scalar twin. A test
+  pins serial==parallel and scalar==avx2 across sizes with partial chunks and non-mult-of-8 tails.
 - **Packing reads must be contiguous.** `pack_a`/`pack_b_trans` read each source row contiguously
   over the contraction and scatter into the L1-resident packed panel; the transposed (strided) order
   thrashes cache and dominates runtime. Don't "simplify" them back to row-inner loops.
