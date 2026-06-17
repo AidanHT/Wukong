@@ -112,9 +112,16 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(s)
 }
 
-/// AVX2/FMA path: identical online-softmax recurrence, with the two `D`-wide inner loops — the
-/// `q_i·k_j` dot and the `acc = acc·corr + p·v_j` rescale-accumulate — vectorized 8-wide (scalar
-/// remainder for `D % 8`). The per-score `exp` stays scalar here; the tiled path vectorizes it.
+/// Query tile: a block of `ATT_QB` query rows is kept hot together so each loaded `k_j`/`v_j` (read
+/// once per key) is reused across all of them — turning the per-query kernel's `S`× re-streaming of
+/// K/V into one L2-resident pass per query block. The block's running stats + `O(QB·D)` accumulator
+/// stay L1-resident.
+const ATT_QB: usize = 32;
+
+/// AVX2/FMA path: the online-softmax recurrence, **query-block tiled** for cache reuse. The keys are
+/// the *outer* loop and the queries within a block the *inner* loop, so `k_j`/`v_j` load once and
+/// feed every query in the block. The two `D`-wide inner loops — the `q_i·k_j` dot and the
+/// `acc = acc·corr + p·v_j` rescale-accumulate — are vectorized 8-wide (scalar remainder for `D % 8`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -130,65 +137,81 @@ unsafe fn attention_avx2(
 ) {
     use std::arch::x86_64::*;
     let dv = d & !7; // largest multiple of 8 ≤ d
-    let mut acc = vec![0.0f32; d];
-    for i in 0..s {
-        let qi = q.add(i * d);
-        let jmax = if causal { i + 1 } else { s };
-        let mut m = f32::NEG_INFINITY;
-        let mut l = 0.0f32;
-        acc.iter_mut().for_each(|a| *a = 0.0);
+    let mut m = vec![f32::NEG_INFINITY; ATT_QB];
+    let mut l = vec![0.0f32; ATT_QB];
+    let mut acc = vec![0.0f32; ATT_QB * d];
+    let mut i0 = 0;
+    while i0 < s {
+        let qb = (s - i0).min(ATT_QB);
+        m[..qb].iter_mut().for_each(|x| *x = f32::NEG_INFINITY);
+        l[..qb].iter_mut().for_each(|x| *x = 0.0);
+        acc[..qb * d].iter_mut().for_each(|x| *x = 0.0);
+        // The largest key any query in this block attends to is `i0 + qb - 1` under a causal mask.
+        let jmax = if causal { i0 + qb } else { s };
         for j in 0..jmax {
             let kj = k.add(j * d);
-            // x = scale · (q_i · k_j)
-            let mut sv = _mm256_setzero_ps();
-            let mut t = 0;
-            while t < dv {
-                sv = _mm256_fmadd_ps(_mm256_loadu_ps(qi.add(t)), _mm256_loadu_ps(kj.add(t)), sv);
-                t += 8;
-            }
-            let mut x = hsum256(sv);
-            while t < d {
-                x += *qi.add(t) * *kj.add(t);
-                t += 1;
-            }
-            x *= scale;
-            let m_new = m.max(x);
-            let corr = (m - m_new).exp();
-            let p = (x - m_new).exp();
-            l = l * corr + p;
-            // acc = acc·corr + p·v_j
             let vj = v.add(j * d);
-            let corrv = _mm256_set1_ps(corr);
-            let pv = _mm256_set1_ps(p);
+            for ii in 0..qb {
+                let i = i0 + ii;
+                if causal && j > i {
+                    continue;
+                }
+                let qi = q.add(i * d);
+                // x = scale · (q_i · k_j)
+                let mut sv = _mm256_setzero_ps();
+                let mut t = 0;
+                while t < dv {
+                    sv = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(qi.add(t)),
+                        _mm256_loadu_ps(kj.add(t)),
+                        sv,
+                    );
+                    t += 8;
+                }
+                let mut x = hsum256(sv);
+                while t < d {
+                    x += *qi.add(t) * *kj.add(t);
+                    t += 1;
+                }
+                x *= scale;
+                let m_new = m[ii].max(x);
+                let corr = (m[ii] - m_new).exp();
+                let p = (x - m_new).exp();
+                l[ii] = l[ii] * corr + p;
+                // acc_ii = acc_ii·corr + p·v_j
+                let accp = acc.as_mut_ptr().add(ii * d);
+                let corrv = _mm256_set1_ps(corr);
+                let pv = _mm256_set1_ps(p);
+                let mut t = 0;
+                while t < dv {
+                    let a = _mm256_mul_ps(_mm256_loadu_ps(accp.add(t)), corrv);
+                    _mm256_storeu_ps(accp.add(t), _mm256_fmadd_ps(pv, _mm256_loadu_ps(vj.add(t)), a));
+                    t += 8;
+                }
+                while t < d {
+                    *accp.add(t) = *accp.add(t) * corr + p * *vj.add(t);
+                    t += 1;
+                }
+                m[ii] = m_new;
+            }
+        }
+        // O_i = acc_i / l_i for each query in the block.
+        for ii in 0..qb {
+            let inv = if l[ii] != 0.0 { 1.0 / l[ii] } else { 0.0 };
+            let oi = o.add((i0 + ii) * d);
+            let accp = acc.as_ptr().add(ii * d);
+            let invv = _mm256_set1_ps(inv);
             let mut t = 0;
             while t < dv {
-                let a = _mm256_mul_ps(_mm256_loadu_ps(acc.as_ptr().add(t)), corrv);
-                let r = _mm256_fmadd_ps(pv, _mm256_loadu_ps(vj.add(t)), a);
-                _mm256_storeu_ps(acc.as_mut_ptr().add(t), r);
+                _mm256_storeu_ps(oi.add(t), _mm256_mul_ps(_mm256_loadu_ps(accp.add(t)), invv));
                 t += 8;
             }
             while t < d {
-                acc[t] = acc[t] * corr + p * *vj.add(t);
+                *oi.add(t) = *accp.add(t) * inv;
                 t += 1;
             }
-            m = m_new;
         }
-        // O_i = acc / l
-        let inv = if l != 0.0 { 1.0 / l } else { 0.0 };
-        let oi = o.add(i * d);
-        let invv = _mm256_set1_ps(inv);
-        let mut t = 0;
-        while t < dv {
-            _mm256_storeu_ps(
-                oi.add(t),
-                _mm256_mul_ps(_mm256_loadu_ps(acc.as_ptr().add(t)), invv),
-            );
-            t += 8;
-        }
-        while t < d {
-            *oi.add(t) = acc[t] * inv;
-            t += 1;
-        }
+        i0 += ATT_QB;
     }
 }
 
@@ -291,6 +314,110 @@ mod tests {
         ] {
             check(s, d, false);
             check(s, d, true);
+        }
+    }
+
+    /// Throughput probe (run: `cargo test -p mercury_runtime --release -- --ignored --nocapture`).
+    /// Compares the fused kernel against Mercury's *own* strongest non-fused path: materialize
+    /// `scores = Q·Kᵀ` with the tuned AVX2 GEMM, softmax the rows, then `O = P·V` with the GEMM —
+    /// the two-matmul + S×S-intermediate shape. Both paths use the same AVX2 primitives and the same
+    /// S² scalar `exp`s, so the delta is purely the fusion / no-materialization effect. That baseline
+    /// is *stronger* than idiomatic C attention (which uses unblocked matmuls), so a win here implies
+    /// a win over C.
+    #[test]
+    #[ignore]
+    fn attention_throughput() {
+        use crate::{mercury_sgemm, mercury_sgemm_nt};
+        use std::time::Instant;
+
+        // Mercury's best non-fused attention: GEMM + materialized softmax + GEMM.
+        fn materialized(
+            q: &[f32],
+            k: &[f32],
+            v: &[f32],
+            s: usize,
+            d: usize,
+            scale: f32,
+            causal: bool,
+        ) -> Vec<f32> {
+            let mut scores = vec![0.0f32; s * s];
+            unsafe {
+                mercury_sgemm_nt(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    scores.as_mut_ptr(),
+                    s as i64,
+                    d as i64,
+                    s as i64,
+                    0,
+                );
+            }
+            for i in 0..s {
+                let row = &mut scores[i * s..i * s + s];
+                let jmax = if causal { i + 1 } else { s };
+                let mut mx = f32::NEG_INFINITY;
+                for r in row.iter_mut().take(jmax) {
+                    *r *= scale;
+                    mx = mx.max(*r);
+                }
+                let mut sum = 0.0f32;
+                for r in row.iter_mut().take(jmax) {
+                    *r = (*r - mx).exp();
+                    sum += *r;
+                }
+                let inv = 1.0 / sum;
+                for r in row.iter_mut().take(jmax) {
+                    *r *= inv;
+                }
+                for r in row.iter_mut().skip(jmax) {
+                    *r = 0.0;
+                }
+            }
+            let mut o = vec![0.0f32; s * d];
+            unsafe {
+                mercury_sgemm(
+                    scores.as_ptr(),
+                    v.as_ptr(),
+                    o.as_mut_ptr(),
+                    s as i64,
+                    s as i64,
+                    d as i64,
+                    0,
+                );
+            }
+            o
+        }
+
+        let bench = |f: &dyn Fn()| {
+            for _ in 0..3 {
+                f();
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..20 {
+                let t = Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best * 1e3
+        };
+
+        for &(s, d) in &[(256usize, 64usize), (512, 64), (1024, 64), (2048, 64)] {
+            let q = fill(1, s * d);
+            let k = fill(2, s * d);
+            let v = fill(3, s * d);
+            let scale = 1.0 / (d as f32).sqrt();
+            let mut o = vec![0.0f32; s * d];
+            let (qp, kp, vp, op) = (q.as_ptr(), k.as_ptr(), v.as_ptr(), o.as_mut_ptr());
+            let mat = bench(&|| {
+                std::hint::black_box(materialized(&q, &k, &v, s, d, scale, false));
+            });
+            let fused = bench(&|| unsafe {
+                mercury_attention_f32(qp, kp, vp, op, s as i64, d as i64, scale, 0);
+            });
+            println!(
+                "S={s:<5} D={d}: materialized {mat:7.3} ms | fused {fused:7.3} ms | {:.2}x",
+                mat / fused
+            );
         }
     }
 }
