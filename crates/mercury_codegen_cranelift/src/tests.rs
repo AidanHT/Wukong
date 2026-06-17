@@ -226,6 +226,51 @@ fn differential_floats() {
     }
 }
 
+/// The transcendental suite (built from primitive ops) must agree between native and interpreter
+/// across the full input range — including `exp`'s overflow/underflow clamp, `log` over many
+/// magnitudes, and `pow` — on both the scalar and the vectorized (unit-stride loop) paths. Since
+/// every step is a primitive both backends already match on, equality is by construction; this
+/// pins it across opt levels and extreme inputs.
+#[test]
+fn differential_transcendentals() {
+    let programs = [
+        // vectorized exp over [-8, 7.5] (the loop vectorizes; mid-range, all finite).
+        "fn main() -> i32 { let mut xs: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { xs[i] = (i as f32) * 0.5 - 8.0; } \
+         let mut ys: [f32; 32] = [0.0; 32]; for i in 0..32 { ys[i] = exp(xs[i]); } \
+         print((ys[0] * 1000000.0) as i32); print((ys[16] * 1000.0) as i32); \
+         print((ys[31] * 100.0) as i32); return 0; }",
+        // exp clamp at the extremes (x>88 -> huge-finite, x<-88 -> ~0): native and interp must
+        // take the same select branches.
+        "fn main() -> i32 { print((exp(100.0) * 0.0 + 7.0) as i32); \
+         print((exp(-100.0) * 1000000.0) as i32); return 0; }",
+        // vectorized log over a wide magnitude range (10 .. 320).
+        "fn main() -> i32 { let mut xs: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { xs[i] = ((i as f32) + 1.0) * 10.0; } \
+         let mut ys: [f32; 32] = [0.0; 32]; for i in 0..32 { ys[i] = log(xs[i]); } \
+         print((ys[0] * 1000.0) as i32); print((ys[31] * 1000.0) as i32); return 0; }",
+        // scalar log across magnitudes incl. sub-1 (negative result).
+        "fn main() -> i32 { print((log(0.001) * 1000.0) as i32); \
+         print((log(1000000.0) * 1000.0) as i32); return 0; }",
+        // vectorized pow (square) and a scalar large exponent.
+        "fn main() -> i32 { let mut xs: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { xs[i] = (i as f32) + 1.0; } \
+         let mut ys: [f32; 16] = [0.0; 16]; for i in 0..16 { ys[i] = pow(xs[i], 2.0); } \
+         print((ys[3] * 100.0) as i32); print((ys[15] * 100.0) as i32); \
+         print((pow(2.0, 20.0) + 0.5) as i32); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "transcendental native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// `if`/`else` used as a value (block tail and `let`-bound), including a branchy ReLU loop.
 #[test]
 fn if_as_expression() {
