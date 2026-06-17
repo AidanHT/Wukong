@@ -1,0 +1,78 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 600
+// EXPECT-OUT: 900
+module tests.run.causal_attention
+
+// Causal (autoregressive) attention — the decoder attention in GPT/Llama. Same as scaled
+// dot-product attention but position i may only attend to positions j ≤ i: future scores are masked
+// to -inf before the softmax (exp(-inf-m) → 0). Both matmuls (Q·Kᵀ, P·V) dispatch to the GEMM
+// kernel; the mask is a conditional store, the softmax vectorizes. S=4 tokens, D=4. With masking,
+// row 0's output equals V row 0 exactly (it attends only to itself); the gate proves native==interp.
+fn causal_attn(q: [f32; 16], k: [f32; 16], v: [f32; 16], scores: [f32; 16], out: [f32; 16]) {
+    // scores = Q · Kᵀ
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for p in 0..4 {
+                s = s + q[i * 4 + p] * k[j * 4 + p];
+            }
+            scores[i * 4 + j] = s;
+        }
+    }
+    // causal mask + row softmax
+    for i in 0..4 {
+        for j in 0..4 {
+            if j > i {
+                scores[i * 4 + j] = -1.0e30;
+            }
+        }
+        let mut m: f32 = scores[i * 4 + 0];
+        for j in 0..4 {
+            m = fmax(m, scores[i * 4 + j]);
+        }
+        let mut sm: f32 = 0.0;
+        for j in 0..4 {
+            let e: f32 = exp(scores[i * 4 + j] - m);
+            scores[i * 4 + j] = e;
+            sm = sm + e;
+        }
+        let inv: f32 = 1.0 / sm;
+        for j in 0..4 {
+            scores[i * 4 + j] = scores[i * 4 + j] * inv;
+        }
+    }
+    // out = P · V
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for p in 0..4 {
+                s = s + scores[i * 4 + p] * v[p * 4 + j];
+            }
+            out[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 16] = [0.0; 16];
+    let mut k: [f32; 16] = [0.0; 16];
+    let mut v: [f32; 16] = [0.0; 16];
+    let mut scores: [f32; 16] = [0.0; 16];
+    let mut out: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        q[i] = ((i % 3) as f32) * 0.1;
+        k[i] = ((i % 4) as f32) * 0.1;
+        v[i] = (i as f32) * 10.0;
+    }
+    causal_attn(q, k, v, scores, out);
+    // row 0 attends only to token 0 → out row 0 == V row 0 = [0,10,20,30].
+    print(out[0] as i32); // 0
+    print(out[3] as i32); // 30 (V[0,3])
+    // later rows mix the allowed (causal) tokens.
+    print((out[12] * 10.0) as i32);
+    print((out[15] * 10.0) as i32);
+    return 0;
+}
