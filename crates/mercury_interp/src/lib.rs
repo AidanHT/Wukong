@@ -138,7 +138,7 @@ impl<'a> Interp<'a> {
             let block = func.block(cur);
             for inst in &block.insts {
                 let rty = inst.result.map(|r| func.value_type(r));
-                let v = self.eval(&inst.op, regs, rty)?;
+                let v = self.eval(&inst.op, func, regs, rty)?;
                 if let Some(r) = inst.result {
                     // Normalize integer results to their declared width: this gives correct
                     // two's-complement wrapping and keeps booleans (`i1`) as 0/1 (so e.g. `!true`
@@ -181,7 +181,13 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn eval(&mut self, op: &Op, regs: &[Value], rty: Option<&MirType>) -> Result<Value, String> {
+    fn eval(
+        &mut self,
+        op: &Op,
+        func: &Function,
+        regs: &[Value],
+        rty: Option<&MirType>,
+    ) -> Result<Value, String> {
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
             Op::ConstFloat(v, _) => Value::Float(*v),
@@ -221,7 +227,7 @@ impl<'a> Interp<'a> {
                 Value::Int(i) => Value::Int(!i),
                 other => Value::Int(!other.as_int()),
             },
-            Op::Cast(kind, v, to) => apply_cast(*kind, reg(regs, *v), to),
+            Op::Cast(kind, v, to) => apply_cast(*kind, reg(regs, *v), func.value_type(*v), to),
             Op::Select(c, a, b) => {
                 if let Some(MirType::Vec(_, n)) = rty {
                     // Lane-wise blend by a mask vector.
@@ -520,6 +526,18 @@ fn int_bits(ty: &MirType) -> u32 {
     }
 }
 
+/// Reinterpret the low `bits` of a (sign-extended) integer value as unsigned. The interpreter keeps
+/// integers sign-extended in an `i128`; unsigned ops (`UDiv`/`URem`/`UiToFp`/`ZExt`) must read only
+/// the value's own `bits`-wide window as unsigned, else a high-bit-set value (e.g. a `u32` ≥ 2^31)
+/// diverges from the native backend, which operates on the true machine width.
+fn uval(v: i128, bits: u32) -> u128 {
+    if bits >= 128 {
+        v as u128
+    } else {
+        (v as u128) & ((1u128 << bits) - 1)
+    }
+}
+
 /// Truncate an integer value to a result type's bit width (signed wrap).
 fn mask(v: i128, ty: &MirType) -> i128 {
     // `i1` is a boolean: keep the low bit unsigned (true == 1, not a sign-extended -1).
@@ -591,10 +609,12 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
             }
         }
         UDiv => {
-            if y == 0 {
+            let w = rty.map(int_bits).unwrap_or(64);
+            let (xu, yu) = (uval(x, w), uval(y, w));
+            if yu == 0 {
                 0
             } else {
-                ((x as u128) / (y as u128)) as i128
+                (xu / yu) as i128
             }
         }
         SRem => {
@@ -605,10 +625,12 @@ fn apply_bin(op: BinOp, a: Value, b: Value, rty: Option<&MirType>) -> Value {
             }
         }
         URem => {
-            if y == 0 {
+            let w = rty.map(int_bits).unwrap_or(64);
+            let (xu, yu) = (uval(x, w), uval(y, w));
+            if yu == 0 {
                 0
             } else {
-                ((x as u128) % (y as u128)) as i128
+                (xu % yu) as i128
             }
         }
         And => x & y,
@@ -652,11 +674,17 @@ fn apply_cmp(op: CmpOp, a: Value, b: Value) -> bool {
     }
 }
 
-fn apply_cast(kind: CastKind, v: Value, to: &MirType) -> Value {
+fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
     use CastKind::*;
     match kind {
-        SExt | ZExt | Trunc => Value::Int(mask(v.as_int(), to)),
-        SiToFp | UiToFp => Value::Float(v.as_int() as f64),
+        SExt | Trunc => Value::Int(mask(v.as_int(), to)),
+        // Zero-extend the source's own `from`-width bits. Because ints are stored sign-extended, a
+        // high-bit-set unsigned source (e.g. `u32` ≥ 2^31) would otherwise widen as negative.
+        ZExt => Value::Int(mask(uval(v.as_int(), int_bits(from)) as i128, to)),
+        SiToFp => Value::Float(v.as_int() as f64),
+        // Unsigned→float: read the source as unsigned in its own width first (matches native
+        // `fcvt_from_uint`); `as_int() as f64` would be negative for a high-bit-set value.
+        UiToFp => Value::Float(uval(v.as_int(), int_bits(from)) as f64),
         // Saturating fp→int, matching the native backend's `fcvt_to_{sint,uint}_sat` (NaN→0, clamp to
         // the target range, negatives→0 for unsigned). Rust's `as` has exactly these semantics; the
         // old bit-mask of an `i128` cast diverged from native for out-of-range / negative-to-unsigned
