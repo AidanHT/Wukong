@@ -836,6 +836,17 @@ fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::Targ
     flag_builder
         .set("is_pic", if pic { "true" } else { "false" })
         .map_err(|e| e.to_string())?;
+    // Emit stack-probe code in any prologue whose frame exceeds a page, so a function with a large
+    // local array (e.g. an im2col scratch buffer) touches each guard page instead of jumping past it
+    // and faulting. The *inline* strategy emits the probe loop directly — no external `__chkstk`
+    // symbol to bind, which the JIT cannot provide. Probing only commits stack pages, so it changes
+    // no computed value and keeps the interpreter/native differential exact.
+    flag_builder
+        .set("enable_probestack", "true")
+        .map_err(|e| e.to_string())?;
+    flag_builder
+        .set("probestack_strategy", "inline")
+        .map_err(|e| e.to_string())?;
     let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
     isa_builder
         .finish(settings::Flags::new(flag_builder))

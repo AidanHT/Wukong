@@ -92,6 +92,26 @@ fn cranelift_still_rejects_f32x8() {
     unsafe { module.free_memory() };
 }
 
+/// A function with a stack frame larger than a page (here a ~200 KB local array — the kind an
+/// im2col/conv scratch buffer needs) must touch each guard page in its prologue instead of jumping
+/// past it. Without `enable_probestack` the JIT'd entry faults when called at a shallow stack depth
+/// (e.g. directly from the bench harness). This asserts it runs and still matches the interpreter.
+#[test]
+fn large_local_array_does_not_smash_stack() {
+    let src = "fn main() -> i32 { let mut buf: [f32; 50000] = [3.0; 50000]; \
+               let mut s: f32 = 0.0; for i in 0..50000 { s = s + buf[i]; } \
+               return (s as i32) / 50000; }";
+    for opt in [0u8, 2, 3] {
+        let n = jit(src, opt).expect("jit run (large frame must not fault)");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(
+            n, i,
+            "native vs interp mismatch at -O{opt} for large-frame fn"
+        );
+        assert_eq!(n.0, 3, "sum(50000 * 3.0)/50000 == 3 at -O{opt}");
+    }
+}
+
 #[test]
 fn loop_sum() {
     let src = "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
