@@ -50,8 +50,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   two backends stay bit-identical.
 - **Reduction vectorization**: a float reduction `s = s + x[k]*y[k]` / `s += ..` lowers to
   vector-lane accumulators (independent FMA chains) + a horizontal reduce + scalar remainder, turning
-  the latency-bound serial sum into a throughput-bound one. `dot` runs ~2.6× faster than serial C.
+  the latency-bound serial sum into a throughput-bound one. `dot` runs ~2.7× faster than serial C.
   `fmax`/`fmin` reductions (`m = fmax(m, x[i])`, softmax's row-max) vectorize the same way.
+- **`@parallel` reduction → multicore reduction kernel**: a reduction loop in a `@parallel` function
+  (dot `x[k]*y[k]`, ssd `(x[k]-y[k])²`, or the unary sum `x[k]`) is **dispatched to a deterministic
+  multicore reduction kernel** (`mercury_sreduce_f32_parallel`), spreading the stream across cores to
+  aggregate memory bandwidth — `dot@parallel` ~7.9×, `ssd@parallel` ~8.6× faster than single-threaded
+  C. The parallel sum is bit-identical to the serial one (fixed-size chunks independent of core count
+  + ascending partial combine), so the differential oracle holds.
 - **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP `f32` minimax
   polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
   `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
