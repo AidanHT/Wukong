@@ -1,0 +1,38 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 14
+// EXPECT-OUT: 32
+// EXPECT-OUT: 77
+// EXPECT-OUT: 98
+module tests.run.gram
+
+// A Gram matrix G = A·Aᵀ — the same array on both sides of the matmul (also the shape of
+// self-attention scores Q·Kᵀ when Q and K share a buffer). The recognizer dispatches it to the GEMM
+// kernel: both operands are read-only, packed into separate scratch, so aliasing is safe. The gate
+// proves native == interp (both marshal the identical kernel with a == b).
+fn gram(a: [f32; 12], g: [f32; 16]) {
+    // A is 4x3; G = A·Aᵀ is 4x4.  G[i,j] = sum_k A[i,k]*A[j,k].
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..3 {
+                s = s + a[i * 3 + k] * a[j * 3 + k];
+            }
+            g[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // rows: [1,2,3], [4,5,6], [7,8,9], [1,4,9]
+    let a: [f32; 12] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 4.0, 9.0,
+    ];
+    let mut g: [f32; 16] = [0.0; 16];
+    gram(a, g);
+    print(g[0] as i32); // row0·row0 = 1+4+9 = 14
+    print(g[1] as i32); // row0·row1 = 4+10+18 = 32
+    print(g[5] as i32); // row1·row1 = 16+25+36 = 77
+    print(g[15] as i32); // row3·row3 = 1+16+81 = 98
+    return 0;
+}
