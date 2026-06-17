@@ -671,5 +671,7 @@ fn c_kernel(body: &str) -> String {
 }
 
 fn rust_kernel(body: &str) -> String {
-    format!("const N: usize = {N};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
+    // `#[allow(unused_variables)]`: some kernels (relu, poly) don't read `y`; the fixed `(x,y,out)`
+    // ABI keeps the param, so silence the warning rather than clutter the benchmark output.
+    format!("const N: usize = {N};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
 }
