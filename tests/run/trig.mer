@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 8660
+// EXPECT-OUT: 0
+// EXPECT-OUT: -10000
+// EXPECT-OUT: 8660
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 4794
+module tests.run.trig
+
+// `sin`/`cos` as fast deterministic polynomials (Cephes minimax + quadrant reduction), built from
+// primitive ops so both backends agree bit-for-bit and they vectorize. Their headline use is **RoPE**
+// (rotary position embeddings — Llama/GPT-NeoX/most current LLMs): a query/key pair is rotated by a
+// position-dependent angle, which is exactly a (cosθ, sinθ) rotation. Values match true sin/cos to
+// f32 precision; sin is odd and cos even (verified in the differential test).
+fn main() -> i32 {
+    // scalar, at π/6 and π (true: sin π/6 = 0.5, cos π/6 = 0.8660, sin π = 0, cos π = -1).
+    let pi6: f32 = 0.5235988;
+    let pi: f32 = 3.1415927;
+    print((sin(pi6) * 10000.0) as i32); // 5000
+    print((cos(pi6) * 10000.0) as i32); // 8660
+    print((sin(pi) * 10000.0) as i32); // 0
+    print((cos(pi) * 10000.0) as i32); // -10000
+
+    // RoPE rotation of the pair (q0,q1)=(1,0) by θ=π/6:
+    //   r0 = q0·cosθ - q1·sinθ,  r1 = q0·sinθ + q1·cosθ  →  (cos π/6, sin π/6) = (0.8660, 0.5).
+    let theta: f32 = pi6;
+    let c: f32 = cos(theta);
+    let s: f32 = sin(theta);
+    let q0: f32 = 1.0;
+    let q1: f32 = 0.0;
+    let r0: f32 = q0 * c - q1 * s;
+    let r1: f32 = q0 * s + q1 * c;
+    print((r0 * 10000.0) as i32); // 8660
+    print((r1 * 10000.0) as i32); // 5000
+
+    // vectorized: sin over an array lowers to SIMD (f32 lane). xs[i] = i·0.1; sin(xs[5]) = sin(0.5).
+    let mut xs: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        xs[i] = (i as f32) * 0.1;
+    }
+    let mut ys: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        ys[i] = sin(xs[i]);
+    }
+    print((ys[5] * 10000.0) as i32); // sin(0.5) = 0.4794 -> 4794
+    return 0;
+}

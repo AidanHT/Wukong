@@ -303,6 +303,41 @@ fn differential_erf() {
     }
 }
 
+/// `sin`/`cos` (which enable RoPE) reduce the argument by quadrant and select ±sin/±cos, all from
+/// primitive ops — so the native backend must match the interpreter bit-for-bit across opt levels,
+/// scalar and vectorized, and across quadrants (incl. negative and out-of-first-period angles).
+#[test]
+fn differential_trig() {
+    let programs = [
+        // scalar sin/cos across several quadrants and signs (0, π/3, π, -1, 5, 10).
+        "fn main() -> i32 { print((sin(1.0471976) * 100000.0) as i32); \
+         print((cos(3.1415927) * 100000.0) as i32); print((sin(0.0 - 1.0) * 100000.0) as i32); \
+         print((cos(5.0) * 100000.0) as i32); print((sin(10.0) * 100000.0) as i32); return 0; }",
+        // vectorized sin over [0, ~4.7] (crosses π/2, π, 3π/2 — exercises all quadrant branches).
+        "fn main() -> i32 { let mut xs: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { xs[i] = (i as f32) * 0.3; } \
+         let mut ys: [f32; 16] = [0.0; 16]; for i in 0..16 { ys[i] = sin(xs[i]); } \
+         print((ys[3] * 100000.0) as i32); print((ys[8] * 100000.0) as i32); \
+         print((ys[15] * 100000.0) as i32); return 0; }",
+        // a RoPE rotation of (q0,q1) by per-element angles, vectorized cos/sin.
+        "fn main() -> i32 { let mut a: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { a[i] = (i as f32) * 0.2; } \
+         let mut r: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { r[i] = 2.0 * cos(a[i]) - 3.0 * sin(a[i]); } \
+         print((r[4] * 10000.0) as i32); print((r[11] * 10000.0) as i32); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "trig native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// A *batched* matmul — H independent matmuls over one buffer, each index carrying a per-head base
 /// offset `h*STRIDE`. This is the multi-head-attention shape (`scores[h] = Q[h]·K[h]ᵀ`). The
 /// recognizer peels the offset and GEPs each base pointer per head before the shared GEMM kernel.
