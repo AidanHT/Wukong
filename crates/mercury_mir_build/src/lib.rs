@@ -1062,7 +1062,7 @@ impl FnLowerer<'_> {
                     && self.vec_check_value(ev, j, locals, lane, acc)
             }
             // Element-wise math intrinsics over vectorizable args. sqrt/rsqrt are one lane op each;
-            // fmax/fmin are a lane compare + blend. (exp vectorization is added separately.)
+            // fmax/fmin are a lane compare + blend; exp is the f32 polynomial expanded per lane.
             ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
                 Some(MathIntrinsic::Sqrt | MathIntrinsic::Rsqrt) => {
                     args.len() == 1 && self.vec_check_value(&args[0], j, locals, lane, acc)
@@ -1072,7 +1072,13 @@ impl FnLowerer<'_> {
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && self.vec_check_value(&args[1], j, locals, lane, acc)
                 }
-                _ => false,
+                Some(MathIntrinsic::Exp) => {
+                    // exp vectorizes only for an f32 lane (its 2^n reconstruction is f32-specific).
+                    args.len() == 1
+                        && self.vec_check_value(&args[0], j, locals, lane, acc)
+                        && *lane == Some(MirType::F32)
+                }
+                None => false,
             },
             _ => false,
         }
@@ -1731,7 +1737,11 @@ impl FnLowerer<'_> {
                     let mask = self.builder.build(mty, Op::Cmp(pred, a, b));
                     self.builder.build(vty.clone(), Op::Select(mask, a, b))
                 }
-                _ => unreachable!("vectorizer accepted a call it cannot lower"),
+                Some(MathIntrinsic::Exp) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_exp_f32(x, vty)
+                }
+                None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
             // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
             _ => {
@@ -2435,10 +2445,7 @@ impl FnLowerer<'_> {
             Some(n) => MirType::Vec(Box::new(MirType::I32), n),
             None => MirType::I32,
         };
-        let mty = match lanes {
-            Some(n) => MirType::Vec(Box::new(MirType::I1), n),
-            None => MirType::I1,
-        };
+        let mty = mask_ty(fty);
 
         // Clamp so 2^n stays representable (exp under/overflows to 0 / +inf outside this range).
         let hi = self.splat_const_f(EXP_HI, fty);
@@ -2485,10 +2492,13 @@ impl FnLowerer<'_> {
         let biased = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Add, ni, bias));
-        let sh = self.splat_const_i(23, &ity);
+        // `<< 23` written as `* 2^23`: keeps both Bin operands the same (vector) type. Cranelift's
+        // vector `ishl` requires a *scalar* shift amount, but `imul` takes two vectors; since
+        // `n + 127 <= 254` the product never overflows i32, so it equals the shift bit-for-bit.
+        let pow = self.splat_const_i(8_388_608, &ity);
         let shifted = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::Shl, biased, sh));
+            .build(ity.clone(), Op::Bin(BinOp::Mul, biased, pow));
         let pow2 = self.builder.build(
             fty.clone(),
             Op::Cast(CastKind::Bitcast, shifted, fty.clone()),
@@ -3598,10 +3608,11 @@ fn float_ty_like(ty: &MirType, lane: MirType) -> MirType {
     }
 }
 
-/// The boolean-mask type a compare on `ty` yields: `i1`, or a per-lane `Vec` of `i1`.
+/// The boolean-mask type a compare on `ty` yields: `i1` for a scalar, or a per-lane integer vector
+/// (matching the native backend's vector compare result) for a `Vec`.
 fn mask_ty(ty: &MirType) -> MirType {
     match ty {
-        MirType::Vec(_, n) => MirType::Vec(Box::new(MirType::I1), *n),
+        MirType::Vec(lane, n) => MirType::Vec(Box::new(mask_lane_type(lane)), *n),
         _ => MirType::I1,
     }
 }
