@@ -294,6 +294,22 @@ fn differential_vmath_dispatch() {
          for i in 0..13 { xs[i] = (i as f32) * 0.5; } \
          let mut ys: [f32; 13] = [0.0; 13]; for i in 0..13 { ys[i] = exp(xs[i]); } \
          print((ys[12] * 100.0) as i32); return 0; }",
+        // silu and gelu (the Llama / BERT activations), dispatched to the fused AVX2 kernels.
+        "fn main() -> i32 { let mut xs: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { xs[i] = (i as f32) * 0.25 - 4.0; } \
+         let mut ys: [f32; 32] = [0.0; 32]; for i in 0..32 { ys[i] = silu(xs[i]); } \
+         print((ys[24] * 1000.0) as i32); return 0; }",
+        "fn main() -> i32 { let mut xs: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { xs[i] = (i as f32) * 0.25 - 4.0; } \
+         let mut ys: [f32; 32] = [0.0; 32]; for i in 0..32 { ys[i] = gelu(xs[i]); } \
+         print((ys[24] * 1000.0) as i32); return 0; }",
+        // adjacent activation loops the fusion pass merges into one multi-statement body: each
+        // statement must still dispatch to its own kernel call (a full-range pass, in source order).
+        "fn main() -> i32 { let mut xs: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { xs[i] = (i as f32) * 0.5 - 4.0; } \
+         let mut a: [f32; 16] = [0.0; 16]; let mut b: [f32; 16] = [0.0; 16]; \
+         for i in 0..16 { a[i] = silu(xs[i]); } for i in 0..16 { b[i] = gelu(xs[i]); } \
+         print((a[10] * 1000.0) as i32); print((b[10] * 1000.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {
@@ -303,18 +319,22 @@ fn differential_vmath_dispatch() {
         }
     }
     // Golden accuracy (≈1 ULP of libm, truncating `as i32`): exp(3.5)=33.1154→33115,
-    // tanh(1)=0.761594→76159, sigmoid(2)=0.880797→88079.
+    // tanh(1)=0.761594→76159, sigmoid(2)=0.880797→88079, silu(2)=1.76159→176159,
+    // gelu(2)=1.95460→195459.
     let golden = "fn main() -> i32 { \
         let a: [f32; 4] = [3.5; 4]; let b: [f32; 4] = [1.0; 4]; let c: [f32; 4] = [2.0; 4]; \
         let oa: [f32; 4] = [0.0; 4]; let ob: [f32; 4] = [0.0; 4]; let oc: [f32; 4] = [0.0; 4]; \
+        let od: [f32; 4] = [0.0; 4]; let oe: [f32; 4] = [0.0; 4]; \
         for i in 0..4 { oa[i] = exp(a[i]); } for i in 0..4 { ob[i] = tanh(b[i]); } \
-        for i in 0..4 { oc[i] = sigmoid(c[i]); } \
+        for i in 0..4 { oc[i] = sigmoid(c[i]); } for i in 0..4 { od[i] = silu(c[i]); } \
+        for i in 0..4 { oe[i] = gelu(c[i]); } \
         print((oa[0] * 1000.0) as i32); print((ob[0] * 100000.0) as i32); \
-        print((oc[0] * 100000.0) as i32); return 0; }";
+        print((oc[0] * 100000.0) as i32); print((od[0] * 100000.0) as i32); \
+        print((oe[0] * 100000.0) as i32); return 0; }";
     let (_, out) = jit(golden, 3).expect("jit golden");
     assert_eq!(
         String::from_utf8(out).unwrap(),
-        "33115\n76159\n88079\n",
+        "33115\n76159\n88079\n176159\n195459\n",
         "vmath kernel drifted from libm accuracy"
     );
 }

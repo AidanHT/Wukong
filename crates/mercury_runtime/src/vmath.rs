@@ -19,6 +19,12 @@ pub const VM_LOG: i64 = 1;
 pub const VM_TANH: i64 = 2;
 pub const VM_SIGMOID: i64 = 3;
 pub const VM_RELU: i64 = 4;
+pub const VM_SILU: i64 = 5;
+pub const VM_GELU: i64 = 6;
+
+// GELU (tanh approximation) constants: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
+const GELU_C0: f32 = 0.7978845608; // √(2/π)
+const GELU_C1: f32 = 0.044715;
 
 // --- Cephes single-precision constants (mirror mercury_mir_build's `exp`/`log` poly constants) ----
 const LOG2EF: f32 = std::f32::consts::LOG2_E;
@@ -116,6 +122,20 @@ fn sigmoid1(x: f32) -> f32 {
     1.0 / (1.0 + exp1(-x))
 }
 
+/// `silu(x) = x·sigmoid(x)` (swish) — the Llama / modern-transformer gating activation.
+#[inline]
+fn silu1(x: f32) -> f32 {
+    x * sigmoid1(x)
+}
+
+/// `gelu(x)` (tanh approximation) — the BERT/GPT-2/ViT activation.
+#[inline]
+fn gelu1(x: f32) -> f32 {
+    let x3 = x * x * x;
+    let inner = GELU_C0 * GELU_C1.mul_add(x3, x);
+    (0.5 * x) * (1.0 + tanh1(inner))
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -125,6 +145,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_TANH => tanh1(x),
         VM_SIGMOID => sigmoid1(x),
         VM_RELU => x.max(0.0),
+        VM_SILU => silu1(x),
+        VM_GELU => gelu1(x),
         _ => x,
     }
 }
@@ -165,6 +187,8 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_TANH => tanh8,
         VM_SIGMOID => sigmoid8,
         VM_RELU => relu8,
+        VM_SILU => silu8,
+        VM_GELU => gelu8,
         _ => return,
     };
     let mut i = 0;
@@ -268,6 +292,28 @@ unsafe fn relu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_max_ps(x, _mm256_setzero_ps())
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x * sigmoid(x)
+    _mm256_mul_ps(x, sigmoid8(x))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // 0.5·x·(1 + tanh(C0·(x + C1·x³))) — mirrors gelu1 op-for-op.
+    let x3 = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
+    let inner = _mm256_mul_ps(
+        _mm256_set1_ps(GELU_C0),
+        _mm256_fmadd_ps(_mm256_set1_ps(GELU_C1), x3, x),
+    );
+    let onep = _mm256_add_ps(_mm256_set1_ps(1.0), tanh8(inner));
+    _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), x), onep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +328,10 @@ mod tests {
             (VM_EXP, |x| x.exp(), 2e-5),
             (VM_TANH, |x| x.tanh(), 2e-5),
             (VM_SIGMOID, |x| 1.0 / (1.0 + (-x).exp()), 2e-5),
+            (VM_SILU, |x| x / (1.0 + (-x).exp()), 2e-5),
+            (VM_GELU, |x| {
+                0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh())
+            }, 5e-5),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
@@ -317,7 +367,7 @@ mod tests {
     #[test]
     fn vmath_tail_matches_lanes() {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
-        for op in [VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU] {
+        for op in [VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU] {
             if op == VM_LOG {
                 continue; // negative inputs are out of log's domain
             }

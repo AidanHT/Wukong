@@ -814,13 +814,8 @@ fn kernels() -> Vec<Kernel> {
         Kernel {
             name: "gelu",
             bytes_per_call: 2 * N * 4,
-            note: "GELU via exp-based tanh, same algorithm everywhere; Mercury vectorizes the exp",
-            mer: mer_kernel(&format!(
-                "for i in 0..{nlit} {{ let v: f32 = x[i]; \
-                 let u: f32 = 0.7978845608 * (v + 0.044715 * v * v * v); \
-                 let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0); \
-                 out[i] = 0.5 * v * (1.0 + t); }}"
-            )),
+            note: "GELU (tanh approx): Mercury dispatches gelu() to a fused 256-bit AVX2 kernel; C/Rust scalar",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = gelu(x[i]); }}")),
             c: c_kernel(
                 "for(long i=0;i<N;i++){ float v=x[i]; \
                  float u=0.7978845608f*(v+0.044715f*v*v*v); \
@@ -839,10 +834,8 @@ fn kernels() -> Vec<Kernel> {
         Kernel {
             name: "silu",
             bytes_per_call: 2 * N * 4,
-            note: "x*sigmoid(x) (swish): Mercury vectorizes sigmoid; C/Rust call scalar expf",
-            mer: mer_kernel(&format!(
-                "for i in 0..{nlit} {{ out[i] = x[i] * sigmoid(x[i]); }}"
-            )),
+            note: "silu/swish x*sigmoid(x): Mercury dispatches silu() to a fused 256-bit AVX2 kernel; C/Rust scalar",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = silu(x[i]); }}")),
             c: c_kernel("for(long i=0;i<N;i++){ float v=x[i]; out[i]=v/(1.0f+expf(-v)); }"),
             rust: rust_kernel(
                 "for i in 0..N { let v= *x.add(i); *out.add(i)=v/(1.0f32+(-v).exp()); }",

@@ -357,6 +357,8 @@ const VMATH_EXP: u32 = 0;
 const VMATH_LOG: u32 = 1;
 const VMATH_TANH: u32 = 2;
 const VMATH_SIGMOID: u32 = 3;
+const VMATH_SILU: u32 = 5;
+const VMATH_GELU: u32 = 6;
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -941,56 +943,72 @@ impl FnLowerer<'_> {
         single_path(base)
     }
 
-    /// Recognize a pure elementwise transcendental loop `for j in lo..hi { out[j] = f(x[j]) }` for a
-    /// supported unary intrinsic `f` (exp/log/tanh/sigmoid) over `f32` arrays, and lower it to one
-    /// `mercury_vmath_f32(x+lo, out+lo, hi-lo, op)` call — the 256-bit AVX2 kernel (Cranelift's
-    /// vectorizer is capped at 128-bit). The interpreter marshals through the *identical* kernel, so
-    /// the differential oracle stays exact. `out` and `x` may be the same array (in-place). Returns
-    /// false on any mismatch, so the caller falls back to the generic 128-bit vectorizer. Pure checks
-    /// run before any MIR is emitted.
-    fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
-        if body.tail.is_some() || body.stmts.len() != 1 {
-            return false;
-        }
+    /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
+    /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
+    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32)> {
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
             value,
-        } = &body.stmts[0].kind
+        } = &stmt.kind
         else {
-            return false;
+            return None;
         };
-        let Some(out_sym) = self.index_by_loopvar(target, j) else {
-            return false;
-        };
+        let out_sym = self.index_by_loopvar(target, j)?;
         let ExprKind::Call { callee, args, .. } = &value.kind else {
-            return false;
+            return None;
         };
         if args.len() != 1 {
-            return false;
+            return None;
         }
         let opcode = match self.vectorizable_intrinsic(callee) {
             Some(MathIntrinsic::Exp) => VMATH_EXP,
             Some(MathIntrinsic::Log) => VMATH_LOG,
             Some(MathIntrinsic::Tanh) => VMATH_TANH,
             Some(MathIntrinsic::Sigmoid) => VMATH_SIGMOID,
-            _ => return false,
+            Some(MathIntrinsic::Silu) => VMATH_SILU,
+            Some(MathIntrinsic::Gelu) => VMATH_GELU,
+            _ => return None,
         };
-        let Some(x_sym) = self.index_by_loopvar(&args[0], j) else {
-            return false;
-        };
+        let x_sym = self.index_by_loopvar(&args[0], j)?;
         // f32-only (the kernel computes f32); bail on f64 / unknown.
         if self.expr_mir(value) != MirType::F32 || self.expr_mir(&args[0]) != MirType::F32 {
+            return None;
+        }
+        Some((out_sym, x_sym, opcode))
+    }
+
+    /// Recognize an elementwise transcendental loop `for j in lo..hi { ... }` whose body is one or
+    /// more independent `out[j] = f(x[j])` activations, and lower it to one `mercury_vmath_f32(x+lo,
+    /// out+lo, hi-lo, op)` call per statement — the 256-bit AVX2 kernel (Cranelift's vectorizer is
+    /// capped at 128-bit). Handles a multi-statement body (e.g. adjacent activation loops the fusion
+    /// pass merged): each kernel call is a full-range pass emitted in source order, which preserves
+    /// the fused loop's per-element semantics (any cross-statement read of an array a prior statement
+    /// wrote sees the same values, since that array is fully written before the next pass reads it).
+    /// `out` and `x` may be the same array (in-place). The interpreter marshals through the identical
+    /// kernel, so the differential oracle stays exact. Returns false (fall back to the generic
+    /// vectorizer) unless *every* statement matches. Pure checks run before any MIR is emitted.
+    fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if body.tail.is_some() || body.stmts.is_empty() {
             return false;
         }
-        let (Some((out_base, _)), Some((x_base, _))) =
-            (self.lookup(out_sym), self.lookup(x_sym))
-        else {
-            return false;
-        };
+        // Every statement must be an independent dispatchable activation, and every array must be in
+        // scope — collect (out_base, x_base, op) for all of them before emitting any MIR.
+        let mut calls: Vec<(ValueId, ValueId, u32)> = Vec::with_capacity(body.stmts.len());
+        for stmt in &body.stmts {
+            let Some((out_sym, x_sym, opcode)) = self.match_vmath_stmt(stmt, j) else {
+                return false;
+            };
+            let (Some((out_base, _)), Some((x_base, _))) =
+                (self.lookup(out_sym), self.lookup(x_sym))
+            else {
+                return false;
+            };
+            calls.push((out_base, x_base, opcode));
+        }
 
-        // All checks passed — now emit. Lower the bounds to i64, GEP each base by the start index
-        // (so a loop from `lo` begins at element `lo`), and call the kernel for `hi-lo` elements.
+        // Lower the bounds once (GEP each base by the start index so a loop from `lo` begins at
+        // element `lo`), then emit one kernel call per statement over the `hi-lo` element range.
         let sty = self.expr_mir(start);
         let s = self.lower_expr(start);
         let s = self.coerce_to(s, &sty, &MirType::I64, true);
@@ -998,29 +1016,31 @@ impl FnLowerer<'_> {
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        let xp = self.builder.build(
-            MirType::Ptr,
-            Op::Gep {
-                ptr: x_base,
-                index: s,
-                elem: MirType::F32,
-            },
-        );
-        let outp = self.builder.build(
-            MirType::Ptr,
-            Op::Gep {
-                ptr: out_base,
-                index: s,
-                elem: MirType::F32,
-            },
-        );
-        let opv = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
-        self.builder.build_void(Op::Call {
-            func: self.gemm.vmath,
-            args: vec![xp, outp, n, opv],
-        });
+        for (out_base, x_base, opcode) in calls {
+            let xp = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: x_base,
+                    index: s,
+                    elem: MirType::F32,
+                },
+            );
+            let outp = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: out_base,
+                    index: s,
+                    elem: MirType::F32,
+                },
+            );
+            let opv = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
+            self.builder.build_void(Op::Call {
+                func: self.gemm.vmath,
+                args: vec![xp, outp, n, opv],
+            });
+        }
         true
     }
 
@@ -1352,7 +1372,9 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Sin
                     | MathIntrinsic::Cos
                     | MathIntrinsic::Tanh
-                    | MathIntrinsic::Sigmoid,
+                    | MathIntrinsic::Sigmoid
+                    | MathIntrinsic::Silu
+                    | MathIntrinsic::Gelu,
                 ) => {
                     // These build on the exp/log polynomials, which vectorize only for an f32 lane
                     // (their IEEE-754 exponent surgery is f32-specific).
@@ -2138,6 +2160,14 @@ impl FnLowerer<'_> {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_sigmoid(x, vty)
                 }
+                Some(MathIntrinsic::Silu) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_silu(x, vty)
+                }
+                Some(MathIntrinsic::Gelu) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_gelu(x, vty)
+                }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
             // an invariant scalar or literal: lower as a scalar (coerced to the lane type) and splat.
@@ -2833,6 +2863,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_sigmoid(x, &rty))
             }
+            MathIntrinsic::Silu => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_silu(x, &rty))
+            }
+            MathIntrinsic::Gelu => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_gelu(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -2904,6 +2942,36 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FDiv, two, denom));
         self.builder
             .build(rty.clone(), Op::Bin(BinOp::FSub, one, frac))
+    }
+
+    /// `silu(x) = x · sigmoid(x)` (swish). The scalar/composed path; an `out[i] = silu(x[i])` loop
+    /// dispatches to the fused AVX2 kernel instead. Bit-identical across backends (see `emit_exp`).
+    fn emit_silu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let s = self.emit_sigmoid(x, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, s))
+    }
+
+    /// `gelu(x)` (tanh approximation): `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`. Mirrors the
+    /// fused AVX2 `gelu8` op-for-op (so the scalar form and the dispatched loop form agree). The
+    /// BERT/GPT-2/ViT activation; bit-identical across backends.
+    fn emit_gelu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
+        let x3 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x2, x));
+        let c1 = self.splat_const_f(0.044715, rty);
+        let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // 0.044715·x³ + x
+        let c0 = self.splat_const_f(0.7978845608, rty);
+        let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
+        let th = self.emit_tanh(inner, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let onep = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, th));
+        let half = self.splat_const_f(0.5, rty);
+        let hx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, half, x));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, hx, onep))
     }
 
     /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
@@ -4693,6 +4761,8 @@ enum MathIntrinsic {
     Cos,
     Tanh,
     Sigmoid,
+    Silu,
+    Gelu,
     Fmax,
     Fmin,
 }
@@ -4709,6 +4779,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "cos" => MathIntrinsic::Cos,
         "tanh" => MathIntrinsic::Tanh,
         "sigmoid" => MathIntrinsic::Sigmoid,
+        "silu" => MathIntrinsic::Silu,
+        "gelu" => MathIntrinsic::Gelu,
         "fmax" => MathIntrinsic::Fmax,
         "fmin" => MathIntrinsic::Fmin,
         _ => return None,
