@@ -923,6 +923,21 @@ fn negative_float_to_signed_int_cast_is_signed() {
     assert_eq!(String::from_utf8(native.1).unwrap(), "-10\n-7\n");
 }
 
+/// Out-of-range and negative→unsigned fp→int casts must saturate identically on both backends
+/// (Cranelift uses the `_sat` fcvt variants). The interpreter previously bit-masked an i128 cast,
+/// which diverged: `1e12 as i32` should clamp to i32::MAX, and `(-5.0) as u32` to 0 — on *both*.
+#[test]
+fn float_to_int_saturation_matches_native() {
+    let src = "module m\nfn main() -> i32 { \
+        let mut big: f32 = 1000000.0; big = big * big; let a: i32 = big as i32; \
+        let mut neg: f32 = 1.0; neg = neg - 6.0; let b: u32 = neg as u32; \
+        print(a); print(b as i32); return 0; }";
+    let native = jit(src, 3).expect("jit");
+    let interp = interp(src, 3).expect("interp");
+    assert_eq!(native, interp, "saturating fp->int: native vs interp");
+    assert_eq!(String::from_utf8(native.1).unwrap(), "2147483647\n0\n");
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.
