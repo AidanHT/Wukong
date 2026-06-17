@@ -80,6 +80,7 @@ const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
 const RT_SGEMM_NT: &str = "mercury_sgemm_nt";
 const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
+const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -720,6 +721,18 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[a, b, c, m, k, n, beta, bias, act]);
             return None;
         }
+        // The vectorized elementwise transcendental: mercury_vmath_f32(x, out, n, op) — two pointers
+        // and two i64 (element count, op code). The 256-bit AVX2 kernel an `out[i]=f(x[i])` loop
+        // lowers to.
+        if name == RT_VMATH && args.len() == 4 {
+            let x = self.val(args[0]);
+            let out = self.val(args[1]);
+            let n = self.coerce_to_i64(args[2]);
+            let op = self.coerce_to_i64(args[3]);
+            let fref = self.rt_refs[RT_VMATH];
+            self.builder.ins().call(fref, &[x, out, n, op]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -826,6 +839,7 @@ struct RtFuncs {
     sgemm_nt: FuncId,
     sgemm_nt_parallel: FuncId,
     sgemm_nt_epi: FuncId,
+    vmath: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -909,7 +923,13 @@ fn populate_module<M: Module>(
     }
     sig_gemm_epi.params.push(AbiParam::new(ptr_ty)); // bias
     sig_gemm_epi.params.push(AbiParam::new(types::I64)); // act
-                                                         // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
+                                                         // mercury_vmath_f32(x: ptr, out: ptr, n: i64, op: i64) — vectorized elementwise transcendental.
+    let mut sig_vmath = Signature::new(call_conv);
+    sig_vmath.params.push(AbiParam::new(ptr_ty));
+    sig_vmath.params.push(AbiParam::new(ptr_ty));
+    sig_vmath.params.push(AbiParam::new(types::I64));
+    sig_vmath.params.push(AbiParam::new(types::I64));
+    // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
     let mut sig_fmod_f64 = Signature::new(call_conv);
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
@@ -945,6 +965,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sgemm_nt_epi: module
             .declare_function(RT_SGEMM_NT_EPI, Linkage::Import, &sig_gemm_epi)
+            .map_err(|e| e.to_string())?,
+        vmath: module
+            .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -1014,6 +1037,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_NT_EPI,
                 module.declare_func_in_func(rt.sgemm_nt_epi, builder.func),
+            );
+            rt_refs.insert(
+                RT_VMATH,
+                module.declare_func_in_func(rt.vmath, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1144,6 +1171,7 @@ pub fn jit_compile(
         RT_SGEMM_NT_EPI,
         mercury_runtime::mercury_sgemm_nt_epi as *const u8,
     );
+    builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -1228,6 +1256,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_SGEMM_NT_EPI,
         mercury_runtime::mercury_sgemm_nt_epi as *const u8,
     );
+    builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);

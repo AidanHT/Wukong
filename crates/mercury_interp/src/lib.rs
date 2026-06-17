@@ -563,6 +563,43 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_vmath_f32(x, out, n, op)` — the 256-bit AVX2 elementwise transcendental kernel
+            // (exp/log/tanh/sigmoid) the compiler lowers an `out[i] = f(x[i])` loop to. Marshal `n`
+            // f32 from x, call the *identical* runtime kernel the native backend calls, write the
+            // result back — so the differential oracle stays exact despite the kernel's wider lanes.
+            // Reading all of x before writing out makes the in-place (x == out) case correct.
+            "mercury_vmath_f32" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let op = args[3].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("vmath operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/obuf are exactly n f32 long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_vmath_f32(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        n as i64,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("vmath output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }
