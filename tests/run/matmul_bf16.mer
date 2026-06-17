@@ -1,0 +1,39 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+module tests.run.matmul_bf16
+
+// bf16 inputs, f32 accumulation — the standard ML mixed-precision matmul. Small integer values are
+// bf16-exact, so C = A·I must reproduce A exactly. Proves bf16 storage + widening work end-to-end
+// through a matmul nest; the mercury_bench gate proves the interpreter and native backend agree.
+fn main() -> i32 {
+    let mut a: [bf16; 16] = [0.0 as bf16; 16]; // row i is all (i+1)
+    let mut b: [bf16; 16] = [0.0 as bf16; 16]; // identity
+    let mut c: [f32; 16] = [0.0; 16];
+
+    for i in 0..4 {
+        for j in 0..4 {
+            a[i * 4 + j] = ((i + 1) as f32) as bf16;
+        }
+        b[i * 4 + i] = 1.0 as bf16;
+    }
+
+    // C = A·B (bf16 reads widen to f32; products and sums accumulate in f32).
+    for i in 0..4 {
+        for k in 0..4 {
+            let aik: f32 = a[i * 4 + k] as f32;
+            for j in 0..4 {
+                c[i * 4 + j] = c[i * 4 + j] + aik * (b[k * 4 + j] as f32);
+            }
+        }
+    }
+
+    print(c[0] as i32); // row 0 -> 1
+    print(c[5] as i32); // row 1 -> 2
+    print(c[10] as i32); // row 2 -> 3
+    print(c[15] as i32); // row 3 -> 4
+    return 0;
+}
