@@ -796,6 +796,55 @@ fn matmul_overwrite_differential() {
     assert_eq!(native, interp, "overwrite matmul native vs interp");
 }
 
+/// The accumulate (beta = 1) matmul — `C += A·B` with `C` pre-initialized — end to end. Guards the
+/// beta=1 dispatch (a real pattern: accumulating a matmul into a bias-initialized output). Unlike the
+/// overwrite test, this also checks the value against an independent reference, so a *beta
+/// misclassification* (silently overwriting and dropping `C`'s initial values) is caught — native ==
+/// interp alone would not notice that. Inputs are exact multiples of 0.5 so the kernel's reassociated
+/// sum equals the naive reference bit-for-bit.
+#[test]
+fn matmul_accumulate_differential() {
+    let ns = 7usize; // not a multiple of MR/NR — exercises the microkernel remainders
+    let n2 = ns * ns;
+    // No per-row zero-init in `mm` => the recognizer reads it as the accumulate (beta = 1) form.
+    let src = format!(
+        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{ \
+         for i in 0..{ns} {{ for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
+         for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
+         fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
+         let mut c: [f32; {n2}] = [0.0; {n2}]; let mut i: i32 = 0; \
+         while i < {n2} {{ a[i] = ((i % 5) as f32) * 0.5; b[i] = ((i % 3) as f32) - 1.0; \
+         c[i] = ((i % 7) as f32) - 2.0; i += 1; }} \
+         mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+         while j < {n2} {{ s = s + c[j]; j += 1; }} return (s * 100.0) as i32; }}"
+    );
+    assert!(lowered_calls(&src, "mercury_sgemm"), "recognizer must fire");
+    let native = jit(&src, 3).expect("jit");
+    let interp = interp(&src, 3).expect("interp");
+    assert_eq!(native, interp, "accumulate matmul native vs interp");
+
+    // Independent reference (C starts at its init values, then accumulates A·B).
+    let (mut a, mut b, mut c) = (vec![0f32; n2], vec![0f32; n2], vec![0f32; n2]);
+    for i in 0..n2 {
+        a[i] = ((i % 5) as f32) * 0.5;
+        b[i] = ((i % 3) as f32) - 1.0;
+        c[i] = ((i % 7) as f32) - 2.0;
+    }
+    for i in 0..ns {
+        for k in 0..ns {
+            let aik = a[i * ns + k];
+            for j in 0..ns {
+                c[i * ns + j] += aik * b[k * ns + j];
+            }
+        }
+    }
+    let mut s = 0f32;
+    for j in 0..n2 {
+        s += c[j];
+    }
+    assert_eq!(native.0, (s * 100.0) as i32 as i64, "accumulate matmul value vs reference");
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.
