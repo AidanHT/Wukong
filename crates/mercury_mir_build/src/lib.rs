@@ -1113,9 +1113,14 @@ impl FnLowerer<'_> {
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && self.vec_check_value(&args[1], j, locals, lane, acc)
                 }
-                Some(MathIntrinsic::Exp | MathIntrinsic::Tanh | MathIntrinsic::Sigmoid) => {
-                    // These build on the exp polynomial, which vectorizes only for an f32 lane
-                    // (its 2^n reconstruction is f32-specific).
+                Some(
+                    MathIntrinsic::Exp
+                    | MathIntrinsic::Log
+                    | MathIntrinsic::Tanh
+                    | MathIntrinsic::Sigmoid,
+                ) => {
+                    // These build on the exp/log polynomials, which vectorize only for an f32 lane
+                    // (their IEEE-754 exponent surgery is f32-specific).
                     args.len() == 1
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && *lane == Some(MirType::F32)
@@ -1864,6 +1869,10 @@ impl FnLowerer<'_> {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_exp_f32(x, vty)
                 }
+                Some(MathIntrinsic::Log) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_log_f32(x, vty)
+                }
                 Some(MathIntrinsic::Tanh) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_tanh(x, vty)
@@ -2531,6 +2540,10 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_exp(x, &rty))
             }
+            MathIntrinsic::Log => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_log(x, &rty))
+            }
             MathIntrinsic::Tanh => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_tanh(x, &rty))
@@ -2686,6 +2699,121 @@ impl FnLowerer<'_> {
 
         self.builder
             .build(fty.clone(), Op::Bin(BinOp::FMul, p, pow2))
+    }
+
+    /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
+    /// computed in `f32`; for an `f64` result the argument is demoted and the result promoted (the
+    /// same f32-precision model `exp` uses). Works on a scalar or a SIMD-vector `f32`.
+    fn emit_log(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let want_f64 = matches!(rty.lane_type(), MirType::F64);
+        let f32ty = float_ty_like(rty, MirType::F32);
+        let xf = if want_f64 {
+            self.builder
+                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
+        } else {
+            x
+        };
+        let r = self.emit_log_f32(xf, &f32ty);
+        if want_f64 {
+            self.builder
+                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
+        } else {
+            r
+        }
+    }
+
+    /// The natural-log polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Decomposes
+    /// `x = m·2^e` with `m ∈ [0.5,1)` by IEEE-754 bit surgery — **no shift**: the exponent field is
+    /// masked off (so the integer is `exp_field·2^23`, exact in `f32` for the ≤8-bit field), widened
+    /// and scaled by `2^-23` to recover the count; the mantissa is OR-ed with biased exponent 126.
+    /// Then a Cephes degree-8 minimax poly gives `log(m)`, and `e·ln2` is added back (same `ln2`
+    /// split as `exp`). Every step is a primitive op both backends agree on bit-for-bit, so `log`
+    /// does too. Assumes `x > 0` (like the rest of the kernels, no domain guard).
+    fn emit_log_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
+        let lanes = match fty {
+            MirType::Vec(_, n) => Some(*n),
+            _ => None,
+        };
+        let ity = match lanes {
+            Some(n) => MirType::Vec(Box::new(MirType::I32), n),
+            None => MirType::I32,
+        };
+        let mty = mask_ty(fty);
+
+        let bits = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, x, ity.clone()));
+
+        // e = (float)(exponent_field) - 126, without a shift: keep only the exponent bits (value is
+        // `exp_field·2^23`, exact in f32), widen to f32, scale by 2^-23.
+        let expmask = self.splat_const_i(0x7F80_0000, &ity);
+        let epart = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, bits, expmask));
+        let epart_f = self
+            .builder
+            .build(fty.clone(), Op::Cast(CastKind::SiToFp, epart, fty.clone()));
+        let inv = self.splat_const_f(INV_2P23, fty);
+        let efield = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, epart_f, inv));
+        let bias = self.splat_const_f(126.0, fty);
+        let mut e = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, efield, bias));
+
+        // m = bitcast((bits & 0x007fffff) | 0x3f000000) — mantissa with biased exponent 126 → [0.5,1).
+        let mmask = self.splat_const_i(0x007F_FFFF, &ity);
+        let mant = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, bits, mmask));
+        let half_exp = self.splat_const_i(0x3F00_0000, &ity);
+        let mbits = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Or, mant, half_exp));
+        let mut m = self
+            .builder
+            .build(fty.clone(), Op::Cast(CastKind::Bitcast, mbits, fty.clone()));
+
+        // if m < √0.5: e -= 1; m = 2m - 1; else m -= 1  (branchless via select).
+        let sqrthf = self.splat_const_f(LOG_SQRTHF, fty);
+        let lt = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, m, sqrthf));
+        let one = self.splat_const_f(1.0, fty);
+        let m2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, m, m));
+        let m_lt = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, m2, one)); // 2m - 1
+        let m_ge = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, m, one)); // m - 1
+        m = self.builder.build(fty.clone(), Op::Select(lt, m_lt, m_ge));
+        let e_dec = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, e, one)); // e - 1
+        e = self.builder.build(fty.clone(), Op::Select(lt, e_dec, e));
+
+        // Degree-8 minimax poly for log(m) on the reduced range, Horner via fmas, then × m × z.
+        let z = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, m, m));
+        let mut p = self.splat_const_f(LOG_P[0], fty);
+        for &c in &LOG_P[1..] {
+            let cc = self.splat_const_f(c, fty);
+            p = self.builder.build(fty.clone(), Op::Fma(p, m, cc));
+        }
+        let pm = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, p, m));
+        let mut y = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, pm, z));
+
+        // y += e·C2 (ln2 low);  y -= 0.5·z
+        let c2 = self.splat_const_f(EXP_C2, fty);
+        y = self.builder.build(fty.clone(), Op::Fma(e, c2, y));
+        let neg_half = self.splat_const_f(-0.5, fty);
+        y = self.builder.build(fty.clone(), Op::Fma(z, neg_half, y));
+
+        // r = m + y + e·C1 (ln2 high)
+        let r = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, m, y));
+        let c1 = self.splat_const_f(EXP_C1, fty);
+        self.builder.build(fty.clone(), Op::Fma(e, c1, r))
     }
 
     /// Build a float constant of type `fty` — a scalar `ConstFloat`, or one splatted to a vector.
@@ -3801,6 +3929,7 @@ enum MathIntrinsic {
     Sqrt,
     Rsqrt,
     Exp,
+    Log,
     Tanh,
     Sigmoid,
     Fmax,
@@ -3812,6 +3941,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "sqrt" => MathIntrinsic::Sqrt,
         "rsqrt" => MathIntrinsic::Rsqrt,
         "exp" => MathIntrinsic::Exp,
+        "log" => MathIntrinsic::Log,
         "tanh" => MathIntrinsic::Tanh,
         "sigmoid" => MathIntrinsic::Sigmoid,
         "fmax" => MathIntrinsic::Fmax,
@@ -3851,6 +3981,23 @@ const EXP_P: [f64; 6] = [
     4.1665795894e-2,
     1.6666665459e-1,
     5.0000001201e-1,
+];
+
+/// Natural-log polynomial constants (Cephes `logf`). `LOG_SQRTHF` is the `√0.5` split point that
+/// keeps the reduced mantissa centered; `LOG_P` is the degree-8 minimax poly on it. `e·ln2` is
+/// added back with the *same* split `EXP_C1`/`EXP_C2` that `exp` uses (ln2 = C1 + C2).
+const LOG_SQRTHF: f64 = std::f64::consts::FRAC_1_SQRT_2; // 1/√2 = √0.5
+const INV_2P23: f64 = 1.0 / 8_388_608.0; // 2^-23 (exact): scales the masked exponent field to a count
+const LOG_P: [f64; 9] = [
+    7.0376836292e-2,
+    -1.1514610310e-1,
+    1.1676998740e-1,
+    -1.2420140846e-1,
+    1.4249322787e-1,
+    -1.6668057665e-1,
+    2.0000714765e-1,
+    -2.4999993993e-1,
+    3.3333331174e-1,
 ];
 
 /// Names that lower to runtime/interpreter intrinsics rather than user functions.

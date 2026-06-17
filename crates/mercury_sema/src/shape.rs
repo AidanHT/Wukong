@@ -15,7 +15,7 @@ use mercury_types::{Dim, Scalar, Shape, Ty};
 
 use crate::{DefKind, FnSig, Sema};
 
-/// Result types for the math intrinsics the backends lower directly (`sqrt`, `rsqrt`, `exp`,
+/// Result types for the math intrinsics the backends lower directly (`sqrt`, `rsqrt`, `exp`, `log`,
 /// `fmax`, `fmin`). The result is the float type of the first argument, defaulting to `f32` so a
 /// bare `exp(x)` is still typed when the argument's type is unknown. Returns `None` for any other
 /// callee — that keeps `type_call` lenient on the unmodeled-builtin path (`min`, `f32x8::load`, …).
@@ -29,7 +29,7 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
         _ => Ty::Scalar(Scalar::F32),
     };
     match name {
-        "sqrt" | "rsqrt" | "exp" | "tanh" | "sigmoid" | "fmax" | "fmin" => Some(float_ty),
+        "sqrt" | "rsqrt" | "exp" | "log" | "tanh" | "sigmoid" | "fmax" | "fmin" => Some(float_ty),
         _ => None,
     }
 }
