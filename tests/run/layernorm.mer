@@ -1,19 +1,25 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: -500
-// EXPECT-OUT: 1626
 // EXPECT-OUT: -1626
+// EXPECT-OUT: -108
 // EXPECT-OUT: 108
+// EXPECT-OUT: 1626
 module tests.run.layernorm
 
-// LayerNorm over a fixed vector (gamma=1, beta=0, eps=1e-5), in the supported subset.
-// mean and variance are sum reductions (the variance addend (x-mean)^2 FMA-contracts); the
-// normalize pass vectorizes with rsqrt's reciprocal as an invariant splat. The mercury_bench
-// gate proves it matches the interpreter bit-for-bit.
+// LayerNorm over a fixed vector (gamma=1, beta=0, eps=1e-5), in the supported subset (fixed
+// [f32; N] arrays + literal `for` loops). This is the canonical multi-pass form — mean, then the
+// squared-deviation variance (its addend FMA-contracts), then `(x-mean) * rsqrt(var+eps)` in place
+// — which the compiler folds into one `mercury_norm_f32(.., NORM_LAYERNORM)` call (each element
+// loaded once + 256-bit AVX2). The differential gate proves the fused kernel matches the
+// interpreter bit-for-bit, and the opt-invariance gate proves -O0 == -O3.
+//
+// The samples below read only the normalized output `x[..]` (never the internal mean/var, which the
+// fused kernel does not expose) so the recognizer fires; the chosen inputs make every reduction an
+// exact (half-)integer, so the fused and generic lowerings agree to the bit here regardless.
 fn main() -> i32 {
     let mut x: [f32; 16] = [0.0; 16];
     for i in 0..16 {
-        x[i] = (i as f32) - 8.0; // -8 .. 7, mean = -0.5
+        x[i] = (i as f32) - 8.0; // -8 .. 7, mean = -0.5, variance = 21.25
     }
 
     // mean
@@ -30,14 +36,15 @@ fn main() -> i32 {
     }
     let inv: f32 = rsqrt(v * 0.0625 + 0.00001);
 
-    // normalize (vectorized)
+    // normalize, in place
     for i in 0..16 {
         x[i] = (x[i] - mean) * inv;
     }
 
-    print((mean * 1000.0) as i32); // -500
-    print((x[15] * 1000.0) as i32); // (7 - mean) * inv, scaled
-    print((x[0] * 1000.0) as i32); // (-8 - mean) * inv, scaled
-    print((x[8] * 1000.0) as i32); // near mean
+    // Standardized samples, symmetric about 0 (inputs are symmetric about the mean).
+    print((x[0] * 1000.0) as i32); // (-8 - mean) * inv
+    print((x[7] * 1000.0) as i32); // (-1 - mean) * inv
+    print((x[8] * 1000.0) as i32); // ( 0 - mean) * inv
+    print((x[15] * 1000.0) as i32); // ( 7 - mean) * inv
     return 0;
 }
