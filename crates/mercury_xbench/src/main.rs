@@ -42,7 +42,34 @@ struct Kernel {
 struct Measure {
     compile: Duration,
     ns_per_call: f64,
-    checksum: f64,
+    /// A snapshot of the kernel's full output buffer, so the cross-language check can diff *every*
+    /// element (not a 3-point sample, which a kernel wrong everywhere else would slip past).
+    out: Vec<f32>,
+}
+
+/// The maximum relative element-wise error between two output buffers, and the index where it
+/// occurs. NaN-vs-NaN and same-sign-Inf agree; a small absolute floor keeps near-zero elements from
+/// blowing up the ratio. This is the honest full-buffer cross-language equality check: the three
+/// languages compute *slightly* differently (Mercury's ≈1-ULP poly vs libm `expf`, FMA vs not), so
+/// it is a tight tolerance rather than bit-exactness — but it sees all N elements.
+fn max_rel_err(a: &[f32], b: &[f32]) -> (f64, usize) {
+    let mut worst = 0.0f64;
+    let mut at = 0usize;
+    for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+        if x.is_nan() && y.is_nan() {
+            continue;
+        }
+        if x == y {
+            continue; // exact (covers ±0 and equal Inf)
+        }
+        let (x, y) = (x as f64, y as f64);
+        let rel = (x - y).abs() / x.abs().max(y.abs()).max(1e-6);
+        if rel > worst {
+            worst = rel;
+            at = i;
+        }
+    }
+    (worst, at)
 }
 
 fn main() {
@@ -185,13 +212,13 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize) {
         gflops(&cm),
         gflops(&rm)
     );
-    // Cross-language correctness: every backend must compute the same C[0,0] (within f32 tol).
+    // Cross-language correctness: every backend must compute the same C, element by element.
     if let (Some(m), Some(c)) = (&mer_par, &cm) {
-        let rel = (m.checksum - c.checksum).abs() / c.checksum.abs().max(1e-6);
+        let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
             println!(
-                "  ! checksum mismatch Mercury={} C={}",
-                m.checksum, c.checksum
+                "  ! full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                m.out[at], c.out[at], rel
             );
         }
     }
@@ -432,11 +459,11 @@ fn bench_conv(cc: &str, dir: &Path) {
         gflops(&rm)
     );
     if let (Some(m), Some(c)) = (&mer, &cm) {
-        let rel = (m.checksum - c.checksum).abs() / c.checksum.abs().max(1e-6);
+        let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
             println!(
-                "  ! checksum mismatch Mercury={} C={}",
-                m.checksum, c.checksum
+                "  ! full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                m.out[at], c.out[at], rel
             );
         }
         let r = (flops / m.ns_per_call) / (flops / c.ns_per_call);
@@ -528,13 +555,13 @@ fn report(k: &Kernel, m: &Option<Measure>, c: &Option<Measure>, r: &Option<Measu
     row("GB/s", &|x| {
         format!("{:.1}", k.bytes_per_call as f64 / x.ns_per_call)
     });
-    // Cross-check that all three computed the same thing (within f32 tolerance).
+    // Cross-check that all three computed the same thing, element by element (within f32 tol).
     if let (Some(m), Some(c)) = (m, c) {
-        let rel = ((m.checksum - c.checksum).abs()) / c.checksum.abs().max(1e-6);
+        let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
             println!(
-                "  ! checksum mismatch Mercury={} C={} (rel {:.2e})",
-                m.checksum, c.checksum, rel
+                "  ! full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                m.out[at], c.out[at], rel
             );
         }
     }
@@ -589,12 +616,12 @@ fn bench_mercury(
 
     out.iter_mut().for_each(|v| *v = 0.0);
     let ns = time_ns(|| unsafe { f(xp, yp, op) });
-    let checksum = checksum(out);
+    let snapshot = out.to_vec();
     drop(handle); // keep alive through timing
     Some(Measure {
         compile,
         ns_per_call: ns,
-        checksum,
+        out: snapshot,
     })
 }
 
@@ -667,11 +694,11 @@ fn bench_external(
         let f: KernelFn = *sym;
         out.iter_mut().for_each(|v| *v = 0.0);
         let ns = time_ns(|| f(xp, yp, op));
-        let checksum = checksum(out);
+        let snapshot = out.to_vec();
         Some(Measure {
             compile,
             ns_per_call: ns,
-            checksum,
+            out: snapshot,
         })
     }
 }
@@ -707,11 +734,6 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
         }
         reps = reps.saturating_mul(2);
     }
-}
-
-fn checksum(out: &[f32]) -> f64 {
-    let n = out.len();
-    (out[0] as f64) + (out[n / 2] as f64) + (out[n - 1] as f64)
 }
 
 fn geomean(xs: &[f64]) -> f64 {
