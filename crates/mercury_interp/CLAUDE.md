@@ -7,6 +7,7 @@ Zero-dependency tree-walking MIR interpreter: the always-available backend and t
 
 ## Key types & entry points
 - `run` / `run_with_output` (`src/lib.rs`) — public entry points. Take `&Program`, an entry `Symbol`, and `&Interner`. `run` returns the entry's result as an `i64` exit code; `run_with_output` also returns captured stdout bytes.
+- `run_kernel_f32` / `run_kernel_i8` — the typed **kernel-entry ABI**: run a kernel function over caller-provided buffers (laid out in flat memory, pointer per array param, copied back on return) instead of via `main`/stdout. The native counterpart is `jit_module().func_ptr()` + a raw call; the full-buffer differential fuzzer runs the same kernel through both and compares the entire output buffer. `run_kernel_i8` is the `u8×i8→i32` int8-GEMM shape (3 params: `a, b, c`).
 - `Interpreter` — the `mercury_backend::Backend` impl; `compile` just calls `run_with_output` and wraps it in `Artifact::Executed { exit_code, stdout }`.
 - `Value` — runtime value: `Int(i128)` (width-agnostic, masked per result type), `Float(f64)`, `Ptr(usize)` (index into flat `memory`), `Unit`.
 - `Interp<'a>` — per-run state: `program`, `interner`, flat `memory: Vec<Value>`, `stdout`, a `frames` pool of recycled register files, and a `scratch` buffer for block-arg passing.

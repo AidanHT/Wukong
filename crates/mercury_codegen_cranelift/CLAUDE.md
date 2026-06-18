@@ -12,6 +12,10 @@ Mercury's runtime competitive; see `BENCHMARKS.md`.
 - `src/backend.rs` — `CraneliftBackend` implementing the `mercury_backend::Backend` trait.
 - `src/tests.rs` — correctness + differential tests (native vs interpreter) incl. the vectorizer and
   `@parallel`.
+- `src/fuzz.rs` — randomized **full-buffer** differential fuzzer (interp vs native over identical
+  random buffers, asserting the whole output buffer is bit-exact): the f32 kernel battery via
+  `mercury_interp::run_kernel_f32` + a `f64`-reference value check, and the int8 `u8×i8→i32` GEMM via
+  `run_kernel_i8` across the kernel's K-chunk boundaries.
 
 ## Key types & entry points
 - `jit_run(program, entry, interner) -> (i64, Vec<u8>)` — compile and run `entry`, capturing stdout

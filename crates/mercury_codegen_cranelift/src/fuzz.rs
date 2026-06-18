@@ -6,8 +6,10 @@
 //! closes that hole: for a battery of kernels it generates random input buffers across many sizes
 //! (deliberately hitting the SIMD remainder boundaries) and adversarial value regimes (NaN, ±Inf,
 //! denormals, ±0, huge magnitudes), runs the *same* kernel through both backends over identical
-//! buffers via the typed kernel-entry ABI (`mercury_interp::run_kernel_f32` / `func_ptr`), and
-//! asserts the **entire** output buffer is bit-for-bit identical.
+//! buffers via the typed kernel-entry ABI (`mercury_interp::run_kernel_f32`/`run_kernel_i8` /
+//! `func_ptr`), and asserts the **entire** output buffer is bit-for-bit identical. The int8
+//! `u8×i8→i32` GEMM gets its own pass (`fuzz_full_buffer_i8_interp_vs_native`) over the kernel's
+//! K-chunk boundaries.
 //!
 //! Both backends execute the same lowered MIR and marshal through the same runtime microkernels, so
 //! bit-exactness is the correct (strongest) bar — not a tolerance. A divergence is a real miscompile.
@@ -392,6 +394,73 @@ fn fuzz_full_buffer_interp_vs_native() {
     }
     // A floor so an accidental empty corpus (e.g. a refactor that drops every kernel) fails loudly.
     assert!(runs > 1000, "fuzzer ran too few cases: {runs}");
+}
+
+type K3i8 = unsafe extern "C" fn(*const u8, *const i8, *mut i32);
+
+/// Full-buffer int8 differential fuzzer: the `u8×i8→i32` quantized `nn.Linear` (`C = A·Bᵀ`) kernel
+/// run through both backends over identical random buffers, with the **entire** `C` buffer compared
+/// bit-for-bit. The square sizes straddle the int8 microkernel's K-chunking — the AVX2 widen+`vpmaddwd`
+/// 32-wide (two chains) and 16-wide steps plus the scalar tail — and odd tails (17/33/49). Inputs span
+/// the full `u8`/`i8` ranges. Integer arithmetic is exact and order-independent (i32 add is associative
+/// mod 2³²), so bit-exact equality is the correct bar with no tolerance and no reassociation caveat.
+#[test]
+fn fuzz_full_buffer_i8_interp_vs_native() {
+    // M = N = K = n; n hits the 16/32/48 K-chunk boundaries and their odd neighbours.
+    const SIZES: &[usize] = &[1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48, 49, 64];
+    let mut rng = Rng(0x_1248_ADDE);
+    let mut runs = 0u64;
+
+    for &n in SIZES {
+        let len = n * n;
+        let src = format!(
+            "module f\nfn lin(a:[u8;{len}], b:[i8;{len}], c:[i32;{len}]) {{ \
+             for i in 0..{n} {{ for j in 0..{n} {{ let mut s: i32 = 0; \
+             for k in 0..{n} {{ s = s + (a[i*{n}+k] as i32) * (b[j*{n}+k] as i32); }} \
+             c[i*{n}+j] = s; }} }} }}\n"
+        );
+        let mut interner = Interner::new();
+        let (module, pd) = mercury_parser::parse_module(&src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "i8 n={n}: parse {pd:?}");
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "i8 n={n}: sema {sd:?}");
+        let lin = interner.intern("lin");
+
+        for &opt in &[0u8, 3u8] {
+            let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(ld.iter().all(|d| !d.is_error()), "i8 n={n}: lower {ld:?}");
+            mercury_opt::optimize(&mut program, opt);
+            let handle = crate::jit_module(&program, &interner).expect("jit_module");
+            let ptr = handle.func_ptr(lin).expect("func_ptr lin");
+            let native: K3i8 = unsafe { std::mem::transmute(ptr) };
+
+            for _ in 0..6 {
+                // Full u8 / i8 ranges (b via a wrapping cast of the low byte).
+                let a: Vec<u8> = (0..len).map(|_| (rng.next_u64() & 0xFF) as u8).collect();
+                let b: Vec<i8> = (0..len)
+                    .map(|_| (rng.next_u64() & 0xFF) as u8 as i8)
+                    .collect();
+
+                let mut ci = vec![0i32; len];
+                mercury_interp::run_kernel_i8(&program, lin, &a, &b, &mut ci, &interner)
+                    .expect("interp i8 kernel");
+
+                let mut cn = vec![0i32; len];
+                unsafe { native(a.as_ptr(), b.as_ptr(), cn.as_mut_ptr()) };
+
+                for idx in 0..len {
+                    assert_eq!(
+                        ci[idx], cn[idx],
+                        "i8 n={n} opt={opt} c[{idx}]: interp={} native={}",
+                        ci[idx], cn[idx]
+                    );
+                }
+                runs += 1;
+            }
+            drop(handle);
+        }
+    }
+    assert!(runs > 100, "i8 fuzzer ran too few cases: {runs}");
 }
 
 /// Verify the *value* of the shared transcendental kernels against an independent `f64` reference
