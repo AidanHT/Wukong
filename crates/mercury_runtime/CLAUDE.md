@@ -47,8 +47,8 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   `vpdpbusd`/`vpmaddwd` are non-saturating, so every order gives the *same bits* — the fused kernel
   equals the naive `s += a[k]*b[k]` loop exactly (twin tests: scalar==avx2==vnni across K boundaries,
   plus an overflow case). Rows independent → `_parallel` maps per-row across cores, serial ==
-  parallel. Measured **~1.3–1.9× faster than gcc single-core** (`-O3 -march=native`, which also uses
-  `vpdpbusd`) — the lead widens with size as C spills cache — and **~6.7–11.5× with `@parallel`**.
+  parallel. Measured **~1.2–2.0× faster than gcc single-core** (`-O3 -march=native`, which also uses
+  `vpdpbusd`) — the lead widens with size — and **~6.7–14.7× with `@parallel`** (3 runs).
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
