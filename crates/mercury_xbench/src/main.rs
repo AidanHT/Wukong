@@ -26,6 +26,10 @@ use mercury_span::{Interner, SourceId};
 /// The shared C ABI of every kernel: `(x, y, out)` over `N` `f32` elements (`N` baked in).
 type KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
 
+/// The int8 quantized-GEMM ABI: `(a: u8, b: i8, c: i32)` — `u8` activations, `i8` weights, `i32`
+/// accumulator (the QNNPACK/oneDNN layout). Dims are baked into the kernel source.
+type I8KernelFn = unsafe extern "C" fn(*const u8, *const i8, *mut i32);
+
 const N: usize = 1 << 20; // 1,048,576 elements (4 MiB per f32 array)
 
 struct Kernel {
@@ -46,6 +50,14 @@ struct Measure {
     /// A snapshot of the kernel's full output buffer, so the cross-language check can diff *every*
     /// element (not a 3-point sample, which a kernel wrong everywhere else would slip past).
     out: Vec<f32>,
+}
+
+/// The int8 twin of [`Measure`]: full `i32` output snapshot for an exact (integer) cross-check.
+#[derive(Clone)]
+struct MeasureI8 {
+    compile: Duration,
+    ns_per_call: f64,
+    out: Vec<i32>,
 }
 
 /// The maximum relative element-wise error between two output buffers, and the index where it
@@ -154,6 +166,7 @@ fn main() {
     bench_linear(&cc, &dir, roof);
     bench_conv(&cc, &dir);
     bench_norm(&cc, &dir);
+    bench_i8gemm(&cc, &dir);
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -401,6 +414,160 @@ fn rust_linear(ns: usize) -> String {
          \x20 for i in 0..NS {{\n\
          \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
          \x20     for k in 0..NS {{ s+=*a.add(i*NS+k)* *b.add(j*NS+k); }}\n\
+         \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+    )
+}
+
+/// int8 quantized `nn.Linear` (`C = A·Bᵀ`, `u8` activations × `i8` weights → `i32` accumulator) — the
+/// quantized-inference GEMM that QNNPACK/oneDNN exist for. Mercury recognizes the nest and dispatches
+/// it to the AVX2 widen+`vpmaddwd` int8 microkernel; C/Rust run the *idiomatic* naive int8 GEMM at
+/// `-O3 -march=native` / `-O -Ctarget-cpu=native` — whatever their auto-vectorizers produce is the
+/// honest baseline (no hand intrinsics, same as every other kernel here). **Integer arithmetic, so
+/// the cross-language check is bit-exact** — a stronger bar than the f32 kernels' tolerance. Reported
+/// as int8 GOP/s (2 ops per multiply-accumulate). The inputs stay within `i32` (no overflow at these
+/// sizes), so all three languages must agree exactly.
+fn bench_i8gemm(cc: &str, dir: &Path) {
+    for ns in [512usize, 1024] {
+        let n2 = ns * ns;
+        // u8 activations 0..250, i8 weights -125..125 — full-range-ish, and small enough that the
+        // K-sum stays well inside i32 (max ≈ ns·250·125 ≪ 2³¹), so the result is overflow-free and
+        // identical across languages.
+        let a: Vec<u8> = (0..n2).map(|i| (i % 251) as u8).collect();
+        let b: Vec<i8> = (0..n2).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+        let mut c = vec![0i32; n2];
+        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+        let ops = 2.0 * (ns as f64).powi(3); // 2 ops per MAC
+        let gops = |m: &Option<MeasureI8>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", ops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "=== i8gemm (int8 nn.Linear C=A·Bᵀ, u8×i8→i32) {ns}x{ns} (GOP/s, higher is better) ==="
+        );
+        let mer = bench_mercury_i8(&mer_i8gemm(ns, false), &mut c, ap, bp, cp);
+        let mer_par = bench_mercury_i8(&mer_i8gemm(ns, true), &mut c, ap, bp, cp);
+        let cm = bench_external_i8(
+            "c",
+            &c_i8gemm(ns),
+            dir,
+            "i8gemm",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        let rm = bench_external_i8(
+            "rs",
+            &rust_i8gemm(ns),
+            dir,
+            "i8gemm",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GOP/s",
+            gops(&mer),
+            gops(&mer_par),
+            gops(&cm),
+            gops(&rm)
+        );
+        // Compile time (Mercury front-end + JIT vs gcc/rustc to a shared lib) — Mercury is far cheaper.
+        let cms = |m: &Option<MeasureI8>| {
+            m.as_ref()
+                .map(|x| format!("{:.0}", x.compile.as_secs_f64() * 1e3))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "compile ms",
+            cms(&mer),
+            cms(&mer_par),
+            cms(&cm),
+            cms(&rm)
+        );
+        // Integer arithmetic → exact equality is the correct cross-language bar. Every available
+        // result must match the single-core Mercury reference exactly; a mismatch is a real bug.
+        if let Some(m) = &mer {
+            for (lang, other) in [("Mer(par)", &mer_par), ("C", &cm), ("Rust", &rm)] {
+                if let Some(o) = other {
+                    if o.out != m.out {
+                        let at = m
+                            .out
+                            .iter()
+                            .zip(&o.out)
+                            .position(|(x, y)| x != y)
+                            .unwrap_or(0);
+                        println!(
+                            "  ! full-buffer mismatch {lang} vs Mer(1core) at [{at}]: {} vs {}",
+                            o.out[at], m.out[at]
+                        );
+                    }
+                }
+            }
+        }
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let r = (ops / m.ns_per_call) / (ops / c2.ns_per_call);
+            println!(
+                "  -> Mercury (1 core) is {:.2}x {} than idiomatic single-threaded C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = (ops / mp.ns_per_call) / (ops / c2.ns_per_call);
+            println!("  -> Mercury @parallel is {r:.2}x faster than idiomatic single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury int8 `nn.Linear`, the idiomatic `ijk` dot-product `C = A·Bᵀ` with `u8`/`i8` operands cast
+/// to `i32` before the multiply — exactly what the `mir_build` recognizer folds to one
+/// `mercury_i8gemm_nt[_parallel]` call.
+fn mer_i8gemm(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(a: [u8; {n2}], b: [i8; {n2}], c: [i32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{\n\
+         \x20           let mut s: i32 = 0;\n\
+         \x20           for k in 0..{ns} {{ s = s + (a[i * {ns} + k] as i32) * (b[j * {ns} + k] as i32); }}\n\
+         \x20           c[i * {ns} + j] = s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_i8gemm(ns: usize) -> String {
+    format!(
+        "#include <stdint.h>\n#define NS {ns}\n\
+         __declspec(dllexport) void kbench(const uint8_t* a, const int8_t* b, int32_t* c) {{\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++){{ int32_t s=0;\n\
+         \x20     for (long k=0;k<NS;k++) s += (int32_t)a[i*NS+k] * (int32_t)b[j*NS+k];\n\
+         \x20     c[i*NS+j]=s; }}\n}}\n"
+    )
+}
+
+fn rust_i8gemm(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const u8, b:*const i8, c:*mut i32) {{\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{ let mut s: i32 = 0;\n\
+         \x20     for k in 0..NS {{ s += *a.add(i*NS+k) as i32 * *b.add(j*NS+k) as i32; }}\n\
          \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
     )
 }
@@ -880,6 +1047,132 @@ fn bench_external(
         let ns = time_ns(|| f(xp, yp, op));
         let snapshot = out.to_vec();
         Some(Measure {
+            compile,
+            ns_per_call: ns,
+            out: snapshot,
+        })
+    }
+}
+
+/// The int8 twin of [`bench_mercury`]: JIT the int8 GEMM kernel and time it through the `(u8, i8,
+/// i32)` ABI.
+fn bench_mercury_i8(
+    src: &str,
+    out: &mut [i32],
+    ap: *const u8,
+    bp: *const i8,
+    cp: *mut i32,
+) -> Option<MeasureI8> {
+    let t = Instant::now();
+    let mut interner = Interner::new();
+    let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    if pd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury parse error");
+        return None;
+    }
+    let (sema, sd) = mercury_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury sema error: {sd:?}");
+        return None;
+    }
+    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    if ld.iter().any(|d| d.is_error()) {
+        eprintln!("mercury lower error: {ld:?}");
+        return None;
+    }
+    mercury_opt::optimize(&mut program, 3);
+    let handle = match mercury_codegen_cranelift::jit_module(&program, &interner) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("mercury codegen error: {e}");
+            return None;
+        }
+    };
+    let sym = interner.intern("kbench");
+    let ptr = handle.func_ptr(sym)?;
+    let compile = t.elapsed();
+    let f: I8KernelFn = unsafe { std::mem::transmute(ptr) };
+
+    out.iter_mut().for_each(|v| *v = 0);
+    let ns = time_ns(|| unsafe { f(ap, bp, cp) });
+    let snapshot = out.to_vec();
+    drop(handle); // keep alive through timing
+    Some(MeasureI8 {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// The int8 twin of [`bench_external`]: compile a C/Rust int8 GEMM to a shared lib and time it.
+#[allow(clippy::too_many_arguments)]
+fn bench_external_i8(
+    ext: &str,
+    src: &str,
+    dir: &Path,
+    name: &str,
+    compiler: &str,
+    args: &[&str],
+    out: &mut [i32],
+    ap: *const u8,
+    bp: *const i8,
+    cp: *mut i32,
+) -> Option<MeasureI8> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let src_path = dir.join(format!("{safe}.{ext}"));
+    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
+    if std::fs::write(&src_path, src).is_err() {
+        return None;
+    }
+    let t = Instant::now();
+    let status = Command::new(compiler)
+        .args(args)
+        .arg("-o")
+        .arg(&dll)
+        .arg(&src_path)
+        .status();
+    let compile = t.elapsed();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("{compiler} failed to compile {name}.{ext}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("could not run `{compiler}` (skipping)");
+            return None;
+        }
+    }
+
+    unsafe {
+        let lib = match libloading::Library::new(&dll) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("load {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let sym: libloading::Symbol<I8KernelFn> = match lib.get(b"kbench\0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("symbol kbench in {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let f: I8KernelFn = *sym;
+        out.iter_mut().for_each(|v| *v = 0);
+        let ns = time_ns(|| f(ap, bp, cp));
+        let snapshot = out.to_vec();
+        Some(MeasureI8 {
             compile,
             ns_per_call: ns,
             out: snapshot,
