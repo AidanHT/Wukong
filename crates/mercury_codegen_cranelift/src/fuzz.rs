@@ -218,6 +218,43 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n * n,
             regimes: &[Normal],
         },
+        // The shape-typed tensor surface: `Tensor[f32, M, N]` params + multi-dimensional indexing
+        // `t[i, j]` now lower and EXECUTE (row-major flat offset), bit-exact on both backends.
+        Kernel {
+            name: "tensor_scale",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:Tensor[f32,{n},{n}], y:Tensor[f32,{n},{n}], out:Tensor[f32,{n},{n}]) {{ \
+             for i in 0..{n} {{ for j in 0..{n} {{ out[i, j] = x[i, j] * 2.0 + y[i, j]; }} }} }}\n"
+                )
+            },
+            len: |n| n * n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "tensor_matmul",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:Tensor[f32,{n},{n}], y:Tensor[f32,{n},{n}], out:Tensor[f32,{n},{n}]) {{ \
+             for i in 0..{n} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
+             for k in 0..{n} {{ s = s + x[i, k] * y[k, j]; }} out[i, j] = s; }} }} }}\n"
+                )
+            },
+            len: |n| n * n,
+            regimes: &[Normal],
+        },
+        // Rank-3: a batched elementwise op over `Tensor[f32, 2, N, N]`, exercising a 3-index flatten.
+        Kernel {
+            name: "tensor3d",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:Tensor[f32,2,{n},{n}], y:Tensor[f32,2,{n},{n}], out:Tensor[f32,2,{n},{n}]) {{ \
+             for b in 0..2 {{ for i in 0..{n} {{ for j in 0..{n} {{ out[b, i, j] = x[b, i, j] - y[b, i, j]; }} }} }} }}\n"
+                )
+            },
+            len: |n| 2 * n * n,
+            regimes: ANY,
+        },
     ]
 }
 
@@ -233,7 +270,7 @@ fn fuzz_full_buffer_interp_vs_native() {
     let mut runs = 0u64;
 
     for k in kernels() {
-        let sizes = if matches!(k.name, "matmul" | "linear") {
+        let sizes = if matches!(k.name, "matmul" | "linear") || k.name.starts_with("tensor") {
             MM_SIZES
         } else {
             EW_SIZES
