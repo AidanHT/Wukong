@@ -59,8 +59,12 @@ const LOG_P: [f32; 9] = [
 
 /// `e^x` (≈1 ULP), the Cephes single-precision algorithm: range-reduce `x = r + n·ln2`, a degree-5
 /// minimax poly for `e^r`, then scale by `2^n` assembled from the IEEE-754 exponent field.
+///
+/// `pub(crate)` so the fused-softmax kernel in `norm.rs` reuses the *exact* same scalar exp — its
+/// AVX2 path uses [`exp8`] and its tail uses this, so a fused `softmax` agrees lane-for-lane with a
+/// dispatched `exp` and the differential oracle stays bit-for-bit exact.
 #[inline]
-fn exp1(x: f32) -> f32 {
+pub(crate) fn exp1(x: f32) -> f32 {
     // `min` then `max`, not `clamp`: this mirrors the AVX2 `_mm256_min_ps`/`_mm256_max_ps` order
     // lane-for-lane (incl. their NaN behavior), which is what keeps the scalar tail bit-identical.
     #[allow(clippy::manual_clamp)]
@@ -209,9 +213,11 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
 
 // --- AVX2 kernels (mirror the scalar twins lane-for-lane) -----------------------------------------
 
+/// `pub(crate)` so `norm.rs`'s AVX2 softmax uses the *exact* same 8-lane exp as a dispatched
+/// `exp` loop — keeping fused softmax bit-identical to the composed form.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let x = _mm256_min_ps(x, _mm256_set1_ps(EXP_HI));
     let x = _mm256_max_ps(x, _mm256_set1_ps(EXP_LO));
