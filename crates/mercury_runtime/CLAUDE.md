@@ -33,7 +33,12 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   `_parallel` just maps the per-row routine across rows: serial == parallel bit-for-bit, no
   cross-row combine. Within a row the reductions use the same fixed 8-lane accumulator + horizontal
   combine in the AVX2 and scalar paths, so they agree bit-for-bit (twin test across tail sizes). `x`
-  and `out` may alias (in-place).
+  and `out` may alias (in-place). **Affine** sibling `mercury_norm_affine_f32[_parallel](x, out,
+  gamma, beta, rows, cols, eps_bits, op)` is the *real* transformer LayerNorm/RMSNorm — a learned
+  per-column scale `gamma` (and, for LayerNorm, a shift `beta`; either may be null → 1 / 0) folded
+  into the normalize writeback via one FMA (scalar `mul_add` == AVX2 `fmadd`, so affine scalar==AVX2
+  bit-for-bit; `affine_gamma1_beta0_matches_plain` pins the duplicated reduction to the plain twin).
+  The plain `mercury_norm_f32` and its tests are untouched.
 - `src/i8gemm.rs` — `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)`: **int8 quantized `nn.Linear`**
   `C = A·Bᵀ` (`u8` activations × `i8` weights → `i32` accumulator), the QNNPACK/oneDNN layout. A's row
   and B's row are both contiguous over `K`, so each `C[i,j]` is a dot. Three tiers, detected **once

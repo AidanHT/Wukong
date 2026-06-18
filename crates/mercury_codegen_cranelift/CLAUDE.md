@@ -53,7 +53,8 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
 - Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`, the GEMM
   microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi`, the int8 GEMM
   `mercury_i8gemm_nt`/`_parallel`, the 256-bit elementwise `mercury_vmath_f32`, the reduction
-  `mercury_sreduce_f32`/`_parallel`, and the fused row-wise norm `mercury_norm_f32`/`_parallel`) are
+  `mercury_sreduce_f32`/`_parallel`, the fused row-wise norm `mercury_norm_f32`/`_parallel` and its
+  affine sibling `mercury_norm_affine_f32` (4 ptr + 4 i64; gamma/beta may be a null pointer)) are
   bound to Rust fns in the JIT and left as imports in the object
   (resolved by the driver's C runtime). A global run lock serialises JIT runs that share the
   stdout-capture buffer.

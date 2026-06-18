@@ -31,7 +31,9 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   baselines at honest default flags (no `-ffast-math`, so their float reductions stay sequential —
   same basis as the `dot` kernel). All three copy `x`→`out` then normalize in place (identical work),
   so the full-buffer cross-check is valid. softmax also pits Mercury's vectorized `exp` vs scalar
-  `expf`.
+  `expf`. The `layernorm_affine`/`rmsnorm_affine` ops add the learned per-column scale `y` (gamma, and
+  for LayerNorm beta — reused) that real transformer norms carry, so Mercury folds them to
+  `mercury_norm_affine_f32`; they hold the same ~1.7–3.7× vs C (the γ/β multiply-add is cheap).
 - `KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32)` — the shared `(x, y, out)` ABI;
   matmul reuses it as `(a, b, c)`. `N = 1<<20` elements; matmul is 512×512.
 - `bench_mercury` parse→sema→lower→`optimize(_,3)`→`jit_module`, times `kbench`; `bench_external`
