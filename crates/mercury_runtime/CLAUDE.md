@@ -25,6 +25,15 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   per-chunk function, and partials summed in ascending chunk order (rayon's indexed `collect`). So
   serial == parallel == interpreter on any machine. AVX2 single accumulator (memory-bound at N=2^20,
   so one is enough) + a scalar tail/twin that matches lane-for-lane (`mul_add` == `fmadd`).
+- `src/norm.rs` — `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)`: **fused
+  single-pass row-wise normalizations** (softmax / LayerNorm / RMSNorm, by `NORM_*` op code) over the
+  last axis of a `[rows, cols]` matrix. Memory-bound, so the win is fusing the 2–3 passes (each row
+  loaded once) + 256-bit AVX2 — and softmax reuses `vmath`'s `exp8`/`exp1`. `eps` rides in as
+  `f32::to_bits()` in an i64 to keep the all-integer dispatch ABI. Rows are independent so
+  `_parallel` just maps the per-row routine across rows: serial == parallel bit-for-bit, no
+  cross-row combine. Within a row the reductions use the same fixed 8-lane accumulator + horizontal
+  combine in the AVX2 and scalar paths, so they agree bit-for-bit (twin test across tail sizes). `x`
+  and `out` may alias (in-place).
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
