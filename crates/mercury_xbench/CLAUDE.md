@@ -8,12 +8,21 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 
 ## Layout
 - `src/main.rs` — entire crate: kernel sources (Mercury/C/Rust string builders), `bench_mercury` /
-  `bench_external`, `time_ns` (best-of-many batches), the elementwise kernel table, and
-  `bench_matmul` (GFLOP/s).
+  `bench_external`, `time_ns` (best-of-many batches), the elementwise kernel table, `bench_matmul` /
+  `bench_linear` (GFLOP/s + roofline %), `bench_conv` (im2col+GEMM vs direct), and `bench_norm`
+  (fused softmax/LayerNorm/RMSNorm vs per-row C/Rust).
 
 ## Key types & entry points
 - `main` — runs the elementwise kernel table (saxpy/dot/relu/poly + `@parallel` variants incl.
-  relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`.
+  relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`,
+  `bench_linear`, `bench_conv`, and `bench_norm`.
+- `bench_norm` (+ `mer_norm`/`c_norm`/`rust_norm`) — fused row normalizations over a `1×cols` feature
+  row (cols ∈ {768, 4096}). The Mercury source is the copy-then-in-place form the `mir_build`
+  recognizer folds to one `mercury_norm_f32` call; C/Rust are the strong cache-friendly per-row
+  baselines at honest default flags (no `-ffast-math`, so their float reductions stay sequential —
+  same basis as the `dot` kernel). All three copy `x`→`out` then normalize in place (identical work),
+  so the full-buffer cross-check is valid. softmax also pits Mercury's vectorized `exp` vs scalar
+  `expf`.
 - `KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32)` — the shared `(x, y, out)` ABI;
   matmul reuses it as `(a, b, c)`. `N = 1<<20` elements; matmul is 512×512.
 - `bench_mercury` parse→sema→lower→`optimize(_,3)`→`jit_module`, times `kbench`; `bench_external`
