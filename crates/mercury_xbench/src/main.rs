@@ -722,16 +722,25 @@ fn rust_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
 fn bench_norm(cc: &str, dir: &Path) {
     for &cols in &[768usize, 4096] {
         let x: Vec<f32> = (0..cols).map(|i| (i % 17) as f32 * 0.5 + 1.0).collect();
+        // gamma (and, for the affine LayerNorm, beta — reused) for the *_affine variants: a distinct
+        // per-column array, the learned scale/shift every real transformer norm carries.
+        let gamma: Vec<f32> = (0..cols).map(|i| (i % 11) as f32 * 0.1 + 0.5).collect();
         let mut out = vec![0.0f32; cols];
-        let (xp, yp, op_) = (x.as_ptr(), x.as_ptr(), out.as_mut_ptr());
+        let (xp, yp, op_) = (x.as_ptr(), gamma.as_ptr(), out.as_mut_ptr());
         println!(
-            "=== fused norms, 1x{cols} feature row (ns/call, lower is better; Mercury → mercury_norm_f32) ==="
+            "=== fused norms, 1x{cols} feature row (ns/call, lower is better; Mercury → mercury_norm_f32[_affine]) ==="
         );
         println!(
-            "  {:<10} {:>12} {:>12} {:>12} {:>16}",
+            "  {:<16} {:>12} {:>12} {:>12} {:>16}",
             "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
         );
-        for op in ["softmax", "layernorm", "rmsnorm"] {
+        for op in [
+            "softmax",
+            "layernorm",
+            "rmsnorm",
+            "layernorm_affine",
+            "rmsnorm_affine",
+        ] {
             let mer = bench_mercury(&mer_norm(cols, op), &mut out, xp, yp, op_);
             let c = bench_external(
                 "c",
@@ -773,7 +782,7 @@ fn bench_norm(cc: &str, dir: &Path) {
                 "n/a".into()
             };
             println!(
-                "  {:<10} {:>12} {:>12} {:>12} {:>16}",
+                "  {:<16} {:>12} {:>12} {:>12} {:>16}",
                 op,
                 ns(&mer),
                 ns(&c),
@@ -797,9 +806,10 @@ fn bench_norm(cc: &str, dir: &Path) {
 }
 
 /// Mercury norm source: copy `x`→`out`, then the canonical in-place multi-pass form the recognizer
-/// folds into one `mercury_norm_f32(out, out, 1, cols, eps, op)` call. The `/ {cols}.0` divisor (and
-/// the `out[0]` softmax seed) are exactly the spellings `match_layernorm`/`match_rmsnorm`/
-/// `match_softmax` accept, so the fused kernel fires.
+/// folds into one `mercury_norm_f32(out, out, 1, cols, eps, op)` call — or, for the `*_affine`
+/// variants whose normalize step also applies the per-column `y` (gamma, and for LayerNorm beta too),
+/// one `mercury_norm_affine_f32(out, out, y, y|null, 1, cols, eps, op)` call. The `/ {cols}.0` divisor
+/// (and the `out[0]` softmax seed) are exactly the spellings the matchers accept, so the kernel fires.
 fn mer_norm(cols: usize, op: &str) -> String {
     let body = match op {
         "softmax" => format!(
@@ -819,6 +829,21 @@ fn mer_norm(cols: usize, op: &str) -> String {
              for i in 0..{cols} {{ v = v + (out[i] - mean) * (out[i] - mean); }} \
              let inv: f32 = rsqrt(v / {cols}.0 + 0.00001); \
              for i in 0..{cols} {{ out[i] = (out[i] - mean) * inv; }}"
+        ),
+        "layernorm_affine" => format!(
+            "let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + out[i]; }} \
+             let mean: f32 = s / {cols}.0; \
+             let mut v: f32 = 0.0; \
+             for i in 0..{cols} {{ v = v + (out[i] - mean) * (out[i] - mean); }} \
+             let inv: f32 = rsqrt(v / {cols}.0 + 0.00001); \
+             for i in 0..{cols} {{ out[i] = (out[i] - mean) * inv * y[i] + y[i]; }}"
+        ),
+        "rmsnorm_affine" => format!(
+            "let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + out[i] * out[i]; }} \
+             let inv: f32 = rsqrt(s / {cols}.0 + 0.00001); \
+             for i in 0..{cols} {{ out[i] = out[i] * inv * y[i]; }}"
         ),
         _ => format!(
             "let mut s: f32 = 0.0; \
@@ -847,6 +872,18 @@ fn c_norm(cols: usize, op: &str) -> String {
              float inv=1.0f/sqrtf(v/(float)C+1e-5f); \
              for(long i=0;i<C;i++) out[i]=(out[i]-mean)*inv;"
         }
+        "layernorm_affine" => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]; \
+             float mean=s/(float)C; float v=0.0f; \
+             for(long i=0;i<C;i++){ float d=out[i]-mean; v+=d*d; } \
+             float inv=1.0f/sqrtf(v/(float)C+1e-5f); \
+             for(long i=0;i<C;i++) out[i]=(out[i]-mean)*inv*y[i]+y[i];"
+        }
+        "rmsnorm_affine" => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]*out[i]; \
+             float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
+             for(long i=0;i<C;i++) out[i]=out[i]*inv*y[i];"
+        }
         _ => {
             "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]*out[i]; \
              float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
@@ -872,6 +909,18 @@ fn rust_norm(cols: usize, op: &str) -> String {
              for i in 0..C { let d=*out.add(i)-mean; v+=d*d; } \
              let inv=1.0f32/(v/(C as f32)+1e-5f32).sqrt(); \
              for i in 0..C { *out.add(i)=(*out.add(i)-mean)*inv; }"
+        }
+        "layernorm_affine" => {
+            "let mut s=0.0f32; for i in 0..C { s+=*out.add(i); } \
+             let mean=s/(C as f32); let mut v=0.0f32; \
+             for i in 0..C { let d=*out.add(i)-mean; v+=d*d; } \
+             let inv=1.0f32/(v/(C as f32)+1e-5f32).sqrt(); \
+             for i in 0..C { *out.add(i)=(*out.add(i)-mean)*inv * *y.add(i) + *y.add(i); }"
+        }
+        "rmsnorm_affine" => {
+            "let mut s=0.0f32; for i in 0..C { let v=*out.add(i); s+=v*v; } \
+             let inv=1.0f32/(s/(C as f32)+1e-5f32).sqrt(); \
+             for i in 0..C { *out.add(i)=*out.add(i)*inv * *y.add(i); }"
         }
         _ => {
             "let mut s=0.0f32; for i in 0..C { let v=*out.add(i); s+=v*v; } \

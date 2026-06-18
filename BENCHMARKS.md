@@ -68,7 +68,10 @@ naively-written source:
   AVX2, the hand-vectorized `exp` for softmax, and the mean / variance / sum-of-squares reductions
   reassociated across 8 lanes. gcc/rustc auto-vectorize the elementwise passes but (without
   `-ffast-math`) keep the float reductions sequential and call scalar `expf` — so this *composes* the
-  reduction-vectorization and transcendental wins into the fused op (**~1.9–6.6× faster than C**).
+  reduction-vectorization and transcendental wins into the fused op (**~1.9–6.6× faster than C**). The
+  **affine** LayerNorm/RMSNorm real models run (a learned per-channel scale γ and shift β) dispatch to
+  a sibling **`mercury_norm_affine_f32`** and hold the same win (**~1.7–3.7×**) — γ/β fold into the
+  writeback for free.
 - **Convolution via im2col + GEMM.** A conv expressed as im2col + matmul has its matmul recognized
   and dispatched to the GEMM microkernel — so Mercury beats hand-written direct convolution ~5.8×,
   the same way XLA/cuDNN lower conv.
@@ -195,8 +198,11 @@ construction.
 
 The per-token normalizations every transformer layer runs. Mercury recognizes the canonical
 multi-pass source (softmax's max/exp/sum/normalize; LayerNorm's mean/variance/normalize; RMSNorm's
-mean-square/normalize) and folds the whole thing into one **`mercury_norm_f32`** call — 256-bit
-AVX2, the hand-vectorized `exp` for softmax, and the reductions reassociated across 8 lanes. gcc and
+mean-square/normalize) and folds the whole thing into one **`mercury_norm_f32`** call — or, when the
+normalize step carries the learned per-channel scale γ and shift β that **real** transformer
+LayerNorm/RMSNorm apply (`(x-μ)·inv·γ + β`), into one **`mercury_norm_affine_f32`** call with γ/β
+folded into the same single-pass writeback. Either way: 256-bit AVX2, the hand-vectorized `exp` for
+softmax, and the reductions reassociated across 8 lanes. gcc and
 rustc at their honest defaults (no `-ffast-math`) auto-vectorize the elementwise passes but keep the
 float reductions strictly sequential, and call scalar `libm` `expf` for softmax. All three languages
 copy `x`→`out` then normalize in place — identical work, so the copy pass is charged to everyone and
@@ -213,14 +219,19 @@ across runs:
 | softmax   | **~4.4–6.6× faster** | vectorized `exp` (gcc's scalar `expf` can't vectorize a loop with a call) + the reassociated sum |
 | LayerNorm | **~3.0–3.5× faster** | two reassociated reductions — the mean, then the variance |
 | RMSNorm   | **~1.9–2.5× faster** | one reduction (mean-square); the copy/scale elementwise passes, which gcc vectorizes too, dilute it |
+| LayerNorm (affine γ, β) | **~2.8–3.7× faster** | the real transformer form `(x-μ)·inv·γ + β` → `mercury_norm_affine_f32`; same reduction win, γ/β fused into the writeback |
+| RMSNorm (affine γ) | **~1.7–3.2× faster** | the real transformer form `x·inv·γ` → same affine kernel |
 
 Softmax wins most — the vectorized `exp` dominates, the same effect as the standalone `exp` kernel.
 LayerNorm and RMSNorm win on their reassociated reductions (gcc keeps float reductions strictly
 sequential without `-ffast-math`), with RMSNorm lowest because it has only one reduction and a larger
 share of plain elementwise work. Rust tracks C within a few percent throughout. One row is one
-token's hidden vector; a real `[tokens, hidden]` batch maps the identical kernel per row. The
-interpreter marshals the identical kernel so the differential oracle stays bit-for-bit exact, and the
-recognizer runs pre-opt so `-O0` == `-O3`.
+token's hidden vector; a real `[tokens, hidden]` batch maps the identical kernel per row. **The affine
+variants hold the same win** (~2.8–3.7× LayerNorm, ~1.7–3.2× RMSNorm) — the learned γ/β are a cheap
+per-element multiply-add that rides along in the writeback, so the fusion + reduction-vectorization
+advantage is unchanged; this is what makes the win apply to the norms real models actually run, not
+just the γ=1 idealization. The interpreter marshals the identical kernel so the differential oracle
+stays bit-for-bit exact, and the recognizer runs pre-opt so `-O0` == `-O3`.
 
 ### int8 quantized `nn.Linear` — `vpdpbusd` register-blocked, beats gcc single-core
 
@@ -318,7 +329,9 @@ single-threaded C:
   recognized from their multi-pass source and folded into one `mercury_norm_f32` call (256-bit AVX2 +
   8-lane reassociated reductions + the vectorized `exp`), **~1.9–6.6× faster than C** — softmax most
   (the vectorized `exp` dominates), RMSNorm least (a single reduction, diluted by its elementwise
-  passes). Both backends marshal the identical kernel, so the differential oracle stays bit-exact.
+  passes). The **affine** form real models run (learned per-channel scale γ + shift β) dispatches to
+  `mercury_norm_affine_f32` and holds the same **~1.7–3.7×** (γ/β fused into the writeback). Both
+  backends marshal the identical kernel, so the differential oracle stays bit-exact.
 - **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Mercury runs a 3×3 conv
   **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
   recognizer accelerates conv for free.
