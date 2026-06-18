@@ -38,6 +38,18 @@ fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
 }
 
+// Reusable per-thread pack scratch for the serial kernel. The A/B panels are fully overwritten by
+// the packers (real data + edge-padding zeros) on every block, so reusing the buffers across calls
+// needs no re-zeroing — and removes a per-call malloc+zero of several hundred KB that was a
+// measurable fraction of a *small* GEMM (e.g. 256³, where it left Mercury ~8% behind a tuned
+// library; large GEMMs are compute-bound and never noticed it). Taken out and put back around the
+// kernel so no borrow is held across it.
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static PACK_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 // Fused-epilogue activation codes (shared with the compiler's recognizer in `mercury_mir_build`).
 // `ACT_IDENTITY` is the implicit passthrough (the kernel only branches on `ACT_RELU`), but it names
 // the protocol value 0 the compiler emits, so it is kept for clarity and used by the tests.
@@ -365,11 +377,25 @@ unsafe fn sgemm_avx2(
     epi: Option<Epilogue>,
 ) {
     // Pack scratch, sized to the actual blocks needed (never larger than the cache-block caps).
+    // Reused across calls via a per-thread buffer (see PACK_SCRATCH): the packers overwrite every
+    // element they read back (data + edge padding), so no re-zeroing is needed, and we avoid a
+    // per-call malloc+zero that was a measurable slice of small-GEMM time. Taken out here and put
+    // back at the end; the body between is panic-free so the buffers are always returned.
     let kc_max = k.min(KC);
     let mc_max = m.min(MC);
     let nc_max = n.min(NC);
-    let mut ap = vec![0.0f32; round_up(mc_max, MR) * kc_max];
-    let mut bp = vec![0.0f32; round_up(nc_max, NR) * kc_max];
+    let ap_cap = round_up(mc_max, MR) * kc_max;
+    let bp_cap = round_up(nc_max, NR) * kc_max;
+    let (mut ap, mut bp) = PACK_SCRATCH.with(|c| {
+        let mut g = c.borrow_mut();
+        (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
+    });
+    if ap.len() < ap_cap {
+        ap.resize(ap_cap, 0.0);
+    }
+    if bp.len() < bp_cap {
+        bp.resize(bp_cap, 0.0);
+    }
 
     let mut jc = 0;
     while jc < n {
@@ -409,6 +435,13 @@ unsafe fn sgemm_avx2(
         }
         jc += NC;
     }
+
+    // Return the (now larger) buffers to the per-thread cache for the next call to reuse.
+    PACK_SCRATCH.with(|c| {
+        let mut g = c.borrow_mut();
+        g.0 = ap;
+        g.1 = bp;
+    });
 }
 
 /// Pack the B panel for cache block `(pc, jc)` into `bp`, honoring the `C = A·Bᵀ` layout when `bt`.
