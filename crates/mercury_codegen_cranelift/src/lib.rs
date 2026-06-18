@@ -83,6 +83,8 @@ const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
 const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
+const RT_NORM: &str = "mercury_norm_f32";
+const RT_NORM_PARALLEL: &str = "mercury_norm_f32_parallel";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -747,6 +749,22 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, y, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
+        // The fused normalization kernel: mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits,
+        // op) — two pointers and four i64 (the softmax/LayerNorm/RMSNorm a recognized multi-pass norm
+        // lowers to). Void, like the GEMM/vmath kernels.
+        if matches!(name, RT_NORM | RT_NORM_PARALLEL) && args.len() == 6 {
+            let x = self.val(args[0]);
+            let out = self.val(args[1]);
+            let rows = self.coerce_to_i64(args[2]);
+            let cols = self.coerce_to_i64(args[3]);
+            let eps = self.coerce_to_i64(args[4]);
+            let op = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder
+                .ins()
+                .call(fref, &[x, out, rows, cols, eps, op]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -856,6 +874,8 @@ struct RtFuncs {
     vmath: FuncId,
     sred: FuncId,
     sred_par: FuncId,
+    norm: FuncId,
+    norm_par: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -952,6 +972,13 @@ fn populate_module<M: Module>(
     sig_sreduce.params.push(AbiParam::new(types::I64));
     sig_sreduce.params.push(AbiParam::new(types::I64));
     sig_sreduce.returns.push(AbiParam::new(types::F32));
+    // mercury_norm_f32[_parallel](x, out: ptr, rows, cols, eps_bits, op: i64) — fused row-wise norm.
+    let mut sig_norm = Signature::new(call_conv);
+    sig_norm.params.push(AbiParam::new(ptr_ty));
+    sig_norm.params.push(AbiParam::new(ptr_ty));
+    for _ in 0..4 {
+        sig_norm.params.push(AbiParam::new(types::I64));
+    }
     // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
     let mut sig_fmod_f64 = Signature::new(call_conv);
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
@@ -997,6 +1024,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sred_par: module
             .declare_function(RT_SREDUCE_PARALLEL, Linkage::Import, &sig_sreduce)
+            .map_err(|e| e.to_string())?,
+        norm: module
+            .declare_function(RT_NORM, Linkage::Import, &sig_norm)
+            .map_err(|e| e.to_string())?,
+        norm_par: module
+            .declare_function(RT_NORM_PARALLEL, Linkage::Import, &sig_norm)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -1078,6 +1111,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SREDUCE_PARALLEL,
                 module.declare_func_in_func(rt.sred_par, builder.func),
+            );
+            rt_refs.insert(RT_NORM, module.declare_func_in_func(rt.norm, builder.func));
+            rt_refs.insert(
+                RT_NORM_PARALLEL,
+                module.declare_func_in_func(rt.norm_par, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1217,6 +1255,11 @@ pub fn jit_compile(
         RT_SREDUCE_PARALLEL,
         mercury_runtime::mercury_sreduce_f32_parallel as *const u8,
     );
+    builder.symbol(RT_NORM, mercury_runtime::mercury_norm_f32 as *const u8);
+    builder.symbol(
+        RT_NORM_PARALLEL,
+        mercury_runtime::mercury_norm_f32_parallel as *const u8,
+    );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -1309,6 +1352,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SREDUCE_PARALLEL,
         mercury_runtime::mercury_sreduce_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_NORM, mercury_runtime::mercury_norm_f32 as *const u8);
+    builder.symbol(
+        RT_NORM_PARALLEL,
+        mercury_runtime::mercury_norm_f32_parallel as *const u8,
     );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);

@@ -694,6 +694,48 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Float(r as f64))
             }
+            // `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)` — the fused row-wise
+            // softmax / LayerNorm / RMSNorm kernel a recognized multi-pass norm lowers to. Marshal the
+            // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel
+            // one the native backend runs, since rows are independent), write the result to out.
+            // Reading all of x before writing out makes the in-place (x == out) case correct.
+            "mercury_norm_f32" | "mercury_norm_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let eps_bits = args[4].as_int() as i64;
+                let op = args[5].as_int() as i64;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("norm operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/obuf are exactly rows*cols f32 long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_norm_f32(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        eps_bits,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("norm output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }
