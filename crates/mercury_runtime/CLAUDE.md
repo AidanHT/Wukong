@@ -36,13 +36,19 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   and `out` may alias (in-place).
 - `src/i8gemm.rs` — `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)`: **int8 quantized `nn.Linear`**
   `C = A·Bᵀ` (`u8` activations × `i8` weights → `i32` accumulator), the QNNPACK/oneDNN layout. A's row
-  and B's row are both contiguous over `K`, so each `C[i,j]` is a dot — the AVX2 path widens `u8`/`i8`
-  to `i16` and folds 16 lanes/step with `vpmaddwd` (`_mm256_madd_epi16`, no saturation since `u8·i8`
-  fits `i16`) into `i32`, 32/step across two chains. **No reassociation exception**: `i32` add is
-  associative mod 2³² (wrapping), so the lane combine and the scalar left-fold give the *same bits* —
-  the fused kernel equals the naive `s += a[k]*b[k]` loop exactly (twin test incl. an overflow case).
-  Rows independent → `_parallel` maps per-row across cores, serial == parallel. (No VNNI yet; the
-  widen+madd path is portable AVX2 and a tiled/packed kernel is a follow-up.)
+  and B's row are both contiguous over `K`, so each `C[i,j]` is a dot. Three tiers, detected **once
+  per call** (not per element): **AVX-VNNI** `vpdpbusd` (`_mm256_dpbusd_avx_epi32` — one instruction
+  folds 32 `u8×i8` products into the 8 `i32` lanes *and* accumulates; the path gcc `-march=native`
+  takes, so it's what beats it), else **AVX2** widen+`vpmaddwd` (`_mm256_madd_epi16`, 16/step), else
+  scalar. Both SIMD tiers are **register-blocked four B-rows at a time** (`dot4_i8_{vnni,avx2}`): the
+  A-row chunk is loaded once per step and reused across the four dots (4× less A traffic) with four
+  independent accumulator chains for ILP and an in-register horizontal sum (no per-`(i,j)` stack
+  round-trip). **No reassociation exception**: `i32` add is associative mod 2³² (wrapping) and
+  `vpdpbusd`/`vpmaddwd` are non-saturating, so every order gives the *same bits* — the fused kernel
+  equals the naive `s += a[k]*b[k]` loop exactly (twin tests: scalar==avx2==vnni across K boundaries,
+  plus an overflow case). Rows independent → `_parallel` maps per-row across cores, serial ==
+  parallel. Measured **~1.3–1.9× faster than gcc single-core** (`-O3 -march=native`, which also uses
+  `vpdpbusd`) — the lead widens with size as C spills cache — and **~6.7–11.5× with `@parallel`**.
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
