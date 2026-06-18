@@ -1280,6 +1280,66 @@ fn matmul_overwrite_differential() {
     assert_eq!(native, interp, "overwrite matmul native vs interp");
 }
 
+/// Affine LayerNorm/RMSNorm (a per-column scale `g[i]` and optional shift `b[i]`) must dispatch to
+/// `mercury_norm_affine_f32`, while plain (gamma=1) norms keep using `mercury_norm_f32`, and a softmax
+/// with a trailing per-column scale must decline both (it has no affine parameters — the soundness
+/// guard makes it fall back to the generic vectorizer rather than silently drop the scale).
+#[test]
+fn affine_norm_dispatch() {
+    // Affine LayerNorm: (x-mean)*inv*g[i] + b[i]
+    let ln_affine = "module m\nfn f(x:[f32;8], g:[f32;8], b:[f32;8]) { \
+        let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let mean: f32 = s / 8.0; \
+        let mut v: f32 = 0.0; for i in 0..8 { v = v + (x[i] - mean) * (x[i] - mean); } \
+        let inv: f32 = rsqrt(v / 8.0 + 0.00001); \
+        for i in 0..8 { x[i] = (x[i] - mean) * inv * g[i] + b[i]; } }";
+    assert!(
+        lowered_calls(ln_affine, "mercury_norm_affine_f32"),
+        "affine LayerNorm -> mercury_norm_affine_f32"
+    );
+    assert!(
+        !lowered_calls(ln_affine, "mercury_norm_f32"),
+        "affine LayerNorm must NOT use the plain kernel"
+    );
+
+    // Affine RMSNorm: x[i]*inv*g[i] (scale only, no shift)
+    let rn_affine = "module m\nfn f(x:[f32;8], g:[f32;8]) { \
+        let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i] * x[i]; } \
+        let inv: f32 = rsqrt(s / 8.0 + 0.00001); \
+        for i in 0..8 { x[i] = x[i] * inv * g[i]; } }";
+    assert!(
+        lowered_calls(rn_affine, "mercury_norm_affine_f32"),
+        "affine RMSNorm -> mercury_norm_affine_f32"
+    );
+
+    // Plain LayerNorm (gamma=1, beta=0) still uses the plain kernel, not the affine one.
+    let ln_plain = "module m\nfn f(x:[f32;8]) { \
+        let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let mean: f32 = s / 8.0; \
+        let mut v: f32 = 0.0; for i in 0..8 { v = v + (x[i] - mean) * (x[i] - mean); } \
+        let inv: f32 = rsqrt(v / 8.0 + 0.00001); \
+        for i in 0..8 { x[i] = (x[i] - mean) * inv; } }";
+    assert!(
+        lowered_calls(ln_plain, "mercury_norm_f32"),
+        "plain LayerNorm -> mercury_norm_f32"
+    );
+    assert!(
+        !lowered_calls(ln_plain, "mercury_norm_affine_f32"),
+        "plain LayerNorm must NOT use the affine kernel"
+    );
+
+    // softmax with a trailing scale has no affine semantics; the guard makes it decline BOTH norm
+    // kernels (falls back to the vectorizer) rather than dropping the scale.
+    let sm_scaled = "module m\nfn f(x:[f32;8], g:[f32;8]) { \
+        let mut m: f32 = x[0]; for i in 0..8 { m = fmax(m, x[i]); } \
+        for i in 0..8 { x[i] = exp(x[i] - m); } \
+        let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let inv: f32 = 1.0 / s; \
+        for i in 0..8 { x[i] = x[i] * inv * g[i]; } }";
+    assert!(
+        !lowered_calls(sm_scaled, "mercury_norm_f32")
+            && !lowered_calls(sm_scaled, "mercury_norm_affine_f32"),
+        "softmax+scale must decline both norm kernels (no affine softmax)"
+    );
+}
+
 /// The accumulate (beta = 1) matmul — `C += A·B` with `C` pre-initialized — end to end. Guards the
 /// beta=1 dispatch (a real pattern: accumulating a matmul into a bias-initialized output). Unlike the
 /// overwrite test, this also checks the value against an independent reference, so a *beta

@@ -846,6 +846,90 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op)` — the affine
+            // (per-column scale gamma + optional shift beta) fused LayerNorm/RMSNorm. Same marshalling
+            // as the plain norm, plus the gamma/beta arrays (length cols). An absent param lowers to a
+            // `Ptr`-typed `ConstInt(0)` → a `Value::Int(0)` here (distinct from a real array's
+            // `Value::Ptr`), so match the variant: pass a null pointer (kernel uses scale 1 / shift 0).
+            "mercury_norm_affine_f32" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let gamma_idx = match args[2] {
+                    Value::Ptr(p) => Some(p),
+                    _ => None,
+                };
+                let beta_idx = match args[3] {
+                    Value::Ptr(p) => Some(p),
+                    _ => None,
+                };
+                let rows = args[4].as_int() as usize;
+                let cols = args[5].as_int() as usize;
+                let eps_bits = args[6].as_int() as i64;
+                let op = args[7].as_int() as i64;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("norm operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut gbuf = Vec::new();
+                if let Some(g) = gamma_idx {
+                    for t in 0..cols {
+                        gbuf.push(
+                            self.memory
+                                .get(g + t)
+                                .ok_or("norm gamma out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                }
+                let mut bbuf = Vec::new();
+                if let Some(bb) = beta_idx {
+                    for t in 0..cols {
+                        bbuf.push(
+                            self.memory
+                                .get(bb + t)
+                                .ok_or("norm beta out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                }
+                let gptr = if gamma_idx.is_some() {
+                    gbuf.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let bptr = if beta_idx.is_some() {
+                    bbuf.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf is rows*cols; gamma/beta (when present) are cols long — kernel contract.
+                unsafe {
+                    mercury_runtime::mercury_norm_affine_f32(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        gptr,
+                        bptr,
+                        rows as i64,
+                        cols as i64,
+                        eps_bits,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("norm output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }

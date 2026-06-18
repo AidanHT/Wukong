@@ -251,6 +251,45 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        // Fused affine RMSNorm with a learned per-column scale gamma (= y): the normalize step
+        // `out[i]*inv*gamma[i]` dispatches to mercury_norm_affine_f32 (gamma non-null, beta null —
+        // exercises the absent-beta marshalling). The real transformer RMSNorm form.
+        Kernel {
+            name: "rmsnorm_affine",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+             for c in 0..{n} {{ out[c] = x[c]; }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[i] * out[i]; }} \
+             let inv: f32 = rsqrt(s / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[i] = out[i] * inv * y[i]; }} }}\n"
+                )
+            },
+            len: |n| n,
+            regimes: ANY,
+        },
+        // Fused affine LayerNorm with BOTH scale gamma and shift beta (both = y, so both pointers are
+        // non-null): `(out[i]-mean)*inv*gamma[i] + beta[i]` → one mercury_norm_affine_f32 call. Covers
+        // the gamma+beta marshalling on both backends; bit-exact full-buffer.
+        Kernel {
+            name: "layernorm_affine",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+             for c in 0..{n} {{ out[c] = x[c]; }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[i]; }} \
+             let mean: f32 = s / {n}.0; \
+             let mut v: f32 = 0.0; \
+             for i in 0..{n} {{ v = v + (out[i] - mean) * (out[i] - mean); }} \
+             let inv: f32 = rsqrt(v / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[i] = (out[i] - mean) * inv * y[i] + y[i]; }} }}\n"
+                )
+            },
+            len: |n| n,
+            regimes: ANY,
+        },
         // matmul C=A·B (ikj) and nn.Linear C=A·Bᵀ (ijk) — both dispatch to the GEMM microkernel.
         Kernel {
             name: "matmul",
