@@ -42,6 +42,8 @@ pub fn lower_program(
         vmath: interner.intern("mercury_vmath_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         norm: interner.intern("mercury_norm_f32"),
+        i8nt: interner.intern("mercury_i8gemm_nt"),
+        i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -52,6 +54,18 @@ pub fn lower_program(
                     let parallel = has_parallel_attr(item, interner);
                     let func =
                         lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // Whole-function int8 quantized matmul (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM
+                // microkernel. Checked *before* the `@parallel` outliner below so a `@parallel` int8
+                // kernel dispatches to the multicore `mercury_i8gemm_nt_parallel` instead of being
+                // outlined to a scalar loop (rows are independent, so it stays deterministic).
+                // Integer math, so the kernel equals the scalar nest bit-for-bit (no reassoc).
+                if let Some(nest) = i8matmul_fn(body, sema, interner) {
+                    let parallel = has_parallel_attr(item, interner);
+                    let func =
+                        lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -369,6 +383,11 @@ struct GemmSyms {
     /// eps_bits, op)`): an idiomatic multi-pass softmax / LayerNorm / RMSNorm written in plain loops
     /// lowers to this one call. The interpreter marshals through the identical kernel.
     norm: Symbol,
+    /// The int8 quantized `nn.Linear` kernel (`mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)`): a
+    /// `u8×i8→i32` `C = A·Bᵀ` nest lowers to this. Integer arithmetic, so the fused kernel equals the
+    /// naive loop bit-for-bit (no reassociation exception).
+    i8nt: Symbol,
+    i8nt_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -1457,6 +1476,37 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)` call for a recognized int8 quantized
+    /// `nn.Linear` (`C = A·Bᵀ`, `u8`×`i8`→`i32`). Bails (false) if an operand/dim is unbound at the
+    /// call site, so the caller lowers the scalar nest. `parallel` selects the multicore kernel (rows
+    /// are independent, so it is bit-identical to the serial one the interpreter runs).
+    fn emit_i8gemm(&mut self, nest: &I8MatmulNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.b),
+            self.lookup(nest.c),
+        ) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.i8nt_par
+        } else {
+            self.gemm.i8nt
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, c, m, k, n],
+        });
+        true
+    }
+
     /// Fuse a `nn.Linear` matmul immediately followed by its bias-add / activation epilogue into one
     /// `mercury_sgemm_nt_epi` call (`C = act(A·Bᵀ + bias)`), folding the epilogue into the GEMM's C
     /// writeback so C is written once instead of paying a separate read-modify-write pass. Fires only
@@ -1733,6 +1783,14 @@ impl FnLowerer<'_> {
         // whole-function `@parallel` form is handled earlier in `lower_program`).
         if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
             if self.emit_sgemm(&nest, false) {
+                return;
+            }
+        }
+        // int8 quantized `nn.Linear` (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM microkernel. Integer
+        // arithmetic, so the kernel equals the scalar nest bit-for-bit; in a `@parallel` function the
+        // multicore kernel is used (rows independent → deterministic, so the gate stays exact).
+        if let Some(nest) = match_matmul_i8_nt(pat, iter, body, self.sema, self.interner) {
+            if self.emit_i8gemm(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -5260,6 +5318,213 @@ fn match_bias_act_epilogue(
     match_epi_value(value, nest.c, ivar, jvar, nest.n, interner)
 }
 
+/// A recognized int8 quantized `nn.Linear` nest: `C[m,n] (i32) = A[m,k] (u8) · B[n,k] (i8)ᵀ`.
+struct I8MatmulNest {
+    a: Symbol,
+    b: Symbol,
+    c: Symbol,
+    m: Dim,
+    k: Dim,
+    n: Dim,
+}
+
+/// Peel an `as`-cast wrapper (`x as T` → `x`); the expression itself otherwise. int8 GEMM source
+/// casts each `u8`/`i8` element to `i32` before multiplying (the product can't fit `i8`).
+fn peel_cast(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Cast { expr, .. } => expr,
+        _ => e,
+    }
+}
+
+/// The scalar type sema assigned to `e`, if any.
+fn scalar_of(e: &Expr, sema: &SemaResult) -> Option<mercury_types::Scalar> {
+    match sema.types.get(&e.id) {
+        Some(Ty::Scalar(s)) => Some(*s),
+        _ => None,
+    }
+}
+
+/// A literal integer `0` (the int8 accumulator seed `let mut s: i32 = 0`).
+fn is_int_zero(e: &Expr, interner: &Interner) -> bool {
+    matches!(&e.kind, ExprKind::Int(t) if parse_int(interner.resolve(*t)) == 0)
+}
+
+/// Recognize the int8 quantized `nn.Linear` nest `C = A·Bᵀ` — the dot-product `ijk` form with `u8`
+/// activations, `i8` weights, and an `i32` accumulator:
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   let mut s: i32 = 0;
+///   for k in 0..K { s = s + (a[i*K + k] as i32) * (b[j*K + k] as i32); }
+///   c[i*N + j] = s;
+/// } }
+/// ```
+///
+/// Returns the nest iff A is `u8`, B is `i8`, C is `i32`, B is transposed (`b[j*K+k]` — the weight
+/// layout `mercury_i8gemm_nt` expects), the strides are consistent (`sa = sb = K`, `sc = N`), and
+/// there are no batch offsets (plain 2-D). The signedness is enforced because the kernel zero-extends
+/// A and sign-extends B; matching the wrong signedness would miscompile, so anything else falls back
+/// to the scalar nest. Integer arithmetic means the kernel equals the scalar nest bit-for-bit.
+fn match_matmul_i8_nt(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<I8MatmulNest> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
+        return None;
+    }
+    // [0] let mut s: i32 = 0;
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_int_zero(s0, interner) {
+        return None;
+    }
+    // [1] for k in 0..K { s = s + (a[..] as i32) * (b[..] as i32); }
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    // The product must be i32 (the casts widen to i32; the accumulation matches the kernel's i32).
+    if !matches!(sema.types.get(&prod.id), Some(t) if mir_ty(t) == MirType::I32) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: f1,
+        rhs: f2,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    // Each factor is `(arr[idx] as i32)`. Peel the cast and identify A (row i) and B (row j, the
+    // transposed weight layout), enforcing A:u8 × B:i8 and no batch offset, in either factor order.
+    let (a_sym, sa, b_sym, sb) = {
+        let mut found = None;
+        for (fa, fb) in [(f1, f2), (f2, f1)] {
+            let (ai, bi) = (peel_cast(fa), peel_cast(fb));
+            let Some((a_sym, sa, a_off)) = match_a_factor(ai, row, kvar, interner) else {
+                continue;
+            };
+            let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
+            else {
+                continue;
+            };
+            if !transposed || !a_off.is_empty() || !b_off.is_empty() {
+                continue;
+            }
+            if scalar_of(ai, sema) != Some(mercury_types::Scalar::U8)
+                || scalar_of(bi, sema) != Some(mercury_types::Scalar::I8)
+            {
+                continue;
+            }
+            found = Some((a_sym, sa, b_sym, sb));
+            break;
+        }
+        found?
+    };
+    // [2] c[i*N + j] = s;  (C must be i32, plain 2-D, strides consistent.)
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(cv) != Some(s_sym) {
+        return None;
+    }
+    let (cbase, cidx) = as_index1(ct)?;
+    let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
+    if !c_off.is_empty() || sa != kdim || sb != kdim || sc != n {
+        return None;
+    }
+    if scalar_of(ct, sema) != Some(mercury_types::Scalar::I32) {
+        return None;
+    }
+    // An input aliasing the output is a hazard (the kernel writes C in a different order). A == B is
+    // fine (both read-only).
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    Some(I8MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+    })
+}
+
 /// Recognize the textbook `ijk` dot-product matmul:
 /// `for i { for j { let s = 0.0; for k { s = s + A[i,k]*B[..]; } c[i*N+j] = s; } }`. This is the
 /// natural way to write `C = A·Bᵀ` (both A and B read contiguously). Always `beta = 0` (s overwrites
@@ -5635,6 +5900,84 @@ fn lower_matmul_fn(
         }
     }
     fl.emit_sgemm(nest, parallel);
+    if !fl.terminated {
+        match ret_mir {
+            MirType::Void => fl.builder.ret(None),
+            _ => {
+                let z = fl.const_zero(ret_mir.clone());
+                fl.builder.ret(Some(z));
+            }
+        }
+    }
+    fl.builder.finish()
+}
+
+/// Recognize a function whose entire body is an int8 matmul nest (`{ for i in 0..M { … } }`) — the
+/// int8 twin of `matmul_fn`, used for whole-function quantized `nn.Linear` kernels.
+fn i8matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<I8MatmulNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_matmul_i8_nt(pat, iter, lb, sema, interner)
+}
+
+/// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base
+/// pointers and tail-calls `mercury_i8gemm_nt`/`mercury_i8gemm_nt_parallel` — the int8 twin of
+/// `lower_matmul_fn`.
+#[allow(clippy::too_many_arguments)]
+fn lower_i8matmul_fn(
+    f: &FnDecl,
+    nest: &I8MatmulNest,
+    parallel: bool,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+    diags: &mut Vec<Diagnostic>,
+) -> Function {
+    let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
+        _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
+    };
+    let ret_mir = mir_ty(&ret_ty);
+    let mut fl = FnLowerer {
+        builder: Builder::new(f.name.sym, ret_mir.clone()),
+        sema,
+        interner,
+        diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+    };
+    let param_vals: Vec<ValueId> = param_tys
+        .iter()
+        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+        .collect();
+    for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+        let mty = mir_ty(pty);
+        if matches!(mty, MirType::Array(..)) {
+            fl.bind(p.name.sym, val, mty);
+        } else {
+            let slot = fl.builder.alloca(mty.clone());
+            fl.builder.build_void(Op::Store {
+                ptr: slot,
+                value: val,
+            });
+            fl.bind(p.name.sym, slot, mty);
+        }
+    }
+    fl.emit_i8gemm(nest, parallel);
     if !fl.terminated {
         match ret_mir {
             MirType::Void => fl.builder.ret(None),

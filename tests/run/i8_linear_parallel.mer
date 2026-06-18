@@ -1,0 +1,45 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -40
+// EXPECT-OUT: 0
+// EXPECT-OUT: -112
+// EXPECT-OUT: -8
+module tests.run.i8_linear_parallel
+
+// A whole-function `@parallel` int8 quantized nn.Linear kernel with RUNTIME dims. Because the
+// function's whole body is the matmul nest, lower_program dispatches it to the multicore int8 GEMM
+// (mercury_i8gemm_nt_parallel) — the same recognizer as the embedded form, but checked *before* the
+// @parallel outliner so a parallel int8 kernel reaches the multicore path instead of being outlined
+// to a scalar loop. Rows are independent and integer math is exact, so serial == parallel
+// bit-for-bit and the differential gate stays exact. A is [2,4] u8, B is [2,4] i8 (its rows are the
+// weight vectors), so C is [2,2] i32.
+@parallel
+fn i8mm(a: [u8; 8], b: [i8; 8], c: [i32; 4], m: i64, n: i64, k: i64) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut s: i32 = 0;
+            for p in 0..k {
+                s = s + (a[i * k + p] as i32) * (b[j * k + p] as i32);
+            }
+            c[i * n + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [u8; 8] = [0 as u8; 8];
+    let mut b: [i8; 8] = [0 as i8; 8];
+    let mut c: [i32; 4] = [0; 4];
+    for i in 0..8 {
+        a[i] = (i + 1) as u8; // 1 .. 8
+    }
+    for i in 0..8 {
+        b[i] = ((i as i32) - 6) as i8; // -6 .. 1
+    }
+    i8mm(a, b, c, 2 as i64, 2 as i64, 4 as i64);
+    print(c[0]); // row0·row0: 1·-6 + 2·-5 + 3·-4 + 4·-3 = -40
+    print(c[1]); // row0·row1: 1·-2 + 2·-1 + 3·0  + 4·1  =   0
+    print(c[2]); // row1·row0: 5·-6 + 6·-5 + 7·-4 + 8·-3 = -112
+    print(c[3]); // row1·row1: 5·-2 + 6·-1 + 7·0  + 8·1  =  -8
+    return 0;
+}
