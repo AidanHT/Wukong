@@ -42,6 +42,7 @@ pub fn lower_program(
         vmath: interner.intern("mercury_vmath_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         norm: interner.intern("mercury_norm_f32"),
+        norm_affine: interner.intern("mercury_norm_affine_f32"),
         i8nt: interner.intern("mercury_i8gemm_nt"),
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
     };
@@ -383,6 +384,10 @@ struct GemmSyms {
     /// eps_bits, op)`): an idiomatic multi-pass softmax / LayerNorm / RMSNorm written in plain loops
     /// lowers to this one call. The interpreter marshals through the identical kernel.
     norm: Symbol,
+    /// The affine fused norm kernel (`mercury_norm_affine_f32(x, out, gamma, beta, rows, cols,
+    /// eps_bits, op)`): a LayerNorm/RMSNorm whose normalize step also applies a per-column scale
+    /// `gamma` (and, for LayerNorm, a shift `beta`) lowers here instead — the real transformer form.
+    norm_affine: Symbol,
     /// The int8 quantized `nn.Linear` kernel (`mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)`): a
     /// `u8×i8→i32` `C = A·Bᵀ` nest lowers to this. Integer arithmetic, so the fused kernel equals the
     /// naive loop bit-for-bit (no reassociation exception).
@@ -513,19 +518,19 @@ impl FnLowerer<'_> {
             // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
             // sum-of-squares+scale), so probe order is immaterial.
             if let Some((n, arr, n_expr)) = self.match_softmax(b, i) {
-                if self.emit_norm(arr, &n_expr, 0, NORM_SOFTMAX) {
+                if self.emit_norm(arr, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps)) = self.match_layernorm(b, i) {
-                if self.emit_norm(arr, &n_expr, eps, NORM_LAYERNORM) {
+            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i) {
+                if self.emit_norm(arr, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps)) = self.match_rmsnorm(b, i) {
-                if self.emit_norm(arr, &n_expr, eps, NORM_RMSNORM) {
+            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i) {
+                if self.emit_norm(arr, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
@@ -800,8 +805,73 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Body `x[v] = x[v] * inv` (scale by an invariant scalar, either operand order). Pure.
-    fn match_scale_body(&self, body: &Block, v: Symbol, x: Symbol, inv: Symbol) -> Option<()> {
+    /// `arr[v]` where `arr != x` (the data) → `arr`: a per-column affine parameter array (gamma/beta)
+    /// indexed by the normalize loop variable. Pure.
+    fn affine_index(&self, e: &Expr, v: Symbol, x: Symbol) -> Option<Symbol> {
+        match self.index_by_loopvar(e, v) {
+            Some(a) if a != x => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Peel an optional affine wrapper `core * gamma[v] (+ beta[v])` off a normalize-loop RHS, in the
+    /// canonical `(... ) * gamma[i] + beta[i]` spelling (gamma on either side of its `*`, beta on
+    /// either side of its `+`). Returns the remaining `core` expression plus the gamma/beta arrays
+    /// (each `None` when absent). `gamma`/`beta` must be indexed by the loop var `v` and be arrays
+    /// other than the data `x`. Pure — leaves `core` == `value` when there is no affine wrapper.
+    fn peel_affine<'e>(
+        &self,
+        value: &'e Expr,
+        v: Symbol,
+        x: Symbol,
+    ) -> (&'e Expr, Option<Symbol>, Option<Symbol>) {
+        // outermost `+ beta[v]`
+        let (after_beta, beta) = match &value.kind {
+            ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } => {
+                if let Some(b) = self.affine_index(rhs, v, x) {
+                    (lhs.as_ref(), Some(b))
+                } else if let Some(b) = self.affine_index(lhs, v, x) {
+                    (rhs.as_ref(), Some(b))
+                } else {
+                    (value, None)
+                }
+            }
+            _ => (value, None),
+        };
+        // then `* gamma[v]`
+        let (core, gamma) = match &after_beta.kind {
+            ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } => {
+                if let Some(g) = self.affine_index(rhs, v, x) {
+                    (lhs.as_ref(), Some(g))
+                } else if let Some(g) = self.affine_index(lhs, v, x) {
+                    (rhs.as_ref(), Some(g))
+                } else {
+                    (after_beta, None)
+                }
+            }
+            _ => (after_beta, None),
+        };
+        (core, gamma, beta)
+    }
+
+    /// Body `x[v] = x[v] * inv [* gamma[v] [+ beta[v]]]` (scale by an invariant scalar, either operand
+    /// order, with an optional affine wrapper for RMSNorm). Returns the captured `(gamma, beta)`
+    /// arrays (both `None` for the plain form). Pure.
+    fn match_scale_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        inv: Symbol,
+    ) -> Option<(Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -814,18 +884,19 @@ impl FnLowerer<'_> {
         if self.index_by_loopvar(target, v) != Some(x) {
             return None;
         }
+        let (core, gamma, beta) = self.peel_affine(value, v, x);
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
             lhs,
             rhs,
-        } = &value.kind
+        } = &core.kind
         else {
             return None;
         };
         let ok = (self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(inv))
             || (self.index_by_loopvar(rhs, v) == Some(x) && single_path(lhs) == Some(inv));
         if ok {
-            Some(())
+            Some((gamma, beta))
         } else {
             None
         }
@@ -921,7 +992,11 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n6, n_expr) {
             return None;
         }
-        self.match_scale_body(body6, v6, x, inv)?;
+        // softmax's normalize is a plain `x[i] *= inv`; reject any affine wrapper (softmax has no
+        // gamma/beta) so it falls back to the generic vectorizer rather than silently dropping it.
+        if self.match_scale_body(body6, v6, x, inv)? != (None, None) {
+            return None;
+        }
         // The three internal scalars must not be read after the window — the kernel hides them.
         let rest = &b.stmts[at + 7..];
         let tail = b.tail.as_deref();
@@ -933,9 +1008,20 @@ impl FnLowerer<'_> {
         Some((7, x, n_expr.clone()))
     }
 
-    /// Emit one in-place `mercury_norm_f32(x, x, 1, N, eps_bits, op)` for a recognized norm. Bails
-    /// (false) if the array base is somehow unbound, so the caller lowers the loops normally.
-    fn emit_norm(&mut self, arr: Symbol, n: &Expr, eps_bits: i64, op: i64) -> bool {
+    /// Emit one in-place recognized norm: `mercury_norm_f32(x, x, 1, N, eps_bits, op)` for a plain
+    /// (gamma=1, beta=0) norm, or `mercury_norm_affine_f32(x, x, gamma, beta, 1, N, eps_bits, op)` when
+    /// the normalize step carried a per-column scale `gamma` (and optional shift `beta`) — the real
+    /// transformer form. Bails (false) if the data array or a captured affine array is somehow unbound,
+    /// so the caller lowers the loops normally.
+    fn emit_norm(
+        &mut self,
+        arr: Symbol,
+        n: &Expr,
+        eps_bits: i64,
+        op: i64,
+        gamma: Option<Symbol>,
+        beta: Option<Symbol>,
+    ) -> bool {
         let Some((xv, _)) = self.lookup(arr) else {
             return false;
         };
@@ -951,9 +1037,33 @@ impl FnLowerer<'_> {
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        if gamma.is_none() && beta.is_none() {
+            self.builder.build_void(Op::Call {
+                func: self.gemm.norm,
+                args: vec![xv, xv, rows, nval, epsv, opv],
+            });
+            return true;
+        }
+        // Affine: resolve gamma/beta to their array base pointers. An absent param is a null pointer,
+        // built as an integer `0` (a `Ptr`-typed `ConstInt` is invalid MIR; the verifier requires
+        // integer-typed int consts). On the native side ptr_ty == i64, so the i64 zero is passed as the
+        // null pointer the kernel checks; the interpreter sees a `Value::Int(0)` (distinct from any
+        // real array's `Value::Ptr` by variant) and marshals it as absent → scale-1 / shift-0.
+        let ptr_or_null = |me: &mut Self, sym: Option<Symbol>| -> Option<ValueId> {
+            match sym {
+                Some(s) => me.lookup(s).map(|(v, _)| v),
+                None => Some(
+                    me.builder
+                        .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                ),
+            }
+        };
+        let (Some(gptr), Some(bptr)) = (ptr_or_null(self, gamma), ptr_or_null(self, beta)) else {
+            return false;
+        };
         self.builder.build_void(Op::Call {
-            func: self.gemm.norm,
-            args: vec![xv, xv, rows, nval, epsv, opv],
+            func: self.gemm.norm_affine,
+            args: vec![xv, xv, gptr, bptr, rows, nval, epsv, opv],
         });
         true
     }
@@ -1099,7 +1209,7 @@ impl FnLowerer<'_> {
         x: Symbol,
         mean: Symbol,
         inv: Symbol,
-    ) -> Option<()> {
+    ) -> Option<(Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -1112,18 +1222,19 @@ impl FnLowerer<'_> {
         if self.index_by_loopvar(target, v) != Some(x) {
             return None;
         }
+        let (core, gamma, beta) = self.peel_affine(value, v, x);
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
             lhs,
             rhs,
-        } = &value.kind
+        } = &core.kind
         else {
             return None;
         };
         let ok = (self.is_centered(lhs, v, x, mean) && single_path(rhs) == Some(inv))
             || (self.is_centered(rhs, v, x, mean) && single_path(lhs) == Some(inv));
         if ok {
-            Some(())
+            Some((gamma, beta))
         } else {
             None
         }
@@ -1203,14 +1314,20 @@ impl FnLowerer<'_> {
     /// let mut v = 0.0;
     /// for i in 0..N { v += (x[i]-mean)*(x[i]-mean); }       // variance sum
     /// let inv = 1.0 / sqrt(v / (N as f32) + eps);           // 1/sqrt(var+eps)
-    /// for i in 0..N { x[i] = (x[i]-mean) * inv; }           // normalize, in place
+    /// for i in 0..N { x[i] = (x[i]-mean) * inv * g[i] + b[i]; }  // normalize (affine g/b optional)
     /// ```
     ///
     /// Same discipline as [`Self::match_softmax`]: every loop ranges the identical `0..N` over the same
     /// array `x`; the divisors are pinned to the trip count; the scalars chain; and the internal
-    /// scalars must not be read after the window (the kernel hides them). Returns `(consumed, array, N,
-    /// eps_bits)`; `None` on any deviation (the generic vectorizer then lowers the loops).
-    fn match_layernorm(&self, b: &Block, at: usize) -> Option<(usize, Symbol, Expr, i64)> {
+    /// scalars must not be read after the window (the kernel hides them). The normalize step may carry
+    /// an optional per-column affine `* gamma[i] (+ beta[i])` (the real transformer form) — those
+    /// arrays are captured and returned. Returns `(consumed, array, N, eps_bits, gamma, beta)`; `None`
+    /// on any deviation (the generic vectorizer then lowers the loops).
+    fn match_layernorm(
+        &self,
+        b: &Block,
+        at: usize,
+    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
             return None;
@@ -1236,7 +1353,7 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n6, n_expr) {
             return None;
         }
-        self.match_shift_scale_body(body6, v6, x, mean, inv)?;
+        let (gamma, beta) = self.match_shift_scale_body(body6, v6, x, mean, inv)?;
         let rest = &b.stmts[at + 7..];
         let tail = b.tail.as_deref();
         for sc in [s, mean, vv, inv] {
@@ -1244,7 +1361,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((7, x, n_expr.clone(), eps_bits))
+        Some((7, x, n_expr.clone(), eps_bits, gamma, beta))
     }
 
     /// Recognize the canonical in-place flat RMSNorm window (4 statements) at `b.stmts[at..]`:
@@ -1253,11 +1370,17 @@ impl FnLowerer<'_> {
     /// let mut s = 0.0;
     /// for i in 0..N { s += x[i]*x[i]; }              // mean-square sum
     /// let inv = 1.0 / sqrt(s / (N as f32) + eps);    // 1/sqrt(ms+eps)
-    /// for i in 0..N { x[i] = x[i] * inv; }           // normalize, in place
+    /// for i in 0..N { x[i] = x[i] * inv * g[i]; }     // normalize (affine scale g[i] optional)
     /// ```
     ///
-    /// Returns `(consumed, array, N, eps_bits)`; `None` on any deviation.
-    fn match_rmsnorm(&self, b: &Block, at: usize) -> Option<(usize, Symbol, Expr, i64)> {
+    /// The normalize step may carry an optional per-column scale `* gamma[i]` (the real transformer
+    /// form; RMSNorm has no shift, but a `+ beta[i]` is also accepted). Returns `(consumed, array, N,
+    /// eps_bits, gamma, beta)`; `None` on any deviation.
+    fn match_rmsnorm(
+        &self,
+        b: &Block,
+        at: usize,
+    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -1273,7 +1396,7 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        self.match_scale_body(body3, v3, x, inv)?;
+        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv)?;
         let rest = &b.stmts[at + 4..];
         let tail = b.tail.as_deref();
         for sc in [s, inv] {
@@ -1281,7 +1404,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((4, x, n_expr.clone(), eps_bits))
+        Some((4, x, n_expr.clone(), eps_bits, gamma, beta))
     }
 
     /// Is `e` the float literal `0.0`? Pure.
