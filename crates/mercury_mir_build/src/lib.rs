@@ -2709,6 +2709,96 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Store { ptr: p, value });
     }
 
+    /// Row-major element strides for a tensor `base`, if computable. `stride_k` = product of the
+    /// dims *after* position `k`; computable when every dim after the first is a compile-time
+    /// `Const` (the leading dim may be `Var`/`Dynamic` — it never contributes to a stride). Returns
+    /// the per-axis strides and the element's MIR type, or `None` (caller falls back to scalar/error).
+    /// This is what makes the shape-typed surface — `a[i, j]` on `Tensor[f32, M, N]` — executable.
+    fn tensor_strides(&self, base: &Expr) -> Option<(Vec<usize>, MirType)> {
+        let Ty::Tensor {
+            elem,
+            shape,
+            layout,
+        } = self.expr_ty(base)
+        else {
+            return None;
+        };
+        // Only row-major (contiguous) tensors flatten to `i0*s0 + … + i_{n-1}` with these strides.
+        if !matches!(layout, mercury_types::Layout::Contiguous) {
+            return None;
+        }
+        let dims = &shape.0;
+        let rank = dims.len();
+        if rank == 0 {
+            return None;
+        }
+        let mut strides = vec![1usize; rank];
+        for k in (0..rank - 1).rev() {
+            let next = match dims[k + 1] {
+                mercury_types::Dim::Const(d) => d as usize,
+                _ => return None, // a symbolic/dynamic interior dim — stride unknown at compile time
+            };
+            strides[k] = strides[k + 1] * next;
+        }
+        Some((strides, mir_ty(&Ty::Scalar(elem))))
+    }
+
+    /// Lower an index expression and widen it to `I64`, so a multi-dimensional flat-offset
+    /// computation is single-typed regardless of the index's source width (loop vars are usually
+    /// `i32`). Non-negative loop counters, so sign/zero-extension agree; we pick by signedness.
+    fn lower_index_i64(&mut self, e: &Expr) -> ValueId {
+        let v = self.lower_expr(e);
+        let ty = self.expr_mir(e);
+        if ty == MirType::I64 {
+            return v;
+        }
+        let kind = if self.signed(e) {
+            CastKind::SExt
+        } else {
+            CastKind::ZExt
+        };
+        self.builder
+            .build(MirType::I64, Op::Cast(kind, v, MirType::I64))
+    }
+
+    /// Lower a multi-dimensional tensor index `base[i0, i1, …]` to a single `Gep` at the row-major
+    /// flat element offset `Σ iₖ·strideₖ`. Returns `None` if `base` is not a flattenable tensor.
+    fn lower_multi_index(&mut self, base: &Expr, indices: &[Expr]) -> Option<(ValueId, MirType)> {
+        let (strides, elem) = self.tensor_strides(base)?;
+        if strides.len() != indices.len() {
+            return None; // rank mismatch (sema already reported E0501); fall back to unsupported
+        }
+        let base_ptr = self.lower_expr(base);
+        let mut flat: Option<ValueId> = None;
+        for (ix, &st) in indices.iter().zip(strides.iter()) {
+            let iv = self.lower_index_i64(ix);
+            let term = if st == 1 {
+                iv
+            } else {
+                let s = self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(st as i128, MirType::I64));
+                self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, iv, s))
+            };
+            flat = Some(match flat {
+                None => term,
+                Some(acc) => self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Add, acc, term)),
+            });
+        }
+        let flat = flat.expect("indices non-empty");
+        let p = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base_ptr,
+                index: flat,
+                elem: elem.clone(),
+            },
+        );
+        Some((p, elem))
+    }
+
     fn lower_place(&mut self, e: &Expr) -> (ValueId, MirType) {
         match &e.kind {
             ExprKind::Path(p) if p.is_single() => {
@@ -2744,6 +2834,19 @@ impl FnLowerer<'_> {
                     },
                 );
                 (p, elem)
+            }
+            // Multi-dimensional tensor indexing `t[i, j, …]` — the shape-typed surface. Flatten to a
+            // row-major offset using the tensor's static strides.
+            ExprKind::Index { base, indices } if indices.len() >= 2 => {
+                if let Some(pe) = self.lower_multi_index(base, indices) {
+                    return pe;
+                }
+                self.unsupported(
+                    e.span,
+                    "multi-dimensional indexing on a non-contiguous or symbolically-strided tensor",
+                );
+                let ty = self.expr_mir(e);
+                (self.builder.alloca(ty.clone()), ty)
             }
             _ => {
                 self.unsupported(e.span, "assignment target");
@@ -2790,7 +2893,7 @@ impl FnLowerer<'_> {
             ExprKind::Unary { op, expr } => self.lower_unary(*op, expr, e),
             ExprKind::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs, e),
             ExprKind::Call { callee, args, .. } => self.lower_call(callee, args, e),
-            ExprKind::Index { base, indices } if indices.len() == 1 => {
+            ExprKind::Index { base, indices } if !indices.is_empty() => {
                 let (ptr, elem) = self.lower_place(e);
                 let _ = (base, indices);
                 self.builder.build(elem.clone(), Op::Load(ptr, elem))
@@ -5131,6 +5234,34 @@ mod tests {
             "expected an array alloca"
         );
         assert!(verify_function(main).is_empty(), "verify failed");
+    }
+
+    #[test]
+    fn multi_dim_tensor_index_lowers_to_row_major_gep() {
+        // The shape-typed surface: `t[i, j]` on `Tensor[f32, M, N]` must lower (no `unsupported`
+        // C0001) to a flat row-major offset `i*N + j`, and the function must verify.
+        let src = "fn k(a: Tensor[f32, 3, 4], out: Tensor[f32, 3, 4]) { \
+                   for i in 0..3 { for j in 0..4 { out[i, j] = a[i, j] * 2.0; } } }";
+        let (prog, diags, mut interner) = lower(src);
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "multi-dim index should lower cleanly: {diags:?}"
+        );
+        let k_sym = interner.intern("k");
+        let k = prog.funcs.iter().find(|f| f.name == k_sym).expect("fn k");
+        assert!(
+            verify_function(k).is_empty(),
+            "verify: {:?}",
+            verify_function(k)
+        );
+        // The inner stride is the trailing dim N=4: expect a `* 4` in the offset arithmetic.
+        assert!(
+            k.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(&i.op, Op::ConstInt(4, MirType::I64))),
+            "expected a stride-4 (trailing dim) constant in the flat-index arithmetic"
+        );
     }
 
     #[test]
