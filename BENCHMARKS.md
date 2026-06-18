@@ -53,6 +53,13 @@ naively-written source:
   `expf`/`logf`/`tanhf` and cannot vectorize a loop containing a call, so the activation family
   (GELU/SiLU/tanh/sigmoid + softmax/log-softmax/cross-entropy) runs **~5–7.5× faster**, and an
   `@parallel` activation dispatches each thread's chunk to the kernel (multicore × 256-bit).
+- **Fused row normalizations → single-pass kernel.** The per-token normalizations every transformer
+  layer runs — **softmax**, **LayerNorm**, **RMSNorm** — are recognized from their canonical
+  multi-pass source and folded into one **`mercury_norm_f32`** call: each row loaded once, 256-bit
+  AVX2, the hand-vectorized `exp` for softmax, and the mean / variance / sum-of-squares reductions
+  reassociated across 8 lanes. gcc/rustc auto-vectorize the elementwise passes but (without
+  `-ffast-math`) keep the float reductions sequential and call scalar `expf` — so this *composes* the
+  reduction-vectorization and transcendental wins into the fused op (**~1.9–6.6× faster than C**).
 - **Convolution via im2col + GEMM.** A conv expressed as im2col + matmul has its matmul recognized
   and dispatched to the GEMM microkernel — so Mercury beats hand-written direct convolution ~5.8×,
   the same way XLA/cuDNN lower conv.
@@ -168,11 +175,43 @@ The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1
 kernel passes the cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and
 compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
 bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
-multicore × 256-bit. `softmax`/`layernorm` and **log-softmax / cross-entropy** (`exp` + `log`) run as
-fused vectorized chains (`tests/run/`); a transformer FFN block (two `nn.Linear` matmuls + GELU)
+multicore × 256-bit. `softmax`/`LayerNorm`/`RMSNorm` are recognized and dispatched to a fused
+single-pass kernel (`mercury_norm_f32` — see the section above), and **log-softmax / cross-entropy**
+(`exp` + `log`) run as fused vectorized chains (`tests/run/`); a transformer FFN block (two `nn.Linear` matmuls + GELU)
 composes the GEMM and activation wins in one function (`tests/run/ffn_block.mer`). All paths are
 bit-identical across backends — the dispatched kernel by marshalling, the inlined polys by
 construction.
+
+### Fused row normalizations — softmax / LayerNorm / RMSNorm dispatch to one kernel
+
+The per-token normalizations every transformer layer runs. Mercury recognizes the canonical
+multi-pass source (softmax's max/exp/sum/normalize; LayerNorm's mean/variance/normalize; RMSNorm's
+mean-square/normalize) and folds the whole thing into one **`mercury_norm_f32`** call — 256-bit
+AVX2, the hand-vectorized `exp` for softmax, and the reductions reassociated across 8 lanes. gcc and
+rustc at their honest defaults (no `-ffast-math`) auto-vectorize the elementwise passes but keep the
+float reductions strictly sequential, and call scalar `libm` `expf` for softmax. All three languages
+copy `x`→`out` then normalize in place — identical work, so the copy pass is charged to everyone and
+these figures *understate* the per-pass advantage — and the full output buffer is cross-checked
+element-by-element (a tight tolerance, since Mercury reassociates the reductions and C does not).
+
+Measured as the **Mercury-vs-C runtime ratio** over feature rows of 768 and 4096 f32. Absolute
+ns/call swings ~2× run-to-run with the laptop's clock/thermal state (the whole machine speeds up or
+slows down together), so — as with the GEMM — the honest figure is the *ratio*, reported as a range
+across runs:
+
+| op | Mercury vs C | where the win comes from |
+|----|--------------|--------------------------|
+| softmax   | **~4.4–6.6× faster** | vectorized `exp` (gcc's scalar `expf` can't vectorize a loop with a call) + the reassociated sum |
+| LayerNorm | **~3.0–3.5× faster** | two reassociated reductions — the mean, then the variance |
+| RMSNorm   | **~1.9–2.5× faster** | one reduction (mean-square); the copy/scale elementwise passes, which gcc vectorizes too, dilute it |
+
+Softmax wins most — the vectorized `exp` dominates, the same effect as the standalone `exp` kernel.
+LayerNorm and RMSNorm win on their reassociated reductions (gcc keeps float reductions strictly
+sequential without `-ffast-math`), with RMSNorm lowest because it has only one reduction and a larger
+share of plain elementwise work. Rust tracks C within a few percent throughout. One row is one
+token's hidden vector; a real `[tokens, hidden]` batch maps the identical kernel per row. The
+interpreter marshals the identical kernel so the differential oracle stays bit-for-bit exact, and the
+recognizer runs pre-opt so `-O0` == `-O3`.
 
 ### Single-threaded elementwise & reductions
 
@@ -220,8 +259,12 @@ single-threaded C:
   where gcc/rustc cannot vectorize a loop with an `expf`/`logf`/`tanhf` call. This is the transformer
   activation family and the cleanest compute-bound win (it roughly doubled when the kernel moved from
   the 128-bit vectorizer to 256-bit). `gelu`/`silu` are first-class intrinsics; an `@parallel`
-  activation runs multicore × 256-bit (~28×); softmax/layernorm/log-softmax/cross-entropy compose
-  the exp/log win.
+  activation runs multicore × 256-bit (~28×); log-softmax/cross-entropy compose the exp/log win.
+- **Fused normalizations (softmax / LayerNorm / RMSNorm):** the per-token transformer norms are
+  recognized from their multi-pass source and folded into one `mercury_norm_f32` call (256-bit AVX2 +
+  8-lane reassociated reductions + the vectorized `exp`), **~1.9–6.6× faster than C** — softmax most
+  (the vectorized `exp` dominates), RMSNorm least (a single reduction, diluted by its elementwise
+  passes). Both backends marshal the identical kernel, so the differential oracle stays bit-exact.
 - **Convolution:** lowered as im2col + GEMM (the XLA/cuDNN strategy), Mercury runs a 3×3 conv
   **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
   recognizer accelerates conv for free.
@@ -244,5 +287,6 @@ single-threaded C:
 
 Where Mercury wins is where a tensor compiler should: compile speed, matmul/GEMM throughput (now on
 runtime dimensions too), convolution (im2col + GEMM), vectorized transcendentals (the transformer
-activation family, including `log` for log-softmax/cross-entropy), automatic parallelism, automatic
-vectorization (including reductions), automatic fusion, and shape safety.
+activation family, including `log` for log-softmax/cross-entropy), fused row normalizations
+(softmax/LayerNorm/RMSNorm), automatic parallelism, automatic vectorization (including reductions),
+automatic fusion, and shape safety.
