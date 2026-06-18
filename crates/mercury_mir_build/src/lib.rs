@@ -387,8 +387,9 @@ const RED_SSD: i64 = 1; // sum((x[k] - y[k])^2)
 const RED_SUM: i64 = 2; // sum(x[k])
 
 // Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
-// (LayerNorm/RMSNorm recognizers follow in a later change; only softmax dispatches today.)
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
+const NORM_LAYERNORM: i64 = 1; // out = (x - mean) / sqrt(var + eps)
+const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -487,11 +488,25 @@ impl FnLowerer<'_> {
                 i += n;
                 continue;
             }
-            // Fused normalization: an idiomatic multi-pass softmax over a flat f32 array folds into
-            // one `mercury_norm_f32` call (each row loaded once + 256-bit AVX2). Checked before the
-            // elementwise-fusion run so it sees the raw loop sequence, not a pre-fused one.
+            // Fused normalization: an idiomatic multi-pass softmax / LayerNorm / RMSNorm over a flat
+            // f32 array folds into one `mercury_norm_f32` call (each row loaded once + 256-bit AVX2).
+            // Checked before the elementwise-fusion run so it sees the raw loop sequence, not a
+            // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
+            // sum-of-squares+scale), so probe order is immaterial.
             if let Some((n, arr, n_expr)) = self.match_softmax(b, i) {
                 if self.emit_norm(arr, &n_expr, 0, NORM_SOFTMAX) {
+                    i += n;
+                    continue;
+                }
+            }
+            if let Some((n, arr, n_expr, eps)) = self.match_layernorm(b, i) {
+                if self.emit_norm(arr, &n_expr, eps, NORM_LAYERNORM) {
+                    i += n;
+                    continue;
+                }
+            }
+            if let Some((n, arr, n_expr, eps)) = self.match_rmsnorm(b, i) {
+                if self.emit_norm(arr, &n_expr, eps, NORM_RMSNORM) {
                     i += n;
                     continue;
                 }
@@ -681,8 +696,19 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Body `s += x[v]` / `s = s + x[v]` (sum into scalar `s`). Pure.
+    /// Body `s += x[v]` / `s = s + x[v]` (sum into scalar `s`), verifying the summed array is `x`. Pure.
     fn match_sum_body(&self, body: &Block, v: Symbol, x: Symbol, s: Symbol) -> Option<()> {
+        if self.sum_body_array(body, v, s)? == x {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Body `s += x[v]` / `s = s + x[v]` (sum into scalar `s`) → the summed array `x` (whichever it
+    /// is). The array-discovering form of [`Self::match_sum_body`] (LayerNorm's leading sum loop is
+    /// what first names the row array). Pure.
+    fn sum_body_array(&self, body: &Block, v: Symbol, s: Symbol) -> Option<Symbol> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign { target, op, value } = &stmt.kind else {
             return None;
@@ -707,8 +733,49 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
-        if self.index_by_loopvar(addend, v) == Some(x) {
-            Some(())
+        self.index_by_loopvar(addend, v)
+    }
+
+    /// Body `s += x[v]*x[v]` (sum of squares into scalar `s`) → the squared array `x` (RMSNorm's lead
+    /// loop, and the mean-square reduction). Pure.
+    fn match_sumsq_body(&self, body: &Block, v: Symbol, s: Symbol) -> Option<Symbol> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(s) {
+            return None;
+        }
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(s) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(s) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // addend must be `x[v] * x[v]` — same array, same index, both factors.
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &addend.kind
+        else {
+            return None;
+        };
+        let xl = self.index_by_loopvar(lhs, v)?;
+        let xr = self.index_by_loopvar(rhs, v)?;
+        if xl == xr {
+            Some(xl)
         } else {
             None
         }
@@ -870,6 +937,337 @@ impl FnLowerer<'_> {
             args: vec![xv, xv, rows, nval, epsv, opv],
         });
         true
+    }
+
+    // ---- LayerNorm / RMSNorm recognition (the per-token transformer normalizations) ----
+
+    /// Is `e` a float literal (or its negation)? → its `f32` bit pattern (the kernel's `eps` ABI). Pure.
+    fn float_lit_bits(&self, e: &Expr) -> Option<i64> {
+        let v: f64 = match &e.kind {
+            ExprKind::Float(t) => parse_float(self.interner.resolve(*t)),
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => match &expr.kind {
+                ExprKind::Float(t) => -parse_float(self.interner.resolve(*t)),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((v as f32).to_bits() as i64)
+    }
+
+    /// Does `d` denote the row length `n` as an `f32` divisor — a float literal equal to a literal
+    /// count, an `(n as f32)` cast of the exact bound, or the bound expression itself? (The mean /
+    /// mean-square divides the row sum by the element count; this pins that divisor to the loop trip
+    /// count, so we only fuse a genuine per-row mean.) Pure.
+    fn count_as_f32(&self, d: &Expr, n: &Expr) -> bool {
+        if let (ExprKind::Float(f), ExprKind::Int(k)) = (&d.kind, &n.kind) {
+            return parse_float(self.interner.resolve(*f))
+                == parse_int(self.interner.resolve(*k)) as f64;
+        }
+        if let ExprKind::Cast { expr, .. } = &d.kind {
+            return self.expr_mir(d) == MirType::F32 && exprs_struct_eq(expr, n);
+        }
+        exprs_struct_eq(d, n)
+    }
+
+    /// Is `f` the float literal `1/count` (the multiply-by-reciprocal mean, e.g. `* 0.0625` for 16)?
+    /// This is exactly what the kernel computes (`* invn`), so it is the *most* faithful spelling. Pure.
+    fn recip_of_count(&self, f: &Expr, n: &Expr) -> bool {
+        if let (ExprKind::Float(t), ExprKind::Int(k)) = (&f.kind, &n.kind) {
+            let cnt = parse_int(self.interner.resolve(*k)) as f64;
+            return cnt != 0.0 && parse_float(self.interner.resolve(*t)) == 1.0 / cnt;
+        }
+        false
+    }
+
+    /// Does `e` scale the row sum `s` by `1/count` — `s / count` or `s * (1/count)` (either factor
+    /// order)? Both the mean and the mean-square divide a row sum by the element count; this accepts
+    /// the divide and the (kernel-faithful) multiply-by-reciprocal spellings. Pure.
+    fn scaled_by_inv_count(&self, e: &Expr, s: Symbol, n: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Binary {
+                op: ast::BinOp::Div,
+                lhs,
+                rhs,
+            } => single_path(lhs) == Some(s) && self.count_as_f32(rhs, n),
+            ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } => {
+                (single_path(lhs) == Some(s) && self.recip_of_count(rhs, n))
+                    || (single_path(rhs) == Some(s) && self.recip_of_count(lhs, n))
+            }
+            _ => false,
+        }
+    }
+
+    /// `let name = s / count` or `s * (1/count)` (row sum → mean), the scale pinned to the trip count
+    /// `n`. Pure.
+    fn match_mean(&self, stmt: &Stmt, s: Symbol, n: &Expr) -> Option<Symbol> {
+        let (name, init) = Self::let_init(stmt)?;
+        if self.scaled_by_inv_count(init, s, n) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Is `e` the centered value `x[v] - mean`? Pure.
+    fn is_centered(&self, e: &Expr, v: Symbol, x: Symbol, mean: Symbol) -> bool {
+        matches!(
+            &e.kind,
+            ExprKind::Binary { op: ast::BinOp::Sub, lhs, rhs }
+                if self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(mean)
+        )
+    }
+
+    /// Body `acc += (x[v]-mean)*(x[v]-mean)` (sum of squared deviations). Pure.
+    fn match_var_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        mean: Symbol,
+        acc: Symbol,
+    ) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(acc) {
+            return None;
+        }
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(acc) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(acc) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &addend.kind
+        else {
+            return None;
+        };
+        if self.is_centered(lhs, v, x, mean) && self.is_centered(rhs, v, x, mean) {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Body `x[v] = (x[v]-mean) * inv` (center then scale, in place; either operand order). Pure.
+    fn match_shift_scale_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        mean: Symbol,
+        inv: Symbol,
+    ) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if self.index_by_loopvar(target, v) != Some(x) {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let ok = (self.is_centered(lhs, v, x, mean) && single_path(rhs) == Some(inv))
+            || (self.is_centered(rhs, v, x, mean) && single_path(lhs) == Some(inv));
+        if ok {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// The argument `X` of `1.0 / sqrt(X)` or `rsqrt(X)`. Pure.
+    fn as_rsqrt_arg<'b>(&self, e: &'b Expr) -> Option<&'b Expr> {
+        match &e.kind {
+            ExprKind::Binary {
+                op: ast::BinOp::Div,
+                lhs,
+                rhs,
+            } if matches!(&lhs.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) =>
+            {
+                let ExprKind::Call { callee, args, .. } = &rhs.kind else {
+                    return None;
+                };
+                if args.len() == 1
+                    && matches!(
+                        self.vectorizable_intrinsic(callee),
+                        Some(MathIntrinsic::Sqrt)
+                    )
+                {
+                    Some(&args[0])
+                } else {
+                    None
+                }
+            }
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 1
+                    && matches!(
+                        self.vectorizable_intrinsic(callee),
+                        Some(MathIntrinsic::Rsqrt)
+                    ) =>
+            {
+                Some(&args[0])
+            }
+            _ => None,
+        }
+    }
+
+    /// `let inv = 1.0 / sqrt(sum/count + eps)` (or `rsqrt(...)`, `eps` either side) → `(inv, eps_bits)`,
+    /// the reciprocal-standard-deviation binding shared by LayerNorm (variance sum) and RMSNorm
+    /// (mean-square sum). Pure.
+    fn match_inv_rstd(&self, stmt: &Stmt, sum: Symbol, n: &Expr) -> Option<(Symbol, i64)> {
+        let (name, init) = Self::let_init(stmt)?;
+        let arg = self.as_rsqrt_arg(init)?;
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        // One operand is the eps literal; the other is `sum / count`.
+        let (ms, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+            (lhs.as_ref(), b)
+        } else if let Some(b) = self.float_lit_bits(lhs) {
+            (rhs.as_ref(), b)
+        } else {
+            return None;
+        };
+        if self.scaled_by_inv_count(ms, sum, n) {
+            Some((name, eps_bits))
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the canonical in-place flat LayerNorm window (7 statements) at `b.stmts[at..]`:
+    ///
+    /// ```text
+    /// let mut s = 0.0;
+    /// for i in 0..N { s += x[i]; }                          // row sum
+    /// let mean = s / (N as f32);                            // mean
+    /// let mut v = 0.0;
+    /// for i in 0..N { v += (x[i]-mean)*(x[i]-mean); }       // variance sum
+    /// let inv = 1.0 / sqrt(v / (N as f32) + eps);           // 1/sqrt(var+eps)
+    /// for i in 0..N { x[i] = (x[i]-mean) * inv; }           // normalize, in place
+    /// ```
+    ///
+    /// Same discipline as [`Self::match_softmax`]: every loop ranges the identical `0..N` over the same
+    /// array `x`; the divisors are pinned to the trip count; the scalars chain; and the internal
+    /// scalars must not be read after the window (the kernel hides them). Returns `(consumed, array, N,
+    /// eps_bits)`; `None` on any deviation (the generic vectorizer then lowers the loops).
+    fn match_layernorm(&self, b: &Block, at: usize) -> Option<(usize, Symbol, Expr, i64)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 7 {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&stmts[0])?;
+        if !self.is_zero_lit(s_init) {
+            return None;
+        }
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let x = self.sum_body_array(body1, v1, s)?;
+        let mean = self.match_mean(&stmts[2], s, n_expr)?;
+        let (vv, vv_init) = Self::let_init(&stmts[3])?;
+        if !self.is_zero_lit(vv_init) {
+            return None;
+        }
+        let (v4, n4, body4) = self.as_range0_for(&stmts[4])?;
+        if !exprs_struct_eq(n4, n_expr) {
+            return None;
+        }
+        self.match_var_body(body4, v4, x, mean, vv)?;
+        let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr)?;
+        let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
+        if !exprs_struct_eq(n6, n_expr) {
+            return None;
+        }
+        self.match_shift_scale_body(body6, v6, x, mean, inv)?;
+        let rest = &b.stmts[at + 7..];
+        let tail = b.tail.as_deref();
+        for sc in [s, mean, vv, inv] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((7, x, n_expr.clone(), eps_bits))
+    }
+
+    /// Recognize the canonical in-place flat RMSNorm window (4 statements) at `b.stmts[at..]`:
+    ///
+    /// ```text
+    /// let mut s = 0.0;
+    /// for i in 0..N { s += x[i]*x[i]; }              // mean-square sum
+    /// let inv = 1.0 / sqrt(s / (N as f32) + eps);    // 1/sqrt(ms+eps)
+    /// for i in 0..N { x[i] = x[i] * inv; }           // normalize, in place
+    /// ```
+    ///
+    /// Returns `(consumed, array, N, eps_bits)`; `None` on any deviation.
+    fn match_rmsnorm(&self, b: &Block, at: usize) -> Option<(usize, Symbol, Expr, i64)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 4 {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&stmts[0])?;
+        if !self.is_zero_lit(s_init) {
+            return None;
+        }
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let x = self.match_sumsq_body(body1, v1, s)?;
+        let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr)?;
+        let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        self.match_scale_body(body3, v3, x, inv)?;
+        let rest = &b.stmts[at + 4..];
+        let tail = b.tail.as_deref();
+        for sc in [s, inv] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((4, x, n_expr.clone(), eps_bits))
+    }
+
+    /// Is `e` the float literal `0.0`? Pure.
+    fn is_zero_lit(&self, e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
     }
 
     fn lower_stmt(&mut self, s: &Stmt) {

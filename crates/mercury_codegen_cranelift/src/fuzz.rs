@@ -211,6 +211,44 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        // Fused LayerNorm (gamma=1, beta=0): the recognizer collapses mean / variance / normalize
+        // into one mercury_norm_f32(.., NORM_LAYERNORM) call, in place on `out`. The `/ {n}.0`
+        // divisor matches the trip count for every fuzz size, so the kernel fires across all sizes
+        // and adversarial regimes; both backends marshal the identical kernel → full-buffer exact.
+        Kernel {
+            name: "layernorm",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+             for c in 0..{n} {{ out[c] = x[c]; }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[i]; }} \
+             let mean: f32 = s / {n}.0; \
+             let mut v: f32 = 0.0; \
+             for i in 0..{n} {{ v = v + (out[i] - mean) * (out[i] - mean); }} \
+             let inv: f32 = rsqrt(v / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[i] = (out[i] - mean) * inv; }} }}\n"
+                )
+            },
+            len: |n| n,
+            regimes: ANY,
+        },
+        // Fused RMSNorm (gamma=1): mean-square / rsqrt / scale → one NORM_RMSNORM call, in place.
+        Kernel {
+            name: "rmsnorm",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+             for c in 0..{n} {{ out[c] = x[c]; }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[i] * out[i]; }} \
+             let inv: f32 = rsqrt(s / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[i] = out[i] * inv; }} }}\n"
+                )
+            },
+            len: |n| n,
+            regimes: ANY,
+        },
         // matmul C=A·B (ikj) and nn.Linear C=A·Bᵀ (ijk) — both dispatch to the GEMM microkernel.
         Kernel {
             name: "matmul",
