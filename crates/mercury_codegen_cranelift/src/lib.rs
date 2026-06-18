@@ -85,6 +85,8 @@ const RT_SREDUCE: &str = "mercury_sreduce_f32";
 const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
 const RT_NORM: &str = "mercury_norm_f32";
 const RT_NORM_PARALLEL: &str = "mercury_norm_f32_parallel";
+const RT_I8GEMM_NT: &str = "mercury_i8gemm_nt";
+const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -765,6 +767,19 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[x, out, rows, cols, eps, op]);
             return None;
         }
+        // The int8 quantized nn.Linear: mercury_i8gemm_nt[_parallel](a, b, c, m, k, n) — three
+        // pointers and three i64 (no beta; the kernel always overwrites C). Void.
+        if matches!(name, RT_I8GEMM_NT | RT_I8GEMM_NT_PARALLEL) && args.len() == 6 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let c = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let k = self.coerce_to_i64(args[4]);
+            let n = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, b, c, m, k, n]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -876,6 +891,8 @@ struct RtFuncs {
     sred_par: FuncId,
     norm: FuncId,
     norm_par: FuncId,
+    i8nt: FuncId,
+    i8nt_par: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -979,6 +996,14 @@ fn populate_module<M: Module>(
     for _ in 0..4 {
         sig_norm.params.push(AbiParam::new(types::I64));
     }
+    // mercury_i8gemm_nt[_parallel](a, b, c: ptr, m, k, n: i64) — int8 quantized nn.Linear (void).
+    let mut sig_i8gemm = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_i8gemm.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..3 {
+        sig_i8gemm.params.push(AbiParam::new(types::I64));
+    }
     // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
     let mut sig_fmod_f64 = Signature::new(call_conv);
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
@@ -1030,6 +1055,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         norm_par: module
             .declare_function(RT_NORM_PARALLEL, Linkage::Import, &sig_norm)
+            .map_err(|e| e.to_string())?,
+        i8nt: module
+            .declare_function(RT_I8GEMM_NT, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        i8nt_par: module
+            .declare_function(RT_I8GEMM_NT_PARALLEL, Linkage::Import, &sig_i8gemm)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -1116,6 +1147,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_NORM_PARALLEL,
                 module.declare_func_in_func(rt.norm_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_I8GEMM_NT,
+                module.declare_func_in_func(rt.i8nt, builder.func),
+            );
+            rt_refs.insert(
+                RT_I8GEMM_NT_PARALLEL,
+                module.declare_func_in_func(rt.i8nt_par, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1260,6 +1299,14 @@ pub fn jit_compile(
         RT_NORM_PARALLEL,
         mercury_runtime::mercury_norm_f32_parallel as *const u8,
     );
+    builder.symbol(
+        RT_I8GEMM_NT,
+        mercury_runtime::mercury_i8gemm_nt as *const u8,
+    );
+    builder.symbol(
+        RT_I8GEMM_NT_PARALLEL,
+        mercury_runtime::mercury_i8gemm_nt_parallel as *const u8,
+    );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -1357,6 +1404,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_NORM_PARALLEL,
         mercury_runtime::mercury_norm_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_I8GEMM_NT,
+        mercury_runtime::mercury_i8gemm_nt as *const u8,
+    );
+    builder.symbol(
+        RT_I8GEMM_NT_PARALLEL,
+        mercury_runtime::mercury_i8gemm_nt_parallel as *const u8,
     );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);

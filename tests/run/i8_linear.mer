@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -40
+// EXPECT-OUT: 40
+// EXPECT-OUT: -8
+// EXPECT-OUT: 152
+module tests.run.i8_linear
+
+// int8 quantized nn.Linear: C = A·Bᵀ with u8 activations, i8 weights, an i32 accumulator — the
+// QNNPACK/oneDNN quantized-inference layout. The compiler recognizes this nest and dispatches it to
+// the AVX2 int8 GEMM kernel (mercury_i8gemm_nt). Integer arithmetic, so the fused kernel equals this
+// scalar nest bit-for-bit — no reassociation, no tolerance: the differential gate is exact, and
+// -O0 == -O3. A is [3,4], B is [3,4] (its rows are the weight vectors), so C is [3,3].
+fn main() -> i32 {
+    let mut a: [u8; 12] = [0 as u8; 12];
+    let mut b: [i8; 12] = [0 as i8; 12];
+    let mut c: [i32; 9] = [0; 9];
+    for i in 0..12 {
+        a[i] = (i + 1) as u8; // 1 .. 12
+    }
+    for i in 0..12 {
+        b[i] = ((i as i32) - 6) as i8; // -6 .. 5
+    }
+
+    // C[i,j] = sum_k A[i,k] * B[j,k]
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s: i32 = 0;
+            for k in 0..4 {
+                s = s + (a[i * 4 + k] as i32) * (b[j * 4 + k] as i32);
+            }
+            c[i * 3 + j] = s;
+        }
+    }
+
+    print(c[0]); // row0·col0: 1·-6 + 2·-5 + 3·-4 + 4·-3 = -40
+    print(c[2]); // row0·col2: 1·2 + 2·3 + 3·4 + 4·5     =  40
+    print(c[4]); // row1·col1: 5·-2 + 6·-1 + 7·0 + 8·1   =  -8
+    print(c[8]); // row2·col2: 9·2 + 10·3 + 11·4 + 12·5  = 152
+    return 0;
+}

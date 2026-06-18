@@ -361,6 +361,78 @@ fn differential_parallel_vmath() {
     }
 }
 
+/// An int8 quantized `nn.Linear` nest (`u8`×`i8`→`i32`, `C = A·Bᵀ`) dispatches to the int8 GEMM
+/// kernel (`mercury_i8gemm_nt`; the `@parallel` form to `_parallel`). Integer arithmetic is exact and
+/// order-independent (associative mod 2³²), so the fused kernel equals the scalar nest bit-for-bit —
+/// native and interp must agree at every opt level. `K = 40` exercises the AVX2 32/16-wide chunks and
+/// the scalar tail; inputs span the full `u8`/`i8` ranges.
+#[test]
+fn differential_i8gemm() {
+    let body = |attr: &str| {
+        format!(
+            "{attr}fn lin(a: [u8; 160], b: [i8; 160], c: [i32; 16]) {{ \
+             for i in 0..4 {{ for j in 0..4 {{ let mut s: i32 = 0; \
+             for k in 0..40 {{ s = s + (a[i * 40 + k] as i32) * (b[j * 40 + k] as i32); }} \
+             c[i * 4 + j] = s; }} }} }} \
+             fn main() -> i32 {{ let mut a: [u8; 160] = [0 as u8; 160]; \
+             let mut b: [i8; 160] = [0 as i8; 160]; let mut c: [i32; 16] = [0; 16]; \
+             for i in 0..160 {{ a[i] = ((i * 7 + 3) % 256) as u8; \
+             b[i] = (((i * 5 + 1) % 256) - 128) as i8; }} \
+             lin(a, b, c); \
+             let mut acc: i32 = 0; for i in 0..16 {{ acc = acc + c[i]; }} \
+             print(acc); print(c[0]); print(c[15]); return 0; }}"
+        )
+    };
+    for src in [body(""), body("@parallel ")] {
+        for opt in [0u8, 2, 3] {
+            let n = jit(&src, opt).expect("jit");
+            let i = interp(&src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "i8gemm native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
+/// The int8 `nn.Linear` nest dispatches to `mercury_i8gemm_nt` (the `@parallel` whole-function form
+/// to `_parallel`, checked before the @parallel outliner so it reaches the multicore kernel rather
+/// than a scalar loop). The signedness guard is correctness-critical (the kernel zero-extends A,
+/// sign-extends B): an `i8×i8` nest must NOT pick the `u8×i8` kernel.
+#[test]
+fn i8_linear_nest_lowers_to_i8gemm() {
+    let lin = |attr: &str| {
+        format!(
+            "module m\n{attr}fn lin(a:[u8;160],b:[i8;160],c:[i32;16]) {{ \
+             for i in 0..4 {{ for j in 0..4 {{ let mut s: i32 = 0; \
+             for k in 0..40 {{ s = s + (a[i*40+k] as i32) * (b[j*40+k] as i32); }} \
+             c[i*4+j] = s; }} }} }}"
+        )
+    };
+    assert!(
+        lowered_calls(&lin(""), "mercury_i8gemm_nt"),
+        "u8×i8 nn.Linear -> i8gemm_nt"
+    );
+    assert!(
+        lowered_calls(&lin("@parallel\n"), "mercury_i8gemm_nt_parallel"),
+        "@parallel u8×i8 nn.Linear -> i8gemm_nt_parallel"
+    );
+    // Signedness mismatch (A is i8, not u8): the kernel's zero/sign-extend split would miscompile, so
+    // the recognizer must bail and never emit either int8 kernel symbol.
+    let signed = "module m\nfn lin(a:[i8;160],b:[i8;160],c:[i32;16]) { \
+        for i in 0..4 { for j in 0..4 { let mut s: i32 = 0; \
+        for k in 0..40 { s = s + (a[i*40+k] as i32) * (b[j*40+k] as i32); } \
+        c[i*4+j] = s; } } }";
+    assert!(
+        !lowered_calls(signed, "mercury_i8gemm_nt"),
+        "i8×i8 must not pick the u8×i8 kernel"
+    );
+    assert!(
+        !lowered_calls(signed, "mercury_i8gemm_nt_parallel"),
+        "i8×i8 must not pick the parallel u8×i8 kernel"
+    );
+}
+
 /// A `@parallel` reduction (`s += f(x[k], y[k])`) dispatches to the multicore reduction kernel
 /// (`mercury_sreduce_f32_parallel`). The native run accumulates across cores; the interpreter calls
 /// the *serial* kernel — both are bit-identical by construction (fixed chunking, ascending combine),

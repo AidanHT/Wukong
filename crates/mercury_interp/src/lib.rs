@@ -573,6 +573,57 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)` — the int8 quantized `nn.Linear` kernel
+            // (`u8` activations × `i8` weights → `i32`, `C = A·Bᵀ`). The interpreter recovers each
+            // operand byte (`as u8`/`as i8` takes the low 8 bits — bit-identical to the native buffer
+            // regardless of how the abstract value was sign-extended) and writes the `i32` result,
+            // calling the *serial* runtime kernel (bit-identical to the parallel one — rows are
+            // independent), so the differential oracle stays exact. Integer math, so no rounding at all.
+            "mercury_i8gemm_nt" | "mercury_i8gemm_nt_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let c = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let mut abuf: Vec<u8> = Vec::with_capacity(m * k);
+                for t in 0..m * k {
+                    abuf.push(
+                        self.memory
+                            .get(a + t)
+                            .ok_or("i8gemm a out of bounds")?
+                            .as_int() as u8,
+                    );
+                }
+                let mut bbuf: Vec<i8> = Vec::with_capacity(n * k);
+                for t in 0..n * k {
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("i8gemm b out of bounds")?
+                            .as_int() as i8,
+                    );
+                }
+                let mut cbuf = vec![0i32; m * n];
+                // SAFETY: buffers are exactly m*k, n*k, m*n long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_i8gemm_nt(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        cbuf.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                    );
+                }
+                for (t, &val) in cbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(c + t)
+                        .ok_or("i8gemm output out of bounds")? = Value::Int(val as i128);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)` — the fused-epilogue Linear
             // (`C = act(A·Bᵀ + bias)`). Like the plain GEMM, the interpreter marshals operands into
             // real f32 buffers, calls the *identical* runtime kernel the native backend calls (which
