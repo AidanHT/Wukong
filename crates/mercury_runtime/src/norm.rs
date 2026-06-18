@@ -281,6 +281,257 @@ unsafe fn rmsnorm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
     }
 }
 
+// --- affine variants: `out = norm(x) * gamma[i] (+ beta[i])` ---------------------------------------
+// These mirror the plain twins above *exactly through the reduction* (mean/inv for LayerNorm,
+// mean-square/inv for RMSNorm); they differ only in the final normalize step, which folds the per-
+// column scale `gamma` and optional shift `beta` into the writeback via one FMA. Scalar `mul_add` ==
+// AVX2 `fmadd`, so the affine scalar twin and AVX2 path agree bit-for-bit (pinned by the same
+// `scalar_matches_avx2` test). `gamma` null means scale by 1.0, `beta` null means no shift (RMSNorm
+// has scale but no shift); both, when present, are per-column arrays of length `n` shared across rows.
+// The reductions are duplicated from the plain twins deliberately — keep them identical if either
+// changes (the `affine_gamma1_matches_plain` test guards against drift).
+
+/// Affine LayerNorm of one row: `out = (x-mean)/sqrt(var+eps) * gamma + beta`, scalar reference.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32 (may alias); `gamma`/`beta` null or valid for `n` f32.
+unsafe fn layernorm_affine_row_scalar(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    n: usize,
+    eps: f32,
+) {
+    let nb = n / 8;
+    let t = nb * 8;
+    let invn = 1.0 / (n as f32);
+    let mut sm = [0.0f32; 8];
+    for s in 0..nb {
+        let b = s * 8;
+        for (j, smj) in sm.iter_mut().enumerate() {
+            *smj += *x.add(b + j);
+        }
+    }
+    for (j, smj) in sm.iter_mut().enumerate().take(n - t) {
+        *smj += *x.add(t + j);
+    }
+    let mean = hsum8(sm) * invn;
+    let mut vv = [0.0f32; 8];
+    for s in 0..nb {
+        let b = s * 8;
+        for (j, vvj) in vv.iter_mut().enumerate() {
+            let d = *x.add(b + j) - mean;
+            *vvj = d.mul_add(d, *vvj);
+        }
+    }
+    for (j, vvj) in vv.iter_mut().enumerate().take(n - t) {
+        let d = *x.add(t + j) - mean;
+        *vvj = d.mul_add(d, *vvj);
+    }
+    let inv = 1.0 / (hsum8(vv) * invn + eps).sqrt();
+    for i in 0..n {
+        let norm = (*x.add(i) - mean) * inv;
+        let g = if gamma.is_null() { 1.0 } else { *gamma.add(i) };
+        let b = if beta.is_null() { 0.0 } else { *beta.add(i) };
+        *out.add(i) = norm.mul_add(g, b);
+    }
+}
+
+/// Affine RMSNorm of one row: `out = x/sqrt(mean(x^2)+eps) * gamma (+ beta)`, scalar reference.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32 (may alias); `gamma`/`beta` null or valid for `n` f32.
+unsafe fn rmsnorm_affine_row_scalar(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    n: usize,
+    eps: f32,
+) {
+    let nb = n / 8;
+    let t = nb * 8;
+    let invn = 1.0 / (n as f32);
+    let mut ss = [0.0f32; 8];
+    for s in 0..nb {
+        let b = s * 8;
+        for (j, ssj) in ss.iter_mut().enumerate() {
+            let v = *x.add(b + j);
+            *ssj = v.mul_add(v, *ssj);
+        }
+    }
+    for (j, ssj) in ss.iter_mut().enumerate().take(n - t) {
+        let v = *x.add(t + j);
+        *ssj = v.mul_add(v, *ssj);
+    }
+    let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    for i in 0..n {
+        let norm = *x.add(i) * inv;
+        let g = if gamma.is_null() { 1.0 } else { *gamma.add(i) };
+        let b = if beta.is_null() { 0.0 } else { *beta.add(i) };
+        *out.add(i) = norm.mul_add(g, b);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn layernorm_affine_row_avx2(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    n: usize,
+    eps: f32,
+) {
+    use std::arch::x86_64::*;
+    let invn = 1.0 / (n as f32);
+    // mean (identical to layernorm_row_avx2)
+    let mut sv = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        sv = _mm256_add_ps(sv, _mm256_loadu_ps(x.add(i)));
+        i += 8;
+    }
+    let mut sm = [0.0f32; 8];
+    _mm256_storeu_ps(sm.as_mut_ptr(), sv);
+    for (j, smj) in sm.iter_mut().enumerate().take(n - i) {
+        *smj += *x.add(i + j);
+    }
+    let mean = hsum8(sm) * invn;
+    let mb = _mm256_set1_ps(mean);
+    // variance
+    let mut vv = _mm256_setzero_ps();
+    i = 0;
+    while i + 8 <= n {
+        let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb);
+        vv = _mm256_fmadd_ps(d, d, vv);
+        i += 8;
+    }
+    let mut va = [0.0f32; 8];
+    _mm256_storeu_ps(va.as_mut_ptr(), vv);
+    for (j, vaj) in va.iter_mut().enumerate().take(n - i) {
+        let d = *x.add(i + j) - mean;
+        *vaj = d.mul_add(d, *vaj);
+    }
+    let inv = 1.0 / (hsum8(va) * invn + eps).sqrt();
+    let ivb = _mm256_set1_ps(inv);
+    // affine normalize: out = ((x-mean)*inv) * gamma + beta, via fmadd
+    let (g_null, b_null) = (gamma.is_null(), beta.is_null());
+    let ones = _mm256_set1_ps(1.0);
+    let zeros = _mm256_setzero_ps();
+    i = 0;
+    while i + 8 <= n {
+        let norm = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb), ivb);
+        let g = if g_null {
+            ones
+        } else {
+            _mm256_loadu_ps(gamma.add(i))
+        };
+        let b = if b_null {
+            zeros
+        } else {
+            _mm256_loadu_ps(beta.add(i))
+        };
+        _mm256_storeu_ps(out.add(i), _mm256_fmadd_ps(norm, g, b));
+        i += 8;
+    }
+    while i < n {
+        let norm = (*x.add(i) - mean) * inv;
+        let g = if g_null { 1.0 } else { *gamma.add(i) };
+        let b = if b_null { 0.0 } else { *beta.add(i) };
+        *out.add(i) = norm.mul_add(g, b);
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn rmsnorm_affine_row_avx2(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    n: usize,
+    eps: f32,
+) {
+    use std::arch::x86_64::*;
+    let invn = 1.0 / (n as f32);
+    let mut ssv = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.add(i));
+        ssv = _mm256_fmadd_ps(v, v, ssv);
+        i += 8;
+    }
+    let mut ss = [0.0f32; 8];
+    _mm256_storeu_ps(ss.as_mut_ptr(), ssv);
+    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
+        let v = *x.add(i + j);
+        *ssj = v.mul_add(v, *ssj);
+    }
+    let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    let ivb = _mm256_set1_ps(inv);
+    let (g_null, b_null) = (gamma.is_null(), beta.is_null());
+    let ones = _mm256_set1_ps(1.0);
+    let zeros = _mm256_setzero_ps();
+    i = 0;
+    while i + 8 <= n {
+        let norm = _mm256_mul_ps(_mm256_loadu_ps(x.add(i)), ivb);
+        let g = if g_null {
+            ones
+        } else {
+            _mm256_loadu_ps(gamma.add(i))
+        };
+        let b = if b_null {
+            zeros
+        } else {
+            _mm256_loadu_ps(beta.add(i))
+        };
+        _mm256_storeu_ps(out.add(i), _mm256_fmadd_ps(norm, g, b));
+        i += 8;
+    }
+    while i < n {
+        let norm = *x.add(i) * inv;
+        let g = if g_null { 1.0 } else { *gamma.add(i) };
+        let b = if b_null { 0.0 } else { *beta.add(i) };
+        *out.add(i) = norm.mul_add(g, b);
+        i += 1;
+    }
+}
+
+/// One row through the selected affine norm (LayerNorm/RMSNorm only; softmax has no affine), AVX2 when
+/// available, else the scalar twin.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32 (may alias); `gamma`/`beta` null or valid for `n` f32.
+#[inline]
+unsafe fn norm_affine_row(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    n: usize,
+    eps: f32,
+    op: i64,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            match op {
+                NORM_LAYERNORM => return layernorm_affine_row_avx2(x, out, gamma, beta, n, eps),
+                NORM_RMSNORM => return rmsnorm_affine_row_avx2(x, out, gamma, beta, n, eps),
+                _ => return,
+            }
+        }
+    }
+    match op {
+        NORM_LAYERNORM => layernorm_affine_row_scalar(x, out, gamma, beta, n, eps),
+        NORM_RMSNORM => rmsnorm_affine_row_scalar(x, out, gamma, beta, n, eps),
+        _ => {}
+    }
+}
+
 /// One row through the selected norm, AVX2 when available, else the scalar twin.
 ///
 /// # Safety
@@ -361,6 +612,87 @@ pub unsafe extern "C" fn mercury_norm_f32_parallel(
             norm_row(
                 (xa as *const f32).add(r * cols),
                 (oa as *mut f32).add(r * cols),
+                cols,
+                eps,
+                op,
+            )
+        };
+    });
+}
+
+/// Row-wise *affine* norm (LayerNorm/RMSNorm with a per-column `gamma` scale and optional `beta`
+/// shift) over a `[rows, cols]` matrix (serial). `gamma`/`beta` are length `cols`, shared across all
+/// rows (the standard transformer layout); either may be null (`gamma` null ⇒ scale 1, `beta` null ⇒
+/// no shift). `eps_bits` is `eps.to_bits()`. `x`/`out` may alias for in-place. softmax never reaches
+/// here (it has no affine parameters).
+///
+/// # Safety
+/// `x`/`out` valid for `rows*cols` f32; `gamma`/`beta` null or valid for `cols` f32.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_norm_affine_f32(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    rows: i64,
+    cols: i64,
+    eps_bits: i64,
+    op: i64,
+) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    let (rows, cols) = (rows as usize, cols as usize);
+    let eps = f32::from_bits(eps_bits as u32);
+    for r in 0..rows {
+        // SAFETY: row r occupies [r*cols, r*cols+cols); gamma/beta indexed within [0,cols).
+        unsafe {
+            norm_affine_row(
+                x.add(r * cols),
+                out.add(r * cols),
+                gamma,
+                beta,
+                cols,
+                eps,
+                op,
+            )
+        };
+    }
+}
+
+/// Multicore affine row-wise norm — **bit-identical** to [`mercury_norm_affine_f32`] (rows are
+/// independent, no cross-row combine, so thread count is irrelevant and the interpreter's serial call
+/// agrees with this `@parallel` path exactly).
+///
+/// # Safety
+/// `x`/`out` valid for `rows*cols` f32; `gamma`/`beta` null or valid for `cols` f32.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_norm_affine_f32_parallel(
+    x: *const f32,
+    out: *mut f32,
+    gamma: *const f32,
+    beta: *const f32,
+    rows: i64,
+    cols: i64,
+    eps_bits: i64,
+    op: i64,
+) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    let (rows, cols) = (rows as usize, cols as usize);
+    let eps = f32::from_bits(eps_bits as u32);
+    // Pointers cross the rayon boundary as integers (null round-trips through 0); rows are disjoint,
+    // gamma/beta are shared read-only.
+    let (xa, oa, ga, ba) = (x as usize, out as usize, gamma as usize, beta as usize);
+    (0..rows).into_par_iter().for_each(|r| {
+        // SAFETY: disjoint row; gamma/beta valid for cols by contract.
+        unsafe {
+            norm_affine_row(
+                (xa as *const f32).add(r * cols),
+                (oa as *mut f32).add(r * cols),
+                ga as *const f32,
+                ba as *const f32,
                 cols,
                 eps,
                 op,
@@ -562,6 +894,229 @@ mod tests {
                 "rmsnorm i={i}: {} vs {want}",
                 rn[i]
             );
+        }
+    }
+
+    // --- affine (gamma/beta) variants ----------------------------------------------------------
+
+    // A second deterministic stream for gamma/beta (distinct from `fill` so the affine params are not
+    // accidentally equal to the data or to each other).
+    fn fill_off(n: usize, off: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32) * 0.011 + off).cos() * 1.7 + 0.3)
+            .collect()
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn affine_scalar_matches_avx2_bit_for_bit() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[1usize, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 257] {
+            let x = fill(n);
+            let gamma = fill_off(n, 0.5);
+            let beta = fill_off(n, 1.3);
+            // LayerNorm exercises gamma+beta; RMSNorm exercises gamma with a null beta.
+            for &(op, with_beta) in &[(NORM_LAYERNORM, true), (NORM_RMSNORM, false)] {
+                let bp = if with_beta {
+                    beta.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let mut a = vec![0.0f32; n];
+                let mut b = vec![0.0f32; n];
+                unsafe {
+                    if op == NORM_LAYERNORM {
+                        layernorm_affine_row_scalar(
+                            x.as_ptr(),
+                            a.as_mut_ptr(),
+                            gamma.as_ptr(),
+                            bp,
+                            n,
+                            EPS,
+                        );
+                        layernorm_affine_row_avx2(
+                            x.as_ptr(),
+                            b.as_mut_ptr(),
+                            gamma.as_ptr(),
+                            bp,
+                            n,
+                            EPS,
+                        );
+                    } else {
+                        rmsnorm_affine_row_scalar(
+                            x.as_ptr(),
+                            a.as_mut_ptr(),
+                            gamma.as_ptr(),
+                            bp,
+                            n,
+                            EPS,
+                        );
+                        rmsnorm_affine_row_avx2(
+                            x.as_ptr(),
+                            b.as_mut_ptr(),
+                            gamma.as_ptr(),
+                            bp,
+                            n,
+                            EPS,
+                        );
+                    }
+                }
+                for i in 0..n {
+                    assert_eq!(
+                        a[i].to_bits(),
+                        b[i].to_bits(),
+                        "affine scalar != avx2 n={n} op={op} i={i}: {} vs {}",
+                        a[i],
+                        b[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affine_serial_matches_parallel_bit_for_bit() {
+        let (rows, cols) = (37usize, 100usize);
+        let x = fill(rows * cols);
+        let gamma = fill_off(cols, 0.5);
+        let beta = fill_off(cols, 1.3);
+        for &op in &[NORM_LAYERNORM, NORM_RMSNORM] {
+            let mut s = vec![0.0f32; rows * cols];
+            let mut p = vec![0.0f32; rows * cols];
+            unsafe {
+                mercury_norm_affine_f32(
+                    x.as_ptr(),
+                    s.as_mut_ptr(),
+                    gamma.as_ptr(),
+                    beta.as_ptr(),
+                    rows as i64,
+                    cols as i64,
+                    EPS.to_bits() as i64,
+                    op,
+                );
+                mercury_norm_affine_f32_parallel(
+                    x.as_ptr(),
+                    p.as_mut_ptr(),
+                    gamma.as_ptr(),
+                    beta.as_ptr(),
+                    rows as i64,
+                    cols as i64,
+                    EPS.to_bits() as i64,
+                    op,
+                );
+            }
+            for i in 0..rows * cols {
+                assert_eq!(
+                    s[i].to_bits(),
+                    p[i].to_bits(),
+                    "affine serial != parallel op={op} i={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn affine_matches_f64_reference() {
+        let n = 512usize;
+        let x = fill(n);
+        let gamma = fill_off(n, 0.5);
+        let beta = fill_off(n, 1.3);
+        let xd: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+
+        // LayerNorm: (x-mean)/sqrt(var+eps) * gamma + beta
+        let mut ln = vec![0.0f32; n];
+        unsafe {
+            mercury_norm_affine_f32(
+                x.as_ptr(),
+                ln.as_mut_ptr(),
+                gamma.as_ptr(),
+                beta.as_ptr(),
+                1,
+                n as i64,
+                EPS.to_bits() as i64,
+                NORM_LAYERNORM,
+            );
+        }
+        let mean = xd.iter().sum::<f64>() / n as f64;
+        let var = xd.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n as f64;
+        let inv = 1.0 / (var + EPS as f64).sqrt();
+        for i in 0..n {
+            let want = (xd[i] - mean) * inv * gamma[i] as f64 + beta[i] as f64;
+            assert!(
+                (ln[i] as f64 - want).abs() < 2e-3,
+                "affine layernorm i={i}: {} vs {want}",
+                ln[i]
+            );
+        }
+
+        // RMSNorm: x/sqrt(mean(x^2)+eps) * gamma  (no beta)
+        let mut rn = vec![0.0f32; n];
+        unsafe {
+            mercury_norm_affine_f32(
+                x.as_ptr(),
+                rn.as_mut_ptr(),
+                gamma.as_ptr(),
+                std::ptr::null(),
+                1,
+                n as i64,
+                EPS.to_bits() as i64,
+                NORM_RMSNORM,
+            );
+        }
+        let ms = xd.iter().map(|&v| v * v).sum::<f64>() / n as f64;
+        let invr = 1.0 / (ms + EPS as f64).sqrt();
+        for i in 0..n {
+            let want = xd[i] * invr * gamma[i] as f64;
+            assert!(
+                (rn[i] as f64 - want).abs() < 2e-3,
+                "affine rmsnorm i={i}: {} vs {want}",
+                rn[i]
+            );
+        }
+    }
+
+    #[test]
+    fn affine_gamma1_beta0_matches_plain() {
+        // gamma=ones, beta=zeros affine must equal the plain norm (within fma-vs-mul rounding / signed
+        // zero). This pins the duplicated affine reductions to the plain twins: if either drifts, the
+        // mean/inv diverge and this fails.
+        let n = 200usize;
+        let x = fill(n);
+        let ones = vec![1.0f32; n];
+        let zeros = vec![0.0f32; n];
+        for &op in &[NORM_LAYERNORM, NORM_RMSNORM] {
+            let mut plain = vec![0.0f32; n];
+            let mut aff = vec![0.0f32; n];
+            unsafe {
+                mercury_norm_f32(
+                    x.as_ptr(),
+                    plain.as_mut_ptr(),
+                    1,
+                    n as i64,
+                    EPS.to_bits() as i64,
+                    op,
+                );
+                mercury_norm_affine_f32(
+                    x.as_ptr(),
+                    aff.as_mut_ptr(),
+                    ones.as_ptr(),
+                    zeros.as_ptr(),
+                    1,
+                    n as i64,
+                    EPS.to_bits() as i64,
+                    op,
+                );
+            }
+            for i in 0..n {
+                assert!(
+                    (plain[i] - aff[i]).abs() <= 1e-6 * plain[i].abs().max(1.0),
+                    "affine(γ1,β0) != plain op={op} i={i}: {} vs {}",
+                    aff[i],
+                    plain[i]
+                );
+            }
         }
     }
 }
