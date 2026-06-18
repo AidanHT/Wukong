@@ -97,6 +97,68 @@ pub fn run_with_output(
     Ok((result.as_int() as i64, interp.stdout))
 }
 
+/// Run an f32-buffer kernel (`entry`) over caller-provided buffers — the interpreter's typed
+/// kernel-entry ABI, the counterpart to the native backend's `jit_module().func_ptr()` + raw call.
+///
+/// `bufs` are the kernel's buffer parameters in declaration order: each slice is copied into the
+/// interpreter's flat memory, the kernel is invoked with a pointer to each, and the final memory
+/// contents are copied back into the slices (so an output or in-place buffer reflects the result).
+/// Every parameter of `entry` must be a pointer — i.e. an `[f32; N]` array parameter, which lowers
+/// to [`MirType::Ptr`]; pass exactly one slice per parameter.
+///
+/// This is what lets a differential fuzzer run the *same* kernel on the interpreter and the native
+/// backend over identical random buffers and compare the **full output buffer**, closing the gap
+/// left by the stdout/exit-code-only oracle (which could only see whatever a `main` chose to print).
+pub fn run_kernel_f32(
+    program: &Program,
+    entry: Symbol,
+    bufs: &mut [&mut [f32]],
+    interner: &Interner,
+) -> Result<(), String> {
+    let func = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    if func.params.len() != bufs.len() {
+        return Err(format!(
+            "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
+            interner.resolve(entry),
+            func.params.len(),
+            bufs.len()
+        ));
+    }
+    let mut interp = Interp {
+        program,
+        interner,
+        memory: Vec::new(),
+        stdout: Vec::new(),
+        frames: Vec::new(),
+        scratch: Vec::with_capacity(8),
+        vecs: Vec::new(),
+    };
+    // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
+    // the kernel performs internally grows memory *past* these regions, so it never clobbers them.
+    let mut bases = Vec::with_capacity(bufs.len());
+    for buf in bufs.iter() {
+        bases.push(interp.memory.len());
+        interp
+            .memory
+            .extend(buf.iter().map(|&v| Value::Float(v as f64)));
+    }
+    let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
+    interp.run_function(func, args)?;
+    // Copy the final contents back out (captures both outputs and in-place mutation).
+    for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = match interp.memory[base + i] {
+                Value::Float(f) => f as f32,
+                Value::Int(n) => n as f32,
+                _ => 0.0,
+            };
+        }
+    }
+    Ok(())
+}
+
 struct Interp<'a> {
     program: &'a Program,
     interner: &'a Interner,
@@ -956,6 +1018,55 @@ mod tests {
         let (code, out) = run_with_output(&program, main, &interner).unwrap();
         assert_eq!(code, 0);
         assert_eq!(String::from_utf8(out).unwrap(), "42\n42\n");
+    }
+
+    /// The typed kernel-entry ABI: lower an f32-buffer kernel and run it over caller-provided
+    /// buffers (no `main` wrapper), then read the full output back. This is the interpreter side of
+    /// the full-buffer differential gate.
+    #[test]
+    fn run_kernel_f32_saxpy_and_dot() {
+        let mut interner = Interner::new();
+        let src = "module m\n\
+            fn saxpy(x: [f32; 8], y: [f32; 8], out: [f32; 8]) { \
+                for i in 0..8 { out[i] = 2.0 * x[i] + y[i]; } }\n\
+            fn dot(x: [f32; 8], y: [f32; 8], out: [f32; 8]) { \
+                let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i] * y[i]; } out[0] = s; }\n";
+        let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+
+        let x: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..8).map(|i| (i as f32) * 0.5 - 1.0).collect();
+
+        // saxpy: out = 2*x + y, full-buffer.
+        let mut out = vec![0.0f32; 8];
+        let (mut xb, mut yb) = (x.clone(), y.clone());
+        run_kernel_f32(
+            &program,
+            interner.intern("saxpy"),
+            &mut [&mut xb, &mut yb, &mut out],
+            &interner,
+        )
+        .unwrap();
+        for i in 0..8 {
+            assert_eq!(out[i], 2.0 * x[i] + y[i], "saxpy[{i}]");
+        }
+
+        // dot: out[0] = sum(x*y).
+        let mut out = vec![0.0f32; 8];
+        let (mut xb, mut yb) = (x.clone(), y.clone());
+        run_kernel_f32(
+            &program,
+            interner.intern("dot"),
+            &mut [&mut xb, &mut yb, &mut out],
+            &interner,
+        )
+        .unwrap();
+        let expect: f32 = (0..8).map(|i| x[i] * y[i]).sum();
+        assert_eq!(out[0], expect, "dot");
     }
 
     #[test]
