@@ -26,6 +26,9 @@ pub use norm::{
     mercury_norm_f32, mercury_norm_f32_parallel, NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX,
 };
 
+mod i8gemm;
+pub use i8gemm::{mercury_i8gemm_nt, mercury_i8gemm_nt_parallel};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer

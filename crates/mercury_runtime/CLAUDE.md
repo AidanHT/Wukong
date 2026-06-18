@@ -34,6 +34,15 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   cross-row combine. Within a row the reductions use the same fixed 8-lane accumulator + horizontal
   combine in the AVX2 and scalar paths, so they agree bit-for-bit (twin test across tail sizes). `x`
   and `out` may alias (in-place).
+- `src/i8gemm.rs` — `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)`: **int8 quantized `nn.Linear`**
+  `C = A·Bᵀ` (`u8` activations × `i8` weights → `i32` accumulator), the QNNPACK/oneDNN layout. A's row
+  and B's row are both contiguous over `K`, so each `C[i,j]` is a dot — the AVX2 path widens `u8`/`i8`
+  to `i16` and folds 16 lanes/step with `vpmaddwd` (`_mm256_madd_epi16`, no saturation since `u8·i8`
+  fits `i16`) into `i32`, 32/step across two chains. **No reassociation exception**: `i32` add is
+  associative mod 2³² (wrapping), so the lane combine and the scalar left-fold give the *same bits* —
+  the fused kernel equals the naive `s += a[k]*b[k]` loop exactly (twin test incl. an overflow case).
+  Rows independent → `_parallel` maps per-row across cores, serial == parallel. (No VNNI yet; the
+  widen+madd path is portable AVX2 and a tiled/packed kernel is a follow-up.)
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
