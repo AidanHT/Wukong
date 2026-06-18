@@ -41,6 +41,7 @@ pub fn lower_program(
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         vmath: interner.intern("mercury_vmath_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
+        norm: interner.intern("mercury_norm_f32"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -364,6 +365,10 @@ struct GemmSyms {
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
     sred_par: Symbol,
+    /// The fused single-pass row-wise normalization kernel (`mercury_norm_f32(x, out, rows, cols,
+    /// eps_bits, op)`): an idiomatic multi-pass softmax / LayerNorm / RMSNorm written in plain loops
+    /// lowers to this one call. The interpreter marshals through the identical kernel.
+    norm: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -380,6 +385,10 @@ const VMATH_GELU: u32 = 6;
 const RED_DOT: i64 = 0; // sum(x[k] * y[k])
 const RED_SSD: i64 = 1; // sum((x[k] - y[k])^2)
 const RED_SUM: i64 = 2; // sum(x[k])
+
+// Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
+// (LayerNorm/RMSNorm recognizers follow in a later change; only softmax dispatches today.)
+const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -478,6 +487,15 @@ impl FnLowerer<'_> {
                 i += n;
                 continue;
             }
+            // Fused normalization: an idiomatic multi-pass softmax over a flat f32 array folds into
+            // one `mercury_norm_f32` call (each row loaded once + 256-bit AVX2). Checked before the
+            // elementwise-fusion run so it sees the raw loop sequence, not a pre-fused one.
+            if let Some((n, arr, n_expr)) = self.match_softmax(b, i) {
+                if self.emit_norm(arr, &n_expr, 0, NORM_SOFTMAX) {
+                    i += n;
+                    continue;
+                }
+            }
             // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
             // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
             // intermediate array through registers, cutting its memory traffic).
@@ -540,6 +558,318 @@ impl FnLowerer<'_> {
             }
         }
         None
+    }
+
+    // ---- fused normalization recognition (block-level look-ahead, like the matmul epilogue) ----
+
+    /// Match `for v in 0..N { body }` (exclusive, literal-0 start, no step), returning the loop
+    /// variable, the upper-bound expression, and the body. Pure (no MIR).
+    fn as_range0_for<'b>(&self, stmt: &'b Stmt) -> Option<(Symbol, &'b Expr, &'b Block)> {
+        let StmtKind::For {
+            pat, iter, body, ..
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        let ast::PatKind::Ident(v) = &pat.kind else {
+            return None;
+        };
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return None;
+        };
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return None;
+        }
+        Some((*v, end, body))
+    }
+
+    /// `let [mut] name [: ty] = init` → `(name, init)`. Pure.
+    fn let_init(stmt: &Stmt) -> Option<(Symbol, &Expr)> {
+        let StmtKind::Let {
+            pat,
+            init: Some(init),
+            ..
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        let ast::PatKind::Ident(name) = &pat.kind else {
+            return None;
+        };
+        Some((*name, init))
+    }
+
+    /// Body `m = fmax(m, x[v])` (running max into scalar `m`, indexing `x` by `v`) → return `x`. Pure.
+    fn match_max_reduce_body(&self, body: &Block, v: Symbol, m: Symbol) -> Option<Symbol> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if single_path(target) != Some(m) {
+            return None;
+        }
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return None;
+        };
+        if args.len() != 2
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Fmax)
+            )
+        {
+            return None;
+        }
+        // One arg must be `m`; the other must be `x[v]`.
+        let xside = if single_path(&args[0]) == Some(m) {
+            1
+        } else if single_path(&args[1]) == Some(m) {
+            0
+        } else {
+            return None;
+        };
+        self.index_by_loopvar(&args[xside], v)
+    }
+
+    /// Body `x[v] = exp(x[v] - m)` over f32, in place. Pure.
+    fn match_exp_sub_body(&self, body: &Block, v: Symbol, x: Symbol, m: Symbol) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if self.index_by_loopvar(target, v) != Some(x) || self.expr_mir(value) != MirType::F32 {
+            return None;
+        }
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return None;
+        };
+        if args.len() != 1
+            || !matches!(
+                self.vectorizable_intrinsic(callee),
+                Some(MathIntrinsic::Exp)
+            )
+        {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Sub,
+            lhs,
+            rhs,
+        } = &args[0].kind
+        else {
+            return None;
+        };
+        if self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(m) {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Body `s += x[v]` / `s = s + x[v]` (sum into scalar `s`). Pure.
+    fn match_sum_body(&self, body: &Block, v: Symbol, x: Symbol, s: Symbol) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(s) {
+            return None;
+        }
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(s) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(s) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if self.index_by_loopvar(addend, v) == Some(x) {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Body `x[v] = x[v] * inv` (scale by an invariant scalar, either operand order). Pure.
+    fn match_scale_body(&self, body: &Block, v: Symbol, x: Symbol, inv: Symbol) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if self.index_by_loopvar(target, v) != Some(x) {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let ok = (self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(inv))
+            || (self.index_by_loopvar(rhs, v) == Some(x) && single_path(lhs) == Some(inv));
+        if ok {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Is `init` a sound running-max seed for softmax over `x` — `x[0]`, or a large-negative literal
+    /// (`<= -1e30`)? Either is `<= max(x)`, so the user's `fmax(seed, …)` equals the true max the
+    /// kernel computes; anything else might change behavior, so we decline. Pure.
+    fn is_max_seed(&self, init: &Expr, x: Symbol) -> bool {
+        if let ExprKind::Index { base, indices } = &init.kind {
+            return single_path(base) == Some(x)
+                && indices.len() == 1
+                && matches!(&indices[0].kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 0);
+        }
+        let v = match &init.kind {
+            ExprKind::Float(t) => parse_float(self.interner.resolve(*t)),
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => match &expr.kind {
+                ExprKind::Float(t) => -parse_float(self.interner.resolve(*t)),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        v <= -1e30
+    }
+
+    /// `let name = 1.0 / s` → `name`. Pure.
+    fn match_recip(&self, stmt: &Stmt, s: Symbol) -> Option<Symbol> {
+        let (name, init) = Self::let_init(stmt)?;
+        let ExprKind::Binary {
+            op: ast::BinOp::Div,
+            lhs,
+            rhs,
+        } = &init.kind
+        else {
+            return None;
+        };
+        let one = matches!(&lhs.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0);
+        if one && single_path(rhs) == Some(s) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the canonical in-place flat softmax window (7 statements) at `b.stmts[at..]`:
+    ///
+    /// ```text
+    /// let mut m = x[0];                       // seed: x[0] or a large-negative literal
+    /// for i in 0..N { m = fmax(m, x[i]); }    // row max
+    /// for i in 0..N { x[i] = exp(x[i] - m); } // exp(x - max), in place
+    /// let mut s = 0.0;
+    /// for i in 0..N { s += x[i]; }            // sum
+    /// let inv = 1.0 / s;
+    /// for i in 0..N { x[i] = x[i] * inv; }    // normalize
+    /// ```
+    ///
+    /// Every loop must range over the identical `0..N` and index the *same* array `x` exactly by its
+    /// loop variable; the scalars must chain (max → exp, sum → reciprocal, reciprocal → scale) and the
+    /// internal scalars must not be read after the window (the kernel hides them). Pure: returns
+    /// `(consumed, array, N)` with `N` cloned so the caller can emit freely. `None` on any deviation
+    /// (the generic vectorizer + vmath path then lowers the loops correctly).
+    fn match_softmax(&self, b: &Block, at: usize) -> Option<(usize, Symbol, Expr)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 7 {
+            return None;
+        }
+        let (m, seed) = Self::let_init(&stmts[0])?;
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let x = self.match_max_reduce_body(body1, v1, m)?;
+        if !self.is_max_seed(seed, x) {
+            return None;
+        }
+        let (v2, n2, body2) = self.as_range0_for(&stmts[2])?;
+        if !exprs_struct_eq(n2, n_expr) {
+            return None;
+        }
+        self.match_exp_sub_body(body2, v2, x, m)?;
+        let (s, s_init) = Self::let_init(&stmts[3])?;
+        if !matches!(&s_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
+            return None;
+        }
+        let (v4, n4, body4) = self.as_range0_for(&stmts[4])?;
+        if !exprs_struct_eq(n4, n_expr) {
+            return None;
+        }
+        self.match_sum_body(body4, v4, x, s)?;
+        let inv = self.match_recip(&stmts[5], s)?;
+        let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
+        if !exprs_struct_eq(n6, n_expr) {
+            return None;
+        }
+        self.match_scale_body(body6, v6, x, inv)?;
+        // The three internal scalars must not be read after the window — the kernel hides them.
+        let rest = &b.stmts[at + 7..];
+        let tail = b.tail.as_deref();
+        for sc in [m, s, inv] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((7, x, n_expr.clone()))
+    }
+
+    /// Emit one in-place `mercury_norm_f32(x, x, 1, N, eps_bits, op)` for a recognized norm. Bails
+    /// (false) if the array base is somehow unbound, so the caller lowers the loops normally.
+    fn emit_norm(&mut self, arr: Symbol, n: &Expr, eps_bits: i64, op: i64) -> bool {
+        let Some((xv, _)) = self.lookup(arr) else {
+            return false;
+        };
+        let n_ty = self.expr_mir(n);
+        let nval = self.lower_expr(n);
+        let nval = self.coerce_to(nval, &n_ty, &MirType::I64, true);
+        let rows = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let epsv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(eps_bits as i128, MirType::I64));
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        self.builder.build_void(Op::Call {
+            func: self.gemm.norm,
+            args: vec![xv, xv, rows, nval, epsv, opv],
+        });
+        true
     }
 
     fn lower_stmt(&mut self, s: &Stmt) {
@@ -3880,6 +4210,15 @@ fn single_path(e: &Expr) -> Option<Symbol> {
     }
 }
 
+/// The single statement of a one-statement, tail-less block (the shape every per-pass norm loop body
+/// has); `None` otherwise.
+fn single_stmt(body: &Block) -> Option<&Stmt> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    Some(&body.stmts[0])
+}
+
 /// Does `e` reference any symbol in `set`? (Used to keep inner vector temps out of index exprs.)
 fn uses_any(e: &Expr, set: &HashSet<Symbol>) -> bool {
     match &e.kind {
@@ -3905,6 +4244,72 @@ fn expr_uses_sym(e: &Expr, sym: Symbol) -> bool {
         }
         ExprKind::Cast { expr, .. } => expr_uses_sym(expr, sym),
         _ => false,
+    }
+}
+
+/// Whole-expression "does this reference `sym`?" — unlike [`expr_uses_sym`] (which only walks the
+/// index/arith subset), this recurses through calls, fields, and casts, and is **conservative**:
+/// expression kinds it does not model return `true`. Used to prove a fused region's internal scalars
+/// do not leak to later code (a `true` just means "can't prove it's safe", so we decline to fuse).
+fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
+    match &e.kind {
+        ExprKind::Path(p) => p.is_single() && p.first().sym == sym,
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_) => false,
+        ExprKind::Unary { expr, .. } => expr_mentions(expr, sym),
+        ExprKind::Binary { lhs, rhs, .. } => expr_mentions(lhs, sym) || expr_mentions(rhs, sym),
+        ExprKind::Call { callee, args, .. } => {
+            expr_mentions(callee, sym) || args.iter().any(|a| expr_mentions(a, sym))
+        }
+        ExprKind::Index { base, indices } => {
+            expr_mentions(base, sym) || indices.iter().any(|i| expr_mentions(i, sym))
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            expr_mentions(base, sym)
+        }
+        ExprKind::Cast { expr, .. } => expr_mentions(expr, sym),
+        // struct/array literals, if/match/block exprs, method calls, ranges, …: assume a use.
+        _ => true,
+    }
+}
+
+/// Conservative "does any statement (or the tail) reference `sym`?" — companion to [`expr_mentions`].
+fn block_mentions(stmts: &[Stmt], tail: Option<&Expr>, sym: Symbol) -> bool {
+    stmts.iter().any(|s| stmt_mentions(s, sym)) || tail.is_some_and(|e| expr_mentions(e, sym))
+}
+
+fn stmt_mentions(s: &Stmt, sym: Symbol) -> bool {
+    match &s.kind {
+        StmtKind::Let { init, .. } => init.as_ref().is_some_and(|e| expr_mentions(e, sym)),
+        StmtKind::Assign { target, value, .. } => {
+            expr_mentions(target, sym) || expr_mentions(value, sym)
+        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => expr_mentions(e, sym),
+        StmtKind::Return(o) => o.as_ref().is_some_and(|e| expr_mentions(e, sym)),
+        StmtKind::Break(_) | StmtKind::Continue(_) => false,
+        StmtKind::While { cond, body, .. } => {
+            expr_mentions(cond, sym) || block_mentions(&body.stmts, body.tail.as_deref(), sym)
+        }
+        StmtKind::For { iter, body, .. } => {
+            for_iter_mentions(iter, sym) || block_mentions(&body.stmts, body.tail.as_deref(), sym)
+        }
+        StmtKind::Loop { body, .. } => block_mentions(&body.stmts, body.tail.as_deref(), sym),
+    }
+}
+
+fn for_iter_mentions(it: &ForIter, sym: Symbol) -> bool {
+    match it {
+        ForIter::Range {
+            start, end, step, ..
+        } => {
+            expr_mentions(start, sym)
+                || end.as_ref().is_some_and(|e| expr_mentions(e, sym))
+                || step.as_ref().is_some_and(|e| expr_mentions(e, sym))
+        }
+        ForIter::Expr(e) => expr_mentions(e, sym),
     }
 }
 

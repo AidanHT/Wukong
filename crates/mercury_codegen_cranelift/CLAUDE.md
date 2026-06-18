@@ -48,9 +48,10 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   why `mercury_xbench` gives gcc `-ffp-contract=fast` — both sides fuse.
 - Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`, the GEMM
   microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi`, the 256-bit elementwise
-  `mercury_vmath_f32`, and the reduction `mercury_sreduce_f32`/`_parallel`) are bound to Rust fns in
-  the JIT and left as imports in the object (resolved by the driver's C runtime). A global run lock
-  serialises JIT runs that share the stdout-capture buffer.
+  `mercury_vmath_f32`, the reduction `mercury_sreduce_f32`/`_parallel`, and the fused row-wise norm
+  `mercury_norm_f32`/`_parallel`) are bound to Rust fns in the JIT and left as imports in the object
+  (resolved by the driver's C runtime). A global run lock serialises JIT runs that share the
+  stdout-capture buffer.
 - **A runtime call may return a value.** Most (`mercury_sgemm*`, `mercury_vmath_f32`) are void, but
   `mercury_sreduce_f32[_parallel]` returns an **f32** — its `lower_call` arm binds the call result
   (`inst_results(call).first().copied()`) instead of returning `None`, and its signature carries a

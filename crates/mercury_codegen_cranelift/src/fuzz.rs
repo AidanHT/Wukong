@@ -190,6 +190,27 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        // Fused softmax: the recognizer collapses the max/exp/sum/normalize passes into one
+        // mercury_norm_f32 call (in place on `out`). The interpreter marshals the identical kernel,
+        // so the full probability buffer must be bit-exact against the native JIT.
+        Kernel {
+            name: "softmax",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+             for c in 0..{n} {{ out[c] = x[c]; }} \
+             let mut m: f32 = out[0]; \
+             for i in 0..{n} {{ m = fmax(m, out[i]); }} \
+             for i in 0..{n} {{ out[i] = exp(out[i] - m); }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[i]; }} \
+             let inv: f32 = 1.0 / s; \
+             for i in 0..{n} {{ out[i] = out[i] * inv; }} }}\n"
+                )
+            },
+            len: |n| n,
+            regimes: ANY,
+        },
         // matmul C=A·B (ikj) and nn.Linear C=A·Bᵀ (ijk) — both dispatch to the GEMM microkernel.
         Kernel {
             name: "matmul",
