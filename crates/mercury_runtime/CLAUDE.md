@@ -43,12 +43,16 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   scalar. Both SIMD tiers are **register-blocked four B-rows at a time** (`dot4_i8_{vnni,avx2}`): the
   A-row chunk is loaded once per step and reused across the four dots (4× less A traffic) with four
   independent accumulator chains for ILP and an in-register horizontal sum (no per-`(i,j)` stack
-  round-trip). **No reassociation exception**: `i32` add is associative mod 2³² (wrapping) and
+  round-trip). The serial VNNI path goes further with a **2×4 register tile** (`dot2x4_i8_vnni` /
+  `gemm_2rows_nt_vnni`): two A-rows at a time, so each B-row chunk loaded once feeds both rows (B
+  traffic halved, 8 accumulator chains); the AVX2 tier and the `_parallel` path stay 1×4 per row.
+  **No reassociation exception**: `i32` add is associative mod 2³² (wrapping) and
   `vpdpbusd`/`vpmaddwd` are non-saturating, so every order gives the *same bits* — the fused kernel
-  equals the naive `s += a[k]*b[k]` loop exactly (twin tests: scalar==avx2==vnni across K boundaries,
+  equals the naive `s += a[k]*b[k]` loop exactly (twin tests: scalar==avx2==vnni==2×4 across K boundaries,
   plus an overflow case). Rows independent → `_parallel` maps per-row across cores, serial ==
-  parallel. Measured **~1.2–2.0× faster than gcc single-core** (`-O3 -march=native`, which also uses
-  `vpdpbusd`) — the lead widens with size — and **~6.7–14.7× with `@parallel`** (3 runs).
+  parallel. Measured **~1.5–2.5× faster than gcc single-core** (`-O3 -march=native`, which also uses
+  `vpdpbusd`) — the lead widens with size — and **~4.6–14.7× with `@parallel`** (clock-sensitive;
+  absolute GOP/s swings ~2–3× with thermal state, so the ratio is what's reported).
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.

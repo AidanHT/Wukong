@@ -9,7 +9,9 @@
 //! gcc's `-march=native` takes, and what it takes to match/beat it. Both paths are **register-blocked
 //! four B-rows at a time** (`dot4_i8_{vnni,avx2}`): the A-row chunk is loaded once per step and reused
 //! across the four dots, with four independent accumulator chains for ILP and an in-register
-//! horizontal sum (no per-`(i,j)` stack round-trip). CPU-feature detection happens **once per call**,
+//! horizontal sum (no per-`(i,j)` stack round-trip). The single-threaded VNNI path tiles **two A-rows
+//! at a time as well** (`dot2x4_i8_vnni`, a 2×4 register tile): each B-row chunk loaded once feeds
+//! both rows, halving B-matrix traffic. CPU-feature detection happens **once per call**,
 //! not per element (VNNI → widen+`vpmaddwd` AVX2 → scalar), so the hot loop is branch-free
 //! `target_feature` code. `vpdpbusd` is the non-saturating form, so it sums the products into `i32`
 //! exactly — bit-identical to the scalar fold, same as the `vpmaddwd` path.
@@ -305,6 +307,116 @@ unsafe fn gemm_row_nt_vnni(arow: *const u8, b: *const i8, crow: *mut i32, k: usi
     }
 }
 
+/// Eight `u8×i8→i32` dots — a **2×4 register tile** (two A-rows × four B-rows) via AVX-VNNI. Each
+/// 32-`i8` B-row chunk is loaded once and reused across *both* A-rows (halving B traffic vs the 1×4
+/// `dot4_i8_vnni`), and eight independent `vpdpbusd` accumulator chains saturate the unit and fully
+/// hide its latency. Returns `[row0 cols0..4, row1 cols0..4]`. Bit-equal to eight [`dot_i8_scalar`]
+/// calls (same products, wrapping-`i32` order-immaterial).
+///
+/// # Safety
+/// `a0`/`a1` valid for `k` `u8`; `b0..b3` for `k` `i8`; requires `avx2`+`avxvnni`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dot2x4_i8_vnni(
+    a0: *const u8,
+    a1: *const u8,
+    b0: *const i8,
+    b1: *const i8,
+    b2: *const i8,
+    b3: *const i8,
+    k: usize,
+) -> [i32; 8] {
+    use std::arch::x86_64::*;
+    let z = _mm256_setzero_si256();
+    let (mut c00, mut c01, mut c02, mut c03) = (z, z, z, z);
+    let (mut c10, mut c11, mut c12, mut c13) = (z, z, z, z);
+    let mut i = 0usize;
+    while i + 32 <= k {
+        let av0 = _mm256_loadu_si256(a0.add(i) as *const __m256i);
+        let av1 = _mm256_loadu_si256(a1.add(i) as *const __m256i);
+        // Load each B-row chunk once, feed it to both A-rows before moving on (1 live B reg).
+        let bv = _mm256_loadu_si256(b0.add(i) as *const __m256i);
+        c00 = _mm256_dpbusd_avx_epi32(c00, av0, bv);
+        c10 = _mm256_dpbusd_avx_epi32(c10, av1, bv);
+        let bv = _mm256_loadu_si256(b1.add(i) as *const __m256i);
+        c01 = _mm256_dpbusd_avx_epi32(c01, av0, bv);
+        c11 = _mm256_dpbusd_avx_epi32(c11, av1, bv);
+        let bv = _mm256_loadu_si256(b2.add(i) as *const __m256i);
+        c02 = _mm256_dpbusd_avx_epi32(c02, av0, bv);
+        c12 = _mm256_dpbusd_avx_epi32(c12, av1, bv);
+        let bv = _mm256_loadu_si256(b3.add(i) as *const __m256i);
+        c03 = _mm256_dpbusd_avx_epi32(c03, av0, bv);
+        c13 = _mm256_dpbusd_avx_epi32(c13, av1, bv);
+        i += 32;
+    }
+    let mut s = [
+        hsum_i32_avx2(c00),
+        hsum_i32_avx2(c01),
+        hsum_i32_avx2(c02),
+        hsum_i32_avx2(c03),
+        hsum_i32_avx2(c10),
+        hsum_i32_avx2(c11),
+        hsum_i32_avx2(c12),
+        hsum_i32_avx2(c13),
+    ];
+    if i < k {
+        let t = k - i;
+        let bb = [b0, b1, b2, b3];
+        for col in 0..4 {
+            s[col] = s[col].wrapping_add(dot_i8_scalar(a0.add(i), bb[col].add(i), t));
+            s[col + 4] = s[col + 4].wrapping_add(dot_i8_scalar(a1.add(i), bb[col].add(i), t));
+        }
+    }
+    s
+}
+
+/// Two rows of `C = A·Bᵀ` on the AVX-VNNI path, 2×4-tiled via [`dot2x4_i8_vnni`] with a per-row
+/// `dot_i8_vnni` column tail. Halves B-matrix traffic vs running two `gemm_row_nt_vnni` passes.
+///
+/// # Safety
+/// `a0r`/`a1r` valid for `k` `u8`; `b` for `n*k` `i8`; `c0r`/`c1r` for `n` `i32`; requires
+/// `avx2`+`avxvnni`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn gemm_2rows_nt_vnni(
+    a0r: *const u8,
+    a1r: *const u8,
+    b: *const i8,
+    c0r: *mut i32,
+    c1r: *mut i32,
+    k: usize,
+    n: usize,
+) {
+    let mut j = 0usize;
+    while j + 4 <= n {
+        let s = dot2x4_i8_vnni(
+            a0r,
+            a1r,
+            b.add(j * k),
+            b.add((j + 1) * k),
+            b.add((j + 2) * k),
+            b.add((j + 3) * k),
+            k,
+        );
+        *c0r.add(j) = s[0];
+        *c0r.add(j + 1) = s[1];
+        *c0r.add(j + 2) = s[2];
+        *c0r.add(j + 3) = s[3];
+        *c1r.add(j) = s[4];
+        *c1r.add(j + 1) = s[5];
+        *c1r.add(j + 2) = s[6];
+        *c1r.add(j + 3) = s[7];
+        j += 4;
+    }
+    while j < n {
+        let bj = b.add(j * k);
+        *c0r.add(j) = dot_i8_vnni(a0r, bj, k);
+        *c1r.add(j) = dot_i8_vnni(a1r, bj, k);
+        j += 1;
+    }
+}
+
 /// Quantized `nn.Linear` `C = A·Bᵀ` (serial): `A` is `[m,k]` `u8` row-major, `B` is `[n,k]` `i8`
 /// row-major (so `B`'s rows are the weight vectors), `C` is `[m,n]` `i32` row-major. Detects AVX2
 /// **once** (not per element) and runs the register-blocked AVX2 nest, else the scalar nest.
@@ -327,9 +439,23 @@ pub unsafe extern "C" fn mercury_i8gemm_nt(
     #[cfg(target_arch = "x86_64")]
     {
         // VNNI (vpdpbusd) is the densest path; widen+madd AVX2 is the fallback; scalar otherwise.
+        // VNNI runs a 2×4 register tile (two C-rows at a time) so each B-row load feeds both rows.
         if is_x86_feature_detected!("avxvnni") {
-            for i in 0..m {
-                // SAFETY: arow valid for k; crow is row i of C (n i32); b valid for n*k.
+            let mut i = 0usize;
+            while i + 2 <= m {
+                // SAFETY: rows i, i+1 of A/C valid; b valid for n*k.
+                gemm_2rows_nt_vnni(
+                    a.add(i * k),
+                    a.add((i + 1) * k),
+                    b,
+                    c.add(i * n),
+                    c.add((i + 1) * n),
+                    k,
+                    n,
+                );
+                i += 2;
+            }
+            if i < m {
                 gemm_row_nt_vnni(a.add(i * k), b, c.add(i * n), k, n);
             }
             return;
@@ -484,6 +610,28 @@ mod tests {
                 )
             };
             assert_eq!(got, want, "dot4_vnni != 4×scalar at k={k}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn dot2x4_vnni_matches_scalar_bit_for_bit() {
+        if !is_x86_feature_detected!("avxvnni") {
+            return;
+        }
+        // The 2×4 tile (two A-rows × four B-rows) must equal eight scalar dots at every K.
+        for &k in &[1usize, 7, 16, 31, 32, 33, 47, 64, 65, 96, 100, 257, 1024] {
+            let a = fill_u8(2 * k);
+            let b = fill_i8(4 * k);
+            let (a0, a1) = (a.as_ptr(), a.as_ptr().wrapping_add(k));
+            let bp = |c: usize| b.as_ptr().wrapping_add(c * k);
+            let got = unsafe { dot2x4_i8_vnni(a0, a1, bp(0), bp(1), bp(2), bp(3), k) };
+            let mut want = [0i32; 8];
+            for col in 0..4 {
+                want[col] = unsafe { dot_i8_scalar(a0, bp(col), k) };
+                want[col + 4] = unsafe { dot_i8_scalar(a1, bp(col), k) };
+            }
+            assert_eq!(got, want, "dot2x4_vnni != 8×scalar at k={k}");
         }
     }
 
