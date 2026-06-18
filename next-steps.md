@@ -8,17 +8,25 @@
 
 ## Why GPU is the next frontier
 
-The honest CPU picture: Mercury already wins on the metrics that matter — GEMM family (2.4–22×),
-conv (6–7×), reductions (~2.8×), vectorized transcendentals (2.5–3.5×), compile time (100–260×) —
-and the tuned AVX2/FMA GEMM microkernel is near the single-core roofline. Two specific findings cap
-further CPU work:
+The honest CPU picture (measured mid-2026, vs gcc/rustc `-O3 -march=native`): Mercury already wins on
+every metric that matters — compile time **84–525×**; matmul **3–3.8× single / 9–16× parallel**
+(455 GFLOP/s @1024³), nn.Linear **23× single / up to ~102× parallel**; conv **~6×**; vectorized
+transcendentals **5–7.5× single / ~19× parallel**; reductions **2.7× single / 7.9–8.6× parallel**;
+elementwise an honest DRAM-bandwidth tie single-thread but **2.2–8× under `@parallel`**. The tuned
+AVX2/FMA GEMM microkernel is at ~90% of the single-core roofline. The CPU path is now
+*comprehensively* ahead, and three findings cap further CPU work:
 
+- **The last `@parallel` gap is closed.** Reductions were the one kernel class with no multicore path
+  (the function-level `@parallel` model can't express a carried-scalar reduction, and it races). They
+  now dispatch to a deterministic multicore reduction kernel (`mercury_sreduce_f32_parallel` —
+  dot/ssd/sum/sumsq), taking dot from ~2.7× to ~7.9× and ssd to ~8.6× vs C. That was the last
+  *substantial* single-machine CPU win; what's left is marginal.
 - **Flash-attention is not a single-thread CPU win** (measured ~2× *slower* than the GEMM-dispatch
   path; preserved on branch `experiment/flash-attention-cpu`, see the memory note). The materialized
   attention is compute-bound on the tuned GEMM, so fusion only saves S² scores traffic that isn't the
   bottleneck. Flash-attention's decisive wins are GPU-shaped: HBM-bandwidth- and kernel-launch-bound.
-- The remaining CPU items (epilogue fusion, parallel-GEMM tuning) are single-digit-percent or
-  hardware-throttle-limited on this 6P+8E hybrid.
+- The remaining CPU items (epilogue fusion beyond Linear, parallel-GEMM tuning, a 256-bit *single-core*
+  reduction) are single-digit-percent or hardware-throttle-limited on this 6P+8E hybrid.
 
 The big ML wins — large-batch training/inference throughput, long-context attention, mixed precision
 that actually pays (tensor cores) — live on the GPU. That is where a tensor-kernel compiler earns its
@@ -88,6 +96,9 @@ body is already proven data-parallel (the interpreter runs it sequentially as th
   third sanctioned reassociation exception alongside reductions and the shared CPU kernels.
 - **Determinism within the GPU path**: fix block/grid sizes and reduction order per kernel so GPU runs
   are reproducible (no atomics-with-nondeterministic-order in reductions unless explicitly tolerated).
+  The CPU `mercury_sreduce_f32_parallel` is the precedent: fixed-size chunks independent of core count
+  + an ascending partial combine make its result identical regardless of how many lanes ran it — the
+  GPU block-reduce should fix its grid/combine order the same way rather than relying on atomic add.
 - **Emit-only CI here**: snapshot the generated CUDA/SPIR-V and lint it (compiles under `nvcc
   --ptx`/`spirv-val`) without executing, so this box still guards codegen regressions.
 
@@ -99,7 +110,10 @@ body is already proven data-parallel (the interpreter runs it sequentially as th
   green GPU kernel + the differential harness.
 - **Phase 1 — elementwise + reductions:** map `@parallel` ranges and the vectorizer's elementwise/
   reduction shapes (saxpy, relu, dot, softmax row-ops, the transcendental polynomials) to device
-  kernels. These are bandwidth-bound — the GPU win over CPU is large and easy to show honestly.
+  kernels. These are bandwidth-bound — the GPU win over CPU is large and easy to show honestly. The
+  CPU reduction recognizer (`match_reduction_kernel` → `mercury_sreduce_f32_parallel`) already
+  identifies dot/ssd/sum and proves them data-parallel; the GPU emits a block-reduce template instead
+  of the CPU chunk kernel, reusing the same recognizer and the same fixed-chunk determinism idea.
 - **Phase 2 — tiled GEMM:** the matmul recognizer emits a shared-memory-tiled GEMM (register-blocked,
   the GPU analog of the AVX2 microkernel). Target f32 first; this is the headline throughput kernel.
 - **Phase 3 — fused attention (the real payoff):** the attention pattern that *lost* on CPU wins here
