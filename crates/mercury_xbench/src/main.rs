@@ -153,6 +153,7 @@ fn main() {
     bench_matmul(&cc, &dir, roof);
     bench_linear(&cc, &dir, roof);
     bench_conv(&cc, &dir);
+    bench_norm(&cc, &dir);
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -538,6 +539,182 @@ fn rust_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
          \x20   }} }} }}\n\
          \x20   *output.add(oc*{ohw} + oy*{oh} + ox) = s;\n\
          \x20 }} }} }}\n}}\n"
+    )
+}
+
+/// Fused row normalizations — **softmax / LayerNorm / RMSNorm** over one feature row of `cols` f32,
+/// the per-token normalization every transformer layer runs. Mercury folds the canonical multi-pass
+/// form into one `mercury_norm_f32` call: 256-bit AVX2, a hand-vectorized `exp` for softmax, and
+/// *reassociated* lane-accumulator reductions for the mean / variance / sum-of-squares. gcc/rustc at
+/// their honest defaults (no `-ffast-math`) auto-vectorize the elementwise passes but keep the float
+/// reductions strictly sequential — and call scalar libm `expf` for softmax — so this is the same
+/// reduction-vectorization + transcendental story as the `dot`/`exp` kernels, now fused. All three
+/// languages copy `x`→`out` then normalize `out` in place (identical work), so the cross-language
+/// full-buffer check sees the same result. One row = one token's hidden vector; a real `[tokens,
+/// hidden]` batch maps the identical kernel per row.
+fn bench_norm(cc: &str, dir: &Path) {
+    for &cols in &[768usize, 4096] {
+        let x: Vec<f32> = (0..cols).map(|i| (i % 17) as f32 * 0.5 + 1.0).collect();
+        let mut out = vec![0.0f32; cols];
+        let (xp, yp, op_) = (x.as_ptr(), x.as_ptr(), out.as_mut_ptr());
+        println!(
+            "=== fused norms, 1x{cols} feature row (ns/call, lower is better; Mercury → mercury_norm_f32) ==="
+        );
+        println!(
+            "  {:<10} {:>12} {:>12} {:>12} {:>16}",
+            "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
+        );
+        for op in ["softmax", "layernorm", "rmsnorm"] {
+            let mer = bench_mercury(&mer_norm(cols, op), &mut out, xp, yp, op_);
+            let c = bench_external(
+                "c",
+                &c_norm(cols, op),
+                dir,
+                &format!("norm_{op}"),
+                cc,
+                &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+                &mut out,
+                xp,
+                yp,
+                op_,
+            );
+            let rust = bench_external(
+                "rs",
+                &rust_norm(cols, op),
+                dir,
+                &format!("norm_{op}"),
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut out,
+                xp,
+                yp,
+                op_,
+            );
+            let ns = |m: &Option<Measure>| {
+                m.as_ref()
+                    .map(|x| format!("{:.0}", x.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let standing = if let (Some(m), Some(c)) = (&mer, &c) {
+                let r = c.ns_per_call / m.ns_per_call;
+                format!(
+                    "{:.2}x {}",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                )
+            } else {
+                "n/a".into()
+            };
+            println!(
+                "  {:<10} {:>12} {:>12} {:>12} {:>16}",
+                op,
+                ns(&mer),
+                ns(&c),
+                ns(&rust),
+                standing
+            );
+            // Cross-language correctness: same normalized row, element by element (f32 tolerance —
+            // Mercury reassociates the reductions, C does not, so it is a tight rel-err, not bits).
+            if let (Some(m), Some(c)) = (&mer, &c) {
+                let (rel, at) = max_rel_err(&m.out, &c.out);
+                if rel > 1e-3 {
+                    println!(
+                        "  ! {op} full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                        m.out[at], c.out[at], rel
+                    );
+                }
+            }
+        }
+        println!();
+    }
+}
+
+/// Mercury norm source: copy `x`→`out`, then the canonical in-place multi-pass form the recognizer
+/// folds into one `mercury_norm_f32(out, out, 1, cols, eps, op)` call. The `/ {cols}.0` divisor (and
+/// the `out[0]` softmax seed) are exactly the spellings `match_layernorm`/`match_rmsnorm`/
+/// `match_softmax` accept, so the fused kernel fires.
+fn mer_norm(cols: usize, op: &str) -> String {
+    let body = match op {
+        "softmax" => format!(
+            "let mut m: f32 = out[0]; \
+             for i in 0..{cols} {{ m = fmax(m, out[i]); }} \
+             for i in 0..{cols} {{ out[i] = exp(out[i] - m); }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + out[i]; }} \
+             let inv: f32 = 1.0 / s; \
+             for i in 0..{cols} {{ out[i] = out[i] * inv; }}"
+        ),
+        "layernorm" => format!(
+            "let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + out[i]; }} \
+             let mean: f32 = s / {cols}.0; \
+             let mut v: f32 = 0.0; \
+             for i in 0..{cols} {{ v = v + (out[i] - mean) * (out[i] - mean); }} \
+             let inv: f32 = rsqrt(v / {cols}.0 + 0.00001); \
+             for i in 0..{cols} {{ out[i] = (out[i] - mean) * inv; }}"
+        ),
+        _ => format!(
+            "let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + out[i] * out[i]; }} \
+             let inv: f32 = rsqrt(s / {cols}.0 + 0.00001); \
+             for i in 0..{cols} {{ out[i] = out[i] * inv; }}"
+        ),
+    };
+    format!(
+        "module bench\nfn kbench(x: [f32; {cols}], y: [f32; {cols}], out: [f32; {cols}]) {{ \
+         for c in 0..{cols} {{ out[c] = x[c]; }} {body} }}\n"
+    )
+}
+
+fn c_norm(cols: usize, op: &str) -> String {
+    let body = match op {
+        "softmax" => {
+            "float m=out[0]; for(long i=0;i<C;i++) if(out[i]>m) m=out[i]; \
+             float s=0.0f; for(long i=0;i<C;i++){ out[i]=expf(out[i]-m); s+=out[i]; } \
+             float inv=1.0f/s; for(long i=0;i<C;i++) out[i]*=inv;"
+        }
+        "layernorm" => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]; \
+             float mean=s/(float)C; float v=0.0f; \
+             for(long i=0;i<C;i++){ float d=out[i]-mean; v+=d*d; } \
+             float inv=1.0f/sqrtf(v/(float)C+1e-5f); \
+             for(long i=0;i<C;i++) out[i]=(out[i]-mean)*inv;"
+        }
+        _ => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]*out[i]; \
+             float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
+             for(long i=0;i<C;i++) out[i]*=inv;"
+        }
+    };
+    format!(
+        "#include <math.h>\n#define C {cols}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
+         for(long i=0;i<C;i++) out[i]=x[i]; {body} }}\n"
+    )
+}
+
+fn rust_norm(cols: usize, op: &str) -> String {
+    let body = match op {
+        "softmax" => {
+            "let mut m=*out.add(0); for i in 0..C { let v=*out.add(i); if v>m { m=v; } } \
+             let mut s=0.0f32; for i in 0..C { let e=(*out.add(i)-m).exp(); *out.add(i)=e; s+=e; } \
+             let inv=1.0f32/s; for i in 0..C { *out.add(i)*=inv; }"
+        }
+        "layernorm" => {
+            "let mut s=0.0f32; for i in 0..C { s+=*out.add(i); } \
+             let mean=s/(C as f32); let mut v=0.0f32; \
+             for i in 0..C { let d=*out.add(i)-mean; v+=d*d; } \
+             let inv=1.0f32/(v/(C as f32)+1e-5f32).sqrt(); \
+             for i in 0..C { *out.add(i)=(*out.add(i)-mean)*inv; }"
+        }
+        _ => {
+            "let mut s=0.0f32; for i in 0..C { let v=*out.add(i); s+=v*v; } \
+             let inv=1.0f32/(s/(C as f32)+1e-5f32).sqrt(); \
+             for i in 0..C { *out.add(i)*=inv; }"
+        }
+    };
+    format!(
+        "const C: usize = {cols};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{ \
+         for i in 0..C {{ *out.add(i)=*x.add(i); }} {body} }}\n"
     )
 }
 
