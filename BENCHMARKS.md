@@ -41,9 +41,11 @@ naively-written source:
   for both its `Q·Kᵀ` and `P·V` matmuls.
 - **int8 quantized `nn.Linear` dispatch.** The quantized-inference GEMM — `u8` activations × `i8`
   weights → an `i32` accumulator (`C = A·Bᵀ`, the QNNPACK/oneDNN layout) — is recognized and lowered
-  to an **AVX-VNNI `vpdpbusd`** microkernel, register-blocked four B-rows at a time. It beats gcc
-  `-O3 -march=native` (which also emits `vpdpbusd`) **~1.2–2.0× single-core** — the lead widening with
-  size — and ~6.7–14.7× with `@parallel`. Integer math, so the kernel equals the scalar nest
+  to an **AVX-VNNI `vpdpbusd`** microkernel, register-blocked four B-rows at a time (and the
+  single-threaded path pairs two A-rows into a 2×4 tile, so each B-row load feeds both rows — halving
+  B-matrix traffic). It beats gcc `-O3 -march=native` (which also emits `vpdpbusd`) **~1.5–2.5×
+  single-core** — the lead widening with size — and ~4.6–14.7× with `@parallel` (clock-state-dependent;
+  parallel int8 is bandwidth-bound). Integer math, so the kernel equals the scalar nest
   *bit-for-bit* (i32 add is associative mod 2³²; no reassociation exception).
 - **Reduction vectorization + multicore dispatch.** A naive f32 reduction (`s += x[i]*y[i]`) is one
   FMA down a single dependency chain — latency-bound. Mercury reassociates it across vector lanes ×
@@ -227,9 +229,12 @@ accumulator** (the QNNPACK / XNNPACK / oneDNN layout). Mercury recognizes the `i
 — `s += (a[..] as i32) * (b[..] as i32)`, A `u8`, B `i8` — and dispatches it to the
 **`mercury_i8gemm_nt`** microkernel: AVX-VNNI **`vpdpbusd`** (one instruction folds 32 `u8×i8`
 products into the `i32` lanes *and* accumulates), register-blocked four B-rows at a time (the A-row
-chunk loaded once and reused across the four dots, four accumulator chains for ILP). C and Rust run
-the idiomatic naive int8 GEMM at `-O3 -march=native` / `-O -Ctarget-cpu=native` — gcc auto-vectorizes
-it to `vpdpbusd` as well, so this is an honest *same-instruction* comparison, not a straw man.
+chunk loaded once and reused across the four dots, four accumulator chains for ILP); the
+single-threaded path additionally pairs **two A-rows into a 2×4 register tile**, so each B-row load
+feeds both rows and B-matrix traffic is halved (the lift that takes single-core from ~1.3× to
+~1.5–2.5×). C and Rust run the idiomatic naive int8 GEMM at `-O3 -march=native` / `-O
+-Ctarget-cpu=native` — gcc auto-vectorizes it to `vpdpbusd` as well, so this is an honest
+*same-instruction* comparison, not a straw man.
 
 **Because the math is integer, the cross-language check is bit-exact** (not a tolerance): `i32` add is
 associative mod 2³² and `vpdpbusd` is non-saturating, so Mercury, C, and Rust must agree on every one
@@ -240,17 +245,21 @@ across runs:
 
 | size | Mercury 1-core vs C | Mercury `@parallel` vs C | Rust |
 |------|---------------------|--------------------------|------|
-| 512×512   | **~1.2–1.4× faster** | **~6.7–8.5× faster** | ~5–9× slower than Mercury 1-core |
-| 1024×1024 | **~1.6–2.0× faster** | **~11.5–14.7× faster** | ~8× slower than Mercury 1-core |
+| 512×512   | **~1.5–1.7× faster** | **~4.6–8.5× faster** | ~5–10× slower than Mercury 1-core |
+| 1024×1024 | **~2.2–2.5× faster** | **~8.0–14.7× faster** | ~8–12× slower than Mercury 1-core |
 
-Across three runs Mercury holds **~98–142 GOP/s single-core** (compute-bound on `vpdpbusd`); gcc runs
-~85–100 GOP/s at 512² and ~60–85 at 1024² — lower on average as the weight matrix grows — so **the
-single-core lead widens with size** (the 1024² ratio exceeded the 512² ratio in *every* run, exactly
-as with the f32 GEMM). The `@parallel` form maps independent rows across cores (rows are independent,
-so serial == parallel bit-for-bit) for a further ~6.7–14.7×. Rust trails badly (~12–19 GOP/s): rustc
-does not auto-vectorize the `u8×i8` widening dot, so it runs essentially scalar. The interpreter
-marshals the identical kernel, so the differential oracle stays bit-for-bit exact, and the recognizer
-runs pre-opt so `-O0` == `-O3`.
+**Absolute throughput swings ~2–3× with the laptop's clock/thermal state, so the clock-invariant
+ratio is the reported quantity** (as with the f32 GEMM's roofline %): a high-clock run measured
+Mercury ~290–347 GOP/s single-core against gcc ~133–226, a cooler run roughly half of each — but the
+*ratio* held. **The single-core lead widens with size** — the 1024² ratio (~2.2–2.5×) exceeded the
+512² ratio (~1.5–1.7×) in every one of the four post-2×4 runs, exactly as with the f32 GEMM, because
+the 2×4 tile's halved B-traffic pays off more once B spills out of L2. The `@parallel` form maps
+independent rows across cores (rows are independent, so serial == parallel bit-for-bit); its lead over
+single-threaded C (~4.6–14.7×) is more clock-sensitive than the single-core figure because parallel
+int8 saturates memory bandwidth (which barely scales with clock) while the lone C core is
+compute-bound (which does). Rust trails badly: rustc does not auto-vectorize the `u8×i8` widening dot,
+so it runs essentially scalar. The interpreter marshals the identical kernel, so the differential
+oracle stays bit-for-bit exact, and the recognizer runs pre-opt so `-O0` == `-O3`.
 
 ### Single-threaded elementwise & reductions
 
@@ -294,10 +303,11 @@ single-threaded C:
   *behind*). The dispatch also fires on **runtime dimensions**, so the win applies to general matmul
   functions, not only fixed-size kernels.
 - **int8 quantized `nn.Linear` (u8×i8→i32):** dispatched to an **AVX-VNNI `vpdpbusd`** register-blocked
-  microkernel, **~1.2–2.0× faster than gcc single-core** (gcc `-march=native` uses `vpdpbusd` too, so
-  it's a fair same-instruction comparison) — the lead widening with size — and ~6.7–14.7× with
-  `@parallel`. Rust runs essentially scalar here (~5–9× behind). Integer math makes the cross-language
-  check **bit-exact**, not a tolerance.
+  microkernel (2×4-tiled on the single-threaded path, halving B-matrix traffic), **~1.5–2.5× faster
+  than gcc single-core** (gcc `-march=native` uses `vpdpbusd` too, so it's a fair same-instruction
+  comparison) — the lead widening with size — and ~4.6–14.7× with `@parallel` (clock-state-dependent).
+  Rust runs essentially scalar here (~5–12× behind). Integer math makes the cross-language check
+  **bit-exact**, not a tolerance.
 - **Transcendentals / activations (exp, log, GELU, SiLU, tanh):** **~5–7.5× faster** than C's scalar
   `libm` — Mercury dispatches the loop to a **256-bit AVX2 ≈1-ULP poly kernel** (`mercury_vmath_f32`),
   where gcc/rustc cannot vectorize a loop with an `expf`/`logf`/`tanhf` call. This is the transformer
