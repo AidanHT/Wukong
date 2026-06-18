@@ -159,6 +159,65 @@ pub fn run_kernel_f32(
     Ok(())
 }
 
+/// Run an int8 quantized GEMM kernel `fn k(a: [u8; _], b: [i8; _], c: [i32; _])` over caller
+/// buffers — the integer twin of [`run_kernel_f32`], for the full-buffer int8 differential fuzzer.
+///
+/// `a`/`b`/`c` are laid out contiguously in flat `Value::Int` memory (`a` zero-extended from `u8`,
+/// `b` sign-extended from `i8` — matching the kernel's widening), the kernel runs with a pointer to
+/// each, and the `i32` results are copied back into `c`. The kernel must take exactly three
+/// (pointer) parameters in `a, b, c` order.
+pub fn run_kernel_i8(
+    program: &Program,
+    entry: Symbol,
+    a: &[u8],
+    b: &[i8],
+    c: &mut [i32],
+    interner: &Interner,
+) -> Result<(), String> {
+    let func = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    if func.params.len() != 3 {
+        return Err(format!(
+            "int8 kernel `{}` takes {} parameter(s), expected 3 (a, b, c)",
+            interner.resolve(entry),
+            func.params.len()
+        ));
+    }
+    let mut interp = Interp {
+        program,
+        interner,
+        memory: Vec::new(),
+        stdout: Vec::new(),
+        frames: Vec::new(),
+        scratch: Vec::with_capacity(8),
+        vecs: Vec::new(),
+    };
+    // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the kernel.
+    let a_base = interp.memory.len();
+    interp
+        .memory
+        .extend(a.iter().map(|&v| Value::Int(v as i128)));
+    let b_base = interp.memory.len();
+    interp
+        .memory
+        .extend(b.iter().map(|&v| Value::Int(v as i128)));
+    let c_base = interp.memory.len();
+    interp
+        .memory
+        .extend(c.iter().map(|&v| Value::Int(v as i128)));
+    let args = vec![Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
+    interp.run_function(func, args)?;
+    for (i, slot) in c.iter_mut().enumerate() {
+        *slot = match interp.memory[c_base + i] {
+            Value::Int(n) => n as i32,
+            Value::Float(f) => f as i32,
+            _ => 0,
+        };
+    }
+    Ok(())
+}
+
 struct Interp<'a> {
     program: &'a Program,
     interner: &'a Interner,
@@ -1160,6 +1219,43 @@ mod tests {
         .unwrap();
         let expect: f32 = (0..8).map(|i| x[i] * y[i]).sum();
         assert_eq!(out[0], expect, "dot");
+    }
+
+    #[test]
+    fn run_kernel_i8_linear() {
+        // C[2,2] = A[2,4](u8) · B[2,4](i8)ᵀ — the int8 kernel-entry ABI, checked against a hand
+        // i64 reference. A=[1..8], B=[-6..1]; the recognizer dispatches this to mercury_i8gemm_nt.
+        let mut interner = Interner::new();
+        let src = "module m\n\
+            fn lin(a: [u8; 8], b: [i8; 8], c: [i32; 4]) { \
+                for i in 0..2 { for j in 0..2 { let mut s: i32 = 0; \
+                for k in 0..4 { s = s + (a[i*4+k] as i32) * (b[j*4+k] as i32); } \
+                c[i*2+j] = s; } } }\n";
+        let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+
+        let a: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let b: [i8; 8] = [-6, -5, -4, -3, -2, -1, 0, 1];
+        let mut c = [0i32; 4];
+        run_kernel_i8(&program, interner.intern("lin"), &a, &b, &mut c, &interner).unwrap();
+
+        // Independent i64 reference: c[i,j] = sum_k a[i*4+k] * b[j*4+k].
+        let mut want = [0i32; 4];
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut s = 0i64;
+                for k in 0..4 {
+                    s += a[i * 4 + k] as i64 * b[j * 4 + k] as i64;
+                }
+                want[i * 2 + j] = s as i32;
+            }
+        }
+        assert_eq!(c, want, "i8 linear");
+        assert_eq!(c, [-40, 0, -112, -8], "i8 linear expected values");
     }
 
     #[test]
