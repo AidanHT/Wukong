@@ -1337,3 +1337,6 @@ pub fn emit_object(program: &Program, interner: &Interner) -> Result<Vec<u8>, St
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod fuzz;
