@@ -39,6 +39,7 @@ struct Kernel {
     rust: String,
 }
 
+#[derive(Clone)]
 struct Measure {
     compile: Duration,
     ns_per_call: f64,
@@ -141,8 +142,16 @@ fn main() {
     }
 
     println!();
-    bench_matmul(&cc, &dir);
-    bench_linear(&cc, &dir);
+    let roof = measure_fma_roofline();
+    if roof > 0.0 {
+        println!(
+            "AVX2-FMA roofline (this run, single core): {roof:.0} GFLOP/s — GEMM is reported as % \
+             of THIS, which is clock-invariant (absolute GFLOP/s swings with the laptop's power state)."
+        );
+        println!();
+    }
+    bench_matmul(&cc, &dir, roof);
+    bench_linear(&cc, &dir, roof);
     bench_conv(&cc, &dir);
 }
 
@@ -151,14 +160,14 @@ fn main() {
 /// an `ikj`-ordered C = A·B (the cache-friendly idiom that auto-vectorizes well) written the same
 /// way in each language, and additionally Mercury's `@parallel` form. Reported as GFLOP/s. The win
 /// is shown across a size sweep so it is clearly structural, not a single-size artifact.
-fn bench_matmul(cc: &str, dir: &Path) {
+fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
     for ns in [256usize, 512, 1024] {
-        bench_matmul_size(cc, dir, ns);
+        bench_matmul_size(cc, dir, ns, roof);
         println!();
     }
 }
 
-fn bench_matmul_size(cc: &str, dir: &Path, ns: usize) {
+fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     let n2 = ns * ns;
     let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
     let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
@@ -199,19 +208,22 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize) {
         bp,
         cp,
     );
+    let tuned = bench_mm_tuned(ns, false, &a, &b, &mut c);
 
     println!(
-        "  {:<18} {:>12} {:>12} {:>12} {:>12}",
-        "", "Mer(1core)", "Mer(parallel)", "C (gcc)", "Rust"
+        "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "", "Mer(1core)", "Mer(par)", "tuned(mm)", "C (gcc)", "Rust"
     );
     println!(
-        "  {:<18} {:>12} {:>12} {:>12} {:>12}",
+        "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
         "GFLOP/s",
         gflops(&mer),
         gflops(&mer_par),
+        gflops(&Some(tuned.clone())),
         gflops(&cm),
         gflops(&rm)
     );
+    report_gemm_standing(&mer, &tuned, roof, flops);
     // Cross-language correctness: every backend must compute the same C, element by element.
     if let (Some(m), Some(c)) = (&mer_par, &cm) {
         let (rel, at) = max_rel_err(&m.out, &c.out);
@@ -287,7 +299,7 @@ fn rust_matmul(ns: usize) -> String {
 /// `nn.Linear`: `C = A·Bᵀ` (A is `[M,K]`, B is `[N,K]`), the matmul every Dense layer runs. Mercury
 /// recognizes the transposed-B nest and dispatches to its tuned GEMM; idiomatic C/Rust write the
 /// naive nest. Square M=K=N for the harness's shared-buffer ABI.
-fn bench_linear(cc: &str, dir: &Path) {
+fn bench_linear(cc: &str, dir: &Path, roof: f64) {
     for ns in [512usize, 1024] {
         let n2 = ns * ns;
         let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
@@ -327,15 +339,17 @@ fn bench_linear(cc: &str, dir: &Path) {
             bp,
             cp,
         );
+        let tuned = bench_mm_tuned(ns, true, &a, &b, &mut c);
         println!(
-            "  {:<18} {:>12} {:>12} {:>12} {:>12}",
-            "", "Mer(1core)", "Mer(parallel)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "tuned(mm)", "C (gcc)", "Rust"
         );
         println!(
-            "  {:<18} {:>12} {:>12} {:>12} {:>12}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&mer),
             gflops(&mer_par),
+            gflops(&Some(tuned.clone())),
             gflops(&cm),
             gflops(&rm)
         );
@@ -346,14 +360,7 @@ fn bench_linear(cc: &str, dir: &Path) {
                 r
             );
         }
-        if let (Some(ms), Some(c)) = (&mer, &cm) {
-            let r = (flops / ms.ns_per_call) / (flops / c.ns_per_call);
-            println!(
-                "  -> Mercury single-core is {:.2}x {} than C single-threaded",
-                if r >= 1.0 { r } else { 1.0 / r },
-                if r >= 1.0 { "faster" } else { "slower" }
-            );
-        }
+        report_gemm_standing(&mer, &tuned, roof, flops);
         println!();
     }
 }
@@ -734,6 +741,122 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
         }
         reps = reps.saturating_mul(2);
     }
+}
+
+/// Print where Mercury's single-core GEMM stands: vs the tuned library (the SOTA-parity check) and
+/// as a % of the measured AVX2-FMA roofline (clock-invariant — the honest figure on this box, whose
+/// absolute GFLOP/s swings with the power/thermal state).
+fn report_gemm_standing(mer: &Option<Measure>, tuned: &Measure, roof: f64, flops: f64) {
+    if let Some(m) = mer {
+        let mer_g = flops / m.ns_per_call;
+        let tuned_g = flops / tuned.ns_per_call;
+        let r = mer_g / tuned_g;
+        println!(
+            "  -> Mercury single-core is {:.2}x {} than tuned matrixmultiply ({mer_g:.0} vs {tuned_g:.0} GFLOP/s)",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" },
+        );
+        if roof > 0.0 {
+            println!(
+                "  -> Mercury single-core = {:.0}% of measured roofline; tuned matrixmultiply = {:.0}%",
+                mer_g / roof * 100.0,
+                tuned_g / roof * 100.0
+            );
+        }
+    }
+}
+
+/// Benchmark a single-threaded tuned-library GEMM (the pure-Rust `matrixmultiply` crate, the engine
+/// behind `ndarray`) at the same size and layout, so Mercury's GEMM is measured against a genuine
+/// optimized peer — not only the naive C/Rust nests. `transpose_b` selects `C = A·Bᵀ` (nn.Linear).
+fn bench_mm_tuned(ns: usize, transpose_b: bool, a: &[f32], b: &[f32], c: &mut [f32]) -> Measure {
+    let (m, k, n) = (ns, ns, ns);
+    // matrixmultiply takes explicit row/col strides; B stored [n,k] row-major is read as Bᵀ (k×n)
+    // by swapping its strides (rsb=1 walks the contraction, csb=k walks the output column).
+    let (rsb, csb) = if transpose_b {
+        (1isize, ns as isize)
+    } else {
+        (ns as isize, 1isize)
+    };
+    c.iter_mut().for_each(|v| *v = 0.0);
+    let ns_per_call = time_ns(|| unsafe {
+        matrixmultiply::sgemm(
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            ns as isize,
+            1,
+            b.as_ptr(),
+            rsb,
+            csb,
+            0.0,
+            c.as_mut_ptr(),
+            ns as isize,
+            1,
+        );
+    });
+    Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: c.to_vec(),
+    }
+}
+
+/// This machine's *currently achievable* single-core AVX2-FMA peak (GFLOP/s), via a tight,
+/// memory-free FMA loop carrying 12 independent accumulators (matching the GEMM microkernel's 12
+/// live `ymm`) so the two FMA units stay saturated past the ~4-cycle FMA latency. Absolute
+/// throughput on this laptop swings with the power/thermal clock state, so the honest figure for the
+/// GEMM is "% of THIS roofline" (clock-invariant), not a fixed GFLOP/s. Returns 0.0 without AVX2/FMA.
+fn measure_fma_roofline() -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { fma_roofline_avx2() };
+        }
+    }
+    0.0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_roofline_avx2() -> f64 {
+    use std::arch::x86_64::*;
+    let a = _mm256_set1_ps(1.000_000_1);
+    let b = _mm256_set1_ps(0.999_999_9);
+    let run = |iters: u64| -> f32 {
+        let mut acc = [_mm256_set1_ps(1e-6f32); 12];
+        for _ in 0..iters {
+            // 12 independent FMA chains: each `acc[i]` depends only on its own prior value, so the
+            // scheduler keeps both FMA units busy rather than stalling on a single 4-cycle chain.
+            for a_i in acc.iter_mut() {
+                *a_i = _mm256_fmadd_ps(a, b, *a_i);
+            }
+        }
+        let mut s = _mm256_setzero_ps();
+        for x in acc {
+            s = _mm256_add_ps(s, x);
+        }
+        let mut tmp = [0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), s);
+        tmp.iter().sum()
+    };
+    let _ = run(2_000_000); // warm up the clock
+    let iters = 40_000_000u64;
+    let mut best = f64::INFINITY;
+    let mut sink = 0f32;
+    for _ in 0..8 {
+        let t = Instant::now();
+        sink += run(iters);
+        let e = t.elapsed().as_secs_f64();
+        if e < best {
+            best = e;
+        }
+    }
+    std::hint::black_box(sink);
+    // 12 FMAs/iter × 8 lanes × 2 flops/FMA.
+    (iters * 12 * 8 * 2) as f64 / best / 1e9
 }
 
 fn geomean(xs: &[f64]) -> f64 {
