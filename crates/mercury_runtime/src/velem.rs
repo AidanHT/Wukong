@@ -5,12 +5,14 @@
 //!  1. **256-bit width.** Cranelift's generic vectorizer is stuck at 128-bit SSE (`f32x8` does not
 //!     legalize), so a Mercury saxpy ran ~15% *behind* gcc's 256-bit AVX2. This kernel restores the
 //!     width parity, the same play as `vmath`/`gemm`.
-//!  2. **Non-temporal (streaming) stores.** For a large output (≥ [`NT_MIN_ELEMS`]) the store goes out
-//!     `vmovntps`, which skips the **read-for-ownership** every cacheable store pays (the CPU must pull
-//!     the target line into cache before overwriting it). gcc/rustc cannot emit this automatically —
-//!     they can't prove the array is large and write-once — but Mercury's domain-aware lowering *knows*
-//!     the loop streams a whole tensor. Measured ~1.2–1.3× over gcc's 256-bit saxpy/relu at the 4 MiB
-//!     benchmark size, widening at real (>L3) activation-tensor sizes where the RFO traffic dominates.
+//!  2. **Non-temporal (streaming) stores.** Once the working set spills L3 (≥ [`NT_MIN_BYTES`] across
+//!     all live arrays) the store goes out `vmovntps`, which skips the **read-for-ownership** every
+//!     cacheable store pays (the CPU must pull the target line into cache before overwriting it).
+//!     gcc/rustc cannot emit this automatically — they can't prove the array is large and write-once —
+//!     but Mercury's domain-aware lowering *knows* the loop streams a whole tensor. The threshold is on
+//!     the *total* bytes touched, not the length, so a cache-resident map keeps its normal store (where
+//!     a needless `vmovntps` would lose): measured ~1.1–1.4× over gcc at real (>L3) activation-tensor
+//!     sizes, and a clean tie at the 4 MiB benchmark size where the output still lives in L3.
 //!
 //! The interpreter marshals its abstract memory through this **identical** kernel (like `vmath`), so
 //! the differential oracle stays bit-for-bit exact. NT and cacheable stores write the *same bits* (the
@@ -30,13 +32,23 @@ pub const VE_RELU6: i64 = 2;
 /// OR'd into `op` when the kernel must read `y` (`b` may be non-zero).
 pub const VE_USE_Y: i64 = 256;
 
-/// Output element count at/above which the store goes non-temporal. Below it the output fits in L2
-/// (and may be re-read soon, e.g. a per-core `@parallel` chunk), so a normal cacheable store is
-/// better — forcing it out to DRAM with `vmovntps` would just re-fetch it; above it the array is
-/// streamed once and the RFO-avoidance of `vmovntps` wins. 2 MiB of f32 ≈ this machine's L2, the
-/// crossover measured on the `@parallel` saxpy (per-core chunks ~190 KiB must stay cacheable, the
-/// single-thread 4 MiB array must go non-temporal).
-const NT_MIN_ELEMS: usize = 1 << 19;
+/// Total streamed bytes (all live arrays) at/above which the store goes non-temporal. Non-temporal
+/// stores pay off only once the working set spills L3: below it a normal cacheable store keeps the
+/// output hot — C/Rust win there, and a per-core `@parallel` chunk may be re-read — while above it
+/// `vmovntps` streams the array out once and skips the read-for-ownership traffic the cacheable store
+/// pays. The crossover is the **total** bytes touched, not the element count: a 2-stream map
+/// (`x → out`) at 1<<20 is 8 MiB and fits L3, but a 3-stream map (`x, y → out`) at the *same* length
+/// is 12 MiB and spills it — so the two want opposite store policies at one length (measured: relu
+/// regressed under non-temporal stores at 1<<20 where saxpy gained). ~10 MiB ≈ this machine's L3.
+const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
+
+/// Whether a kernel touching `streams` arrays of `n` f32 each should use non-temporal stores — true
+/// once the working set spills L3 (see [`NT_MIN_BYTES`]). `streams` counts every live array (the
+/// output plus each input read), since they all compete for cache residency.
+#[inline]
+fn use_nt(n: usize, streams: usize) -> bool {
+    streams.saturating_mul(n).saturating_mul(4) >= NT_MIN_BYTES
+}
 
 /// Software-prefetch distance (elements ahead). A prefetch of an address past the buffer end is a
 /// hint the hardware silently drops — never a fault — so the last iterations need no guard.
@@ -136,7 +148,9 @@ unsafe fn velem_avx2(
     let six = _mm256_set1_ps(6.0);
     let use_y = op & VE_USE_Y != 0;
     let act = op & 0xff;
-    let nt = n >= NT_MIN_ELEMS;
+    // Streams = output + x (+ y when read). The non-temporal decision keys on the whole working set,
+    // so a 2-input saxpy spills L3 (and wants `vmovntps`) at a length where a 1-input map still fits.
+    let nt = use_nt(n, if use_y { 3 } else { 2 });
     let mut i = 0usize;
     // For the streaming store, peel a scalar prologue until `out` is 32-byte aligned (vmovntps faults
     // on a misaligned address); after that each 8-lane step keeps it aligned.
@@ -147,26 +161,56 @@ unsafe fn velem_avx2(
             i += 1;
         }
     }
-    while i + 8 <= n {
-        _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
-        let xv = _mm256_loadu_ps(x.add(i));
-        let inner = if use_y {
-            _mm_prefetch(y.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
-            _mm256_fmadd_ps(vb, _mm256_loadu_ps(y.add(i)), vc)
-        } else {
-            vc
+    // One 8-lane result vector for the element at `i + $off`: the affine `a·x (+ b·y) + c` followed by
+    // the optional ReLU/ReLU6 clamp. Factored so the main loop can run four of them with no
+    // inter-vector dependency.
+    macro_rules! compute {
+        ($off:expr) => {{
+            let xv = _mm256_loadu_ps(x.add(i + $off));
+            let inner = if use_y {
+                _mm256_fmadd_ps(vb, _mm256_loadu_ps(y.add(i + $off)), vc)
+            } else {
+                vc
+            };
+            let mut r = _mm256_fmadd_ps(va, xv, inner);
+            if act == VE_RELU {
+                r = _mm256_max_ps(r, zero);
+            } else if act == VE_RELU6 {
+                r = _mm256_min_ps(_mm256_max_ps(r, zero), six);
+            }
+            r
+        }};
+    }
+    macro_rules! store {
+        ($p:expr, $v:expr) => {
+            if nt {
+                _mm256_stream_ps($p, $v);
+            } else {
+                _mm256_storeu_ps($p, $v);
+            }
         };
-        let mut r = _mm256_fmadd_ps(va, xv, inner);
-        if act == VE_RELU {
-            r = _mm256_max_ps(r, zero);
-        } else if act == VE_RELU6 {
-            r = _mm256_min_ps(_mm256_max_ps(r, zero), six);
+    }
+    // Unroll ×4 (32 elements/step) so four independent load→fma→max→store chains are in flight,
+    // hiding the ~4-cycle FMA / load latency. A single 8-lane step leaves the pipe stalling on the
+    // dependent store and lost to gcc's unrolled relu; four chains restore the throughput.
+    while i + 32 <= n {
+        _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+        if use_y {
+            _mm_prefetch(y.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
         }
-        if nt {
-            _mm256_stream_ps(out.add(i), r);
-        } else {
-            _mm256_storeu_ps(out.add(i), r);
-        }
+        let r0 = compute!(0);
+        let r1 = compute!(8);
+        let r2 = compute!(16);
+        let r3 = compute!(24);
+        store!(out.add(i), r0);
+        store!(out.add(i + 8), r1);
+        store!(out.add(i + 16), r2);
+        store!(out.add(i + 24), r3);
+        i += 32;
+    }
+    while i + 8 <= n {
+        let r = compute!(0);
+        store!(out.add(i), r);
         i += 8;
     }
     // The non-temporal stores are weakly ordered; fence before the buffer is read back by anyone.
@@ -253,7 +297,8 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
     }
     let cv = &cv[..nc];
     let c0 = cv[0];
-    let nt = n >= NT_MIN_ELEMS;
+    // Two streams (x in, out): non-temporal once the pair spills L3.
+    let nt = use_nt(n, 2);
     let mut i = 0usize;
     if nt {
         while i < n && (out.add(i) as usize) & 31 != 0 {
@@ -318,7 +363,7 @@ mod tests {
     /// not a multiple of 8 (and that crosses the NT alignment prologue) produces a consistent result.
     #[test]
     fn velem_tail_matches_lanes() {
-        let n = 600_003usize; // forces NT path (> NT_MIN_ELEMS), a misaligned tail, and a prologue
+        let n = 1_500_003usize; // 2-stream case is 12 MiB > NT_MIN_BYTES: forces NT, a tail, a prologue
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 19.0) - 7.0).collect();
         let y: Vec<f32> = (0..n).map(|i| (i as f32 % 11.0) * 0.5 - 2.0).collect();
         let cases: &[(i64, f32, f32, f32)] = &[
@@ -373,7 +418,7 @@ mod tests {
     /// boundary and a misaligned tail, for several degrees (incl. the degenerate constant `ncoeff=1`).
     #[test]
     fn vhorner_tail_matches_lanes() {
-        let n = 600_005usize; // forces NT path, prologue, and a non-mult-of-8 tail
+        let n = 1_500_005usize; // 12 MiB (2 streams) > NT_MIN_BYTES: forces NT, prologue, mult-of-8 tail
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 23.0) * 0.1 - 1.1).collect();
         for coeffs in [
             vec![3.0f32],                              // constant
