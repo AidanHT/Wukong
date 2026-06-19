@@ -41,6 +41,7 @@ pub fn lower_program(
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         vmath: interner.intern("mercury_vmath_f32"),
         velem: interner.intern("mercury_velem_f32"),
+        vhorner: interner.intern("mercury_vhorner_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         norm: interner.intern("mercury_norm_f32"),
         norm_affine: interner.intern("mercury_norm_affine_f32"),
@@ -381,6 +382,9 @@ struct GemmSyms {
     /// recognized `out[i] = act(a·x[i] (+ b·y[i]) + c)` map loop (saxpy / scale / residual-add /
     /// bias / ReLU / ReLU6) lowers to this — 256-bit AVX2 + non-temporal stores for a large output.
     velem: Symbol,
+    /// The streaming Horner-polynomial kernel (`mercury_vhorner_f32(x, out, n, coeffs, ncoeff)`): a
+    /// recognized `r = c0; r = r*x + c1; …; out[i] = r` per-element polynomial lowers to this.
+    vhorner: Symbol,
     /// The multicore deterministic f32 reduction kernel (`mercury_sreduce_f32_parallel(x, y, n, op)
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
@@ -2399,6 +2403,164 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Match `r = r·v + Ck` (the running Horner step) for accumulator `r` and per-element value `v`,
+    /// either factor order and either `Add` operand order. `Ck` must be a loop-invariant f32 (free of
+    /// the loop var `j`). Returns the coefficient expr. Pure.
+    fn match_horner_step<'b>(&self, stmt: &'b Stmt, r: Symbol, v: Symbol, j: Symbol) -> Option<&'b Expr> {
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if single_path(target) != Some(r) {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let is_rv = |e: &Expr| {
+            matches!(&e.kind, ExprKind::Binary { op: ast::BinOp::Mul, lhs, rhs }
+                if (single_path(lhs) == Some(r) && single_path(rhs) == Some(v))
+                    || (single_path(lhs) == Some(v) && single_path(rhs) == Some(r)))
+        };
+        let ck = if is_rv(lhs) {
+            rhs
+        } else if is_rv(rhs) {
+            lhs
+        } else {
+            return None;
+        };
+        if expr_mentions(ck, j) || self.expr_mir(ck) != MirType::F32 {
+            return None;
+        }
+        Some(ck)
+    }
+
+    /// Recognize a per-element Horner polynomial body and return `(out_base, x_base, coeffs)` (highest
+    /// degree first). The canonical shape (the one gcc/rustc also vectorize, but only at 128-bit):
+    ///
+    /// ```text
+    /// let v: f32 = x[j];          // the element
+    /// let mut r: f32 = C0;        // seed = leading coefficient
+    /// r = r * v + C1;             // one or more Horner steps
+    /// …
+    /// out[j] = r;                 // store
+    /// ```
+    ///
+    /// `v`/`r` are body-local scalars; the coefficients are loop-invariant f32 (the benchmark's are
+    /// literals). Pure (emits no MIR). `None` on any deviation (the generic vectorizer then lowers it).
+    fn match_vhorner_body<'b>(
+        &self,
+        j: Symbol,
+        body: &'b Block,
+    ) -> Option<(ValueId, ValueId, Vec<&'b Expr>)> {
+        if body.tail.is_some() || body.stmts.len() < 4 {
+            return None;
+        }
+        let stmts = &body.stmts;
+        let n = stmts.len();
+        // `let v = x[j]`
+        let (v, v_init) = Self::let_init(&stmts[0])?;
+        let x_sym = self.index_by_loopvar(v_init, j)?;
+        if self.expr_mir(v_init) != MirType::F32 {
+            return None;
+        }
+        // `let mut r = C0` (leading coefficient, loop-invariant f32)
+        let (r, c0) = Self::let_init(&stmts[1])?;
+        if expr_mentions(c0, j) || self.expr_mir(c0) != MirType::F32 {
+            return None;
+        }
+        let mut coeffs = vec![c0];
+        for stmt in &stmts[2..n - 1] {
+            coeffs.push(self.match_horner_step(stmt, r, v, j)?);
+        }
+        // `out[j] = r`
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmts[n - 1].kind
+        else {
+            return None;
+        };
+        let out_sym = self.index_by_loopvar(target, j)?;
+        if single_path(value) != Some(r) {
+            return None;
+        }
+        Some((self.lookup(out_sym)?.0, self.lookup(x_sym)?.0, coeffs))
+    }
+
+    /// Emit one `mercury_vhorner_f32(x+s, out+s, e-s, coeffs, ncoeff)` call: materialize the
+    /// coefficient array on the stack (an entry-block alloca + a store per coefficient, lowered from
+    /// their loop-invariant exprs), then GEP `x`/`out` by `s` and call. The interpreter marshals the
+    /// identical kernel, so the differential oracle stays exact.
+    fn emit_vhorner(&mut self, s: ValueId, e: ValueId, out_base: ValueId, x_base: ValueId, coeffs: &[&Expr]) {
+        let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        let arr = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::F32), coeffs.len() as u32));
+        for (k, ce) in coeffs.iter().enumerate() {
+            let idx = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let p = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: arr,
+                    index: idx,
+                    elem: MirType::F32,
+                },
+            );
+            let cv = self.lower_coeff(Some(ce), 0.0);
+            self.builder.build_void(Op::Store { ptr: p, value: cv });
+        }
+        let gep = |me: &mut Self, base: ValueId| {
+            me.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base,
+                    index: s,
+                    elem: MirType::F32,
+                },
+            )
+        };
+        let xp = gep(self, x_base);
+        let outp = gep(self, out_base);
+        let ncoeff = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(coeffs.len() as i128, MirType::I64));
+        self.builder.build_void(Op::Call {
+            func: self.gemm.vhorner,
+            args: vec![xp, outp, n, arr, ncoeff],
+        });
+    }
+
+    /// Recognize a per-element Horner polynomial loop `for j in lo..hi { let v=x[j]; let mut r=c0; r =
+    /// r*v+c1; …; out[j]=r }` and lower it to one `mercury_vhorner_f32` call — 256-bit AVX2 + (for a
+    /// large output) non-temporal stores, both beyond Cranelift's 128-bit vectorizer. Returns false
+    /// (fall through) unless the body matches.
+    fn try_vhorner_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) else {
+            return false;
+        };
+        let sty = self.expr_mir(start);
+        let s = self.lower_expr(start);
+        let s = self.coerce_to(s, &sty, &MirType::I64, true);
+        let ety = self.expr_mir(end);
+        let e = self.lower_expr(end);
+        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        self.emit_vhorner(s, e, out_base, x_base, &coeffs);
+        true
+    }
+
     /// Attempt SIMD lowering of `for j in start..end { body }`. Returns true on success.
     fn try_vectorize_for(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         let j = match &pat.kind {
@@ -2419,6 +2581,12 @@ impl FnLowerer<'_> {
         // the 256-bit AVX2 + non-temporal-store kernel — both wider than and store-cheaper than the
         // generic 128-bit vectorizer. Tried before it (which would otherwise emit cacheable stores).
         if self.try_velem_for(j, start, end, body) {
+            return true;
+        }
+        // A per-element Horner polynomial `let v=x[j]; let mut r=c0; r=r*v+c1; …; out[j]=r` dispatches
+        // to the 256-bit AVX2 + non-temporal-store Horner kernel (the generic vectorizer would inline
+        // it at 128-bit with cacheable stores).
+        if self.try_vhorner_for(j, start, end, body) {
             return true;
         }
         // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
@@ -2550,6 +2718,13 @@ impl FnLowerer<'_> {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
             self.emit_velem_call(s, e, &plan);
+            return true;
+        }
+        // A Horner polynomial per `@parallel` chunk → the same 256-bit AVX2 + NT-store Horner kernel.
+        if let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) {
+            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+            self.emit_vhorner(s, e, out_base, x_base, &coeffs);
             return true;
         }
         let Some((lane, w)) = self.vectorizable(body, j) else {
