@@ -166,6 +166,7 @@ fn main() {
     bench_linear(&cc, &dir, roof);
     bench_conv(&cc, &dir);
     bench_norm(&cc, &dir);
+    bench_norm_batched(&cc, &dir);
     bench_i8gemm(&cc, &dir);
     bench_streaming_large(&cc, &dir);
 }
@@ -932,6 +933,143 @@ fn rust_norm(cols: usize, op: &str) -> String {
     format!(
         "const C: usize = {cols};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{ \
          for i in 0..C {{ *out.add(i)=*x.add(i); }} {body} }}\n"
+    )
+}
+
+/// Batched RMSNorm over a `[rows, cols]` activation — the *real* transformer shape (norm over
+/// `[batch*seq, hidden]`, one row per token), where `bench_norm`'s single feature row was just one
+/// token. Mercury folds the `for r { <RMSNorm over out[r*C+i]> }` loop into one `mercury_norm_f32`
+/// call (each row a fused single pass); under `@parallel` the independent rows map across cores via
+/// `mercury_norm_f32_parallel`. C/Rust are the idiomatic per-row nested loops at honest defaults
+/// (sequential float reductions, no `-ffast-math`). All three copy `x`→`out` then normalize in place,
+/// so the full-buffer cross-check is valid. The serial row is apples-to-apples (both single-threaded);
+/// the `@parallel` row pits Mercury's automatic SIMD+multicore against idiomatic single-threaded C/Rust.
+fn bench_norm_batched(cc: &str, dir: &Path) {
+    // Two regimes: an L3-resident batch (the fused single-pass *serial* win, both single-threaded), and
+    // a batch whose working set far exceeds L3 — memory-bandwidth-bound, where a single core cannot
+    // saturate DRAM and `@parallel` (rows across cores) pays off. RMSNorm is memory-bound (read twice,
+    // write once), so `@parallel` only helps once the data spills L3 — the same working-set rule as the
+    // streaming-elementwise non-temporal dispatch.
+    for &(rows, cols) in &[(512usize, 768usize), (4096usize, 4096usize)] {
+        let n = rows * cols;
+        let mb = (n * 4) as f64 / (1 << 20) as f64;
+        let x: Vec<f32> = (0..n).map(|i| (i % 17) as f32 * 0.5 + 1.0).collect();
+        let mut out = vec![0.0f32; n];
+        // No affine params here, so the `y` arg is unused; alias it to `x` rather than allocate a buffer.
+        let (xp, yp, op_) = (x.as_ptr(), x.as_ptr(), out.as_mut_ptr());
+        println!(
+            "=== batched RMSNorm, {rows}x{cols} = [tokens, hidden], {mb:.1} MB/buffer (ns/call, lower is better; Mercury → mercury_norm_f32[_parallel]) ==="
+        );
+        println!(
+            "  {:<16} {:>12} {:>12} {:>12} {:>16}",
+            "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
+        );
+        // C/Rust baselines are single-threaded per-row norms — the same for both Mercury rows, so time once.
+        let c = bench_external(
+            "c",
+            &c_norm_batched(rows, cols),
+            dir,
+            "bnorm",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut out,
+            xp,
+            yp,
+            op_,
+        );
+        let rust = bench_external(
+            "rs",
+            &rust_norm_batched(rows, cols),
+            dir,
+            "bnorm",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            xp,
+            yp,
+            op_,
+        );
+        for (label, par) in [("rmsnorm", false), ("rmsnorm@parallel", true)] {
+            let mer = bench_mercury(&mer_norm_batched(rows, cols, par), &mut out, xp, yp, op_);
+            let ns = |m: &Option<Measure>| {
+                m.as_ref()
+                    .map(|x| format!("{:.0}", x.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let standing = if let (Some(m), Some(c)) = (&mer, &c) {
+                let r = c.ns_per_call / m.ns_per_call;
+                format!(
+                    "{:.2}x {}",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                )
+            } else {
+                "n/a".into()
+            };
+            println!(
+                "  {:<16} {:>12} {:>12} {:>12} {:>16}",
+                label,
+                ns(&mer),
+                ns(&c),
+                ns(&rust),
+                standing
+            );
+            // Full-buffer cross-check (f32 tolerance: Mercury reassociates the per-row reductions, C does not).
+            if let (Some(m), Some(c)) = (&mer, &c) {
+                let (rel, at) = max_rel_err(&m.out, &c.out);
+                if rel > 1e-3 {
+                    println!(
+                        "  ! {label} full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                        m.out[at], c.out[at], rel
+                    );
+                }
+            }
+        }
+        println!();
+    }
+}
+
+/// Mercury batched-RMSNorm source: copy `x`→`out`, then the `for r { <RMSNorm over out[r*C+i]> }` form
+/// the `mir_build` recognizer folds to one `mercury_norm_f32(out, out, R, C, eps, op)` call — or, under
+/// `@parallel`, `mercury_norm_f32_parallel` (rows across cores). The `r*{cols}+i` offset and `/{cols}.0`
+/// divisor are exactly the spellings `match_batched_norm` accepts.
+fn mer_norm_batched(rows: usize, cols: usize, parallel: bool) -> String {
+    let n = rows * cols;
+    let attr = if parallel { "@parallel\n" } else { "" };
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{ \
+         for c in 0..{n} {{ out[c] = x[c]; }} \
+         for r in 0..{rows} {{ \
+         let mut s: f32 = 0.0; \
+         for i in 0..{cols} {{ s = s + out[r*{cols}+i] * out[r*{cols}+i]; }} \
+         let inv: f32 = rsqrt(s / {cols}.0 + 0.00001); \
+         for i in 0..{cols} {{ out[r*{cols}+i] = out[r*{cols}+i] * inv; }} }} }}\n"
+    )
+}
+
+fn c_norm_batched(rows: usize, cols: usize) -> String {
+    let n = rows * cols;
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define C {cols}\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
+         for(long i=0;i<N;i++) out[i]=x[i]; \
+         for(long r=0;r<R;r++){{ float* o=out+(long)r*C; \
+         float s=0.0f; for(long i=0;i<C;i++) s+=o[i]*o[i]; \
+         float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
+         for(long i=0;i<C;i++) o[i]*=inv; }} }}\n"
+    )
+}
+
+fn rust_norm_batched(rows: usize, cols: usize) -> String {
+    let n = rows * cols;
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\nconst N: usize = {n};\n\
+         #[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{ \
+         for i in 0..N {{ *out.add(i)=*x.add(i); }} \
+         for r in 0..R {{ let o=out.add(r*C); \
+         let mut s=0.0f32; for i in 0..C {{ let v=*o.add(i); s+=v*v; }} \
+         let inv=1.0f32/(s/(C as f32)+1e-5f32).sqrt(); \
+         for i in 0..C {{ *o.add(i)*=inv; }} }} }}\n"
     )
 }
 
