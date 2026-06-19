@@ -161,7 +161,7 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 
 The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
 Mercury recognizes a pure `out[i] = f(x[i])` loop for
-`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish` and lowers the whole
+`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish` and lowers the whole
 loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same domain-aware dispatch
 as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a time; gcc/rustc call
 scalar `libm` `expf`/`logf`/`tanhf` and **cannot vectorize a loop containing a call** (no `libmvec` on
@@ -187,8 +187,8 @@ auto-vectorize at 128-bit; `erf` gives the exact erf-GELU and `sin`/`cos` give R
 | `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
 The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
-`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`, and
-`fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
+`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`,
+and `fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
 with `libm` within tolerance) and
 compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
 bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
@@ -349,7 +349,7 @@ single-threaded C:
   Rust runs essentially scalar here (~5–12× behind). Integer math makes the cross-language check
   **bit-exact**, not a tolerance.
 - **Transcendentals / activations (exp, log, tanh, sigmoid, GELU, SiLU, ELU, leaky_relu, softplus,
-  mish):** **~5–7.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
+  mish, SELU, tanhshrink, hardsigmoid, hardswish — 15 in all):** **~5–7.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
   ≈1-ULP poly kernel** (`mercury_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
   `expf`/`logf`/`tanhf` call. This is the transformer/vision activation family and the cleanest
   compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).
