@@ -18,6 +18,9 @@ cudarc = { version = "0.16", default-features = false, features = [
     "dynamic-loading",
     "cuda-12060",
 ], optional = true }
+# Used (only under `gpu`) by the tolerance harness as the CPU oracle: the GPU kernels are diffed
+# against the *identical* runtime kernels the interpreter marshals (vmath / sreduce / norm).
+mercury_runtime = { workspace = true, optional = true }
 
 [features]
-gpu = ["dep:cudarc"]
+gpu = ["dep:cudarc", "dep:mercury_runtime"]
