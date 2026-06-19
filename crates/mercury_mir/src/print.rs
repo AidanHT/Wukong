@@ -83,6 +83,15 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Splat(v) => format!("splat {}", val(*v)),
         Op::Fma(a, b, c) => format!("fma {}, {}, {}", val(*a), val(*b), val(*c)),
         Op::Sqrt(a) => format!("sqrt {}", val(*a)),
+        Op::Round(mode, a) => {
+            let m = match mode {
+                crate::inst::RoundMode::Nearest => "nearest",
+                crate::inst::RoundMode::Floor => "floor",
+                crate::inst::RoundMode::Ceil => "ceil",
+                crate::inst::RoundMode::Trunc => "trunc",
+            };
+            format!("round.{m} {}", val(*a))
+        }
     }
 }
 

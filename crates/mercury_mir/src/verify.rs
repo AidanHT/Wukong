@@ -278,6 +278,17 @@ impl Verifier<'_> {
                     }
                 }
             }
+            Op::Round(_, a) => {
+                let ok = self.use_val(*a);
+                if let Some(res) = self.result_ty(result) {
+                    if !res.lane_type().is_float() {
+                        self.err(format!("round on non-float type {}", res.display()));
+                    }
+                    if ok {
+                        self.expect_ty(*a, &res, "round");
+                    }
+                }
+            }
             Op::Splat(v) => {
                 if self.use_val(*v) {
                     if let (Some(vt), Some(res)) = (self.ty(*v).cloned(), self.result_ty(result)) {

@@ -12,7 +12,7 @@ pub mod print;
 pub mod verify;
 
 pub use builder::Builder;
-pub use inst::{BinOp, CastKind, CmpOp, Inst, Op, Terminator};
+pub use inst::{BinOp, CastKind, CmpOp, Inst, Op, RoundMode, Terminator};
 
 use mercury_span::Symbol;
 use mercury_types::Scalar;
