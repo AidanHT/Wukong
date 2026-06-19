@@ -416,6 +416,7 @@ const VMATH_ELU: u32 = 7;
 const VMATH_LEAKYRELU: u32 = 8;
 const VMATH_SOFTPLUS: u32 = 9;
 const VMATH_MISH: u32 = 10;
+const VMATH_SELU: u32 = 11;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2107,6 +2108,7 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::LeakyRelu) => VMATH_LEAKYRELU,
             Some(MathIntrinsic::Softplus) => VMATH_SOFTPLUS,
             Some(MathIntrinsic::Mish) => VMATH_MISH,
+            Some(MathIntrinsic::Selu) => VMATH_SELU,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -2943,7 +2945,8 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Elu
                     | MathIntrinsic::LeakyRelu
                     | MathIntrinsic::Softplus
-                    | MathIntrinsic::Mish,
+                    | MathIntrinsic::Mish
+                    | MathIntrinsic::Selu,
                 ) => {
                     // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
                     // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
@@ -3752,6 +3755,10 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Mish) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_mish(x, vty)
+                }
+                Some(MathIntrinsic::Selu) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_selu(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -4575,6 +4582,10 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_mish(x, &rty))
             }
+            MathIntrinsic::Selu => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_selu(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -4733,6 +4744,28 @@ impl FnLowerer<'_> {
         let sp = self.emit_softplus(x, rty);
         let th = self.emit_tanh(sp, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th))
+    }
+
+    /// `selu(x) = λ·(x>0 ? x : α·(eˣ−1))`, the scaled ELU of self-normalizing networks. Mirrors `selu8`
+    /// op-for-op, including the multiply order `λ·(α·em1)` (float mul isn't associative).
+    fn emit_selu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let lambda = self.splat_const_f(1.050_700_98, rty);
+        let posval = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, lambda, x));
+        let e = self.emit_exp(x, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let em1 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, e, one));
+        let alpha = self.splat_const_f(1.673_263_2, rty);
+        let aem1 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, alpha, em1));
+        let negval = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, lambda, aem1));
+        let zero = self.splat_const_f(0.0, rty);
+        let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(pos, posval, negval))
     }
 
     /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
@@ -6940,6 +6973,7 @@ enum MathIntrinsic {
     LeakyRelu,
     Softplus,
     Mish,
+    Selu,
     Fmax,
     Fmin,
 }
@@ -6962,6 +6996,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "leaky_relu" => MathIntrinsic::LeakyRelu,
         "softplus" => MathIntrinsic::Softplus,
         "mish" => MathIntrinsic::Mish,
+        "selu" => MathIntrinsic::Selu,
         "fmax" => MathIntrinsic::Fmax,
         "fmin" => MathIntrinsic::Fmin,
         _ => return None,

@@ -1,0 +1,26 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1520
+// EXPECT-OUT: -691
+// EXPECT-OUT: 1050
+// EXPECT-OUT: 3152
+module tests.run.selu
+
+// SELU (scaled ELU, self-normalizing networks): out[i] = λ·(x>0 ? x : α·(eˣ−1)) with the fixed
+// λ≈1.0507, α≈1.6733. An `out[i] = selu(x[i])` loop dispatches to the 256-bit AVX2 mercury_vmath_f32
+// kernel (op = SELU); the negative branch reuses the shared ≈1-ULP exp poly, bit-identical across
+// backends.
+//   selu(-2)=λα(e^-2−1)≈-1.520 → -1520; selu(-0.5)≈-0.6915 → -691;
+//   selu(1)=λ·1≈1.0507 → 1050; selu(3)=λ·3≈3.152 → 3152.
+fn main() -> i32 {
+    let x: [f32; 4] = [-2.0, -0.5, 1.0, 3.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        out[i] = selu(x[i]);
+    }
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}

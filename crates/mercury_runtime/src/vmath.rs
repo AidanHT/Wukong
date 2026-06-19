@@ -29,6 +29,12 @@ pub const VM_ELU: i64 = 7;
 pub const VM_LEAKYRELU: i64 = 8;
 pub const VM_SOFTPLUS: i64 = 9;
 pub const VM_MISH: i64 = 10;
+pub const VM_SELU: i64 = 11;
+
+// SELU (self-normalizing networks, Klambauer 2017) constants — the fixed λ, α that make the
+// activation variance-preserving.
+const SELU_LAMBDA: f32 = 1.050_700_98;
+const SELU_ALPHA: f32 = 1.673_263_2;
 
 /// Leaky-ReLU negative-slope (the conventional 0.01); fixed so `leaky_relu` stays a single-arg
 /// intrinsic that fits the elementwise dispatch.
@@ -194,6 +200,18 @@ fn mish1(x: f32) -> f32 {
     x * tanh1(softplus1(x))
 }
 
+/// `selu(x) = λ·(x>0 ? x : α·(eˣ−1))` — the scaled ELU of self-normalizing networks (fixed λ, α).
+/// A scaled [`elu1`]; reuses [`exp1`], so the AVX2 [`selu8`] and tail agree.
+#[inline]
+fn selu1(x: f32) -> f32 {
+    SELU_LAMBDA
+        * if x > 0.0 {
+            x
+        } else {
+            SELU_ALPHA * (exp1(x) - 1.0)
+        }
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -209,6 +227,7 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_LEAKYRELU => leakyrelu1(x),
         VM_SOFTPLUS => softplus1(x),
         VM_MISH => mish1(x),
+        VM_SELU => selu1(x),
         _ => x,
     }
 }
@@ -255,6 +274,7 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_LEAKYRELU => leakyrelu8,
         VM_SOFTPLUS => softplus8,
         VM_MISH => mish8,
+        VM_SELU => selu8,
         _ => return,
     };
     let mut i = 0;
@@ -422,6 +442,20 @@ unsafe fn mish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_mul_ps(x, tanh8(softplus8(x)))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn selu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // λ·(x>0 ? x : α·(eˣ−1)) — mirrors selu1 op-for-op, incl. the multiply *order* `λ·(α·em1)` (float
+    // mul isn't associative, and the scalar tail must match these lanes bit-for-bit).
+    let lambda = _mm256_set1_ps(SELU_LAMBDA);
+    let posval = _mm256_mul_ps(lambda, x);
+    let em1 = _mm256_sub_ps(exp8(x), _mm256_set1_ps(1.0));
+    let negval = _mm256_mul_ps(lambda, _mm256_mul_ps(_mm256_set1_ps(SELU_ALPHA), em1));
+    let pos = _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps());
+    _mm256_blendv_ps(negval, posval, pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +489,11 @@ mod tests {
             // (softplus(−20)≈2e−9 → 0) that a pure-relative check would reject.
             (VM_SOFTPLUS, |x| (1.0 + x.exp()).ln(), 1e-4),
             (VM_MISH, |x| x * (1.0 + x.exp()).ln().tanh(), 2e-4),
+            (
+                VM_SELU,
+                |x| SELU_LAMBDA * if x > 0.0 { x } else { SELU_ALPHA * (x.exp() - 1.0) },
+                2e-5,
+            ),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
