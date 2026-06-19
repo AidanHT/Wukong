@@ -243,36 +243,40 @@ advantage is unchanged; this is what makes the win apply to the norms real model
 just the γ=1 idealization. The interpreter marshals the identical kernel so the differential oracle
 stays bit-for-bit exact, and the recognizer runs pre-opt so `-O0` == `-O3`.
 
-### Batched RMSNorm — the whole `[tokens, hidden]` matrix in one call, and across cores
+### Batched norms — the whole `[tokens, hidden]` matrix in one call, and across cores
 
 A single feature row is one token; a transformer normalizes a whole `[tokens, hidden]` activation.
-Mercury recognizes the **batched** form — `for r in 0..R { <RMSNorm over x[r*C + i]> }`, the row-major
-`[R, C]` matrix — and folds the entire batch into one `mercury_norm_f32(x, x, R, C, …)` call (each row
-a fused single pass), instead of leaving the outer loop to scalar/vectorized code. In a `@parallel`
-function the same batch dispatches to **`mercury_norm_f32_parallel`**, mapping the independent rows
-across cores.
+Mercury recognizes the **batched** form — `for r in 0..R { <norm over x[r*C + i]> }`, the row-major
+`[R, C]` matrix — for all three norms and folds the entire batch into one `mercury_norm_f32(x, x, R, C,
+…)` call (each row a fused single pass), instead of leaving the outer loop to scalar/vectorized code. In
+a `@parallel` function the same batch dispatches to **`mercury_norm_f32_parallel`**, mapping the
+independent rows across cores. Measured as the **Mercury-vs-C runtime ratio**, serial *and* `@parallel`,
+at an L3-resident batch and a batch that spills L3:
 
-RMSNorm is **memory-bound** (it reads each row twice and writes once), so whether multicore helps is
-purely a question of working-set vs cache — the same rule as the non-temporal streaming dispatch:
+| op | 512×768 (1.5 MB, in L3) serial · @parallel | 4096×4096 (64 MB, ≫ L3) serial · @parallel |
+|----|-----|-----|
+| RMSNorm   | **~2.0×** · ~1.1× | **~2.0×** · **~2.9×** |
+| LayerNorm | **~2.5×** · **~1.9×** | **~2.1×** · **~4.0×** |
+| softmax   | **~5.6×** · **~6.1×** | **~4.7×** · **~10.2×** |
 
-| `[rows, cols]` | working set | serial vs C | `@parallel` vs C |
-|----------------|-------------|-------------|------------------|
-| 512 × 768   | 1.5 MB (fits L3) | **~2.1× faster** | ~1.3× — *slower* than serial: no DRAM headroom, so the rayon/contention overhead is pure loss |
-| 4096 × 4096 | 64 MB (≫ L3) | **~2.3× faster** | **~3.6× faster** — ≈1.6× over Mercury's own serial: one core can't saturate DRAM, so rows-across-cores wins |
+The **serial** fused single-pass form is an unconditional win for every norm (~2.0–5.6× vs
+single-threaded C, fused-vs-multipass; softmax most, on its vectorized `exp` vs scalar `expf`). Whether
+`@parallel` *adds* to that depends on where the kernel's bottleneck is:
 
-So the fused single-pass **serial** batched norm is an unconditional win (~2.1–2.3× vs single-threaded
-C, fused-vs-multipass), and `@parallel` is the right lowering **only once the batch spills L3**. Both
-paths marshal the identical per-row kernel through the interpreter, and the multicore kernel has no
+- **RMSNorm is purely memory-bound** (read twice, write once), so multicore only helps once the batch
+  spills L3 (~2.9× at 64 MB); L3-resident it's a wash (~1.1×) — the same working-set rule as the
+  non-temporal streaming dispatch.
+- **softmax is compute-bound** (the vectorized `exp` per element), so `@parallel` pays off *even
+  L3-resident* (~6.1×) and reaches **~10.2×** at scale.
+- **LayerNorm sits between** (two reductions + the center/scale): ~1.9× in L3, ~4.0× past it.
+
+Both paths marshal the identical per-row kernel through the interpreter, and the multicore kernel has no
 cross-row combine, so the differential oracle stays bit-for-bit exact (the runtime's
 `serial_matches_parallel_bit_for_bit` pins the kernel equality; the codegen's
-`differential_parallel_batched_norm` pins the end-to-end dispatch). C/Rust here are the idiomatic
-single-threaded per-row nested loops at honest defaults.
-
-**LayerNorm and softmax batch identically** — `for r { <LayerNorm / softmax over x[r*C + i]> }` folds to
-the same `mercury_norm_f32[_parallel]` call (with `NORM_LAYERNORM` / `NORM_SOFTMAX`), so they inherit the
-same serial-always-wins / `@parallel`-only-past-L3 behavior (they share the kernel and the dispatch path).
-The benchmark measures RMSNorm; the gates (`tests/run/batched_{layernorm,softmax}.mer`, the fuzzer's
-`layernorm_batched`/`softmax_batched` kernels) cover all three for correctness.
+`differential_parallel_batched_norm` pins the end-to-end dispatch; `tests/run/batched_*.mer` and the
+fuzzer's `{rmsnorm,layernorm,softmax}_batched` kernels cover all three). The **affine** forms (a learned
+per-column γ/β) batch the same way — `mercury_norm_affine_f32[_parallel]`, the real transformer norm.
+C/Rust here are the idiomatic single-threaded per-row nested loops at honest defaults.
 
 ### int8 quantized `nn.Linear` — `vpdpbusd` register-blocked, beats gcc single-core
 
