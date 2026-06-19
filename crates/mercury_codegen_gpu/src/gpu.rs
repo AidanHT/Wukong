@@ -383,6 +383,40 @@ pub fn gemm_nt_bf16(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// Fused row-wise normalization on the GPU — the GPU twin of `mercury_norm_f32`. `op` is a `NORM_*`
+/// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. One warp per row; the row
+/// reductions are warp-butterfly all-reduces (deterministic order). Tolerance-gated.
+pub fn norm(
+    g: &mut Gpu,
+    op: i64,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<Vec<f32>, DriverError> {
+    use mercury_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+    assert_eq!(x.len(), rows * cols);
+    let entry = match op {
+        v if v == NORM_SOFTMAX => "softmax",
+        v if v == NORM_LAYERNORM => "layernorm",
+        v if v == NORM_RMSNORM => "rmsnorm",
+        _ => panic!("norm op {op} not implemented on GPU yet"),
+    };
+    let f = g.function("norm", crate::ptx_norm::norm_ptx(), entry)?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let mut out_d = g.stream.memcpy_stod(&vec![0f32; x.len()])?;
+    let (r, c) = (rows as u32, cols as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (r, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&r).arg(&c).arg(&eps).arg(&x_d).arg(&mut out_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&out_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +696,45 @@ mod tests {
                 );
                 eprintln!(
                     "wmma_bf16 {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    fn cpu_norm(op: i64, x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        unsafe {
+            mercury_runtime::mercury_norm_f32(
+                x.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+                eps.to_bits() as i64,
+                op,
+            )
+        };
+        out
+    }
+
+    #[test]
+    fn norms_match_cpu_oracle_within_tol() {
+        use mercury_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX};
+        with_gpu("norms", |g| {
+            let mut rng = crate::diff::Rng::new(0x5037);
+            let (rows, cols) = (128usize, 1024usize);
+            let x = rng.vec(rows * cols, -3.0, 3.0);
+            let eps = 1e-5f32;
+            for (op, label) in [
+                (NORM_SOFTMAX, "softmax"),
+                (NORM_LAYERNORM, "layernorm"),
+                (NORM_RMSNORM, "rmsnorm"),
+            ] {
+                let got = norm(g, op, &x, rows, cols, eps).unwrap();
+                let oracle = cpu_norm(op, &x, rows, cols, eps);
+                let s = crate::diff::assert_close(label, &got, &oracle, 1e-4, 1e-3);
+                eprintln!(
+                    "norm {label:10}: max_abs={:.2e} max_rel={:.2e}",
                     s.max_abs, s.max_rel
                 );
             }
