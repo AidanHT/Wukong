@@ -194,6 +194,26 @@ pub enum Op {
     /// bit-identical. Pure and side-effect-free. (`rsqrt` and `exp` are built from primitive ops,
     /// so they need no dedicated variant.)
     Sqrt(ValueId),
+    /// Round a float to an integral value (scalar or `Vec`), by `RoundMode`; operand and result share
+    /// one float type. Lowers to a hardware round (`roundss`/`roundps`); the interpreter mirrors it
+    /// with the matching `f32`/`f64` method (`Nearest` ⇒ `round_ties_even`, the IEEE
+    /// round-to-nearest-ties-to-even that `nearest` emits — *not* `round`, which is ties-away), so the
+    /// two stay bit-identical. Pure and side-effect-free.
+    Round(RoundMode, ValueId),
+}
+
+/// Rounding direction for [`Op::Round`]. Each maps to one Cranelift instruction and one `f32`/`f64`
+/// method, chosen so the native and interpreter results agree bit-for-bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundMode {
+    /// To nearest, ties to even (`nearest` / `round_ties_even`).
+    Nearest,
+    /// Toward −∞ (`floor`).
+    Floor,
+    /// Toward +∞ (`ceil`).
+    Ceil,
+    /// Toward zero (`trunc`).
+    Trunc,
 }
 
 /// One instruction: an optional result value plus its operation.

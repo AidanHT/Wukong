@@ -504,6 +504,18 @@ impl<'a> Interp<'a> {
                     apply_sqrt(reg(regs, *v), rty)
                 }
             }
+            Op::Round(mode, v) => {
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    let xv = self.vec_lanes(reg(regs, *v));
+                    let lane = (**lane).clone();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| apply_round(*mode, xv[i], Some(&lane)))
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    apply_round(*mode, reg(regs, *v), rty)
+                }
+            }
         })
     }
 
@@ -1148,6 +1160,33 @@ fn apply_sqrt(v: Value, rty: Option<&MirType>) -> Value {
         Value::Float((v.as_float() as f32).sqrt() as f64)
     } else {
         Value::Float(v.as_float().sqrt())
+    }
+}
+
+/// Round to an integral, mirroring the native `roundss`/`roundps` (and `Op::Round`'s contract):
+/// `Nearest` is round-to-nearest-ties-to-**even** (`round_ties_even`, the IEEE form `nearest` emits —
+/// *not* `round`, which is ties-away). Narrow-float results round in `f32` first, like every other op.
+fn apply_round(mode: mercury_mir::RoundMode, v: Value, rty: Option<&MirType>) -> Value {
+    use mercury_mir::RoundMode::*;
+    let f = |x: f64| -> f64 {
+        match mode {
+            Nearest => x.round_ties_even(),
+            Floor => x.floor(),
+            Ceil => x.ceil(),
+            Trunc => x.trunc(),
+        }
+    };
+    if rty.is_some_and(is_narrow_float) {
+        let x = v.as_float() as f32;
+        let r = match mode {
+            Nearest => x.round_ties_even(),
+            Floor => x.floor(),
+            Ceil => x.ceil(),
+            Trunc => x.trunc(),
+        };
+        Value::Float(r as f64)
+    } else {
+        Value::Float(f(v.as_float()))
     }
 }
 

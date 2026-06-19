@@ -464,6 +464,17 @@ impl<'a> FnTranslator<'a> {
                 let x = self.val(*v);
                 self.builder.ins().sqrt(x)
             }
+            // Hardware round-to-integral (scalar or 128-bit vector); the interpreter mirrors each mode
+            // with the matching `f32`/`f64` method (`Nearest` ⇒ `round_ties_even`), so the two agree.
+            Op::Round(mode, v) => {
+                let x = self.val(*v);
+                match mode {
+                    mercury_mir::RoundMode::Nearest => self.builder.ins().nearest(x),
+                    mercury_mir::RoundMode::Floor => self.builder.ins().floor(x),
+                    mercury_mir::RoundMode::Ceil => self.builder.ins().ceil(x),
+                    mercury_mir::RoundMode::Trunc => self.builder.ins().trunc(x),
+                }
+            }
         };
         if let Some(r) = res {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's

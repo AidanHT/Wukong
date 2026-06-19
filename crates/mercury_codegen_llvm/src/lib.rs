@@ -341,6 +341,32 @@ impl Emitter<'_> {
                 };
                 format!("call {ty} @llvm.sqrt.{suffix}({ty} {})", self.operand(*a))
             }
+            Op::Round(mode, a) => {
+                // Map each mode to its LLVM intrinsic (`roundeven` is round-to-nearest-ties-even,
+                // matching Cranelift `nearest` / `round_ties_even`). Same caveat as `sqrt`: this text
+                // path is not the oracle and not assembled here.
+                let r = inst.result.unwrap();
+                let ty = self.ty(r);
+                let suffix = match self.f.value_type(r) {
+                    MirType::F64 => "f64".to_string(),
+                    MirType::Vec(lane, n) => {
+                        let ls = if matches!(**lane, MirType::F64) {
+                            "f64"
+                        } else {
+                            "f32"
+                        };
+                        format!("v{n}{ls}")
+                    }
+                    _ => "f32".to_string(),
+                };
+                let intr = match mode {
+                    mercury_mir::RoundMode::Nearest => "roundeven",
+                    mercury_mir::RoundMode::Floor => "floor",
+                    mercury_mir::RoundMode::Ceil => "ceil",
+                    mercury_mir::RoundMode::Trunc => "trunc",
+                };
+                format!("call {ty} @llvm.{intr}.{suffix}({ty} {})", self.operand(*a))
+            }
         };
         let _ = writeln!(out, "  {line}");
     }
