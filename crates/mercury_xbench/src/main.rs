@@ -1506,6 +1506,35 @@ fn kernels() -> Vec<Kernel> {
                 "for i in 0..N { let v= *x.add(i); *out.add(i)=v/(1.0f32+(-v).exp()); }",
             ),
         },
+        // softplus ln(1+e^x): Mercury dispatches to the vectorized exp+log; C/Rust call scalar libm.
+        // x ∈ [1,9] here, so the idiomatic naive log(1+exp(x)) is overflow-safe and equals Mercury's
+        // stable max(x,0)+log(1+exp(-|x|)) to f32 tolerance.
+        Kernel {
+            name: "softplus",
+            bytes_per_call: 2 * N * 4,
+            note: "softplus ln(1+e^x): Mercury dispatches to a 256-bit AVX2 exp+log kernel; C/Rust scalar",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = softplus(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++){ float v=x[i]; out[i]=logf(1.0f+expf(v)); }"),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); *out.add(i)=(1.0f32+v.exp()).ln(); }",
+            ),
+        },
+        // mish x*tanh(softplus(x)): the heaviest activation (three transcendentals), so the widest
+        // gap vs scalar libm. C/Rust spell tanh and softplus with scalar expf/logf.
+        Kernel {
+            name: "mish",
+            bytes_per_call: 2 * N * 4,
+            note: "mish x*tanh(softplus(x)): Mercury dispatches to a 256-bit AVX2 kernel; C/Rust scalar",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = mish(x[i]); }}")),
+            c: c_kernel(
+                "for(long i=0;i<N;i++){ float v=x[i]; float sp=logf(1.0f+expf(v)); \
+                 out[i]=v*(1.0f-2.0f/(expf(2.0f*sp)+1.0f)); }",
+            ),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); let sp=(1.0f32+v.exp()).ln(); \
+                 *out.add(i)=v*(1.0f32-2.0/((2.0*sp).exp()+1.0)); }",
+            ),
+        },
         // tanh activation, the *identical* exp-based algorithm in all three (Mercury vectorizes it).
         Kernel {
             name: "tanh",
