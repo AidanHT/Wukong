@@ -29,4 +29,7 @@ pub mod ptx_gemm;
 pub mod ptx_wmma;
 
 #[cfg(feature = "gpu")]
+pub mod ptx_norm;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
