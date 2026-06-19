@@ -268,6 +268,12 @@ cross-row combine, so the differential oracle stays bit-for-bit exact (the runti
 `differential_parallel_batched_norm` pins the end-to-end dispatch). C/Rust here are the idiomatic
 single-threaded per-row nested loops at honest defaults.
 
+**LayerNorm and softmax batch identically** — `for r { <LayerNorm / softmax over x[r*C + i]> }` folds to
+the same `mercury_norm_f32[_parallel]` call (with `NORM_LAYERNORM` / `NORM_SOFTMAX`), so they inherit the
+same serial-always-wins / `@parallel`-only-past-L3 behavior (they share the kernel and the dispatch path).
+The benchmark measures RMSNorm; the gates (`tests/run/batched_{layernorm,softmax}.mer`, the fuzzer's
+`layernorm_batched`/`softmax_batched` kernels) cover all three for correctness.
+
 ### int8 quantized `nn.Linear` — `vpdpbusd` register-blocked, beats gcc single-core
 
 Quantized inference runs `nn.Linear` as `C = A·Bᵀ` with **`u8` activations × `i8` weights → an `i32`
