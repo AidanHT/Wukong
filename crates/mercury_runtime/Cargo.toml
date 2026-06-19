@@ -9,3 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 rayon = "1"
+# IEEE f16 scalar conversion for the low-precision (bf16/f16) kernels. f16→f32 is lossless, so the
+# scalar twin matches the F16C `vcvtph2ps` SIMD path bit-for-bit.
+half = "2"

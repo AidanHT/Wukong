@@ -558,15 +558,18 @@ mod tests {
             (VM_MISH, |x| x * (1.0 + x.exp()).ln().tanh(), 2e-4),
             (
                 VM_SELU,
-                |x| SELU_LAMBDA * if x > 0.0 { x } else { SELU_ALPHA * (x.exp() - 1.0) },
+                |x| {
+                    SELU_LAMBDA
+                        * if x > 0.0 {
+                            x
+                        } else {
+                            SELU_ALPHA * (x.exp() - 1.0)
+                        }
+                },
                 2e-5,
             ),
             (VM_TANHSHRINK, |x| x - x.tanh(), 2e-5),
-            (
-                VM_HARDSIGMOID,
-                |x| (x + 3.0).max(0.0).min(6.0) * INV6,
-                1e-6,
-            ),
+            (VM_HARDSIGMOID, |x| (x + 3.0).max(0.0).min(6.0) * INV6, 1e-6),
             (
                 VM_HARDSWISH,
                 |x| x * ((x + 3.0).max(0.0).min(6.0) * INV6),

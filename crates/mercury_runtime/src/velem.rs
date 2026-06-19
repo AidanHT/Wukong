@@ -84,7 +84,11 @@ fn act1(op: i64, v: f32) -> f32 {
 /// caller set `VE_USE_Y`.
 #[inline]
 fn elem1(op: i64, x: f32, y: f32, a: f32, b: f32, c: f32) -> f32 {
-    let inner = if op & VE_USE_Y != 0 { b.mul_add(y, c) } else { c };
+    let inner = if op & VE_USE_Y != 0 {
+        b.mul_add(y, c)
+    } else {
+        c
+    };
     act1(op, a.mul_add(x, inner))
 }
 
@@ -367,19 +371,28 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 19.0) - 7.0).collect();
         let y: Vec<f32> = (0..n).map(|i| (i as f32 % 11.0) * 0.5 - 2.0).collect();
         let cases: &[(i64, f32, f32, f32)] = &[
-            (VE_ID | VE_USE_Y, 2.0, 1.0, 0.0),   // saxpy
-            (VE_ID, 3.5, 0.0, 0.0),              // scale
-            (VE_ID | VE_USE_Y, 1.0, 1.0, 0.0),   // residual add
-            (VE_ID, 1.0, 0.0, 0.75),             // bias
-            (VE_RELU, 1.0, 0.0, 0.0),            // relu
-            (VE_RELU, 2.0, 0.0, 1.0),            // fused linear→relu
-            (VE_RELU6, 1.0, 0.0, 0.0),           // relu6
+            (VE_ID | VE_USE_Y, 2.0, 1.0, 0.0), // saxpy
+            (VE_ID, 3.5, 0.0, 0.0),            // scale
+            (VE_ID | VE_USE_Y, 1.0, 1.0, 0.0), // residual add
+            (VE_ID, 1.0, 0.0, 0.75),           // bias
+            (VE_RELU, 1.0, 0.0, 0.0),          // relu
+            (VE_RELU, 2.0, 0.0, 1.0),          // fused linear→relu
+            (VE_RELU6, 1.0, 0.0, 0.0),         // relu6
             (VE_RELU6 | VE_USE_Y, 1.0, 1.0, 0.0),
         ];
         for &(op, a, b, c) in cases {
             let mut got = vec![0.0f32; n];
             unsafe {
-                mercury_velem_f32(x.as_ptr(), y.as_ptr(), got.as_mut_ptr(), n as i64, a, b, c, op);
+                mercury_velem_f32(
+                    x.as_ptr(),
+                    y.as_ptr(),
+                    got.as_mut_ptr(),
+                    n as i64,
+                    a,
+                    b,
+                    c,
+                    op,
+                );
             }
             for i in 0..n {
                 let yi = if op & VE_USE_Y != 0 { y[i] } else { 0.0 };
@@ -410,7 +423,11 @@ mod tests {
             );
         }
         for i in 0..n {
-            assert_eq!(got[i].to_bits(), 2.0f32.mul_add(x[i], y[i]).to_bits(), "i {i}");
+            assert_eq!(
+                got[i].to_bits(),
+                2.0f32.mul_add(x[i], y[i]).to_bits(),
+                "i {i}"
+            );
         }
     }
 
@@ -421,9 +438,9 @@ mod tests {
         let n = 1_500_005usize; // 12 MiB (2 streams) > NT_MIN_BYTES: forces NT, prologue, mult-of-8 tail
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 23.0) * 0.1 - 1.1).collect();
         for coeffs in [
-            vec![3.0f32],                              // constant
-            vec![2.0f32, -1.0],                        // linear
-            vec![1e-5f32, 1e-4, 1e-3, 1e-2, 1e-1],     // the deg-4 poly benchmark
+            vec![3.0f32],                          // constant
+            vec![2.0f32, -1.0],                    // linear
+            vec![1e-5f32, 1e-4, 1e-3, 1e-2, 1e-1], // the deg-4 poly benchmark
         ] {
             let mut got = vec![0.0f32; n];
             unsafe {
@@ -436,7 +453,12 @@ mod tests {
                 );
             }
             for i in 0..n {
-                assert_eq!(got[i].to_bits(), horner1(x[i], &coeffs).to_bits(), "deg {} i {i}", coeffs.len());
+                assert_eq!(
+                    got[i].to_bits(),
+                    horner1(x[i], &coeffs).to_bits(),
+                    "deg {} i {i}",
+                    coeffs.len()
+                );
             }
         }
     }

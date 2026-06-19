@@ -584,6 +584,7 @@ dependencies = [
 name = "mercury_runtime"
 version = "0.1.0"
 dependencies = [
+ "half",
  "rayon",
 ]
 

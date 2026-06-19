@@ -1,0 +1,406 @@
+//! Low-precision (bf16 / f16) CPU reduction kernels with an **f32 accumulator** — the standard
+//! mixed-precision contract. On this AVX2+F16C box there is no native bf16/f16 MAC, so low precision
+//! is a **bandwidth / footprint** win, not a FLOP/s one: a reduction over half-width inputs streams
+//! half the bytes, so a memory-bound reduction runs ~2× faster than its f32 twin. We widen on load
+//! (F16C `vcvtph2ps` for f16; a `<<16` bit-extend for bf16 — both *lossless*) and accumulate in f32.
+//!
+//! Determinism / twin contract: the SIMD path keeps 8 lane accumulators (lane `l` sums elements
+//! `8k+l` in ascending `k`) and combines them with a fixed tree; the scalar twin keeps the identical
+//! 8 logical lanes, so SIMD == scalar **bit-for-bit** (a test pins this across partial tails). The
+//! widen is exact, so the only float rounding is the f32 accumulation — identical in both paths.
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+use crate::bf16_bits_to_f32;
+
+/// IEEE f16 (stored bits) → f32. Lossless, so it equals the F16C `vcvtph2ps` result exactly.
+#[inline]
+fn f16_to_f32(h: u16) -> f32 {
+    half::f16::from_bits(h).to_f32()
+}
+
+/// Fixed 8-lane horizontal combine tree (the same order the scalar twin and the SIMD path use).
+#[inline]
+fn hcombine8(l: &[f32; 8]) -> f32 {
+    ((l[0] + l[1]) + (l[2] + l[3])) + ((l[4] + l[5]) + (l[6] + l[7]))
+}
+
+/// Element kind for the generic scalar twin.
+#[derive(Clone, Copy)]
+enum Half {
+    F16,
+    Bf16,
+}
+
+impl Half {
+    #[inline]
+    fn widen(self, bits: u16) -> f32 {
+        match self {
+            Half::F16 => f16_to_f32(bits),
+            Half::Bf16 => bf16_bits_to_f32(bits),
+        }
+    }
+}
+
+/// Scalar twin of the SIMD sum: 8 logical lane accumulators, fixed combine, scalar tail. This is the
+/// reference the SIMD path must match bit-for-bit, and the no-AVX2 fallback.
+fn sum_scalar(kind: Half, x: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = [0.0f32; 8];
+    for c in 0..chunks {
+        for (l, a) in acc.iter_mut().enumerate() {
+            *a += kind.widen(x[c * 8 + l]);
+        }
+    }
+    let mut s = hcombine8(&acc);
+    for &v in &x[chunks * 8..] {
+        s += kind.widen(v);
+    }
+    s
+}
+
+/// Scalar twin of the SIMD dot (f32-accumulated, fused like the SIMD `fmadd`).
+fn dot_scalar(kind: Half, x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = [0.0f32; 8];
+    for c in 0..chunks {
+        for (l, a) in acc.iter_mut().enumerate() {
+            *a = kind
+                .widen(x[c * 8 + l])
+                .mul_add(kind.widen(y[c * 8 + l]), *a);
+        }
+    }
+    let mut s = hcombine8(&acc);
+    for i in chunks * 8..n {
+        s = kind.widen(x[i]).mul_add(kind.widen(y[i]), s);
+    }
+    s
+}
+
+// ---- SIMD widen helpers (8 lanes) ----
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+#[inline]
+unsafe fn widen_f16(p: *const u16) -> __m256 {
+    _mm256_cvtph_ps(_mm_loadu_si128(p as *const __m128i))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn widen_bf16(p: *const u16) -> __m256 {
+    // zero-extend 8×u16 → 8×u32, shift the bf16 bits into the f32 high half, reinterpret.
+    let lo = _mm_loadu_si128(p as *const __m128i);
+    let w = _mm256_cvtepu16_epi32(lo);
+    _mm256_castsi256_ps(_mm256_slli_epi32(w, 16))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+unsafe fn sum_f16_avx(x: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        acc = _mm256_add_ps(acc, widen_f16(x.as_ptr().add(c * 8)));
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut s = hcombine8(&lanes);
+    for &v in &x[chunks * 8..] {
+        s += f16_to_f32(v);
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_bf16_avx(x: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        acc = _mm256_add_ps(acc, widen_bf16(x.as_ptr().add(c * 8)));
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut s = hcombine8(&lanes);
+    for &v in &x[chunks * 8..] {
+        s += bf16_bits_to_f32(v);
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c,fma")]
+unsafe fn dot_f16_avx(x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        let a = widen_f16(x.as_ptr().add(c * 8));
+        let b = widen_f16(y.as_ptr().add(c * 8));
+        acc = _mm256_fmadd_ps(a, b, acc);
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut s = hcombine8(&lanes);
+    for i in chunks * 8..n {
+        s = f16_to_f32(x[i]).mul_add(f16_to_f32(y[i]), s);
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_avx(x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        let a = widen_bf16(x.as_ptr().add(c * 8));
+        let b = widen_bf16(y.as_ptr().add(c * 8));
+        acc = _mm256_fmadd_ps(a, b, acc);
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut s = hcombine8(&lanes);
+    for i in chunks * 8..n {
+        s = bf16_bits_to_f32(x[i]).mul_add(bf16_bits_to_f32(y[i]), s);
+    }
+    s
+}
+
+// ---- Public C-ABI entry points (f32-accumulated) ----
+
+/// `sum(widen(x[i]))` over `n` IEEE-f16 values (stored as `u16` bits), accumulated in f32.
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sum_f16(x: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+        return sum_f16_avx(x);
+    }
+    sum_scalar(Half::F16, x)
+}
+
+/// `sum(widen(x[i]))` over `n` bf16 values (stored as `u16` bits), accumulated in f32.
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sum_bf16(x: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return sum_bf16_avx(x);
+    }
+    sum_scalar(Half::Bf16, x)
+}
+
+/// `sum(widen(x[i])·widen(y[i]))` over `n` IEEE-f16 values, accumulated in f32.
+///
+/// # Safety
+/// `x` and `y` must each point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_dot_f16(x: *const u16, y: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let x = std::slice::from_raw_parts(x, n as usize);
+    let y = std::slice::from_raw_parts(y, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+        return dot_f16_avx(x, y);
+    }
+    dot_scalar(Half::F16, x, y)
+}
+
+/// `sum(widen(x[i])·widen(y[i]))` over `n` bf16 values, accumulated in f32.
+///
+/// # Safety
+/// `x` and `y` must each point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_dot_bf16(x: *const u16, y: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let x = std::slice::from_raw_parts(x, n as usize);
+    let y = std::slice::from_raw_parts(y, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return dot_bf16_avx(x, y);
+    }
+    dot_scalar(Half::Bf16, x, y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bf16_bits(x: f32) -> u16 {
+        crate::f32_to_bf16_bits(x)
+    }
+    fn f16_bits(x: f32) -> u16 {
+        half::f16::from_f32(x).to_bits()
+    }
+
+    #[test]
+    fn simd_equals_scalar_twin_bit_for_bit() {
+        // include a non-multiple-of-8 tail
+        for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
+            let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013 - 3.1).sin()).collect();
+            let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.019 + 1.7).cos()).collect();
+            let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
+            let yf16: Vec<u16> = ys.iter().map(|&v| f16_bits(v)).collect();
+            let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+            let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+
+            unsafe {
+                assert_eq!(
+                    mercury_sum_f16(xf16.as_ptr(), n as i64).to_bits(),
+                    sum_scalar(Half::F16, &xf16).to_bits(),
+                    "sum_f16 n={n}"
+                );
+                assert_eq!(
+                    mercury_sum_bf16(xbf.as_ptr(), n as i64).to_bits(),
+                    sum_scalar(Half::Bf16, &xbf).to_bits(),
+                    "sum_bf16 n={n}"
+                );
+                assert_eq!(
+                    mercury_dot_f16(xf16.as_ptr(), yf16.as_ptr(), n as i64).to_bits(),
+                    dot_scalar(Half::F16, &xf16, &yf16).to_bits(),
+                    "dot_f16 n={n}"
+                );
+                assert_eq!(
+                    mercury_dot_bf16(xbf.as_ptr(), ybf.as_ptr(), n as i64).to_bits(),
+                    dot_scalar(Half::Bf16, &xbf, &ybf).to_bits(),
+                    "dot_bf16 n={n}"
+                );
+            }
+        }
+    }
+
+    /// Bandwidth win: a reduction over half-width inputs streams half the bytes, so for a working
+    /// set well past L3 it runs ~2× faster than the f32 reduction. Compares Mercury's SIMD bf16/f16
+    /// sum to Mercury's tuned f32 sum AND to a plain (rustc-autovectorized) Rust f32/bf16 sum.
+    /// Run: `cargo test -p mercury_runtime --release lowp_bandwidth -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "bandwidth bench; run explicitly in --release"]
+    fn lowp_bandwidth() {
+        use std::time::Instant;
+        let n = 32 << 20; // 32M elements — 128 MB f32, 64 MB half, both ≫ L3
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 251) as f32) * 0.001).collect();
+        let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
+        let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+
+        let best = |iters: usize, mut f: Box<dyn FnMut() -> f32>| -> f64 {
+            let _ = f(); // warmup
+            let mut t = f64::INFINITY;
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                std::hint::black_box(f());
+                t = t.min(t0.elapsed().as_secs_f64());
+            }
+            t
+        };
+
+        let xs2 = xs.clone();
+        let t_rust_f32 = best(5, Box::new(move || xs2.iter().copied().sum()));
+        let xp = xs.as_ptr() as usize;
+        let t_merc_f32 = best(
+            5,
+            Box::new(move || unsafe {
+                crate::mercury_sreduce_f32(
+                    xp as *const f32,
+                    xp as *const f32,
+                    n as i64,
+                    crate::RED_SUM,
+                )
+            }),
+        );
+        let xbf2 = xbf.clone();
+        let t_rust_bf16 = best(
+            5,
+            Box::new(move || xbf2.iter().map(|&b| bf16_bits_to_f32(b)).sum()),
+        );
+        let bp = xbf.as_ptr() as usize;
+        let t_merc_bf16 = best(
+            5,
+            Box::new(move || unsafe { mercury_sum_bf16(bp as *const u16, n as i64) }),
+        );
+        let fp = xf16.as_ptr() as usize;
+        let t_merc_f16 = best(
+            5,
+            Box::new(move || unsafe { mercury_sum_f16(fp as *const u16, n as i64) }),
+        );
+
+        let gbps = |bytes: f64, t: f64| bytes / t / 1e9;
+        let nf = n as f64;
+        eprintln!("sum over {n} elements (best of 5):");
+        eprintln!(
+            "  rust f32 (autovec): {:.2} ms  {:.0} GB/s",
+            t_rust_f32 * 1e3,
+            gbps(4.0 * nf, t_rust_f32)
+        );
+        eprintln!(
+            "  merc f32 (AVX2):    {:.2} ms  {:.0} GB/s",
+            t_merc_f32 * 1e3,
+            gbps(4.0 * nf, t_merc_f32)
+        );
+        eprintln!(
+            "  rust bf16 (autovec):{:.2} ms  {:.0} GB/s",
+            t_rust_bf16 * 1e3,
+            gbps(2.0 * nf, t_rust_bf16)
+        );
+        eprintln!(
+            "  merc bf16 (AVX2):   {:.2} ms  {:.0} GB/s  → {:.2}× vs merc-f32",
+            t_merc_bf16 * 1e3,
+            gbps(2.0 * nf, t_merc_bf16),
+            t_merc_f32 / t_merc_bf16
+        );
+        eprintln!(
+            "  merc f16  (F16C):   {:.2} ms  {:.0} GB/s  → {:.2}× vs merc-f32",
+            t_merc_f16 * 1e3,
+            gbps(2.0 * nf, t_merc_f16),
+            t_merc_f32 / t_merc_f16
+        );
+    }
+
+    #[test]
+    fn within_ulp_tolerance_of_f64_reference() {
+        let n = 1 << 16;
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 97) as f32) * 0.01).collect();
+        let ys: Vec<f32> = (0..n).map(|i| ((i % 53) as f32) * 0.02).collect();
+        // f16 sum
+        let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
+        let ref_sum: f64 = xf16.iter().map(|&b| f16_to_f32(b) as f64).sum();
+        let got = unsafe { mercury_sum_f16(xf16.as_ptr(), n as i64) };
+        let rel = (got as f64 - ref_sum).abs() / ref_sum.abs().max(1.0);
+        assert!(rel < 1e-3, "f16 sum rel {rel:.2e}");
+        // bf16 dot
+        let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+        let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+        let ref_dot: f64 = xbf
+            .iter()
+            .zip(&ybf)
+            .map(|(&a, &b)| bf16_bits_to_f32(a) as f64 * bf16_bits_to_f32(b) as f64)
+            .sum();
+        let got = unsafe { mercury_dot_bf16(xbf.as_ptr(), ybf.as_ptr(), n as i64) };
+        let rel = (got as f64 - ref_dot).abs() / ref_dot.abs().max(1.0);
+        assert!(rel < 1e-2, "bf16 dot rel {rel:.2e}");
+    }
+}
