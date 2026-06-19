@@ -1,0 +1,25 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -145
+// EXPECT-OUT: -303
+// EXPECT-OUT: 865
+// EXPECT-OUT: 3997
+module tests.run.mish
+
+// Mish (self-gated smooth activation, YOLOv4 / modern vision): out[i] = x · tanh(softplus(x)). An
+// `out[i] = mish(x[i])` loop dispatches to the 256-bit AVX2 mercury_vmath_f32 kernel (op = MISH),
+// composed from the shared softplus + tanh, so bit-identical across backends.
+//   mish(-3)=-3·tanh(0.0486)≈-0.1457 → -145; mish(-1)=-tanh(0.3133)≈-0.3035 → -303;
+//   mish(1)=tanh(1.3133)≈0.8654 → 865; mish(4)=4·tanh(4.0181)≈3.9973 → 3997.
+fn main() -> i32 {
+    let x: [f32; 4] = [-3.0, -1.0, 1.0, 4.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        out[i] = mish(x[i]);
+    }
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}

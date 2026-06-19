@@ -1,0 +1,26 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 48
+// EXPECT-OUT: 313
+// EXPECT-OUT: 1313
+// EXPECT-OUT: 4018
+module tests.run.softplus
+
+// Softplus (smooth ReLU): out[i] = ln(1 + e^x). An `out[i] = softplus(x[i])` loop dispatches to the
+// 256-bit AVX2 mercury_vmath_f32 kernel (op = SOFTPLUS), evaluated in the stable form
+// max(x,0) + ln(1 + e^{-|x|}) (no overflow); reuses the shared exp/log polys, so bit-identical
+// across backends.
+//   softplus(-3)=ln(1+e^-3)≈0.0486 → 48; softplus(-1)≈0.3133 → 313;
+//   softplus(1)≈1.3133 → 1313; softplus(4)≈4.0181 → 4018.
+fn main() -> i32 {
+    let x: [f32; 4] = [-3.0, -1.0, 1.0, 4.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        out[i] = softplus(x[i]);
+    }
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}
