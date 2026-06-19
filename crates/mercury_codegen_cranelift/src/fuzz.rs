@@ -191,6 +191,18 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        Kernel {
+            name: "softplus",
+            src: |n| ew(n, "out[i] = softplus(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "mish",
+            src: |n| ew(n, "out[i] = mish(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
         // Reductions (result lands in out[0]); the rest of `out` stays 0 on both backends.
         Kernel {
             name: "dot",

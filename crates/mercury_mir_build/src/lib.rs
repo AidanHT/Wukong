@@ -414,6 +414,8 @@ const VMATH_SILU: u32 = 5;
 const VMATH_GELU: u32 = 6;
 const VMATH_ELU: u32 = 7;
 const VMATH_LEAKYRELU: u32 = 8;
+const VMATH_SOFTPLUS: u32 = 9;
+const VMATH_MISH: u32 = 10;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2103,6 +2105,8 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Gelu) => VMATH_GELU,
             Some(MathIntrinsic::Elu) => VMATH_ELU,
             Some(MathIntrinsic::LeakyRelu) => VMATH_LEAKYRELU,
+            Some(MathIntrinsic::Softplus) => VMATH_SOFTPLUS,
+            Some(MathIntrinsic::Mish) => VMATH_MISH,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -2937,7 +2941,9 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Silu
                     | MathIntrinsic::Gelu
                     | MathIntrinsic::Elu
-                    | MathIntrinsic::LeakyRelu,
+                    | MathIntrinsic::LeakyRelu
+                    | MathIntrinsic::Softplus
+                    | MathIntrinsic::Mish,
                 ) => {
                     // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
                     // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
@@ -3738,6 +3744,14 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::LeakyRelu) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_leaky_relu(x, vty)
+                }
+                Some(MathIntrinsic::Softplus) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_softplus(x, vty)
+                }
+                Some(MathIntrinsic::Mish) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_mish(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -4553,6 +4567,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_leaky_relu(x, &rty))
             }
+            MathIntrinsic::Softplus => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_softplus(x, &rty))
+            }
+            MathIntrinsic::Mish => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_mish(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -4678,6 +4700,39 @@ impl FnLowerer<'_> {
         let zero = self.splat_const_f(0.0, rty);
         let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
         self.builder.build(rty.clone(), Op::Select(pos, x, scaled))
+    }
+
+    /// `softplus(x) = ln(1 + e^x)`, the smooth ReLU, in the stable form `max(x,0) + ln(1 + e^{−|x|})`
+    /// (the `exp` never overflows). `|x|` is `max(x, −x)` here (vs the kernel's bit-clear abs — the two
+    /// differ only at ±0, which is washed out by the following `exp`, and a loop dispatches to the
+    /// kernel regardless). Reuses `emit_exp`/`emit_log`, so it is bit-identical across backends.
+    fn emit_softplus(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let zero = self.splat_const_f(0.0, rty);
+        let negx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
+        let gtm = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
+        let absx = self.builder.build(rty.clone(), Op::Select(gtm, x, negx));
+        let nabs = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, absx));
+        let e = self.emit_exp(nabs, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let onepe = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, e));
+        let l = self.emit_log(onepe, rty);
+        let posm = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        let relux = self.builder.build(rty.clone(), Op::Select(posm, x, zero));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, relux, l))
+    }
+
+    /// `mish(x) = x · tanh(softplus(x))`, the self-gated smooth activation. Mirrors `mish8` op-for-op.
+    fn emit_mish(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let sp = self.emit_softplus(x, rty);
+        let th = self.emit_tanh(sp, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th))
     }
 
     /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
@@ -6883,6 +6938,8 @@ enum MathIntrinsic {
     Gelu,
     Elu,
     LeakyRelu,
+    Softplus,
+    Mish,
     Fmax,
     Fmin,
 }
@@ -6903,6 +6960,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "gelu" => MathIntrinsic::Gelu,
         "elu" => MathIntrinsic::Elu,
         "leaky_relu" => MathIntrinsic::LeakyRelu,
+        "softplus" => MathIntrinsic::Softplus,
+        "mish" => MathIntrinsic::Mish,
         "fmax" => MathIntrinsic::Fmax,
         "fmin" => MathIntrinsic::Fmin,
         _ => return None,

@@ -23,6 +23,8 @@ pub const VM_SILU: i64 = 5;
 pub const VM_GELU: i64 = 6;
 pub const VM_ELU: i64 = 7;
 pub const VM_LEAKYRELU: i64 = 8;
+pub const VM_SOFTPLUS: i64 = 9;
+pub const VM_MISH: i64 = 10;
 
 /// Leaky-ReLU negative-slope (the conventional 0.01); fixed so `leaky_relu` stays a single-arg
 /// intrinsic that fits the elementwise dispatch.
@@ -173,6 +175,21 @@ fn leakyrelu1(x: f32) -> f32 {
     }
 }
 
+/// `softplus(x) = ln(1 + e^x)`, the smooth ReLU — evaluated in the numerically stable form
+/// `max(x,0) + ln(1 + e^{−|x|})` so the `exp` never overflows for large positive `x` (it saturates to
+/// `x`) and underflows cleanly to 0 for large negative `x`. Reuses [`exp1`]/[`log1`], so the AVX2
+/// [`softplus8`], the tail, and the composed scalar MIR agree.
+#[inline]
+fn softplus1(x: f32) -> f32 {
+    x.max(0.0) + log1(1.0 + exp1(-x.abs()))
+}
+
+/// `mish(x) = x · tanh(softplus(x))` — the smooth, self-gated activation (YOLOv4 / modern vision).
+#[inline]
+fn mish1(x: f32) -> f32 {
+    x * tanh1(softplus1(x))
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -186,6 +203,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_GELU => gelu1(x),
         VM_ELU => elu1(x),
         VM_LEAKYRELU => leakyrelu1(x),
+        VM_SOFTPLUS => softplus1(x),
+        VM_MISH => mish1(x),
         _ => x,
     }
 }
@@ -230,6 +249,8 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_GELU => gelu8,
         VM_ELU => elu8,
         VM_LEAKYRELU => leakyrelu8,
+        VM_SOFTPLUS => softplus8,
+        VM_MISH => mish8,
         _ => return,
     };
     let mut i = 0;
@@ -375,6 +396,28 @@ unsafe fn leakyrelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 
     _mm256_blendv_ps(scaled, x, pos)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softplus8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // max(x,0) + log(1 + exp(-|x|)) — the stable softplus, mirroring softplus1. `|x|` clears the sign
+    // bit (== f32::abs), matching the scalar twin bit-for-bit.
+    let absx = _mm256_and_ps(x, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF)));
+    let nabs = _mm256_sub_ps(_mm256_setzero_ps(), absx);
+    let e = exp8(nabs);
+    let l = log8(_mm256_add_ps(_mm256_set1_ps(1.0), e));
+    let relu = _mm256_max_ps(x, _mm256_setzero_ps());
+    _mm256_add_ps(relu, l)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn mish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x · tanh(softplus(x)) — mirrors mish1.
+    _mm256_mul_ps(x, tanh8(softplus8(x)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +447,10 @@ mod tests {
                 |x| if x > 0.0 { x } else { LEAKY_ALPHA * x },
                 1e-6,
             ),
+            // softplus/mish: the mixed bound's absolute floor covers the underflowing tail
+            // (softplus(−20)≈2e−9 → 0) that a pure-relative check would reject.
+            (VM_SOFTPLUS, |x| (1.0 + x.exp()).ln(), 1e-4),
+            (VM_MISH, |x| x * (1.0 + x.exp()).ln().tanh(), 2e-4),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
