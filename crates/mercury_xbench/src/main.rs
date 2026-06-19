@@ -167,6 +167,7 @@ fn main() {
     bench_conv(&cc, &dir);
     bench_norm(&cc, &dir);
     bench_i8gemm(&cc, &dir);
+    bench_streaming_large(&cc, &dir);
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -1633,6 +1634,116 @@ fn kernels() -> Vec<Kernel> {
     ]
 }
 
+/// Streaming elementwise at a **>L3** tensor size — the regime that matters for real activation
+/// tensors (a `[batch, seq, hidden]` block is hundreds of MB, far larger than the 4 MiB kernels
+/// above). At N=2²⁴ (64 MiB/array) the working set cannot stay in cache, so Mercury's recognized
+/// streaming maps dispatch to `mercury_velem_f32` with **non-temporal** stores, skipping the
+/// read-for-ownership traffic gcc/rustc pay on every cacheable store (a store path they will not emit
+/// automatically). The lead is larger here than at 2²⁰, where the RFO is partly absorbed by L3.
+fn bench_streaming_large(cc: &str, dir: &Path) {
+    const NL: usize = 1 << 24; // 16,777,216 elements, 64 MiB per f32 array
+    let x: Vec<f32> = (0..NL).map(|i| (i % 17) as f32 * 0.5 - 3.0).collect();
+    let y: Vec<f32> = (0..NL).map(|i| (i % 13) as f32 * 0.25 - 0.5).collect();
+    let mut out = vec![0.0f32; NL];
+    let (xp, yp, op) = (x.as_ptr(), y.as_ptr(), out.as_mut_ptr());
+    println!("=== streaming elementwise at N=2^24 (64 MiB/array, >L3; GB/s, higher is better) ===");
+    println!(
+        "  {:<10} {:>10} {:>10} {:>10} {:>14}",
+        "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
+    );
+    // (name, body-in-each-language(identical math), traffic bytes/call)
+    let cases: [(&str, String, String, String, usize); 4] = [
+        (
+            "saxpy",
+            format!("for i in 0..{NL} {{ out[i] = 2.0 * x[i] + y[i]; }}"),
+            "for(long i=0;i<N;i++) out[i]=2.0f*x[i]+y[i];".into(),
+            "for i in 0..N { *out.add(i)=2.0* *x.add(i)+ *y.add(i); }".into(),
+            3 * NL * 4,
+        ),
+        (
+            "residual",
+            format!("for i in 0..{NL} {{ out[i] = x[i] + y[i]; }}"),
+            "for(long i=0;i<N;i++) out[i]=x[i]+y[i];".into(),
+            "for i in 0..N { *out.add(i)= *x.add(i)+ *y.add(i); }".into(),
+            3 * NL * 4,
+        ),
+        (
+            "scale",
+            format!("for i in 0..{NL} {{ out[i] = 0.5 * x[i]; }}"),
+            "for(long i=0;i<N;i++) out[i]=0.5f*x[i];".into(),
+            "for i in 0..N { *out.add(i)=0.5* *x.add(i); }".into(),
+            2 * NL * 4,
+        ),
+        (
+            "relu",
+            format!("for i in 0..{NL} {{ out[i] = if x[i] > 0.0 {{ x[i] }} else {{ 0.0 }}; }}"),
+            "for(long i=0;i<N;i++){ float v=x[i]; out[i]= v>0.0f? v:0.0f; }".into(),
+            "for i in 0..N { let v= *x.add(i); *out.add(i)= if v>0.0 {v} else {0.0}; }".into(),
+            2 * NL * 4,
+        ),
+    ];
+    for (name, mb, cb, rb, bytes) in &cases {
+        let mer = bench_mercury(&mer_kernel_n(NL, mb), &mut out, xp, yp, op);
+        let c = bench_external(
+            "c",
+            &c_kernel_n(NL, cb),
+            dir,
+            &format!("stream_{name}"),
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        let rust = bench_external(
+            "rs",
+            &rust_kernel_n(NL, rb),
+            dir,
+            &format!("stream_{name}"),
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        let gbs = |m: &Option<Measure>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", *bytes as f64 / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        let standing = if let (Some(m), Some(c)) = (&mer, &c) {
+            let r = c.ns_per_call / m.ns_per_call;
+            format!(
+                "{:.2}x {}",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            )
+        } else {
+            "n/a".into()
+        };
+        println!(
+            "  {:<10} {:>10} {:>10} {:>10} {:>14}",
+            name,
+            gbs(&mer),
+            gbs(&c),
+            gbs(&rust),
+            standing
+        );
+        if let (Some(m), Some(c)) = (&mer, &c) {
+            let (rel, at) = max_rel_err(&m.out, &c.out);
+            if rel > 1e-4 {
+                println!(
+                    "  ! {name} full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                    m.out[at], c.out[at], rel
+                );
+            }
+        }
+    }
+    println!();
+}
+
 fn mer_kernel(body: &str) -> String {
     format!(
         "module bench\nfn kbench(x: [f32; {N}], y: [f32; {N}], out: [f32; {N}]) {{\n    {body}\n}}\n"
@@ -1654,4 +1765,16 @@ fn rust_kernel(body: &str) -> String {
     // `#[allow(unused_variables)]`: some kernels (relu, poly) don't read `y`; the fixed `(x,y,out)`
     // ABI keeps the param, so silence the warning rather than clutter the benchmark output.
     format!("const N: usize = {N};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
+}
+
+// Parameterized kernel builders (an explicit element count `n`) — used by the large-tensor streaming
+// benchmark, which runs at N=2²⁴ rather than the module-global N=2²⁰.
+fn mer_kernel_n(n: usize, body: &str) -> String {
+    format!("module bench\nfn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n    {body}\n}}\n")
+}
+fn c_kernel_n(n: usize, body: &str) -> String {
+    format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")
+}
+fn rust_kernel_n(n: usize, body: &str) -> String {
+    format!("const N: usize = {n};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
 }
