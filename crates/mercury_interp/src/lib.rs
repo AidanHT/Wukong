@@ -696,7 +696,12 @@ impl<'a> Interp<'a> {
                 let k = args[4].as_int() as usize;
                 let n = args[5].as_int() as usize;
                 let beta = args[6].as_int() as i64;
-                let bias = ptr(args[7])?;
+                // An absent bias arrives as a `Value::Int(0)` (the null built as an integer 0) vs a
+                // real array's `Value::Ptr` — distinguished by variant, like the affine-norm params.
+                let bias_idx = match args[7] {
+                    Value::Ptr(p) => Some(p),
+                    _ => None,
+                };
                 let act = args[8].as_int() as i64;
                 let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
@@ -712,8 +717,16 @@ impl<'a> Interp<'a> {
                 let abuf = read(&self.memory, a, m * k)?;
                 let bbuf = read(&self.memory, b, n * k)?;
                 let mut cbuf = read(&self.memory, c, m * n)?;
-                let biasbuf = read(&self.memory, bias, n)?;
-                // SAFETY: buffers are exactly m*k, n*k, m*n, n long — the kernel's contract.
+                let biasbuf = match bias_idx {
+                    Some(base) => read(&self.memory, base, n)?,
+                    None => Vec::new(),
+                };
+                let bias_ptr = if bias_idx.is_some() {
+                    biasbuf.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                // SAFETY: buffers are exactly m*k, n*k, m*n long; bias is null or n long — kernel contract.
                 unsafe {
                     mercury_runtime::mercury_sgemm_nt_epi(
                         abuf.as_ptr(),
@@ -723,7 +736,7 @@ impl<'a> Interp<'a> {
                         k as i64,
                         n as i64,
                         beta,
-                        biasbuf.as_ptr(),
+                        bias_ptr,
                         act,
                     );
                 }

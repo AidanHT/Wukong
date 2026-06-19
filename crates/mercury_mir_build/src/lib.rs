@@ -1704,26 +1704,29 @@ impl FnLowerer<'_> {
     /// Emit the fused `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)` call for a recognized
     /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
     /// caller falls back to lowering the matmul and the epilogue loop separately.
-    fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Symbol, act: u32) -> bool {
-        let (
-            Some((a, _)),
-            Some((b, _)),
-            Some((c, _)),
-            Some((bias_ptr, _)),
-            Some(m),
-            Some(k),
-            Some(n),
-        ) = (
+    fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Option<Symbol>, act: u32) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((c, _)), Some(m), Some(k), Some(n)) = (
             self.lookup(nest.a),
             self.lookup(nest.b),
             self.lookup(nest.c),
-            self.lookup(bias),
             self.dim_value(nest.m),
             self.dim_value(nest.k),
             self.dim_value(nest.n),
-        )
-        else {
+        ) else {
             return false;
+        };
+        // An absent bias is a null pointer, built as an integer `0` (a `Ptr`-typed `ConstInt` is
+        // invalid MIR): the kernel checks `bias.is_null()`, and the interpreter distinguishes the
+        // `Value::Int(0)` from a real array's `Value::Ptr` by variant — same convention as the affine
+        // norm null params.
+        let bias_ptr = match bias {
+            Some(s) => match self.lookup(s) {
+                Some((v, _)) => v,
+                None => return false,
+            },
+            None => self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
         };
         let beta = self
             .builder
@@ -5837,9 +5840,11 @@ fn match_c_plus_bias(
     None
 }
 
-/// Match the epilogue RHS over `C[i*N+j] + bias[j]`: bare (identity), `fmax(_, 0)` (ReLU), or a
-/// `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ + bias)` shape). Bias is
-/// required. Returns `(bias_array, act_code)`.
+/// Match the epilogue RHS over the matmul output `C[i*N+j]`: bare `C+bias` (identity), `fmax(_, 0)`
+/// (ReLU), or a `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ [+ bias])`
+/// shape). Bias is **optional for the activation forms** — the bias-free `silu(x·Wᵀ)` is the
+/// LLaMA/Mistral SwiGLU FFN — but required for identity (a bare `C = C` copy is a no-op, nothing to
+/// fuse). Returns `(optional_bias_array, act_code)`.
 fn match_epi_value(
     e: &Expr,
     c_sym: Symbol,
@@ -5847,20 +5852,31 @@ fn match_epi_value(
     jvar: Symbol,
     n: Dim,
     interner: &Interner,
-) -> Option<(Symbol, u32)> {
+) -> Option<(Option<Symbol>, u32)> {
+    // `C[i*N+j] + bias[j]` → `Some(bias)`; the bare output element `C[i*N+j]` → `None`; anything else
+    // is not an epilogue over this matmul's output.
+    let c_with_opt_bias = |x: &Expr| -> Option<Option<Symbol>> {
+        if let Some(bias) = match_c_plus_bias(x, c_sym, ivar, jvar, n, interner) {
+            Some(Some(bias))
+        } else if is_c_elem(x, c_sym, ivar, jvar, n, interner) {
+            Some(None)
+        } else {
+            None
+        }
+    };
     if let ExprKind::Call { callee, args, .. } = &e.kind {
         // ReLU written as `fmax(inner, 0.0)`.
         if args.len() == 2
             && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
             && is_float_zero(&args[1], interner)
         {
-            let bias = match_c_plus_bias(&args[0], c_sym, ivar, jvar, n, interner)?;
-            return Some((bias, EPI_ACT_RELU));
+            return Some((c_with_opt_bias(&args[0])?, EPI_ACT_RELU));
         }
-        // GELU / SiLU activation wrapping the bias-add (`gelu(C[i*N+j] + bias[j])`). Both are
-        // first-class intrinsics, so a single-arg call by that name is unambiguous; the runtime
-        // epilogue applies the identical scalar form (`mercury_runtime::vmath::{gelu1,silu1}`), so the
-        // fused result equals the unfused `matmul → bias → activation` the recognizer replaces.
+        // GELU / SiLU activation wrapping the (optional) bias-add (`gelu(C[i*N+j] + bias[j])` or the
+        // bias-free `silu(C[i*N+j])`). Both are first-class intrinsics, so a single-arg call by that
+        // name is unambiguous; the runtime epilogue applies the identical scalar form
+        // (`mercury_runtime::vmath::{gelu1,silu1}`), so the fused result equals the unfused
+        // `matmul → [bias →] activation` the recognizer replaces.
         if args.len() == 1 {
             let act = match single_path(callee).map(|s| interner.resolve(s)) {
                 Some("gelu") => Some(EPI_ACT_GELU),
@@ -5868,26 +5884,25 @@ fn match_epi_value(
                 _ => None,
             };
             if let Some(act) = act {
-                let bias = match_c_plus_bias(&args[0], c_sym, ivar, jvar, n, interner)?;
-                return Some((bias, act));
+                return Some((c_with_opt_bias(&args[0])?, act));
             }
         }
     }
-    // Identity: just the bias add.
+    // Identity: just the bias add (bias required — see above).
     let bias = match_c_plus_bias(e, c_sym, ivar, jvar, n, interner)?;
-    Some((bias, EPI_ACT_IDENTITY))
+    Some((Some(bias), EPI_ACT_IDENTITY))
 }
 
 /// Match the bias/activation epilogue loop following a recognized `nn.Linear` matmul:
-/// `for i in 0..M { for j in 0..N { C[i*N+j] = C[i*N+j] + bias[j] } }`, optionally wrapped in
-/// `fmax(_, 0)` (ReLU). `M`/`N`/the stride/the output array/the column index must all match `nest`,
-/// so it never misfires; bias is required. Returns `(bias_array, act_code)`, else `None` (the loop
-/// is then lowered normally as a separate pass).
+/// `for i in 0..M { for j in 0..N { C[i*N+j] = act(C[i*N+j] [+ bias[j]]) } }`. `M`/`N`/the stride/the
+/// output array/the column index must all match `nest`, so it never misfires. Returns
+/// `(optional_bias_array, act_code)` (bias optional for the activation forms — see [`match_epi_value`]),
+/// else `None` (the loop is then lowered normally as a separate pass).
 fn match_bias_act_epilogue(
     stmt: &Stmt,
     nest: &MatmulNest<'_>,
     interner: &Interner,
-) -> Option<(Symbol, u32)> {
+) -> Option<(Option<Symbol>, u32)> {
     // for i in 0..M { <single nested loop> }
     let (ipat, iiter, ibody) = fusable_for(stmt)?;
     let ivar = match &ipat.kind {
