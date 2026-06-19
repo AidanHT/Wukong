@@ -16,6 +16,9 @@ pub use vmath::{
     mercury_vmath_f32, VM_EXP, VM_GELU, VM_LOG, VM_RELU, VM_SIGMOID, VM_SILU, VM_TANH,
 };
 
+mod velem;
+pub use velem::{mercury_velem_f32, VE_ID, VE_RELU, VE_RELU6, VE_USE_Y};
+
 mod reduce;
 pub use reduce::{
     mercury_sreduce_f32, mercury_sreduce_f32_parallel, RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ,
