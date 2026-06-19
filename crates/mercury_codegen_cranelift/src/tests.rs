@@ -1451,6 +1451,22 @@ fn batched_norm_dispatch() {
         "batched softmax (for r {{ <row r> }}) must dispatch to mercury_norm_f32"
     );
 
+    // Batched AFFINE RMSNorm (per-column scale g[i]) must route to the affine kernel, not the plain one
+    // — the data is offset-indexed x[r*4+i] while gamma stays column-indexed g[i].
+    let batched_affine = "module m\nfn f(x:[f32;12], g:[f32;4]) { \
+        for r in 0..3 { \
+        let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i] * x[r*4+i]; } \
+        let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
+        for i in 0..4 { x[r*4+i] = x[r*4+i] * inv * g[i]; } } }";
+    assert!(
+        lowered_calls(batched_affine, "mercury_norm_affine_f32"),
+        "batched affine RMSNorm -> mercury_norm_affine_f32"
+    );
+    assert!(
+        !lowered_calls(batched_affine, "mercury_norm_f32"),
+        "batched affine RMSNorm must NOT use the plain kernel"
+    );
+
     // The single-row form (no outer loop) must still dispatch — rows = 1 is the `batch = None` path.
     let single = "module m\nfn f(x:[f32;4]) { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[i] * x[i]; } \
