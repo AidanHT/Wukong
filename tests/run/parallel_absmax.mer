@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 155
+// EXPECT-OUT: 205
+module tests.run.parallel_absmax
+
+// `@parallel` absmax: `fmax(m, abs(x[k]))` dispatches to the multicore RED_MAXABS reduction kernel —
+// the per-tensor absmax dynamic symmetric int8 quantization uses to compute the scale
+// (scale = absmax/127). The kernel abs's each element (sign-bit clear) then folds by fmax; serial ==
+// parallel == interpreter bit-for-bit (the mercury_bench gate proves it). absmax picks |an element|,
+// so the value is exact.
+
+@parallel
+fn absmaxv(x: [f32; 256], o: [f32; 1]) {
+    let mut m: f32 = 0.0;
+    for k in 0..256 { m = fmax(m, abs(x[k])); }
+    o[0] = m;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 256] = [0.0; 256];
+    for i in 0..256 { x[i] = (i as f32) - 100.0; } // -100 .. 155
+    let mut o: [f32; 1] = [0.0; 1];
+    absmaxv(x, o); print((o[0]) as i32); // max(|-100..155|) = 155
+
+    // A second tensor whose largest magnitude is on the negative side.
+    for i in 0..256 { x[i] = 50.0 - (i as f32); } // 50 down to -205
+    absmaxv(x, o); print((o[0]) as i32); // max(|50 .. -205|) = 205
+    return 0;
+}

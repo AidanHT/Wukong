@@ -476,6 +476,13 @@ fn differential_parallel_reduce() {
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = 5.0 - (i as f32) * 0.001; } minv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
+        // running absmax (fmax fold over abs(x[k]) → RED_MAXABS; negative-dominant tail)
+        "@parallel fn absmaxv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut m: f32 = 0.0; for k in 0..4096 { m = fmax(m, abs(x[k])); } o[0] = m; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = 3.0 - (i as f32) * 0.002; } absmaxv(x, o); \
+         print((o[0] * 1000.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {
@@ -515,6 +522,18 @@ fn differential_parallel_reduce() {
         String::from_utf8(out).unwrap(),
         "3095\n-1000\n",
         "parallel max/min produced the wrong value"
+    );
+    // Absmax golden over a ramp straddling zero (exact integer elements): max(|i−3000|) = 3000
+    // (the negative end |−3000| beats the positive end |1095|).
+    let golden_abs = "@parallel fn absmaxv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut m: f32 = 0.0; for k in 0..4096 { m = fmax(m, abs(x[k])); } o[0] = m; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) - 3000.0; } absmaxv(x, o); print((o[0]) as i32); return 0; }";
+    let (_, out) = jit(golden_abs, 3).expect("jit golden_abs");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "3000\n",
+        "parallel absmax produced the wrong value"
     );
 }
 

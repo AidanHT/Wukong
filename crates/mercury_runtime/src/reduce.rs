@@ -35,12 +35,14 @@ pub const RED_SUM: i64 = 2; // sum(x[i])
 pub const RED_SUMSQ: i64 = 3; // sum(x[i] * x[i])
 pub const RED_MAX: i64 = 4; // max(x[i])  — fold by fmax
 pub const RED_MIN: i64 = 5; // min(x[i])  — fold by fmin
+pub const RED_MAXABS: i64 = 6; // max(|x[i]|) — abs each element, fold by fmax (symmetric int8 quant)
 
-/// The fold identity: `0.0` for the additive ops, `∓∞` for max/min so the first real element wins.
+/// The fold identity: `0.0` for the additive ops, `∓∞` for max/min/maxabs so the first real element
+/// wins (`maxabs` folds by max, identity `−∞`).
 #[inline(always)]
 fn ident(op: i64) -> f32 {
     match op {
-        RED_MAX => f32::NEG_INFINITY,
+        RED_MAX | RED_MAXABS => f32::NEG_INFINITY,
         RED_MIN => f32::INFINITY,
         _ => 0.0,
     }
@@ -53,7 +55,8 @@ fn ident(op: i64) -> f32 {
 #[inline(always)]
 fn fold2(a: f32, b: f32, op: i64) -> f32 {
     match op {
-        RED_MAX => {
+        // maxabs folds its (already abs'd) partials by plain max.
+        RED_MAX | RED_MAXABS => {
             if a > b {
                 a
             } else {
@@ -90,6 +93,7 @@ fn contrib(a: f32, xi: f32, yi: f32, op: i64) -> f32 {
         RED_SUM => a + xi,
         RED_SUMSQ => xi.mul_add(xi, a),
         RED_MAX | RED_MIN => fold2(a, xi, op), // `(a > xi) ? a : xi` ≡ `_mm256_max_ps(a, xi)`
+        RED_MAXABS => fold2(a, xi.abs(), RED_MAX), // `f32::abs` clears the sign bit ≡ `andnot(-0, xi)`
         _ => a,
     }
 }
@@ -178,6 +182,8 @@ unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, 
             RED_SUMSQ => _mm256_fmadd_ps(xv, xv, acc),
             RED_MAX => _mm256_max_ps(acc, xv), // `(acc > xv) ? acc : xv`, lane-wise
             RED_MIN => _mm256_min_ps(acc, xv),
+            // |xv| via `andnot(-0.0, xv)` (clear the sign bit) ≡ the scalar `f32::abs`, then max.
+            RED_MAXABS => _mm256_max_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), xv)),
             _ => acc,
         };
     }
@@ -286,19 +292,23 @@ mod tests {
                 RED_SUMSQ => s += xi * xi,
                 RED_MAX => s = if s > xi { s } else { xi },
                 RED_MIN => s = if s < xi { s } else { xi },
+                RED_MAXABS => {
+                    let axi = xi.abs();
+                    s = if s > axi { s } else { axi }
+                }
                 _ => {}
             };
         }
         s
     }
 
-    const OPS: [i64; 6] = [
-        RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ, RED_MAX, RED_MIN,
+    const OPS: [i64; 7] = [
+        RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ, RED_MAX, RED_MIN, RED_MAXABS,
     ];
 
     // The unary ops read only `x`; the recognizer passes `y == x` for them.
     fn unary(op: i64) -> bool {
-        matches!(op, RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN)
+        matches!(op, RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN | RED_MAXABS)
     }
 
     #[test]
