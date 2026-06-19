@@ -1,0 +1,34 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1725
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1050
+// EXPECT-OUT: 3152
+module tests.run.selu_parallel
+
+// A whole-function `@parallel` activation: each per-core chunk of the `out[i] = selu(x[i])` loop is
+// itself dispatched to the 256-bit AVX2 mercury_vmath_f32 kernel, so the work runs multicore × SIMD.
+// The chunking is deterministic, so serial == parallel == interpreter bit-for-bit (the differential
+// gate and -O0==-O3 both check this); the values equal the serial selu over the same inputs.
+//   x[i] = (i % 8) − 4, so: selu(-4)≈-1.726 → -1725; selu(0)=0; selu(1)≈1.0507 → 1050;
+//   selu(3)≈3.152 → 3152.
+@parallel
+fn act(x: [f32; 4096], out: [f32; 4096]) {
+    for i in 0..4096 {
+        out[i] = selu(x[i]);
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 4096] = [0.0; 4096];
+    for i in 0..4096 {
+        x[i] = ((i % 8) as f32) - 4.0;
+    }
+    let mut out: [f32; 4096] = [0.0; 4096];
+    act(x, out);
+    print((out[0] * 1000.0) as i32); // selu(-4)
+    print((out[4] * 1000.0) as i32); // selu(0)
+    print((out[5] * 1000.0) as i32); // selu(1)
+    print((out[2055] * 1000.0) as i32); // selu(x[7] = 3)
+    return 0;
+}
