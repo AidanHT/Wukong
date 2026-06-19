@@ -14,10 +14,13 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   fused-epilogue `nn.Linear` (`C = act(A·Bᵀ + bias)`): bias-add + activation (identity / ReLU) folded
   into the C-tile writeback on the final K-block, so C is written once (serial-only).
 - `src/vmath.rs` — `mercury_vmath_f32(x, out, n, op)`: the **256-bit AVX2/FMA elementwise
-  transcendental** kernel (exp/log/tanh/sigmoid/silu/gelu/relu, by `VM_*` op code) — the width
-  Cranelift can't emit. 8 lanes/step + a scalar tail; the per-element op sequence mirrors the inlined
-  Cephes polys in `mercury_mir_build`, and the scalar twins (`exp1`/`log1`/…) back the tail and the
-  no-AVX2 fallback, so every lane of every path agrees.
+  transcendental** kernel (exp/log/tanh/sigmoid/relu/silu/gelu/**elu/leaky_relu/softplus/mish**, by
+  `VM_*` op code) — the width Cranelift can't emit. 8 lanes/step + a scalar tail; the per-element op
+  sequence mirrors the inlined Cephes polys in `mercury_mir_build`, and the scalar twins
+  (`exp1`/`log1`/…) back the tail and the no-AVX2 fallback, so every lane of every path agrees. The
+  activations compose the shared `exp`/`log` (silu=x·sigmoid, gelu tanh-approx, elu=x>0?x:eˣ−1,
+  softplus=max(x,0)+ln(1+e^−|x|), mish=x·tanh(softplus)), so one ≈1-ULP `exp` keeps the family exact;
+  `gelu1`/`silu1` are `pub(crate)` for the GEMM fused epilogue.
 - `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
   reductions** (dot / ssd / sum / sumsq, by `RED_*` op code). A `@parallel` reduction loop lowers to
   the `_parallel` one. The parallel result is **bit-identical** to the serial one: the array is cut

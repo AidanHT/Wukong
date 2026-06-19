@@ -1,7 +1,11 @@
 //! Vectorized elementwise transcendentals — the **256-bit AVX2** path the Cranelift backend cannot
 //! emit (`f32x8` does not legalize, so the generic vectorizer is stuck at 128-bit SSE). These are the
-//! transformer activation family — `exp`, `log`, `tanh`, `sigmoid` — and they are *compute*-bound (a
-//! ~20-flop minimax polynomial per element), so doubling the SIMD width nearly doubles throughput.
+//! transformer/vision activation family — `exp`, `log`, `tanh`, `sigmoid`, `relu`, `silu`, `gelu`,
+//! `elu`, `leaky_relu`, `softplus`, `mish` — and they are *compute*-bound (a ~20-flop minimax
+//! polynomial per element, more for the composed ones), so doubling the SIMD width nearly doubles
+//! throughput. The activations all build on the shared `exp`/`log` polynomials (e.g.
+//! `silu = x·sigmoid`, `softplus = ln(1+eˣ)`, `mish = x·tanh(softplus)`), so one ≈1-ULP `exp` keeps
+//! the whole family accurate and bit-identical across backends.
 //!
 //! The compiler recognizes an elementwise `for i { out[i] = f(x[i]) }` loop and lowers it to one
 //! [`mercury_vmath_f32`] call (the same play as the matmul→GEMM dispatch). The interpreter marshals

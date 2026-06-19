@@ -343,12 +343,15 @@ single-threaded C:
   comparison) — the lead widening with size — and ~4.6–14.7× with `@parallel` (clock-state-dependent).
   Rust runs essentially scalar here (~5–12× behind). Integer math makes the cross-language check
   **bit-exact**, not a tolerance.
-- **Transcendentals / activations (exp, log, GELU, SiLU, tanh):** **~5–7.5× faster** than C's scalar
-  `libm` — Mercury dispatches the loop to a **256-bit AVX2 ≈1-ULP poly kernel** (`mercury_vmath_f32`),
-  where gcc/rustc cannot vectorize a loop with an `expf`/`logf`/`tanhf` call. This is the transformer
-  activation family and the cleanest compute-bound win (it roughly doubled when the kernel moved from
-  the 128-bit vectorizer to 256-bit). `gelu`/`silu` are first-class intrinsics; an `@parallel`
-  activation runs multicore × 256-bit (~28×); log-softmax/cross-entropy compose the exp/log win.
+- **Transcendentals / activations (exp, log, tanh, sigmoid, GELU, SiLU, ELU, leaky_relu, softplus,
+  mish):** **~5–7.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
+  ≈1-ULP poly kernel** (`mercury_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
+  `expf`/`logf`/`tanhf` call. This is the transformer/vision activation family and the cleanest
+  compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).
+  All of them are first-class intrinsics composing the shared ≈1-ULP `exp`/`log` (e.g.
+  `softplus = ln(1+eˣ)`, `mish = x·tanh(softplus)`), so the whole family is exact and bit-identical
+  across backends; an `@parallel` activation runs multicore × 256-bit (~28×); log-softmax /
+  cross-entropy compose the exp/log win.
 - **Fused normalizations (softmax / LayerNorm / RMSNorm):** the per-token transformer norms are
   recognized from their multi-pass source and folded into one `mercury_norm_f32` call (256-bit AVX2 +
   8-lane reassociated reductions + the vectorized `exp`), **~1.9–6.6× faster than C** — softmax most

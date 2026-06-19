@@ -150,16 +150,18 @@ LLVM backend, by the runtime).
 - `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`.
 - `erf(x)` — for the exact (erf-based) GELU of BERT/GPT-2.
 - `sin(x)` / `cos(x)` — for RoPE rotary position embeddings.
-- `tanh(x)` / `sigmoid(x)` / `silu(x)` / `gelu(x)` — the transformer activation family
-  (`silu(x) = x·sigmoid(x)`; `gelu` is the tanh approximation).
+- `tanh(x)` / `sigmoid(x)` / `silu(x)` / `gelu(x)` / `elu(x)` / `leaky_relu(x)` / `softplus(x)` /
+  `mish(x)` — the transformer/vision activation family (`silu(x) = x·sigmoid(x)`; `gelu` is the tanh
+  approximation; `elu(x) = x>0 ? x : eˣ−1`; `leaky_relu` has slope 0.01; `softplus(x) = ln(1+eˣ)`;
+  `mish(x) = x·tanh(softplus(x))`).
 - `fmax(a, b)` / `fmin(a, b)`.
 
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, `exp`/`log`/`tanh`/
-`sigmoid`/`silu`/`gelu` are **dispatched to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) —
-the same domain-aware lowering as matmul→GEMM — so the activation family runs ~5–7.5× faster than C's
-scalar `libm`, and ~28× across cores under `@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`)
-auto-vectorize the inlined poly at 128-bit. Every form is bit-identical across the interpreter and
-native backends.
+`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish` are **dispatched to a tuned 256-bit
+AVX2/FMA kernel** (`mercury_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
+activation family runs ~5–7.5× faster than C's scalar `libm`, and ~28× across cores under
+`@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`) auto-vectorize the inlined poly at 128-bit.
+Every form is bit-identical across the interpreter and native backends.
 
 ## Memory and parallelism
 
