@@ -630,7 +630,7 @@ impl FnLowerer<'_> {
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i) {
+            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None) {
                 if self.emit_norm(arr, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
                     i += n;
                     continue;
@@ -828,8 +828,15 @@ impl FnLowerer<'_> {
     }
 
     /// Body `s += x[v]` / `s = s + x[v]` (sum into scalar `s`), verifying the summed array is `x`. Pure.
-    fn match_sum_body(&self, body: &Block, v: Symbol, x: Symbol, s: Symbol) -> Option<()> {
-        if self.sum_body_array(body, v, s)? == x {
+    fn match_sum_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        s: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<()> {
+        if self.sum_body_array(body, v, s, batch)? == x {
             Some(())
         } else {
             None
@@ -839,7 +846,13 @@ impl FnLowerer<'_> {
     /// Body `s += x[v]` / `s = s + x[v]` (sum into scalar `s`) → the summed array `x` (whichever it
     /// is). The array-discovering form of [`Self::match_sum_body`] (LayerNorm's leading sum loop is
     /// what first names the row array). Pure.
-    fn sum_body_array(&self, body: &Block, v: Symbol, s: Symbol) -> Option<Symbol> {
+    fn sum_body_array(
+        &self,
+        body: &Block,
+        v: Symbol,
+        s: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign { target, op, value } = &stmt.kind else {
             return None;
@@ -864,7 +877,7 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
-        self.index_by_loopvar(addend, v)
+        self.index_off(addend, v, batch)
     }
 
     /// Body `s += x[v]*x[v]` (sum of squares into scalar `s`) → the squared array `x` (RMSNorm's lead
@@ -1102,7 +1115,7 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n4, n_expr) {
             return None;
         }
-        self.match_sum_body(body4, v4, x, s)?;
+        self.match_sum_body(body4, v4, x, s, None)?;
         let inv = self.match_recip(&stmts[5], s)?;
         let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
         if !exprs_struct_eq(n6, n_expr) {
@@ -1282,11 +1295,18 @@ impl FnLowerer<'_> {
     }
 
     /// Is `e` the centered value `x[v] - mean`? Pure.
-    fn is_centered(&self, e: &Expr, v: Symbol, x: Symbol, mean: Symbol) -> bool {
+    fn is_centered(
+        &self,
+        e: &Expr,
+        v: Symbol,
+        x: Symbol,
+        mean: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> bool {
         matches!(
             &e.kind,
             ExprKind::Binary { op: ast::BinOp::Sub, lhs, rhs }
-                if self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(mean)
+                if self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(mean)
         )
     }
 
@@ -1298,6 +1318,7 @@ impl FnLowerer<'_> {
         x: Symbol,
         mean: Symbol,
         acc: Symbol,
+        batch: Option<(Symbol, &Expr)>,
     ) -> Option<()> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign { target, op, value } = &stmt.kind else {
@@ -1331,7 +1352,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.is_centered(lhs, v, x, mean) && self.is_centered(rhs, v, x, mean) {
+        if self.is_centered(lhs, v, x, mean, batch) && self.is_centered(rhs, v, x, mean, batch) {
             Some(())
         } else {
             None
@@ -1346,6 +1367,7 @@ impl FnLowerer<'_> {
         x: Symbol,
         mean: Symbol,
         inv: Symbol,
+        batch: Option<(Symbol, &Expr)>,
     ) -> Option<(Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
@@ -1356,7 +1378,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.index_by_loopvar(target, v) != Some(x) {
+        if self.index_off(target, v, batch) != Some(x) {
             return None;
         }
         let (core, gamma, beta) = self.peel_affine(value, v, x);
@@ -1368,8 +1390,8 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let ok = (self.is_centered(lhs, v, x, mean) && single_path(rhs) == Some(inv))
-            || (self.is_centered(rhs, v, x, mean) && single_path(lhs) == Some(inv));
+        let ok = (self.is_centered(lhs, v, x, mean, batch) && single_path(rhs) == Some(inv))
+            || (self.is_centered(rhs, v, x, mean, batch) && single_path(lhs) == Some(inv));
         if ok {
             Some((gamma, beta))
         } else {
@@ -1464,6 +1486,7 @@ impl FnLowerer<'_> {
         &self,
         b: &Block,
         at: usize,
+        batch: Option<Symbol>,
     ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
@@ -1474,7 +1497,11 @@ impl FnLowerer<'_> {
             return None;
         }
         let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
-        let x = self.sum_body_array(body1, v1, s)?;
+        // Batched: the data is row-offset-indexed `row*cols + i` (cols == this inner bound); single-row:
+        // just `i`. The mean/variance scalars and the `/cols` divisor are per-row, unchanged either way;
+        // the affine gamma/beta (peeled in the scale body) stay column-indexed, shared across rows.
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.sum_body_array(body1, v1, s, data_batch)?;
         let mean = self.match_mean(&stmts[2], s, n_expr)?;
         let (vv, vv_init) = Self::let_init(&stmts[3])?;
         if !self.is_zero_lit(vv_init) {
@@ -1484,13 +1511,13 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n4, n_expr) {
             return None;
         }
-        self.match_var_body(body4, v4, x, mean, vv)?;
+        self.match_var_body(body4, v4, x, mean, vv, data_batch)?;
         let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr)?;
         let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
         if !exprs_struct_eq(n6, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_shift_scale_body(body6, v6, x, mean, inv)?;
+        let (gamma, beta) = self.match_shift_scale_body(body6, v6, x, mean, inv, data_batch)?;
         let rest = &b.stmts[at + 7..];
         let tail = b.tail.as_deref();
         for sc in [s, mean, vv, inv] {
@@ -2122,7 +2149,7 @@ impl FnLowerer<'_> {
         pat: &Pattern,
         iter: &ForIter,
         body: &Block,
-    ) -> Option<(Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Expr, i64, i64, Option<Symbol>, Option<Symbol>)> {
         let ForIter::Range {
             start,
             end: Some(_),
@@ -2142,15 +2169,23 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else.
+        // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else. LayerNorm
+        // (7 stmts) and RMSNorm (4 stmts) are structurally disjoint, so probe order is immaterial;
+        // softmax is not batched yet (its `out[r*C]` max-seed needs separate offset handling).
         if body.tail.is_some() {
             return None;
         }
-        let (consumed, x, cols, eps, gamma, beta) = self.match_rmsnorm(body, 0, Some(*r))?;
-        if consumed != body.stmts.len() {
-            return None;
+        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_layernorm(body, 0, Some(*r)) {
+            if consumed == body.stmts.len() {
+                return Some((x, cols, eps, NORM_LAYERNORM, gamma, beta));
+            }
         }
-        Some((x, cols, eps, gamma, beta))
+        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_rmsnorm(body, 0, Some(*r)) {
+            if consumed == body.stmts.len() {
+                return Some((x, cols, eps, NORM_RMSNORM, gamma, beta));
+            }
+        }
+        None
     }
 
     /// Dispatch a recognized batched norm to one fused norm kernel with `rows = R`. Runs pre-opt, so
@@ -2160,8 +2195,8 @@ impl FnLowerer<'_> {
         let ForIter::Range { end: Some(end), .. } = iter else {
             return false;
         };
-        if let Some((x, cols, eps, gamma, beta)) = self.match_batched_norm(pat, iter, body) {
-            return self.emit_norm(x, Some(end), &cols, eps, NORM_RMSNORM, gamma, beta);
+        if let Some((x, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body) {
+            return self.emit_norm(x, Some(end), &cols, eps, op, gamma, beta);
         }
         false
     }

@@ -395,6 +395,30 @@ fn kernels() -> Vec<Kernel> {
             len: |n| 3 * n,
             regimes: ANY,
         },
+        // Batched LayerNorm: `for r in 0..3 { <LayerNorm over out[r*C + i]> }` → one
+        // mercury_norm_f32(.., rows=3, cols=C, LAYERNORM) call. Exercises the rows>1 path for the
+        // two-reduction (mean, then variance) norm — the offset machinery threaded through the
+        // sum/centered-variance/center-scale bodies. Same [batch*seq, hidden] transformer shape.
+        Kernel {
+            name: "layernorm_batched",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+             for c in 0..{l} {{ out[c] = x[c]; }} \
+             for r in 0..3 {{ \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[r*{n}+i]; }} \
+             let mean: f32 = s / {n}.0; \
+             let mut v: f32 = 0.0; \
+             for i in 0..{n} {{ v = v + (out[r*{n}+i] - mean) * (out[r*{n}+i] - mean); }} \
+             let inv: f32 = rsqrt(v / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[r*{n}+i] = (out[r*{n}+i] - mean) * inv; }} }} }}\n",
+                    l = 3 * n
+                )
+            },
+            len: |n| 3 * n,
+            regimes: ANY,
+        },
         // matmul C=A·B (ikj) and nn.Linear C=A·Bᵀ (ijk) — both dispatch to the GEMM microkernel.
         Kernel {
             name: "matmul",

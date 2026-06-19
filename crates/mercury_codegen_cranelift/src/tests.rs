@@ -1427,6 +1427,18 @@ fn batched_norm_dispatch() {
         "batched RMSNorm (for r {{ <row r> }}) must dispatch to mercury_norm_f32"
     );
 
+    // Batched LayerNorm (two reductions: mean, then variance) over the `r*4 + i` offset must dispatch too.
+    let batched_ln = "module m\nfn f(x:[f32;12]) { \
+        for r in 0..3 { \
+        let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i]; } let mean: f32 = s / 4.0; \
+        let mut v: f32 = 0.0; for i in 0..4 { v = v + (x[r*4+i] - mean) * (x[r*4+i] - mean); } \
+        let inv: f32 = rsqrt(v / 4.0 + 0.00001); \
+        for i in 0..4 { x[r*4+i] = (x[r*4+i] - mean) * inv; } } }";
+    assert!(
+        lowered_calls(batched_ln, "mercury_norm_f32"),
+        "batched LayerNorm (for r {{ <row r> }}) must dispatch to mercury_norm_f32"
+    );
+
     // The single-row form (no outer loop) must still dispatch — rows = 1 is the `batch = None` path.
     let single = "module m\nfn f(x:[f32;4]) { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[i] * x[i]; } \
