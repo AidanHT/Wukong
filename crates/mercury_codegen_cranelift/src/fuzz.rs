@@ -395,6 +395,26 @@ fn kernels() -> Vec<Kernel> {
             len: |n| 3 * n,
             regimes: ANY,
         },
+        // Batched AFFINE RMSNorm — the real transformer form: a learned per-COLUMN scale `y[i]`
+        // (length cols, shared across rows) rides the writeback → mercury_norm_affine_f32(.., rows=3).
+        // Confirms the batched data offset `out[r*C+i]` and the column-indexed gamma `y[i]` compose.
+        Kernel {
+            name: "rmsnorm_affine_batched",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+             for c in 0..{l} {{ out[c] = x[c]; }} \
+             for r in 0..3 {{ \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[r*{n}+i] * out[r*{n}+i]; }} \
+             let inv: f32 = rsqrt(s / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[r*{n}+i] = out[r*{n}+i] * inv * y[i]; }} }} }}\n",
+                    l = 3 * n
+                )
+            },
+            len: |n| 3 * n,
+            regimes: ANY,
+        },
         // Batched softmax: `for r in 0..3 { <softmax over out[r*C + i]> }` → one
         // mercury_norm_f32(.., rows=3, cols=C, SOFTMAX) call. Exercises the rows>1 path for the
         // max/exp/sum/normalize window — including the row-local `out[r*C]` max-seed (the bare
