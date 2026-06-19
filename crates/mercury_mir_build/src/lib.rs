@@ -410,9 +410,10 @@ const VMATH_SILU: u32 = 5;
 const VMATH_GELU: u32 = 6;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
-// is the activation (here `VE_ID`; ReLU/ReLU6 added with their matchers); `VE_USE_Y` (bit 8) flags
-// that the kernel reads `y`.
+// is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
 const VE_ID: i64 = 0; // out = a·x (+ b·y) + c
+const VE_RELU: i64 = 1; // out = max(.., 0)
+const VE_RELU6: i64 = 2; // out = min(max(.., 0), 6)
 const VE_USE_Y: i64 = 256;
 
 /// One additive term of a recognized streaming affine body. `Scaled(arr, s)` is `arr[j]` (`s = None`,
@@ -2223,8 +2224,15 @@ impl FnLowerer<'_> {
     /// covering saxpy / scale / residual-add / bias / copy. Up to two distinct array reads (`x`, then
     /// `y`) and one bias. Pure (emits no MIR): returns the resolved bases + coefficient exprs, or
     /// `None` to fall through to ReLU recognition / the generic vectorizer. The activation `act` is
-    /// supplied by the caller (`VE_ID` here; ReLU forms peel their wrapper first).
-    fn match_velem_affine<'b>(&self, j: Symbol, value: &'b Expr, target: &Expr) -> Option<VElemPlan<'b>> {
+    /// supplied by the caller (`VE_ID` for the bare arithmetic forms; ReLU/ReLU6 peel their wrapper
+    /// first and pass the inner affine `value` here with `act = VE_RELU`/`VE_RELU6`).
+    fn match_velem_affine<'b>(
+        &self,
+        j: Symbol,
+        value: &'b Expr,
+        target: &Expr,
+        act: i64,
+    ) -> Option<VElemPlan<'b>> {
         let out_sym = self.index_by_loopvar(target, j)?;
         if self.expr_mir(value) != MirType::F32 {
             return None;
@@ -2259,13 +2267,53 @@ impl FnLowerer<'_> {
             a,
             b,
             c: consts.first().copied(),
-            op: VE_ID | op_y,
+            op: act | op_y,
         })
     }
 
-    /// Recognize the whole body of a streaming elementwise map: a single `out[j] = …` assignment that
-    /// matches [`match_velem_affine`] (saxpy / scale / add / bias / copy). Pure. ReLU/ReLU6 add their
-    /// own peel in a later commit; here the affine identity activation covers the arithmetic forms.
+    /// Peel a ReLU / ReLU6 activation wrapper off `value`, returning the inner (affine) expr and the
+    /// `VE_RELU`/`VE_RELU6` code. ReLU is the idiomatic `if INNER > 0.0 { INNER } else { 0.0 }`
+    /// (`max(INNER, 0)`); ReLU6 is `if INNER < 6.0 { <ReLU of INNER> } else { 6.0 }` (`clamp(INNER,
+    /// 0, 6)`), where the outer guard compares the *same* `INNER`. Pure.
+    fn peel_velem_act<'b>(&self, value: &'b Expr) -> Option<(&'b Expr, i64)> {
+        let ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+            return None;
+        };
+        let else_e = branch_value(else_branch.as_deref()?)?;
+        let then_e = block_value(then_branch)?;
+        let is_lit = |e: &Expr, v: f32| {
+            matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) as f32 == v)
+        };
+        match op {
+            // ReLU: `if INNER > 0 { INNER } else { 0 }` — the then-branch returns the compared INNER.
+            ast::BinOp::Gt if is_lit(rhs, 0.0) && is_lit(else_e, 0.0) && exprs_struct_eq(then_e, lhs) => {
+                Some((lhs, VE_RELU))
+            }
+            // ReLU6: `if INNER < 6 { ReLU(INNER) } else { 6 }` — the then-branch is a ReLU whose inner
+            // is the same INNER the guard compares.
+            ast::BinOp::Lt if is_lit(rhs, 6.0) && is_lit(else_e, 6.0) => {
+                let (inner, inner_act) = self.peel_velem_act(then_e)?;
+                if inner_act == VE_RELU && exprs_struct_eq(inner, lhs) {
+                    Some((inner, VE_RELU6))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Recognize the whole body of a streaming elementwise map: a single `out[j] = …` assignment whose
+    /// RHS is either a bare affine form (saxpy / scale / add / bias / copy) or a ReLU/ReLU6-wrapped
+    /// one. Pure (emits no MIR).
     fn match_velem_body<'b>(&self, j: Symbol, body: &'b Block) -> Option<VElemPlan<'b>> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
@@ -2276,7 +2324,11 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        self.match_velem_affine(j, value, target)
+        if let Some(plan) = self.match_velem_affine(j, value, target, VE_ID) {
+            return Some(plan);
+        }
+        let (inner, act) = self.peel_velem_act(value)?;
+        self.match_velem_affine(j, inner, target, act)
     }
 
     /// Lower a coefficient expr (or a default constant when absent) to an f32 ValueId.
@@ -5132,8 +5184,10 @@ fn affine_stride(e: &Expr, j: Symbol) -> Option<i64> {
     }
 }
 
-/// Structural equality over the index-expression subset (ints, single paths, `+`/`-`/`*`). Used to
-/// confirm a written array is touched at exactly one index (no loop-carried dependence).
+/// Structural equality over the elementwise-expression subset (ints, floats, single paths, unary,
+/// `+`/`-`/`*`, and unit-stride `Index`). Used to confirm a written array is touched at exactly one
+/// index (no loop-carried dependence) and that a ReLU's then-branch returns the value its guard
+/// compares (`if v > 0 { v } else { 0 }`). The `Index` arm is what lets `x[i] == x[i]` hold.
 fn exprs_struct_eq(a: &Expr, b: &Expr) -> bool {
     match (&a.kind, &b.kind) {
         (ExprKind::Int(x), ExprKind::Int(y)) => x == y,
@@ -5141,6 +5195,10 @@ fn exprs_struct_eq(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Path(p), ExprKind::Path(q)) => {
             p.is_single() && q.is_single() && p.first().sym == q.first().sym
         }
+        (
+            ExprKind::Unary { op: o1, expr: e1 },
+            ExprKind::Unary { op: o2, expr: e2 },
+        ) => o1 == o2 && exprs_struct_eq(e1, e2),
         (
             ExprKind::Binary {
                 op: o1,
@@ -5153,6 +5211,20 @@ fn exprs_struct_eq(a: &Expr, b: &Expr) -> bool {
                 rhs: r2,
             },
         ) => o1 == o2 && exprs_struct_eq(l1, l2) && exprs_struct_eq(r1, r2),
+        (
+            ExprKind::Index {
+                base: b1,
+                indices: i1,
+            },
+            ExprKind::Index {
+                base: b2,
+                indices: i2,
+            },
+        ) => {
+            i1.len() == i2.len()
+                && exprs_struct_eq(b1, b2)
+                && i1.iter().zip(i2).all(|(x, y)| exprs_struct_eq(x, y))
+        }
         _ => false,
     }
 }
