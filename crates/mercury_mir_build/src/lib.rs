@@ -412,6 +412,8 @@ const VMATH_TANH: u32 = 2;
 const VMATH_SIGMOID: u32 = 3;
 const VMATH_SILU: u32 = 5;
 const VMATH_GELU: u32 = 6;
+const VMATH_ELU: u32 = 7;
+const VMATH_LEAKYRELU: u32 = 8;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2099,6 +2101,8 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Sigmoid) => VMATH_SIGMOID,
             Some(MathIntrinsic::Silu) => VMATH_SILU,
             Some(MathIntrinsic::Gelu) => VMATH_GELU,
+            Some(MathIntrinsic::Elu) => VMATH_ELU,
+            Some(MathIntrinsic::LeakyRelu) => VMATH_LEAKYRELU,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -2931,10 +2935,12 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Tanh
                     | MathIntrinsic::Sigmoid
                     | MathIntrinsic::Silu
-                    | MathIntrinsic::Gelu,
+                    | MathIntrinsic::Gelu
+                    | MathIntrinsic::Elu
+                    | MathIntrinsic::LeakyRelu,
                 ) => {
-                    // These build on the exp/log polynomials, which vectorize only for an f32 lane
-                    // (their IEEE-754 exponent surgery is f32-specific).
+                    // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
+                    // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
                     args.len() == 1
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && *lane == Some(MirType::F32)
@@ -3724,6 +3730,14 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Gelu) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_gelu(x, vty)
+                }
+                Some(MathIntrinsic::Elu) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_elu(x, vty)
+                }
+                Some(MathIntrinsic::LeakyRelu) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_leaky_relu(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -4531,6 +4545,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_gelu(x, &rty))
             }
+            MathIntrinsic::Elu => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_elu(x, &rty))
+            }
+            MathIntrinsic::LeakyRelu => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_leaky_relu(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -4632,6 +4654,30 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FMul, half, x));
         self.builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, hx, onep))
+    }
+
+    /// `elu(x) = x>0 ? x : e^x − 1` (α=1), the exponential linear unit. Mirrors the fused AVX2 `elu8`
+    /// (`blendv(exp−1, x, x>0)`) — `x` passes through for the positive lane, `exp(x)−1` for the
+    /// negative — so the scalar form and the dispatched loop agree; bit-identical across backends.
+    fn emit_elu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let e = self.emit_exp(x, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let em1 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, e, one));
+        let zero = self.splat_const_f(0.0, rty);
+        let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(pos, x, em1))
+    }
+
+    /// `leaky_relu(x) = x>0 ? x : 0.01·x`, the leaky rectifier. Mirrors the fused AVX2 `leakyrelu8`
+    /// (`blendv(0.01·x, x, x>0)`). No transcendental — just a scaled negative slope.
+    fn emit_leaky_relu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let alpha = self.splat_const_f(0.01, rty);
+        let scaled = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, x, alpha));
+        let zero = self.splat_const_f(0.0, rty);
+        let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(pos, x, scaled))
     }
 
     /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
@@ -6835,6 +6881,8 @@ enum MathIntrinsic {
     Sigmoid,
     Silu,
     Gelu,
+    Elu,
+    LeakyRelu,
     Fmax,
     Fmin,
 }
@@ -6853,6 +6901,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "sigmoid" => MathIntrinsic::Sigmoid,
         "silu" => MathIntrinsic::Silu,
         "gelu" => MathIntrinsic::Gelu,
+        "elu" => MathIntrinsic::Elu,
+        "leaky_relu" => MathIntrinsic::LeakyRelu,
         "fmax" => MathIntrinsic::Fmax,
         "fmin" => MathIntrinsic::Fmin,
         _ => return None,

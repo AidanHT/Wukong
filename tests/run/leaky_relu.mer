@@ -1,0 +1,25 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -20
+// EXPECT-OUT: 2000
+// EXPECT-OUT: -49
+// EXPECT-OUT: 3000
+module tests.run.leaky_relu
+
+// Leaky ReLU (negative slope 0.01): out[i] = x>0 ? x : 0.01·x. An `out[i] = leaky_relu(x[i])` loop
+// dispatches to the 256-bit AVX2 mercury_vmath_f32 kernel (op = LEAKYRELU); it is exact (a branch +
+// one multiply), so it is bit-identical across backends and to the scalar form (and opt-invariant).
+//   leaky(2)=2 → 2000; leaky(3)=3 → 3000. The negative branch carries the f32 rounding of 0.01
+//   (≈0.00999999978): leaky(-5)·1000 = -49.9999… → -49 (truncates toward 0), leaky(-2)·1000 → -20.
+fn main() -> i32 {
+    let x: [f32; 4] = [-2.0, 2.0, -5.0, 3.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        out[i] = leaky_relu(x[i]);
+    }
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}
