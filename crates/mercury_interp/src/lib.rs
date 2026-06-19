@@ -973,12 +973,13 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
-            // `mercury_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op)` — the affine
-            // (per-column scale gamma + optional shift beta) fused LayerNorm/RMSNorm. Same marshalling
-            // as the plain norm, plus the gamma/beta arrays (length cols). An absent param lowers to a
-            // `Ptr`-typed `ConstInt(0)` → a `Value::Int(0)` here (distinct from a real array's
+            // `mercury_norm_affine_f32[_parallel](x, out, gamma, beta, rows, cols, eps_bits, op)` — the
+            // affine (per-column scale gamma + optional shift beta) fused LayerNorm/RMSNorm. Same
+            // marshalling as the plain norm, plus the gamma/beta arrays (length cols). An absent param
+            // lowers to a `Ptr`-typed `ConstInt(0)` → a `Value::Int(0)` here (distinct from a real array's
             // `Value::Ptr`), so match the variant: pass a null pointer (kernel uses scale 1 / shift 0).
-            "mercury_norm_affine_f32" => {
+            // Both names marshal through the *serial* runtime kernel (bit-identical — rows independent).
+            "mercury_norm_affine_f32" | "mercury_norm_affine_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let gamma_idx = match args[2] {

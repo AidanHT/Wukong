@@ -46,6 +46,7 @@ pub fn lower_program(
         norm: interner.intern("mercury_norm_f32"),
         norm_par: interner.intern("mercury_norm_f32_parallel"),
         norm_affine: interner.intern("mercury_norm_affine_f32"),
+        norm_affine_par: interner.intern("mercury_norm_affine_f32_parallel"),
         i8nt: interner.intern("mercury_i8gemm_nt"),
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
     };
@@ -454,6 +455,10 @@ struct GemmSyms {
     /// eps_bits, op)`): a LayerNorm/RMSNorm whose normalize step also applies a per-column scale
     /// `gamma` (and, for LayerNorm, a shift `beta`) lowers here instead — the real transformer form.
     norm_affine: Symbol,
+    /// The multicore variant of `mercury_norm_affine_f32` (`mercury_norm_affine_f32_parallel`): a
+    /// *batched* affine norm (`rows > 1`) in a `@parallel` function maps its independent rows across
+    /// cores here, bit-equal to the serial affine kernel the interpreter marshals (no cross-row combine).
+    norm_affine_par: Symbol,
     /// The int8 quantized `nn.Linear` kernel (`mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)`): a
     /// `u8×i8→i32` `C = A·Bᵀ` nest lowers to this. Integer arithmetic, so the fused kernel equals the
     /// naive loop bit-for-bit (no reassociation exception).
@@ -1235,8 +1240,13 @@ impl FnLowerer<'_> {
         let (Some(gptr), Some(bptr)) = (ptr_or_null(self, gamma), ptr_or_null(self, beta)) else {
             return false;
         };
+        let func = if batched_parallel {
+            self.gemm.norm_affine_par
+        } else {
+            self.gemm.norm_affine
+        };
         self.builder.build_void(Op::Call {
-            func: self.gemm.norm_affine,
+            func,
             args: vec![xv, xv, gptr, bptr, rows, nval, epsv, opv],
         });
         true

@@ -1505,6 +1505,29 @@ fn differential_parallel_batched_norm() {
         let i = interp(src, opt).expect("interp");
         assert_eq!(n, i, "parallel batched norm native vs interp at -O{opt}");
     }
+
+    // The affine form (a learned per-column gamma) maps rows across cores via the multicore *affine*
+    // kernel `mercury_norm_affine_f32_parallel`, and must stay bit-exact vs the serial kernel the
+    // interpreter marshals (rows independent, no cross-row combine).
+    let src_affine = "@parallel fn rmsnorm_affine_batch(x: [f32; 4096], g: [f32; 64]) { \
+         for r in 0..64 { \
+         let mut s: f32 = 0.0; for i in 0..64 { s = s + x[r*64+i] * x[r*64+i]; } \
+         let inv: f32 = rsqrt(s / 64.0 + 0.00001); \
+         for i in 0..64 { x[r*64+i] = x[r*64+i] * inv * g[i]; } } } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut g: [f32; 64] = [0.0; 64]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } \
+         for i in 0..64 { g[i] = (i as f32) * 0.01 + 0.5; } rmsnorm_affine_batch(x, g); \
+         let mut s: f32 = 0.0; for i in 0..4096 { s = s + x[i]; } \
+         print((s * 1000.0) as i32); return 0; }";
+    assert!(
+        lowered_calls(src_affine, "mercury_norm_affine_f32_parallel"),
+        "@parallel batched affine RMSNorm must dispatch to the multicore affine kernel"
+    );
+    for opt in [0u8, 2, 3] {
+        let n = jit(src_affine, opt).expect("jit");
+        let i = interp(src_affine, opt).expect("interp");
+        assert_eq!(n, i, "parallel batched affine norm native vs interp at -O{opt}");
+    }
 }
 
 /// The accumulate (beta = 1) matmul — `C += A·B` with `C` pre-initialized — end to end. Guards the
