@@ -44,6 +44,7 @@ pub fn lower_program(
         vhorner: interner.intern("mercury_vhorner_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         norm: interner.intern("mercury_norm_f32"),
+        norm_par: interner.intern("mercury_norm_f32_parallel"),
         norm_affine: interner.intern("mercury_norm_affine_f32"),
         i8nt: interner.intern("mercury_i8gemm_nt"),
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
@@ -69,6 +70,18 @@ pub fn lower_program(
                     let parallel = has_parallel_attr(item, interner);
                     let func =
                         lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` *batched norm* (`fn f(x){ for r in 0..R { <norm row r over x[r*C+i]> } }`)
+                // dispatches to the multicore `mercury_norm_f32_parallel`: rows are independent (so it
+                // is deterministic and bit-equal to the serial kernel the interpreter calls) and each
+                // row is one fused pass. Checked *before* the generic `@parallel` outliner below — which
+                // would instead split the rows into chunks of per-row *vectorized* loops and lose the
+                // single-pass fusion — mirroring the sgemm/int8 whole-function interceptions above.
+                if has_parallel_attr(item, interner) && is_batched_norm_fn(f, body, sema, interner, gemm)
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -164,6 +177,45 @@ fn parallel_spec<'a>(
         return None;
     };
     Some((*name, end, lb))
+}
+
+/// Is this function body a single batched-norm loop (`for r in 0..R { <RMSNorm over x[r*C + i]> }`)?
+/// Probed with a throwaway lowerer — the recognizer (`match_batched_norm`) is pure: it reads
+/// sema/interner and emits no MIR, so a never-built `Builder` is harmless. The `@parallel` driver runs
+/// this *before* the generic loop outliner so a `@parallel` batched norm is routed through normal
+/// lowering (where `emit_norm` dispatches to the multicore `mercury_norm_f32_parallel`, one fused pass
+/// per row across cores) rather than outlined into chunks of per-row *vectorized* loops that lose the
+/// fusion — mirroring the int8/sgemm whole-function interceptions.
+fn is_batched_norm_fn(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat, iter, body: lb, ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    let mut diags = Vec::new();
+    let probe = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::I64),
+        sema,
+        interner,
+        diags: &mut diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+    };
+    probe.match_batched_norm(pat, iter, lb).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,6 +445,11 @@ struct GemmSyms {
     /// eps_bits, op)`): an idiomatic multi-pass softmax / LayerNorm / RMSNorm written in plain loops
     /// lowers to this one call. The interpreter marshals through the identical kernel.
     norm: Symbol,
+    /// The multicore variant of `mercury_norm_f32` (`mercury_norm_f32_parallel`): a *batched* norm
+    /// (`rows > 1`) in a `@parallel` function maps its independent rows across cores here. Each row is
+    /// normalized by the same per-row routine with no cross-row combine, so it is bit-equal to the
+    /// serial kernel the interpreter calls — the differential gate holds regardless of thread count.
+    norm_par: Symbol,
     /// The affine fused norm kernel (`mercury_norm_affine_f32(x, out, gamma, beta, rows, cols,
     /// eps_bits, op)`): a LayerNorm/RMSNorm whose normalize step also applies a per-column scale
     /// `gamma` (and, for LayerNorm, a shift `beta`) lowers here instead — the real transformer form.
@@ -1085,6 +1142,11 @@ impl FnLowerer<'_> {
         let Some((xv, _)) = self.lookup(arr) else {
             return false;
         };
+        // A batched norm (`rows > 1`) inside a `@parallel` function maps its independent rows across
+        // cores via the multicore kernel; rows are normalized independently (no cross-row combine), so
+        // it stays bit-equal to the serial kernel the interpreter marshals. A single-row norm has no
+        // row parallelism, so it stays serial even in a `@parallel` function (one row = no speedup).
+        let batched_parallel = self.parallel_fn && rows.is_some();
         let n_ty = self.expr_mir(n);
         let nval = self.lower_expr(n);
         let nval = self.coerce_to(nval, &n_ty, &MirType::I64, true);
@@ -1108,8 +1170,13 @@ impl FnLowerer<'_> {
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
         if gamma.is_none() && beta.is_none() {
+            let func = if batched_parallel {
+                self.gemm.norm_par
+            } else {
+                self.gemm.norm
+            };
             self.builder.build_void(Op::Call {
-                func: self.gemm.norm,
+                func,
                 args: vec![xv, xv, rows, nval, epsv, opv],
             });
             return true;
@@ -2042,41 +2109,59 @@ impl FnLowerer<'_> {
         true
     }
 
-    /// Recognize `for r in 0..R { <per-row norm over x[r*C + i]> }` — a **batched** row normalization
-    /// over a flat `[R, C]` matrix — and dispatch the whole batch to one fused norm kernel with
-    /// `rows = R`. The body must be a complete norm window whose data accesses are row-offset-indexed
-    /// by `r*C` (verified by `match_rmsnorm`'s offset machinery), consuming every body statement.
-    /// Returns true on success. RMSNorm only for now (the highest-value modern norm); the same offset
-    /// path generalizes to LayerNorm/softmax. Runs pre-opt, so `-O0`==`-O3`; both backends marshal the
-    /// identical kernel, so the differential gate stays bit-exact.
-    fn try_emit_batched_norm(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+    /// Pure structural recognizer for a **batched** row normalization `for r in 0..R { <per-row norm
+    /// over x[r*C + i]> }` over a flat `[R, C]` matrix. The body must be a complete norm window whose
+    /// data accesses are row-offset-indexed by `r*C` (verified by `match_rmsnorm`'s offset machinery),
+    /// consuming every body statement. Returns the data array, the per-row width `C`, eps, and any
+    /// affine params — everything `emit_norm` needs besides `rows = R` (the caller holds the loop
+    /// bound). `&self` (reads sema/interner, emits no MIR), so it doubles as the whole-function probe
+    /// the `@parallel` driver runs before the generic outliner. RMSNorm only for now (the highest-value
+    /// modern norm); the same offset path generalizes to LayerNorm/softmax.
+    fn match_batched_norm(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+    ) -> Option<(Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let ForIter::Range {
             start,
-            end: Some(end),
+            end: Some(_),
             inclusive: false,
             step: None,
         } = iter
         else {
-            return false;
+            return None;
         };
         if const_usize_expr(start, self.interner) != Some(0) {
-            return false;
+            return None;
         }
         let Pattern {
             kind: ast::PatKind::Ident(r),
             ..
         } = pat
         else {
-            return false;
+            return None;
         };
         // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else.
         if body.tail.is_some() {
-            return false;
+            return None;
         }
-        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_rmsnorm(body, 0, Some(*r)) {
-            if consumed == body.stmts.len() {
-                return self.emit_norm(x, Some(end), &cols, eps, NORM_RMSNORM, gamma, beta);
-            }
+        let (consumed, x, cols, eps, gamma, beta) = self.match_rmsnorm(body, 0, Some(*r))?;
+        if consumed != body.stmts.len() {
+            return None;
+        }
+        Some((x, cols, eps, gamma, beta))
+    }
+
+    /// Dispatch a recognized batched norm to one fused norm kernel with `rows = R`. Runs pre-opt, so
+    /// `-O0`==`-O3`; both backends marshal the identical kernel, so the differential gate stays
+    /// bit-exact. In a `@parallel` function `emit_norm` selects the multicore `_parallel` variant.
+    fn try_emit_batched_norm(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range { end: Some(end), .. } = iter else {
+            return false;
+        };
+        if let Some((x, cols, eps, gamma, beta)) = self.match_batched_norm(pat, iter, body) {
+            return self.emit_norm(x, Some(end), &cols, eps, NORM_RMSNORM, gamma, beta);
         }
         false
     }

@@ -1438,6 +1438,35 @@ fn batched_norm_dispatch() {
     );
 }
 
+/// A `@parallel` batched RMSNorm normalizes its rows across CPU cores via `mercury_norm_f32_parallel`
+/// (intercepted before the generic `@parallel` outliner, mirroring the sgemm/int8 whole-function
+/// interceptions). Rows are independent — no cross-row combine — so the multicore kernel is bit-
+/// identical to the serial one the interpreter marshals, and native must equal interp at every opt
+/// level. (The runtime's own `serial_matches_parallel_bit_for_bit` test pins the kernel equality; this
+/// pins the end-to-end dispatch + the rows>1 marshalling across the rayon boundary.)
+#[test]
+fn differential_parallel_batched_norm() {
+    // 64 rows × 64 cols = 4096; many rows so the kernel genuinely spreads across cores.
+    let src = "@parallel fn rmsnorm_batch(x: [f32; 4096]) { \
+         for r in 0..64 { \
+         let mut s: f32 = 0.0; for i in 0..64 { s = s + x[r*64+i] * x[r*64+i]; } \
+         let inv: f32 = rsqrt(s / 64.0 + 0.00001); \
+         for i in 0..64 { x[r*64+i] = x[r*64+i] * inv; } } } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } rmsnorm_batch(x); \
+         let mut s: f32 = 0.0; for i in 0..4096 { s = s + x[i]; } \
+         print((s * 1000.0) as i32); return 0; }";
+    assert!(
+        lowered_calls(src, "mercury_norm_f32_parallel"),
+        "@parallel batched RMSNorm must dispatch to the multicore norm kernel"
+    );
+    for opt in [0u8, 2, 3] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "parallel batched norm native vs interp at -O{opt}");
+    }
+}
+
 /// The accumulate (beta = 1) matmul — `C += A·B` with `C` pre-initialized — end to end. Guards the
 /// beta=1 dispatch (a real pattern: accumulating a matmul into a bias-initialized output). Unlike the
 /// overwrite test, this also checks the value against an independent reference, so a *beta
