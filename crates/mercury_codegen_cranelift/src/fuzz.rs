@@ -143,6 +143,14 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: POS,
         },
+        // abs = max(x, -x), a compare+select that vectorizes; the adversarial regime (negatives,
+        // ±0, NaN, inf) is exactly where the two backends must still agree lane-for-lane.
+        Kernel {
+            name: "abs",
+            src: |n| ew(n, "out[i] = abs(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
         Kernel {
             name: "exp",
             src: |n| ew(n, "out[i] = exp(x[i]);"),

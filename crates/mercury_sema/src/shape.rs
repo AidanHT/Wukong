@@ -29,10 +29,9 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
         _ => Ty::Scalar(Scalar::F32),
     };
     match name {
-        "sqrt" | "rsqrt" | "exp" | "log" | "pow" | "erf" | "sin" | "cos" | "tanh" | "sigmoid"
-        | "silu" | "gelu" | "elu" | "leaky_relu" | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish" | "fmax" | "fmin" => {
-            Some(float_ty)
-        }
+        "sqrt" | "rsqrt" | "abs" | "exp" | "log" | "pow" | "erf" | "sin" | "cos" | "tanh"
+        | "sigmoid" | "silu" | "gelu" | "elu" | "leaky_relu" | "softplus" | "mish" | "selu"
+        | "tanhshrink" | "hardsigmoid" | "hardswish" | "fmax" | "fmin" => Some(float_ty),
         _ => None,
     }
 }
