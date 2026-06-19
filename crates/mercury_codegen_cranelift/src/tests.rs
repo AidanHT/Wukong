@@ -433,10 +433,11 @@ fn i8_linear_nest_lowers_to_i8gemm() {
     );
 }
 
-/// A `@parallel` reduction (`s += f(x[k], y[k])`) dispatches to the multicore reduction kernel
-/// (`mercury_sreduce_f32_parallel`). The native run accumulates across cores; the interpreter calls
-/// the *serial* kernel — both are bit-identical by construction (fixed chunking, ascending combine),
-/// so native and interp must agree at every opt level. Covers dot, ssd, and the unary sum.
+/// A `@parallel` reduction (`s += f(x[k], y[k])`, `m = fmax(m, x[k])`) dispatches to the multicore
+/// reduction kernel (`mercury_sreduce_f32_parallel`). The native run folds across cores; the
+/// interpreter calls the *serial* kernel — both are bit-identical by construction (fixed chunking,
+/// ascending combine), so native and interp must agree at every opt level. Covers dot, ssd, the
+/// unary sum, and the running max/min (the per-tensor max/absmax for softmax / int8 quantization).
 #[test]
 fn differential_parallel_reduce() {
     let programs = [
@@ -461,6 +462,20 @@ fn differential_parallel_reduce() {
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.01; } sumv(x, o); \
          print((o[0]) as i32); return 0; }",
+        // running max (fold by fmax; mixed-sign fractional inputs)
+        "@parallel fn maxv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut m: f32 = x[0]; for k in 0..4096 { m = fmax(m, x[k]); } o[0] = m; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } maxv(x, o); \
+         print((o[0] * 1000.0) as i32); return 0; }",
+        // running min (fold by fmin, operand order m second)
+        "@parallel fn minv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut m: f32 = x[0]; for k in 0..4096 { m = fmin(x[k], m); } o[0] = m; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = 5.0 - (i as f32) * 0.001; } minv(x, o); \
+         print((o[0] * 1000.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {
@@ -486,6 +501,20 @@ fn differential_parallel_reduce() {
         String::from_utf8(out).unwrap(),
         "24576\n8192\n",
         "parallel reduction produced the wrong value"
+    );
+    // Max/min golden over a ramp (exact integer elements): max(i−1000) = 3095, min = −1000.
+    let golden_mm = "@parallel fn maxv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut m: f32 = x[0]; for k in 0..4096 { m = fmax(m, x[k]); } o[0] = m; } \
+         @parallel fn minv(x: [f32; 4096], o: [f32; 1]) { \
+         let mut m: f32 = x[0]; for k in 0..4096 { m = fmin(m, x[k]); } o[0] = m; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) - 1000.0; } \
+         maxv(x, o); print((o[0]) as i32); minv(x, o); print((o[0]) as i32); return 0; }";
+    let (_, out) = jit(golden_mm, 3).expect("jit golden_mm");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "3095\n-1000\n",
+        "parallel max/min produced the wrong value"
     );
 }
 
