@@ -1,0 +1,45 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 731
+// EXPECT-OUT: 1761
+// EXPECT-OUT: 2857
+// EXPECT-OUT: 3928
+module tests.run.linear_silu
+
+// A LLaMA/Mistral SwiGLU FFN projection: out = silu(x · Wᵀ) — a bias-free nn.Linear followed by a
+// SiLU activation. The matmul nest and the SiLU loop fuse into one mercury_sgemm_nt_epi call with
+// act = SiLU and a *null* bias (the bias-free epilogue), so C is written once with the activation
+// already applied.
+//
+// x = [[1,2],[3,4]], W = I (so x·Wᵀ = x), no bias:
+//   silu([1,2,3,4]) = [silu(1), silu(2), silu(3), silu(4)]
+// silu(z) = z·sigmoid(z): silu(1)≈0.7311, silu(2)≈1.7616, silu(3)≈2.8577, silu(4)≈3.9281.
+// Printed as (out*1000) as i32: 731 / 1761 / 2857 / 3928.
+fn linear(x: [f32; 4], w: [f32; 4], out: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + x[i * 2 + k] * w[j * 2 + k];
+            }
+            out[i * 2 + j] = s;
+        }
+    }
+    for i in 0..2 {
+        for j in 0..2 {
+            out[i * 2 + j] = silu(out[i * 2 + j]);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let w: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    linear(x, w, out);
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}
