@@ -1,0 +1,23 @@
+[package]
+name = "mercury_codegen_gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# The GPU backend: Mercury emits PTX text and driver-JIT-loads it via `cudarc`
+# (`cuModuleLoadData` — the NVIDIA driver's built-in PTX→SASS JIT needs no `nvcc`/`ptxas`).
+# All GPU code is behind the `gpu` feature so the toolchain-free CPU core (`cargo test`) never
+# pulls in `cudarc` or needs a GPU. `cudarc` uses `dynamic-loading` (dlopens `nvcuda.dll`), so even
+# with the feature on, building needs no CUDA toolkit — only running needs the driver + a device.
+
+[dependencies]
+cudarc = { version = "0.16", default-features = false, features = [
+    "driver",
+    "dynamic-loading",
+    "cuda-12060",
+], optional = true }
+
+[features]
+gpu = ["dep:cudarc"]
