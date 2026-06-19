@@ -458,6 +458,7 @@ const RED_SSD: i64 = 1; // sum((x[k] - y[k])^2)
 const RED_SUM: i64 = 2; // sum(x[k])
 const RED_MAX: i64 = 4; // max(x[k])  — fold by fmax
 const RED_MIN: i64 = 5; // min(x[k])  — fold by fmin
+const RED_MAXABS: i64 = 6; // max(|x[k]|) — fmax(m, abs(x[k])), symmetric int8 quant absmax
 
 // Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
@@ -1848,8 +1849,30 @@ impl FnLowerer<'_> {
                         } else {
                             return None;
                         };
-                        let a = idx_base(other)?;
-                        return Some((s, red, a, a));
+                        // `other` is `x[k]` (RED_MAX/MIN), or — for fmax — `abs(x[k])` (running
+                        // absmax, the symmetric int8-quant scale). The kernel applies the abs.
+                        if let Some(a) = idx_base(other) {
+                            return Some((s, red, a, a));
+                        }
+                        if red == RED_MAX {
+                            if let ExprKind::Call {
+                                callee: ac,
+                                args: aargs,
+                                ..
+                            } = &other.kind
+                            {
+                                if aargs.len() == 1
+                                    && matches!(
+                                        self.vectorizable_intrinsic(ac),
+                                        Some(MathIntrinsic::Abs)
+                                    )
+                                {
+                                    let a = idx_base(&aargs[0])?;
+                                    return Some((s, RED_MAXABS, a, a));
+                                }
+                            }
+                        }
+                        return None;
                     }
                 }
             }
@@ -1972,11 +1995,12 @@ impl FnLowerer<'_> {
             .builder
             .build(MirType::F32, Op::Load(s_slot, MirType::F32));
         let new_s = match op {
-            RED_MAX | RED_MIN => {
-                let pred = if op == RED_MAX {
-                    CmpOp::Fogt
-                } else {
+            RED_MAX | RED_MIN | RED_MAXABS => {
+                // max/maxabs fold by fmax (Fogt); min by fmin (Folt).
+                let pred = if op == RED_MIN {
                     CmpOp::Folt
+                } else {
+                    CmpOp::Fogt
                 };
                 let mask =
                     self.builder
