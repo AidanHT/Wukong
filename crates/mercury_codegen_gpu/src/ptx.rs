@@ -445,3 +445,235 @@ END:
     ret;
 }
 "#;
+
+/// Tiled shared-memory f32 GEMM — the GPU analogue of the AVX2 `mercury_sgemm` microkernel. Two
+/// entries: `gemm_nn` (`C = A·B`) and `gemm_nt` (`C = A·Bᵀ`, the nn.Linear spelling). 16×16 thread
+/// blocks each compute a 16×16 C tile; A and B tiles are staged in shared memory (`As`/`Bs`) and the
+/// `TILE=16` inner product runs from there, so each global element is loaded once per tile instead of
+/// once per MAC. One C element per thread (no register blocking yet) — a clear win over a naive nest;
+/// the register-blocked / vectorized version that chases cuBLAS comes next. Uses **named PTX
+/// registers** for legibility. Out-of-range threads load zeros (keeping `bar.sync` uniform) and skip
+/// the C store, so ragged M/N/K are handled. `A,B,C` are f32; `fma.rn` accumulation.
+pub const GEMM: &str = r#"
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry gemm_nt(
+    .param .u32 pM,
+    .param .u32 pN,
+    .param .u32 pK,
+    .param .u64 pA,
+    .param .u64 pB,
+    .param .u64 pC
+)
+{
+    .reg .pred %p0, %p1, %p2, %p3;
+    .reg .f32 %acc, %a, %b, %va, %vb;
+    .reg .b32 %M, %N, %K, %tx, %ty, %col, %row, %t, %ntiles, %kA, %kB, %kk, %tmp, %tmp2;
+    .reg .b64 %A, %B, %C, %off, %addr, %sA, %sB, %sAt, %sBt;
+    .shared .align 4 .b8 As[1024];
+    .shared .align 4 .b8 Bs[1024];
+
+    ld.param.u32 %M, [pM];
+    ld.param.u32 %N, [pN];
+    ld.param.u32 %K, [pK];
+    ld.param.u64 %A, [pA];
+    ld.param.u64 %B, [pB];
+    ld.param.u64 %C, [pC];
+    cvta.to.global.u64 %A, %A;
+    cvta.to.global.u64 %B, %B;
+    cvta.to.global.u64 %C, %C;
+
+    mov.u32 %tx, %tid.x;
+    mov.u32 %ty, %tid.y;
+    mov.u32 %tmp, %ctaid.x;
+    mad.lo.s32 %col, %tmp, 16, %tx;
+    mov.u32 %tmp, %ctaid.y;
+    mad.lo.s32 %row, %tmp, 16, %ty;
+
+    mov.f32 %acc, 0f00000000;
+    add.u32 %tmp, %K, 15;
+    shr.u32 %ntiles, %tmp, 4;
+
+    mov.u64 %sA, As;
+    mov.u64 %sB, Bs;
+    mad.lo.s32 %tmp, %ty, 16, %tx;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %sAt, %sA, %off;
+    add.s64 %sBt, %sB, %off;
+
+    mov.u32 %t, 0;
+TILELOOP:
+    setp.ge.u32 %p0, %t, %ntiles;
+    @%p0 bra ENDTILES;
+
+    mad.lo.s32 %kA, %t, 16, %tx;
+    mov.f32 %va, 0f00000000;
+    setp.ge.u32 %p1, %row, %M;
+    setp.ge.u32 %p2, %kA, %K;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra STOREA;
+    mad.lo.s32 %tmp, %row, %K, %kA;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %A, %off;
+    ld.global.f32 %va, [%addr];
+STOREA:
+    st.shared.f32 [%sAt], %va;
+
+    mad.lo.s32 %kB, %t, 16, %ty;
+    mov.f32 %vb, 0f00000000;
+    setp.ge.u32 %p1, %col, %N;
+    setp.ge.u32 %p2, %kB, %K;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra STOREB;
+    mad.lo.s32 %tmp, %col, %K, %kB;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %B, %off;
+    ld.global.f32 %vb, [%addr];
+STOREB:
+    st.shared.f32 [%sBt], %vb;
+
+    bar.sync 0;
+
+    mov.u32 %kk, 0;
+INNER:
+    setp.ge.u32 %p0, %kk, 16;
+    @%p0 bra ENDINNER;
+    mad.lo.s32 %tmp, %ty, 16, %kk;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %sA, %off;
+    ld.shared.f32 %a, [%addr];
+    mad.lo.s32 %tmp2, %kk, 16, %tx;
+    mul.wide.u32 %off, %tmp2, 4;
+    add.s64 %addr, %sB, %off;
+    ld.shared.f32 %b, [%addr];
+    fma.rn.f32 %acc, %a, %b, %acc;
+    add.u32 %kk, %kk, 1;
+    bra INNER;
+ENDINNER:
+    bar.sync 0;
+    add.u32 %t, %t, 1;
+    bra TILELOOP;
+ENDTILES:
+    setp.ge.u32 %p1, %row, %M;
+    setp.ge.u32 %p2, %col, %N;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra DONE;
+    mad.lo.s32 %tmp, %row, %N, %col;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %C, %off;
+    st.global.f32 [%addr], %acc;
+DONE:
+    ret;
+}
+
+.visible .entry gemm_nn(
+    .param .u32 pM,
+    .param .u32 pN,
+    .param .u32 pK,
+    .param .u64 pA,
+    .param .u64 pB,
+    .param .u64 pC
+)
+{
+    .reg .pred %p0, %p1, %p2, %p3;
+    .reg .f32 %acc, %a, %b, %va, %vb;
+    .reg .b32 %M, %N, %K, %tx, %ty, %col, %row, %t, %ntiles, %kA, %kB, %kk, %tmp, %tmp2;
+    .reg .b64 %A, %B, %C, %off, %addr, %sA, %sB, %sAt, %sBt;
+    .shared .align 4 .b8 As[1024];
+    .shared .align 4 .b8 Bs[1024];
+
+    ld.param.u32 %M, [pM];
+    ld.param.u32 %N, [pN];
+    ld.param.u32 %K, [pK];
+    ld.param.u64 %A, [pA];
+    ld.param.u64 %B, [pB];
+    ld.param.u64 %C, [pC];
+    cvta.to.global.u64 %A, %A;
+    cvta.to.global.u64 %B, %B;
+    cvta.to.global.u64 %C, %C;
+
+    mov.u32 %tx, %tid.x;
+    mov.u32 %ty, %tid.y;
+    mov.u32 %tmp, %ctaid.x;
+    mad.lo.s32 %col, %tmp, 16, %tx;
+    mov.u32 %tmp, %ctaid.y;
+    mad.lo.s32 %row, %tmp, 16, %ty;
+
+    mov.f32 %acc, 0f00000000;
+    add.u32 %tmp, %K, 15;
+    shr.u32 %ntiles, %tmp, 4;
+
+    mov.u64 %sA, As;
+    mov.u64 %sB, Bs;
+    mad.lo.s32 %tmp, %ty, 16, %tx;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %sAt, %sA, %off;
+    add.s64 %sBt, %sB, %off;
+
+    mov.u32 %t, 0;
+TILELOOP2:
+    setp.ge.u32 %p0, %t, %ntiles;
+    @%p0 bra ENDTILES2;
+
+    mad.lo.s32 %kA, %t, 16, %tx;
+    mov.f32 %va, 0f00000000;
+    setp.ge.u32 %p1, %row, %M;
+    setp.ge.u32 %p2, %kA, %K;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra STOREA2;
+    mad.lo.s32 %tmp, %row, %K, %kA;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %A, %off;
+    ld.global.f32 %va, [%addr];
+STOREA2:
+    st.shared.f32 [%sAt], %va;
+
+    mad.lo.s32 %kB, %t, 16, %ty;
+    mov.f32 %vb, 0f00000000;
+    setp.ge.u32 %p1, %col, %N;
+    setp.ge.u32 %p2, %kB, %K;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra STOREB2;
+    mad.lo.s32 %tmp, %kB, %N, %col;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %B, %off;
+    ld.global.f32 %vb, [%addr];
+STOREB2:
+    st.shared.f32 [%sBt], %vb;
+
+    bar.sync 0;
+
+    mov.u32 %kk, 0;
+INNER2:
+    setp.ge.u32 %p0, %kk, 16;
+    @%p0 bra ENDINNER2;
+    mad.lo.s32 %tmp, %ty, 16, %kk;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %sA, %off;
+    ld.shared.f32 %a, [%addr];
+    mad.lo.s32 %tmp2, %kk, 16, %tx;
+    mul.wide.u32 %off, %tmp2, 4;
+    add.s64 %addr, %sB, %off;
+    ld.shared.f32 %b, [%addr];
+    fma.rn.f32 %acc, %a, %b, %acc;
+    add.u32 %kk, %kk, 1;
+    bra INNER2;
+ENDINNER2:
+    bar.sync 0;
+    add.u32 %t, %t, 1;
+    bra TILELOOP2;
+ENDTILES2:
+    setp.ge.u32 %p1, %row, %M;
+    setp.ge.u32 %p2, %col, %N;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra DONE2;
+    mad.lo.s32 %tmp, %row, %N, %col;
+    mul.wide.u32 %off, %tmp, 4;
+    add.s64 %addr, %C, %off;
+    st.global.f32 [%addr], %acc;
+DONE2:
+    ret;
+}
+"#;

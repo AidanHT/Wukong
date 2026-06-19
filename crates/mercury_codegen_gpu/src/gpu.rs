@@ -181,9 +181,74 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
     Ok(acc)
 }
 
+/// Launch config for the 16×16-tiled GEMM: one 16×16 thread block per 16×16 C tile.
+fn gemm_cfg(m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `C = A·Bᵀ` on the GPU (the nn.Linear spelling): `A` is `m×k`, `B` is `n×k`, `C` is `m×n`. GPU
+/// twin of `mercury_sgemm_nt`. Tolerance-gated (the GPU reduces K in a different order).
+pub fn gemm_nt(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
+    let f = g.function("gemm", crate::ptx::GEMM, "gemm_nt")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(gemm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·B` on the GPU: `A` is `m×k`, `B` is `k×n`, `C` is `m×n`. GPU twin of `mercury_sgemm`.
+pub fn gemm_nn(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), m * k, "A must be m×k");
+    assert_eq!(b.len(), k * n, "B must be k×n (A·B)");
+    let f = g.function("gemm", crate::ptx::GEMM, "gemm_nn")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(gemm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Run `body` with the shared GPU, or skip (printing why) if none is present.
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
@@ -302,6 +367,124 @@ mod tests {
                 again.to_bits(),
                 "reduction must be deterministic"
             );
+        });
+    }
+
+    /// f64 reference for `C = A·Bᵀ` (`A` m×k, `B` n×k).
+    fn ref_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    acc += a[i * k + kk] as f64 * b[j * k + kk] as f64;
+                }
+                c[i * n + j] = acc as f32;
+            }
+        }
+        c
+    }
+
+    /// f64 reference for `C = A·B` (`A` m×k, `B` k×n).
+    fn ref_nn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    acc += a[i * k + kk] as f64 * b[kk * n + j] as f64;
+                }
+                c[i * n + j] = acc as f32;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn gemm_matches_reference_within_tol() {
+        with_gpu("gemm", |g| {
+            let mut rng = crate::diff::Rng::new(0x6E33);
+            // include ragged (non-multiple-of-16) M/N/K to exercise the bounds guards
+            let shapes = [(64usize, 64usize, 64usize), (100, 80, 48), (128, 256, 192)];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let bt = rng.vec(n * k, -1.0, 1.0); // n×k for A·Bᵀ
+                let bn = rng.vec(k * n, -1.0, 1.0); // k×n for A·B
+
+                // c·√K·ε bound; abs cushion for tiles where the true value is ~0
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+
+                let c_nt = gemm_nt(g, &a, &bt, m, k, n).unwrap();
+                let r_nt = ref_nt(&a, &bt, m, k, n);
+                let s = crate::diff::assert_close(
+                    &format!("gemm_nt {m}x{k}x{n}"),
+                    &c_nt,
+                    &r_nt,
+                    1e-3,
+                    rel,
+                );
+                eprintln!(
+                    "gemm_nt {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+
+                let c_nn = gemm_nn(g, &a, &bn, m, k, n).unwrap();
+                let r_nn = ref_nn(&a, &bn, m, k, n);
+                crate::diff::assert_close(&format!("gemm_nn {m}x{k}x{n}"), &c_nn, &r_nn, 1e-3, rel);
+            }
+        });
+    }
+
+    /// Kernel-resident throughput (no per-iter H2D/D2H): upload once, launch many, sync once.
+    /// Run with `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn gemm_throughput() {
+        with_gpu("gemm_throughput", |g| {
+            let mut rng = crate::diff::Rng::new(1);
+            for sz in [512usize, 1024, 2048] {
+                let (m, k, n) = (sz, sz, sz);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let f = g.function("gemm", crate::ptx::GEMM, "gemm_nt").unwrap();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let cfg = gemm_cfg(m, n);
+                // warmup
+                {
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut c_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let iters = 30;
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&mm)
+                        .arg(&nn)
+                        .arg(&kk)
+                        .arg(&a_d)
+                        .arg(&b_d)
+                        .arg(&mut c_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let secs = t0.elapsed().as_secs_f64() / iters as f64;
+                let gflops = 2.0 * (m as f64) * (k as f64) * (n as f64) / secs / 1e9;
+                eprintln!(
+                    "gemm_nt {m}³: {:.3} ms/iter  {:.0} GFLOP/s (f32, 16×16 tiled, no TC)",
+                    secs * 1e3,
+                    gflops
+                );
+            }
         });
     }
 }
