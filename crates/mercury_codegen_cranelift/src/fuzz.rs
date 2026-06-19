@@ -179,6 +179,18 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        Kernel {
+            name: "elu",
+            src: |n| ew(n, "out[i] = elu(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "leaky_relu",
+            src: |n| ew(n, "out[i] = leaky_relu(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
         // Reductions (result lands in out[0]); the rest of `out` stays 0 on both backends.
         Kernel {
             name: "dot",
@@ -527,6 +539,16 @@ fn vmath_kernels_match_f64_reference() {
             1e-4,
         ),
         ("silu", |v| v / (1.0 + (-v).exp()), Regime::Normal, 1e-4),
+        // leaky_relu is exact (a branch + one multiply), so it holds to f32 rounding. `elu` is omitted
+        // here: its only nonlinearity is the same `exp8` the "exp" case already value-checks, and
+        // `exp(x)−1` cancels catastrophically near 0⁻ (a *relative*-error artifact of ELU's definition,
+        // not a kernel bug) — the full-buffer fuzzer still gates its interp-vs-native equality.
+        (
+            "leaky_relu",
+            |v| if v > 0.0 { v } else { 0.01 * v },
+            Regime::Normal,
+            1e-6,
+        ),
     ];
     let n = 256usize;
     let mut rng = Rng(0x_5EED_2024);

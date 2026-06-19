@@ -1,0 +1,25 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -864
+// EXPECT-OUT: -632
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+module tests.run.elu
+
+// ELU (exponential linear unit, α=1): out[i] = x>0 ? x : e^x − 1. An `out[i] = elu(x[i])` loop
+// dispatches to the 256-bit AVX2 mercury_vmath_f32 kernel (op = ELU); the negative branch reuses the
+// same ≈1-ULP exp poly as `exp`, so it is bit-identical across backends.
+//   elu(-2)=e^-2−1≈-0.8647 → -864 (truncates toward 0); elu(-1)=e^-1−1≈-0.6321 → -632;
+//   elu(1)=1 → 1000; elu(2)=2 → 2000.
+fn main() -> i32 {
+    let x: [f32; 4] = [-2.0, -1.0, 1.0, 2.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        out[i] = elu(x[i]);
+    }
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}

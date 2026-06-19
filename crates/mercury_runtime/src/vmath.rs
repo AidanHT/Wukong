@@ -21,6 +21,12 @@ pub const VM_SIGMOID: i64 = 3;
 pub const VM_RELU: i64 = 4;
 pub const VM_SILU: i64 = 5;
 pub const VM_GELU: i64 = 6;
+pub const VM_ELU: i64 = 7;
+pub const VM_LEAKYRELU: i64 = 8;
+
+/// Leaky-ReLU negative-slope (the conventional 0.01); fixed so `leaky_relu` stays a single-arg
+/// intrinsic that fits the elementwise dispatch.
+const LEAKY_ALPHA: f32 = 0.01;
 
 // GELU (tanh approximation) constants: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
 const GELU_C0: f32 = 0.797_884_6; // √(2/π)
@@ -146,6 +152,27 @@ pub(crate) fn gelu1(x: f32) -> f32 {
     (0.5 * x) * (1.0 + tanh1(inner))
 }
 
+/// `elu(x) = x>0 ? x : e^x − 1` (α=1) — the exponential linear unit (smooth, saturating negative
+/// tail). Reuses [`exp1`], so the AVX2 [`elu8`], the tail, and the composed scalar MIR all agree.
+#[inline]
+fn elu1(x: f32) -> f32 {
+    if x > 0.0 {
+        x
+    } else {
+        exp1(x) - 1.0
+    }
+}
+
+/// `leaky_relu(x) = x>0 ? x : 0.01·x` — the leaky rectifier (a small negative slope, no saturation).
+#[inline]
+fn leakyrelu1(x: f32) -> f32 {
+    if x > 0.0 {
+        x
+    } else {
+        LEAKY_ALPHA * x
+    }
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -157,6 +184,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_RELU => x.max(0.0),
         VM_SILU => silu1(x),
         VM_GELU => gelu1(x),
+        VM_ELU => elu1(x),
+        VM_LEAKYRELU => leakyrelu1(x),
         _ => x,
     }
 }
@@ -199,6 +228,8 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_RELU => relu8,
         VM_SILU => silu8,
         VM_GELU => gelu8,
+        VM_ELU => elu8,
+        VM_LEAKYRELU => leakyrelu8,
         _ => return,
     };
     let mut i = 0;
@@ -323,6 +354,27 @@ unsafe fn gelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), x), onep)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn elu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x>0 ? x : exp(x)−1 — blendv picks `x` where the (x>0) mask is set, else the saturating tail.
+    // Mirrors elu1: the negative branch is exp8 (== exp1), so lanes and tail agree.
+    let em1 = _mm256_sub_ps(exp8(x), _mm256_set1_ps(1.0));
+    let pos = _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps());
+    _mm256_blendv_ps(em1, x, pos)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn leakyrelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x>0 ? x : 0.01·x — mirrors leakyrelu1.
+    let scaled = _mm256_mul_ps(x, _mm256_set1_ps(LEAKY_ALPHA));
+    let pos = _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps());
+    _mm256_blendv_ps(scaled, x, pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +397,12 @@ mod tests {
                 VM_GELU,
                 |x| 0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh()),
                 5e-5,
+            ),
+            (VM_ELU, |x| if x > 0.0 { x } else { x.exp() - 1.0 }, 2e-5),
+            (
+                VM_LEAKYRELU,
+                |x| if x > 0.0 { x } else { LEAKY_ALPHA * x },
+                1e-6,
             ),
         ];
         for &(op, libm, tol) in cases {
