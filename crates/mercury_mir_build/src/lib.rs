@@ -418,6 +418,8 @@ const VMATH_SOFTPLUS: u32 = 9;
 const VMATH_MISH: u32 = 10;
 const VMATH_SELU: u32 = 11;
 const VMATH_TANHSHRINK: u32 = 12;
+const VMATH_HARDSIGMOID: u32 = 13;
+const VMATH_HARDSWISH: u32 = 14;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2111,6 +2113,8 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Mish) => VMATH_MISH,
             Some(MathIntrinsic::Selu) => VMATH_SELU,
             Some(MathIntrinsic::Tanhshrink) => VMATH_TANHSHRINK,
+            Some(MathIntrinsic::HardSigmoid) => VMATH_HARDSIGMOID,
+            Some(MathIntrinsic::HardSwish) => VMATH_HARDSWISH,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -2949,7 +2953,9 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Softplus
                     | MathIntrinsic::Mish
                     | MathIntrinsic::Selu
-                    | MathIntrinsic::Tanhshrink,
+                    | MathIntrinsic::Tanhshrink
+                    | MathIntrinsic::HardSigmoid
+                    | MathIntrinsic::HardSwish,
                 ) => {
                     // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
                     // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
@@ -3766,6 +3772,14 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Tanhshrink) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_tanhshrink(x, vty)
+                }
+                Some(MathIntrinsic::HardSigmoid) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_hardsigmoid(x, vty)
+                }
+                Some(MathIntrinsic::HardSwish) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_hardswish(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -4597,6 +4611,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_tanhshrink(x, &rty))
             }
+            MathIntrinsic::HardSigmoid => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_hardsigmoid(x, &rty))
+            }
+            MathIntrinsic::HardSwish => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_hardswish(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -4783,6 +4805,28 @@ impl FnLowerer<'_> {
     fn emit_tanhshrink(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let th = self.emit_tanh(x, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, x, th))
+    }
+
+    /// `hardsigmoid(x) = clamp(x+3, 0, 6)·(1/6)`. The clamp is `Cmp(Fogt)`/`Cmp(Folt)` + `Select`,
+    /// which matches the AVX2 `hardsigmoid8` (`max_ps`/`min_ps`) bit-for-bit (ordered compares are
+    /// false for NaN, so both return the bound).
+    fn emit_hardsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let three = self.splat_const_f(3.0, rty);
+        let y = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, x, three));
+        let zero = self.splat_const_f(0.0, rty);
+        let gt0 = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, y, zero));
+        let lo = self.builder.build(rty.clone(), Op::Select(gt0, y, zero));
+        let six = self.splat_const_f(6.0, rty);
+        let lt6 = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Folt, lo, six));
+        let hi = self.builder.build(rty.clone(), Op::Select(lt6, lo, six));
+        let inv6 = self.splat_const_f(1.0 / 6.0, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, hi, inv6))
+    }
+
+    /// `hardswish(x) = x · hardsigmoid(x)`. Mirrors `hardswish8`.
+    fn emit_hardswish(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let hs = self.emit_hardsigmoid(x, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, hs))
     }
 
     /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
@@ -6992,6 +7036,8 @@ enum MathIntrinsic {
     Mish,
     Selu,
     Tanhshrink,
+    HardSigmoid,
+    HardSwish,
     Fmax,
     Fmin,
 }
@@ -7016,6 +7062,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "mish" => MathIntrinsic::Mish,
         "selu" => MathIntrinsic::Selu,
         "tanhshrink" => MathIntrinsic::Tanhshrink,
+        "hardsigmoid" => MathIntrinsic::HardSigmoid,
+        "hardswish" => MathIntrinsic::HardSwish,
         "fmax" => MathIntrinsic::Fmax,
         "fmin" => MathIntrinsic::Fmin,
         _ => return None,

@@ -215,6 +215,18 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        Kernel {
+            name: "hardsigmoid",
+            src: |n| ew(n, "out[i] = hardsigmoid(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "hardswish",
+            src: |n| ew(n, "out[i] = hardswish(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
         // Reductions (result lands in out[0]); the rest of `out` stays 0 on both backends.
         Kernel {
             name: "dot",

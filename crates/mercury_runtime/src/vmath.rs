@@ -31,6 +31,12 @@ pub const VM_SOFTPLUS: i64 = 9;
 pub const VM_MISH: i64 = 10;
 pub const VM_SELU: i64 = 11;
 pub const VM_TANHSHRINK: i64 = 12;
+pub const VM_HARDSIGMOID: i64 = 13;
+pub const VM_HARDSWISH: i64 = 14;
+
+/// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
+/// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
+const INV6: f32 = 1.0 / 6.0;
 
 // SELU (self-normalizing networks, Klambauer 2017) constants — the fixed λ, α that make the
 // activation variance-preserving.
@@ -220,6 +226,24 @@ fn tanhshrink1(x: f32) -> f32 {
     x - tanh1(x)
 }
 
+/// `hardsigmoid(x) = clamp(x+3, 0, 6)/6` — the cheap piecewise-linear sigmoid of MobileNetV3 /
+/// EfficientNet. The clamp is written as the manual branches that match `_mm256_max_ps`/`_mm256_min_ps`
+/// (and the `Cmp+Select` MIR) bit-for-bit on NaN/±0 — `v>0`/`v<6` are false for NaN, so it returns the
+/// bound, exactly as the SSE max/min instructions do (the same trick `velem`'s relu6 uses).
+#[inline]
+fn hardsigmoid1(x: f32) -> f32 {
+    let y = x + 3.0;
+    let lo = if y > 0.0 { y } else { 0.0 };
+    let hi = if lo < 6.0 { lo } else { 6.0 };
+    hi * INV6
+}
+
+/// `hardswish(x) = x · hardsigmoid(x)` — the MobileNetV3 self-gated activation.
+#[inline]
+fn hardswish1(x: f32) -> f32 {
+    x * hardsigmoid1(x)
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -237,6 +261,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_MISH => mish1(x),
         VM_SELU => selu1(x),
         VM_TANHSHRINK => tanhshrink1(x),
+        VM_HARDSIGMOID => hardsigmoid1(x),
+        VM_HARDSWISH => hardswish1(x),
         _ => x,
     }
 }
@@ -285,6 +311,8 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_MISH => mish8,
         VM_SELU => selu8,
         VM_TANHSHRINK => tanhshrink8,
+        VM_HARDSIGMOID => hardsigmoid8,
+        VM_HARDSWISH => hardswish8,
         _ => return,
     };
     let mut i = 0;
@@ -474,6 +502,24 @@ unsafe fn tanhshrink8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256
     _mm256_sub_ps(x, tanh8(x))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hardsigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // clamp(x+3, 0, 6)·(1/6) — max_ps/min_ps match hardsigmoid1's `v>0`/`v<6` branches bit-for-bit.
+    let y = _mm256_add_ps(x, _mm256_set1_ps(3.0));
+    let clamped = _mm256_min_ps(_mm256_max_ps(y, _mm256_setzero_ps()), _mm256_set1_ps(6.0));
+    _mm256_mul_ps(clamped, _mm256_set1_ps(INV6))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hardswish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x · hardsigmoid(x) — mirrors hardswish1.
+    _mm256_mul_ps(x, hardsigmoid8(x))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +559,16 @@ mod tests {
                 2e-5,
             ),
             (VM_TANHSHRINK, |x| x - x.tanh(), 2e-5),
+            (
+                VM_HARDSIGMOID,
+                |x| (x + 3.0).max(0.0).min(6.0) * INV6,
+                1e-6,
+            ),
+            (
+                VM_HARDSWISH,
+                |x| x * ((x + 3.0).max(0.0).min(6.0) * INV6),
+                1e-6,
+            ),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
