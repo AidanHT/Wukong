@@ -875,9 +875,10 @@ fn vectorized_ssd_reduction() {
     }
 }
 
-/// ReLU via if-conversion: `out[i] = if x[i] > 0 { x[i] } else { 0 }` must vectorize to a vector
-/// compare + blend, agree between interpreter and native, and match the scalar reference across
-/// sizes that exercise the vector body and the remainder. x[i] = i - n/2 spans negatives/positives.
+/// ReLU streaming dispatch: `out[i] = if x[i] > 0 { x[i] } else { 0 }` (= `max(x, 0)`) must lower to
+/// one `mercury_velem_f32` call (the 256-bit AVX2 + non-temporal-store kernel, `VE_RELU`), agree
+/// between interpreter and native, and match the scalar reference across sizes that exercise the
+/// kernel's vector body and its tail. x[i] = i - n/2 spans negatives/positives.
 #[test]
 fn vectorized_relu_is_correct() {
     let kernel = |n: usize| {
@@ -895,8 +896,8 @@ fn vectorized_relu_is_correct() {
     let (prog, interner) = lowered(&kernel(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
-        mir.contains("select") && mir.contains("x f32>"),
-        "relu should vectorize"
+        mir.contains("mercury_velem_f32"),
+        "relu should dispatch to the streaming velem kernel:\n{mir}"
     );
 
     for n in [3usize, 4, 8, 13, 64, 257] {
@@ -1028,8 +1029,10 @@ fn fusion_collapses_adjacent_loops() {
     assert_eq!(native.0, 2500);
 }
 
-/// Nested if-conversion: relu6 `clamp(x, 0, 6)` written as nested value-ifs must vectorize (nested
-/// vector blends) and stay correct. Exercises the recursive `else`/`then` handling in the vectorizer.
+/// ReLU6 streaming dispatch: `clamp(x, 0, 6)` written as the nested value-ifs `if x < 6 { if x > 0 {
+/// x } else { 0 } } else { 6 }` must lower to one `mercury_velem_f32` call (`VE_RELU6`) and stay
+/// correct across sizes. Exercises the recursive ReLU6 peel (`peel_velem_act`) that matches the outer
+/// `< 6` guard around an inner ReLU over the same value.
 #[test]
 fn vectorized_relu6_nested_if() {
     let kernel = |n: usize| {
@@ -1045,8 +1048,8 @@ fn vectorized_relu6_nested_if() {
     let (prog, interner) = lowered(&kernel(40), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
-        mir.contains("select"),
-        "relu6 should vectorize via nested blends"
+        mir.contains("mercury_velem_f32"),
+        "relu6 should dispatch to the streaming velem kernel:\n{mir}"
     );
     for n in [5usize, 8, 13, 40] {
         let src = kernel(n);
