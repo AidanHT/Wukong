@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 644
+// EXPECT-OUT: 250
+// EXPECT-OUT: 948
+module tests.run.batched_softmax
+
+// Batched softmax over a flat [R, C] matrix: each row r is softmaxed independently,
+// x[r*C+i] = exp(x[r*C+i] - max_r) / sum_r. The `for r { ...row r... }` outer loop dispatches to the
+// fused single-pass norm kernel with rows = R — the real attention shape (softmax over [heads*seq, seq]
+// score rows). The row-local max seed is x[r*C] (the row's first element). mercury_bench proves interp ==
+// native.
+
+fn softmax_batch(x: [f32; 12]) { // R = 3 rows, C = 4 cols
+    for r in 0..3 {
+        let mut m: f32 = x[r*4];
+        for i in 0..4 { m = fmax(m, x[r*4+i]); }
+        for i in 0..4 { x[r*4+i] = exp(x[r*4+i] - m); }
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + x[r*4+i]; }
+        let inv: f32 = 1.0 / s;
+        for i in 0..4 { x[r*4+i] = x[r*4+i] * inv; }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 12] = [0.0; 12];
+    x[0]=1.0; x[1]=2.0; x[2]=3.0; x[3]=4.0;     // row 0
+    x[4]=2.0; x[5]=2.0; x[6]=2.0; x[7]=2.0;     // row 1 (uniform → 0.25 each)
+    x[8]=0.0; x[9]=0.0; x[10]=0.0; x[11]=4.0;   // row 2
+    softmax_batch(x);
+
+    // row 0: exp(x-4) / Σ → largest element 4 ⇒ 1/1.553 ≈ 0.6439
+    print(round(x[3] * 1000.0) as i32);   // 644
+    // row 1 uniform: 1/4 = 0.25
+    print(round(x[4] * 1000.0) as i32);   // 250
+    // row 2: element 4 dominates ⇒ 1/1.0549 ≈ 0.9480
+    print(round(x[11] * 1000.0) as i32);  // 948
+    return 0;
+}
