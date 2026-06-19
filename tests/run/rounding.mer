@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -16
+// EXPECT-OUT: -14
+// EXPECT-OUT: 123
+module tests.run.rounding
+
+// round / floor / ceil / trunc lower to one hardware round-to-integral op (roundss/roundps), scalar
+// or vectorized. round is round-to-nearest-ties-to-EVEN (matching the native `nearest` and the
+// interpreter's `round_ties_even`), so 2.5 → 2 and 3.5 → 4. Bit-identical across backends (the
+// mercury_bench gate proves it); a `round(x / scale)` is the quantization step that pairs with absmax.
+
+fn main() -> i32 {
+    let a: f32 = 2.5;
+    print(round(a) as i32); // ties to even: 2
+    let b: f32 = 3.5;
+    print(round(b) as i32); // ties to even: 4
+
+    let c: f32 = 2.3;
+    print(floor(c) as i32); // 2
+    print(ceil(c) as i32);  // 3
+
+    let d: f32 = -2.3;
+    print(trunc(d) as i32); // toward zero: -2
+    print(floor(d) as i32); // -3
+    print(ceil(d) as i32);  // -2
+
+    // Vectorized round over exact half-integers (exercises the round lane op + ties-to-even).
+    let mut x: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) * 0.5 - 16.0; } // -16, -15.5, -15, -14.5, ...
+    let mut out: [f32; 64] = [0.0; 64];
+    for i in 0..64 { out[i] = round(x[i]); }
+    print(out[1] as i32); // round(-15.5) → -16 (even)
+    print(out[3] as i32); // round(-14.5) → -14 (even)
+
+    let v: f32 = 123.456;
+    print(round(v) as i32); // 123
+    return 0;
+}

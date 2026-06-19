@@ -15,7 +15,7 @@ use mercury_ast::{
     self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind,
 };
 use mercury_diag::Diagnostic;
-use mercury_mir::{BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, ValueId};
+use mercury_mir::{BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId};
 use mercury_sema::{DefKind, SemaResult};
 use mercury_span::{Interner, Span, Symbol};
 use mercury_types::Ty;
@@ -3000,9 +3000,15 @@ impl FnLowerer<'_> {
             // Element-wise math intrinsics over vectorizable args. sqrt/rsqrt are one lane op each;
             // fmax/fmin are a lane compare + blend; exp is the f32 polynomial expanded per lane.
             ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
-                Some(MathIntrinsic::Sqrt | MathIntrinsic::Rsqrt | MathIntrinsic::Abs) => {
-                    args.len() == 1 && self.vec_check_value(&args[0], j, locals, lane, acc)
-                }
+                Some(
+                    MathIntrinsic::Sqrt
+                    | MathIntrinsic::Rsqrt
+                    | MathIntrinsic::Abs
+                    | MathIntrinsic::Round
+                    | MathIntrinsic::Floor
+                    | MathIntrinsic::Ceil
+                    | MathIntrinsic::Trunc,
+                ) => args.len() == 1 && self.vec_check_value(&args[0], j, locals, lane, acc),
                 Some(MathIntrinsic::Fmax | MathIntrinsic::Fmin) => {
                     args.len() == 2
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
@@ -3771,6 +3777,15 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Abs) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_abs(x, vty)
+                }
+                Some(
+                    op @ (MathIntrinsic::Round
+                    | MathIntrinsic::Floor
+                    | MathIntrinsic::Ceil
+                    | MathIntrinsic::Trunc),
+                ) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.builder.build(vty.clone(), Op::Round(round_mode(op), x))
                 }
                 Some(op @ (MathIntrinsic::Fmax | MathIntrinsic::Fmin)) => {
                     let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -4616,6 +4631,11 @@ impl FnLowerer<'_> {
             MathIntrinsic::Abs => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_abs(x, &rty))
+            }
+            MathIntrinsic::Round | MathIntrinsic::Floor | MathIntrinsic::Ceil
+            | MathIntrinsic::Trunc => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.builder.build(rty.clone(), Op::Round(round_mode(op), x)))
             }
             MathIntrinsic::Exp => {
                 let x = self.lower_expr(args.first()?);
@@ -7113,6 +7133,10 @@ enum MathIntrinsic {
     Sqrt,
     Rsqrt,
     Abs,
+    Round,
+    Floor,
+    Ceil,
+    Trunc,
     Exp,
     Log,
     Pow,
@@ -7135,11 +7159,27 @@ enum MathIntrinsic {
     Fmin,
 }
 
+/// The `RoundMode` for a rounding intrinsic (`Round`→Nearest, else the matching mode). Panics on a
+/// non-rounding intrinsic — callers gate on the four rounding variants.
+fn round_mode(op: MathIntrinsic) -> RoundMode {
+    match op {
+        MathIntrinsic::Round => RoundMode::Nearest,
+        MathIntrinsic::Floor => RoundMode::Floor,
+        MathIntrinsic::Ceil => RoundMode::Ceil,
+        MathIntrinsic::Trunc => RoundMode::Trunc,
+        _ => unreachable!("round_mode on non-rounding intrinsic"),
+    }
+}
+
 fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
     Some(match name {
         "sqrt" => MathIntrinsic::Sqrt,
         "rsqrt" => MathIntrinsic::Rsqrt,
         "abs" => MathIntrinsic::Abs,
+        "round" => MathIntrinsic::Round,
+        "floor" => MathIntrinsic::Floor,
+        "ceil" => MathIntrinsic::Ceil,
+        "trunc" => MathIntrinsic::Trunc,
         "exp" => MathIntrinsic::Exp,
         "log" => MathIntrinsic::Log,
         "pow" => MathIntrinsic::Pow,

@@ -151,6 +151,33 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        // round (ties-to-even) / floor / ceil / trunc — one hardware round-to-integral each. The
+        // adversarial regime (huge magnitudes already integral, .5 ties, NaN, inf) pins native
+        // `nearest`/`floor`/`ceil`/`trunc` == interp `round_ties_even`/`floor`/`ceil`/`trunc`.
+        Kernel {
+            name: "round",
+            src: |n| ew(n, "out[i] = round(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "floor",
+            src: |n| ew(n, "out[i] = floor(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "ceil",
+            src: |n| ew(n, "out[i] = ceil(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
+        Kernel {
+            name: "trunc",
+            src: |n| ew(n, "out[i] = trunc(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
         Kernel {
             name: "exp",
             src: |n| ew(n, "out[i] = exp(x[i]);"),
