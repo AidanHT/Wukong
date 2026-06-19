@@ -62,7 +62,8 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
   `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
   position embeddings), the activation family `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/
-  `softplus`/`mish` (all built on `exp`/`log`, all first-class intrinsics), and `fmax`/`fmin` — all
+  `softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish` (the transcendental ones built on
+  `exp`/`log`, the piecewise ones on min/max, all first-class intrinsics), and `fmax`/`fmin` — all
   built from primitive ops both backends agree on bit-for-bit. A pure `out[i] = f(x[i])` loop for any
   of `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish` is **dispatched
   to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit)
