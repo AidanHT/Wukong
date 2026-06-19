@@ -936,10 +936,10 @@ fn rust_norm(cols: usize, op: &str) -> String {
     )
 }
 
-/// Batched RMSNorm over a `[rows, cols]` activation — the *real* transformer shape (norm over
-/// `[batch*seq, hidden]`, one row per token), where `bench_norm`'s single feature row was just one
-/// token. Mercury folds the `for r { <RMSNorm over out[r*C+i]> }` loop into one `mercury_norm_f32`
-/// call (each row a fused single pass); under `@parallel` the independent rows map across cores via
+/// Batched norms (softmax / LayerNorm / RMSNorm) over a `[rows, cols]` activation — the *real*
+/// transformer shape (norm over `[batch*seq, hidden]`, one row per token), where `bench_norm`'s single
+/// feature row was just one token. Mercury folds the `for r { <norm over out[r*C+i]> }` loop into one
+/// `mercury_norm_f32` call (each row a fused single pass); under `@parallel` the independent rows map across cores via
 /// `mercury_norm_f32_parallel`. C/Rust are the idiomatic per-row nested loops at honest defaults
 /// (sequential float reductions, no `-ffast-math`). All three copy `x`→`out` then normalize in place,
 /// so the full-buffer cross-check is valid. The serial row is apples-to-apples (both single-threaded);
@@ -958,70 +958,74 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
         // No affine params here, so the `y` arg is unused; alias it to `x` rather than allocate a buffer.
         let (xp, yp, op_) = (x.as_ptr(), x.as_ptr(), out.as_mut_ptr());
         println!(
-            "=== batched RMSNorm, {rows}x{cols} = [tokens, hidden], {mb:.1} MB/buffer (ns/call, lower is better; Mercury → mercury_norm_f32[_parallel]) ==="
+            "=== batched norms (softmax / LayerNorm / RMSNorm), {rows}x{cols} = [tokens, hidden], {mb:.1} MB/buffer (ns/call, lower is better; Mercury → mercury_norm_f32[_parallel]) ==="
         );
         println!(
-            "  {:<16} {:>12} {:>12} {:>12} {:>16}",
+            "  {:<18} {:>12} {:>12} {:>12} {:>16}",
             "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
         );
-        // C/Rust baselines are single-threaded per-row norms — the same for both Mercury rows, so time once.
-        let c = bench_external(
-            "c",
-            &c_norm_batched(rows, cols),
-            dir,
-            "bnorm",
-            cc,
-            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut out,
-            xp,
-            yp,
-            op_,
-        );
-        let rust = bench_external(
-            "rs",
-            &rust_norm_batched(rows, cols),
-            dir,
-            "bnorm",
-            "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
-            &mut out,
-            xp,
-            yp,
-            op_,
-        );
-        for (label, par) in [("rmsnorm", false), ("rmsnorm@parallel", true)] {
-            let mer = bench_mercury(&mer_norm_batched(rows, cols, par), &mut out, xp, yp, op_);
-            let ns = |m: &Option<Measure>| {
-                m.as_ref()
-                    .map(|x| format!("{:.0}", x.ns_per_call))
-                    .unwrap_or_else(|| "n/a".into())
-            };
-            let standing = if let (Some(m), Some(c)) = (&mer, &c) {
-                let r = c.ns_per_call / m.ns_per_call;
-                format!(
-                    "{:.2}x {}",
-                    if r >= 1.0 { r } else { 1.0 / r },
-                    if r >= 1.0 { "faster" } else { "slower" }
-                )
-            } else {
-                "n/a".into()
-            };
-            println!(
-                "  {:<16} {:>12} {:>12} {:>12} {:>16}",
-                label,
-                ns(&mer),
-                ns(&c),
-                ns(&rust),
-                standing
+        for op in ["rmsnorm", "layernorm", "softmax"] {
+            // C/Rust baselines are single-threaded per-row norms — the same for both Mercury rows
+            // (serial + @parallel), so time once per op.
+            let c = bench_external(
+                "c",
+                &c_norm_batched(rows, cols, op),
+                dir,
+                "bnorm",
+                cc,
+                &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+                &mut out,
+                xp,
+                yp,
+                op_,
             );
-            // Full-buffer cross-check (f32 tolerance: Mercury reassociates the per-row reductions, C does not).
-            if let (Some(m), Some(c)) = (&mer, &c) {
-                let (rel, at) = max_rel_err(&m.out, &c.out);
-                if rel > 1e-3 {
-                    println!(
-                        "  ! {label} full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
-                        m.out[at], c.out[at], rel
-                    );
+            let rust = bench_external(
+                "rs",
+                &rust_norm_batched(rows, cols, op),
+                dir,
+                "bnorm",
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut out,
+                xp,
+                yp,
+                op_,
+            );
+            for (suffix, par) in [("", false), ("@parallel", true)] {
+                let label = format!("{op}{suffix}");
+                let mer = bench_mercury(&mer_norm_batched(rows, cols, op, par), &mut out, xp, yp, op_);
+                let ns = |m: &Option<Measure>| {
+                    m.as_ref()
+                        .map(|x| format!("{:.0}", x.ns_per_call))
+                        .unwrap_or_else(|| "n/a".into())
+                };
+                let standing = if let (Some(m), Some(c)) = (&mer, &c) {
+                    let r = c.ns_per_call / m.ns_per_call;
+                    format!(
+                        "{:.2}x {}",
+                        if r >= 1.0 { r } else { 1.0 / r },
+                        if r >= 1.0 { "faster" } else { "slower" }
+                    )
+                } else {
+                    "n/a".into()
+                };
+                println!(
+                    "  {:<18} {:>12} {:>12} {:>12} {:>16}",
+                    label,
+                    ns(&mer),
+                    ns(&c),
+                    ns(&rust),
+                    standing
+                );
+                // Full-buffer cross-check (f32 tolerance: Mercury reassociates the per-row reductions).
+                if let (Some(m), Some(c)) = (&mer, &c) {
+                    let (rel, at) = max_rel_err(&m.out, &c.out);
+                    if rel > 1e-3 {
+                        println!(
+                            "  ! {label} full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                            m.out[at], c.out[at], rel
+                        );
+                    }
                 }
             }
         }
@@ -1029,47 +1033,91 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
     }
 }
 
-/// Mercury batched-RMSNorm source: copy `x`→`out`, then the `for r { <RMSNorm over out[r*C+i]> }` form
-/// the `mir_build` recognizer folds to one `mercury_norm_f32(out, out, R, C, eps, op)` call — or, under
-/// `@parallel`, `mercury_norm_f32_parallel` (rows across cores). The `r*{cols}+i` offset and `/{cols}.0`
-/// divisor are exactly the spellings `match_batched_norm` accepts.
-fn mer_norm_batched(rows: usize, cols: usize, parallel: bool) -> String {
+/// Mercury batched-norm source for `op` ∈ {rmsnorm, layernorm, softmax}: copy `x`→`out`, then the
+/// `for r { <op over out[r*C+i]> }` form the `mir_build` recognizer folds to one `mercury_norm_f32(out,
+/// out, R, C, eps, op)` call — or, under `@parallel`, `mercury_norm_f32_parallel` (rows across cores).
+/// The `r*{cols}+i` offset, `/{cols}.0` divisor, and softmax's `out[r*C]` row-local max-seed are exactly
+/// the spellings `match_batched_norm` accepts (all three norms share the kernel + dispatch path).
+fn mer_norm_batched(rows: usize, cols: usize, op: &str, parallel: bool) -> String {
     let n = rows * cols;
     let attr = if parallel { "@parallel\n" } else { "" };
+    let body = match op {
+        "layernorm" => format!(
+            "let mut s: f32 = 0.0; for i in 0..{cols} {{ s = s + out[r*{cols}+i]; }} \
+             let mean: f32 = s / {cols}.0; let mut v: f32 = 0.0; \
+             for i in 0..{cols} {{ v = v + (out[r*{cols}+i] - mean) * (out[r*{cols}+i] - mean); }} \
+             let inv: f32 = rsqrt(v / {cols}.0 + 0.00001); \
+             for i in 0..{cols} {{ out[r*{cols}+i] = (out[r*{cols}+i] - mean) * inv; }}"
+        ),
+        "softmax" => format!(
+            "let mut m: f32 = out[r*{cols}]; for i in 0..{cols} {{ m = fmax(m, out[r*{cols}+i]); }} \
+             for i in 0..{cols} {{ out[r*{cols}+i] = exp(out[r*{cols}+i] - m); }} \
+             let mut s: f32 = 0.0; for i in 0..{cols} {{ s = s + out[r*{cols}+i]; }} \
+             let inv: f32 = 1.0 / s; for i in 0..{cols} {{ out[r*{cols}+i] = out[r*{cols}+i] * inv; }}"
+        ),
+        _ => format!(
+            "let mut s: f32 = 0.0; for i in 0..{cols} {{ s = s + out[r*{cols}+i] * out[r*{cols}+i]; }} \
+             let inv: f32 = rsqrt(s / {cols}.0 + 0.00001); \
+             for i in 0..{cols} {{ out[r*{cols}+i] = out[r*{cols}+i] * inv; }}"
+        ),
+    };
     format!(
         "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{ \
          for c in 0..{n} {{ out[c] = x[c]; }} \
-         for r in 0..{rows} {{ \
-         let mut s: f32 = 0.0; \
-         for i in 0..{cols} {{ s = s + out[r*{cols}+i] * out[r*{cols}+i]; }} \
-         let inv: f32 = rsqrt(s / {cols}.0 + 0.00001); \
-         for i in 0..{cols} {{ out[r*{cols}+i] = out[r*{cols}+i] * inv; }} }} }}\n"
+         for r in 0..{rows} {{ {body} }} }}\n"
     )
 }
 
-fn c_norm_batched(rows: usize, cols: usize) -> String {
+fn c_norm_batched(rows: usize, cols: usize, op: &str) -> String {
     let n = rows * cols;
+    // `o = out + r*C` is the row base; the softmax seed `o[0]` is the row's first element.
+    let body = match op {
+        "layernorm" => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=o[i]; float mean=s/(float)C; float v=0.0f; \
+             for(long i=0;i<C;i++){ float d=o[i]-mean; v+=d*d; } \
+             float inv=1.0f/sqrtf(v/(float)C+1e-5f); for(long i=0;i<C;i++) o[i]=(o[i]-mean)*inv;"
+        }
+        "softmax" => {
+            "float m=o[0]; for(long i=0;i<C;i++) if(o[i]>m) m=o[i]; \
+             float s=0.0f; for(long i=0;i<C;i++){ o[i]=expf(o[i]-m); s+=o[i]; } \
+             float inv=1.0f/s; for(long i=0;i<C;i++) o[i]*=inv;"
+        }
+        _ => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=o[i]*o[i]; \
+             float inv=1.0f/sqrtf(s/(float)C+1e-5f); for(long i=0;i<C;i++) o[i]*=inv;"
+        }
+    };
     format!(
         "#include <math.h>\n#define R {rows}\n#define C {cols}\n#define N {n}\n\
          __declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{ \
          for(long i=0;i<N;i++) out[i]=x[i]; \
-         for(long r=0;r<R;r++){{ float* o=out+(long)r*C; \
-         float s=0.0f; for(long i=0;i<C;i++) s+=o[i]*o[i]; \
-         float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
-         for(long i=0;i<C;i++) o[i]*=inv; }} }}\n"
+         for(long r=0;r<R;r++){{ float* o=out+(long)r*C; {body} }} }}\n"
     )
 }
 
-fn rust_norm_batched(rows: usize, cols: usize) -> String {
+fn rust_norm_batched(rows: usize, cols: usize, op: &str) -> String {
     let n = rows * cols;
+    let body = match op {
+        "layernorm" => {
+            "let mut s=0.0f32; for i in 0..C { s+=*o.add(i); } let mean=s/(C as f32); let mut v=0.0f32; \
+             for i in 0..C { let d=*o.add(i)-mean; v+=d*d; } \
+             let inv=1.0f32/(v/(C as f32)+1e-5f32).sqrt(); for i in 0..C { *o.add(i)=(*o.add(i)-mean)*inv; }"
+        }
+        "softmax" => {
+            "let mut m=*o.add(0); for i in 0..C { let val=*o.add(i); if val>m { m=val; } } \
+             let mut s=0.0f32; for i in 0..C { let e=(*o.add(i)-m).exp(); *o.add(i)=e; s+=e; } \
+             let inv=1.0f32/s; for i in 0..C { *o.add(i)*=inv; }"
+        }
+        _ => {
+            "let mut s=0.0f32; for i in 0..C { let val=*o.add(i); s+=val*val; } \
+             let inv=1.0f32/(s/(C as f32)+1e-5f32).sqrt(); for i in 0..C { *o.add(i)*=inv; }"
+        }
+    };
     format!(
         "const R: usize = {rows};\nconst C: usize = {cols};\nconst N: usize = {n};\n\
          #[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{ \
          for i in 0..N {{ *out.add(i)=*x.add(i); }} \
-         for r in 0..R {{ let o=out.add(r*C); \
-         let mut s=0.0f32; for i in 0..C {{ let v=*o.add(i); s+=v*v; }} \
-         let inv=1.0f32/(s/(C as f32)+1e-5f32).sqrt(); \
-         for i in 0..C {{ *o.add(i)*=inv; }} }} }}\n"
+         for r in 0..R {{ let o=out.add(r*C); {body} }} }}\n"
     )
 }
 
