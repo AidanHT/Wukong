@@ -51,13 +51,16 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   with `mul_add`, and the two agree bit-for-bit (gated by `fma_contraction_is_bit_exact`). This is
   why `mercury_xbench` gives gcc `-ffp-contract=fast` — both sides fuse.
 - Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`, the GEMM
-  microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi`, the int8 GEMM
-  `mercury_i8gemm_nt`/`_parallel`, the 256-bit elementwise `mercury_vmath_f32`, the reduction
-  `mercury_sreduce_f32`/`_parallel`, the fused row-wise norm `mercury_norm_f32`/`_parallel` and its
-  affine sibling `mercury_norm_affine_f32` (4 ptr + 4 i64; gamma/beta may be a null pointer)) are
-  bound to Rust fns in the JIT and left as imports in the object
-  (resolved by the driver's C runtime). A global run lock serialises JIT runs that share the
-  stdout-capture buffer.
+  microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi` (the `_nt_epi` fused-epilogue
+  one takes a bias pointer + an `act` code: identity/ReLU/GELU/SiLU, bias may be a null pointer), the
+  int8 GEMM `mercury_i8gemm_nt`/`_parallel`, the 256-bit elementwise transcendental
+  `mercury_vmath_f32` (op codes exp/log/tanh/sigmoid/relu/silu/gelu/elu/leaky_relu/softplus/mish/selu),
+  the streaming affine+activation `mercury_velem_f32` (8 args: 3 ptr + i64 + 3 f32 + i64) and Horner
+  `mercury_vhorner_f32` (ptr,ptr,i64,ptr,i64), the reduction `mercury_sreduce_f32`/`_parallel`, the
+  fused row-wise norm `mercury_norm_f32`/`_parallel` and its affine sibling `mercury_norm_affine_f32`
+  (4 ptr + 4 i64; gamma/beta may be a null pointer)) are bound to Rust fns in the JIT and left as
+  imports in the object (resolved by the driver's C runtime). A global run lock serialises JIT runs
+  that share the stdout-capture buffer.
 - **A runtime call may return a value.** Most (`mercury_sgemm*`, `mercury_vmath_f32`) are void, but
   `mercury_sreduce_f32[_parallel]` returns an **f32** — its `lower_call` arm binds the call result
   (`inst_results(call).first().copied()`) instead of returning `None`, and its signature carries a
