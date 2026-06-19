@@ -88,6 +88,7 @@ const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
 const RT_NORM: &str = "mercury_norm_f32";
 const RT_NORM_PARALLEL: &str = "mercury_norm_f32_parallel";
 const RT_NORM_AFFINE: &str = "mercury_norm_affine_f32";
+const RT_NORM_AFFINE_PARALLEL: &str = "mercury_norm_affine_f32_parallel";
 const RT_I8GEMM_NT: &str = "mercury_i8gemm_nt";
 const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
@@ -809,10 +810,11 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[x, out, rows, cols, eps, op]);
             return None;
         }
-        // The affine fused norm: mercury_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits,
-        // op) — four pointers (gamma/beta may be null) and four i64 (LayerNorm/RMSNorm with a learned
-        // per-column scale/shift). Void, like the plain norm.
-        if name == RT_NORM_AFFINE && args.len() == 8 {
+        // The affine fused norm: mercury_norm_affine_f32[_parallel](x, out, gamma, beta, rows, cols,
+        // eps_bits, op) — four pointers (gamma/beta may be null) and four i64 (LayerNorm/RMSNorm with a
+        // learned per-column scale/shift). Void, like the plain norm; the _parallel one maps rows across
+        // cores (bit-equal to serial — rows independent).
+        if matches!(name, RT_NORM_AFFINE | RT_NORM_AFFINE_PARALLEL) && args.len() == 8 {
             let x = self.val(args[0]);
             let out = self.val(args[1]);
             let gamma = self.val(args[2]);
@@ -954,6 +956,7 @@ struct RtFuncs {
     norm: FuncId,
     norm_par: FuncId,
     norm_affine: FuncId,
+    norm_affine_par: FuncId,
     i8nt: FuncId,
     i8nt_par: FuncId,
     fmod_f64: FuncId,
@@ -1153,6 +1156,9 @@ fn populate_module<M: Module>(
         norm_affine: module
             .declare_function(RT_NORM_AFFINE, Linkage::Import, &sig_norm_affine)
             .map_err(|e| e.to_string())?,
+        norm_affine_par: module
+            .declare_function(RT_NORM_AFFINE_PARALLEL, Linkage::Import, &sig_norm_affine)
+            .map_err(|e| e.to_string())?,
         i8nt: module
             .declare_function(RT_I8GEMM_NT, Linkage::Import, &sig_i8gemm)
             .map_err(|e| e.to_string())?,
@@ -1256,6 +1262,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_NORM_AFFINE,
                 module.declare_func_in_func(rt.norm_affine, builder.func),
+            );
+            rt_refs.insert(
+                RT_NORM_AFFINE_PARALLEL,
+                module.declare_func_in_func(rt.norm_affine_par, builder.func),
             );
             rt_refs.insert(
                 RT_I8GEMM_NT,
@@ -1415,6 +1425,10 @@ pub fn jit_compile(
         mercury_runtime::mercury_norm_affine_f32 as *const u8,
     );
     builder.symbol(
+        RT_NORM_AFFINE_PARALLEL,
+        mercury_runtime::mercury_norm_affine_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_I8GEMM_NT,
         mercury_runtime::mercury_i8gemm_nt as *const u8,
     );
@@ -1525,6 +1539,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_NORM_AFFINE,
         mercury_runtime::mercury_norm_affine_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_NORM_AFFINE_PARALLEL,
+        mercury_runtime::mercury_norm_affine_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_I8GEMM_NT,
