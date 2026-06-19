@@ -1407,6 +1407,37 @@ fn affine_norm_dispatch() {
     );
 }
 
+/// A batched norm — `for r in 0..R { <RMSNorm over x[r*C + i]> }` — must dispatch to the fused
+/// `mercury_norm_f32` kernel with `rows = R` (the real `[batch*seq, hidden]` transformer shape) rather
+/// than fall back to the scalar vectorizer; and the refactor that threaded the batch offset through the
+/// recognizer must not have broken the single-row (`rows = 1`) form. The differential gate
+/// (native == interp over rows > 1, adversarial inputs) lives in the fuzzer's `rmsnorm_batched` kernel,
+/// and the independent per-row reference in `tests/run/batched_rmsnorm.mer`; this just pins that the
+/// recognizer keeps *firing* (a silent fallback to scalar would pass both of those yet regress speed).
+#[test]
+fn batched_norm_dispatch() {
+    // R = 3 rows, C = 4 cols, normalized in place over the flat [12] buffer via the `r*4 + i` offset.
+    let batched = "module m\nfn f(x:[f32;12]) { \
+        for r in 0..3 { \
+        let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i] * x[r*4+i]; } \
+        let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
+        for i in 0..4 { x[r*4+i] = x[r*4+i] * inv; } } }";
+    assert!(
+        lowered_calls(batched, "mercury_norm_f32"),
+        "batched RMSNorm (for r {{ <row r> }}) must dispatch to mercury_norm_f32"
+    );
+
+    // The single-row form (no outer loop) must still dispatch — rows = 1 is the `batch = None` path.
+    let single = "module m\nfn f(x:[f32;4]) { \
+        let mut s: f32 = 0.0; for i in 0..4 { s = s + x[i] * x[i]; } \
+        let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
+        for i in 0..4 { x[i] = x[i] * inv; } }";
+    assert!(
+        lowered_calls(single, "mercury_norm_f32"),
+        "single-row RMSNorm must still dispatch to mercury_norm_f32"
+    );
+}
+
 /// The accumulate (beta = 1) matmul — `C += A·B` with `C` pre-initialized — end to end. Guards the
 /// beta=1 dispatch (a real pattern: accumulating a matmul into a bias-initialized output). Unlike the
 /// overwrite test, this also checks the value against an independent reference, so a *beta

@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 365
+module tests.run.batched_rmsnorm
+
+// Batched RMSNorm over a flat [R, C] matrix: each row r is normalized by its own RMS,
+// x[r*C+i] /= sqrt(mean(x[r*C+·]²) + eps). The `for r { ...row r... }` outer loop dispatches to the
+// fused single-pass norm kernel with rows = R (each row normalized independently) — the real
+// transformer shape (norm over [batch*seq, hidden]). The mercury_bench gate proves interp == native.
+
+fn rmsnorm_batch(x: [f32; 12]) { // R = 3 rows, C = 4 cols
+    for r in 0..3 {
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s += x[r*4+i] * x[r*4+i]; }
+        let inv: f32 = rsqrt(s / 4.0 + 0.00001);
+        for i in 0..4 { x[r*4+i] = x[r*4+i] * inv; }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 12] = [0.0; 12];
+    x[0]=1.0; x[1]=2.0; x[2]=3.0; x[3]=4.0;     // row 0
+    x[4]=2.0; x[5]=2.0; x[6]=2.0; x[7]=2.0;     // row 1 (uniform)
+    x[8]=0.0; x[9]=0.0; x[10]=0.0; x[11]=4.0;   // row 2
+    rmsnorm_batch(x);
+
+    // row 1 uniform 2.0: rms = 2, each → 2/2 = 1.0
+    print(round(x[4] * 1000.0) as i32);  // 1000
+    // row 2: meansq = 16/4 = 4, rms = 2, x[11] = 4/2 = 2.0
+    print(round(x[11] * 1000.0) as i32); // 2000
+    // row 0: meansq = 30/4 = 7.5, rms ≈ 2.7386, x[0] = 1/2.7386 ≈ 0.3651
+    print(round(x[0] * 1000.0) as i32);  // 365
+    return 0;
+}
