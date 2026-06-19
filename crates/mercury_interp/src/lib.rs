@@ -772,6 +772,61 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_velem_f32(x, y, out, n, a, b, c, op)` — the streaming affine+activation kernel
+            // (saxpy / scale / residual-add / bias / ReLU) a recognized `out[i] = act(a·x[i] + b·y[i]
+            // + c)` map lowers to. Marshal `n` f32 from x and y, call the *identical* runtime kernel
+            // the native backend calls, write the result back — so the differential oracle stays exact
+            // despite the wider lanes / non-temporal stores (which write the same bits). Reading all of
+            // x/y before writing out makes the in-place (x == out) case correct. When `y` is unused the
+            // recognizer passes the x pointer for it (never dereferenced by the kernel), so marshalling
+            // y unconditionally is harmless.
+            "mercury_velem_f32" => {
+                let x = ptr(args[0])?;
+                let y = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let n = args[3].as_int() as usize;
+                let a = args[4].as_float() as f32;
+                let b = args[5].as_float() as f32;
+                let c = args[6].as_float() as f32;
+                let op = args[7].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("velem operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    ybuf.push(
+                        self.memory
+                            .get(y + t)
+                            .ok_or("velem operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/ybuf/obuf are exactly n f32 long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_velem_f32(
+                        xbuf.as_ptr(),
+                        ybuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        n as i64,
+                        a,
+                        b,
+                        c,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("velem output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32` — the deterministic reduction kernel
             // a `@parallel` reduction loop lowers to (dot / ssd / sum). Marshal `n` f32 out of x and y
             // and call the *serial* runtime kernel, which is bit-identical to the parallel one the

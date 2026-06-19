@@ -671,9 +671,11 @@ fn lowered(src: &str, opt: u8) -> (mercury_mir::Program, Interner) {
     (program, interner)
 }
 
-/// The SIMD loop vectorizer: a saxpy `for` loop must (a) actually lower to vector ops, (b) agree
-/// between interpreter and native, and (c) compute the same result the scalar loop would — checked
-/// across sizes that hit the vector body only, the remainder only, and both. `sum(2*i+1) == N*N`.
+/// The streaming saxpy dispatch: a `for k { o[k] = a*x[k] + y[k] }` loop must (a) lower to one
+/// `mercury_velem_f32` call (the 256-bit AVX2 + non-temporal-store kernel — wider than, and store-
+/// cheaper than, the generic 128-bit vectorizer), (b) agree between interpreter and native, and (c)
+/// compute the same result the scalar loop would — across sizes that hit the kernel's vector body
+/// only, the scalar tail only, and both. `sum(2*i+1) == N*N`.
 #[test]
 fn vectorized_saxpy_is_correct_across_sizes() {
     let kernel = |n: usize| {
@@ -687,17 +689,13 @@ fn vectorized_saxpy_is_correct_across_sizes() {
         )
     };
 
-    // The vectorizer must have fired at least once on a representative size, and `a*x[k] + y[k]`
-    // must have contracted to a lane-wise fused multiply-add.
+    // The streaming recognizer must have fired: `a*x[k] + y[k]` is one `mercury_velem_f32` call (the
+    // fused multiply-add and the lane work now live inside that kernel, not as inline MIR vector ops).
     let (prog, interner) = lowered(&kernel(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
-        mir.contains("splat") && mir.contains("x f32>"),
-        "saxpy loop should have vectorized to SIMD ops"
-    );
-    assert!(
-        mir.contains("fma") && mir.contains("x f32>"),
-        "saxpy `a*x + y` should contract to a vector fma:\n{mir}"
+        mir.contains("mercury_velem_f32"),
+        "saxpy `a*x + y` should dispatch to the streaming velem kernel:\n{mir}"
     );
 
     // 2 (remainder only), 4 (one vector, no remainder), 7/13 (vector + remainder), 1024 (many).

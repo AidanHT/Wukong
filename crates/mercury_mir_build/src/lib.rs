@@ -40,6 +40,7 @@ pub fn lower_program(
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         vmath: interner.intern("mercury_vmath_f32"),
+        velem: interner.intern("mercury_velem_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         norm: interner.intern("mercury_norm_f32"),
         norm_affine: interner.intern("mercury_norm_affine_f32"),
@@ -376,6 +377,10 @@ struct GemmSyms {
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
+    /// The streaming affine+activation kernel (`mercury_velem_f32(x, y, out, n, a, b, c, op)`): a
+    /// recognized `out[i] = act(a·x[i] (+ b·y[i]) + c)` map loop (saxpy / scale / residual-add /
+    /// bias / ReLU / ReLU6) lowers to this — 256-bit AVX2 + non-temporal stores for a large output.
+    velem: Symbol,
     /// The multicore deterministic f32 reduction kernel (`mercury_sreduce_f32_parallel(x, y, n, op)
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
@@ -403,6 +408,33 @@ const VMATH_TANH: u32 = 2;
 const VMATH_SIGMOID: u32 = 3;
 const VMATH_SILU: u32 = 5;
 const VMATH_GELU: u32 = 6;
+
+// Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
+// is the activation (here `VE_ID`; ReLU/ReLU6 added with their matchers); `VE_USE_Y` (bit 8) flags
+// that the kernel reads `y`.
+const VE_ID: i64 = 0; // out = a·x (+ b·y) + c
+const VE_USE_Y: i64 = 256;
+
+/// One additive term of a recognized streaming affine body. `Scaled(arr, s)` is `arr[j]` (`s = None`,
+/// coefficient 1) or `s·arr[j]` / `arr[j]·s` for a loop-invariant f32 scalar `s`; `Const(s)` is a
+/// loop-invariant f32 scalar added in (the bias). Borrows the coefficient exprs from the body.
+enum VTerm<'b> {
+    Scaled(Symbol, Option<&'b Expr>),
+    Const(&'b Expr),
+}
+
+/// A recognized `out[j] = act(a·x[j] (+ b·y[j]) + c)` streaming map: resolved array base pointers plus
+/// the (loop-invariant) coefficient exprs, lowered to ValueIds at emit time so a runtime scale such as
+/// saxpy's `a` works. `op` is the activation byte; `VE_USE_Y` is set iff `y` is present.
+struct VElemPlan<'b> {
+    out: ValueId,
+    x: ValueId,
+    y: Option<ValueId>,
+    a: Option<&'b Expr>,
+    b: Option<&'b Expr>,
+    c: Option<&'b Expr>,
+    op: i64,
+}
 
 // Reduction op codes — must match `mercury_runtime::reduce`'s `RED_*`. `x[k]*x[k]` recognizes as
 // `RED_DOT` with both bases equal (≡ sum-of-squares), so the recognizer needs only these three.
@@ -2140,6 +2172,181 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// A loop-invariant f32 coefficient: an expr provably free of the loop var `j` and typed f32 (a
+    /// literal like `2.0`, or an outer scalar like saxpy's `a`). Lowered to a ValueId at emit time.
+    /// Uses the **conservative** [`expr_mentions`] (recurses through calls/casts/fields and assumes a
+    /// use for anything it cannot model), so a per-element factor like `sigmoid(x[j])` is correctly
+    /// rejected rather than mistaken for an invariant scale. Pure.
+    fn velem_coeff<'b>(&self, e: &'b Expr, j: Symbol) -> Option<&'b Expr> {
+        if expr_mentions(e, j) || self.expr_mir(e) != MirType::F32 {
+            return None;
+        }
+        Some(e)
+    }
+
+    /// Classify one additive term of a streaming affine body over loop var `j`: a (possibly scaled)
+    /// unit-stride f32 array read `arr[j]`, or a loop-invariant f32 scalar (bias). Pure.
+    fn velem_term<'b>(&self, e: &'b Expr, j: Symbol) -> Option<VTerm<'b>> {
+        if let Some(arr) = self.index_by_loopvar(e, j) {
+            if self.expr_mir(e) != MirType::F32 {
+                return None;
+            }
+            return Some(VTerm::Scaled(arr, None));
+        }
+        if let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &e.kind
+        {
+            if let Some(arr) = self.index_by_loopvar(lhs, j) {
+                if self.expr_mir(lhs) == MirType::F32 {
+                    if let Some(s) = self.velem_coeff(rhs, j) {
+                        return Some(VTerm::Scaled(arr, Some(s)));
+                    }
+                }
+            }
+            if let Some(arr) = self.index_by_loopvar(rhs, j) {
+                if self.expr_mir(rhs) == MirType::F32 {
+                    if let Some(s) = self.velem_coeff(lhs, j) {
+                        return Some(VTerm::Scaled(arr, Some(s)));
+                    }
+                }
+            }
+            return None;
+        }
+        self.velem_coeff(e, j).map(VTerm::Const)
+    }
+
+    /// Recognize a streaming affine+activation map body — one statement `out[j] = act(a·x[j] (+
+    /// b·y[j]) + c)` whose RHS is a sum of (scaled) f32 array reads plus an optional invariant bias —
+    /// covering saxpy / scale / residual-add / bias / copy. Up to two distinct array reads (`x`, then
+    /// `y`) and one bias. Pure (emits no MIR): returns the resolved bases + coefficient exprs, or
+    /// `None` to fall through to ReLU recognition / the generic vectorizer. The activation `act` is
+    /// supplied by the caller (`VE_ID` here; ReLU forms peel their wrapper first).
+    fn match_velem_affine<'b>(&self, j: Symbol, value: &'b Expr, target: &Expr) -> Option<VElemPlan<'b>> {
+        let out_sym = self.index_by_loopvar(target, j)?;
+        if self.expr_mir(value) != MirType::F32 {
+            return None;
+        }
+        let mut terms = Vec::new();
+        flatten_add_terms(value, &mut terms);
+        let mut arrays: Vec<(Symbol, Option<&Expr>)> = Vec::new();
+        let mut consts: Vec<&Expr> = Vec::new();
+        for t in &terms {
+            match self.velem_term(t, j)? {
+                VTerm::Scaled(arr, s) => arrays.push((arr, s)),
+                VTerm::Const(s) => consts.push(s),
+            }
+        }
+        // Must read at least one array (else it is not a map over x); at most two; at most one bias.
+        if arrays.is_empty() || arrays.len() > 2 || consts.len() > 1 {
+            return None;
+        }
+        let (x_sym, a) = arrays[0];
+        let x = self.lookup(x_sym)?.0;
+        let (y, b, op_y) = if arrays.len() == 2 {
+            let (y_sym, b) = arrays[1];
+            (Some(self.lookup(y_sym)?.0), b, VE_USE_Y)
+        } else {
+            (None, None, 0)
+        };
+        let out = self.lookup(out_sym)?.0;
+        Some(VElemPlan {
+            out,
+            x,
+            y,
+            a,
+            b,
+            c: consts.first().copied(),
+            op: VE_ID | op_y,
+        })
+    }
+
+    /// Recognize the whole body of a streaming elementwise map: a single `out[j] = …` assignment that
+    /// matches [`match_velem_affine`] (saxpy / scale / add / bias / copy). Pure. ReLU/ReLU6 add their
+    /// own peel in a later commit; here the affine identity activation covers the arithmetic forms.
+    fn match_velem_body<'b>(&self, j: Symbol, body: &'b Block) -> Option<VElemPlan<'b>> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        self.match_velem_affine(j, value, target)
+    }
+
+    /// Lower a coefficient expr (or a default constant when absent) to an f32 ValueId.
+    fn lower_coeff(&mut self, e: Option<&Expr>, default: f64) -> ValueId {
+        match e {
+            Some(e) => {
+                let ty = self.expr_mir(e);
+                let v = self.lower_expr(e);
+                self.coerce_to(v, &ty, &MirType::F32, true)
+            }
+            None => self
+                .builder
+                .build(MirType::F32, Op::ConstFloat(default, MirType::F32)),
+        }
+    }
+
+    /// Emit one `mercury_velem_f32(x+s, y+s, out+s, e-s, a, b, c, op)` call for a recognized streaming
+    /// map over the i64 range `[s, e)`. When `y` is absent the kernel never reads it (`VE_USE_Y`
+    /// unset), so the `x` pointer is reused for the unused `y` argument (a valid, never-dereferenced
+    /// pointer — no need for a Ptr-typed null const, which is invalid MIR).
+    fn emit_velem_call(&mut self, s: ValueId, e: ValueId, plan: &VElemPlan) {
+        let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        let gep = |me: &mut Self, base: ValueId| {
+            me.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base,
+                    index: s,
+                    elem: MirType::F32,
+                },
+            )
+        };
+        let xp = gep(self, plan.x);
+        let yp = match plan.y {
+            Some(y) => gep(self, y),
+            None => xp,
+        };
+        let outp = gep(self, plan.out);
+        // Default `b` is 1.0 when `y` is read, else 0.0 (unused); `a` defaults to 1.0, `c` to 0.0.
+        let a = self.lower_coeff(plan.a, 1.0);
+        let b = self.lower_coeff(plan.b, if plan.y.is_some() { 1.0 } else { 0.0 });
+        let c = self.lower_coeff(plan.c, 0.0);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(plan.op as i128, MirType::I64));
+        self.builder.build_void(Op::Call {
+            func: self.gemm.velem,
+            args: vec![xp, yp, outp, n, a, b, c, opv],
+        });
+    }
+
+    /// Recognize a streaming elementwise map `for j in lo..hi { out[j] = act(a·x[j] (+ b·y[j]) + c) }`
+    /// (saxpy / scale / residual-add / bias) and lower it to one `mercury_velem_f32` call — 256-bit
+    /// AVX2 + non-temporal stores, the width Cranelift can't reach and a store path gcc won't emit.
+    /// `out` may alias `x`/`y` (in-place). The interpreter marshals the identical kernel, so the
+    /// differential oracle stays exact. Returns false (fall through) unless the body matches.
+    fn try_velem_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        let Some(plan) = self.match_velem_body(j, body) else {
+            return false;
+        };
+        let sty = self.expr_mir(start);
+        let s = self.lower_expr(start);
+        let s = self.coerce_to(s, &sty, &MirType::I64, true);
+        let ety = self.expr_mir(end);
+        let e = self.lower_expr(end);
+        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        self.emit_velem_call(s, e, &plan);
+        true
+    }
+
     /// Attempt SIMD lowering of `for j in start..end { body }`. Returns true on success.
     fn try_vectorize_for(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         let j = match &pat.kind {
@@ -2154,6 +2361,12 @@ impl FnLowerer<'_> {
         // 256-bit AVX2 runtime kernel — the width Cranelift's 128-bit vectorizer can't reach. Tried
         // before the generic (Cranelift-emitted) vectorizer, which would otherwise inline the poly.
         if self.try_vmath_for(j, start, end, body) {
+            return true;
+        }
+        // A streaming affine map `out[j] = a·x[j] (+ b·y[j]) + c` (saxpy/scale/add/bias) dispatches to
+        // the 256-bit AVX2 + non-temporal-store kernel — both wider than and store-cheaper than the
+        // generic 128-bit vectorizer. Tried before it (which would otherwise emit cacheable stores).
+        if self.try_velem_for(j, start, end, body) {
             return true;
         }
         // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
@@ -2276,6 +2489,15 @@ impl FnLowerer<'_> {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
             self.emit_vmath_calls(s, e, calls);
+            return true;
+        }
+        // A streaming affine map per `@parallel` chunk → the same 256-bit + non-temporal-store kernel,
+        // so an `@parallel` saxpy/scale/add runs multicore × 256-bit with RFO-free stores. Elementwise,
+        // so each thread's per-chunk pass agrees with the interpreter's whole-range pass.
+        if let Some(plan) = self.match_velem_body(j, body) {
+            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+            self.emit_velem_call(s, e, &plan);
             return true;
         }
         let Some((lane, w)) = self.vectorizable(body, j) else {
