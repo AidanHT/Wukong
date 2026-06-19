@@ -373,6 +373,28 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        // Batched RMSNorm: a `for r in 0..3 { <RMSNorm over out[r*C + i]> }` outer loop normalizes
+        // each of 3 rows independently → one mercury_norm_f32(.., rows=3, cols=C, RMSNORM) call. This
+        // is the ONLY kernel exercising the rows>1 path on the native backend: the kernel loops rows
+        // and the interp marshals rows*cols (not just cols) floats. C = n straddles the kernel's
+        // internal column vectorization across every fuzz size — the real [batch*seq, hidden] shape.
+        Kernel {
+            name: "rmsnorm_batched",
+            src: |n| {
+                format!(
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+             for c in 0..{l} {{ out[c] = x[c]; }} \
+             for r in 0..3 {{ \
+             let mut s: f32 = 0.0; \
+             for i in 0..{n} {{ s = s + out[r*{n}+i] * out[r*{n}+i]; }} \
+             let inv: f32 = rsqrt(s / {n}.0 + 0.00001); \
+             for i in 0..{n} {{ out[r*{n}+i] = out[r*{n}+i] * inv; }} }} }}\n",
+                    l = 3 * n
+                )
+            },
+            len: |n| 3 * n,
+            regimes: ANY,
+        },
         // matmul C=A·B (ikj) and nn.Linear C=A·Bᵀ (ijk) — both dispatch to the GEMM microkernel.
         Kernel {
             name: "matmul",

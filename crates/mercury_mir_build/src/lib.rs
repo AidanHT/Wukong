@@ -568,19 +568,19 @@ impl FnLowerer<'_> {
             // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
             // sum-of-squares+scale), so probe order is immaterial.
             if let Some((n, arr, n_expr)) = self.match_softmax(b, i) {
-                if self.emit_norm(arr, &n_expr, 0, NORM_SOFTMAX, None, None) {
+                if self.emit_norm(arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
                     continue;
                 }
             }
             if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i) {
-                if self.emit_norm(arr, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
+                if self.emit_norm(arr, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i) {
-                if self.emit_norm(arr, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
+                if self.emit_norm(arr, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
@@ -812,7 +812,13 @@ impl FnLowerer<'_> {
 
     /// Body `s += x[v]*x[v]` (sum of squares into scalar `s`) → the squared array `x` (RMSNorm's lead
     /// loop, and the mean-square reduction). Pure.
-    fn match_sumsq_body(&self, body: &Block, v: Symbol, s: Symbol) -> Option<Symbol> {
+    fn match_sumsq_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        s: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign { target, op, value } = &stmt.kind else {
             return None;
@@ -846,8 +852,8 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let xl = self.index_by_loopvar(lhs, v)?;
-        let xr = self.index_by_loopvar(rhs, v)?;
+        let xl = self.index_off(lhs, v, batch)?;
+        let xr = self.index_off(rhs, v, batch)?;
         if xl == xr {
             Some(xl)
         } else {
@@ -921,6 +927,7 @@ impl FnLowerer<'_> {
         v: Symbol,
         x: Symbol,
         inv: Symbol,
+        batch: Option<(Symbol, &Expr)>,
     ) -> Option<(Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
@@ -931,7 +938,9 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.index_by_loopvar(target, v) != Some(x) {
+        // The data `x` is row-offset-indexed when batched; gamma/beta stay column-indexed (per-column,
+        // shared across rows), so `peel_affine` is unbatched.
+        if self.index_off(target, v, batch) != Some(x) {
             return None;
         }
         let (core, gamma, beta) = self.peel_affine(value, v, x);
@@ -943,8 +952,8 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let ok = (self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(inv))
-            || (self.index_by_loopvar(rhs, v) == Some(x) && single_path(lhs) == Some(inv));
+        let ok = (self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(inv))
+            || (self.index_off(rhs, v, batch) == Some(x) && single_path(lhs) == Some(inv));
         if ok {
             Some((gamma, beta))
         } else {
@@ -1044,7 +1053,7 @@ impl FnLowerer<'_> {
         }
         // softmax's normalize is a plain `x[i] *= inv`; reject any affine wrapper (softmax has no
         // gamma/beta) so it falls back to the generic vectorizer rather than silently dropping it.
-        if self.match_scale_body(body6, v6, x, inv)? != (None, None) {
+        if self.match_scale_body(body6, v6, x, inv, None)? != (None, None) {
             return None;
         }
         // The three internal scalars must not be read after the window — the kernel hides them.
@@ -1066,6 +1075,7 @@ impl FnLowerer<'_> {
     fn emit_norm(
         &mut self,
         arr: Symbol,
+        rows: Option<&Expr>,
         n: &Expr,
         eps_bits: i64,
         op: i64,
@@ -1078,9 +1088,19 @@ impl FnLowerer<'_> {
         let n_ty = self.expr_mir(n);
         let nval = self.lower_expr(n);
         let nval = self.coerce_to(nval, &n_ty, &MirType::I64, true);
-        let rows = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        // `rows` is 1 for a single-row norm, or the batched outer-loop trip count `R` (a `[R, N]`
+        // matrix). The kernel normalizes each of the `rows` rows independently — and the `_parallel`
+        // variant maps that across cores, which only does real work when `rows > 1`.
+        let rows = match rows {
+            None => self
+                .builder
+                .build(MirType::I64, Op::ConstInt(1, MirType::I64)),
+            Some(r) => {
+                let rty = self.expr_mir(r);
+                let rv = self.lower_expr(r);
+                self.coerce_to(rv, &rty, &MirType::I64, true)
+            }
+        };
         let epsv = self
             .builder
             .build(MirType::I64, Op::ConstInt(eps_bits as i128, MirType::I64));
@@ -1430,6 +1450,7 @@ impl FnLowerer<'_> {
         &self,
         b: &Block,
         at: usize,
+        batch: Option<Symbol>,
     ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
@@ -1440,13 +1461,15 @@ impl FnLowerer<'_> {
             return None;
         }
         let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
-        let x = self.match_sumsq_body(body1, v1, s)?;
+        // Batched: the data is indexed `row*cols + i` (cols == this inner bound); single-row: just `i`.
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
         let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr)?;
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv)?;
+        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
         let rest = &b.stmts[at + 4..];
         let tail = b.tail.as_deref();
         for sc in [s, inv] {
@@ -2019,6 +2042,45 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Recognize `for r in 0..R { <per-row norm over x[r*C + i]> }` — a **batched** row normalization
+    /// over a flat `[R, C]` matrix — and dispatch the whole batch to one fused norm kernel with
+    /// `rows = R`. The body must be a complete norm window whose data accesses are row-offset-indexed
+    /// by `r*C` (verified by `match_rmsnorm`'s offset machinery), consuming every body statement.
+    /// Returns true on success. RMSNorm only for now (the highest-value modern norm); the same offset
+    /// path generalizes to LayerNorm/softmax. Runs pre-opt, so `-O0`==`-O3`; both backends marshal the
+    /// identical kernel, so the differential gate stays bit-exact.
+    fn try_emit_batched_norm(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(r),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else.
+        if body.tail.is_some() {
+            return false;
+        }
+        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_rmsnorm(body, 0, Some(*r)) {
+            if consumed == body.stmts.len() {
+                return self.emit_norm(x, Some(end), &cols, eps, NORM_RMSNORM, gamma, beta);
+            }
+        }
+        false
+    }
+
     fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
         // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
         // whole-function `@parallel` form is handled earlier in `lower_program`).
@@ -2038,6 +2100,12 @@ impl FnLowerer<'_> {
         // Inside a `@parallel` function, a recognized reduction loop (`s += x[k]*y[k]`, etc.) lowers
         // to one multicore `mercury_sreduce_f32_parallel` call instead of the sequential vectorizer.
         if self.parallel_fn && self.try_emit_parallel_reduction(pat, iter, body) {
+            return;
+        }
+        // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
+        // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
+        // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
+        if self.try_emit_batched_norm(pat, iter, body) {
             return;
         }
         let (start, end, inclusive, step) = match iter {
@@ -2143,13 +2211,55 @@ impl FnLowerer<'_> {
     /// If `e` is `arr[j]` — a single-segment array path indexed by exactly the loop variable `j`
     /// (unit stride, zero offset) — return the array's symbol. The shape the vmath kernel needs.
     fn index_by_loopvar(&self, e: &Expr, j: Symbol) -> Option<Symbol> {
+        self.index_off(e, j, None)
+    }
+
+    /// Like [`index_by_loopvar`], but for a **batched** row normalization the data index is
+    /// `row*cols + j` (row-major), where `batch = Some((row, cols))` carries the outer row variable
+    /// and the per-row width. With `batch = None` it is exactly `base[j]` (the single-row case). The
+    /// `row*cols` term may be written either factor order. Returns the base array symbol. Pure.
+    fn index_off(&self, e: &Expr, j: Symbol, batch: Option<(Symbol, &Expr)>) -> Option<Symbol> {
         let ExprKind::Index { base, indices } = &e.kind else {
             return None;
         };
-        if indices.len() != 1 || single_path(&indices[0]) != Some(j) {
+        if indices.len() != 1 {
             return None;
         }
+        let idx = &indices[0];
+        match batch {
+            None => {
+                if single_path(idx) != Some(j) {
+                    return None;
+                }
+            }
+            Some((row, cols)) => {
+                // `row*cols + j` / `j + row*cols` (the additive split of a row-major flat index).
+                let ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } = &idx.kind
+                else {
+                    return None;
+                };
+                let is_row_off = |me: &Self, e: &Expr| me.is_mul_of(e, row, cols);
+                let ok = (is_row_off(self, lhs) && single_path(rhs) == Some(j))
+                    || (is_row_off(self, rhs) && single_path(lhs) == Some(j));
+                if !ok {
+                    return None;
+                }
+            }
+        }
         single_path(base)
+    }
+
+    /// Is `e` the product `row * cols` (either factor order) — the row base offset of a flat
+    /// `[rows, cols]` index? `row` is matched by symbol, `cols` structurally (it is the loop bound). Pure.
+    fn is_mul_of(&self, e: &Expr, row: Symbol, cols: &Expr) -> bool {
+        matches!(&e.kind,
+            ExprKind::Binary { op: ast::BinOp::Mul, lhs, rhs }
+                if (single_path(lhs) == Some(row) && exprs_struct_eq(rhs, cols))
+                    || (single_path(rhs) == Some(row) && exprs_struct_eq(lhs, cols)))
     }
 
     /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
