@@ -1677,6 +1677,25 @@ fn kernels() -> Vec<Kernel> {
                 "let mut m= *x.add(0); for i in 0..N { let v= *x.add(i); if v>m { m=v; } } *out.add(0)=m;",
             ),
         },
+        // Absmax across cores — the per-tensor max|x| symmetric dynamic int8 quantization needs for
+        // the scale (scale = absmax/127). A `@parallel` fmax(m, abs(x[k])) loop → the multicore
+        // RED_MAXABS kernel; C/Rust use the branchless `fabsf`/`.abs()` (a recognized bitwise builtin,
+        // not a libm call), then a compare-select max the compiler still keeps serial without
+        // -ffast-math. Single input stream, bytes = N*4 (unary).
+        Kernel {
+            name: "absmax@parallel",
+            bytes_per_call: N * 4,
+            note: "max(|x|) across cores (multicore reduction kernel) vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "let mut m: f32 = 0.0; for k in 0..{N} {{ m = fmax(m, abs(x[k])); }} out[0] = m;"
+            )),
+            c: c_kernel(
+                "float m=0.0f; for(long i=0;i<N;i++){ float a=fabsf(x[i]); m = a>m? a:m; } out[0]=m;",
+            ),
+            rust: rust_kernel(
+                "let mut m=0.0f32; for i in 0..N { let a=(*x.add(i)).abs(); if a>m { m=a; } } *out.add(0)=m;",
+            ),
+        },
     ]
 }
 
