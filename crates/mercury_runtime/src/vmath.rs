@@ -30,6 +30,7 @@ pub const VM_LEAKYRELU: i64 = 8;
 pub const VM_SOFTPLUS: i64 = 9;
 pub const VM_MISH: i64 = 10;
 pub const VM_SELU: i64 = 11;
+pub const VM_TANHSHRINK: i64 = 12;
 
 // SELU (self-normalizing networks, Klambauer 2017) constants — the fixed λ, α that make the
 // activation variance-preserving.
@@ -212,6 +213,13 @@ fn selu1(x: f32) -> f32 {
         }
 }
 
+/// `tanhshrink(x) = x − tanh(x)` — the high-pass-shaped activation (audio/signal models). Reuses the
+/// shared `tanh` (built on `exp`), so the AVX2 [`tanhshrink8`] and tail agree.
+#[inline]
+fn tanhshrink1(x: f32) -> f32 {
+    x - tanh1(x)
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -228,6 +236,7 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_SOFTPLUS => softplus1(x),
         VM_MISH => mish1(x),
         VM_SELU => selu1(x),
+        VM_TANHSHRINK => tanhshrink1(x),
         _ => x,
     }
 }
@@ -275,6 +284,7 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_SOFTPLUS => softplus8,
         VM_MISH => mish8,
         VM_SELU => selu8,
+        VM_TANHSHRINK => tanhshrink8,
         _ => return,
     };
     let mut i = 0;
@@ -456,6 +466,14 @@ unsafe fn selu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_blendv_ps(negval, posval, pos)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanhshrink8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x − tanh(x) — mirrors tanhshrink1.
+    _mm256_sub_ps(x, tanh8(x))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +512,7 @@ mod tests {
                 |x| SELU_LAMBDA * if x > 0.0 { x } else { SELU_ALPHA * (x.exp() - 1.0) },
                 2e-5,
             ),
+            (VM_TANHSHRINK, |x| x - x.tanh(), 2e-5),
         ];
         for &(op, libm, tol) in cases {
             unsafe {

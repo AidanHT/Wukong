@@ -1,0 +1,24 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1035
+// EXPECT-OUT: 37
+// EXPECT-OUT: 1035
+// EXPECT-OUT: 3000
+module tests.run.tanhshrink
+
+// Tanhshrink: out[i] = x − tanh(x). An `out[i] = tanhshrink(x[i])` loop dispatches to the 256-bit
+// AVX2 mercury_vmath_f32 kernel (op = TANHSHRINK), reusing the shared exp-based tanh, bit-identical
+// across backends.
+//   ts(-2)=-2−tanh(-2)≈-1.036 → -1035; ts(0.5)≈0.0379 → 37; ts(2)≈1.036 → 1035; ts(4)≈3.001 → 3000.
+fn main() -> i32 {
+    let x: [f32; 4] = [-2.0, 0.5, 2.0, 4.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        out[i] = tanhshrink(x[i]);
+    }
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}

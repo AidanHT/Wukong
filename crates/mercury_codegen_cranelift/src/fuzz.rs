@@ -209,6 +209,12 @@ fn kernels() -> Vec<Kernel> {
             len: |n| n,
             regimes: ANY,
         },
+        Kernel {
+            name: "tanhshrink",
+            src: |n| ew(n, "out[i] = tanhshrink(x[i]);"),
+            len: |n| n,
+            regimes: ANY,
+        },
         // Reductions (result lands in out[0]); the rest of `out` stays 0 on both backends.
         Kernel {
             name: "dot",
