@@ -17,10 +17,13 @@ cudarc = { version = "0.16", default-features = false, features = [
     "driver",
     "dynamic-loading",
     "cuda-12060",
+    "f16",
 ], optional = true }
 # Used (only under `gpu`) by the tolerance harness as the CPU oracle: the GPU kernels are diffed
 # against the *identical* runtime kernels the interpreter marshals (vmath / sreduce / norm).
 mercury_runtime = { workspace = true, optional = true }
+# f16/bf16 host-side conversion for the tensor-core path (low-precision in, f32 accumulate).
+half = { version = "2", optional = true }
 
 [features]
-gpu = ["dep:cudarc", "dep:mercury_runtime"]
+gpu = ["dep:cudarc", "dep:mercury_runtime", "dep:half"]

@@ -283,6 +283,90 @@ pub fn gemm_nn(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// Launch config for the WMMA tensor-core GEMM: one warp (32 threads) per 16×16 C tile.
+fn wmma_cfg(m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Tensor-core `C = A·Bᵀ` in **fp16 inputs with f32 accumulate** (the mixed-precision contract).
+/// `A` (m×k) and `B` (n×k) arrive as f32 and are rounded to f16 on the host; `C` is f32. Requires
+/// m, n, k to be multiples of 16. The FLOP/s headline — bf16/fp16 on the Ada tensor cores.
+pub fn gemm_nt_f16(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
+        "WMMA requires 16-multiple dims"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(wmma_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Tensor-core `C = A·Bᵀ` in **bf16 inputs with f32 accumulate**. Same contract as [`gemm_nt_f16`]
+/// but bf16 (wider range, fewer mantissa bits) — the precision modern transformers train in.
+pub fn gemm_nt_bf16(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::bf16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
+        "WMMA requires 16-multiple dims"
+    );
+    let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+    let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+    let f = g.function(
+        "wmma_bf16",
+        crate::ptx_wmma::wmma_bf16_ptx(),
+        "wmma_nt_bf16",
+    )?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(wmma_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +583,75 @@ mod tests {
         });
     }
 
+    /// f64 reference for `C = A·Bᵀ` with each input first rounded by `round` (to match what the
+    /// tensor-core kernel actually multiplies: f16/bf16 inputs). Isolates the GEMM accumulation error
+    /// from the input-precision loss.
+    fn ref_nt_rounded(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        round: impl Fn(f32) -> f32,
+    ) -> Vec<f32> {
+        let ar: Vec<f64> = a.iter().map(|&x| round(x) as f64).collect();
+        let br: Vec<f64> = b.iter().map(|&x| round(x) as f64).collect();
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    acc += ar[i * k + kk] * br[j * k + kk];
+                }
+                c[i * n + j] = acc as f32;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn wmma_tensorcore_matches_reference_within_tol() {
+        use half::{bf16, f16};
+        with_gpu("wmma", |g| {
+            let mut rng = crate::diff::Rng::new(0x7C0DE);
+            let shapes = [(16usize, 16usize, 16usize), (64, 64, 64), (256, 128, 512)];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+
+                // f16 inputs: products are exact in f32, so only f32 accumulation deviates.
+                let c16 = gemm_nt_f16(g, &a, &b, m, k, n).unwrap();
+                let r16 = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16 {m}x{k}x{n}"),
+                    &c16,
+                    &r16,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!(
+                    "wmma_f16  {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+
+                // bf16 inputs: fewer mantissa bits → looser tolerance, but still exact products.
+                let cb = gemm_nt_bf16(g, &a, &b, m, k, n).unwrap();
+                let rb = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
+                let s = crate::diff::assert_close(
+                    &format!("wmma_bf16 {m}x{k}x{n}"),
+                    &cb,
+                    &rb,
+                    2e-2,
+                    1e-2,
+                );
+                eprintln!(
+                    "wmma_bf16 {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
     /// Time `iters` resident launches of a GEMM `(M,N,K, A,B,C)` kernel; returns seconds/iter.
     fn time_gemm(
         g: &Gpu,
@@ -511,7 +664,7 @@ mod tests {
         iters: usize,
     ) -> f64 {
         let (mm, nn, kk) = dims;
-        let mut launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
             bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d);
             unsafe { bld.launch(cfg).unwrap() };
@@ -561,5 +714,102 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Tensor-core throughput: f32 register-blocked vs fp16/bf16 WMMA (f32 accumulate), kernel-resident.
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn tensorcore_throughput() {
+        use half::{bf16, f16};
+        with_gpu("tensorcore_throughput", |g| {
+            let mut rng = crate::diff::Rng::new(7);
+            for sz in [512usize, 1024, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let flop = 2.0 * (m as f64) * (k as f64) * (n as f64);
+                let dims = (m as u32, n as u32, k as u32);
+
+                // f32 register-blocked (reference)
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let f_rb = g
+                    .function("gemm_rb", crate::ptx_gemm::gemm_rb_ptx(), "gemm_nt_rb")
+                    .unwrap();
+                let s_rb = time_gemm(g, &f_rb, gemm_rb_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 30);
+
+                // fp16 WMMA
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a16_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let f_f16 = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16")
+                    .unwrap();
+                let s_f16 = time_wmma(
+                    g,
+                    &f_f16,
+                    wmma_cfg(m, n),
+                    dims,
+                    &a16_d,
+                    &b16_d,
+                    &mut c_d,
+                    50,
+                );
+
+                // bf16 WMMA
+                let ab: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+                let bb: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+                let ab_d = g.stream.memcpy_stod(&ab).unwrap();
+                let bb_d = g.stream.memcpy_stod(&bb).unwrap();
+                let f_bf16 = g
+                    .function(
+                        "wmma_bf16",
+                        crate::ptx_wmma::wmma_bf16_ptx(),
+                        "wmma_nt_bf16",
+                    )
+                    .unwrap();
+                let s_bf16 =
+                    time_wmma(g, &f_bf16, wmma_cfg(m, n), dims, &ab_d, &bb_d, &mut c_d, 50);
+
+                eprintln!(
+                    "{m}³: f32-rb {:.0} GFLOP/s | f16-TC {:.0} GFLOP/s ({:.1}× rb) | bf16-TC {:.0} GFLOP/s ({:.1}× rb)",
+                    flop / s_rb / 1e9,
+                    flop / s_f16 / 1e9,
+                    s_rb / s_f16,
+                    flop / s_bf16 / 1e9,
+                    s_rb / s_bf16,
+                );
+            }
+        });
+    }
+
+    /// Time WMMA launches with half-precision inputs (a/b, f16 or bf16) and an f32 C; seconds/iter.
+    fn time_wmma<T: cudarc::driver::DeviceRepr>(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<T>,
+        b_d: &cudarc::driver::CudaSlice<T>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
     }
 }
