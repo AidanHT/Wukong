@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 666
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 666
+// EXPECT-OUT: 4000
+module tests.run.hardswish
+
+// The MobileNetV3 / EfficientNet activation pair, both dispatched to the 256-bit AVX2
+// mercury_vmath_f32 kernel (op = HARDSIGMOID / HARDSWISH):
+//   hardsigmoid(x) = clamp(x+3, 0, 6)/6      (the cheap piecewise-linear sigmoid)
+//   hardswish(x)   = x · hardsigmoid(x)
+// The clamp is exact (min/max), so it is bit-identical across backends (the differential fuzzer
+// checks this even on NaN/±0 inputs).
+//   hardsigmoid(-4)=0; (0)=0.5 → 500; (1)=4/6 → 666; (4)=1 → 1000.
+//   hardswish(1)=0.6667 → 666; hardswish(4)=4 → 4000.
+fn main() -> i32 {
+    let x: [f32; 4] = [-4.0, 0.0, 1.0, 4.0];
+    let mut hs: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        hs[i] = hardsigmoid(x[i]);
+    }
+    let mut hw: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        hw[i] = hardswish(x[i]);
+    }
+    print((hs[0] * 1000.0) as i32);
+    print((hs[1] * 1000.0) as i32);
+    print((hs[2] * 1000.0) as i32);
+    print((hs[3] * 1000.0) as i32);
+    print((hw[2] * 1000.0) as i32);
+    print((hw[3] * 1000.0) as i32);
+    return 0;
+}
