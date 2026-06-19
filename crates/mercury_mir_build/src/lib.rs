@@ -450,10 +450,14 @@ struct VElemPlan<'b> {
 }
 
 // Reduction op codes — must match `mercury_runtime::reduce`'s `RED_*`. `x[k]*x[k]` recognizes as
-// `RED_DOT` with both bases equal (≡ sum-of-squares), so the recognizer needs only these three.
+// `RED_DOT` with both bases equal (≡ sum-of-squares), so the recognizer needs only these. The
+// additive ops fold by `+`; `RED_MAX`/`RED_MIN` fold by `fmax`/`fmin` (per-tensor max/absmax for
+// softmax stability and dynamic int8 quantization), and the outer combine is a `Cmp+Select`.
 const RED_DOT: i64 = 0; // sum(x[k] * y[k])
 const RED_SSD: i64 = 1; // sum((x[k] - y[k])^2)
 const RED_SUM: i64 = 2; // sum(x[k])
+const RED_MAX: i64 = 4; // max(x[k])  — fold by fmax
+const RED_MIN: i64 = 5; // min(x[k])  — fold by fmin
 
 // Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
@@ -1796,10 +1800,11 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Recognize a kernel-dispatchable reduction body `s = s + f(x[k], y[k])` (or `s += …`) over the
-    /// loop variable `k`: dot `x[k]*y[k]`, ssd `(x[k]-y[k])*(x[k]-y[k])`, or sum `x[k]`. Returns the
-    /// accumulator symbol, the `RED_*` op code, and the two array bases (`y == x` for the unary sum).
-    /// Strict pure-AST match — single statement, index exactly `k`.
+    /// Recognize a kernel-dispatchable reduction body over the loop variable `k`: an additive fold
+    /// `s = s + f(x[k], y[k])` (or `s += …`) — dot `x[k]*y[k]`, ssd `(x[k]-y[k])²`, sum `x[k]` — or a
+    /// running max/min `m = fmax(m, x[k])` / `m = fmin(m, x[k])`. Returns the accumulator symbol, the
+    /// `RED_*` op code, and the two array bases (`y == x` for the unary sum/max/min). Strict pure-AST
+    /// match — single statement, index exactly `k`.
     fn match_reduction_kernel(
         &self,
         body: &Block,
@@ -1814,6 +1819,40 @@ impl FnLowerer<'_> {
         let s = single_path(target)?;
         if s == k {
             return None;
+        }
+        // `base[k]` with the index exactly the loop variable → the base array symbol.
+        let idx_base = |e: &Expr| -> Option<Symbol> {
+            let ExprKind::Index { base, indices } = &e.kind else {
+                return None;
+            };
+            if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+                return None;
+            }
+            single_path(base)
+        };
+        // Running max/min: `m = fmax(m, x[k])` / `m = fmin(m, x[k])` (either operand order). The other
+        // operand must be `x[k]`; the kernel folds by `fmax`/`fmin`, the outer combine by `Cmp+Select`.
+        if let ast::AssignOp::Assign = op {
+            if let ExprKind::Call { callee, args, .. } = &value.kind {
+                if args.len() == 2 {
+                    let red = match self.vectorizable_intrinsic(callee) {
+                        Some(MathIntrinsic::Fmax) => Some(RED_MAX),
+                        Some(MathIntrinsic::Fmin) => Some(RED_MIN),
+                        _ => None,
+                    };
+                    if let Some(red) = red {
+                        let other = if single_path(&args[0]) == Some(s) {
+                            &args[1]
+                        } else if single_path(&args[1]) == Some(s) {
+                            &args[0]
+                        } else {
+                            return None;
+                        };
+                        let a = idx_base(other)?;
+                        return Some((s, red, a, a));
+                    }
+                }
+            }
         }
         // `s += addend`, or `s = s + addend` / `s = addend + s`.
         let addend: &Expr = match op {
@@ -1836,16 +1875,6 @@ impl FnLowerer<'_> {
         if expr_uses_sym(addend, s) {
             return None;
         }
-        // `base[k]` with the index exactly the loop variable → the base array symbol.
-        let idx_base = |e: &Expr| -> Option<Symbol> {
-            let ExprKind::Index { base, indices } = &e.kind else {
-                return None;
-            };
-            if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
-                return None;
-            }
-            single_path(base)
-        };
         match &addend.kind {
             // dot `a[k]*b[k]` (a==b ≡ sum-of-squares), or ssd `(a[k]-b[k])*(a[k]-b[k])`.
             ExprKind::Binary {
@@ -1935,13 +1964,30 @@ impl FnLowerer<'_> {
                 args: vec![xv, yv, n, opv],
             },
         );
-        // s = s + result — matches the loop's `s_final = s_init + Σ` (reassociated inside the kernel).
+        // Combine the kernel result into the accumulator. Additive: `s = s + result` (matches the
+        // loop's `s_final = s_init + Σ`, reassociated inside the kernel). Max/min: `s = fmax(s,
+        // result)` as `Cmp(Fogt/Folt)+Select` — the identical fold the kernel and the sequential
+        // `fmax` vectorizer use, so interp (serial kernel) and native (parallel kernel) agree.
         let cur = self
             .builder
             .build(MirType::F32, Op::Load(s_slot, MirType::F32));
-        let new_s = self
-            .builder
-            .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result));
+        let new_s = match op {
+            RED_MAX | RED_MIN => {
+                let pred = if op == RED_MAX {
+                    CmpOp::Fogt
+                } else {
+                    CmpOp::Folt
+                };
+                let mask =
+                    self.builder
+                        .build(mask_ty(&MirType::F32), Op::Cmp(pred, cur, result));
+                self.builder
+                    .build(MirType::F32, Op::Select(mask, cur, result))
+            }
+            _ => self
+                .builder
+                .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result)),
+        };
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: new_s,
