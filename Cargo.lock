@@ -440,6 +440,7 @@ name = "mercury_codegen_gpu"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "mercury_runtime",
 ]
 
 [[package]]

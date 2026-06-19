@@ -105,6 +105,82 @@ pub fn vadd(g: &mut Gpu, x: &[f32], y: &[f32], out: &mut [f32]) -> Result<(), Dr
     Ok(())
 }
 
+/// Apply an elementwise activation `out[i] = f(x[i])` on the GPU — the GPU twin of
+/// `mercury_vmath_f32`. `op` is a `VM_*` code (exp/relu/sigmoid/tanh/silu/gelu so far). Transcendental
+/// ops use SFU approximations, so the result is tolerance-close to the CPU kernel, not bit-exact.
+pub fn vmath(g: &mut Gpu, op: i64, x: &[f32]) -> Result<Vec<f32>, DriverError> {
+    let entry = vmath_entry(op);
+    let n = x.len() as u32;
+    let f = g.function("vmath", crate::ptx::vmath_ptx(), entry)?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let mut out_d = g.stream.memcpy_stod(&vec![0f32; x.len()])?;
+    let cfg = LaunchConfig::for_num_elems(n);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&n).arg(&x_d).arg(&mut out_d);
+    unsafe { b.launch(cfg)? };
+    g.stream.memcpy_dtov(&out_d)
+}
+
+fn vmath_entry(op: i64) -> &'static str {
+    use mercury_runtime::{VM_EXP, VM_GELU, VM_RELU, VM_SIGMOID, VM_SILU, VM_TANH};
+    match op {
+        x if x == VM_RELU => "relu",
+        x if x == VM_EXP => "exp",
+        x if x == VM_SIGMOID => "sigmoid",
+        x if x == VM_TANH => "tanh",
+        x if x == VM_SILU => "silu",
+        x if x == VM_GELU => "gelu",
+        _ => panic!("vmath op {op} not implemented on GPU yet"),
+    }
+}
+
+/// Fixed reduction grid — see `ptx::REDUCE`. The grid is independent of input size and occupancy, so
+/// the GPU result is identical run-to-run (determinism by fixed decomposition, not associativity).
+pub const RED_GRID: u32 = 256;
+pub const RED_BLOCK: u32 = 256;
+/// `max(x[i])` reduction op-code (mirrors `mercury_runtime::reduce::RED_MAX`, which isn't re-exported).
+pub const RED_MAX: i64 = 4;
+
+/// Deterministic GPU reduction — the GPU twin of `mercury_sreduce_f32`. `op` is `RED_SUM` /
+/// `RED_DOT` (needs `y`) / [`RED_MAX`]. Blocks tree-reduce in shared memory; the `RED_GRID` partials
+/// are combined on the host in ascending block order.
+pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32, DriverError> {
+    use mercury_runtime::{RED_DOT, RED_SUM};
+    let entry = match op {
+        v if v == RED_SUM => "reduce_sum",
+        v if v == RED_DOT => "reduce_dot",
+        v if v == RED_MAX => "reduce_max",
+        _ => panic!("reduce op {op} not implemented on GPU yet"),
+    };
+    let n = x.len() as u32;
+    let f = g.function("reduce", crate::ptx::REDUCE, entry)?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let y_d = match y {
+        Some(y) => Some(g.stream.memcpy_stod(y)?),
+        None => None,
+    };
+    let mut partials_d = g.stream.memcpy_stod(&vec![0f32; RED_GRID as usize])?;
+    let cfg = LaunchConfig {
+        grid_dim: (RED_GRID, 1, 1),
+        block_dim: (RED_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&n).arg(&x_d);
+    if let Some(ref yd) = y_d {
+        b.arg(yd);
+    }
+    b.arg(&mut partials_d);
+    unsafe { b.launch(cfg)? };
+    let partials = g.stream.memcpy_dtov(&partials_d)?;
+    let is_max = op == RED_MAX;
+    let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
+    for &p in &partials {
+        acc = if is_max { acc.max(p) } else { acc + p };
+    }
+    Ok(acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +222,86 @@ mod tests {
             for i in 0..n {
                 assert_eq!(out[i].to_bits(), (x[i] + y[i]).to_bits(), "vadd lane {i}");
             }
+        });
+    }
+
+    fn cpu_vmath(op: i64, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        unsafe {
+            mercury_runtime::mercury_vmath_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i64, op)
+        };
+        out
+    }
+
+    #[test]
+    fn vmath_activations_match_cpu_oracle_within_tol() {
+        use mercury_runtime::{VM_EXP, VM_GELU, VM_RELU, VM_SIGMOID, VM_SILU, VM_TANH};
+        with_gpu("vmath_activations", |g| {
+            let mut rng = crate::diff::Rng::new(0xA1);
+            let n = 50_000usize; // not a multiple of any block size
+            let x = rng.vec(n, -10.0, 10.0);
+            // (op, label, abs_tol, rel_tol). relu is exact; transcendentals use SFU approximations.
+            let cases: &[(i64, &str, f64, f64)] = &[
+                (VM_RELU, "relu", 0.0, 0.0),
+                (VM_EXP, "exp", 1e-3, 5e-4),
+                (VM_SIGMOID, "sigmoid", 5e-4, 1e-3),
+                (VM_TANH, "tanh", 5e-4, 1e-3),
+                (VM_SILU, "silu", 1e-3, 1e-3),
+                (VM_GELU, "gelu", 1e-3, 1e-3),
+            ];
+            for &(op, label, abs_tol, rel_tol) in cases {
+                let got = vmath(g, op, &x).unwrap();
+                let oracle = cpu_vmath(op, &x);
+                let s = crate::diff::assert_close(label, &got, &oracle, abs_tol, rel_tol);
+                eprintln!(
+                    "vmath {label:8}: max_abs={:.3e} max_rel={:.3e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn reductions_match_reference_within_tol_and_are_deterministic() {
+        use mercury_runtime::{mercury_sreduce_f32, RED_DOT, RED_SUM};
+        with_gpu("reductions", |g| {
+            let mut rng = crate::diff::Rng::new(0xBEEF);
+            let n = 1 << 20; // 1,048,576 elements
+                             // Positive inputs keep sum/dot well-conditioned (no catastrophic cancellation), so a
+                             // relative tolerance is meaningful.
+            let x = rng.vec(n, 0.0, 1.0);
+            let y = rng.vec(n, 0.0, 1.0);
+
+            // --- sum ---
+            let gpu_sum = reduce(g, RED_SUM, &x, None).unwrap();
+            let ref_sum: f64 = x.iter().map(|&v| v as f64).sum();
+            let cpu_sum = unsafe { mercury_sreduce_f32(x.as_ptr(), x.as_ptr(), n as i64, RED_SUM) };
+            let rel = crate::diff::assert_scalar_close("sum vs f64", gpu_sum, ref_sum, 1e-1, 1e-3);
+            eprintln!("reduce sum: gpu={gpu_sum} cpu={cpu_sum} ref={ref_sum:.6} rel={rel:.3e}");
+
+            // --- dot ---
+            let gpu_dot = reduce(g, RED_DOT, &x, Some(&y)).unwrap();
+            let ref_dot: f64 = x.iter().zip(&y).map(|(&a, &b)| a as f64 * b as f64).sum();
+            let rel = crate::diff::assert_scalar_close("dot vs f64", gpu_dot, ref_dot, 1e-1, 1e-3);
+            eprintln!("reduce dot: gpu={gpu_dot} ref={ref_dot:.6} rel={rel:.3e}");
+
+            // --- max (order-independent and exact: GPU == true max bit-for-bit) ---
+            let xs = rng.vec(n, -5.0, 5.0);
+            let gpu_max = reduce(g, RED_MAX, &xs, None).unwrap();
+            let ref_max = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(
+                gpu_max.to_bits(),
+                ref_max.to_bits(),
+                "gpu max must be exact"
+            );
+
+            // --- determinism: same inputs → identical bits across runs ---
+            let again = reduce(g, RED_SUM, &x, None).unwrap();
+            assert_eq!(
+                gpu_sum.to_bits(),
+                again.to_bits(),
+                "reduction must be deterministic"
+            );
         });
     }
 }
