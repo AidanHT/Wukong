@@ -1,19 +1,24 @@
 //! Single-precision reductions — dot product and friends, with a **deterministic multicore** variant.
 //!
-//! Computes `sum_i f(x[i], y[i])` for `f` in `{ x·y (dot), (x−y)² (ssd), x (sum), x·x (sumsq) }`.
-//! These are the reductions transformer math leans on: attention scores and projections (dot), the
-//! L2 loss (ssd), and LayerNorm/RMSNorm mean & variance (sum, sumsq). The compiler recognizes the
-//! reduction loop in a `@parallel` function and lowers it to one of these calls — the same play as
+//! Computes `reduce_i f(x[i], y[i])` for `f` in `{ x·y (dot), (x−y)² (ssd), x (sum), x·x (sumsq) }`
+//! folded by `+`, and `{ x (max), x (min) }` folded by `fmax`/`fmin`. These are the reductions
+//! transformer math leans on: attention scores and projections (dot), the L2 loss (ssd),
+//! LayerNorm/RMSNorm mean & variance (sum, sumsq), and the per-tensor **max/absmax** that softmax
+//! stability and dynamic int8 quantization scale-computation need (max, min). The compiler recognizes
+//! the reduction loop in a `@parallel` function and lowers it to one of these calls — the same play as
 //! the matmul→GEMM and activation→`mercury_vmath_f32` dispatch. The interpreter marshals its abstract
 //! memory through the **identical serial kernel**, so the differential oracle stays bit-for-bit exact.
 //!
-//! **Determinism is the whole game for a *parallel* float sum** — the result must not depend on how
+//! **Determinism is the whole game for a *parallel* reduction** — the result must not depend on how
 //! many cores ran it. So the array is cut into FIXED-size chunks (count independent of thread count);
-//! each chunk is reduced to a partial by the identical [`reduce_chunk`]; the partials are summed in
+//! each chunk is reduced to a partial by the identical [`reduce_chunk`]; the partials are folded in
 //! ascending chunk order. The serial and parallel entries call the same per-chunk function and combine
-//! in the same order, so `serial == parallel == interpreter`, bit for bit, on any machine. Within a
-//! chunk the AVX2 path and the scalar twin are also bit-identical (lane `j` sums elements `≡ j (mod
-//! 8)`, then a fixed-order horizontal combine; `f32::mul_add` is the same fused op as `_mm256_fmadd`).
+//! in the same order, so `serial == parallel == interpreter`, bit for bit, on any machine. (`fmax`/
+//! `fmin` are *not* associative on NaN/±0, but determinism here rests on the FIXED decomposition and
+//! ascending combine, not on associativity — the serial and parallel forms evaluate the identical
+//! expression tree.) Within a chunk the AVX2 path and the scalar twin are also bit-identical (lane `j`
+//! folds elements `≡ j (mod 8)`, then a fixed-order horizontal combine; `f32::mul_add` is the same
+//! fused op as `_mm256_fmadd`, and the scalar `(a > b) ? a : b` is the same as `_mm256_max_ps`).
 //!
 //! At `N = 2^20` a dot is *memory-bound* (a single core already saturates load bandwidth at ~44
 //! GB/s), so one 8-lane accumulator per chunk is enough to be bandwidth-bound; the win is spreading
@@ -28,6 +33,43 @@ pub const RED_DOT: i64 = 0; // sum(x[i] * y[i])
 pub const RED_SSD: i64 = 1; // sum((x[i] - y[i])^2)
 pub const RED_SUM: i64 = 2; // sum(x[i])
 pub const RED_SUMSQ: i64 = 3; // sum(x[i] * x[i])
+pub const RED_MAX: i64 = 4; // max(x[i])  — fold by fmax
+pub const RED_MIN: i64 = 5; // min(x[i])  — fold by fmin
+
+/// The fold identity: `0.0` for the additive ops, `∓∞` for max/min so the first real element wins.
+#[inline(always)]
+fn ident(op: i64) -> f32 {
+    match op {
+        RED_MAX => f32::NEG_INFINITY,
+        RED_MIN => f32::INFINITY,
+        _ => 0.0,
+    }
+}
+
+/// Fold two partials under the reduction's combine: `a + b` (additive), or `(a > b) ? a : b` /
+/// `(a < b) ? a : b` for max/min — the exact semantics of `_mm256_max_ps`/`_mm256_min_ps` (and of
+/// the MIR `Cmp(Fogt/Folt)+Select` the recognizer emits to combine the kernel result), so the AVX2
+/// lanes, the scalar twin, and the compiler's outer fold all agree bit-for-bit.
+#[inline(always)]
+fn fold2(a: f32, b: f32, op: i64) -> f32 {
+    match op {
+        RED_MAX => {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        RED_MIN => {
+            if a < b {
+                a
+            } else {
+                b
+            }
+        }
+        _ => a + b,
+    }
+}
 
 // Fixed chunk size in elements — independent of thread count, which is what makes the parallel
 // partial decomposition deterministic. 8192 f32 = 32 KB (an L1's worth) per chunk; at N=2^20 that is
@@ -47,15 +89,22 @@ fn contrib(a: f32, xi: f32, yi: f32, op: i64) -> f32 {
         }
         RED_SUM => a + xi,
         RED_SUMSQ => xi.mul_add(xi, a),
+        RED_MAX | RED_MIN => fold2(a, xi, op), // `(a > xi) ? a : xi` ≡ `_mm256_max_ps(a, xi)`
         _ => a,
     }
 }
 
-/// Fixed-order horizontal combine of the 8 lane accumulators: a balanced tree, identical in the AVX2
-/// and scalar paths so both produce the same bits.
+/// Fixed-order horizontal combine of the 8 lane accumulators: a balanced tree built from [`fold2`],
+/// identical in the AVX2 and scalar paths so both produce the same bits. For the additive ops this is
+/// exactly `((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7))` (unchanged); for max/min it is the same tree under
+/// `fmax`/`fmin`.
 #[inline(always)]
-fn hcombine8(a: [f32; 8]) -> f32 {
-    ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
+fn hcombine8(a: [f32; 8], op: i64) -> f32 {
+    fold2(
+        fold2(fold2(a[0], a[1], op), fold2(a[2], a[3], op), op),
+        fold2(fold2(a[4], a[5], op), fold2(a[6], a[7], op), op),
+        op,
+    )
 }
 
 /// Reduce `x[lo..hi]` (and `y[lo..hi]` for the binary ops) to a scalar partial. Pure function of its
@@ -82,7 +131,7 @@ unsafe fn reduce_chunk(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i
 /// # Safety
 /// `x`/`y` valid on `[lo, hi)`.
 unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
-    let mut acc = [0.0f32; 8];
+    let mut acc = [ident(op); 8];
     let len = hi - lo;
     let nsteps = len / 8;
     for s in 0..nsteps {
@@ -100,7 +149,7 @@ unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize
         // SAFETY: i < hi.
         *a = contrib(*a, unsafe { *x.add(i) }, unsafe { *y.add(i) }, op);
     }
-    hcombine8(acc)
+    hcombine8(acc, op)
 }
 
 /// AVX2 chunk reduce: one `__m256` accumulator (lane `j` sums elements `≡ j (mod 8)` over the chunk),
@@ -112,7 +161,8 @@ unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize
 #[target_feature(enable = "avx2,fma")]
 unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
     use std::arch::x86_64::*;
-    let mut acc = _mm256_setzero_ps();
+    // `set1(ident)` is `setzero` for the additive ops (+0.0 = all-zero bits), and ∓∞ for max/min.
+    let mut acc = _mm256_set1_ps(ident(op));
     let len = hi - lo;
     let nsteps = len / 8;
     for s in 0..nsteps {
@@ -126,18 +176,21 @@ unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, 
             }
             RED_SUM => _mm256_add_ps(xv, acc),
             RED_SUMSQ => _mm256_fmadd_ps(xv, xv, acc),
+            RED_MAX => _mm256_max_ps(acc, xv), // `(acc > xv) ? acc : xv`, lane-wise
+            RED_MIN => _mm256_min_ps(acc, xv),
             _ => acc,
         };
     }
-    let mut tmp = [0.0f32; 8];
+    let mut tmp = [ident(op); 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-    // Scalar tail into the same lanes — `contrib` (mul_add) matches the fmadd lanes exactly.
+    // Scalar tail into the same lanes — `contrib` matches the AVX2 lane op exactly (mul_add↔fmadd,
+    // `(a > xi) ? a : xi` ↔ max_ps).
     let tail = lo + nsteps * 8;
     for (j, t) in tmp.iter_mut().enumerate().take(len - nsteps * 8) {
         let i = tail + j;
         *t = contrib(*t, *x.add(i), *y.add(i), op);
     }
-    hcombine8(tmp)
+    hcombine8(tmp, op)
 }
 
 /// `sum_i f(x[i], y[i])` for `i in 0..n` (serial). For `RED_SUM`/`RED_SUMSQ`, `y` is ignored (callers
@@ -148,16 +201,16 @@ unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, 
 #[no_mangle]
 pub unsafe extern "C" fn mercury_sreduce_f32(x: *const f32, y: *const f32, n: i64, op: i64) -> f32 {
     if n <= 0 {
-        return 0.0;
+        return ident(op);
     }
     let n = n as usize;
     let nchunks = n.div_ceil(RCHUNK);
-    let mut acc = 0.0f32;
+    let mut acc = ident(op);
     for c in 0..nchunks {
         let lo = c * RCHUNK;
         let hi = ((c + 1) * RCHUNK).min(n);
         // SAFETY: [lo, hi) ⊆ [0, n); buffers valid for n by contract.
-        acc += unsafe { reduce_chunk(x, y, lo, hi, op) };
+        acc = fold2(acc, unsafe { reduce_chunk(x, y, lo, hi, op) }, op);
     }
     acc
 }
@@ -178,7 +231,7 @@ pub unsafe extern "C" fn mercury_sreduce_f32_parallel(
     op: i64,
 ) -> f32 {
     if n <= 0 {
-        return 0.0;
+        return ident(op);
     }
     let n = n as usize;
     let nchunks = n.div_ceil(RCHUNK);
@@ -198,9 +251,9 @@ pub unsafe extern "C" fn mercury_sreduce_f32_parallel(
             unsafe { reduce_chunk(xa as *const f32, ya as *const f32, lo, hi, op) }
         })
         .collect();
-    let mut acc = 0.0f32;
+    let mut acc = ident(op);
     for p in partials {
-        acc += p;
+        acc = fold2(acc, p, op);
     }
     acc
 }
@@ -221,22 +274,32 @@ mod tests {
     }
 
     fn naive(x: &[f32], y: &[f32], op: i64) -> f64 {
-        // f64 reference for the tolerance check.
-        let mut s = 0.0f64;
+        // f64 reference for the tolerance check. For max/min the fold picks an actual element, so the
+        // f64 result equals the f32 kernel's bit-for-bit on the finite, non-NaN test data.
+        let mut s = ident(op) as f64;
         for i in 0..x.len() {
             let (xi, yi) = (x[i] as f64, y[i] as f64);
-            s += match op {
-                RED_DOT => xi * yi,
-                RED_SSD => (xi - yi) * (xi - yi),
-                RED_SUM => xi,
-                RED_SUMSQ => xi * xi,
-                _ => 0.0,
+            match op {
+                RED_DOT => s += xi * yi,
+                RED_SSD => s += (xi - yi) * (xi - yi),
+                RED_SUM => s += xi,
+                RED_SUMSQ => s += xi * xi,
+                RED_MAX => s = if s > xi { s } else { xi },
+                RED_MIN => s = if s < xi { s } else { xi },
+                _ => {}
             };
         }
         s
     }
 
-    const OPS: [i64; 4] = [RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ];
+    const OPS: [i64; 6] = [
+        RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ, RED_MAX, RED_MIN,
+    ];
+
+    // The unary ops read only `x`; the recognizer passes `y == x` for them.
+    fn unary(op: i64) -> bool {
+        matches!(op, RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN)
+    }
 
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
@@ -245,11 +308,7 @@ mod tests {
             let (x, y) = fill(n);
             for &op in &OPS {
                 // For the unary ops the recognizer passes y == x; mirror that here.
-                let yp = if op == RED_SUM || op == RED_SUMSQ {
-                    x.as_ptr()
-                } else {
-                    y.as_ptr()
-                };
+                let yp = if unary(op) { x.as_ptr() } else { y.as_ptr() };
                 let s = unsafe { mercury_sreduce_f32(x.as_ptr(), yp, n as i64, op) };
                 let p = unsafe { mercury_sreduce_f32_parallel(x.as_ptr(), yp, n as i64, op) };
                 assert_eq!(
@@ -266,11 +325,7 @@ mod tests {
         let n = 100_003;
         let (x, y) = fill(n);
         for &op in &OPS {
-            let yp = if op == RED_SUM || op == RED_SUMSQ {
-                x.as_ptr()
-            } else {
-                y.as_ptr()
-            };
+            let yp = if unary(op) { x.as_ptr() } else { y.as_ptr() };
             let got = unsafe { mercury_sreduce_f32(x.as_ptr(), yp, n as i64, op) } as f64;
             let want = naive(&x, &y, op);
             let rel = (got - want).abs() / want.abs().max(1.0);
