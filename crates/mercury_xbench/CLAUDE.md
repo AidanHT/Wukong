@@ -17,7 +17,7 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 ## Key types & entry points
 - `main` — runs the elementwise kernel table (saxpy/dot/relu/poly + `@parallel` variants incl.
   relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`,
-  `bench_linear`, `bench_conv`, `bench_norm`, and `bench_i8gemm`.
+  `bench_linear`, `bench_conv`, `bench_norm`, `bench_norm_batched`, and `bench_i8gemm`.
 - `bench_i8gemm` (+ `mer_i8gemm`/`c_i8gemm`/`rust_i8gemm`) — int8 quantized `nn.Linear` (`C = A·Bᵀ`,
   `u8`×`i8`→`i32`) at 512²/1024². The Mercury source is the `ijk` dot-product the `mir_build`
   recognizer folds to one `mercury_i8gemm_nt[_parallel]` call (AVX-VNNI `vpdpbusd`); C/Rust are the
@@ -34,6 +34,14 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   `expf`. The `layernorm_affine`/`rmsnorm_affine` ops add the learned per-column scale `y` (gamma, and
   for LayerNorm beta — reused) that real transformer norms carry, so Mercury folds them to
   `mercury_norm_affine_f32`; they hold the same ~1.7–3.7× vs C (the γ/β multiply-add is cheap).
+- `bench_norm_batched` (+ `mer_norm_batched`/`c_norm_batched`/`rust_norm_batched`) — **batched** RMSNorm
+  over a `[rows, cols]` matrix (the real `[tokens, hidden]` shape; `bench_norm`'s single row was one
+  token), Mercury's batched recognizer folding `for r { <RMSNorm over out[r*C+i]> }` to one
+  `mercury_norm_f32` call (or `mercury_norm_f32_parallel` under `@parallel`) vs the per-row C/Rust
+  nested loops. Two shapes because RMSNorm is **memory-bound**: 512×768 (1.5 MB, L3-resident — serial
+  ~2.1× vs C, `@parallel` *slower* than serial) and 4096×4096 (64 MB, ≫ L3 — serial ~2.3×, `@parallel`
+  ~3.6×, ≈1.6× over serial). The serial fused form always wins; `@parallel` only once the batch spills
+  L3 (same working-set rule as the non-temporal streaming dispatch). The unused `y` arg aliases `x`.
 - `KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32)` — the shared `(x, y, out)` ABI;
   matmul reuses it as `(a, b, c)`. `N = 1<<20` elements; matmul is 512×512.
 - `bench_mercury` parse→sema→lower→`optimize(_,3)`→`jit_module`, times `kbench`; `bench_external`

@@ -235,12 +235,38 @@ Softmax wins most — the vectorized `exp` dominates, the same effect as the sta
 LayerNorm and RMSNorm win on their reassociated reductions (gcc keeps float reductions strictly
 sequential without `-ffast-math`), with RMSNorm lowest because it has only one reduction and a larger
 share of plain elementwise work. Rust tracks C within a few percent throughout. One row is one
-token's hidden vector; a real `[tokens, hidden]` batch maps the identical kernel per row. **The affine
+token's hidden vector; the whole `[tokens, hidden]` batch is recognized too (see *Batched RMSNorm*
+below). **The affine
 variants hold the same win** (~2.8–3.7× LayerNorm, ~1.7–3.2× RMSNorm) — the learned γ/β are a cheap
 per-element multiply-add that rides along in the writeback, so the fusion + reduction-vectorization
 advantage is unchanged; this is what makes the win apply to the norms real models actually run, not
 just the γ=1 idealization. The interpreter marshals the identical kernel so the differential oracle
 stays bit-for-bit exact, and the recognizer runs pre-opt so `-O0` == `-O3`.
+
+### Batched RMSNorm — the whole `[tokens, hidden]` matrix in one call, and across cores
+
+A single feature row is one token; a transformer normalizes a whole `[tokens, hidden]` activation.
+Mercury recognizes the **batched** form — `for r in 0..R { <RMSNorm over x[r*C + i]> }`, the row-major
+`[R, C]` matrix — and folds the entire batch into one `mercury_norm_f32(x, x, R, C, …)` call (each row
+a fused single pass), instead of leaving the outer loop to scalar/vectorized code. In a `@parallel`
+function the same batch dispatches to **`mercury_norm_f32_parallel`**, mapping the independent rows
+across cores.
+
+RMSNorm is **memory-bound** (it reads each row twice and writes once), so whether multicore helps is
+purely a question of working-set vs cache — the same rule as the non-temporal streaming dispatch:
+
+| `[rows, cols]` | working set | serial vs C | `@parallel` vs C |
+|----------------|-------------|-------------|------------------|
+| 512 × 768   | 1.5 MB (fits L3) | **~2.1× faster** | ~1.3× — *slower* than serial: no DRAM headroom, so the rayon/contention overhead is pure loss |
+| 4096 × 4096 | 64 MB (≫ L3) | **~2.3× faster** | **~3.6× faster** — ≈1.6× over Mercury's own serial: one core can't saturate DRAM, so rows-across-cores wins |
+
+So the fused single-pass **serial** batched norm is an unconditional win (~2.1–2.3× vs single-threaded
+C, fused-vs-multipass), and `@parallel` is the right lowering **only once the batch spills L3**. Both
+paths marshal the identical per-row kernel through the interpreter, and the multicore kernel has no
+cross-row combine, so the differential oracle stays bit-for-bit exact (the runtime's
+`serial_matches_parallel_bit_for_bit` pins the kernel equality; the codegen's
+`differential_parallel_batched_norm` pins the end-to-end dispatch). C/Rust here are the idiomatic
+single-threaded per-row nested loops at honest defaults.
 
 ### int8 quantized `nn.Linear` — `vpdpbusd` register-blocked, beats gcc single-core
 
