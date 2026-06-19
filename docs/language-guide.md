@@ -128,8 +128,9 @@ real consumers on the native backend: **`@parallel`** functions execute across C
 loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically** (✅) — a
 plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop, and
 FMA-contracted with no annotation. A **reduction** in a `@parallel` function — `let mut s = 0.0; for
-k in 0..n { s += x[k]*y[k] }` (also `(x[k]-y[k])²`, the plain sum, and a running `fmax`/`fmin`
-max/min — the per-tensor max softmax stability and dynamic int8 quantization need) — dispatches to a
+k in 0..n { s += x[k]*y[k] }` (also `(x[k]-y[k])²`, the plain sum, a running `fmax`/`fmin` max/min,
+and `fmax(m, abs(x[k]))` absmax — the per-tensor max/range softmax stability and dynamic int8
+quantization need) — dispatches to a
 deterministic multicore reduction kernel that reaches aggregate memory bandwidth (~8× single-threaded
 C), with a result independent of core count (✅). `@tile` (cache tiling) and explicit `@simd`-typed
 vector values are still under construction (🔵).
@@ -148,6 +149,8 @@ LLVM backend, by the runtime).
 `f32` (scalar or in a loop), each a ≈1-ULP minimax polynomial built from primitive ops:
 
 - `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal).
+- `abs(x)` — `|x|` (as `max(x, −x)`); vectorizes, and a `fmax(m, abs(x[k]))` loop is the per-tensor
+  absmax dynamic symmetric int8 quantization uses for its scale.
 - `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`.
 - `erf(x)` — for the exact (erf-based) GELU of BERT/GPT-2.
 - `sin(x)` / `cos(x)` — for RoPE rotary position embeddings.
