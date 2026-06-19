@@ -2976,7 +2976,7 @@ impl FnLowerer<'_> {
             // Element-wise math intrinsics over vectorizable args. sqrt/rsqrt are one lane op each;
             // fmax/fmin are a lane compare + blend; exp is the f32 polynomial expanded per lane.
             ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
-                Some(MathIntrinsic::Sqrt | MathIntrinsic::Rsqrt) => {
+                Some(MathIntrinsic::Sqrt | MathIntrinsic::Rsqrt | MathIntrinsic::Abs) => {
                     args.len() == 1 && self.vec_check_value(&args[0], j, locals, lane, acc)
                 }
                 Some(MathIntrinsic::Fmax | MathIntrinsic::Fmin) => {
@@ -3743,6 +3743,10 @@ impl FnLowerer<'_> {
                     let one = self.splat_const_f(1.0, vty);
                     self.builder
                         .build(vty.clone(), Op::Bin(BinOp::FDiv, one, s))
+                }
+                Some(MathIntrinsic::Abs) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_abs(x, vty)
                 }
                 Some(op @ (MathIntrinsic::Fmax | MathIntrinsic::Fmin)) => {
                     let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -4585,6 +4589,10 @@ impl FnLowerer<'_> {
                         .build(rty.clone(), Op::Bin(BinOp::FDiv, one, s)),
                 )
             }
+            MathIntrinsic::Abs => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_abs(x, &rty))
+            }
             MathIntrinsic::Exp => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_exp(x, &rty))
@@ -4680,6 +4688,20 @@ impl FnLowerer<'_> {
                 Some(self.builder.build(rty.clone(), Op::Select(c, a, b)))
             }
         }
+    }
+
+    /// `abs(x) = max(x, −x)` as a compare + select — the same form `emit_softplus` uses for `|x|`, so
+    /// the two agree. Lane-type-agnostic (f32 or f64) and built only from primitives (`FSub`/`Cmp`/
+    /// `Select`), so it vectorizes and is bit-identical across backends. Differs from the reduction
+    /// kernel's bit-clear abs only at ±0 (a `−0` here yields `+0`, harmless and never compared against
+    /// the kernel — a `@parallel` absmax dispatches to the kernel, a scalar/sequential one uses this).
+    fn emit_abs(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let zero = self.splat_const_f(0.0, rty);
+        let negx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
+        let gtm = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
+        self.builder.build(rty.clone(), Op::Select(gtm, x, negx))
     }
 
     /// `exp(x)` as a fast, deterministic polynomial (≈1 ULP of the true `exp`). Always computed in
@@ -7066,6 +7088,7 @@ enum RedOp {
 enum MathIntrinsic {
     Sqrt,
     Rsqrt,
+    Abs,
     Exp,
     Log,
     Pow,
@@ -7092,6 +7115,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
     Some(match name {
         "sqrt" => MathIntrinsic::Sqrt,
         "rsqrt" => MathIntrinsic::Rsqrt,
+        "abs" => MathIntrinsic::Abs,
         "exp" => MathIntrinsic::Exp,
         "log" => MathIntrinsic::Log,
         "pow" => MathIntrinsic::Pow,

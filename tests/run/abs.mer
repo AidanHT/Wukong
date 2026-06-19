@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 35
+// EXPECT-OUT: 22
+// EXPECT-OUT: 32
+// EXPECT-OUT: 8
+// EXPECT-OUT: 32
+module tests.run.abs
+
+// `abs(x)` is a primitive intrinsic lowered to `max(x, -x)` (compare + select) — scalar or
+// vectorized, bit-identical across the interpreter and native backend (the mercury_bench gate proves
+// it). A `fmax(m, abs(x[i]))` loop is the per-tensor absmax dynamic int8 quantization uses to compute
+// a symmetric scale (scale = absmax/127).
+
+fn main() -> i32 {
+    let a: f32 = -3.5;
+    print((abs(a) * 10.0) as i32); // |−3.5|·10 = 35
+
+    let b: f32 = 2.25;
+    print((abs(b) * 10.0) as i32); // |2.25|·10 = 22.5 → 22
+
+    // Vectorized abs over an array (exercises the auto-vectorizer's abs lane op).
+    let mut x: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) - 32.0; } // -32 .. 31
+    let mut out: [f32; 64] = [0.0; 64];
+    for i in 0..64 { out[i] = abs(x[i]); }
+    print(out[0] as i32);  // |−32| = 32
+    print(out[40] as i32); // |8| = 8
+
+    // Sequential absmax reduction (fmax fold over abs(x[i])).
+    let mut m: f32 = 0.0;
+    for i in 0..64 { m = fmax(m, abs(x[i])); }
+    print(m as i32); // max(|x|) = 32
+
+    return 0;
+}
