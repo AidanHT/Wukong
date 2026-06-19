@@ -151,6 +151,9 @@ LLVM backend, by the runtime).
 - `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal).
 - `abs(x)` — `|x|` (as `max(x, −x)`); vectorizes, and a `fmax(m, abs(x[k]))` loop is the per-tensor
   absmax dynamic symmetric int8 quantization uses for its scale.
+- `round(x)` / `floor(x)` / `ceil(x)` / `trunc(x)` — round to an integral value (one hardware
+  `roundss`/`roundps` each; vectorizes). `round` is round-to-nearest-ties-to-**even** (so `2.5 → 2`,
+  `3.5 → 4`); `round(x / scale)` is the quantization step that pairs with `absmax`.
 - `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`.
 - `erf(x)` — for the exact (erf-based) GELU of BERT/GPT-2.
 - `sin(x)` / `cos(x)` — for RoPE rotary position embeddings.
