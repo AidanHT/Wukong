@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -45
+// EXPECT-OUT: 1954
+// EXPECT-OUT: 0
+module tests.run.linear_bias_gelu
+
+// A transformer FFN first layer: out = gelu(x · Wᵀ + bias). The matmul nest and the following
+// bias+GELU loop fuse into one mercury_sgemm_nt_epi call with act = GELU (the epilogue folded into
+// the GEMM C writeback, so C is written once with the activation already applied) — the canonical
+// BERT/GPT-2 feed-forward shape.
+//
+// x = [[1,2],[3,4]], W = I (so x·Wᵀ = x), bias = [-1,-4]:
+//   row0: gelu([1,2] + [-1,-4]) = gelu([ 0, -2]) = [0,        gelu(-2)]
+//   row1: gelu([3,4] + [-1,-4]) = gelu([ 2,  0]) = [gelu(2),  0       ]
+// gelu(0)=0; gelu(-2)≈-0.0454; gelu(2)≈1.9546 (tanh approx) — cross-checked against gelu.mer.
+// Printed as (out*1000) as i32: 0 / -45 / 1954 / 0.
+fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + x[i * 2 + k] * w[j * 2 + k];
+            }
+            out[i * 2 + j] = s;
+        }
+    }
+    for i in 0..2 {
+        for j in 0..2 {
+            out[i * 2 + j] = gelu(out[i * 2 + j] + bias[j]);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let w: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let bias: [f32; 2] = [-1.0, -4.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    linear(x, w, bias, out);
+    print((out[0] * 1000.0) as i32);
+    print((out[1] * 1000.0) as i32);
+    print((out[2] * 1000.0) as i32);
+    print((out[3] * 1000.0) as i32);
+    return 0;
+}

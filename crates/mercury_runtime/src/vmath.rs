@@ -129,15 +129,18 @@ fn sigmoid1(x: f32) -> f32 {
     1.0 / (1.0 + exp1(-x))
 }
 
-/// `silu(x) = x·sigmoid(x)` (swish) — the Llama / modern-transformer gating activation.
+/// `silu(x) = x·sigmoid(x)` (swish) — the Llama / modern-transformer gating activation. `pub(crate)`
+/// so the GEMM fused epilogue (`gemm.rs`) applies the *identical* scalar form a standalone `silu(...)`
+/// would, keeping a fused `silu(x·Wᵀ+b)` bit-equal to the unfused `{ t = x·Wᵀ+b; silu(t) }`.
 #[inline]
-fn silu1(x: f32) -> f32 {
+pub(crate) fn silu1(x: f32) -> f32 {
     x * sigmoid1(x)
 }
 
-/// `gelu(x)` (tanh approximation) — the BERT/GPT-2/ViT activation.
+/// `gelu(x)` (tanh approximation) — the BERT/GPT-2/ViT activation. `pub(crate)` for the GEMM fused
+/// epilogue (see [`silu1`]).
 #[inline]
-fn gelu1(x: f32) -> f32 {
+pub(crate) fn gelu1(x: f32) -> f32 {
     let x3 = x * x * x;
     let inner = GELU_C0 * GELU_C1.mul_add(x3, x);
     (0.5 * x) * (1.0 + tanh1(inner))
