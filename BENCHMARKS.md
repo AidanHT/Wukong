@@ -274,14 +274,30 @@ oracle stays bit-for-bit exact, and the recognizer runs pre-opt so `-O0` == `-O3
 
 ### Single-threaded elementwise & reductions
 
+A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
+`mercury_velem_f32`** kernel and a Horner polynomial to **`mercury_vhorner_f32`** — both 4×-unrolled,
+both emitting **non-temporal stores** once the working set spills L3 (the store path gcc/rustc will
+not emit, skipping read-for-ownership traffic). This turns the former bandwidth-bound *ties* into
+wins:
+
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
-| saxpy  | ≈tie (~0.95×) | memory-bandwidth bound; everyone is at the wall (~54 vs ~59 GB/s) |
-| relu   | ≈tie (~0.95×) | memory-bound; vectorized via if-conversion (one load per element) |
-| poly   | ≈tie (~1.0×, ±) | deg-4 Horner; memory-bound at N=2²⁰ (~1 FLOP/byte), so width is moot here |
-| fused linear→relu | ~1.0× faster | two source loops Mercury auto-fuses; C/Rust stream the intermediate |
-| dot    | **~2.7–2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
-| ssd (Σ(x−y)²) | **~2.6–2.7× faster** | same — an L2-loss reduction |
+| saxpy  | **~1.3–1.5× faster** | `velem` 256-bit + non-temporal store (3-stream, spills L3) — Rust ~1.4× behind too |
+| relu   | ≈tie (~1.0×) | 2-stream, L3-resident at N=2²⁰ so stores stay cacheable; the win shows at >L3 (below) |
+| poly   | **~1.1–1.2× faster** | `vhorner` 4×-unrolled AVX2 Horner; **ties Rust's autovec** (both ~43 GB/s) |
+| fused linear→relu | **~1.1× faster** | two source loops Mercury auto-fuses; C/Rust stream the intermediate |
+| dot    | **~2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
+| ssd (Σ(x−y)²) | **~2.6–2.9× faster** | same — an L2-loss reduction |
+
+**At real (>L3) activation-tensor sizes the lead widens** — non-temporal stores avoid the RFO traffic
+that dominates when nothing fits in cache. At N=2²⁴ (64 MiB/array):
+
+| kernel (N=2²⁴) | Mercury vs C | Mercury vs Rust |
+|--------|--------------|--------|
+| saxpy  | **~1.4× faster** | ~1.4× |
+| residual (x+y) | **~1.3–1.4× faster** | ~1.4× |
+| scale (a·x) | **~1.3× faster** | ~1.4× |
+| relu | **~1.5–1.6× faster** | ~1.7× |
 
 A `@parallel` reduction goes further: it dispatches to a deterministic multicore reduction kernel
 (`mercury_sreduce_f32_parallel`), spreading the stream across cores to reach *aggregate* bandwidth —
@@ -313,6 +329,14 @@ single-threaded C:
   and ~690 at 2048³. This is a reversal of the previous honest loss (single-core matmul used to be ~3×
   *behind*). The dispatch also fires on **runtime dimensions**, so the win applies to general matmul
   functions, not only fixed-size kernels.
+- **Fused FFN epilogue (`act(x·Wᵀ [+ bias])`):** a `nn.Linear` immediately followed by a
+  bias-add/activation loop folds into **one** `mercury_sgemm_nt_epi` call — the bias and activation
+  are applied in the GEMM's C-tile writeback, so the M×N output is written **once** instead of streamed
+  again by a separate pass. The activation set covers the transformer FFNs: **ReLU, GELU** (BERT/GPT-2,
+  matching `vmath`'s ≈1-ULP form) and **SiLU** (the LLaMA gate), with **bias optional** so the bias-free
+  `silu(x·Wᵀ)` **SwiGLU** projection fuses too. On top of the GEMM win above, this removes a full
+  read-modify-write pass over the activation tensor; both backends call the identical kernel, so the
+  fused result is bit-equal to the unfused `matmul → bias → activation`.
 - **int8 quantized `nn.Linear` (u8×i8→i32):** dispatched to an **AVX-VNNI `vpdpbusd`** register-blocked
   microkernel (2×4-tiled on the single-threaded path, halving B-matrix traffic), **~1.5–2.5× faster
   than gcc single-core** (gcc `-march=native` uses `vpdpbusd` too, so it's a fair same-instruction
@@ -339,13 +363,16 @@ single-threaded C:
   row-max).
 - **Auto-parallel:** ~1.8–7.6× faster than idiomatic single-threaded C across elementwise kernels —
   bounded by aggregate memory bandwidth, not core count (these kernels are memory-bound).
-- **Single-thread memory-bound elementwise (saxpy/relu/poly):** a genuine **tie** (within ~5%) —
-  these are at the DRAM/cache bandwidth wall, where no compiler "heavily exceeds" another. The
-  general (non-GEMM) vectorizer emits 128-bit SSE because Cranelift cannot legalize a 256-bit
-  `f32x8` value (verified, pinned as a tripwire test); at N=2²⁰ these kernels are memory-bound, so
-  the SIMD width is moot and matching gcc's AVX is the bandwidth ceiling anyway. The widths that
-  matter most — the GEMM family and the activation family — get true 256-bit AVX2/FMA via runtime
-  kernels (`mercury_sgemm*` and `mercury_vmath_f32`), the two compute-bound regimes where width pays.
+- **Single-thread memory-bound elementwise (saxpy/scale/residual/poly):** now a **win** (~1.1–1.5×
+  vs C at N=2²⁰, widening to ~1.3–1.6× at >L3 sizes), where it used to be a tie. A recognized
+  streaming map dispatches to the 256-bit AVX2 `mercury_velem_f32` / `mercury_vhorner_f32` kernels
+  (4×-unrolled for ILP) which emit **non-temporal stores** once the working set spills L3 — skipping
+  the read-for-ownership traffic every cacheable store pays, a store path gcc/rustc don't emit
+  automatically. The non-temporal decision keys on the *total* streamed bytes (all live arrays), so a
+  cache-resident map keeps its normal store (where a needless `vmovntps` would lose): `relu` at N=2²⁰
+  (2-stream, 8 MiB, L3-resident) is a clean tie, and a win at >L3. This is the same play as the GEMM
+  and activation families (`mercury_sgemm*`, `mercury_vmath_f32`) — true 256-bit width plus a
+  domain-aware store policy the generic 128-bit-only Cranelift vectorizer can't reach.
 - **Storage:** `bf16` is real 2-byte storage at bf16 precision (round-to-nearest-even), bit-exact
   across backends. On this AVX2 box (no bf16 FMA) a bf16 GEMM would widen to f32 and match f32
   throughput — a memory-footprint feature, not a FLOP/s win — so it is held at the correctness path.
