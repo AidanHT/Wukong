@@ -61,15 +61,16 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP `f32` minimax
   polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
   `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
-  position embeddings), `tanh`/`sigmoid`/`silu`/`gelu` (built on `exp`; `silu`/`gelu` first-class),
-  and `fmax`/`fmin` — all built from primitive ops both backends agree on bit-for-bit. A pure
-  `out[i] = f(x[i])` loop for `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` is **dispatched to a tuned
-  256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit) vectorizer
-  can't reach; the rest auto-vectorize the inlined poly at 128-bit. So softmax, layernorm, GELU (tanh
-  and exact erf), SiLU/swish, tanh, RoPE, and **log-softmax / cross-entropy** run on SIMD instead of
-  scalar `libm` — **~5–7.5× faster** than gcc/rustc's scalar `expf`/`logf`/`tanhf` (~28× across cores
-  under `@parallel`). See
-  `tests/run/{transcendental,softmax,layernorm,gelu,activations,log,erf,trig,log_softmax,ffn_block}.mer`.
+  position embeddings), the activation family `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/
+  `softplus`/`mish` (all built on `exp`/`log`, all first-class intrinsics), and `fmax`/`fmin` — all
+  built from primitive ops both backends agree on bit-for-bit. A pure `out[i] = f(x[i])` loop for any
+  of `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish` is **dispatched
+  to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit)
+  vectorizer can't reach; the rest auto-vectorize the inlined poly at 128-bit. So softmax, layernorm,
+  GELU (tanh and exact erf), SiLU/swish, ELU, softplus, mish, tanh, RoPE, and **log-softmax /
+  cross-entropy** run on SIMD instead of scalar `libm` — **~5–7.5× faster** than gcc/rustc's scalar
+  `expf`/`logf`/`tanhf` (~28× across cores under `@parallel`). See `tests/run/{transcendental,softmax,
+  layernorm,gelu,elu,leaky_relu,softplus,mish,activations,log,erf,trig,log_softmax,ffn_block}.mer`.
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
   runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
@@ -78,13 +79,15 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   one loop when the combined body is dependence-safe; CSE then forwards the intermediate through
   registers rather than memory.
 - **GEMM epilogue fusion**: a recognized `nn.Linear` matmul (`C = A·Bᵀ`) immediately followed by a
-  bias-add / ReLU loop over `C` (`C[i,j] = relu(C[i,j] + bias[j])`) fuses into one
+  bias-add / activation loop over `C` (`C[i,j] = act(C[i,j] [+ bias[j]])`) fuses into one
   `mercury_sgemm_nt_epi` call that folds the bias + activation into the microkernel's C-tile
   writeback — so `C` is written once instead of paying a separate read-modify-write pass over it. The
   saving is a fraction of the C-pass traffic, so it grows as K shrinks: ~1.0× at 512³ (compute-bound,
   no harm), ~1.34× at K=64/N=2048, ~1.65× at K=32/N=4096 — exactly the small-K/large-N projections
-  (attention-output, down-projection). Serial; identity (bias-only) and ReLU. Both backends call the
-  identical kernel, so it stays bit-exact. See `tests/run/linear_bias_relu.mer`.
+  (attention-output, down-projection). Serial; the activation set is identity (bias-only), **ReLU,
+  GELU, and SiLU** — the transformer FFNs — with **bias optional**, so the bias-free `silu(x·Wᵀ)`
+  **SwiGLU** projection (LLaMA/Mistral) fuses too. Both backends call the identical kernel, so it
+  stays bit-exact. See `tests/run/{linear_bias_relu,linear_bias_gelu,linear_silu}.mer`.
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
 - Intrinsics `print`/`println`/`assert`.
@@ -106,9 +109,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## Planned
 
-- Fusing chains *under* `@parallel`; extending GEMM **epilogue fusion** to the transcendental
-  activations (the current fused epilogue folds bias-add + ReLU into the microkernel write-back —
-  GELU/SiLU folding and a parallel fused-epilogue kernel are the remaining steps).
+- Fusing chains *under* `@parallel`; a **parallel** fused-epilogue GEMM kernel (the serial one already
+  folds bias + ReLU/GELU/SiLU, bias optional, into the microkernel write-back — a multicore
+  `mercury_sgemm_nt_epi_parallel` is the remaining step).
 - A **GPU backend** (the next major frontier — where flash-attention and large-batch throughput
   actually win). Scoped in `next-steps.md` at the repo root.
 - 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
