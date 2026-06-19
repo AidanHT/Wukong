@@ -22,12 +22,20 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   softplus=max(x,0)+ln(1+e^−|x|), mish=x·tanh(softplus), selu=scaled elu, hardsigmoid/hardswish=min/max clamp), so one ≈1-ULP `exp` keeps the family exact;
   `gelu1`/`silu1` are `pub(crate)` for the GEMM fused epilogue.
 - `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
-  reductions** (dot / ssd / sum / sumsq, by `RED_*` op code). A `@parallel` reduction loop lowers to
-  the `_parallel` one. The parallel result is **bit-identical** to the serial one: the array is cut
-  into fixed-size `RCHUNK` chunks (count independent of thread count), each reduced by the identical
-  per-chunk function, and partials summed in ascending chunk order (rayon's indexed `collect`). So
-  serial == parallel == interpreter on any machine. AVX2 single accumulator (memory-bound at N=2^20,
-  so one is enough) + a scalar tail/twin that matches lane-for-lane (`mul_add` == `fmadd`).
+  reductions** (dot / ssd / sum / sumsq folded by `+`, and **max / min folded by `fmax`/`fmin`**, by
+  `RED_*` op code — the per-tensor max/absmax softmax stability and dynamic int8 quantization need). A
+  `@parallel` reduction loop lowers to the `_parallel` one. The parallel result is **bit-identical** to
+  the serial one: the array is cut into fixed-size `RCHUNK` chunks (count independent of thread count),
+  each reduced by the identical per-chunk function, and partials folded in ascending chunk order
+  (rayon's indexed `collect`). So serial == parallel == interpreter on any machine. The fold is
+  op-parameterized (`fold2`/`ident`): the additive ops keep their exact bits (identity `0.0`, the same
+  balanced `hcombine` tree), max/min use `(a > b) ? a : b` (identity `∓∞`) — the exact semantics of
+  `_mm256_max_ps`/`_mm256_min_ps`, which is also the `Cmp(Fogt/Folt)+Select` the compiler emits to
+  combine the kernel result, so AVX2 lanes / scalar twin / outer combine agree. **Determinism rests on
+  the fixed decomposition + ascending combine, not associativity** (`fmax`/`fmin` aren't associative on
+  NaN/±0, but serial and parallel evaluate the *identical* expression tree). AVX2 single accumulator
+  (memory-bound at N=2^20, so one is enough) + a scalar tail/twin that matches lane-for-lane (`mul_add`
+  == `fmadd`, `(a > b) ? a : b` == `max_ps`).
 - `src/norm.rs` — `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)`: **fused
   single-pass row-wise normalizations** (softmax / LayerNorm / RMSNorm, by `NORM_*` op code) over the
   last axis of a `[rows, cols]` matrix. Memory-bound, so the win is fusing the 2–3 passes (each row
