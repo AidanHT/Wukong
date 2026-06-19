@@ -1439,6 +1439,18 @@ fn batched_norm_dispatch() {
         "batched LayerNorm (for r {{ <row r> }}) must dispatch to mercury_norm_f32"
     );
 
+    // Batched softmax (max/exp/sum/normalize, with the row-local `x[r*4]` max-seed) over the offset.
+    let batched_sm = "module m\nfn f(x:[f32;12]) { \
+        for r in 0..3 { \
+        let mut m: f32 = x[r*4]; for i in 0..4 { m = fmax(m, x[r*4+i]); } \
+        for i in 0..4 { x[r*4+i] = exp(x[r*4+i] - m); } \
+        let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i]; } let inv: f32 = 1.0 / s; \
+        for i in 0..4 { x[r*4+i] = x[r*4+i] * inv; } } }";
+    assert!(
+        lowered_calls(batched_sm, "mercury_norm_f32"),
+        "batched softmax (for r {{ <row r> }}) must dispatch to mercury_norm_f32"
+    );
+
     // The single-row form (no outer loop) must still dispatch — rows = 1 is the `batch = None` path.
     let single = "module m\nfn f(x:[f32;4]) { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[i] * x[i]; } \

@@ -624,7 +624,7 @@ impl FnLowerer<'_> {
             // Checked before the elementwise-fusion run so it sees the raw loop sequence, not a
             // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
             // sum-of-squares+scale), so probe order is immaterial.
-            if let Some((n, arr, n_expr)) = self.match_softmax(b, i) {
+            if let Some((n, arr, n_expr)) = self.match_softmax(b, i, None) {
                 if self.emit_norm(arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
                     continue;
@@ -752,7 +752,13 @@ impl FnLowerer<'_> {
     }
 
     /// Body `m = fmax(m, x[v])` (running max into scalar `m`, indexing `x` by `v`) → return `x`. Pure.
-    fn match_max_reduce_body(&self, body: &Block, v: Symbol, m: Symbol) -> Option<Symbol> {
+    fn match_max_reduce_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        m: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -776,7 +782,7 @@ impl FnLowerer<'_> {
         {
             return None;
         }
-        // One arg must be `m`; the other must be `x[v]`.
+        // One arg must be `m`; the other must be `x[v]` (row-offset-indexed when batched).
         let xside = if single_path(&args[0]) == Some(m) {
             1
         } else if single_path(&args[1]) == Some(m) {
@@ -784,11 +790,18 @@ impl FnLowerer<'_> {
         } else {
             return None;
         };
-        self.index_by_loopvar(&args[xside], v)
+        self.index_off(&args[xside], v, batch)
     }
 
     /// Body `x[v] = exp(x[v] - m)` over f32, in place. Pure.
-    fn match_exp_sub_body(&self, body: &Block, v: Symbol, x: Symbol, m: Symbol) -> Option<()> {
+    fn match_exp_sub_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        m: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<()> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -798,7 +811,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.index_by_loopvar(target, v) != Some(x) || self.expr_mir(value) != MirType::F32 {
+        if self.index_off(target, v, batch) != Some(x) || self.expr_mir(value) != MirType::F32 {
             return None;
         }
         let ExprKind::Call { callee, args, .. } = &value.kind else {
@@ -820,7 +833,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.index_by_loopvar(lhs, v) == Some(x) && single_path(rhs) == Some(m) {
+        if self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(m) {
             Some(())
         } else {
             None
@@ -1034,11 +1047,19 @@ impl FnLowerer<'_> {
     /// Is `init` a sound running-max seed for softmax over `x` — `x[0]`, or a large-negative literal
     /// (`<= -1e30`)? Either is `<= max(x)`, so the user's `fmax(seed, …)` equals the true max the
     /// kernel computes; anything else might change behavior, so we decline. Pure.
-    fn is_max_seed(&self, init: &Expr, x: Symbol) -> bool {
+    fn is_max_seed(&self, init: &Expr, x: Symbol, batch: Option<(Symbol, &Expr)>) -> bool {
         if let ExprKind::Index { base, indices } = &init.kind {
-            return single_path(base) == Some(x)
-                && indices.len() == 1
-                && matches!(&indices[0].kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 0);
+            if single_path(base) != Some(x) || indices.len() != 1 {
+                return false;
+            }
+            // Single-row: the seed is `x[0]`. Batched row `r`: the seed is `x[r*C]` — the row's first
+            // element (the bare `row*cols` base offset, no `+ i`), which `is_mul_of` matches.
+            return match batch {
+                None => {
+                    matches!(&indices[0].kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 0)
+                }
+                Some((row, cols)) => self.is_mul_of(&indices[0], row, cols),
+            };
         }
         let v = match &init.kind {
             ExprKind::Float(t) => parse_float(self.interner.resolve(*t)),
@@ -1090,22 +1111,25 @@ impl FnLowerer<'_> {
     /// internal scalars must not be read after the window (the kernel hides them). Pure: returns
     /// `(consumed, array, N)` with `N` cloned so the caller can emit freely. `None` on any deviation
     /// (the generic vectorizer + vmath path then lowers the loops correctly).
-    fn match_softmax(&self, b: &Block, at: usize) -> Option<(usize, Symbol, Expr)> {
+    fn match_softmax(&self, b: &Block, at: usize, batch: Option<Symbol>) -> Option<(usize, Symbol, Expr)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
             return None;
         }
         let (m, seed) = Self::let_init(&stmts[0])?;
         let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
-        let x = self.match_max_reduce_body(body1, v1, m)?;
-        if !self.is_max_seed(seed, x) {
+        // Batched: the data is row-offset-indexed `row*cols + i` (and the max-seed is `x[row*cols]`);
+        // single-row: just `x[i]` (seed `x[0]`). The max / sum scalars and `1/s` are per-row, unchanged.
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.match_max_reduce_body(body1, v1, m, data_batch)?;
+        if !self.is_max_seed(seed, x, data_batch) {
             return None;
         }
         let (v2, n2, body2) = self.as_range0_for(&stmts[2])?;
         if !exprs_struct_eq(n2, n_expr) {
             return None;
         }
-        self.match_exp_sub_body(body2, v2, x, m)?;
+        self.match_exp_sub_body(body2, v2, x, m, data_batch)?;
         let (s, s_init) = Self::let_init(&stmts[3])?;
         if !matches!(&s_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
         {
@@ -1115,7 +1139,7 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n4, n_expr) {
             return None;
         }
-        self.match_sum_body(body4, v4, x, s, None)?;
+        self.match_sum_body(body4, v4, x, s, data_batch)?;
         let inv = self.match_recip(&stmts[5], s)?;
         let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
         if !exprs_struct_eq(n6, n_expr) {
@@ -1123,7 +1147,7 @@ impl FnLowerer<'_> {
         }
         // softmax's normalize is a plain `x[i] *= inv`; reject any affine wrapper (softmax has no
         // gamma/beta) so it falls back to the generic vectorizer rather than silently dropping it.
-        if self.match_scale_body(body6, v6, x, inv, None)? != (None, None) {
+        if self.match_scale_body(body6, v6, x, inv, data_batch)? != (None, None) {
             return None;
         }
         // The three internal scalars must not be read after the window — the kernel hides them.
@@ -2169,11 +2193,16 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else. LayerNorm
-        // (7 stmts) and RMSNorm (4 stmts) are structurally disjoint, so probe order is immaterial;
-        // softmax is not batched yet (its `out[r*C]` max-seed needs separate offset handling).
+        // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else. softmax
+        // (7 stmts, fmax/exp), LayerNorm (7 stmts, mean/variance), and RMSNorm (4 stmts) are pairwise
+        // structurally disjoint, so probe order is immaterial.
         if body.tail.is_some() {
             return None;
+        }
+        if let Some((consumed, x, cols)) = self.match_softmax(body, 0, Some(*r)) {
+            if consumed == body.stmts.len() {
+                return Some((x, cols, 0, NORM_SOFTMAX, None, None));
+            }
         }
         if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_layernorm(body, 0, Some(*r)) {
             if consumed == body.stmts.len() {
