@@ -5771,9 +5771,12 @@ fn recognize_matmul<'a>(
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
 }
 
-// Fused-epilogue activation codes — must match `mercury_runtime`'s gemm kernel (ACT_IDENTITY/RELU).
+// Fused-epilogue activation codes — must match `mercury_runtime`'s gemm kernel
+// (ACT_IDENTITY/RELU/GELU/SILU).
 const EPI_ACT_IDENTITY: u32 = 0;
 const EPI_ACT_RELU: u32 = 1;
+const EPI_ACT_GELU: u32 = 2;
+const EPI_ACT_SILU: u32 = 3;
 
 /// If `e` is `base_sym[idx]` (single index off the path `base_sym`), return `idx`.
 fn index_of(e: &Expr, base_sym: Symbol) -> Option<&Expr> {
@@ -5834,8 +5837,9 @@ fn match_c_plus_bias(
     None
 }
 
-/// Match the epilogue RHS: `C[i*N+j] + bias[j]` (identity) or `fmax(C[i*N+j] + bias[j], 0)` (ReLU).
-/// Bias is required (the common `act(x·Wᵀ + bias)` shape). Returns `(bias_array, act_code)`.
+/// Match the epilogue RHS over `C[i*N+j] + bias[j]`: bare (identity), `fmax(_, 0)` (ReLU), or a
+/// `gelu(_)` / `silu(_)` activation call (the transformer FFN `act(x·Wᵀ + bias)` shape). Bias is
+/// required. Returns `(bias_array, act_code)`.
 fn match_epi_value(
     e: &Expr,
     c_sym: Symbol,
@@ -5844,14 +5848,29 @@ fn match_epi_value(
     n: Dim,
     interner: &Interner,
 ) -> Option<(Symbol, u32)> {
-    // ReLU written as `fmax(inner, 0.0)`.
     if let ExprKind::Call { callee, args, .. } = &e.kind {
+        // ReLU written as `fmax(inner, 0.0)`.
         if args.len() == 2
             && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
             && is_float_zero(&args[1], interner)
         {
             let bias = match_c_plus_bias(&args[0], c_sym, ivar, jvar, n, interner)?;
             return Some((bias, EPI_ACT_RELU));
+        }
+        // GELU / SiLU activation wrapping the bias-add (`gelu(C[i*N+j] + bias[j])`). Both are
+        // first-class intrinsics, so a single-arg call by that name is unambiguous; the runtime
+        // epilogue applies the identical scalar form (`mercury_runtime::vmath::{gelu1,silu1}`), so the
+        // fused result equals the unfused `matmul → bias → activation` the recognizer replaces.
+        if args.len() == 1 {
+            let act = match single_path(callee).map(|s| interner.resolve(s)) {
+                Some("gelu") => Some(EPI_ACT_GELU),
+                Some("silu") => Some(EPI_ACT_SILU),
+                _ => None,
+            };
+            if let Some(act) = act {
+                let bias = match_c_plus_bias(&args[0], c_sym, ivar, jvar, n, interner)?;
+                return Some((bias, act));
+            }
         }
     }
     // Identity: just the bias add.

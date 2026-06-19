@@ -51,14 +51,17 @@ thread_local! {
 }
 
 // Fused-epilogue activation codes (shared with the compiler's recognizer in `mercury_mir_build`).
-// `ACT_IDENTITY` is the implicit passthrough (the kernel only branches on `ACT_RELU`), but it names
+// `ACT_IDENTITY` is the implicit passthrough (the kernel only branches on the others), but it names
 // the protocol value 0 the compiler emits, so it is kept for clarity and used by the tests.
 #[allow(dead_code)]
 const ACT_IDENTITY: u32 = 0;
 const ACT_RELU: u32 = 1;
+const ACT_GELU: u32 = 2;
+const ACT_SILU: u32 = 3;
 
 /// A fused GEMM epilogue, applied to each `C` element **on the final K-block writeback only**:
-/// `c = act(c + bias[col])`. `bias` is null for no bias; `act` is [`ACT_IDENTITY`] or [`ACT_RELU`].
+/// `c = act(c + bias[col])`. `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
+/// [`ACT_RELU`], [`ACT_GELU`], [`ACT_SILU`] (the transformer FFN activations).
 /// Folding it here means `C` is written once with the bias+activation already applied, instead of a
 /// separate read-modify-write pass over `C` — the memory traffic a `linear → bias → act` otherwise
 /// pays. Both backends call the identical kernel, so the fused result stays bit-for-bit exact.
@@ -77,8 +80,14 @@ impl Epilogue {
         if !self.bias.is_null() {
             y += *self.bias.add(j);
         }
-        if self.act == ACT_RELU {
-            y = y.max(0.0);
+        // GELU/SiLU reuse `vmath`'s scalar form so a fused `act(x·Wᵀ+b)` is bit-identical to the
+        // unfused `{ t = x·Wᵀ+b; act(t) }`. The epilogue is applied scalar in the (always-taken-when-
+        // present) general writeback path, so one scalar call per active C element is the whole cost.
+        match self.act {
+            ACT_RELU => y = y.max(0.0),
+            ACT_GELU => y = crate::vmath::gelu1(y),
+            ACT_SILU => y = crate::vmath::silu1(y),
+            _ => {}
         }
         y
     }
@@ -136,7 +145,8 @@ pub unsafe extern "C" fn mercury_sgemm_nt(
 /// `C = act(A·Bᵀ + bias)` — the `nn.Linear` form with a fused bias-add + activation epilogue, folded
 /// into the GEMM's C-tile writeback so `C` is written once (no separate read-modify-write pass). The
 /// compiler lowers a `matmul → bias-add → activation` chain to this. `bias` may be null (no bias) and
-/// must otherwise be valid for `n` `f32`; `act` is 0 (identity) or 1 (ReLU). `beta` rule as usual.
+/// must otherwise be valid for `n` `f32`; `act` is 0 (identity), 1 (ReLU), 2 (GELU), or 3 (SiLU).
+/// `beta` rule as usual.
 /// Single-threaded (the epilogue folds into the serial writeback).
 ///
 /// # Safety
@@ -1213,7 +1223,7 @@ mod tests {
             let b = fill(12, n * k);
             let bias = fill(13, n);
             let base = naive_nt(&a, &b, m, k, n); // C = A·Bᵀ
-            for &act in &[ACT_IDENTITY, ACT_RELU] {
+            for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                 for use_bias in [false, true] {
                     let mut want = base.clone();
                     for i in 0..m {
@@ -1222,9 +1232,12 @@ mod tests {
                             if use_bias {
                                 v += bias[j];
                             }
-                            if act == ACT_RELU {
-                                v = v.max(0.0);
-                            }
+                            v = match act {
+                                ACT_RELU => v.max(0.0),
+                                ACT_GELU => crate::vmath::gelu1(v),
+                                ACT_SILU => crate::vmath::silu1(v),
+                                _ => v,
+                            };
                             want[i * n + j] = v;
                         }
                     }
