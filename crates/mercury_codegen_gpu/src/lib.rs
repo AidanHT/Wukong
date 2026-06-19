@@ -23,4 +23,7 @@ pub mod gpu;
 pub mod ptx;
 
 #[cfg(feature = "gpu")]
+pub mod ptx_gemm;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};

@@ -218,6 +218,44 @@ pub fn gemm_nt(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// Launch config for the register-blocked GEMM: a 16×16 block computes a 64×64 C tile.
+fn gemm_rb_cfg(m: usize, n: usize) -> LaunchConfig {
+    use crate::ptx_gemm::{TILE_M, TILE_N};
+    LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(TILE_N), (m as u32).div_ceil(TILE_M), 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Register-blocked `C = A·Bᵀ` (nn.Linear): the faster GEMM (64×64 tile, 4×4 per thread). Same
+/// math/contract as [`gemm_nt`]; tolerance-gated.
+pub fn gemm_nt_rb(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let f = g.function("gemm_rb", crate::ptx_gemm::gemm_rb_ptx(), "gemm_nt_rb")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(gemm_rb_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// `C = A·B` on the GPU: `A` is `m×k`, `B` is `k×n`, `C` is `m×n`. GPU twin of `mercury_sgemm`.
 pub fn gemm_nn(
     g: &mut Gpu,
@@ -435,6 +473,59 @@ mod tests {
         });
     }
 
+    #[test]
+    fn gemm_rb_matches_reference_within_tol() {
+        with_gpu("gemm_rb", |g| {
+            let mut rng = crate::diff::Rng::new(0x9C17);
+            let shapes = [(64usize, 64usize, 64usize), (100, 80, 48), (130, 200, 70)];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let bt = rng.vec(n * k, -1.0, 1.0);
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+                let c = gemm_nt_rb(g, &a, &bt, m, k, n).unwrap();
+                let r = ref_nt(&a, &bt, m, k, n);
+                let s = crate::diff::assert_close(
+                    &format!("gemm_nt_rb {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-3,
+                    rel,
+                );
+                eprintln!(
+                    "gemm_nt_rb {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    /// Time `iters` resident launches of a GEMM `(M,N,K, A,B,C)` kernel; returns seconds/iter.
+    fn time_gemm(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<f32>,
+        b_d: &cudarc::driver::CudaSlice<f32>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let mut launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
     /// Kernel-resident throughput (no per-iter H2D/D2H): upload once, launch many, sync once.
     /// Run with `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
@@ -446,43 +537,27 @@ mod tests {
                 let (m, k, n) = (sz, sz, sz);
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let b = rng.vec(n * k, -1.0, 1.0);
-                let f = g.function("gemm", crate::ptx::GEMM, "gemm_nt").unwrap();
                 let a_d = g.stream.memcpy_stod(&a).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
-                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
-                let cfg = gemm_cfg(m, n);
-                // warmup
-                {
-                    let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&mm)
-                        .arg(&nn)
-                        .arg(&kk)
-                        .arg(&a_d)
-                        .arg(&b_d)
-                        .arg(&mut c_d);
-                    unsafe { bld.launch(cfg).unwrap() };
-                }
-                g.stream.synchronize().unwrap();
-                let iters = 30;
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&mm)
-                        .arg(&nn)
-                        .arg(&kk)
-                        .arg(&a_d)
-                        .arg(&b_d)
-                        .arg(&mut c_d);
-                    unsafe { bld.launch(cfg).unwrap() };
-                }
-                g.stream.synchronize().unwrap();
-                let secs = t0.elapsed().as_secs_f64() / iters as f64;
-                let gflops = 2.0 * (m as f64) * (k as f64) * (n as f64) / secs / 1e9;
+                let dims = (m as u32, n as u32, k as u32);
+                let flop = 2.0 * (m as f64) * (k as f64) * (n as f64);
+
+                let f_simple = g.function("gemm", crate::ptx::GEMM, "gemm_nt").unwrap();
+                let s0 = time_gemm(g, &f_simple, gemm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 30);
+
+                let f_rb = g
+                    .function("gemm_rb", crate::ptx_gemm::gemm_rb_ptx(), "gemm_nt_rb")
+                    .unwrap();
+                let s1 = time_gemm(g, &f_rb, gemm_rb_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 30);
+
                 eprintln!(
-                    "gemm_nt {m}³: {:.3} ms/iter  {:.0} GFLOP/s (f32, 16×16 tiled, no TC)",
-                    secs * 1e3,
-                    gflops
+                    "gemm_nt {m}³: simple {:.0} GFLOP/s ({:.2} ms) | reg-blocked {:.0} GFLOP/s ({:.2} ms)  → {:.2}× ",
+                    flop / s0 / 1e9,
+                    s0 * 1e3,
+                    flop / s1 / 1e9,
+                    s1 * 1e3,
+                    s0 / s1
                 );
             }
         });
