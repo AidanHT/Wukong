@@ -827,6 +827,53 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_vhorner_f32(x, out, n, coeffs, ncoeff)` — the streaming Horner-polynomial kernel
+            // a recognized `r = c0; r = r*x + c1; …; out[i] = r` loop lowers to. Marshal `n` f32 from x
+            // and `ncoeff` f32 from coeffs, call the identical runtime kernel, write out — so the
+            // differential oracle stays exact despite the wider lanes / non-temporal stores.
+            "mercury_vhorner_f32" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let coeffs = ptr(args[3])?;
+                let ncoeff = args[4].as_int() as usize;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("vhorner operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut cbuf = Vec::with_capacity(ncoeff);
+                for t in 0..ncoeff {
+                    cbuf.push(
+                        self.memory
+                            .get(coeffs + t)
+                            .ok_or("vhorner coeff out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/obuf are n f32, cbuf is ncoeff f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_vhorner_f32(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        n as i64,
+                        cbuf.as_ptr(),
+                        ncoeff as i64,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("vhorner output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32` — the deterministic reduction kernel
             // a `@parallel` reduction loop lowers to (dot / ssd / sum). Marshal `n` f32 out of x and y
             // and call the *serial* runtime kernel, which is bit-identical to the parallel one the

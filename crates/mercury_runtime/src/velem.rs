@@ -30,10 +30,13 @@ pub const VE_RELU6: i64 = 2;
 /// OR'd into `op` when the kernel must read `y` (`b` may be non-zero).
 pub const VE_USE_Y: i64 = 256;
 
-/// Output element count at/above which the store goes non-temporal. Below it the output is small
-/// enough to stay cache-resident (and may be re-read soon), so a normal cacheable store is better;
-/// above it the array is streamed once and the RFO-avoidance of `vmovntps` wins. 256 KiB of f32.
-const NT_MIN_ELEMS: usize = 1 << 16;
+/// Output element count at/above which the store goes non-temporal. Below it the output fits in L2
+/// (and may be re-read soon, e.g. a per-core `@parallel` chunk), so a normal cacheable store is
+/// better — forcing it out to DRAM with `vmovntps` would just re-fetch it; above it the array is
+/// streamed once and the RFO-avoidance of `vmovntps` wins. 2 MiB of f32 ≈ this machine's L2, the
+/// crossover measured on the `@parallel` saxpy (per-core chunks ~190 KiB must stay cacheable, the
+/// single-thread 4 MiB array must go non-temporal).
+const NT_MIN_ELEMS: usize = 1 << 19;
 
 /// Software-prefetch distance (elements ahead). A prefetch of an address past the buffer end is a
 /// hint the hardware silently drops — never a fault — so the last iterations need no guard.
@@ -177,6 +180,93 @@ unsafe fn velem_avx2(
     }
 }
 
+/// One element of a Horner polynomial `((c[0]·x + c[1])·x + …)·x + c[n-1]`, the fused `mul_add` chain
+/// matching the AVX2 lanes and the `r = r·x + c` source (which contracts to one `fma` per step under
+/// gcc's `-ffp-contract=fast`).
+#[inline]
+fn horner1(x: f32, coeffs: &[f32]) -> f32 {
+    let mut r = coeffs[0];
+    for &c in &coeffs[1..] {
+        r = r.mul_add(x, c);
+    }
+    r
+}
+
+/// `out[i] = poly(x[i])` for `i in 0..n`, where `poly` is the Horner evaluation of `coeffs` (highest
+/// degree first; `ncoeff` terms). The 256-bit AVX2/FMA kernel a recognized `r = c0; r = r*x + c1; …;
+/// out[i] = r` loop lowers to — Cranelift's vectorizer is stuck at 128-bit, and (like saxpy) the
+/// streamed output goes out non-temporal for a large array, the store path gcc won't emit. `x` and
+/// `out` may alias. Degenerate `ncoeff <= 1` writes the constant `coeffs[0]`.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32; `coeffs` valid for `ncoeff` f32.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_vhorner_f32(
+    x: *const f32,
+    out: *mut f32,
+    n: i64,
+    coeffs: *const f32,
+    ncoeff: i64,
+) {
+    if n <= 0 || ncoeff <= 0 {
+        return;
+    }
+    let n = n as usize;
+    // SAFETY: caller guarantees coeffs valid for ncoeff f32.
+    let coeffs = unsafe { std::slice::from_raw_parts(coeffs, ncoeff as usize) };
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: features detected; buffers valid for n by the caller contract.
+            unsafe { vhorner_avx2(x, out, n, coeffs) };
+            return;
+        }
+    }
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n.
+        unsafe { *out.add(i) = horner1(*x.add(i), coeffs) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
+    use std::arch::x86_64::*;
+    // Pre-splat the coefficients once (cheap vs the N-long loop) so the inner FMA chain has no
+    // per-iteration broadcasts.
+    let cv: Vec<__m256> = coeffs.iter().map(|&c| _mm256_set1_ps(c)).collect();
+    let c0 = cv[0];
+    let nt = n >= NT_MIN_ELEMS;
+    let mut i = 0usize;
+    if nt {
+        while i < n && (out.add(i) as usize) & 31 != 0 {
+            *out.add(i) = horner1(*x.add(i), coeffs);
+            i += 1;
+        }
+    }
+    while i + 8 <= n {
+        _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+        let xv = _mm256_loadu_ps(x.add(i));
+        let mut r = c0;
+        for ck in &cv[1..] {
+            r = _mm256_fmadd_ps(r, xv, *ck);
+        }
+        if nt {
+            _mm256_stream_ps(out.add(i), r);
+        } else {
+            _mm256_storeu_ps(out.add(i), r);
+        }
+        i += 8;
+    }
+    if nt {
+        _mm_sfence();
+    }
+    while i < n {
+        *out.add(i) = horner1(*x.add(i), coeffs);
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +275,7 @@ mod tests {
     /// not a multiple of 8 (and that crosses the NT alignment prologue) produces a consistent result.
     #[test]
     fn velem_tail_matches_lanes() {
-        let n = 100_003usize; // forces NT path (> NT_MIN_ELEMS), a misaligned tail, and a prologue
+        let n = 600_003usize; // forces NT path (> NT_MIN_ELEMS), a misaligned tail, and a prologue
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 19.0) - 7.0).collect();
         let y: Vec<f32> = (0..n).map(|i| (i as f32 % 11.0) * 0.5 - 2.0).collect();
         let cases: &[(i64, f32, f32, f32)] = &[
@@ -233,6 +323,33 @@ mod tests {
         }
         for i in 0..n {
             assert_eq!(got[i].to_bits(), 2.0f32.mul_add(x[i], y[i]).to_bits(), "i {i}");
+        }
+    }
+
+    /// The Horner kernel's AVX2 lanes and scalar tail must agree element-for-element across the NT
+    /// boundary and a misaligned tail, for several degrees (incl. the degenerate constant `ncoeff=1`).
+    #[test]
+    fn vhorner_tail_matches_lanes() {
+        let n = 600_005usize; // forces NT path, prologue, and a non-mult-of-8 tail
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 % 23.0) * 0.1 - 1.1).collect();
+        for coeffs in [
+            vec![3.0f32],                              // constant
+            vec![2.0f32, -1.0],                        // linear
+            vec![1e-5f32, 1e-4, 1e-3, 1e-2, 1e-1],     // the deg-4 poly benchmark
+        ] {
+            let mut got = vec![0.0f32; n];
+            unsafe {
+                mercury_vhorner_f32(
+                    x.as_ptr(),
+                    got.as_mut_ptr(),
+                    n as i64,
+                    coeffs.as_ptr(),
+                    coeffs.len() as i64,
+                );
+            }
+            for i in 0..n {
+                assert_eq!(got[i].to_bits(), horner1(x[i], &coeffs).to_bits(), "deg {} i {i}", coeffs.len());
+            }
         }
     }
 
