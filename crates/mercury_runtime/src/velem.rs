@@ -228,13 +228,30 @@ pub unsafe extern "C" fn mercury_vhorner_f32(
     }
 }
 
+/// Largest polynomial degree the AVX2 path keeps its splatted coefficients on the stack for (degree
+/// MAX_HORNER-1). Far beyond any real activation/approximation polynomial; a longer one falls back to
+/// the scalar path. Stack storage avoids a per-call heap allocation — which, plus the runtime-length
+/// inner loop, was what made the first cut *lose* to gcc on the degree-4 poly.
+const MAX_HORNER: usize = 32;
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
     use std::arch::x86_64::*;
-    // Pre-splat the coefficients once (cheap vs the N-long loop) so the inner FMA chain has no
-    // per-iteration broadcasts.
-    let cv: Vec<__m256> = coeffs.iter().map(|&c| _mm256_set1_ps(c)).collect();
+    let nc = coeffs.len();
+    if nc > MAX_HORNER {
+        for i in 0..n {
+            *out.add(i) = horner1(*x.add(i), coeffs);
+        }
+        return;
+    }
+    // Pre-splat the coefficients once onto the **stack** (no per-call heap alloc) so the FMA chain
+    // has no per-iteration broadcasts and stays L1/register-resident.
+    let mut cv = [_mm256_setzero_ps(); MAX_HORNER];
+    for k in 0..nc {
+        cv[k] = _mm256_set1_ps(coeffs[k]);
+    }
+    let cv = &cv[..nc];
     let c0 = cv[0];
     let nt = n >= NT_MIN_ELEMS;
     let mut i = 0usize;
@@ -244,18 +261,44 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
             i += 1;
         }
     }
-    while i + 8 <= n {
+    // Horner is a *latency-bound* dependent chain (`r = r·x + c`), so a single accumulator would
+    // stall on the ~4-cycle FMA latency. Run four independent 8-lane chains (32 elements/step) so four
+    // FMAs are always in flight — matching the generic vectorizer's unroll, at twice its width.
+    macro_rules! store {
+        ($p:expr, $v:expr) => {
+            if nt {
+                _mm256_stream_ps($p, $v);
+            } else {
+                _mm256_storeu_ps($p, $v);
+            }
+        };
+    }
+    while i + 32 <= n {
         _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+        let x0 = _mm256_loadu_ps(x.add(i));
+        let x1 = _mm256_loadu_ps(x.add(i + 8));
+        let x2 = _mm256_loadu_ps(x.add(i + 16));
+        let x3 = _mm256_loadu_ps(x.add(i + 24));
+        let (mut r0, mut r1, mut r2, mut r3) = (c0, c0, c0, c0);
+        for ck in &cv[1..] {
+            r0 = _mm256_fmadd_ps(r0, x0, *ck);
+            r1 = _mm256_fmadd_ps(r1, x1, *ck);
+            r2 = _mm256_fmadd_ps(r2, x2, *ck);
+            r3 = _mm256_fmadd_ps(r3, x3, *ck);
+        }
+        store!(out.add(i), r0);
+        store!(out.add(i + 8), r1);
+        store!(out.add(i + 16), r2);
+        store!(out.add(i + 24), r3);
+        i += 32;
+    }
+    while i + 8 <= n {
         let xv = _mm256_loadu_ps(x.add(i));
         let mut r = c0;
         for ck in &cv[1..] {
             r = _mm256_fmadd_ps(r, xv, *ck);
         }
-        if nt {
-            _mm256_stream_ps(out.add(i), r);
-        } else {
-            _mm256_storeu_ps(out.add(i), r);
-        }
+        store!(out.add(i), r);
         i += 8;
     }
     if nt {
