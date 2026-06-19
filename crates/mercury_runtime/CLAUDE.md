@@ -22,8 +22,9 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   softplus=max(x,0)+ln(1+e^−|x|), mish=x·tanh(softplus), selu=scaled elu, hardsigmoid/hardswish=min/max clamp), so one ≈1-ULP `exp` keeps the family exact;
   `gelu1`/`silu1` are `pub(crate)` for the GEMM fused epilogue.
 - `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
-  reductions** (dot / ssd / sum / sumsq folded by `+`, and **max / min folded by `fmax`/`fmin`**, by
-  `RED_*` op code — the per-tensor max/absmax softmax stability and dynamic int8 quantization need). A
+  reductions** (dot / ssd / sum / sumsq folded by `+`, **max / min folded by `fmax`/`fmin`**, and
+  **maxabs** = `fmax` over `|x|` (AVX2 `andnot(-0, x)` / scalar `f32::abs`, bit-identical), by `RED_*`
+  op code — the per-tensor max/range/absmax softmax stability and dynamic int8 quantization need). A
   `@parallel` reduction loop lowers to the `_parallel` one. The parallel result is **bit-identical** to
   the serial one: the array is cut into fixed-size `RCHUNK` chunks (count independent of thread count),
   each reduced by the identical per-chunk function, and partials folded in ascending chunk order
