@@ -160,13 +160,15 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 ### Transcendentals / activations — Mercury dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
 The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
-Mercury recognizes a pure `out[i] = f(x[i])` loop for `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` and
-lowers the whole loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same
-domain-aware dispatch as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a
-time; gcc/rustc call scalar `libm` `expf`/`logf`/`tanhf` and **cannot vectorize a loop containing a
-call** (no `libmvec` on this mingw toolchain), so they stay serial. `silu` (Llama/SwiGLU) and `gelu`
-(BERT/GPT-2/ViT, tanh approximation) are first-class intrinsics dispatched to fused kernels. The
-interpreter marshals through the *identical* kernel, so the differential oracle stays exact.
+Mercury recognizes a pure `out[i] = f(x[i])` loop for
+`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish` and lowers the whole
+loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same domain-aware dispatch
+as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a time; gcc/rustc call
+scalar `libm` `expf`/`logf`/`tanhf` and **cannot vectorize a loop containing a call** (no `libmvec` on
+this mingw toolchain), so they stay serial. `silu` (Llama/SwiGLU) and `gelu` (BERT/GPT-2/ViT, tanh
+approximation) are first-class intrinsics, as are `elu`, `leaky_relu`, `softplus` (= `ln(1+eˣ)`), and
+`mish` (= `x·tanh(softplus)`) — all composing the shared ≈1-ULP `exp`/`log`. The interpreter marshals
+through the *identical* kernel, so the differential oracle stays exact.
 
 This is the change that took the activations from a ~128-bit ~2.5–3.5× win to the ~5–7.5× range —
 **roughly double**, because they are compute-bound (~20 flops/element) and the missing 256 bits were
@@ -179,12 +181,15 @@ auto-vectorize at 128-bit; `erf` gives the exact erf-GELU and `sin`/`cos` give R
 | `log`  | **~4.6–7.5× faster** | `out=log(x)`; 256-bit Cephes poly vs scalar `logf` (libm `logf` timing varies run-to-run) |
 | `tanh` | **~4.5–6.1× faster** | exp-based, identical algorithm everywhere; only Mercury vectorizes (256-bit) |
 | `gelu` | **~5.0–6.5× faster** | tanh-GELU intrinsic → fused 256-bit kernel; C/Rust the same math, scalar |
-| `silu` (swish) | **~5.2–5.8× faster** | `silu()` intrinsic (`x·sigmoid(x)`) → fused 256-bit kernel; C/Rust scalar |
+| `silu` (swish) | **~3.6–5.8× faster** | `silu()` intrinsic (`x·sigmoid(x)`) → fused 256-bit kernel; C/Rust scalar |
+| `softplus` | **~6.6× faster** | `ln(1+eˣ)` (exp+log) → fused 256-bit kernel; also ~4× vs Rust |
+| `mish` | **~5.7× faster** | `x·tanh(softplus(x))`, three transcendentals — the heaviest, widest gap; ~6× vs Rust |
 | `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
 The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
-`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`, and `fmax`/`fmin` — all vectorize. Every
-kernel passes the cross-language checksum (the ≈1-ULP poly agrees with `libm` within tolerance) and
+`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`, and
+`fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
+with `libm` within tolerance) and
 compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
 bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
 multicore × 256-bit. `softmax`/`LayerNorm`/`RMSNorm` are recognized and dispatched to a fused
@@ -282,10 +287,10 @@ wins:
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
-| saxpy  | **~1.3–1.5× faster** | `velem` 256-bit + non-temporal store (3-stream, spills L3) — Rust ~1.4× behind too |
+| saxpy  | **~1.25–1.45× faster** | `velem` 256-bit + non-temporal store (3-stream, spills L3) — Rust ~1.4× behind too |
 | relu   | ≈tie (~1.0×) | 2-stream, L3-resident at N=2²⁰ so stores stay cacheable; the win shows at >L3 (below) |
 | poly   | **~1.1–1.2× faster** | `vhorner` 4×-unrolled AVX2 Horner; **ties Rust's autovec** (both ~43 GB/s) |
-| fused linear→relu | **~1.1× faster** | two source loops Mercury auto-fuses; C/Rust stream the intermediate |
+| fused linear→relu | ≈tie (±10%, clock-dependent) | matvec-bound (M=1) at the bandwidth wall; Mercury fuses the two source loops |
 | dot    | **~2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
 | ssd (Σ(x−y)²) | **~2.6–2.9× faster** | same — an L2-loss reduction |
 
