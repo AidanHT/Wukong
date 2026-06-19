@@ -51,9 +51,10 @@ naively-written source:
   FMA down a single dependency chain — latency-bound. Mercury reassociates it across vector lanes ×
   unrolled accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without
   `-ffast-math`. A `@parallel` reduction goes further, lowering to a **deterministic multicore
-  reduction kernel** (`mercury_sreduce_f32_parallel`: dot/ssd/sum/sumsq folded by `+`, and **max/min**
-  folded by `fmax`/`fmin` — the per-tensor max/absmax softmax stability and dynamic int8 quantization
-  scale-computation need) whose result is bit-identical to the serial form regardless of core count
+  reduction kernel** (`mercury_sreduce_f32_parallel`: dot/ssd/sum/sumsq folded by `+`, **max/min**
+  folded by `fmax`/`fmin`, and **absmax** = `fmax` over `|x|` — the per-tensor max/range/absmax softmax
+  stability and dynamic int8 quantization scale-computation (`scale = absmax/127`) need) whose result
+  is bit-identical to the serial form regardless of core count
   (fixed-size chunks, ascending partial combine — which holds even for the non-associative `fmax`/
   `fmin`, since both forms evaluate the identical expression tree).
 - **Auto-vectorization + fusion** of elementwise loops (incl. branchy ones via if-conversion), `x +
@@ -328,6 +329,7 @@ single-threaded C:
 | dot@parallel   | **~7.9×** (~135 GB/s) — reduction across cores; C/Rust keep it serial & latency-bound |
 | ssd@parallel   | **~8.6×** (~144 GB/s) — L2-loss reduction across cores |
 | max@parallel   | **~25–26×** (~85 GB/s) — per-tensor max (int8-quant range / softmax stability) across cores; C's single-stream float-max chain is especially latency-bound (~3 GB/s) without `-ffast-math` |
+| absmax@parallel | **~25×** (~80 GB/s) — per-tensor max\|x\| (symmetric int8-quant scale) across cores; `abs` is free (a bitwise op) so C stays latency-bound like `max` (~3 GB/s) |
 
 ## Honest summary
 
