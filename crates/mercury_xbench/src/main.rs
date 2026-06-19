@@ -1660,6 +1660,23 @@ fn kernels() -> Vec<Kernel> {
                 "let mut s=0.0f32; for i in 0..N { let d= *x.add(i)- *y.add(i); s+=d*d; } *out.add(0)=s;",
             ),
         },
+        // Max across cores — the per-tensor max softmax stability and dynamic int8 quantization
+        // (absmax → scale = absmax/127) need. A `@parallel` fmax reduction dispatches to the multicore
+        // kernel (RED_MAX); the C/Rust baselines are the idiomatic compare-select max the compiler
+        // can auto-vectorize (the honest single-thread bar), so the win is one core's bandwidth ×
+        // all cores. Single input stream, so bytes = N·4 (unary).
+        Kernel {
+            name: "max@parallel",
+            bytes_per_call: N * 4,
+            note: "max(x) across cores (multicore reduction kernel) vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "let mut m: f32 = x[0]; for k in 0..{N} {{ m = fmax(m, x[k]); }} out[0] = m;"
+            )),
+            c: c_kernel("float m=x[0]; for(long i=0;i<N;i++){ float v=x[i]; m = v>m? v:m; } out[0]=m;"),
+            rust: rust_kernel(
+                "let mut m= *x.add(0); for i in 0..N { let v= *x.add(i); if v>m { m=v; } } *out.add(0)=m;",
+            ),
+        },
     ]
 }
 
