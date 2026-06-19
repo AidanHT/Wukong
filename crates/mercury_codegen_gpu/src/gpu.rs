@@ -283,12 +283,30 @@ pub fn gemm_nn(
     g.stream.memcpy_dtov(&c_d)
 }
 
-/// Launch config for the WMMA tensor-core GEMM: one warp (32 threads) per 16×16 C tile.
-fn wmma_cfg(m: usize, n: usize) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
+/// Pick the WMMA entry + launch config: the fragment-reuse multi-tile kernel (`<base>_mt`, one warp
+/// per WARP_M×WARP_N block) when M and N are multiples of the warp tile, else the single-16×16-tile
+/// kernel (`<base>`, any 16-multiple). One warp (32 threads) per block either way.
+fn wmma_pick(base: &str, m: usize, n: usize) -> (String, LaunchConfig) {
+    use crate::ptx_wmma::{WARP_M, WARP_N};
+    let block_dim = (32, 1, 1);
+    if m % WARP_M == 0 && n % WARP_N == 0 {
+        (
+            format!("{base}_mt"),
+            LaunchConfig {
+                grid_dim: ((n / WARP_N) as u32, (m / WARP_M) as u32, 1),
+                block_dim,
+                shared_mem_bytes: 0,
+            },
+        )
+    } else {
+        (
+            base.to_string(),
+            LaunchConfig {
+                grid_dim: (n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1),
+                block_dim,
+                shared_mem_bytes: 0,
+            },
+        )
     }
 }
 
@@ -312,7 +330,8 @@ pub fn gemm_nt_f16(
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
-    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16")?;
+    let (entry, cfg) = wmma_pick("wmma_nt_f16", m, n);
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &entry)?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -324,7 +343,7 @@ pub fn gemm_nt_f16(
         .arg(&a_d)
         .arg(&b_d)
         .arg(&mut c_d);
-    unsafe { bld.launch(wmma_cfg(m, n))? };
+    unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -347,11 +366,8 @@ pub fn gemm_nt_bf16(
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
-    let f = g.function(
-        "wmma_bf16",
-        crate::ptx_wmma::wmma_bf16_ptx(),
-        "wmma_nt_bf16",
-    )?;
+    let (entry, cfg) = wmma_pick("wmma_nt_bf16", m, n);
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), &entry)?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -363,7 +379,7 @@ pub fn gemm_nt_bf16(
         .arg(&a_d)
         .arg(&b_d)
         .arg(&mut c_d);
-    unsafe { bld.launch(wmma_cfg(m, n))? };
+    unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -745,34 +761,22 @@ mod tests {
                 let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
                 let a16_d = g.stream.memcpy_stod(&a16).unwrap();
                 let b16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let (e16, c16) = wmma_pick("wmma_nt_f16", m, n);
                 let f_f16 = g
-                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16")
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16)
                     .unwrap();
-                let s_f16 = time_wmma(
-                    g,
-                    &f_f16,
-                    wmma_cfg(m, n),
-                    dims,
-                    &a16_d,
-                    &b16_d,
-                    &mut c_d,
-                    50,
-                );
+                let s_f16 = time_wmma(g, &f_f16, c16, dims, &a16_d, &b16_d, &mut c_d, 50);
 
                 // bf16 WMMA
                 let ab: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
                 let bb: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
                 let ab_d = g.stream.memcpy_stod(&ab).unwrap();
                 let bb_d = g.stream.memcpy_stod(&bb).unwrap();
+                let (eb, cb) = wmma_pick("wmma_nt_bf16", m, n);
                 let f_bf16 = g
-                    .function(
-                        "wmma_bf16",
-                        crate::ptx_wmma::wmma_bf16_ptx(),
-                        "wmma_nt_bf16",
-                    )
+                    .function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), &eb)
                     .unwrap();
-                let s_bf16 =
-                    time_wmma(g, &f_bf16, wmma_cfg(m, n), dims, &ab_d, &bb_d, &mut c_d, 50);
+                let s_bf16 = time_wmma(g, &f_bf16, cb, dims, &ab_d, &bb_d, &mut c_d, 50);
 
                 eprintln!(
                     "{m}³: f32-rb {:.0} GFLOP/s | f16-TC {:.0} GFLOP/s ({:.1}× rb) | bf16-TC {:.0} GFLOP/s ({:.1}× rb)",
