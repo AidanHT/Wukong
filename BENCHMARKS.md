@@ -415,26 +415,35 @@ far below a desktop/datacenter part), so the absolute TFLOP/s are honest for *th
 
 **Tensor-core GEMM (fp16/bf16/fp8 inputs, f32 accumulate).** fp16/bf16 use WMMA `m16n16k16`
 (fragment-reuse multi-tile); fp8 (E4M3) has no WMMA on `sm_89`, so it is the warp-level
-`mma.sync.m16n8k32` with the fragments placed by hand. GFLOP/s, two representative runs (absolute
-throughput **swings ~1.4× with the laptop's power/thermal state** — a cool/idle run and a warmer run):
+`mma.sync.m16n8k32` with the fragments placed by hand — both a naive single-tile form and a
+fragment-reuse multi-tile (`_mt`) form. Absolute throughput **swings ~7× with the laptop's
+power/thermal state**, so the table below is *one representative back-to-back run* (every column
+measured in the same clock state — only the cross-column ratios within a run are meaningful, never the
+absolute GFLOP/s across runs):
 
-| size | f32 reg-blocked | fp16 TC | bf16 TC | fp8 TC | fp16 vs f32 |
-|------|-----------------|---------|---------|--------|-------------|
-| 512³  | 1.1–1.4 K | 7.6–8.7 K | 7.0–7.6 K | 4.5 K | ~5–7× |
-| 1024³ | 1.5–2.2 K | 9.2–11.7 K | 9.2–12.7 K | 5.2 K | ~5–6× |
-| 2048³ | 1.5–2.0 K | 8.9–**12.8 K** | 8.5–12.3 K | 5.6 K | ~6× |
-| 4096³ | 1.2–1.4 K | 7.7 K | 7.3–7.4 K | 6.5 K | ~5–6× |
+| size | f32 reg-blocked | fp16 TC | bf16 TC | fp8 single | **fp8 multi-tile** |
+|------|-----------------|---------|---------|------------|--------------------|
+| 512³  | 1152 | 7542 | 7621 | 4622 | **9881** |
+| 1024³ | 1216 | 7220 | 7875 | 4758 | **10045** |
+| 2048³ | 1431 | 8217 | 10564 | 5527 | **13474** |
+| 4096³ | —¹ | 5991 | 5410 | 5815 | **13739** |
 
-The Ada tensor cores hit **~9–13 TFLOP/s fp16/bf16** (clock-dependent) at 1–2 K — **~5–6× the f32
-register-blocked path** on the same GPU — with f32 accumulation (the mixed-precision contract). The
-f32-accumulate tolerance gates pass (fp16 ~2e-3 rel, bf16 ~1e-2 rel, fp8 vs e4m3-rounded inputs ~2e-3
-rel, isolating accumulation error from input rounding). **fp8 is correct but currently ~4.5–6.5
-TFLOP/s — *below* the tuned fp16/bf16 path**, because this fp8 kernel is the naive single-tile form
-(one 16×8 tile per warp, re-reads A/B from global each K-step, no fragment reuse or shared-mem
-staging) and so is memory-bound. The hard part — the manual `mma.sync` fp8 fragment layout on
-`sm_89` — is done and bit-exact (`max_abs=0` vs an asymmetric e4m3-exact reference); realizing fp8's
-~2× compute peak needs the same fragment-reuse/SMEM tiling the WMMA `_mt` kernel already has, which is
-documented future work.
+¹ the 4096³ f32 run hit a clock dip (226 GFLOP/s); omitted to avoid a misleading ratio.
+
+The Ada tensor cores hit **~9–13 TFLOP/s fp16/bf16** in warmer runs — **~5–6× the f32 register-blocked
+path** on the same GPU — with f32 accumulation (the mixed-precision contract). The f32-accumulate
+tolerance gates pass (fp16 ~2e-3 rel, bf16 ~1e-2 rel, fp8 vs e4m3-rounded inputs ~2e-3 rel, isolating
+accumulation error from input rounding). **The fragment-reuse multi-tile fp8 path is now the fastest
+tensor-core kernel** (`fp8_gemm_mt_ptx`: each warp computes a 2×4 block of 16×8 tiles, loading each A
+fragment once and reusing it across 4 B-tiles and each B fragment across both A-tiles). In the run
+above it is **2.1–2.4× the naive single-tile fp8** and **1.3–2.3× fp16/bf16** (the lead widens with
+size as the kernel becomes compute- rather than memory-bound) — finally realizing Ada's ~2× fp8
+tensor-core rate. The naive single-tile form (one 16×8 tile per warp, re-reading A/B from global each
+K-step) is retained as the fallback for shapes the multi-tile block doesn't divide (`M%32≠0` or
+`N%32≠0`); it is memory-bound and sits below fp16, as expected. The hard part — the manual `mma.sync`
+fp8 fragment layout on `sm_89` — is bit-exact (`max_abs=0` vs an asymmetric e4m3-exact reference), and
+the multi-tile correctness gate covers it at 64³ and 128×256×64. SMEM K/V staging for fp8's true peak
+remains documented future work.
 
 **Fused flash-attention** (online softmax, never materializes the `S×S` scores in HBM — the kernel
 that *lost* on CPU, where the tuned GEMM dominates) — warp-per-query-row, `d=64`:
@@ -535,8 +544,9 @@ skips cleanly with no GPU) and `… --release -- --ignored --nocapture` (through
 - **GPU backend (RTX 4050):** a PTX-emitting, driver-JIT GPU path (no CUDA toolkit) runs every
   transformer op category on-device, tolerance-gated. **Tensor-core GEMM** (fp16/bf16 in, f32
   accumulate) hits **~9–13 TFLOP/s** (clock-dependent) — ~5–6× the f32 path on the same GPU;
-  **fp8 (E4M3) via hand-laid `mma.sync` is validated bit-exact** but its naive single-tile kernel is
-  memory-bound (~4.5–6.5 TFLOP/s, below the tuned fp16 path — fragment-reuse is future work). **Fused
+  **fp8 (E4M3) via hand-laid `mma.sync` is validated bit-exact**, and its fragment-reuse multi-tile
+  kernel is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and ~1.3–2.3×
+  fp16/bf16 in the same run (realizing Ada's ~2× fp8 rate once it's compute-bound). **Fused
   flash-attention** (online softmax, no `S²` scores in HBM) reaches **372 GFLOP/s** at 4 K context;
   and a **whole pre-norm transformer layer runs end-to-end GPU-resident** (matching a CPU f64
   reference to max_rel 2.7e-4, deterministic run-to-run). Numbers are honest for a power-capped 6 GB
