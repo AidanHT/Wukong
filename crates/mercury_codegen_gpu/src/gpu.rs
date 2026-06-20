@@ -503,6 +503,168 @@ pub fn conv2d(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// The learned weights of one transformer layer (all `A·Bᵀ` projections): attention `Wq/Wk/Wv/Wo`
+/// are `[D, D]`, the FFN is up `W1` `[Dff, D]` then down `W2` `[D, Dff]`.
+pub struct TransformerWeights<'a> {
+    pub wq: &'a [f32],
+    pub wk: &'a [f32],
+    pub wv: &'a [f32],
+    pub wo: &'a [f32],
+    pub w1: &'a [f32],
+    pub w2: &'a [f32],
+}
+
+/// One **pre-norm transformer encoder layer, end-to-end GPU-resident**. The input `x` (`[S, D]`) and
+/// all weights are uploaded to the device **once**; every op then runs on device buffers with **no
+/// host round-trip between ops**, and only the final `[S, D]` output is copied back. The sequence
+/// chains the kernels this crate already ships:
+///
+/// ```text
+///   h1 = RMSNorm(x)                              (ptx_norm)
+///   Q,K,V = h1·Wqᵀ, h1·Wkᵀ, h1·Wvᵀ              (register-blocked GEMM ×3)
+///   A  = FlashAttention(Q, K, V, 1/√D)           (ptx_flash, fused — no S² scores in HBM)
+///   x  = x + A·Woᵀ                               (GEMM + residual add)
+///   h2 = RMSNorm(x)                              (ptx_norm)
+///   x  = x + SiLU(h2·W1ᵀ)·W2ᵀ                    (GEMM, vmath SiLU, GEMM, residual add)
+/// ```
+///
+/// Single head; `d` must be a flash-supported head dim (32/64/128). Tolerance-gated against a CPU f64
+/// reference of the same layer. This is the "whole layer stays resident on the GPU" milestone — the
+/// payoff of having every transformer op available as a device kernel.
+pub fn transformer_layer(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &TransformerWeights,
+    s: usize,
+    d: usize,
+    dff: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(x.len(), s * d, "x must be S×D");
+    for (name, wt, len) in [
+        ("wq", w.wq, d * d),
+        ("wk", w.wk, d * d),
+        ("wv", w.wv, d * d),
+        ("wo", w.wo, d * d),
+        ("w1", w.w1, dff * d),
+        ("w2", w.w2, d * dff),
+    ] {
+        assert_eq!(wt.len(), len, "{name} wrong size");
+    }
+    assert!(
+        crate::ptx_flash::SUPPORTED_D.contains(&d),
+        "transformer_layer: head dim {d} unsupported by flash (need {:?})",
+        crate::ptx_flash::SUPPORTED_D
+    );
+
+    // Preload every kernel once — the only `&mut g` use; the returned handles are owned, so after
+    // this the device work runs through `stream` (a cloned `Arc`) with no further borrow of `g`.
+    let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
+    let f_gemm = g.function("gemm_rb", crate::ptx_gemm::gemm_rb_ptx(), "gemm_nt_rb")?;
+    let f_flash = g.function(
+        "flash",
+        crate::ptx_flash::flash_ptx(),
+        &format!("flash_d{d}"),
+    )?;
+    let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd")?;
+    let f_silu = g.function("vmath", crate::ptx::vmath_ptx(), "silu")?;
+    let stream = g.stream.clone();
+
+    // Upload input + weights once.
+    let x_d = stream.memcpy_stod(x)?;
+    let wq = stream.memcpy_stod(w.wq)?;
+    let wk = stream.memcpy_stod(w.wk)?;
+    let wv = stream.memcpy_stod(w.wv)?;
+    let wo = stream.memcpy_stod(w.wo)?;
+    let w1 = stream.memcpy_stod(w.w1)?;
+    let w2 = stream.memcpy_stod(w.w2)?;
+
+    let eps = 1e-5f32;
+    let norm_cfg = LaunchConfig {
+        grid_dim: (s as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // RMSNorm a `[rows, d]` device buffer into a fresh one.
+    let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
+        let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
+        let (r, c) = (rows as u32, d as u32);
+        let mut bld = stream.launch_builder(&f_norm);
+        bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
+        unsafe { bld.launch(norm_cfg)? };
+        Ok(out)
+    };
+    // C = A·Bᵀ, A `[m,k]`, B `[n,k]` → C `[m,n]`, all device buffers.
+    let gemm = |a: &cudarc::driver::CudaSlice<f32>,
+                b: &cudarc::driver::CudaSlice<f32>,
+                m: usize,
+                k: usize,
+                n: usize|
+     -> Result<_, DriverError> {
+        let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+        let mut bld = stream.launch_builder(&f_gemm);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
+        unsafe { bld.launch(gemm_rb_cfg(m, n))? };
+        Ok(c)
+    };
+    // out = a + b (residual), element count `n`.
+    let add = |a: &cudarc::driver::CudaSlice<f32>,
+               b: &cudarc::driver::CudaSlice<f32>,
+               n: usize|
+     -> Result<_, DriverError> {
+        let mut out = stream.memcpy_stod(&vec![0f32; n])?;
+        let nn = n as u32;
+        let mut bld = stream.launch_builder(&f_vadd);
+        bld.arg(&nn).arg(a).arg(b).arg(&mut out);
+        unsafe { bld.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(out)
+    };
+
+    // --- attention block ---
+    let h1 = norm(&x_d, s)?;
+    let q = gemm(&h1, &wq, s, d, d)?;
+    let k = gemm(&h1, &wk, s, d, d)?;
+    let v = gemm(&h1, &wv, s, d, d)?;
+    // fused flash-attention over the device Q/K/V (one warp per query row).
+    let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
+    {
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let ss = s as u32;
+        let flash_cfg = LaunchConfig {
+            grid_dim: (s as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bld = stream.launch_builder(&f_flash);
+        bld.arg(&ss)
+            .arg(&scale)
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&mut attn);
+        unsafe { bld.launch(flash_cfg)? };
+    }
+    let o = gemm(&attn, &wo, s, d, d)?;
+    let x = add(&x_d, &o, s * d)?; // residual 1
+
+    // --- FFN block ---
+    let h2 = norm(&x, s)?;
+    let f1 = gemm(&h2, &w1, s, d, dff)?; // [S, Dff]
+                                         // SiLU(f1) → a fresh device buffer (out[i]=f(x[i]) needs no aliasing, so no host round-trip).
+    let mut f1act = stream.memcpy_stod(&vec![0f32; s * dff])?;
+    {
+        let n = (s * dff) as u32;
+        let mut bld = stream.launch_builder(&f_silu);
+        bld.arg(&n).arg(&f1).arg(&mut f1act);
+        unsafe { bld.launch(LaunchConfig::for_num_elems(n))? };
+    }
+    let f2 = gemm(&f1act, &w2, s, dff, d)?; // [S, D]
+    let x = add(&x, &f2, s * d)?; // residual 2
+
+    stream.memcpy_dtov(&x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1166,86 @@ mod tests {
                     st.max_abs, st.max_rel
                 );
             }
+        });
+    }
+
+    /// f64 RMSNorm reference over `[rows, cols]`: `out = x / sqrt(mean(x²) + eps)` per row — the
+    /// non-affine form the GPU `rmsnorm` kernel computes.
+    fn ref_rmsnorm(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
+        let mut o = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let mut ms = 0.0f64;
+            for i in 0..cols {
+                let v = x[r * cols + i] as f64;
+                ms += v * v;
+            }
+            let inv = 1.0 / (ms / cols as f64 + eps as f64).sqrt();
+            for i in 0..cols {
+                o[r * cols + i] = (x[r * cols + i] as f64 * inv) as f32;
+            }
+        }
+        o
+    }
+
+    /// f64 SiLU `x·σ(x)`.
+    fn ref_silu(x: f32) -> f32 {
+        let x = x as f64;
+        (x / (1.0 + (-x).exp())) as f32
+    }
+
+    /// CPU f64 reference for the whole pre-norm transformer layer — the independent oracle for
+    /// [`transformer_layer`], composing the existing `ref_rmsnorm` / `ref_nt` / `ref_attn` pieces.
+    fn ref_transformer_layer(
+        x: &[f32],
+        w: &TransformerWeights,
+        s: usize,
+        d: usize,
+        dff: usize,
+    ) -> Vec<f32> {
+        let eps = 1e-5f32;
+        let h1 = ref_rmsnorm(x, s, d, eps);
+        let q = ref_nt(&h1, w.wq, s, d, d);
+        let k = ref_nt(&h1, w.wk, s, d, d);
+        let v = ref_nt(&h1, w.wv, s, d, d);
+        let a = ref_attn(&q, &k, &v, s, d, 1.0 / (d as f32).sqrt());
+        let o = ref_nt(&a, w.wo, s, d, d);
+        let x1: Vec<f32> = x.iter().zip(&o).map(|(&a, &b)| a + b).collect();
+        let h2 = ref_rmsnorm(&x1, s, d, eps);
+        let f1 = ref_nt(&h2, w.w1, s, d, dff);
+        let f1act: Vec<f32> = f1.iter().map(|&z| ref_silu(z)).collect();
+        let f2 = ref_nt(&f1act, w.w2, s, dff, d);
+        x1.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
+    }
+
+    #[test]
+    fn transformer_layer_matches_reference_within_tol() {
+        with_gpu("transformer_layer", |g| {
+            let mut rng = crate::diff::Rng::new(0x7A11);
+            let (s, d, dff) = (96usize, 64usize, 256usize);
+            let x = rng.vec(s * d, -1.0, 1.0);
+            // Small weights keep activations O(1) (RMSNorm makes rows unit-RMS), so the layer is
+            // well-conditioned and the cross-check is a tight tolerance.
+            let wq = rng.vec(d * d, -0.1, 0.1);
+            let wk = rng.vec(d * d, -0.1, 0.1);
+            let wv = rng.vec(d * d, -0.1, 0.1);
+            let wo = rng.vec(d * d, -0.1, 0.1);
+            let w1 = rng.vec(dff * d, -0.1, 0.1);
+            let w2 = rng.vec(d * dff, -0.1, 0.1);
+            let w = TransformerWeights {
+                wq: &wq,
+                wk: &wk,
+                wv: &wv,
+                wo: &wo,
+                w1: &w1,
+                w2: &w2,
+            };
+            let got = transformer_layer(g, &x, &w, s, d, dff).unwrap();
+            let oracle = ref_transformer_layer(&x, &w, s, d, dff);
+            let st = crate::diff::assert_close("transformer_layer", &got, &oracle, 2e-2, 2e-2);
+            eprintln!(
+                "transformer_layer S={s} D={d} Dff={dff} (GPU-resident): max_abs={:.2e} max_rel={:.2e}",
+                st.max_abs, st.max_rel
+            );
         });
     }
 
