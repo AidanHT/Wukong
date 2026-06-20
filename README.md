@@ -24,10 +24,11 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   `matrixmultiply` Rust crate**) **and up to ~20× parallel** on plain `C = A·B`, **~80–156× on
   `nn.Linear`** (where naive C leaves the reduction latency-bound), the lead *growing with matrix
   size* as their version falls out of cache;
-- **wins the transcendental/activation family ~4–8.6×** — the cleanest compute-bound win. Mercury
-  dispatches a pure `out[i]=f(x[i])` loop for **18** functions (`exp`/`log`/`tanh`/`sigmoid`/`gelu`/
-  `silu`/`softplus`/`mish`/`sin`/`cos`/`erf`/`exp2`/`log2`/`sinh`/`cosh`/… — the transformer activations
-  plus **RoPE**'s `sin`/`cos` and the exact-GELU `erf`) to a **256-bit AVX2 ≈1-ULP poly kernel**, where
+- **wins the transcendental/activation family ~4–11.5×** — the cleanest compute-bound win. Mercury
+  dispatches a pure `out[i]=f(x[i])` loop for **24** functions (`exp`/`log`/`exp2`/`log2`/`tanh`/`sigmoid`/`gelu`/
+  `silu`/`softplus`/`mish`/`sin`/`cos`/`erf` plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`
+  — the transformer activations plus **RoPE**'s `sin`/`cos`, the exact-GELU `erf`, and the
+  hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where
   gcc/rustc call scalar `libm` and **cannot vectorize a loop containing the call**;
 - **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form) **~1.7–6.7×**
   and **convolution** (im2col + GEMM) **~5–7×**;
