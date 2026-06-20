@@ -105,6 +105,7 @@ const RT_REDUCE_F16: &str = "mercury_reduce_f16";
 const RT_F32_TO_F16: &str = "mercury_f32_to_f16_bits";
 const RT_F16_TO_F32: &str = "mercury_f16_bits_to_f32";
 const RT_AXPBY_BF16: &str = "mercury_axpby_bf16";
+const RT_AXPBY_F16: &str = "mercury_axpby_f16";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -879,17 +880,17 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
-        // The bf16 mixed-precision streaming axpby: mercury_axpby_bf16(x, y, out, n, a, b) — two bf16
-        // input pointers, one f32 output pointer, an i64 count, and two f32 coefficients (bf16 in, f32
-        // out, f32 math — the saxpy/axpby map a recognized bf16 elementwise loop lowers to). Void.
-        if name == RT_AXPBY_BF16 && args.len() == 6 {
+        // The bf16/f16 mixed-precision streaming axpby: mercury_axpby_{bf16,f16}(x, y, out, n, a, b) —
+        // two half-precision input pointers, one f32 output pointer, an i64 count, and two f32
+        // coefficients (half in, f32 out, f32 math — the saxpy/axpby a recognized loop lowers to). Void.
+        if (name == RT_AXPBY_BF16 || name == RT_AXPBY_F16) && args.len() == 6 {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
             let out = self.val(args[2]);
             let n = self.coerce_to_i64(args[3]);
             let a = self.val(args[4]);
             let b = self.val(args[5]);
-            let fref = self.rt_refs[RT_AXPBY_BF16];
+            let fref = self.rt_refs[name];
             self.builder.ins().call(fref, &[x, y, out, n, a, b]);
             return None;
         }
@@ -1064,6 +1065,7 @@ struct RtFuncs {
     dot_bf16: FuncId,
     sum_bf16: FuncId,
     reduce_bf16: FuncId,
+    axpby_f16: FuncId,
     dot_f16: FuncId,
     sum_f16: FuncId,
     reduce_f16: FuncId,
@@ -1330,7 +1332,10 @@ fn populate_module<M: Module>(
         reduce_bf16: module
             .declare_function(RT_REDUCE_BF16, Linkage::Import, &sig_reduce_bf16)
             .map_err(|e| e.to_string())?,
-        // f16 reductions reuse the bf16 signatures (same shapes; only the kernel's widen differs).
+        // f16 streaming/reductions reuse the bf16 signatures (same shapes; only the widen differs).
+        axpby_f16: module
+            .declare_function(RT_AXPBY_F16, Linkage::Import, &sig_axpby_bf16)
+            .map_err(|e| e.to_string())?,
         dot_f16: module
             .declare_function(RT_DOT_F16, Linkage::Import, &sig_dot_bf16)
             .map_err(|e| e.to_string())?,
@@ -1483,6 +1488,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_REDUCE_BF16,
                 module.declare_func_in_func(rt.reduce_bf16, builder.func),
+            );
+            rt_refs.insert(
+                RT_AXPBY_F16,
+                module.declare_func_in_func(rt.axpby_f16, builder.func),
             );
             rt_refs.insert(
                 RT_DOT_F16,
@@ -1683,6 +1692,10 @@ pub fn jit_compile(
         RT_REDUCE_BF16,
         mercury_runtime::mercury_reduce_bf16 as *const u8,
     );
+    builder.symbol(
+        RT_AXPBY_F16,
+        mercury_runtime::mercury_axpby_f16 as *const u8,
+    );
     builder.symbol(RT_DOT_F16, mercury_runtime::mercury_dot_f16 as *const u8);
     builder.symbol(RT_SUM_F16, mercury_runtime::mercury_sum_f16 as *const u8);
     builder.symbol(
@@ -1834,6 +1847,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_REDUCE_BF16,
         mercury_runtime::mercury_reduce_bf16 as *const u8,
+    );
+    builder.symbol(
+        RT_AXPBY_F16,
+        mercury_runtime::mercury_axpby_f16 as *const u8,
     );
     builder.symbol(RT_DOT_F16, mercury_runtime::mercury_dot_f16 as *const u8);
     builder.symbol(RT_SUM_F16, mercury_runtime::mercury_sum_f16 as *const u8);

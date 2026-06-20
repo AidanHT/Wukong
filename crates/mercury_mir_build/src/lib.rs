@@ -61,6 +61,7 @@ pub fn lower_program(
         sum_f16: interner.intern("mercury_sum_f16"),
         reduce_f16: interner.intern("mercury_reduce_f16"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
+        axpby_f16: interner.intern("mercury_axpby_f16"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -512,6 +513,8 @@ struct GemmSyms {
     /// `mercury_axpby_bf16(x, y, out, n, a, b)` — bf16→f32 streaming axpby (`out = a*x + b*y`, bf16
     /// inputs, f32 output, f32 math). The mixed-precision elementwise twin of the f32 streaming kernel.
     axpby_bf16: Symbol,
+    /// `mercury_axpby_f16` — the F16C twin of `axpby_bf16` (f16 inputs widened with `vcvtph2ps`).
+    axpby_f16: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2385,11 +2388,11 @@ impl FnLowerer<'_> {
     /// `0*inf=NaN` the source never has — and the interp==native gate, both calling the same kernel,
     /// would not catch it). Returns `(out, x, y, a_coef?, b_coef?)`, where a `None` coef means literal 1.
     #[allow(clippy::type_complexity)]
-    fn match_bf16_axpby<'b>(
+    fn match_lowp_axpby<'b>(
         &self,
         body: &'b Block,
         k: Symbol,
-    ) -> Option<(Symbol, Symbol, Symbol, Option<&'b Expr>, Option<&'b Expr>)> {
+    ) -> Option<(Symbol, Symbol, Symbol, Option<&'b Expr>, Option<&'b Expr>, bool)> {
         if body.tail.is_some() || body.stmts.len() != 1 {
             return None;
         }
@@ -2412,8 +2415,8 @@ impl FnLowerer<'_> {
             return None;
         }
         let out = single_path(base)?;
-        // `(arr[k] as f32)` with arr bf16, indexed exactly by k → arr symbol.
-        let bf16_load = |e: &Expr| -> Option<Symbol> {
+        // `(arr[k] as f32)` with arr `[bf16]`/`[f16]`, indexed exactly by k → (arr symbol, is_f16).
+        let lowp_load = |e: &Expr| -> Option<(Symbol, bool)> {
             let ExprKind::Cast { expr: inner, .. } = &e.kind else {
                 return None;
             };
@@ -2426,15 +2429,17 @@ impl FnLowerer<'_> {
             if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
                 return None;
             }
-            if scalar_of(inner, self.sema) != Some(mercury_types::Scalar::Bf16) {
-                return None;
-            }
-            single_path(base)
+            let is_f16 = match scalar_of(inner, self.sema) {
+                Some(mercury_types::Scalar::Bf16) => false,
+                Some(mercury_types::Scalar::F16) => true,
+                _ => return None,
+            };
+            Some((single_path(base)?, is_f16))
         };
-        // One additive term → (coef?, arr). `coef * load` (either factor order) or a bare `load`.
-        let term = |e: &'b Expr| -> Option<(Option<&'b Expr>, Symbol)> {
-            if let Some(arr) = bf16_load(e) {
-                return Some((None, arr));
+        // One additive term → (coef?, arr, is_f16). `coef * load` (either factor order) or a bare load.
+        let term = |e: &'b Expr| -> Option<(Option<&'b Expr>, Symbol, bool)> {
+            if let Some((arr, f16)) = lowp_load(e) {
+                return Some((None, arr, f16));
             }
             let ExprKind::Binary {
                 op: ast::BinOp::Mul,
@@ -2444,14 +2449,14 @@ impl FnLowerer<'_> {
             else {
                 return None;
             };
-            if let Some(arr) = bf16_load(rhs) {
+            if let Some((arr, f16)) = lowp_load(rhs) {
                 if !expr_uses_sym(lhs, k) {
-                    return Some((Some(lhs.as_ref()), arr));
+                    return Some((Some(lhs.as_ref()), arr, f16));
                 }
             }
-            if let Some(arr) = bf16_load(lhs) {
+            if let Some((arr, f16)) = lowp_load(lhs) {
                 if !expr_uses_sym(rhs, k) {
-                    return Some((Some(rhs.as_ref()), arr));
+                    return Some((Some(rhs.as_ref()), arr, f16));
                 }
             }
             None
@@ -2464,9 +2469,13 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let (a, x) = term(lhs)?;
-        let (b, y) = term(rhs)?;
-        Some((out, x, y, a, b))
+        let (a, x, xf) = term(lhs)?;
+        let (b, y, yf) = term(rhs)?;
+        // Both inputs must be the same precision (one kernel widens one width).
+        if xf != yf {
+            return None;
+        }
+        Some((out, x, y, a, b, xf))
     }
 
     /// Lower a recognized bf16→f32 axpby `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as f32) }`
@@ -2494,7 +2503,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let Some((out, x, y, a_expr, b_expr)) = self.match_bf16_axpby(body, *k) else {
+        let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, *k) else {
             return false;
         };
         let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
@@ -2521,7 +2530,11 @@ impl FnLowerer<'_> {
         let n = self.lower_expr(end);
         let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
         self.builder.build_void(Op::Call {
-            func: self.gemm.axpby_bf16,
+            func: if is_f16 {
+                self.gemm.axpby_f16
+            } else {
+                self.gemm.axpby_bf16
+            },
             args: vec![xv, yv, outv, n, av, bv],
         });
         true

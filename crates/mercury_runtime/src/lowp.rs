@@ -448,6 +448,59 @@ pub unsafe extern "C" fn mercury_axpby_bf16(
     axpby_bf16_scalar(Half::Bf16, x, y, out, a, b);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn axpby_f16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) {
+    let n = out.len();
+    let chunks = n / 8;
+    let av = _mm256_set1_ps(a);
+    let bv = _mm256_set1_ps(b);
+    for c in 0..chunks {
+        let xw = widen_f16(x.as_ptr().add(c * 8)); // F16C vcvtph2ps
+        let yw = widen_f16(y.as_ptr().add(c * 8));
+        let t = _mm256_mul_ps(av, xw);
+        let r = _mm256_fmadd_ps(bv, yw, t); // b·yw + a·xw, same op order as the scalar twin
+        _mm256_storeu_ps(out.as_mut_ptr().add(c * 8), r);
+    }
+    for i in chunks * 8..n {
+        let xw = f16_to_f32(x[i]);
+        let yw = f16_to_f32(y[i]);
+        out[i] = b.mul_add(yw, a * xw);
+    }
+}
+
+/// `out[i] = a·widen(x[i]) + b·widen(y[i])` over `n` **IEEE-f16** inputs with an **f32 output** — the
+/// F16C twin of [`mercury_axpby_bf16`] (widens with `vcvtph2ps`). 8 bytes/elem vs an all-f32 axpby's
+/// 12; the only rounding is the f32 math, identical in the AVX2 and scalar paths (twin-tested).
+///
+/// # Safety
+/// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_axpby_f16(
+    x: *const u16,
+    y: *const u16,
+    out: *mut f32,
+    n: i64,
+    a: f32,
+    b: f32,
+) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    let x = std::slice::from_raw_parts(x, n);
+    let y = std::slice::from_raw_parts(y, n);
+    let out = std::slice::from_raw_parts_mut(out, n);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+    {
+        return axpby_f16_avx(x, y, out, a, b);
+    }
+    axpby_bf16_scalar(Half::F16, x, y, out, a, b);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,25 +600,43 @@ mod tests {
     }
 
     #[test]
-    fn axpby_bf16_simd_equals_scalar_twin() {
+    fn axpby_lowp_simd_equals_scalar_twin() {
         for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
             let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011 - 2.3).sin()).collect();
             let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017 + 0.9).cos()).collect();
-            let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
-            let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
             let (a, b) = (1.5f32, -0.75f32);
-            let mut got = vec![0f32; n];
-            unsafe {
-                mercury_axpby_bf16(xbf.as_ptr(), ybf.as_ptr(), got.as_mut_ptr(), n as i64, a, b);
-            }
-            let mut want = vec![0f32; n];
-            axpby_bf16_scalar(Half::Bf16, &xbf, &ybf, &mut want, a, b);
-            for i in 0..n {
-                assert_eq!(
-                    got[i].to_bits(),
-                    want[i].to_bits(),
-                    "axpby_bf16 n={n} i={i}"
-                );
+            for (kind, conv) in [
+                (Half::Bf16, bf16_bits as fn(f32) -> u16),
+                (Half::F16, f16_bits as fn(f32) -> u16),
+            ] {
+                let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
+                let yb: Vec<u16> = ys.iter().map(|&v| conv(v)).collect();
+                let mut got = vec![0f32; n];
+                unsafe {
+                    match kind {
+                        Half::Bf16 => mercury_axpby_bf16(
+                            xb.as_ptr(),
+                            yb.as_ptr(),
+                            got.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        ),
+                        Half::F16 => mercury_axpby_f16(
+                            xb.as_ptr(),
+                            yb.as_ptr(),
+                            got.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        ),
+                    }
+                }
+                let mut want = vec![0f32; n];
+                axpby_bf16_scalar(kind, &xb, &yb, &mut want, a, b);
+                for i in 0..n {
+                    assert_eq!(got[i].to_bits(), want[i].to_bits(), "axpby n={n} i={i}");
+                }
             }
         }
     }
