@@ -2104,6 +2104,42 @@ fn kernels() -> Vec<Kernel> {
                  *out.add(i)=s*y; }",
             ),
         },
+        // Comprehensive vectorized elementwise math: base-2 exp/log (FlashAttention-2 base-2 softmax,
+        // quantization bit-width, entropy in bits) and hyperbolic sinh/cosh. Mercury dispatches each to
+        // the 256-bit `mercury_vmath_f32`; C/Rust call scalar libm `exp2f`/`log2f`/`sinhf`/`coshf` and
+        // cannot vectorize the call — the same compute-bound win as `exp`.
+        Kernel {
+            name: "exp2",
+            bytes_per_call: 2 * N * 4,
+            note: "out = exp2(x) = 2^x: 256-bit AVX2 (exp(x·ln2)) vs scalar libm exp2f",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = exp2(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=exp2f(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).exp2(); }"),
+        },
+        Kernel {
+            name: "log2",
+            bytes_per_call: 2 * N * 4,
+            note: "out = log2(x): 256-bit AVX2 (log(x)·log2e) vs scalar libm log2f",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = log2(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=log2f(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).log2(); }"),
+        },
+        Kernel {
+            name: "sinh",
+            bytes_per_call: 2 * N * 4,
+            note: "out = sinh(x) = (e^x - e^-x)/2: 256-bit AVX2 vs scalar libm sinhf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = sinh(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=sinhf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).sinh(); }"),
+        },
+        Kernel {
+            name: "cosh",
+            bytes_per_call: 2 * N * 4,
+            note: "out = cosh(x) = (e^x + e^-x)/2: 256-bit AVX2 vs scalar libm coshf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = cosh(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=coshf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).cosh(); }"),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
