@@ -2161,6 +2161,16 @@ fn kernels() -> Vec<Kernel> {
             c: c_kernel("for(long i=0;i<N;i++) out[i]=acoshf(x[i]);"),
             rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).acosh(); }"),
         },
+        // atan (all-real) — Cephes 3-region reduction + degree-3 poly at 256-bit; C/Rust call scalar
+        // libm atanf and can't vectorize the call. Angle/geometry ops, atan2-style positional schemes.
+        Kernel {
+            name: "atan",
+            bytes_per_call: 2 * N * 4,
+            note: "out = atan(x): 256-bit AVX2 (Cephes) vs scalar libm atanf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = atan(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=atanf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).atan(); }"),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
