@@ -15,7 +15,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **`bf16` is real 2-byte storage** rounded to
   bf16 (round-to-nearest-even) on store and on `as bf16`, with `f32` compute; `f16` still promotes to
-  `f32`; `f64` is full.
+  `f32` on the CPU (its real low-precision path is the GPU's F16C/tensor cores); `f64` is full.
+- **bf16 mixed-precision reductions → SIMD dispatch**: a `s += (x[k] as f32) [* (y[k] as f32)]`
+  reduction over `[bf16; _]` arrays (bf16 storage, **f32 accumulate** — the standard ML contract) is
+  recognized and lowered to the `mercury_dot_bf16` / `mercury_sum_bf16` runtime kernels (widen bf16→f32,
+  8-lane f32 accumulate). A bandwidth win that grows as the working set spills L3: ~3.0–3.5× vs C for
+  dot, ~6–8× for sum (`tests/run/reduce_bf16.mer`; `differential_bf16_reduce` pins native==interp).
 - All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
@@ -98,6 +103,30 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   forwarding, DSE, and **loop-invariant code motion**. Guarded by an `-O0`-vs-`-O{1,2,3}` differential
   test and post-pass MIR verification; across the run suite and kernels it removes ~48% of IR ops
   (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0`.
+
+## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
+
+A third backend, `mercury_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
+it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
+toolkit** is needed to build or run, only the driver). Every transformer op category is a device
+kernel, each gated against a CPU reference by a **tolerance** differential (`c·√K·ε`, deterministic
+grids) — the CPU↔GPU analogue of the bit-exact CPU gate. Measured honestly on a power-capped 6 GB
+mobile 4050 (see `BENCHMARKS.md`):
+
+- **Tensor-core GEMM** (fp16/bf16/fp8 inputs, f32 accumulate): WMMA `m16n16k16` for fp16/bf16
+  (~9–13 TFLOP/s, ~5–6× the f32 path); **fp8 (E4M3)** via hand-laid `mma.sync.m16n8k32` (no WMMA fp8 on
+  `sm_89`), validated bit-exact but currently memory-bound below fp16 (fragment-reuse is future work).
+- **Fused flash-attention** (online softmax, never materializes the `S×S` scores — the kernel that
+  *loses* on CPU): warp-per-query-row, 183→372 GFLOP/s as context grows to 4 K.
+- **Fused row norms** (softmax/LayerNorm/RMSNorm, one warp per row), **activations** (SFU), **reductions**
+  (deterministic; max bit-exact), **conv2d**, and elementwise.
+- **A whole pre-norm transformer layer runs end-to-end GPU-resident** — RMSNorm → QKV → flash-attn →
+  output proj → residual → RMSNorm → FFN(SiLU) → residual, all on device buffers with no host round-trip
+  between ops, matching a CPU f64 reference to max_rel 2.7e-4 and **deterministic** run-to-run.
+
+Run with `cargo test -p mercury_codegen_gpu --features gpu` (skips cleanly with no GPU). A
+`--backend=gpu` CLI flag that offloads recognized ops through the driver is the next integration step;
+today the GPU path is exercised through the crate's host API + tests.
 
 ## Checked but not yet executed
 

@@ -55,11 +55,17 @@ source.mer
 - `mercury_opt` — pass manager, CFG/dominator analyses, and SSA MIR transforms.
 - `mercury_backend` — `Backend` trait + `Artifact` enum: the MIR-to-execution/emission seam.
 - `mercury_interp` — zero-dep tree-walking MIR interpreter; default backend and differential oracle.
+- `mercury_codegen_cranelift` — native backend via Cranelift (no LLVM): JIT + object/exe; the fast path.
 - `mercury_codegen_llvm` — LLVM backend: lowers MIR to textual LLVM IR.
-- `mercury_runtime` — minimal runtime: bump arena allocator and sequential `parallel_for`.
+- `mercury_codegen_gpu` — GPU backend (behind `--features gpu`): emits PTX + driver-JIT via `cudarc`
+  (no CUDA toolkit); tensor-core GEMM (fp16/bf16/fp8), fused flash-attention, norms, conv, and a whole
+  transformer layer GPU-resident on the RTX 4050. CPU↔GPU gate is a `c·√K·ε` tolerance differential.
+- `mercury_runtime` — minimal runtime: arena, `parallel_for`, and the AVX2/FMA microkernels (GEMM,
+  vmath, reductions, norms, int8 GEMM, **bf16/f16 reductions** — the symbols recognizers dispatch to).
 - `mercury_driver` — orchestrates the compile pipeline; owns SourceMap/Interner and honors `--emit`.
 - `mercuryc` — CLI binary parsing args and delegating compilation to `mercury_driver`.
 - `mercury_bench` — benchmark harness: optimizer effectiveness, interpreter timing, equivalence gate.
+- `mercury_xbench` — cross-language benchmark: Mercury vs C vs Rust (see `BENCHMARKS.md`).
 
 Dependencies flow strictly downward (no cycles); every crate is prefixed `mercury_` (binary is `mercuryc`).
 
