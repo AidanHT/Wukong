@@ -1744,6 +1744,103 @@ mod tests {
         });
     }
 
+    /// **The honest three-tier GPU scoreboard for fp16 GEMM** — the Phase-0 payoff. Mercury's
+    /// tensor-core GEMM measured *same-run, same buffers* against the only peers that mean anything on
+    /// a GPU: NVIDIA's hand-tuned **cuBLAS** (Tier B, the gold standard — Mercury is reported as a % of
+    /// it) and a **naive CUDA-C** kernel compiled by NVRTC (Tier A — the literal "beat the C a
+    /// programmer writes," the GPU twin of beating scalar CPU-C). No Mercury-GPU-vs-CPU-C comparison
+    /// appears anywhere; that would only prove a GPU beats a CPU (GPU plan §1).
+    ///
+    /// Correctness gates speed (the first law): both peers are first cross-checked against the f64 CPU
+    /// reference at a small shape, and at each timing shape all three implementations' output checksums
+    /// must agree — a fast-but-wrong kernel never scores. Requires the redist DLLs on PATH; skips
+    /// (never fails) if they are absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture gemm_vs_peers`
+    /// with `tools/cuda-redist/nvidia/{cuda_nvrtc,cublas}/bin` prepended to PATH.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn gemm_vs_peers() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16, gemm_flop, nvrtc_naive_gemm_nt, peer_env_hint, peers_available,
+            time_cublas_gemm_nt_f16, time_nvrtc_naive_gemm_nt,
+        };
+        use half::f16;
+        with_gpu("gemm_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] gemm_vs_peers: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+
+            // --- Correctness first: both peers must match the f64 oracle at a small shape. ---
+            let mut rng = crate::diff::Rng::new(0x9E3D);
+            for (m, k, n) in [(256usize, 256usize, 256usize), (250, 260, 270)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0); // n×k for C = A·Bᵀ
+                let r = ref_nt(&a, &b, m, k, n);
+                // cuBLAS here is f16-in/f16-out with f32 accumulate, so its error vs the f64 oracle is
+                // dominated by ~2^-11 fp16 *quantization* of inputs/output (roughly flat in K, since the
+                // sum itself is f32), not the √K accumulation growth — a ~2% rel / 5e-2 abs bound passes
+                // a correct fp16 GEMM comfortably yet still fails a transpose/index slip (off by ~100%).
+                let cub = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap();
+                crate::diff::assert_close(&format!("cuBLAS fp16 {m}x{k}x{n}"), &cub, &r, 5e-2, 2e-2);
+                let naive = nvrtc_naive_gemm_nt(g, &a, &b, m, k, n).unwrap();
+                let rel_f32 = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+                crate::diff::assert_close(&format!("naive CUDA-C {m}x{k}x{n}"), &naive, &r, 1e-3, rel_f32);
+            }
+            eprintln!("[gate] cuBLAS + naive CUDA-C both match the f64 oracle ✓");
+
+            // --- Speed: same-run fp16 GEMM, Mercury vs cuBLAS (Tier B) vs naive CUDA-C (Tier A). ---
+            let roof = wmma_roofline_f16(g, 4096, 2048, 5).unwrap();
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+
+                // Mercury fp16 WMMA fragment-reuse path (same kernel as tensorcore_roofline_pct).
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a16_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let (e16, c16) = wmma_pick("wmma_nt_f16", m, n);
+                let f16f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16).unwrap();
+                let s_merc = time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50);
+
+                // Peers (same buffers' worth of work). Naive is slow → fewer iters, still per-iter time.
+                let s_cub = time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap();
+                let naive_iters = if sz >= 4096 { 3 } else { 10 };
+                let s_naive = time_nvrtc_naive_gemm_nt(g, m, k, n, naive_iters).unwrap();
+
+                // Checksum cross-check at this shape: all three must compute the same matrix.
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_m = csum(&gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
+                let cs_c = csum(&cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
+                let cs_n = csum(&nvrtc_naive_gemm_nt(g, &a, &b, m, k, n).unwrap());
+                let agree = |x: f64, y: f64| (x - y).abs() / y.max(1.0) < 3e-2;
+                assert!(
+                    agree(cs_m, cs_n) && agree(cs_c, cs_n),
+                    "{sz}³ checksum disagreement: mercury={cs_m:.3e} cublas={cs_c:.3e} naive={cs_n:.3e}"
+                );
+
+                let (g_merc, g_cub, g_naive) = (flop / s_merc, flop / s_cub, flop / s_naive);
+                eprintln!(
+                    "\n{sz}³ fp16 GEMM (same-run):\n  \
+                     Mercury WMMA : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.1}× vs naive CUDA-C\n  \
+                     cuBLAS fp16  : {:>7.0} GFLOP/s  | gold standard      | {:>5.1}× vs naive CUDA-C\n  \
+                     naive CUDA-C : {:>7.0} GFLOP/s  | Tier-A baseline\n  \
+                     fp16 roofline: {:>7.0} GFLOP/s  | Mercury {:>4.1}% / cuBLAS {:>4.1}% of roof",
+                    g_merc / 1e9, 100.0 * g_merc / g_cub, g_merc / g_naive,
+                    g_cub / 1e9, g_cub / g_naive,
+                    g_naive / 1e9,
+                    roof / 1e9, 100.0 * g_merc / roof, 100.0 * g_cub / roof,
+                );
+            }
+        });
+    }
+
     /// The roofline microbench must JIT and run, returning a positive, plausible TC rate (sanity that
     /// the compute-bound kernel isn't dead-code-eliminated to ~0 or mis-issued). Not a tolerance gate.
     #[test]

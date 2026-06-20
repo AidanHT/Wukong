@@ -14,6 +14,9 @@
 pub const GPU_ENABLED: bool = cfg!(feature = "gpu");
 
 #[cfg(feature = "gpu")]
+pub mod baselines;
+
+#[cfg(feature = "gpu")]
 pub mod diff;
 
 #[cfg(feature = "gpu")]
