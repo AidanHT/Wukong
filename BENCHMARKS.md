@@ -413,19 +413,28 @@ is checked over the full output, and the GPU reductions/norms are deterministic 
 + warp-butterfly all-reduce). Measured on a **mobile RTX 4050** (Ada, 6 GB, **power-capped ~30–50 W** —
 far below a desktop/datacenter part), so the absolute TFLOP/s are honest for *this* GPU, not a 4090/H100.
 
-**Tensor-core GEMM (bf16/fp16 inputs, f32 accumulate)** — WMMA `m16n16k16`, fragment-reuse multi-tile:
+**Tensor-core GEMM (fp16/bf16/fp8 inputs, f32 accumulate).** fp16/bf16 use WMMA `m16n16k16`
+(fragment-reuse multi-tile); fp8 (E4M3) has no WMMA on `sm_89`, so it is the warp-level
+`mma.sync.m16n8k32` with the fragments placed by hand. GFLOP/s, two representative runs (absolute
+throughput **swings ~1.4× with the laptop's power/thermal state** — a cool/idle run and a warmer run):
 
-| size | f32 reg-blocked | fp16 tensor-core | bf16 tensor-core | TC speedup |
-|------|-----------------|------------------|------------------|------------|
-| 512³  | 1430 GFLOP/s | 8665 | 7039 | ~4.9–6.1× |
-| 1024³ | 2161 | 11736 | 12653 | ~5.4–5.9× |
-| 2048³ | 1973 | **12797** | 12253 | ~6.2–6.5× |
-| 4096³ | 1406 | 7752 | 7346 | ~5.2–5.5× |
+| size | f32 reg-blocked | fp16 TC | bf16 TC | fp8 TC | fp16 vs f32 |
+|------|-----------------|---------|---------|--------|-------------|
+| 512³  | 1.1–1.4 K | 7.6–8.7 K | 7.0–7.6 K | 4.5 K | ~5–7× |
+| 1024³ | 1.5–2.2 K | 9.2–11.7 K | 9.2–12.7 K | 5.2 K | ~5–6× |
+| 2048³ | 1.5–2.0 K | 8.9–**12.8 K** | 8.5–12.3 K | 5.6 K | ~6× |
+| 4096³ | 1.2–1.4 K | 7.7 K | 7.3–7.4 K | 6.5 K | ~5–6× |
 
-The Ada tensor cores hit **~12.8 TFLOP/s fp16 / ~12.7 TFLOP/s bf16** at 1–2 K — ~5–6× the f32
-register-blocked path on the same GPU — with f32 accumulation (the mixed-precision contract). The
-drop at 4096³ is the 6 GB card under memory pressure. f32-accumulate tolerance gates pass (fp16 ~2e-3
-rel, bf16 ~1e-2 rel, isolating accumulation error from input rounding).
+The Ada tensor cores hit **~9–13 TFLOP/s fp16/bf16** (clock-dependent) at 1–2 K — **~5–6× the f32
+register-blocked path** on the same GPU — with f32 accumulation (the mixed-precision contract). The
+f32-accumulate tolerance gates pass (fp16 ~2e-3 rel, bf16 ~1e-2 rel, fp8 vs e4m3-rounded inputs ~2e-3
+rel, isolating accumulation error from input rounding). **fp8 is correct but currently ~4.5–6.5
+TFLOP/s — *below* the tuned fp16/bf16 path**, because this fp8 kernel is the naive single-tile form
+(one 16×8 tile per warp, re-reads A/B from global each K-step, no fragment reuse or shared-mem
+staging) and so is memory-bound. The hard part — the manual `mma.sync` fp8 fragment layout on
+`sm_89` — is done and bit-exact (`max_abs=0` vs an asymmetric e4m3-exact reference); realizing fp8's
+~2× compute peak needs the same fragment-reuse/SMEM tiling the WMMA `_mt` kernel already has, which is
+documented future work.
 
 **Fused flash-attention** (online softmax, never materializes the `S×S` scores in HBM — the kernel
 that *lost* on CPU, where the tuned GEMM dominates) — warp-per-query-row, `d=64`:
@@ -525,11 +534,13 @@ skips cleanly with no GPU) and `… --release -- --ignored --nocapture` (through
   feature, not a FLOP/s win — so that path stays at f32; the reduction kernels are where bf16 pays.
 - **GPU backend (RTX 4050):** a PTX-emitting, driver-JIT GPU path (no CUDA toolkit) runs every
   transformer op category on-device, tolerance-gated. **Tensor-core GEMM** (fp16/bf16 in, f32
-  accumulate) hits **~12.8 TFLOP/s** — ~5–6× the f32 path on the same GPU; **fused flash-attention**
-  (online softmax, no `S²` scores in HBM) reaches **372 GFLOP/s** at 4 K context; and a **whole
-  pre-norm transformer layer runs end-to-end GPU-resident** (matching a CPU f64 reference to
-  max_rel 2.7e-4). Numbers are honest for a power-capped 6 GB mobile GPU, not a datacenter part —
-  see the GPU section above. The CPU↔GPU differential is a `c·√K·ε` tolerance over the full output.
+  accumulate) hits **~9–13 TFLOP/s** (clock-dependent) — ~5–6× the f32 path on the same GPU;
+  **fp8 (E4M3) via hand-laid `mma.sync` is validated bit-exact** but its naive single-tile kernel is
+  memory-bound (~4.5–6.5 TFLOP/s, below the tuned fp16 path — fragment-reuse is future work). **Fused
+  flash-attention** (online softmax, no `S²` scores in HBM) reaches **372 GFLOP/s** at 4 K context;
+  and a **whole pre-norm transformer layer runs end-to-end GPU-resident** (matching a CPU f64
+  reference to max_rel 2.7e-4, deterministic run-to-run). Numbers are honest for a power-capped 6 GB
+  mobile GPU, not a datacenter part. The CPU↔GPU differential is a `c·√K·ε` tolerance over the full output.
 - **Safety:** Mercury checks tensor **shapes at compile time** (in the type system), a class of bug
   C/C++/Rust-with-raw-pointers cannot catch.
 
