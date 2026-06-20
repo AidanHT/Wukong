@@ -25,7 +25,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   `nn.Linear`** (where naive C leaves the reduction latency-bound), the lead *growing with matrix
   size* as their version falls out of cache;
 - **wins the transcendental/activation family ~4–11.5×** — the cleanest compute-bound win. Mercury
-  dispatches a pure `out[i]=f(x[i])` loop for **34** functions (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/
+  dispatches a pure `out[i]=f(x[i])` loop for **35** functions (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/
   `silu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`
   — the transformer activations plus **RoPE**'s `sin`/`cos`, the inverse trig `atan`/`asin`/`acos`, the
   exact-GELU `erf`, the stable `expm1`/`log1p`/`logsigmoid`, and the hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where
@@ -34,7 +34,7 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   and **convolution** (im2col + GEMM) **~5–7×**;
 - **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~8× parallel**, and runs a full
   **bf16 *and* f16 mixed-precision CPU suite** — `dot`/`sum` (**~3–8×**), `max`/`min`/`absmax`
-  (the symmetric-quant scale), streaming `axpby`, and the 35-op activation set — all half-in/f32-out,
+  (the symmetric-quant scale), streaming `axpby`, and the 36-op activation set — all half-in/f32-out,
   where C/Rust can vectorize neither `libm` nor the half→f32 widen (f16 via the F16C `vcvtph2ps`);
 - **wins reductions ~2.6–3.6×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
   which gcc/rustc leave serial;

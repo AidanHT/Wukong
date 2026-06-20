@@ -52,7 +52,7 @@ naively-written source:
   accumulate/compute — the standard ML contract — dispatch to half-precision runtime kernels across the
   whole op surface, *symmetric* for both precisions: **`dot`/`sum`** (`mercury_{dot,sum}_{bf16,f16}`),
   **`max`/`min`/`absmax`** (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric-quant
-  scale), **streaming `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **35-op activation
+  scale), **streaming `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **36-op activation
   set** (`mercury_vmath_{bf16,f16}`). Because half precision moves **half the input bytes** of f32, the
   memory-bound ops are *bandwidth* wins that grow as the data spills cache: **~3.0–3.5× vs C** for dot,
   **~6–8×** for sum; and C/Rust can vectorize neither a `libm` call nor the half→f32 widen, so the
@@ -176,8 +176,8 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 ### Transcendentals / activations — Mercury dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
 The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
-Mercury recognizes a pure `out[i] = f(x[i])` loop for **34** functions —
-`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`expm1`/`log1p`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf`
+Mercury recognizes a pure `out[i] = f(x[i])` loop for **35** functions —
+`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf`
 plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh` — and lowers the whole
 loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same domain-aware dispatch
 as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a time; gcc/rustc call
@@ -220,8 +220,8 @@ than a bare `out[i]=f(x[i])` loop — still lowers to the inlined ≈1-ULP poly 
 | `expm1` | **~2.0× faster** | stable `eˣ−1` (Kahan) vs scalar `expm1f` — the family's most *modest* win, since the stable form computes **both** `exp` and `log` per element |
 | `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
-The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log`/`exp2`/`log2`/`exp10`/`log10` (≈1-ULP minimax polys),
-`pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`,
+The full elementwise math suite — `sqrt`/`rsqrt`/`cbrt` (root family), `exp`/`log`/`exp2`/`log2`/`exp10`/`log10` (≈1-ULP minimax polys),
+`pow` (= `exp(y·log(x))`), `atan2`/`hypot` (two-arg geometry), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`,
 the trig `sin`/`cos`/`tan`/`atan`/`asin`/`acos`, the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`, and `fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
 with `libm` within tolerance) and
 compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
@@ -380,7 +380,7 @@ instead of the bf16 `<<16`; f16 storage is bit-exact via shared `half`-crate shi
 x64 has no f16 convert lowering) and **extended across the op surface** for both precisions:
 **`max`/`min`/`absmax`** (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric int8
 quant scale; exact, since max/min round nothing), **streaming `axpby`** (`out = a·x + b·y`,
-half-in/f32-out, ~1.3× ≫ L3), and the **35-op activation set** (`mercury_vmath_{bf16,f16}`, where the
+half-in/f32-out, ~1.3× ≫ L3), and the **36-op activation set** (`mercury_vmath_{bf16,f16}`, where the
 cheap ops gain bandwidth and the transcendentals keep the full libm-vectorization win — C can vectorize
 neither the `libm` call nor the half→f32 widen). e2e: `tests/run/{f16,reduce_f16,reduce_bf16_minmax,
 vmath_{bf16,f16},axpby_f16}.mer`; all bit-exact interp == native.
@@ -565,7 +565,7 @@ abs on this box). A device error surfaces as an error, never a silent CPU fallba
   **bit-exact**, not a tolerance.
 - **Transcendentals / activations (exp, log, exp2, log2, exp10, log10, expm1, log1p, tanh, sigmoid, GELU, SiLU, ELU,
   leaky_relu, softplus, softsign, logsigmoid, mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, tan, atan, asin, acos, erf, and the
-  hyperbolic family sinh, cosh, asinh, acosh, atanh — 34 in all):** **~2–11.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
+  cbrt, hyperbolic family sinh, cosh, asinh, acosh, atanh — 35 in all):** **~2–13× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
   ≈1-ULP poly kernel** (`mercury_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
   `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff`/`asinhf` call. This is the transformer/vision activation family and the cleanest
   compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).
