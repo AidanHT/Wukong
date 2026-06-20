@@ -171,19 +171,23 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 
 The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
 Mercury recognizes a pure `out[i] = f(x[i])` loop for
-`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish` and lowers the whole
+`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`erf`
+and lowers the whole
 loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same domain-aware dispatch
 as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a time; gcc/rustc call
-scalar `libm` `expf`/`logf`/`tanhf` and **cannot vectorize a loop containing a call** (no `libmvec` on
+scalar `libm` `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff` and **cannot vectorize a loop containing a call** (no `libmvec` on
 this mingw toolchain), so they stay serial. `silu` (Llama/SwiGLU) and `gelu` (BERT/GPT-2/ViT, tanh
 approximation) are first-class intrinsics, as are `elu`, `leaky_relu`, `softplus` (= `ln(1+eˣ)`), and
-`mish` (= `x·tanh(softplus)`) — all composing the shared ≈1-ULP `exp`/`log`. The interpreter marshals
+`mish` (= `x·tanh(softplus)`) — all composing the shared ≈1-ULP `exp`/`log`. **`sin`/`cos`** (the
+rotary-position-embedding transcendentals in every modern LLM) and **`erf`** (the original BERT/GPT-2
+GELU's core) now dispatch to the 256-bit kernel too. The interpreter marshals
 through the *identical* kernel, so the differential oracle stays exact.
 
 This is the change that took the activations from a ~128-bit ~2.5–3.5× win to the ~5–7.5× range —
 **roughly double**, because they are compute-bound (~20 flops/element) and the missing 256 bits were
-the ceiling. (Composed/scalar `exp`/`erf`/`sin`/`cos` still lower to the inlined ≈1-ULP poly and
-auto-vectorize at 128-bit; `erf` gives the exact erf-GELU and `sin`/`cos` give RoPE.)
+the ceiling. (A *composed* `exp`/`erf`/`sin`/`cos` — one inside a larger arithmetic expression rather
+than a bare `out[i]=f(x[i])` loop — still lowers to the inlined ≈1-ULP poly and auto-vectorizes at
+128-bit; the dispatched 256-bit kernel mirrors that poly op-for-op, so the two agree.)
 
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
@@ -194,6 +198,9 @@ auto-vectorize at 128-bit; `erf` gives the exact erf-GELU and `sin`/`cos` give R
 | `silu` (swish) | **~3.6–5.8× faster** | `silu()` intrinsic (`x·sigmoid(x)`) → fused 256-bit kernel; C/Rust scalar |
 | `softplus` | **~6.6× faster** | `ln(1+eˣ)` (exp+log) → fused 256-bit kernel; also ~4× vs Rust |
 | `mish` | **~5.7× faster** | `x·tanh(softplus(x))`, three transcendentals — the heaviest, widest gap; ~6× vs Rust |
+| `sin` | **~6.0–8.6× faster** | RoPE; 256-bit Cephes `sinf` poly + quadrant reduction vs scalar `sinf` (heavier than `expf`, so the widest single-call gap) |
+| `cos` | **~6.0–8.2× faster** | RoPE; the cos branch of the same reduced-argument poly |
+| `erf` | **~3.9–4.9× faster** | exact (erf-based) GELU; 256-bit Abramowitz–Stegun poly vs scalar `erff` |
 | `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
 The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
@@ -362,8 +369,8 @@ wins:
 | kernel | Mercury vs C | notes |
 |--------|--------------|-------|
 | saxpy  | **~1.25–1.45× faster** | `velem` 256-bit + non-temporal store (3-stream, spills L3) — Rust ~1.4× behind too |
-| relu   | ≈tie (~1.0×) | 2-stream, L3-resident at N=2²⁰ so stores stay cacheable; the win shows at >L3 (below) |
-| poly   | **~1.1–1.2× faster** | `vhorner` 4×-unrolled AVX2 Horner; **ties Rust's autovec** (both ~43 GB/s) |
+| relu   | ≈tie (~1.0×) | 2-stream, L3-resident at N=2²⁰ so stores stay cacheable; both are bandwidth-bound (an [identity-affine fast path](crates/mercury_runtime/src/velem.rs) drops the wasted `fma(1·x+0)` so it no longer trails gcc); the win shows at >L3 (~1.4×, below) |
+| poly   | **~1.1–1.2× faster** | `vhorner` AVX2 Horner, **six** independent chains (was four — a 5-deep dependent FMA chain needs ~8 in flight to fill both ports); now a consistent win over gcc's own 256-bit autovec where four chains only tied |
 | fused linear→relu | ≈tie (±10%, clock-dependent) | matvec-bound (M=1) at the bandwidth wall; Mercury fuses the two source loops |
 | dot    | **~2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
 | ssd (Σ(x−y)²) | **~2.6–2.9× faster** | same — an L2-loss reduction |
@@ -530,10 +537,12 @@ abs on this box). A device error surfaces as an error, never a silent CPU fallba
   Rust runs essentially scalar here (~5–12× behind). Integer math makes the cross-language check
   **bit-exact**, not a tolerance.
 - **Transcendentals / activations (exp, log, tanh, sigmoid, GELU, SiLU, ELU, leaky_relu, softplus,
-  mish, SELU, tanhshrink, hardsigmoid, hardswish — 15 in all):** **~5–7.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
+  mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, erf — 18 in all):** **~4–8.6× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
   ≈1-ULP poly kernel** (`mercury_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
-  `expf`/`logf`/`tanhf` call. This is the transformer/vision activation family and the cleanest
+  `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff` call. This is the transformer/vision activation family and the cleanest
   compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).
+  `sin`/`cos` (the **RoPE** rotary-embedding transcendentals) win the most (~6–8.6×) — `libm`'s
+  `sinf`/`cosf` are heavier than `expf` — and `erf` gives the exact BERT/GPT-2 GELU.
   All of them are first-class intrinsics composing the shared ≈1-ULP `exp`/`log` (e.g.
   `softplus = ln(1+eˣ)`, `mish = x·tanh(softplus)`), so the whole family is exact and bit-identical
   across backends; an `@parallel` activation runs multicore × 256-bit (~28×); log-softmax /
