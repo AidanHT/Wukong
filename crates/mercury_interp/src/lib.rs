@@ -1115,6 +1115,51 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 Ok(Value::Float(r as f64))
             }
+            // `mercury_axpby_bf16(x, y, out, n, a, b)` — the bf16→f32 streaming axpby a recognized
+            // `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` map over `[bf16; _]` inputs (f32 output)
+            // lowers to. Reconstruct the bf16 input bits exactly (as the reductions do), call the
+            // identical kernel, write the f32 result back — so the differential gate stays exact.
+            "mercury_axpby_bf16" => {
+                let x = ptr(args[0])?;
+                let y = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let n = args[3].as_int() as usize;
+                let a = args[4].as_float() as f32;
+                let b = args[5].as_float() as f32;
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    Ok(mercury_runtime::f32_to_bf16_bits(
+                        self.memory
+                            .get(idx + t)
+                            .ok_or("bf16 axpby operand out of bounds")?
+                            .as_float() as f32,
+                    ))
+                };
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(bits(x, t)?);
+                    ybuf.push(bits(y, t)?);
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/ybuf are n u16, obuf is n f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_axpby_bf16(
+                        xbuf.as_ptr(),
+                        ybuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        n as i64,
+                        a,
+                        b,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("bf16 axpby output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)` — the fused row-wise
             // softmax / LayerNorm / RMSNorm kernel a recognized multi-pass norm lowers to. Marshal the
             // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel
