@@ -53,6 +53,7 @@ pub fn lower_program(
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
+        axpby_bf16: interner.intern("mercury_axpby_bf16"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -480,6 +481,9 @@ struct GemmSyms {
     /// exception, like the f32 reduction kernel).
     dot_bf16: Symbol,
     sum_bf16: Symbol,
+    /// `mercury_axpby_bf16(x, y, out, n, a, b)` — bf16→f32 streaming axpby (`out = a*x + b*y`, bf16
+    /// inputs, f32 output, f32 math). The mixed-precision elementwise twin of the f32 streaming kernel.
+    axpby_bf16: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2268,6 +2272,155 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Pure recognizer for a **bf16→f32 axpby** body `out[k] = A + B` where each of `A`, `B` is either
+    /// `(arr[k] as f32)` (coefficient 1) or `coef * (arr[k] as f32)` with `coef` loop-invariant — i.e.
+    /// `out[k] = a*(x[k] as f32) + b*(y[k] as f32)`, the mixed-precision saxpy/axpby (bf16 inputs, f32
+    /// output). Requires **two** additive terms (a 1-term scale `a*x[k]` would force `b=0, y=x` and a
+    /// `0*inf=NaN` the source never has — and the interp==native gate, both calling the same kernel,
+    /// would not catch it). Returns `(out, x, y, a_coef?, b_coef?)`, where a `None` coef means literal 1.
+    #[allow(clippy::type_complexity)]
+    fn match_bf16_axpby<'b>(
+        &self,
+        body: &'b Block,
+        k: Symbol,
+    ) -> Option<(Symbol, Symbol, Symbol, Option<&'b Expr>, Option<&'b Expr>)> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        // Target is `out[k]` with `out` an f32 array indexed exactly by k.
+        let ExprKind::Index { base, indices } = &target.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        let out = single_path(base)?;
+        // `(arr[k] as f32)` with arr bf16, indexed exactly by k → arr symbol.
+        let bf16_load = |e: &Expr| -> Option<Symbol> {
+            let ExprKind::Cast { expr: inner, .. } = &e.kind else {
+                return None;
+            };
+            if scalar_of(e, self.sema) != Some(mercury_types::Scalar::F32) {
+                return None;
+            }
+            let ExprKind::Index { base, indices } = &inner.kind else {
+                return None;
+            };
+            if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+                return None;
+            }
+            if scalar_of(inner, self.sema) != Some(mercury_types::Scalar::Bf16) {
+                return None;
+            }
+            single_path(base)
+        };
+        // One additive term → (coef?, arr). `coef * load` (either factor order) or a bare `load`.
+        let term = |e: &'b Expr| -> Option<(Option<&'b Expr>, Symbol)> {
+            if let Some(arr) = bf16_load(e) {
+                return Some((None, arr));
+            }
+            let ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } = &e.kind
+            else {
+                return None;
+            };
+            if let Some(arr) = bf16_load(rhs) {
+                if !expr_uses_sym(lhs, k) {
+                    return Some((Some(lhs.as_ref()), arr));
+                }
+            }
+            if let Some(arr) = bf16_load(lhs) {
+                if !expr_uses_sym(rhs, k) {
+                    return Some((Some(rhs.as_ref()), arr));
+                }
+            }
+            None
+        };
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let (a, x) = term(lhs)?;
+        let (b, y) = term(rhs)?;
+        Some((out, x, y, a, b))
+    }
+
+    /// Lower a recognized bf16→f32 axpby `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as f32) }`
+    /// to one `mercury_axpby_bf16(x, y, out, n, a, b)` call (bf16 in, f32 out, f32 math). Half-width
+    /// inputs ⇒ ~1.5× the streamed bytes saved vs the f32 kernel. Both backends marshal the identical
+    /// kernel, so the differential gate stays exact. Falls back unless the range is `0..n` and out / x /
+    /// y are in scope.
+    fn try_emit_bf16_axpby(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((out, x, y, a_expr, b_expr)) = self.match_bf16_axpby(body, *k) else {
+            return false;
+        };
+        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
+            (self.lookup(out), self.lookup(x), self.lookup(y))
+        else {
+            return false;
+        };
+        // Coefficients: lower the invariant expr (coerced to f32), or a literal 1.0 when implicit.
+        let mut coef = |e: Option<&Expr>| -> ValueId {
+            match e {
+                Some(e) => {
+                    let ty = self.expr_mir(e);
+                    let v = self.lower_expr(e);
+                    self.coerce_to(v, &ty, &MirType::F32, true)
+                }
+                None => self
+                    .builder
+                    .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
+            }
+        };
+        let av = coef(a_expr);
+        let bv = coef(b_expr);
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        self.builder.build_void(Op::Call {
+            func: self.gemm.axpby_bf16,
+            args: vec![xv, yv, outv, n, av, bv],
+        });
+        true
+    }
+
     /// Lower a recognized bf16 reduction `for k in 0..n { s += (x[k] as f32) [* (y[k] as f32)] }` to
     /// `s = s + mercury_dot_bf16(x, y, n)` (or `mercury_sum_bf16(x, n)`). The kernel widens bf16→f32
     /// and accumulates in f32; the interpreter marshals the identical kernel (reconstructing the bf16
@@ -2424,6 +2577,12 @@ impl FnLowerer<'_> {
         // accumulate). bf16 storage is bit-exact across interp/native and both call the identical
         // kernel, so the differential gate stays exact (a reassociation exception, like the f32 path).
         if self.try_emit_lowp_reduction(pat, iter, body) {
+            return;
+        }
+        // A bf16 mixed-precision elementwise `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as
+        // f32) }` (bf16 inputs, f32 output) dispatches to the streaming axpby kernel — half-width
+        // inputs, so ~1.5× the bytes saved on this memory-bound shape. Same exact-gate rationale.
+        if self.try_emit_bf16_axpby(pat, iter, body) {
             return;
         }
         // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the

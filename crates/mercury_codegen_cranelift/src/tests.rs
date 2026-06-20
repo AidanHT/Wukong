@@ -593,6 +593,67 @@ fn differential_bf16_reduce() {
     );
 }
 
+/// The bf16→f32 streaming axpby `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` must dispatch to
+/// `mercury_axpby_bf16` (bf16 in, f32 out, f32 math) and stay native==interp across opt levels (both
+/// marshal the identical kernel). A 1-term scale must NOT dispatch (it would force a `0*y` the source
+/// lacks). Golden small-integer case pins the value.
+#[test]
+fn differential_bf16_axpby() {
+    let axpby = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } }";
+    assert!(
+        lowered_calls(axpby, "mercury_axpby_bf16"),
+        "bf16 axpby -> mercury_axpby_bf16"
+    );
+    let saxpy = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = 3.0 * (x[k] as f32) + (y[k] as f32); } }";
+    assert!(
+        lowered_calls(saxpy, "mercury_axpby_bf16"),
+        "bf16 saxpy (implicit b=1) -> mercury_axpby_bf16"
+    );
+    let add = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = (x[k] as f32) + (y[k] as f32); } }";
+    assert!(
+        lowered_calls(add, "mercury_axpby_bf16"),
+        "bf16 add -> mercury_axpby_bf16"
+    );
+    // A 1-term scale has no second additive term, so it must decline (avoids a 0*inf the source lacks).
+    let scale = "module m\nfn ax(x:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = 2.0 * (x[k] as f32); } }";
+    assert!(
+        !lowered_calls(scale, "mercury_axpby_bf16"),
+        "1-term scale must not dispatch to the axpby kernel"
+    );
+
+    // native == interp across opt levels, fractional non-bf16-exact inputs.
+    let prog = "fn ax(x:[bf16;4096], y:[bf16;4096], o:[f32;4096]) { \
+         for k in 0..4096 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } } \
+         fn main() -> i32 { let mut x:[bf16;4096]=[0.0 as bf16;4096]; \
+         let mut y:[bf16;4096]=[0.0 as bf16;4096]; let mut o:[f32;4096]=[0.0;4096]; \
+         for i in 0..4096 { x[i]=((i as f32)*0.001) as bf16; y[i]=((i as f32)*0.002-1.3) as bf16; } \
+         ax(x,y,o); let mut s:f32=0.0; for t in 0..4096 { s = s + o[t]; } \
+         print((s*10.0) as i32); return 0; }";
+    for opt in [0u8, 2, 3] {
+        assert_eq!(
+            jit(prog, opt).expect("jit"),
+            interp(prog, opt).expect("interp"),
+            "bf16 axpby native vs interp mismatch at -O{opt}"
+        );
+    }
+    // Golden bf16-exact: o[k] = 2·(k+1) + 3·2 = 2(k+1)+6; Σ_{k=0..7} = 2·36 + 48 = 120.
+    let golden = "fn ax(x:[bf16;8], y:[bf16;8], o:[f32;8]) { \
+        for k in 0..8 { o[k] = 2.0*(x[k] as f32) + 3.0*(y[k] as f32); } } \
+        fn main() -> i32 { let mut x:[bf16;8]=[0.0 as bf16;8]; let mut y:[bf16;8]=[0.0 as bf16;8]; \
+        let mut o:[f32;8]=[0.0;8]; for i in 0..8 { x[i]=((i+1) as f32) as bf16; y[i]=2.0 as bf16; } \
+        ax(x,y,o); let mut s:f32=0.0; for t in 0..8 { s = s + o[t]; } print((s) as i32); return 0; }";
+    let (_, out) = jit(golden, 3).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "120\n",
+        "bf16 axpby produced the wrong value"
+    );
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.

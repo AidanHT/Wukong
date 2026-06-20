@@ -247,6 +247,69 @@ pub unsafe extern "C" fn mercury_dot_bf16(x: *const u16, y: *const u16, n: i64) 
     dot_scalar(Half::Bf16, x, y)
 }
 
+/// Scalar twin of the bf16→f32 axpby: `out[i] = a·widen(x[i]) + b·widen(y[i])`. The op order
+/// (`t = a·xw` then `fma(b, yw, t)`) is chosen to match the AVX2 path's `mul`+`fmadd` lane-for-lane,
+/// so SIMD == scalar bit-for-bit (the twin test pins this); it's also the no-AVX2 fallback.
+fn axpby_bf16_scalar(kind: Half, x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) {
+    for i in 0..out.len() {
+        let xw = kind.widen(x[i]);
+        let yw = kind.widen(y[i]);
+        out[i] = b.mul_add(yw, a * xw); // b·yw + a·xw, the same op order as the fmadd path
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpby_bf16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) {
+    let n = out.len();
+    let chunks = n / 8;
+    let av = _mm256_set1_ps(a);
+    let bv = _mm256_set1_ps(b);
+    for c in 0..chunks {
+        let xw = widen_bf16(x.as_ptr().add(c * 8));
+        let yw = widen_bf16(y.as_ptr().add(c * 8));
+        let t = _mm256_mul_ps(av, xw);
+        let r = _mm256_fmadd_ps(bv, yw, t); // b·yw + a·xw
+        _mm256_storeu_ps(out.as_mut_ptr().add(c * 8), r);
+    }
+    for i in chunks * 8..n {
+        let xw = bf16_bits_to_f32(x[i]);
+        let yw = bf16_bits_to_f32(y[i]);
+        out[i] = b.mul_add(yw, a * xw);
+    }
+}
+
+/// `out[i] = a·widen(x[i]) + b·widen(y[i])` over `n` **bf16** inputs (stored as `u16` bits) with an
+/// **f32 output** — the mixed-precision streaming elementwise (saxpy/axpby) twin of the f32
+/// `mercury_velem_f32`. bf16 in + f32 out streams 8 bytes/elem vs the f32 kernel's 12, so on a
+/// memory-bound elementwise it runs ~1.5× faster. Compute is f32 (widen is lossless), so the only
+/// rounding is the f32 math — identical in the AVX2 and scalar paths (twin-tested).
+///
+/// # Safety
+/// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_axpby_bf16(
+    x: *const u16,
+    y: *const u16,
+    out: *mut f32,
+    n: i64,
+    a: f32,
+    b: f32,
+) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    let x = std::slice::from_raw_parts(x, n);
+    let y = std::slice::from_raw_parts(y, n);
+    let out = std::slice::from_raw_parts_mut(out, n);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return axpby_bf16_avx(x, y, out, a, b);
+    }
+    axpby_bf16_scalar(Half::Bf16, x, y, out, a, b);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +355,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn axpby_bf16_simd_equals_scalar_twin() {
+        for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
+            let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011 - 2.3).sin()).collect();
+            let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017 + 0.9).cos()).collect();
+            let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+            let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+            let (a, b) = (1.5f32, -0.75f32);
+            let mut got = vec![0f32; n];
+            unsafe {
+                mercury_axpby_bf16(xbf.as_ptr(), ybf.as_ptr(), got.as_mut_ptr(), n as i64, a, b);
+            }
+            let mut want = vec![0f32; n];
+            axpby_bf16_scalar(Half::Bf16, &xbf, &ybf, &mut want, a, b);
+            for i in 0..n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "axpby_bf16 n={n} i={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn axpby_bf16_within_ulp_of_f64_reference() {
+        let n = 1 << 14;
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 89) as f32) * 0.03 - 1.0).collect();
+        let ys: Vec<f32> = (0..n).map(|i| ((i % 61) as f32) * 0.02 - 0.5).collect();
+        let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+        let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+        let (a, b) = (0.6f32, 1.3f32);
+        let mut got = vec![0f32; n];
+        unsafe {
+            mercury_axpby_bf16(xbf.as_ptr(), ybf.as_ptr(), got.as_mut_ptr(), n as i64, a, b);
+        }
+        // f64 reference over the SAME widened bf16 inputs (so this isolates the f32 math error).
+        let mut max_rel = 0.0f64;
+        for i in 0..n {
+            let r = a as f64 * bf16_bits_to_f32(xbf[i]) as f64
+                + b as f64 * bf16_bits_to_f32(ybf[i]) as f64;
+            let rel = (got[i] as f64 - r).abs() / r.abs().max(1.0);
+            max_rel = max_rel.max(rel);
+        }
+        assert!(max_rel < 1e-6, "axpby_bf16 rel {max_rel:.2e}");
     }
 
     /// Bandwidth win: a reduction over half-width inputs streams half the bytes, so for a working

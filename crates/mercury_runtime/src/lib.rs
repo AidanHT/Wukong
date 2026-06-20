@@ -34,7 +34,9 @@ mod i8gemm;
 pub use i8gemm::{mercury_i8gemm_nt, mercury_i8gemm_nt_parallel};
 
 mod lowp;
-pub use lowp::{mercury_dot_bf16, mercury_dot_f16, mercury_sum_bf16, mercury_sum_f16};
+pub use lowp::{
+    mercury_axpby_bf16, mercury_dot_bf16, mercury_dot_f16, mercury_sum_bf16, mercury_sum_f16,
+};
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
