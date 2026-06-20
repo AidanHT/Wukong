@@ -115,7 +115,9 @@ mobile 4050 (see `BENCHMARKS.md`):
 
 - **Tensor-core GEMM** (fp16/bf16/fp8 inputs, f32 accumulate): WMMA `m16n16k16` for fp16/bf16
   (~9–13 TFLOP/s, ~5–6× the f32 path); **fp8 (E4M3)** via hand-laid `mma.sync.m16n8k32` (no WMMA fp8 on
-  `sm_89`), validated bit-exact but currently memory-bound below fp16 (fragment-reuse is future work).
+  `sm_89`), validated bit-exact. Its fragment-reuse multi-tile kernel (`fp8_gemm_mt_ptx`, 2×4 block of
+  16×8 tiles per warp) is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and
+  ~1.3–2.3× fp16/bf16 in the same run (single-tile retained as the fallback for non-divisible shapes).
 - **Fused flash-attention** (online softmax, never materializes the `S×S` scores — the kernel that
   *loses* on CPU): warp-per-query-row, 183→372 GFLOP/s as context grows to 4 K.
 - **Fused row norms** (softmax/LayerNorm/RMSNorm, one warp per row), **activations** (SFU), **reductions**
