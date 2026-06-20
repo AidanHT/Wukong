@@ -20,18 +20,29 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   C/Rust+LLVM toolchain) — the metric that dominates real ML edit-run iteration;
 - **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
   `nn.Linear` `A·Bᵀ` form) and dispatches it to a tuned register-blocked, cache-tiled, packed
-  **AVX2/FMA** microkernel — **~2.4–3.5× faster single-thread and up to ~10× parallel** on plain
-  `C = A·B`, and **~19–70× on `nn.Linear`** (where naive C leaves the reduction latency-bound), the
-  lead *growing with matrix size* as their version falls out of cache;
-- **wins reductions ~2.6–2.8×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
+  **AVX2/FMA** microkernel — **~2.8–3.5× faster single-thread** (and **~1.3–1.7× over the tuned
+  `matrixmultiply` Rust crate**) **and up to ~20× parallel** on plain `C = A·B`, **~80–156× on
+  `nn.Linear`** (where naive C leaves the reduction latency-bound), the lead *growing with matrix
+  size* as their version falls out of cache;
+- **wins the transcendental/activation family ~4–8.6×** — the cleanest compute-bound win. Mercury
+  dispatches a pure `out[i]=f(x[i])` loop for **18** functions (`exp`/`log`/`tanh`/`sigmoid`/`gelu`/
+  `silu`/`softplus`/`mish`/`sin`/`cos`/`erf`/`exp2`/`log2`/`sinh`/`cosh`/… — the transformer activations
+  plus **RoPE**'s `sin`/`cos` and the exact-GELU `erf`) to a **256-bit AVX2 ≈1-ULP poly kernel**, where
+  gcc/rustc call scalar `libm` and **cannot vectorize a loop containing the call**;
+- **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form) **~1.7–6.7×**
+  and **convolution** (im2col + GEMM) **~5–7×**;
+- **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~8× parallel** and **bf16 reductions ~3–8×**;
+- **wins reductions ~2.6–3.6×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
   which gcc/rustc leave serial;
-- is **~1.8–7.6× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and
-  vectorizes the loop (bounded by aggregate memory bandwidth on these memory-bound kernels).
+- is **~1.8–26× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and
+  vectorizes the loop (bounded by aggregate memory bandwidth on the memory-bound kernels).
 
-Where Mercury *ties* is single-thread, memory-bandwidth-bound elementwise (saxpy/relu/poly) — the
-DRAM/cache wall every compiler hits. The general (non-GEMM) vectorizer emits 128-bit SSE (Cranelift
-cannot legalize a 256-bit `f32x8`), so width-sensitive elementwise matches rather than beats gcc's
-AVX; the width that matters most — the GEMM family — gets true AVX2/FMA via the runtime microkernel.
+The domain-aware paths (GEMM, the `vmath` transcendentals, the `velem` streaming elementwise, the
+fused norms) all emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — the width
+Cranelift's *general* vectorizer can't legalize (it caps at 128-bit `f32x4`). So even the
+memory-bandwidth-bound elementwise kernels are now small **wins** (saxpy ~1.3×, poly ~1.2×, widening
+to ~1.3–1.6× at realistic >L3 tensor sizes via non-temporal stores); the one honest **tie** left is
+`relu` at an L3-resident size, where both languages are pinned to the same cache bandwidth.
 
 Where Mercury is built to win for the ML/DL niche:
 
