@@ -1980,6 +1980,108 @@ mod tests {
         });
     }
 
+    /// **M12 — every GPU kernel is bit-identical run-to-run.** Mercury's kernels use fixed grids and
+    /// atomic-free, fixed-order reductions (warp-butterfly shuffles / a fixed ascending host combine),
+    /// so identical inputs yield identical *bits* every time — a contract cuBLAS does not offer (its
+    /// heuristically-selected algorithms and split-K atomic accumulation are reproducible only
+    /// incidentally, never guaranteed across shapes, library versions, or GPU architecture).
+    /// Reproducibility is load-bearing for regression gates, debugging, and regulated training. Here we
+    /// assert it directly across every kernel family that performs a reduction — the only place
+    /// nondeterminism could creep in; elementwise kernels are included for completeness. (The whole
+    /// fused layer is separately covered by `transformer_layer_matches_reference_within_tol`, and the
+    /// reductions by `reductions_match_reference_within_tol_and_are_deterministic`.)
+    #[test]
+    fn gpu_kernels_bit_reproducible() {
+        use mercury_runtime::{NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX, RED_DOT, RED_SUM, VM_GELU};
+        with_gpu("bit_reproducible", |g| {
+            let mut rng = crate::diff::Rng::new(0xD37E);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            // Run a kernel twice on identical inputs; the two outputs must be bitwise identical.
+            macro_rules! twice_eq {
+                ($label:literal, $call:expr) => {{
+                    let a = $call;
+                    let b = $call;
+                    assert_eq!(bits(&a), bits(&b), concat!($label, " must be bit-reproducible"));
+                }};
+            }
+
+            // GEMM — every WMMA variant (each C element accumulates K in a fixed per-thread order).
+            // 64-aligned M,N and 16-aligned K so the SMEM-staged variants accept the shape.
+            let (m, k, n) = (128usize, 96usize, 128usize);
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let bmat = rng.vec(n * k, -1.0, 1.0);
+            twice_eq!("gemm_nt_f16", gemm_nt_f16(g, &a, &bmat, m, k, n).unwrap());
+            twice_eq!("gemm_nt_f16_sm", gemm_nt_f16_sm(g, &a, &bmat, m, k, n).unwrap());
+            twice_eq!("gemm_nt_f16_sm_db", gemm_nt_f16_sm_db(g, &a, &bmat, m, k, n).unwrap());
+
+            // Fused row norms — one warp/row, shfl-butterfly reduction over a fixed lane order.
+            let (rows, cols) = (40usize, 128usize);
+            let xn = rng.vec(rows * cols, -3.0, 3.0);
+            for op in [NORM_SOFTMAX, NORM_LAYERNORM, NORM_RMSNORM] {
+                twice_eq!("norm", norm(g, op, &xn, rows, cols, 1e-5).unwrap());
+            }
+
+            // Flash-attention — online softmax streamed over K/V in fixed tile order.
+            let (seq, d) = (64usize, 64usize);
+            let q = rng.vec(seq * d, -1.0, 1.0);
+            let kk = rng.vec(seq * d, -1.0, 1.0);
+            let vv = rng.vec(seq * d, -1.0, 1.0);
+            twice_eq!("flash_attn", flash_attn(g, &q, &kk, &vv, seq, d, 0.125).unwrap());
+
+            // Conv2d — one thread/output, fixed C·R·S fma order.
+            let (c, h, wd, kc, r, s) = (3usize, 16usize, 16usize, 4usize, 3usize, 3usize);
+            let xc = rng.vec(c * h * wd, -1.0, 1.0);
+            let wc = rng.vec(kc * c * r * s, -1.0, 1.0);
+            twice_eq!("conv2d", conv2d(g, &xc, &wc, c, h, wd, kc, r, s).unwrap());
+
+            // Reductions — fixed grid + fixed ascending host combine.
+            let xr = rng.vec(1 << 16, 0.0, 1.0);
+            let yr = rng.vec(1 << 16, 0.0, 1.0);
+            twice_eq!("reduce_sum", vec![reduce(g, RED_SUM, &xr, None).unwrap()]);
+            twice_eq!("reduce_dot", vec![reduce(g, RED_DOT, &xr, Some(&yr)).unwrap()]);
+
+            // Elementwise — trivially deterministic, included for completeness.
+            twice_eq!("vmath_gelu", vmath(g, VM_GELU, &xr).unwrap());
+            twice_eq!("copy", copy(g, &xr).unwrap());
+
+            eprintln!("M12: all GPU kernel families bit-identical run-to-run ✓");
+        });
+    }
+
+    /// **M12 logged win — Mercury is reproducible where cuBLAS makes no such promise.** Asserts
+    /// Mercury's fp16 GEMM is bit-identical across three runs (guaranteed by construction), then logs
+    /// whether cuBLAS is too. cuBLAS may *happen* to be bit-stable for a fixed shape/version on a fixed
+    /// device, but NVIDIA documents no reproducibility contract across library versions, GPU
+    /// architectures, or its heuristic algorithm selection — so the *guarantee*, not the incidental
+    /// match, is the win. Needs the CUDA redist DLLs on PATH (see `gemm_vs_peers`); skips otherwise.
+    #[test]
+    #[ignore = "needs CUDA redist DLLs on PATH; run explicitly"]
+    fn reproducibility_vs_cublas() {
+        use crate::baselines::{cublas_gemm_nt_f16, peer_env_hint, peers_available};
+        with_gpu("repro_vs_cublas", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] reproducibility_vs_cublas: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0xC0FFEE);
+            let (m, k, n) = (1024usize, 1024usize, 1024usize);
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let b = rng.vec(n * k, -1.0, 1.0);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+            let mer: Vec<_> = (0..3).map(|_| gemm_nt_f16_sm_db(g, &a, &b, m, k, n).unwrap()).collect();
+            let mer_stable = bits(&mer[0]) == bits(&mer[1]) && bits(&mer[1]) == bits(&mer[2]);
+            assert!(mer_stable, "Mercury GEMM must be bit-identical run-to-run");
+
+            let cub: Vec<_> = (0..3).map(|_| cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap()).collect();
+            let cub_stable = bits(&cub[0]) == bits(&cub[1]) && bits(&cub[1]) == bits(&cub[2]);
+
+            eprintln!("reproducibility @ {m}³ fp16 (3 runs, same buffers):");
+            eprintln!("  Mercury: bit-identical = {mer_stable}  (GUARANTEED — fixed grid, no atomics, fixed K order)");
+            eprintln!("  cuBLAS : bit-identical = {cub_stable}  (incidental — no cross-version/arch/heuristic contract)");
+        });
+    }
+
     /// End-to-end latency of the GPU-resident transformer layer (full call: weights H2D + the kernel
     /// chain + result D2H). Reported as ms/layer and tokens/s. A real model keeps weights resident, so
     /// this is a conservative (transfer-inclusive) figure.
