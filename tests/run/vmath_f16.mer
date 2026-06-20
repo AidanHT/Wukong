@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2718
+// EXPECT-OUT: 1761
+// EXPECT-OUT: 1954
+// EXPECT-OUT: 841
+module tests.run.vmath_f16
+
+// The f16-input activation dispatch: `out[i] = f((x[i] as f32))` over a `[f16]` array (f32 output)
+// lowers to `mercury_vmath_f16` — the same 256-bit transcendental kernel as the f32/bf16 paths, but
+// the 8-lane load is F16C `vcvtph2ps` (lossless). interp marshals through the identical kernel.
+//
+// Inputs are multiples of 0.125 in [-4, 4) — all f16-exact — so widen(f16(x)) is exactly x and the
+// outputs match the f32 `vmath_dispatch`: exp(1)=2.718, silu(2)=1.761, gelu(2)=1.954, gelu(1)=0.841.
+fn main() -> i32 {
+    let mut x: [f16; 64] = [0.0 as f16; 64];
+    let mut e: [f32; 64] = [0.0; 64];
+    let mut s: [f32; 64] = [0.0; 64];
+    let mut g: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = ((i as f32 - 32.0) * 0.125) as f16; }
+
+    for i in 0..64 { e[i] = exp((x[i] as f32)); }
+    for i in 0..64 { s[i] = silu((x[i] as f32)); }
+    for i in 0..64 { g[i] = gelu((x[i] as f32)); }
+
+    print((e[40] * 1000.0) as i32);  // exp(1.0)
+    print((s[48] * 1000.0) as i32);  // silu(2.0)
+    print((g[48] * 1000.0) as i32);  // gelu(2.0)
+    print((g[40] * 1000.0) as i32);  // gelu(1.0)
+    return 0;
+}

@@ -44,6 +44,7 @@ pub fn lower_program(
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
         vmath_bf16: interner.intern("mercury_vmath_bf16"),
+        vmath_f16: interner.intern("mercury_vmath_f16"),
         velem: interner.intern("mercury_velem_f32"),
         vhorner: interner.intern("mercury_vhorner_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
@@ -454,6 +455,8 @@ struct GemmSyms {
     /// loop over a `[bf16]` array (f32 output) lowers to this — same 256-bit kernel, half the input
     /// bytes (a lossless widen), so the cheap memory-bound ops gain ~1.3× over the f32 path.
     vmath_bf16: Symbol,
+    /// The **f16-input** twin (`mercury_vmath_f16`): same as `vmath_bf16` but widens with F16C.
+    vmath_f16: Symbol,
     /// The streaming affine+activation kernel (`mercury_velem_f32(x, y, out, n, a, b, c, op)`): a
     /// recognized `out[i] = act(a·x[i] (+ b·y[i]) + c)` map loop (saxpy / scale / residual-add /
     /// bias / ReLU / ReLU6) lowers to this — 256-bit AVX2 + non-temporal stores for a large output.
@@ -2887,7 +2890,7 @@ impl FnLowerer<'_> {
 
     /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
     /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
-    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32, bool)> {
+    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32, MirType)> {
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -2945,16 +2948,20 @@ impl FnLowerer<'_> {
             return None;
         }
         let arg = &args[0];
-        // bf16-input form `f((x[j] as f32))`: x a `[bf16]` array, widened losslessly, out f32. Dispatch
-        // to `mercury_vmath_bf16` (half the input bytes). Require the out array f32 (the kernel stores
-        // f32 — never let an f32 store land in a 2-byte bf16 slot).
+        // bf16/f16-input form `f((x[j] as f32))`: x a `[bf16]`/`[f16]` array, widened losslessly, out
+        // f32. Dispatch to `mercury_vmath_{bf16,f16}` (half the input bytes). Require the out array f32
+        // (the kernel stores f32 — never let an f32 store land in a 2-byte slot).
         if let ExprKind::Cast { expr: inner, .. } = &arg.kind {
+            let in_elem = match scalar_of(inner, self.sema) {
+                Some(mercury_types::Scalar::Bf16) => MirType::BF16,
+                Some(mercury_types::Scalar::F16) => MirType::F16,
+                _ => return None,
+            };
             if self.expr_mir(target) == MirType::F32
                 && scalar_of(arg, self.sema) == Some(mercury_types::Scalar::F32)
-                && scalar_of(inner, self.sema) == Some(mercury_types::Scalar::Bf16)
             {
                 let x_sym = self.index_by_loopvar(inner, j)?;
-                return Some((out_sym, x_sym, opcode, true));
+                return Some((out_sym, x_sym, opcode, in_elem));
             }
             return None;
         }
@@ -2963,23 +2970,27 @@ impl FnLowerer<'_> {
             return None;
         }
         let x_sym = self.index_by_loopvar(arg, j)?;
-        Some((out_sym, x_sym, opcode, false))
+        Some((out_sym, x_sym, opcode, MirType::F32))
     }
 
     /// Match a transcendental-activation loop body: every statement must be an independent
     /// `out[j] = f(x[j])` over f32 (see [`match_vmath_stmt`]), with every array in scope. Returns the
     /// resolved `(out_base, x_base, op)` per statement, or `None` if any statement fails. Pure — emits
     /// no MIR — so it is safe to call before deciding whether to lower the loop bounds.
-    fn match_vmath_body(&self, j: Symbol, body: &Block) -> Option<Vec<(ValueId, ValueId, u32, bool)>> {
+    fn match_vmath_body(
+        &self,
+        j: Symbol,
+        body: &Block,
+    ) -> Option<Vec<(ValueId, ValueId, u32, MirType)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
-            let (out_sym, x_sym, opcode, is_bf16) = self.match_vmath_stmt(stmt, j)?;
+            let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j)?;
             let (out_base, _) = self.lookup(out_sym)?;
             let (x_base, _) = self.lookup(x_sym)?;
-            calls.push((out_base, x_base, opcode, is_bf16));
+            calls.push((out_base, x_base, opcode, in_elem));
         }
         Some(calls)
     }
@@ -2991,16 +3002,16 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        calls: Vec<(ValueId, ValueId, u32, bool)>,
+        calls: Vec<(ValueId, ValueId, u32, MirType)>,
     ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        for (out_base, x_base, opcode, is_bf16) in calls {
-            // bf16 input strides by 2-byte elements through `mercury_vmath_bf16`; f32 input by 4-byte
-            // elements through `mercury_vmath_f32`. The output is always f32.
-            let (in_elem, func) = if is_bf16 {
-                (MirType::BF16, self.gemm.vmath_bf16)
-            } else {
-                (MirType::F32, self.gemm.vmath)
+        for (out_base, x_base, opcode, in_elem) in calls {
+            // The input strides by its element width (f32/bf16/f16) through the matching kernel; the
+            // output is always f32.
+            let func = match in_elem {
+                MirType::BF16 => self.gemm.vmath_bf16,
+                MirType::F16 => self.gemm.vmath_f16,
+                _ => self.gemm.vmath,
             };
             let xp = self.builder.build(
                 MirType::Ptr,
