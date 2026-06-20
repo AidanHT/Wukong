@@ -149,6 +149,164 @@ fn entry(name: &str, ty: &str, tm: usize, tn: usize) -> String {
     s
 }
 
+// ---- Shared-memory-staged WMMA GEMM (the `_sm` kernels) -------------------------------------------
+// A CTA of SM_WARPS_M×SM_WARPS_N warps cooperatively stages a SM_BM×SM_BK tile of A and a SM_BN×SM_BK
+// tile of B into shared memory each K-step, then every warp computes its SM_TM×SM_TN grid of 16×16
+// WMMA tiles *out of shared memory*. So each global element is fetched once per CTA tile and reused by
+// all warps — the per-warp `_mt` kernel instead reloads overlapping rows/cols straight from global,
+// which spills L2 and craters at large N (the measured 2.3× cliff 2048³→4096³). Requires M%SM_BM==0,
+// N%SM_BN==0, K%16==0; the dispatcher falls back to `_mt`/single-tile otherwise.
+pub const SM_BM: usize = 64;
+pub const SM_BN: usize = 64;
+pub const SM_BK: usize = 16;
+pub const SM_WARPS_M: usize = 2;
+pub const SM_WARPS_N: usize = 2;
+const SM_TM: usize = SM_BM / (16 * SM_WARPS_M); // 16×16 tiles per warp, M direction
+const SM_TN: usize = SM_BN / (16 * SM_WARPS_N); // 16×16 tiles per warp, N direction
+/// CTA thread count for the `_sm` kernels (one warp per (SM_WARPS_M,SM_WARPS_N) cell).
+pub const SM_THREADS: usize = SM_WARPS_M * SM_WARPS_N * 32;
+
+/// Generate a shared-memory-staged WMMA GEMM entry computing `C = A·Bᵀ`. `ty` is "f16" or "bf16".
+fn entry_smem(name: &str, ty: &str) -> String {
+    let mma_ty = if ty == "f16" {
+        "f32.f32".to_string()
+    } else {
+        format!("f32.{ty}.{ty}.f32")
+    };
+    let nab = if ty == "f16" { 8 } else { 4 };
+    let (tm, tn) = (SM_TM, SM_TN);
+    let smem_a = SM_BM * SM_BK * 2; // bytes
+    let smem_b = SM_BN * SM_BK * 2;
+    // 128-bit (8×f16) vectorized global→shared chunks per thread. Alignment holds: each chunk's
+    // global index is K(·16)-aligned + kt(·16) + {0,8} ⇒ a multiple of 8 ⇒ 16-byte aligned.
+    let a_chunks = SM_BM * SM_BK / (SM_THREADS * 8);
+    let b_chunks = SM_BN * SM_BK / (SM_THREADS * 8);
+    let wn_shift = SM_WARPS_N.trailing_zeros(); // warpId / WARPS_N  (WARPS_N a power of two)
+    let wm = (16 * tm) as i64; // per-warp rows owned
+    let wn = (16 * tn) as i64; // per-warp cols owned
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n"
+    );
+    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+    s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    s += "    .reg .pred %p0;\n";
+    // NB: the linear thread id reg is %tix, NOT %tid — %tid is the PTX special register (threadIdx),
+    // so a user reg named %tid makes the assembler read `%tid.x` as a video selector and reject it.
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%v0,%v1,%v2,%v3;\n";
+    let mut decl_c = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..8 {
+                decl_c += &format!("%c{ti}_{tj}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    let mut decl_ab = String::new();
+    for ti in 0..tm {
+        for r in 0..nab {
+            decl_ab += &format!("%a{ti}_{r},");
+        }
+    }
+    for tj in 0..tn {
+        for r in 0..nab {
+            decl_ab += &format!("%b{tj}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
+    s += "    .reg .b64 %A,%B,%C,%off,%gp,%gptr,%cptr;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{SM_BM};\n");
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{SM_BN};\n");
+    s += "    mov.u32 %ldm,16;\n"; // SMEM tile leading dim (BK); wmma.load/.store want a reg stride
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
+    s += &format!("    and.b32 %warpCol,%warpId,{};\n", SM_WARPS_N - 1);
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..8 {
+                s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+            }
+        }
+    }
+
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    // Cooperative global→shared staging. element e in the BM×BK (resp BN×BK) tile: r=e/BK, c=e%BK; the
+    // shared byte offset is just e·2 because r·BK+c == e (BK==16).
+    let stage = |g_base: &str, gptr: &str, smem: String, chunks: usize, s: &mut String| {
+        for li in 0..chunks {
+            // chunk e (each = 8 contiguous f16); flat element = e·8, so row r=e/2, col0=(e&1)·8.
+            if li == 0 {
+                *s += "    mov.u32 %e,%tix;\n";
+            } else {
+                *s += &format!("    add.u32 %e,%tix,{};\n", li * SM_THREADS);
+            }
+            *s += "    shr.u32 %r,%e,1;\n    and.b32 %c,%e,1;\n    shl.b32 %c,%c,3;\n";
+            *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kt;\n    add.u32 %tmp,%tmp,%c;\n");
+            *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gptr},%off;\n");
+            *s += "    ld.global.v4.u32 {%v0,%v1,%v2,%v3},[%gptr];\n";
+            // shared dest byte = flat·2 = e·16.
+            *s += &format!("    mov.u32 %tmp,{smem};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n");
+            *s += "    st.shared.v4.u32 [%tmp],{%v0,%v1,%v2,%v3};\n";
+        }
+    };
+    stage("%baseRow", "%A", format!("smemA_{name}"), a_chunks, &mut s);
+    stage("%baseCol", "%B", format!("smemB_{name}"), b_chunks, &mut s);
+    s += "    bar.sync 0;\n";
+
+    // Each warp loads its fragments from shared (generic addr via cvta.shared) and accumulates.
+    for ti in 0..tm {
+        s += &format!("    mov.u32 %tmp,smemA_{name};\n");
+        s += &format!("    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n", ti * 16);
+        s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+        s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
+        let ra = veclist(&format!("a{ti}_"), nab);
+        s += &format!("    wmma.load.a.sync.aligned.m16n16k16.row.{ty} {ra}, [%gp], %ldm;\n");
+    }
+    for tj in 0..tn {
+        s += &format!("    mov.u32 %tmp,smemB_{name};\n");
+        s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+        s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+        s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
+        let rb = veclist(&format!("b{tj}_"), nab);
+        s += &format!("    wmma.load.b.sync.aligned.m16n16k16.col.{ty} {rb}, [%gp], %ldm;\n");
+    }
+    for ti in 0..tm {
+        let ra = veclist(&format!("a{ti}_"), nab);
+        for tj in 0..tn {
+            let rb = veclist(&format!("b{tj}_"), nab);
+            let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+            s += &format!(
+                "    wmma.mma.sync.aligned.row.col.m16n16k16.{mma_ty} {cc}, {ra}, {rb}, {cc};\n"
+            );
+        }
+    }
+    s += "    bar.sync 0;\n";
+    s += &format!("    add.u32 %kt,%kt,16;\n    bra KLOOP_{name};\n");
+
+    s += &format!("KEND_{name}:\n");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            // row = baseRow + warpRow·wm + ti·16 ; col = baseCol + warpCol·wn + tj·16
+            s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+            s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+            s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+            s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+            s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
 /// Number of independent accumulator fragments the roofline kernel keeps in flight (ILP to hide MMA
 /// latency so the loop measures tensor-core *throughput*, not the dependent-chain latency).
 pub const ROOFLINE_ACC: usize = 4;
@@ -226,6 +384,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         m += &entry("wmma_nt_f16", "f16", 1, 1);
         m += &entry("wmma_nt_f16_mt", "f16", TM_TILES, TN_TILES);
+        m += &entry_smem("wmma_nt_f16_sm", "f16");
         m
     })
     .as_str()

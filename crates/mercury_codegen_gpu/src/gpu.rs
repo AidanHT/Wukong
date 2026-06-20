@@ -345,6 +345,7 @@ pub fn gemm_nt_f16(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
     use half::f16;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
@@ -352,6 +353,11 @@ pub fn gemm_nt_f16(
         m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
         "WMMA requires 16-multiple dims"
     );
+    // Prefer the shared-memory-staged kernel where the CTA tile divides cleanly — same numerics,
+    // but ≥ the per-warp `_mt` path at every measured size (1.2–1.3× at 1024³/4096³, tie at 2048³).
+    if m % SM_BM == 0 && n % SM_BN == 0 {
+        return gemm_nt_f16_sm(g, a, b, m, k, n);
+    }
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
     let (entry, cfg) = wmma_pick("wmma_nt_f16", m, n);
@@ -368,6 +374,55 @@ pub fn gemm_nt_f16(
         .arg(&b_d)
         .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Launch config for the shared-memory-staged WMMA kernels (`*_sm`): `SM_THREADS` threads per CTA,
+/// one CTA per `SM_BM×SM_BN` output tile. Applicable when `M%SM_BM==0 && N%SM_BN==0 && K%16==0`.
+fn wmma_sm_cfg(m: usize, n: usize) -> LaunchConfig {
+    use crate::ptx_wmma::{SM_BM, SM_BN, SM_THREADS};
+    LaunchConfig {
+        grid_dim: ((n / SM_BN) as u32, (m / SM_BM) as u32, 1),
+        block_dim: (SM_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `C = A·Bᵀ` (fp16-in, f32-out) via the **shared-memory-staged** kernel `wmma_nt_f16_sm` — a CTA of
+/// warps cooperatively stages A/B tiles into shared memory and reuses them, instead of each warp
+/// re-streaming overlapping rows/cols from global (the `_mt` path). Requires `M%SM_BM==0`,
+/// `N%SM_BN==0`, `K%16==0`. The lever for the 4096³ cliff; tolerance-gated like the other GEMMs.
+pub fn gemm_nt_f16_sm(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "wmma_nt_f16_sm requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -1109,6 +1164,76 @@ mod tests {
         });
     }
 
+    /// The shared-memory-staged fp16 GEMM (`wmma_nt_f16_sm`) must match the f16-rounded f64 reference,
+    /// to the same tolerance as the `_mt` path — it computes the identical math, only with A/B tiles
+    /// routed through shared memory and warps cooperating per CTA. Shapes exercise the SM_BM/SM_BN
+    /// divisibility plus a rectangular case (stresses the cooperative-load and store indexing).
+    #[test]
+    fn wmma_sm_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_sm", |g| {
+            let mut rng = crate::diff::Rng::new(0x5EED);
+            let shapes = [
+                (64usize, 64usize, 64usize),
+                (128, 128, 128),
+                (128, 80, 192),
+                (256, 128, 512),
+            ];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = gemm_nt_f16_sm(g, &a, &b, m, k, n).unwrap();
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16_sm {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!(
+                    "wmma_f16_sm {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    /// Diagnostic: JIT a PTX module with the driver's error-log buffer attached and print it. The
+    /// plain `load_module` path only surfaces `CUDA_ERROR_INVALID_PTX` with no detail; this prints
+    /// `ptxas`'s actual line/error, which is how every hand-written PTX kernel here gets debugged.
+    /// Point it at whichever module you're bringing up. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu jit_log -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic; prints the driver JIT log for a PTX module"]
+    fn jit_log() {
+        with_gpu("jitlog", |g| {
+            use cudarc::driver::sys;
+            g.ctx.bind_to_thread().unwrap();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx(); // ← swap in the module under test
+            let ptx_c = std::ffi::CString::new(ptx).unwrap();
+            let mut log = vec![0u8; 32768];
+            let mut opts = [
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            ];
+            let mut vals: [*mut std::ffi::c_void; 2] =
+                [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            let res = unsafe {
+                sys::cuModuleLoadDataEx(
+                    &mut module,
+                    ptx_c.as_ptr() as *const _,
+                    2,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                )
+            };
+            let s = String::from_utf8_lossy(&log);
+            eprintln!("=== JIT result {:?} ===\n{}", res, s.trim_end_matches('\0'));
+        });
+    }
+
     fn cpu_norm(op: i64, x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
         let mut out = vec![0.0f32; x.len()];
         unsafe {
@@ -1807,35 +1932,44 @@ mod tests {
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 let (e16, c16) = wmma_pick("wmma_nt_f16", m, n);
                 let f16f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16).unwrap();
-                let s_merc = time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50);
+                let s_mt = time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50);
+                // Mercury SMEM-staged kernel — the Phase-1 lever (CTA-cooperative shared-memory tiles).
+                let f_sm = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm")
+                    .unwrap();
+                let s_sm = time_wmma(g, &f_sm, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
 
                 // Peers (same buffers' worth of work). Naive is slow → fewer iters, still per-iter time.
                 let s_cub = time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap();
                 let naive_iters = if sz >= 4096 { 3 } else { 10 };
                 let s_naive = time_nvrtc_naive_gemm_nt(g, m, k, n, naive_iters).unwrap();
 
-                // Checksum cross-check at this shape: all three must compute the same matrix.
+                // Checksum cross-check at this shape: all paths must compute the same matrix.
                 let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
-                let cs_m = csum(&gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
+                let cs_mt = csum(&gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
+                let cs_sm = csum(&gemm_nt_f16_sm(g, &a, &b, m, k, n).unwrap());
                 let cs_c = csum(&cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
                 let cs_n = csum(&nvrtc_naive_gemm_nt(g, &a, &b, m, k, n).unwrap());
                 let agree = |x: f64, y: f64| (x - y).abs() / y.max(1.0) < 3e-2;
                 assert!(
-                    agree(cs_m, cs_n) && agree(cs_c, cs_n),
-                    "{sz}³ checksum disagreement: mercury={cs_m:.3e} cublas={cs_c:.3e} naive={cs_n:.3e}"
+                    agree(cs_mt, cs_n) && agree(cs_sm, cs_n) && agree(cs_c, cs_n),
+                    "{sz}³ checksum disagreement: mt={cs_mt:.3e} sm={cs_sm:.3e} cublas={cs_c:.3e} naive={cs_n:.3e}"
                 );
 
-                let (g_merc, g_cub, g_naive) = (flop / s_merc, flop / s_cub, flop / s_naive);
+                let (g_mt, g_sm, g_cub, g_naive) =
+                    (flop / s_mt, flop / s_sm, flop / s_cub, flop / s_naive);
                 eprintln!(
                     "\n{sz}³ fp16 GEMM (same-run):\n  \
-                     Mercury WMMA : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.1}× vs naive CUDA-C\n  \
-                     cuBLAS fp16  : {:>7.0} GFLOP/s  | gold standard      | {:>5.1}× vs naive CUDA-C\n  \
-                     naive CUDA-C : {:>7.0} GFLOP/s  | Tier-A baseline\n  \
-                     fp16 roofline: {:>7.0} GFLOP/s  | Mercury {:>4.1}% / cuBLAS {:>4.1}% of roof",
-                    g_merc / 1e9, 100.0 * g_merc / g_cub, g_merc / g_naive,
-                    g_cub / 1e9, g_cub / g_naive,
+                     Mercury _mt   : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS\n  \
+                     Mercury _sm   : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.2}× vs _mt | {:>5.1}× vs naive\n  \
+                     cuBLAS fp16   : {:>7.0} GFLOP/s  | gold standard\n  \
+                     naive CUDA-C  : {:>7.0} GFLOP/s  | Tier-A baseline\n  \
+                     fp16 roofline : {:>7.0} GFLOP/s  | _mt {:>4.1}% / _sm {:>4.1}% / cuBLAS {:>4.1}% of roof",
+                    g_mt / 1e9, 100.0 * g_mt / g_cub,
+                    g_sm / 1e9, 100.0 * g_sm / g_cub, g_sm / g_mt, g_sm / g_naive,
+                    g_cub / 1e9,
                     g_naive / 1e9,
-                    roof / 1e9, 100.0 * g_merc / roof, 100.0 * g_cub / roof,
+                    roof / 1e9, 100.0 * g_mt / roof, 100.0 * g_sm / roof, 100.0 * g_cub / roof,
                 );
             }
         });
