@@ -51,6 +51,8 @@ pub const VM_EXPM1: i64 = 26;
 pub const VM_LOG1P: i64 = 27;
 pub const VM_EXP10: i64 = 28;
 pub const VM_LOG10: i64 = 29;
+pub const VM_SOFTSIGN: i64 = 30;
+pub const VM_LOGSIGMOID: i64 = 31;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -291,6 +293,27 @@ fn selu1(x: f32) -> f32 {
 #[inline]
 fn tanhshrink1(x: f32) -> f32 {
     x - tanh1(x)
+}
+
+/// `softsign(x) = x / (1 + |x|)` — a bounded activation (range (−1, 1)) that saturates polynomially
+/// rather than exponentially like `tanh`, so it's cheaper (no transcendental) and keeps larger
+/// gradients in the tails. `|x|` clears the sign bit (== `f32::abs`), matching the AVX2 [`softsign8`]
+/// bit-for-bit; the divide is the only real cost.
+#[inline]
+fn softsign1(x: f32) -> f32 {
+    let ax = f32::from_bits(x.to_bits() & 0x7FFF_FFFF); // |x|
+    x / (1.0 + ax)
+}
+
+/// `logsigmoid(x) = ln(σ(x)) = −softplus(−x)` — the numerically-stable log-sigmoid (PyTorch's
+/// `F.logsigmoid`). The headline use is binary-cross-entropy-with-logits and contrastive/RL losses,
+/// where `log(sigmoid(x))` computed naively overflows for large negative `x`; routing through the
+/// stable [`softplus1`] (`max(t,0) + ln(1+e^{−|t|})`) is exact across the range. Reuses [`softplus1`],
+/// so the AVX2 [`logsigmoid8`] and the tail agree. C/Rust have no `logsigmoidf` at all — it's two
+/// scalar libm calls (`log(1/(1+exp(-x)))`), neither vectorizable.
+#[inline]
+fn logsigmoid1(x: f32) -> f32 {
+    -softplus1(-x)
 }
 
 /// `hardsigmoid(x) = clamp(x+3, 0, 6)/6` — the cheap piecewise-linear sigmoid of MobileNetV3 /
@@ -543,6 +566,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_LOG1P => log1p_1(x),
         VM_EXP10 => exp10_1(x),
         VM_LOG10 => log10_1(x),
+        VM_SOFTSIGN => softsign1(x),
+        VM_LOGSIGMOID => logsigmoid1(x),
         _ => x,
     }
 }
@@ -611,6 +636,8 @@ fn vmath8_for(op: i64) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::ar
         VM_LOG1P => log1p_8,
         VM_EXP10 => exp10_8,
         VM_LOG10 => log10_8,
+        VM_SOFTSIGN => softsign8,
+        VM_LOGSIGMOID => logsigmoid8,
         _ => return None,
     })
 }
@@ -909,6 +936,24 @@ unsafe fn tanhshrink8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256
     use std::arch::x86_64::*;
     // x − tanh(x) — mirrors tanhshrink1.
     _mm256_sub_ps(x, tanh8(x))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softsign8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // x / (1 + |x|) — `|x|` clears the sign bit (== softsign1's bit-clear), so lanes/tail agree.
+    let absx = _mm256_and_ps(x, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF)));
+    _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), absx))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn logsigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    // −softplus(−x) — mirrors logsigmoid1; reuses softplus8 so the stable form (and the tail) agree.
+    let nx = _mm256_sub_ps(_mm256_setzero_ps(), x);
+    _mm256_sub_ps(_mm256_setzero_ps(), softplus8(nx))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1227,6 +1272,11 @@ mod tests {
             (VM_EXP10, |x| 10.0f32.powf(x), 5e-5),
             (VM_SINH, |x| x.sinh(), 5e-5),
             (VM_COSH, |x| x.cosh(), 5e-5),
+            // softsign: exact (just abs + div). logsigmoid: the stable log-sigmoid; the naive
+            // `ln(σ(x))` reference is overflow-safe over [-20.48, 20.47], and the mixed bound's
+            // absolute floor covers the ≈x linear tail for large negative x.
+            (VM_SOFTSIGN, |x| x / (1.0 + x.abs()), 1e-6),
+            (VM_LOGSIGMOID, |x| (1.0 / (1.0 + (-x).exp())).ln(), 1e-4),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
@@ -1372,6 +1422,7 @@ mod tests {
         for op in [
             VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
             VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1, VM_EXP10, VM_LOG10,
+            VM_SOFTSIGN, VM_LOGSIGMOID,
         ] {
             if op == VM_LOG || op == VM_LOG2 || op == VM_LOG10 {
                 continue; // negative inputs are out of log's domain

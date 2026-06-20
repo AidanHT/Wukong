@@ -548,6 +548,8 @@ const VMATH_EXPM1: u32 = 26;
 const VMATH_LOG1P: u32 = 27;
 const VMATH_EXP10: u32 = 28;
 const VMATH_LOG10: u32 = 29;
+const VMATH_SOFTSIGN: u32 = 30;
+const VMATH_LOGSIGMOID: u32 = 31;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2958,6 +2960,12 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Log1p) => VMATH_LOG1P,
             Some(MathIntrinsic::Exp10) => VMATH_EXP10,
             Some(MathIntrinsic::Log10) => VMATH_LOG10,
+            // softsign (bounded poly activation) and logsigmoid (stable log-sigmoid for
+            // BCE-with-logits / contrastive losses): C/Rust compute these as scalar libm
+            // (logsigmoid has no libm entry at all — it's two scalar calls), so the 256-bit
+            // dispatch wins; both compose existing kernels, so dispatched == composed.
+            Some(MathIntrinsic::Softsign) => VMATH_SOFTSIGN,
+            Some(MathIntrinsic::LogSigmoid) => VMATH_LOGSIGMOID,
             _ => return None,
         };
         // The kernel computes (and writes) f32, so the activation's result must be f32.
@@ -3904,7 +3912,9 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Selu
                     | MathIntrinsic::Tanhshrink
                     | MathIntrinsic::HardSigmoid
-                    | MathIntrinsic::HardSwish,
+                    | MathIntrinsic::HardSwish
+                    | MathIntrinsic::Softsign
+                    | MathIntrinsic::LogSigmoid,
                 ) => {
                     // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
                     // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
@@ -4795,6 +4805,14 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::HardSwish) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_hardswish(x, vty)
+                }
+                Some(MathIntrinsic::Softsign) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_softsign(x, vty)
+                }
+                Some(MathIntrinsic::LogSigmoid) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_logsigmoid(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -5706,6 +5724,14 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_hardswish(x, &rty))
             }
+            MathIntrinsic::Softsign => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_softsign(x, &rty))
+            }
+            MathIntrinsic::LogSigmoid => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_logsigmoid(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -5890,6 +5916,27 @@ impl FnLowerer<'_> {
         let sp = self.emit_softplus(x, rty);
         let th = self.emit_tanh(sp, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th))
+    }
+
+    /// `softsign(x) = x / (1 + |x|)`, the bounded polynomial activation. `|x|` is `max(x, −x)` here
+    /// (vs the kernel's bit-clear abs — differing only at ±0, which the `x/(1+|x|)` then washes out:
+    /// the result is ±0 either way). No transcendental, so it vectorizes and is bit-identical across
+    /// backends; a loop dispatches to `softsign8` regardless.
+    fn emit_softsign(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let ax = self.emit_abs(x, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let den = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, ax));
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, x, den))
+    }
+
+    /// `logsigmoid(x) = ln(σ(x)) = −softplus(−x)`, the stable log-sigmoid. Reuses `emit_softplus`
+    /// (itself the stable `max(t,0)+ln(1+e^{−|t|})`), so it is bit-identical to `logsigmoid8` and to
+    /// the scalar twin; the two negations are exact.
+    fn emit_logsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let zero = self.splat_const_f(0.0, rty);
+        let nx = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
+        let sp = self.emit_softplus(nx, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, zero, sp))
     }
 
     /// `selu(x) = λ·(x>0 ? x : α·(eˣ−1))`, the scaled ELU of self-normalizing networks. Mirrors `selu8`
@@ -8314,6 +8361,8 @@ enum MathIntrinsic {
     Log2,
     Exp10,
     Log10,
+    Softsign,
+    LogSigmoid,
     Sinh,
     Cosh,
     Asinh,
@@ -8369,6 +8418,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "log2" => MathIntrinsic::Log2,
         "exp10" => MathIntrinsic::Exp10,
         "log10" => MathIntrinsic::Log10,
+        "softsign" => MathIntrinsic::Softsign,
+        "logsigmoid" => MathIntrinsic::LogSigmoid,
         "sinh" => MathIntrinsic::Sinh,
         "cosh" => MathIntrinsic::Cosh,
         "asinh" => MathIntrinsic::Asinh,

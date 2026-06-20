@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 0
+// EXPECT-OUT: -693
+// EXPECT-OUT: -638
+module tests.run.softsign_logsigmoid
+
+// `softsign(x) = x/(1+|x|)` — a bounded (−1,1) activation that saturates polynomially (cheaper than
+// tanh, fatter gradient tails). `logsigmoid(x) = ln(σ(x)) = −softplus(−x)` — the numerically-stable
+// log-sigmoid behind binary-cross-entropy-with-logits and contrastive/RL losses. Both compose
+// existing kernels (abs/div; the stable softplus), so a dispatched `out[i] = f(x[i])` loop lowers to
+// the 256-bit `mercury_vmath_f32` and agrees with the composed/scalar form — interp == native,
+// -O0 == -O3. C/Rust can vectorize neither (softsign is a libm-free div but logsigmoid is two scalar
+// libm calls, and a loop with a call won't vectorize at all).
+fn main() -> i32 {
+    // Scalar softsign: softsign(1) = 1/2 = 0.5; softsign(-1) = -0.5; softsign(0) = 0.
+    print((softsign(1.0) * 1000.0) as i32);  // 500
+    print((softsign(-1.0) * 1000.0) as i32); // -500
+    print((softsign(0.0) * 1000.0) as i32);  // 0
+
+    // Scalar logsigmoid: logsigmoid(0) = ln(0.5) = -0.6931 -> -693.
+    print((logsigmoid(0.0) * 1000.0) as i32); // -693
+
+    // Vectorized logsigmoid over an array dispatches to the kernel. Symmetry check:
+    // logsigmoid(x) - logsigmoid(-x) = x (since ln σ(x) - ln σ(-x) = x). Sum over a symmetric
+    // ±set cancels to Σx; here use a one-sided checksum instead.
+    let mut xs: [f32; 8] = [0.0; 8];
+    let mut i: i32 = 0;
+    while i < 8 {
+        xs[i] = (i as f32) * 0.25 - 1.0; // [-1, -0.75, ..., 0.75]
+        i = i + 1;
+    }
+    let mut o: [f32; 8] = [0.0; 8];
+    let mut k: i32 = 0;
+    while k < 8 {
+        o[k] = logsigmoid(xs[k]);
+        k = k + 1;
+    }
+    let mut s: f32 = 0.0;
+    let mut n: i32 = 0;
+    while n < 8 {
+        s = s + o[n];
+        n = n + 1;
+    }
+    print((s * 100.0) as i32); // logsigmoid checksum -> -638
+    return 0;
+}
