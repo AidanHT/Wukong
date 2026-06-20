@@ -1177,6 +1177,61 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let r = unsafe { mercury_runtime::mercury_reduce_bf16(xbuf.as_ptr(), n as i64, op) };
                 Ok(Value::Float(r as f64))
             }
+            // The IEEE-f16 twins: `mercury_dot_f16` / `mercury_sum_f16` / `mercury_reduce_f16` — same
+            // marshaling as the bf16 reductions, but reconstruct the exact f16 bits via
+            // `f32_to_f16_bits` (the stored value is already f16-rounded, so this is exact) and call
+            // the F16C kernels. interp == native bit-for-bit (the widen is lossless, identical kernel).
+            "mercury_dot_f16" | "mercury_sum_f16" => {
+                let is_dot = name == "mercury_dot_f16";
+                let x = ptr(args[0])?;
+                let (y, n) = if is_dot {
+                    (ptr(args[1])?, args[2].as_int() as usize)
+                } else {
+                    (x, args[1].as_int() as usize)
+                };
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    Ok(mercury_runtime::f32_to_f16_bits(
+                        self.memory
+                            .get(idx + t)
+                            .ok_or("f16 reduce operand out of bounds")?
+                            .as_float() as f32,
+                    ))
+                };
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(bits(x, t)?);
+                    if is_dot {
+                        ybuf.push(bits(y, t)?);
+                    }
+                }
+                // SAFETY: the buffers are exactly n u16 long — the kernels' contract.
+                let r = unsafe {
+                    if is_dot {
+                        mercury_runtime::mercury_dot_f16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
+                    } else {
+                        mercury_runtime::mercury_sum_f16(xbuf.as_ptr(), n as i64)
+                    }
+                };
+                Ok(Value::Float(r as f64))
+            }
+            "mercury_reduce_f16" => {
+                let x = ptr(args[0])?;
+                let n = args[1].as_int() as usize;
+                let op = args[2].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(mercury_runtime::f32_to_f16_bits(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("f16 reduce operand out of bounds")?
+                            .as_float() as f32,
+                    ));
+                }
+                // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
+                let r = unsafe { mercury_runtime::mercury_reduce_f16(xbuf.as_ptr(), n as i64, op) };
+                Ok(Value::Float(r as f64))
+            }
             // `mercury_axpby_bf16(x, y, out, n, a, b)` — the bf16→f32 streaming axpby a recognized
             // `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` map over `[bf16; _]` inputs (f32 output)
             // lowers to. Reconstruct the bf16 input bits exactly (as the reductions do), call the
