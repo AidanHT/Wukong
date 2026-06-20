@@ -53,6 +53,9 @@ pub const VM_EXP10: i64 = 28;
 pub const VM_LOG10: i64 = 29;
 pub const VM_SOFTSIGN: i64 = 30;
 pub const VM_LOGSIGMOID: i64 = 31;
+pub const VM_TAN: i64 = 32;
+pub const VM_ASIN: i64 = 33;
+pub const VM_ACOS: i64 = 34;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -499,6 +502,29 @@ fn atan1(x: f32) -> f32 {
     f32::from_bits(yf.to_bits() | (x.to_bits() & 0x8000_0000)) // copysign(yf, x)
 }
 
+/// `tan(x) = sin(x)/cos(x)` — reuses the shared sin/cos (one range reduction each), so the AVX2
+/// [`tan8`], the tail, and the composed scalar MIR agree bit-for-bit. Accurate where `cos(x)` is not
+/// near zero (away from the ±π/2 poles), exactly as libm's `tanf` is.
+#[inline]
+fn tan1(x: f32) -> f32 {
+    sincos1(x, false) / sincos1(x, true)
+}
+
+/// `asin(x) = atan(x/√(1−x²))` over `[−1, 1]` — the angle whose sine is `x` (3D rotation, geometry,
+/// graphics/vision ML). Reuses [`atan1`] and `√`; the endpoints fall out for free (`±1/√0 = ±∞`,
+/// `atan(±∞) = ±π/2`) and `|x| > 1` yields `NaN` like libm. ≈atan's ≈1-ULP accuracy except very near
+/// ±1 where the `1−x²` cancellation bites. Bit-identical to [`asin8`] (same ops, same order).
+#[inline]
+fn asin1(x: f32) -> f32 {
+    atan1(x / (1.0 - x * x).sqrt())
+}
+
+/// `acos(x) = π/2 − asin(x)` over `[−1, 1]`. Reuses [`asin1`], so [`acos8`] and the tail agree.
+#[inline]
+fn acos1(x: f32) -> f32 {
+    ATAN_PIO2 - asin1(x)
+}
+
 /// `expm1(x) = eˣ − 1`, the numerically-stable form (the exact ELU/`SELU` negative tail, stable
 /// losses). Kahan's correction `(u−1)·x/ln(u)` with `u = eˣ` cancels the catastrophic `eˣ − 1` loss
 /// for small `x` (the ratio `(u−1)/ln(u) → 1` as `u → 1`); the guard returns `x` when `u` rounds to 1
@@ -568,6 +594,9 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_LOG10 => log10_1(x),
         VM_SOFTSIGN => softsign1(x),
         VM_LOGSIGMOID => logsigmoid1(x),
+        VM_TAN => tan1(x),
+        VM_ASIN => asin1(x),
+        VM_ACOS => acos1(x),
         _ => x,
     }
 }
@@ -638,6 +667,9 @@ fn vmath8_for(op: i64) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::ar
         VM_LOG10 => log10_8,
         VM_SOFTSIGN => softsign8,
         VM_LOGSIGMOID => logsigmoid8,
+        VM_TAN => tan8,
+        VM_ASIN => asin8,
+        VM_ACOS => acos8,
         _ => return None,
     })
 }
@@ -1182,6 +1214,33 @@ unsafe fn atan8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_or_ps(yf, _mm256_and_ps(x, signmask))
 }
 
+/// 8-lane `tan(x) = sin(x)/cos(x)` — mirrors [`tan1`] (sin8/cos8 lanes already == sincos1).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tan8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    _mm256_div_ps(sin8(x), cos8(x))
+}
+
+/// 8-lane `asin(x) = atan(x/√(1−x²))` — mirrors [`asin1`] op-for-op (`x²`, `1−x²`, `√`, divide, then
+/// the shared [`atan8`]), so the lanes equal the scalar tail bit-for-bit on `[−1, 1]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn asin8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let x2 = _mm256_mul_ps(x, x);
+    let s = _mm256_sqrt_ps(_mm256_sub_ps(_mm256_set1_ps(1.0), x2));
+    atan8(_mm256_div_ps(x, s))
+}
+
+/// 8-lane `acos(x) = π/2 − asin(x)` — mirrors [`acos1`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn acos8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    _mm256_sub_ps(_mm256_set1_ps(ATAN_PIO2), asin8(x))
+}
+
 /// 8-lane `expm1(x) = (u−1)·x/log(u)`, `u = eˣ`, guard `u==1 → x` — mirrors [`expm1_1`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -1372,6 +1431,34 @@ mod tests {
         // atanh: |x| ≤ 0.9.
         let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.0018).collect();
         check(VM_ATANH, &xs, |x| x.atanh(), 5e-5);
+    }
+
+    /// tan/asin/acos vs `std`, each over a domain that keeps the composition accurate (tan away from
+    /// the ±π/2 poles where cos → 0; asin/acos to |x| ≤ 0.95, the `1−x²` cancellation biting nearer
+    /// ±1). Like the inverse-hyperbolics, the scalar twin == AVX2 lanes (bit-for-bit) tail-match is
+    /// folded in — these can't ride the all-real `vmath_tail_matches_lanes` loop (poles / |x|>1 NaN).
+    #[test]
+    fn vmath_inverse_trig() {
+        let check = |op: i64, xs: &[f32], reference: fn(f32) -> f32, tol: f32| {
+            let mut out = vec![0.0f32; xs.len()];
+            unsafe { mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op) };
+            for (i, &x) in xs.iter().enumerate() {
+                let want = reference(x);
+                assert!(
+                    (out[i] - want).abs() <= tol + tol * want.abs(),
+                    "op {op} x={x}: got {} want {want}",
+                    out[i]
+                );
+                assert_eq!(out[i].to_bits(), apply1(op, x).to_bits(), "op {op} tail x={x}");
+            }
+        };
+        // tan: |x| ≤ 1.4 (cos stays well off zero; tan(1.4) ≈ 5.8). 1001 ≠ 8k → exercises the tail.
+        let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.0028).collect();
+        check(VM_TAN, &xs, |x| x.tan(), 5e-5);
+        // asin/acos: |x| ≤ 0.95.
+        let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.0019).collect();
+        check(VM_ASIN, &xs, |x| x.asin(), 1e-4);
+        check(VM_ACOS, &xs, |x| x.acos(), 1e-4);
     }
 
     /// expm1/log1p vs `std`, including the **small-x relative** check the Kahan correction exists for:

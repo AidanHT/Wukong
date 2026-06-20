@@ -550,6 +550,9 @@ const VMATH_EXP10: u32 = 28;
 const VMATH_LOG10: u32 = 29;
 const VMATH_SOFTSIGN: u32 = 30;
 const VMATH_LOGSIGMOID: u32 = 31;
+const VMATH_TAN: u32 = 32;
+const VMATH_ASIN: u32 = 33;
+const VMATH_ACOS: u32 = 34;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2966,6 +2969,13 @@ impl FnLowerer<'_> {
             // dispatch wins; both compose existing kernels, so dispatched == composed.
             Some(MathIntrinsic::Softsign) => VMATH_SOFTSIGN,
             Some(MathIntrinsic::LogSigmoid) => VMATH_LOGSIGMOID,
+            // tan/asin/acos complete the trig family (sin/cos/atan): geometry, 3D vision, graphics
+            // ML (rotations, NeRF/SLAM angles). C/Rust call scalar libm tanf/asinf/acosf — a loop with
+            // the call won't vectorize — and these compose the shared sin/cos/atan, so dispatched ==
+            // composed and the 256-bit kernel wins.
+            Some(MathIntrinsic::Tan) => VMATH_TAN,
+            Some(MathIntrinsic::Asin) => VMATH_ASIN,
+            Some(MathIntrinsic::Acos) => VMATH_ACOS,
             _ => return None,
         };
         // The kernel computes (and writes) f32, so the activation's result must be f32.
@@ -3914,7 +3924,10 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::HardSigmoid
                     | MathIntrinsic::HardSwish
                     | MathIntrinsic::Softsign
-                    | MathIntrinsic::LogSigmoid,
+                    | MathIntrinsic::LogSigmoid
+                    | MathIntrinsic::Tan
+                    | MathIntrinsic::Asin
+                    | MathIntrinsic::Acos,
                 ) => {
                     // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
                     // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
@@ -4813,6 +4826,18 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::LogSigmoid) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_logsigmoid(x, vty)
+                }
+                Some(MathIntrinsic::Tan) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_tan(x, vty)
+                }
+                Some(MathIntrinsic::Asin) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_asin(x, vty)
+                }
+                Some(MathIntrinsic::Acos) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_acos(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -5732,6 +5757,18 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_logsigmoid(x, &rty))
             }
+            MathIntrinsic::Tan => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_tan(x, &rty))
+            }
+            MathIntrinsic::Asin => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_asin(x, &rty))
+            }
+            MathIntrinsic::Acos => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_acos(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -6344,6 +6381,33 @@ impl FnLowerer<'_> {
         let negyf = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, yf, neg1));
         let isneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
         self.builder.build(fty.clone(), Op::Select(isneg, negyf, yf))
+    }
+
+    /// `tan(x) = sin(x)/cos(x)` — reuses `emit_trig` (which mirrors `sincos1`/`sin8`), so the composed
+    /// and dispatched forms agree. Works on a scalar or a SIMD vector.
+    fn emit_tan(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let s = self.emit_trig(x, rty, false);
+        let c = self.emit_trig(x, rty, true);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, s, c))
+    }
+
+    /// `asin(x) = atan(x/√(1−x²))` over `[−1, 1]` — mirrors `asin1`/`asin8` op-for-op (`x²`, `1−x²`,
+    /// `Op::Sqrt`, divide, then `emit_atan`), so dispatched and composed agree bit-for-bit on `f32`.
+    fn emit_asin(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
+        let one = self.splat_const_f(1.0, rty);
+        let om = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, x2));
+        let sq = self.builder.build(rty.clone(), Op::Sqrt(om));
+        let d = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, x, sq));
+        self.emit_atan(d, rty)
+    }
+
+    /// `acos(x) = π/2 − asin(x)` over `[−1, 1]` — mirrors `acos1`/`acos8`. The π/2 constant is the same
+    /// `FRAC_PI_2 as f32` the kernel uses, so it matches bit-for-bit.
+    fn emit_acos(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let asin = self.emit_asin(x, rty);
+        let pio2 = self.splat_const_f(ATAN_PIO2, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, pio2, asin))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
@@ -8363,6 +8427,9 @@ enum MathIntrinsic {
     Log10,
     Softsign,
     LogSigmoid,
+    Tan,
+    Asin,
+    Acos,
     Sinh,
     Cosh,
     Asinh,
@@ -8420,6 +8487,9 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "log10" => MathIntrinsic::Log10,
         "softsign" => MathIntrinsic::Softsign,
         "logsigmoid" => MathIntrinsic::LogSigmoid,
+        "tan" => MathIntrinsic::Tan,
+        "asin" => MathIntrinsic::Asin,
+        "acos" => MathIntrinsic::Acos,
         "sinh" => MathIntrinsic::Sinh,
         "cosh" => MathIntrinsic::Cosh,
         "asinh" => MathIntrinsic::Asinh,
