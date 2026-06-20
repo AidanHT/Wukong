@@ -470,4 +470,112 @@ mod gpu_e2e_tests {
             );
         }
     }
+
+    /// Run `entry` over `init` (full buffer list, inputs + zeroed outputs) twice — once on the
+    /// interpreter oracle, once on the GPU offload — and return both buffer sets plus how many
+    /// kernels actually ran on the device. The two runs see identical inputs and the same MIR.
+    fn run_both(
+        g: &mut mercury_codegen_gpu::Gpu,
+        program: &mercury_mir::Program,
+        entry: mercury_span::Symbol,
+        interner: &Interner,
+        init: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, u32) {
+        let mut cpu: Vec<Vec<f32>> = init.to_vec();
+        {
+            let mut refs: Vec<&mut [f32]> = cpu.iter_mut().map(|v| v.as_mut_slice()).collect();
+            mercury_interp::run_kernel_f32(program, entry, &mut refs, interner).unwrap();
+        }
+        let mut gpu: Vec<Vec<f32>> = init.to_vec();
+        let mut accel = gpu_accel::GpuAccel::new(g);
+        {
+            let mut refs: Vec<&mut [f32]> = gpu.iter_mut().map(|v| v.as_mut_slice()).collect();
+            mercury_interp::run_kernel_f32_accel(program, entry, &mut refs, interner, &mut accel)
+                .unwrap();
+        }
+        (cpu, gpu, accel.calls)
+    }
+
+    /// The other three GPU kernel families behind `--backend=gpu`: activation (vmath), reduction
+    /// (sreduce), and a fused row norm (softmax). Each must fire on the device and match the interp
+    /// oracle within tolerance (transcendental SFU approximations are looser than the GEMM bound).
+    #[test]
+    fn gpu_backend_activation_reduction_norm_match_interp() {
+        let mut guard = mercury_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                eprintln!(
+                    "skip gpu_backend_activation_reduction_norm_match_interp: no CUDA device"
+                );
+                return;
+            }
+        };
+        let mut rng = Rng::new(0x5EED_1234);
+
+        // 1) Activation: out[i] = silu(x[i]) -> mercury_vmath_f32 (SFU sigmoid approx on GPU).
+        {
+            let n = 64usize;
+            let src = format!(
+                "module m\nfn act(x:[f32;{n}], out:[f32;{n}]) {{ \
+                 for i in 0..{n} {{ out[i] = silu(x[i]); }} }}"
+            );
+            let (program, mut interner) = build(&src);
+            let entry = interner.intern("act");
+            let init = vec![rng.vec(n, -4.0, 4.0), vec![0.0; n]];
+            let (cpu, gpu, calls) = run_both(g, &program, entry, &interner, &init);
+            assert!(calls >= 1, "activation offload never fired");
+            let s = assert_close("silu activation", &gpu[1], &cpu[1], 2e-3, 5e-3);
+            eprintln!(
+                "gpu --backend silu[{n}]: {calls} call(s), max_abs={:.2e} max_rel={:.2e}",
+                s.max_abs, s.max_rel
+            );
+        }
+
+        // 2) Reduction: o[0] = Σ x·y -> mercury_sreduce_f32_parallel (dot, written to a [1] buffer).
+        {
+            let n = 1024usize;
+            let src = format!(
+                "@parallel fn dotp(x:[f32;{n}], y:[f32;{n}], o:[f32;1]) {{ \
+                 let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k] * y[k]; }} o[0] = s; }}"
+            );
+            let (program, mut interner) = build(&src);
+            let entry = interner.intern("dotp");
+            let init = vec![rng.vec(n, -1.0, 1.0), rng.vec(n, -1.0, 1.0), vec![0.0; 1]];
+            let (cpu, gpu, calls) = run_both(g, &program, entry, &interner, &init);
+            assert!(calls >= 1, "reduction offload never fired");
+            let rel = (16.0 * (n as f64).sqrt() * f32::EPSILON as f64).max(1e-5);
+            let s = assert_close("dot reduction", &gpu[2], &cpu[2], 1e-3, rel);
+            eprintln!(
+                "gpu --backend dot[{n}]: {calls} call(s), max_abs={:.2e} max_rel={:.2e}",
+                s.max_abs, s.max_rel
+            );
+        }
+
+        // 3) Fused norm: batched softmax over [R,C] -> mercury_norm_f32 (in place; GPU uses ex2.approx).
+        {
+            let (r, c) = (4usize, 16usize);
+            let n = r * c;
+            let src = format!(
+                "module m\nfn sm(x:[f32;{n}]) {{ for row in 0..{r} {{ \
+                 let mut m: f32 = x[row*{c}]; for i in 0..{c} {{ m = fmax(m, x[row*{c}+i]); }} \
+                 for i in 0..{c} {{ x[row*{c}+i] = exp(x[row*{c}+i] - m); }} \
+                 let mut s: f32 = 0.0; for i in 0..{c} {{ s = s + x[row*{c}+i]; }} \
+                 let inv: f32 = 1.0 / s; for i in 0..{c} {{ x[row*{c}+i] = x[row*{c}+i] * inv; }} }} }}"
+            );
+            let (program, mut interner) = build(&src);
+            let entry = interner.intern("sm");
+            let init = vec![rng.vec(n, -3.0, 3.0)];
+            let (cpu, gpu, calls) = run_both(g, &program, entry, &interner, &init);
+            assert!(
+                calls >= 1,
+                "norm offload never fired (softmax did not lower to mercury_norm_f32)"
+            );
+            let s = assert_close("batched softmax", &gpu[0], &cpu[0], 2e-3, 5e-3);
+            eprintln!(
+                "gpu --backend softmax[{r}x{c}]: {calls} call(s), max_abs={:.2e} max_rel={:.2e}",
+                s.max_abs, s.max_rel
+            );
+        }
+    }
 }

@@ -898,14 +898,24 @@ impl<'a, 'k> Interp<'a, 'k> {
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
-                // SAFETY: xbuf/obuf are exactly n f32 long — the kernel's contract.
-                unsafe {
-                    mercury_runtime::mercury_vmath_f32(
-                        xbuf.as_ptr(),
-                        obuf.as_mut_ptr(),
-                        n as i64,
-                        op,
-                    );
+                // Offload the activation to the accelerator (GPU) when it claims this op; otherwise
+                // (or with no accelerator — the oracle) fall back to the identical CPU kernel.
+                let offloaded = self
+                    .accel
+                    .as_mut()
+                    .and_then(|acc| acc.vmath(op, &xbuf, &mut obuf));
+                match offloaded {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Err(e),
+                    // SAFETY: xbuf/obuf are exactly n f32 long — the kernel's contract.
+                    None => unsafe {
+                        mercury_runtime::mercury_vmath_f32(
+                            xbuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            op,
+                        );
+                    },
                 }
                 for (t, &val) in obuf.iter().enumerate() {
                     *self
@@ -1043,9 +1053,24 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .as_float() as f32,
                     );
                 }
-                // SAFETY: xbuf/ybuf are exactly n f32 long — the kernel's contract.
-                let r = unsafe {
-                    mercury_runtime::mercury_sreduce_f32(xbuf.as_ptr(), ybuf.as_ptr(), n as i64, op)
+                // Offload the reduction to the accelerator (GPU) when it covers this op; otherwise
+                // (or with no accelerator) call the serial CPU kernel.
+                let offloaded = self
+                    .accel
+                    .as_mut()
+                    .and_then(|acc| acc.sreduce(op, &xbuf, &ybuf));
+                let r = match offloaded {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => return Err(e),
+                    // SAFETY: xbuf/ybuf are exactly n f32 long — the kernel's contract.
+                    None => unsafe {
+                        mercury_runtime::mercury_sreduce_f32(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            n as i64,
+                            op,
+                        )
+                    },
                 };
                 Ok(Value::Float(r as f64))
             }
@@ -1113,16 +1138,32 @@ impl<'a, 'k> Interp<'a, 'k> {
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
-                // SAFETY: xbuf/obuf are exactly rows*cols f32 long — the kernel's contract.
-                unsafe {
-                    mercury_runtime::mercury_norm_f32(
-                        xbuf.as_ptr(),
-                        obuf.as_mut_ptr(),
-                        rows as i64,
-                        cols as i64,
-                        eps_bits,
+                // Offload the fused norm to the accelerator (GPU) when present; else the CPU kernel.
+                // The runtime ABI carries eps as raw f32 bits; the GPU wrapper takes an f32, so widen.
+                let offloaded = self.accel.as_mut().and_then(|acc| {
+                    acc.norm(
                         op,
-                    );
+                        &xbuf,
+                        &mut obuf,
+                        rows,
+                        cols,
+                        f32::from_bits(eps_bits as u32),
+                    )
+                });
+                match offloaded {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Err(e),
+                    // SAFETY: xbuf/obuf are exactly rows*cols f32 long — the kernel's contract.
+                    None => unsafe {
+                        mercury_runtime::mercury_norm_f32(
+                            xbuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            rows as i64,
+                            cols as i64,
+                            eps_bits,
+                            op,
+                        );
+                    },
                 }
                 for (t, &val) in obuf.iter().enumerate() {
                     *self
