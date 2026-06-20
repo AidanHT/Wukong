@@ -926,6 +926,43 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_vmath_bf16(x, out, n, op)` — the bf16-input twin of `mercury_vmath_f32` an
+            // `out[i] = f((x[i] as f32))` loop over a `[bf16]` array lowers to. Reconstruct the exact
+            // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-
+            // rounded, so `f32_to_bf16_bits` is exact), call the *identical* runtime kernel the native
+            // backend calls, write the f32 result back — so the differential oracle stays exact.
+            "mercury_vmath_bf16" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let op = args[3].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(mercury_runtime::f32_to_bf16_bits(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("vmath bf16 operand out of bounds")?
+                            .as_float() as f32,
+                    ));
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf is n u16, obuf is n f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_vmath_bf16(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        n as i64,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("vmath bf16 output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_velem_f32(x, y, out, n, a, b, c, op)` — the streaming affine+activation kernel
             // (saxpy / scale / residual-add / bias / ReLU) a recognized `out[i] = act(a·x[i] + b·y[i]
             // + c)` map lowers to. Marshal `n` f32 from x and y, call the *identical* runtime kernel
