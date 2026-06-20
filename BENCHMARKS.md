@@ -524,6 +524,27 @@ the plain staged 64-tile otherwise — each the measured winner in its range. Re
 `gemm_vs_peers` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
 `baselines.rs`).
 
+**Beating cuBLAS by fusion (M1-fused).** cuBLAS can only compute `A·Bᵀ`; an activation needs a *second*
+kernel that reads C back from HBM, applies the op, and writes it again. Mercury fuses the activation
+into the WMMA store epilogue (elementwise on the f32 accumulators, before the C store — `Act` in
+`ptx_wmma.rs`), so `relu(A·Bᵀ)` is **one kernel that writes C once**. Measured on resident device
+buffers (`fused_gemm_relu_vs_chain`, fused output gated == `relu(cuBLAS)`; the chain cost is GEMM+relu
+summed, which is exact since they are dependency-serialized):
+
+| size | Mercury fused | Mercury GEMM+relu | cuBLAS GEMM+relu | fusion vs own chain | **fused vs cuBLAS chain** |
+|------|---------------|-------------------|------------------|---------------------|---------------------------|
+| 512³ | 0.035 ms | 0.077 ms | 0.084 ms | 2.21× | **2.41×** |
+| 1024³ | 0.163 ms | 0.199 ms | 0.193 ms | 1.22× | **1.18×** |
+| 2048³ | 1.258 ms | 1.579 ms | 1.177 ms | 1.26× | 0.94× |
+
+So **at L2-resident sizes (≤1024³) the single fused kernel beats the cuBLAS GEMM+activation chain
+1.18–2.41×** — the first place Mercury is *faster than cuBLAS*, precisely because it does the fusion
+cuBLAS structurally cannot. Fusion beats Mercury's own two-kernel chain at **every** size (1.2–2.2×,
+biggest where the GEMM is small and the saved relu pass is a larger share). At 2048³ cuBLAS's faster
+raw GEMM still wins the whole chain despite the fused saving (honest — the 2048³+ GEMM gap stands).
+gelu/silu epilogues (needing the transcendental PTX) and a fused bias (needs the fragment col layout)
+are the obvious next steps; the recognizer that routes `act(matmul(…))` to the fused kernel is Phase 2.
+
 **Compile latency + cubin cache (M10).** Mercury emits PTX and the driver JITs it to SASS; there is no
 30–120 s autotuning compile like Triton/TorchInductor. Measured (`cubin_cache_compile_latency`, RTX
 4050): a from-scratch driver JIT of the fp16 WMMA module (43 KB PTX → 26 KB cubin) is **0.76 ms** — so
