@@ -14,10 +14,11 @@ use std::arch::x86_64::*;
 
 use crate::bf16_bits_to_f32;
 
-/// IEEE f16 (stored bits) → f32. Lossless, so it equals the F16C `vcvtph2ps` result exactly.
+/// IEEE f16 (stored bits) → f32. Lossless, so it equals the F16C `vcvtph2ps` result exactly. Thin
+/// alias for the crate-root [`crate::f16_bits_to_f32`] — one shared definition of the f16 widen.
 #[inline]
 fn f16_to_f32(h: u16) -> f32 {
-    half::f16::from_bits(h).to_f32()
+    crate::f16_bits_to_f32(h)
 }
 
 /// Fixed 8-lane horizontal combine tree (the same order the scalar twin and the SIMD path use).

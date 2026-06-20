@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 25
+// EXPECT-OUT: 35
+// EXPECT-OUT: 1003
+module tests.run.f16
+
+// Real f16 (IEEE half) storage: `[f16; N]` holds 2-byte values rounded to the f16 grid
+// (round-to-nearest-even, 10 mantissa bits — finer than bf16's 7). Casts and array load/store all
+// round through the single shared `half`-crate conversion; the native backend calls the identical
+// `mercury_f32_to_f16_bits`/`mercury_f16_bits_to_f32` shims the interpreter uses, so the two agree
+// bit-for-bit (the mercury_bench gate proves it). The runtime f16 reductions widen with F16C.
+fn main() -> i32 {
+    // f16-exact values are unchanged.
+    let one: f16 = 1.0 as f16;
+    print((one as f32) as i32); // 1
+
+    // array store then load round-trips at f16 precision.
+    let mut a: [f16; 8] = [0.0 as f16; 8];
+    for i in 0..8 {
+        a[i] = ((i as f32) * 0.5) as f16; // 0, 0.5, 1.0, ... all f16-exact
+    }
+    print((a[5] as f32 * 10.0) as i32); // 2.5 * 10 = 25
+    print((a[7] as f32 * 10.0) as i32); // 3.5 * 10 = 35
+
+    // 1 + 1/256 = 1.00390625 is f16-exact (mantissa step at 1.0 is 1/1024), so f16 *keeps* it where
+    // bf16 (step 1/128) rounds it away to 1.0 — the finer mantissa on display.
+    let c0: f16 = (1.0 + 0.00390625) as f16;
+    print((c0 as f32 * 1000.0) as i32); // 1003 (1.00390625 * 1000)
+    return 0;
+}
