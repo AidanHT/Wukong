@@ -195,16 +195,17 @@ unsafe fn gemm_dispatch(
     // Multi-thread only above a work threshold: below it, cross-core wake/sync (worse on this
     // P+E-core hybrid, where the E-cores are slow to spin up) costs more than it saves and the
     // parallel path is a net loss — empirically ~256^3 runs faster on one core than across all of
-    // them. The serial AVX2 kernel is the fast path for everything smaller. The fused-epilogue path
-    // is serial-only (the epilogue folds into the serial writeback), so an epilogue forces serial.
-    let par = par && epi.is_none() && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
+    // them. The serial AVX2 kernel is the fast path for everything smaller. The epilogue folds into
+    // the per-tile writeback on the final K-block, so the parallel path carries it too (each C tile
+    // is owned by exactly one task) — a `@parallel` fused FFN runs the bias+activation across cores.
+    let par = par && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 if par {
-                    sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt);
+                    sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi);
                 } else {
                     sgemm_avx2(a, b, c, m, k, n, beta, bt, epi);
                 }
@@ -253,6 +254,35 @@ pub unsafe extern "C" fn mercury_sgemm_nt_parallel(
     gemm_dispatch(a, b, c, m, k, n, beta, true, true, None);
 }
 
+/// Multi-threaded `C = act(A·Bᵀ + bias)` — the fused-epilogue `nn.Linear` across cores (the
+/// `@parallel` transformer FFN). Same epilogue contract as [`mercury_sgemm_nt_epi`]; the bias +
+/// activation folds into each tile's final-K-block writeback, and each C tile is owned by exactly one
+/// task with the same per-(i,j) accumulation order as the serial kernel — so it is bit-identical to
+/// the serial `mercury_sgemm_nt_epi` the interpreter oracle calls. Below the work threshold it runs
+/// the serial fused path. This lets a `@parallel` FFN combine the fusion *and* all the cores (before,
+/// the epilogue forced serial, so a fused FFN could use one or the other but not both).
+///
+/// # Safety
+/// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32`; `bias` null or valid for `n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_nt_epi_parallel(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+) {
+    let epi = Epilogue {
+        bias,
+        act: act as u32,
+    };
+    gemm_dispatch(a, b, c, m, k, n, beta, true, true, Some(epi));
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -265,6 +295,7 @@ unsafe fn sgemm_avx2_parallel(
     n: usize,
     beta: f32,
     bt: bool,
+    epi: Option<Epilogue>,
 ) {
     use rayon::prelude::*;
     // Pack scratch allocated ONCE and reused across every cache block, instead of a fresh
@@ -283,6 +314,14 @@ unsafe fn sgemm_avx2_parallel(
         while pc < k {
             let kc = (k - pc).min(KC);
             let beta_eff = if pc == 0 { beta } else { 1.0 };
+            // The epilogue (bias + activation) is folded into the C writeback on the FINAL K-block
+            // only — exactly as the serial path does. Captured as Send-safe primitives (a raw `bias`
+            // pointer can't cross into the rayon closure), reconstructed per tile at its global column.
+            let is_last_k = pc + kc == k;
+            let (epi_on, epi_bias_addr, epi_act) = match epi {
+                Some(e) if is_last_k => (true, e.bias as usize, e.act),
+                _ => (false, 0usize, 0u32),
+            };
             // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) — in parallel, since with
             // the C compute spread across every core the serial pack would dominate (Amdahl).
             pack_a_par(a.add(pc), k, m, kc, ap.as_mut_ptr());
@@ -304,6 +343,16 @@ unsafe fn sgemm_avx2_parallel(
                 for jp in 0..npanels {
                     let j0 = jp * NR;
                     let nrv = (nc - j0).min(NR);
+                    // Reconstruct the epilogue at this tile's global column (jc + j0); `None` off the
+                    // final K-block. A null bias-addr (0) stays null through `shift`. Matches the serial
+                    // path's double shift (jc, then j0) bit-for-bit, so parallel-fused == serial-fused.
+                    let tile_epi = epi_on.then(|| {
+                        Epilogue {
+                            bias: epi_bias_addr as *const f32,
+                            act: epi_act,
+                        }
+                        .shift(jc + j0)
+                    });
                     // SAFETY: disjoint C rows; shared read-only packed panels; avx2 verified above.
                     unsafe {
                         micro_6x16(
@@ -315,7 +364,7 @@ unsafe fn sgemm_avx2_parallel(
                             beta_eff,
                             mrv,
                             nrv,
-                            None, // the parallel path is never the fused-epilogue path (serial only)
+                            tile_epi,
                         );
                     }
                 }
@@ -1205,9 +1254,16 @@ mod tests {
                 mercury_sgemm_nt_epi(ap, bp, cp, m as i64, k as i64, n as i64, 0, biasp, 1);
                 std::hint::black_box(cp);
             });
+            // The `@parallel` fused FFN: same fold, spread across cores (used to be serial-only).
+            let fused_par = bench(&|| unsafe {
+                mercury_sgemm_nt_epi_parallel(ap, bp, cp, m as i64, k as i64, n as i64, 0, biasp, 1);
+                std::hint::black_box(cp);
+            });
             println!(
-                "m{m} k{k} n{n}: separate {sep:7.3} ms | fused {fused:7.3} ms | {:.2}x",
-                sep / fused
+                "m{m} k{k} n{n}: separate {sep:7.3} ms | fused {fused:7.3} ms ({:.2}x) | \
+                 fused@parallel {fused_par:7.3} ms ({:.2}x vs serial-fused)",
+                sep / fused,
+                fused / fused_par
             );
         }
     }
@@ -1269,6 +1325,42 @@ mod tests {
                             want[idx]
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The parallel fused epilogue (`mercury_sgemm_nt_epi_parallel`) must be **bit-for-bit** identical
+    /// to the serial `mercury_sgemm_nt_epi` (each C tile is owned by one task and the per-(i,j)
+    /// accumulation order is unchanged) — this is what lets the interpreter call the serial fused kernel
+    /// as the oracle for a `@parallel` FFN and stay exact. Sizes exceed `PAR_MIN_MACS` so the parallel
+    /// path is really taken, with `k > KC` so the epilogue-on-final-K-block logic is exercised.
+    #[test]
+    fn sgemm_nt_epi_parallel_matches_serial() {
+        for &(m, k, n) in &[(512, 300, 512), (640, 300, 400)] {
+            assert!((m * k * n) as u64 >= PAR_MIN_MACS, "size must trip the parallel path");
+            let a = fill(21, m * k);
+            let b = fill(22, n * k);
+            let bias = fill(23, n);
+            for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
+                for use_bias in [false, true] {
+                    let bias_ptr = if use_bias {
+                        bias.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
+                    let (mut serial, mut par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+                    unsafe {
+                        mercury_sgemm_nt_epi(
+                            a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
+                            m as i64, k as i64, n as i64, 0, bias_ptr, act as i64,
+                        );
+                        mercury_sgemm_nt_epi_parallel(
+                            a.as_ptr(), b.as_ptr(), par.as_mut_ptr(),
+                            m as i64, k as i64, n as i64, 0, bias_ptr, act as i64,
+                        );
+                    }
+                    assert_eq!(serial, par, "par-fused != serial-fused (m{m} k{k} n{n} act{act} bias{use_bias})");
                 }
             }
         }
