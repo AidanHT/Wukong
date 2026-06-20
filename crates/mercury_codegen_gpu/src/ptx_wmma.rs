@@ -322,6 +322,26 @@ fn entry_smem(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, warps_
     s
 }
 
+/// Fused activation epilogue applied to the f32 accumulator **before** the C store — the thing cuBLAS
+/// structurally cannot do (it only computes `A·Bᵀ`; an activation needs a second kernel that
+/// round-trips C through HBM). The activation is elementwise on each accumulator register, so it needs
+/// no knowledge of the WMMA fragment's row/col layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    None,
+    Relu,
+}
+
+impl Act {
+    /// PTX applying the activation in place to one f32 accumulator register `reg`.
+    fn epilogue(self, reg: &str) -> String {
+        match self {
+            Act::None => String::new(),
+            Act::Relu => format!("    max.f32 {reg},{reg},0f00000000;\n"),
+        }
+    }
+}
+
 /// Generate a **`cp.async` double-buffered** SMEM-staged WMMA GEMM (`_sm_db`). Same CTA tiling as
 /// [`entry_smem`], but the K-loop is software-pipelined: each step issues `cp.async` copies that
 /// prefetch the *next* A/B tile into the alternate shared buffer **while the tensor cores consume the
@@ -329,8 +349,17 @@ fn entry_smem(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, warps_
 /// global-load latency with compute — the lever for the large-GEMM cliff, which the 128×128 experiment
 /// showed is latency- not bandwidth-*volume*-bound (cuBLAS hides the same latency with a multi-stage
 /// pipeline). Two shared buffers toggle by XOR (the tile size is a power of two). Requires `bm==bn`
-/// (one buffer-offset register drives both A and B) and the [`entry_smem`] staging constraints.
-fn entry_smem_db(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, warps_n: usize) -> String {
+/// (one buffer-offset register drives both A and B) and the [`entry_smem`] staging constraints. `act`
+/// fuses an activation into the C-store epilogue (`Act::None` is the plain GEMM).
+fn entry_smem_db(
+    name: &str,
+    ty: &str,
+    bm: usize,
+    bn: usize,
+    warps_m: usize,
+    warps_n: usize,
+    act: Act,
+) -> String {
     assert_eq!(bm, bn, "the double-buffered kernel uses one buffer-offset reg for A and B");
     let mma_ty = if ty == "f16" {
         "f32.f32".to_string()
@@ -473,6 +502,10 @@ fn entry_smem_db(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, war
             s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
             s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
             s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            // Fused epilogue: activate each accumulator register in place before storing C.
+            for r in 0..8 {
+                s += &act.epilogue(&format!("%c{ti}_{tj}_{r}"));
+            }
             let cc = veclist(&format!("c{ti}_{tj}_"), 8);
             s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
         }
@@ -559,7 +592,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         m += &entry("wmma_nt_f16", "f16", 1, 1);
         m += &entry("wmma_nt_f16_mt", "f16", TM_TILES, TN_TILES);
         m += &entry_smem("wmma_nt_f16_sm", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N);
-        m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N);
+        m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None);
         m += &entry_smem_db(
             "wmma_nt_f16_sm128_db",
             "f16",
@@ -567,6 +600,17 @@ pub fn wmma_f16_ptx() -> &'static str {
             SM128_BN,
             SM128_WARPS_M,
             SM128_WARPS_N,
+            Act::None,
+        );
+        // Fused activation epilogue — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
+        m += &entry_smem_db(
+            "wmma_nt_f16_sm_db_relu",
+            "f16",
+            SM_BM,
+            SM_BN,
+            SM_WARPS_M,
+            SM_WARPS_N,
+            Act::Relu,
         );
         m
     })

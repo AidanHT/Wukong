@@ -518,6 +518,45 @@ pub fn gemm_nt_f16_sm_db(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// `C = relu(A·Bᵀ)` (fp16-in, f32-out) in **one kernel** via `wmma_nt_f16_sm_db_relu` — the cp.async
+/// double-buffered GEMM with the activation fused into the C-store epilogue. This is the lever cuBLAS
+/// cannot match: it only computes `A·Bᵀ`, so a cuBLAS pipeline must launch a *second* kernel that reads
+/// C back from HBM, applies relu, and writes it again. The fused kernel writes C exactly once. Requires
+/// `M%SM_BM==0`, `N%SM_BN==0`, `K%16==0`; tolerance-gated against `relu(A·Bᵀ)`.
+pub fn gemm_nt_f16_sm_db_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "wmma_nt_f16_sm_db_relu requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db_relu")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// `C = A·Bᵀ` (fp16-in, f32-out) via the **128×128 CTA-tile + `cp.async` double-buffered** kernel
 /// `wmma_nt_f16_sm128_db` — the cuBLAS recipe: a big tile cuts redundant inter-CTA global traffic
 /// *and* software pipelining hides what's left, the combination aimed at the large-GEMM regime where
@@ -1404,6 +1443,39 @@ mod tests {
         });
     }
 
+    /// The **fused** `relu(A·Bᵀ)` kernel must equal relu applied to the same f16-rounded f64 reference
+    /// — i.e. the epilogue activates the accumulator with no effect on the GEMM math. relu is exact
+    /// (`max(x,0)`), so it neither tightens nor loosens the GEMM's accumulation tolerance; a missing or
+    /// misplaced epilogue (e.g. negative outputs surviving) fails immediately.
+    #[test]
+    fn wmma_sm_db_relu_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_sm_db_relu", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DB2);
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = gemm_nt_f16_sm_db_relu(g, &a, &b, m, k, n).unwrap();
+                let mut r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                for v in &mut r {
+                    *v = v.max(0.0); // fused relu
+                }
+                assert!(c.iter().all(|&v| v >= 0.0), "relu output must be non-negative");
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16_sm_db_relu {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!(
+                    "wmma_f16_sm_db_relu {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
     /// Diagnostic: JIT a PTX module with the driver's error-log buffer attached and print it. The
     /// plain `load_module` path only surfaces `CUDA_ERROR_INVALID_PTX` with no detail; this prints
     /// `ptxas`'s actual line/error, which is how every hand-written PTX kernel here gets debugged.
@@ -2283,6 +2355,71 @@ mod tests {
         });
     }
 
+    /// **The beat-cuBLAS lever: fusion.** `relu(A·Bᵀ)` as a single fused kernel vs the two-kernel call
+    /// chains cuBLAS forces (GEMM writes C to HBM, a second kernel reads it back, applies relu, writes
+    /// it again). cuBLAS *cannot* fuse, so its pipeline always pays that extra C round-trip; the fused
+    /// kernel writes C once. Times are on resident device buffers; the chain cost is GEMM + relu summed
+    /// (they are dependency-serialized — relu reads the GEMM's output — so there is no overlap to model,
+    /// and the sum is the true chain time). Correctness gates speed: the fused output must equal
+    /// relu(cuBLAS) at every shape. Run with the CUDA redist DLLs on PATH (see `gemm_vs_peers`).
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn fused_gemm_relu_vs_chain() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
+        use half::f16;
+        with_gpu("fused_relu", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] fused_gemm_relu_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0xF0ED);
+            for sz in [512usize, 1024, 2048] {
+                let (m, k, n) = (sz, sz, sz);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+
+                // Correctness first: the fused kernel must equal relu applied to cuBLAS's GEMM.
+                let fused = gemm_nt_f16_sm_db_relu(g, &a, &b, m, k, n).unwrap();
+                let cub_relu: Vec<f32> =
+                    cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap().iter().map(|&x| x.max(0.0)).collect();
+                assert!(fused.iter().all(|&v| v >= 0.0), "relu output must be non-negative");
+                crate::diff::assert_close(&format!("fused vs cuBLAS+relu {sz}³"), &fused, &cub_relu, 5e-2, 2e-2);
+
+                // Timing on resident device buffers.
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let dims = (m as u32, n as u32, k as u32);
+                let ptx = crate::ptx_wmma::wmma_f16_ptx();
+                let f_fused = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_relu").unwrap();
+                let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db").unwrap();
+                let f_relu = g.function("vmath", crate::ptx::vmath_ptx(), "relu").unwrap();
+
+                let t_fused = time_wmma(g, &f_fused, wmma_sm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 50);
+                let t_gemm = time_wmma(g, &f_gemm, wmma_sm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, 50);
+                let t_relu = time_relu(g, &f_relu, m * n, 50);
+                let t_cub = time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap();
+
+                let (mer_chain, cub_chain) = (t_gemm + t_relu, t_cub + t_relu);
+                let flop = gemm_flop(m, n, k);
+                eprintln!(
+                    "\n{sz}³ relu(A·Bᵀ) (same-run, on-device):\n  \
+                     Mercury fused     : {:>7.3} ms  ({:>6.0} GFLOP/s)\n  \
+                     Mercury GEMM+relu : {:>7.3} ms  ({:.3} gemm + {:.3} relu)  | fusion {:>4.2}× faster\n  \
+                     cuBLAS  GEMM+relu : {:>7.3} ms  ({:.3} gemm + {:.3} relu)  | fused {:>4.2}× vs cuBLAS chain",
+                    t_fused * 1e3, flop / t_fused / 1e9,
+                    mer_chain * 1e3, t_gemm * 1e3, t_relu * 1e3, mer_chain / t_fused,
+                    cub_chain * 1e3, t_cub * 1e3, t_relu * 1e3, cub_chain / t_fused,
+                );
+            }
+        });
+    }
+
     /// The roofline microbench must JIT and run, returning a positive, plausible TC rate (sanity that
     /// the compute-bound kernel isn't dead-code-eliminated to ~0 or mis-issued). Not a tolerance gate.
     #[test]
@@ -2319,6 +2456,29 @@ mod tests {
         let t0 = Instant::now();
         for _ in 0..iters {
             launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Per-iter device time of one elementwise pass over `n` f32 (the `vmath` `relu` kernel: read x,
+    /// write out — exactly the HBM round-trip a non-fused GEMM+activation chain pays and a fused
+    /// epilogue avoids). `f` is the prefetched `relu` function.
+    fn time_relu(g: &Gpu, f: &cudarc::driver::CudaFunction, n: usize, iters: usize) -> f64 {
+        let nn = n as u32;
+        let x_d = g.stream.memcpy_stod(&vec![0.5f32; n]).unwrap();
+        let mut out_d = g.stream.memcpy_stod(&vec![0f32; n]).unwrap();
+        let cfg = LaunchConfig::for_num_elems(nn);
+        let launch = |out_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut b = g.stream.launch_builder(f);
+            b.arg(&nn).arg(&x_d).arg(out_d);
+            unsafe { b.launch(cfg).unwrap() };
+        };
+        launch(&mut out_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(&mut out_d);
         }
         g.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() / iters as f64
