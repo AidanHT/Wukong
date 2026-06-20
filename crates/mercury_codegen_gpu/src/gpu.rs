@@ -462,6 +462,47 @@ pub fn flash_attn(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// Direct 2D **convolution** on the GPU (single batch, stride 1, no padding): input `x` is `[C,H,W]`,
+/// weights `w` are `[K,C,R,S]`, output is `[K,P,Q]` with `P=H-R+1`, `Q=W-S+1` — the valid
+/// cross-correlation deep-learning calls conv2d. One thread per output element. Tolerance-gated
+/// (the GPU `fma`-accumulates the C·R·S window in a different order than a serial reference).
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let p = h - r + 1;
+    let q = width - s + 1;
+    let total = (k * p * q) as u32;
+    let f = g.function("conv2d", crate::ptx_conv::CONV2D, "conv2d")?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let w_d = g.stream.memcpy_stod(w)?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
+    let dims = [c, h, width, k, r, s, p, q].map(|v| v as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    for d in &dims {
+        bld.arg(d);
+    }
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +936,72 @@ mod tests {
                     "flash s={seq} d={d}: {:.2} ms/iter, {:.0} GFLOP/s (fused, no s² scores in HBM)",
                     spi * 1e3,
                     flop / spi / 1e9
+                );
+            }
+        });
+    }
+
+    /// f64 reference for direct conv2d (single batch, stride 1, no padding): `X[C,H,W]`, `W[K,C,R,S]`
+    /// → `O[K,P,Q]`, `P=H-R+1`, `Q=W-S+1`. The independent oracle for the GPU kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_conv2d(
+        x: &[f32],
+        w: &[f32],
+        c: usize,
+        h: usize,
+        width: usize,
+        k: usize,
+        r: usize,
+        s: usize,
+    ) -> Vec<f32> {
+        let (p, q) = (h - r + 1, width - s + 1);
+        let mut o = vec![0.0f32; k * p * q];
+        for kk in 0..k {
+            for pp in 0..p {
+                for qq in 0..q {
+                    let mut acc = 0.0f64;
+                    for cc in 0..c {
+                        for rr in 0..r {
+                            for ss in 0..s {
+                                let (ih, iw) = (pp + rr, qq + ss);
+                                acc += x[(cc * h + ih) * width + iw] as f64
+                                    * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                            }
+                        }
+                    }
+                    o[(kk * p + pp) * q + qq] = acc as f32;
+                }
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn conv2d_matches_reference_within_tol() {
+        with_gpu("conv2d", |g| {
+            let mut rng = crate::diff::Rng::new(0xC0FFEE);
+            // (C, H, W, K, R, S) — a 3×3 over 3 channels, and a 5×5 over 16 channels
+            let cases = [
+                (3usize, 16usize, 16usize, 8usize, 3usize, 3usize),
+                (16, 32, 32, 4, 5, 5),
+            ];
+            for (c, h, width, k, r, s) in cases {
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d(g, &x, &w, c, h, width, k, r, s).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                // c·√(R·S)·ε accumulation bound, abs cushion for near-zero outputs
+                let rel = ((8.0 * ((c * r * s) as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+                let st = crate::diff::assert_close(
+                    &format!("conv2d C{c} {h}x{width} K{k} {r}x{s}"),
+                    &got,
+                    &oracle,
+                    1e-4,
+                    rel,
+                );
+                eprintln!(
+                    "conv2d C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
                 );
             }
         });

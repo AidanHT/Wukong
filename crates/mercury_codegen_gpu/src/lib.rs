@@ -35,4 +35,7 @@ pub mod ptx_norm;
 pub mod ptx_flash;
 
 #[cfg(feature = "gpu")]
+pub mod ptx_conv;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
