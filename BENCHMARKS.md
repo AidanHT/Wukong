@@ -474,6 +474,17 @@ deterministic reductions (sum/dot/max — bit-exact for max, tolerance for the f
 row), and direct conv2d. Reproduce: `cargo test -p mercury_codegen_gpu --features gpu` (correctness;
 skips cleanly with no GPU) and `… --release -- --ignored --nocapture` (throughput).
 
+**End-to-end `--backend=gpu`.** Beyond the crate's host API, the GPU is wired as a third compiler
+backend: `mercuryc --features gpu --backend=gpu --run foo.mer` tree-walks the program on an
+*offloading interpreter* and runs recognized GEMM / activation / reduction / fused-norm calls on the
+device (an `Accelerator` seam in `mercury_interp` that the driver fills with `mercury_codegen_gpu`).
+With no accelerator — the differential oracle and every other caller — the interpreter path is
+byte-for-byte unchanged, so the toolchain-free core is untouched and the bit-exact CPU gate is intact.
+The CPU↔GPU boundary stays a tolerance differential: the `gpu_backend_*` driver tests run each family
+on the interp oracle and the GPU over identical buffers and require both that the offload *actually
+fired* and that outputs match within `c·√K·ε` (GEMM bit-exact; silu ~5e-7, dot ~7e-7, softmax ~3e-8
+abs on this box). A device error surfaces as an error, never a silent CPU fallback.
+
 ## Honest summary
 
 - **Compile time:** ~100–260× faster than gcc/rustc (geomean ~135–155×). Robust every run; the metric
