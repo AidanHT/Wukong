@@ -417,6 +417,51 @@ pub fn norm(
     g.stream.memcpy_dtov(&out_d)
 }
 
+/// Fused **flash-attention** on the GPU: `O = softmax(scale · Q·Kᵀ) · V`, single head, Q/K/V/O all
+/// `[seq, d]` row-major. Never materializes the `seq×seq` score matrix — the online-softmax
+/// recurrence streams K/V once (one warp per query row). `d` must be one of [`ptx_flash::SUPPORTED_D`]
+/// (32/64/128). Tolerance-gated against a full-softmax CPU reference. The marquee GPU kernel: the
+/// fused form that *lost* on CPU (where the tuned GEMM dominates) wins here by halving HBM traffic.
+pub fn flash_attn(
+    g: &mut Gpu,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    d: usize,
+    scale: f32,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(q.len(), seq * d, "Q must be seq×d");
+    assert_eq!(k.len(), seq * d, "K must be seq×d");
+    assert_eq!(v.len(), seq * d, "V must be seq×d");
+    assert!(
+        crate::ptx_flash::SUPPORTED_D.contains(&d),
+        "flash_attn: head dim {d} has no generated kernel (supported: {:?})",
+        crate::ptx_flash::SUPPORTED_D
+    );
+    let entry = format!("flash_d{d}");
+    let f = g.function("flash", crate::ptx_flash::flash_ptx(), &entry)?;
+    let q_d = g.stream.memcpy_stod(q)?;
+    let k_d = g.stream.memcpy_stod(k)?;
+    let v_d = g.stream.memcpy_stod(v)?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; seq * d])?;
+    let s = seq as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (s, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&s)
+        .arg(&scale)
+        .arg(&q_d)
+        .arg(&k_d)
+        .arg(&v_d)
+        .arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +781,120 @@ mod tests {
                 eprintln!(
                     "norm {label:10}: max_abs={:.2e} max_rel={:.2e}",
                     s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    /// f64 reference for single-head attention `O = softmax(scale·Q·Kᵀ)·V`, all `[seq, d]`. The
+    /// non-flash (materialized, two-pass softmax) form: an independent oracle for the fused kernel.
+    fn ref_attn(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize, scale: f32) -> Vec<f32> {
+        let mut o = vec![0.0f32; seq * d];
+        for i in 0..seq {
+            // scores[j] = scale · Q[i]·K[j]
+            let mut scores = vec![0.0f64; seq];
+            for (j, sc) in scores.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for t in 0..d {
+                    acc += q[i * d + t] as f64 * k[j * d + t] as f64;
+                }
+                *sc = acc * scale as f64;
+            }
+            let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut l = 0.0f64;
+            for sc in &mut scores {
+                *sc = (*sc - m).exp();
+                l += *sc;
+            }
+            for t in 0..d {
+                let mut acc = 0.0f64;
+                for (j, &p) in scores.iter().enumerate() {
+                    acc += p * v[j * d + t] as f64;
+                }
+                o[i * d + t] = (acc / l) as f32;
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn flash_attention_matches_reference_within_tol() {
+        with_gpu("flash_attention", |g| {
+            let mut rng = crate::diff::Rng::new(0xF1A54);
+            // ragged seq (not a multiple of any block) across the supported head dims
+            for (seq, d) in [(128usize, 32usize), (200, 64), (96, 128)] {
+                let q = rng.vec(seq * d, -1.0, 1.0);
+                let k = rng.vec(seq * d, -1.0, 1.0);
+                let v = rng.vec(seq * d, -1.0, 1.0);
+                let scale = 1.0 / (d as f32).sqrt();
+                let got = flash_attn(g, &q, &k, &v, seq, d, scale).unwrap();
+                let oracle = ref_attn(&q, &k, &v, seq, d, scale);
+                let s = crate::diff::assert_close(
+                    &format!("flash s={seq} d={d}"),
+                    &got,
+                    &oracle,
+                    1e-3,
+                    3e-3,
+                );
+                eprintln!(
+                    "flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    /// Flash-attention throughput at increasing context length, kernel-resident (no per-iter copies).
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn flash_throughput() {
+        with_gpu("flash_throughput", |g| {
+            let mut rng = crate::diff::Rng::new(11);
+            let d = 64usize;
+            let f = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64")
+                .unwrap();
+            for seq in [512usize, 1024, 2048, 4096] {
+                let q = rng.vec(seq * d, -1.0, 1.0);
+                let k = rng.vec(seq * d, -1.0, 1.0);
+                let v = rng.vec(seq * d, -1.0, 1.0);
+                let q_d = g.stream.memcpy_stod(&q).unwrap();
+                let k_d = g.stream.memcpy_stod(&k).unwrap();
+                let v_d = g.stream.memcpy_stod(&v).unwrap();
+                let mut o_d = g.stream.memcpy_stod(&vec![0f32; seq * d]).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let s = seq as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: (s, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch = |o_d: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&s)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                };
+                launch(&mut o_d);
+                g.stream.synchronize().unwrap();
+                let iters = 20;
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    launch(&mut o_d);
+                }
+                g.stream.synchronize().unwrap();
+                let spi = t0.elapsed().as_secs_f64() / iters as f64;
+                // attention FLOPs ≈ QKᵀ (2·s²·d) + P·V (2·s²·d) = 4·s²·d
+                let flop = 4.0 * (seq as f64) * (seq as f64) * (d as f64);
+                eprintln!(
+                    "flash s={seq} d={d}: {:.2} ms/iter, {:.0} GFLOP/s (fused, no s² scores in HBM)",
+                    spi * 1e3,
+                    flop / spi / 1e9
                 );
             }
         });
