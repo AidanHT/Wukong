@@ -479,24 +479,44 @@ fp8 fragment layout on `sm_89` — is bit-exact (`max_abs=0` vs an asymmetric e4
 the multi-tile correctness gate covers it at 64³ and 128×256×64. SMEM K/V staging for fp8's true peak
 remains documented future work.
 
-**% of roofline (the honest substitute for a cuBLAS peer).** There is **no cuBLAS / cuDNN on this
-box** — only the NVIDIA driver, no CUDA toolkit — so a tuned-library comparison is physically
-unmeasurable here (the same wall as the absent LLVM). Instead we measure a **compute-bound fp16 WMMA
-roofline** microbench (one fragment load, then a long loop of `wmma.mma`s over 4 independent
-accumulators — near-zero hot-loop memory traffic) and report the real GEMM as a **same-run %** of it
-(clock-invariant, unlike the ~7×-swinging absolutes):
+**Honest peer scoreboard — vs cuBLAS and naive CUDA-C.** A GPU kernel's only meaningful rivals run on
+the *same GPU*. Both are now measured here (Phase 0 of the GPU plan): the redistributable **NVRTC** +
+**cuBLAS** DLLs `dlopen` like the driver itself, so `cargo test` stays toolkit-free and the peer bench
+*skips* (never fails) when they are absent. Two bars:
 
-| | fp16 roofline | fp16-mt GEMM | fp8-mt GEMM |
-|--|--------------|--------------|-------------|
-| 2048³ | ~16.3 TFLOP/s | 59% of roof | 100% of fp16 roof |
-| 4096³ | ~16.3 TFLOP/s | 39% of roof | 87% of fp16 roof |
+- **Tier A — naive CUDA-C** compiled at runtime by NVRTC (the idiomatic one-thread-per-output GEMM a
+  programmer writes by hand). Beating it is the literal "beat C/C++/Rust **on the GPU**" — the GPU twin
+  of Mercury beating scalar CPU-C, via tiling and tensor cores the author never wrote.
+- **Tier B — cuBLAS fp16** (`cublasGemmEx`, f32 accumulate): NVIDIA's hand-tuned closed-source gold
+  standard. Mercury is reported as a **% of cuBLAS**.
 
-The fp16 GEMM reaches ~40–60% of the practical fp16 tensor-core ceiling — the rest is the
-global-load-bound gap (no shared-memory staging), the documented next lever. fp8-mt hits ~100% of the
-*fp16* roofline (so ~44–50% of fp8's own ~2× ceiling — fp8 issues at twice fp16's rate). Note the
-roofline itself (~16 TFLOP/s) is far below the ~80–97 TFLOP/s *rated* dense peak: the 6 GB mobile 4050
-is power-capped, so ~16 TFLOP/s is the **real** sustained ceiling on this part, not a kernel shortfall.
-Reproduce: `cargo test -p mercury_codegen_gpu --features gpu tensorcore_roofline_pct -- --ignored --nocapture`.
+Same-run, same device buffers, checksum-cross-checked, both peers first tolerance-gated against the f64
+oracle (a fast-but-wrong kernel never scores). Two back-to-back runs (the mid-size % swings with the
+laptop's clock state; the 4096³ cliff does not):
+
+| size | Mercury WMMA, % of cuBLAS | × vs naive CUDA-C | cuBLAS (gold) vs internal roofline |
+|------|--------------------------|-------------------|------------------------------------|
+| 1024³ | ~51–72% | ~64–83× | ~100–104% (cuBLAS ≈ roof) |
+| 2048³ | ~66–78% | ~64–72× | ~79–92% |
+| 4096³ | **~28%** | ~37–115× | ~92% |
+
+The honest standing: **a wide Tier-A win** — Mercury's tensor-core GEMM beats the naive hand-written
+CUDA-C kernel by tens-to-100×+, the same way it beats naive CPU-C — but **well short of cuBLAS** (the
+plan's M1 target is ≥95% isolated, >100% fused). The scoreboard also exposes what the internal roofline
+hid: **cuBLAS matches or exceeds that roofline** (~100–104% at 1024³), so the roofline was a soft
+under-estimate, not a true ceiling; and Mercury's WMMA **regresses ~2.3× from 2048³→4096³** (its
+per-warp, no-shared-memory tiles thrash global memory once the tile working set spills L2) while cuBLAS
+keeps climbing. Closing that gap — CTA-level **shared-memory staging**, `cp.async` double-buffering,
+warp-tiling, split-K — is the active work, and the cuBLAS % is exactly the number it moves. Reproduce:
+`gemm_vs_peers` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
+`baselines.rs`).
+
+**Internal fp16 WMMA roofline** (retained as a same-run, clock-invariant compute ceiling — one fragment
+load then a long `wmma.mma` loop over 4 independent accumulators, ~zero hot-loop memory traffic): the
+fp16-mt GEMM sits at ~25–72% of it and fp8-mt at ~75–100% of it across 2048³–4096³. The roofline itself
+(~17 TFLOP/s here) is far below the ~80–97 TFLOP/s *rated* dense peak because the 6 GB mobile 4050 is
+power-capped — and, as the cuBLAS column shows, it is ≈ the cuBLAS-achievable rate, not a kernel-bounding
+wall. Reproduce: `tensorcore_roofline_pct`.
 
 **Fused flash-attention** (online softmax, never materializes the `S×S` scores in HBM — the kernel
 that *lost* on CPU, where the tuned GEMM dominates) — warp-per-query-row, `d=64`:

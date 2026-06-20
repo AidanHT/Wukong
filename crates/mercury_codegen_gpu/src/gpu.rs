@@ -409,9 +409,9 @@ pub fn gemm_nt_bf16(
 
 /// Measure the **fp16 tensor-core roofline** in FLOP/s: `warps` warps each issue `iters·ROOFLINE_ACC`
 /// `wmma.mma`s on register-resident fragments (one global load, no hot-loop memory traffic), so the
-/// achieved rate is the practical TC ceiling on this GPU. Best-of-`reps` to ride out clock dips. The
-/// real GEMM measured in the same run as a fraction of this is the honest "% of roofline" (there is no
-/// cuBLAS here to compare against — no CUDA toolkit). See [`crate::ptx_wmma::roofline_entry`].
+/// achieved rate is the practical TC ceiling on this GPU. Best-of-`reps` to ride out clock dips. This
+/// is an *internal* ceiling; the real peer is cuBLAS (`baselines.rs` / `gemm_vs_peers`), which matches
+/// or exceeds it — so it is a soft under-estimate. See [`crate::ptx_wmma::roofline_entry`].
 pub fn wmma_roofline_f16(
     g: &mut Gpu,
     iters: u32,
