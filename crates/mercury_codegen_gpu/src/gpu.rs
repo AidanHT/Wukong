@@ -665,6 +665,74 @@ pub fn transformer_layer(
     stream.memcpy_dtov(&x)
 }
 
+/// One **fp8 (E4M3) tensor-core tile** `D = A·B` via `mma.sync.m16n8k32` (Ada has no WMMA fp8): `a`
+/// is `16×32` row-major, `b_col` is `32×8` **column-major** (the `.col` operand), both arrive as f32
+/// and are rounded to E4M3 on the host; `D` is `16×8` f32 (the mixed-precision accumulate). Validates
+/// the manual fragment layout — the core a full fp8 GEMM would tile over.
+pub fn fp8_tile(g: &mut Gpu, a: &[f32], b_col: &[f32]) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), 16 * 32, "A must be 16×32");
+    assert_eq!(b_col.len(), 32 * 8, "B must be 32×8 (column-major)");
+    let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b_col
+        .iter()
+        .map(|&x| crate::ptx_fp8::f32_to_e4m3(x))
+        .collect();
+    let f = g.function("fp8_tile", crate::ptx_fp8::FP8_TILE, "fp8_tile")?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; 16 * 8])?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Full **fp8 (E4M3) tensor-core `C = A·Bᵀ`** (nn.Linear): `A` (m×k) and `B` (n×k) arrive as f32 and
+/// are rounded to E4M3 on the host; `C` is f32 (mixed-precision accumulate). Each warp computes a
+/// 16×8 tile via `mma.sync.m16n8k32`. Requires m%16==0, n%8==0, k%32==0. The lowest-precision /
+/// highest-throughput tensor-core path on Ada — 2× the fp16 rate at peak.
+pub fn gemm_nt_fp8(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % 16 == 0 && n % 8 == 0 && k % 32 == 0,
+        "fp8 GEMM needs M%16==0, N%8==0, K%32==0"
+    );
+    let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let f = g.function("fp8_gemm", crate::ptx_fp8::fp8_gemm_ptx(), "fp8_gemm_nt")?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,6 +1368,70 @@ mod tests {
         });
     }
 
+    #[test]
+    fn fp8_tensorcore_tile_matches_reference() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_tile", |g| {
+            // Asymmetric, e4m3-exact integer data — a layout bug can't hide (all-ones would).
+            let a: Vec<f32> = (0..16 * 32)
+                .map(|t| {
+                    let (i, k) = (t / 32, t % 32);
+                    ((i + 2 * k) % 7) as f32
+                })
+                .collect();
+            // B column-major: b_col[j*32 + k] = B[k][j].
+            let b_col: Vec<f32> = (0..32 * 8)
+                .map(|t| {
+                    let (j, k) = (t / 32, t % 32);
+                    ((3 * k + j) % 5) as f32
+                })
+                .collect();
+            let got = fp8_tile(g, &a, &b_col).unwrap();
+            // reference: C[i][j] = Σ_k e4m3(A[i][k])·e4m3(B[k][j]) (exact at these integer magnitudes)
+            let mut refc = vec![0.0f32; 16 * 8];
+            for i in 0..16 {
+                for j in 0..8 {
+                    let mut acc = 0.0f64;
+                    for k in 0..32 {
+                        let av = e4m3_to_f32(f32_to_e4m3(a[i * 32 + k])) as f64;
+                        let bv = e4m3_to_f32(f32_to_e4m3(b_col[j * 32 + k])) as f64;
+                        acc += av * bv;
+                    }
+                    refc[i * 8 + j] = acc as f32;
+                }
+            }
+            let st = crate::diff::assert_close("fp8_tile", &got, &refc, 1e-3, 1e-3);
+            eprintln!(
+                "fp8_tile m16n8k32 (E4M3 tensor core): max_abs={:.2e} max_rel={:.2e}",
+                st.max_abs, st.max_rel
+            );
+        });
+    }
+
+    #[test]
+    fn fp8_gemm_matches_reference_within_tol() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_gemm", |g| {
+            let mut rng = crate::diff::Rng::new(0x00F8);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            // e4m3 products are exact in f32 (4 sig bits × 4 = 8 ≤ 23), so vs an e4m3-rounded-input
+            // reference only the f32 accumulation reassociates → a tight tolerance like the WMMA case.
+            for (m, k, n) in [(16usize, 32usize, 8usize), (64, 64, 64), (128, 256, 64)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = gemm_nt_fp8(g, &a, &b, m, k, n).unwrap();
+                let r = ref_nt_rounded(&a, &b, m, k, n, round);
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                let st =
+                    crate::diff::assert_close(&format!("fp8_gemm {m}x{k}x{n}"), &c, &r, 1e-2, rel);
+                eprintln!(
+                    "fp8_gemm {m}x{k}x{n} (E4M3 tensor core): max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
     /// Time `iters` resident launches of a GEMM `(M,N,K, A,B,C)` kernel; returns seconds/iter.
     fn time_gemm(
         g: &Gpu,
@@ -1410,13 +1542,30 @@ mod tests {
                     .unwrap();
                 let s_bf16 = time_wmma(g, &f_bf16, cb, dims, &ab_d, &bb_d, &mut c_d, 50);
 
+                // fp8 (E4M3) mma.sync — Ada's lowest-precision / highest-throughput tensor-core path
+                let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+                let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+                let a8_d = g.stream.memcpy_stod(&a8).unwrap();
+                let b8_d = g.stream.memcpy_stod(&b8).unwrap();
+                let f_fp8 = g
+                    .function("fp8_gemm", crate::ptx_fp8::fp8_gemm_ptx(), "fp8_gemm_nt")
+                    .unwrap();
+                let cfp8 = LaunchConfig {
+                    grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_fp8 = time_wmma(g, &f_fp8, cfp8, dims, &a8_d, &b8_d, &mut c_d, 50);
+
                 eprintln!(
-                    "{m}³: f32-rb {:.0} GFLOP/s | f16-TC {:.0} GFLOP/s ({:.1}× rb) | bf16-TC {:.0} GFLOP/s ({:.1}× rb)",
+                    "{m}³: f32-rb {:.0} | f16-TC {:.0} ({:.1}×) | bf16-TC {:.0} ({:.1}×) | fp8-TC {:.0} ({:.1}×)  GFLOP/s",
                     flop / s_rb / 1e9,
                     flop / s_f16 / 1e9,
                     s_rb / s_f16,
                     flop / s_bf16 / 1e9,
                     s_rb / s_bf16,
+                    flop / s_fp8 / 1e9,
+                    s_rb / s_fp8,
                 );
             }
         });
