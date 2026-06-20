@@ -2068,6 +2068,42 @@ fn kernels() -> Vec<Kernel> {
                 "for i in 0..N { let v= *x.add(i); *out.add(i)=1.0f32-2.0/((2.0*v).exp()+1.0); }",
             ),
         },
+        // sin/cos: the rotary-position-embedding (RoPE) transcendentals every modern LLM precomputes.
+        // Mercury dispatches a pure `out[i]=sin(x[i])` loop to the 256-bit AVX2 `mercury_vmath_f32`
+        // (VM_SIN/VM_COS); gcc/rustc call scalar libm `sinf`/`cosf` and cannot vectorize a loop with the
+        // call — the same compute-bound regime as `exp`.
+        Kernel {
+            name: "sin",
+            bytes_per_call: 2 * N * 4,
+            note: "out = sin(x): Mercury dispatches to a 256-bit AVX2 poly; C/Rust call scalar libm sinf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = sin(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=sinf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).sin(); }"),
+        },
+        Kernel {
+            name: "cos",
+            bytes_per_call: 2 * N * 4,
+            note: "out = cos(x): Mercury dispatches to a 256-bit AVX2 poly; C/Rust call scalar libm cosf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = cos(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=cosf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).cos(); }"),
+        },
+        // erf: the exact (erf-based) GELU's core transcendental — BERT/GPT-2's original activation.
+        // Mercury vectorizes the Abramowitz–Stegun poly at 256-bit; C calls scalar libm `erff`, and Rust
+        // (no std erf) runs the idiomatic scalar A&S a programmer writes without a libm dependency.
+        Kernel {
+            name: "erf",
+            bytes_per_call: 2 * N * 4,
+            note: "out = erf(x): Mercury dispatches to a 256-bit AVX2 poly; C calls scalar libm erff",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = erf(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=erff(x[i]);"),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); let s=if v<0.0 {-1.0f32} else {1.0}; \
+                 let ax=v.abs(); let t=1.0f32/(1.0+0.3275911*ax); \
+                 let y=1.0f32-(((((1.061405429f32*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t)*(-ax*ax).exp(); \
+                 *out.add(i)=s*y; }",
+            ),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
