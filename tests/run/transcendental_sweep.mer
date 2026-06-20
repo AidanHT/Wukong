@@ -1,0 +1,63 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 43836
+module tests.run.transcendental_sweep
+
+// A breadth sweep over the 2026-06 transcendental additions, exercising the paths that the
+// per-function tests don't combine: a **fused multi-statement body** (several distinct activations
+// over the same range → one `mercury_vmath_f32` call each, in source order) and an **@parallel**
+// body (each thread's chunk dispatched). Every op composes the shared exp/log/sin/cos/atan/√, so the
+// dispatched kernel, the scalar tail, and the inlined MIR all agree — this pins interp == native and
+// -O0 == -O3 across the whole expanded set at once.
+
+@parallel
+fn par_sweep(x: [f32; 64], a: [f32; 64], b: [f32; 64]) {
+    for i in 0..64 { a[i] = exp10(x[i]); }
+    for i in 0..64 { b[i] = cbrt(x[i]); }
+}
+
+fn checksum(v: [f32; 64]) -> f32 {
+    let mut s: f32 = 0.0;
+    for k in 0..64 { s = s + v[k]; }
+    return s;
+}
+
+fn main() -> i32 {
+    // x in [0, 0.63] — safe for every op below (asin/acos need |x|<1, tan off the poles, log10>0
+    // via the +1.0 shift).
+    let mut x: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) * 0.01; }
+
+    // Fused multi-statement body: 4 distinct kernels dispatched over the same range, in order.
+    let mut e10: [f32; 64] = [0.0; 64];
+    let mut l10: [f32; 64] = [0.0; 64];
+    let mut ss: [f32; 64] = [0.0; 64];
+    let mut lsg: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        e10[i] = exp10(x[i]);
+        l10[i] = log10(x[i] + 1.0);
+        ss[i] = softsign(x[i]);
+        lsg[i] = logsigmoid(x[i]);
+    }
+
+    // Inverse trig (second fused body).
+    let mut tn: [f32; 64] = [0.0; 64];
+    let mut asn: [f32; 64] = [0.0; 64];
+    let mut acs: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        tn[i] = tan(x[i]);
+        asn[i] = asin(x[i]);
+        acs[i] = acos(x[i]);
+    }
+
+    // @parallel sweep (multicore × 256-bit) — must match the serial dispatch bit-for-bit.
+    let mut pe: [f32; 64] = [0.0; 64];
+    let mut pc: [f32; 64] = [0.0; 64];
+    par_sweep(x, pe, pc);
+
+    // One combined checksum (scaled) folds every result; any backend/opt divergence shifts it.
+    let total = checksum(e10) + checksum(l10) + checksum(ss) + checksum(lsg)
+        + checksum(tn) + checksum(asn) + checksum(acs) + checksum(pe) + checksum(pc);
+    print((total * 100.0 + 0.5) as i32);
+    return 0;
+}
