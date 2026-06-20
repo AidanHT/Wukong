@@ -157,8 +157,9 @@ pub const ROOFLINE_ACC: usize = 4;
 /// B-fragment from global (so ptxas can't constant-fold), then loops `iters` times issuing
 /// `ROOFLINE_ACC` independent `wmma.mma`s that reuse those fragments. One load + `iters·ACC` MMAs +
 /// one store ⇒ effectively zero memory traffic in the hot loop, so the achieved rate is the practical
-/// tensor-core ceiling on this (power-capped) GPU. Measuring a real GEMM as a same-run % of this is
-/// the honest "% of roofline" — there is no cuBLAS on this box (no CUDA toolkit) to compare against.
+/// tensor-core ceiling on this (power-capped) GPU. This is an *internal* same-run ceiling; the real
+/// peer is now cuBLAS (see `baselines.rs`), which in practice matches/exceeds this roofline — so treat
+/// it as a soft under-estimate, not a hard wall.
 /// FLOPs = warps · iters · ACC · (16·16·16·2). Entry `wmma_roofline_f16`; launch block=32 (one warp).
 fn roofline_entry() -> String {
     let (ty, nab, nacc) = ("f16", 8usize, ROOFLINE_ACC);
