@@ -70,6 +70,54 @@ impl Backend for Interpreter {
     }
 }
 
+/// An accelerator that can run recognized runtime kernels in place of the CPU `mercury_runtime`
+/// microkernels — the seam the **GPU backend** plugs into. The interpreter stays zero-dependency by
+/// knowing only this trait; the driver supplies a GPU implementation behind its `gpu` feature, and
+/// the offload runs over the *same* tree-walked MIR (so control flow, buffer layout, and every
+/// non-kernel op are identical — only the recognized kernel calls move to the device).
+///
+/// Each method mirrors one `mercury_runtime` kernel over already-marshalled f32 buffers. Returning
+/// `None` means "not handled here — fall back to the CPU kernel", so partial / precision-restricted
+/// support is fine. With no accelerator installed (the default, and every existing caller), the
+/// differential oracle path is **byte-for-byte unchanged**; the CPU↔GPU gate is therefore a
+/// *tolerance* differential (interp-CPU vs interp-with-this-accelerator over identical inputs).
+pub trait Accelerator {
+    /// `C = A·Bᵀ` (the `_nt` form) with `beta == 0` (overwrite). Return `None` for the `beta != 0`
+    /// or non-transposed forms the GPU GEMM wrapper does not cover.
+    fn sgemm_nt(
+        &mut self,
+        _a: &[f32],
+        _b: &[f32],
+        _c: &mut [f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+    ) -> Option<Result<(), String>> {
+        None
+    }
+    /// `out[i] = f_op(x[i])` — the 256-bit activation kernel (`op` is the shared runtime op code).
+    fn vmath(&mut self, _op: i64, _x: &[f32], _out: &mut [f32]) -> Option<Result<(), String>> {
+        None
+    }
+    /// Fused row norm (softmax / LayerNorm / RMSNorm): `out` = norm over each `cols`-wide row of `x`.
+    fn norm(
+        &mut self,
+        _op: i64,
+        _x: &[f32],
+        _out: &mut [f32],
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> Option<Result<(), String>> {
+        None
+    }
+    /// Deterministic reduction returning a scalar (sum / dot / max / …); `y` is the second operand
+    /// (used by dot/ssd, ignored otherwise).
+    fn sreduce(&mut self, _op: i64, _x: &[f32], _y: &[f32]) -> Option<Result<f32, String>> {
+        None
+    }
+}
+
 /// Run `entry` (typically `main`) and return its integer result as a process exit code.
 pub fn run(program: &Program, entry: Symbol, interner: &Interner) -> Result<i64, String> {
     Ok(run_with_output(program, entry, interner)?.0)
@@ -92,6 +140,34 @@ pub fn run_with_output(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        accel: None,
+    };
+    let result = interp.run_function(func, Vec::new())?;
+    Ok((result.as_int() as i64, interp.stdout))
+}
+
+/// Like [`run_with_output`] but offloads recognized kernel calls to `accel` (the GPU backend). This
+/// is the `--backend=gpu` execution path: the whole program is still tree-walked here, but every
+/// recognized GEMM / norm / activation / reduction call runs on the device instead of the CPU
+/// microkernel. Falls back to the CPU kernel for any call `accel` declines (returns `None`).
+pub fn run_with_output_accel(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    accel: &mut dyn Accelerator,
+) -> Result<(i64, Vec<u8>), String> {
+    let func = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    let mut interp = Interp {
+        program,
+        interner,
+        memory: Vec::new(),
+        stdout: Vec::new(),
+        frames: Vec::new(),
+        scratch: Vec::with_capacity(8),
+        vecs: Vec::new(),
+        accel: Some(accel),
     };
     let result = interp.run_function(func, Vec::new())?;
     Ok((result.as_int() as i64, interp.stdout))
@@ -115,6 +191,29 @@ pub fn run_kernel_f32(
     bufs: &mut [&mut [f32]],
     interner: &Interner,
 ) -> Result<(), String> {
+    run_kernel_f32_inner(program, entry, bufs, interner, None)
+}
+
+/// Like [`run_kernel_f32`] but offloads recognized kernel calls to `accel` — the full-buffer
+/// **tolerance** gate for the GPU backend: run the same kernel on the CPU oracle (no accelerator)
+/// and on the GPU (this) over identical random buffers, then compare within `c·√K·ε`.
+pub fn run_kernel_f32_accel(
+    program: &Program,
+    entry: Symbol,
+    bufs: &mut [&mut [f32]],
+    interner: &Interner,
+    accel: &mut dyn Accelerator,
+) -> Result<(), String> {
+    run_kernel_f32_inner(program, entry, bufs, interner, Some(accel))
+}
+
+fn run_kernel_f32_inner(
+    program: &Program,
+    entry: Symbol,
+    bufs: &mut [&mut [f32]],
+    interner: &Interner,
+    accel: Option<&mut dyn Accelerator>,
+) -> Result<(), String> {
     let func = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
@@ -134,6 +233,7 @@ pub fn run_kernel_f32(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        accel,
     };
     // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
     // the kernel performs internally grows memory *past* these regions, so it never clobbers them.
@@ -192,6 +292,7 @@ pub fn run_kernel_i8(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        accel: None,
     };
     // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the kernel.
     let a_base = interp.memory.len();
@@ -218,7 +319,7 @@ pub fn run_kernel_i8(
     Ok(())
 }
 
-struct Interp<'a> {
+struct Interp<'a, 'k> {
     program: &'a Program,
     interner: &'a Interner,
     memory: Vec<Value>,
@@ -231,9 +332,12 @@ struct Interp<'a> {
     /// Backing store for SIMD vector values; `Value::VecRef(i)` indexes this. Vectors only live in
     /// registers (never in `memory`, which stays scalar), so this grows but is never aliased.
     vecs: Vec<Vec<Value>>,
+    /// Optional accelerator the recognized kernel calls offload to (the GPU backend). `None` for the
+    /// reference oracle and every plain run, so their numerics are untouched.
+    accel: Option<&'k mut (dyn Accelerator + 'k)>,
 }
 
-impl<'a> Interp<'a> {
+impl<'a, 'k> Interp<'a, 'k> {
     fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
         // Take a recycled register file (or a fresh one) and size it for this function. Values
         // start as `Unit`, the interpreter's "undefined"; well-formed MIR writes before it reads.
@@ -612,29 +716,43 @@ impl<'a> Interp<'a> {
                 let bbuf = read(&self.memory, b, k * n)?;
                 let mut cbuf = read(&self.memory, c, m * n)?;
                 let transposed = name.contains("_nt");
-                // SAFETY: buffers are exactly m*k, k*n (= n*k), m*n long — the kernel's contract.
-                unsafe {
-                    if transposed {
-                        mercury_runtime::mercury_sgemm_nt(
-                            abuf.as_ptr(),
-                            bbuf.as_ptr(),
-                            cbuf.as_mut_ptr(),
-                            m as i64,
-                            k as i64,
-                            n as i64,
-                            beta,
-                        );
-                    } else {
-                        mercury_runtime::mercury_sgemm(
-                            abuf.as_ptr(),
-                            bbuf.as_ptr(),
-                            cbuf.as_mut_ptr(),
-                            m as i64,
-                            k as i64,
-                            n as i64,
-                            beta,
-                        );
-                    }
+                // Offload to the accelerator (GPU) for the `C = A·Bᵀ` overwrite form it covers; any
+                // other shape (beta != 0, non-transposed) or a declined call falls back to the CPU
+                // kernel. With no accelerator (the oracle) this is always the CPU path.
+                let offloaded = if transposed && beta == 0 {
+                    self.accel
+                        .as_mut()
+                        .and_then(|acc| acc.sgemm_nt(&abuf, &bbuf, &mut cbuf, m, k, n))
+                } else {
+                    None
+                };
+                match offloaded {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Err(e),
+                    // SAFETY: buffers are exactly m*k, k*n (= n*k), m*n long — the kernel's contract.
+                    None => unsafe {
+                        if transposed {
+                            mercury_runtime::mercury_sgemm_nt(
+                                abuf.as_ptr(),
+                                bbuf.as_ptr(),
+                                cbuf.as_mut_ptr(),
+                                m as i64,
+                                k as i64,
+                                n as i64,
+                                beta,
+                            );
+                        } else {
+                            mercury_runtime::mercury_sgemm(
+                                abuf.as_ptr(),
+                                bbuf.as_ptr(),
+                                cbuf.as_mut_ptr(),
+                                m as i64,
+                                k as i64,
+                                n as i64,
+                                beta,
+                            );
+                        }
+                    },
                 }
                 for (t, &val) in cbuf.iter().enumerate() {
                     *self

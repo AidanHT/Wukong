@@ -33,6 +33,7 @@ mercury_interp = { path = "crates/mercury_interp" }
 mercury_opt = { path = "crates/mercury_opt" }
 mercury_codegen_llvm = { path = "crates/mercury_codegen_llvm" }
 mercury_codegen_cranelift = { path = "crates/mercury_codegen_cranelift" }
+mercury_codegen_gpu = { path = "crates/mercury_codegen_gpu" }
 mercury_runtime = { path = "crates/mercury_runtime" }
 
 [profile.release]
