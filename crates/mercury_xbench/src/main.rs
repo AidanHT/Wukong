@@ -2171,6 +2171,24 @@ fn kernels() -> Vec<Kernel> {
             c: c_kernel("for(long i=0;i<N;i++) out[i]=atanf(x[i]);"),
             rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).atan(); }"),
         },
+        // expm1/log1p — the numerically-stable eˣ−1 / ln(1+x) (Kahan, reusing the 256-bit exp/log);
+        // C/Rust call scalar libm expm1f/log1pf and can't vectorize the call. ELU exact tail, stable losses.
+        Kernel {
+            name: "expm1",
+            bytes_per_call: 2 * N * 4,
+            note: "out = expm1(x) = e^x-1: 256-bit AVX2 (Kahan) vs scalar libm expm1f",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = expm1(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=expm1f(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).exp_m1(); }"),
+        },
+        Kernel {
+            name: "log1p",
+            bytes_per_call: 2 * N * 4,
+            note: "out = log1p(x) = ln(1+x): 256-bit AVX2 (Kahan) vs scalar libm log1pf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = log1p(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=log1pf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).ln_1p(); }"),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
