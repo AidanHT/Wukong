@@ -30,6 +30,7 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     };
     match name {
         "sqrt" | "rsqrt" | "abs" | "round" | "floor" | "ceil" | "trunc" | "exp" | "log" | "pow"
+        | "exp2" | "log2" | "sinh" | "cosh"
         | "erf" | "sin" | "cos" | "tanh" | "sigmoid" | "silu" | "gelu" | "elu" | "leaky_relu"
         | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish" | "fmax"
         | "fmin" => Some(float_ty),

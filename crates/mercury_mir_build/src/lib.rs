@@ -505,6 +505,10 @@ const VMATH_HARDSWISH: u32 = 14;
 const VMATH_SIN: u32 = 15;
 const VMATH_COS: u32 = 16;
 const VMATH_ERF: u32 = 17;
+const VMATH_EXP2: u32 = 18;
+const VMATH_LOG2: u32 = 19;
+const VMATH_SINH: u32 = 20;
+const VMATH_COSH: u32 = 21;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2788,6 +2792,13 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Sin) => VMATH_SIN,
             Some(MathIntrinsic::Cos) => VMATH_COS,
             Some(MathIntrinsic::Erf) => VMATH_ERF,
+            // Comprehensive vectorized elementwise math: base-2 exp/log (FlashAttention-2 base-2
+            // softmax, quantization bit-width, entropy in bits) and hyperbolic sinh/cosh — all compose
+            // the shared ≈1-ULP exp/log, all scalar in C/Rust libm (no vectorized call), so all win.
+            Some(MathIntrinsic::Exp2) => VMATH_EXP2,
+            Some(MathIntrinsic::Log2) => VMATH_LOG2,
+            Some(MathIntrinsic::Sinh) => VMATH_SINH,
+            Some(MathIntrinsic::Cosh) => VMATH_COSH,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -3634,6 +3645,10 @@ impl FnLowerer<'_> {
                 Some(
                     MathIntrinsic::Exp
                     | MathIntrinsic::Log
+                    | MathIntrinsic::Exp2
+                    | MathIntrinsic::Log2
+                    | MathIntrinsic::Sinh
+                    | MathIntrinsic::Cosh
                     | MathIntrinsic::Erf
                     | MathIntrinsic::Sin
                     | MathIntrinsic::Cos
@@ -4424,6 +4439,22 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Log) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_log_f32(x, vty)
+                }
+                Some(MathIntrinsic::Exp2) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let ln2 = self.splat_const_f(std::f64::consts::LN_2, vty);
+                    let xl = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, x, ln2));
+                    self.emit_exp_f32(xl, vty)
+                }
+                Some(MathIntrinsic::Log2) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let lx = self.emit_log_f32(x, vty);
+                    let log2e = self.splat_const_f(std::f64::consts::LOG2_E, vty);
+                    self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, lx, log2e))
+                }
+                Some(op @ (MathIntrinsic::Sinh | MathIntrinsic::Cosh)) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_sinh_cosh(x, vty, matches!(op, MathIntrinsic::Cosh))
                 }
                 Some(MathIntrinsic::Pow) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -5268,6 +5299,25 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_log(x, &rty))
             }
+            // exp2(x)=exp(x·ln2), log2(x)=log(x)·log2(e), sinh/cosh=(eˣ∓e⁻ˣ)/2 — composed from the
+            // shared exp/log so they vectorize and stay bit-exact across backends; the dispatched
+            // 256-bit kernel mirrors this op-for-op.
+            MathIntrinsic::Exp2 => {
+                let x = self.lower_expr(args.first()?);
+                let ln2 = self.splat_const_f(std::f64::consts::LN_2, &rty);
+                let xl = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, ln2));
+                Some(self.emit_exp(xl, &rty))
+            }
+            MathIntrinsic::Log2 => {
+                let x = self.lower_expr(args.first()?);
+                let lx = self.emit_log(x, &rty);
+                let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
+                Some(self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, log2e)))
+            }
+            MathIntrinsic::Sinh | MathIntrinsic::Cosh => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_sinh_cosh(x, &rty, matches!(op, MathIntrinsic::Cosh)))
+            }
             MathIntrinsic::Pow => {
                 // pow(x, y) = exp(y * log(x)), reusing the two polynomials (so it vectorizes and is
                 // bit-exact across backends for free). Defined for x > 0, like the rest of the suite.
@@ -5660,6 +5710,24 @@ impl FnLowerer<'_> {
         let ge = self.builder.build(mty, Op::Cmp(CmpOp::Foge, x, zero));
         self.builder
             .build(fty.clone(), Op::Select(ge, mag, neg_mag))
+    }
+
+    /// `sinh(x)` (`is_cosh == false`) or `cosh(x)` (`true`) = `(eˣ ∓ e⁻ˣ)·0.5`, composed from the
+    /// shared `exp` so it vectorizes and stays bit-identical across backends; the dispatched
+    /// `sinh8`/`cosh8` kernel mirrors this op-for-op (`-x` via `·-1` to match). Overflows like libm.
+    fn emit_sinh_cosh(&mut self, x: ValueId, rty: &MirType, is_cosh: bool) -> ValueId {
+        let neg1 = self.splat_const_f(-1.0, rty);
+        let nx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, neg1));
+        let ex = self.emit_exp(x, rty);
+        let enx = self.emit_exp(nx, rty);
+        let combined = if is_cosh {
+            self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, ex, enx))
+        } else {
+            self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, ex, enx))
+        };
+        let half = self.splat_const_f(0.5, rty);
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, combined, half))
     }
 
     /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`) as a fast, deterministic polynomial. Always
@@ -7785,6 +7853,10 @@ enum MathIntrinsic {
     Trunc,
     Exp,
     Log,
+    Exp2,
+    Log2,
+    Sinh,
+    Cosh,
     Pow,
     Erf,
     Sin,
@@ -7828,6 +7900,10 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "trunc" => MathIntrinsic::Trunc,
         "exp" => MathIntrinsic::Exp,
         "log" => MathIntrinsic::Log,
+        "exp2" => MathIntrinsic::Exp2,
+        "log2" => MathIntrinsic::Log2,
+        "sinh" => MathIntrinsic::Sinh,
+        "cosh" => MathIntrinsic::Cosh,
         "pow" => MathIntrinsic::Pow,
         "erf" => MathIntrinsic::Erf,
         "sin" => MathIntrinsic::Sin,
