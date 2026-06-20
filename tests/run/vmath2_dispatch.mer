@@ -1,0 +1,38 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8000
+// EXPECT-OUT: 785
+// EXPECT-OUT: 5000
+module tests.run.vmath2_dispatch
+
+// The two-input transcendentals (`pow`/`atan2`/`hypot`) in a `for j { out[j] = f(x[j], y[j]) }` loop
+// dispatch to the **256-bit** `mercury_vmath2_f32` kernel (vs the generic vectorizer's inlined
+// 128-bit poly). The kernel mirrors the inlined MIR op-for-op (pow = exp(y·ln x); atan2 = atan(y/x)
+// + quadrant fix; hypot = m·√((a/m)²+(b/m)²)), and the interpreter marshals through that very kernel,
+// so interp == native and -O0 == -O3. C/Rust call scalar libm here — a loop with the call won't
+// vectorize at all.
+fn main() -> i32 {
+    let mut base: [f32; 16] = [2.0; 16];
+    let mut expo: [f32; 16] = [3.0; 16];
+    let mut yv: [f32; 16] = [1.0; 16];
+    let mut xv: [f32; 16] = [1.0; 16];
+
+    // pow: out[j] = base[j]^expo[j] = 2^3 = 8.
+    let mut p: [f32; 16] = [0.0; 16];
+    for j in 0..16 { p[j] = pow(base[j], expo[j]); }
+    print((p[0] * 1000.0 + 0.5) as i32); // 8.0 -> 8000
+
+    // atan2: out[j] = atan2(1, 1) = π/4 ≈ 0.785.
+    let mut a: [f32; 16] = [0.0; 16];
+    for j in 0..16 { a[j] = atan2(yv[j], xv[j]); }
+    print((a[0] * 1000.0 + 0.5) as i32); // π/4 -> 785
+
+    // hypot: out[j] = hypot(3, 4) = 5. Dedicated (directly-initialized) inputs so the loop body is a
+    // single hypot stmt — no adjacent store loop to fuse with and defeat the dispatch.
+    let ha: [f32; 16] = [3.0; 16];
+    let hb: [f32; 16] = [4.0; 16];
+    let mut h: [f32; 16] = [0.0; 16];
+    for j in 0..16 { h[j] = hypot(ha[j], hb[j]); }
+    print((h[0] * 1000.0 + 0.5) as i32); // 5.0 -> 5000
+    return 0;
+}

@@ -13,10 +13,10 @@ pub use gemm::{
 
 mod vmath;
 pub use vmath::{
-    mercury_vmath_bf16, mercury_vmath_f16, mercury_vmath_f32, VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH,
-    VM_ATAN, VM_ATANH, VM_CBRT, VM_COS, VM_COSH, VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU,
-    VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID, VM_RELU, VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH,
-    VM_SOFTSIGN, VM_TAN, VM_TANH,
+    mercury_vmath2_f32, mercury_vmath_bf16, mercury_vmath_f16, mercury_vmath_f32, VM_ACOS,
+    VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS, VM_COSH, VM_ERF, VM_EXP,
+    VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID,
+    VM_RELU, VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_SOFTSIGN, VM_TAN, VM_TANH,
 };
 
 mod velem;

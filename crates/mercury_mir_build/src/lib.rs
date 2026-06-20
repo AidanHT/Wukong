@@ -43,6 +43,7 @@ pub fn lower_program(
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
+        vmath2: interner.intern("mercury_vmath2_f32"),
         vmath_bf16: interner.intern("mercury_vmath_bf16"),
         vmath_f16: interner.intern("mercury_vmath_f16"),
         velem: interner.intern("mercury_velem_f32"),
@@ -452,6 +453,9 @@ struct GemmSyms {
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
+    /// The **two-input** twin (`mercury_vmath2_f32(x, y, out, n, op)`): an `out[i] = f(x[i], y[i])`
+    /// loop for `pow`/`atan2`/`hypot` lowers to this — the 256-bit kernel, vs the inlined 128-bit poly.
+    vmath2: Symbol,
     /// The **bf16-input** twin (`mercury_vmath_bf16(x, out, n, op)`): an `out[i] = f((x[i] as f32))`
     /// loop over a `[bf16]` array (f32 output) lowers to this — same 256-bit kernel, half the input
     /// bytes (a lossless widen), so the cheap memory-bound ops gain ~1.3× over the f32 path.
@@ -554,6 +558,10 @@ const VMATH_TAN: u32 = 32;
 const VMATH_ASIN: u32 = 33;
 const VMATH_ACOS: u32 = 34;
 const VMATH_CBRT: u32 = 35;
+// Two-input kernel op codes (`mercury_vmath2_f32`, separate namespace — must match `vmath`'s `VM2_*`).
+const VMATH2_POW: u32 = 0;
+const VMATH2_ATAN2: u32 = 1;
+const VMATH2_HYPOT: u32 = 2;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2400,7 +2408,14 @@ impl FnLowerer<'_> {
         &self,
         body: &'b Block,
         k: Symbol,
-    ) -> Option<(Symbol, Symbol, Symbol, Option<&'b Expr>, Option<&'b Expr>, bool)> {
+    ) -> Option<(
+        Symbol,
+        Symbol,
+        Symbol,
+        Option<&'b Expr>,
+        Option<&'b Expr>,
+        bool,
+    )> {
         if body.tail.is_some() || body.stmts.len() != 1 {
             return None;
         }
@@ -2591,11 +2606,19 @@ impl FnLowerer<'_> {
         // routes through the op-coded reduce kernel. f16 uses the F16C twins, bf16 the `<<16` ones.
         let (func, args) = match red_op {
             RED_DOT => (
-                if is_f16 { self.gemm.dot_f16 } else { self.gemm.dot_bf16 },
+                if is_f16 {
+                    self.gemm.dot_f16
+                } else {
+                    self.gemm.dot_bf16
+                },
                 vec![xv, yv, n],
             ),
             RED_SUM => (
-                if is_f16 { self.gemm.sum_f16 } else { self.gemm.sum_bf16 },
+                if is_f16 {
+                    self.gemm.sum_f16
+                } else {
+                    self.gemm.sum_bf16
+                },
                 vec![xv, n],
             ),
             _ => {
@@ -3100,6 +3123,116 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Match one statement `out[j] = f(x[j], y[j])` for a two-input transcendental `f`
+    /// (`pow`/`atan2`/`hypot`) over `f32` arrays, returning `(out, x, y, op)` — the two operands are
+    /// positional (the kernel interprets them per op). Pure. The 256-bit twin of the inlined poly.
+    fn match_vmath2_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, Symbol, u32)> {
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        let out_sym = self.index_by_loopvar(target, j)?;
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let opcode = match self.vectorizable_intrinsic(callee) {
+            Some(MathIntrinsic::Pow) => VMATH2_POW,
+            Some(MathIntrinsic::Atan2) => VMATH2_ATAN2,
+            Some(MathIntrinsic::Hypot) => VMATH2_HYPOT,
+            _ => return None,
+        };
+        // The kernel computes (and writes) f32; both operands must be unit-stride f32 array reads.
+        if self.expr_mir(value) != MirType::F32
+            || self.expr_mir(&args[0]) != MirType::F32
+            || self.expr_mir(&args[1]) != MirType::F32
+        {
+            return None;
+        }
+        let x_sym = self.index_by_loopvar(&args[0], j)?;
+        let y_sym = self.index_by_loopvar(&args[1], j)?;
+        Some((out_sym, x_sym, y_sym, opcode))
+    }
+
+    /// Match a two-input transcendental loop body: every statement is an independent
+    /// `out[j] = f(x[j], y[j])` (see [`match_vmath2_stmt`]). Returns the resolved bases per statement,
+    /// or `None` if any fails. Pure — emits no MIR.
+    fn match_vmath2_body(
+        &self,
+        j: Symbol,
+        body: &Block,
+    ) -> Option<Vec<(ValueId, ValueId, ValueId, u32)>> {
+        if body.tail.is_some() || body.stmts.is_empty() {
+            return None;
+        }
+        let mut calls = Vec::with_capacity(body.stmts.len());
+        for stmt in &body.stmts {
+            let (out_sym, x_sym, y_sym, opcode) = self.match_vmath2_stmt(stmt, j)?;
+            let (out_base, _) = self.lookup(out_sym)?;
+            let (x_base, _) = self.lookup(x_sym)?;
+            let (y_base, _) = self.lookup(y_sym)?;
+            calls.push((out_base, x_base, y_base, opcode));
+        }
+        Some(calls)
+    }
+
+    /// Emit one `mercury_vmath2_f32(x+s, y+s, out+s, e-s, op)` call per resolved statement over `[s, e)`.
+    fn emit_vmath2_calls(
+        &mut self,
+        s: ValueId,
+        e: ValueId,
+        calls: Vec<(ValueId, ValueId, ValueId, u32)>,
+    ) {
+        let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        for (out_base, x_base, y_base, opcode) in calls {
+            let gep = |this: &mut Self, base: ValueId, elem: MirType| {
+                this.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: base,
+                        index: s,
+                        elem,
+                    },
+                )
+            };
+            let xp = gep(self, x_base, MirType::F32);
+            let yp = gep(self, y_base, MirType::F32);
+            let outp = gep(self, out_base, MirType::F32);
+            let opv = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
+            let func = self.gemm.vmath2;
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![xp, yp, outp, n, opv],
+            });
+        }
+    }
+
+    /// Recognize a two-input transcendental loop `for j in lo..hi { out[j] = f(x[j], y[j]) }`
+    /// (`pow`/`atan2`/`hypot`) and lower it to one `mercury_vmath2_f32` call per statement — the 256-bit
+    /// AVX2 kernel, vs the generic vectorizer's inlined 128-bit poly. The interpreter marshals through
+    /// the identical kernel, so the differential oracle stays exact. Returns false to fall back.
+    fn try_vmath2_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        let Some(calls) = self.match_vmath2_body(j, body) else {
+            return false;
+        };
+        let sty = self.expr_mir(start);
+        let s = self.lower_expr(start);
+        let s = self.coerce_to(s, &sty, &MirType::I64, true);
+        let ety = self.expr_mir(end);
+        let e = self.lower_expr(end);
+        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        self.emit_vmath2_calls(s, e, calls);
+        true
+    }
+
     /// A loop-invariant f32 coefficient: an expr provably free of the loop var `j` and typed f32 (a
     /// literal like `2.0`, or an outer scalar like saxpy's `a`). Lowered to a ValueId at emit time.
     /// Uses the **conservative** [`expr_mentions`] (recurses through calls/casts/fields and assumes a
@@ -3514,6 +3647,11 @@ impl FnLowerer<'_> {
         if self.try_vmath_for(j, start, end, body) {
             return true;
         }
+        // A two-input transcendental map `out[j] = pow/atan2/hypot(x[j], y[j])` dispatches to the
+        // 256-bit `mercury_vmath2_f32` kernel (vs the generic vectorizer's inlined 128-bit poly).
+        if self.try_vmath2_for(j, start, end, body) {
+            return true;
+        }
         // A streaming affine map `out[j] = a·x[j] (+ b·y[j]) + c` (saxpy/scale/add/bias) dispatches to
         // the 256-bit AVX2 + non-temporal-store kernel — both wider than and store-cheaper than the
         // generic 128-bit vectorizer. Tried before it (which would otherwise emit cacheable stores).
@@ -3673,14 +3811,27 @@ impl FnLowerer<'_> {
                 let in_elem = if is_f16 { MirType::F16 } else { MirType::BF16 };
                 let xp = self.builder.build(
                     MirType::Ptr,
-                    Op::Gep { ptr: xv, index: s, elem: in_elem.clone() },
+                    Op::Gep {
+                        ptr: xv,
+                        index: s,
+                        elem: in_elem.clone(),
+                    },
                 );
-                let yp = self
-                    .builder
-                    .build(MirType::Ptr, Op::Gep { ptr: yv, index: s, elem: in_elem });
+                let yp = self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: yv,
+                        index: s,
+                        elem: in_elem,
+                    },
+                );
                 let outp = self.builder.build(
                     MirType::Ptr,
-                    Op::Gep { ptr: outv, index: s, elem: MirType::F32 },
+                    Op::Gep {
+                        ptr: outv,
+                        index: s,
+                        elem: MirType::F32,
+                    },
                 );
                 self.builder.build_void(Op::Call {
                     func: if is_f16 {
@@ -4714,26 +4865,32 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Exp2) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let ln2 = self.splat_const_f(std::f64::consts::LN_2, vty);
-                    let xl = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, x, ln2));
+                    let xl = self
+                        .builder
+                        .build(vty.clone(), Op::Bin(BinOp::FMul, x, ln2));
                     self.emit_exp_f32(xl, vty)
                 }
                 Some(MathIntrinsic::Log2) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let lx = self.emit_log_f32(x, vty);
                     let log2e = self.splat_const_f(std::f64::consts::LOG2_E, vty);
-                    self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, lx, log2e))
+                    self.builder
+                        .build(vty.clone(), Op::Bin(BinOp::FMul, lx, log2e))
                 }
                 Some(MathIntrinsic::Exp10) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let ln10 = self.splat_const_f(std::f64::consts::LN_10, vty);
-                    let xl = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, x, ln10));
+                    let xl = self
+                        .builder
+                        .build(vty.clone(), Op::Bin(BinOp::FMul, x, ln10));
                     self.emit_exp_f32(xl, vty)
                 }
                 Some(MathIntrinsic::Log10) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let lx = self.emit_log_f32(x, vty);
                     let log10e = self.splat_const_f(std::f64::consts::LOG10_E, vty);
-                    self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, lx, log10e))
+                    self.builder
+                        .build(vty.clone(), Op::Bin(BinOp::FMul, lx, log10e))
                 }
                 Some(op @ (MathIntrinsic::Sinh | MathIntrinsic::Cosh)) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -5646,26 +5803,36 @@ impl FnLowerer<'_> {
             MathIntrinsic::Exp2 => {
                 let x = self.lower_expr(args.first()?);
                 let ln2 = self.splat_const_f(std::f64::consts::LN_2, &rty);
-                let xl = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, ln2));
+                let xl = self
+                    .builder
+                    .build(rty.clone(), Op::Bin(BinOp::FMul, x, ln2));
                 Some(self.emit_exp(xl, &rty))
             }
             MathIntrinsic::Log2 => {
                 let x = self.lower_expr(args.first()?);
                 let lx = self.emit_log(x, &rty);
                 let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
-                Some(self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, log2e)))
+                Some(
+                    self.builder
+                        .build(rty.clone(), Op::Bin(BinOp::FMul, lx, log2e)),
+                )
             }
             MathIntrinsic::Exp10 => {
                 let x = self.lower_expr(args.first()?);
                 let ln10 = self.splat_const_f(std::f64::consts::LN_10, &rty);
-                let xl = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, ln10));
+                let xl = self
+                    .builder
+                    .build(rty.clone(), Op::Bin(BinOp::FMul, x, ln10));
                 Some(self.emit_exp(xl, &rty))
             }
             MathIntrinsic::Log10 => {
                 let x = self.lower_expr(args.first()?);
                 let lx = self.emit_log(x, &rty);
                 let log10e = self.splat_const_f(std::f64::consts::LOG10_E, &rty);
-                Some(self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, log10e)))
+                Some(
+                    self.builder
+                        .build(rty.clone(), Op::Bin(BinOp::FMul, lx, log10e)),
+                )
             }
             MathIntrinsic::Sinh | MathIntrinsic::Cosh => {
                 let x = self.lower_expr(args.first()?);
@@ -6003,8 +6170,11 @@ impl FnLowerer<'_> {
     fn emit_softsign(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let ax = self.emit_abs(x, rty);
         let one = self.splat_const_f(1.0, rty);
-        let den = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, ax));
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, x, den))
+        let den = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, ax));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FDiv, x, den))
     }
 
     /// `logsigmoid(x) = ln(σ(x)) = −softplus(−x)`, the stable log-sigmoid. Reuses `emit_softplus`
@@ -6012,9 +6182,12 @@ impl FnLowerer<'_> {
     /// the scalar twin; the two negations are exact.
     fn emit_logsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let zero = self.splat_const_f(0.0, rty);
-        let nx = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
+        let nx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
         let sp = self.emit_softplus(nx, rty);
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, zero, sp))
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, sp))
     }
 
     /// `selu(x) = λ·(x>0 ? x : α·(eˣ−1))`, the scaled ELU of self-normalizing networks. Mirrors `selu8`
@@ -6158,13 +6331,17 @@ impl FnLowerer<'_> {
     /// `sinh8`/`cosh8` kernel mirrors this op-for-op (`-x` via `·-1` to match). Overflows like libm.
     fn emit_sinh_cosh(&mut self, x: ValueId, rty: &MirType, is_cosh: bool) -> ValueId {
         let neg1 = self.splat_const_f(-1.0, rty);
-        let nx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, neg1));
+        let nx = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, x, neg1));
         let ex = self.emit_exp(x, rty);
         let enx = self.emit_exp(nx, rty);
         let combined = if is_cosh {
-            self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, ex, enx))
+            self.builder
+                .build(rty.clone(), Op::Bin(BinOp::FAdd, ex, enx))
         } else {
-            self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, ex, enx))
+            self.builder
+                .build(rty.clone(), Op::Bin(BinOp::FSub, ex, enx))
         };
         let half = self.splat_const_f(0.5, rty);
         self.builder
@@ -6176,15 +6353,21 @@ impl FnLowerer<'_> {
     /// `emit_abs`/`emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_asinh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let ax = self.emit_abs(x, rty);
-        let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, ax, ax));
+        let x2 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, ax, ax));
         let one = self.splat_const_f(1.0, rty);
-        let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, x2, one));
+        let inner = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, x2, one));
         let s = self.builder.build(rty.clone(), Op::Sqrt(inner));
         let sum = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, ax, s));
         let t = self.emit_log(sum, rty);
         // copysign(t, x) via select (t ≥ 0): x < 0 ? −t : t.
         let neg1 = self.splat_const_f(-1.0, rty);
-        let negt = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, t, neg1));
+        let negt = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, t, neg1));
         let zero = self.splat_const_f(0.0, rty);
         let isneg = self
             .builder
@@ -6197,7 +6380,9 @@ impl FnLowerer<'_> {
     fn emit_acosh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
         let one = self.splat_const_f(1.0, rty);
-        let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, x2, one));
+        let inner = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, x2, one));
         let s = self.builder.build(rty.clone(), Op::Sqrt(inner));
         let sum = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, x, s));
         self.emit_log(sum, rty)
@@ -6207,12 +6392,19 @@ impl FnLowerer<'_> {
     /// works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_atanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let one = self.splat_const_f(1.0, rty);
-        let num = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, x));
-        let den = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, x));
-        let r = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, num, den));
+        let num = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, x));
+        let den = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, x));
+        let r = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FDiv, num, den));
         let l = self.emit_log(r, rty);
         let half = self.splat_const_f(0.5, rty);
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, l, half))
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, l, half))
     }
 
     /// `expm1(x) = eˣ − 1` via Kahan's stable correction `(u−1)·x/log(u)`, `u = eˣ`, guarding `u==1 → x`
@@ -6221,13 +6413,17 @@ impl FnLowerer<'_> {
     fn emit_expm1(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let u = self.emit_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
-        let um1 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, u, one));
+        let um1 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, u, one));
         let lu = self.emit_log(u, rty);
         let ratio = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, x, lu));
         let val = self
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, um1, ratio));
-        let is1 = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, one));
+        let is1 = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, one));
         self.builder.build(rty.clone(), Op::Select(is1, x, val))
     }
 
@@ -6235,14 +6431,20 @@ impl FnLowerer<'_> {
     /// Reuses `emit_log`; mirrors `log1p_1`/`log1p_8` op-for-op. Scalar or SIMD; bit-identical backends.
     fn emit_log1p(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let one = self.splat_const_f(1.0, rty);
-        let u = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, x));
-        let d = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, u, one));
+        let u = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, one, x));
+        let d = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, u, one));
         let lu = self.emit_log(u, rty);
         let ratio = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, x, d));
         let val = self
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, lu, ratio));
-        let is1 = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, one));
+        let is1 = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, one));
         self.builder.build(rty.clone(), Op::Select(is1, x, val))
     }
 
@@ -6388,17 +6590,27 @@ impl FnLowerer<'_> {
         let ax = self.emit_abs(x, fty);
         let tan3 = self.splat_const_f(ATAN_TAN_3PI8, fty);
         let tan1 = self.splat_const_f(ATAN_TAN_PI8, fty);
-        let big = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, ax, tan3));
-        let mid = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, ax, tan1));
+        let big = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Fogt, ax, tan3));
+        let mid = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Fogt, ax, tan1));
         let one = self.splat_const_f(1.0, fty);
         let neg1 = self.splat_const_f(-1.0, fty);
         // mid candidate (ax−1)/(ax+1); big candidate −1/ax.
-        let axm1 = self.builder.build(fty.clone(), Op::Bin(BinOp::FSub, ax, one));
-        let axp1 = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, ax, one));
+        let axm1 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, ax, one));
+        let axp1 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, ax, one));
         let xr_mid = self
             .builder
             .build(fty.clone(), Op::Bin(BinOp::FDiv, axm1, axp1));
-        let xr_big = self.builder.build(fty.clone(), Op::Bin(BinOp::FDiv, neg1, ax));
+        let xr_big = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FDiv, neg1, ax));
         let xr = self.builder.build(fty.clone(), Op::Select(mid, xr_mid, ax));
         let xr = self.builder.build(fty.clone(), Op::Select(big, xr_big, xr));
         // offset 0 → π/4 (mid) → π/2 (big).
@@ -6408,20 +6620,31 @@ impl FnLowerer<'_> {
         let y = self.builder.build(fty.clone(), Op::Select(mid, pio4, zero));
         let y = self.builder.build(fty.clone(), Op::Select(big, pio2, y));
         // degree-3 odd minimax via FMA Horner: ((((P0·z+P1)·z+P2)·z+P3)·z·xr) + xr.
-        let z = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, xr, xr));
+        let z = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, xr, xr));
         let mut p = self.splat_const_f(ATAN_P[0], fty);
         for &c in &ATAN_P[1..] {
             let cc = self.splat_const_f(c, fty);
             p = self.builder.build(fty.clone(), Op::Fma(p, z, cc));
         }
         let pz = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, p, z));
-        let pzx = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, pz, xr));
-        let res = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, pzx, xr));
-        let yf = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, y, res));
+        let pzx = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, pz, xr));
+        let res = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, pzx, xr));
+        let yf = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, y, res));
         // copysign(yf, x) via select (yf ≥ 0): x < 0 ? −yf : yf.
-        let negyf = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, yf, neg1));
+        let negyf = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, yf, neg1));
         let isneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
-        self.builder.build(fty.clone(), Op::Select(isneg, negyf, yf))
+        self.builder
+            .build(fty.clone(), Op::Select(isneg, negyf, yf))
     }
 
     /// `tan(x) = sin(x)/cos(x)` — reuses `emit_trig` (which mirrors `sincos1`/`sin8`), so the composed
@@ -6437,7 +6660,9 @@ impl FnLowerer<'_> {
     fn emit_asin(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
         let one = self.splat_const_f(1.0, rty);
-        let om = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, x2));
+        let om = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, one, x2));
         let sq = self.builder.build(rty.clone(), Op::Sqrt(om));
         let d = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, x, sq));
         self.emit_atan(d, rty)
@@ -6448,7 +6673,8 @@ impl FnLowerer<'_> {
     fn emit_acos(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let asin = self.emit_asin(x, rty);
         let pio2 = self.splat_const_f(ATAN_PIO2, rty);
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, pio2, asin))
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, pio2, asin))
     }
 
     /// `cbrt(x) = copysign(e^{ln|x|/3}, x)` with the `|x|==0 → 0` guard — mirrors `cbrt1`/`cbrt8`,
@@ -6458,16 +6684,27 @@ impl FnLowerer<'_> {
         let ax = self.emit_abs(x, rty);
         let lx = self.emit_log(ax, rty);
         let third = self.splat_const_f(1.0 / 3.0, rty);
-        let scaled = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, third));
+        let scaled = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, lx, third));
         let mag = self.emit_exp(scaled, rty);
         let zero = self.splat_const_f(0.0, rty);
-        let iszero = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, ax, zero));
-        let mag = self.builder.build(rty.clone(), Op::Select(iszero, zero, mag));
+        let iszero = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, ax, zero));
+        let mag = self
+            .builder
+            .build(rty.clone(), Op::Select(iszero, zero, mag));
         // copysign(mag, x) via select (mag ≥ 0): x < 0 ? −mag : mag.
         let neg1 = self.splat_const_f(-1.0, rty);
-        let negmag = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, mag, neg1));
-        let isneg = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Folt, x, zero));
-        self.builder.build(rty.clone(), Op::Select(isneg, negmag, mag))
+        let negmag = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, mag, neg1));
+        let isneg = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, x, zero));
+        self.builder
+            .build(rty.clone(), Op::Select(isneg, negmag, mag))
     }
 
     /// `atan2(y, x)` — the full-circle angle of `(x, y)` (geometry, robotics, complex argument, RoPE-style
@@ -6483,11 +6720,18 @@ impl FnLowerer<'_> {
         let pi = self.splat_const_f(std::f64::consts::PI, rty);
         let neg_pi = self.splat_const_f(-std::f64::consts::PI, rty);
         // copysign(π, y) via select: y < 0 → −π, else +π.
-        let yneg = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Folt, y, zero));
-        let pi_signed = self.builder.build(rty.clone(), Op::Select(yneg, neg_pi, pi));
+        let yneg = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, y, zero));
+        let pi_signed = self
+            .builder
+            .build(rty.clone(), Op::Select(yneg, neg_pi, pi));
         let xneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
-        let adj = self.builder.build(rty.clone(), Op::Select(xneg, pi_signed, zero));
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, a, adj))
+        let adj = self
+            .builder
+            .build(rty.clone(), Op::Select(xneg, pi_signed, zero));
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, a, adj))
     }
 
     /// `hypot(a, b) = √(a² + b²)`, the overflow-safe 2-norm/magnitude (gradient norms, complex modulus,
@@ -6498,17 +6742,24 @@ impl FnLowerer<'_> {
         let mty = mask_ty(rty);
         let aa = self.emit_abs(a, rty);
         let bb = self.emit_abs(b, rty);
-        let agtb = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, aa, bb));
+        let agtb = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Fogt, aa, bb));
         let m = self.builder.build(rty.clone(), Op::Select(agtb, aa, bb));
         let ra = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, a, m));
         let rb = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, b, m));
-        let ra2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, ra, ra));
+        let ra2 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, ra, ra));
         let sum = self.builder.build(rty.clone(), Op::Fma(rb, rb, ra2)); // rb² + ra²
         let root = self.builder.build(rty.clone(), Op::Sqrt(sum));
-        let scaled = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, m, root));
+        let scaled = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, m, root));
         let zero = self.splat_const_f(0.0, rty);
         let mzero = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, m, zero));
-        self.builder.build(rty.clone(), Op::Select(mzero, zero, scaled))
+        self.builder
+            .build(rty.clone(), Op::Select(mzero, zero, scaled))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
