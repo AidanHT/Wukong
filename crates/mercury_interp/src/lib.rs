@@ -1265,7 +1265,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` map over `[bf16; _]` inputs (f32 output)
             // lowers to. Reconstruct the bf16 input bits exactly (as the reductions do), call the
             // identical kernel, write the f32 result back — so the differential gate stays exact.
-            "mercury_axpby_bf16" => {
+            "mercury_axpby_bf16" | "mercury_axpby_f16" => {
+                let is_f16 = name == "mercury_axpby_f16";
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -1273,12 +1274,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let a = args[4].as_float() as f32;
                 let b = args[5].as_float() as f32;
                 let bits = |idx: usize, t: usize| -> Result<u16, String> {
-                    Ok(mercury_runtime::f32_to_bf16_bits(
-                        self.memory
-                            .get(idx + t)
-                            .ok_or("bf16 axpby operand out of bounds")?
-                            .as_float() as f32,
-                    ))
+                    let f = self
+                        .memory
+                        .get(idx + t)
+                        .ok_or("lowp axpby operand out of bounds")?
+                        .as_float() as f32;
+                    Ok(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    })
                 };
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
@@ -1289,20 +1294,31 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let mut obuf = vec![0.0f32; n];
                 // SAFETY: xbuf/ybuf are n u16, obuf is n f32 — the kernel's contract.
                 unsafe {
-                    mercury_runtime::mercury_axpby_bf16(
-                        xbuf.as_ptr(),
-                        ybuf.as_ptr(),
-                        obuf.as_mut_ptr(),
-                        n as i64,
-                        a,
-                        b,
-                    );
+                    if is_f16 {
+                        mercury_runtime::mercury_axpby_f16(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        );
+                    } else {
+                        mercury_runtime::mercury_axpby_bf16(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        );
+                    }
                 }
                 for (t, &val) in obuf.iter().enumerate() {
                     *self
                         .memory
                         .get_mut(out + t)
-                        .ok_or("bf16 axpby output out of bounds")? = Value::Float(val as f64);
+                        .ok_or("lowp axpby output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }
