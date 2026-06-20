@@ -41,10 +41,13 @@ All notable changes to Mercury are documented here. The format is loosely based 
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
   run ~2.6–2.8× faster than serial C.
-- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **27** functions —
+- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **34** functions —
   `exp`/`log`/`expm1`/`log1p`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
-  `hardsigmoid`/`hardswish` plus **`sin`/`cos`/`atan`** (RoPE rotary embeddings, angle/geometry), **`erf`** (exact
-  BERT/GPT-2 GELU), **`exp2`/`log2`** (FlashAttention base-2 softmax, quantization), and the full
+  `hardsigmoid`/`hardswish` plus **`softsign`** (bounded poly activation) and **`logsigmoid`** (the stable
+  log-sigmoid behind binary-cross-entropy-with-logits / contrastive losses), **`sin`/`cos`/`tan`/`atan`/`asin`/`acos`**
+  (RoPE rotary embeddings and the geometry/3D-vision/graphics-ML angle ops), **`erf`** (exact
+  BERT/GPT-2 GELU), **`exp2`/`log2`/`exp10`/`log10`** (FlashAttention base-2 softmax, quantization, and
+  base-10 decibel/log-scale features), and the full
   **hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`** (`atanh` = the Fisher z-transform; the
   inverse trio powers hyperbolic/Poincaré embeddings and normalizing flows) — lowers to a tuned **256-bit AVX2/FMA runtime
   kernel** (`mercury_vmath_f32`) — the width Cranelift's general vectorizer can't emit (it caps at
@@ -84,7 +87,7 @@ All notable changes to Mercury are documented here. The format is loosely based 
   `vcvtph2ps` for f16) with f32 accumulate/compute dispatches to half-precision runtime kernels:
   **`dot`/`sum`** (`mercury_{dot,sum}_{bf16,f16}`, ~3–8× vs C), **`max`/`min`/`absmax`**
   (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric int8-quant scale), **streaming
-  `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **28-op activation set**
+  `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **35-op activation set**
   (`mercury_vmath_{bf16,f16}`). Precision-generic recognizers; the interpreter marshals through the
   identical kernel, so native == interp bit-for-bit. C/Rust can vectorize neither a `libm` call nor the
   half→f32 widen, so the gap is structural.
