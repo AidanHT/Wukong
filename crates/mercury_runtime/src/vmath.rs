@@ -1559,4 +1559,75 @@ mod tests {
             }
         }
     }
+
+    /// In-process throughput: the 256-bit AVX2 kernel vs a scalar `libm`-call loop computing the
+    /// *same* function — exactly the code gcc/rustc emit for a `for i { out[i] = f(x[i]) }` loop, which
+    /// **cannot vectorize a call** (no `libmvec` on this toolchain). So `scalar/kernel` is the real
+    /// per-function speedup over scalar `libm`, measured locally (no cross-language build needed). The
+    /// working set fits L2 so the comparison is compute-bound, not bandwidth-bound.
+    /// Observed on a Meteor Lake laptop (ratios are clock-invariant): exp ~5.9×, gelu ~5.5×, tan ~3.6×,
+    /// asin ~5.4×, acos ~5.0×, exp10 ~13× (Rust's `powf` is a heavy general path), log10 ~4.1×,
+    /// logsigmoid ~4.6×.
+    /// Run: `cargo test -p mercury_runtime --release vmath_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly in --release"]
+    fn vmath_throughput() {
+        use std::time::Instant;
+        let n = 1 << 16; // 64K f32 = 256 KB, fits L2 → compute-bound
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 1801) as f32 / 1000.0) - 0.9).collect(); // [-0.9, 0.9]
+        let mut out = vec![0.0f32; n];
+        let best = |iters: usize, mut f: Box<dyn FnMut()>| -> f64 {
+            f(); // warmup
+            let mut t = f64::INFINITY;
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                f();
+                t = t.min(t0.elapsed().as_secs_f64());
+            }
+            t
+        };
+        // (op, name, scalar libm twin) — the new transcendentals plus a few references. All are true
+        // libm calls C must keep scalar (softsign omitted: it's abs+div, which C *can* autovectorize).
+        let cases: &[(i64, &str, fn(f32) -> f32)] = &[
+            (VM_EXP, "exp", |x| x.exp()),
+            (VM_GELU, "gelu", |x| 0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())),
+            (VM_TAN, "tan", |x| x.tan()),
+            (VM_ASIN, "asin", |x| x.asin()),
+            (VM_ACOS, "acos", |x| x.acos()),
+            (VM_EXP10, "exp10", |x| 10.0f32.powf(x)),
+            (VM_LOG10, "log10", |x| (x + 1.1).log10()), // shift into the positive domain
+            (VM_LOGSIGMOID, "logsigmoid", |x| (1.0 / (1.0 + (-x).exp())).ln()),
+        ];
+        let iters = 200;
+        eprintln!("vmath throughput over {n} elements (best of {iters}), kernel vs scalar libm:");
+        for &(op, name, scalar) in cases {
+            let xp = xs.as_ptr() as usize;
+            let op2 = xs.clone();
+            let outp = out.as_mut_ptr() as usize;
+            let t_kernel = best(
+                iters,
+                Box::new(move || unsafe {
+                    mercury_vmath_f32(xp as *const f32, outp as *mut f32, n as i64, op);
+                    std::hint::black_box(outp);
+                }),
+            );
+            let mut so = vec![0.0f32; n];
+            let t_scalar = best(
+                iters,
+                Box::new(move || {
+                    for i in 0..n {
+                        so[i] = scalar(op2[i]);
+                    }
+                    std::hint::black_box(so.as_ptr());
+                }),
+            );
+            let gelems = |t: f64| n as f64 / t / 1e9;
+            eprintln!(
+                "  {name:<11} kernel {:.0} Melem/s | scalar libm {:.0} Melem/s | {:.1}x",
+                gelems(t_kernel) * 1e3,
+                gelems(t_scalar) * 1e3,
+                t_scalar / t_kernel
+            );
+        }
+    }
 }
