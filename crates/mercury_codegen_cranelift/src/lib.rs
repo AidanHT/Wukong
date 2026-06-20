@@ -91,6 +91,8 @@ const RT_NORM_AFFINE: &str = "mercury_norm_affine_f32";
 const RT_NORM_AFFINE_PARALLEL: &str = "mercury_norm_affine_f32_parallel";
 const RT_I8GEMM_NT: &str = "mercury_i8gemm_nt";
 const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
+const RT_DOT_BF16: &str = "mercury_dot_bf16";
+const RT_SUM_BF16: &str = "mercury_sum_bf16";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -794,6 +796,24 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, y, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
+        // The bf16 mixed-precision reductions: mercury_dot_bf16(x, y, n) -> f32 (3 args) and
+        // mercury_sum_bf16(x, n) -> f32 (2 args). bf16 storage, f32 accumulate; both return the
+        // accumulated f32, so bind the call result like the sreduce kernel above.
+        if name == RT_DOT_BF16 && args.len() == 3 {
+            let x = self.val(args[0]);
+            let y = self.val(args[1]);
+            let n = self.coerce_to_i64(args[2]);
+            let fref = self.rt_refs[name];
+            let call = self.builder.ins().call(fref, &[x, y, n]);
+            return self.builder.inst_results(call).first().copied();
+        }
+        if name == RT_SUM_BF16 && args.len() == 2 {
+            let x = self.val(args[0]);
+            let n = self.coerce_to_i64(args[1]);
+            let fref = self.rt_refs[name];
+            let call = self.builder.ins().call(fref, &[x, n]);
+            return self.builder.inst_results(call).first().copied();
+        }
         // The fused normalization kernel: mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits,
         // op) — two pointers and four i64 (the softmax/LayerNorm/RMSNorm a recognized multi-pass norm
         // lowers to). Void, like the GEMM/vmath kernels.
@@ -959,6 +979,8 @@ struct RtFuncs {
     norm_affine_par: FuncId,
     i8nt: FuncId,
     i8nt_par: FuncId,
+    dot_bf16: FuncId,
+    sum_bf16: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -1095,6 +1117,17 @@ fn populate_module<M: Module>(
     for _ in 0..3 {
         sig_i8gemm.params.push(AbiParam::new(types::I64));
     }
+    // mercury_dot_bf16(x, y: ptr, n: i64) -> f32 — bf16 mixed-precision dot (f32 accumulate).
+    let mut sig_dot_bf16 = Signature::new(call_conv);
+    sig_dot_bf16.params.push(AbiParam::new(ptr_ty));
+    sig_dot_bf16.params.push(AbiParam::new(ptr_ty));
+    sig_dot_bf16.params.push(AbiParam::new(types::I64));
+    sig_dot_bf16.returns.push(AbiParam::new(types::F32));
+    // mercury_sum_bf16(x: ptr, n: i64) -> f32 — bf16 mixed-precision sum (f32 accumulate).
+    let mut sig_sum_bf16 = Signature::new(call_conv);
+    sig_sum_bf16.params.push(AbiParam::new(ptr_ty));
+    sig_sum_bf16.params.push(AbiParam::new(types::I64));
+    sig_sum_bf16.returns.push(AbiParam::new(types::F32));
     // mercury_rt_fmod_f64(a, b) -> f64 and the f32 variant — true fmod backing float `%`.
     let mut sig_fmod_f64 = Signature::new(call_conv);
     sig_fmod_f64.params.push(AbiParam::new(types::F64));
@@ -1164,6 +1197,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         i8nt_par: module
             .declare_function(RT_I8GEMM_NT_PARALLEL, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        dot_bf16: module
+            .declare_function(RT_DOT_BF16, Linkage::Import, &sig_dot_bf16)
+            .map_err(|e| e.to_string())?,
+        sum_bf16: module
+            .declare_function(RT_SUM_BF16, Linkage::Import, &sig_sum_bf16)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -1274,6 +1313,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_I8GEMM_NT_PARALLEL,
                 module.declare_func_in_func(rt.i8nt_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_DOT_BF16,
+                module.declare_func_in_func(rt.dot_bf16, builder.func),
+            );
+            rt_refs.insert(
+                RT_SUM_BF16,
+                module.declare_func_in_func(rt.sum_bf16, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1406,7 +1453,10 @@ pub fn jit_compile(
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
-    builder.symbol(RT_VHORNER, mercury_runtime::mercury_vhorner_f32 as *const u8);
+    builder.symbol(
+        RT_VHORNER,
+        mercury_runtime::mercury_vhorner_f32 as *const u8,
+    );
     builder.symbol(
         RT_SREDUCE,
         mercury_runtime::mercury_sreduce_f32 as *const u8,
@@ -1436,6 +1486,8 @@ pub fn jit_compile(
         RT_I8GEMM_NT_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_parallel as *const u8,
     );
+    builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
+    builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -1522,7 +1574,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
-    builder.symbol(RT_VHORNER, mercury_runtime::mercury_vhorner_f32 as *const u8);
+    builder.symbol(
+        RT_VHORNER,
+        mercury_runtime::mercury_vhorner_f32 as *const u8,
+    );
     builder.symbol(
         RT_SREDUCE,
         mercury_runtime::mercury_sreduce_f32 as *const u8,
@@ -1552,6 +1607,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_I8GEMM_NT_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_parallel as *const u8,
     );
+    builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
+    builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);

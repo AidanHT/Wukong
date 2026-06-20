@@ -931,6 +931,47 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Float(r as f64))
             }
+            // `mercury_dot_bf16(x, y, n) -> f32` / `mercury_sum_bf16(x, n) -> f32` — the bf16
+            // mixed-precision reduction a `s += (x[k] as f32) [* (y[k] as f32)]` loop over `[bf16; _]`
+            // arrays lowers to (bf16 storage, f32 accumulate). The interpreter stores bf16 as the
+            // bf16-rounded f32 value; reconstruct the exact 16 stored bits via `f32_to_bf16_bits`
+            // (idempotent on an already-bf16-rounded value) so the buffer is identical to the native
+            // backend's 2-byte storage, then call the identical kernel — the differential gate stays
+            // exact despite the kernel's reassociated 8-lane accumulation.
+            "mercury_dot_bf16" | "mercury_sum_bf16" => {
+                let is_dot = name == "mercury_dot_bf16";
+                let x = ptr(args[0])?;
+                let (y, n) = if is_dot {
+                    (ptr(args[1])?, args[2].as_int() as usize)
+                } else {
+                    (x, args[1].as_int() as usize)
+                };
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    Ok(mercury_runtime::f32_to_bf16_bits(
+                        self.memory
+                            .get(idx + t)
+                            .ok_or("bf16 reduce operand out of bounds")?
+                            .as_float() as f32,
+                    ))
+                };
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(bits(x, t)?);
+                    if is_dot {
+                        ybuf.push(bits(y, t)?);
+                    }
+                }
+                // SAFETY: the buffers are exactly n u16 long — the kernels' contract.
+                let r = unsafe {
+                    if is_dot {
+                        mercury_runtime::mercury_dot_bf16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
+                    } else {
+                        mercury_runtime::mercury_sum_bf16(xbuf.as_ptr(), n as i64)
+                    }
+                };
+                Ok(Value::Float(r as f64))
+            }
             // `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)` — the fused row-wise
             // softmax / LayerNorm / RMSNorm kernel a recognized multi-pass norm lowers to. Marshal the
             // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel

@@ -537,6 +537,62 @@ fn differential_parallel_reduce() {
     );
 }
 
+/// bf16 mixed-precision reductions (`mercury_dot_bf16` / `mercury_sum_bf16`): a `s += (x[k] as f32)
+/// [* (y[k] as f32)]` loop over `[bf16; _]` arrays with an f32 accumulator. The native backend rounds
+/// to bf16 on store (`round_to_bf16`, the identical integer arithmetic as the interpreter's
+/// `round_bf16`) and both call the identical reassociated kernel, so they must agree bit-for-bit even
+/// for *non*-bf16-exact, fractional inputs that genuinely exercise the rounding and the 8-lane sum.
+#[test]
+fn differential_bf16_reduce() {
+    let programs = [
+        // bf16 dot Σ (x·y) with fractional, non-bf16-exact elements (real rounding + reassociation).
+        "fn dotbf(x: [bf16; 4096], y: [bf16; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s = s + (x[k] as f32) * (y[k] as f32); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [bf16; 4096] = [0.0 as bf16; 4096]; \
+         let mut y: [bf16; 4096] = [0.0 as bf16; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = ((i as f32) * 0.001) as bf16; y[i] = 1.5 as bf16; } dotbf(x, y, o); \
+         print((o[0] * 100.0) as i32); return 0; }",
+        // bf16 unary sum Σ x with fractional elements.
+        "fn sumbf(x: [bf16; 4096], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += (x[k] as f32); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [bf16; 4096] = [0.0 as bf16; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = ((i as f32) * 0.003 - 1.7) as bf16; } sumbf(x, o); \
+         print((o[0] * 10.0) as i32); return 0; }",
+        // the reduction directly in main (no helper fn), accumulator reused by `s = s + …` form.
+        "fn main() -> i32 { let mut x: [bf16; 1000] = [0.0 as bf16; 1000]; \
+         for i in 0..1000 { x[i] = ((i as f32) * 0.01) as bf16; } \
+         let mut s: f32 = 0.0; for k in 0..1000 { s = s + (x[k] as f32); } \
+         print((s * 10.0) as i32); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "bf16 reduce native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+    // Golden, bf16-exact small integers so the reassociated sum is unambiguous: dot = 2·(1+…+8) =
+    // 72, sum = 36. Proves the dispatch produces the right value, not just self-consistency.
+    let golden = "fn dotbf(x: [bf16; 8], y: [bf16; 8], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..8 { s = s + (x[k] as f32) * (y[k] as f32); } o[0] = s; } \
+         fn sumbf(x: [bf16; 8], o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..8 { s += (x[k] as f32); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [bf16; 8] = [0.0 as bf16; 8]; \
+         let mut y: [bf16; 8] = [0.0 as bf16; 8]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..8 { x[i] = ((i + 1) as f32) as bf16; y[i] = 2.0 as bf16; } \
+         dotbf(x, y, o); print((o[0]) as i32); sumbf(x, o); print((o[0]) as i32); return 0; }";
+    let (_, out) = jit(golden, 3).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "72\n36\n",
+        "bf16 reduction produced the wrong value"
+    );
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
@@ -682,11 +738,11 @@ fn differential_linear_epilogue() {
     let silu = body.replace("EPI", "silu(out[i*2+j] + bias[j])");
     let silu_nobias = nobias.replace("EPI", "silu(out[i*2+j])");
     for (src, expect) in [
-        (&relu, "0\n1\n0\n3\n"),         // relu([-9,1,-7,3])
-        (&ident, "-9\n1\n-7\n3\n"),      // x·Wᵀ + bias
-        (&gelu, "0\n0\n0\n2\n"),         // gelu([-9,1,-7,3]) as i32: gelu(1)=0.84→0, gelu(3)=3.0→2
-        (&silu, "0\n0\n0\n2\n"),         // silu([-9,1,-7,3]) as i32: silu(1)=0.73→0, silu(3)=2.86→2
-        (&silu_nobias, "0\n1\n2\n3\n"),  // silu([1,2,3,4]) as i32: 0.73,1.76,2.86,3.93
+        (&relu, "0\n1\n0\n3\n"),        // relu([-9,1,-7,3])
+        (&ident, "-9\n1\n-7\n3\n"),     // x·Wᵀ + bias
+        (&gelu, "0\n0\n0\n2\n"),        // gelu([-9,1,-7,3]) as i32: gelu(1)=0.84→0, gelu(3)=3.0→2
+        (&silu, "0\n0\n0\n2\n"),        // silu([-9,1,-7,3]) as i32: silu(1)=0.73→0, silu(3)=2.86→2
+        (&silu_nobias, "0\n1\n2\n3\n"), // silu([1,2,3,4]) as i32: 0.73,1.76,2.86,3.93
     ] {
         for opt in [0u8, 2, 3] {
             let n = jit(src, opt).expect("jit");
@@ -1526,7 +1582,10 @@ fn differential_parallel_batched_norm() {
     for opt in [0u8, 2, 3] {
         let n = jit(src_affine, opt).expect("jit");
         let i = interp(src_affine, opt).expect("interp");
-        assert_eq!(n, i, "parallel batched affine norm native vs interp at -O{opt}");
+        assert_eq!(
+            n, i,
+            "parallel batched affine norm native vs interp at -O{opt}"
+        );
     }
 }
 

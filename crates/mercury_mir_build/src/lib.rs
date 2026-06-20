@@ -15,7 +15,9 @@ use mercury_ast::{
     self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind,
 };
 use mercury_diag::Diagnostic;
-use mercury_mir::{BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId};
+use mercury_mir::{
+    BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId,
+};
 use mercury_sema::{DefKind, SemaResult};
 use mercury_span::{Interner, Span, Symbol};
 use mercury_types::Ty;
@@ -49,6 +51,8 @@ pub fn lower_program(
         norm_affine_par: interner.intern("mercury_norm_affine_f32_parallel"),
         i8nt: interner.intern("mercury_i8gemm_nt"),
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
+        dot_bf16: interner.intern("mercury_dot_bf16"),
+        sum_bf16: interner.intern("mercury_sum_bf16"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -80,7 +84,8 @@ pub fn lower_program(
                 // row is one fused pass. Checked *before* the generic `@parallel` outliner below — which
                 // would instead split the rows into chunks of per-row *vectorized* loops and lose the
                 // single-pass fusion — mirroring the sgemm/int8 whole-function interceptions above.
-                if has_parallel_attr(item, interner) && is_batched_norm_fn(f, body, sema, interner, gemm)
+                if has_parallel_attr(item, interner)
+                    && is_batched_norm_fn(f, body, sema, interner, gemm)
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
@@ -198,7 +203,10 @@ fn is_batched_norm_fn(
         return false;
     }
     let StmtKind::For {
-        pat, iter, body: lb, ..
+        pat,
+        iter,
+        body: lb,
+        ..
     } = &body.stmts[0].kind
     else {
         return false;
@@ -464,6 +472,14 @@ struct GemmSyms {
     /// naive loop bit-for-bit (no reassociation exception).
     i8nt: Symbol,
     i8nt_par: Symbol,
+    /// The bf16 mixed-precision reduction kernels (`mercury_dot_bf16(x, y, n) -> f32` and
+    /// `mercury_sum_bf16(x, n) -> f32`): a reduction loop `s += (x[k] as f32) [* (y[k] as f32)]` over
+    /// `[bf16; _]` arrays with an f32 accumulator lowers to one of these — bf16 storage, f32
+    /// accumulate (the standard ML mixed-precision contract). bf16 is bit-exact across interp/native
+    /// and both call the identical kernel, so the differential gate stays exact (a reassociation
+    /// exception, like the f32 reduction kernel).
+    dot_bf16: Symbol,
+    sum_bf16: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -1116,7 +1132,12 @@ impl FnLowerer<'_> {
     /// internal scalars must not be read after the window (the kernel hides them). Pure: returns
     /// `(consumed, array, N)` with `N` cloned so the caller can emit freely. `None` on any deviation
     /// (the generic vectorizer + vmath path then lowers the loops correctly).
-    fn match_softmax(&self, b: &Block, at: usize, batch: Option<Symbol>) -> Option<(usize, Symbol, Expr)> {
+    fn match_softmax(
+        &self,
+        b: &Block,
+        at: usize,
+        batch: Option<Symbol>,
+    ) -> Option<(usize, Symbol, Expr)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
             return None;
@@ -2153,9 +2174,9 @@ impl FnLowerer<'_> {
                 } else {
                     CmpOp::Fogt
                 };
-                let mask =
-                    self.builder
-                        .build(mask_ty(&MirType::F32), Op::Cmp(pred, cur, result));
+                let mask = self
+                    .builder
+                    .build(mask_ty(&MirType::F32), Op::Cmp(pred, cur, result));
                 self.builder
                     .build(MirType::F32, Op::Select(mask, cur, result))
             }
@@ -2163,6 +2184,142 @@ impl FnLowerer<'_> {
                 .builder
                 .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result)),
         };
+        self.builder.build_void(Op::Store {
+            ptr: s_slot,
+            value: new_s,
+        });
+        true
+    }
+
+    /// Recognize a **bf16 mixed-precision** reduction body over `k`: `s = s + (x[k] as f32)` (sum) or
+    /// `s = s + (x[k] as f32) * (y[k] as f32)` (dot), where `x` (and `y`) are `[bf16; _]` arrays read
+    /// through an `as f32` widening cast. Returns the accumulator symbol, `is_dot`, and the array
+    /// bases (`y == x` for sum). Strict pure-AST match — single statement, index exactly `k`, both
+    /// loads bf16, cast target f32. The f32 accumulate is the standard ML mixed-precision contract.
+    fn match_bf16_reduction(
+        &self,
+        body: &Block,
+        k: Symbol,
+    ) -> Option<(Symbol, bool, Symbol, Symbol)> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign { target, op, value } = &body.stmts[0].kind else {
+            return None;
+        };
+        let s = single_path(target)?;
+        if s == k {
+            return None;
+        }
+        // `s += addend`, or `s = s + addend` / `s = addend + s`.
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(s) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(s) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if expr_uses_sym(addend, s) {
+            return None;
+        }
+        // `(base[k] as f32)` where `base` is a bf16 array indexed exactly by `k`: peel the cast (it
+        // must target f32), require the inner indexed value's scalar be bf16, return the base symbol.
+        let bf16_load = |e: &Expr| -> Option<Symbol> {
+            let ExprKind::Cast { expr: inner, .. } = &e.kind else {
+                return None;
+            };
+            if scalar_of(e, self.sema) != Some(mercury_types::Scalar::F32) {
+                return None;
+            }
+            let ExprKind::Index { base, indices } = &inner.kind else {
+                return None;
+            };
+            if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+                return None;
+            }
+            if scalar_of(inner, self.sema) != Some(mercury_types::Scalar::Bf16) {
+                return None;
+            }
+            single_path(base)
+        };
+        match &addend.kind {
+            // dot: `(x[k] as f32) * (y[k] as f32)`
+            ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } => Some((s, true, bf16_load(lhs)?, bf16_load(rhs)?)),
+            // sum: `(x[k] as f32)`
+            ExprKind::Cast { .. } => {
+                let xb = bf16_load(addend)?;
+                Some((s, false, xb, xb))
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower a recognized bf16 reduction `for k in 0..n { s += (x[k] as f32) [* (y[k] as f32)] }` to
+    /// `s = s + mercury_dot_bf16(x, y, n)` (or `mercury_sum_bf16(x, n)`). The kernel widens bf16→f32
+    /// and accumulates in f32; the interpreter marshals the identical kernel (reconstructing the bf16
+    /// bits from its bf16-rounded storage), so native and interp agree bit-for-bit despite the
+    /// kernel's reassociated 8-lane accumulation. Falls back (returns false) unless the range is
+    /// `0..n`, the accumulator is an in-scope f32 scalar, and the arrays are in scope.
+    fn try_emit_lowp_reduction(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((s, is_dot, xb, yb)) = self.match_bf16_reduction(body, *k) else {
+            return false;
+        };
+        // Accumulator must be an in-scope f32 scalar; both arrays must be in scope (base pointers).
+        let Some((s_slot, MirType::F32)) = self.lookup(s) else {
+            return false;
+        };
+        let (Some((xv, _)), Some((yv, _))) = (self.lookup(xb), self.lookup(yb)) else {
+            return false;
+        };
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let (func, args) = if is_dot {
+            (self.gemm.dot_bf16, vec![xv, yv, n])
+        } else {
+            (self.gemm.sum_bf16, vec![xv, n])
+        };
+        let result = self.builder.build(MirType::F32, Op::Call { func, args });
+        // `s = s + kernel` — matches the loop's `s_final = s_init + Σ`, reassociated inside the kernel.
+        let cur = self
+            .builder
+            .build(MirType::F32, Op::Load(s_slot, MirType::F32));
+        let new_s = self
+            .builder
+            .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result));
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: new_s,
@@ -2214,7 +2371,8 @@ impl FnLowerer<'_> {
                 return Some((x, cols, 0, NORM_SOFTMAX, None, None));
             }
         }
-        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_layernorm(body, 0, Some(*r)) {
+        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_layernorm(body, 0, Some(*r))
+        {
             if consumed == body.stmts.len() {
                 return Some((x, cols, eps, NORM_LAYERNORM, gamma, beta));
             }
@@ -2259,6 +2417,13 @@ impl FnLowerer<'_> {
         // Inside a `@parallel` function, a recognized reduction loop (`s += x[k]*y[k]`, etc.) lowers
         // to one multicore `mercury_sreduce_f32_parallel` call instead of the sequential vectorizer.
         if self.parallel_fn && self.try_emit_parallel_reduction(pat, iter, body) {
+            return;
+        }
+        // A bf16 mixed-precision reduction `for k in 0..n { s += (x[k] as f32) [* (y[k] as f32)] }`
+        // over `[bf16; _]` arrays with an f32 accumulator dispatches to the bf16 dot/sum kernel (f32
+        // accumulate). bf16 storage is bit-exact across interp/native and both call the identical
+        // kernel, so the differential gate stays exact (a reassociation exception, like the f32 path).
+        if self.try_emit_lowp_reduction(pat, iter, body) {
             return;
         }
         // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
@@ -2651,12 +2816,12 @@ impl FnLowerer<'_> {
         };
         let else_e = branch_value(else_branch.as_deref()?)?;
         let then_e = block_value(then_branch)?;
-        let is_lit = |e: &Expr, v: f32| {
-            matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) as f32 == v)
-        };
+        let is_lit = |e: &Expr, v: f32| matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) as f32 == v);
         match op {
             // ReLU: `if INNER > 0 { INNER } else { 0 }` — the then-branch returns the compared INNER.
-            ast::BinOp::Gt if is_lit(rhs, 0.0) && is_lit(else_e, 0.0) && exprs_struct_eq(then_e, lhs) => {
+            ast::BinOp::Gt
+                if is_lit(rhs, 0.0) && is_lit(else_e, 0.0) && exprs_struct_eq(then_e, lhs) =>
+            {
                 Some((lhs, VE_RELU))
             }
             // ReLU6: `if INNER < 6 { ReLU(INNER) } else { 6 }` — the then-branch is a ReLU whose inner
@@ -2764,7 +2929,13 @@ impl FnLowerer<'_> {
     /// Match `r = r·v + Ck` (the running Horner step) for accumulator `r` and per-element value `v`,
     /// either factor order and either `Add` operand order. `Ck` must be a loop-invariant f32 (free of
     /// the loop var `j`). Returns the coefficient expr. Pure.
-    fn match_horner_step<'b>(&self, stmt: &'b Stmt, r: Symbol, v: Symbol, j: Symbol) -> Option<&'b Expr> {
+    fn match_horner_step<'b>(
+        &self,
+        stmt: &'b Stmt,
+        r: Symbol,
+        v: Symbol,
+        j: Symbol,
+    ) -> Option<&'b Expr> {
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -2860,7 +3031,14 @@ impl FnLowerer<'_> {
     /// coefficient array on the stack (an entry-block alloca + a store per coefficient, lowered from
     /// their loop-invariant exprs), then GEP `x`/`out` by `s` and call. The interpreter marshals the
     /// identical kernel, so the differential oracle stays exact.
-    fn emit_vhorner(&mut self, s: ValueId, e: ValueId, out_base: ValueId, x_base: ValueId, coeffs: &[&Expr]) {
+    fn emit_vhorner(
+        &mut self,
+        s: ValueId,
+        e: ValueId,
+        out_base: ValueId,
+        x_base: ValueId,
+        coeffs: &[&Expr],
+    ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         let arr = self
             .builder
@@ -2892,9 +3070,10 @@ impl FnLowerer<'_> {
         };
         let xp = gep(self, x_base);
         let outp = gep(self, out_base);
-        let ncoeff = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(coeffs.len() as i128, MirType::I64));
+        let ncoeff = self.builder.build(
+            MirType::I64,
+            Op::ConstInt(coeffs.len() as i128, MirType::I64),
+        );
         self.builder.build_void(Op::Call {
             func: self.gemm.vhorner,
             args: vec![xp, outp, n, arr, ncoeff],
@@ -4054,7 +4233,8 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Trunc),
                 ) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
-                    self.builder.build(vty.clone(), Op::Round(round_mode(op), x))
+                    self.builder
+                        .build(vty.clone(), Op::Round(round_mode(op), x))
                 }
                 Some(op @ (MathIntrinsic::Fmax | MathIntrinsic::Fmin)) => {
                     let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -4901,10 +5081,15 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_abs(x, &rty))
             }
-            MathIntrinsic::Round | MathIntrinsic::Floor | MathIntrinsic::Ceil
+            MathIntrinsic::Round
+            | MathIntrinsic::Floor
+            | MathIntrinsic::Ceil
             | MathIntrinsic::Trunc => {
                 let x = self.lower_expr(args.first()?);
-                Some(self.builder.build(rty.clone(), Op::Round(round_mode(op), x)))
+                Some(
+                    self.builder
+                        .build(rty.clone(), Op::Round(round_mode(op), x)),
+                )
             }
             MathIntrinsic::Exp => {
                 let x = self.lower_expr(args.first()?);
@@ -5013,7 +5198,9 @@ impl FnLowerer<'_> {
         let negx = self
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
-        let gtm = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
+        let gtm = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
         self.builder.build(rty.clone(), Op::Select(gtm, x, negx))
     }
 
@@ -5109,9 +5296,13 @@ impl FnLowerer<'_> {
     fn emit_elu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let e = self.emit_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
-        let em1 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, e, one));
+        let em1 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, e, one));
         let zero = self.splat_const_f(0.0, rty);
-        let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        let pos = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
         self.builder.build(rty.clone(), Op::Select(pos, x, em1))
     }
 
@@ -5123,7 +5314,9 @@ impl FnLowerer<'_> {
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, x, alpha));
         let zero = self.splat_const_f(0.0, rty);
-        let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        let pos = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
         self.builder.build(rty.clone(), Op::Select(pos, x, scaled))
     }
 
@@ -5136,7 +5329,9 @@ impl FnLowerer<'_> {
         let negx = self
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
-        let gtm = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
+        let gtm = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
         let absx = self.builder.build(rty.clone(), Op::Select(gtm, x, negx));
         let nabs = self
             .builder
@@ -5147,7 +5342,9 @@ impl FnLowerer<'_> {
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FAdd, one, e));
         let l = self.emit_log(onepe, rty);
-        let posm = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        let posm = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
         let relux = self.builder.build(rty.clone(), Op::Select(posm, x, zero));
         self.builder
             .build(rty.clone(), Op::Bin(BinOp::FAdd, relux, l))
@@ -5169,7 +5366,9 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FMul, lambda, x));
         let e = self.emit_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
-        let em1 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, e, one));
+        let em1 = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FSub, e, one));
         let alpha = self.splat_const_f(1.673_263_2, rty);
         let aem1 = self
             .builder
@@ -5178,8 +5377,11 @@ impl FnLowerer<'_> {
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, lambda, aem1));
         let zero = self.splat_const_f(0.0, rty);
-        let pos = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
-        self.builder.build(rty.clone(), Op::Select(pos, posval, negval))
+        let pos = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, zero));
+        self.builder
+            .build(rty.clone(), Op::Select(pos, posval, negval))
     }
 
     /// `tanhshrink(x) = x − tanh(x)`. Mirrors `tanhshrink8`.
@@ -5193,15 +5395,22 @@ impl FnLowerer<'_> {
     /// false for NaN, so both return the bound).
     fn emit_hardsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let three = self.splat_const_f(3.0, rty);
-        let y = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, x, three));
+        let y = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, x, three));
         let zero = self.splat_const_f(0.0, rty);
-        let gt0 = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, y, zero));
+        let gt0 = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, y, zero));
         let lo = self.builder.build(rty.clone(), Op::Select(gt0, y, zero));
         let six = self.splat_const_f(6.0, rty);
-        let lt6 = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Folt, lo, six));
+        let lt6 = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, lo, six));
         let hi = self.builder.build(rty.clone(), Op::Select(lt6, lo, six));
         let inv6 = self.splat_const_f(1.0 / 6.0, rty);
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, hi, inv6))
+        self.builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, hi, inv6))
     }
 
     /// `hardswish(x) = x · hardsigmoid(x)`. Mirrors `hardswish8`.
@@ -5949,10 +6158,9 @@ fn exprs_struct_eq(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Path(p), ExprKind::Path(q)) => {
             p.is_single() && q.is_single() && p.first().sym == q.first().sym
         }
-        (
-            ExprKind::Unary { op: o1, expr: e1 },
-            ExprKind::Unary { op: o2, expr: e2 },
-        ) => o1 == o2 && exprs_struct_eq(e1, e2),
+        (ExprKind::Unary { op: o1, expr: e1 }, ExprKind::Unary { op: o2, expr: e2 }) => {
+            o1 == o2 && exprs_struct_eq(e1, e2)
+        }
         (
             ExprKind::Binary {
                 op: o1,
