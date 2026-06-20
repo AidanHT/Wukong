@@ -7,6 +7,8 @@
 // EXPECT-OUT: 8660
 // EXPECT-OUT: 5000
 // EXPECT-OUT: 4794
+// EXPECT-OUT: 8775
+// EXPECT-OUT: 3286
 module tests.run.trig
 
 // `sin`/`cos` as fast deterministic polynomials (Cephes minimax + quadrant reduction), built from
@@ -45,5 +47,19 @@ fn main() -> i32 {
         ys[i] = sin(xs[i]);
     }
     print((ys[5] * 10000.0) as i32); // sin(0.5) = 0.4794 -> 4794
+
+    // A pure `out[i] = cos(x[i])` / `erf(x[i])` loop now dispatches to the 256-bit AVX2
+    // `mercury_vmath_f32` kernel (the same play as `exp`); both backends marshal the identical kernel
+    // so the differential oracle stays exact. cos(0.5) = 0.8776 -> 8775; erf(0.3) = 0.3286 -> 3286.
+    let mut cz: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        cz[i] = cos(xs[i]);
+    }
+    print((cz[5] * 10000.0) as i32); // 8775
+    let mut ez: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        ez[i] = erf(xs[i]);
+    }
+    print((ez[3] * 10000.0) as i32); // 3286
     return 0;
 }
