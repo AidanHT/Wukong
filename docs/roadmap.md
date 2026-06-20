@@ -69,14 +69,15 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   C. The parallel sum is bit-identical to the serial one (fixed-size chunks independent of core count
   + ascending partial combine), so the differential oracle holds.
 - **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log`/`exp2`/`log2` (≈1-ULP `f32`
-  minimax polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
+  minimax polynomials), `expm1`/`log1p` (Kahan-stable `eˣ−1` / `ln(1+x)`, ≈1-ULP near 0),
+  `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
   `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
   position embeddings), `atan` (Cephes 3-region reduction, for angle/geometry ops), the activation
   family `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
   `hardsigmoid`/`hardswish`, the full hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`
   (the inverse trio for hyperbolic/Poincaré embeddings + the Fisher z-transform), and `fmax`/`fmin` —
   all built from primitive ops both backends agree on bit-for-bit. A pure `out[i] = f(x[i])` loop for
-  **any of the 25** transcendentals is **dispatched
+  **any of the 27** transcendentals (incl. the stable `expm1`/`log1p`) is **dispatched
   to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit)
   vectorizer can't reach; a *composed* use auto-vectorizes the inlined poly at 128-bit. So softmax, layernorm,
   GELU (tanh and exact erf), SiLU/swish, ELU, softplus, mish, tanh, RoPE, and **log-softmax /
