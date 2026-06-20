@@ -21,6 +21,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   recognized and lowered to the `mercury_dot_bf16` / `mercury_sum_bf16` runtime kernels (widen bf16→f32,
   8-lane f32 accumulate). A bandwidth win that grows as the working set spills L3: ~3.0–3.5× vs C for
   dot, ~6–8× for sum (`tests/run/reduce_bf16.mer`; `differential_bf16_reduce` pins native==interp).
+- **bf16 mixed-precision elementwise → SIMD dispatch**: `out[k] = a*(x[k] as f32) + b*(y[k] as f32)`
+  over `[bf16; _]` inputs with an f32 output (saxpy/axpby/add) lowers to `mercury_axpby_bf16` (AVX2
+  widen+fmadd, f32 math). bf16 in + f32 out streams 8 bytes/elem vs the f32 kernel's 12 → ~1.3× on a
+  working set ≫ L3 (`differential_bf16_axpby`; `axpby_bf16_bandwidth`). Requires two additive terms
+  (a 1-term scale would force a `0*inf` the source lacks). A bf16 *output* (→ ~2×) is future work.
 - All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
