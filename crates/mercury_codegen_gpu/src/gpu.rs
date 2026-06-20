@@ -1246,6 +1246,57 @@ mod tests {
                 "transformer_layer S={s} D={d} Dff={dff} (GPU-resident): max_abs={:.2e} max_rel={:.2e}",
                 st.max_abs, st.max_rel
             );
+            // Determinism: identical inputs → bit-identical output (every kernel uses a fixed grid +
+            // warp-butterfly reductions, no atomics), so the layer is reproducible run-to-run.
+            let again = transformer_layer(g, &x, &w, s, d, dff).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got),
+                bits(&again),
+                "GPU-resident transformer layer must be deterministic"
+            );
+        });
+    }
+
+    /// End-to-end latency of the GPU-resident transformer layer (full call: weights H2D + the kernel
+    /// chain + result D2H). Reported as ms/layer and tokens/s. A real model keeps weights resident, so
+    /// this is a conservative (transfer-inclusive) figure.
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn transformer_layer_throughput() {
+        with_gpu("transformer_layer_throughput", |g| {
+            let mut rng = crate::diff::Rng::new(0x7A12);
+            let (d, dff) = (64usize, 256usize);
+            for s in [256usize, 512, 1024] {
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let wq = rng.vec(d * d, -0.1, 0.1);
+                let wk = rng.vec(d * d, -0.1, 0.1);
+                let wv = rng.vec(d * d, -0.1, 0.1);
+                let wo = rng.vec(d * d, -0.1, 0.1);
+                let w1 = rng.vec(dff * d, -0.1, 0.1);
+                let w2 = rng.vec(d * dff, -0.1, 0.1);
+                let w = TransformerWeights {
+                    wq: &wq,
+                    wk: &wk,
+                    wv: &wv,
+                    wo: &wo,
+                    w1: &w1,
+                    w2: &w2,
+                };
+                transformer_layer(g, &x, &w, s, d, dff).unwrap(); // warm up (JIT + cache modules)
+                let iters = 50;
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    transformer_layer(g, &x, &w, s, d, dff).unwrap();
+                }
+                let spi = t0.elapsed().as_secs_f64() / iters as f64;
+                eprintln!(
+                    "transformer_layer S={s} D={d} Dff={dff}: {:.2} ms/layer, {:.0} tokens/s",
+                    spi * 1e3,
+                    s as f64 / spi
+                );
+            }
         });
     }
 
