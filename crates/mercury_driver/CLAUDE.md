@@ -3,7 +3,11 @@
 Orchestrates the full compile pipeline: owns the `SourceMap`/`Interner`/`DiagnosticSink`, runs each stage in order, and honors `--emit`. Sits between the CLI (`mercuryc`) and every front-end/back-end crate.
 
 ## Layout
-- `src/lib.rs` — the whole crate: `Options`, `EmitStage`, `ErrorFormat`, the `exit` codes module, and `compile()` plus the private `emit_native`/`emit_mir`/`emit_diag`/`render_all` helpers.
+- `src/lib.rs` — the whole crate: `Options`, `EmitStage`, `ErrorFormat`, `BackendKind`, the `exit` codes module, and `compile()` plus the private `emit_native`/`emit_mir`/`emit_diag`/`render_all`/`run_on_gpu` helpers.
+- `src/gpu_accel.rs` — **(behind `--features gpu`)** `GpuAccel`, the `mercury_interp::Accelerator` impl that forwards recognized kernels to `mercury_codegen_gpu` launch wrappers. It counts device calls (`calls`) so the e2e tests can assert the offload actually fired. A GPU error becomes `Some(Err(..))` (never `None`/silent CPU fallback when the user asked for the GPU).
+
+## Backends & the `gpu` feature
+`BackendKind` is `Interp` (default, the oracle), `Native` (Cranelift JIT), or `Gpu`. `--backend=gpu` requires building with the driver's `gpu` feature (off by default → toolchain-free core; it pulls `mercury_codegen_gpu/gpu` + `cudarc`). `run_on_gpu` acquires the process-wide `Gpu`, wraps it in `GpuAccel`, and runs the program via `mercury_interp::run_with_output_accel` (the offloading interpreter — recognized GEMM/activation/reduction/norm calls run on the device, everything else on the CPU). Without the feature, `--backend=gpu` is a clear build-capability error, not a silent fallback. Gated by the `gpu_e2e_tests` module (only with `--features gpu`; skips with no device).
 
 ## Key types & entry points
 - `compile(opts: &Options) -> i32` (`src/lib.rs`) — single entry point. Reads the input file, runs lexer -> parser -> sema -> mir_build -> opt -> backend, returns a process exit code. Each `--emit` stage short-circuits with its own dump.

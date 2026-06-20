@@ -126,9 +126,20 @@ mobile 4050 (see `BENCHMARKS.md`):
   output proj → residual → RMSNorm → FFN(SiLU) → residual, all on device buffers with no host round-trip
   between ops, matching a CPU f64 reference to max_rel 2.7e-4 and **deterministic** run-to-run.
 
-Run with `cargo test -p mercury_codegen_gpu --features gpu` (skips cleanly with no GPU). A
-`--backend=gpu` CLI flag that offloads recognized ops through the driver is the next integration step;
-today the GPU path is exercised through the crate's host API + tests.
+**End-to-end `--backend=gpu`.** `mercuryc --features gpu --backend=gpu --run foo.mer` executes the
+program through an **offloading interpreter**: the whole program is tree-walked on the CPU (identical
+control flow, buffer layout, and every non-kernel op to the oracle), but recognized GEMM / activation
+/ reduction / fused-norm calls run on the device via an `Accelerator` seam (`mercury_interp`) the
+driver implements with `mercury_codegen_gpu` (`GpuAccel`). With no accelerator — every other caller,
+the differential oracle — the path is byte-for-byte unchanged, so the toolchain-free core is
+untouched. The CPU↔GPU boundary is tolerance-gated, so a device error surfaces as an error rather than
+a silent CPU fallback. Gated by `gpu_backend_*` tests (driver, `--features gpu`): each family runs on
+the interp oracle and the GPU over identical buffers and matches within tolerance (GEMM bit-exact;
+silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
+
+Run the kernel suite with `cargo test -p mercury_codegen_gpu --features gpu` (skips cleanly with no
+GPU). A full MIR→PTX scalar compiler (so arbitrary, non-recognized kernels run GPU-side too) is the
+remaining stretch; today unrecognized ops execute on the CPU within the same offloading run.
 
 ## Checked but not yet executed
 

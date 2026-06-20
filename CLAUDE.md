@@ -19,6 +19,9 @@ cargo build --features llvm                  # native codegen path (requires LLV
 
 CLI flags (`crates/mercuryc/src/main.rs` → `mercury_driver::Options`):
 - `--run` — compile and execute via the interpreter (the default execution path here).
+- `--backend=interp|native|gpu` — execution backend for `--run` (default `interp`). `native` is the
+  Cranelift JIT. `gpu` requires a build with `--features gpu` + a CUDA device: it runs recognized
+  GEMM/activation/reduction/norm calls on the device via an offloading interpreter (see GPU backend below).
 - `--emit=<stage>` — emit one artifact and stop: `tokens`, `ast`, `mir-high`, `mir` (alias `mir-low`),
   `llvm-ir`, `obj`, `exe` (default `exe`). Artifacts go to stdout; diagnostics to stderr.
 - `-O0|-O1|-O2|-O3` — optimization level (default `-O0`).
@@ -36,7 +39,8 @@ source.mer
   → sema        mercury_sema::check                  name res, types, SHAPE check
   → mir_build   mercury_mir_build::lower_program     -> MIR (High, alloca-per-local)
   → opt         mercury_opt::optimize                fixpoint SSA passes -> MIR (Low)
-  → backend     mercury_interp (--run) | mercury_codegen_llvm (--emit=llvm-ir|obj|exe)
+  → backend     mercury_interp (--run) | mercury_codegen_cranelift (--backend=native)
+                | mercury_codegen_gpu (--backend=gpu, offloading interp) | mercury_codegen_llvm (--emit=llvm-ir|obj|exe)
 ```
 
 `mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early.
