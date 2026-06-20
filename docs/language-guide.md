@@ -148,7 +148,7 @@ LLVM backend, by the runtime).
 
 `f32` (scalar or in a loop), each a ≈1-ULP minimax polynomial built from primitive ops:
 
-- `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal).
+- `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal); `cbrt(x)` — the all-real cube root.
 - `abs(x)` — `|x|` (as `max(x, −x)`); vectorizes, and a `fmax(m, abs(x[k]))` loop is the per-tensor
   absmax dynamic symmetric int8 quantization uses for its scale.
 - `round(x)` / `floor(x)` / `ceil(x)` / `trunc(x)` — round to an integral value (one hardware
@@ -157,6 +157,7 @@ LLVM backend, by the runtime).
 - `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`. Also `exp2`/`log2`
   (base-2, FlashAttention/quantization) and `exp10`/`log10` (base-10, decibel/log-scale features), plus
   the Kahan-stable `expm1`/`log1p`.
+- `atan2(y, x)` / `hypot(a, b)` — the full-circle angle of a point, and the overflow-safe 2-norm.
 - `erf(x)` — for the exact (erf-based) GELU of BERT/GPT-2.
 - `sin(x)` / `cos(x)` / `tan(x)` / `atan(x)` / `asin(x)` / `acos(x)` — RoPE rotary position embeddings
   (`sin`/`cos`) and the angle/geometry/3D-vision/graphics-ML ops (the inverse trig).
@@ -167,7 +168,7 @@ LLVM backend, by the runtime).
   `mish(x) = x·tanh(softplus(x))`). Plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`.
 - `fmax(a, b)` / `fmin(a, b)`.
 
-When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 34**
+When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
 are **dispatched to a tuned 256-bit
 AVX2/FMA kernel** (`mercury_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the

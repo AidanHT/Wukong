@@ -41,13 +41,14 @@ All notable changes to Mercury are documented here. The format is loosely based 
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
   run ~2.6–2.8× faster than serial C.
-- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **34** functions —
+- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **35** functions —
   `exp`/`log`/`expm1`/`log1p`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
   `hardsigmoid`/`hardswish` plus **`softsign`** (bounded poly activation) and **`logsigmoid`** (the stable
   log-sigmoid behind binary-cross-entropy-with-logits / contrastive losses), **`sin`/`cos`/`tan`/`atan`/`asin`/`acos`**
   (RoPE rotary embeddings and the geometry/3D-vision/graphics-ML angle ops), **`erf`** (exact
   BERT/GPT-2 GELU), **`exp2`/`log2`/`exp10`/`log10`** (FlashAttention base-2 softmax, quantization, and
-  base-10 decibel/log-scale features), and the full
+  base-10 decibel/log-scale features), **`cbrt`** (the all-real cube root — LAB color, variance-stabilizing
+  transforms — completing the `sqrt`/`rsqrt`/`cbrt` root family), and the full
   **hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`** (`atanh` = the Fisher z-transform; the
   inverse trio powers hyperbolic/Poincaré embeddings and normalizing flows) — lowers to a tuned **256-bit AVX2/FMA runtime
   kernel** (`mercury_vmath_f32`) — the width Cranelift's general vectorizer can't emit (it caps at
@@ -58,7 +59,14 @@ All notable changes to Mercury are documented here. The format is loosely based 
   `@parallel` activation dispatches each thread's chunk — so it runs multicore × 256-bit. Versus C's
   scalar `libm` (which can't vectorize a loop with a call), the family runs **~4–11.5×
   faster** single-thread (`asinh`/`acosh` and `sin`/`cos` win most — `libm`'s `asinhf`/`sinf`/`cosf`
-  are heavier than `expf`), ~28× `@parallel`.
+  are heavier than `expf`), ~28× `@parallel`. The in-process `vmath_throughput` probe (kernel vs the
+  scalar `libm`-call loop gcc/rustc are forced to emit) confirms it locally: exp ~5.9×, gelu ~5.5×,
+  tan ~3.6×, asin ~5.4×, exp10 ~13×, logsigmoid ~4.6×.
+- **Two-arg transcendentals (`pow`/`atan2`/`hypot`)**: `pow(x,y) = exp(y·log(x))`, `atan2(y,x)` (the
+  full-circle angle — geometry, robotics, complex argument), and `hypot(a,b)` (the overflow-safe
+  2-norm) compose existing primitives, so they lower to the inlined ≈1-ULP poly that auto-vectorizes at
+  128-bit — still a win over C's scalar `atan2f`/`hypotf`/`powf` (a loop with the call won't vectorize),
+  and bit-identical across backends and opt levels.
 - **Streaming elementwise → 256-bit AVX2 dispatch**: a recognized streaming map
   (`out[i] = act(a·x[i] (+ b·y[i]) + c)`, incl. ReLU/ReLU6) lowers to `mercury_velem_f32` and a Horner
   polynomial to `mercury_vhorner_f32` — both true 256-bit AVX2/FMA, unrolled, emitting **non-temporal
@@ -87,7 +95,7 @@ All notable changes to Mercury are documented here. The format is loosely based 
   `vcvtph2ps` for f16) with f32 accumulate/compute dispatches to half-precision runtime kernels:
   **`dot`/`sum`** (`mercury_{dot,sum}_{bf16,f16}`, ~3–8× vs C), **`max`/`min`/`absmax`**
   (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric int8-quant scale), **streaming
-  `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **35-op activation set**
+  `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **36-op activation set**
   (`mercury_vmath_{bf16,f16}`). Precision-generic recognizers; the interpreter marshals through the
   identical kernel, so native == interp bit-for-bit. C/Rust can vectorize neither a `libm` call nor the
   half→f32 widen, so the gap is structural.
