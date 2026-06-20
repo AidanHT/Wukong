@@ -46,6 +46,7 @@ pub const VM_COSH: i64 = 21;
 pub const VM_ASINH: i64 = 22;
 pub const VM_ACOSH: i64 = 23;
 pub const VM_ATANH: i64 = 24;
+pub const VM_ATAN: i64 = 25;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -125,6 +126,20 @@ const ERF_A: [f32; 5] = [
 // `emit_exp(x*ln2)` / `emit_log(x)*log2e` bit-for-bit).
 const LN_2: f32 = std::f64::consts::LN_2 as f32; // exp2(x) = exp(x·ln2)
 const LOG2_E: f32 = std::f64::consts::LOG2_E as f32; // log2(x) = log(x)·log2(e)
+
+// atan (Cephes `atanf`): a 3-region reduction of |x| at the two breakpoints tan(π/8)=√2−1 and
+// tan(3π/8)=1+√2, each mapping into [0, tan(π/8)] where a degree-3 odd minimax poly is ≈1 ULP. The
+// `f64 as f32` casts mirror `splat_const_f` in mir_build so the dispatched kernel equals the inlined form.
+const ATAN_TAN_3PI8: f32 = 2.414213562373095_f64 as f32; // tan(3π/8) = 1 + √2
+const ATAN_TAN_PI8: f32 = 0.4142135623730950_f64 as f32; // tan(π/8) = √2 − 1
+const ATAN_PIO2: f32 = std::f64::consts::FRAC_PI_2 as f32; // π/2 offset (big region)
+const ATAN_PIO4: f32 = std::f64::consts::FRAC_PI_4 as f32; // π/4 offset (mid region)
+const ATAN_P: [f32; 4] = [
+    0.080_537_444_953_8_f64 as f32,
+    -0.138_776_856_032_f64 as f32,
+    0.199_777_106_478_f64 as f32,
+    -0.333_329_491_539_f64 as f32,
+];
 
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback; mirror the MIR poly element-for-element) --
 
@@ -412,6 +427,36 @@ fn atanh1(x: f32) -> f32 {
     log1(r) * 0.5
 }
 
+/// `atan(x)` (≈1 ULP), the Cephes single-precision algorithm: fold to `|x|`, reduce into
+/// `[0, tan(π/8)]` by the two breakpoints (a degree-3 odd minimax poly there), then restore the
+/// `π/4`/`π/2` offset and the sign. Branchless (all three region candidates computed, then selected)
+/// so the scalar twin equals the AVX2 [`atan8`] lane-for-lane — the tail-match test pins it. The
+/// headline ML use is angle/geometry ops and `atan2`-style positional schemes.
+#[inline]
+fn atan1(x: f32) -> f32 {
+    let ax = f32::from_bits(x.to_bits() & 0x7FFF_FFFF); // |x|
+    let big = ax > ATAN_TAN_3PI8;
+    let mid = ax > ATAN_TAN_PI8; // includes `big`; `big` overrides below (mirrors if/else-if/else)
+    let xr_mid = (ax - 1.0) / (ax + 1.0);
+    let xr_big = -1.0 / ax;
+    let mut xr = ax;
+    xr = if mid { xr_mid } else { xr };
+    xr = if big { xr_big } else { xr };
+    let mut y = 0.0f32;
+    y = if mid { ATAN_PIO4 } else { y };
+    y = if big { ATAN_PIO2 } else { y };
+    let z = xr * xr;
+    let mut p = ATAN_P[0];
+    p = p.mul_add(z, ATAN_P[1]);
+    p = p.mul_add(z, ATAN_P[2]);
+    p = p.mul_add(z, ATAN_P[3]);
+    let pz = p * z;
+    let pzx = pz * xr;
+    let res = pzx + xr;
+    let yf = y + res; // ≥ 0 for ax ≥ 0 (atan is odd)
+    f32::from_bits(yf.to_bits() | (x.to_bits() & 0x8000_0000)) // copysign(yf, x)
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -441,6 +486,7 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_ASINH => asinh1(x),
         VM_ACOSH => acosh1(x),
         VM_ATANH => atanh1(x),
+        VM_ATAN => atan1(x),
         _ => x,
     }
 }
@@ -501,6 +547,7 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_ASINH => asinh8,
         VM_ACOSH => acosh8,
         VM_ATANH => atanh8,
+        VM_ATAN => atan8,
         _ => return,
     };
     let mut i = 0;
@@ -869,6 +916,39 @@ unsafe fn atanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_mul_ps(log8(_mm256_div_ps(num, den)), _mm256_set1_ps(0.5))
 }
 
+/// 8-lane `atan(x)` (Cephes) — mirrors [`atan1`] op-for-op: bit-mask `|x|`, the two `_CMP_GT_OQ`
+/// region masks, both reduced candidates blended in, the degree-3 FMA poly, then the offset and a
+/// bit-or sign restore. The `mid` mask includes `big`; blending `big` last overrides it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn atan8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x8000_0000_u32 as i32));
+    let ax = _mm256_and_ps(x, absmask);
+    let big = _mm256_cmp_ps::<_CMP_GT_OQ>(ax, _mm256_set1_ps(ATAN_TAN_3PI8));
+    let mid = _mm256_cmp_ps::<_CMP_GT_OQ>(ax, _mm256_set1_ps(ATAN_TAN_PI8));
+    let one = _mm256_set1_ps(1.0);
+    let xr_mid = _mm256_div_ps(_mm256_sub_ps(ax, one), _mm256_add_ps(ax, one));
+    let xr_big = _mm256_div_ps(_mm256_set1_ps(-1.0), ax);
+    let mut xr = ax;
+    xr = _mm256_blendv_ps(xr, xr_mid, mid);
+    xr = _mm256_blendv_ps(xr, xr_big, big);
+    let mut y = _mm256_setzero_ps();
+    y = _mm256_blendv_ps(y, _mm256_set1_ps(ATAN_PIO4), mid);
+    y = _mm256_blendv_ps(y, _mm256_set1_ps(ATAN_PIO2), big);
+    let z = _mm256_mul_ps(xr, xr);
+    let mut p = _mm256_set1_ps(ATAN_P[0]);
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(ATAN_P[1]));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(ATAN_P[2]));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(ATAN_P[3]));
+    let pz = _mm256_mul_ps(p, z);
+    let pzx = _mm256_mul_ps(pz, xr);
+    let res = _mm256_add_ps(pzx, xr);
+    let yf = _mm256_add_ps(y, res);
+    _mm256_or_ps(yf, _mm256_and_ps(x, signmask))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +1006,8 @@ mod tests {
             // relative check would blow up.
             (VM_SIN, |x| x.sin(), 1e-4),
             (VM_COS, |x| x.cos(), 1e-4),
+            // atan: bounded & ≈1-ULP over the whole real line (Cephes 3-region reduction).
+            (VM_ATAN, |x| x.atan(), 5e-5),
             // exp2/sinh/cosh reuse exp, so ≈exp's accuracy; relative over the full range.
             (VM_EXP2, |x| x.exp2(), 5e-5),
             (VM_SINH, |x| x.sinh(), 5e-5),
@@ -1033,7 +1115,7 @@ mod tests {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
             VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
-            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH,
+            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN,
         ] {
             if op == VM_LOG || op == VM_LOG2 {
                 continue; // negative inputs are out of log's domain

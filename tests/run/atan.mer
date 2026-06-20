@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7853
+// EXPECT-OUT: 4636
+// EXPECT-OUT: 14711
+// EXPECT-OUT: -12490
+// EXPECT-OUT: 0
+// EXPECT-OUT: -13258
+module tests.run.atan
+
+// `atan(x)` — the Cephes single-precision arctangent: fold to |x|, reduce into [0, tan(π/8)] at the
+// two breakpoints (small/mid/big regions), a degree-3 odd minimax poly there, then restore the
+// π/4·π/2 offset and the sign. Built from primitive ops (branchless region blends), so it vectorizes
+// to the 256-bit kernel and both backends agree bit-for-bit. Used for angle/geometry ops and
+// atan2-style positional schemes.
+fn main() -> i32 {
+    // The three regions: small (|x|≤tan π/8), mid, big (|x|>tan 3π/8).
+    let a: f32 = 1.0;
+    print((atan(a) * 10000.0) as i32); // π/4 -> 7853
+    let mid: f32 = 0.5;
+    print((atan(mid) * 10000.0) as i32); // 0.463648 -> 4636
+    let big: f32 = 10.0;
+    print((atan(big) * 10000.0) as i32); // 1.471128 -> 14711
+    let neg: f32 = -3.0;
+    print((atan(neg) * 10000.0) as i32); // odd: -atan(3) -> -12490
+
+    // atan is odd: atan(x) + atan(-x) = 0.
+    let s: f32 = atan(big) + atan(-10.0);
+    print((s * 10000.0) as i32); // 0
+
+    // Vectorized atan over an array lowers to the 256-bit dispatch (kernel path); checksum the lanes.
+    let mut xs: [f32; 16] = [0.0; 16];
+    let mut i: i32 = 0;
+    while i < 16 {
+        xs[i] = (i as f32) * 0.5 - 4.0;
+        i = i + 1;
+    }
+    let mut out: [f32; 16] = [0.0; 16];
+    let mut k: i32 = 0;
+    while k < 16 {
+        out[k] = atan(xs[k]);
+        k = k + 1;
+    }
+    let mut acc: f32 = 0.0;
+    let mut m: i32 = 0;
+    while m < 16 {
+        acc = acc + out[m];
+        m = m + 1;
+    }
+    print((acc * 10000.0) as i32); // checksum -> -13258
+    return 0;
+}

@@ -512,6 +512,7 @@ const VMATH_COSH: u32 = 21;
 const VMATH_ASINH: u32 = 22;
 const VMATH_ACOSH: u32 = 23;
 const VMATH_ATANH: u32 = 24;
+const VMATH_ATAN: u32 = 25;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2805,6 +2806,7 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Asinh) => VMATH_ASINH,
             Some(MathIntrinsic::Acosh) => VMATH_ACOSH,
             Some(MathIntrinsic::Atanh) => VMATH_ATANH,
+            Some(MathIntrinsic::Atan) => VMATH_ATAN,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -3658,6 +3660,7 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Asinh
                     | MathIntrinsic::Acosh
                     | MathIntrinsic::Atanh
+                    | MathIntrinsic::Atan
                     | MathIntrinsic::Erf
                     | MathIntrinsic::Sin
                     | MathIntrinsic::Cos
@@ -4476,6 +4479,10 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Atanh) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_atanh(x, vty)
+                }
+                Some(MathIntrinsic::Atan) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_atan(x, vty)
                 }
                 Some(MathIntrinsic::Pow) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -5354,6 +5361,10 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_atanh(x, &rty))
             }
+            MathIntrinsic::Atan => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_atan(x, &rty))
+            }
             MathIntrinsic::Pow => {
                 // pow(x, y) = exp(y * log(x)), reusing the two polynomials (so it vectorizes and is
                 // bit-exact across backends for free). Defined for x > 0, like the rest of the suite.
@@ -5920,6 +5931,72 @@ impl FnLowerer<'_> {
         let sel23 = self.builder.build(fty.clone(), Op::Select(eq2, a2, a3));
         let sel123 = self.builder.build(fty.clone(), Op::Select(eq1, a1, sel23));
         self.builder.build(fty.clone(), Op::Select(eq0, a0, sel123))
+    }
+
+    /// `atan(x)`, computed in `f32` (demote/promote an `f64` result like `exp`). Works on a scalar or
+    /// a SIMD vector; bit-identical across backends. Enables angle/geometry ops and `atan2`-style schemes.
+    fn emit_atan(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let want_f64 = matches!(rty.lane_type(), MirType::F64);
+        let f32ty = float_ty_like(rty, MirType::F32);
+        let xf = if want_f64 {
+            self.builder
+                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
+        } else {
+            x
+        };
+        let r = self.emit_atan_f32(xf, &f32ty);
+        if want_f64 {
+            self.builder
+                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
+        } else {
+            r
+        }
+    }
+
+    /// The Cephes `atan` poly in `f32` (`fty` is `f32` or a `Vec` of `f32`) — mirrors `atan1`/`atan8`
+    /// op-for-op: `|x|`, the two breakpoint masks, both reduced candidates blended in (`big` overrides
+    /// `mid`), a degree-3 odd FMA poly, the `π/4`/`π/2` offset, and a sign restore by select. For finite
+    /// `x` this equals the dispatched 256-bit kernel bit-for-bit (abs/copysign agree with the kernel's
+    /// bit-mask forms on finite inputs), so dispatched and composed `atan` agree.
+    fn emit_atan_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
+        let mty = mask_ty(fty);
+        let ax = self.emit_abs(x, fty);
+        let tan3 = self.splat_const_f(ATAN_TAN_3PI8, fty);
+        let tan1 = self.splat_const_f(ATAN_TAN_PI8, fty);
+        let big = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, ax, tan3));
+        let mid = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, ax, tan1));
+        let one = self.splat_const_f(1.0, fty);
+        let neg1 = self.splat_const_f(-1.0, fty);
+        // mid candidate (ax−1)/(ax+1); big candidate −1/ax.
+        let axm1 = self.builder.build(fty.clone(), Op::Bin(BinOp::FSub, ax, one));
+        let axp1 = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, ax, one));
+        let xr_mid = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FDiv, axm1, axp1));
+        let xr_big = self.builder.build(fty.clone(), Op::Bin(BinOp::FDiv, neg1, ax));
+        let xr = self.builder.build(fty.clone(), Op::Select(mid, xr_mid, ax));
+        let xr = self.builder.build(fty.clone(), Op::Select(big, xr_big, xr));
+        // offset 0 → π/4 (mid) → π/2 (big).
+        let zero = self.splat_const_f(0.0, fty);
+        let pio4 = self.splat_const_f(ATAN_PIO4, fty);
+        let pio2 = self.splat_const_f(ATAN_PIO2, fty);
+        let y = self.builder.build(fty.clone(), Op::Select(mid, pio4, zero));
+        let y = self.builder.build(fty.clone(), Op::Select(big, pio2, y));
+        // degree-3 odd minimax via FMA Horner: ((((P0·z+P1)·z+P2)·z+P3)·z·xr) + xr.
+        let z = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, xr, xr));
+        let mut p = self.splat_const_f(ATAN_P[0], fty);
+        for &c in &ATAN_P[1..] {
+            let cc = self.splat_const_f(c, fty);
+            p = self.builder.build(fty.clone(), Op::Fma(p, z, cc));
+        }
+        let pz = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, p, z));
+        let pzx = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, pz, xr));
+        let res = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, pzx, xr));
+        let yf = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, y, res));
+        // copysign(yf, x) via select (yf ≥ 0): x < 0 ? −yf : yf.
+        let negyf = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, yf, neg1));
+        let isneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
+        self.builder.build(fty.clone(), Op::Select(isneg, negyf, yf))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
@@ -7940,6 +8017,7 @@ enum MathIntrinsic {
     Asinh,
     Acosh,
     Atanh,
+    Atan,
     Pow,
     Erf,
     Sin,
@@ -7990,6 +8068,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "asinh" => MathIntrinsic::Asinh,
         "acosh" => MathIntrinsic::Acosh,
         "atanh" => MathIntrinsic::Atanh,
+        "atan" => MathIntrinsic::Atan,
         "pow" => MathIntrinsic::Pow,
         "erf" => MathIntrinsic::Erf,
         "sin" => MathIntrinsic::Sin,
@@ -8087,6 +8166,18 @@ const COS_P: [f64; 3] = [
     2.443_315_711_809_948e-5,
     -1.388_731_625_493_765e-3,
     4.166_664_568_298_827e-2,
+];
+// atan (Cephes): 3-region reduction breakpoints + the π/4·π/2 offsets + the degree-3 odd minimax poly
+// (mirror `mercury_runtime::vmath`'s ATAN_* so the inlined form equals the dispatched kernel).
+const ATAN_TAN_3PI8: f64 = 2.414213562373095; // tan(3π/8) = 1 + √2
+const ATAN_TAN_PI8: f64 = 0.4142135623730950; // tan(π/8) = √2 − 1
+const ATAN_PIO2: f64 = std::f64::consts::FRAC_PI_2;
+const ATAN_PIO4: f64 = std::f64::consts::FRAC_PI_4;
+const ATAN_P: [f64; 4] = [
+    0.080_537_444_953_8,
+    -0.138_776_856_032,
+    0.199_777_106_478,
+    -0.333_329_491_539,
 ];
 
 /// Names that lower to runtime/interpreter intrinsics rather than user functions.
