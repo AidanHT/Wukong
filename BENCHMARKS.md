@@ -170,9 +170,9 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 ### Transcendentals / activations — Mercury dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
 The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
-Mercury recognizes a pure `out[i] = f(x[i])` loop for
-`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`erf`
-and lowers the whole
+Mercury recognizes a pure `out[i] = f(x[i])` loop for **24** functions —
+`exp`/`log`/`exp2`/`log2`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`erf`
+plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh` — and lowers the whole
 loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same domain-aware dispatch
 as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a time; gcc/rustc call
 scalar `libm` `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff` and **cannot vectorize a loop containing a call** (no `libmvec` on
@@ -180,8 +180,10 @@ this mingw toolchain), so they stay serial. `silu` (Llama/SwiGLU) and `gelu` (BE
 approximation) are first-class intrinsics, as are `elu`, `leaky_relu`, `softplus` (= `ln(1+eˣ)`), and
 `mish` (= `x·tanh(softplus)`) — all composing the shared ≈1-ULP `exp`/`log`. **`sin`/`cos`** (the
 rotary-position-embedding transcendentals in every modern LLM) and **`erf`** (the original BERT/GPT-2
-GELU's core) now dispatch to the 256-bit kernel too. The interpreter marshals
-through the *identical* kernel, so the differential oracle stays exact.
+GELU's core) dispatch to the 256-bit kernel too, as does the full **hyperbolic family** —
+`sinh`/`cosh` plus the inverse `asinh`/`acosh`/`atanh` (`atanh` is the Fisher z-transform; the inverse
+trio powers hyperbolic/Poincaré embeddings and normalizing flows), each composing the shared `log`/`√`.
+The interpreter marshals through the *identical* kernel, so the differential oracle stays exact.
 
 This is the change that took the activations from a ~128-bit ~2.5–3.5× win to the ~5–7.5× range —
 **roughly double**, because they are compute-bound (~20 flops/element) and the missing 256 bits were
@@ -201,11 +203,13 @@ than a bare `out[i]=f(x[i])` loop — still lowers to the inlined ≈1-ULP poly 
 | `sin` | **~6.0–8.6× faster** | RoPE; 256-bit Cephes `sinf` poly + quadrant reduction vs scalar `sinf` (heavier than `expf`, so the widest single-call gap) |
 | `cos` | **~6.0–8.2× faster** | RoPE; the cos branch of the same reduced-argument poly |
 | `erf` | **~3.9–4.9× faster** | exact (erf-based) GELU; 256-bit Abramowitz–Stegun poly vs scalar `erff` |
+| `asinh` | **~10–11.5× faster** | `sign(x)·log(\|x\|+√(x²+1))` (sign-stable) vs scalar `asinhf` — libm's `asinhf` carries its own reduction over a log, so the widest gap in the suite |
+| `acosh` | **~7.6× faster** | `log(x+√(x²−1))`, x≥1, vs scalar `acoshf` |
 | `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
-The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP minimax polys),
+The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log`/`exp2`/`log2` (≈1-ULP minimax polys),
 `pow` (= `exp(y·log(x))`), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`,
-and `fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
+the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`, and `fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
 with `libm` within tolerance) and
 compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
 bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
@@ -536,10 +540,11 @@ abs on this box). A device error surfaces as an error, never a silent CPU fallba
   comparison) — the lead widening with size — and ~4.6–14.7× with `@parallel` (clock-state-dependent).
   Rust runs essentially scalar here (~5–12× behind). Integer math makes the cross-language check
   **bit-exact**, not a tolerance.
-- **Transcendentals / activations (exp, log, tanh, sigmoid, GELU, SiLU, ELU, leaky_relu, softplus,
-  mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, erf — 18 in all):** **~4–8.6× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
+- **Transcendentals / activations (exp, log, exp2, log2, tanh, sigmoid, GELU, SiLU, ELU, leaky_relu,
+  softplus, mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, erf, and the hyperbolic family
+  sinh, cosh, asinh, acosh, atanh — 24 in all):** **~4–11.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
   ≈1-ULP poly kernel** (`mercury_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
-  `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff` call. This is the transformer/vision activation family and the cleanest
+  `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff`/`asinhf` call. This is the transformer/vision activation family and the cleanest
   compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).
   `sin`/`cos` (the **RoPE** rotary-embedding transcendentals) win the most (~6–8.6×) — `libm`'s
   `sinf`/`cosf` are heavier than `expf` — and `erf` gives the exact BERT/GPT-2 GELU.

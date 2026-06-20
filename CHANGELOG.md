@@ -41,19 +41,21 @@ All notable changes to Mercury are documented here. The format is loosely based 
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
   run ~2.6–2.8× faster than serial C.
-- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **18** functions —
+- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **24** functions —
   `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
-  `hardsigmoid`/`hardswish` plus **`sin`/`cos`** (RoPE rotary embeddings) and **`erf`** (exact
-  BERT/GPT-2 GELU) and **`exp2`/`log2`/`sinh`/`cosh`** (FlashAttention base-2 softmax, quantization,
-  the exponential family) — lowers to a tuned **256-bit AVX2/FMA runtime
+  `hardsigmoid`/`hardswish` plus **`sin`/`cos`** (RoPE rotary embeddings), **`erf`** (exact
+  BERT/GPT-2 GELU), **`exp2`/`log2`** (FlashAttention base-2 softmax, quantization), and the full
+  **hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`** (`atanh` = the Fisher z-transform; the
+  inverse trio powers hyperbolic/Poincaré embeddings and normalizing flows) — lowers to a tuned **256-bit AVX2/FMA runtime
   kernel** (`mercury_vmath_f32`) — the width Cranelift's general vectorizer can't emit (it caps at
   128-bit SSE). `silu` (Llama/SwiGLU) and `gelu` (BERT/GPT-2/ViT) are first-class intrinsics; the
   kernel's per-element op sequence mirrors the inlined Cephes/A&S polynomial, and the interpreter marshals
   through the identical kernel, so the differential oracle stays exact and dispatched/composed forms
   agree. A multi-statement (fusion-merged) body dispatches one kernel call per activation, and an
   `@parallel` activation dispatches each thread's chunk — so it runs multicore × 256-bit. Versus C's
-  scalar `libm` (which can't vectorize a loop with a call), the family runs **~4–8.6×
-  faster** single-thread (`sin`/`cos` win most — `libm`'s `sinf`/`cosf` are heavier than `expf`), ~28× `@parallel`.
+  scalar `libm` (which can't vectorize a loop with a call), the family runs **~4–11.5×
+  faster** single-thread (`asinh`/`acosh` and `sin`/`cos` win most — `libm`'s `asinhf`/`sinf`/`cosf`
+  are heavier than `expf`), ~28× `@parallel`.
 - **Streaming elementwise → 256-bit AVX2 dispatch**: a recognized streaming map
   (`out[i] = act(a·x[i] (+ b·y[i]) + c)`, incl. ReLU/ReLU6) lowers to `mercury_velem_f32` and a Horner
   polynomial to `mercury_vhorner_f32` — both true 256-bit AVX2/FMA, unrolled, emitting **non-temporal
