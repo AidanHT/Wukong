@@ -68,20 +68,21 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   aggregate memory bandwidth — `dot@parallel` ~7.9×, `ssd@parallel` ~8.6× faster than single-threaded
   C. The parallel sum is bit-identical to the serial one (fixed-size chunks independent of core count
   + ascending partial combine), so the differential oracle holds.
-- **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log` (≈1-ULP `f32` minimax
-  polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
+- **Transcendental intrinsics**: `sqrt`/`rsqrt` (hardware), `exp`/`log`/`exp2`/`log2` (≈1-ULP `f32`
+  minimax polynomials), `pow` (= `exp(y·log(x))`), `erf` (Abramowitz–Stegun, for **exact** GELU
   `0.5·x·(1+erf(x/√2))`), `sin`/`cos` (Cephes minimax + quadrant reduction, for **RoPE** rotary
-  position embeddings), the activation family `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/
-  `softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish` (the transcendental ones built on
-  `exp`/`log`, the piecewise ones on min/max, all first-class intrinsics), and `fmax`/`fmin` — all
-  built from primitive ops both backends agree on bit-for-bit. A pure `out[i] = f(x[i])` loop for any
-  of `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish` is **dispatched
+  position embeddings), `atan` (Cephes 3-region reduction, for angle/geometry ops), the activation
+  family `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
+  `hardsigmoid`/`hardswish`, the full hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`
+  (the inverse trio for hyperbolic/Poincaré embeddings + the Fisher z-transform), and `fmax`/`fmin` —
+  all built from primitive ops both backends agree on bit-for-bit. A pure `out[i] = f(x[i])` loop for
+  **any of the 25** transcendentals is **dispatched
   to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit)
-  vectorizer can't reach; the rest auto-vectorize the inlined poly at 128-bit. So softmax, layernorm,
+  vectorizer can't reach; a *composed* use auto-vectorizes the inlined poly at 128-bit. So softmax, layernorm,
   GELU (tanh and exact erf), SiLU/swish, ELU, softplus, mish, tanh, RoPE, and **log-softmax /
-  cross-entropy** run on SIMD instead of scalar `libm` — **~5–7.5× faster** than gcc/rustc's scalar
-  `expf`/`logf`/`tanhf` (~28× across cores under `@parallel`). See `tests/run/{transcendental,softmax,
-  layernorm,gelu,elu,leaky_relu,softplus,mish,activations,log,erf,trig,log_softmax,ffn_block}.mer`.
+  cross-entropy** run on SIMD instead of scalar `libm` — **~4–11.5× faster** than gcc/rustc's scalar
+  `libm` call (which can't vectorize a loop containing it; ~28× across cores under `@parallel`). See `tests/run/{transcendental,softmax,
+  layernorm,gelu,elu,leaky_relu,softplus,mish,activations,log,erf,trig,ihyp,atan,log_softmax,ffn_block}.mer`.
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
   runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
