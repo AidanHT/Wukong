@@ -36,6 +36,9 @@ pub const VM_SELU: i64 = 11;
 pub const VM_TANHSHRINK: i64 = 12;
 pub const VM_HARDSIGMOID: i64 = 13;
 pub const VM_HARDSWISH: i64 = 14;
+pub const VM_SIN: i64 = 15;
+pub const VM_COS: i64 = 16;
+pub const VM_ERF: i64 = 17;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -81,6 +84,34 @@ const LOG_P: [f32; 9] = [
     2.000_071_4e-1,
     -2.499_999_4e-1,
     3.333_333e-1,
+];
+
+// --- sin/cos and erf constants (mirror mercury_mir_build's inlined `emit_trig_f32`/`emit_erf_f32`
+// poly constants, so a dispatched `sin`/`cos`/`erf` loop agrees with a composed/scalar one) ---------
+// The `f64 as f32` casts reproduce exactly what `splat_const_f` does to the matching f64 literals
+// there, keeping the dispatched kernel bit-identical to the inlined form.
+const TWO_OVER_PI: f32 = std::f64::consts::FRAC_2_PI as f32; // 2/π — quadrant count = round(x·2/π)
+const PIO2_1: f32 = 1.5703125_f64 as f32; // π/2 high (2 × Cephes DP1)
+const PIO2_2: f32 = 4.837_512_969_970_703e-4_f64 as f32; // π/2 mid (2 × DP2)
+const PIO2_3: f32 = 7.549_789_954_891_88e-8_f64 as f32; // π/2 low (2 × DP3)
+const SIN_P: [f32; 3] = [
+    -1.9515295891e-4_f64 as f32,
+    8.3321608736e-3_f64 as f32,
+    -1.6666654611e-1_f64 as f32,
+];
+const COS_P: [f32; 3] = [
+    2.443_315_711_809_948e-5_f64 as f32,
+    -1.388_731_625_493_765e-3_f64 as f32,
+    4.166_664_568_298_827e-2_f64 as f32,
+];
+// erf (Abramowitz–Stegun 7.1.26): erf(|x|) = 1 − (a₁t + … + a₅t⁵)·e^(−x²), t = 1/(1 + P·|x|).
+const ERF_P: f32 = 0.327_591_1_f64 as f32;
+const ERF_A: [f32; 5] = [
+    0.254_829_592_f64 as f32,
+    -0.284_496_736_f64 as f32,
+    1.421_413_741_f64 as f32,
+    -1.453_152_027_f64 as f32,
+    1.061_405_429_f64 as f32,
 ];
 
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback; mirror the MIR poly element-for-element) --
@@ -247,6 +278,78 @@ fn hardswish1(x: f32) -> f32 {
     x * hardsigmoid1(x)
 }
 
+/// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`), the Cephes single-precision algorithm: reduce
+/// `x` to `r ∈ [−π/4, π/4]` by `q = round(x·2/π)` quadrants (the add-magic round-to-nearest), evaluate
+/// the `sinf`/`cosf` minimax polys on `r`, and pick ±sin/±cos by `q mod 4`. Mirrors `emit_trig_f32`
+/// op-for-op (same constants, same FMA structure, the quadrant blended with float-eq masks), so a
+/// dispatched `sin(x)` loop agrees with a composed/scalar one. Accurate to ≈1 ULP for the |x| where the
+/// 3-part π/2 split holds (RoPE angles, ≲ a few thousand); large |x| loses the reduction, as with libm.
+#[inline]
+fn sincos1(x: f32, is_cos: bool) -> f32 {
+    let tt = x.mul_add(TWO_OVER_PI, EXP_MAGIC);
+    let qf = tt - EXP_MAGIC;
+    let r = qf.mul_add(-PIO2_1, x);
+    let r = qf.mul_add(-PIO2_2, r);
+    let r = qf.mul_add(-PIO2_3, r);
+    let z = r * r;
+    // sin_p(r) = r + (poly·z)·r,  poly = ((s₀z + s₁)z + s₂)
+    let mut s = SIN_P[0];
+    s = s.mul_add(z, SIN_P[1]);
+    s = s.mul_add(z, SIN_P[2]);
+    let sz = s * z;
+    let sin_p = sz.mul_add(r, r);
+    // cos_p(r) = (1 − 0.5z) + (poly·z²),  poly = ((c₀z + c₁)z + c₂)
+    let mut c = COS_P[0];
+    c = c.mul_add(z, COS_P[1]);
+    c = c.mul_add(z, COS_P[2]);
+    let z2 = z * z;
+    let cz2 = c * z2;
+    let hz = (-0.5f32).mul_add(z, 1.0);
+    let cos_p = hz + cz2;
+    // quadrant: (int)qf & 3, back to an exact float for the float-eq selects.
+    let quad = ((qf as i32) & 3) as f32;
+    // `* -1.0` (not unary `-`) to match the AVX2 `mulps` and `emit_trig`'s `FMul(_, -1)` on signed zero.
+    let neg_sin = sin_p * -1.0;
+    let neg_cos = cos_p * -1.0;
+    let (a0, a1, a2, a3) = if is_cos {
+        (cos_p, neg_sin, neg_cos, sin_p)
+    } else {
+        (sin_p, cos_p, neg_sin, neg_cos)
+    };
+    let sel23 = if quad == 2.0 { a2 } else { a3 };
+    let sel123 = if quad == 1.0 { a1 } else { sel23 };
+    if quad == 0.0 {
+        a0
+    } else {
+        sel123
+    }
+}
+
+/// `erf(x)` (Abramowitz–Stegun 7.1.26, ~1.5e-7 max error — f32-grade), reusing the shared [`exp1`].
+/// Mirrors `emit_erf_f32` op-for-op (incl. `|x| = max(x, −x)` via compare+select and the odd-function
+/// sign fixup), so a dispatched `erf(x)` loop agrees with a composed one — and gives the exact
+/// (erf-based) GELU the original BERT/GPT-2 use.
+#[inline]
+fn erf1(x: f32) -> f32 {
+    let negx = x * -1.0;
+    let ax = if x > negx { x } else { negx };
+    let t = 1.0 / ERF_P.mul_add(ax, 1.0);
+    let mut h = ERF_A[4];
+    h = h.mul_add(t, ERF_A[3]);
+    h = h.mul_add(t, ERF_A[2]);
+    h = h.mul_add(t, ERF_A[1]);
+    h = h.mul_add(t, ERF_A[0]);
+    let poly = h * t;
+    let ax2 = ax * ax;
+    let e = exp1(ax2 * -1.0);
+    let mag = 1.0 - poly * e;
+    if x >= 0.0 {
+        mag
+    } else {
+        mag * -1.0
+    }
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -266,6 +369,9 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_TANHSHRINK => tanhshrink1(x),
         VM_HARDSIGMOID => hardsigmoid1(x),
         VM_HARDSWISH => hardswish1(x),
+        VM_SIN => sincos1(x, false),
+        VM_COS => sincos1(x, true),
+        VM_ERF => erf1(x),
         _ => x,
     }
 }
@@ -316,6 +422,9 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_TANHSHRINK => tanhshrink8,
         VM_HARDSIGMOID => hardsigmoid8,
         VM_HARDSWISH => hardswish8,
+        VM_SIN => sin8,
+        VM_COS => cos8,
+        VM_ERF => erf8,
         _ => return,
     };
     let mut i = 0;
@@ -523,6 +632,94 @@ unsafe fn hardswish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 
     _mm256_mul_ps(x, hardsigmoid8(x))
 }
 
+/// 8-lane `sin`/`cos`, mirroring [`sincos1`] op-for-op (so the scalar tail agrees with the lanes and a
+/// dispatched trig loop matches the inlined `emit_trig_f32`). The quadrant blend uses float-eq masks +
+/// `blendv`, matching the scalar `if quad == k` chain.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sincos8(x: std::arch::x86_64::__m256, is_cos: bool) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let magic = _mm256_set1_ps(EXP_MAGIC);
+    let tt = _mm256_fmadd_ps(x, _mm256_set1_ps(TWO_OVER_PI), magic);
+    let qf = _mm256_sub_ps(tt, magic);
+    let r = _mm256_fmadd_ps(qf, _mm256_set1_ps(-PIO2_1), x);
+    let r = _mm256_fmadd_ps(qf, _mm256_set1_ps(-PIO2_2), r);
+    let r = _mm256_fmadd_ps(qf, _mm256_set1_ps(-PIO2_3), r);
+    let z = _mm256_mul_ps(r, r);
+    // sin_p(r) = r + (poly·z)·r
+    let mut s = _mm256_set1_ps(SIN_P[0]);
+    s = _mm256_fmadd_ps(s, z, _mm256_set1_ps(SIN_P[1]));
+    s = _mm256_fmadd_ps(s, z, _mm256_set1_ps(SIN_P[2]));
+    let sz = _mm256_mul_ps(s, z);
+    let sin_p = _mm256_fmadd_ps(sz, r, r);
+    // cos_p(r) = (1 − 0.5z) + poly·z²
+    let mut c = _mm256_set1_ps(COS_P[0]);
+    c = _mm256_fmadd_ps(c, z, _mm256_set1_ps(COS_P[1]));
+    c = _mm256_fmadd_ps(c, z, _mm256_set1_ps(COS_P[2]));
+    let z2 = _mm256_mul_ps(z, z);
+    let cz2 = _mm256_mul_ps(c, z2);
+    let hz = _mm256_fmadd_ps(_mm256_set1_ps(-0.5), z, _mm256_set1_ps(1.0));
+    let cos_p = _mm256_add_ps(hz, cz2);
+    // quad = (int)qf & 3, back to float for the float-eq masks (mirrors the scalar truncating cast).
+    let quad_i = _mm256_and_si256(_mm256_cvttps_epi32(qf), _mm256_set1_epi32(3));
+    let quad = _mm256_cvtepi32_ps(quad_i);
+    let neg1 = _mm256_set1_ps(-1.0);
+    let neg_sin = _mm256_mul_ps(sin_p, neg1);
+    let neg_cos = _mm256_mul_ps(cos_p, neg1);
+    let (a0, a1, a2, a3) = if is_cos {
+        (cos_p, neg_sin, neg_cos, sin_p)
+    } else {
+        (sin_p, cos_p, neg_sin, neg_cos)
+    };
+    // blendv(a, b, mask) = mask ? b : a, so this is the `if quad==k {hit} else {miss}` chain.
+    let eq0 = _mm256_cmp_ps::<_CMP_EQ_OQ>(quad, _mm256_setzero_ps());
+    let eq1 = _mm256_cmp_ps::<_CMP_EQ_OQ>(quad, _mm256_set1_ps(1.0));
+    let eq2 = _mm256_cmp_ps::<_CMP_EQ_OQ>(quad, _mm256_set1_ps(2.0));
+    let sel23 = _mm256_blendv_ps(a3, a2, eq2);
+    let sel123 = _mm256_blendv_ps(sel23, a1, eq1);
+    _mm256_blendv_ps(sel123, a0, eq0)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sin8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    sincos8(x, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cos8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    sincos8(x, true)
+}
+
+/// 8-lane `erf`, mirroring [`erf1`] op-for-op (reuses [`exp8`] for `e^(−x²)`, so a dispatched `erf`
+/// agrees with the composed exp). `|x|` is the compare+select form (not `andps`) to match the scalar
+/// twin and `emit_erf_f32` bit-for-bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn erf8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    let neg1 = _mm256_set1_ps(-1.0);
+    let negx = _mm256_mul_ps(x, neg1);
+    let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(x, negx);
+    let ax = _mm256_blendv_ps(negx, x, gt); // gt ? x : negx  == |x|
+    let denom = _mm256_fmadd_ps(_mm256_set1_ps(ERF_P), ax, one);
+    let t = _mm256_div_ps(one, denom);
+    let mut h = _mm256_set1_ps(ERF_A[4]);
+    h = _mm256_fmadd_ps(h, t, _mm256_set1_ps(ERF_A[3]));
+    h = _mm256_fmadd_ps(h, t, _mm256_set1_ps(ERF_A[2]));
+    h = _mm256_fmadd_ps(h, t, _mm256_set1_ps(ERF_A[1]));
+    h = _mm256_fmadd_ps(h, t, _mm256_set1_ps(ERF_A[0]));
+    let poly = _mm256_mul_ps(h, t);
+    let ax2 = _mm256_mul_ps(ax, ax);
+    let e = exp8(_mm256_mul_ps(ax2, neg1));
+    let mag = _mm256_sub_ps(one, _mm256_mul_ps(poly, e));
+    let neg_mag = _mm256_mul_ps(mag, neg1);
+    let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, _mm256_setzero_ps());
+    _mm256_blendv_ps(neg_mag, mag, ge) // ge ? mag : -mag
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +772,11 @@ mod tests {
                 |x| x * ((x + 3.0).max(0.0).min(6.0) * INV6),
                 1e-6,
             ),
+            // sin/cos vs Rust's libm over [-20.48, 20.47] — the 3-part π/2 reduction holds well past
+            // RoPE's angle range. The 1e-4 absolute floor covers the near-zero crossings a pure
+            // relative check would blow up.
+            (VM_SIN, |x| x.sin(), 1e-4),
+            (VM_COS, |x| x.cos(), 1e-4),
         ];
         for &(op, libm, tol) in cases {
             unsafe {
@@ -605,13 +807,42 @@ mod tests {
         }
     }
 
+    /// `erf` has no `std` reference, so check known values (odd-symmetric, → ±1 at the tails) to a
+    /// tolerance comfortably inside the A&S formula's ~1.5e-7 error — enough to catch a transcription
+    /// slip in either the scalar twin or the AVX2 lanes (the tail-match test pins the two equal).
+    #[test]
+    fn vmath_erf_known_values() {
+        // (x, erf(x)) reference values.
+        let refs: &[(f32, f32)] = &[
+            (0.0, 0.0),
+            (0.5, 0.520_499_9),
+            (1.0, 0.842_700_8),
+            (2.0, 0.995_322_3),
+            (-1.0, -0.842_700_8),
+            (-0.25, -0.276_326_4),
+            (3.0, 0.999_977_9),
+        ];
+        let xs: Vec<f32> = refs.iter().map(|&(x, _)| x).collect();
+        let mut out = vec![0.0f32; xs.len()];
+        unsafe {
+            mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_ERF);
+        }
+        for (i, &(x, want)) in refs.iter().enumerate() {
+            assert!(
+                (out[i] - want).abs() <= 3e-5,
+                "erf({x}): got {} want {want}",
+                out[i]
+            );
+        }
+    }
+
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
     /// not a multiple of 8 produces a consistent result regardless of where the tail starts.
     #[test]
     fn vmath_tail_matches_lanes() {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
-            VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU,
+            VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
         ] {
             if op == VM_LOG {
                 continue; // negative inputs are out of log's domain

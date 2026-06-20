@@ -502,6 +502,9 @@ const VMATH_SELU: u32 = 11;
 const VMATH_TANHSHRINK: u32 = 12;
 const VMATH_HARDSIGMOID: u32 = 13;
 const VMATH_HARDSWISH: u32 = 14;
+const VMATH_SIN: u32 = 15;
+const VMATH_COS: u32 = 16;
+const VMATH_ERF: u32 = 17;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2778,6 +2781,13 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Tanhshrink) => VMATH_TANHSHRINK,
             Some(MathIntrinsic::HardSigmoid) => VMATH_HARDSIGMOID,
             Some(MathIntrinsic::HardSwish) => VMATH_HARDSWISH,
+            // sin/cos (RoPE) and erf (exact GELU): C/Rust call scalar libm sinf/cosf/erff and cannot
+            // vectorize a loop with the call, so the 256-bit kernel is a clean compute-bound win. The
+            // kernel mirrors the inlined `emit_trig_f32`/`emit_erf_f32`, so a dispatched loop and a
+            // composed expression agree.
+            Some(MathIntrinsic::Sin) => VMATH_SIN,
+            Some(MathIntrinsic::Cos) => VMATH_COS,
+            Some(MathIntrinsic::Erf) => VMATH_ERF,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;

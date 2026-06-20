@@ -13,7 +13,8 @@ pub use gemm::{
 
 mod vmath;
 pub use vmath::{
-    mercury_vmath_f32, VM_EXP, VM_GELU, VM_LOG, VM_RELU, VM_SIGMOID, VM_SILU, VM_TANH,
+    mercury_vmath_f32, VM_COS, VM_ERF, VM_EXP, VM_GELU, VM_LOG, VM_RELU, VM_SIGMOID, VM_SILU, VM_SIN,
+    VM_TANH,
 };
 
 mod velem;
