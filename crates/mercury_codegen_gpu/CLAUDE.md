@@ -26,7 +26,10 @@ toolkit — only **running** needs the driver + a device.
   host round-trip; `TransformerWeights` bundles the six projections).
 - `src/ptx.rs` — base PTX (saxpy/vadd/vmath/reduce/simple GEMM), target `sm_89`.
 - `src/ptx_gemm.rs` — register-blocked f32 GEMM generator (64×64 tile, 4×4/thread).
-- `src/ptx_wmma.rs` — WMMA fp16/bf16 tensor-core GEMM generators (single-tile + fragment-reuse `_mt`).
+- `src/ptx_wmma.rs` — WMMA fp16/bf16 tensor-core GEMM generators: single-tile, fragment-reuse `_mt`,
+  shared-memory-staged `_sm` (cooperative CTA tiles, vectorized 128-bit loads), and **`cp.async`
+  double-buffered** `_sm_db`/`_sm128_db` (pipelined K-loop; `_sm_db` ≈ cuBLAS at 1024³). `gemm_nt_f16`
+  dispatches among them by size regime (see the `entry_smem`/`entry_smem_db` generators).
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM, single-tile and fragment-reuse
   multi-tile (`_mt`, 2×4 16×8 tiles/warp — the fastest tensor-core path; no WMMA fp8 on sm_89, so the
   fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
