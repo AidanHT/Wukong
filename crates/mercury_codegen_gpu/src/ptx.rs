@@ -103,6 +103,93 @@ DONE:
 }
 "#;
 
+/// `dst[i] = src[i]` — a pure streaming **copy**, the canonical memory-bandwidth kernel (milestone
+/// M9). Vectorized 128-bit access (`ld.global.v4.f32` / `st.global.v4.f32` = 4 floats/op) with **4×
+/// ILP**: each thread issues four *independent* float4 loads (distinct registers + grid-stride-spaced
+/// addresses) before any store, so four memory requests are in flight per thread. That extra
+/// memory-level parallelism is what saturates HBM on a 1:1 read/write copy — with one float4 per
+/// thread there are only `len/4` threads, too few outstanding requests to hide DRAM latency + bus
+/// turnaround (measured ~84%); 4-wide clears 90%. Every warp's access stays coalesced (32 threads ×
+/// 16 B = one 512-B segment) because the four groups are each grid-stride-spaced. `pn4` is the float4
+/// count (`len/4`); the host guarantees `len % 4 == 0` and 16-B alignment (cudaMalloc gives ≥256 B).
+/// The grid-stride GRID/TAIL split covers any `n4` for any launch size — each thread copies exactly
+/// its `{i, i+S, i+2S, …}` positions, four at a time while they fit, one at a time for the remainder.
+/// No arithmetic between load and store: this measures DRAM throughput, the traffic of any elementwise
+/// pass (`2·len` floats moved).
+pub const COPY_V4: &str = r#"
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry copy_v4(
+    .param .u32 pn4,
+    .param .u64 psrc,
+    .param .u64 pdst
+)
+{
+    .reg .pred %p;
+    .reg .b32  %n4, %tix, %ntx, %cta, %ncta, %i, %i1, %i2, %i3, %S, %S4;
+    .reg .b64  %src, %dst, %o, %a, %b, %o1, %a1, %b1, %o2, %a2, %b2, %o3, %a3, %b3;
+    .reg .f32  %x0, %x1, %x2, %x3, %y0, %y1, %y2, %y3;
+    .reg .f32  %z0, %z1, %z2, %z3, %w0, %w1, %w2, %w3;
+
+    ld.param.u32 %n4, [pn4];
+    ld.param.u64 %src, [psrc];
+    ld.param.u64 %dst, [pdst];
+    cvta.to.global.u64 %src, %src;
+    cvta.to.global.u64 %dst, %dst;
+
+    mov.u32 %tix, %tid.x;
+    mov.u32 %ntx, %ntid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %ncta, %nctaid.x;
+    mad.lo.s32 %i, %cta, %ntx, %tix;
+    mul.lo.s32 %S, %ncta, %ntx;
+    shl.b32 %S4, %S, 2;
+
+GRID:
+    add.u32 %i1, %i, %S;
+    add.u32 %i2, %i1, %S;
+    add.u32 %i3, %i2, %S;
+    setp.ge.u32 %p, %i3, %n4;
+    @%p bra TAIL;
+    mul.wide.u32 %o, %i, 16;
+    add.s64 %a, %src, %o;
+    add.s64 %b, %dst, %o;
+    mul.wide.u32 %o1, %i1, 16;
+    add.s64 %a1, %src, %o1;
+    add.s64 %b1, %dst, %o1;
+    mul.wide.u32 %o2, %i2, 16;
+    add.s64 %a2, %src, %o2;
+    add.s64 %b2, %dst, %o2;
+    mul.wide.u32 %o3, %i3, 16;
+    add.s64 %a3, %src, %o3;
+    add.s64 %b3, %dst, %o3;
+    ld.global.v4.f32 {%x0, %x1, %x2, %x3}, [%a];
+    ld.global.v4.f32 {%y0, %y1, %y2, %y3}, [%a1];
+    ld.global.v4.f32 {%z0, %z1, %z2, %z3}, [%a2];
+    ld.global.v4.f32 {%w0, %w1, %w2, %w3}, [%a3];
+    st.global.v4.f32 [%b], {%x0, %x1, %x2, %x3};
+    st.global.v4.f32 [%b1], {%y0, %y1, %y2, %y3};
+    st.global.v4.f32 [%b2], {%z0, %z1, %z2, %z3};
+    st.global.v4.f32 [%b3], {%w0, %w1, %w2, %w3};
+    add.u32 %i, %i, %S4;
+    bra GRID;
+TAIL:
+    setp.ge.u32 %p, %i, %n4;
+    @%p bra DONE;
+    mul.wide.u32 %o, %i, 16;
+    add.s64 %a, %src, %o;
+    add.s64 %b, %dst, %o;
+    ld.global.v4.f32 {%x0, %x1, %x2, %x3}, [%a];
+    st.global.v4.f32 [%b], {%x0, %x1, %x2, %x3};
+    add.u32 %i, %i, %S;
+    bra TAIL;
+DONE:
+    ret;
+}
+"#;
+
 use std::sync::OnceLock;
 
 /// `0f` + the IEEE-754 f32 hex of `x` — a PTX f32 immediate (`mov.f32 %f, 0f3F800000`). Built from
