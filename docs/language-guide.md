@@ -154,17 +154,22 @@ LLVM backend, by the runtime).
 - `round(x)` / `floor(x)` / `ceil(x)` / `trunc(x)` — round to an integral value (one hardware
   `roundss`/`roundps` each; vectorizes). `round` is round-to-nearest-ties-to-**even** (so `2.5 → 2`,
   `3.5 → 4`); `round(x / scale)` is the quantization step that pairs with `absmax`.
-- `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`.
+- `exp(x)` / `log(x)` / `pow(x, y)` — `pow` is `exp(y·log(x))`; defined for `x > 0`. Also `exp2`/`log2`
+  (base-2, FlashAttention/quantization) and `exp10`/`log10` (base-10, decibel/log-scale features), plus
+  the Kahan-stable `expm1`/`log1p`.
 - `erf(x)` — for the exact (erf-based) GELU of BERT/GPT-2.
-- `sin(x)` / `cos(x)` — for RoPE rotary position embeddings.
+- `sin(x)` / `cos(x)` / `tan(x)` / `atan(x)` / `asin(x)` / `acos(x)` — RoPE rotary position embeddings
+  (`sin`/`cos`) and the angle/geometry/3D-vision/graphics-ML ops (the inverse trig).
 - `tanh(x)` / `sigmoid(x)` / `silu(x)` / `gelu(x)` / `elu(x)` / `leaky_relu(x)` / `softplus(x)` /
-  `mish(x)` / `selu(x)` / `tanhshrink(x)` / `hardsigmoid(x)` / `hardswish(x)` — the transformer/vision activation family (`silu(x) = x·sigmoid(x)`; `gelu` is the tanh
+  `softsign(x)` / `logsigmoid(x)` / `mish(x)` / `selu(x)` / `tanhshrink(x)` / `hardsigmoid(x)` / `hardswish(x)` — the transformer/vision activation family (`silu(x) = x·sigmoid(x)`; `gelu` is the tanh
   approximation; `elu(x) = x>0 ? x : eˣ−1`; `leaky_relu` has slope 0.01; `softplus(x) = ln(1+eˣ)`;
-  `mish(x) = x·tanh(softplus(x))`).
+  `softsign(x) = x/(1+|x|)`; `logsigmoid(x) = ln σ(x)`, the stable BCE-with-logits primitive;
+  `mish(x) = x·tanh(softplus(x))`). Plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`.
 - `fmax(a, b)` / `fmin(a, b)`.
 
-When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, `exp`/`log`/`tanh`/
-`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish` are **dispatched to a tuned 256-bit
+When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 34**
+transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
+are **dispatched to a tuned 256-bit
 AVX2/FMA kernel** (`mercury_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
 activation family runs ~5–7.5× faster than C's scalar `libm`, and ~28× across cores under
 `@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`) auto-vectorize the inlined poly at 128-bit.
