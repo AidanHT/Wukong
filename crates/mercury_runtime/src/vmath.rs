@@ -56,6 +56,7 @@ pub const VM_LOGSIGMOID: i64 = 31;
 pub const VM_TAN: i64 = 32;
 pub const VM_ASIN: i64 = 33;
 pub const VM_ACOS: i64 = 34;
+pub const VM_CBRT: i64 = 35;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -525,6 +526,19 @@ fn acos1(x: f32) -> f32 {
     ATAN_PIO2 - asin1(x)
 }
 
+/// `cbrt(x) = copysign(e^{ln|x|/3}, x)` — the all-real cube root (LAB color, variance-stabilizing
+/// transforms, physics). Evaluating on `|x|` and restoring the sign keeps `log` in its domain;
+/// the `|x| == 0 → 0` guard avoids `log(0)`'s garbage feeding `exp`. Reuses [`exp1`]/[`log1`], with
+/// the abs/sign as bit masks, so [`cbrt8`] and the tail agree bit-for-bit (the ±0 sign mirrors the
+/// `asinh` precedent: copysign restores it).
+#[inline]
+fn cbrt1(x: f32) -> f32 {
+    let ax = f32::from_bits(x.to_bits() & 0x7FFF_FFFF); // |x|
+    let mag = exp1(log1(ax) * (1.0 / 3.0));
+    let mag = if ax == 0.0 { 0.0 } else { mag };
+    f32::from_bits(mag.to_bits() | (x.to_bits() & 0x8000_0000)) // copysign(mag, x)
+}
+
 /// `expm1(x) = eˣ − 1`, the numerically-stable form (the exact ELU/`SELU` negative tail, stable
 /// losses). Kahan's correction `(u−1)·x/ln(u)` with `u = eˣ` cancels the catastrophic `eˣ − 1` loss
 /// for small `x` (the ratio `(u−1)/ln(u) → 1` as `u → 1`); the guard returns `x` when `u` rounds to 1
@@ -597,6 +611,7 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_TAN => tan1(x),
         VM_ASIN => asin1(x),
         VM_ACOS => acos1(x),
+        VM_CBRT => cbrt1(x),
         _ => x,
     }
 }
@@ -670,6 +685,7 @@ fn vmath8_for(op: i64) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::ar
         VM_TAN => tan8,
         VM_ASIN => asin8,
         VM_ACOS => acos8,
+        VM_CBRT => cbrt8,
         _ => return None,
     })
 }
@@ -1241,6 +1257,21 @@ unsafe fn acos8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_sub_ps(_mm256_set1_ps(ATAN_PIO2), asin8(x))
 }
 
+/// 8-lane `cbrt(x) = copysign(e^{ln|x|/3}, x)` with the `|x|==0 → 0` guard — mirrors [`cbrt1`]
+/// (bit-mask abs, blend the zero case, bit-or the sign).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cbrt8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x8000_0000_u32 as i32));
+    let ax = _mm256_and_ps(x, absmask);
+    let mag = exp8(_mm256_mul_ps(log8(ax), _mm256_set1_ps(1.0 / 3.0)));
+    let iszero = _mm256_cmp_ps::<_CMP_EQ_OQ>(ax, _mm256_setzero_ps());
+    let mag = _mm256_blendv_ps(mag, _mm256_setzero_ps(), iszero); // iszero ? 0 : mag
+    _mm256_or_ps(mag, _mm256_and_ps(x, signmask)) // copysign(mag, x)
+}
+
 /// 8-lane `expm1(x) = (u−1)·x/log(u)`, `u = eˣ`, guard `u==1 → x` — mirrors [`expm1_1`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -1331,6 +1362,7 @@ mod tests {
             (VM_EXP10, |x| 10.0f32.powf(x), 5e-5),
             (VM_SINH, |x| x.sinh(), 5e-5),
             (VM_COSH, |x| x.cosh(), 5e-5),
+            (VM_CBRT, |x| x.cbrt(), 5e-5), // all-real, incl. negatives and 0
             // softsign: exact (just abs + div). logsigmoid: the stable log-sigmoid; the naive
             // `ln(σ(x))` reference is overflow-safe over [-20.48, 20.47], and the mixed bound's
             // absolute floor covers the ≈x linear tail for large negative x.
@@ -1509,7 +1541,7 @@ mod tests {
         for op in [
             VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
             VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1, VM_EXP10, VM_LOG10,
-            VM_SOFTSIGN, VM_LOGSIGMOID,
+            VM_SOFTSIGN, VM_LOGSIGMOID, VM_CBRT,
         ] {
             if op == VM_LOG || op == VM_LOG2 || op == VM_LOG10 {
                 continue; // negative inputs are out of log's domain

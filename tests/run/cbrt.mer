@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2000
+// EXPECT-OUT: -3000
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 36000
+module tests.run.cbrt
+
+// `cbrt(x)` — the all-real cube root (LAB color space, variance-stabilizing transforms, physics).
+// `cbrt(x) = copysign(exp(ln|x|/3), x)` composes the shared exp/log, with a `|x|==0 → 0` guard, so a
+// dispatched `out[i] = cbrt(x[i])` loop lowers to the 256-bit `mercury_vmath_f32` and agrees with the
+// composed/scalar form — interp == native, -O0 == -O3. C/Rust call scalar libm `cbrtf`, unvectorizable
+// in a loop. Completes the root family alongside `sqrt`/`rsqrt`.
+fn main() -> i32 {
+    // Scalar: cbrt(8)=2, cbrt(-27)=-3, cbrt(0)=0.
+    print((cbrt(8.0) * 1000.0 + 0.5) as i32);    // 2.0  -> 2000
+    print((cbrt(-27.0) * 1000.0 - 0.5) as i32);  // -3.0 -> -3000
+    print((cbrt(0.0) * 1000.0 + 0.5) as i32);    // 0.0  -> 0
+
+    // Vectorized cbrt over an array dispatches to the kernel: x=[125,125,...] (8) → each 5.0.
+    let mut xs: [f32; 8] = [125.0; 8];
+    let mut o: [f32; 8] = [0.0; 8];
+    for i in 0..8 { o[i] = cbrt(xs[i]); }
+    print((o[0] * 1000.0 + 0.5) as i32); // cbrt(125) = 5 -> 5000
+
+    // Checksum of cbrt over a perfect-cube array [1,8,27,64,125,216,343,512] -> [1..8], sum=36.
+    let cubes: [f32; 8] = [1.0, 8.0, 27.0, 64.0, 125.0, 216.0, 343.0, 512.0];
+    let mut c: [f32; 8] = [0.0; 8];
+    for i in 0..8 { c[i] = cbrt(cubes[i]); }
+    let mut s: f32 = 0.0;
+    for k in 0..8 { s = s + c[k]; }
+    print((s * 1000.0 + 0.5) as i32); // cbrt cubes -> 1+2+...+8 = 36 -> 36000
+    return 0;
+}

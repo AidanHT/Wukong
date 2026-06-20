@@ -553,6 +553,7 @@ const VMATH_LOGSIGMOID: u32 = 31;
 const VMATH_TAN: u32 = 32;
 const VMATH_ASIN: u32 = 33;
 const VMATH_ACOS: u32 = 34;
+const VMATH_CBRT: u32 = 35;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2976,6 +2977,10 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Tan) => VMATH_TAN,
             Some(MathIntrinsic::Asin) => VMATH_ASIN,
             Some(MathIntrinsic::Acos) => VMATH_ACOS,
+            // cbrt completes the root family (sqrt/rsqrt/cbrt): LAB color, variance-stabilizing
+            // transforms. C's `cbrtf` is scalar libm; composes the shared exp/log so dispatched ==
+            // composed.
+            Some(MathIntrinsic::Cbrt) => VMATH_CBRT,
             _ => return None,
         };
         // The kernel computes (and writes) f32, so the activation's result must be f32.
@@ -3927,7 +3932,8 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::LogSigmoid
                     | MathIntrinsic::Tan
                     | MathIntrinsic::Asin
-                    | MathIntrinsic::Acos,
+                    | MathIntrinsic::Acos
+                    | MathIntrinsic::Cbrt,
                 ) => {
                     // These build on the exp/log polynomials (or, for leaky-relu, the f32 select),
                     // which vectorize only for an f32 lane (their IEEE-754 surgery is f32-specific).
@@ -4849,6 +4855,10 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Acos) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_acos(x, vty)
+                }
+                Some(MathIntrinsic::Cbrt) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_cbrt(x, vty)
                 }
                 None => unreachable!("vectorizer accepted a call it cannot lower"),
             },
@@ -5796,6 +5806,10 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_acos(x, &rty))
             }
+            MathIntrinsic::Cbrt => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_cbrt(x, &rty))
+            }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
@@ -6435,6 +6449,25 @@ impl FnLowerer<'_> {
         let asin = self.emit_asin(x, rty);
         let pio2 = self.splat_const_f(ATAN_PIO2, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, pio2, asin))
+    }
+
+    /// `cbrt(x) = copysign(e^{ln|x|/3}, x)` with the `|x|==0 → 0` guard — mirrors `cbrt1`/`cbrt8`,
+    /// reusing `emit_exp`/`emit_log`. The ±0 sign follows the `emit_asinh` precedent (select-based
+    /// copysign). Works scalar or vector; bit-identical to the dispatched kernel.
+    fn emit_cbrt(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let ax = self.emit_abs(x, rty);
+        let lx = self.emit_log(ax, rty);
+        let third = self.splat_const_f(1.0 / 3.0, rty);
+        let scaled = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, third));
+        let mag = self.emit_exp(scaled, rty);
+        let zero = self.splat_const_f(0.0, rty);
+        let iszero = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, ax, zero));
+        let mag = self.builder.build(rty.clone(), Op::Select(iszero, zero, mag));
+        // copysign(mag, x) via select (mag ≥ 0): x < 0 ? −mag : mag.
+        let neg1 = self.splat_const_f(-1.0, rty);
+        let negmag = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, mag, neg1));
+        let isneg = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Folt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(isneg, negmag, mag))
     }
 
     /// `atan2(y, x)` — the full-circle angle of `(x, y)` (geometry, robotics, complex argument, RoPE-style
@@ -8500,6 +8533,7 @@ enum MathIntrinsic {
     Acos,
     Atan2,
     Hypot,
+    Cbrt,
     Sinh,
     Cosh,
     Asinh,
@@ -8562,6 +8596,7 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "acos" => MathIntrinsic::Acos,
         "atan2" => MathIntrinsic::Atan2,
         "hypot" => MathIntrinsic::Hypot,
+        "cbrt" => MathIntrinsic::Cbrt,
         "sinh" => MathIntrinsic::Sinh,
         "cosh" => MathIntrinsic::Cosh,
         "asinh" => MathIntrinsic::Asinh,
