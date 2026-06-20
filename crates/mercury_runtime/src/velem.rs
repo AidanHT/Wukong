@@ -82,14 +82,27 @@ fn act1(op: i64, v: f32) -> f32 {
 /// chain is exactly two roundings — matching the AVX2 `fmadd` pair, and (for saxpy `a·x + y`, i.e.
 /// `b = 1, c = 0`) the single `fma` gcc emits under `-ffp-contract=fast`. `y` is only read when the
 /// caller set `VE_USE_Y`.
+///
+/// **Identity-affine fast path.** When `a == 1`, `c == 0` and `y` is unread, `a·x + c` is just `x`, so
+/// the FMA is skipped entirely — the case a recognized `relu`/`relu6`/copy hits (`out[i] =
+/// max(x[i], 0)`). For `max(1·x+0, 0)` == `max(x, 0)` bit-for-bit (the FMA's only observable effect,
+/// flipping `-0.0` to `+0.0`, is erased by the following `max`), and a bare copy preserves the input.
+/// The AVX2 lanes apply the identical (loop-invariant) test, so the scalar tail and the vector body
+/// still agree lane-for-lane — what `velem_tail_matches_lanes` pins. This removes the wasted multiply
+/// that left a pure `relu` a touch *behind* gcc's bare `maxps` loop at L3-resident sizes.
 #[inline]
 fn elem1(op: i64, x: f32, y: f32, a: f32, b: f32, c: f32) -> f32 {
-    let inner = if op & VE_USE_Y != 0 {
-        b.mul_add(y, c)
+    let base = if op & VE_USE_Y == 0 && a == 1.0 && c == 0.0 {
+        x
     } else {
-        c
+        let inner = if op & VE_USE_Y != 0 {
+            b.mul_add(y, c)
+        } else {
+            c
+        };
+        a.mul_add(x, inner)
     };
-    act1(op, a.mul_add(x, inner))
+    act1(op, base)
 }
 
 /// `out[i] = act(a·x[i] + b·y[i] + c)` for `i in 0..n`. Uses the 256-bit AVX2/FMA kernel when
@@ -152,6 +165,11 @@ unsafe fn velem_avx2(
     let six = _mm256_set1_ps(6.0);
     let use_y = op & VE_USE_Y != 0;
     let act = op & 0xff;
+    // Identity affine (`a == 1`, `c == 0`, no `y`): the FMA degenerates to `x`, so skip it — the case a
+    // bare `relu`/`relu6`/copy hits. Hoisted here so the hot loop branches on a single invariant flag
+    // (matching `elem1`'s scalar fast path), turning a recognized ReLU into gcc's bare `maxps` loop at
+    // true 256-bit width instead of paying a wasted multiply per 8 lanes.
+    let id_affine = !use_y && a == 1.0 && c == 0.0;
     // Streams = output + x (+ y when read). The non-temporal decision keys on the whole working set,
     // so a 2-input saxpy spills L3 (and wants `vmovntps`) at a length where a 1-input map still fits.
     let nt = use_nt(n, if use_y { 3 } else { 2 });
@@ -171,12 +189,16 @@ unsafe fn velem_avx2(
     macro_rules! compute {
         ($off:expr) => {{
             let xv = _mm256_loadu_ps(x.add(i + $off));
-            let inner = if use_y {
-                _mm256_fmadd_ps(vb, _mm256_loadu_ps(y.add(i + $off)), vc)
+            let mut r = if id_affine {
+                xv
             } else {
-                vc
+                let inner = if use_y {
+                    _mm256_fmadd_ps(vb, _mm256_loadu_ps(y.add(i + $off)), vc)
+                } else {
+                    vc
+                };
+                _mm256_fmadd_ps(va, xv, inner)
             };
-            let mut r = _mm256_fmadd_ps(va, xv, inner);
             if act == VE_RELU {
                 r = _mm256_max_ps(r, zero);
             } else if act == VE_RELU6 {
@@ -198,9 +220,14 @@ unsafe fn velem_avx2(
     // hiding the ~4-cycle FMA / load latency. A single 8-lane step leaves the pipe stalling on the
     // dependent store and lost to gcc's unrolled relu; four chains restore the throughput.
     while i + 32 <= n {
-        _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
-        if use_y {
-            _mm_prefetch(y.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+        // Software prefetch only when streaming from DRAM (the non-temporal regime). For an
+        // L3-resident map the hardware prefetcher already has the lines, so an explicit `prefetcht0`
+        // just burns an issue slot — which is part of why a cache-resident `relu` trailed gcc.
+        if nt {
+            _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+            if use_y {
+                _mm_prefetch(y.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+            }
         }
         let r0 = compute!(0);
         let r1 = compute!(8);
@@ -310,9 +337,12 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
             i += 1;
         }
     }
-    // Horner is a *latency-bound* dependent chain (`r = r·x + c`), so a single accumulator would
-    // stall on the ~4-cycle FMA latency. Run four independent 8-lane chains (32 elements/step) so four
-    // FMAs are always in flight — matching the generic vectorizer's unroll, at twice its width.
+    // Horner is a *latency-bound* dependent chain (`r = r·x + c`): each step waits on the previous
+    // FMA's ~4-cycle latency. A single accumulator stalls; four chains (the old unroll) keep only four
+    // FMAs in flight, under-filling the two FMA ports that retire 2/cycle (need ~8 in flight to hide the
+    // latency) — so the degree-4 poly only tied gcc's own 256-bit autovec. Run **six** independent
+    // 8-lane chains (48 elements/step): six accumulators + six `x` vectors + the broadcast `ck` = 13 of
+    // the 16 YMM registers, so it lifts ILP toward the port limit *without* the spills eight chains hit.
     macro_rules! store {
         ($p:expr, $v:expr) => {
             if nt {
@@ -322,24 +352,35 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
             }
         };
     }
-    while i + 32 <= n {
-        _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+    while i + 48 <= n {
+        // Prefetch only when streaming from DRAM; an L3-resident poly is served by the HW prefetcher.
+        if nt {
+            _mm_prefetch(x.add(i + PF_AHEAD) as *const i8, _MM_HINT_T0);
+        }
         let x0 = _mm256_loadu_ps(x.add(i));
         let x1 = _mm256_loadu_ps(x.add(i + 8));
         let x2 = _mm256_loadu_ps(x.add(i + 16));
         let x3 = _mm256_loadu_ps(x.add(i + 24));
-        let (mut r0, mut r1, mut r2, mut r3) = (c0, c0, c0, c0);
+        let x4 = _mm256_loadu_ps(x.add(i + 32));
+        let x5 = _mm256_loadu_ps(x.add(i + 40));
+        let (mut r0, mut r1, mut r2) = (c0, c0, c0);
+        let (mut r3, mut r4, mut r5) = (c0, c0, c0);
         for ck in &cv[1..] {
-            r0 = _mm256_fmadd_ps(r0, x0, *ck);
-            r1 = _mm256_fmadd_ps(r1, x1, *ck);
-            r2 = _mm256_fmadd_ps(r2, x2, *ck);
-            r3 = _mm256_fmadd_ps(r3, x3, *ck);
+            let ck = *ck;
+            r0 = _mm256_fmadd_ps(r0, x0, ck);
+            r1 = _mm256_fmadd_ps(r1, x1, ck);
+            r2 = _mm256_fmadd_ps(r2, x2, ck);
+            r3 = _mm256_fmadd_ps(r3, x3, ck);
+            r4 = _mm256_fmadd_ps(r4, x4, ck);
+            r5 = _mm256_fmadd_ps(r5, x5, ck);
         }
         store!(out.add(i), r0);
         store!(out.add(i + 8), r1);
         store!(out.add(i + 16), r2);
         store!(out.add(i + 24), r3);
-        i += 32;
+        store!(out.add(i + 32), r4);
+        store!(out.add(i + 40), r5);
+        i += 48;
     }
     while i + 8 <= n {
         let xv = _mm256_loadu_ps(x.add(i));
