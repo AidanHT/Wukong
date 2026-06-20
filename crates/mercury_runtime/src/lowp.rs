@@ -83,10 +83,12 @@ fn dot_scalar(kind: Half, x: &[u16], y: &[u16]) -> f32 {
 
 // ---- SIMD widen helpers (8 lanes) ----
 
+/// `pub(crate)` so `vmath.rs`'s f16-input activation kernel widens with the *identical* F16C
+/// `vcvtph2ps` this module's f16 reductions use — one source of truth for the f16 widen.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,f16c")]
 #[inline]
-unsafe fn widen_f16(p: *const u16) -> __m256 {
+pub(crate) unsafe fn widen_f16(p: *const u16) -> __m256 {
     _mm256_cvtph_ps(_mm_loadu_si128(p as *const __m128i))
 }
 

@@ -664,6 +664,54 @@ unsafe fn vmath_bf16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
     }
 }
 
+/// `out[i] = f(widen(x[i]))` — the **IEEE-f16** twin of [`mercury_vmath_bf16`]: same 28-op dispatch,
+/// reading f16 (widened with F16C `vcvtph2ps`, lossless) and writing f32. Equals
+/// `mercury_vmath_f32(widen(x), …)` bit-for-bit (the widen is exact and `f` is the same kernel), so
+/// the interpreter marshals through this kernel and interp == native.
+///
+/// # Safety
+/// `x` must be valid for `n` `u16` (f16 bits); `out` for `n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_vmath_f16(x: *const u16, out: *mut f32, n: i64, op: i64) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            // SAFETY: features detected; buffers valid for n by the caller contract.
+            unsafe { vmath_f16_avx2(x, out, n, op) };
+            return;
+        }
+    }
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n.
+        unsafe { *out.add(i) = apply1(op, crate::f16_bits_to_f32(*x.add(i))) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn vmath_f16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
+    use std::arch::x86_64::*;
+    let Some(f) = vmath8_for(op) else { return };
+    let mut i = 0;
+    while i + 8 <= n {
+        // lossless f16→f32 widen (F16C `vcvtph2ps`), then the shared activation kernel.
+        let v = crate::lowp::widen_f16(x.add(i));
+        _mm256_storeu_ps(out.add(i), f(v));
+        i += 8;
+    }
+    while i < n {
+        *out.add(i) = apply1(op, crate::f16_bits_to_f32(*x.add(i)));
+        i += 1;
+    }
+}
+
 // --- AVX2 kernels (mirror the scalar twins lane-for-lane) -----------------------------------------
 
 /// `pub(crate)` so `norm.rs`'s AVX2 softmax uses the *exact* same 8-lane exp as a dispatched
@@ -1303,34 +1351,36 @@ mod tests {
         }
     }
 
-    /// The bf16-input activation kernel must equal the f32 kernel run on the *widened* inputs,
-    /// bit-for-bit — that equality is exactly what lets the interpreter marshal `mercury_vmath_bf16`
-    /// (reconstructing the bf16 bits, calling this very kernel) and still match the native backend.
-    /// Covers a non-multiple-of-8 length to exercise both the 8-lane body and the scalar tail.
+    /// The bf16/f16-input activation kernels must equal the f32 kernel run on the *widened* inputs,
+    /// bit-for-bit — that equality is exactly what lets the interpreter marshal `mercury_vmath_{bf16,
+    /// f16}` (reconstructing the half bits, calling the very kernel) and still match the native
+    /// backend. Covers a non-multiple-of-8 length to exercise both the 8-lane body and the scalar tail.
     #[test]
-    fn vmath_bf16_matches_f32_on_widened() {
+    fn vmath_lowp_matches_f32_on_widened() {
         let n = 1003usize;
-        // inputs in [-2, 2]; bf16-round them so widen(bf16(x)) is a fixed grid value.
         let xf: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.004).collect();
-        let xbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_bf16_bits(v)).collect();
-        let widened: Vec<f32> = xbits.iter().map(|&b| crate::bf16_bits_to_f32(b)).collect();
-        for op in [
+        let ops = [
             VM_EXP, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_ELU, VM_SOFTPLUS, VM_MISH,
             VM_SIN, VM_COS, VM_ERF, VM_EXP2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1,
-        ] {
-            let mut from_bf = vec![0.0f32; n];
-            let mut from_f32 = vec![0.0f32; n];
+        ];
+        // bf16
+        let bbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_bf16_bits(v)).collect();
+        let bwide: Vec<f32> = bbits.iter().map(|&b| crate::bf16_bits_to_f32(b)).collect();
+        // f16
+        let hbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_f16_bits(v)).collect();
+        let hwide: Vec<f32> = hbits.iter().map(|&b| crate::f16_bits_to_f32(b)).collect();
+        for op in ops {
+            let (mut gb, mut gh, mut rb, mut rh) =
+                (vec![0f32; n], vec![0f32; n], vec![0f32; n], vec![0f32; n]);
             unsafe {
-                mercury_vmath_bf16(xbits.as_ptr(), from_bf.as_mut_ptr(), n as i64, op);
-                mercury_vmath_f32(widened.as_ptr(), from_f32.as_mut_ptr(), n as i64, op);
+                mercury_vmath_bf16(bbits.as_ptr(), gb.as_mut_ptr(), n as i64, op);
+                mercury_vmath_f32(bwide.as_ptr(), rb.as_mut_ptr(), n as i64, op);
+                mercury_vmath_f16(hbits.as_ptr(), gh.as_mut_ptr(), n as i64, op);
+                mercury_vmath_f32(hwide.as_ptr(), rh.as_mut_ptr(), n as i64, op);
             }
             for i in 0..n {
-                assert_eq!(
-                    from_bf[i].to_bits(),
-                    from_f32[i].to_bits(),
-                    "op {op} i {i} x {}",
-                    widened[i]
-                );
+                assert_eq!(gb[i].to_bits(), rb[i].to_bits(), "bf16 op {op} i {i}");
+                assert_eq!(gh[i].to_bits(), rh[i].to_bits(), "f16 op {op} i {i}");
             }
         }
     }

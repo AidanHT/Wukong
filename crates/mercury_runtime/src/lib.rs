@@ -13,9 +13,9 @@ pub use gemm::{
 
 mod vmath;
 pub use vmath::{
-    mercury_vmath_bf16, mercury_vmath_f32, VM_ACOSH, VM_ASINH, VM_ATAN, VM_ATANH, VM_COS, VM_COSH,
-    VM_ERF, VM_EXP, VM_EXP2, VM_EXPM1, VM_GELU, VM_LOG, VM_LOG1P, VM_LOG2, VM_RELU, VM_SIGMOID,
-    VM_SILU, VM_SIN, VM_SINH, VM_TANH,
+    mercury_vmath_bf16, mercury_vmath_f16, mercury_vmath_f32, VM_ACOSH, VM_ASINH, VM_ATAN, VM_ATANH,
+    VM_COS, VM_COSH, VM_ERF, VM_EXP, VM_EXP2, VM_EXPM1, VM_GELU, VM_LOG, VM_LOG1P, VM_LOG2, VM_RELU,
+    VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_TANH,
 };
 
 mod velem;
