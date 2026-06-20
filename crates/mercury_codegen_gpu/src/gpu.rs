@@ -407,6 +407,54 @@ pub fn gemm_nt_bf16(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// Measure the **fp16 tensor-core roofline** in FLOP/s: `warps` warps each issue `iters·ROOFLINE_ACC`
+/// `wmma.mma`s on register-resident fragments (one global load, no hot-loop memory traffic), so the
+/// achieved rate is the practical TC ceiling on this GPU. Best-of-`reps` to ride out clock dips. The
+/// real GEMM measured in the same run as a fraction of this is the honest "% of roofline" (there is no
+/// cuBLAS here to compare against — no CUDA toolkit). See [`crate::ptx_wmma::roofline_entry`].
+pub fn wmma_roofline_f16(
+    g: &mut Gpu,
+    iters: u32,
+    warps: u32,
+    reps: usize,
+) -> Result<f64, DriverError> {
+    use half::f16;
+    let f = g.function(
+        "wmma_roofline_f16",
+        crate::ptx_wmma::roofline_f16_ptx(),
+        "wmma_roofline_f16",
+    )?;
+    let a: Vec<f16> = vec![f16::from_f32(0.01); 256];
+    let b: Vec<f16> = vec![f16::from_f32(0.01); 256];
+    let a_d = g.stream.memcpy_stod(&a)?;
+    let b_d = g.stream.memcpy_stod(&b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; warps as usize * 256])?;
+    let cfg = LaunchConfig {
+        grid_dim: (warps, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let launch = |g: &Gpu, c_d: &mut cudarc::driver::CudaSlice<f32>| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&iters).arg(&a_d).arg(&b_d).arg(c_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g, &mut c_d)?; // warm up (JIT + clocks)
+    g.stream.synchronize()?;
+    let flop = warps as f64
+        * iters as f64
+        * crate::ptx_wmma::ROOFLINE_ACC as f64
+        * (16.0 * 16.0 * 16.0 * 2.0);
+    let mut best = f64::INFINITY;
+    for _ in 0..reps.max(1) {
+        let t0 = std::time::Instant::now();
+        launch(g, &mut c_d)?;
+        g.stream.synchronize()?;
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    Ok(flop / best)
+}
+
 /// Fused row-wise normalization on the GPU — the GPU twin of `mercury_norm_f32`. `op` is a `NORM_*`
 /// code (softmax / layernorm / rmsnorm); `x` is `rows×cols` row-major. One warp per row; the row
 /// reductions are warp-butterfly all-reduces (deterministic order). Tolerance-gated.
@@ -1631,6 +1679,82 @@ mod tests {
                     s_rb / s_fp8m,
                 );
             }
+        });
+    }
+
+    /// Report the real tensor-core GEMM as a **% of the measured fp16 roofline** — the honest
+    /// substitute for a cuBLAS comparison (no CUDA toolkit on this box ⇒ no cuBLAS to measure
+    /// against). Roofline and GEMMs are timed in the SAME run so the ratio is clock-invariant
+    /// (absolutes swing ~7× with boost). fp8-mt is shown vs the *fp16* roofline, so >100% is expected
+    /// and correct — Ada's fp8 tensor-core rate is ~2× fp16's, i.e. fp8's own ceiling is ~2× higher.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn tensorcore_roofline_pct() {
+        use crate::ptx_fp8::{FP8_TM, FP8_TN};
+        use half::f16;
+        with_gpu("tensorcore_roofline_pct", |g| {
+            let roof = wmma_roofline_f16(g, 4096, 2048, 5).unwrap();
+            let mut rng = crate::diff::Rng::new(11);
+            for sz in [2048usize, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let flop = 2.0 * m as f64 * k as f64 * n as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a16_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let (e16, c16) = wmma_pick("wmma_nt_f16", m, n);
+                let f_f16 = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16)
+                    .unwrap();
+                let s_f16 = time_wmma(g, &f_f16, c16, dims, &a16_d, &b16_d, &mut c_d, 50);
+
+                let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+                let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+                let a8_d = g.stream.memcpy_stod(&a8).unwrap();
+                let b8_d = g.stream.memcpy_stod(&b8).unwrap();
+                let f_fp8m = g
+                    .function(
+                        "fp8_gemm_mt",
+                        crate::ptx_fp8::fp8_gemm_mt_ptx(),
+                        "fp8_gemm_nt_mt",
+                    )
+                    .unwrap();
+                let cfp8m = LaunchConfig {
+                    grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_fp8m = time_wmma(g, &f_fp8m, cfp8m, dims, &a8_d, &b8_d, &mut c_d, 50);
+
+                eprintln!(
+                    "{m}³: fp16 roofline {:.0} GFLOP/s | fp16-mt {:.0} ({:.0}% of fp16 roof) | \
+                     fp8-mt {:.0} ({:.0}% of fp16 roof)",
+                    roof / 1e9,
+                    flop / s_f16 / 1e9,
+                    100.0 * (flop / s_f16) / roof,
+                    flop / s_fp8m / 1e9,
+                    100.0 * (flop / s_fp8m) / roof,
+                );
+            }
+        });
+    }
+
+    /// The roofline microbench must JIT and run, returning a positive, plausible TC rate (sanity that
+    /// the compute-bound kernel isn't dead-code-eliminated to ~0 or mis-issued). Not a tolerance gate.
+    #[test]
+    fn roofline_kernel_runs() {
+        with_gpu("roofline_kernel_runs", |g| {
+            let r = wmma_roofline_f16(g, 256, 256, 2).unwrap();
+            assert!(
+                r > 1.0e11 && r < 5.0e14,
+                "fp16 roofline {r:.3e} FLOP/s implausible (DCE'd or mis-measured?)"
+            );
+            eprintln!("fp16 TC roofline (small probe): {:.0} GFLOP/s", r / 1e9);
         });
     }
 

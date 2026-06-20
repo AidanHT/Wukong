@@ -149,6 +149,74 @@ fn entry(name: &str, ty: &str, tm: usize, tn: usize) -> String {
     s
 }
 
+/// Number of independent accumulator fragments the roofline kernel keeps in flight (ILP to hide MMA
+/// latency so the loop measures tensor-core *throughput*, not the dependent-chain latency).
+pub const ROOFLINE_ACC: usize = 4;
+
+/// A compute-bound fp16 tensor-core **roofline** kernel: each warp loads ONE A-fragment and ONE
+/// B-fragment from global (so ptxas can't constant-fold), then loops `iters` times issuing
+/// `ROOFLINE_ACC` independent `wmma.mma`s that reuse those fragments. One load + `iters·ACC` MMAs +
+/// one store ⇒ effectively zero memory traffic in the hot loop, so the achieved rate is the practical
+/// tensor-core ceiling on this (power-capped) GPU. Measuring a real GEMM as a same-run % of this is
+/// the honest "% of roofline" — there is no cuBLAS on this box (no CUDA toolkit) to compare against.
+/// FLOPs = warps · iters · ACC · (16·16·16·2). Entry `wmma_roofline_f16`; launch block=32 (one warp).
+fn roofline_entry() -> String {
+    let (ty, nab, nacc) = ("f16", 8usize, ROOFLINE_ACC);
+    let mut s = String::new();
+    s += ".visible .entry wmma_roofline_f16(\n    .param .u32 pIters,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{\n";
+    s += "    .reg .pred %p0;\n    .reg .b32 %iters,%i,%ld;\n";
+    let mut decl_c = String::new();
+    for j in 0..nacc {
+        for r in 0..8 {
+            decl_c += &format!("%c{j}_{r},");
+        }
+    }
+    s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    let mut decl_ab = String::new();
+    for r in 0..nab {
+        decl_ab += &format!("%a{r},");
+    }
+    for r in 0..nab {
+        decl_ab += &format!("%b{r},");
+    }
+    s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
+    s += "    .reg .b64 %A,%B,%C,%off,%cptr;\n";
+    s += "    ld.param.u32 %iters,[pIters];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    s += "    mov.u32 %ld,16;\n";
+    // Load one A (row) and one B (col) fragment, leading dim 16.
+    let ra = veclist("a", nab);
+    let rb = veclist("b", nab);
+    s += &format!("    wmma.load.a.sync.aligned.m16n16k16.row.{ty} {ra}, [%A], %ld;\n");
+    s += &format!("    wmma.load.b.sync.aligned.m16n16k16.col.{ty} {rb}, [%B], %ld;\n");
+    for j in 0..nacc {
+        for r in 0..8 {
+            s += &format!("    mov.f32 %c{j}_{r},0f00000000;\n");
+        }
+    }
+    s += "    mov.u32 %i,0;\nRLOOP:\n    setp.ge.u32 %p0,%i,%iters;\n    @%p0 bra REND;\n";
+    for j in 0..nacc {
+        let cc = veclist(&format!("c{j}_"), 8);
+        s += &format!(
+            "    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};\n"
+        );
+    }
+    s += "    add.u32 %i,%i,1;\n    bra RLOOP;\nREND:\n";
+    // Fold the ACC accumulators into c0 so none are dead-code-eliminated (keeps every chain live).
+    for r in 0..8 {
+        for j in 1..nacc {
+            s += &format!("    add.f32 %c0_{r},%c0_{r},%c{j}_{r};\n");
+        }
+    }
+    // Store c0 to this warp's own 256-f32 slot (block=32 ⇒ warp id = ctaid.x).
+    s += "    mov.u32 %i,%ctaid.x;\n    mul.wide.u32 %off,%i,1024;\n    add.s64 %cptr,%C,%off;\n";
+    let cc0 = veclist("c0_", 8);
+    s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc0}, %ld;\n");
+    s += "    ret;\n}\n";
+    s
+}
+
 /// fp16 tensor-core GEMM module: `wmma_nt_f16` (single 16×16 tile/warp, any 16-multiple dims) and
 /// `wmma_nt_f16_mt` (2×4 tiles/warp = 32×64, fragment-reuse, the fast path for large GEMMs).
 pub fn wmma_f16_ptx() -> &'static str {
@@ -169,6 +237,17 @@ pub fn wmma_bf16_ptx() -> &'static str {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         m += &entry("wmma_nt_bf16", "bf16", 1, 1);
         m += &entry("wmma_nt_bf16_mt", "bf16", TM_TILES, TN_TILES);
+        m
+    })
+    .as_str()
+}
+
+/// fp16 tensor-core roofline module — entry `wmma_roofline_f16` (see [`roofline_entry`]).
+pub fn roofline_f16_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        m += &roofline_entry();
         m
     })
     .as_str()
