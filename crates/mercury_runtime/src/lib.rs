@@ -7,8 +7,8 @@
 
 mod gemm;
 pub use gemm::{
-    mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_epi, mercury_sgemm_nt_parallel,
-    mercury_sgemm_parallel,
+    mercury_sgemm, mercury_sgemm_nt, mercury_sgemm_nt_epi, mercury_sgemm_nt_epi_parallel,
+    mercury_sgemm_nt_parallel, mercury_sgemm_parallel,
 };
 
 mod vmath;

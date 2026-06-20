@@ -813,12 +813,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
-            // `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)` — the fused-epilogue Linear
-            // (`C = act(A·Bᵀ + bias)`). Like the plain GEMM, the interpreter marshals operands into
-            // real f32 buffers, calls the *identical* runtime kernel the native backend calls (which
-            // folds the bias+activation into the C writeback), and writes the result back — so the
-            // two backends stay bit-for-bit exact.
-            "mercury_sgemm_nt_epi" => {
+            // `mercury_sgemm_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)` — the fused-epilogue
+            // Linear (`C = act(A·Bᵀ + bias)`). Like the plain GEMM, the interpreter marshals operands
+            // into real f32 buffers and calls the *serial* runtime kernel as the oracle. The native
+            // `@parallel` variant is bit-identical to it (each C tile owned by one task, same per-(i,j)
+            // accumulation order), so calling the serial form here keeps the two backends bit-for-bit
+            // exact without spawning threads in the interpreter.
+            "mercury_sgemm_nt_epi" | "mercury_sgemm_nt_epi_parallel" => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;

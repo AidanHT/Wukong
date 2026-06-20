@@ -41,6 +41,7 @@ pub fn lower_program(
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
+        nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
         velem: interner.intern("mercury_velem_f32"),
         vhorner: interner.intern("mercury_vhorner_f32"),
@@ -437,6 +438,10 @@ struct GemmSyms {
     /// The fused-epilogue `nn.Linear` kernel (`mercury_sgemm_nt_epi`): `C = act(A·Bᵀ + bias)`. A
     /// matmul immediately followed by a bias-add / ReLU loop over its output lowers to this.
     nt_epi: Symbol,
+    /// The multicore fused-epilogue `nn.Linear` (`mercury_sgemm_nt_epi_parallel`): the same
+    /// `C = act(A·Bᵀ + bias)` fusion in a `@parallel` function, run across cores. Bit-identical to the
+    /// serial `nt_epi` the interpreter calls (each C tile owned by one task), so the gate stays exact.
+    nt_epi_par: Symbol,
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
@@ -1936,8 +1941,16 @@ impl FnLowerer<'_> {
         let act_v = self
             .builder
             .build(MirType::I64, Op::ConstInt(act as i128, MirType::I64));
+        // In a `@parallel` function, dispatch the fused FFN across cores (bit-identical to the serial
+        // kernel, which the interpreter calls as the oracle). Before, the epilogue forced serial — so a
+        // `@parallel` fused FFN could use the fusion or the cores, but not both.
+        let func = if self.parallel_fn {
+            self.gemm.nt_epi_par
+        } else {
+            self.gemm.nt_epi
+        };
         self.builder.build_void(Op::Call {
-            func: self.gemm.nt_epi,
+            func,
             args: vec![a, b, c, m, k, n, beta, bias_ptr, act_v],
         });
         true
