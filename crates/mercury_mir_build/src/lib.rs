@@ -509,6 +509,9 @@ const VMATH_EXP2: u32 = 18;
 const VMATH_LOG2: u32 = 19;
 const VMATH_SINH: u32 = 20;
 const VMATH_COSH: u32 = 21;
+const VMATH_ASINH: u32 = 22;
+const VMATH_ACOSH: u32 = 23;
+const VMATH_ATANH: u32 = 24;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2799,6 +2802,9 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Log2) => VMATH_LOG2,
             Some(MathIntrinsic::Sinh) => VMATH_SINH,
             Some(MathIntrinsic::Cosh) => VMATH_COSH,
+            Some(MathIntrinsic::Asinh) => VMATH_ASINH,
+            Some(MathIntrinsic::Acosh) => VMATH_ACOSH,
+            Some(MathIntrinsic::Atanh) => VMATH_ATANH,
             _ => return None,
         };
         let x_sym = self.index_by_loopvar(&args[0], j)?;
@@ -3649,6 +3655,9 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Log2
                     | MathIntrinsic::Sinh
                     | MathIntrinsic::Cosh
+                    | MathIntrinsic::Asinh
+                    | MathIntrinsic::Acosh
+                    | MathIntrinsic::Atanh
                     | MathIntrinsic::Erf
                     | MathIntrinsic::Sin
                     | MathIntrinsic::Cos
@@ -4455,6 +4464,18 @@ impl FnLowerer<'_> {
                 Some(op @ (MathIntrinsic::Sinh | MathIntrinsic::Cosh)) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     self.emit_sinh_cosh(x, vty, matches!(op, MathIntrinsic::Cosh))
+                }
+                Some(MathIntrinsic::Asinh) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_asinh(x, vty)
+                }
+                Some(MathIntrinsic::Acosh) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_acosh(x, vty)
+                }
+                Some(MathIntrinsic::Atanh) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    self.emit_atanh(x, vty)
                 }
                 Some(MathIntrinsic::Pow) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -5318,6 +5339,21 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_sinh_cosh(x, &rty, matches!(op, MathIntrinsic::Cosh)))
             }
+            // asinh = sign(x)·log(|x|+√(x²+1)),  acosh = log(x+√(x²−1)),
+            // atanh = ½·log((1+x)/(1−x)) — composed from the shared `log` (and `√`), so they vectorize
+            // and the dispatched 256-bit kernel mirrors this op-for-op.
+            MathIntrinsic::Asinh => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_asinh(x, &rty))
+            }
+            MathIntrinsic::Acosh => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_acosh(x, &rty))
+            }
+            MathIntrinsic::Atanh => {
+                let x = self.lower_expr(args.first()?);
+                Some(self.emit_atanh(x, &rty))
+            }
             MathIntrinsic::Pow => {
                 // pow(x, y) = exp(y * log(x)), reusing the two polynomials (so it vectorizes and is
                 // bit-exact across backends for free). Defined for x > 0, like the rest of the suite.
@@ -5728,6 +5764,50 @@ impl FnLowerer<'_> {
         let half = self.splat_const_f(0.5, rty);
         self.builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, combined, half))
+    }
+
+    /// `asinh(x) = sign(x)·log(|x| + √(x²+1))` — the sign-stable inverse hyperbolic sine (evaluating
+    /// `log` on `|x|+√(…) ≥ 1` dodges the `x+√(x²+1)` cancellation for large negative `x`). Reuses
+    /// `emit_abs`/`emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
+    fn emit_asinh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let ax = self.emit_abs(x, rty);
+        let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, ax, ax));
+        let one = self.splat_const_f(1.0, rty);
+        let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, x2, one));
+        let s = self.builder.build(rty.clone(), Op::Sqrt(inner));
+        let sum = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, ax, s));
+        let t = self.emit_log(sum, rty);
+        // copysign(t, x) via select (t ≥ 0): x < 0 ? −t : t.
+        let neg1 = self.splat_const_f(-1.0, rty);
+        let negt = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, t, neg1));
+        let zero = self.splat_const_f(0.0, rty);
+        let isneg = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(isneg, negt, t))
+    }
+
+    /// `acosh(x) = log(x + √(x²−1))` for `x ≥ 1` (`√` of a negative → `NaN` below, matching `libm`).
+    /// Reuses `emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
+    fn emit_acosh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
+        let one = self.splat_const_f(1.0, rty);
+        let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, x2, one));
+        let s = self.builder.build(rty.clone(), Op::Sqrt(inner));
+        let sum = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, x, s));
+        self.emit_log(sum, rty)
+    }
+
+    /// `atanh(x) = ½·log((1+x)/(1−x))` for `|x| < 1` (the Fisher z-transform). Reuses `emit_log`;
+    /// works on a scalar or a SIMD vector, bit-identical across backends.
+    fn emit_atanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let one = self.splat_const_f(1.0, rty);
+        let num = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, x));
+        let den = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, x));
+        let r = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, num, den));
+        let l = self.emit_log(r, rty);
+        let half = self.splat_const_f(0.5, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, l, half))
     }
 
     /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`) as a fast, deterministic polynomial. Always
@@ -7857,6 +7937,9 @@ enum MathIntrinsic {
     Log2,
     Sinh,
     Cosh,
+    Asinh,
+    Acosh,
+    Atanh,
     Pow,
     Erf,
     Sin,
@@ -7904,6 +7987,9 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "log2" => MathIntrinsic::Log2,
         "sinh" => MathIntrinsic::Sinh,
         "cosh" => MathIntrinsic::Cosh,
+        "asinh" => MathIntrinsic::Asinh,
+        "acosh" => MathIntrinsic::Acosh,
+        "atanh" => MathIntrinsic::Atanh,
         "pow" => MathIntrinsic::Pow,
         "erf" => MathIntrinsic::Erf,
         "sin" => MathIntrinsic::Sin,

@@ -43,6 +43,9 @@ pub const VM_EXP2: i64 = 18;
 pub const VM_LOG2: i64 = 19;
 pub const VM_SINH: i64 = 20;
 pub const VM_COSH: i64 = 21;
+pub const VM_ASINH: i64 = 22;
+pub const VM_ACOSH: i64 = 23;
+pub const VM_ATANH: i64 = 24;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -383,6 +386,32 @@ fn cosh1(x: f32) -> f32 {
     (exp1(x) + exp1(x * -1.0)) * 0.5
 }
 
+/// `asinh(x) = sign(x)·ln(|x| + √(x²+1))` — the all-real inverse hyperbolic sine (Poincaré/hyperbolic
+/// embeddings, the `symlog` robust activation). Reusing `|x|` (and restoring the sign by `copysign`)
+/// evaluates the `log` on `|x| + √(…) ≥ 1`, dodging the catastrophic `x + √(x²+1)` cancellation that
+/// the naive form suffers for large negative `x`. Reuses [`log1`]; `√`, the abs/sign bit-masks, are all
+/// exact, so the scalar twin and the AVX2 [`asinh8`] agree bit-for-bit (the tail-match test pins it).
+#[inline]
+fn asinh1(x: f32) -> f32 {
+    let ax = f32::from_bits(x.to_bits() & 0x7FFF_FFFF); // |x|
+    let t = log1(ax + (ax * ax + 1.0).sqrt()); // ≥ 0
+    f32::from_bits(t.to_bits() | (x.to_bits() & 0x8000_0000)) // copysign(t, x)
+}
+
+/// `acosh(x) = ln(x + √(x²−1))` for `x ≥ 1` (`NaN` below, matching `libm`'s domain). Reuses [`log1`].
+#[inline]
+fn acosh1(x: f32) -> f32 {
+    let x2 = x * x;
+    log1(x + (x2 - 1.0).sqrt())
+}
+
+/// `atanh(x) = ½·ln((1+x)/(1−x))` for `|x| < 1` (the Fisher z-transform; ±∞ at ±1). Reuses [`log1`].
+#[inline]
+fn atanh1(x: f32) -> f32 {
+    let r = (1.0 + x) / (1.0 - x);
+    log1(r) * 0.5
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -409,6 +438,9 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_LOG2 => log2_1(x),
         VM_SINH => sinh1(x),
         VM_COSH => cosh1(x),
+        VM_ASINH => asinh1(x),
+        VM_ACOSH => acosh1(x),
+        VM_ATANH => atanh1(x),
         _ => x,
     }
 }
@@ -466,6 +498,9 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_LOG2 => log2_8,
         VM_SINH => sinh8,
         VM_COSH => cosh8,
+        VM_ASINH => asinh8,
+        VM_ACOSH => acosh8,
+        VM_ATANH => atanh8,
         _ => return,
     };
     let mut i = 0;
@@ -797,6 +832,43 @@ unsafe fn cosh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_mul_ps(_mm256_add_ps(ex, enx), _mm256_set1_ps(0.5))
 }
 
+/// 8-lane `asinh(x) = copysign(log(|x| + √(x²+1)), x)` — mirrors [`asinh1`] (bit-mask abs / sqrt /
+/// bit-or sign restore, so the lanes equal the scalar twin exactly). `mul`+`add` (not `fmadd`) for
+/// `|x|²+1` matches the scalar twin's separate ops.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn asinh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x8000_0000_u32 as i32));
+    let ax = _mm256_and_ps(x, absmask);
+    let x2 = _mm256_mul_ps(ax, ax);
+    let s = _mm256_sqrt_ps(_mm256_add_ps(x2, _mm256_set1_ps(1.0)));
+    let t = log8(_mm256_add_ps(ax, s));
+    _mm256_or_ps(t, _mm256_and_ps(x, signmask))
+}
+
+/// 8-lane `acosh(x) = log(x + √(x²−1))` (x ≥ 1) — mirrors [`acosh1`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn acosh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let x2 = _mm256_mul_ps(x, x);
+    let s = _mm256_sqrt_ps(_mm256_sub_ps(x2, _mm256_set1_ps(1.0)));
+    log8(_mm256_add_ps(x, s))
+}
+
+/// 8-lane `atanh(x) = ½·log((1+x)/(1−x))` (|x| < 1) — mirrors [`atanh1`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn atanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    let num = _mm256_add_ps(one, x);
+    let den = _mm256_sub_ps(one, x);
+    _mm256_mul_ps(log8(_mm256_div_ps(num, den)), _mm256_set1_ps(0.5))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +994,38 @@ mod tests {
         }
     }
 
+    /// asinh/acosh/atanh vs `std`, each over its domain. The composed `log(x+√(x²±1))` /
+    /// `½·log((1+x)/(1−x))` is ≈exp/log-grade. `acosh` loses precision as `x → 1⁺` (the `x²−1`
+    /// cancellation), so it is checked from 1.2 up; `atanh` to |x| ≤ 0.9 (it diverges at ±1). The
+    /// domain-restricted tail-match (scalar twin == AVX2 lanes, bit-for-bit) is folded in here since
+    /// `acosh`/`atanh` can't ride the all-real `vmath_tail_matches_lanes` loop.
+    #[test]
+    fn vmath_inverse_hyperbolic() {
+        let check = |op: i64, xs: &[f32], reference: fn(f32) -> f32, tol: f32| {
+            let mut out = vec![0.0f32; xs.len()];
+            unsafe { mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op) };
+            for (i, &x) in xs.iter().enumerate() {
+                let want = reference(x);
+                assert!(
+                    (out[i] - want).abs() <= tol + tol * want.abs(),
+                    "op {op} x={x}: got {} want {want}",
+                    out[i]
+                );
+                // scalar twin (the AVX2 tail) must equal the kernel lane bit-for-bit.
+                assert_eq!(out[i].to_bits(), apply1(op, x).to_bits(), "op {op} tail x={x}");
+            }
+        };
+        // asinh: all-real (the sign-stable form holds for large negative x too). 1001 ≠ 8k → tail.
+        let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.05).collect();
+        check(VM_ASINH, &xs, |x| x.asinh(), 5e-5);
+        // acosh: x ≥ 1.2.
+        let xs: Vec<f32> = (0..1001).map(|i| 1.2 + i as f32 * 0.05).collect();
+        check(VM_ACOSH, &xs, |x| x.acosh(), 5e-5);
+        // atanh: |x| ≤ 0.9.
+        let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.0018).collect();
+        check(VM_ATANH, &xs, |x| x.atanh(), 5e-5);
+    }
+
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
     /// not a multiple of 8 produces a consistent result regardless of where the tail starts.
     #[test]
@@ -929,7 +1033,7 @@ mod tests {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
             VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
-            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH,
+            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH,
         ] {
             if op == VM_LOG || op == VM_LOG2 {
                 continue; // negative inputs are out of log's domain
