@@ -1,0 +1,51 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 100
+// EXPECT-OUT: 3000
+module tests.run.exp10_log10
+
+// `exp10(x) = 10ˣ` and `log10(x) = log₁₀(x)` — base-10 exp/log. Both compose the shared exp/log
+// polynomials (`exp10 = exp(x·ln10)`, `log10 = log(x)·log₁₀e`), so both vectorize to the same
+// 256-bit `mercury_vmath_f32` kernel and both backends agree bit-for-bit. Base-10 shows up in
+// dB / log-scale features and decibel/SPL audio front-ends. C's scalar `exp10f`/`log10f` can't
+// vectorize a loop with a call, so the dispatched form is a structural win.
+fn main() -> i32 {
+    // Mutual inverses: log10∘exp10 = id, exp10∘log10 = id (round, not truncate, near the boundary).
+    let x: f32 = 0.5;
+    print((log10(exp10(x)) * 10000.0 + 0.5) as i32); // 5000
+    print((exp10(log10(x)) * 10000.0 + 0.5) as i32); // 5000
+
+    // Vectorized exp10/log10 over an array lower to the 256-bit dispatch (kernel path).
+    let mut xs: [f32; 8] = [0.0; 8];
+    let mut i: i32 = 0;
+    while i < 8 {
+        xs[i] = (i as f32) * 0.5;
+        i = i + 1;
+    }
+    // exp10: [1, 10^0.5, 10, 10^1.5, 100, ...]; index 4 = 10^2 = 100 exactly.
+    let mut e: [f32; 8] = [0.0; 8];
+    let mut k: i32 = 0;
+    while k < 8 {
+        e[k] = exp10(xs[k]);
+        k = k + 1;
+    }
+    print((e[4] + 0.5) as i32); // 10^2.0 = 100
+
+    // log10 of powers of ten: log10(1000) = 3.
+    let mut p: [f32; 8] = [1.0; 8];
+    let mut j: i32 = 0;
+    while j < 8 {
+        p[j] = 1000.0;
+        j = j + 1;
+    }
+    let mut l: [f32; 8] = [0.0; 8];
+    let mut m: i32 = 0;
+    while m < 8 {
+        l[m] = log10(p[m]);
+        m = m + 1;
+    }
+    print((l[0] * 1000.0 + 0.5) as i32); // log10(1000) = 3 -> 3000
+    return 0;
+}
