@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 39682
+// EXPECT-OUT: 15357
+module tests.run.expm1_log1p
+
+// `expm1(x) = eˣ−1` and `log1p(x) = ln(1+x)` — the numerically-stable forms. Kahan's correction
+// (`(u−1)·x/ln(u)` for expm1, `ln(u)·x/(u−1)` for log1p, with the `u==1 → x` guard) reuses the shared
+// exp/log polynomials, so both vectorize to the 256-bit kernel and both backends agree bit-for-bit.
+// They are inverses, and the stable forms stay ≈1-ULP near 0 where the naive `eˣ−1` / `log(1+x)` lose
+// relative accuracy — the regime that matters for ELU's exact negative tail and stable losses
+// (log-sum-exp, BCE).
+fn main() -> i32 {
+    // Mutual inverses: log1p∘expm1 = id, expm1∘log1p = id.
+    let x: f32 = 0.5;
+    print((log1p(expm1(x)) * 10000.0) as i32); // 5000
+    print((expm1(log1p(x)) * 10000.0) as i32); // 5000
+
+    // Vectorized expm1/log1p over an array lower to the 256-bit dispatch (kernel path).
+    let mut xs: [f32; 8] = [0.0; 8];
+    let mut i: i32 = 0;
+    while i < 8 {
+        xs[i] = (i as f32) * 0.2 - 0.4;
+        i = i + 1;
+    }
+    let mut o1: [f32; 8] = [0.0; 8];
+    let mut o2: [f32; 8] = [0.0; 8];
+    let mut k: i32 = 0;
+    while k < 8 {
+        o1[k] = expm1(xs[k]);
+        o2[k] = log1p(xs[k]);
+        k = k + 1;
+    }
+    let mut se: f32 = 0.0;
+    let mut sl: f32 = 0.0;
+    let mut n: i32 = 0;
+    while n < 8 {
+        se = se + o1[n];
+        sl = sl + o2[n];
+        n = n + 1;
+    }
+    print((se * 10000.0) as i32); // expm1 checksum -> 39682
+    print((sl * 10000.0) as i32); // log1p checksum -> 15357
+    return 0;
+}

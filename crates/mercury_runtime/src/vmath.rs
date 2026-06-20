@@ -47,6 +47,8 @@ pub const VM_ASINH: i64 = 22;
 pub const VM_ACOSH: i64 = 23;
 pub const VM_ATANH: i64 = 24;
 pub const VM_ATAN: i64 = 25;
+pub const VM_EXPM1: i64 = 26;
+pub const VM_LOG1P: i64 = 27;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -457,6 +459,39 @@ fn atan1(x: f32) -> f32 {
     f32::from_bits(yf.to_bits() | (x.to_bits() & 0x8000_0000)) // copysign(yf, x)
 }
 
+/// `expm1(x) = eˣ − 1`, the numerically-stable form (the exact ELU/`SELU` negative tail, stable
+/// losses). Kahan's correction `(u−1)·x/ln(u)` with `u = eˣ` cancels the catastrophic `eˣ − 1` loss
+/// for small `x` (the ratio `(u−1)/ln(u) → 1` as `u → 1`); the guard returns `x` when `u` rounds to 1
+/// (else the `0·∞` would be `NaN`). Reuses [`exp1`]/[`log1`], so the scalar twin, AVX2 [`expm1_8`], and
+/// inlined MIR agree. Computed branchlessly (mirrors the AVX2 blend) for the tail-match.
+#[inline]
+fn expm1_1(x: f32) -> f32 {
+    let u = exp1(x);
+    let um1 = u - 1.0;
+    let val = um1 * (x / log1(u));
+    if u == 1.0 {
+        x
+    } else {
+        val
+    }
+}
+
+/// `log1p(x) = ln(1+x)`, the numerically-stable form (stable BCE/log-sum-exp). Kahan's correction
+/// `ln(u)·x/(u−1)` with `u = 1+x` undoes the rounding of `1+x` for small `x`; the guard returns `x`
+/// when `u` rounds to 1. Reuses [`log1`]; agrees bit-for-bit across the scalar twin, AVX2 [`log1p_8`],
+/// and inlined MIR.
+#[inline]
+fn log1p_1(x: f32) -> f32 {
+    let u = 1.0 + x;
+    let d = u - 1.0;
+    let val = log1(u) * (x / d);
+    if u == 1.0 {
+        x
+    } else {
+        val
+    }
+}
+
 /// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
 #[inline]
 fn apply1(op: i64, x: f32) -> f32 {
@@ -487,6 +522,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_ACOSH => acosh1(x),
         VM_ATANH => atanh1(x),
         VM_ATAN => atan1(x),
+        VM_EXPM1 => expm1_1(x),
+        VM_LOG1P => log1p_1(x),
         _ => x,
     }
 }
@@ -548,6 +585,8 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
         VM_ACOSH => acosh8,
         VM_ATANH => atanh8,
         VM_ATAN => atan8,
+        VM_EXPM1 => expm1_8,
+        VM_LOG1P => log1p_8,
         _ => return,
     };
     let mut i = 0;
@@ -949,6 +988,32 @@ unsafe fn atan8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_or_ps(yf, _mm256_and_ps(x, signmask))
 }
 
+/// 8-lane `expm1(x) = (u−1)·x/log(u)`, `u = eˣ`, guard `u==1 → x` — mirrors [`expm1_1`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn expm1_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    let u = exp8(x);
+    let um1 = _mm256_sub_ps(u, one);
+    let val = _mm256_mul_ps(um1, _mm256_div_ps(x, log8(u)));
+    let is1 = _mm256_cmp_ps::<_CMP_EQ_OQ>(u, one);
+    _mm256_blendv_ps(val, x, is1)
+}
+
+/// 8-lane `log1p(x) = log(u)·x/(u−1)`, `u = 1+x`, guard `u==1 → x` — mirrors [`log1p_1`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn log1p_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    let u = _mm256_add_ps(one, x);
+    let d = _mm256_sub_ps(u, one);
+    let val = _mm256_mul_ps(log8(u), _mm256_div_ps(x, d));
+    let is1 = _mm256_cmp_ps::<_CMP_EQ_OQ>(u, one);
+    _mm256_blendv_ps(val, x, is1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,6 +1173,46 @@ mod tests {
         check(VM_ATANH, &xs, |x| x.atanh(), 5e-5);
     }
 
+    /// expm1/log1p vs `std`, including the **small-x relative** check the Kahan correction exists for:
+    /// at `x = 1e-3 … 1e-6`, `expm1(x) ≈ x` and `log1p(x) ≈ x` to ≈1 ULP, where naive `eˣ−1` / `log(1+x)`
+    /// lose ~1e-4 relative. The wide-range pass uses the combined abs+rel floor; the small-x pass is
+    /// relative-only (so it would fail for the naive forms). Also pins scalar twin == AVX2 lanes.
+    #[test]
+    fn vmath_expm1_log1p() {
+        let kernel = |op: i64, xs: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; xs.len()];
+            unsafe { mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op) };
+            out
+        };
+        // Wide range. expm1 all-real (to +10 before exp gets large); log1p needs x > −1.
+        let xe: Vec<f32> = (0..2001).map(|i| (i as f32 - 1000.0) * 0.01).collect();
+        for (i, &x) in xe.iter().enumerate() {
+            let (got, want) = (kernel(VM_EXPM1, &xe)[i], x.exp_m1());
+            assert!(
+                (got - want).abs() <= 5e-5 + 5e-5 * want.abs(),
+                "expm1({x}): got {got} want {want}"
+            );
+            assert_eq!(got.to_bits(), apply1(VM_EXPM1, x).to_bits(), "expm1 tail {x}");
+        }
+        let xl: Vec<f32> = (0..2001).map(|i| -0.9 + i as f32 * 0.01).collect();
+        for (i, &x) in xl.iter().enumerate() {
+            let (got, want) = (kernel(VM_LOG1P, &xl)[i], x.ln_1p());
+            assert!(
+                (got - want).abs() <= 5e-5 + 5e-5 * want.abs(),
+                "log1p({x}): got {got} want {want}"
+            );
+            assert_eq!(got.to_bits(), apply1(VM_LOG1P, x).to_bits(), "log1p tail {x}");
+        }
+        // Small-x relative accuracy — the whole point of the stable forms.
+        let small: Vec<f32> = vec![1e-3, 1e-4, 1e-5, 1e-6, -1e-3, -1e-4, -1e-5];
+        let (em, lm) = (kernel(VM_EXPM1, &small), kernel(VM_LOG1P, &small));
+        for (i, &x) in small.iter().enumerate() {
+            let (we, wl) = (x.exp_m1(), x.ln_1p());
+            assert!((em[i] - we).abs() <= 5e-5 * we.abs(), "expm1 rel {x}: {} vs {we}", em[i]);
+            assert!((lm[i] - wl).abs() <= 5e-5 * wl.abs(), "log1p rel {x}: {} vs {wl}", lm[i]);
+        }
+    }
+
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
     /// not a multiple of 8 produces a consistent result regardless of where the tail starts.
     #[test]
@@ -1115,7 +1220,7 @@ mod tests {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
             VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
-            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN,
+            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1,
         ] {
             if op == VM_LOG || op == VM_LOG2 {
                 continue; // negative inputs are out of log's domain
