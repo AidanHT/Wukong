@@ -494,22 +494,27 @@ Same-run, same device buffers, checksum-cross-checked, both peers first toleranc
 oracle (a fast-but-wrong kernel never scores). Two back-to-back runs (the mid-size % swings with the
 laptop's clock state; the 4096³ cliff does not):
 
-| size | Mercury WMMA, % of cuBLAS | × vs naive CUDA-C | cuBLAS (gold) vs internal roofline |
-|------|--------------------------|-------------------|------------------------------------|
-| 1024³ | ~51–72% | ~64–83× | ~100–104% (cuBLAS ≈ roof) |
-| 2048³ | ~66–78% | ~64–72× | ~79–92% |
-| 4096³ | **~28%** | ~37–115× | ~92% |
+| size | Mercury (default `_sm`), % of cuBLAS | × vs naive CUDA-C | vs prior `_mt` kernel |
+|------|--------------------------------------|-------------------|-----------------------|
+| 1024³ | ~85% | ~80× | **1.27×** |
+| 2048³ | ~63% | ~60× | ~1.0× (tie) |
+| 4096³ | ~34% | ~44× | **1.21×** |
 
 The honest standing: **a wide Tier-A win** — Mercury's tensor-core GEMM beats the naive hand-written
-CUDA-C kernel by tens-to-100×+, the same way it beats naive CPU-C — but **well short of cuBLAS** (the
-plan's M1 target is ≥95% isolated, >100% fused). The scoreboard also exposes what the internal roofline
+CUDA-C kernel by tens-to-100×+, the same way it beats naive CPU-C — but **still short of cuBLAS** (the
+plan's M1 target is ≥95% isolated, >100% fused). The scoreboard also exposed what the internal roofline
 hid: **cuBLAS matches or exceeds that roofline** (~100–104% at 1024³), so the roofline was a soft
-under-estimate, not a true ceiling; and Mercury's WMMA **regresses ~2.3× from 2048³→4096³** (its
-per-warp, no-shared-memory tiles thrash global memory once the tile working set spills L2) while cuBLAS
-keeps climbing. Closing that gap — CTA-level **shared-memory staging**, `cp.async` double-buffering,
-warp-tiling, split-K — is the active work, and the cuBLAS % is exactly the number it moves. Reproduce:
-`gemm_vs_peers` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
-`baselines.rs`).
+under-estimate, not a true ceiling.
+
+**Phase-1 progress — shared-memory staging.** The original per-warp `_mt` kernel re-streamed
+overlapping A/B rows/cols from global every K-step and **cratered to ~28% of cuBLAS at 4096³** (a 2.3×
+regression vs 2048³ as the tile working set spilled L2). The new default `wmma_nt_f16_sm` kernel —
+a 64×64 CTA of 4 warps that cooperatively stages A/B tiles into shared memory with **vectorized 128-bit
+loads**, so each global element is fetched once per CTA tile and reused across all warps — is **≥ `_mt`
+at every size** (1.27× @1024³, 1.21× @4096³, tie @2048³) and reaches **~85% of cuBLAS at 1024³**. The
+4096³ case is improved (28%→34%) but still load-bound: **`cp.async` double-buffering, bigger CTA tiles,
+warp-tiling and split-K** are the remaining levers toward ≥95%. Reproduce: `gemm_vs_peers` in
+`mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in `baselines.rs`).
 
 **Internal fp16 WMMA roofline** (retained as a same-run, clock-invariant compute ceiling — one fragment
 load then a long `wmma.mma` loop over 4 independent accumulators, ~zero hot-loop memory traffic): the
