@@ -40,7 +40,7 @@ pub const RED_MAXABS: i64 = 6; // max(|x[i]|) — abs each element, fold by fmax
 /// The fold identity: `0.0` for the additive ops, `∓∞` for max/min/maxabs so the first real element
 /// wins (`maxabs` folds by max, identity `−∞`).
 #[inline(always)]
-fn ident(op: i64) -> f32 {
+pub(crate) fn ident(op: i64) -> f32 {
     match op {
         RED_MAX | RED_MAXABS => f32::NEG_INFINITY,
         RED_MIN => f32::INFINITY,
@@ -53,7 +53,7 @@ fn ident(op: i64) -> f32 {
 /// the MIR `Cmp(Fogt/Folt)+Select` the recognizer emits to combine the kernel result), so the AVX2
 /// lanes, the scalar twin, and the compiler's outer fold all agree bit-for-bit.
 #[inline(always)]
-fn fold2(a: f32, b: f32, op: i64) -> f32 {
+pub(crate) fn fold2(a: f32, b: f32, op: i64) -> f32 {
     match op {
         // maxabs folds its (already abs'd) partials by plain max.
         RED_MAX | RED_MAXABS => {
@@ -103,7 +103,7 @@ fn contrib(a: f32, xi: f32, yi: f32, op: i64) -> f32 {
 /// exactly `((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7))` (unchanged); for max/min it is the same tree under
 /// `fmax`/`fmin`.
 #[inline(always)]
-fn hcombine8(a: [f32; 8], op: i64) -> f32 {
+pub(crate) fn hcombine8(a: [f32; 8], op: i64) -> f32 {
     fold2(
         fold2(fold2(a[0], a[1], op), fold2(a[2], a[3], op), op),
         fold2(fold2(a[4], a[5], op), fold2(a[6], a[7], op), op),

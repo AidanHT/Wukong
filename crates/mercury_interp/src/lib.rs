@@ -1153,6 +1153,27 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 Ok(Value::Float(r as f64))
             }
+            // `mercury_reduce_bf16(x, n, op) -> f32` — the bf16 max-family reduction (max/min/absmax)
+            // a `m = fmax/fmin(m, (x[k] as f32))` loop over `[bf16]` lowers to. Reconstruct the exact
+            // bf16 bits (as the dot/sum path does), call the identical kernel — the widen is lossless
+            // and max/min round nothing, so interp == native exactly.
+            "mercury_reduce_bf16" => {
+                let x = ptr(args[0])?;
+                let n = args[1].as_int() as usize;
+                let op = args[2].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(mercury_runtime::f32_to_bf16_bits(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("bf16 reduce operand out of bounds")?
+                            .as_float() as f32,
+                    ));
+                }
+                // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
+                let r = unsafe { mercury_runtime::mercury_reduce_bf16(xbuf.as_ptr(), n as i64, op) };
+                Ok(Value::Float(r as f64))
+            }
             // `mercury_axpby_bf16(x, y, out, n, a, b)` — the bf16→f32 streaming axpby a recognized
             // `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` map over `[bf16; _]` inputs (f32 output)
             // lowers to. Reconstruct the bf16 input bits exactly (as the reductions do), call the
