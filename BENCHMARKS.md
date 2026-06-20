@@ -170,8 +170,8 @@ free* through the existing matmul dispatch (`tests/run/conv_im2col.mer`).
 ### Transcendentals / activations — Mercury dispatches to a 256-bit AVX2 kernel; C calls scalar `libm`
 
 The activation family every transformer runs, and **the cleanest compute-bound win in the suite**.
-Mercury recognizes a pure `out[i] = f(x[i])` loop for **24** functions —
-`exp`/`log`/`exp2`/`log2`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`erf`
+Mercury recognizes a pure `out[i] = f(x[i])` loop for **25** functions —
+`exp`/`log`/`exp2`/`log2`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`/`sin`/`cos`/`atan`/`erf`
 plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh` — and lowers the whole
 loop to a **256-bit AVX2/FMA runtime kernel** (`mercury_vmath_f32`) — the same domain-aware dispatch
 as matmul→GEMM. The kernel runs a ≈1-ULP Cephes minimax polynomial 8 lanes at a time; gcc/rustc call
@@ -205,6 +205,7 @@ than a bare `out[i]=f(x[i])` loop — still lowers to the inlined ≈1-ULP poly 
 | `erf` | **~3.9–4.9× faster** | exact (erf-based) GELU; 256-bit Abramowitz–Stegun poly vs scalar `erff` |
 | `asinh` | **~10–11.5× faster** | `sign(x)·log(\|x\|+√(x²+1))` (sign-stable) vs scalar `asinhf` — libm's `asinhf` carries its own reduction over a log, so the widest gap in the suite |
 | `acosh` | **~7.6× faster** | `log(x+√(x²−1))`, x≥1, vs scalar `acoshf` |
+| `atan` | **~8.9–9.5× faster** | Cephes 3-region reduction + degree-3 poly vs scalar `atanf` (its branchy reduction is heavy per element) |
 | `gelu@parallel` | **~28× faster** | GELU over a large tensor across cores: multicore × 256-bit vs single-thread scalar C |
 
 The full elementwise math suite — `sqrt`/`rsqrt` (hardware), `exp`/`log`/`exp2`/`log2` (≈1-ULP minimax polys),
@@ -541,8 +542,8 @@ abs on this box). A device error surfaces as an error, never a silent CPU fallba
   Rust runs essentially scalar here (~5–12× behind). Integer math makes the cross-language check
   **bit-exact**, not a tolerance.
 - **Transcendentals / activations (exp, log, exp2, log2, tanh, sigmoid, GELU, SiLU, ELU, leaky_relu,
-  softplus, mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, erf, and the hyperbolic family
-  sinh, cosh, asinh, acosh, atanh — 24 in all):** **~4–11.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
+  softplus, mish, SELU, tanhshrink, hardsigmoid, hardswish, sin, cos, atan, erf, and the hyperbolic
+  family sinh, cosh, asinh, acosh, atanh — 25 in all):** **~4–11.5× faster** than C's scalar `libm` — Mercury dispatches the loop to a **256-bit AVX2
   ≈1-ULP poly kernel** (`mercury_vmath_f32`), where gcc/rustc cannot vectorize a loop with an
   `expf`/`logf`/`tanhf`/`sinf`/`cosf`/`erff`/`asinhf` call. This is the transformer/vision activation family and the cleanest
   compute-bound win (it roughly doubled when the kernel moved from the 128-bit vectorizer to 256-bit).

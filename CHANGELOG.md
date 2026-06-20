@@ -41,9 +41,9 @@ All notable changes to Mercury are documented here. The format is loosely based 
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
   run ~2.6–2.8× faster than serial C.
-- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **24** functions —
+- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **25** functions —
   `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
-  `hardsigmoid`/`hardswish` plus **`sin`/`cos`** (RoPE rotary embeddings), **`erf`** (exact
+  `hardsigmoid`/`hardswish` plus **`sin`/`cos`/`atan`** (RoPE rotary embeddings, angle/geometry), **`erf`** (exact
   BERT/GPT-2 GELU), **`exp2`/`log2`** (FlashAttention base-2 softmax, quantization), and the full
   **hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`** (`atanh` = the Fisher z-transform; the
   inverse trio powers hyperbolic/Poincaré embeddings and normalizing flows) — lowers to a tuned **256-bit AVX2/FMA runtime
