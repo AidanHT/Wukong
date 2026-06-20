@@ -1,0 +1,60 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 15000
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 4812
+// EXPECT-OUT: 13169
+// EXPECT-OUT: 5493
+// EXPECT-OUT: -18184
+// EXPECT-OUT: -14436
+module tests.run.ihyp
+
+// Inverse hyperbolic functions — asinh = sign(x)·log(|x|+√(x²+1)), acosh = log(x+√(x²−1)) for x≥1,
+// atanh = ½·log((1+x)/(1−x)) for |x|<1. Composed from the shared `log`/`sqrt`, so they vectorize and
+// both backends agree bit-for-bit. They complete the hyperbolic family (sinh/cosh/tanh) and power
+// hyperbolic neural networks (Poincaré/Lorentz embeddings) and normalizing flows; atanh is the Fisher
+// z-transform. asinh's sign-stable form stays ≈1-ULP even for large negative x (no `x+√(x²+1)`
+// cancellation).
+fn main() -> i32 {
+    // Round-trip identities — asinh∘sinh = id, acosh∘cosh = |·|, atanh∘tanh = id.
+    let x: f32 = 1.0;
+    print((asinh(sinh(x)) * 10000.0) as i32); // 10000
+    let y: f32 = 1.5;
+    print((acosh(cosh(y)) * 10000.0) as i32); // 15000
+    let z: f32 = 0.7;
+    print((atanh(tanh(z)) * 10000.0) as i32); // 7000
+
+    // Direct scalar values (the inlined-MIR path).
+    let a: f32 = 0.5;
+    let b: f32 = 2.0;
+    print((asinh(a) * 10000.0) as i32); // asinh(0.5)  = 0.481212 -> 4812
+    print((acosh(b) * 10000.0) as i32); // acosh(2.0)  = 1.316958 -> 13169
+    print((atanh(a) * 10000.0) as i32); // atanh(0.5)  = 0.549306 -> 5493
+
+    // asinh is odd: asinh(-3) = -asinh(3) — exercises the sign-stable large-|x| branch.
+    let na: f32 = -3.0;
+    print((asinh(na) * 10000.0) as i32); // -1.818446 -> -18184
+
+    // Vectorized asinh over an array lowers to the 256-bit dispatch (kernel path); checksum the 8 lanes.
+    let mut xs: [f32; 8] = [0.0; 8];
+    let mut i: i32 = 0;
+    while i < 8 {
+        xs[i] = (i as f32) * 0.5 - 2.0;
+        i = i + 1;
+    }
+    let mut out: [f32; 8] = [0.0; 8];
+    let mut k: i32 = 0;
+    while k < 8 {
+        out[k] = asinh(xs[k]);
+        k = k + 1;
+    }
+    let mut s: f32 = 0.0;
+    let mut m: i32 = 0;
+    while m < 8 {
+        s = s + out[m];
+        m = m + 1;
+    }
+    print((s * 10000.0) as i32); // checksum -> -14436
+    return 0;
+}
