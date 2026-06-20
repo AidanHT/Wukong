@@ -13,19 +13,28 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - Modules, functions (including recursion and mutual recursion), and direct calls.
 - `let`/`let mut`/`const`, shadowing, block-as-expression values.
 - Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
-  precision** (interpreter and native agree exactly); **`bf16` is real 2-byte storage** rounded to
-  bf16 (round-to-nearest-even) on store and on `as bf16`, with `f32` compute; `f16` still promotes to
-  `f32` on the CPU (its real low-precision path is the GPU's F16C/tensor cores); `f64` is full.
-- **bf16 mixed-precision reductions → SIMD dispatch**: a `s += (x[k] as f32) [* (y[k] as f32)]`
-  reduction over `[bf16; _]` arrays (bf16 storage, **f32 accumulate** — the standard ML contract) is
-  recognized and lowered to the `mercury_dot_bf16` / `mercury_sum_bf16` runtime kernels (widen bf16→f32,
-  8-lane f32 accumulate). A bandwidth win that grows as the working set spills L3: ~3.0–3.5× vs C for
-  dot, ~6–8× for sum (`tests/run/reduce_bf16.mer`; `differential_bf16_reduce` pins native==interp).
-- **bf16 mixed-precision elementwise → SIMD dispatch**: `out[k] = a*(x[k] as f32) + b*(y[k] as f32)`
-  over `[bf16; _]` inputs with an f32 output (saxpy/axpby/add) lowers to `mercury_axpby_bf16` (AVX2
-  widen+fmadd, f32 math). bf16 in + f32 out streams 8 bytes/elem vs the f32 kernel's 12 → ~1.3× on a
-  working set ≫ L3 (`differential_bf16_axpby`; `axpby_bf16_bandwidth`). Requires two additive terms
-  (a 1-term scale would force a `0*inf` the source lacks). A bf16 *output* (→ ~2×) is future work.
+  precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
+  rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
+  with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
+  shortcut and Cranelift x64 has no f16 convert lowering, so f16 cast/load/store call shared `half`-crate
+  shims (`mercury_f32_to_f16_bits`/`mercury_f16_bits_to_f32`) the interpreter uses too — bit-exact by
+  construction. `f64` is full. (The GPU adds tensor-core fp16/bf16/fp8 GEMM on top.)
+- **Mixed-precision (bf16 *and* f16) CPU suite → SIMD dispatch**: low-precision `[bf16]`/`[f16]` arrays
+  read through an `as f32` widening cast (lossless: `<<16` for bf16, F16C `vcvtph2ps` for f16) with
+  **f32 accumulate/compute** — the standard ML contract — are recognized and lowered to half-precision
+  runtime kernels. Symmetric across both precisions:
+  - **reductions** `dot`/`sum` (`mercury_{dot,sum}_{bf16,f16}`) — ~3.0–3.5× vs C for dot, ~6–8× for
+    sum, growing as the working set spills L3 (`tests/run/reduce_{bf16,f16}.mer`);
+  - **max/min/absmax** (`mercury_reduce_{bf16,f16}(x,n,op)`) — the per-tensor absmax is the
+    symmetric-quantization scale; exact (max/min round nothing) (`reduce_bf16_minmax.mer`);
+  - **streaming axpby** `out = a·x + b·y` (`mercury_axpby_{bf16,f16}`), half-in/f32-out, ~1.3× ≫ L3
+    (requires two additive terms; a 1-term scale would force a `0*inf` the source lacks);
+  - **activations** — the full 28-op transcendental set over a half-precision input
+    (`mercury_vmath_{bf16,f16}`, `out[i] = f((x[i] as f32))`).
+  The recognizers are precision-generic (`match_lowp_reduction`/`match_lowp_axpby`/`match_vmath_stmt`),
+  and the interpreter marshals through the identical kernel, so native == interp bit-for-bit. C/Rust
+  can vectorize neither a `libm` call nor the half→f32 widen, so the gap is structural. A half-precision
+  *output* (→ ~2× on the streaming ops) needs a narrowing store and is future work.
 - All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
@@ -174,10 +183,12 @@ remaining stretch; today unrecognized ops execute on the CPU within the same off
 
 ## Known limitations / sharp edges
 
-- `bf16` is now real 2-byte storage at bf16 precision (round-to-nearest-even), f32 compute; `f16`
-  still promotes to `f32`. On this AVX2 box (no AVX-512-BF16) a bf16 *GEMM* would widen to f32 and
-  match f32 throughput — a memory-footprint feature, not a FLOP/s win — so it is left at the proven
-  correctness path (`tests/run/matmul_bf16.mer`), not a tuned bf16 kernel.
+- `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
+  symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above). On this
+  AVX2+F16C box (no AVX-512-BF16) a half-precision *GEMM* would widen to f32 and match f32 throughput
+  — a memory-footprint feature, not a FLOP/s win — so it is left at the proven correctness path
+  (`tests/run/matmul_bf16.mer`), not a tuned half kernel. A half-precision *output* on the streaming
+  ops (→ ~2×) needs a narrowing store and is still future work.
 - The *general* vectorizer emits 128-bit SIMD (Cranelift's vector ISA rejects 256-bit `f32x8` —
   verified empirically on Cranelift 0.124). Compute-bound *elementwise* kernels therefore use 2× the
   FMA ports they could; 4× unrolling and auto-parallelism recover throughput, and the vectorized
