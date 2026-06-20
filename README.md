@@ -32,7 +32,10 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   gcc/rustc call scalar `libm` and **cannot vectorize a loop containing the call**;
 - **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form) **~1.7–6.7×**
   and **convolution** (im2col + GEMM) **~5–7×**;
-- **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~8× parallel** and **bf16 reductions ~3–8×**;
+- **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~8× parallel**, and runs a full
+  **bf16 *and* f16 mixed-precision CPU suite** — `dot`/`sum` (**~3–8×**), `max`/`min`/`absmax`
+  (the symmetric-quant scale), streaming `axpby`, and the 28-op activation set — all half-in/f32-out,
+  where C/Rust can vectorize neither `libm` nor the half→f32 widen (f16 via the F16C `vcvtph2ps`);
 - **wins reductions ~2.6–3.6×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
   which gcc/rustc leave serial;
 - is **~1.8–26× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and

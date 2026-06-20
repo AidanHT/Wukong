@@ -77,6 +77,17 @@ All notable changes to Mercury are documented here. The format is loosely based 
 - **`@parallel`**: loops execute across CPU cores via a rayon runtime, each per-core chunk itself
   vectorized — ~2.2–8× faster than idiomatic single-threaded C on the (memory-bound) elementwise and
   reduction kernels.
+- **Mixed-precision (bf16 *and* f16) → SIMD dispatch**: both `bf16` and `f16` are real 2-byte storage
+  (round-to-nearest-even on store/cast, f32 compute; bf16 via inline bit-math, f16 via shared
+  `half`-crate shims since Cranelift x64 lacks f16 convert lowering). A full, symmetric op suite over
+  `[bf16]`/`[f16]` arrays read through an `as f32` widening cast (lossless: `<<16` for bf16, F16C
+  `vcvtph2ps` for f16) with f32 accumulate/compute dispatches to half-precision runtime kernels:
+  **`dot`/`sum`** (`mercury_{dot,sum}_{bf16,f16}`, ~3–8× vs C), **`max`/`min`/`absmax`**
+  (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric int8-quant scale), **streaming
+  `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **28-op activation set**
+  (`mercury_vmath_{bf16,f16}`). Precision-generic recognizers; the interpreter marshals through the
+  identical kernel, so native == interp bit-for-bit. C/Rust can vectorize neither a `libm` call nor the
+  half→f32 widen, so the gap is structural.
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
   with a runtime index, and array parameters passed by base pointer (out-params work). Real kernels
   (dot product, SAXPY, a flat GEMM) run on the interpreter.

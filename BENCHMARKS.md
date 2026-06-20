@@ -47,12 +47,18 @@ naively-written source:
   single-core** — the lead widening with size — and ~4.6–14.7× with `@parallel` (clock-state-dependent;
   parallel int8 is bandwidth-bound). Integer math, so the kernel equals the scalar nest
   *bit-for-bit* (i32 add is associative mod 2³²; no reassociation exception).
-- **bf16 mixed-precision reduction dispatch.** A `s += (x[k] as f32) [* (y[k] as f32)]` reduction over
-  `[bf16; _]` arrays (bf16 storage, f32 accumulate — the standard ML contract) is recognized and
-  lowered to **`mercury_dot_bf16`** / **`mercury_sum_bf16`** (widen bf16→f32, 8-lane f32 accumulate).
-  Because bf16 moves **half the bytes** of f32, this is a *bandwidth* win that grows as the data spills
-  cache: **~3.0–3.5× vs C** for dot, **~6–8×** for sum (C's unary f32 sum is latency-bound). bf16
-  storage is bit-exact across backends, and both call the identical kernel, so the gate stays exact.
+- **bf16 *and* f16 mixed-precision dispatch (full suite).** Low-precision `[bf16]`/`[f16]` arrays read
+  through an `as f32` widening cast (lossless: `<<16` for bf16, F16C `vcvtph2ps` for f16) with f32
+  accumulate/compute — the standard ML contract — dispatch to half-precision runtime kernels across the
+  whole op surface, *symmetric* for both precisions: **`dot`/`sum`** (`mercury_{dot,sum}_{bf16,f16}`),
+  **`max`/`min`/`absmax`** (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric-quant
+  scale), **streaming `axpby`** (`mercury_axpby_{bf16,f16}`, half-in/f32-out), and the **28-op activation
+  set** (`mercury_vmath_{bf16,f16}`). Because half precision moves **half the input bytes** of f32, the
+  memory-bound ops are *bandwidth* wins that grow as the data spills cache: **~3.0–3.5× vs C** for dot,
+  **~6–8×** for sum; and C/Rust can vectorize neither a `libm` call nor the half→f32 widen, so the
+  activation gap is structural. Half storage is bit-exact across backends (f16 via shared `half`-crate
+  shims, since Cranelift x64 lacks f16 convert lowering), and both call the identical kernel, so the gate
+  stays exact.
 - **Reduction vectorization + multicore dispatch.** A naive f32 reduction (`s += x[i]*y[i]`) is one
   FMA down a single dependency chain — latency-bound. Mercury reassociates it across vector lanes ×
   unrolled accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without
@@ -337,7 +343,7 @@ compute-bound (which does). Rust trails badly: rustc does not auto-vectorize the
 so it runs essentially scalar. The interpreter marshals the identical kernel, so the differential
 oracle stays bit-for-bit exact, and the recognizer runs pre-opt so `-O0` == `-O3`.
 
-### bf16 mixed-precision reductions — bf16 storage, f32 accumulate
+### bf16 / f16 mixed-precision — half storage, f32 accumulate
 
 The ML mixed-precision contract: store activations in `bf16` (half the bytes), accumulate the
 reduction in `f32` (full precision). Mercury recognizes a `s += (x[k] as f32) [* (y[k] as f32)]`
@@ -364,6 +370,16 @@ is bit-exact across the interpreter and native backends (`round_to_bf16` emits t
 arithmetic as the interpreter's `round_bf16`), and both call the identical reduction kernel, so the
 differential gate stays exact for *fractional, non-bf16-exact* inputs across `-O0`/`-O2`/`-O3`
 (`differential_bf16_reduce`); `tests/run/reduce_bf16.mer` pins the e2e value.
+
+The same dispatch is now **symmetric for `f16`** (widened with the F16C `vcvtph2ps` instruction
+instead of the bf16 `<<16`; f16 storage is bit-exact via shared `half`-crate shims, since Cranelift
+x64 has no f16 convert lowering) and **extended across the op surface** for both precisions:
+**`max`/`min`/`absmax`** (`mercury_reduce_{bf16,f16}` — the per-tensor absmax is the symmetric int8
+quant scale; exact, since max/min round nothing), **streaming `axpby`** (`out = a·x + b·y`,
+half-in/f32-out, ~1.3× ≫ L3), and the **28-op activation set** (`mercury_vmath_{bf16,f16}`, where the
+cheap ops gain bandwidth and the transcendentals keep the full libm-vectorization win — C can vectorize
+neither the `libm` call nor the half→f32 widen). e2e: `tests/run/{f16,reduce_f16,reduce_bf16_minmax,
+vmath_{bf16,f16},axpby_f16}.mer`; all bit-exact interp == native.
 
 ### Single-threaded elementwise & reductions
 
