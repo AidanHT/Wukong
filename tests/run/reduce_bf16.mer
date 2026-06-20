@@ -1,0 +1,34 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 72
+// EXPECT-OUT: 36
+module tests.run.reduce_bf16
+
+// bf16 mixed-precision reductions: `s += (x[k] as f32) [* (y[k] as f32)]` over `[bf16; _]` arrays
+// with an f32 accumulator dispatches to mercury_dot_bf16 / mercury_sum_bf16 (bf16 storage, f32
+// accumulate — the standard ML contract). The values here are bf16-exact small integers, so the
+// fused kernel and a naive sum agree exactly; the mercury_bench gate proves the interpreter and the
+// native backend agree bit-for-bit (both call the identical kernel).
+fn main() -> i32 {
+    let mut x: [bf16; 8] = [0.0 as bf16; 8];
+    let mut y: [bf16; 8] = [0.0 as bf16; 8];
+    for i in 0..8 {
+        x[i] = ((i + 1) as f32) as bf16; // 1, 2, ..., 8
+        y[i] = 2.0 as bf16; // all 2
+    }
+
+    // dot = Σ x[k]·y[k] = 2·(1+2+…+8) = 144? no: 2·36 = 72.
+    let mut d: f32 = 0.0;
+    for k in 0..8 {
+        d = d + (x[k] as f32) * (y[k] as f32);
+    }
+    print(d as i32); // 72
+
+    // sum = Σ x[k] = 36.
+    let mut s: f32 = 0.0;
+    for k in 0..8 {
+        s = s + (x[k] as f32);
+    }
+    print(s as i32); // 36
+    return 0;
+}
