@@ -11,6 +11,10 @@ use mercury_span::{Interner, SourceMap};
 
 pub use mercury_diag::{all_explanations, explain, Explanation};
 
+/// The GPU offloading bridge (`--backend=gpu`), compiled only with the `gpu` feature.
+#[cfg(feature = "gpu")]
+mod gpu_accel;
+
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EmitStage {
@@ -54,6 +58,10 @@ pub enum BackendKind {
     Interp,
     /// Cranelift native codegen — JIT for `--run`, object/exe for `--emit`.
     Native,
+    /// GPU offload (`--features gpu`): the interpreter tree-walks the program but runs recognized
+    /// GEMM / norm / activation / reduction calls on the local CUDA device. Tolerance-gated against
+    /// the interpreter oracle (the CPU↔GPU boundary cannot be bit-exact).
+    Gpu,
 }
 
 /// Compiler invocation options, normally produced by the CLI.
@@ -190,6 +198,7 @@ pub fn compile(opts: &Options) -> i32 {
         let result = match opts.backend {
             BackendKind::Interp => mercury_interp::run_with_output(&program, main, &interner),
             BackendKind::Native => mercury_codegen_cranelift::jit_run(&program, main, &interner),
+            BackendKind::Gpu => run_on_gpu(&program, main, &interner),
         };
         return match result {
             Ok((exit_code, stdout)) => {
@@ -222,6 +231,41 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     exit::OK
+}
+
+/// Execute `entry` on the GPU backend: the interpreter tree-walks the program while recognized kernel
+/// calls run on the device (see [`gpu_accel`]). Built only with `--features gpu`.
+#[cfg(feature = "gpu")]
+fn run_on_gpu(
+    program: &mercury_mir::Program,
+    entry: mercury_span::Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    let mut guard = mercury_codegen_gpu::gpu();
+    match guard.as_mut() {
+        Some(g) => {
+            let mut accel = gpu_accel::GpuAccel::new(g);
+            mercury_interp::run_with_output_accel(program, entry, interner, &mut accel)
+        }
+        None => Err(
+            "`--backend=gpu` requires a CUDA device, but none was reachable (the driver \
+                     dlopens `nvcuda.dll`; check the NVIDIA driver is installed)"
+                .into(),
+        ),
+    }
+}
+
+/// Without the `gpu` feature, `--backend=gpu` is a clear build-time-capability error rather than a
+/// silent fallback (which would dishonestly run on the CPU when the user asked for the GPU).
+#[cfg(not(feature = "gpu"))]
+fn run_on_gpu(
+    _program: &mercury_mir::Program,
+    _entry: mercury_span::Symbol,
+    _interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    Err("this `mercuryc` was built without GPU support; rebuild with `--features gpu` (or, from the \
+         workspace, `-p mercuryc --features gpu`) to use `--backend=gpu`"
+        .into())
 }
 
 /// The C runtime linked into native executables: it backs the `print`/`assert` intrinsics that the
@@ -334,5 +378,96 @@ fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceM
 fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
     for d in sink.diagnostics() {
         emit_diag(d, fmt, renderer, sm);
+    }
+}
+
+/// End-to-end GPU-backend gate: the `--backend=gpu` path (offloading interpreter + [`gpu_accel`])
+/// must match the pure-interpreter oracle within the CPU↔GPU tolerance over the **same** lowered MIR.
+/// Only built with `--features gpu`; skips (does not fail) when no CUDA device is present.
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_e2e_tests {
+    use super::*;
+    use mercury_codegen_gpu::diff::{assert_close, Rng};
+    use mercury_span::SourceMap;
+
+    /// Lex → parse → sema → mir_build → opt(2), asserting each stage is clean. The recognizers run in
+    /// mir_build, so the resulting MIR already carries the `mercury_sgemm_nt` call the GPU offloads.
+    fn build(src: &str) -> (mercury_mir::Program, Interner) {
+        let mut sm = SourceMap::new();
+        let id = sm.add("gpu_e2e.mer".to_string(), src.to_string());
+        let (tokens, ld) = mercury_lexer::tokenize(sm.source(id), id);
+        assert!(!ld.iter().any(|d| d.is_error()), "lex errors");
+        let mut interner = Interner::new();
+        let (module, pd) =
+            mercury_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        assert!(!pd.iter().any(|d| d.is_error()), "parse errors");
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema errors");
+        let (mut program, md) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(!md.iter().any(|d| d.is_error()), "mir_build errors");
+        mercury_opt::optimize(&mut program, 2);
+        (program, interner)
+    }
+
+    /// The `ijk` `C = A·Bᵀ` (nn.Linear) nest that the recognizer lowers to `mercury_sgemm_nt`.
+    fn linear_src(m: usize, k: usize, n: usize) -> String {
+        format!(
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],c:[f32;{mn}]) {{ \
+             for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
+             for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} }}",
+            mk = m * k,
+            nk = n * k,
+            mn = m * n
+        )
+    }
+
+    #[test]
+    fn gpu_backend_linear_matches_interp_within_tol() {
+        let mut guard = mercury_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                eprintln!("skip gpu_backend_linear_matches_interp_within_tol: no CUDA device");
+                return;
+            }
+        };
+        let mut rng = Rng::new(0x00C0FFEE);
+        for &(m, k, n) in &[(8usize, 16usize, 8usize), (16, 32, 16), (32, 48, 24)] {
+            let (program, mut interner) = build(&linear_src(m, k, n));
+            let entry = interner.intern("lin");
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let b = rng.vec(n * k, -1.0, 1.0);
+
+            // CPU oracle (no accelerator).
+            let (mut ac, mut bc, mut cc) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cc];
+                mercury_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+
+            // GPU offload over the identical MIR + inputs.
+            let (mut ag, mut bg, mut cg) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut cg];
+                mercury_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            assert!(
+                accel.calls >= 1,
+                "{m}x{k}x{n}: GPU offload never fired — the nest did not lower to sgemm_nt, so this \
+                 would silently test CPU-vs-CPU"
+            );
+
+            // tol = c·√K·ε (the sgemm_matches_naive shape): both sides are f32, K-reduction order differs.
+            let rel_tol = (16.0 * (k as f64).sqrt() * f32::EPSILON as f64).max(1e-5);
+            let s = assert_close(&format!("linear {m}x{k}x{n}"), &cg, &cc, 1e-4, rel_tol);
+            eprintln!(
+                "gpu --backend linear {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                accel.calls, s.max_abs, s.max_rel
+            );
+        }
     }
 }

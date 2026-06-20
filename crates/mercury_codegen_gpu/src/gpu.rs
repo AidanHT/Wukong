@@ -134,6 +134,18 @@ fn vmath_entry(op: i64) -> &'static str {
     }
 }
 
+/// Whether [`vmath`] has a GPU kernel for activation op `op`. The `--backend=gpu` offload checks this
+/// and falls back to the CPU kernel for activations not yet on the GPU (instead of panicking).
+pub fn vmath_supported(op: i64) -> bool {
+    use mercury_runtime::{VM_EXP, VM_GELU, VM_RELU, VM_SIGMOID, VM_SILU, VM_TANH};
+    op == VM_RELU
+        || op == VM_EXP
+        || op == VM_SIGMOID
+        || op == VM_TANH
+        || op == VM_SILU
+        || op == VM_GELU
+}
+
 /// Fixed reduction grid — see `ptx::REDUCE`. The grid is independent of input size and occupancy, so
 /// the GPU result is identical run-to-run (determinism by fixed decomposition, not associativity).
 pub const RED_GRID: u32 = 256;
@@ -179,6 +191,18 @@ pub fn reduce(g: &mut Gpu, op: i64, x: &[f32], y: Option<&[f32]>) -> Result<f32,
         acc = if is_max { acc.max(p) } else { acc + p };
     }
     Ok(acc)
+}
+
+/// Whether [`reduce`] has a GPU kernel for reduction op `op` (sum/dot/max so far). The
+/// `--backend=gpu` offload checks this and falls back to the CPU kernel for the rest.
+pub fn reduce_supported(op: i64) -> bool {
+    use mercury_runtime::{RED_DOT, RED_SUM};
+    op == RED_SUM || op == RED_DOT || op == RED_MAX
+}
+
+/// Whether reduction op `op` consumes the second operand `y` (only the dot product does).
+pub fn reduce_needs_y(op: i64) -> bool {
+    op == mercury_runtime::RED_DOT
 }
 
 /// Launch config for the 16×16-tiled GEMM: one 16×16 thread block per 16×16 C tile.
