@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1954
+// EXPECT-OUT: 841
+// EXPECT-OUT: 12
+// EXPECT-OUT: 768
+module tests.run.parallel_lowp
+
+// `@parallel` mixed-precision streaming: the half-precision activation and axpby kernels dispatch
+// per-thread chunk too (each chunk is one `mercury_vmath_{bf16,f16}` / `mercury_axpby_{bf16,f16}`
+// call over `[s, e)`), so a mixed-precision activation/residual-add runs multicore — the bandwidth
+// payoff is largest here (≫ L3). Elementwise + a fixed chunking, so each per-chunk pass agrees with
+// the interpreter's whole-range marshal of the identical kernel: interp == native, -O0 == -O3.
+
+@parallel
+fn act_bf16(x: [bf16; 64], out: [f32; 64]) {
+    for i in 0..64 { out[i] = gelu((x[i] as f32)); }
+}
+
+@parallel
+fn axpby_f16(x: [f16; 64], y: [f16; 64], out: [f32; 64]) {
+    for i in 0..64 { out[i] = 2.0 * (x[i] as f32) + 1.0 * (y[i] as f32); }
+}
+
+fn main() -> i32 {
+    // @parallel bf16 activation: x[i] = (i-32)*0.125 (bf16-exact) → gelu over the chunked range.
+    let mut xb: [bf16; 64] = [0.0 as bf16; 64];
+    for i in 0..64 { xb[i] = ((i as f32 - 32.0) * 0.125) as bf16; }
+    let mut g: [f32; 64] = [0.0; 64];
+    act_bf16(xb, g);
+    print((g[48] * 1000.0) as i32); // gelu(2.0) = 1954
+    print((g[40] * 1000.0) as i32); // gelu(1.0) = 841
+
+    // @parallel f16 axpby: out = 2x + y, x=[1..64], y=[10,20,...,640].
+    let mut xf: [f16; 64] = [0.0 as f16; 64];
+    let mut yf: [f16; 64] = [0.0 as f16; 64];
+    for i in 0..64 { xf[i] = ((i + 1) as f32) as f16; yf[i] = (((i + 1) * 10) as f32) as f16; }
+    let mut o: [f32; 64] = [0.0; 64];
+    axpby_f16(xf, yf, o);
+    print(o[0] as i32);  // 2*1 + 10 = 12
+    print(o[63] as i32); // 2*64 + 640 = 768
+    return 0;
+}
