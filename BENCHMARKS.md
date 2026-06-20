@@ -444,7 +444,11 @@ projections → flash-attention → output projection → residual → RMSNorm �
 runs entirely on the device: inputs/weights upload once, every op reads/writes device buffers with no
 host round-trip of activations between them, only the final `[S, D]` copies back. It matches a CPU
 f64 reference of the same layer to **max_abs 6e-7, max_rel 2.7e-4** (errors barely accumulate across
-the 8-op chain) — the payoff of having every transformer op as a device kernel.
+the 8-op chain) — the payoff of having every transformer op as a device kernel. End-to-end latency
+(`d=64`, `dff=256`, full call incl. weights H2D + D2H — a real model keeps weights resident, so this
+is conservative): **1.33 ms/layer at S=256, 3.13 at S=512, 6.07 at S=1024** (~160–190 K tokens/s).
+The layer is **deterministic** — bit-identical run-to-run, since every kernel uses a fixed grid and
+warp-butterfly reductions with no atomics.
 
 **Other op categories** (all emit+execute, tolerance-gated on the 4050): elementwise (saxpy/vadd),
 deterministic reductions (sum/dot/max — bit-exact for max, tolerance for the f32 sums), activations
