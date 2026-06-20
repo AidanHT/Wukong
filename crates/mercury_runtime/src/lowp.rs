@@ -490,6 +490,79 @@ mod tests {
         );
     }
 
+    /// Bandwidth win for the streaming **axpby** (`out = a·x + b·y`): bf16 inputs + f32 output move
+    /// 8 bytes/elem vs an all-f32 axpby's 12, so on a working set ≫ L3 the bf16-in kernel runs ~1.5×
+    /// faster. Compares `mercury_axpby_bf16` to a plain (rustc-autovectorized) f32 axpby.
+    /// Run: `cargo test -p mercury_runtime --release axpby_bf16_bandwidth -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "bandwidth bench; run explicitly in --release"]
+    fn axpby_bf16_bandwidth() {
+        use std::time::Instant;
+        let n = 32 << 20; // 32M elems — bf16 in 128 MB, f32 in 256 MB, both ≫ L3
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 251) as f32) * 0.001).collect();
+        let ys: Vec<f32> = (0..n).map(|i| ((i % 199) as f32) * 0.002).collect();
+        let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+        let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+        let (a, b) = (1.5f32, 0.75f32);
+        let best = |iters: usize, mut f: Box<dyn FnMut()>| -> f64 {
+            f();
+            let mut t = f64::INFINITY;
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                f();
+                t = t.min(t0.elapsed().as_secs_f64());
+            }
+            t
+        };
+
+        let (xp, yp) = (xbf.as_ptr() as usize, ybf.as_ptr() as usize);
+        let mut out_bf = vec![0f32; n];
+        let obp = out_bf.as_mut_ptr() as usize;
+        let t_bf = best(
+            5,
+            Box::new(move || unsafe {
+                mercury_axpby_bf16(
+                    xp as *const u16,
+                    yp as *const u16,
+                    obp as *mut f32,
+                    n as i64,
+                    a,
+                    b,
+                );
+                std::hint::black_box(obp);
+            }),
+        );
+        let (xfp, yfp) = (xs.as_ptr() as usize, ys.as_ptr() as usize);
+        let mut out_f = vec![0f32; n];
+        let ofp = out_f.as_mut_ptr() as usize;
+        let t_f = best(
+            5,
+            Box::new(move || unsafe {
+                let x = std::slice::from_raw_parts(xfp as *const f32, n);
+                let y = std::slice::from_raw_parts(yfp as *const f32, n);
+                let o = std::slice::from_raw_parts_mut(ofp as *mut f32, n);
+                for i in 0..n {
+                    o[i] = a * x[i] + b * y[i];
+                }
+                std::hint::black_box(ofp);
+            }),
+        );
+        let gbps = |bytes: f64, t: f64| bytes / t / 1e9;
+        let nf = n as f64;
+        eprintln!("axpby out=a·x+b·y over {n} elements (best of 5):");
+        eprintln!(
+            "  rust f32  (autovec, 12 B/elem): {:.2} ms  {:.0} GB/s",
+            t_f * 1e3,
+            gbps(12.0 * nf, t_f)
+        );
+        eprintln!(
+            "  merc bf16-in/f32-out (8 B/elem): {:.2} ms  {:.0} GB/s  → {:.2}× faster",
+            t_bf * 1e3,
+            gbps(8.0 * nf, t_bf),
+            t_f / t_bf
+        );
+    }
+
     #[test]
     fn within_ulp_tolerance_of_f64_reference() {
         let n = 1 << 16;
