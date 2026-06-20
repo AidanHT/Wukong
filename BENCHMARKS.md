@@ -556,6 +556,18 @@ unlike the driver's opaque/clearable compute cache it is **portable and determin
 runs. Every kernel load now flows through it (`Gpu::load_module_cached`), degrading gracefully to a
 direct PTX JIT on any cache miss/failure, so it can never break a load that would otherwise succeed.
 
+**Memory-bound bandwidth (M9): ≥90% of peak HBM.** The denominator is honest — the device's *own*
+theoretical peak from its memory clock × bus width (`cuDeviceGetAttribute`, the exact `deviceQuery`
+formula `2 × clock × busBytes`), reading **192.0 GB/s** on the RTX 4050, dead-on the spec. Measured on
+256 MB/array buffers (far past L2, so it's DRAM not cache), best-of-N to capture the un-throttled clock
+(the laptop dynamically down-clocks memory — the *same* kernel spanned 63%–96% of peak across runs
+purely from clock state, so a single round is meaningless and the best round is the device's true
+capability): the **saxpy triad reaches 183.9 GB/s = 95.7% of peak** (M9 met — a memory-bound kernel at
+≥90%). The vectorized copy (`COPY_V4`, 128-bit `ld/st.global.v4` with 4× ILP — four independent float4
+loads in flight per thread, the memory-level parallelism a 1:1 read/write copy needs to hide latency +
+bus turnaround) sits at 168.8 GB/s = 87.9%, the 1:1 mix's turnaround tax. Correctness gates speed: the
+copy is checked bitwise-exact first. Reproduce: `… --ignored --nocapture hbm_bandwidth`.
+
 **Internal fp16 WMMA roofline** (retained as a same-run, clock-invariant compute ceiling — one fragment
 load then a long `wmma.mma` loop over 4 independent accumulators, ~zero hot-loop memory traffic): the
 fp16-mt GEMM sits at ~25–72% of it and fp8-mt at ~75–100% of it across 2048³–4096³. The roofline itself

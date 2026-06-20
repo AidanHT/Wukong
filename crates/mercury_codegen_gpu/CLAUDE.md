@@ -19,7 +19,8 @@ toolkit — only **running** needs the driver + a device.
 - `src/lib.rs` — crate root; `GPU_ENABLED` const; re-exports behind `#[cfg(feature = "gpu")]`.
 - `src/gpu.rs` — host harness: `Gpu` (context + default stream + PTX-module cache), the process-wide
   `gpu()` accessor (a `Mutex<Option<Gpu>>` — `None` means no device → tests *skip*, not fail), and the
-  typed launch wrappers: `saxpy`/`vadd`, `vmath` (activations), `reduce` (sum/dot/max), `gemm_nt`/`_rb`
+  typed launch wrappers: `saxpy`/`vadd`/`copy` (streaming), `vmath` (activations), `reduce` (sum/dot/max),
+  device-property queries `peak_hbm_gbs`/`sm_count` (the M9 bandwidth denominator), `gemm_nt`/`_rb`
   (f32, simple + register-blocked), `gemm_nt_f16`/`_bf16` (WMMA tensor core), `gemm_nt_fp8` + `fp8_tile`
   (fp8 mma.sync), `norm` (softmax/LayerNorm/RMSNorm), `conv2d`, `flash_attn`, and `transformer_layer`
   (a whole pre-norm encoder layer, end-to-end GPU-resident — chains the above on device buffers with no
@@ -28,7 +29,8 @@ toolkit — only **running** needs the driver + a device.
   emit SASS; `Gpu::load_module_cached` caches it on disk (keyed by PTX hash + driver version) so warm
   processes load precompiled cubins via `cuModuleLoad` instead of re-JITing. Graceful fallback to a
   direct PTX JIT on any miss/failure.
-- `src/ptx.rs` — base PTX (saxpy/vadd/vmath/reduce/simple GEMM), target `sm_89`.
+- `src/ptx.rs` — base PTX (saxpy/vadd/vmath/reduce/simple GEMM) + `COPY_V4`, the vectorized streaming
+  copy (128-bit `ld/st.global.v4` with 4× ILP) that drives the M9 HBM-bandwidth bench; target `sm_89`.
 - `src/ptx_gemm.rs` — register-blocked f32 GEMM generator (64×64 tile, 4×4/thread).
 - `src/ptx_wmma.rs` — WMMA fp16/bf16 tensor-core GEMM generators: single-tile, fragment-reuse `_mt`,
   shared-memory-staged `_sm` (cooperative CTA tiles, vectorized 128-bit loads), **`cp.async`
