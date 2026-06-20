@@ -82,6 +82,7 @@ const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_SGEMM_NT_EPI_PAR: &str = "mercury_sgemm_nt_epi_parallel";
 const RT_VMATH: &str = "mercury_vmath_f32";
+const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
@@ -750,12 +751,14 @@ impl<'a> FnTranslator<'a> {
         // The vectorized elementwise transcendental: mercury_vmath_f32(x, out, n, op) — two pointers
         // and two i64 (element count, op code). The 256-bit AVX2 kernel an `out[i]=f(x[i])` loop
         // lowers to.
-        if name == RT_VMATH && args.len() == 4 {
+        // Same 4-arg shape for the bf16-input twin `mercury_vmath_bf16` (x is a `[bf16]` pointer; the
+        // kernel widens losslessly). Identical signature, so just route by name.
+        if (name == RT_VMATH || name == RT_VMATH_BF16) && args.len() == 4 {
             let x = self.val(args[0]);
             let out = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
             let op = self.coerce_to_i64(args[3]);
-            let fref = self.rt_refs[RT_VMATH];
+            let fref = self.rt_refs[name];
             self.builder.ins().call(fref, &[x, out, n, op]);
             return None;
         }
@@ -987,6 +990,7 @@ struct RtFuncs {
     sgemm_nt_epi: FuncId,
     sgemm_nt_epi_par: FuncId,
     vmath: FuncId,
+    vmath_bf16: FuncId,
     velem: FuncId,
     vhorner: FuncId,
     sred: FuncId,
@@ -1198,6 +1202,10 @@ fn populate_module<M: Module>(
         vmath: module
             .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        // bf16-input twin: identical (ptr, ptr, i64, i64) signature.
+        vmath_bf16: module
+            .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         velem: module
             .declare_function(RT_VELEM, Linkage::Import, &sig_velem)
             .map_err(|e| e.to_string())?,
@@ -1313,6 +1321,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VMATH,
                 module.declare_func_in_func(rt.vmath, builder.func),
+            );
+            rt_refs.insert(
+                RT_VMATH_BF16,
+                module.declare_func_in_func(rt.vmath_bf16, builder.func),
             );
             rt_refs.insert(
                 RT_VELEM,
@@ -1497,6 +1509,10 @@ pub fn jit_compile(
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
+    builder.symbol(
+        RT_VMATH_BF16,
+        mercury_runtime::mercury_vmath_bf16 as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
@@ -1626,6 +1642,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
+    builder.symbol(
+        RT_VMATH_BF16,
+        mercury_runtime::mercury_vmath_bf16 as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,

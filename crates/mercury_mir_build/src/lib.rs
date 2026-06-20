@@ -43,6 +43,7 @@ pub fn lower_program(
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
+        vmath_bf16: interner.intern("mercury_vmath_bf16"),
         velem: interner.intern("mercury_velem_f32"),
         vhorner: interner.intern("mercury_vhorner_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
@@ -445,6 +446,10 @@ struct GemmSyms {
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
+    /// The **bf16-input** twin (`mercury_vmath_bf16(x, out, n, op)`): an `out[i] = f((x[i] as f32))`
+    /// loop over a `[bf16]` array (f32 output) lowers to this — same 256-bit kernel, half the input
+    /// bytes (a lossless widen), so the cheap memory-bound ops gain ~1.3× over the f32 path.
+    vmath_bf16: Symbol,
     /// The streaming affine+activation kernel (`mercury_velem_f32(x, y, out, n, a, b, c, op)`): a
     /// recognized `out[i] = act(a·x[i] (+ b·y[i]) + c)` map loop (saxpy / scale / residual-add /
     /// bias / ReLU / ReLU6) lowers to this — 256-bit AVX2 + non-temporal stores for a large output.
@@ -2773,7 +2778,7 @@ impl FnLowerer<'_> {
 
     /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
     /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
-    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32)> {
+    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32, bool)> {
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -2826,28 +2831,46 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Log1p) => VMATH_LOG1P,
             _ => return None,
         };
-        let x_sym = self.index_by_loopvar(&args[0], j)?;
-        // f32-only (the kernel computes f32); bail on f64 / unknown.
-        if self.expr_mir(value) != MirType::F32 || self.expr_mir(&args[0]) != MirType::F32 {
+        // The kernel computes (and writes) f32, so the activation's result must be f32.
+        if self.expr_mir(value) != MirType::F32 {
             return None;
         }
-        Some((out_sym, x_sym, opcode))
+        let arg = &args[0];
+        // bf16-input form `f((x[j] as f32))`: x a `[bf16]` array, widened losslessly, out f32. Dispatch
+        // to `mercury_vmath_bf16` (half the input bytes). Require the out array f32 (the kernel stores
+        // f32 — never let an f32 store land in a 2-byte bf16 slot).
+        if let ExprKind::Cast { expr: inner, .. } = &arg.kind {
+            if self.expr_mir(target) == MirType::F32
+                && scalar_of(arg, self.sema) == Some(mercury_types::Scalar::F32)
+                && scalar_of(inner, self.sema) == Some(mercury_types::Scalar::Bf16)
+            {
+                let x_sym = self.index_by_loopvar(inner, j)?;
+                return Some((out_sym, x_sym, opcode, true));
+            }
+            return None;
+        }
+        // f32 form `f(x[j])`: bail on f64 / unknown.
+        if self.expr_mir(arg) != MirType::F32 {
+            return None;
+        }
+        let x_sym = self.index_by_loopvar(arg, j)?;
+        Some((out_sym, x_sym, opcode, false))
     }
 
     /// Match a transcendental-activation loop body: every statement must be an independent
     /// `out[j] = f(x[j])` over f32 (see [`match_vmath_stmt`]), with every array in scope. Returns the
     /// resolved `(out_base, x_base, op)` per statement, or `None` if any statement fails. Pure — emits
     /// no MIR — so it is safe to call before deciding whether to lower the loop bounds.
-    fn match_vmath_body(&self, j: Symbol, body: &Block) -> Option<Vec<(ValueId, ValueId, u32)>> {
+    fn match_vmath_body(&self, j: Symbol, body: &Block) -> Option<Vec<(ValueId, ValueId, u32, bool)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
-            let (out_sym, x_sym, opcode) = self.match_vmath_stmt(stmt, j)?;
+            let (out_sym, x_sym, opcode, is_bf16) = self.match_vmath_stmt(stmt, j)?;
             let (out_base, _) = self.lookup(out_sym)?;
             let (x_base, _) = self.lookup(x_sym)?;
-            calls.push((out_base, x_base, opcode));
+            calls.push((out_base, x_base, opcode, is_bf16));
         }
         Some(calls)
     }
@@ -2855,15 +2878,27 @@ impl FnLowerer<'_> {
     /// Emit one `mercury_vmath_f32(x+s, out+s, e-s, op)` call per resolved statement over the i64
     /// range `[s, e)`. Each is a full-range pass; in source order they preserve a fused multi-statement
     /// body's per-element semantics (an array is fully written before a later pass reads it).
-    fn emit_vmath_calls(&mut self, s: ValueId, e: ValueId, calls: Vec<(ValueId, ValueId, u32)>) {
+    fn emit_vmath_calls(
+        &mut self,
+        s: ValueId,
+        e: ValueId,
+        calls: Vec<(ValueId, ValueId, u32, bool)>,
+    ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        for (out_base, x_base, opcode) in calls {
+        for (out_base, x_base, opcode, is_bf16) in calls {
+            // bf16 input strides by 2-byte elements through `mercury_vmath_bf16`; f32 input by 4-byte
+            // elements through `mercury_vmath_f32`. The output is always f32.
+            let (in_elem, func) = if is_bf16 {
+                (MirType::BF16, self.gemm.vmath_bf16)
+            } else {
+                (MirType::F32, self.gemm.vmath)
+            };
             let xp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
                     ptr: x_base,
                     index: s,
-                    elem: MirType::F32,
+                    elem: in_elem,
                 },
             );
             let outp = self.builder.build(
@@ -2878,7 +2913,7 @@ impl FnLowerer<'_> {
                 .builder
                 .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
             self.builder.build_void(Op::Call {
-                func: self.gemm.vmath,
+                func,
                 args: vec![xp, outp, n, opv],
             });
         }

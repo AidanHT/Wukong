@@ -89,10 +89,13 @@ unsafe fn widen_f16(p: *const u16) -> __m256 {
     _mm256_cvtph_ps(_mm_loadu_si128(p as *const __m128i))
 }
 
+/// `pub(crate)` so `vmath.rs`'s bf16-input activation kernel (`mercury_vmath_bf16`) widens with the
+/// *identical* lossless `<<16` bit-extend this module's reductions use — one source of truth for the
+/// bf16→f32 widen keeps every bf16 dispatch path bit-for-bit consistent.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn widen_bf16(p: *const u16) -> __m256 {
+pub(crate) unsafe fn widen_bf16(p: *const u16) -> __m256 {
     // zero-extend 8×u16 → 8×u32, shift the bf16 bits into the f32 high half, reinterpret.
     let lo = _mm_loadu_si128(p as *const __m128i);
     let w = _mm256_cvtepu16_epi32(lo);
