@@ -108,11 +108,19 @@ fn main() {
     );
     println!("N = {N} f32 elements, single-threaded, -march=native. Lower ns is better.\n");
 
+    // Optional substring filter (first CLI arg): run only the kernels/sections whose name contains it,
+    // for fast single-kernel iteration. No arg → the full suite, byte-for-byte as before.
+    let filter = std::env::args().nth(1);
+    let want = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
+
     let kernels = kernels();
     let mut runtime_ratios_c = Vec::new();
     let mut compile_ratios_c = Vec::new();
 
     for k in &kernels {
+        if !want(k.name) {
+            continue;
+        }
         // Shared buffers, filled once; kernels read x,y and write out.
         let x: Vec<f32> = (0..N).map(|i| (i as f32 % 17.0) * 0.5 + 1.0).collect();
         let y: Vec<f32> = (0..N).map(|i| (i as f32 % 13.0) * 0.25 - 0.5).collect();
@@ -175,14 +183,28 @@ fn main() {
         );
         println!();
     }
-    bench_matmul(&cc, &dir, roof);
-    bench_linear(&cc, &dir, roof);
-    bench_conv(&cc, &dir);
-    bench_norm(&cc, &dir);
-    bench_norm_batched(&cc, &dir);
-    bench_i8gemm(&cc, &dir);
-    bench_bf16(&cc, &dir);
-    bench_streaming_large(&cc, &dir);
+    if want("matmul") {
+        bench_matmul(&cc, &dir, roof);
+    }
+    if want("linear") {
+        bench_linear(&cc, &dir, roof);
+    }
+    if want("conv") {
+        bench_conv(&cc, &dir);
+    }
+    if want("norm") {
+        bench_norm(&cc, &dir);
+        bench_norm_batched(&cc, &dir);
+    }
+    if want("i8gemm") {
+        bench_i8gemm(&cc, &dir);
+    }
+    if want("bf16") {
+        bench_bf16(&cc, &dir);
+    }
+    if want("streaming") {
+        bench_streaming_large(&cc, &dir);
+    }
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
