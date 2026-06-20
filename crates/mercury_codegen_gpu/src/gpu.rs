@@ -345,7 +345,7 @@ pub fn gemm_nt_f16(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use crate::ptx_wmma::{SM128_BM, SM128_BN, SM_BM, SM_BN};
     use half::f16;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
@@ -353,8 +353,18 @@ pub fn gemm_nt_f16(
         m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
         "WMMA requires 16-multiple dims"
     );
-    // Prefer the shared-memory-staged kernel where the CTA tile divides cleanly — same numerics,
-    // but ≥ the per-warp `_mt` path at every measured size (1.2–1.3× at 1024³/4096³, tie at 2048³).
+    // Regime-aware dispatch among the SMEM-staged kernels (all same numerics, ≥ the per-warp `_mt`
+    // path; measured same-run on the RTX 4050). cp.async software-pipelining wins where the working
+    // set is L2-resident — the 64×64 double-buffered kernel reaches ~cuBLAS at 1024³ — but pipelining
+    // the small tile saturates DRAM and *regresses* once it spills L2. There the 128×128 tile (half
+    // the redundant inter-CTA traffic) plus the same pipeline is the best path. Outside both, the
+    // plain staged 64×64 kernel is the robust default.
+    if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
+        return gemm_nt_f16_sm_db(g, a, b, m, k, n);
+    }
+    if m >= 2048 && n >= 2048 && m % SM128_BM == 0 && n % SM128_BN == 0 {
+        return gemm_nt_f16_sm128_db(g, a, b, m, k, n);
+    }
     if m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_sm(g, a, b, m, k, n);
     }
@@ -423,6 +433,94 @@ pub fn gemm_nt_f16_sm(
         .arg(&b_d)
         .arg(&mut c_d);
     unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Launch config for the 128×128 SMEM-staged kernel (`wmma_nt_f16_sm128_db`): `SM128_THREADS` threads
+/// per CTA, one CTA per `SM128_BM×SM128_BN` output tile. Applies when `M%128==0 && N%128==0 && K%16==0`.
+fn wmma_sm128_cfg(m: usize, n: usize) -> LaunchConfig {
+    use crate::ptx_wmma::{SM128_BM, SM128_BN, SM128_THREADS};
+    LaunchConfig {
+        grid_dim: ((n / SM128_BN) as u32, (m / SM128_BM) as u32, 1),
+        block_dim: (SM128_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `C = A·Bᵀ` (fp16-in, f32-out) via the **`cp.async` double-buffered** SMEM-staged kernel
+/// `wmma_nt_f16_sm_db` — same 64×64 CTA tile as [`gemm_nt_f16_sm`], but the K-loop prefetches the next
+/// A/B tile into the alternate shared buffer while the tensor cores consume the current one, hiding
+/// global-load latency. The lever for the large-GEMM cliff (latency-, not bandwidth-volume-bound).
+/// Requires `M%SM_BM==0`, `N%SM_BN==0`, `K%16==0`; tolerance-gated like the other GEMMs.
+pub fn gemm_nt_f16_sm_db(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "wmma_nt_f16_sm_db requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ` (fp16-in, f32-out) via the **128×128 CTA-tile + `cp.async` double-buffered** kernel
+/// `wmma_nt_f16_sm128_db` — the cuBLAS recipe: a big tile cuts redundant inter-CTA global traffic
+/// *and* software pipelining hides what's left, the combination aimed at the large-GEMM regime where
+/// neither lever alone sufficed. Requires `M%128==0`, `N%128==0`, `K%16==0`; tolerance-gated.
+pub fn gemm_nt_f16_sm128_db(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM128_BM, SM128_BN};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % SM128_BM == 0 && n % SM128_BN == 0 && k % 16 == 0,
+        "wmma_nt_f16_sm128_db requires M%{SM128_BM}==0, N%{SM128_BN}==0, K%16==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128_db")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(wmma_sm128_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -1199,6 +1297,81 @@ mod tests {
         });
     }
 
+    /// The 128×128 cp.async double-buffered kernel (`wmma_nt_f16_sm128_db`) must match the f16-rounded
+    /// f64 reference to the same tolerance as the 64×64 paths — identical math, only a bigger
+    /// cooperative tile, an 8-warp (2×4) grid, and the pipelined K-loop. Shapes exercise the M%128/N%128
+    /// divisibility plus rectangular K and N (stresses the 256-thread vectorized staging, the per-warp
+    /// 4×2 store indexing, and the pipeline prologue/drain at small and large K).
+    #[test]
+    fn wmma_sm128_db_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_sm128_db", |g| {
+            let mut rng = crate::diff::Rng::new(0x5E12);
+            let shapes = [
+                (128usize, 16usize, 128usize),
+                (128, 128, 128),
+                (256, 256, 256),
+                (256, 128, 512),
+                (384, 160, 256),
+                (512, 80, 128),
+            ];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let c = gemm_nt_f16_sm128_db(g, &a, &b, m, k, n).unwrap();
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16_sm128_db {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!(
+                    "wmma_f16_sm128_db {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    /// The `cp.async` double-buffered kernel (`wmma_nt_f16_sm_db`) must match the f16-rounded f64
+    /// reference to the same tolerance as the `_sm` path — identical math and tiling, only the K-loop
+    /// is software-pipelined (prefetch next tile via cp.async while computing the current). Shapes
+    /// stress the pipeline prologue/steady-state/drain: K=16 (single tile, no prefetch), K=64/256
+    /// (many steps), plus rectangular cases.
+    #[test]
+    fn wmma_sm_db_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_sm_db", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DB1);
+            let shapes = [
+                (64usize, 16usize, 64usize),
+                (64, 64, 64),
+                (128, 256, 128),
+                (128, 80, 192),
+                (256, 128, 512),
+            ];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = gemm_nt_f16_sm_db(g, &a, &b, m, k, n).unwrap();
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16_sm_db {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!(
+                    "wmma_f16_sm_db {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
     /// Diagnostic: JIT a PTX module with the driver's error-log buffer attached and print it. The
     /// plain `load_module` path only surfaces `CUDA_ERROR_INVALID_PTX` with no detail; this prints
     /// `ptxas`'s actual line/error, which is how every hand-written PTX kernel here gets debugged.
@@ -1938,6 +2111,17 @@ mod tests {
                     .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm")
                     .unwrap();
                 let s_sm = time_wmma(g, &f_sm, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
+                // Mercury cp.async double-buffered 64×64 kernel — overlap next-tile load with compute.
+                let f_db = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")
+                    .unwrap();
+                let s_db = time_wmma(g, &f_db, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
+                // Mercury 128×128 + cp.async double-buffered — the cuBLAS recipe (big tile + pipeline).
+                let f_sm128 = g
+                    .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128_db")
+                    .unwrap();
+                let s_sm128 =
+                    time_wmma(g, &f_sm128, wmma_sm128_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
 
                 // Peers (same buffers' worth of work). Naive is slow → fewer iters, still per-iter time.
                 let s_cub = time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap();
@@ -1948,28 +2132,35 @@ mod tests {
                 let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
                 let cs_mt = csum(&gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
                 let cs_sm = csum(&gemm_nt_f16_sm(g, &a, &b, m, k, n).unwrap());
+                let cs_sm128 = csum(&gemm_nt_f16_sm128_db(g, &a, &b, m, k, n).unwrap());
+                let cs_db = csum(&gemm_nt_f16_sm_db(g, &a, &b, m, k, n).unwrap());
                 let cs_c = csum(&cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap());
                 let cs_n = csum(&nvrtc_naive_gemm_nt(g, &a, &b, m, k, n).unwrap());
                 let agree = |x: f64, y: f64| (x - y).abs() / y.max(1.0) < 3e-2;
                 assert!(
-                    agree(cs_mt, cs_n) && agree(cs_sm, cs_n) && agree(cs_c, cs_n),
-                    "{sz}³ checksum disagreement: mt={cs_mt:.3e} sm={cs_sm:.3e} cublas={cs_c:.3e} naive={cs_n:.3e}"
+                    agree(cs_mt, cs_n) && agree(cs_sm, cs_n) && agree(cs_sm128, cs_n)
+                        && agree(cs_db, cs_n) && agree(cs_c, cs_n),
+                    "{sz}³ checksum disagreement: mt={cs_mt:.3e} sm={cs_sm:.3e} sm128={cs_sm128:.3e} db={cs_db:.3e} cublas={cs_c:.3e} naive={cs_n:.3e}"
                 );
 
-                let (g_mt, g_sm, g_cub, g_naive) =
-                    (flop / s_mt, flop / s_sm, flop / s_cub, flop / s_naive);
+                let (g_mt, g_sm, g_sm128, g_db, g_cub, g_naive) =
+                    (flop / s_mt, flop / s_sm, flop / s_sm128, flop / s_db, flop / s_cub, flop / s_naive);
                 eprintln!(
                     "\n{sz}³ fp16 GEMM (same-run):\n  \
                      Mercury _mt   : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS\n  \
-                     Mercury _sm   : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.2}× vs _mt | {:>5.1}× vs naive\n  \
+                     Mercury _sm     : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.2}× vs _mt\n  \
+                     Mercury _sm_db  : {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.2}× vs _sm | {:>5.1}× vs naive\n  \
+                     Mercury _sm128db: {:>7.0} GFLOP/s  | {:>5.1}% of cuBLAS | {:>5.2}× vs _sm\n  \
                      cuBLAS fp16   : {:>7.0} GFLOP/s  | gold standard\n  \
                      naive CUDA-C  : {:>7.0} GFLOP/s  | Tier-A baseline\n  \
-                     fp16 roofline : {:>7.0} GFLOP/s  | _mt {:>4.1}% / _sm {:>4.1}% / cuBLAS {:>4.1}% of roof",
+                     fp16 roofline : {:>7.0} GFLOP/s  | _sm {:>4.1}% / _sm_db {:>4.1}% / cuBLAS {:>4.1}% of roof",
                     g_mt / 1e9, 100.0 * g_mt / g_cub,
-                    g_sm / 1e9, 100.0 * g_sm / g_cub, g_sm / g_mt, g_sm / g_naive,
+                    g_sm / 1e9, 100.0 * g_sm / g_cub, g_sm / g_mt,
+                    g_db / 1e9, 100.0 * g_db / g_cub, g_db / g_sm, g_db / g_naive,
+                    g_sm128 / 1e9, 100.0 * g_sm128 / g_cub, g_sm128 / g_sm,
                     g_cub / 1e9,
                     g_naive / 1e9,
-                    roof / 1e9, 100.0 * g_mt / roof, 100.0 * g_sm / roof, 100.0 * g_cub / roof,
+                    roof / 1e9, 100.0 * g_sm / roof, 100.0 * g_db / roof, 100.0 * g_cub / roof,
                 );
             }
         });

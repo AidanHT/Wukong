@@ -494,27 +494,35 @@ Same-run, same device buffers, checksum-cross-checked, both peers first toleranc
 oracle (a fast-but-wrong kernel never scores). Two back-to-back runs (the mid-size % swings with the
 laptop's clock state; the 4096³ cliff does not):
 
-| size | Mercury (default `_sm`), % of cuBLAS | × vs naive CUDA-C | vs prior `_mt` kernel |
-|------|--------------------------------------|-------------------|-----------------------|
-| 1024³ | ~85% | ~80× | **1.27×** |
-| 2048³ | ~63% | ~60× | ~1.0× (tie) |
-| 4096³ | ~34% | ~44× | **1.21×** |
+| size | dispatched kernel | % of cuBLAS | × vs naive CUDA-C | vs prior `_sm` default |
+|------|-------------------|-------------|-------------------|------------------------|
+| 1024³ | `_sm_db` (64-tile + cp.async) | **~101%** | ~98× | **1.16×** |
+| 2048³ | `_sm128_db` (128-tile + cp.async) | ~74% | ~71× | **1.15×** |
+| 4096³ | `_sm128_db` (128-tile + cp.async) | ~34% | ~47× | ~1.07× |
 
-The honest standing: **a wide Tier-A win** — Mercury's tensor-core GEMM beats the naive hand-written
-CUDA-C kernel by tens-to-100×+, the same way it beats naive CPU-C — but **still short of cuBLAS** (the
-plan's M1 target is ≥95% isolated, >100% fused). The scoreboard also exposed what the internal roofline
-hid: **cuBLAS matches or exceeds that roofline** (~100–104% at 1024³), so the roofline was a soft
-under-estimate, not a true ceiling.
+The honest standing: at L2-resident sizes Mercury's fp16 tensor-core GEMM now **reaches cuBLAS parity
+(~101% at 1024³)** — the plan's M1 isolated target (≥95%) is met there — on top of a **wide Tier-A win**
+(tens-to-100×+ over the naive hand-written CUDA-C kernel, the same way it beats naive CPU-C). The large
+4096³ case is improved but **still short of cuBLAS** (~34%); closing it is ongoing.
 
-**Phase-1 progress — shared-memory staging.** The original per-warp `_mt` kernel re-streamed
-overlapping A/B rows/cols from global every K-step and **cratered to ~28% of cuBLAS at 4096³** (a 2.3×
-regression vs 2048³ as the tile working set spilled L2). The new default `wmma_nt_f16_sm` kernel —
-a 64×64 CTA of 4 warps that cooperatively stages A/B tiles into shared memory with **vectorized 128-bit
-loads**, so each global element is fetched once per CTA tile and reused across all warps — is **≥ `_mt`
-at every size** (1.27× @1024³, 1.21× @4096³, tie @2048³) and reaches **~85% of cuBLAS at 1024³**. The
-4096³ case is improved (28%→34%) but still load-bound: **`cp.async` double-buffering, bigger CTA tiles,
-warp-tiling and split-K** are the remaining levers toward ≥95%. Reproduce: `gemm_vs_peers` in
-`mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in `baselines.rs`).
+**Phase-1 progress — `cp.async` software pipelining.** The shared-memory-staged kernel's `{load-all;
+sync; compute-all; sync}` K-loop stalls on global-load latency once the working set spills L2. Two
+levers were measured same-run against cuBLAS:
+- A **bigger 128×128 CTA tile** (halves redundant inter-CTA global traffic) was **~neutral alone**
+  (33.9%→34.6% @4096³) — proof by elimination that the large-GEMM cliff is **latency-, not
+  bandwidth-volume-bound**.
+- **`cp.async` double-buffering** (prefetch the next A/B tile into the alternate shared buffer while the
+  tensor cores consume the current one) is a **large win where the problem is L2-resident** — the 64×64
+  pipelined kernel `wmma_nt_f16_sm_db` hits **~101% of cuBLAS at 1024³ (1.16× over the prior `_sm`)** —
+  but *regresses* large (eager loads saturate DRAM). Combined with the 128×128 tile,
+  `wmma_nt_f16_sm128_db` (the cuBLAS recipe: big tile cuts traffic, pipeline hides the rest) is the
+  best large-GEMM path (**1.15× @2048³, ~1.07× @4096³ over `_sm`**).
+
+`gemm_nt_f16` now **dispatches by regime**: the 64-tile pipeline ≤1024², the 128-tile pipeline ≥2048²,
+the plain staged 64-tile otherwise — each the measured winner in its range. Remaining levers toward
+≥95% at 4096³: deeper (3+-stage) pipelines, `ldmatrix`, swizzled SMEM, warp-tiling, split-K. Reproduce:
+`gemm_vs_peers` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
+`baselines.rs`).
 
 **Internal fp16 WMMA roofline** (retained as a same-run, clock-invariant compute ceiling — one fragment
 load then a long `wmma.mma` loop over 4 independent accumulators, ~zero hot-loop memory traffic): the
