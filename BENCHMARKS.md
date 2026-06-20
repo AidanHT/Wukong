@@ -571,6 +571,10 @@ abs on this box). A device error surfaces as an error, never a silent CPU fallba
   latency-bound), the lead **growing as the working set spills L3** (see the table below). On this
   AVX2 box (no bf16 FMA) a bf16 *GEMM* would widen to f32 and match f32 throughput — a footprint
   feature, not a FLOP/s win — so that path stays at f32; the reduction kernels are where bf16 pays.
+  The same dispatch now also covers **bf16 elementwise** (`out[k] = a*(x[k] as f32) + b*(y[k] as
+  f32)` → `mercury_axpby_bf16`, bf16 in / f32 out): ~1.3× a plain f32 axpby (8 vs 12 bytes/elem; below
+  2× because the f32 output + write-allocate dilute the half-width-input savings — a bf16 output would
+  reach ~2× but needs a narrowing-store differential).
 - **GPU backend (RTX 4050):** a PTX-emitting, driver-JIT GPU path (no CUDA toolkit) runs every
   transformer op category on-device, tolerance-gated. **Tensor-core GEMM** (fp16/bf16 in, f32
   accumulate) hits **~9–13 TFLOP/s** (clock-dependent) — ~5–6× the f32 path on the same GPU;
