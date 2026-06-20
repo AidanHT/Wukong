@@ -524,6 +524,17 @@ the plain staged 64-tile otherwise — each the measured winner in its range. Re
 `gemm_vs_peers` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH (one-line setup in
 `baselines.rs`).
 
+**Compile latency + cubin cache (M10).** Mercury emits PTX and the driver JITs it to SASS; there is no
+30–120 s autotuning compile like Triton/TorchInductor. Measured (`cubin_cache_compile_latency`, RTX
+4050): a from-scratch driver JIT of the fp16 WMMA module (43 KB PTX → 26 KB cubin) is **0.76 ms** — so
+even *cold*, Mercury's compile is **~4×10⁴–1.6×10⁵× faster** than a Triton/Inductor cold build (M10
+asked ≥100×). On top of that, a **persistent cubin cache** (`cubin.rs`: the driver's own `cuLink*` JIT
+emits the SASS, keyed by a hash of the PTX + driver version, loaded warm via `cuModuleLoad`) drops the
+warm load to **0.16 ms** — 2.0× under the driver's own JIT-cache-warm PTX load and 4.8× under cold, and
+unlike the driver's opaque/clearable compute cache it is **portable and deterministic** across process
+runs. Every kernel load now flows through it (`Gpu::load_module_cached`), degrading gracefully to a
+direct PTX JIT on any cache miss/failure, so it can never break a load that would otherwise succeed.
+
 **Internal fp16 WMMA roofline** (retained as a same-run, clock-invariant compute ceiling — one fragment
 load then a long `wmma.mma` loop over 4 independent accumulators, ~zero hot-loop memory traffic): the
 fp16-mt GEMM sits at ~25–72% of it and fp8-mt at ~75–100% of it across 2048³–4096³. The roofline itself

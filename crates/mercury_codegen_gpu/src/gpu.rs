@@ -12,12 +12,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
+use cudarc::nvrtc::Ptx;
 
 /// A live CUDA device + stream + a cache of JIT-loaded PTX modules (keyed by a stable string).
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
+    /// Installed driver version — part of the on-disk cubin cache key (a cubin is driver-ABI specific).
+    driver_tag: i32,
 }
 
 impl Gpu {
@@ -28,6 +31,7 @@ impl Gpu {
             ctx,
             stream,
             modules: HashMap::new(),
+            driver_tag: crate::cubin::driver_version(),
         })
     }
 
@@ -38,8 +42,10 @@ impl Gpu {
             .unwrap_or_else(|_| "<unknown CUDA device>".into())
     }
 
-    /// Load (JIT) `ptx` once under `key`, caching the module, and return the named entry function.
-    /// The driver compiles PTX→SASS internally, so no `ptxas` is required.
+    /// Load `ptx` once under `key`, caching the module in-process, and return the named entry
+    /// function. The first load consults the persistent **cubin cache** (M10): a warm process loads
+    /// precompiled SASS instead of re-JITing the PTX. The driver compiles PTX→SASS internally, so no
+    /// external `ptxas` is required either way.
     pub fn function(
         &mut self,
         key: &'static str,
@@ -47,10 +53,36 @@ impl Gpu {
         name: &str,
     ) -> Result<CudaFunction, DriverError> {
         if !self.modules.contains_key(key) {
-            let module = self.ctx.load_module(ptx.into())?;
+            let module = self.load_module_cached(ptx)?;
             self.modules.insert(key, module);
         }
         self.modules[key].load_function(name)
+    }
+
+    /// Load a module for `ptx`, preferring a cached cubin over a fresh JIT. Warm path: a previously
+    /// cached cubin loads via `cuModuleLoad` (no compilation). Cold path: compile to a cubin once,
+    /// persist it, and load that. Every cubin-route failure (no linker, unwritable cache, a stale or
+    /// driver-incompatible cubin) degrades to the proven direct-PTX JIT — so caching is a pure
+    /// optimization that can never break a load that would otherwise succeed.
+    fn load_module_cached(&self, ptx: &str) -> Result<Arc<CudaModule>, DriverError> {
+        let path = crate::cubin::cache_path(ptx, self.driver_tag);
+        if path.exists() {
+            if let Ok(m) = self.ctx.load_module(Ptx::from_file(&path)) {
+                return Ok(m); // warm: loaded precompiled SASS, no JIT
+            }
+            let _ = std::fs::remove_file(&path); // stale/incompatible → drop and recompile
+        }
+        // The raw cuLink compile needs a context current on this thread (cudarc's load_module binds
+        // itself, but ptx_to_cubin does not) — otherwise it fails and we'd silently skip caching.
+        let _ = self.ctx.bind_to_thread();
+        if let Ok(cubin) = crate::cubin::ptx_to_cubin(ptx) {
+            if crate::cubin::write_atomic(&path, &cubin).is_ok() {
+                if let Ok(m) = self.ctx.load_module(Ptx::from_file(&path)) {
+                    return Ok(m); // cold: compiled, cached, and loaded the cubin (one compile)
+                }
+            }
+        }
+        self.ctx.load_module(ptx.into()) // fallback: direct PTX JIT (the original path)
     }
 }
 
@@ -1404,6 +1436,91 @@ mod tests {
             };
             let s = String::from_utf8_lossy(&log);
             eprintln!("=== JIT result {:?} ===\n{}", res, s.trim_end_matches('\0'));
+        });
+    }
+
+    /// The cubin cache route (M10): `ptx_to_cubin` must emit a real SASS cubin (ELF), and loading it
+    /// back via `Ptx::from_file` must yield a module whose entries resolve — i.e. a warm process skips
+    /// the PTX JIT entirely. (Execution equivalence of the cached path is covered by the whole suite,
+    /// which loads every kernel through `load_module_cached`; a second test-binary run exercises the
+    /// warm branch end-to-end.)
+    #[test]
+    fn cubin_cache_roundtrips_to_loadable_sass() {
+        with_gpu("cubin_roundtrip", |g| {
+            let _ = g.ctx.bind_to_thread();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let cubin = crate::cubin::ptx_to_cubin(ptx).expect("driver should link PTX→cubin");
+            assert!(
+                cubin.len() > 64 && &cubin[..4] == b"\x7fELF",
+                "expected an ELF SASS cubin, got {} bytes",
+                cubin.len()
+            );
+            let tmp = std::env::temp_dir()
+                .join(format!("mercury_cubin_roundtrip_{}.cubin", std::process::id()));
+            crate::cubin::write_atomic(&tmp, &cubin).unwrap();
+            let m = g
+                .ctx
+                .load_module(Ptx::from_file(&tmp))
+                .expect("a cached cubin must load without JIT");
+            for entry in ["wmma_nt_f16_sm", "wmma_nt_f16_sm_db", "wmma_nt_f16_sm128_db"] {
+                m.load_function(entry)
+                    .unwrap_or_else(|_| panic!("entry {entry} missing from the cubin"));
+            }
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    /// M10 latency: a warm cubin load (precompiled SASS) vs a from-scratch PTX JIT, same module,
+    /// same process. Reports the true-cold first JIT, the driver's own JIT-cache-warm PTX load, and
+    /// Mercury's cubin load — the last is fast *and* portable/deterministic (independent of the
+    /// driver's opaque, clearable compute cache). The cold figure also documents that even a
+    /// from-scratch driver JIT is orders of magnitude under Triton/Inductor's 30–120 s cold autotune.
+    #[test]
+    #[ignore = "latency bench; run explicitly"]
+    fn cubin_cache_compile_latency() {
+        use std::time::Instant;
+        with_gpu("cubin_latency", |g| {
+            let _ = g.ctx.bind_to_thread();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let cubin = crate::cubin::ptx_to_cubin(ptx).expect("link PTX→cubin");
+            let tmp = std::env::temp_dir()
+                .join(format!("mercury_cubin_lat_{}.cubin", std::process::id()));
+            crate::cubin::write_atomic(&tmp, &cubin).unwrap();
+
+            // First load = true cold for this process (may populate the driver's own JIT cache).
+            let t0 = Instant::now();
+            let _ = g.ctx.load_module(Ptx::from_src(ptx)).unwrap();
+            let cold_first = t0.elapsed().as_secs_f64();
+            // Best-of-N: PTX load (driver-JIT-cache warm) vs cubin load (Mercury cache).
+            let mut ptx_warm = f64::INFINITY;
+            let mut cubin_warm = f64::INFINITY;
+            for _ in 0..10 {
+                let t = Instant::now();
+                let _ = g.ctx.load_module(Ptx::from_src(ptx)).unwrap();
+                ptx_warm = ptx_warm.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                let _ = g.ctx.load_module(Ptx::from_file(&tmp)).unwrap();
+                cubin_warm = cubin_warm.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "module load latency — wmma_f16 ({} B PTX → {} B cubin):",
+                ptx.len(),
+                cubin.len()
+            );
+            eprintln!("  cold PTX JIT (first this process) : {:>7.2} ms", cold_first * 1e3);
+            eprintln!("  PTX load, driver-cache warm       : {:>7.2} ms  (best/10)", ptx_warm * 1e3);
+            eprintln!(
+                "  cubin load (Mercury cache)        : {:>7.2} ms  (best/10) | {:.1}× vs cold-first | {:.1}× vs PTX-warm",
+                cubin_warm * 1e3,
+                cold_first / cubin_warm,
+                ptx_warm / cubin_warm
+            );
+            eprintln!(
+                "  vs Triton/Inductor cold 30–120 s  : even the cold PTX JIT is ~{:.0}×–{:.0}× faster (M10 ≥100×)",
+                30.0 / cold_first,
+                120.0 / cold_first
+            );
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 

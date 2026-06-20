@@ -24,6 +24,10 @@ toolkit — only **running** needs the driver + a device.
   (fp8 mma.sync), `norm` (softmax/LayerNorm/RMSNorm), `conv2d`, `flash_attn`, and `transformer_layer`
   (a whole pre-norm encoder layer, end-to-end GPU-resident — chains the above on device buffers with no
   host round-trip; `TransformerWeights` bundles the six projections).
+- `src/cubin.rs` — persistent **cubin cache** (M10): `ptx_to_cubin` runs the driver's `cuLink*` JIT to
+  emit SASS; `Gpu::load_module_cached` caches it on disk (keyed by PTX hash + driver version) so warm
+  processes load precompiled cubins via `cuModuleLoad` instead of re-JITing. Graceful fallback to a
+  direct PTX JIT on any miss/failure.
 - `src/ptx.rs` — base PTX (saxpy/vadd/vmath/reduce/simple GEMM), target `sm_89`.
 - `src/ptx_gemm.rs` — register-blocked f32 GEMM generator (64×64 tile, 4×4/thread).
 - `src/ptx_wmma.rs` — WMMA fp16/bf16 tensor-core GEMM generators: single-tile, fragment-reuse `_mt`,
