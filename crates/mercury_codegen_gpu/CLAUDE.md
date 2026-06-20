@@ -18,9 +18,21 @@ toolkit — only **running** needs the driver + a device.
 ## Layout
 - `src/lib.rs` — crate root; `GPU_ENABLED` const; re-exports behind `#[cfg(feature = "gpu")]`.
 - `src/gpu.rs` — host harness: `Gpu` (context + default stream + PTX-module cache), the process-wide
-  `gpu()` accessor (a `Mutex<Option<Gpu>>` — `None` means no device → tests *skip*, not fail), and
-  typed launch wrappers (`saxpy`, `vadd`, …).
-- `src/ptx.rs` — hand-emitted PTX kernel sources (string constants), target `sm_89`.
+  `gpu()` accessor (a `Mutex<Option<Gpu>>` — `None` means no device → tests *skip*, not fail), and the
+  typed launch wrappers: `saxpy`/`vadd`, `vmath` (activations), `reduce` (sum/dot/max), `gemm_nt`/`_rb`
+  (f32, simple + register-blocked), `gemm_nt_f16`/`_bf16` (WMMA tensor core), `gemm_nt_fp8` + `fp8_tile`
+  (fp8 mma.sync), `norm` (softmax/LayerNorm/RMSNorm), `conv2d`, `flash_attn`, and `transformer_layer`
+  (a whole pre-norm encoder layer, end-to-end GPU-resident — chains the above on device buffers with no
+  host round-trip; `TransformerWeights` bundles the six projections).
+- `src/ptx.rs` — base PTX (saxpy/vadd/vmath/reduce/simple GEMM), target `sm_89`.
+- `src/ptx_gemm.rs` — register-blocked f32 GEMM generator (64×64 tile, 4×4/thread).
+- `src/ptx_wmma.rs` — WMMA fp16/bf16 tensor-core GEMM generators (single-tile + fragment-reuse `_mt`).
+- `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM (no WMMA fp8 on sm_89, so the
+  fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
+- `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
+- `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
+- `src/ptx_conv.rs` — direct conv2d (one thread per output element).
+- `src/diff.rs` — tolerance harness (`Rng`, `assert_close`/`assert_scalar_close`).
 
 ## Key facts / gotchas
 - **One process-wide `Gpu` behind a `Mutex`.** `cargo` runs tests on many threads and a CUDA context
