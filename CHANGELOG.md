@@ -62,11 +62,15 @@ All notable changes to Mercury are documented here. The format is loosely based 
   are heavier than `expf`), ~28× `@parallel`. The in-process `vmath_throughput` probe (kernel vs the
   scalar `libm`-call loop gcc/rustc are forced to emit) confirms it locally: exp ~5.9×, gelu ~5.5×,
   tan ~3.6×, asin ~5.4×, exp10 ~13×, logsigmoid ~4.6×.
-- **Two-arg transcendentals (`pow`/`atan2`/`hypot`)**: `pow(x,y) = exp(y·log(x))`, `atan2(y,x)` (the
-  full-circle angle — geometry, robotics, complex argument), and `hypot(a,b)` (the overflow-safe
-  2-norm) compose existing primitives, so they lower to the inlined ≈1-ULP poly that auto-vectorizes at
-  128-bit — still a win over C's scalar `atan2f`/`hypotf`/`powf` (a loop with the call won't vectorize),
-  and bit-identical across backends and opt levels.
+- **Two-arg transcendentals → 256-bit AVX2 dispatch (`pow`/`atan2`/`hypot`)**: `pow(x,y) = exp(y·log(x))`,
+  `atan2(y,x)` (the full-circle angle — geometry, robotics, complex argument), and `hypot(a,b)` (the
+  overflow-safe 2-norm) get a two-input kernel (`mercury_vmath2_f32`): a `for j { out[j] = f(x[j], y[j]) }`
+  loop lowers to the **256-bit** AVX2 kernel (the same width jump that ~doubled the single-arg
+  activations), and the three kernels mirror the inlined `emit_pow`/`emit_atan2`/`emit_hypot` op-for-op
+  (via the shared exp8/log8/atan8/√), so dispatched == composed and the interpreter marshals through the
+  identical kernel — interp == native, -O0 == -O3. A composed/scalar use (or a body that fuses with an
+  adjacent store loop) still lowers to the inlined ≈1-ULP poly (128-bit auto-vec). Either way a win over
+  C's scalar `powf`/`atan2f`/`hypotf` (a loop with the call won't vectorize).
 - **Streaming elementwise → 256-bit AVX2 dispatch**: a recognized streaming map
   (`out[i] = act(a·x[i] (+ b·y[i]) + c)`, incl. ReLU/ReLU6) lowers to `mercury_velem_f32` and a Horner
   polynomial to `mercury_vhorner_f32` — both true 256-bit AVX2/FMA, unrolled, emitting **non-temporal
