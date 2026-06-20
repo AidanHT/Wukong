@@ -689,17 +689,21 @@ unsafe fn relu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_max_ps(x, _mm256_setzero_ps())
 }
 
+/// `pub(crate)` so the GEMM fused epilogue (`gemm.rs`) applies the *identical* 8-lane SiLU as a
+/// dispatched `silu` loop — `silu8` mirrors `silu1` bit-for-bit (the tail-match test pins it), so a
+/// vectorized fused `silu(x·Wᵀ+b)` writeback equals the scalar epilogue the interpreter oracle uses.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn silu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn silu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // x * sigmoid(x)
     _mm256_mul_ps(x, sigmoid8(x))
 }
 
+/// `pub(crate)` for the GEMM fused epilogue (see [`silu8`]); `gelu8` mirrors `gelu1` bit-for-bit.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn gelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn gelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // 0.5·x·(1 + tanh(C0·(x + C1·x³))) — mirrors gelu1 op-for-op.
     let x3 = _mm256_mul_ps(_mm256_mul_ps(x, x), x);

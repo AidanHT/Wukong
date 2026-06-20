@@ -858,6 +858,61 @@ unsafe fn micro_6x16(
         return;
     }
 
+    // Fused-epilogue fast path: a FULL 6×16 tile on the final K-block. Apply the beta rule, the per-
+    // column bias (16 cols = two 256-bit lanes, broadcast identically across the 6 rows), and the
+    // activation — all 256-bit, instead of the 96-element scalar spill+writeback below. Bit-identical
+    // to that scalar epilogue: `_mm256_max_ps`==`f32::max`, and `gelu8`/`silu8` mirror `gelu1`/`silu1`
+    // lane-for-lane (the vmath tail-match invariant), so the interpreter's scalar oracle still agrees.
+    // The bias add is *skipped* (not added-as-zero) when null, matching `Epilogue::apply` on ±0.
+    if let Some(e) = epi {
+        if mr == MR && nr == NR {
+            let has_bias = !e.bias.is_null();
+            let (bias_lo, bias_hi) = if has_bias {
+                (_mm256_loadu_ps(e.bias), _mm256_loadu_ps(e.bias.add(8)))
+            } else {
+                (_mm256_setzero_ps(), _mm256_setzero_ps())
+            };
+            macro_rules! act8 {
+                ($v:expr) => {{
+                    match e.act {
+                        ACT_RELU => _mm256_max_ps($v, _mm256_setzero_ps()),
+                        ACT_GELU => crate::vmath::gelu8($v),
+                        ACT_SILU => crate::vmath::silu8($v),
+                        _ => $v,
+                    }
+                }};
+            }
+            macro_rules! wbe {
+                ($lo:expr, $hi:expr, $r:expr) => {{
+                    let row = c.add($r * ldc);
+                    let mut lo = if beta == 0.0 {
+                        $lo
+                    } else {
+                        _mm256_add_ps(_mm256_loadu_ps(row), $lo)
+                    };
+                    let mut hi = if beta == 0.0 {
+                        $hi
+                    } else {
+                        _mm256_add_ps(_mm256_loadu_ps(row.add(8)), $hi)
+                    };
+                    if has_bias {
+                        lo = _mm256_add_ps(lo, bias_lo);
+                        hi = _mm256_add_ps(hi, bias_hi);
+                    }
+                    _mm256_storeu_ps(row, act8!(lo));
+                    _mm256_storeu_ps(row.add(8), act8!(hi));
+                }};
+            }
+            wbe!(c0, c1, 0);
+            wbe!(c2, c3, 1);
+            wbe!(c4, c5, 2);
+            wbe!(c6, c7, 3);
+            wbe!(c8, c9, 4);
+            wbe!(c10, c11, 5);
+            return;
+        }
+    }
+
     // General path (partial edge tiles + the fused epilogue): spill the tile, then write back the
     // valid corner with the beta rule (and, on the final K-block, the fused bias+activation).
     let mut tmp = [0.0f32; MR * NR];
