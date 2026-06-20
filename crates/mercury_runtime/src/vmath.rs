@@ -1947,4 +1947,65 @@ mod tests {
             );
         }
     }
+
+    /// Two-input throughput: the 256-bit `mercury_vmath2_f32` kernel vs a scalar `libm`-call loop
+    /// (`powf`/`atan2f`/`hypotf`), the code gcc/rustc emit and cannot vectorize. `scalar/kernel` is the
+    /// per-function speedup, clock-invariant. Working set fits L2 → compute-bound.
+    /// Observed (Meteor Lake): pow ~4.6×, atan2 ~7.1×, hypot ~4.4× — the 256-bit two-input kernel over
+    /// the unvectorizable scalar `powf`/`atan2f`/`hypotf` loop.
+    /// Run: `cargo test -p mercury_runtime --release vmath2_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly in --release"]
+    fn vmath2_throughput() {
+        use std::time::Instant;
+        let n = 1 << 16;
+        let xs: Vec<f32> = (0..n).map(|i| 0.5 + (i % 397) as f32 * 0.01).collect();
+        let ys: Vec<f32> = (0..n).map(|i| 0.5 + (i % 311) as f32 * 0.01).collect();
+        let mut out = vec![0.0f32; n];
+        let best = |iters: usize, mut f: Box<dyn FnMut()>| -> f64 {
+            f();
+            let mut t = f64::INFINITY;
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                f();
+                t = t.min(t0.elapsed().as_secs_f64());
+            }
+            t
+        };
+        let cases: &[(i64, &str, fn(f32, f32) -> f32)] = &[
+            (VM2_POW, "pow", |x, y| x.powf(y)),
+            (VM2_ATAN2, "atan2", |y, x| y.atan2(x)),
+            (VM2_HYPOT, "hypot", |a, b| a.hypot(b)),
+        ];
+        let iters = 200;
+        eprintln!("vmath2 throughput over {n} pairs (best of {iters}), kernel vs scalar libm:");
+        for &(op, name, scalar) in cases {
+            let (xp, yp) = (xs.as_ptr() as usize, ys.as_ptr() as usize);
+            let outp = out.as_mut_ptr() as usize;
+            let t_kernel = best(
+                iters,
+                Box::new(move || unsafe {
+                    mercury_vmath2_f32(xp as *const f32, yp as *const f32, outp as *mut f32, n as i64, op);
+                    std::hint::black_box(outp);
+                }),
+            );
+            let (xc, yc) = (xs.clone(), ys.clone());
+            let mut so = vec![0.0f32; n];
+            let t_scalar = best(
+                iters,
+                Box::new(move || {
+                    for i in 0..n {
+                        so[i] = scalar(xc[i], yc[i]);
+                    }
+                    std::hint::black_box(so.as_ptr());
+                }),
+            );
+            eprintln!(
+                "  {name:<6} kernel {:.0} Melem/s | scalar libm {:.0} Melem/s | {:.1}x",
+                n as f64 / t_kernel / 1e6,
+                n as f64 / t_scalar / 1e6,
+                t_scalar / t_kernel
+            );
+        }
+    }
 }
