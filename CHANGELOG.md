@@ -41,16 +41,30 @@ All notable changes to Mercury are documented here. The format is loosely based 
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
   run ~2.6–2.8× faster than serial C.
-- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for
-  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu` (over f32) lowers to a tuned **256-bit AVX2/FMA runtime
+- **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **18** functions —
+  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
+  `hardsigmoid`/`hardswish` plus **`sin`/`cos`** (RoPE rotary embeddings) and **`erf`** (exact
+  BERT/GPT-2 GELU) and **`exp2`/`log2`/`sinh`/`cosh`** (FlashAttention base-2 softmax, quantization,
+  the exponential family) — lowers to a tuned **256-bit AVX2/FMA runtime
   kernel** (`mercury_vmath_f32`) — the width Cranelift's general vectorizer can't emit (it caps at
   128-bit SSE). `silu` (Llama/SwiGLU) and `gelu` (BERT/GPT-2/ViT) are first-class intrinsics; the
-  kernel's per-element op sequence mirrors the inlined Cephes polynomial, and the interpreter marshals
+  kernel's per-element op sequence mirrors the inlined Cephes/A&S polynomial, and the interpreter marshals
   through the identical kernel, so the differential oracle stays exact and dispatched/composed forms
   agree. A multi-statement (fusion-merged) body dispatches one kernel call per activation, and an
   `@parallel` activation dispatches each thread's chunk — so it runs multicore × 256-bit. Versus C's
-  scalar `libm` (which can't vectorize a loop with a call), the activation family runs **~5–7.5×
-  faster** single-thread, ~28× `@parallel`.
+  scalar `libm` (which can't vectorize a loop with a call), the family runs **~4–8.6×
+  faster** single-thread (`sin`/`cos` win most — `libm`'s `sinf`/`cosf` are heavier than `expf`), ~28× `@parallel`.
+- **Streaming elementwise → 256-bit AVX2 dispatch**: a recognized streaming map
+  (`out[i] = act(a·x[i] (+ b·y[i]) + c)`, incl. ReLU/ReLU6) lowers to `mercury_velem_f32` and a Horner
+  polynomial to `mercury_vhorner_f32` — both true 256-bit AVX2/FMA, unrolled, emitting **non-temporal
+  stores** once the working set spills L3 (the read-for-ownership-skipping store gcc/rustc won't emit).
+  This turns the former memory-bound *ties* into wins: saxpy ~1.3×, poly ~1.2× at `N=2²⁰`, widening to
+  ~1.3–1.6× at realistic >L3 tensor sizes. A velem **identity-affine fast path** (skip the wasted
+  `fma(1·x+0)` for a bare `relu`/copy) plus gating the software prefetch on the DRAM/non-temporal
+  regime removed a ~1.2× `relu` regression at L3-resident sizes (now a clean tie there, ~1.4× at >L3);
+  `vhorner` runs **six** independent Horner chains (was four — a 5-deep dependent-FMA chain needs ~8 in
+  flight to fill both FMA ports), turning the degree-4 poly tie into a consistent win over gcc's own
+  256-bit autovec. The interpreter marshals through the identical kernel, so the oracle stays exact.
 - **`@parallel` reduction → multicore reduction kernel**: a reduction loop in a `@parallel` function
   (`s += x[k]*y[k]`, `(x[k]-y[k])²`, or `x[k]`) lowers to a **deterministic multicore reduction
   kernel** (`mercury_sreduce_f32_parallel`: dot/ssd/sum/sumsq) instead of a sequential per-thread
