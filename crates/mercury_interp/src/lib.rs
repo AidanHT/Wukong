@@ -516,11 +516,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                     self.push_vec(lanes)
                 } else {
                     let v = *self.memory.get(idx).ok_or("load out of bounds")?;
-                    // `[bf16; N]` storage holds bf16 precision: round on read (the native backend
-                    // stores the rounded 16 bits, so a load there observes the same value).
+                    // `[bf16; N]`/`[f16; N]` storage holds reduced precision: round on read (the native
+                    // backend stores the rounded 16 bits, so a load there observes the same value).
                     match (ty, v) {
                         (MirType::BF16, Value::Float(f)) => {
                             Value::Float(mercury_runtime::round_bf16(f as f32) as f64)
+                        }
+                        (MirType::F16, Value::Float(f)) => {
+                            Value::Float(mercury_runtime::round_f16(f as f32) as f64)
                         }
                         _ => v,
                     }
@@ -1647,11 +1650,12 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
             };
             Value::Int(mask(i, to))
         }
-        // Widening is exact. Narrowing to bf16 rounds to bf16 (the native backend rounds on store /
-        // cast identically); narrowing to f16/f32 is left to the per-op f32 rounding in `exec`.
+        // Widening is exact. Narrowing to bf16/f16 rounds to that grid (the native backend rounds on
+        // store / cast identically); narrowing to f32 is left to the per-op f32 rounding in `exec`.
         FpExt => Value::Float(v.as_float()),
         FpTrunc => match to {
             MirType::BF16 => Value::Float(mercury_runtime::round_bf16(v.as_float() as f32) as f64),
+            MirType::F16 => Value::Float(mercury_runtime::round_f16(v.as_float() as f32) as f64),
             _ => Value::Float(v.as_float()),
         },
         // Reinterpret the raw bits between an int and a same-width float (matches the native

@@ -96,6 +96,10 @@ const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
 const RT_DOT_BF16: &str = "mercury_dot_bf16";
 const RT_SUM_BF16: &str = "mercury_sum_bf16";
 const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
+// f16 has no cheap inline round (unlike bf16's `<<16`), so f16 load/store/cast call these shims —
+// the *same* `half`-crate conversion the interpreter uses, keeping native == interp bit-for-bit.
+const RT_F32_TO_F16: &str = "mercury_f32_to_f16_bits";
+const RT_F16_TO_F32: &str = "mercury_f16_bits_to_f32";
 const RT_AXPBY_BF16: &str = "mercury_axpby_bf16";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
@@ -413,6 +417,17 @@ impl<'a> FnTranslator<'a> {
                     self.builder
                         .ins()
                         .bitcast(types::F32, MemFlags::new(), shifted)
+                } else if matches!(ty, MirType::F16) {
+                    // f16 storage is 2 bytes; widen via the runtime shim (no cheap inline bit-extend
+                    // like bf16). Register type is f32.
+                    let half = self
+                        .builder
+                        .ins()
+                        .load(types::I16, MemFlags::trusted(), addr, 0);
+                    let ext = self.builder.ins().uextend(types::I32, half);
+                    let fref = self.rt_refs[RT_F16_TO_F32];
+                    let call = self.builder.ins().call(fref, &[ext]);
+                    self.builder.inst_results(call)[0]
                 } else {
                     let t = cl_type(ty, self.ptr_ty).unwrap_or(self.ptr_ty);
                     self.builder.ins().load(t, MemFlags::trusted(), addr, 0)
@@ -430,6 +445,14 @@ impl<'a> FnTranslator<'a> {
                         .bitcast(types::I32, MemFlags::new(), rounded);
                     let hi = self.builder.ins().ushr_imm(bits, 16);
                     let half = self.builder.ins().ireduce(types::I16, hi);
+                    self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
+                } else if matches!(self.ty_of(*value), MirType::F16) {
+                    // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
+                    let v = self.val(*value);
+                    let fref = self.rt_refs[RT_F32_TO_F16];
+                    let call = self.builder.ins().call(fref, &[v]);
+                    let bits = self.builder.inst_results(call)[0]; // i32, low 16 = f16 bits
+                    let half = self.builder.ins().ireduce(types::I16, bits);
                     self.builder.ins().store(MemFlags::trusted(), half, addr, 0);
                 } else {
                     let v = self.val(*value);
@@ -613,6 +636,14 @@ impl<'a> FnTranslator<'a> {
                         x
                     };
                     self.round_to_bf16(f)
+                } else if matches!(to, MirType::F16) {
+                    // f16's register type is f32; demote an f64 source first, then round to f16.
+                    let f = if from_ty == types::F64 {
+                        self.builder.ins().fdemote(types::F32, x)
+                    } else {
+                        x
+                    };
+                    self.round_to_f16(f)
                 } else if to_ty == from_ty {
                     x
                 } else {
@@ -659,6 +690,19 @@ impl<'a> FnTranslator<'a> {
         self.builder
             .ins()
             .bitcast(types::F32, MemFlags::new(), resbits)
+    }
+
+    /// Round an `f32` to f16 precision and back to `f32`, by calling the runtime shims
+    /// (`mercury_f32_to_f16_bits` then `mercury_f16_bits_to_f32`). f16's exponent/mantissa layout has
+    /// no cheap inline round like bf16, so a call to the *identical* `half`-crate conversion the
+    /// interpreter uses keeps native == interp bit-for-bit. Returns the f16-rounded `f32`.
+    fn round_to_f16(&mut self, x: Value) -> Value {
+        let pack = self.rt_refs[RT_F32_TO_F16];
+        let c1 = self.builder.ins().call(pack, &[x]);
+        let bits = self.builder.inst_results(c1)[0]; // i32, low 16 = f16 bits
+        let unpack = self.rt_refs[RT_F16_TO_F32];
+        let c2 = self.builder.ins().call(unpack, &[bits]);
+        self.builder.inst_results(c2)[0]
     }
 
     /// Sign- or zero-extend, truncate, or pass through an integer to a target width.
@@ -1015,6 +1059,8 @@ struct RtFuncs {
     dot_bf16: FuncId,
     sum_bf16: FuncId,
     reduce_bf16: FuncId,
+    f32_to_f16: FuncId,
+    f16_to_f32: FuncId,
     axpby_bf16: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
@@ -1169,6 +1215,13 @@ fn populate_module<M: Module>(
     sig_reduce_bf16.params.push(AbiParam::new(types::I64));
     sig_reduce_bf16.params.push(AbiParam::new(types::I64));
     sig_reduce_bf16.returns.push(AbiParam::new(types::F32));
+    // mercury_f32_to_f16_bits(f32) -> i32 (low 16 = f16 bits); mercury_f16_bits_to_f32(i32) -> f32.
+    let mut sig_f32_to_f16 = Signature::new(call_conv);
+    sig_f32_to_f16.params.push(AbiParam::new(types::F32));
+    sig_f32_to_f16.returns.push(AbiParam::new(types::I32));
+    let mut sig_f16_to_f32 = Signature::new(call_conv);
+    sig_f16_to_f32.params.push(AbiParam::new(types::I32));
+    sig_f16_to_f32.returns.push(AbiParam::new(types::F32));
     // mercury_axpby_bf16(x, y: ptr<bf16>, out: ptr<f32>, n: i64, a, b: f32) — bf16→f32 axpby. Void.
     let mut sig_axpby_bf16 = Signature::new(call_conv);
     sig_axpby_bf16.params.push(AbiParam::new(ptr_ty));
@@ -1265,6 +1318,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         reduce_bf16: module
             .declare_function(RT_REDUCE_BF16, Linkage::Import, &sig_reduce_bf16)
+            .map_err(|e| e.to_string())?,
+        f32_to_f16: module
+            .declare_function(RT_F32_TO_F16, Linkage::Import, &sig_f32_to_f16)
+            .map_err(|e| e.to_string())?,
+        f16_to_f32: module
+            .declare_function(RT_F16_TO_F32, Linkage::Import, &sig_f16_to_f32)
             .map_err(|e| e.to_string())?,
         fmod_f64: module
             .declare_function(RT_FMOD_F64, Linkage::Import, &sig_fmod_f64)
@@ -1399,6 +1458,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_REDUCE_BF16,
                 module.declare_func_in_func(rt.reduce_bf16, builder.func),
+            );
+            rt_refs.insert(
+                RT_F32_TO_F16,
+                module.declare_func_in_func(rt.f32_to_f16, builder.func),
+            );
+            rt_refs.insert(
+                RT_F16_TO_F32,
+                module.declare_func_in_func(rt.f16_to_f32, builder.func),
             );
             rt_refs.insert(
                 RT_FMOD_F64,
@@ -1579,6 +1646,14 @@ pub fn jit_compile(
         mercury_runtime::mercury_reduce_bf16 as *const u8,
     );
     builder.symbol(
+        RT_F32_TO_F16,
+        mercury_runtime::mercury_f32_to_f16_bits as *const u8,
+    );
+    builder.symbol(
+        RT_F16_TO_F32,
+        mercury_runtime::mercury_f16_bits_to_f32 as *const u8,
+    );
+    builder.symbol(
         RT_AXPBY_BF16,
         mercury_runtime::mercury_axpby_bf16 as *const u8,
     );
@@ -1714,6 +1789,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_REDUCE_BF16,
         mercury_runtime::mercury_reduce_bf16 as *const u8,
+    );
+    builder.symbol(
+        RT_F32_TO_F16,
+        mercury_runtime::mercury_f32_to_f16_bits as *const u8,
+    );
+    builder.symbol(
+        RT_F16_TO_F32,
+        mercury_runtime::mercury_f16_bits_to_f32 as *const u8,
     );
     builder.symbol(
         RT_AXPBY_BF16,

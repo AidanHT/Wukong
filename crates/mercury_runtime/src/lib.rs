@@ -70,6 +70,51 @@ pub fn round_bf16(x: f32) -> f32 {
     bf16_bits_to_f32(f32_to_bf16_bits(x))
 }
 
+/// IEEE `f16` (half precision) round-to-nearest-even from an `f32`, returning the 16 stored bits.
+/// Backed by the `half` crate, which matches the F16C `vcvtps2ph` the runtime f16 reduction kernels
+/// use (the `simd_equals_scalar_twin` test pins F16C == `half`). The single shared definition the
+/// interpreter and the native backend both use (the latter via the `mercury_f32_to_f16_bits` shim),
+/// so the two agree bit-for-bit. Unlike bf16 (the top 16 bits of an f32, a cheap inline round), f16
+/// has a different exponent/mantissa layout, so the conversion is a function call, not inline math.
+#[inline]
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    half::f16::from_f32(x).to_bits()
+}
+
+/// Widen `f16` stored bits to the `f32` they represent (lossless; equals F16C `vcvtph2ps`).
+#[inline]
+pub fn f16_bits_to_f32(b: u16) -> f32 {
+    half::f16::from_bits(b).to_f32()
+}
+
+/// `x` rounded to `f16` precision, as an `f32 -> f16 -> f32` round-trip yields — the value `[f16; N]`
+/// storage observes; the native backend computes the identical result (it calls these shims).
+#[inline]
+pub fn round_f16(x: f32) -> f32 {
+    f16_bits_to_f32(f32_to_f16_bits(x))
+}
+
+/// C-ABI shim: round an `f32` to `f16`, returning the 16 stored bits (in an `i32` for a clean call
+/// ABI). The Cranelift backend calls this for an `f16` store/cast, so native and interp — which uses
+/// [`f32_to_f16_bits`] directly — round through the identical code.
+///
+/// # Safety
+/// Pure; `extern "C"` only for the JIT symbol table.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_f32_to_f16_bits(x: f32) -> i32 {
+    f32_to_f16_bits(x) as i32
+}
+
+/// C-ABI shim: widen `f16` stored bits (low 16 of `b`) to `f32`. The Cranelift backend calls this for
+/// an `f16` load/cast.
+///
+/// # Safety
+/// Pure; `extern "C"` only for the JIT symbol table.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_f16_bits_to_f32(b: i32) -> f32 {
+    f16_bits_to_f32(b as u16)
+}
+
 /// A bump (arena) allocator over an owned byte buffer. Allocation is a pointer bump; freeing is
 /// all-at-once via [`Arena::reset`]. This is the idiomatic allocator for kernel scratch space:
 /// no per-object bookkeeping, no fragmentation.
