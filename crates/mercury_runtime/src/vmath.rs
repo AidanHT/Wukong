@@ -49,6 +49,8 @@ pub const VM_ATANH: i64 = 24;
 pub const VM_ATAN: i64 = 25;
 pub const VM_EXPM1: i64 = 26;
 pub const VM_LOG1P: i64 = 27;
+pub const VM_EXP10: i64 = 28;
+pub const VM_LOG10: i64 = 29;
 
 /// `1/6` in f32 — the hard-sigmoid/hard-swish scale. Used as a multiply (not a divide) identically in
 /// the scalar twin, the AVX2 lanes, and the composed MIR, so all three agree bit-for-bit.
@@ -128,6 +130,8 @@ const ERF_A: [f32; 5] = [
 // `emit_exp(x*ln2)` / `emit_log(x)*log2e` bit-for-bit).
 const LN_2: f32 = std::f64::consts::LN_2 as f32; // exp2(x) = exp(x·ln2)
 const LOG2_E: f32 = std::f64::consts::LOG2_E as f32; // log2(x) = log(x)·log2(e)
+const LN_10: f32 = std::f64::consts::LN_10 as f32; // exp10(x) = exp(x·ln10)
+const LOG10_E: f32 = std::f64::consts::LOG10_E as f32; // log10(x) = log(x)·log10(e)
 
 // atan (Cephes `atanf`): a 3-region reduction of |x| at the two breakpoints tan(π/8)=√2−1 and
 // tan(3π/8)=1+√2, each mapping into [0, tan(π/8)] where a degree-3 odd minimax poly is ≈1 ULP. The
@@ -391,6 +395,19 @@ fn log2_1(x: f32) -> f32 {
     log1(x) * LOG2_E
 }
 
+/// `exp10(x) = 10^x = e^{x·ln10}` (decibels, log-scale features, base-10 schedules). Reuses [`exp1`],
+/// so the AVX2 [`exp10_8`], the tail, and the composed scalar MIR all agree bit-for-bit.
+#[inline]
+fn exp10_1(x: f32) -> f32 {
+    exp1(x * LN_10)
+}
+
+/// `log10(x) = ln(x)·log10(e)` (decibels, perplexity in base 10, log-scale metrics). Reuses [`log1`].
+#[inline]
+fn log10_1(x: f32) -> f32 {
+    log1(x) * LOG10_E
+}
+
 /// `sinh(x) = (e^x − e^{−x})/2`. Reuses [`exp1`]; overflows like `libm` for large |x|.
 #[inline]
 fn sinh1(x: f32) -> f32 {
@@ -524,6 +541,8 @@ fn apply1(op: i64, x: f32) -> f32 {
         VM_ATAN => atan1(x),
         VM_EXPM1 => expm1_1(x),
         VM_LOG1P => log1p_1(x),
+        VM_EXP10 => exp10_1(x),
+        VM_LOG10 => log10_1(x),
         _ => x,
     }
 }
@@ -590,6 +609,8 @@ fn vmath8_for(op: i64) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::ar
         VM_ATAN => atan8,
         VM_EXPM1 => expm1_8,
         VM_LOG1P => log1p_8,
+        VM_EXP10 => exp10_8,
+        VM_LOG10 => log10_8,
         _ => return None,
     })
 }
@@ -1012,6 +1033,20 @@ unsafe fn log2_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     _mm256_mul_ps(log8(x), _mm256_set1_ps(LOG2_E))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp10_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    exp8(_mm256_mul_ps(x, _mm256_set1_ps(LN_10)))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn log10_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    _mm256_mul_ps(log8(x), _mm256_set1_ps(LOG10_E))
+}
+
 /// 8-lane `sinh(x) = (e^x − e^{−x})·0.5` — mirrors [`sinh1`] (`-x` via `*-1` to match the scalar twin).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -1187,8 +1222,9 @@ mod tests {
             (VM_COS, |x| x.cos(), 1e-4),
             // atan: bounded & ≈1-ULP over the whole real line (Cephes 3-region reduction).
             (VM_ATAN, |x| x.atan(), 5e-5),
-            // exp2/sinh/cosh reuse exp, so ≈exp's accuracy; relative over the full range.
+            // exp2/exp10/sinh/cosh reuse exp, so ≈exp's accuracy; relative over the full range.
             (VM_EXP2, |x| x.exp2(), 5e-5),
+            (VM_EXP10, |x| 10.0f32.powf(x), 5e-5),
             (VM_SINH, |x| x.sinh(), 5e-5),
             (VM_COSH, |x| x.cosh(), 5e-5),
         ];
@@ -1211,6 +1247,7 @@ mod tests {
         for (op, libm) in [
             (VM_LOG, f32::ln as fn(f32) -> f32),
             (VM_LOG2, f32::log2 as fn(f32) -> f32),
+            (VM_LOG10, f32::log10 as fn(f32) -> f32),
         ] {
             unsafe {
                 mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op);
@@ -1334,9 +1371,9 @@ mod tests {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
             VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
-            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1,
+            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1, VM_EXP10, VM_LOG10,
         ] {
-            if op == VM_LOG || op == VM_LOG2 {
+            if op == VM_LOG || op == VM_LOG2 || op == VM_LOG10 {
                 continue; // negative inputs are out of log's domain
             }
             let mut full = vec![0.0f32; xs.len()];

@@ -546,6 +546,8 @@ const VMATH_ATANH: u32 = 24;
 const VMATH_ATAN: u32 = 25;
 const VMATH_EXPM1: u32 = 26;
 const VMATH_LOG1P: u32 = 27;
+const VMATH_EXP10: u32 = 28;
+const VMATH_LOG10: u32 = 29;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -2954,6 +2956,8 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Atan) => VMATH_ATAN,
             Some(MathIntrinsic::Expm1) => VMATH_EXPM1,
             Some(MathIntrinsic::Log1p) => VMATH_LOG1P,
+            Some(MathIntrinsic::Exp10) => VMATH_EXP10,
+            Some(MathIntrinsic::Log10) => VMATH_LOG10,
             _ => return None,
         };
         // The kernel computes (and writes) f32, so the activation's result must be f32.
@@ -3884,6 +3888,8 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Atan
                     | MathIntrinsic::Expm1
                     | MathIntrinsic::Log1p
+                    | MathIntrinsic::Exp10
+                    | MathIntrinsic::Log10
                     | MathIntrinsic::Erf
                     | MathIntrinsic::Sin
                     | MathIntrinsic::Cos
@@ -4686,6 +4692,18 @@ impl FnLowerer<'_> {
                     let lx = self.emit_log_f32(x, vty);
                     let log2e = self.splat_const_f(std::f64::consts::LOG2_E, vty);
                     self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, lx, log2e))
+                }
+                Some(MathIntrinsic::Exp10) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let ln10 = self.splat_const_f(std::f64::consts::LN_10, vty);
+                    let xl = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, x, ln10));
+                    self.emit_exp_f32(xl, vty)
+                }
+                Some(MathIntrinsic::Log10) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let lx = self.emit_log_f32(x, vty);
+                    let log10e = self.splat_const_f(std::f64::consts::LOG10_E, vty);
+                    self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, lx, log10e))
                 }
                 Some(op @ (MathIntrinsic::Sinh | MathIntrinsic::Cosh)) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -5572,6 +5590,18 @@ impl FnLowerer<'_> {
                 let lx = self.emit_log(x, &rty);
                 let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
                 Some(self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, log2e)))
+            }
+            MathIntrinsic::Exp10 => {
+                let x = self.lower_expr(args.first()?);
+                let ln10 = self.splat_const_f(std::f64::consts::LN_10, &rty);
+                let xl = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, ln10));
+                Some(self.emit_exp(xl, &rty))
+            }
+            MathIntrinsic::Log10 => {
+                let x = self.lower_expr(args.first()?);
+                let lx = self.emit_log(x, &rty);
+                let log10e = self.splat_const_f(std::f64::consts::LOG10_E, &rty);
+                Some(self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, lx, log10e)))
             }
             MathIntrinsic::Sinh | MathIntrinsic::Cosh => {
                 let x = self.lower_expr(args.first()?);
@@ -8282,6 +8312,8 @@ enum MathIntrinsic {
     Log,
     Exp2,
     Log2,
+    Exp10,
+    Log10,
     Sinh,
     Cosh,
     Asinh,
@@ -8335,6 +8367,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "log" => MathIntrinsic::Log,
         "exp2" => MathIntrinsic::Exp2,
         "log2" => MathIntrinsic::Log2,
+        "exp10" => MathIntrinsic::Exp10,
+        "log10" => MathIntrinsic::Log10,
         "sinh" => MathIntrinsic::Sinh,
         "cosh" => MathIntrinsic::Cosh,
         "asinh" => MathIntrinsic::Asinh,
