@@ -648,7 +648,9 @@ pub unsafe extern "C" fn mercury_vmath_f32(x: *const f32, out: *mut f32, n: i64,
 /// bf16), which keeps `mercury_vmath_bf16` bit-for-bit consistent with `mercury_vmath_f32`.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn vmath8_for(op: i64) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256> {
+fn vmath8_for(
+    op: i64,
+) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256> {
     Some(match op {
         VM_EXP => exp8,
         VM_LOG => log8,
@@ -704,6 +706,180 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
     // Scalar tail (same poly as the lanes, via the scalar twins) for the final < 8 elements.
     while i < n {
         *out.add(i) = apply1(op, *x.add(i));
+        i += 1;
+    }
+}
+
+// --- two-input transcendentals (pow/atan2/hypot) ---------------------------------------------------
+// The 256-bit twin of the inlined two-arg poly: `out[i] = f(x[i], y[i])`. Op codes are a separate
+// namespace (`VM2_*`) from the one-input `VM_*`. Each kernel mirrors `emit_pow`/`emit_atan2`/
+// `emit_hypot` op-for-op (via the shared exp8/log8/atan8/sqrt that already match the inlined MIR), so
+// a dispatched loop equals the composed/scalar form bit-for-bit.
+pub const VM2_POW: i64 = 0;
+pub const VM2_ATAN2: i64 = 1;
+pub const VM2_HYPOT: i64 = 2;
+
+/// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
+#[inline]
+fn pow2_1(x: f32, y: f32) -> f32 {
+    exp1(y * log1(x))
+}
+
+/// `atan2(y, x)` — `atan(y/x)` + the quadrant fix (`x<0` adds `copysign(π, y)`; `x=0` falls out via
+/// `atan(±∞)=±π/2`). Mirrors `emit_atan2`.
+#[inline]
+fn atan2_1(y: f32, x: f32) -> f32 {
+    let a = atan1(y / x);
+    let adj = if x < 0.0 {
+        if y < 0.0 {
+            -std::f32::consts::PI
+        } else {
+            std::f32::consts::PI
+        }
+    } else {
+        0.0
+    };
+    a + adj
+}
+
+/// `hypot(a, b) = m·√((a/m)²+(b/m)²)`, `m = max(|a|,|b|)`, guarded `m==0 → 0`. Mirrors `emit_hypot`
+/// (the `fma(rb,rb,ra²)` order matches; abs clears the sign bit).
+#[inline]
+fn hypot_1(a: f32, b: f32) -> f32 {
+    let aa = f32::from_bits(a.to_bits() & 0x7FFF_FFFF);
+    let bb = f32::from_bits(b.to_bits() & 0x7FFF_FFFF);
+    let m = if aa > bb { aa } else { bb };
+    let ra = a / m;
+    let rb = b / m;
+    let scaled = m * rb.mul_add(rb, ra * ra).sqrt();
+    if m == 0.0 {
+        0.0
+    } else {
+        scaled
+    }
+}
+
+/// Scalar dispatch for one element pair (the AVX2 tail and the no-AVX2 fallback). The two inputs are
+/// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot.
+#[inline]
+fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
+    match op {
+        VM2_POW => pow2_1(x, y),
+        VM2_ATAN2 => atan2_1(x, y),
+        VM2_HYPOT => hypot_1(x, y),
+        _ => x,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn pow2_8(
+    x: std::arch::x86_64::__m256,
+    y: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    exp8(_mm256_mul_ps(y, log8(x)))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn atan2_8(
+    y: std::arch::x86_64::__m256,
+    x: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let a = atan8(_mm256_div_ps(y, x));
+    let zero = _mm256_setzero_ps();
+    let yneg = _mm256_cmp_ps::<_CMP_LT_OQ>(y, zero);
+    // yneg ? −π : π
+    let pi_signed = _mm256_blendv_ps(
+        _mm256_set1_ps(std::f32::consts::PI),
+        _mm256_set1_ps(-std::f32::consts::PI),
+        yneg,
+    );
+    let xneg = _mm256_cmp_ps::<_CMP_LT_OQ>(x, zero);
+    let adj = _mm256_blendv_ps(zero, pi_signed, xneg); // xneg ? pi_signed : 0
+    _mm256_add_ps(a, adj)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hypot8_2(
+    a: std::arch::x86_64::__m256,
+    b: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let aa = _mm256_and_ps(a, absmask);
+    let bb = _mm256_and_ps(b, absmask);
+    let m = _mm256_blendv_ps(bb, aa, _mm256_cmp_ps::<_CMP_GT_OQ>(aa, bb)); // max(|a|,|b|)
+    let ra = _mm256_div_ps(a, m);
+    let rb = _mm256_div_ps(b, m);
+    let sum = _mm256_fmadd_ps(rb, rb, _mm256_mul_ps(ra, ra));
+    let scaled = _mm256_mul_ps(m, _mm256_sqrt_ps(sum));
+    let mzero = _mm256_cmp_ps::<_CMP_EQ_OQ>(m, _mm256_setzero_ps());
+    _mm256_blendv_ps(scaled, _mm256_setzero_ps(), mzero) // mzero ? 0 : scaled
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn vmath2_8_for(
+    op: i64,
+) -> Option<
+    unsafe fn(std::arch::x86_64::__m256, std::arch::x86_64::__m256) -> std::arch::x86_64::__m256,
+> {
+    Some(match op {
+        VM2_POW => pow2_8,
+        VM2_ATAN2 => atan2_8,
+        VM2_HYPOT => hypot8_2,
+        _ => return None,
+    })
+}
+
+/// `out[i] = f(x[i], y[i])` for the two-input transcendentals (`VM2_*`). The 256-bit AVX2 twin of the
+/// inlined two-arg poly an `out[i] = pow/atan2/hypot(x[i], y[i])` loop lowers to; mirrors the inlined
+/// MIR op-for-op, so the interpreter marshalling through this kernel keeps native == interp exact.
+/// `x`, `y`, `out` must each be valid for `n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_vmath2_f32(
+    x: *const f32,
+    y: *const f32,
+    out: *mut f32,
+    n: i64,
+    op: i64,
+) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: features detected; buffers valid for n by the caller contract.
+            unsafe { vmath2_avx2(x, y, out, n, op) };
+            return;
+        }
+    }
+    for i in 0..n {
+        // SAFETY: i < n; buffers valid for n.
+        unsafe { *out.add(i) = apply2_1(op, *x.add(i), *y.add(i)) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vmath2_avx2(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64) {
+    use std::arch::x86_64::*;
+    let Some(f) = vmath2_8_for(op) else { return };
+    let mut i = 0;
+    while i + 8 <= n {
+        let xv = _mm256_loadu_ps(x.add(i));
+        let yv = _mm256_loadu_ps(y.add(i));
+        _mm256_storeu_ps(out.add(i), f(xv, yv));
+        i += 8;
+    }
+    while i < n {
+        *out.add(i) = apply2_1(op, *x.add(i), *y.add(i));
         i += 1;
     }
 }
@@ -1451,7 +1627,11 @@ mod tests {
                     out[i]
                 );
                 // scalar twin (the AVX2 tail) must equal the kernel lane bit-for-bit.
-                assert_eq!(out[i].to_bits(), apply1(op, x).to_bits(), "op {op} tail x={x}");
+                assert_eq!(
+                    out[i].to_bits(),
+                    apply1(op, x).to_bits(),
+                    "op {op} tail x={x}"
+                );
             }
         };
         // asinh: all-real (the sign-stable form holds for large negative x too). 1001 ≠ 8k → tail.
@@ -1481,7 +1661,11 @@ mod tests {
                     "op {op} x={x}: got {} want {want}",
                     out[i]
                 );
-                assert_eq!(out[i].to_bits(), apply1(op, x).to_bits(), "op {op} tail x={x}");
+                assert_eq!(
+                    out[i].to_bits(),
+                    apply1(op, x).to_bits(),
+                    "op {op} tail x={x}"
+                );
             }
         };
         // tan: |x| ≤ 1.4 (cos stays well off zero; tan(1.4) ≈ 5.8). 1001 ≠ 8k → exercises the tail.
@@ -1491,6 +1675,52 @@ mod tests {
         let xs: Vec<f32> = (0..1001).map(|i| (i as f32 - 500.0) * 0.0019).collect();
         check(VM_ASIN, &xs, |x| x.asin(), 1e-4);
         check(VM_ACOS, &xs, |x| x.acos(), 1e-4);
+    }
+
+    /// The two-input kernel (`mercury_vmath2_f32`): pow/atan2/hypot vs `std`, plus the scalar twin ==
+    /// AVX2 lanes (bit-for-bit) tail match. `pow` over x∈(0,4], y∈[−2,2]; atan2/hypot over a paired
+    /// sweep avoiding the (0,0) origin. 1003 pairs (≠ 8k) exercises the < 8 tail.
+    #[test]
+    fn vmath2_matches_libm() {
+        let n = 1003;
+        let check = |op: i64, xs: &[f32], ys: &[f32], reference: fn(f32, f32) -> f32, tol: f32| {
+            let mut out = vec![0.0f32; xs.len()];
+            unsafe {
+                mercury_vmath2_f32(
+                    xs.as_ptr(),
+                    ys.as_ptr(),
+                    out.as_mut_ptr(),
+                    xs.len() as i64,
+                    op,
+                );
+            }
+            for i in 0..xs.len() {
+                let want = reference(xs[i], ys[i]);
+                assert!(
+                    (out[i] - want).abs() <= tol + tol * want.abs(),
+                    "op {op} ({},{}): got {} want {want}",
+                    xs[i],
+                    ys[i],
+                    out[i]
+                );
+                assert_eq!(
+                    out[i].to_bits(),
+                    apply2_1(op, xs[i], ys[i]).to_bits(),
+                    "op {op} tail ({},{})",
+                    xs[i],
+                    ys[i]
+                );
+            }
+        };
+        // pow: base in (0, 4], exponent in [-2, 2].
+        let xb: Vec<f32> = (0..n).map(|i| 0.01 + (i % 400) as f32 * 0.01).collect();
+        let ye: Vec<f32> = (0..n).map(|i| (i % 81) as f32 * 0.05 - 2.0).collect();
+        check(VM2_POW, &xb, &ye, |x, y| x.powf(y), 5e-5);
+        // atan2/hypot: paired sweep over the four quadrants, never both zero.
+        let ya: Vec<f32> = (0..n).map(|i| (i as f32 - 501.0) * 0.013).collect();
+        let xa: Vec<f32> = (0..n).map(|i| (i as f32 - 499.0) * 0.011).collect();
+        check(VM2_ATAN2, &ya, &xa, |y, x| y.atan2(x), 5e-5);
+        check(VM2_HYPOT, &ya, &xa, |a, b| a.hypot(b), 5e-5);
     }
 
     /// expm1/log1p vs `std`, including the **small-x relative** check the Kahan correction exists for:
@@ -1512,7 +1742,11 @@ mod tests {
                 (got - want).abs() <= 5e-5 + 5e-5 * want.abs(),
                 "expm1({x}): got {got} want {want}"
             );
-            assert_eq!(got.to_bits(), apply1(VM_EXPM1, x).to_bits(), "expm1 tail {x}");
+            assert_eq!(
+                got.to_bits(),
+                apply1(VM_EXPM1, x).to_bits(),
+                "expm1 tail {x}"
+            );
         }
         let xl: Vec<f32> = (0..2001).map(|i| -0.9 + i as f32 * 0.01).collect();
         for (i, &x) in xl.iter().enumerate() {
@@ -1521,15 +1755,27 @@ mod tests {
                 (got - want).abs() <= 5e-5 + 5e-5 * want.abs(),
                 "log1p({x}): got {got} want {want}"
             );
-            assert_eq!(got.to_bits(), apply1(VM_LOG1P, x).to_bits(), "log1p tail {x}");
+            assert_eq!(
+                got.to_bits(),
+                apply1(VM_LOG1P, x).to_bits(),
+                "log1p tail {x}"
+            );
         }
         // Small-x relative accuracy — the whole point of the stable forms.
         let small: Vec<f32> = vec![1e-3, 1e-4, 1e-5, 1e-6, -1e-3, -1e-4, -1e-5];
         let (em, lm) = (kernel(VM_EXPM1, &small), kernel(VM_LOG1P, &small));
         for (i, &x) in small.iter().enumerate() {
             let (we, wl) = (x.exp_m1(), x.ln_1p());
-            assert!((em[i] - we).abs() <= 5e-5 * we.abs(), "expm1 rel {x}: {} vs {we}", em[i]);
-            assert!((lm[i] - wl).abs() <= 5e-5 * wl.abs(), "log1p rel {x}: {} vs {wl}", lm[i]);
+            assert!(
+                (em[i] - we).abs() <= 5e-5 * we.abs(),
+                "expm1 rel {x}: {} vs {we}",
+                em[i]
+            );
+            assert!(
+                (lm[i] - wl).abs() <= 5e-5 * wl.abs(),
+                "log1p rel {x}: {} vs {wl}",
+                lm[i]
+            );
         }
     }
 
@@ -1539,9 +1785,28 @@ mod tests {
     fn vmath_tail_matches_lanes() {
         let xs: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) * 0.013).collect();
         for op in [
-            VM_EXP, VM_LOG, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_SIN, VM_COS, VM_ERF,
-            VM_EXP2, VM_LOG2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1, VM_EXP10, VM_LOG10,
-            VM_SOFTSIGN, VM_LOGSIGMOID, VM_CBRT,
+            VM_EXP,
+            VM_LOG,
+            VM_TANH,
+            VM_SIGMOID,
+            VM_RELU,
+            VM_SILU,
+            VM_GELU,
+            VM_SIN,
+            VM_COS,
+            VM_ERF,
+            VM_EXP2,
+            VM_LOG2,
+            VM_SINH,
+            VM_COSH,
+            VM_ASINH,
+            VM_ATAN,
+            VM_EXPM1,
+            VM_EXP10,
+            VM_LOG10,
+            VM_SOFTSIGN,
+            VM_LOGSIGMOID,
+            VM_CBRT,
         ] {
             if op == VM_LOG || op == VM_LOG2 || op == VM_LOG10 {
                 continue; // negative inputs are out of log's domain
@@ -1567,8 +1832,24 @@ mod tests {
         let n = 1003usize;
         let xf: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.004).collect();
         let ops = [
-            VM_EXP, VM_TANH, VM_SIGMOID, VM_RELU, VM_SILU, VM_GELU, VM_ELU, VM_SOFTPLUS, VM_MISH,
-            VM_SIN, VM_COS, VM_ERF, VM_EXP2, VM_SINH, VM_COSH, VM_ASINH, VM_ATAN, VM_EXPM1,
+            VM_EXP,
+            VM_TANH,
+            VM_SIGMOID,
+            VM_RELU,
+            VM_SILU,
+            VM_GELU,
+            VM_ELU,
+            VM_SOFTPLUS,
+            VM_MISH,
+            VM_SIN,
+            VM_COS,
+            VM_ERF,
+            VM_EXP2,
+            VM_SINH,
+            VM_COSH,
+            VM_ASINH,
+            VM_ATAN,
+            VM_EXPM1,
         ];
         // bf16
         let bbits: Vec<u16> = xf.iter().map(|&v| crate::f32_to_bf16_bits(v)).collect();
@@ -1622,13 +1903,17 @@ mod tests {
         // libm calls C must keep scalar (softsign omitted: it's abs+div, which C *can* autovectorize).
         let cases: &[(i64, &str, fn(f32) -> f32)] = &[
             (VM_EXP, "exp", |x| x.exp()),
-            (VM_GELU, "gelu", |x| 0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())),
+            (VM_GELU, "gelu", |x| {
+                0.5 * x * (1.0 + (GELU_C0 * (x + GELU_C1 * x * x * x)).tanh())
+            }),
             (VM_TAN, "tan", |x| x.tan()),
             (VM_ASIN, "asin", |x| x.asin()),
             (VM_ACOS, "acos", |x| x.acos()),
             (VM_EXP10, "exp10", |x| 10.0f32.powf(x)),
             (VM_LOG10, "log10", |x| (x + 1.1).log10()), // shift into the positive domain
-            (VM_LOGSIGMOID, "logsigmoid", |x| (1.0 / (1.0 + (-x).exp())).ln()),
+            (VM_LOGSIGMOID, "logsigmoid", |x| {
+                (1.0 / (1.0 + (-x).exp())).ln()
+            }),
         ];
         let iters = 200;
         eprintln!("vmath throughput over {n} elements (best of {iters}), kernel vs scalar libm:");

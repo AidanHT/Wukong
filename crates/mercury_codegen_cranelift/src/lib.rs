@@ -82,6 +82,7 @@ const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_SGEMM_NT_EPI_PAR: &str = "mercury_sgemm_nt_epi_parallel";
 const RT_VMATH: &str = "mercury_vmath_f32";
+const RT_VMATH2: &str = "mercury_vmath2_f32";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_VELEM: &str = "mercury_velem_f32";
@@ -812,6 +813,19 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, out, n, op]);
             return None;
         }
+        // The two-input transcendental: mercury_vmath2_f32(x, y, out, n, op) — three pointers, two i64
+        // (element count, op code). The 256-bit AVX2 kernel an `out[i]=pow/atan2/hypot(x[i],y[i])`
+        // loop lowers to.
+        if name == RT_VMATH2 && args.len() == 5 {
+            let x = self.val(args[0]);
+            let y = self.val(args[1]);
+            let out = self.val(args[2]);
+            let n = self.coerce_to_i64(args[3]);
+            let op = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[RT_VMATH2];
+            self.builder.ins().call(fref, &[x, y, out, n, op]);
+            return None;
+        }
         // The streaming affine+activation kernel: mercury_velem_f32(x, y, out, n, a, b, c, op) — three
         // pointers, one i64 count, three f32 coefficients, one i64 op (256-bit AVX2 + non-temporal
         // stores, the saxpy/scale/add/bias/ReLU map a recognized streaming loop lowers to). Void.
@@ -1050,6 +1064,7 @@ struct RtFuncs {
     sgemm_nt_epi: FuncId,
     sgemm_nt_epi_par: FuncId,
     vmath: FuncId,
+    vmath2: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     velem: FuncId,
@@ -1161,6 +1176,13 @@ fn populate_module<M: Module>(
     sig_vmath.params.push(AbiParam::new(ptr_ty));
     sig_vmath.params.push(AbiParam::new(types::I64));
     sig_vmath.params.push(AbiParam::new(types::I64));
+    // mercury_vmath2_f32(x, y, out: ptr, n: i64, op: i64) — two-input transcendental (pow/atan2/hypot).
+    let mut sig_vmath2 = Signature::new(call_conv);
+    sig_vmath2.params.push(AbiParam::new(ptr_ty));
+    sig_vmath2.params.push(AbiParam::new(ptr_ty));
+    sig_vmath2.params.push(AbiParam::new(ptr_ty));
+    sig_vmath2.params.push(AbiParam::new(types::I64));
+    sig_vmath2.params.push(AbiParam::new(types::I64));
     // mercury_velem_f32(x, y, out: ptr, n: i64, a, b, c: f32, op: i64) — streaming affine+activation.
     let mut sig_velem = Signature::new(call_conv);
     sig_velem.params.push(AbiParam::new(ptr_ty));
@@ -1282,6 +1304,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         vmath: module
             .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        vmath2: module
+            .declare_function(RT_VMATH2, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
@@ -1427,6 +1452,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VMATH,
                 module.declare_func_in_func(rt.vmath, builder.func),
+            );
+            rt_refs.insert(
+                RT_VMATH2,
+                module.declare_func_in_func(rt.vmath2, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -1647,11 +1676,15 @@ pub fn jit_compile(
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
+    builder.symbol(RT_VMATH2, mercury_runtime::mercury_vmath2_f32 as *const u8);
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
-    builder.symbol(RT_VMATH_F16, mercury_runtime::mercury_vmath_f16 as *const u8);
+    builder.symbol(
+        RT_VMATH_F16,
+        mercury_runtime::mercury_vmath_f16 as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
@@ -1803,11 +1836,15 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
+    builder.symbol(RT_VMATH2, mercury_runtime::mercury_vmath2_f32 as *const u8);
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
-    builder.symbol(RT_VMATH_F16, mercury_runtime::mercury_vmath_f16 as *const u8);
+    builder.symbol(
+        RT_VMATH_F16,
+        mercury_runtime::mercury_vmath_f16 as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
