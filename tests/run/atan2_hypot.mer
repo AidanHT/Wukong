@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 785
+// EXPECT-OUT: 2356
+// EXPECT-OUT: -2356
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 13000
+// EXPECT-OUT: 6000
+module tests.run.atan2_hypot
+
+// `atan2(y, x)` — the full-circle angle of (x, y) (geometry, robotics, complex argument). `hypot(a, b)`
+// — the overflow-safe 2-norm/magnitude. Both are two-arg transcendentals that compose existing
+// primitives (atan / √ + a quadrant or scale fix), like `pow`, so they lower to the inlined ≈1-ULP
+// poly (auto-vectorized) and agree bit-for-bit across interp/native and -O0/-O3. C/Rust call scalar
+// libm atan2f/hypotf, which won't vectorize inside a loop.
+fn main() -> i32 {
+    // atan2 quadrants: atan2(1,1)=π/4≈0.785; atan2(1,-1)=3π/4≈2.356; atan2(-1,-1)=-3π/4≈-2.356.
+    print((atan2(1.0, 1.0) * 1000.0 + 0.5) as i32);   // π/4   -> 785
+    print((atan2(1.0, -1.0) * 1000.0 + 0.5) as i32);  // 3π/4  -> 2356
+    print((atan2(-1.0, -1.0) * 1000.0 - 0.5) as i32); // -3π/4 -> -2356
+
+    // hypot: 3-4-5 and 5-12-13 right triangles (exact).
+    print((hypot(3.0, 4.0) * 1000.0 + 0.5) as i32);  // 5.0  -> 5000
+    print((hypot(5.0, 12.0) * 1000.0 + 0.5) as i32); // 13.0 -> 13000
+
+    // Vectorized `out[i] = hypot(a[i], b[i])` — a `for` loop auto-vectorizes the inlined poly (the
+    // 128-bit win over C's scalar hypotf). a=[3,3,..], b=[4,4,..] → each 5.0, sum over 12 = 60.0.
+    let mut a: [f32; 12] = [3.0; 12];
+    let mut b: [f32; 12] = [4.0; 12];
+    let mut o: [f32; 12] = [0.0; 12];
+    for i in 0..12 { o[i] = hypot(a[i], b[i]); }
+    let mut s: f32 = 0.0;
+    for k in 0..12 { s = s + o[k]; }
+    print((s * 100.0 + 0.5) as i32); // 12 * 5.0 * 100 -> 6000
+    return 0;
+}

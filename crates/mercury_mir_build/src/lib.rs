@@ -3935,8 +3935,9 @@ impl FnLowerer<'_> {
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && *lane == Some(MirType::F32)
                 }
-                Some(MathIntrinsic::Pow) => {
-                    // pow = exp(y·log(x)); two args, f32 lane only (same reason as exp/log).
+                Some(MathIntrinsic::Pow | MathIntrinsic::Atan2 | MathIntrinsic::Hypot) => {
+                    // Two-arg transcendentals (pow = exp(y·log(x)); atan2; hypot); f32 lane only, same
+                    // reason as exp/log — the IEEE surgery in the composed polys is f32-specific.
                     args.len() == 2
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && self.vec_check_value(&args[1], j, locals, lane, acc)
@@ -4762,6 +4763,16 @@ impl FnLowerer<'_> {
                     let lx = self.emit_log_f32(x, vty);
                     let ylx = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, y, lx));
                     self.emit_exp_f32(ylx, vty)
+                }
+                Some(MathIntrinsic::Atan2) => {
+                    let y = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let x = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    self.emit_atan2(y, x, vty)
+                }
+                Some(MathIntrinsic::Hypot) => {
+                    let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let b = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    self.emit_hypot(a, b, vty)
                 }
                 Some(MathIntrinsic::Erf) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -5689,6 +5700,22 @@ impl FnLowerer<'_> {
                 let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
                 Some(self.emit_exp(ylx, &rty))
             }
+            MathIntrinsic::Atan2 => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let y = self.lower_expr(&args[0]);
+                let x = self.lower_expr(&args[1]);
+                Some(self.emit_atan2(y, x, &rty))
+            }
+            MathIntrinsic::Hypot => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                Some(self.emit_hypot(a, b, &rty))
+            }
             MathIntrinsic::Erf => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_erf(x, &rty))
@@ -6408,6 +6435,47 @@ impl FnLowerer<'_> {
         let asin = self.emit_asin(x, rty);
         let pio2 = self.splat_const_f(ATAN_PIO2, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, pio2, asin))
+    }
+
+    /// `atan2(y, x)` — the full-circle angle of `(x, y)` (geometry, robotics, complex argument, RoPE-style
+    /// angle recovery). `atan(y/x)` then a quadrant fix: when `x < 0`, add `+π` (for `y ≥ 0`) or `−π`
+    /// (for `y < 0`). `x = 0` falls out (`y/x = ±∞`, `atan(±∞) = ±π/2`, no fix since `x` is not `< 0`).
+    /// Built only from `emit_atan` + primitives, so it vectorizes and is bit-identical across backends;
+    /// matches libm except at the `(0,0)` origin (→ `NaN` here vs libm's `0`). Works scalar or vector.
+    fn emit_atan2(&mut self, y: ValueId, x: ValueId, rty: &MirType) -> ValueId {
+        let mty = mask_ty(rty);
+        let q = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, y, x));
+        let a = self.emit_atan(q, rty);
+        let zero = self.splat_const_f(0.0, rty);
+        let pi = self.splat_const_f(std::f64::consts::PI, rty);
+        let neg_pi = self.splat_const_f(-std::f64::consts::PI, rty);
+        // copysign(π, y) via select: y < 0 → −π, else +π.
+        let yneg = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Folt, y, zero));
+        let pi_signed = self.builder.build(rty.clone(), Op::Select(yneg, neg_pi, pi));
+        let xneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
+        let adj = self.builder.build(rty.clone(), Op::Select(xneg, pi_signed, zero));
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, a, adj))
+    }
+
+    /// `hypot(a, b) = √(a² + b²)`, the overflow-safe 2-norm/magnitude (gradient norms, complex modulus,
+    /// 2-D distance). Scaled by `m = max(|a|, |b|)` so `(a/m)² + (b/m)² ≤ 2` never overflows; the `m = 0`
+    /// case (both zero) is guarded to `0` (else `0/0 = NaN`). All primitive ops, so it vectorizes and is
+    /// bit-identical across backends. Works scalar or vector.
+    fn emit_hypot(&mut self, a: ValueId, b: ValueId, rty: &MirType) -> ValueId {
+        let mty = mask_ty(rty);
+        let aa = self.emit_abs(a, rty);
+        let bb = self.emit_abs(b, rty);
+        let agtb = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, aa, bb));
+        let m = self.builder.build(rty.clone(), Op::Select(agtb, aa, bb));
+        let ra = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, a, m));
+        let rb = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, b, m));
+        let ra2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, ra, ra));
+        let sum = self.builder.build(rty.clone(), Op::Fma(rb, rb, ra2)); // rb² + ra²
+        let root = self.builder.build(rty.clone(), Op::Sqrt(sum));
+        let scaled = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, m, root));
+        let zero = self.splat_const_f(0.0, rty);
+        let mzero = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, m, zero));
+        self.builder.build(rty.clone(), Op::Select(mzero, zero, scaled))
     }
 
     /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
@@ -8430,6 +8498,8 @@ enum MathIntrinsic {
     Tan,
     Asin,
     Acos,
+    Atan2,
+    Hypot,
     Sinh,
     Cosh,
     Asinh,
@@ -8490,6 +8560,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "tan" => MathIntrinsic::Tan,
         "asin" => MathIntrinsic::Asin,
         "acos" => MathIntrinsic::Acos,
+        "atan2" => MathIntrinsic::Atan2,
+        "hypot" => MathIntrinsic::Hypot,
         "sinh" => MathIntrinsic::Sinh,
         "cosh" => MathIntrinsic::Cosh,
         "asinh" => MathIntrinsic::Asinh,
