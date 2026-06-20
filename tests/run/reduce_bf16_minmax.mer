@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: -20
+// EXPECT-OUT: 20
+module tests.run.reduce_bf16_minmax
+
+// bf16 max-family reductions: `m = fmax(m, (x[k] as f32))` / `fmin` / `fmax(m, abs((x[k] as f32)))`
+// over a `[bf16]` array dispatch to mercury_reduce_bf16 (RED_MAX/RED_MIN/RED_MAXABS). The widen is
+// lossless and max/min round nothing, so the result is the exact reduction of the widened values; the
+// interpreter calls the identical kernel, so interp and native agree bit-for-bit. The per-tensor
+// absmax is the symmetric-quantization scale a bf16 weight tensor's int8 export needs.
+//
+// x[k] = (k - 4)*0.5 for k in 0..8 → -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5 (all bf16-exact):
+//   max = 1.5, min = -2.0, absmax = 2.0.
+fn main() -> i32 {
+    let mut x: [bf16; 8] = [0.0 as bf16; 8];
+    for k in 0..8 { x[k] = ((k as f32 - 4.0) * 0.5) as bf16; }
+
+    let mut mx: f32 = -1e30;
+    for k in 0..8 { mx = fmax(mx, (x[k] as f32)); }
+    print((mx * 10.0) as i32); // 15
+
+    let mut mn: f32 = 1e30;
+    for k in 0..8 { mn = fmin(mn, (x[k] as f32)); }
+    print((mn * 10.0) as i32); // -20
+
+    let mut amx: f32 = 0.0;
+    for k in 0..8 { amx = fmax(amx, abs((x[k] as f32))); }
+    print((amx * 10.0) as i32); // 20
+    return 0;
+}

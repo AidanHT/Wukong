@@ -55,6 +55,7 @@ pub fn lower_program(
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
+        reduce_bf16: interner.intern("mercury_reduce_bf16"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
     };
     for item in &module.items {
@@ -491,6 +492,11 @@ struct GemmSyms {
     /// exception, like the f32 reduction kernel).
     dot_bf16: Symbol,
     sum_bf16: Symbol,
+    /// `mercury_reduce_bf16(x, n, op) -> f32` — the bf16 **max-family** reduction (`RED_MAX`/`RED_MIN`/
+    /// `RED_MAXABS`): a `m = fmax(m, (x[k] as f32))` / `fmin` / `fmax(m, abs(...))` loop over `[bf16]`
+    /// lowers here. The widen is lossless and max/min round nothing, so it is the exact reduction; the
+    /// outer combine is `Cmp+Select` (as in the f32 path), and interp calls the identical kernel.
+    reduce_bf16: Symbol,
     /// `mercury_axpby_bf16(x, y, out, n, a, b)` — bf16→f32 streaming axpby (`out = a*x + b*y`, bf16
     /// inputs, f32 output, f32 math). The mixed-precision elementwise twin of the f32 streaming kernel.
     axpby_bf16: Symbol,
@@ -2235,7 +2241,7 @@ impl FnLowerer<'_> {
         &self,
         body: &Block,
         k: Symbol,
-    ) -> Option<(Symbol, bool, Symbol, Symbol)> {
+    ) -> Option<(Symbol, i64, Symbol, Symbol)> {
         if body.tail.is_some() || body.stmts.len() != 1 {
             return None;
         }
@@ -2244,27 +2250,6 @@ impl FnLowerer<'_> {
         };
         let s = single_path(target)?;
         if s == k {
-            return None;
-        }
-        // `s += addend`, or `s = s + addend` / `s = addend + s`.
-        let addend: &Expr = match op {
-            ast::AssignOp::Add => value,
-            ast::AssignOp::Assign => match &value.kind {
-                ExprKind::Binary {
-                    op: ast::BinOp::Add,
-                    lhs,
-                    rhs,
-                } if single_path(lhs) == Some(s) => rhs,
-                ExprKind::Binary {
-                    op: ast::BinOp::Add,
-                    lhs,
-                    rhs,
-                } if single_path(rhs) == Some(s) => lhs,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        if expr_uses_sym(addend, s) {
             return None;
         }
         // `(base[k] as f32)` where `base` is a bf16 array indexed exactly by `k`: peel the cast (it
@@ -2287,17 +2272,85 @@ impl FnLowerer<'_> {
             }
             single_path(base)
         };
+        // Running max/min over widened bf16: `m = fmax(m, (x[k] as f32))` / `fmin` (either operand
+        // order), or — for fmax — `m = fmax(m, abs((x[k] as f32)))` (running **absmax**, the symmetric
+        // int8-quant scale a bf16 weight tensor needs). Dispatches to `mercury_reduce_bf16` (op-coded),
+        // outer-combined by `Cmp+Select` exactly like the f32 reduction. Mirrors `match_reduction_kernel`
+        // but through the bf16-widening load.
+        if let ast::AssignOp::Assign = op {
+            if let ExprKind::Call { callee, args, .. } = &value.kind {
+                if args.len() == 2 {
+                    let red = match self.vectorizable_intrinsic(callee) {
+                        Some(MathIntrinsic::Fmax) => Some(RED_MAX),
+                        Some(MathIntrinsic::Fmin) => Some(RED_MIN),
+                        _ => None,
+                    };
+                    if let Some(red) = red {
+                        let other = if single_path(&args[0]) == Some(s) {
+                            &args[1]
+                        } else if single_path(&args[1]) == Some(s) {
+                            &args[0]
+                        } else {
+                            return None;
+                        };
+                        if let Some(a) = bf16_load(other) {
+                            return Some((s, red, a, a));
+                        }
+                        if red == RED_MAX {
+                            if let ExprKind::Call {
+                                callee: ac,
+                                args: aargs,
+                                ..
+                            } = &other.kind
+                            {
+                                if aargs.len() == 1
+                                    && matches!(
+                                        self.vectorizable_intrinsic(ac),
+                                        Some(MathIntrinsic::Abs)
+                                    )
+                                {
+                                    let a = bf16_load(&aargs[0])?;
+                                    return Some((s, RED_MAXABS, a, a));
+                                }
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+        // `s += addend`, or `s = s + addend` / `s = addend + s`.
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(s) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(s) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if expr_uses_sym(addend, s) {
+            return None;
+        }
         match &addend.kind {
             // dot: `(x[k] as f32) * (y[k] as f32)`
             ExprKind::Binary {
                 op: ast::BinOp::Mul,
                 lhs,
                 rhs,
-            } => Some((s, true, bf16_load(lhs)?, bf16_load(rhs)?)),
+            } => Some((s, RED_DOT, bf16_load(lhs)?, bf16_load(rhs)?)),
             // sum: `(x[k] as f32)`
             ExprKind::Cast { .. } => {
                 let xb = bf16_load(addend)?;
-                Some((s, false, xb, xb))
+                Some((s, RED_SUM, xb, xb))
             }
             _ => None,
         }
@@ -2478,7 +2531,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let Some((s, is_dot, xb, yb)) = self.match_bf16_reduction(body, *k) else {
+        let Some((s, red_op, xb, yb)) = self.match_bf16_reduction(body, *k) else {
             return false;
         };
         // Accumulator must be an in-scope f32 scalar; both arrays must be in scope (base pointers).
@@ -2491,19 +2544,43 @@ impl FnLowerer<'_> {
         let n_ty = self.expr_mir(end);
         let n = self.lower_expr(end);
         let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
-        let (func, args) = if is_dot {
-            (self.gemm.dot_bf16, vec![xv, yv, n])
-        } else {
-            (self.gemm.sum_bf16, vec![xv, n])
+        // Pick the kernel: additive dot/sum have dedicated symbols; the max-family routes through the
+        // op-coded `mercury_reduce_bf16`.
+        let (func, args) = match red_op {
+            RED_DOT => (self.gemm.dot_bf16, vec![xv, yv, n]),
+            RED_SUM => (self.gemm.sum_bf16, vec![xv, n]),
+            _ => {
+                let opv = self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(red_op as i128, MirType::I64));
+                (self.gemm.reduce_bf16, vec![xv, n, opv])
+            }
         };
         let result = self.builder.build(MirType::F32, Op::Call { func, args });
-        // `s = s + kernel` — matches the loop's `s_final = s_init + Σ`, reassociated inside the kernel.
         let cur = self
             .builder
             .build(MirType::F32, Op::Load(s_slot, MirType::F32));
-        let new_s = self
-            .builder
-            .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result));
+        // Combine the kernel result into the accumulator — additive: `s = s + result` (matches the
+        // loop's reassociated `s_final = s_init + Σ`); max/min: `s = fmax/fmin(s, result)` as
+        // `Cmp(Fogt/Folt)+Select`, the identical fold the kernel and the source loop use, so interp
+        // (same kernel) and native agree.
+        let new_s = match red_op {
+            RED_MAX | RED_MIN | RED_MAXABS => {
+                let pred = if red_op == RED_MIN {
+                    CmpOp::Folt
+                } else {
+                    CmpOp::Fogt
+                };
+                let mask = self
+                    .builder
+                    .build(mask_ty(&MirType::F32), Op::Cmp(pred, cur, result));
+                self.builder
+                    .build(MirType::F32, Op::Select(mask, cur, result))
+            }
+            _ => self
+                .builder
+                .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result)),
+        };
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: new_s,

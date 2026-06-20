@@ -178,6 +178,91 @@ unsafe fn dot_bf16_avx(x: &[u16], y: &[u16]) -> f32 {
     s
 }
 
+// ---- bf16 max / min / absmax (the max-family folds; widen is lossless and max/min round nothing,
+//      so the result is the *exact* reduction of the widened values — no f32-accumulator caveat) ----
+
+/// One widened element folded into a max/min/maxabs accumulator, matching `reduce.rs::contrib` for
+/// these ops so the bf16 max-family fold is consistent with the f32 reduction's semantics (and the
+/// scalar twin matches the AVX2 lanes: `f32::abs` clears the sign bit ≡ `andnot(-0.0, v)`).
+#[inline(always)]
+fn rfold(a: f32, xi: f32, op: i64) -> f32 {
+    use crate::reduce::{fold2, RED_MAX, RED_MAXABS};
+    if op == RED_MAXABS {
+        fold2(a, xi.abs(), RED_MAX)
+    } else {
+        fold2(a, xi, op)
+    }
+}
+
+/// Scalar twin of the bf16 max/min/maxabs reduction: 8 logical lane accumulators (lane `l` folds
+/// elements `8k+l`), the fixed [`crate::reduce::hcombine8`] combine, then a scalar tail — bit-identical
+/// to the AVX2 path (a test pins it) and the no-AVX2 fallback.
+fn reduce_minmax_scalar(op: i64, x: &[u16]) -> f32 {
+    use crate::reduce::{hcombine8, ident};
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = [ident(op); 8];
+    for c in 0..chunks {
+        for (l, a) in acc.iter_mut().enumerate() {
+            *a = rfold(*a, bf16_bits_to_f32(x[c * 8 + l]), op);
+        }
+    }
+    let mut s = hcombine8(acc, op);
+    for &v in &x[chunks * 8..] {
+        s = rfold(s, bf16_bits_to_f32(v), op);
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reduce_minmax_avx(op: i64, x: &[u16]) -> f32 {
+    use crate::reduce::{hcombine8, ident, RED_MAXABS, RED_MIN};
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_set1_ps(ident(op));
+    let absmask = _mm256_set1_ps(-0.0); // andnot(-0.0, v) clears the sign bit = |v|
+    for c in 0..chunks {
+        let mut v = widen_bf16(x.as_ptr().add(c * 8));
+        if op == RED_MAXABS {
+            v = _mm256_andnot_ps(absmask, v);
+        }
+        acc = if op == RED_MIN {
+            _mm256_min_ps(acc, v)
+        } else {
+            _mm256_max_ps(acc, v) // RED_MAX and the (already-abs'd) RED_MAXABS both fold by max
+        };
+    }
+    let mut lanes = [ident(op); 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut s = hcombine8(lanes, op);
+    for &v in &x[chunks * 8..] {
+        s = rfold(s, bf16_bits_to_f32(v), op);
+    }
+    s
+}
+
+/// `reduce_i widen(x[i])` over `n` bf16 values for the **max-family** ops — `RED_MAX` (per-tensor
+/// max, e.g. the softmax-stability shift), `RED_MIN`, and `RED_MAXABS` (the symmetric-quantization
+/// absmax scale a `[bf16]` weight tensor's int8 export needs). f32 result; half the bytes of the f32
+/// reduction. The widen is lossless and the folds round nothing, so this is the *exact* reduction of
+/// the widened values — the interpreter marshals through this very kernel, so interp == native.
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_reduce_bf16(x: *const u16, n: i64, op: i64) -> f32 {
+    if n <= 0 {
+        return crate::reduce::ident(op);
+    }
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return reduce_minmax_avx(op, x);
+    }
+    reduce_minmax_scalar(op, x)
+}
+
 // ---- Public C-ABI entry points (f32-accumulated) ----
 
 /// `sum(widen(x[i]))` over `n` IEEE-f16 values (stored as `u16` bits), accumulated in f32.
@@ -356,6 +441,48 @@ mod tests {
                     dot_scalar(Half::Bf16, &xbf, &ybf).to_bits(),
                     "dot_bf16 n={n}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn reduce_bf16_simd_equals_scalar_and_reference() {
+        use crate::reduce::{ident, RED_MAX, RED_MAXABS, RED_MIN};
+        // fold matching `reduce.rs::fold2` exactly, so the reference picks the same element on ties.
+        let fold = |a: f32, v: f32, op: i64| -> f32 {
+            match op {
+                RED_MIN => {
+                    if a < v {
+                        a
+                    } else {
+                        v
+                    }
+                }
+                _ => {
+                    if a > v {
+                        a
+                    } else {
+                        v
+                    }
+                }
+            }
+        };
+        for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
+            let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013 - 7.0).sin() * 3.0).collect();
+            let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+            for op in [RED_MAX, RED_MIN, RED_MAXABS] {
+                let got = unsafe { mercury_reduce_bf16(xbf.as_ptr(), n as i64, op) };
+                // AVX2 == scalar twin, bit-for-bit.
+                let twin = reduce_minmax_scalar(op, &xbf);
+                assert_eq!(got.to_bits(), twin.to_bits(), "twin op {op} n {n}");
+                // == the exact reduction of the widened values (max/min round nothing).
+                let mut want = ident(op);
+                for &b in &xbf {
+                    let v = bf16_bits_to_f32(b);
+                    let v = if op == RED_MAXABS { v.abs() } else { v };
+                    want = fold(want, v, if op == RED_MAXABS { RED_MAX } else { op });
+                }
+                assert_eq!(got.to_bits(), want.to_bits(), "ref op {op} n {n}");
             }
         }
     }
