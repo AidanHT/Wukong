@@ -56,6 +56,9 @@ pub fn lower_program(
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
         reduce_bf16: interner.intern("mercury_reduce_bf16"),
+        dot_f16: interner.intern("mercury_dot_f16"),
+        sum_f16: interner.intern("mercury_sum_f16"),
+        reduce_f16: interner.intern("mercury_reduce_f16"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
     };
     for item in &module.items {
@@ -497,6 +500,12 @@ struct GemmSyms {
     /// lowers here. The widen is lossless and max/min round nothing, so it is the exact reduction; the
     /// outer combine is `Cmp+Select` (as in the f32 path), and interp calls the identical kernel.
     reduce_bf16: Symbol,
+    /// The IEEE-f16 twins of the reductions above (`mercury_dot_f16` / `mercury_sum_f16` /
+    /// `mercury_reduce_f16`): same dispatch, but the kernel widens f16→f32 with F16C `vcvtph2ps`
+    /// instead of the bf16 `<<16`. A `[f16]` reduction loop routes here.
+    dot_f16: Symbol,
+    sum_f16: Symbol,
+    reduce_f16: Symbol,
     /// `mercury_axpby_bf16(x, y, out, n, a, b)` — bf16→f32 streaming axpby (`out = a*x + b*y`, bf16
     /// inputs, f32 output, f32 math). The mixed-precision elementwise twin of the f32 streaming kernel.
     axpby_bf16: Symbol,
@@ -2237,11 +2246,11 @@ impl FnLowerer<'_> {
     /// through an `as f32` widening cast. Returns the accumulator symbol, `is_dot`, and the array
     /// bases (`y == x` for sum). Strict pure-AST match — single statement, index exactly `k`, both
     /// loads bf16, cast target f32. The f32 accumulate is the standard ML mixed-precision contract.
-    fn match_bf16_reduction(
+    fn match_lowp_reduction(
         &self,
         body: &Block,
         k: Symbol,
-    ) -> Option<(Symbol, i64, Symbol, Symbol)> {
+    ) -> Option<(Symbol, i64, Symbol, Symbol, bool)> {
         if body.tail.is_some() || body.stmts.len() != 1 {
             return None;
         }
@@ -2252,9 +2261,10 @@ impl FnLowerer<'_> {
         if s == k {
             return None;
         }
-        // `(base[k] as f32)` where `base` is a bf16 array indexed exactly by `k`: peel the cast (it
-        // must target f32), require the inner indexed value's scalar be bf16, return the base symbol.
-        let bf16_load = |e: &Expr| -> Option<Symbol> {
+        // `(base[k] as f32)` where `base` is a `[bf16]` *or* `[f16]` array indexed exactly by `k`: peel
+        // the cast (must target f32), require the inner scalar be bf16/f16, return the base symbol and
+        // which precision it is (`true` = f16). The reduction dispatches to the matching half kernel.
+        let lowp_load = |e: &Expr| -> Option<(Symbol, bool)> {
             let ExprKind::Cast { expr: inner, .. } = &e.kind else {
                 return None;
             };
@@ -2267,16 +2277,18 @@ impl FnLowerer<'_> {
             if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
                 return None;
             }
-            if scalar_of(inner, self.sema) != Some(mercury_types::Scalar::Bf16) {
-                return None;
-            }
-            single_path(base)
+            let is_f16 = match scalar_of(inner, self.sema) {
+                Some(mercury_types::Scalar::Bf16) => false,
+                Some(mercury_types::Scalar::F16) => true,
+                _ => return None,
+            };
+            Some((single_path(base)?, is_f16))
         };
-        // Running max/min over widened bf16: `m = fmax(m, (x[k] as f32))` / `fmin` (either operand
+        // Running max/min over widened bf16/f16: `m = fmax(m, (x[k] as f32))` / `fmin` (either operand
         // order), or — for fmax — `m = fmax(m, abs((x[k] as f32)))` (running **absmax**, the symmetric
-        // int8-quant scale a bf16 weight tensor needs). Dispatches to `mercury_reduce_bf16` (op-coded),
-        // outer-combined by `Cmp+Select` exactly like the f32 reduction. Mirrors `match_reduction_kernel`
-        // but through the bf16-widening load.
+        // int8-quant scale a low-precision weight tensor needs). Dispatches to `mercury_reduce_{bf16,
+        // f16}` (op-coded), outer-combined by `Cmp+Select` exactly like the f32 reduction. Mirrors
+        // `match_reduction_kernel` but through the widening load.
         if let ast::AssignOp::Assign = op {
             if let ExprKind::Call { callee, args, .. } = &value.kind {
                 if args.len() == 2 {
@@ -2293,8 +2305,8 @@ impl FnLowerer<'_> {
                         } else {
                             return None;
                         };
-                        if let Some(a) = bf16_load(other) {
-                            return Some((s, red, a, a));
+                        if let Some((a, f16)) = lowp_load(other) {
+                            return Some((s, red, a, a, f16));
                         }
                         if red == RED_MAX {
                             if let ExprKind::Call {
@@ -2309,8 +2321,8 @@ impl FnLowerer<'_> {
                                         Some(MathIntrinsic::Abs)
                                     )
                                 {
-                                    let a = bf16_load(&aargs[0])?;
-                                    return Some((s, RED_MAXABS, a, a));
+                                    let (a, f16) = lowp_load(&aargs[0])?;
+                                    return Some((s, RED_MAXABS, a, a, f16));
                                 }
                             }
                         }
@@ -2341,16 +2353,23 @@ impl FnLowerer<'_> {
             return None;
         }
         match &addend.kind {
-            // dot: `(x[k] as f32) * (y[k] as f32)`
+            // dot: `(x[k] as f32) * (y[k] as f32)` — both operands must be the same precision.
             ExprKind::Binary {
                 op: ast::BinOp::Mul,
                 lhs,
                 rhs,
-            } => Some((s, RED_DOT, bf16_load(lhs)?, bf16_load(rhs)?)),
+            } => {
+                let (xb, xf) = lowp_load(lhs)?;
+                let (yb, yf) = lowp_load(rhs)?;
+                if xf != yf {
+                    return None;
+                }
+                Some((s, RED_DOT, xb, yb, xf))
+            }
             // sum: `(x[k] as f32)`
             ExprKind::Cast { .. } => {
-                let xb = bf16_load(addend)?;
-                Some((s, RED_SUM, xb, xb))
+                let (xb, xf) = lowp_load(addend)?;
+                Some((s, RED_SUM, xb, xb, xf))
             }
             _ => None,
         }
@@ -2531,7 +2550,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let Some((s, red_op, xb, yb)) = self.match_bf16_reduction(body, *k) else {
+        let Some((s, red_op, xb, yb, is_f16)) = self.match_lowp_reduction(body, *k) else {
             return false;
         };
         // Accumulator must be an in-scope f32 scalar; both arrays must be in scope (base pointers).
@@ -2544,16 +2563,29 @@ impl FnLowerer<'_> {
         let n_ty = self.expr_mir(end);
         let n = self.lower_expr(end);
         let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
-        // Pick the kernel: additive dot/sum have dedicated symbols; the max-family routes through the
-        // op-coded `mercury_reduce_bf16`.
+        // Pick the kernel by op and precision: additive dot/sum have dedicated symbols; the max-family
+        // routes through the op-coded reduce kernel. f16 uses the F16C twins, bf16 the `<<16` ones.
         let (func, args) = match red_op {
-            RED_DOT => (self.gemm.dot_bf16, vec![xv, yv, n]),
-            RED_SUM => (self.gemm.sum_bf16, vec![xv, n]),
+            RED_DOT => (
+                if is_f16 { self.gemm.dot_f16 } else { self.gemm.dot_bf16 },
+                vec![xv, yv, n],
+            ),
+            RED_SUM => (
+                if is_f16 { self.gemm.sum_f16 } else { self.gemm.sum_bf16 },
+                vec![xv, n],
+            ),
             _ => {
                 let opv = self
                     .builder
                     .build(MirType::I64, Op::ConstInt(red_op as i128, MirType::I64));
-                (self.gemm.reduce_bf16, vec![xv, n, opv])
+                (
+                    if is_f16 {
+                        self.gemm.reduce_f16
+                    } else {
+                        self.gemm.reduce_bf16
+                    },
+                    vec![xv, n, opv],
+                )
             }
         };
         let result = self.builder.build(MirType::F32, Op::Call { func, args });

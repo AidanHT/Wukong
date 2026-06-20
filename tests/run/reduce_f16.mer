@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 72
+// EXPECT-OUT: 36
+// EXPECT-OUT: 15
+// EXPECT-OUT: 20
+module tests.run.reduce_f16
+
+// IEEE-f16 reductions: `s += (x[k] as f32) [* (y[k] as f32)]` and `m = fmax/fmin(m, (x[k] as f32))`
+// over `[f16]` arrays dispatch to the F16C kernels (mercury_dot_f16 / sum_f16 / reduce_f16) — f16
+// storage, f32 accumulate / exact max-fold. The kernel widens with `vcvtph2ps`; the interpreter
+// reconstructs the f16 bits and calls the identical kernel, so interp and native agree bit-for-bit.
+fn main() -> i32 {
+    let mut x: [f16; 8] = [0.0 as f16; 8];
+    let mut y: [f16; 8] = [0.0 as f16; 8];
+    for i in 0..8 {
+        x[i] = ((i + 1) as f32) as f16; // 1, 2, ..., 8 (f16-exact)
+        y[i] = 2.0 as f16;
+    }
+
+    // dot = Σ x[k]·y[k] = 2·36 = 72.
+    let mut d: f32 = 0.0;
+    for k in 0..8 { d = d + (x[k] as f32) * (y[k] as f32); }
+    print(d as i32); // 72
+
+    // sum = 36.
+    let mut s: f32 = 0.0;
+    for k in 0..8 { s = s + (x[k] as f32); }
+    print(s as i32); // 36
+
+    // max = 8, then *... use a signed set for min/absmax flavor.
+    let mut z: [f16; 8] = [0.0 as f16; 8];
+    for i in 0..8 { z[i] = ((i as f32 - 4.0) * 0.5) as f16; } // -2 .. 1.5
+    let mut mx: f32 = -1e30;
+    for k in 0..8 { mx = fmax(mx, (z[k] as f32)); }
+    print((mx * 10.0) as i32); // 1.5*10 = 15
+    let mut amx: f32 = 0.0;
+    for k in 0..8 { amx = fmax(amx, abs((z[k] as f32))); }
+    print((amx * 10.0) as i32); // 2.0*10 = 20
+    return 0;
+}

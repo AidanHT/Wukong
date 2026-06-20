@@ -195,29 +195,29 @@ fn rfold(a: f32, xi: f32, op: i64) -> f32 {
     }
 }
 
-/// Scalar twin of the bf16 max/min/maxabs reduction: 8 logical lane accumulators (lane `l` folds
+/// Scalar twin of the bf16/f16 max/min/maxabs reduction: 8 logical lane accumulators (lane `l` folds
 /// elements `8k+l`), the fixed [`crate::reduce::hcombine8`] combine, then a scalar tail — bit-identical
-/// to the AVX2 path (a test pins it) and the no-AVX2 fallback.
-fn reduce_minmax_scalar(op: i64, x: &[u16]) -> f32 {
+/// to the AVX2 path (a test pins it) and the no-AVX2 fallback. Generic over the half kind.
+fn reduce_minmax_scalar(kind: Half, op: i64, x: &[u16]) -> f32 {
     use crate::reduce::{hcombine8, ident};
     let n = x.len();
     let chunks = n / 8;
     let mut acc = [ident(op); 8];
     for c in 0..chunks {
         for (l, a) in acc.iter_mut().enumerate() {
-            *a = rfold(*a, bf16_bits_to_f32(x[c * 8 + l]), op);
+            *a = rfold(*a, kind.widen(x[c * 8 + l]), op);
         }
     }
     let mut s = hcombine8(acc, op);
     for &v in &x[chunks * 8..] {
-        s = rfold(s, bf16_bits_to_f32(v), op);
+        s = rfold(s, kind.widen(v), op);
     }
     s
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn reduce_minmax_avx(op: i64, x: &[u16]) -> f32 {
+unsafe fn reduce_minmax_bf16_avx(op: i64, x: &[u16]) -> f32 {
     use crate::reduce::{hcombine8, ident, RED_MAXABS, RED_MIN};
     let n = x.len();
     let chunks = n / 8;
@@ -243,6 +243,34 @@ unsafe fn reduce_minmax_avx(op: i64, x: &[u16]) -> f32 {
     s
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+unsafe fn reduce_minmax_f16_avx(op: i64, x: &[u16]) -> f32 {
+    use crate::reduce::{hcombine8, ident, RED_MAXABS, RED_MIN};
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = _mm256_set1_ps(ident(op));
+    let absmask = _mm256_set1_ps(-0.0);
+    for c in 0..chunks {
+        let mut v = widen_f16(x.as_ptr().add(c * 8)); // F16C vcvtph2ps, lossless
+        if op == RED_MAXABS {
+            v = _mm256_andnot_ps(absmask, v);
+        }
+        acc = if op == RED_MIN {
+            _mm256_min_ps(acc, v)
+        } else {
+            _mm256_max_ps(acc, v)
+        };
+    }
+    let mut lanes = [ident(op); 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut s = hcombine8(lanes, op);
+    for &v in &x[chunks * 8..] {
+        s = rfold(s, f16_to_f32(v), op);
+    }
+    s
+}
+
 /// `reduce_i widen(x[i])` over `n` bf16 values for the **max-family** ops — `RED_MAX` (per-tensor
 /// max, e.g. the softmax-stability shift), `RED_MIN`, and `RED_MAXABS` (the symmetric-quantization
 /// absmax scale a `[bf16]` weight tensor's int8 export needs). f32 result; half the bytes of the f32
@@ -259,9 +287,28 @@ pub unsafe extern "C" fn mercury_reduce_bf16(x: *const u16, n: i64, op: i64) -> 
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
-        return reduce_minmax_avx(op, x);
+        return reduce_minmax_bf16_avx(op, x);
     }
-    reduce_minmax_scalar(op, x)
+    reduce_minmax_scalar(Half::Bf16, op, x)
+}
+
+/// `reduce_i widen(x[i])` over `n` IEEE-f16 values for the max-family ops (RED_MAX/RED_MIN/RED_MAXABS),
+/// f32 result. The F16C twin of [`mercury_reduce_bf16`] — widens with `vcvtph2ps` (lossless); the
+/// folds round nothing, so it is the exact reduction. Interp marshals through this very kernel.
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_reduce_f16(x: *const u16, n: i64, op: i64) -> f32 {
+    if n <= 0 {
+        return crate::reduce::ident(op);
+    }
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+        return reduce_minmax_f16_avx(op, x);
+    }
+    reduce_minmax_scalar(Half::F16, op, x)
 }
 
 // ---- Public C-ABI entry points (f32-accumulated) ----
@@ -471,19 +518,28 @@ mod tests {
         for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
             let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013 - 7.0).sin() * 3.0).collect();
             let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+            let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
             for op in [RED_MAX, RED_MIN, RED_MAXABS] {
-                let got = unsafe { mercury_reduce_bf16(xbf.as_ptr(), n as i64, op) };
-                // AVX2 == scalar twin, bit-for-bit.
-                let twin = reduce_minmax_scalar(op, &xbf);
-                assert_eq!(got.to_bits(), twin.to_bits(), "twin op {op} n {n}");
-                // == the exact reduction of the widened values (max/min round nothing).
-                let mut want = ident(op);
-                for &b in &xbf {
-                    let v = bf16_bits_to_f32(b);
-                    let v = if op == RED_MAXABS { v.abs() } else { v };
-                    want = fold(want, v, if op == RED_MAXABS { RED_MAX } else { op });
+                for (kind, xb, got) in [
+                    (Half::Bf16, &xbf, unsafe {
+                        mercury_reduce_bf16(xbf.as_ptr(), n as i64, op)
+                    }),
+                    (Half::F16, &xf16, unsafe {
+                        mercury_reduce_f16(xf16.as_ptr(), n as i64, op)
+                    }),
+                ] {
+                    // AVX2/F16C == scalar twin, bit-for-bit.
+                    let twin = reduce_minmax_scalar(kind, op, xb);
+                    assert_eq!(got.to_bits(), twin.to_bits(), "twin op {op} n {n}");
+                    // == the exact reduction of the widened values (max/min round nothing).
+                    let mut want = ident(op);
+                    for &b in xb {
+                        let v = kind.widen(b);
+                        let v = if op == RED_MAXABS { v.abs() } else { v };
+                        want = fold(want, v, if op == RED_MAXABS { RED_MAX } else { op });
+                    }
+                    assert_eq!(got.to_bits(), want.to_bits(), "ref op {op} n {n}");
                 }
-                assert_eq!(got.to_bits(), want.to_bits(), "ref op {op} n {n}");
             }
         }
     }
