@@ -60,6 +60,19 @@ struct MeasureI8 {
     out: Vec<i32>,
 }
 
+/// The bf16-reduction ABI: `(x, y: *const u16, o: *mut f32)` — bf16 stored bits in, the f32 scalar
+/// accumulator written to `o[0]`. `y` is unused (aliases `x`) for the unary sum.
+type Bf16KernelFn = unsafe extern "C" fn(*const u16, *const u16, *mut f32);
+
+/// The bf16 twin of [`Measure`]: just the scalar reduction result (checked across languages with a
+/// tight relative tolerance — the three reassociate the f32 sum differently).
+#[derive(Clone)]
+struct MeasureBf16 {
+    compile: Duration,
+    ns_per_call: f64,
+    out: f32,
+}
+
 /// The maximum relative element-wise error between two output buffers, and the index where it
 /// occurs. NaN-vs-NaN and same-sign-Inf agree; a small absolute floor keeps near-zero elements from
 /// blowing up the ratio. This is the honest full-buffer cross-language equality check: the three
@@ -168,6 +181,7 @@ fn main() {
     bench_norm(&cc, &dir);
     bench_norm_batched(&cc, &dir);
     bench_i8gemm(&cc, &dir);
+    bench_bf16(&cc, &dir);
     bench_streaming_large(&cc, &dir);
 }
 
@@ -571,6 +585,172 @@ fn rust_i8gemm(ns: usize) -> String {
          \x20   for j in 0..NS {{ let mut s: i32 = 0;\n\
          \x20     for k in 0..NS {{ s += *a.add(i*NS+k) as i32 * *b.add(j*NS+k) as i32; }}\n\
          \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+    )
+}
+
+/// Round an `f32` to bf16 (round-to-nearest-even), returning the 16 stored bits — the same arithmetic
+/// `mercury_runtime::f32_to_bf16_bits` uses, so the benchmark data matches what the compiler stores.
+/// (Benchmark inputs are finite, so the NaN case the runtime handles is irrelevant here.)
+fn to_bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let bias = 0x0000_7fff + ((b >> 16) & 1);
+    ((b + bias) >> 16) as u16
+}
+
+/// bf16 **mixed-precision reductions** (bf16 storage, f32 accumulate — the standard ML contract):
+/// dot `Σ x·y` and unary sum `Σ x` over `[bf16; N]` arrays. Mercury folds the loop to one
+/// `mercury_dot_bf16` / `mercury_sum_bf16` SIMD kernel (F16C-class widen + 8-lane f32 accumulate);
+/// C/Rust run the idiomatic `<<16` widen + accumulate at honest default flags (no `-ffast-math`, so
+/// their f32 reductions stay sequential — the same basis as the `dot` kernel). The payoff is
+/// **bandwidth**: bf16 moves half the bytes of f32, so the win grows once the working set spills L3.
+/// Two sizes bracket that: 1<<20 (L2/L3-resident) and 1<<24 (32 MB of bf16 ≫ L3). All-positive inputs
+/// keep the reduction well-conditioned, so the cross-language scalar check is a tight tolerance.
+fn bench_bf16(cc: &str, dir: &Path) {
+    for nbits in [20u32, 24] {
+        let n = 1usize << nbits;
+        // bf16 stored bits of small positive values (well-conditioned f32 accumulation).
+        let x: Vec<u16> = (0..n)
+            .map(|i| to_bf16_bits((i as f32 % 17.0) * 0.05 + 0.5))
+            .collect();
+        let y: Vec<u16> = (0..n)
+            .map(|i| to_bf16_bits((i as f32 % 13.0) * 0.03 + 0.25))
+            .collect();
+        let mut o = vec![0.0f32; 1];
+        let (xp, yp, op) = (x.as_ptr(), y.as_ptr(), o.as_mut_ptr());
+        println!("=== bf16 reductions (bf16 in, f32 accumulate) N=2^{nbits} (GB/s, higher is better) ===");
+        for (kind, is_dot) in [("dot Σx·y", true), ("sum Σx", false)] {
+            let streams = if is_dot { 2 } else { 1 };
+            let bytes = (streams * n * 2) as f64; // bf16 input traffic
+            let gbps = |m: &Option<MeasureBf16>| {
+                m.as_ref()
+                    .map(|x| format!("{:.1}", bytes / x.ns_per_call)) // bytes/ns == GB/s
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let mer = bench_mercury_bf16(&mer_bf16(n, is_dot), &mut o, xp, yp, op);
+            let cm = bench_external_bf16(
+                "c",
+                &c_bf16(n, is_dot),
+                dir,
+                "bf16",
+                cc,
+                &["-O3", "-march=native", "-shared"],
+                &mut o,
+                xp,
+                yp,
+                op,
+            );
+            let rm = bench_external_bf16(
+                "rs",
+                &rust_bf16(n, is_dot),
+                dir,
+                "bf16",
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut o,
+                xp,
+                yp,
+                op,
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11}",
+                kind, "Mercury", "C (gcc)", "Rust"
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11}",
+                "GB/s",
+                gbps(&mer),
+                gbps(&cm),
+                gbps(&rm)
+            );
+            // All-positive, well-conditioned reduction → a tight relative tolerance is the right
+            // cross-language bar (the three reassociate the f32 sum differently: Mercury 8-lane SIMD
+            // vs sequential C/Rust). Report the scalars so any drift is visible.
+            if let Some(m) = &mer {
+                for (lang, other) in [("C", &cm), ("Rust", &rm)] {
+                    if let Some(o2) = other {
+                        let (a, b) = (m.out, o2.out);
+                        let rel = (a - b).abs() as f64 / (a.abs().max(b.abs()).max(1e-6) as f64);
+                        if rel > 1e-3 {
+                            println!("  ! {lang} scalar drift: {b} vs Mercury {a} (rel {rel:.2e})");
+                        }
+                    }
+                }
+            }
+            if let (Some(m), Some(c2)) = (&mer, &cm) {
+                let r = c2.ns_per_call / m.ns_per_call;
+                println!(
+                    "  -> Mercury is {:.2}x {} than idiomatic single-threaded C",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                );
+            }
+            // Compile time (Mercury front-end + JIT vs gcc/rustc to a shared lib).
+            let cms = |m: &Option<MeasureBf16>| {
+                m.as_ref()
+                    .map(|x| format!("{:.0}", x.compile.as_secs_f64() * 1e3))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11}",
+                "compile ms",
+                cms(&mer),
+                cms(&cm),
+                cms(&rm)
+            );
+        }
+        println!();
+    }
+}
+
+/// Mercury bf16 reduction: `s += (x[k] as f32) [* (y[k] as f32)]` — exactly what the `mir_build`
+/// recognizer folds to one `mercury_dot_bf16` / `mercury_sum_bf16` call (bf16 storage, f32 accumulate).
+fn mer_bf16(n: usize, is_dot: bool) -> String {
+    let term = if is_dot {
+        "(x[k] as f32) * (y[k] as f32)"
+    } else {
+        "(x[k] as f32)"
+    };
+    format!(
+        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], o: [f32; 1]) {{\n\
+         \x20   let mut s: f32 = 0.0;\n\
+         \x20   for k in 0..{n} {{ s = s + {term}; }}\n\
+         \x20   o[0] = s;\n}}\n"
+    )
+}
+
+/// Idiomatic C bf16 reduction: widen the 16 stored bits to f32 (`<<16` into the high half) and
+/// accumulate. gcc `-O3 -march=native` is free to vectorize the widen; the f32 reduction stays
+/// sequential at default flags (no `-ffast-math`), the honest baseline.
+fn c_bf16(n: usize, is_dot: bool) -> String {
+    let term = if is_dot {
+        "bf(x[k]) * bf(y[k])"
+    } else {
+        "bf(x[k])"
+    };
+    format!(
+        "#include <stdint.h>\n#include <string.h>\n#define N {n}\n\
+         static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
+         __declspec(dllexport) void kbench(const uint16_t* x, const uint16_t* y, float* o){{\n\
+         \x20   float s=0.0f;\n\
+         \x20   for (long k=0;k<N;k++) s += {term};\n\
+         \x20   o[0]=s;\n}}\n"
+    )
+}
+
+/// Idiomatic Rust bf16 reduction (same `<<16` widen; rustc `-O -Ctarget-cpu=native`, no contraction).
+fn rust_bf16(n: usize, is_dot: bool) -> String {
+    let term = if is_dot {
+        "bf(*x.add(k)) * bf(*y.add(k))"
+    } else {
+        "bf(*x.add(k))"
+    };
+    let yname = if is_dot { "y" } else { "_y" }; // y is unused for the unary sum
+    format!(
+        "#[inline(always)]\nfn bf(b: u16) -> f32 {{ f32::from_bits((b as u32) << 16) }}\n\
+         #[no_mangle]\npub extern \"C\" fn kbench(x: *const u16, {yname}: *const u16, o: *mut f32) {{ unsafe {{\n\
+         \x20   let mut s = 0.0f32;\n\
+         \x20   for k in 0..{n} {{ s += {term}; }}\n\
+         \x20   *o = s;\n}} }}\n"
     )
 }
 
@@ -993,7 +1173,13 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
             );
             for (suffix, par) in [("", false), ("@parallel", true)] {
                 let label = format!("{op}{suffix}");
-                let mer = bench_mercury(&mer_norm_batched(rows, cols, op, par), &mut out, xp, yp, op_);
+                let mer = bench_mercury(
+                    &mer_norm_batched(rows, cols, op, par),
+                    &mut out,
+                    xp,
+                    yp,
+                    op_,
+                );
                 let ns = |m: &Option<Measure>| {
                     m.as_ref()
                         .map(|x| format!("{:.0}", x.ns_per_call))
@@ -1409,6 +1595,132 @@ fn bench_external_i8(
         let ns = time_ns(|| f(ap, bp, cp));
         let snapshot = out.to_vec();
         Some(MeasureI8 {
+            compile,
+            ns_per_call: ns,
+            out: snapshot,
+        })
+    }
+}
+
+/// The bf16 twin of [`bench_mercury_i8`]: JIT-compile a Mercury bf16 reduction and time it. `out` is a
+/// 1-element f32 buffer holding the scalar result.
+fn bench_mercury_bf16(
+    src: &str,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+    op: *mut f32,
+) -> Option<MeasureBf16> {
+    let t = Instant::now();
+    let mut interner = Interner::new();
+    let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    if pd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury parse error");
+        return None;
+    }
+    let (sema, sd) = mercury_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury sema error: {sd:?}");
+        return None;
+    }
+    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    if ld.iter().any(|d| d.is_error()) {
+        eprintln!("mercury lower error: {ld:?}");
+        return None;
+    }
+    mercury_opt::optimize(&mut program, 3);
+    let handle = match mercury_codegen_cranelift::jit_module(&program, &interner) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("mercury codegen error: {e}");
+            return None;
+        }
+    };
+    let sym = interner.intern("kbench");
+    let ptr = handle.func_ptr(sym)?;
+    let compile = t.elapsed();
+    let f: Bf16KernelFn = unsafe { std::mem::transmute(ptr) };
+
+    out[0] = 0.0;
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot = out[0];
+    drop(handle); // keep alive through timing
+    Some(MeasureBf16 {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// The bf16 twin of [`bench_external_i8`]: compile a C/Rust bf16 reduction to a shared lib and time it.
+#[allow(clippy::too_many_arguments)]
+fn bench_external_bf16(
+    ext: &str,
+    src: &str,
+    dir: &Path,
+    name: &str,
+    compiler: &str,
+    args: &[&str],
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+    op: *mut f32,
+) -> Option<MeasureBf16> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let src_path = dir.join(format!("{safe}.{ext}"));
+    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
+    if std::fs::write(&src_path, src).is_err() {
+        return None;
+    }
+    let t = Instant::now();
+    let status = Command::new(compiler)
+        .args(args)
+        .arg("-o")
+        .arg(&dll)
+        .arg(&src_path)
+        .status();
+    let compile = t.elapsed();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("{compiler} failed to compile {name}.{ext}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("could not run `{compiler}` (skipping)");
+            return None;
+        }
+    }
+
+    unsafe {
+        let lib = match libloading::Library::new(&dll) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("load {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let sym: libloading::Symbol<Bf16KernelFn> = match lib.get(b"kbench\0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("symbol kbench in {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let f: Bf16KernelFn = *sym;
+        out[0] = 0.0;
+        let ns = time_ns(|| f(xp, yp, op));
+        let snapshot = out[0];
+        Some(MeasureBf16 {
             compile,
             ns_per_call: ns,
             out: snapshot,
