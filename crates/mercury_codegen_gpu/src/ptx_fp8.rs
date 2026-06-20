@@ -118,6 +118,111 @@ pub const FP8_TILE: &str = r#".version 8.4
 }
 "#;
 
+/// Multi-tile per warp for fp8: `M` direction tiles (each 16 rows) and `N` direction tiles (each 8
+/// cols). 2×4 → a 32×32 C block per warp, 8 `mma`s per K-step. Each warp tile size = 16·TM × 8·TN.
+pub const FP8_TM: usize = 2;
+pub const FP8_TN: usize = 4;
+
+/// **Fragment-reuse fp8 GEMM** — the throughput path. Each warp computes a `FP8_TM×FP8_TN` block of
+/// 16×8 tiles, loading each A fragment once and reusing it across all `FP8_TN` B-tiles (and vice
+/// versa), so the global-load traffic per `mma` drops by ~`FP8_TN`/`FP8_TM`× and the kernel becomes
+/// compute-bound — the lift the naive single-tile [`fp8_gemm_ptx`] lacks. Same E4M3 `mma.sync.m16n8k32`
+/// layout, offset by each sub-tile's origin. Entry `fp8_gemm_nt_mt`; requires M%(16·TM)==N%(8·TN)==0.
+pub fn fp8_gemm_mt_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        let (tm, tn) = (FP8_TM, FP8_TN);
+        let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+        s += ".visible .entry fp8_gemm_nt_mt(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{\n";
+        s += "    .reg .pred %p;\n";
+        s += "    .reg .b32 %M,%N,%K,%lane,%grp,%tg4,%tg2,%row0,%col0,%k,%tmp;\n";
+        // accumulators d[mt][nt][0..3], A frags a[mt][0..3], B frags b[nt][0..1]
+        let mut f32regs = String::from("%z");
+        for mi in 0..tm {
+            for ni in 0..tn {
+                for r in 0..4 {
+                    f32regs += &format!(",%d{mi}_{ni}_{r}");
+                }
+            }
+        }
+        s += &format!("    .reg .f32 {f32regs};\n");
+        let mut b32regs = String::new();
+        for mi in 0..tm {
+            for r in 0..4 {
+                b32regs += &format!("%a{mi}_{r},");
+            }
+        }
+        for ni in 0..tn {
+            for r in 0..2 {
+                b32regs += &format!("%b{ni}_{r},");
+            }
+        }
+        s += &format!("    .reg .b32 {}; \n", b32regs.trim_end_matches(','));
+        let mut b64regs = String::from("%A,%B,%C,%t,%kk,%cp");
+        for mi in 0..tm {
+            b64regs += &format!(",%a0p{mi},%a8p{mi}");
+        }
+        for ni in 0..tn {
+            b64regs += &format!(",%bp{ni}");
+        }
+        s += &format!("    .reg .b64 {b64regs};\n");
+
+        s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+        s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+        s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+        s += "    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg4,%lane,3;\n";
+        s += "    shl.b32 %tg2,%tg4,1;\n    shl.b32 %tg4,%tg4,2;\n";
+        s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %row0,%tmp,{};\n", 16 * tm);
+        s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %col0,%tmp,{};\n", 8 * tn);
+
+        // per-m-tile A base addresses (rows grp / grp+8), per-n-tile B base addresses
+        for mi in 0..tm {
+            s += &format!("    add.s32 %tmp,%row0,%grp;\n    add.s32 %tmp,%tmp,{};\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.s32 %tmp,%tmp,%tg4;\n    cvt.u64.u32 %t,%tmp;\n    add.s64 %a0p{mi},%A,%t;\n", mi * 16);
+            s += &format!("    add.s32 %tmp,%row0,%grp;\n    add.s32 %tmp,%tmp,{};\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.s32 %tmp,%tmp,%tg4;\n    cvt.u64.u32 %t,%tmp;\n    add.s64 %a8p{mi},%A,%t;\n", mi * 16 + 8);
+        }
+        for ni in 0..tn {
+            s += &format!("    add.s32 %tmp,%col0,%grp;\n    add.s32 %tmp,%tmp,{};\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.s32 %tmp,%tmp,%tg4;\n    cvt.u64.u32 %t,%tmp;\n    add.s64 %bp{ni},%B,%t;\n", ni * 8);
+        }
+        // zero accumulators
+        for mi in 0..tm {
+            for ni in 0..tn {
+                for r in 0..4 {
+                    s += &format!("    mov.f32 %d{mi}_{ni}_{r},0f00000000;\n");
+                }
+            }
+        }
+        s += "    mov.u32 %k,0;\nKLOOP:\n    setp.ge.u32 %p,%k,%K;\n    @%p bra KEND;\n    cvt.u64.u32 %kk,%k;\n";
+        // load A frags
+        for mi in 0..tm {
+            s += &format!("    add.s64 %t,%a0p{mi},%kk;\n    ld.global.b32 %a{mi}_0,[%t];\n    ld.global.b32 %a{mi}_2,[%t+16];\n");
+            s += &format!("    add.s64 %t,%a8p{mi},%kk;\n    ld.global.b32 %a{mi}_1,[%t];\n    ld.global.b32 %a{mi}_3,[%t+16];\n");
+        }
+        // load B frags
+        for ni in 0..tn {
+            s += &format!("    add.s64 %t,%bp{ni},%kk;\n    ld.global.b32 %b{ni}_0,[%t];\n    ld.global.b32 %b{ni}_1,[%t+16];\n");
+        }
+        // mma all tiles (A frag reused across N, B frag reused across M)
+        for mi in 0..tm {
+            for ni in 0..tn {
+                s += &format!("    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32\n        {{%d{mi}_{ni}_0,%d{mi}_{ni}_1,%d{mi}_{ni}_2,%d{mi}_{ni}_3}}, {{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}}, {{%b{ni}_0,%b{ni}_1}}, {{%d{mi}_{ni}_0,%d{mi}_{ni}_1,%d{mi}_{ni}_2,%d{mi}_{ni}_3}};\n");
+            }
+        }
+        s += "    add.u32 %k,%k,32;\n    bra KLOOP;\nKEND:\n";
+        // store each sub-tile
+        for mi in 0..tm {
+            for ni in 0..tn {
+                // C[(row0+mi*16+grp)][col0+ni*8+tg2]
+                s += &format!("    add.s32 %tmp,%row0,%grp;\n    add.s32 %tmp,%tmp,{};\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.s32 %tmp,%tmp,%col0;\n    add.s32 %tmp,%tmp,{};\n    add.s32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,2;\n    cvt.u64.u32 %t,%tmp;\n    add.s64 %cp,%C,%t;\n", mi * 16, ni * 8);
+                s += &format!("    st.global.f32 [%cp],%d{mi}_{ni}_0;\n    st.global.f32 [%cp+4],%d{mi}_{ni}_1;\n");
+                s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %t,%tmp;\n    add.s64 %cp,%cp,%t;\n    st.global.f32 [%cp],%d{mi}_{ni}_2;\n    st.global.f32 [%cp+4],%d{mi}_{ni}_3;\n");
+            }
+        }
+        s += "    ret;\n}\n";
+        s
+    })
+    .as_str()
+}
+
 /// Full **fp8 (E4M3) tensor-core GEMM** `C = A·Bᵀ` (the nn.Linear form): A is `[M,K]` row-major, B is
 /// `[N,K]` row-major — which *is* the `K×N` column-major layout the `mma` `.col` operand wants, so
 /// `A·Bᵀ` maps straight onto `mma.row.col` with no transpose. Each warp owns a `16×8` C tile and

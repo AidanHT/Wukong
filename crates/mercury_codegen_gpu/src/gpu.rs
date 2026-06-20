@@ -712,16 +712,35 @@ pub fn gemm_nt_fp8(
     );
     let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
     let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
-    let f = g.function("fp8_gemm", crate::ptx_fp8::fp8_gemm_ptx(), "fp8_gemm_nt")?;
+    // Fragment-reuse multi-tile kernel when the block divides evenly (the fast path), else single-tile.
+    use crate::ptx_fp8::{FP8_TM, FP8_TN};
+    let (f, cfg) = if m % (16 * FP8_TM) == 0 && n % (8 * FP8_TN) == 0 {
+        (
+            g.function(
+                "fp8_gemm_mt",
+                crate::ptx_fp8::fp8_gemm_mt_ptx(),
+                "fp8_gemm_nt_mt",
+            )?,
+            LaunchConfig {
+                grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    } else {
+        (
+            g.function("fp8_gemm", crate::ptx_fp8::fp8_gemm_ptx(), "fp8_gemm_nt")?,
+            LaunchConfig {
+                grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    };
     let a_d = g.stream.memcpy_stod(&a8)?;
     let b_d = g.stream.memcpy_stod(&b8)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
-    let cfg = LaunchConfig {
-        grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm)
         .arg(&nn)
@@ -1542,7 +1561,10 @@ mod tests {
                     .unwrap();
                 let s_bf16 = time_wmma(g, &f_bf16, cb, dims, &ab_d, &bb_d, &mut c_d, 50);
 
-                // fp8 (E4M3) mma.sync — Ada's lowest-precision / highest-throughput tensor-core path
+                // fp8 (E4M3) mma.sync — Ada's lowest-precision / highest-throughput tensor-core path.
+                // Measure single-tile and fragment-reuse multi-tile back-to-back so the A/B shares the
+                // GPU's clock state (absolute GFLOP/s swings ~7× with boost on this power-capped mobile
+                // part, so only a same-run ratio is meaningful).
                 let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
                 let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
                 let a8_d = g.stream.memcpy_stod(&a8).unwrap();
@@ -1557,8 +1579,23 @@ mod tests {
                 };
                 let s_fp8 = time_wmma(g, &f_fp8, cfp8, dims, &a8_d, &b8_d, &mut c_d, 50);
 
+                use crate::ptx_fp8::{FP8_TM, FP8_TN};
+                let f_fp8m = g
+                    .function(
+                        "fp8_gemm_mt",
+                        crate::ptx_fp8::fp8_gemm_mt_ptx(),
+                        "fp8_gemm_nt_mt",
+                    )
+                    .unwrap();
+                let cfp8m = LaunchConfig {
+                    grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_fp8m = time_wmma(g, &f_fp8m, cfp8m, dims, &a8_d, &b8_d, &mut c_d, 50);
+
                 eprintln!(
-                    "{m}³: f32-rb {:.0} | f16-TC {:.0} ({:.1}×) | bf16-TC {:.0} ({:.1}×) | fp8-TC {:.0} ({:.1}×)  GFLOP/s",
+                    "{m}³: f32-rb {:.0} | f16-TC {:.0} ({:.1}×) | bf16-TC {:.0} ({:.1}×) | fp8-TC {:.0} ({:.1}×) | fp8-mt {:.0} ({:.1}×)  GFLOP/s",
                     flop / s_rb / 1e9,
                     flop / s_f16 / 1e9,
                     s_rb / s_f16,
@@ -1566,6 +1603,8 @@ mod tests {
                     s_rb / s_bf16,
                     flop / s_fp8 / 1e9,
                     s_rb / s_fp8,
+                    flop / s_fp8m / 1e9,
+                    s_rb / s_fp8m,
                 );
             }
         });
