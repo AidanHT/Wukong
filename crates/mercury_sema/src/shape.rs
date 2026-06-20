@@ -33,8 +33,8 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
         | "exp2" | "log2" | "exp10" | "log10" | "expm1" | "log1p" | "sinh" | "cosh" | "asinh"
         | "acosh" | "atanh" | "atan"
         | "erf" | "sin" | "cos" | "tanh" | "sigmoid" | "silu" | "gelu" | "elu" | "leaky_relu"
-        | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish" | "fmax"
-        | "fmin" => Some(float_ty),
+        | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish" | "softsign"
+        | "logsigmoid" | "fmax" | "fmin" => Some(float_ty),
         _ => None,
     }
 }
