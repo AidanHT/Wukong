@@ -839,7 +839,9 @@ fn vmath2_8_for(
 /// `out[i] = f(x[i], y[i])` for the two-input transcendentals (`VM2_*`). The 256-bit AVX2 twin of the
 /// inlined two-arg poly an `out[i] = pow/atan2/hypot(x[i], y[i])` loop lowers to; mirrors the inlined
 /// MIR op-for-op, so the interpreter marshalling through this kernel keeps native == interp exact.
-/// `x`, `y`, `out` must each be valid for `n` `f32`.
+///
+/// # Safety
+/// `x`, `y`, and `out` must each be valid for `n` `f32` elements.
 #[no_mangle]
 pub unsafe extern "C" fn mercury_vmath2_f32(
     x: *const f32,
