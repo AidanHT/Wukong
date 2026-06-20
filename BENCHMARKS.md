@@ -445,6 +445,25 @@ fp8 fragment layout on `sm_89` — is bit-exact (`max_abs=0` vs an asymmetric e4
 the multi-tile correctness gate covers it at 64³ and 128×256×64. SMEM K/V staging for fp8's true peak
 remains documented future work.
 
+**% of roofline (the honest substitute for a cuBLAS peer).** There is **no cuBLAS / cuDNN on this
+box** — only the NVIDIA driver, no CUDA toolkit — so a tuned-library comparison is physically
+unmeasurable here (the same wall as the absent LLVM). Instead we measure a **compute-bound fp16 WMMA
+roofline** microbench (one fragment load, then a long loop of `wmma.mma`s over 4 independent
+accumulators — near-zero hot-loop memory traffic) and report the real GEMM as a **same-run %** of it
+(clock-invariant, unlike the ~7×-swinging absolutes):
+
+| | fp16 roofline | fp16-mt GEMM | fp8-mt GEMM |
+|--|--------------|--------------|-------------|
+| 2048³ | ~16.3 TFLOP/s | 59% of roof | 100% of fp16 roof |
+| 4096³ | ~16.3 TFLOP/s | 39% of roof | 87% of fp16 roof |
+
+The fp16 GEMM reaches ~40–60% of the practical fp16 tensor-core ceiling — the rest is the
+global-load-bound gap (no shared-memory staging), the documented next lever. fp8-mt hits ~100% of the
+*fp16* roofline (so ~44–50% of fp8's own ~2× ceiling — fp8 issues at twice fp16's rate). Note the
+roofline itself (~16 TFLOP/s) is far below the ~80–97 TFLOP/s *rated* dense peak: the 6 GB mobile 4050
+is power-capped, so ~16 TFLOP/s is the **real** sustained ceiling on this part, not a kernel shortfall.
+Reproduce: `cargo test -p mercury_codegen_gpu --features gpu tensorcore_roofline_pct -- --ignored --nocapture`.
+
 **Fused flash-attention** (online softmax, never materializes the `S×S` scores in HBM — the kernel
 that *lost* on CPU, where the tuned GEMM dominates) — warp-per-query-row, `d=64`:
 
