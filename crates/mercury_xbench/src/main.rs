@@ -2140,6 +2140,27 @@ fn kernels() -> Vec<Kernel> {
             c: c_kernel("for(long i=0;i<N;i++) out[i]=coshf(x[i]);"),
             rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).cosh(); }"),
         },
+        // Inverse hyperbolics — asinh = log(|x|+√(x²+1)) (sign-stable), acosh = log(x+√(x²−1)) for x≥1
+        // (the shared input is [1,9], in-domain for both). Compose the shared 256-bit `log`; C/Rust call
+        // scalar libm `asinhf`/`acoshf` and can't vectorize the call. `atanh` shares the identical
+        // kernel shape (log + a divide) but needs |x|<1, outside this buffer's range, so it isn't
+        // separately timed here — its throughput tracks these.
+        Kernel {
+            name: "asinh",
+            bytes_per_call: 2 * N * 4,
+            note: "out = asinh(x): 256-bit AVX2 (log+sqrt) vs scalar libm asinhf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = asinh(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=asinhf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).asinh(); }"),
+        },
+        Kernel {
+            name: "acosh",
+            bytes_per_call: 2 * N * 4,
+            note: "out = acosh(x), x>=1: 256-bit AVX2 (log+sqrt) vs scalar libm acoshf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = acosh(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=acoshf(x[i]);"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= (*x.add(i)).acosh(); }"),
+        },
         // Operator fusion: a linear map then ReLU, written as TWO loops in every language. Mercury's
         // compiler fuses them into one pass (intermediate stays in registers, not streamed to the
         // scratch array `y`); idiomatic C/Rust as-written make two passes over `y`.
