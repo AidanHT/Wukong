@@ -3630,6 +3630,42 @@ impl FnLowerer<'_> {
             self.emit_velem_call(s, e, &plan);
             return true;
         }
+        // A bf16/f16→f32 axpby per `@parallel` chunk → `mercury_axpby_{bf16,f16}` over `[s, e)`, so a
+        // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
+        // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
+        // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
+        if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
+            if let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
+                (self.lookup(out), self.lookup(x), self.lookup(y))
+            {
+                let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+                let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+                let av = self.lower_coeff(a_expr, 1.0);
+                let bv = self.lower_coeff(b_expr, 1.0);
+                let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+                let in_elem = if is_f16 { MirType::F16 } else { MirType::BF16 };
+                let xp = self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep { ptr: xv, index: s, elem: in_elem.clone() },
+                );
+                let yp = self
+                    .builder
+                    .build(MirType::Ptr, Op::Gep { ptr: yv, index: s, elem: in_elem });
+                let outp = self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep { ptr: outv, index: s, elem: MirType::F32 },
+                );
+                self.builder.build_void(Op::Call {
+                    func: if is_f16 {
+                        self.gemm.axpby_f16
+                    } else {
+                        self.gemm.axpby_bf16
+                    },
+                    args: vec![xp, yp, outp, n, av, bv],
+                });
+                return true;
+            }
+        }
         // A Horner polynomial per `@parallel` chunk → the same 256-bit AVX2 + NT-store Horner kernel.
         if let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
