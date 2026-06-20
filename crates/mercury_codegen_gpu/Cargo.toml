@@ -18,6 +18,16 @@ cudarc = { version = "0.16", default-features = false, features = [
     "dynamic-loading",
     "cuda-12060",
     "f16",
+    # `std` gates cudarc's `impl std::error::Error` for DriverError/CublasError/CompileError, so the
+    # peer baselines can unify the three error families behind one boxed error with `?`.
+    "std",
+    # Honest GPU peer baselines (Phase 0 of the GPU plan): cuBLAS is the Tier-B gold-standard
+    # GEMM peer; NVRTC compiles the Tier-A naive CUDA-C baseline at runtime. Both dlopen their
+    # redistributable DLLs (cublas64_12.dll / nvrtc64_120_0.dll) exactly like the driver does for
+    # nvcuda.dll — so *building* still needs no toolkit; only *running the peer benches* needs the
+    # DLLs reachable (we point at a local `tools/cuda-redist` via PATH; see baselines.rs).
+    "cublas",
+    "nvrtc",
 ], optional = true }
 # Used (only under `gpu`) by the tolerance harness as the CPU oracle: the GPU kernels are diffed
 # against the *identical* runtime kernels the interpreter marshals (vmath / sreduce / norm).

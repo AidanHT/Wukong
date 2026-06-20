@@ -16,6 +16,12 @@ a.out
 /llvm
 /.llvm
 
+# Local CUDA redistributables (NVRTC + cuBLAS DLLs) for the GPU peer benchmarks.
+# Pulled via `pip install --target tools/cuda-redist nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12`
+# so the Tier-A (NVRTC CUDA-C) and Tier-B (cuBLAS) peers are measurable without a full toolkit.
+# Hundreds of MB of vendor binaries — never committed; reproduced by the pip command above.
+/tools/cuda-redist
+
 # Editor / OS noise
 .vscode/
 .idea/
