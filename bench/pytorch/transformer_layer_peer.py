@@ -35,10 +35,11 @@ D, DFF, EPS = 64, 256, 1e-5
 HALF = torch.float16
 
 # Mercury fp16 fused resident, measured same-GPU (cublas_chain_vs_mercury / resident_model_vs_cublas),
-# post the alloc_zeros pipelining fix AND the W=2 flash-occupancy fix. Authoritative figures live in the
-# Rust bench; these are side-by-side convenience only (re-run the Rust benches; ~10-20% clock variance).
-MERCURY_MS_PER_LAYER = {256: 0.35, 512: 0.55, 1024: 1.07}         # single layer, resident
-MERCURY_STACK_MS_PER_LAYER = {1: 0.50, 2: 0.39, 4: 0.48, 8: 0.43}  # depth sweep, S=512
+# post the alloc_zeros pipelining fix AND the SMEM key-block-tiled flash kernel (which cut the S=1024
+# single-layer from ~1.07 to ~0.80 ms — see the same-process flash_tiled_vs_untiled A/B). Authoritative
+# figures live in the Rust bench; these are side-by-side convenience only (re-run; ~10-20% clock var).
+MERCURY_MS_PER_LAYER = {256: 0.23, 512: 0.34, 1024: 0.80}         # single layer, resident (tiled flash)
+MERCURY_STACK_MS_PER_LAYER = {1: 0.34, 2: 0.35, 4: 0.36, 8: 0.36}  # depth sweep, S=512 (tiled flash)
 
 
 def rmsnorm_f32(x):
