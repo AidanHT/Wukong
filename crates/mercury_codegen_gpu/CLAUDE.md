@@ -38,7 +38,9 @@ toolkit — only **running** needs the driver + a device.
   activation epilogue** (`Act` enum — relu/silu/gelu applied to the f32 accumulators before the C store;
   the transcendentals reuse `vmath`'s exact SFU formulas → `_sm_db_{relu,silu,gelu}` beat the cuBLAS
   GEMM+activation chain ~1.1–1.4×, the thing cuBLAS can't fuse). `gemm_nt_f16` dispatches the plain
-  GEMMs by size regime (see the `entry_smem`/`entry_smem_db` generators).
+  GEMMs by size regime. The pipelined+fused generators are **precision-generic** (`entry_smem_db` keys
+  fragment width/mma type off `ty`), so bf16 gets the same `wmma_nt_bf16_sm_db` + `_sm_db_{relu,silu,
+  gelu}` (the training-dtype fusion). See the `entry_smem`/`entry_smem_db` generators.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM, single-tile and fragment-reuse
   multi-tile (`_mt`, 2×4 16×8 tiles/warp — the fastest tensor-core path; no WMMA fp8 on sm_89, so the
   fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
