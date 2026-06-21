@@ -4308,7 +4308,13 @@ mod tests {
             }
             const ROUNDS: usize = 5;
 
-            for s in [256usize, 512, 1024] {
+            // 2048/4096 are the long-context regime: single-head attention is O(S²·D) and dominates
+            // the O(S·D·Dff) FFN (~8× the flops at S=4096), so the per-layer ratio here is governed by
+            // the flash kernel — the regime the WMMA flash was built for. Attention is COMMON to both
+            // stacks (same kernel), so the cuBLAS edge narrows toward 1.0 as S grows; the real
+            // long-context test is the torch harness (separate flash kernels). These absolute ms/layer
+            // feed MERCURY_MS_PER_LAYER in bench/pytorch/transformer_layer_peer.py.
+            for s in [256usize, 512, 1024, 2048, 4096] {
                 let x = rng.vec(s * d, -1.0, 1.0);
                 let wq = rng.vec(d * d, -0.1, 0.1);
                 let wk = rng.vec(d * d, -0.1, 0.1);

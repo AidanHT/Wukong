@@ -642,36 +642,55 @@ large-K GEMM ≥2048³, the GEMM table above — and the fused epilogues, the ad
 can't fold in, add ~1.08–1.09×.) The cuBLAS path is *generous* — it gets Mercury's fast flash for free.
 Run: `… --ignored --nocapture cublas_chain_vs_mercury` / `resident_model_vs_cublas`.
 
-**PyTorch (Tier C) — cleared at the realistic sizes (honest).** The same layer in PyTorch
-(`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls + fused **SDPA flash
-attention**, f32 norm/softmax, verified against an f64 reference of the identical function on the same
-RTX 4050) runs **~flat at ~0.63 ms/layer** (launch/dispatch-bound at these small sizes — its per-layer
-time barely moves from S=256 to S=1024). Mercury, after the pipelining fix + the SMEM key-block-tiled
-flash + the tensor-core flash (S≥512), is **~0.23 ms at S=256, ~0.33 at S=512, ~0.68 at S=1024** and
-**~0.34 ms/layer across a depth-8 stack**, so:
+**PyTorch (Tier C) — Mercury wins the realistic sizes, PyTorch wins long context (honest crossover).**
+The same layer in PyTorch (`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls
++ fused **SDPA flash attention**, f32 norm/softmax, verified against an f64 reference of the identical
+function on the same RTX 4050) runs **~flat at ~1.1–1.5 ms/layer from S=256 all the way to S=4096** —
+its per-layer time *barely moves* even as the attention work grows 256×. That flatness is the signature
+of **launch/Python-dispatch overhead** (~1 ms of fixed per-layer cost from ~15 eager kernel launches),
+not compute: even at S=4096 the actual GPU work hides under the overhead envelope. Mercury, by contrast,
+is **resident and overhead-free**, so its per-layer time is pure compute and **scales with S**. One run,
+one clock (the figures feeding `MERCURY_MS_PER_LAYER`):
 
-| case | Mercury | PyTorch eager | **Mercury faster** |
+| case | Mercury | PyTorch eager | result |
 |---|---|---|---|
-| single layer, S=256 | ~0.23 ms | ~0.68 ms | **~3.0×** |
-| single layer, S=512 | ~0.33 ms | ~0.63 ms | **~1.9×** |
-| single layer, S=1024 | ~0.68 ms | ~0.63 ms | **~0.93× (≈par)** |
-| stack (S=512, depth 1–8) | ~0.34 ms/layer | ~0.62–0.86 ms/layer | **~1.8–2.4×** |
+| single layer, S=256 | 0.385 ms | 1.169 ms | **Mercury ~3.0×** |
+| single layer, S=512 | 0.557 ms | 1.480 ms | **Mercury ~2.7×** |
+| single layer, S=1024 | 0.767 ms | 1.221 ms | **Mercury ~1.6×** |
+| single layer, S=2048 | 2.075 ms | 1.163 ms | **PyTorch ~1.8×** |
+| single layer, S=4096 | 6.396 ms | 1.126 ms | **PyTorch ~5.7×** |
+| stack (S=512, depth 1–8) | ~0.34 ms/layer | ~0.98–1.29 ms/layer | **Mercury ~2.9–3.8×** |
 
-So M13's "beat PyTorch" is **met for eager** — clearly at S≤512 and across the multi-layer stack (the
-realistic serving shape), where Mercury's fused resident chain (no per-op Python dispatch, fused
-epilogues, one stream) is ~2× PyTorch's. The hard case is the **single layer at S=1024**, where torch's
-*flat* (launch-bound) ~0.63 ms/layer competes with Mercury's `O(S²)` attention. Two flash kernels closed
-most of the gap: **key-block tiling** (the f32 default — 8 query-row warps stage each `BK=1024/D` key
-block in 8 KB of SMEM, an 8× L2-traffic cut, `0.56–0.90×` the untiled in `flash_tiled_vs_untiled`) took
-S=1024 from ~1.07→~0.80 ms; then **tensor-core (WMMA) flash** (`flash_d64_w` — `Q·Kᵀ` and `P·V` of the
-online-softmax on the Ada tensor cores, f16 in / f32 accumulate; dispatched in the layer for S≥512) took
-it to **~0.68 ms** (torch ratio ~0.59× → ~0.93×, now ≈par). The WMMA path is `0.92× / 0.80× / 0.69× /
-0.63×` the tiled at S = `512 / 1024 / 2048 / 4096` (same-process A/B) — its win **grows with sequence
-length**, so beyond these sizes (long context, S≥2048) it is the decisive attention path; below 512 its
-`S/16`-warp occupancy is too low and the tiled f32 kernel stays the default. Honest caveats: this is
-**eager** PyTorch (torch.compile / Inductor, the fusing bar, needs Triton, which has no working install
-on this Windows box); and it is a cross-process comparison (both warmed, best-of-N, same GPU), like the
-C/Rust CPU baselines, not a same-buffer in-process gate.
+So M13's "beat PyTorch" is **met for eager at the realistic shapes** — S≤1024 single layer and the whole
+multi-layer stack (the serving shape), where Mercury's fused resident chain (no per-op Python dispatch,
+fused epilogues, one stream) beats overhead-bound eager torch by ~1.6–3.8×. But there is a **clear
+crossover at S≈1024–2048**: beyond it **PyTorch wins** (`~1.8×` at S=2048, `~5.7×` at S=4096), and the
+cause is **Mercury's flash kernel**, not the GEMMs. At S=4096 the whole layer is `~6.4 ms` for `~4 GFLOP`
+≈ **0.67 TFLOP/s** — a fraction of roofline — because the single-head flash is **occupancy-limited**:
+`flash_d64_w` runs 1 warp per CTA, its `~9.7 KB` of static SMEM (the opaque WMMA accumulator must be
+staged through SMEM, not held in registers) caps it to ~10 CTAs/SM ≈ 21% occupancy, and the per-key-tile
+online-softmax rescale is a serial 256-iteration dependency chain with only 16 active lanes. torch's
+production SDPA flash has none of these and disappears under its own launch overhead even at S=4096.
+
+**Correcting a prior overclaim:** the WMMA flash *is* `0.92× / 0.80× / 0.69× / 0.63×` the tiled flash at
+S = `512 / 1024 / 2048 / 4096` (same-process A/B, `flash_tiled_vs_untiled`) — a real win whose margin
+grows with S. But that is a win **over Mercury's own tiled flash**, *not* over PyTorch; the earlier
+claim that this made long context "the decisive attention path" was measuring the wrong baseline. Against
+torch's flash, Mercury's flash (tiled *or* WMMA) is far behind at long context. **The identified lever is
+an FA2-style CTA-level flash** — multiple query warps per CTA sharing K/V tiles in SMEM, a
+register-resident accumulator (hand-placed `mma.sync` fragments like the fp8 path, escaping the opaque
+WMMA store), and softmax amortized over wider key tiles — and/or a **multi-head** flash, where the head
+dimension naturally fills the occupancy the single-head benchmark starves (this single-head D=64
+long-context case is the *worst* case for Mercury's flash).
+
+Honest caveats: this is **eager** PyTorch (torch.compile / Inductor — the overhead-free fusing bar that
+would expose torch's *kernels* at small S too, where Mercury currently beats torch's *overhead* — needs
+Triton, which has no working install on this Windows box). And it is a cross-process comparison (both
+warmed, best-of-N, same GPU), like the C/Rust CPU baselines — **heavily clock-noisy** at this ~1 ms
+scale: torch's own measured ms/layer swung `~0.63 → ~1.1–1.5` between two runs (a ~2× clock swing best-of-N
+can't remove), so the small-S *ratios* above are order-of-magnitude. The **robust, run-invariant** signals
+are qualitative and survive the noise: torch eager is **flat** (overhead-bound), Mercury **scales**
+(compute-bound), so Mercury wins small/medium S and PyTorch wins long context — a real, unspun crossover.
 
 **Determinism, every kernel (M12).** Not just the layer: `gpu_kernels_bit_reproducible` asserts every
 reduction-bearing family — `gemm_nt_f16` and its `_sm`/`_sm_db` variants, the three fused row norms,

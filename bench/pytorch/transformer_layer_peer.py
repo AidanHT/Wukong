@@ -38,8 +38,12 @@ HALF = torch.float16
 # post the alloc_zeros pipelining fix, the SMEM key-block-tiled flash, AND the tensor-core (WMMA) flash
 # dispatched for S>=512 (which took the S=1024 single-layer ~1.07 -> ~0.80 -> ~0.68 ms; see the
 # same-process flash_tiled_vs_untiled A/B). Authoritative figures live in the Rust bench; these are
-# side-by-side convenience only (re-run; ~10-20% clock variance, and absolute ms swing with the clock).
-MERCURY_MS_PER_LAYER = {256: 0.23, 512: 0.33, 1024: 0.68}         # single layer, resident (WMMA flash >=512)
+# side-by-side convenience only. CAVEAT: this is a CROSS-PROCESS bar, and the laptop GPU clock swings
+# run-to-run far beyond best-of-N's reach (the *same* Mercury layer measured 0.23 and 0.385 ms on two
+# runs — a ~1.7× clock swing), so the torch/Mercury *ratio* is order-of-magnitude only, not precise. The
+# whole set below is ONE consistent run (so the Mercury column is at least self-consistent across S); the
+# rigorous long-context claim is the same-process flash A/B + cuBLAS same-run bench, not this ratio.
+MERCURY_MS_PER_LAYER = {256: 0.385, 512: 0.557, 1024: 0.767, 2048: 2.075, 4096: 6.396}  # one run, WMMA flash >=512
 MERCURY_STACK_MS_PER_LAYER = {1: 0.34, 2: 0.34, 4: 0.34, 8: 0.34}  # depth sweep, S=512 (WMMA flash)
 
 
@@ -154,7 +158,10 @@ def main():
     torch.cuda.synchronize()
 
     print("\n== single layer (D=64, Dff=256, resident, fp16 eager) ==")
-    for S in (256, 512, 1024):
+    # 2048/4096 = long context: attention (O(S²·D), torch's flash SDPA vs Mercury's WMMA flash)
+    # dominates the FFN, so these sizes test the flash kernels head-to-head — the regime where torch's
+    # production fused SDPA is strongest and Mercury's hand-rolled WMMA flash is most exposed.
+    for S in (256, 512, 1024, 2048, 4096):
         x = torch.rand(S, D, device=dev) * 2 - 1
         layer = TorchLayer(gen, HALF)
         got = layer.forward(x)
