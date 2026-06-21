@@ -196,6 +196,23 @@ pub fn copy(g: &mut Gpu, x: &[f32]) -> Result<Vec<f32>, DriverError> {
     g.stream.memcpy_dtov(&out_d)
 }
 
+/// Narrow `x` (f32) to f16 on the GPU and widen back to f32 — round-trips through the `cast_f32_f16`
+/// kernel (round-to-nearest-even, matching `half::f16::from_f32` bit-for-bit). This is the glue a
+/// resident fp16 pipeline needs at an f32→f16 stage boundary (e.g. RMSNorm's f32 output feeding an
+/// f16-input WMMA GEMM, with no host round-trip — see the resident FFN). Gate-able as a round-trip.
+pub fn cast_f32_to_f16(g: &mut Gpu, x: &[f32]) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    let f = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let mut out_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.0); x.len()])?;
+    let n = x.len() as u32;
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&n).arg(&x_d).arg(&mut out_d);
+    unsafe { b.launch(LaunchConfig::for_num_elems(n))? };
+    let hd: Vec<f16> = g.stream.memcpy_dtov(&out_d)?;
+    Ok(hd.iter().map(|h| h.to_f32()).collect())
+}
+
 /// Apply an elementwise activation `out[i] = f(x[i])` on the GPU — the GPU twin of
 /// `mercury_vmath_f32`. `op` is a `VM_*` code (exp/relu/sigmoid/tanh/silu/gelu so far). Transcendental
 /// ops use SFU approximations, so the result is tolerance-close to the CPU kernel, not bit-exact.
@@ -1478,6 +1495,25 @@ mod tests {
                 for i in 0..n {
                     assert_eq!(out[i].to_bits(), x[i].to_bits(), "copy lane {i} (n={n})");
                 }
+            }
+        });
+    }
+
+    /// The f32→f16 device cast (`cast_f32_f16`, `cvt.rn.f16.f32`) must round-to-nearest-even exactly
+    /// like `half::f16::from_f32` — bit-for-bit, so a resident fp16 pipeline's on-device narrowing is
+    /// identical to the host-side rounding the GEMM wrappers do. Covers normals plus edges: ±0, f16-max
+    /// (65504), a subnormal-ish 1e-5, and 2049/−2049 (round-half-to-even ties at the f16 mantissa step).
+    #[test]
+    fn cast_f32_to_f16_round_trips_bit_exact() {
+        use half::f16;
+        with_gpu("cast_f16", |g| {
+            let mut rng = crate::diff::Rng::new(0xCA57);
+            let mut x = rng.vec(4096, -3.0, 3.0);
+            x.extend_from_slice(&[0.0, -0.0, 1.0, 65504.0, 1e-5, 0.5, 2049.0, -2049.0]);
+            let got = cast_f32_to_f16(g, &x).unwrap();
+            for (i, (&xi, &gi)) in x.iter().zip(got.iter()).enumerate() {
+                let want = f16::from_f32(xi).to_f32();
+                assert_eq!(gi.to_bits(), want.to_bits(), "cast lane {i}: x={xi}");
             }
         });
     }

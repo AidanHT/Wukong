@@ -103,6 +103,54 @@ DONE:
 }
 "#;
 
+/// `dst_f16[i] = (f16)src_f32[i]` — round-to-nearest-even narrowing (`cvt.rn.f16.f32`), matching
+/// `half::f16::from_f32` bit-for-bit. The glue that lets a resident fp16 pipeline chain an f32-output
+/// stage (e.g. RMSNorm) into an f16-input WMMA GEMM on-device, with no host round-trip. `src` is N×f32,
+/// `dst` is N×f16 (2 bytes/elem); one thread per element, grid-stride not needed (host sizes the grid).
+pub const CAST_F32_F16: &str = r#"
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry cast_f32_f16(
+    .param .u32 n,
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .pred  %p<2>;
+    .reg .f32   %f<2>;
+    .reg .b16   %h<2>;
+    .reg .b32   %r<5>;
+    .reg .b64   %rd<6>;
+
+    ld.param.u32    %r1, [n];
+    ld.param.u64    %rd1, [src];
+    ld.param.u64    %rd2, [dst];
+
+    mov.u32     %r2, %ntid.x;
+    mov.u32     %r3, %ctaid.x;
+    mov.u32     %r4, %tid.x;
+    mad.lo.s32  %r2, %r3, %r2, %r4;
+
+    setp.ge.u32 %p1, %r2, %r1;
+    @%p1 bra    DONE;
+
+    cvta.to.global.u64  %rd1, %rd1;
+    cvta.to.global.u64  %rd2, %rd2;
+    mul.wide.u32 %rd3, %r2, 4;
+    add.s64     %rd4, %rd1, %rd3;
+    ld.global.f32   %f1, [%rd4];
+    cvt.rn.f16.f32  %h1, %f1;
+    mul.wide.u32 %rd5, %r2, 2;
+    add.s64     %rd4, %rd2, %rd5;
+    st.global.b16   [%rd4], %h1;
+
+DONE:
+    ret;
+}
+"#;
+
 /// `dst[i] = src[i]` — a pure streaming **copy**, the canonical memory-bandwidth kernel (milestone
 /// M9). Vectorized 128-bit access (`ld.global.v4.f32` / `st.global.v4.f32` = 4 floats/op) with **4×
 /// ILP**: each thread issues four *independent* float4 loads (distinct registers + grid-stride-spaced
