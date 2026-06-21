@@ -1188,6 +1188,98 @@ pub fn conv2d(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
+/// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
+/// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
+/// up-projection's WMMA store, the residual into the down-projection's accumulator (`wmma.load.c`):
+///
+/// ```text
+///   h2  = RMSNorm(x)                    f32 [S,D]     ptx_norm rmsnorm
+///   h2' = (f16) h2                      cast          cast_f32_f16   (f32→f16 stage boundary)
+///   f1a = SiLU(h2'·W1ᵀ)                 f32 [S,Dff]   wmma_nt_f16_sm_db_silu   (GEMM+act fused)
+///   f1a'= (f16) f1a                     cast
+///   out = (f1a'·W2ᵀ) + x                f32 [S,D]     wmma_nt_f16_sm_db_residual (GEMM+residual fused)
+/// ```
+///
+/// A library FFN is `norm, GEMM, SiLU, GEMM, add` — 5 launches with the SiLU and residual each a kernel
+/// round-tripping `[S,Dff]`/`[S,D]` through HBM. This folds both into the GEMMs (the casts are cheap
+/// memory passes). `W1` is `[Dff,D]`, `W2` is `[D,Dff]`; requires `S%64==0, D%64==0, Dff%64==0` (the
+/// WMMA-staged tiles). fp16-GEMM precision ⇒ tolerance-gated against the f64 reference of the same FFN.
+pub fn ffn_fused(
+    g: &mut Gpu,
+    x: &[f32],
+    w1: &[f32],
+    w2: &[f32],
+    s: usize,
+    d: usize,
+    dff: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), s * d, "x must be S×D");
+    assert_eq!(w1.len(), dff * d, "w1 must be Dff×D");
+    assert_eq!(w2.len(), d * dff, "w2 must be D×Dff");
+    assert!(
+        s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
+        "ffn_fused needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
+    );
+    // Preload every kernel once (the only &mut g use); afterwards device work runs through the cloned
+    // stream Arc with no further borrow of g — same pattern as transformer_layer.
+    let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
+    let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+    let ptx = crate::ptx_wmma::wmma_f16_ptx();
+    let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
+    let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")?;
+    let stream = g.stream.clone();
+
+    let x_d = stream.memcpy_stod(x)?;
+    let w1_16: Vec<f16> = w1.iter().map(|&v| f16::from_f32(v)).collect();
+    let w2_16: Vec<f16> = w2.iter().map(|&v| f16::from_f32(v)).collect();
+    let w1_d = stream.memcpy_stod(&w1_16)?;
+    let w2_d = stream.memcpy_stod(&w2_16)?;
+    let eps = 1e-5f32;
+
+    // device f32 → device f16 narrowing (the stage-boundary cast).
+    let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<_, DriverError> {
+        let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+        let nn = n as u32;
+        let mut b = stream.launch_builder(&f_cast);
+        b.arg(&nn).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
+    };
+
+    // h2 = RMSNorm(x)  (one warp per row).
+    let mut h2 = stream.memcpy_stod(&vec![0f32; s * d])?;
+    {
+        let (r, c) = (s as u32, d as u32);
+        let mut b = stream.launch_builder(&f_norm);
+        b.arg(&r).arg(&c).arg(&eps).arg(&x_d).arg(&mut h2);
+        let cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg)? };
+    }
+    let h2_16 = cast(&h2, s * d)?;
+
+    // f1a = SiLU(h2·W1ᵀ):  A = h2 [S,D], B = W1 [Dff,D]  ⇒ C [S,Dff].
+    let mut f1a = stream.memcpy_stod(&vec![0f32; s * dff])?;
+    {
+        let (mm, nn, kk) = (s as u32, dff as u32, d as u32);
+        let mut b = stream.launch_builder(&f_silu);
+        b.arg(&mm).arg(&nn).arg(&kk).arg(&h2_16).arg(&w1_d).arg(&mut f1a);
+        unsafe { b.launch(wmma_sm_cfg(s, dff))? };
+    }
+    let f1a_16 = cast(&f1a, s * dff)?;
+
+    // out = (f1a·W2ᵀ) + x:  A = f1a [S,Dff], B = W2 [D,Dff] ⇒ C [S,D], residual = x.
+    let mut out = stream.memcpy_stod(&vec![0f32; s * d])?;
+    {
+        let (mm, nn, kk) = (s as u32, d as u32, dff as u32);
+        let mut b = stream.launch_builder(&f_resid);
+        b.arg(&mm).arg(&nn).arg(&kk).arg(&f1a_16).arg(&w2_d).arg(&mut out).arg(&x_d);
+        unsafe { b.launch(wmma_sm_cfg(s, d))? };
+    }
+    stream.memcpy_dtov(&out)
+}
+
 /// The learned weights of one transformer layer (all `A·Bᵀ` projections): attention `Wq/Wk/Wv/Wo`
 /// are `[D, D]`, the FFN is up `W1` `[Dff, D]` then down `W2` `[D, Dff]`.
 pub struct TransformerWeights<'a> {
@@ -2595,6 +2687,43 @@ mod tests {
         let f1act: Vec<f32> = f1.iter().map(|&z| ref_silu(z)).collect();
         let f2 = ref_nt(&f1act, w.w2, s, dff, d);
         x1.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
+    }
+
+    /// CPU f64 reference for [`ffn_fused`] — RMSNorm, then the two projections with **f16-rounded
+    /// inputs** (matching the kernel's cast + WMMA f16 fragments) and SiLU between, then the f32
+    /// residual added in full precision (the kernel seeds it via wmma.load.c, also f32).
+    fn ref_ffn(x: &[f32], w1: &[f32], w2: &[f32], s: usize, d: usize, dff: usize) -> Vec<f32> {
+        let eps = 1e-5f32;
+        let round = |v: f32| half::f16::from_f32(v).to_f32();
+        let h2 = ref_rmsnorm(x, s, d, eps);
+        let f1 = ref_nt_rounded(&h2, w1, s, d, dff, round);
+        let f1a: Vec<f32> = f1.iter().map(|&z| ref_silu(z)).collect();
+        let f2 = ref_nt_rounded(&f1a, w2, s, dff, d, round);
+        x.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
+    }
+
+    /// [`ffn_fused`] (GPU-resident, fp16 fused-epilogue FFN) vs its f64 reference. Small weights keep
+    /// activations O(1) (RMSNorm gives unit-RMS rows) so the fp16 error stays well inside tolerance.
+    /// Also checks determinism (fixed grids + warp-butterfly reductions ⇒ bit-identical run-to-run).
+    #[test]
+    fn ffn_fused_matches_reference_within_tol() {
+        with_gpu("ffn_fused", |g| {
+            let mut rng = crate::diff::Rng::new(0x55FF);
+            let (s, d, dff) = (128usize, 64usize, 256usize);
+            let x = rng.vec(s * d, -1.0, 1.0);
+            let w1 = rng.vec(dff * d, -0.1, 0.1);
+            let w2 = rng.vec(d * dff, -0.1, 0.1);
+            let got = ffn_fused(g, &x, &w1, &w2, s, d, dff).unwrap();
+            let oracle = ref_ffn(&x, &w1, &w2, s, d, dff);
+            let st = crate::diff::assert_close("ffn_fused", &got, &oracle, 3e-2, 3e-2);
+            eprintln!(
+                "ffn_fused S={s} D={d} Dff={dff} (GPU-resident, 5 launches): max_abs={:.2e} max_rel={:.2e}",
+                st.max_abs, st.max_rel
+            );
+            let again = ffn_fused(g, &x, &w1, &w2, s, d, dff).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|z| z.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&again), "ffn_fused must be bit-reproducible run-to-run");
+        });
     }
 
     #[test]
