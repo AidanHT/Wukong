@@ -558,3 +558,64 @@ impl CublasChainLayer {
         Ok(self.stream.memcpy_dtov(&out)?)
     }
 }
+
+/// A stack of N [`CublasChainLayer`]s — the cuBLAS-call-chain counterpart to Mercury's whole-model
+/// `ResidentModelF16`, for the M13 "**beat the library-call-chain stack end-to-end**" claim. Each layer
+/// keeps its own f16 weights and cuBLAS handle; [`forward_device`](Self::forward_device) chains them on
+/// device buffers exactly like the resident model (one layer's output is the next's input). The contrast
+/// the depth bench draws out: Mercury's resident model keeps every activation on-device across all N
+/// layers with fused epilogues, whereas this chain pays cuBLAS's per-call dispatch *plus* the separate
+/// residual-add/SiLU launches at **every** layer — so the per-layer gap is paid N times.
+pub struct CublasChainModel {
+    stream: Arc<CudaStream>,
+    layers: Vec<CublasChainLayer>,
+    s: usize,
+    d: usize,
+}
+
+impl CublasChainModel {
+    /// Build the N cuBLAS-chain layers (one [`CublasChainLayer::new`] per weight set) — all share the one
+    /// device stream, so the whole stack enqueues in order on a single timeline (as the resident model does).
+    pub fn new(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        s: usize,
+        d: usize,
+        dff: usize,
+    ) -> Result<Self, PeerError> {
+        assert!(!weights.is_empty(), "model needs at least one layer");
+        let mut layers = Vec::with_capacity(weights.len());
+        for w in weights {
+            layers.push(CublasChainLayer::new(g, w, s, d, dff)?);
+        }
+        let stream = g.stream.clone();
+        Ok(Self { stream, layers, s, d })
+    }
+
+    /// Number of layers in the stack.
+    pub fn depth(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Run the whole cuBLAS call-chain stack on a **resident** `[S,D]` buffer → resident final output, the
+    /// pure on-device N-layer chain (no host transfer between layers) — the fair counterpart to
+    /// [`ResidentModelF16::forward_device`], differing only in cuBLAS-GEMM + unfused epilogues per layer.
+    pub fn forward_device(
+        &self,
+        x_d: &CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, PeerError> {
+        let mut cur = self.layers[0].forward_device(x_d)?;
+        for layer in &self.layers[1..] {
+            cur = layer.forward_device(&cur)?;
+        }
+        Ok(cur)
+    }
+
+    /// One-shot host call: upload `x` once, run the whole chain stack, copy the final `[S,D]` back once.
+    pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, PeerError> {
+        assert_eq!(x.len(), self.s * self.d, "x must be S×D");
+        let x_d = self.stream.memcpy_stod(x)?;
+        let out = self.forward_device(&x_d)?;
+        Ok(self.stream.memcpy_dtov(&out)?)
+    }
+}
