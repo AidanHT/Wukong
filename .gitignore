@@ -22,6 +22,11 @@ a.out
 # Hundreds of MB of vendor binaries — never committed; reproduced by the pip command above.
 /tools/cuda-redist
 
+# Local CUDA PyTorch venv for the Tier-C (PyTorch) GPU peer benchmark.
+# Created via `python -m venv tools/torch-venv` + `pip install torch --index-url
+# https://download.pytorch.org/whl/cu124` — ~2.5 GB of wheels; never committed.
+/tools/torch-venv
+
 # Editor / OS noise
 .vscode/
 .idea/
