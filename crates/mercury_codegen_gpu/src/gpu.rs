@@ -1143,7 +1143,21 @@ pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
     d == 64 && s % 16 == 0 && s >= 512
 }
 
-/// Launch config for the tensor-core flash kernel `flash_d64_w`: one warp per 16-query-row block.
+/// Tensor-core flash entry name for this seq: the **wide 64-key kernel** (`flash_d64_w4`) when
+/// `S % 64 == 0` — it stages 64 keys per online-softmax step instead of 16, cutting the serial KB
+/// dependency chain (and its SMEM round-trips) 4× for **~2× the throughput** of the 16-key `flash_d64_w`
+/// (`flash_tiled_vs_untiled`: wmma4/wmma ~0.45–0.61× across S). Falls back to the 16-key kernel for the
+/// `S % 16 == 0` but not `% 64` seqs (the layer is always `% 64`, so it always gets the wide path). Both
+/// share [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA).
+pub(crate) fn wmma_flash_entry(s: usize) -> &'static str {
+    if s % (16 * crate::ptx_flash::WMMA_FLASH_NKB) == 0 {
+        "flash_d64_w4"
+    } else {
+        "flash_d64_w"
+    }
+}
+
+/// Launch config for the tensor-core flash kernels (`flash_d64_w`/`_w4`): one warp per 16-query-row block.
 pub(crate) fn wmma_flash_cfg(s: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((s / 16) as u32, 1, 1),
@@ -1586,7 +1600,7 @@ impl ResidentLayerF16 {
         let (flash_name, flash_cfg) = flash_plan(d, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_flash_w = if wmma_flash_applies(d, s) {
-            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w")?;
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), wmma_flash_entry(s))?;
             Some((f, wmma_flash_cfg(s)))
         } else {
             None
@@ -3082,6 +3096,35 @@ mod tests {
                     "wmma flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
                 );
+                // The wide-key-tile kernel (64 keys/softmax step) — same online-softmax math, ~2× faster
+                // (the long-context lever). It needs S % 64 == 0 (no ragged key tail); the layer's WMMA
+                // path is always %64. Must hold to the same tolerance as the 16-key kernel.
+                if seq % (16 * crate::ptx_flash::WMMA_FLASH_NKB) == 0 {
+                    let mut ow_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
+                    let fw = g
+                        .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w4")
+                        .unwrap();
+                    let mut bld = g.stream.launch_builder(&fw);
+                    bld.arg(&s32)
+                        .arg(&scale)
+                        .arg(&q_d)
+                        .arg(&k_d)
+                        .arg(&v_d)
+                        .arg(&mut ow_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    let gotw = g.stream.memcpy_dtov(&ow_d).unwrap();
+                    let stw = crate::diff::assert_close(
+                        &format!("wmma4 flash s={seq}"),
+                        &gotw,
+                        &oracle,
+                        2e-3,
+                        2e-2,
+                    );
+                    eprintln!(
+                        "wmma4 flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                        stw.max_abs, stw.max_rel
+                    );
+                }
             }
         });
     }
@@ -3171,9 +3214,13 @@ mod tests {
             let f_til = g
                 .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_t")
                 .unwrap();
-            // The experimental tensor-core kernel (f16 in). Same attention, WMMA `Q·Kᵀ` + `P·V`.
+            // The tensor-core kernels (f16 in). Same attention, WMMA `Q·Kᵀ` + `P·V`; `_w` stages 16 keys
+            // per softmax step, `_w4` stages 64 (4× fewer serial KB iterations — the long-context lever).
             let f_wmma = g
                 .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w")
+                .unwrap();
+            let f_wmma4 = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w4")
                 .unwrap();
             let to16 = |x: &[f32]| -> Vec<half::f16> {
                 x.iter().map(|&v| half::f16::from_f32(v)).collect()
@@ -3223,6 +3270,26 @@ mod tests {
                     maxdiff < 1e-4,
                     "S={s}: tiled vs untiled disagree, max_abs={maxdiff:.2e}"
                 );
+                // The wide WMMA kernel (f16 in) must match the f32 reference within the f16 round-trip
+                // tolerance (every A/B size is %64, so the 64-key tile has no ragged tail). A
+                // fragment-layout or indexing bug would scatter O(0.1+); the online-softmax regrouping is
+                // exact, so the only honest deviation is f16 input quantization (~1e-3 here).
+                {
+                    let mut bld = g.stream.launch_builder(&f_wmma4);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                    unsafe { bld.launch(cfg_w).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_w4 = g.stream.memcpy_dtov(&o).unwrap();
+                let w4diff = out_unt
+                    .iter()
+                    .zip(&out_w4)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    w4diff < 5e-2,
+                    "S={s}: wide WMMA flash vs f32 reference disagree, max_abs={w4diff:.2e}"
+                );
 
                 pin!();
                 let t_unt = best_of(5, || {
@@ -3257,13 +3324,27 @@ mod tests {
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / 100.0
                 });
+                pin!();
+                let t_w4 = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_wmma4);
+                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        unsafe { bld.launch(cfg_w).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
                 eprintln!(
-                    "S={s:>4}: untiled {:.4} | tiled {:.4} | wmma {:.4} ms || tiled/untiled {:.2}× | wmma/tiled {:.2}×",
+                    "S={s:>4}: untiled {:.4} | tiled {:.4} | wmma {:.4} | wmma4 {:.4} ms || tiled/untiled {:.2}× | wmma/tiled {:.2}× | wmma4/wmma {:.2}× | wmma4/tiled {:.2}×",
                     t_unt * 1e3,
                     t_til * 1e3,
                     t_w * 1e3,
+                    t_w4 * 1e3,
                     t_til / t_unt,
                     t_w / t_til,
+                    t_w4 / t_w,
+                    t_w4 / t_til,
                 );
             }
         });
