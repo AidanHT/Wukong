@@ -1464,6 +1464,198 @@ pub fn transformer_layer(
 /// the dynamic range. `Wq/Wk/Wv/Wo` are `[D,D]`, `W1` is `[Dff,D]`, `W2` is `[D,Dff]`; requires
 /// `S%64==0, D%64==0, Dff%64==0` (the WMMA tile) and `D` a flash head dim (64/128). fp16-GEMM precision
 /// ⇒ tolerance-gated against the f64 reference of the same layer with f16-rounded GEMM inputs.
+pub struct ResidentLayerF16 {
+    stream: Arc<CudaStream>,
+    f_norm: CudaFunction,
+    f_cast: CudaFunction,
+    f_flash: CudaFunction,
+    f_gemm: CudaFunction,
+    f_silu: CudaFunction,
+    f_resid: CudaFunction,
+    wq: cudarc::driver::CudaSlice<half::f16>,
+    wk: cudarc::driver::CudaSlice<half::f16>,
+    wv: cudarc::driver::CudaSlice<half::f16>,
+    wo: cudarc::driver::CudaSlice<half::f16>,
+    w1: cudarc::driver::CudaSlice<half::f16>,
+    w2: cudarc::driver::CudaSlice<half::f16>,
+    s: usize,
+    d: usize,
+    dff: usize,
+    eps: f32,
+}
+
+impl ResidentLayerF16 {
+    /// Upload the weights (narrowed to f16) and preload the kernels — the one-time, `&mut Gpu` setup.
+    /// The three WMMA entries (`_sm_db`, `_sm_db_silu`, `_sm_db_residual`) share one JITed module.
+    pub fn new(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        s: usize,
+        d: usize,
+        dff: usize,
+    ) -> Result<Self, DriverError> {
+        use half::f16;
+        for (name, wt, len) in [
+            ("wq", w.wq, d * d),
+            ("wk", w.wk, d * d),
+            ("wv", w.wv, d * d),
+            ("wo", w.wo, d * d),
+            ("w1", w.w1, dff * d),
+            ("w2", w.w2, d * dff),
+        ] {
+            assert_eq!(wt.len(), len, "{name} wrong size");
+        }
+        assert!(
+            s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
+            "ResidentLayerF16 needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
+        );
+        assert!(
+            crate::ptx_flash::SUPPORTED_D.contains(&d),
+            "ResidentLayerF16: head dim {d} unsupported by flash (need {:?})",
+            crate::ptx_flash::SUPPORTED_D
+        );
+        let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
+        let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+        let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &format!("flash_d{d}"))?;
+        let ptx = crate::ptx_wmma::wmma_f16_ptx();
+        let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db")?;
+        let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
+        let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")?;
+        let stream = g.stream.clone();
+        let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
+        let wq = stream.memcpy_stod(&to16(w.wq))?;
+        let wk = stream.memcpy_stod(&to16(w.wk))?;
+        let wv = stream.memcpy_stod(&to16(w.wv))?;
+        let wo = stream.memcpy_stod(&to16(w.wo))?;
+        let w1 = stream.memcpy_stod(&to16(w.w1))?;
+        let w2 = stream.memcpy_stod(&to16(w.w2))?;
+        Ok(Self {
+            stream,
+            f_norm,
+            f_cast,
+            f_flash,
+            f_gemm,
+            f_silu,
+            f_resid,
+            wq,
+            wk,
+            wv,
+            wo,
+            w1,
+            w2,
+            s,
+            d,
+            dff,
+            eps: 1e-5,
+        })
+    }
+
+    /// Run the layer on a **resident** `[S,D]` f32 activation buffer, returning a fresh resident `[S,D]`
+    /// f32 buffer — the pure on-device kernel chain, no host transfer. This is what stacks N-deep into a
+    /// whole-model forward pass: one layer's output is the next layer's input, never leaving the GPU.
+    pub fn forward_device(
+        &self,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+    ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        use half::f16;
+        let stream = &self.stream;
+        let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
+        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+
+        // RMSNorm a `[rows, d]` f32 buffer into a fresh f32 buffer (one warp per row).
+        let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
+            let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
+            let (r, c) = (rows as u32, d as u32);
+            let mut bld = stream.launch_builder(&self.f_norm);
+            bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
+            unsafe { bld.launch(norm_cfg)? };
+            Ok(out)
+        };
+        // device f32 -> device f16 narrowing (the stage boundary between norm/flash and the WMMA GEMMs).
+        let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
+            let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+            let nn = n as u32;
+            let mut b = stream.launch_builder(&self.f_cast);
+            b.arg(&nn).arg(src).arg(&mut dst);
+            unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+            Ok(dst)
+        };
+        // C = A*Bᵀ (fp16-in, f32-out) via a chosen WMMA entry (`f_gemm` plain, or `f_silu` SiLU-fused).
+        let gemm16 = |f: &cudarc::driver::CudaFunction,
+                      a: &cudarc::driver::CudaSlice<f16>,
+                      b: &cudarc::driver::CudaSlice<f16>,
+                      m: usize,
+                      k: usize,
+                      n: usize|
+         -> Result<_, DriverError> {
+            let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+        // C = A*Bᵀ + residual (fp16-in; f32 residual seeded via wmma.load.c) — the skip connection fused
+        // into the GEMM accumulator (no separate add kernel, no HBM round-trip).
+        let resid_gemm = |a: &cudarc::driver::CudaSlice<f16>,
+                          b: &cudarc::driver::CudaSlice<f16>,
+                          residual: &cudarc::driver::CudaSlice<f32>,
+                          m: usize,
+                          k: usize,
+                          n: usize|
+         -> Result<_, DriverError> {
+            let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(&self.f_resid);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c).arg(residual);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+
+        // --- attention: fp16 tensor-core Q/K/V/O projections, f32 flash, residual fused into O ---
+        let h1 = norm(x_d, s)?;
+        let h1_16 = cast(&h1, s * d)?;
+        let q = gemm16(&self.f_gemm, &h1_16, &self.wq, s, d, d)?;
+        let k = gemm16(&self.f_gemm, &h1_16, &self.wk, s, d, d)?;
+        let v = gemm16(&self.f_gemm, &h1_16, &self.wv, s, d, d)?;
+        let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
+        {
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let ss = s as u32;
+            let flash_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+            let mut bld = stream.launch_builder(&self.f_flash);
+            bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
+            unsafe { bld.launch(flash_cfg)? };
+        }
+        let attn_16 = cast(&attn, s * d)?;
+        let x1 = resid_gemm(&attn_16, &self.wo, x_d, s, d, d)?; // x + A*Woᵀ  (residual 1, fused)
+
+        // --- FFN: RMSNorm -> SiLU up-projection (fused) -> down-projection with residual (fused) ---
+        let h2 = norm(&x1, s)?;
+        let h2_16 = cast(&h2, s * d)?;
+        let f1 = gemm16(&self.f_silu, &h2_16, &self.w1, s, d, dff)?; // SiLU(h2*W1ᵀ) [S,Dff], act fused
+        let f1_16 = cast(&f1, s * dff)?;
+        let out = resid_gemm(&f1_16, &self.w2, &x1, s, dff, d)?; // x1 + f1*W2ᵀ  (residual 2, fused)
+        Ok(out)
+    }
+
+    /// One-shot host call: upload `x` (`[S,D]` f32), run [`forward_device`](Self::forward_device), copy
+    /// the `[S,D]` result back. The transfer-inclusive convenience path; a real stack keeps both ends
+    /// resident and calls `forward_device` directly.
+    pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, DriverError> {
+        assert_eq!(x.len(), self.s * self.d, "x must be S×D");
+        let x_d = self.stream.memcpy_stod(x)?;
+        let out = self.forward_device(&x_d)?;
+        self.stream.memcpy_dtov(&out)
+    }
+}
+
+/// One **pre-norm transformer layer on the fp16 tensor cores** (one-shot): builds a [`ResidentLayerF16`]
+/// (weights narrowed to f16 and uploaded once) and runs one [`forward`](ResidentLayerF16::forward). The
+/// fast, fused sibling of the f32 [`transformer_layer`]; see [`ResidentLayerF16`] for the kernel chain
+/// and shape constraints. fp16-GEMM precision ⇒ tolerance-gated against the same layer's f64 reference
+/// with f16-rounded GEMM inputs. For a resident stack (no per-call weight upload), build the layer once
+/// and call [`forward_device`](ResidentLayerF16::forward_device).
 pub fn transformer_layer_f16(
     g: &mut Gpu,
     x: &[f32],
@@ -1472,128 +1664,8 @@ pub fn transformer_layer_f16(
     d: usize,
     dff: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    use half::f16;
     assert_eq!(x.len(), s * d, "x must be S×D");
-    for (name, wt, len) in [
-        ("wq", w.wq, d * d),
-        ("wk", w.wk, d * d),
-        ("wv", w.wv, d * d),
-        ("wo", w.wo, d * d),
-        ("w1", w.w1, dff * d),
-        ("w2", w.w2, d * dff),
-    ] {
-        assert_eq!(wt.len(), len, "{name} wrong size");
-    }
-    assert!(
-        s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
-        "transformer_layer_f16 needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
-    );
-    assert!(
-        crate::ptx_flash::SUPPORTED_D.contains(&d),
-        "transformer_layer_f16: head dim {d} unsupported by flash (need {:?})",
-        crate::ptx_flash::SUPPORTED_D
-    );
-
-    // Preload every kernel once (the only `&mut g` use); device work then runs through the cloned
-    // stream Arc with no further borrow of g. The three WMMA entries share one JITed module.
-    let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
-    let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-    let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &format!("flash_d{d}"))?;
-    let ptx = crate::ptx_wmma::wmma_f16_ptx();
-    let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db")?;
-    let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
-    let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")?;
-    let stream = g.stream.clone();
-
-    // Upload input (f32) + weights (pre-narrowed to f16 once).
-    let x_d = stream.memcpy_stod(x)?;
-    let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
-    let wq = stream.memcpy_stod(&to16(w.wq))?;
-    let wk = stream.memcpy_stod(&to16(w.wk))?;
-    let wv = stream.memcpy_stod(&to16(w.wv))?;
-    let wo = stream.memcpy_stod(&to16(w.wo))?;
-    let w1 = stream.memcpy_stod(&to16(w.w1))?;
-    let w2 = stream.memcpy_stod(&to16(w.w2))?;
-
-    let eps = 1e-5f32;
-    let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
-
-    // RMSNorm a `[rows, d]` f32 buffer into a fresh f32 buffer (one warp per row).
-    let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
-        let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
-        let (r, c) = (rows as u32, d as u32);
-        let mut bld = stream.launch_builder(&f_norm);
-        bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
-        unsafe { bld.launch(norm_cfg)? };
-        Ok(out)
-    };
-    // device f32 → device f16 narrowing (the stage-boundary cast between norm/flash and the WMMA GEMMs).
-    let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
-        let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
-        let nn = n as u32;
-        let mut b = stream.launch_builder(&f_cast);
-        b.arg(&nn).arg(src).arg(&mut dst);
-        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
-        Ok(dst)
-    };
-    // C = A·Bᵀ (fp16-in, f32-out) via a chosen WMMA entry (`f_gemm` plain, or `f_silu` SiLU-fused).
-    let gemm16 = |f: &cudarc::driver::CudaFunction,
-                  a: &cudarc::driver::CudaSlice<f16>,
-                  b: &cudarc::driver::CudaSlice<f16>,
-                  m: usize,
-                  k: usize,
-                  n: usize|
-     -> Result<_, DriverError> {
-        let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
-        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
-        let mut bld = stream.launch_builder(f);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
-        unsafe { bld.launch(wmma_sm_cfg(m, n))? };
-        Ok(c)
-    };
-    // C = A·Bᵀ + residual (fp16-in; f32 residual seeded via wmma.load.c) — the skip connection fused
-    // into the GEMM accumulator (no separate add kernel, no HBM round-trip).
-    let resid_gemm = |a: &cudarc::driver::CudaSlice<f16>,
-                      b: &cudarc::driver::CudaSlice<f16>,
-                      residual: &cudarc::driver::CudaSlice<f32>,
-                      m: usize,
-                      k: usize,
-                      n: usize|
-     -> Result<_, DriverError> {
-        let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
-        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
-        let mut bld = stream.launch_builder(&f_resid);
-        bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c).arg(residual);
-        unsafe { bld.launch(wmma_sm_cfg(m, n))? };
-        Ok(c)
-    };
-
-    // --- attention block: fp16 tensor-core Q/K/V/O projections, f32 flash, residual fused into O ---
-    let h1 = norm(&x_d, s)?;
-    let h1_16 = cast(&h1, s * d)?;
-    let q = gemm16(&f_gemm, &h1_16, &wq, s, d, d)?;
-    let k = gemm16(&f_gemm, &h1_16, &wk, s, d, d)?;
-    let v = gemm16(&f_gemm, &h1_16, &wv, s, d, d)?;
-    let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
-    {
-        let scale = 1.0f32 / (d as f32).sqrt();
-        let ss = s as u32;
-        let flash_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
-        let mut bld = stream.launch_builder(&f_flash);
-        bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
-        unsafe { bld.launch(flash_cfg)? };
-    }
-    let attn_16 = cast(&attn, s * d)?;
-    let x1 = resid_gemm(&attn_16, &wo, &x_d, s, d, d)?; // x + A·Woᵀ  (residual 1, fused)
-
-    // --- FFN block: RMSNorm → SiLU up-projection (fused) → down-projection with residual (fused) ---
-    let h2 = norm(&x1, s)?;
-    let h2_16 = cast(&h2, s * d)?;
-    let f1 = gemm16(&f_silu, &h2_16, &w1, s, d, dff)?; // SiLU(h2·W1ᵀ)  [S,Dff], activation fused
-    let f1_16 = cast(&f1, s * dff)?;
-    let out = resid_gemm(&f1_16, &w2, &x1, s, dff, d)?; // x1 + f1·W2ᵀ  (residual 2, fused)
-
-    stream.memcpy_dtov(&out)
+    ResidentLayerF16::new(g, w, s, d, dff)?.forward(x)
 }
 
 /// One **fp8 (E4M3) tensor-core tile** `D = A·B` via `mma.sync.m16n8k32` (Ada has no WMMA fp8): `a`
@@ -3091,15 +3163,16 @@ mod tests {
         });
     }
 
-    /// End-to-end latency of the GPU-resident transformer layer (full call: weights H2D + the kernel
-    /// chain + result D2H), the **fp16 tensor-core fused path vs the f32 scalar chain** — both Mercury,
-    /// same machine, same buffers, measured same-run (this is an internal optimized-vs-naive speedup,
-    /// NOT a cross-vendor claim). The fp16 path runs every projection on the WMMA tensor cores and folds
+    /// Latency of the GPU transformer layer, **fp16 tensor-core fused vs f32 scalar chain** — both
+    /// Mercury, same machine, same buffers, measured same-run (an internal optimized-vs-naive speedup,
+    /// NOT a cross-vendor claim). Three figures: (1) f32 full call and (2) fp16 full call both pay the
+    /// per-call weights-H2D + result-D2H; (3) fp16 **resident** times only the on-device kernel chain
+    /// from a [`ResidentLayerF16`] whose weights uploaded once — the real serving cost (a deployed model
+    /// never re-uploads weights). The fp16 path runs every projection on the WMMA tensor cores and folds
     /// the two residual adds + the SiLU into the GEMMs; the f32 path is the register-blocked scalar GEMM
-    /// chain with separate add/SiLU launches. Reported as ms/layer + tokens/s for each, plus the ratio.
-    /// The laptop GPU clock is warmed first and each figure is `best_of(ROUNDS)` (min time = peak-clock
-    /// sample), or the ~7× boost ramp would corrupt the ratio. Each size is also correctness-gated
-    /// against the f64 oracle before its speed is reported (the correctness-before-speed law).
+    /// chain with separate add/SiLU launches. The laptop GPU clock is warmed first and each figure is
+    /// `best_of(ROUNDS)` (min time = peak-clock sample), or the ~7× boost ramp would corrupt the ratio.
+    /// Each size is also correctness-gated against the f64 oracle before its speed is reported.
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
     #[ignore = "throughput bench; run explicitly"]
@@ -3108,16 +3181,22 @@ mod tests {
             let mut rng = crate::diff::Rng::new(0x7A12);
             let (d, dff) = (64usize, 256usize);
 
-            // Warm the laptop GPU clock (it boosts ~7× under sustained load); a cold first call reads
-            // slow and would make the f32-vs-f16 ratio a clock artifact rather than a kernel difference.
-            {
-                let wa = rng.vec(1024 * 1024, -1.0, 1.0);
-                let wb = rng.vec(1024 * 1024, -1.0, 1.0);
-                for _ in 0..30 {
-                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
-                }
+            // Pin the laptop GPU clock with a sustained fp16-GEMM burst. The clock boosts ~7× under load
+            // and DECAYS in the gaps between measurements, so a single up-front warmup is not enough over
+            // a multi-second bench — re-pinning immediately before each timing keeps all three (f32 /
+            // fp16 full / fp16 resident) in the same clock regime, the only way the ratios are honest
+            // (the "GPU clock" lesson: on this part only same-regime ratios are meaningful).
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin_clock {
+                () => {{
+                    for _ in 0..25 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
             }
-            const ROUNDS: usize = 4;
+            pin_clock!();
+            const ROUNDS: usize = 5;
 
             for s in [256usize, 512, 1024] {
                 let x = rng.vec(s * d, -1.0, 1.0);
@@ -3142,7 +3221,15 @@ mod tests {
                 let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
                 crate::diff::assert_close(&format!("tl_f16 S={s}"), &got16, &oracle, 5e-2, 5e-2);
 
-                let iters = 50;
+                // Build the resident fp16 layer ONCE (weights → f16, uploaded once) and pin x on-device;
+                // the struct owns a cloned stream Arc, not a borrow of `g`, so the full-call timings below
+                // (which take `&mut g`) still compile while it is alive.
+                let layer = ResidentLayerF16::new(g, &w, s, d, dff).unwrap();
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+                layer.forward_device(&x_d).unwrap(); // warm
+
+                let iters = 60;
+                pin_clock!();
                 let t_f32 = best_of(ROUNDS, || {
                     let t0 = Instant::now();
                     for _ in 0..iters {
@@ -3150,6 +3237,7 @@ mod tests {
                     }
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
+                pin_clock!();
                 let t_f16 = best_of(ROUNDS, || {
                     let t0 = Instant::now();
                     for _ in 0..iters {
@@ -3157,15 +3245,31 @@ mod tests {
                     }
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
+                // Resident per-token compute: only the on-device kernel chain (weights AND x already
+                // resident, output stays resident). The launches are async, so sync once before stopping
+                // the clock. This is the real serving cost — a deployed model never re-uploads weights.
+                pin_clock!();
+                let t_res = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = layer.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
                 eprintln!(
                     "transformer_layer S={s} D={d} Dff={dff} (same-run, both Mercury):\n  \
-                     f32 scalar chain (gemm_nt_rb) : {:.3} ms/layer, {:>7.0} tokens/s\n  \
-                     fp16 tensor-core fused        : {:.3} ms/layer, {:>7.0} tokens/s  → {:.2}× faster",
+                     f32  scalar chain,    full call : {:.3} ms, {:>7.0} tok/s\n  \
+                     fp16 tensor-core fused, full call : {:.3} ms, {:>7.0} tok/s  → {:.2}× vs f32\n  \
+                     fp16 tensor-core fused, RESIDENT  : {:.3} ms, {:>7.0} tok/s  → {:.2}× vs f32 (weights+x resident, no D2H)",
                     t_f32 * 1e3,
                     s as f64 / t_f32,
                     t_f16 * 1e3,
                     s as f64 / t_f16,
                     t_f32 / t_f16,
+                    t_res * 1e3,
+                    s as f64 / t_res,
+                    t_f32 / t_res,
                 );
             }
         });
