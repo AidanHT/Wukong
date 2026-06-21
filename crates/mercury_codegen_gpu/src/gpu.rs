@@ -3471,6 +3471,145 @@ mod tests {
         });
     }
 
+    /// **M13 — the megakernel beats the call-chain, at the FFN-block level.** Times the resident
+    /// [`ffn_fused`] (5 launches: norm, cast, SiLU-GEMM, cast, residual-GEMM — the SiLU folded into the
+    /// up-proj store, the residual into the down-proj accumulator) against the unfused chain the same
+    /// kernels run with the epilogues SPLIT OUT (7 launches: norm, cast, GEMM, SiLU, cast, GEMM, add —
+    /// the SiLU and add are two extra kernels, each round-tripping [S,Dff]/[S,D] through HBM). Identical
+    /// GEMMs, identical buffers, fully resident (uploaded once); the only difference is the two fused
+    /// epilogues, so the ratio isolates the fusion value (2 launches + 2 HBM round-trips). best_of after
+    /// a clock warmup. Correctness gates speed: the two chains' outputs must agree (checksum).
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn ffn_fused_vs_chain_throughput() {
+        use half::f16;
+        with_gpu("ffn_throughput", |g| {
+            let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm").unwrap();
+            let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16").unwrap();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let f_silu_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu").unwrap();
+            let f_resid_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual").unwrap();
+            let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db").unwrap();
+            let f_siluv = g.function("vmath", crate::ptx::vmath_ptx(), "silu").unwrap();
+            let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
+            let stream = g.stream.clone();
+            let eps = 1e-5f32;
+            let mut rng = crate::diff::Rng::new(0xFF11);
+
+            // Clock warmup so fused/unfused are sampled at the same peak clock (cf. gemm_vs_peers).
+            {
+                use crate::baselines::{peers_available, time_cublas_gemm_nt_f16};
+                if peers_available(g) {
+                    for _ in 0..30 {
+                        let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+                    }
+                }
+            }
+            const ITERS: usize = 50;
+
+            for &(s, d, dff) in &[(128usize, 64usize, 256usize), (512, 256, 1024)] {
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let w1_f32 = rng.vec(dff * d, -0.1, 0.1);
+                let w2_f32 = rng.vec(d * dff, -0.1, 0.1);
+                let w1: Vec<f16> = w1_f32.iter().map(|&v| f16::from_f32(v)).collect();
+                let w2: Vec<f16> = w2_f32.iter().map(|&v| f16::from_f32(v)).collect();
+                let x_d = stream.memcpy_stod(&x).unwrap();
+                let w1_d = stream.memcpy_stod(&w1).unwrap();
+                let w2_d = stream.memcpy_stod(&w2).unwrap();
+                let mut h2 = stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
+                let mut h2_16 = stream.memcpy_stod(&vec![f16::from_f32(0.0); s * d]).unwrap();
+                let mut t_dff = stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
+                let mut t_dff_b = stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
+                let mut t_dff16 = stream.memcpy_stod(&vec![f16::from_f32(0.0); s * dff]).unwrap();
+                let mut t_d = stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
+                let mut out = stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
+                let norm_cfg =
+                    LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+                let cfg1 = wmma_sm_cfg(s, dff); // up-proj  C[S,Dff]
+                let cfg2 = wmma_sm_cfg(s, d); // down-proj C[S,D]
+                let (mm1, nn1, kk1) = (s as u32, dff as u32, d as u32);
+                let (mm2, nn2, kk2) = (s as u32, d as u32, dff as u32);
+                let n_sd = (s * d) as u32;
+                let n_sdff = (s * dff) as u32;
+                let cast_sd = LaunchConfig::for_num_elems(n_sd);
+                let cast_sdff = LaunchConfig::for_num_elems(n_sdff);
+
+                // Fused: norm → cast → SiLU-GEMM → cast → residual-GEMM (5 launches/iter).
+                let t_fused = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        let mut b = stream.launch_builder(&f_norm);
+                        b.arg(&mm2).arg(&nn2).arg(&eps).arg(&x_d).arg(&mut h2); // mm2=S, nn2=D
+                        unsafe { b.launch(norm_cfg).unwrap() };
+                        let mut b = stream.launch_builder(&f_cast);
+                        b.arg(&n_sd).arg(&h2).arg(&mut h2_16);
+                        unsafe { b.launch(cast_sd).unwrap() };
+                        let mut b = stream.launch_builder(&f_silu_gemm);
+                        b.arg(&mm1).arg(&nn1).arg(&kk1).arg(&h2_16).arg(&w1_d).arg(&mut t_dff);
+                        unsafe { b.launch(cfg1).unwrap() };
+                        let mut b = stream.launch_builder(&f_cast);
+                        b.arg(&n_sdff).arg(&t_dff).arg(&mut t_dff16);
+                        unsafe { b.launch(cast_sdff).unwrap() };
+                        let mut b = stream.launch_builder(&f_resid_gemm);
+                        b.arg(&mm2).arg(&nn2).arg(&kk2).arg(&t_dff16).arg(&w2_d).arg(&mut out).arg(&x_d);
+                        unsafe { b.launch(cfg2).unwrap() };
+                    }
+                    stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / ITERS as f64
+                });
+
+                // Unfused: norm → cast → GEMM → SiLU → cast → GEMM → add (7 launches/iter).
+                let t_chain = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        let mut b = stream.launch_builder(&f_norm);
+                        b.arg(&mm2).arg(&nn2).arg(&eps).arg(&x_d).arg(&mut h2);
+                        unsafe { b.launch(norm_cfg).unwrap() };
+                        let mut b = stream.launch_builder(&f_cast);
+                        b.arg(&n_sd).arg(&h2).arg(&mut h2_16);
+                        unsafe { b.launch(cast_sd).unwrap() };
+                        let mut b = stream.launch_builder(&f_gemm);
+                        b.arg(&mm1).arg(&nn1).arg(&kk1).arg(&h2_16).arg(&w1_d).arg(&mut t_dff);
+                        unsafe { b.launch(cfg1).unwrap() };
+                        let mut b = stream.launch_builder(&f_siluv);
+                        b.arg(&n_sdff).arg(&t_dff).arg(&mut t_dff_b);
+                        unsafe { b.launch(cast_sdff).unwrap() };
+                        let mut b = stream.launch_builder(&f_cast);
+                        b.arg(&n_sdff).arg(&t_dff_b).arg(&mut t_dff16);
+                        unsafe { b.launch(cast_sdff).unwrap() };
+                        let mut b = stream.launch_builder(&f_gemm);
+                        b.arg(&mm2).arg(&nn2).arg(&kk2).arg(&t_dff16).arg(&w2_d).arg(&mut t_d);
+                        unsafe { b.launch(cfg2).unwrap() };
+                        let mut b = stream.launch_builder(&f_vadd);
+                        b.arg(&n_sd).arg(&t_d).arg(&x_d).arg(&mut out);
+                        unsafe { b.launch(cast_sd).unwrap() };
+                    }
+                    stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / ITERS as f64
+                });
+
+                // Correctness gates speed: the unfused timing loop ran last, so `out` holds its result —
+                // verify it against the f64 FFN reference (the fused path is gated separately by
+                // ffn_fused_matches_reference_within_tol; both share the same WMMA GEMMs).
+                let oracle = ref_ffn(&x, &w1_f32, &w2_f32, s, d, dff);
+                let chain_out = stream.memcpy_dtov(&out).unwrap();
+                crate::diff::assert_close(
+                    &format!("FFN chain {s}x{d}x{dff}"),
+                    &chain_out,
+                    &oracle,
+                    3e-2,
+                    3e-2,
+                );
+
+                let flop = 4.0 * s as f64 * d as f64 * dff as f64; // two GEMMs
+                eprintln!(
+                    "FFN {s}x{d}x{dff} (resident, same-run): fused {:>7.3} ms ({:>6.0} GFLOP/s, 5 launches) | unfused chain {:>7.3} ms (7 launches) | fused {:>4.2}× faster",
+                    t_fused * 1e3, flop / t_fused / 1e9, t_chain * 1e3, t_chain / t_fused,
+                );
+            }
+        });
+    }
+
     /// **M9 — memory-bound kernels at ≥90% of peak HBM bandwidth.** Times three pure-streaming kernels
     /// on resident device buffers (no host round-trip) against the *theoretical* peak derived from the
     /// device's own clock + bus width (`peak_hbm_gbs`, the same formula NVIDIA's `deviceQuery` prints) —
