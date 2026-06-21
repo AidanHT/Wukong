@@ -3210,6 +3210,13 @@ mod tests {
                 0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
             };
             let mut rng = crate::diff::Rng::new(0xF0ED);
+            // Warm the clock first (cf. gemm_vs_peers): without it the GEMM/cuBLAS times (measured at the
+            // top of each size block, cold) are compared against fused times measured later (warm), and
+            // the laptop GPU's load-ramp clock boost inflates the ratio — a cold-vs-warm artifact, not an
+            // honest peak-vs-peak fusion win. best_of(5) alone can't fix a monotonic within-block ramp.
+            for _ in 0..30 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
             for sz in [512usize, 1024, 2048] {
                 let (m, k, n) = (sz, sz, sz);
                 let a = rng.vec(m * k, -1.0, 1.0);
@@ -3264,6 +3271,37 @@ mod tests {
                         cub_chain * 1e3, cub_chain / t_fused,
                     );
                 }
+
+                // --- Residual fusion: out = A·Bᵀ + x (the transformer skip connection). Fused via
+                // wmma.load.c in ONE kernel vs the call-chain a GEMM library writes: the GEMM, then a
+                // separate vadd that reads C back from HBM, adds x, and writes out. (cuBLAS's beta=1 can
+                // fold a C += into the GEMM, but still needs C pre-loaded with x — an extra copy; the
+                // honest, simplest peer is gemm + vadd.) Same megakernel-beats-call-chain principle (M13).
+                let resid = rng.vec(m * n, -1.0, 1.0);
+                let fused_r = gemm_nt_f16_sm_db_residual(g, &a, &b, &resid, m, k, n).unwrap();
+                let ref_r: Vec<f32> =
+                    cub_out.iter().zip(resid.iter()).map(|(&c, &x)| c + x).collect();
+                crate::diff::assert_close(
+                    &format!("fused residual vs cuBLAS+add {sz}³"),
+                    &fused_r,
+                    &ref_r,
+                    5e-2,
+                    2e-2,
+                );
+                let resid_d = g.stream.memcpy_stod(&resid).unwrap();
+                let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual").unwrap();
+                let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
+                let t_fused_r = best_of(5, || {
+                    time_wmma_residual(g, &f_resid, wmma_sm_cfg(m, n), dims, &a_d, &b_d, &mut c_d, &resid_d, 30)
+                });
+                let t_add = best_of(5, || time_vadd(g, &f_vadd, m * n, 30));
+                let (mer_chain_r, cub_chain_r) = (t_gemm + t_add, t_cub + t_add);
+                eprintln!(
+                    "  residual: fused {:>7.3} ms ({:>6.0} GFLOP/s) | Mercury chain {:>7.3} ms ({:>4.2}× slower) | cuBLAS chain {:>7.3} ms (fused {:>4.2}× faster)",
+                    t_fused_r * 1e3, flop / t_fused_r / 1e9,
+                    mer_chain_r * 1e3, mer_chain_r / t_fused_r,
+                    cub_chain_r * 1e3, cub_chain_r / t_fused_r,
+                );
             }
         });
     }
@@ -3415,6 +3453,59 @@ mod tests {
         let t0 = Instant::now();
         for _ in 0..iters {
             launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Per-iter device time of the fused-residual GEMM (`wmma_nt_f16_sm_db_residual`), which takes the
+    /// `residual[M,N]` (f32) as a 7th param after C. Same warmup+loop shape as [`time_wmma`].
+    fn time_wmma_residual<T: cudarc::driver::DeviceRepr>(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<T>,
+        b_d: &cudarc::driver::CudaSlice<T>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        resid_d: &cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(resid_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Per-iter device time of one `vadd` (`out = x + y`, the residual add a call-chain pays as a
+    /// separate kernel) over `n` f32 — 3N traffic (read x, read y, write out), on resident buffers.
+    /// `f` is the prefetched `vadd` entry.
+    fn time_vadd(g: &Gpu, f: &cudarc::driver::CudaFunction, n: usize, iters: usize) -> f64 {
+        let nn = n as u32;
+        let x_d = g.stream.memcpy_stod(&vec![0.5f32; n]).unwrap();
+        let y_d = g.stream.memcpy_stod(&vec![0.25f32; n]).unwrap();
+        let mut out_d = g.stream.memcpy_stod(&vec![0f32; n]).unwrap();
+        let cfg = LaunchConfig::for_num_elems(nn);
+        let launch = |out_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut b = g.stream.launch_builder(f);
+            b.arg(&nn).arg(&x_d).arg(&y_d).arg(out_d);
+            unsafe { b.launch(cfg).unwrap() };
+        };
+        launch(&mut out_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(&mut out_d);
         }
         g.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() / iters as f64
