@@ -546,8 +546,13 @@ cuBLAS structurally cannot. Fusion beats Mercury's own two-kernel chain at **eve
 biggest where the GEMM is small and the saved relu pass is a larger share). silu and gelu fuse with the
 same effect — across 512³–2048³ all three beat the cuBLAS GEMM+activation chain by **~1.1–1.4×** at
 boost clock (the margin is the eliminated activation kernel's launch + C round-trip, which cuBLAS
-cannot fuse). A fused bias (needs the fragment column layout) and the recognizer that routes
-`act(matmul(…))` from Mercury source to the fused kernel are the remaining Phase-2 steps.
+cannot fuse). The **fused bias** epilogue `act(x·Wᵀ + bias)` — the canonical `nn.Linear`/FFN form — is
+fused too: because the WMMA fragment→column map is opaque, the bias path `wmma.store.d`s each tile into
+a per-warp SMEM scratch and re-reads by explicit (row,col) to add `bias[col]` before the activation
+(`_sm_db_bias{,_relu,_silu,_gelu}`; identity-with-bias is the affine Linear). And the recognizer routes
+`act(matmul(…) [+ bias])` straight from Mercury source to these fused kernels under `--backend=gpu`, so
+the fusion is a **compiler feature, not a host-API call** (gates `gpu_backend_fused_epilogue_matches_interp`
++ `…_bias_…`, each asserting the offload fired).
 
 **Compile latency + cubin cache (M10).** Mercury emits PTX and the driver JITs it to SASS; there is no
 30–120 s autotuning compile like Triton/TorchInductor. Measured (`cubin_cache_compile_latency`, RTX
