@@ -764,6 +764,26 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 false,
             );
         }
+        // Fused **bias (+ activation)** epilogues for bf16 too — the bias path acts on the f32
+        // accumulator (dtype-independent), so the same SMEM-staged store-back gives the bf16 training
+        // dtype the canonical `act(x·Wᵀ + bias)` Linear/FFN fusion. `bias` alone = affine Linear.
+        for (suffix, act) in [
+            ("bias", Act::None),
+            ("bias_relu", Act::Relu),
+            ("bias_silu", Act::Silu),
+            ("bias_gelu", Act::Gelu),
+        ] {
+            m += &entry_smem_db(
+                &format!("wmma_nt_bf16_sm_db_{suffix}"),
+                "bf16",
+                SM_BM,
+                SM_BN,
+                SM_WARPS_M,
+                SM_WARPS_N,
+                act,
+                true,
+            );
+        }
         m
     })
     .as_str()
