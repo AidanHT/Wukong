@@ -444,8 +444,180 @@ fn entry_wmma(d: usize) -> String {
     s
 }
 
+/// **Wide-key-tile** tensor-core flash (`flash_d{d}_w{nkb}`) — identical online-softmax math to
+/// [`entry_wmma`] but processes `WK = 16·nkb` keys per softmax step instead of 16. The narrow kernel's
+/// KB loop is a serial dependency chain of `S/16` iterations, each paying four `bar.sync`s and several
+/// SMEM round-trips (store S → load for softmax → store P → store PV → accumulate O); under the kernel's
+/// ~21% occupancy (1 warp/CTA, SMEM-capped) those per-iteration latencies are not hidden, so at long
+/// context the kernel runs at a fraction of roofline (~0.67 TFLOP/s @ S=4096). Widening to `WK` keys cuts
+/// the iteration count — and thus the round-trip count — by `nkb×`; the online softmax is associative
+/// over any tile width so O is unchanged to f32 rounding. Cost: `smemS`/`smemP` grow `nkb×`, trimming
+/// occupancy, so the net is an empirical A/B (`flash_tiled_vs_untiled`). Requires `S % WK == 0` (no
+/// ragged key tail) — fine for the layer, whose WMMA path is already `S % 64 == 0`.
+fn entry_wmma_wide(d: usize, nkb: usize) -> String {
+    assert!(d % 16 == 0, "WMMA flash needs D % 16 == 0");
+    assert!(nkb >= 1, "nkb must be >= 1");
+    let kt = d / 16; // Q·Kᵀ contraction tiles (over the head dim) AND P·V output n-tiles (over D)
+    let wk = 16 * nkb; // keys staged + softmaxed per KB step
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = format!("flash_d{d}_w{nkb}");
+    // SMEM (one warp, Br=16): smemS[16·WK] f32 | smemP[16·WK] f16 | smemPV[16·D] f32 | smemO[16·D] f32
+    let off_s = 0usize;
+    let off_p = off_s + 16 * wk * 4;
+    let off_pv = off_p + 16 * wk * 2;
+    let off_o = off_pv + 16 * d * 4;
+    let smem_bytes = off_o + 16 * d * 4;
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0;\n";
+    let mut fr = String::from("%scale,%mlane,%llane,%corr,%rmax,%mnew,%scv,%pp,%psum,%ov,%pvv");
+    for r in 0..8 {
+        fr += &format!(",%s{r}");
+    }
+    for n in 0..kt {
+        for r in 0..8 {
+            fr += &format!(",%pv{n}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    // WMMA fragments: qa (kt×8, loaded once), kb (kt×8, reused per sub-tile), pa+vb (8 each, reused).
+    let mut br = String::new();
+    for n in 0..kt {
+        for r in 0..8 {
+            br += &format!("%qa{n}_{r},%kb{n}_{r},");
+        }
+    }
+    for r in 0..8 {
+        br += &format!("%pa_{r},%vb_{r},");
+    }
+    s += &format!(
+        "    .reg .b32 {}%S,%lane,%row,%kb,%c,%sa,%tmp,%tmp2,%pf,%st64,%stwk;\n",
+        br
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%qap,%kbp,%vbp,%gp,%off,%optr;\n";
+    s += &format!("    .shared .align 16 .b8 smem_{name}[{smem_bytes}];\n");
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    s += &format!("    mov.u32 %st64,{d};\n    mov.u32 %stwk,{wk};\n");
+    s += "    mov.u32 %tmp,%tid.x;\n    and.b32 %lane,%tmp,31;\n    mov.u32 %tmp,%ctaid.x;\n    shl.b32 %row,%tmp,4;\n"; // row = ctaid*16
+
+    // Load Q (A, f16, .row) once: kt k-tiles at Q + (row*D + 16k)*2, stride D.
+    for n in 0..kt {
+        s += &format!("    mul.lo.s32 %tmp,%row,{d};\n    add.u32 %tmp,%tmp,{};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %qap,%Q,%off;\n", n * 16);
+        s += &format!(
+            "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {}, [%qap], %st64;\n",
+            frag(&format!("qa{n}_"), 8)
+        );
+    }
+    s += "    mov.f32 %mlane,0fFF800000;\n    mov.f32 %llane,0f00000000;\n";
+    s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra INITDONE_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_o};\n    mul.lo.s32 %tmp2,%lane,{};\n    add.u32 %tmp,%tmp,%tmp2;\n", d * 4);
+    for c in 0..d {
+        s += &format!("    st.shared.f32 [%tmp+{}],0f00000000;\n", c * 4);
+    }
+    s += &format!("INITDONE_{name}:\n");
+
+    // for kb in 0..S step WK
+    s += "    mov.u32 %kb,0;\n";
+    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra KBDONE_{name};\n");
+
+    // For each 16-key sub-tile j: S_j = Q · K[kb+16j]ᵀ (kt mma) → smemS[:,16j] (stride WK).
+    for j in 0..nkb {
+        for r in 0..8 {
+            s += &format!("    mov.f32 %s{r},0f00000000;\n");
+        }
+        for n in 0..kt {
+            s += &format!("    add.u32 %tmp,%kb,{};\n    mul.lo.s32 %tmp,%tmp,{d};\n    add.u32 %tmp,%tmp,{};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %kbp,%K,%off;\n", j * 16, n * 16);
+            s += &format!(
+                "    wmma.load.b.sync.aligned.m16n16k16.col.f16 {}, [%kbp], %st64;\n",
+                frag(&format!("kb{n}_"), 8)
+            );
+        }
+        for n in 0..kt {
+            s += &format!(
+                "    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {}, {}, {}, {};\n",
+                frag("s", 8),
+                frag(&format!("qa{n}_"), 8),
+                frag(&format!("kb{n}_"), 8),
+                frag("s", 8)
+            );
+        }
+        s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{};\n    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {}, %stwk;\n", off_s + j * 16 * 4, frag("s", 8));
+    }
+    s += "    bar.sync 0;\n";
+
+    // online softmax over the full WK-wide smemS row (lane==row, lanes 0..15)
+    s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra SOFTDONE_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_s};\n    mul.lo.s32 %tmp2,%lane,{};\n    add.u32 %sa,%tmp,%tmp2;\n", wk * 4); // &smemS[lane][0]
+    s += "    mov.f32 %rmax,0fFF800000;\n";
+    for c in 0..wk {
+        s += &format!("    ld.shared.f32 %scv,[%sa+{}];\n    mul.f32 %scv,%scv,%scale;\n    max.f32 %rmax,%rmax,%scv;\n", c * 4);
+    }
+    s += "    max.f32 %mnew,%mlane,%rmax;\n";
+    s += &format!("    sub.f32 %corr,%mlane,%mnew;\n    mul.f32 %corr,%corr,{log2e};\n    ex2.approx.f32 %corr,%corr;\n");
+    s += "    mul.f32 %llane,%llane,%corr;\n    mov.f32 %psum,0f00000000;\n";
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_p};\n    mul.lo.s32 %tmp2,%lane,{};\n    add.u32 %pf,%tmp,%tmp2;\n", wk * 2); // &smemP[lane][0]
+    for c in 0..wk {
+        s += &format!("    ld.shared.f32 %scv,[%sa+{}];\n    mul.f32 %scv,%scv,%scale;\n    sub.f32 %pp,%scv,%mnew;\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 %pp,%pp;\n    add.f32 %psum,%psum,%pp;\n    cvt.rn.f16.f32 %tmp2,%pp;\n    st.shared.b16 [%pf+{}],%tmp2;\n", c * 4, c * 2);
+    }
+    s += "    add.f32 %llane,%llane,%psum;\n    mov.f32 %mlane,%mnew;\n";
+    s += &format!("SOFTDONE_{name}:\n    bar.sync 0;\n");
+
+    // O += P·V : for each output d-tile n, accumulate nkb k-steps (P[:,16j]·V[kb+16j, 16n]) → smemPV[:,16n]
+    for n in 0..kt {
+        for r in 0..8 {
+            s += &format!("    mov.f32 %pv{n}_{r},0f00000000;\n");
+        }
+    }
+    for n in 0..kt {
+        for j in 0..nkb {
+            // pa = smemP[:,16j] (A,.row, base off_p+16j·2, stride WK)
+            s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{};\n    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n    wmma.load.a.sync.aligned.m16n16k16.row.f16 {}, [%gp], %stwk;\n", off_p + j * 16 * 2, frag("pa_", 8));
+            // vb = V[(kb+16j)·D + 16n] (B,.row, stride D)
+            s += &format!("    add.u32 %tmp,%kb,{};\n    mul.lo.s32 %tmp,%tmp,{d};\n    add.u32 %tmp,%tmp,{};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %vbp,%V,%off;\n", j * 16, n * 16);
+            s += &format!(
+                "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {}, [%vbp], %st64;\n",
+                frag("vb_", 8)
+            );
+            s += &format!(
+                "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 {}, {}, {}, {};\n",
+                frag(&format!("pv{n}_"), 8),
+                frag("pa_", 8),
+                frag("vb_", 8),
+                frag(&format!("pv{n}_"), 8)
+            );
+        }
+        s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{};\n    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {}, %st64;\n", off_pv + n * 16 * 4, frag(&format!("pv{n}_"), 8));
+    }
+    s += "    bar.sync 0;\n";
+    // smemO[lane][c] = smemO[lane][c]·corr + smemPV[lane][c] (lane==row, lanes 0..15)
+    s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra RESDONE_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_pv};\n    mul.lo.s32 %tmp2,%lane,{};\n    add.u32 %tmp,%tmp,%tmp2;\n", d * 4);
+    s += &format!("    mov.u32 %tmp2,smem_{name};\n    add.u32 %tmp2,%tmp2,{off_o};\n    mul.lo.s32 %sa,%lane,{};\n    add.u32 %tmp2,%tmp2,%sa;\n", d * 4);
+    for c in 0..d {
+        s += &format!("    ld.shared.f32 %pvv,[%tmp+{0}];\n    ld.shared.f32 %ov,[%tmp2+{0}];\n    fma.rn.f32 %ov,%ov,%corr,%pvv;\n    st.shared.f32 [%tmp2+{0}],%ov;\n", c * 4);
+    }
+    s += &format!("RESDONE_{name}:\n    bar.sync 0;\n");
+
+    s += &format!("    add.u32 %kb,%kb,{wk};\n    bra KB_{name};\n");
+
+    // O[row][c] = smemO[lane][c] / l (lane==row, lanes 0..15)
+    s += &format!("KBDONE_{name}:\n    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra RET_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_o};\n    mul.lo.s32 %tmp2,%lane,{0};\n    add.u32 %tmp,%tmp,%tmp2;\n    add.u32 %c,%row,%lane;\n    mul.lo.s32 %c,%c,{d};\n    mul.wide.u32 %off,%c,4;\n    add.s64 %optr,%O,%off;\n", d * 4);
+    for c in 0..d {
+        s += &format!("    ld.shared.f32 %ov,[%tmp+{0}];\n    div.rn.f32 %ov,%ov,%llane;\n    st.global.f32 [%optr+{0}],%ov;\n", c * 4);
+    }
+    s += &format!("RET_{name}:\n    ret;\n}}\n");
+    s
+}
+
 /// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, plus the
-/// experimental tensor-core `flash_d64_w`.
+/// tensor-core `flash_d64_w` (16-key tile) and the wide-key-tile `flash_d64_w4` (64-key tile).
 pub fn flash_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
@@ -455,10 +627,15 @@ pub fn flash_ptx() -> &'static str {
             m += &entry_tiled(d, FLASH_TWARPS);
         }
         m += &entry_wmma(64);
+        m += &entry_wmma_wide(64, WMMA_FLASH_NKB);
         m
     })
     .as_str()
 }
+
+/// 16-key sub-tiles staged per online-softmax step in the wide WMMA flash (`flash_d64_w{N}`). `WK = 16·N`
+/// keys per step ⇒ `S % WK == 0` required; 4 → 64-key tile, divides every layer seq (which is `S%64==0`).
+pub const WMMA_FLASH_NKB: usize = 4;
 
 /// Head dims with a generated kernel (the common transformer values).
 pub const SUPPORTED_D: [usize; 3] = [32, 64, 128];
