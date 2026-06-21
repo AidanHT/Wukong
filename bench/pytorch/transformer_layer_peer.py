@@ -43,7 +43,7 @@ HALF = torch.float16
 # runs — a ~1.7× clock swing), so the torch/Mercury *ratio* is order-of-magnitude only, not precise. The
 # whole set below is ONE consistent run (so the Mercury column is at least self-consistent across S); the
 # rigorous long-context claim is the same-process flash A/B + cuBLAS same-run bench, not this ratio.
-MERCURY_MS_PER_LAYER = {256: 0.385, 512: 0.557, 1024: 0.767, 2048: 2.075, 4096: 6.396}  # one run, WMMA flash >=512
+MERCURY_MS_PER_LAYER = {256: 0.526, 512: 0.605, 1024: 0.601, 2048: 1.617, 4096: 3.961}  # one run, WIDE WMMA flash (w4) >=512
 MERCURY_STACK_MS_PER_LAYER = {1: 0.34, 2: 0.34, 4: 0.34, 8: 0.34}  # depth sweep, S=512 (WMMA flash)
 
 
