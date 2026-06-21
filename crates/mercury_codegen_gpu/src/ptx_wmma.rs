@@ -330,14 +330,41 @@ fn entry_smem(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, warps_
 pub enum Act {
     None,
     Relu,
+    Silu,
+    Gelu,
 }
 
 impl Act {
-    /// PTX applying the activation in place to one f32 accumulator register `reg`.
+    /// PTX applying the activation in place to one f32 accumulator register `reg`. Transcendental
+    /// activations use the Ada SFU fast paths (`ex2.approx`/`tanh.approx`/`rcp.approx`) and the **exact
+    /// same formulas + constants** as the standalone `ptx::vmath_ptx` kernels, so a fused `silu(A·Bᵀ)`
+    /// equals the unfused `silu(gemm)` and inherits its tolerance gate. Scratch lives in `%act0`/`%act1`
+    /// (declared by `entry_smem_db`); each accumulator is processed sequentially so the scratch reuses.
     fn epilogue(self, reg: &str) -> String {
+        let hexf = |x: f32| format!("0f{:08X}", x.to_bits());
         match self {
             Act::None => String::new(),
             Act::Relu => format!("    max.f32 {reg},{reg},0f00000000;\n"),
+            // silu(x) = x·sigmoid(x) = x / (1 + exp(-x)), exp via 2^(x·log2e).
+            Act::Silu => {
+                let (nlog2e, one) = (hexf(-std::f32::consts::LOG2_E), hexf(1.0));
+                format!(
+                    "    mul.f32 %act0,{reg},{nlog2e};\n    ex2.approx.f32 %act0,%act0;\n    \
+                     add.f32 %act0,%act0,{one};\n    rcp.approx.f32 %act0,%act0;\n    \
+                     mul.f32 {reg},{reg},%act0;\n"
+                )
+            }
+            // gelu(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
+            Act::Gelu => {
+                let c0 = hexf((2.0f32 / std::f32::consts::PI).sqrt());
+                let (c1, one, half) = (hexf(0.044715), hexf(1.0), hexf(0.5));
+                format!(
+                    "    mul.f32 %act0,{reg},{reg};\n    mul.f32 %act0,%act0,{reg};\n    \
+                     fma.rn.f32 %act0,%act0,{c1},{reg};\n    mul.f32 %act0,%act0,{c0};\n    \
+                     tanh.approx.f32 %act0,%act0;\n    add.f32 %act0,%act0,{one};\n    \
+                     mul.f32 %act1,{reg},{half};\n    mul.f32 {reg},%act0,%act1;\n"
+                )
+            }
         }
     }
 }
@@ -394,7 +421,9 @@ fn entry_smem_db(
             }
         }
     }
-    s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    // `%act0`/`%act1` are scratch for a fused transcendental epilogue (Act::Silu/Gelu); unused (and
+    // dropped by ptxas) for Act::None/Relu.
+    s += &format!("    .reg .f32 {},%act0,%act1;\n", decl_c.trim_end_matches(','));
     let mut decl_ab = String::new();
     for ti in 0..tm {
         for r in 0..nab {
@@ -602,16 +631,24 @@ pub fn wmma_f16_ptx() -> &'static str {
             SM128_WARPS_N,
             Act::None,
         );
-        // Fused activation epilogue — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
-        m += &entry_smem_db(
-            "wmma_nt_f16_sm_db_relu",
-            "f16",
-            SM_BM,
-            SM_BN,
-            SM_WARPS_M,
-            SM_WARPS_N,
-            Act::Relu,
-        );
+        // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
+        // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
+        // particular fuses the SwiGLU FFN up-projection (`silu(x·W1ᵀ)`) into one kernel.
+        for (suffix, act) in [
+            ("relu", Act::Relu),
+            ("silu", Act::Silu),
+            ("gelu", Act::Gelu),
+        ] {
+            m += &entry_smem_db(
+                &format!("wmma_nt_f16_sm_db_{suffix}"),
+                "f16",
+                SM_BM,
+                SM_BN,
+                SM_WARPS_M,
+                SM_WARPS_N,
+                act,
+            );
+        }
         m
     })
     .as_str()
