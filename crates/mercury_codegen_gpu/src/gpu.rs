@@ -2921,8 +2921,19 @@ mod tests {
             }
             eprintln!("[gate] cuBLAS + naive CUDA-C both match the f64 oracle ✓");
 
+            // --- Clock warmup + peak-clock sampling (honesty law: same-run, peak-vs-peak ratios). ---
+            // A mobile GPU boosts its clock as sustained load ramps, so the FIRST size otherwise reads at a
+            // cold clock: pre-warmup, 1024³ cuBLAS clocked 8× slower than 2048³ (1825 vs 15847 GFLOP/s)
+            // purely from that, and the roofline (sampled first, cold) read 10× under cuBLAS. Hammer a
+            // large GEMM until the clock settles, then sample every kernel with `best_of` (min time =
+            // peak-clock sample) so each size's %-of-cuBLAS is clock-invariant. cf. the HBM bench's best_bw.
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 4;
+
             // --- Speed: same-run fp16 GEMM, Mercury vs cuBLAS (Tier B) vs naive CUDA-C (Tier A). ---
-            let roof = wmma_roofline_f16(g, 4096, 2048, 5).unwrap();
+            let roof = wmma_roofline_f16(g, 4096, 2048, 30).unwrap();
             for sz in [1024usize, 2048, 4096] {
                 let (m, k, n) = (sz, sz, sz);
                 let flop = gemm_flop(m, n, k);
@@ -2938,26 +2949,29 @@ mod tests {
                 let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
                 let (e16, c16) = wmma_pick("wmma_nt_f16", m, n);
                 let f16f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), &e16).unwrap();
-                let s_mt = time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50);
+                let s_mt = best_of(ROUNDS, || time_wmma(g, &f16f, c16, dims, &a16_d, &b16_d, &mut c_d, 50));
                 // Mercury SMEM-staged kernel — the Phase-1 lever (CTA-cooperative shared-memory tiles).
                 let f_sm = g
                     .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm")
                     .unwrap();
-                let s_sm = time_wmma(g, &f_sm, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
+                let s_sm =
+                    best_of(ROUNDS, || time_wmma(g, &f_sm, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50));
                 // Mercury cp.async double-buffered 64×64 kernel — overlap next-tile load with compute.
                 let f_db = g
                     .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")
                     .unwrap();
-                let s_db = time_wmma(g, &f_db, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
+                let s_db =
+                    best_of(ROUNDS, || time_wmma(g, &f_db, wmma_sm_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50));
                 // Mercury 128×128 + cp.async double-buffered — the cuBLAS recipe (big tile + pipeline).
                 let f_sm128 = g
                     .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm128_db")
                     .unwrap();
-                let s_sm128 =
-                    time_wmma(g, &f_sm128, wmma_sm128_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50);
+                let s_sm128 = best_of(ROUNDS, || {
+                    time_wmma(g, &f_sm128, wmma_sm128_cfg(m, n), dims, &a16_d, &b16_d, &mut c_d, 50)
+                });
 
                 // Peers (same buffers' worth of work). Naive is slow → fewer iters, still per-iter time.
-                let s_cub = time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap();
+                let s_cub = best_of(ROUNDS, || time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap());
                 let naive_iters = if sz >= 4096 { 3 } else { 10 };
                 let s_naive = time_nvrtc_naive_gemm_nt(g, m, k, n, naive_iters).unwrap();
 
