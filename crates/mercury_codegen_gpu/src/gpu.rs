@@ -3601,6 +3601,129 @@ mod tests {
         });
     }
 
+    /// **M13 milestone — Mercury's whole-model resident stack vs the cuBLAS call-chain stack, end-to-end
+    /// across depth** (the prompt's "beat the library-call-chain stack end-to-end", the multi-layer
+    /// completion of the single-layer `cublas_chain_vs_mercury_layer_throughput`). At each depth N both run
+    /// the SAME N weight sets: [`ResidentModelF16`] (whole model GPU-resident, fused epilogues) vs
+    /// [`CublasChainModel`](crate::baselines::CublasChainModel) (N cuBLAS-chain layers — cuBLAS GEMM +
+    /// separate add/SiLU, **identical** norm/flash/cast glue). Resident `forward_device` timed same-run
+    /// (the one H2D/D2H amortizes away), reported as ms/layer so depth-invariance and the per-layer gap
+    /// (paid N times) are both visible. Both stacks are cross-checked against the f64 `ref_model_f16`
+    /// oracle end-to-end before any speed is reported (the fp16 error stays bounded across depth — each
+    /// layer's RMSNorm re-normalizes the residual stream). Clock warmed + `best_of`. Needs the CUDA redist
+    /// DLLs on PATH (see `gemm_vs_peers`); skips otherwise. Run: `cargo test -p mercury_codegen_gpu
+    /// --features gpu --release -- --ignored --nocapture resident_model_vs_cublas`.
+    #[test]
+    #[ignore = "needs CUDA redist DLLs on PATH; throughput bench; run explicitly"]
+    fn resident_model_vs_cublas_chain_throughput() {
+        use crate::baselines::{peer_env_hint, peers_available, CublasChainModel};
+        with_gpu("resident_model_vs_cublas", |g| {
+            if !peers_available(g) {
+                eprintln!(
+                    "[skip] resident_model_vs_cublas_chain_throughput: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0x0CB3);
+            let (s, d, dff) = (512usize, 64usize, 256usize);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin_clock {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            for depth in [1usize, 2, 4, 8] {
+                let wdata: Vec<[Vec<f32>; 6]> = (0..depth)
+                    .map(|_| {
+                        [
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(dff * d, -0.1, 0.1),
+                            rng.vec(d * dff, -0.1, 0.1),
+                        ]
+                    })
+                    .collect();
+                let weights: Vec<TransformerWeights> = wdata
+                    .iter()
+                    .map(|wl| TransformerWeights {
+                        wq: wl[0].as_slice(),
+                        wk: wl[1].as_slice(),
+                        wv: wl[2].as_slice(),
+                        wo: wl[3].as_slice(),
+                        w1: wl[4].as_slice(),
+                        w2: wl[5].as_slice(),
+                    })
+                    .collect();
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let mer = ResidentModelF16::new(g, &weights, s, d, dff).unwrap();
+                let chain = CublasChainModel::new(g, &weights, s, d, dff).unwrap();
+
+                // Correctness before speed: both stacks match the f64 oracle end-to-end at this depth.
+                let oracle = ref_model_f16(&x, &weights, s, d, dff);
+                let mer_out = mer.forward(&x).unwrap();
+                let chain_out = chain.forward(&x).unwrap();
+                crate::diff::assert_close(
+                    &format!("Mercury model depth={depth}"),
+                    &mer_out,
+                    &oracle,
+                    5e-3,
+                    1e-1,
+                );
+                crate::diff::assert_close(
+                    &format!("cuBLAS chain model depth={depth}"),
+                    &chain_out,
+                    &oracle,
+                    5e-3,
+                    1e-1,
+                );
+
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+                let iters = 40;
+                pin_clock!();
+                let t_mer = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = mer.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_chain = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = chain.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let dl = depth as f64;
+                eprintln!(
+                    "M13 stack depth={depth} S={s} D={d} Dff={dff} (resident, same-run): \
+                     Mercury {:.3} ms ({:.3} ms/layer, {:.0} tok/s) | cuBLAS chain {:.3} ms ({:.3} ms/layer) \
+                     || Mercury {:.2}× faster end-to-end",
+                    t_mer * 1e3,
+                    t_mer * 1e3 / dl,
+                    s as f64 / t_mer,
+                    t_chain * 1e3,
+                    t_chain * 1e3 / dl,
+                    t_chain / t_mer,
+                );
+            }
+        });
+    }
+
     /// **What fusion buys at the full-layer level** — the same [`ResidentLayerF16`], resident, timed two
     /// ways same-run: `forward_device` (the 2 residual adds + SiLU folded into the GEMMs) vs
     /// `forward_device_unfused` (identical WMMA GEMMs but 3 separate `vadd`/`silu` launches, each
