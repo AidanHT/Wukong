@@ -1134,6 +1134,24 @@ pub(crate) fn flash_plan_forced(d: usize, seq: usize, tiled: bool) -> (String, L
     (name, cfg)
 }
 
+/// Whether [`ResidentLayerF16`] dispatches the **tensor-core flash** (`flash_d64_w`) for this shape:
+/// `D == 64`, `S` a multiple of 16, and `S >= 512`. Below 512 the kernel's `S/16` warps can't fill the
+/// SM and the tiled f32 flash wins (measured in `flash_tiled_vs_untiled`); at/above it the WMMA `Q·Kᵀ`
+/// + `P·V` wins, the margin growing with S (0.92× the tiled @512 → 0.63× @4096). The WMMA path casts
+/// Q/K/V to f16 (the tensor-core dtype) — an extra 3 cheap cast launches that the win pays back.
+pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
+    d == 64 && s % 16 == 0 && s >= 512
+}
+
+/// Launch config for the tensor-core flash kernel `flash_d64_w`: one warp per 16-query-row block.
+pub(crate) fn wmma_flash_cfg(s: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((s / 16) as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// Fused **flash-attention** on the GPU: `O = softmax(scale · Q·Kᵀ) · V`, single head, Q/K/V/O all
 /// `[seq, d]` row-major. Never materializes the `seq×seq` score matrix — the online-softmax recurrence
 /// streams K/V once. `d` must be one of [`ptx_flash::SUPPORTED_D`] (32/64/128). The kernel is chosen by
@@ -1509,6 +1527,10 @@ pub struct ResidentLayerF16 {
     /// Launch config matched to `f_flash`'s kernel (untiled vs tiled), resolved once by [`flash_plan`]
     /// at construction since the sequence length is fixed for a resident layer.
     flash_cfg: LaunchConfig,
+    /// The tensor-core flash kernel (`flash_d64_w`) + its launch config — `Some` when
+    /// [`wmma_flash_applies`] (D=64, S≥512, S%16==0). When set, attention runs on the tensor cores
+    /// (Q/K/V cast to f16) instead of `f_flash`; the cast is `f_cast`.
+    f_flash_w: Option<(CudaFunction, LaunchConfig)>,
     f_gemm: CudaFunction,
     f_silu: CudaFunction,
     f_resid: CudaFunction,
@@ -1563,6 +1585,12 @@ impl ResidentLayerF16 {
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
         let (flash_name, flash_cfg) = flash_plan(d, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
+        let f_flash_w = if wmma_flash_applies(d, s) {
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w")?;
+            Some((f, wmma_flash_cfg(s)))
+        } else {
+            None
+        };
         let ptx = crate::ptx_wmma::wmma_f16_ptx();
         let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db")?;
         let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
@@ -1583,6 +1611,7 @@ impl ResidentLayerF16 {
             f_cast,
             f_flash,
             flash_cfg,
+            f_flash_w,
             f_gemm,
             f_silu,
             f_resid,
@@ -1599,6 +1628,54 @@ impl ResidentLayerF16 {
             dff,
             eps: 1e-5,
         })
+    }
+
+    /// Narrow a device `[n]` f32 buffer to f16 (the tensor-core flash input dtype) via `f_cast`.
+    fn cast16(
+        &self,
+        src: &cudarc::driver::CudaSlice<f32>,
+        n: usize,
+    ) -> Result<cudarc::driver::CudaSlice<half::f16>, DriverError> {
+        let mut dst = self.stream.alloc_zeros::<half::f16>(n)?;
+        let nn = n as u32;
+        let mut b = self.stream.launch_builder(&self.f_cast);
+        b.arg(&nn).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
+    }
+
+    /// `O = softmax(scale·Q·Kᵀ)·V` over the resident f32 Q/K/V. Dispatches the **tensor-core** flash
+    /// (`f_flash_w`, casting Q/K/V to f16) when [`wmma_flash_applies`], else the f32 `f_flash` (untiled
+    /// or SMEM-tiled). Returns a fresh f32 `attn` buffer. The seam both forward paths share.
+    fn run_attn(
+        &self,
+        q: &cudarc::driver::CudaSlice<f32>,
+        k: &cudarc::driver::CudaSlice<f32>,
+        v: &cudarc::driver::CudaSlice<f32>,
+        s: usize,
+        d: usize,
+    ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let ss = s as u32;
+        let mut attn = self.stream.alloc_zeros::<f32>(s * d)?;
+        if let Some((f_w, cfg_w)) = &self.f_flash_w {
+            let q16 = self.cast16(q, s * d)?;
+            let k16 = self.cast16(k, s * d)?;
+            let v16 = self.cast16(v, s * d)?;
+            let mut bld = self.stream.launch_builder(f_w);
+            bld.arg(&ss)
+                .arg(&scale)
+                .arg(&q16)
+                .arg(&k16)
+                .arg(&v16)
+                .arg(&mut attn);
+            unsafe { bld.launch(*cfg_w)? };
+        } else {
+            let mut bld = self.stream.launch_builder(&self.f_flash);
+            bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
+            unsafe { bld.launch(self.flash_cfg)? };
+        }
+        Ok(attn)
     }
 
     /// Run the layer on a **resident** `[S,D]` f32 activation buffer, returning a fresh resident `[S,D]`
@@ -1669,15 +1746,7 @@ impl ResidentLayerF16 {
         let q = gemm16(&self.f_gemm, &h1_16, &self.wq, s, d, d)?;
         let k = gemm16(&self.f_gemm, &h1_16, &self.wk, s, d, d)?;
         let v = gemm16(&self.f_gemm, &h1_16, &self.wv, s, d, d)?;
-        let mut attn = stream.alloc_zeros::<f32>(s * d)?;
-        {
-            let scale = 1.0f32 / (d as f32).sqrt();
-            let ss = s as u32;
-            let flash_cfg = self.flash_cfg;
-            let mut bld = stream.launch_builder(&self.f_flash);
-            bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
-            unsafe { bld.launch(flash_cfg)? };
-        }
+        let attn = self.run_attn(&q, &k, &v, s, d)?;
         let attn_16 = cast(&attn, s * d)?;
         let x1 = resid_gemm(&attn_16, &self.wo, x_d, s, d, d)?; // x + A*Woᵀ  (residual 1, fused)
 
@@ -1756,15 +1825,7 @@ impl ResidentLayerF16 {
         let q = gemm(&h1_16, &self.wq, s, d, d)?;
         let k = gemm(&h1_16, &self.wk, s, d, d)?;
         let v = gemm(&h1_16, &self.wv, s, d, d)?;
-        let mut attn = stream.alloc_zeros::<f32>(s * d)?;
-        {
-            let scale = 1.0f32 / (d as f32).sqrt();
-            let ss = s as u32;
-            let flash_cfg = self.flash_cfg;
-            let mut bld = stream.launch_builder(&self.f_flash);
-            bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
-            unsafe { bld.launch(flash_cfg)? };
-        }
+        let attn = self.run_attn(&q, &k, &v, s, d)?;
         let attn_16 = cast(&attn, s * d)?;
         let o = gemm(&attn_16, &self.wo, s, d, d)?;
         let x1 = vadd(x_d, &o, s * d)?; // separate residual 1
@@ -3451,36 +3512,42 @@ mod tests {
     fn transformer_layer_f16_matches_reference_within_tol() {
         with_gpu("transformer_layer_f16", |g| {
             let mut rng = crate::diff::Rng::new(0x7A13);
-            let (s, d, dff) = (128usize, 64usize, 256usize); // S,D,Dff all %64 for the WMMA tile
-            let x = rng.vec(s * d, -1.0, 1.0);
-            let wq = rng.vec(d * d, -0.1, 0.1);
-            let wk = rng.vec(d * d, -0.1, 0.1);
-            let wv = rng.vec(d * d, -0.1, 0.1);
-            let wo = rng.vec(d * d, -0.1, 0.1);
-            let w1 = rng.vec(dff * d, -0.1, 0.1);
-            let w2 = rng.vec(d * dff, -0.1, 0.1);
-            let w = TransformerWeights {
-                wq: &wq,
-                wk: &wk,
-                wv: &wv,
-                wo: &wo,
-                w1: &w1,
-                w2: &w2,
-            };
-            let got = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
-            let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
-            let st = crate::diff::assert_close("transformer_layer_f16", &got, &oracle, 5e-2, 5e-2);
-            eprintln!(
-                "transformer_layer_f16 S={s} D={d} Dff={dff} (fp16 tensor-core, fused residual+SiLU, 13 launches): max_abs={:.2e} max_rel={:.2e}",
-                st.max_abs, st.max_rel
-            );
-            let again = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
-            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-            assert_eq!(
-                bits(&got),
-                bits(&again),
-                "fp16 GPU-resident transformer layer must be deterministic"
-            );
+            let (d, dff) = (64usize, 256usize);
+            // S=128 exercises the f32 flash path; S=512 trips `wmma_flash_applies` so the layer runs the
+            // tensor-core flash (Q/K/V cast to f16) — both must match the same f64 layer reference.
+            for s in [128usize, 512] {
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let wq = rng.vec(d * d, -0.1, 0.1);
+                let wk = rng.vec(d * d, -0.1, 0.1);
+                let wv = rng.vec(d * d, -0.1, 0.1);
+                let wo = rng.vec(d * d, -0.1, 0.1);
+                let w1 = rng.vec(dff * d, -0.1, 0.1);
+                let w2 = rng.vec(d * dff, -0.1, 0.1);
+                let w = TransformerWeights {
+                    wq: &wq,
+                    wk: &wk,
+                    wv: &wv,
+                    wo: &wo,
+                    w1: &w1,
+                    w2: &w2,
+                };
+                let got = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
+                let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
+                let st =
+                    crate::diff::assert_close("transformer_layer_f16", &got, &oracle, 5e-2, 5e-2);
+                let flash = if wmma_flash_applies(d, s) { "wmma" } else { "f32" };
+                eprintln!(
+                    "transformer_layer_f16 S={s} D={d} Dff={dff} [{flash} flash]: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+                let again = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&got),
+                    bits(&again),
+                    "fp16 GPU-resident transformer layer must be deterministic"
+                );
+            }
         });
     }
 

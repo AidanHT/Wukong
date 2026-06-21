@@ -360,6 +360,10 @@ pub struct CublasChainLayer {
     f_flash: CudaFunction,
     /// Launch config matched to `f_flash` (untiled vs SMEM-tiled), resolved once by `gpu::flash_plan`.
     flash_cfg: LaunchConfig,
+    /// Tensor-core flash (`flash_d64_w`) + cfg — `Some` when `gpu::wmma_flash_applies`. Kept identical
+    /// to `ResidentLayerF16` so the flash stays *common* to both stacks and the measured gap is purely
+    /// cuBLAS-vs-WMMA GEMM + epilogue fusion, not a difference in the attention kernel.
+    f_flash_w: Option<(CudaFunction, LaunchConfig)>,
     f_silu: CudaFunction,
     f_vadd: CudaFunction,
     wq: CudaSlice<f16>,
@@ -410,6 +414,12 @@ impl CublasChainLayer {
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
         let (flash_name, flash_cfg) = crate::gpu::flash_plan(d, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
+        let f_flash_w = if crate::gpu::wmma_flash_applies(d, s) {
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w")?;
+            Some((f, crate::gpu::wmma_flash_cfg(s)))
+        } else {
+            None
+        };
         let f_silu = g.function("vmath", crate::ptx::vmath_ptx(), "silu")?;
         let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd")?;
         let stream = g.stream.clone();
@@ -427,6 +437,7 @@ impl CublasChainLayer {
             f_cast,
             f_flash,
             flash_cfg,
+            f_flash_w,
             f_silu,
             f_vadd,
             wq,
@@ -478,7 +489,9 @@ impl CublasChainLayer {
         Ok(c)
     }
 
-    /// Fused flash-attention over `[S,D]` Q/K/V (Mercury's exact `flash_d{D}` kernel) → `[S,D]` f32.
+    /// Fused flash-attention over `[S,D]` Q/K/V (Mercury's exact flash kernel — tensor-core `flash_d64_w`
+    /// when `wmma_flash_applies`, else the f32 `flash_d{D}`) → `[S,D]` f32. Identical to
+    /// `ResidentLayerF16::run_attn` so the attention is common to both stacks.
     fn flash(
         &self,
         q: &CudaSlice<f32>,
@@ -488,11 +501,35 @@ impl CublasChainLayer {
         let mut attn = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
         let scale = 1.0f32 / (self.d as f32).sqrt();
         let ss = self.s as u32;
-        let cfg = self.flash_cfg;
-        let mut bld = self.stream.launch_builder(&self.f_flash);
-        bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
-        unsafe { bld.launch(cfg)? };
+        if let Some((f_w, cfg_w)) = &self.f_flash_w {
+            let q16 = self.cast16(q)?;
+            let k16 = self.cast16(k)?;
+            let v16 = self.cast16(v)?;
+            let mut bld = self.stream.launch_builder(f_w);
+            bld.arg(&ss)
+                .arg(&scale)
+                .arg(&q16)
+                .arg(&k16)
+                .arg(&v16)
+                .arg(&mut attn);
+            unsafe { bld.launch(*cfg_w)? };
+        } else {
+            let mut bld = self.stream.launch_builder(&self.f_flash);
+            bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
+            unsafe { bld.launch(self.flash_cfg)? };
+        }
         Ok(attn)
+    }
+
+    /// Narrow a device `[S·D]` f32 buffer to f16 (the tensor-core flash input dtype) via `f_cast`.
+    fn cast16(&self, src: &CudaSlice<f32>) -> Result<CudaSlice<f16>, DriverError> {
+        let n = self.s * self.d;
+        let mut dst = self.stream.alloc_zeros::<f16>(n)?;
+        let nn = n as u32;
+        let mut b = self.stream.launch_builder(&self.f_cast);
+        b.arg(&nn).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
     }
 
     /// Separate residual add `out = a + b` — the kernel cuBLAS forces (Mercury folds it via wmma.load.c).
