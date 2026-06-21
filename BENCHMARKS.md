@@ -527,9 +527,12 @@ the plain staged 64-tile otherwise — each the measured winner in its range. Re
 **Beating cuBLAS by fusion (M1-fused).** cuBLAS can only compute `A·Bᵀ`; an activation needs a *second*
 kernel that reads C back from HBM, applies the op, and writes it again. Mercury fuses the activation
 into the WMMA store epilogue (elementwise on the f32 accumulators, before the C store — `Act` in
-`ptx_wmma.rs`), so `relu(A·Bᵀ)` is **one kernel that writes C once**. Measured on resident device
-buffers (`fused_gemm_relu_vs_chain`, fused output gated == `relu(cuBLAS)`; the chain cost is GEMM+relu
-summed, which is exact since they are dependency-serialized):
+`ptx_wmma.rs`), so `act(A·Bᵀ)` is **one kernel that writes C once**. The fused activations are **relu,
+silu, and gelu** — silu fuses the SwiGLU FFN up-projection `silu(x·W1ᵀ)` into a single kernel, and the
+transcendental ones reuse the exact SFU formulas of the standalone `vmath` kernels so the fused result
+equals the unfused one. Measured on resident device buffers (`fused_gemm_activation_vs_chain`, fused
+output gated == `act(cuBLAS)`; the chain cost is GEMM+act summed, exact since they are
+dependency-serialized; best-of-N timing so the ratio is clock-stable). The relu case in detail:
 
 | size | Mercury fused | Mercury GEMM+relu | cuBLAS GEMM+relu | fusion vs own chain | **fused vs cuBLAS chain** |
 |------|---------------|-------------------|------------------|---------------------|---------------------------|
@@ -540,10 +543,11 @@ summed, which is exact since they are dependency-serialized):
 So **at L2-resident sizes (≤1024³) the single fused kernel beats the cuBLAS GEMM+activation chain
 1.18–2.41×** — the first place Mercury is *faster than cuBLAS*, precisely because it does the fusion
 cuBLAS structurally cannot. Fusion beats Mercury's own two-kernel chain at **every** size (1.2–2.2×,
-biggest where the GEMM is small and the saved relu pass is a larger share). At 2048³ cuBLAS's faster
-raw GEMM still wins the whole chain despite the fused saving (honest — the 2048³+ GEMM gap stands).
-gelu/silu epilogues (needing the transcendental PTX) and a fused bias (needs the fragment col layout)
-are the obvious next steps; the recognizer that routes `act(matmul(…))` to the fused kernel is Phase 2.
+biggest where the GEMM is small and the saved relu pass is a larger share). silu and gelu fuse with the
+same effect — across 512³–2048³ all three beat the cuBLAS GEMM+activation chain by **~1.1–1.4×** at
+boost clock (the margin is the eliminated activation kernel's launch + C round-trip, which cuBLAS
+cannot fuse). A fused bias (needs the fragment column layout) and the recognizer that routes
+`act(matmul(…))` from Mercury source to the fused kernel are the remaining Phase-2 steps.
 
 **Compile latency + cubin cache (M10).** Mercury emits PTX and the driver JITs it to SASS; there is no
 30–120 s autotuning compile like Triton/TorchInductor. Measured (`cubin_cache_compile_latency`, RTX
