@@ -441,7 +441,7 @@ impl CublasChainLayer {
 
     /// RMSNorm a `[rows, d]` f32 buffer (one warp per row) — Mercury's exact `rmsnorm` kernel.
     fn norm(&self, src: &CudaSlice<f32>, rows: usize) -> Result<CudaSlice<f32>, DriverError> {
-        let mut out = self.stream.memcpy_stod(&vec![0f32; rows * self.d])?;
+        let mut out = self.stream.alloc_zeros::<f32>(rows * self.d)?;
         let (r, c) = (rows as u32, self.d as u32);
         let cfg = LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
         let mut bld = self.stream.launch_builder(&self.f_norm);
@@ -453,7 +453,7 @@ impl CublasChainLayer {
     /// device f32 → device f16 narrowing (the stage boundary before each cuBLAS GEMM) — Mercury's
     /// exact `cast_f32_f16` kernel, so the f16 inputs both stacks feed their GEMMs are bit-identical.
     fn cast(&self, src: &CudaSlice<f32>, n: usize) -> Result<CudaSlice<f16>, DriverError> {
-        let mut dst = self.stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+        let mut dst = self.stream.alloc_zeros::<f16>(n)?;
         let nn = n as u32;
         let mut b = self.stream.launch_builder(&self.f_cast);
         b.arg(&nn).arg(src).arg(&mut dst);
@@ -470,7 +470,7 @@ impl CublasChainLayer {
         k: usize,
         n: usize,
     ) -> Result<CudaSlice<f32>, PeerError> {
-        let mut c = self.stream.memcpy_stod(&vec![0f32; m * n])?;
+        let mut c = self.stream.alloc_zeros::<f32>(m * n)?;
         unsafe { gemm_ex_nt_f16_f32out(&self.blas, &self.stream, a, b, &mut c, m, k, n)? };
         Ok(c)
     }
@@ -482,7 +482,7 @@ impl CublasChainLayer {
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, DriverError> {
-        let mut attn = self.stream.memcpy_stod(&vec![0f32; self.s * self.d])?;
+        let mut attn = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
         let scale = 1.0f32 / (self.d as f32).sqrt();
         let ss = self.s as u32;
         let cfg = LaunchConfig { grid_dim: (self.s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
@@ -499,7 +499,7 @@ impl CublasChainLayer {
         b: &CudaSlice<f32>,
         n: usize,
     ) -> Result<CudaSlice<f32>, DriverError> {
-        let mut out = self.stream.memcpy_stod(&vec![0f32; n])?;
+        let mut out = self.stream.alloc_zeros::<f32>(n)?;
         let nn = n as u32;
         let mut bld = self.stream.launch_builder(&self.f_vadd);
         bld.arg(&nn).arg(a).arg(b).arg(&mut out);
@@ -509,7 +509,7 @@ impl CublasChainLayer {
 
     /// Separate SiLU activation — the kernel cuBLAS forces (Mercury folds it into the up-proj store).
     fn silu(&self, src: &CudaSlice<f32>, n: usize) -> Result<CudaSlice<f32>, DriverError> {
-        let mut out = self.stream.memcpy_stod(&vec![0f32; n])?;
+        let mut out = self.stream.alloc_zeros::<f32>(n)?;
         let nn = n as u32;
         let mut bld = self.stream.launch_builder(&self.f_silu);
         bld.arg(&nn).arg(src).arg(&mut out);
