@@ -3685,6 +3685,182 @@ mod tests {
         });
     }
 
+    /// **Correctness gate for the Tier-B cuBLAS call-chain peer** ([`CublasChainLayer`]) — law #1, before
+    /// any speed number. (a) the f16-in/f32-out `cublasGemmEx` primitive vs the f64 reference catches a
+    /// transpose/dtype slip in isolation; (b) the whole cuBLAS chain layer vs the **same** f64 oracle the
+    /// fused Mercury layer uses; (c) a cross-check that the cuBLAS chain and Mercury's fused WMMA layer
+    /// compute the same function — two independent GEMM implementations consuming bit-identical f16 inputs
+    /// (the cast kernel is shared) and differing only in f32 accumulation order, hence the √K·ε tolerance.
+    /// Needs the CUDA redist DLLs on PATH (see `gemm_vs_peers`); skips otherwise.
+    #[test]
+    #[ignore = "needs CUDA redist DLLs on PATH; run explicitly"]
+    fn cublas_chain_layer_matches_reference_within_tol() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16_f32out, peer_env_hint, peers_available, CublasChainLayer,
+        };
+        with_gpu("cublas_chain_layer", |g| {
+            if !peers_available(g) {
+                eprintln!(
+                    "[skip] cublas_chain_layer_matches_reference: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0x0CB1);
+            let round = |v: f32| half::f16::from_f32(v).to_f32();
+
+            // (a) the f16-in/f32-out GEMM primitive in isolation vs the f64 reference.
+            {
+                let (m, k, n) = (128usize, 64usize, 64usize);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let got = cublas_gemm_nt_f16_f32out(g, &a, &b, m, k, n).unwrap();
+                let oracle = ref_nt_rounded(&a, &b, m, k, n, round);
+                let st = crate::diff::assert_close("cublas_f16_f32out", &got, &oracle, 2e-2, 2e-2);
+                eprintln!(
+                    "cublasGemmEx f16-in/f32-out {m}×{n}×{k}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+
+            // (b)+(c) the whole cuBLAS call-chain layer.
+            let (s, d, dff) = (128usize, 64usize, 256usize); // S,D,Dff %64 to match the WMMA peer's tiles
+            let x = rng.vec(s * d, -1.0, 1.0);
+            let wq = rng.vec(d * d, -0.1, 0.1);
+            let wk = rng.vec(d * d, -0.1, 0.1);
+            let wv = rng.vec(d * d, -0.1, 0.1);
+            let wo = rng.vec(d * d, -0.1, 0.1);
+            let w1 = rng.vec(dff * d, -0.1, 0.1);
+            let w2 = rng.vec(d * dff, -0.1, 0.1);
+            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+
+            let chain_out = CublasChainLayer::new(g, &w, s, d, dff).unwrap().forward(&x).unwrap();
+            let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
+            let st = crate::diff::assert_close("cublas_chain", &chain_out, &oracle, 5e-2, 5e-2);
+
+            let mer_out = ResidentLayerF16::new(g, &w, s, d, dff).unwrap().forward(&x).unwrap();
+            let st2 =
+                crate::diff::assert_close("cublas_chain vs Mercury-fused", &chain_out, &mer_out, 5e-2, 5e-2);
+
+            eprintln!(
+                "cuBLAS call-chain layer S={s} D={d} Dff={dff}: vs f64 oracle max_abs={:.2e} max_rel={:.2e} | vs Mercury-fused max_abs={:.2e} max_rel={:.2e}",
+                st.max_abs, st.max_rel, st2.max_abs, st2.max_rel
+            );
+        });
+    }
+
+    /// **M13 milestone bench — Mercury's fused fp16 stack vs the cuBLAS GEMM call-chain** (the literal
+    /// "library call-chain" the milestone must beat), Tier B, same machine, same buffers, same-run. Three
+    /// resident timings per S: Mercury *fused* ([`ResidentLayerF16::forward_device`] — WMMA with the two
+    /// residual adds & SiLU folded into the GEMMs), Mercury *unfused*
+    /// ([`ResidentLayerF16::forward_device_unfused`] — WMMA with separate add/SiLU launches), and the
+    /// *cuBLAS chain* ([`CublasChainLayer`] — cuBLAS GEMM with separate add/SiLU, **identical** norm/flash/
+    /// cast glue). The decomposition is the point: **Mercury-unfused vs cuBLAS** isolates GEMM quality (same
+    /// glue, only the GEMM differs) and **fused vs unfused** isolates the epilogue fusion — together they
+    /// explain the **fused vs cuBLAS** headline. Both projection paths are f16-in/f32-out, so neither pays
+    /// a post-GEMM cast. Laptop clock warmed + each figure `best_of(ROUNDS)` (the ~7× boost ramp would
+    /// corrupt the ratio otherwise). Correctness-gated against the f64 oracle first. Needs the CUDA redist
+    /// DLLs on PATH (see `gemm_vs_peers`); skips otherwise. Run: `cargo test -p mercury_codegen_gpu
+    /// --features gpu --release -- --ignored --nocapture cublas_chain_vs_mercury`.
+    #[test]
+    #[ignore = "needs CUDA redist DLLs on PATH; throughput bench; run explicitly"]
+    fn cublas_chain_vs_mercury_layer_throughput() {
+        use crate::baselines::{peer_env_hint, peers_available, CublasChainLayer};
+        with_gpu("cublas_chain_vs_mercury", |g| {
+            if !peers_available(g) {
+                eprintln!(
+                    "[skip] cublas_chain_vs_mercury_layer_throughput: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0x0CB2);
+            let (d, dff) = (64usize, 256usize);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin_clock {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            // Heavy initial warmup: a light pin does not boost a cold laptop GPU (see the M13 harness note).
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            for s in [256usize, 512, 1024] {
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let wq = rng.vec(d * d, -0.1, 0.1);
+                let wk = rng.vec(d * d, -0.1, 0.1);
+                let wv = rng.vec(d * d, -0.1, 0.1);
+                let wo = rng.vec(d * d, -0.1, 0.1);
+                let w1 = rng.vec(dff * d, -0.1, 0.1);
+                let w2 = rng.vec(d * dff, -0.1, 0.1);
+                let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+                let mer = ResidentLayerF16::new(g, &w, s, d, dff).unwrap();
+                let chain = CublasChainLayer::new(g, &w, s, d, dff).unwrap();
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                // Correctness before speed: both stacks must match the f64 oracle at this shape.
+                let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
+                let mer_out = g.stream.memcpy_dtov(&mer.forward_device(&x_d).unwrap()).unwrap();
+                let chain_out = g.stream.memcpy_dtov(&chain.forward_device(&x_d).unwrap()).unwrap();
+                crate::diff::assert_close(&format!("Mercury fused S={s}"), &mer_out, &oracle, 5e-2, 5e-2);
+                crate::diff::assert_close(&format!("cuBLAS chain S={s}"), &chain_out, &oracle, 5e-2, 5e-2);
+
+                let iters = 60;
+                pin_clock!();
+                let t_fused = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = mer.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_unf = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = mer.forward_device_unfused(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_chain = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = chain.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+
+                // Honest headline either direction: report whichever stack is faster, with the magnitude.
+                let (hdl_lbl, hdl) = if t_chain >= t_fused {
+                    ("Mercury fused faster", t_chain / t_fused)
+                } else {
+                    ("cuBLAS chain faster", t_fused / t_chain)
+                };
+                eprintln!(
+                    "M13 layer S={s} D={d} Dff={dff} (resident, same-run): \
+                     Mercury fused {:.3} ms ({:.0} tok/s) | Mercury unfused {:.3} ms | cuBLAS chain {:.3} ms \
+                     || {hdl_lbl} {hdl:.2}× | GEMM-quality (Mercury-unfused vs cuBLAS) {:.2}× | fusion {:.2}×",
+                    t_fused * 1e3,
+                    s as f64 / t_fused,
+                    t_unf * 1e3,
+                    t_chain * 1e3,
+                    t_chain / t_unf,
+                    t_unf / t_fused,
+                );
+            }
+        });
+    }
+
     #[test]
     fn fp8_tensorcore_tile_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
