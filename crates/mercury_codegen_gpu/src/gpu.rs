@@ -2967,6 +2967,64 @@ mod tests {
         });
     }
 
+    /// Gate for the **tensor-core (WMMA) flash** kernel `flash_d64_w` (experiment). Q/K/V are f16 (the
+    /// tensor-core dtype), so the reference is `ref_attn` over the *same* f16-rounded-back-to-f32 inputs
+    /// — isolating the kernel's compute error (f32 accumulation order + the f16 P round-trip), not the
+    /// input rounding. The tolerance is looser than the f32 kernels (f16 in), but a mis-mapped WMMA
+    /// fragment would scatter O(1) error, which this still catches. `S % 16 == 0` (no ragged key tail).
+    #[test]
+    fn wmma_flash_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_flash", |g| {
+            let mut rng = crate::diff::Rng::new(0x3FA);
+            let d = 64usize;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for seq in [16usize, 64, 256, 512] {
+                let q16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w")
+                    .unwrap();
+                let s32 = seq as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((seq / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), seq, d, scale);
+                // Tight enough to catch any WMMA fragment-layout regression (which scatters O(0.1+)),
+                // loose enough for the f16 input round-trip (observed max_abs ~1e-4 on [-1,1] inputs).
+                let st = crate::diff::assert_close(
+                    &format!("wmma flash s={seq}"),
+                    &got,
+                    &oracle,
+                    2e-3,
+                    2e-2,
+                );
+                eprintln!(
+                    "wmma flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
     /// Flash-attention throughput at increasing context length, kernel-resident (no per-iter copies).
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
@@ -3052,15 +3110,33 @@ mod tests {
             let f_til = g
                 .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_t")
                 .unwrap();
+            // The experimental tensor-core kernel (f16 in). Same attention, WMMA `Q·Kᵀ` + `P·V`.
+            let f_wmma = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w")
+                .unwrap();
+            let to16 = |x: &[f32]| -> Vec<half::f16> {
+                x.iter().map(|&v| half::f16::from_f32(v)).collect()
+            };
             for s in [256usize, 384, 512, 768, 1024, 1536, 2048, 4096] {
-                let q = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
-                let k = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
-                let v = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let qf = rng.vec(s * d, -1.0, 1.0);
+                let kf = rng.vec(s * d, -1.0, 1.0);
+                let vf = rng.vec(s * d, -1.0, 1.0);
+                let q = g.stream.memcpy_stod(&qf).unwrap();
+                let k = g.stream.memcpy_stod(&kf).unwrap();
+                let v = g.stream.memcpy_stod(&vf).unwrap();
+                let q16 = g.stream.memcpy_stod(&to16(&qf)).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&kf)).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&vf)).unwrap();
                 let mut o = g.stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let ss = s as u32;
                 let (_, cfg_unt) = flash_plan_forced(d, s, false);
                 let (_, cfg_til) = flash_plan_forced(d, s, true);
+                let cfg_w = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
 
                 // Correctness at scale: untiled and tiled differ only in data movement ⇒ identical output.
                 {
@@ -3109,16 +3185,24 @@ mod tests {
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / 100.0
                 });
-                let dispatch = if s >= crate::ptx_flash::FLASH_TILE_MIN {
-                    "tiled"
-                } else {
-                    "untiled"
-                };
+                pin!();
+                let t_w = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_wmma);
+                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        unsafe { bld.launch(cfg_w).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
                 eprintln!(
-                    "S={s:>4}: untiled {:.4} ms | tiled {:.4} ms | tiled/untiled {:.2}× | dispatch→{dispatch}",
+                    "S={s:>4}: untiled {:.4} | tiled {:.4} | wmma {:.4} ms || tiled/untiled {:.2}× | wmma/tiled {:.2}×",
                     t_unt * 1e3,
                     t_til * 1e3,
+                    t_w * 1e3,
                     t_til / t_unt,
+                    t_w / t_til,
                 );
             }
         });

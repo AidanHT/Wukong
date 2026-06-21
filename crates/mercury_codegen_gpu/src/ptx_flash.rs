@@ -265,7 +265,187 @@ fn entry_tiled(d: usize, warps: u32) -> String {
     s
 }
 
-/// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim.
+/// Comma-joined `{%pfx0,…,%pfx{n-1}}` WMMA fragment register vector.
+fn frag(pfx: &str, n: usize) -> String {
+    let r: Vec<String> = (0..n).map(|i| format!("%{pfx}{i}")).collect();
+    format!("{{{}}}", r.join(","))
+}
+
+/// Generate the **tensor-core (WMMA) flash** kernel for head dim `d` (multiple of 16). Name =
+/// `flash_d{d}_w`. **EXPERIMENT** — the online-softmax attention with its two matmuls (`Q·Kᵀ` and
+/// `P·V`) on the Ada tensor cores (f16 in, f32 accumulate), vs the hand `fma`+shuffle `_t`/untiled
+/// kernels. ONE warp handles a 16-query-row block (`row = ctaid·16 + 0..15`); requires `S % 16 == 0`
+/// (no ragged key tail). Inputs Q/K/V are **f16** (the tensor-core dtype), O is f32.
+///
+/// The WMMA accumulator fragment→(row,col) map is opaque, so every fragment is immediately
+/// `wmma.store.d`'d to shared memory and the per-row work (softmax, the running-max rescale of O) is
+/// done with an explicit `lane==row` mapping in SMEM — the same trick the GEMM bias epilogue uses. Per
+/// 16-key block: (1) `S = Q·Kᵀ` (nt WMMA, f32 acc) → `smemS`; (2) online softmax in `smemS` (lane owns
+/// row=lane, `m`/`l` in registers) writing `smemP` (f16) + a per-row correction `corr`; (3) `O += P·V`
+/// (nn WMMA) → `smemPV`, then `smemO = smemO·corr + smemPV`. Final `O = smemO / l`. Tolerance-gated;
+/// f16 inputs mean a looser tol than the f32 kernels (consistent with the fp16 WMMA layer).
+fn entry_wmma(d: usize) -> String {
+    assert!(d % 16 == 0, "WMMA flash needs D % 16 == 0");
+    let kt = d / 16; // Q·Kᵀ contraction tiles (over the head dim) AND P·V output n-tiles (over D)
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = format!("flash_d{d}_w");
+    // SMEM layout (one warp, Br=16): smemS[16·16] f32 | smemP[16·16] f16 | smemPV[16·D] f32 | smemO[16·D] f32
+    let off_s = 0usize;
+    let off_p = off_s + 16 * 16 * 4;
+    let off_pv = off_p + 16 * 16 * 2;
+    let off_o = off_pv + 16 * d * 4;
+    let smem_bytes = off_o + 16 * d * 4;
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0;\n";
+    // f32: scalars + S accumulator (8) + PV accumulators (kt tiles × 8)
+    let mut fr = String::from("%scale,%mlane,%llane,%corr,%rmax,%mnew,%scv,%pp,%psum,%ov,%pvv");
+    for r in 0..8 {
+        fr += &format!(",%s{r}");
+    }
+    for n in 0..kt {
+        for r in 0..8 {
+            fr += &format!(",%pv{n}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    // b32: WMMA fragments (qa: kt×8, kb: kt×8, pa: 8, vb: kt×8) + scalars
+    let mut br = String::new();
+    for n in 0..kt {
+        for r in 0..8 {
+            br += &format!("%qa{n}_{r},%kb{n}_{r},%vb{n}_{r},");
+        }
+    }
+    for r in 0..8 {
+        br += &format!("%pa_{r},");
+    }
+    s += &format!(
+        "    .reg .b32 {}%S,%lane,%row,%kb,%c,%sa,%tmp,%tmp2,%pf,%st64,%st16;\n",
+        br
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%qap,%kbp,%vbp,%gp,%off,%optr;\n";
+    s += &format!("    .shared .align 16 .b8 smem_{name}[{smem_bytes}];\n");
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    // wmma.load/.store strides must be REGISTERS, not immediates (an immediate JITs but mis-addresses).
+    s += &format!("    mov.u32 %st64,{d};\n    mov.u32 %st16,16;\n");
+    s += "    mov.u32 %tmp,%tid.x;\n    and.b32 %lane,%tmp,31;\n    mov.u32 %tmp,%ctaid.x;\n    shl.b32 %row,%tmp,4;\n"; // row = ctaid*16
+
+    // Load Q (A, f16, .row) once: kt k-tiles at Q + (row*D + 16k)*2, stride D.
+    for n in 0..kt {
+        s += &format!("    mul.lo.s32 %tmp,%row,{d};\n    add.u32 %tmp,%tmp,{};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %qap,%Q,%off;\n", n * 16);
+        s += &format!(
+            "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {}, [%qap], %st64;\n",
+            frag(&format!("qa{n}_"), 8)
+        );
+    }
+    // m=-inf, l=0 (per-lane regs, harmless on all lanes); smemO[lane][0..D]=0 ONLY on lanes 0..15
+    // (lane==row, only 16 rows of smemO exist — an unguarded init would write past SMEM on lanes 16..31).
+    s += "    mov.f32 %mlane,0fFF800000;\n    mov.f32 %llane,0f00000000;\n";
+    s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra INITDONE_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_o};\n    mul.lo.s32 %tmp2,%lane,{};\n    add.u32 %tmp,%tmp,%tmp2;\n", d * 4);
+    for c in 0..d {
+        s += &format!("    st.shared.f32 [%tmp+{}],0f00000000;\n", c * 4);
+    }
+    s += &format!("INITDONE_{name}:\n");
+
+    // for kb in 0..S step 16
+    s += "    mov.u32 %kb,0;\n";
+    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra KBDONE_{name};\n");
+
+    // S = Q · K[kb..]ᵀ  (nt WMMA): load K (B, .col) kt tiles, accumulate kt mma into %s0..7
+    for r in 0..8 {
+        s += &format!("    mov.f32 %s{r},0f00000000;\n");
+    }
+    for n in 0..kt {
+        s += &format!("    mul.lo.s32 %tmp,%kb,{d};\n    add.u32 %tmp,%tmp,{};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %kbp,%K,%off;\n", n * 16);
+        s += &format!(
+            "    wmma.load.b.sync.aligned.m16n16k16.col.f16 {}, [%kbp], %st64;\n",
+            frag(&format!("kb{n}_"), 8)
+        );
+    }
+    for n in 0..kt {
+        s += &format!(
+            "    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {}, {}, {}, {};\n",
+            frag("s", 8),
+            frag(&format!("qa{n}_"), 8),
+            frag(&format!("kb{n}_"), 8),
+            frag("s", 8)
+        );
+    }
+    // store S → smemS (f32, stride 16)
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_s};\n    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {}, %st16;\n", frag("s", 8));
+    s += "    bar.sync 0;\n";
+
+    // online softmax over smemS row (lane==row, lanes 0..15): rmax→m→corr→P(f16)→l
+    s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra SOFTDONE_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_s};\n    mul.lo.s32 %tmp2,%lane,64;\n    add.u32 %sa,%tmp,%tmp2;\n"); // %sa := &smemS[lane][0] (row stride 16 f32 = 64 B)
+    // rmax = max_c scale*smemS[lane][c]
+    s += "    mov.f32 %rmax,0fFF800000;\n";
+    for c in 0..16 {
+        s += &format!("    ld.shared.f32 %scv,[%sa+{}];\n    mul.f32 %scv,%scv,%scale;\n    max.f32 %rmax,%rmax,%scv;\n", c * 4);
+    }
+    s += "    max.f32 %mnew,%mlane,%rmax;\n";
+    s += &format!("    sub.f32 %corr,%mlane,%mnew;\n    mul.f32 %corr,%corr,{log2e};\n    ex2.approx.f32 %corr,%corr;\n");
+    s += "    mul.f32 %llane,%llane,%corr;\n    mov.f32 %psum,0f00000000;\n";
+    // P[c] = exp(scale*S - mnew) → smemP (f16) ; psum += P
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_p};\n    mul.lo.s32 %tmp2,%lane,32;\n    add.u32 %pf,%tmp,%tmp2;\n"); // &smemP[lane][0] (16 f16 = 32 B)
+    for c in 0..16 {
+        s += &format!("    ld.shared.f32 %scv,[%sa+{}];\n    mul.f32 %scv,%scv,%scale;\n    sub.f32 %pp,%scv,%mnew;\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 %pp,%pp;\n    add.f32 %psum,%psum,%pp;\n    cvt.rn.f16.f32 %tmp2,%pp;\n    st.shared.b16 [%pf+{}],%tmp2;\n", c * 4, c * 2);
+    }
+    s += "    add.f32 %llane,%llane,%psum;\n    mov.f32 %mlane,%mnew;\n";
+    s += &format!("SOFTDONE_{name}:\n    bar.sync 0;\n");
+
+    // O += P·V  (nn WMMA): load P (A, .row, from smemP) + V (B, .row) kt n-tiles, mma into pv, store smemPV
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_p};\n    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n    wmma.load.a.sync.aligned.m16n16k16.row.f16 {}, [%gp], %st16;\n", frag("pa_", 8));
+    for n in 0..kt {
+        s += &format!("    mul.lo.s32 %tmp,%kb,{d};\n    add.u32 %tmp,%tmp,{};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %vbp,%V,%off;\n", n * 16);
+        s += &format!(
+            "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {}, [%vbp], %st64;\n",
+            frag(&format!("vb{n}_"), 8)
+        );
+        for r in 0..8 {
+            s += &format!("    mov.f32 %pv{n}_{r},0f00000000;\n");
+        }
+        s += &format!(
+            "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 {}, {}, {}, {};\n",
+            frag(&format!("pv{n}_"), 8),
+            frag("pa_", 8),
+            frag(&format!("vb{n}_"), 8),
+            frag(&format!("pv{n}_"), 8)
+        );
+        // store this n-tile → smemPV at col 16n (stride D)
+        s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{};\n    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {}, %st64;\n", off_pv + n * 16 * 4, frag(&format!("pv{n}_"), 8));
+    }
+    s += "    bar.sync 0;\n";
+    // smemO[lane][c] = smemO[lane][c]*corr + smemPV[lane][c]  (lane==row, lanes 0..15)
+    s += &format!("    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra RESDONE_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_pv};\n    mul.lo.s32 %tmp2,%lane,{};\n    add.u32 %tmp,%tmp,%tmp2;\n", d * 4); // &smemPV[lane]
+    s += &format!("    mov.u32 %tmp2,smem_{name};\n    add.u32 %tmp2,%tmp2,{off_o};\n    mul.lo.s32 %sa,%lane,{};\n    add.u32 %tmp2,%tmp2,%sa;\n", d * 4); // &smemO[lane]  (%sa scratch)
+    for c in 0..d {
+        s += &format!("    ld.shared.f32 %pvv,[%tmp+{0}];\n    ld.shared.f32 %ov,[%tmp2+{0}];\n    fma.rn.f32 %ov,%ov,%corr,%pvv;\n    st.shared.f32 [%tmp2+{0}],%ov;\n", c * 4);
+    }
+    s += &format!("RESDONE_{name}:\n    bar.sync 0;\n");
+
+    s += &format!("    add.u32 %kb,%kb,16;\n    bra KB_{name};\n");
+
+    // O[row][c] = smemO[lane][c] / l   (lane==row, lanes 0..15)
+    s += &format!("KBDONE_{name}:\n    setp.ge.u32 %p0,%lane,16;\n    @%p0 bra RET_{name};\n");
+    s += &format!("    mov.u32 %tmp,smem_{name};\n    add.u32 %tmp,%tmp,{off_o};\n    mul.lo.s32 %tmp2,%lane,{0};\n    add.u32 %tmp,%tmp,%tmp2;\n    add.u32 %c,%row,%lane;\n    mul.lo.s32 %c,%c,{d};\n    mul.wide.u32 %off,%c,4;\n    add.s64 %optr,%O,%off;\n", d * 4);
+    for c in 0..d {
+        s += &format!("    ld.shared.f32 %ov,[%tmp+{0}];\n    div.rn.f32 %ov,%ov,%llane;\n    st.global.f32 [%optr+{0}],%ov;\n", c * 4);
+    }
+    s += &format!("RET_{name}:\n    ret;\n}}\n");
+    s
+}
+
+/// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, plus the
+/// experimental tensor-core `flash_d64_w`.
 pub fn flash_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
@@ -274,6 +454,7 @@ pub fn flash_ptx() -> &'static str {
             m += &entry_untiled(d, FLASH_WARPS);
             m += &entry_tiled(d, FLASH_TWARPS);
         }
+        m += &entry_wmma(64);
         m
     })
     .as_str()
