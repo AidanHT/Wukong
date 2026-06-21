@@ -625,53 +625,53 @@ same-buffers, same-run, clock-pinned (`d=64`, `dff=256`, resident):
 
 | case | Mercury fused | cuBLAS call-chain | **Mercury faster** |
 |---|---|---|---|
-| stack, depth 2 (S=512) | 0.35 ms/layer | 0.38 ms/layer | **1.08×** |
-| stack, depth 4 (S=512) | 0.36 ms/layer | 0.39 ms/layer | **1.08×** |
-| stack, depth 8 (S=512) | 0.36 ms/layer | 0.39 ms/layer | **1.06×** |
-| single layer, S=256 | 0.24 ms | 0.28 ms | **1.17×** |
-| single layer, S=1024 | 0.79 ms | 0.89 ms | **1.12×** |
+| stack, depth 2 (S=512) | 0.53 ms/layer | 0.64 ms/layer | **1.20×** |
+| stack, depth 4 (S=512) | 0.54 ms/layer | 0.69 ms/layer | **1.28×** |
+| stack, depth 8 (S=512) | 0.59 ms/layer | 0.77 ms/layer | **1.32×** |
+| single layer, S=1024 | 0.76 ms | 0.79 ms | **1.04×** |
 
-The **stack is the clean signal** (longer runs, less clock jitter than the sub-ms single layer): Mercury
-holds a flat ~0.36 ms/layer while the cuBLAS chain pays ~0.38 — the per-call dispatch + the separate
-add/SiLU launches, paid at every layer, that the resident fused model folds away (single-layer S=512 is
-~par within noise). The margin tightened from an earlier ~1.3–1.4× because the SMEM key-block-tiled flash
-(below) cut the attention cost that was *common* to both stacks, so the residual gap is now almost purely
-**GEMM + epilogue fusion**: at these small-K (64/256) shapes Mercury's WMMA GEMM alone (*unfused*,
-identical glue) is ~par with cuBLAS — *regime specific*, cuBLAS still wins the isolated large-K GEMM
-(≥2048³, the GEMM table above) — and the fused epilogues (the add/SiLU cuBLAS structurally can't fold in)
-add the rest (`fusion` factor 1.38× @S=256). The cuBLAS path is, if anything, *generous* (it runs
-Mercury's own fused flash for free). Run: `… --ignored --nocapture cublas_chain_vs_mercury` /
-`resident_model_vs_cublas`.
+The **stack is the clean signal** (longer runs; the sub-ms single layer is clock-noisy, ~par–1.04×).
+Both stacks run the *same* attention (the tensor-core flash below, S≥512), so the measured gap is purely
+**GEMM + epilogue fusion** — the per-call dispatch + the separate add/SiLU launches, paid at every layer,
+that the resident fused model folds away. The ratio **widens with depth** (1.20→1.32×) because that
+per-layer overhead is fixed while the fused model amortises it; it is also *larger* than the pre-WMMA
+~1.06–1.08× because the faster common flash shrinks the attention term, making the GEMM+fusion edge a
+bigger fraction of the layer. (Decomposed: Mercury's WMMA GEMM alone, *unfused* with identical glue, is
+~par with cuBLAS at these small-K (64/256) shapes — *regime specific*, cuBLAS still wins the isolated
+large-K GEMM ≥2048³, the GEMM table above — and the fused epilogues, the add/SiLU cuBLAS structurally
+can't fold in, add ~1.08–1.09×.) The cuBLAS path is *generous* — it gets Mercury's fast flash for free.
+Run: `… --ignored --nocapture cublas_chain_vs_mercury` / `resident_model_vs_cublas`.
 
 **PyTorch (Tier C) — cleared at the realistic sizes (honest).** The same layer in PyTorch
 (`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls + fused **SDPA flash
 attention**, f32 norm/softmax, verified against an f64 reference of the identical function on the same
 RTX 4050) runs **~flat at ~0.63 ms/layer** (launch/dispatch-bound at these small sizes — its per-layer
 time barely moves from S=256 to S=1024). Mercury, after the pipelining fix + the SMEM key-block-tiled
-flash, is **~0.23 ms at S=256, ~0.34 at S=512, ~0.80 at S=1024** and **~0.35 ms/layer across a depth-8
-stack**, so:
+flash + the tensor-core flash (S≥512), is **~0.23 ms at S=256, ~0.33 at S=512, ~0.68 at S=1024** and
+**~0.34 ms/layer across a depth-8 stack**, so:
 
 | case | Mercury | PyTorch eager | **Mercury faster** |
 |---|---|---|---|
 | single layer, S=256 | ~0.23 ms | ~0.68 ms | **~3.0×** |
-| single layer, S=512 | ~0.34 ms | ~0.63 ms | **~1.8×** |
-| single layer, S=1024 | ~0.80 ms | ~0.63 ms | **0.79× (torch wins)** |
-| stack (S=512, depth 1–8) | ~0.35 ms/layer | ~0.62–0.86 ms/layer | **~1.8–2.4×** |
+| single layer, S=512 | ~0.33 ms | ~0.63 ms | **~1.9×** |
+| single layer, S=1024 | ~0.68 ms | ~0.63 ms | **~0.93× (≈par)** |
+| stack (S=512, depth 1–8) | ~0.34 ms/layer | ~0.62–0.86 ms/layer | **~1.8–2.4×** |
 
 So M13's "beat PyTorch" is **met for eager** — clearly at S≤512 and across the multi-layer stack (the
 realistic serving shape), where Mercury's fused resident chain (no per-op Python dispatch, fused
-epilogues, one stream) is ~2× PyTorch's. The **one remaining spot torch eager still wins is the single
-layer at S=1024** (0.79×): torch's per-layer is *flat* (launch-bound), while Mercury's grows with its
-`O(S²)` attention. Key-block tiling (the new default flash kernel — 8 query-row warps cooperatively stage
-each `BK=1024/D` key block in 8 KB of SMEM and reuse it, an 8× L2-traffic cut, measured `0.56–0.90×` the
-untiled in the same-process `flash_tiled_vs_untiled` A/B) **narrowed S=1024 from ~1.07 to ~0.80 ms** (the
-torch ratio from ~0.59× to 0.79×) — but the flash kernel still dominates that layer (~0.65 ms of it) and
-is a hand `fma`+warp-shuffle kernel (~410 GFLOP/s), leaving the tensor cores idle. The *remaining* lever
-is therefore **tensor-core (WMMA) flash** — running the `Q·Kᵀ` and `P·V` matmuls of the online-softmax on
-the tensor cores, as production flash-attention does. Honest caveats: this is **eager** PyTorch
-(torch.compile / Inductor, the fusing bar, needs Triton, which has no working install on this Windows
-box); and it is a cross-process comparison (both warmed, best-of-N, same GPU), like the C/Rust CPU
-baselines, not a same-buffer in-process gate.
+epilogues, one stream) is ~2× PyTorch's. The hard case is the **single layer at S=1024**, where torch's
+*flat* (launch-bound) ~0.63 ms/layer competes with Mercury's `O(S²)` attention. Two flash kernels closed
+most of the gap: **key-block tiling** (the f32 default — 8 query-row warps stage each `BK=1024/D` key
+block in 8 KB of SMEM, an 8× L2-traffic cut, `0.56–0.90×` the untiled in `flash_tiled_vs_untiled`) took
+S=1024 from ~1.07→~0.80 ms; then **tensor-core (WMMA) flash** (`flash_d64_w` — `Q·Kᵀ` and `P·V` of the
+online-softmax on the Ada tensor cores, f16 in / f32 accumulate; dispatched in the layer for S≥512) took
+it to **~0.68 ms** (torch ratio ~0.59× → ~0.93×, now ≈par). The WMMA path is `0.92× / 0.80× / 0.69× /
+0.63×` the tiled at S = `512 / 1024 / 2048 / 4096` (same-process A/B) — its win **grows with sequence
+length**, so beyond these sizes (long context, S≥2048) it is the decisive attention path; below 512 its
+`S/16`-warp occupancy is too low and the tiled f32 kernel stays the default. Honest caveats: this is
+**eager** PyTorch (torch.compile / Inductor, the fusing bar, needs Triton, which has no working install
+on this Windows box); and it is a cross-process comparison (both warmed, best-of-N, same GPU), like the
+C/Rust CPU baselines, not a same-buffer in-process gate.
 
 **Determinism, every kernel (M12).** Not just the layer: `gpu_kernels_bit_reproducible` asserts every
 reduction-bearing family — `gemm_nt_f16` and its `_sm`/`_sm_db` variants, the three fused row norms,
