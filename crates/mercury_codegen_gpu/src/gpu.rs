@@ -1102,11 +1102,25 @@ pub fn norm(
     g.stream.memcpy_dtov(&out_d)
 }
 
+/// Launch config for the flash-attention kernel: [`ptx_flash::FLASH_WARPS`] independent query-row warps
+/// per CTA (the kernel computes `row = ctaid·W + warpId`), so the grid is `ceil(S/W)` CTAs of `32·W`
+/// threads. Packing warps fills the SM and hides the serial key-loop's L2 latency — a one-warp-per-CTA
+/// launch left the SM blocks-limited to ~half occupancy. All five flash launch sites use this.
+pub(crate) fn flash_launch_cfg(seq: usize) -> LaunchConfig {
+    let w = crate::ptx_flash::FLASH_WARPS;
+    LaunchConfig {
+        grid_dim: ((seq as u32).div_ceil(w), 1, 1),
+        block_dim: (32 * w, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// Fused **flash-attention** on the GPU: `O = softmax(scale · Q·Kᵀ) · V`, single head, Q/K/V/O all
 /// `[seq, d]` row-major. Never materializes the `seq×seq` score matrix — the online-softmax
-/// recurrence streams K/V once (one warp per query row). `d` must be one of [`ptx_flash::SUPPORTED_D`]
-/// (32/64/128). Tolerance-gated against a full-softmax CPU reference. The marquee GPU kernel: the
-/// fused form that *lost* on CPU (where the tuned GEMM dominates) wins here by halving HBM traffic.
+/// recurrence streams K/V once (one warp per query row, [`ptx_flash::FLASH_WARPS`] rows per CTA for
+/// occupancy). `d` must be one of [`ptx_flash::SUPPORTED_D`] (32/64/128). Tolerance-gated against a
+/// full-softmax CPU reference. The marquee GPU kernel: the fused form that *lost* on CPU (where the
+/// tuned GEMM dominates) wins here by halving HBM traffic.
 pub fn flash_attn(
     g: &mut Gpu,
     q: &[f32],
@@ -1131,11 +1145,7 @@ pub fn flash_attn(
     let v_d = g.stream.memcpy_stod(v)?;
     let mut o_d = g.stream.memcpy_stod(&vec![0f32; seq * d])?;
     let s = seq as u32;
-    let cfg = LaunchConfig {
-        grid_dim: (s, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flash_launch_cfg(seq);
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&s)
         .arg(&scale)
@@ -1631,7 +1641,7 @@ impl ResidentLayerF16 {
         {
             let scale = 1.0f32 / (d as f32).sqrt();
             let ss = s as u32;
-            let flash_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+            let flash_cfg = flash_launch_cfg(s);
             let mut bld = stream.launch_builder(&self.f_flash);
             bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
             unsafe { bld.launch(flash_cfg)? };
@@ -1718,7 +1728,7 @@ impl ResidentLayerF16 {
         {
             let scale = 1.0f32 / (d as f32).sqrt();
             let ss = s as u32;
-            let flash_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+            let flash_cfg = flash_launch_cfg(s);
             let mut bld = stream.launch_builder(&self.f_flash);
             bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
             unsafe { bld.launch(flash_cfg)? };
@@ -3769,7 +3779,7 @@ mod tests {
                 let mut c = g.stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let ss = s as u32;
-                let flash_cfg = LaunchConfig { grid_dim: (ss, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+                let flash_cfg = flash_launch_cfg(s);
                 pin!();
                 let t_flash = best_of(5, || {
                     let t0 = Instant::now();
