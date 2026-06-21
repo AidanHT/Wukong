@@ -35,10 +35,10 @@ D, DFF, EPS = 64, 256, 1e-5
 HALF = torch.float16
 
 # Mercury fp16 fused resident, measured same-GPU (cublas_chain_vs_mercury / resident_model_vs_cublas),
-# post the alloc_zeros pipelining fix. Authoritative figures live in the Rust bench; these are for
-# side-by-side convenience only (re-run the Rust benches to refresh; ~10-20% run-to-run clock variance).
-MERCURY_MS_PER_LAYER = {256: 0.31, 512: 0.72, 1024: 1.34}         # single layer, resident
-MERCURY_STACK_MS_PER_LAYER = {1: 0.622, 2: 0.514, 4: 0.529, 8: 0.561}  # depth sweep, S=512
+# post the alloc_zeros pipelining fix AND the W=2 flash-occupancy fix. Authoritative figures live in the
+# Rust bench; these are side-by-side convenience only (re-run the Rust benches; ~10-20% clock variance).
+MERCURY_MS_PER_LAYER = {256: 0.35, 512: 0.55, 1024: 1.07}         # single layer, resident
+MERCURY_STACK_MS_PER_LAYER = {1: 0.50, 2: 0.39, 4: 0.48, 8: 0.43}  # depth sweep, S=512
 
 
 def rmsnorm_f32(x):
