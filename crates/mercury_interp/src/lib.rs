@@ -116,6 +116,25 @@ pub trait Accelerator {
     fn sreduce(&mut self, _op: i64, _x: &[f32], _y: &[f32]) -> Option<Result<f32, String>> {
         None
     }
+    /// **Fused-epilogue Linear** `C = act(A·Bᵀ + bias)` with `beta == 0` (the `mercury_sgemm_nt_epi`
+    /// shape a `act(matmul(x,w)[+bias])` Mercury expression lowers to). `bias` is `None` for the
+    /// bias-free SwiGLU form; `act` is the runtime `ACT_*` code (1=relu, 2=gelu, 3=silu). Return `None`
+    /// for any case the device kernel doesn't cover (non-zero beta, a bias it can't fuse, an unsupported
+    /// activation, or an unaligned shape) so it falls back to the CPU fused kernel.
+    fn sgemm_nt_epi(
+        &mut self,
+        _a: &[f32],
+        _b: &[f32],
+        _c: &mut [f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _beta: i64,
+        _bias: Option<&[f32]>,
+        _act: i64,
+    ) -> Option<Result<(), String>> {
+        None
+    }
 }
 
 /// Run `entry` (typically `main`) and return its integer result as a process exit code.
@@ -860,19 +879,31 @@ impl<'a, 'k> Interp<'a, 'k> {
                 } else {
                     std::ptr::null()
                 };
-                // SAFETY: buffers are exactly m*k, n*k, m*n long; bias is null or n long — kernel contract.
-                unsafe {
-                    mercury_runtime::mercury_sgemm_nt_epi(
-                        abuf.as_ptr(),
-                        bbuf.as_ptr(),
-                        cbuf.as_mut_ptr(),
-                        m as i64,
-                        k as i64,
-                        n as i64,
-                        beta,
-                        bias_ptr,
-                        act,
-                    );
+                // Offload the fused epilogue to the accelerator (GPU) when it covers this case; a decline
+                // (`None`) or no accelerator falls back to the identical CPU kernel — same contract as the
+                // plain GEMM above. With no accelerator (the oracle) this is always the CPU path.
+                let bias_opt = bias_idx.is_some().then_some(biasbuf.as_slice());
+                let offloaded = self
+                    .accel
+                    .as_mut()
+                    .and_then(|acc| acc.sgemm_nt_epi(&abuf, &bbuf, &mut cbuf, m, k, n, beta, bias_opt, act));
+                match offloaded {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Err(e),
+                    // SAFETY: buffers are exactly m*k, n*k, m*n long; bias is null or n long — kernel contract.
+                    None => unsafe {
+                        mercury_runtime::mercury_sgemm_nt_epi(
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
+                            bias_ptr,
+                            act,
+                        );
+                    },
                 }
                 for (t, &val) in cbuf.iter().enumerate() {
                     *self

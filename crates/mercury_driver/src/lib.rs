@@ -421,6 +421,28 @@ mod gpu_e2e_tests {
         )
     }
 
+    /// The `C = A·Bᵀ` nest followed by a separate elementwise activation loop over `C` — which the
+    /// recognizer folds into one `mercury_sgemm_nt_epi` (bias-free, the SwiGLU/FFN `act(x·Wᵀ)` shape).
+    /// `actname` is `relu`/`silu`/`gelu`.
+    fn linear_act_src(actname: &str, m: usize, k: usize, n: usize) -> String {
+        let cij = format!("c[i*{n}+j]");
+        let act = match actname {
+            "relu" => format!("fmax({cij}, 0.0)"),
+            "silu" => format!("silu({cij})"),
+            "gelu" => format!("gelu({cij})"),
+            other => panic!("unknown activation {other}"),
+        };
+        format!(
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],c:[f32;{mn}]) {{ \
+             for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
+             for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} \
+             for i in 0..{m} {{ for j in 0..{n} {{ c[i*{n}+j] = {act}; }} }} }}",
+            mk = m * k,
+            nk = n * k,
+            mn = m * n
+        )
+    }
+
     #[test]
     fn gpu_backend_linear_matches_interp_within_tol() {
         let mut guard = mercury_codegen_gpu::gpu();
@@ -468,6 +490,63 @@ mod gpu_e2e_tests {
                 "gpu --backend linear {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                 accel.calls, s.max_abs, s.max_rel
             );
+        }
+    }
+
+    /// **`act(matmul(x,w))` from Mercury source runs the fused tensor-core kernel** (Phase-2 fusion
+    /// engine). The recognizer folds the matmul + activation loop into `mercury_sgemm_nt_epi`; the GPU
+    /// `Accelerator` routes that to the single fused WMMA kernel (`gemm_nt_f16_sm_db_{relu,silu,gelu}`,
+    /// the one that beats the cuBLAS GEMM+activation chain). Aligned shapes (M,N %64, K %16) so the
+    /// tensor-core tiling accepts them. The offload must fire (`calls >= 1`, else it would silently
+    /// test CPU-vs-CPU); the fp16 path is tolerance-gated against the f32 CPU oracle, not bit-exact.
+    #[test]
+    fn gpu_backend_fused_epilogue_matches_interp() {
+        let mut guard = mercury_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                eprintln!("skip gpu_backend_fused_epilogue_matches_interp: no CUDA device");
+                return;
+            }
+        };
+        let mut rng = Rng::new(0x0FADE5);
+        for actname in ["relu", "silu", "gelu"] {
+            for &(m, k, n) in &[(64usize, 16usize, 64usize), (64, 32, 128)] {
+                let (program, mut interner) = build(&linear_act_src(actname, m, k, n));
+                let entry = interner.intern("lin");
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+
+                // CPU oracle (no accelerator) — the f32 fused epilogue.
+                let (mut ac, mut bc, mut cc) = (a.clone(), b.clone(), vec![0f32; m * n]);
+                {
+                    let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cc];
+                    mercury_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+                }
+
+                // GPU offload over the identical MIR + inputs.
+                let (mut ag, mut bg, mut cg) = (a.clone(), b.clone(), vec![0f32; m * n]);
+                let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+                {
+                    let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut cg];
+                    mercury_interp::run_kernel_f32_accel(
+                        &program, entry, &mut bufs, &interner, &mut accel,
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    accel.calls >= 1,
+                    "{actname} {m}x{k}x{n}: fused epilogue never offloaded — the act(matmul) nest did \
+                     not fold to sgemm_nt_epi or the GPU declined, so this would silently test CPU-vs-CPU"
+                );
+
+                // fp16 tensor-core path → fp16 tolerance (looser than the f32 GEMM bound).
+                let s = assert_close(&format!("fused {actname} {m}x{k}x{n}"), &cg, &cc, 5e-2, 2e-2);
+                eprintln!(
+                    "gpu --backend fused {actname} {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                    accel.calls, s.max_abs, s.max_rel
+                );
+            }
         }
     }
 

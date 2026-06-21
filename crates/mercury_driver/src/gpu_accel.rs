@@ -75,6 +75,40 @@ impl Accelerator for GpuAccel<'_> {
         )
     }
 
+    fn sgemm_nt_epi(
+        &mut self,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        beta: i64,
+        bias: Option<&[f32]>,
+        act: i64,
+    ) -> Option<Result<(), String>> {
+        // The fused tensor-core kernel covers only the overwrite (`beta == 0`), bias-free form (fusing a
+        // bias needs the WMMA fragment column layout — not done yet), the relu/gelu/silu activations
+        // (ACT_RELU=1, ACT_GELU=2, ACT_SILU=3 in `mercury_runtime`), and the `_sm_db` tiling's aligned
+        // shapes (M,N multiples of 64; K a multiple of 16). Anything else declines to the CPU kernel.
+        // This is the fp16 tensor-core path, so it's tolerance-gated against the f32 CPU oracle (the
+        // same `--backend=gpu` differential contract), not bit-exact.
+        if beta != 0 || bias.is_some() || m % 64 != 0 || n % 64 != 0 || k % 16 != 0 {
+            return None;
+        }
+        let res = match act {
+            1 => mercury_codegen_gpu::gpu::gemm_nt_f16_sm_db_relu(self.gpu, a, b, m, k, n),
+            2 => mercury_codegen_gpu::gpu::gemm_nt_f16_sm_db_gelu(self.gpu, a, b, m, k, n),
+            3 => mercury_codegen_gpu::gpu::gemm_nt_f16_sm_db_silu(self.gpu, a, b, m, k, n),
+            _ => return None, // ACT_IDENTITY (0) or anything unrecognized → CPU
+        };
+        self.calls += 1;
+        Some(
+            res.map(|out| c.copy_from_slice(&out))
+                .map_err(|e| format!("GPU sgemm_nt_epi failed: {e:?}")),
+        )
+    }
+
     fn sreduce(&mut self, op: i64, x: &[f32], y: &[f32]) -> Option<Result<f32, String>> {
         // GPU reduce covers sum/dot/max; decline the rest so the CPU kernel handles them.
         if !mercury_codegen_gpu::gpu::reduce_supported(op) {
