@@ -87,20 +87,30 @@ impl Accelerator for GpuAccel<'_> {
         bias: Option<&[f32]>,
         act: i64,
     ) -> Option<Result<(), String>> {
-        // The fused tensor-core kernel covers only the overwrite (`beta == 0`), bias-free form (fusing a
-        // bias needs the WMMA fragment column layout — not done yet), the relu/gelu/silu activations
-        // (ACT_RELU=1, ACT_GELU=2, ACT_SILU=3 in `mercury_runtime`), and the `_sm_db` tiling's aligned
-        // shapes (M,N multiples of 64; K a multiple of 16). Anything else declines to the CPU kernel.
-        // This is the fp16 tensor-core path, so it's tolerance-gated against the f32 CPU oracle (the
-        // same `--backend=gpu` differential contract), not bit-exact.
-        if beta != 0 || bias.is_some() || m % 64 != 0 || n % 64 != 0 || k % 16 != 0 {
+        // The fused tensor-core kernel covers the overwrite form (`beta == 0`), the relu/gelu/silu
+        // activations (ACT_RELU=1, ACT_GELU=2, ACT_SILU=3 in `mercury_runtime`; ACT_IDENTITY=0), an
+        // **optional per-column bias** (`act(x·Wᵀ + bias)` — the canonical `nn.Linear`/FFN epilogue, via
+        // the `_sm_db_bias*` kernels that route the tile through SMEM to add bias by explicit column),
+        // and the `_sm_db` tiling's aligned shapes (M,N multiples of 64; K a multiple of 16). Anything
+        // else declines to the CPU kernel. This is the fp16 tensor-core path, so it's tolerance-gated
+        // against the f32 CPU oracle (the same `--backend=gpu` differential contract), not bit-exact.
+        if beta != 0 || m % 64 != 0 || n % 64 != 0 || k % 16 != 0 {
             return None;
         }
-        let res = match act {
-            1 => mercury_codegen_gpu::gpu::gemm_nt_f16_sm_db_relu(self.gpu, a, b, m, k, n),
-            2 => mercury_codegen_gpu::gpu::gemm_nt_f16_sm_db_gelu(self.gpu, a, b, m, k, n),
-            3 => mercury_codegen_gpu::gpu::gemm_nt_f16_sm_db_silu(self.gpu, a, b, m, k, n),
-            _ => return None, // ACT_IDENTITY (0) or anything unrecognized → CPU
+        use mercury_codegen_gpu::gpu as g;
+        let res = match (bias, act) {
+            // Bias-free: the activation-only fused kernels. Identity-without-bias is a plain GEMM (no
+            // epilogue to fuse) — decline so the regular `sgemm_nt` path handles it.
+            (None, 1) => g::gemm_nt_f16_sm_db_relu(self.gpu, a, b, m, k, n),
+            (None, 2) => g::gemm_nt_f16_sm_db_gelu(self.gpu, a, b, m, k, n),
+            (None, 3) => g::gemm_nt_f16_sm_db_silu(self.gpu, a, b, m, k, n),
+            (None, _) => return None,
+            // With bias: `act(x·Wᵀ + bias)`. ACT_IDENTITY=0 is the affine Linear `x·Wᵀ + bias`.
+            (Some(bias), 0) => g::gemm_nt_f16_sm_db_bias(self.gpu, a, b, bias, m, k, n),
+            (Some(bias), 1) => g::gemm_nt_f16_sm_db_bias_relu(self.gpu, a, b, bias, m, k, n),
+            (Some(bias), 2) => g::gemm_nt_f16_sm_db_bias_gelu(self.gpu, a, b, bias, m, k, n),
+            (Some(bias), 3) => g::gemm_nt_f16_sm_db_bias_silu(self.gpu, a, b, bias, m, k, n),
+            (Some(_), _) => return None,
         };
         self.calls += 1;
         Some(

@@ -443,6 +443,30 @@ mod gpu_e2e_tests {
         )
     }
 
+    /// The `C = A·Bᵀ` nest followed by a **bias-add (+ optional activation)** epilogue loop — which the
+    /// recognizer folds into one `mercury_sgemm_nt_epi` with a *non-null* bias (the canonical
+    /// `nn.Linear`/FFN `act(x·Wᵀ + bias)`). `actname` is `none` (affine Linear), `relu`, `silu`, `gelu`.
+    /// The `bias` param sits between `b` and `c`, so the buffer list is `[a, b, bias, c]`.
+    fn linear_bias_act_src(actname: &str, m: usize, k: usize, n: usize) -> String {
+        let inner = format!("c[i*{n}+j] + bias[j]");
+        let act = match actname {
+            "none" => inner.clone(),
+            "relu" => format!("fmax({inner}, 0.0)"),
+            "silu" => format!("silu({inner})"),
+            "gelu" => format!("gelu({inner})"),
+            other => panic!("unknown activation {other}"),
+        };
+        format!(
+            "module m\nfn lin(a:[f32;{mk}],b:[f32;{nk}],bias:[f32;{n}],c:[f32;{mn}]) {{ \
+             for i in 0..{m} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
+             for kk in 0..{k} {{ s = s + a[i*{k}+kk] * b[j*{k}+kk]; }} c[i*{n}+j] = s; }} }} \
+             for i in 0..{m} {{ for j in 0..{n} {{ c[i*{n}+j] = {act}; }} }} }}",
+            mk = m * k,
+            nk = n * k,
+            mn = m * n
+        )
+    }
+
     #[test]
     fn gpu_backend_linear_matches_interp_within_tol() {
         let mut guard = mercury_codegen_gpu::gpu();
@@ -544,6 +568,68 @@ mod gpu_e2e_tests {
                 let s = assert_close(&format!("fused {actname} {m}x{k}x{n}"), &cg, &cc, 5e-2, 2e-2);
                 eprintln!(
                     "gpu --backend fused {actname} {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                    accel.calls, s.max_abs, s.max_rel
+                );
+            }
+        }
+    }
+
+    /// **`act(matmul(x,w) + bias)` from Mercury source runs the fused tensor-core *bias* kernel** — the
+    /// canonical `nn.Linear`/FFN epilogue (the affine `none` case is a plain biased Linear). The
+    /// recognizer folds matmul + bias-add (+ activation) into `mercury_sgemm_nt_epi` with a non-null
+    /// bias; the GPU `Accelerator` routes it to `gemm_nt_f16_sm_db_bias{,_relu,_silu,_gelu}` (which
+    /// store each tile through SMEM to add the per-column bias the opaque WMMA fragment layout otherwise
+    /// blocks). Aligned shapes; the offload must fire (`calls >= 1`, else it would silently test
+    /// CPU-vs-CPU); fp16 path → tolerance-gated against the f32 CPU oracle, not bit-exact.
+    #[test]
+    fn gpu_backend_fused_bias_epilogue_matches_interp() {
+        let mut guard = mercury_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                eprintln!("skip gpu_backend_fused_bias_epilogue_matches_interp: no CUDA device");
+                return;
+            }
+        };
+        let mut rng = Rng::new(0x0B1A5E);
+        for actname in ["none", "relu", "silu", "gelu"] {
+            for &(m, k, n) in &[(64usize, 16usize, 64usize), (64, 32, 128)] {
+                let (program, mut interner) = build(&linear_bias_act_src(actname, m, k, n));
+                let entry = interner.intern("lin");
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+
+                // CPU oracle (no accelerator) — the f32 fused bias epilogue. Buffers: [a, b, bias, c].
+                let (mut ac, mut bc, mut biasc, mut cc) =
+                    (a.clone(), b.clone(), bias.clone(), vec![0f32; m * n]);
+                {
+                    let mut bufs: [&mut [f32]; 4] = [&mut ac, &mut bc, &mut biasc, &mut cc];
+                    mercury_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+                }
+
+                // GPU offload over the identical MIR + inputs.
+                let (mut ag, mut bg, mut biasg, mut cg) =
+                    (a.clone(), b.clone(), bias.clone(), vec![0f32; m * n]);
+                let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+                {
+                    let mut bufs: [&mut [f32]; 4] = [&mut ag, &mut bg, &mut biasg, &mut cg];
+                    mercury_interp::run_kernel_f32_accel(
+                        &program, entry, &mut bufs, &interner, &mut accel,
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    accel.calls >= 1,
+                    "{actname} {m}x{k}x{n}: fused bias epilogue never offloaded — the act(matmul+bias) \
+                     nest did not fold to sgemm_nt_epi or the GPU declined, so this would silently test \
+                     CPU-vs-CPU"
+                );
+
+                let s =
+                    assert_close(&format!("fused bias {actname} {m}x{k}x{n}"), &cg, &cc, 5e-2, 2e-2);
+                eprintln!(
+                    "gpu --backend fused bias {actname} {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                     accel.calls, s.max_abs, s.max_rel
                 );
             }
