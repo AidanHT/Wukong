@@ -1472,6 +1472,11 @@ pub struct ResidentLayerF16 {
     f_gemm: CudaFunction,
     f_silu: CudaFunction,
     f_resid: CudaFunction,
+    /// Standalone SiLU (`vmath`) + residual-add (`vadd`) kernels — used only by the unfused reference
+    /// path [`forward_device_unfused`](Self::forward_device_unfused), to measure what the fused
+    /// epilogues buy. The fused [`forward_device`](Self::forward_device) never launches them.
+    f_act: CudaFunction,
+    f_vadd: CudaFunction,
     wq: cudarc::driver::CudaSlice<half::f16>,
     wk: cudarc::driver::CudaSlice<half::f16>,
     wv: cudarc::driver::CudaSlice<half::f16>,
@@ -1521,6 +1526,8 @@ impl ResidentLayerF16 {
         let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db")?;
         let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
         let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")?;
+        let f_act = g.function("vmath", crate::ptx::vmath_ptx(), "silu")?;
+        let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd")?;
         let stream = g.stream.clone();
         let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
         let wq = stream.memcpy_stod(&to16(w.wq))?;
@@ -1537,6 +1544,8 @@ impl ResidentLayerF16 {
             f_gemm,
             f_silu,
             f_resid,
+            f_act,
+            f_vadd,
             wq,
             wk,
             wv,
@@ -1636,6 +1645,96 @@ impl ResidentLayerF16 {
         let f1 = gemm16(&self.f_silu, &h2_16, &self.w1, s, d, dff)?; // SiLU(h2*W1ᵀ) [S,Dff], act fused
         let f1_16 = cast(&f1, s * dff)?;
         let out = resid_gemm(&f1_16, &self.w2, &x1, s, dff, d)?; // x1 + f1*W2ᵀ  (residual 2, fused)
+        Ok(out)
+    }
+
+    /// **Unfused reference path** — the same layer with NO fused epilogues: a plain WMMA GEMM for every
+    /// projection, then a SEPARATE `vadd` for each residual and a SEPARATE `silu` (`vmath`) for the
+    /// activation. Numerically equal to [`forward_device`](Self::forward_device) up to f32-accumulation
+    /// order (the SiLU input is an exact f32 store/reload; only the residual add order differs: `x+Σ` vs
+    /// `Σ+x`), but it launches **3 extra kernels** (2 residual adds + 1 SiLU) that each round-trip a
+    /// `[S,D]`/`[S,Dff]` tensor through HBM. Exists only to measure what the fused epilogues buy at the
+    /// full-layer level (`layer_fusion_vs_unfused_throughput`) — it is not the production path.
+    pub fn forward_device_unfused(
+        &self,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+    ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        use half::f16;
+        let stream = &self.stream;
+        let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
+        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+
+        let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
+            let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
+            let (r, c) = (rows as u32, d as u32);
+            let mut bld = stream.launch_builder(&self.f_norm);
+            bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
+            unsafe { bld.launch(norm_cfg)? };
+            Ok(out)
+        };
+        let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
+            let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+            let nn = n as u32;
+            let mut b = stream.launch_builder(&self.f_cast);
+            b.arg(&nn).arg(src).arg(&mut dst);
+            unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+            Ok(dst)
+        };
+        // plain C = A*Bᵀ, no epilogue (always self.f_gemm) — the down/out projections do NOT fold residual.
+        let gemm = |a: &cudarc::driver::CudaSlice<f16>, b: &cudarc::driver::CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<_, DriverError> {
+            let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(&self.f_gemm);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+        // separate residual add `out = a + b` (the kernel the fused residual GEMM folds away).
+        let vadd = |a: &cudarc::driver::CudaSlice<f32>, b: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<_, DriverError> {
+            let mut out = stream.memcpy_stod(&vec![0f32; n])?;
+            let nn = n as u32;
+            let mut bld = stream.launch_builder(&self.f_vadd);
+            bld.arg(&nn).arg(a).arg(b).arg(&mut out);
+            unsafe { bld.launch(LaunchConfig::for_num_elems(nn))? };
+            Ok(out)
+        };
+        // separate SiLU activation (the kernel the fused SiLU GEMM folds away).
+        let silu = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<_, DriverError> {
+            let mut out = stream.memcpy_stod(&vec![0f32; n])?;
+            let nn = n as u32;
+            let mut bld = stream.launch_builder(&self.f_act);
+            bld.arg(&nn).arg(src).arg(&mut out);
+            unsafe { bld.launch(LaunchConfig::for_num_elems(nn))? };
+            Ok(out)
+        };
+
+        // attention: plain projections, flash, then a SEPARATE residual add.
+        let h1 = norm(x_d, s)?;
+        let h1_16 = cast(&h1, s * d)?;
+        let q = gemm(&h1_16, &self.wq, s, d, d)?;
+        let k = gemm(&h1_16, &self.wk, s, d, d)?;
+        let v = gemm(&h1_16, &self.wv, s, d, d)?;
+        let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
+        {
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let ss = s as u32;
+            let flash_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+            let mut bld = stream.launch_builder(&self.f_flash);
+            bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
+            unsafe { bld.launch(flash_cfg)? };
+        }
+        let attn_16 = cast(&attn, s * d)?;
+        let o = gemm(&attn_16, &self.wo, s, d, d)?;
+        let x1 = vadd(x_d, &o, s * d)?; // separate residual 1
+
+        // FFN: plain up-proj, SEPARATE SiLU, plain down-proj, SEPARATE residual add.
+        let h2 = norm(&x1, s)?;
+        let h2_16 = cast(&h2, s * d)?;
+        let f1 = gemm(&h2_16, &self.w1, s, d, dff)?;
+        let f1act = silu(&f1, s * dff)?;
+        let f1act_16 = cast(&f1act, s * dff)?;
+        let f2 = gemm(&f1act_16, &self.w2, s, dff, d)?;
+        let out = vadd(&x1, &f2, s * d)?; // separate residual 2
         Ok(out)
     }
 
@@ -3497,6 +3596,90 @@ mod tests {
                     t_res * 1e3,
                     t_res * 1e3 / dl,
                     s as f64 / t_res,
+                );
+            }
+        });
+    }
+
+    /// **What fusion buys at the full-layer level** — the same [`ResidentLayerF16`], resident, timed two
+    /// ways same-run: `forward_device` (the 2 residual adds + SiLU folded into the GEMMs) vs
+    /// `forward_device_unfused` (identical WMMA GEMMs but 3 separate `vadd`/`silu` launches, each
+    /// round-tripping a tensor through HBM — the naive call-chain structure). Same GEMM kernels both
+    /// sides, so this isolates the FUSION win (not GEMM quality): the canonical fused-vs-unfused report.
+    /// Both paths are first cross-checked against the f64 oracle (correctness before speed); clock is
+    /// re-pinned before each measurement.
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn layer_fusion_vs_unfused_throughput() {
+        with_gpu("layer_fusion_vs_unfused", |g| {
+            let mut rng = crate::diff::Rng::new(0x7A16);
+            let (d, dff) = (64usize, 256usize);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin_clock {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            for s in [256usize, 512, 1024] {
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let wq = rng.vec(d * d, -0.1, 0.1);
+                let wk = rng.vec(d * d, -0.1, 0.1);
+                let wv = rng.vec(d * d, -0.1, 0.1);
+                let wo = rng.vec(d * d, -0.1, 0.1);
+                let w1 = rng.vec(dff * d, -0.1, 0.1);
+                let w2 = rng.vec(d * dff, -0.1, 0.1);
+                let w = TransformerWeights {
+                    wq: &wq,
+                    wk: &wk,
+                    wv: &wv,
+                    wo: &wo,
+                    w1: &w1,
+                    w2: &w2,
+                };
+                let layer = ResidentLayerF16::new(g, &w, s, d, dff).unwrap();
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+                // Correctness before speed: BOTH paths must match the f64 oracle at this shape.
+                let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
+                let fused_out = g.stream.memcpy_dtov(&layer.forward_device(&x_d).unwrap()).unwrap();
+                let unfused_out = g.stream.memcpy_dtov(&layer.forward_device_unfused(&x_d).unwrap()).unwrap();
+                crate::diff::assert_close(&format!("fused S={s}"), &fused_out, &oracle, 5e-2, 5e-2);
+                crate::diff::assert_close(&format!("unfused S={s}"), &unfused_out, &oracle, 5e-2, 5e-2);
+
+                let iters = 60;
+                pin_clock!();
+                let t_fused = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = layer.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_unf = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = layer.forward_device_unfused(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                eprintln!(
+                    "layer_fusion S={s} D={d} Dff={dff} (resident, same-run): \
+                     fused {:.3} ms ({:.0} tok/s) | unfused {:.3} ms | fusion {:.2}× (folds 2 residual adds + 1 SiLU)",
+                    t_fused * 1e3,
+                    s as f64 / t_fused,
+                    t_unf * 1e3,
+                    t_unf / t_fused,
                 );
             }
         });
