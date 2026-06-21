@@ -358,6 +358,8 @@ pub struct CublasChainLayer {
     f_norm: CudaFunction,
     f_cast: CudaFunction,
     f_flash: CudaFunction,
+    /// Launch config matched to `f_flash` (untiled vs SMEM-tiled), resolved once by `gpu::flash_plan`.
+    flash_cfg: LaunchConfig,
     f_silu: CudaFunction,
     f_vadd: CudaFunction,
     wq: CudaSlice<f16>,
@@ -406,8 +408,8 @@ impl CublasChainLayer {
         let blas = CudaBlas::new(g.stream.clone())?;
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-        let f_flash =
-            g.function("flash", crate::ptx_flash::flash_ptx(), &format!("flash_d{d}"))?;
+        let (flash_name, flash_cfg) = crate::gpu::flash_plan(d, s);
+        let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_silu = g.function("vmath", crate::ptx::vmath_ptx(), "silu")?;
         let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd")?;
         let stream = g.stream.clone();
@@ -424,6 +426,7 @@ impl CublasChainLayer {
             f_norm,
             f_cast,
             f_flash,
+            flash_cfg,
             f_silu,
             f_vadd,
             wq,
@@ -485,7 +488,7 @@ impl CublasChainLayer {
         let mut attn = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
         let scale = 1.0f32 / (self.d as f32).sqrt();
         let ss = self.s as u32;
-        let cfg = crate::gpu::flash_launch_cfg(self.s);
+        let cfg = self.flash_cfg;
         let mut bld = self.stream.launch_builder(&self.f_flash);
         bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
         unsafe { bld.launch(cfg)? };

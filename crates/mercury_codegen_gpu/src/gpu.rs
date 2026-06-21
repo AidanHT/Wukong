@@ -1102,25 +1102,44 @@ pub fn norm(
     g.stream.memcpy_dtov(&out_d)
 }
 
-/// Launch config for the flash-attention kernel: [`ptx_flash::FLASH_WARPS`] independent query-row warps
-/// per CTA (the kernel computes `row = ctaid·W + warpId`), so the grid is `ceil(S/W)` CTAs of `32·W`
-/// threads. Packing warps fills the SM and hides the serial key-loop's L2 latency — a one-warp-per-CTA
-/// launch left the SM blocks-limited to ~half occupancy. All five flash launch sites use this.
-pub(crate) fn flash_launch_cfg(seq: usize) -> LaunchConfig {
-    let w = crate::ptx_flash::FLASH_WARPS;
-    LaunchConfig {
+/// Pick the flash kernel **entry name and matched launch config** for sequence length `seq`, head dim
+/// `d`. `seq >= ptx_flash::FLASH_TILE_MIN` selects the SMEM key-block-tiled kernel (`flash_d{d}_t`,
+/// [`ptx_flash::FLASH_TWARPS`] warps/CTA — `W×` less L2 traffic, the long-sequence lever); shorter
+/// sequences use the lower-overhead untiled kernel (`flash_d{d}`, [`ptx_flash::FLASH_WARPS`] warps/CTA).
+/// Returning name+config together guarantees the block dim always matches the chosen kernel's `W`. The
+/// two kernels are bit-identical, so the choice is purely performance. SMEM is static ⇒ `shared_mem_bytes`
+/// stays 0. Every flash launch site uses this (struct sites resolve it once at construction).
+pub(crate) fn flash_plan(d: usize, seq: usize) -> (String, LaunchConfig) {
+    flash_plan_forced(d, seq, seq >= crate::ptx_flash::FLASH_TILE_MIN)
+}
+
+/// As [`flash_plan`] but with an explicit `tiled` choice — used by the correctness gate to exercise
+/// *both* kernels at the same (ragged) sizes regardless of the dispatch crossover.
+pub(crate) fn flash_plan_forced(d: usize, seq: usize, tiled: bool) -> (String, LaunchConfig) {
+    let w = if tiled {
+        crate::ptx_flash::FLASH_TWARPS
+    } else {
+        crate::ptx_flash::FLASH_WARPS
+    };
+    let name = if tiled {
+        format!("flash_d{d}_t")
+    } else {
+        format!("flash_d{d}")
+    };
+    let cfg = LaunchConfig {
         grid_dim: ((seq as u32).div_ceil(w), 1, 1),
         block_dim: (32 * w, 1, 1),
         shared_mem_bytes: 0,
-    }
+    };
+    (name, cfg)
 }
 
 /// Fused **flash-attention** on the GPU: `O = softmax(scale · Q·Kᵀ) · V`, single head, Q/K/V/O all
-/// `[seq, d]` row-major. Never materializes the `seq×seq` score matrix — the online-softmax
-/// recurrence streams K/V once (one warp per query row, [`ptx_flash::FLASH_WARPS`] rows per CTA for
-/// occupancy). `d` must be one of [`ptx_flash::SUPPORTED_D`] (32/64/128). Tolerance-gated against a
+/// `[seq, d]` row-major. Never materializes the `seq×seq` score matrix — the online-softmax recurrence
+/// streams K/V once. `d` must be one of [`ptx_flash::SUPPORTED_D`] (32/64/128). The kernel is chosen by
+/// [`flash_plan`] (untiled at short S, SMEM key-block-tiled at long S). Tolerance-gated against a
 /// full-softmax CPU reference. The marquee GPU kernel: the fused form that *lost* on CPU (where the
-/// tuned GEMM dominates) wins here by halving HBM traffic.
+/// tuned GEMM dominates) wins here by never spilling the scores to HBM.
 pub fn flash_attn(
     g: &mut Gpu,
     q: &[f32],
@@ -1130,6 +1149,24 @@ pub fn flash_attn(
     d: usize,
     scale: f32,
 ) -> Result<Vec<f32>, DriverError> {
+    let (entry, cfg) = flash_plan(d, seq);
+    flash_attn_run(g, q, k, v, seq, d, scale, &entry, cfg)
+}
+
+/// Launch a specific flash kernel (`entry`/`cfg` from [`flash_plan`] or [`flash_plan_forced`]) over
+/// host Q/K/V and copy O back. The seam the correctness gate uses to drive *both* kernels at one shape.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flash_attn_run(
+    g: &mut Gpu,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    d: usize,
+    scale: f32,
+    entry: &str,
+    cfg: LaunchConfig,
+) -> Result<Vec<f32>, DriverError> {
     assert_eq!(q.len(), seq * d, "Q must be seq×d");
     assert_eq!(k.len(), seq * d, "K must be seq×d");
     assert_eq!(v.len(), seq * d, "V must be seq×d");
@@ -1138,14 +1175,12 @@ pub fn flash_attn(
         "flash_attn: head dim {d} has no generated kernel (supported: {:?})",
         crate::ptx_flash::SUPPORTED_D
     );
-    let entry = format!("flash_d{d}");
-    let f = g.function("flash", crate::ptx_flash::flash_ptx(), &entry)?;
+    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry)?;
     let q_d = g.stream.memcpy_stod(q)?;
     let k_d = g.stream.memcpy_stod(k)?;
     let v_d = g.stream.memcpy_stod(v)?;
     let mut o_d = g.stream.memcpy_stod(&vec![0f32; seq * d])?;
     let s = seq as u32;
-    let cfg = flash_launch_cfg(seq);
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&s)
         .arg(&scale)
@@ -1347,11 +1382,8 @@ pub fn transformer_layer(
     // this the device work runs through `stream` (a cloned `Arc`) with no further borrow of `g`.
     let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
     let f_gemm = g.function("gemm_rb", crate::ptx_gemm::gemm_rb_ptx(), "gemm_nt_rb")?;
-    let f_flash = g.function(
-        "flash",
-        crate::ptx_flash::flash_ptx(),
-        &format!("flash_d{d}"),
-    )?;
+    let (flash_name, flash_cfg) = flash_plan(d, s);
+    let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
     let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd")?;
     let f_silu = g.function("vmath", crate::ptx::vmath_ptx(), "silu")?;
     let stream = g.stream.clone();
@@ -1418,7 +1450,6 @@ pub fn transformer_layer(
     {
         let scale = 1.0f32 / (d as f32).sqrt();
         let ss = s as u32;
-        let flash_cfg = flash_launch_cfg(s);
         let mut bld = stream.launch_builder(&f_flash);
         bld.arg(&ss)
             .arg(&scale)
@@ -1475,6 +1506,9 @@ pub struct ResidentLayerF16 {
     f_norm: CudaFunction,
     f_cast: CudaFunction,
     f_flash: CudaFunction,
+    /// Launch config matched to `f_flash`'s kernel (untiled vs tiled), resolved once by [`flash_plan`]
+    /// at construction since the sequence length is fixed for a resident layer.
+    flash_cfg: LaunchConfig,
     f_gemm: CudaFunction,
     f_silu: CudaFunction,
     f_resid: CudaFunction,
@@ -1527,7 +1561,8 @@ impl ResidentLayerF16 {
         );
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-        let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &format!("flash_d{d}"))?;
+        let (flash_name, flash_cfg) = flash_plan(d, s);
+        let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let ptx = crate::ptx_wmma::wmma_f16_ptx();
         let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db")?;
         let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
@@ -1547,6 +1582,7 @@ impl ResidentLayerF16 {
             f_norm,
             f_cast,
             f_flash,
+            flash_cfg,
             f_gemm,
             f_silu,
             f_resid,
@@ -1637,7 +1673,7 @@ impl ResidentLayerF16 {
         {
             let scale = 1.0f32 / (d as f32).sqrt();
             let ss = s as u32;
-            let flash_cfg = flash_launch_cfg(s);
+            let flash_cfg = self.flash_cfg;
             let mut bld = stream.launch_builder(&self.f_flash);
             bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
             unsafe { bld.launch(flash_cfg)? };
@@ -1724,7 +1760,7 @@ impl ResidentLayerF16 {
         {
             let scale = 1.0f32 / (d as f32).sqrt();
             let ss = s as u32;
-            let flash_cfg = flash_launch_cfg(s);
+            let flash_cfg = self.flash_cfg;
             let mut bld = stream.launch_builder(&self.f_flash);
             bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
             unsafe { bld.launch(flash_cfg)? };
@@ -2890,25 +2926,43 @@ mod tests {
     fn flash_attention_matches_reference_within_tol() {
         with_gpu("flash_attention", |g| {
             let mut rng = crate::diff::Rng::new(0xF1A54);
-            // ragged seq (not a multiple of any block) across the supported head dims
-            for (seq, d) in [(128usize, 32usize), (200, 64), (96, 128)] {
+            // Gate BOTH kernels (untiled + SMEM key-block-tiled) at every shape, regardless of the
+            // dispatch crossover — they must agree with the f64 oracle (and, being identical arithmetic,
+            // with each other). Ragged seq across the supported head dims: (130,64)/(35,32) are *not*
+            // multiples of FLASH_TWARPS(8), so the tiled kernel's final CTA has inactive warps — this
+            // exercises the no-deadlock guard (inactive warps still stage K/V + hit both bar.syncs); all
+            // are ragged in the key block BK=1024/D, exercising the partial-tail cooperative load. The
+            // (768,64) case is at/above FLASH_TILE_MIN so it also confirms the *production* dispatch
+            // (`flash_attn` → tiled) is correct at scale.
+            for (seq, d) in [
+                (128usize, 32usize),
+                (200, 64),
+                (96, 128),
+                (130, 64),
+                (35, 32),
+                (768, 64),
+            ] {
                 let q = rng.vec(seq * d, -1.0, 1.0);
                 let k = rng.vec(seq * d, -1.0, 1.0);
                 let v = rng.vec(seq * d, -1.0, 1.0);
                 let scale = 1.0 / (d as f32).sqrt();
-                let got = flash_attn(g, &q, &k, &v, seq, d, scale).unwrap();
                 let oracle = ref_attn(&q, &k, &v, seq, d, scale);
-                let s = crate::diff::assert_close(
-                    &format!("flash s={seq} d={d}"),
-                    &got,
-                    &oracle,
-                    1e-3,
-                    3e-3,
-                );
-                eprintln!(
-                    "flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
-                    s.max_abs, s.max_rel
-                );
+                for tiled in [false, true] {
+                    let (entry, cfg) = flash_plan_forced(d, seq, tiled);
+                    let got =
+                        flash_attn_run(g, &q, &k, &v, seq, d, scale, &entry, cfg).unwrap();
+                    let s = crate::diff::assert_close(
+                        &format!("flash s={seq} d={d} [{entry}]"),
+                        &got,
+                        &oracle,
+                        1e-3,
+                        3e-3,
+                    );
+                    eprintln!(
+                        "flash s={seq} d={d} [{entry}]: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
+                }
             }
         });
     }
@@ -2921,9 +2975,6 @@ mod tests {
         with_gpu("flash_throughput", |g| {
             let mut rng = crate::diff::Rng::new(11);
             let d = 64usize;
-            let f = g
-                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64")
-                .unwrap();
             for seq in [512usize, 1024, 2048, 4096] {
                 let q = rng.vec(seq * d, -1.0, 1.0);
                 let k = rng.vec(seq * d, -1.0, 1.0);
@@ -2934,7 +2985,11 @@ mod tests {
                 let mut o_d = g.stream.memcpy_stod(&vec![0f32; seq * d]).unwrap();
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let s = seq as u32;
-                let cfg = flash_launch_cfg(seq);
+                // production dispatch: untiled below FLASH_TILE_MIN, SMEM key-block-tiled at/above it.
+                let (fname, cfg) = flash_plan(d, seq);
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), &fname)
+                    .unwrap();
                 let launch = |o_d: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut bld = g.stream.launch_builder(&f);
                     bld.arg(&s)
@@ -2957,9 +3012,113 @@ mod tests {
                 // attention FLOPs ≈ QKᵀ (2·s²·d) + P·V (2·s²·d) = 4·s²·d
                 let flop = 4.0 * (seq as f64) * (seq as f64) * (d as f64);
                 eprintln!(
-                    "flash s={seq} d={d}: {:.2} ms/iter, {:.0} GFLOP/s (fused, no s² scores in HBM)",
+                    "flash s={seq} d={d} [{fname}]: {:.2} ms/iter, {:.0} GFLOP/s (fused, no s² scores in HBM)",
                     spi * 1e3,
                     flop / spi / 1e9
+                );
+            }
+        });
+    }
+
+    /// **Same-process A/B of the two flash kernels** — untiled `flash_d64` vs SMEM key-block-tiled
+    /// `flash_d64_t` — across sequence length under one pinned clock. This is the honest measurement
+    /// behind [`ptx_flash::FLASH_TILE_MIN`]: cross-*run* flash comparisons are corrupted by the ~7×
+    /// laptop-GPU clock swing, so untiled and tiled are timed back-to-back in the SAME process with a
+    /// re-pin before each `best_of(5)`. Buffers are resident (uploaded once). The two kernels are
+    /// bit-identical by construction, so the bench first *asserts* their outputs agree at every S
+    /// (covering S far past the correctness gate's sizes), then reports `tiled/untiled` — the crossover
+    /// is where that ratio drops below 1.0. Run: `… --ignored --nocapture flash_tiled_vs_untiled`.
+    #[test]
+    #[ignore = "tuning bench; run explicitly"]
+    fn flash_tiled_vs_untiled() {
+        with_gpu("flash_tiled_vs_untiled", |g| {
+            let mut rng = crate::diff::Rng::new(0x7117ED);
+            let d = 64usize;
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            let f_unt = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64")
+                .unwrap();
+            let f_til = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_t")
+                .unwrap();
+            for s in [256usize, 384, 512, 768, 1024, 1536, 2048, 4096] {
+                let q = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let k = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let v = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let mut o = g.stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let (_, cfg_unt) = flash_plan_forced(d, s, false);
+                let (_, cfg_til) = flash_plan_forced(d, s, true);
+
+                // Correctness at scale: untiled and tiled differ only in data movement ⇒ identical output.
+                {
+                    let mut bld = g.stream.launch_builder(&f_unt);
+                    bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                    unsafe { bld.launch(cfg_unt).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_unt = g.stream.memcpy_dtov(&o).unwrap();
+                {
+                    let mut bld = g.stream.launch_builder(&f_til);
+                    bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                    unsafe { bld.launch(cfg_til).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_til = g.stream.memcpy_dtov(&o).unwrap();
+                let maxdiff = out_unt
+                    .iter()
+                    .zip(&out_til)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    maxdiff < 1e-4,
+                    "S={s}: tiled vs untiled disagree, max_abs={maxdiff:.2e}"
+                );
+
+                pin!();
+                let t_unt = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_unt);
+                        bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                        unsafe { bld.launch(cfg_unt).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                pin!();
+                let t_til = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_til);
+                        bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                        unsafe { bld.launch(cfg_til).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                let dispatch = if s >= crate::ptx_flash::FLASH_TILE_MIN {
+                    "tiled"
+                } else {
+                    "untiled"
+                };
+                eprintln!(
+                    "S={s:>4}: untiled {:.4} ms | tiled {:.4} ms | tiled/untiled {:.2}× | dispatch→{dispatch}",
+                    t_unt * 1e3,
+                    t_til * 1e3,
+                    t_til / t_unt,
                 );
             }
         });
@@ -3755,7 +3914,6 @@ mod tests {
             for _ in 0..1500 {
                 gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
             }
-            let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64").unwrap();
             let f_gemm = g
                 .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")
                 .unwrap();
@@ -3771,7 +3929,10 @@ mod tests {
                 let mut c = g.stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let ss = s as u32;
-                let flash_cfg = flash_launch_cfg(s);
+                let (fname, flash_cfg) = flash_plan(d, s);
+                let f_flash = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), &fname)
+                    .unwrap();
                 pin!();
                 let t_flash = best_of(5, || {
                     let t0 = Instant::now();
@@ -3797,7 +3958,7 @@ mod tests {
                     t0.elapsed().as_secs_f64() / 100.0
                 });
                 eprintln!(
-                    "S={s} (resident, pure kernel): flash {:.4} ms | WMMA gemm S×{d}×{dff} {:.4} ms | flash/gemm {:.1}×",
+                    "S={s} (resident, pure kernel): flash [{fname}] {:.4} ms | WMMA gemm S×{d}×{dff} {:.4} ms | flash/gemm {:.1}×",
                     t_flash * 1e3,
                     t_gemm * 1e3,
                     t_flash / t_gemm,
