@@ -9,11 +9,26 @@
 //! the full score, then the online-softmax update rescales the running denominator `l` and the
 //! per-lane output accumulators `acc[r]`. `R` is unrolled at PTX-gen time (acc/q in registers), so a
 //! kernel is generated per supported D. exp uses `ex2.approx`; tolerance-gated vs a CPU f64 reference.
+//!
+//! **Occupancy**: the warps are fully independent (each owns one query row, no shared/cross-warp
+//! state), so we pack [`FLASH_WARPS`] of them per CTA — `row = ctaid·W + warpId`. One warp per CTA
+//! left the SM blocks-per-SM-limited to ~half occupancy, which starved the latency-hiding the serial
+//! key loop needs (K/V are L2-resident, so it is L2-*latency*-bound, not HBM-bandwidth-bound); packing
+//! warps fills the SM and lets resident warps hide each other's loads. The launcher sizes the grid as
+//! `ceil(S/W)` CTAs of `32·W` threads (see `gpu::flash_launch_cfg`).
 
 use std::sync::OnceLock;
 
+/// Independent query rows (warps) per CTA — see the occupancy note above. The launch config and the
+/// kernel's `row = ctaid·W + warpId` must agree on this. **W=2** is the sweet spot on Ada (sm_89): a
+/// 64-thread CTA already breaks the 24-blocks-per-SM cap that limited one-warp CTAs to ~half occupancy
+/// (2 warps × 24 blocks = the full 48 warps/SM), while keeping the grid as fine as possible (most CTAs
+/// ⇒ best load balance) — larger W coarsens the grid and regresses small S without adding occupancy.
+pub const FLASH_WARPS: u32 = 2;
+
 /// Generate a flash-attention kernel for head dim `d` (must be a multiple of 32). Name = `flash_d{d}`.
-fn entry(d: usize) -> String {
+/// `warps` independent query-row warps run per CTA (occupancy packing; the launcher must match).
+fn entry(d: usize, warps: u32) -> String {
     assert!(d % 32 == 0, "D must be a multiple of 32");
     let r = d / 32; // values per lane
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -30,16 +45,17 @@ fn entry(d: usize) -> String {
         fregs += &format!(",%q{i},%acc{i}");
     }
     s += &format!("    .reg .f32 {fregs};\n");
-    s += "    .reg .b32 %S,%row,%lane,%j,%tmp;\n";
+    s += "    .reg .b32 %S,%row,%lane,%warpid,%j,%tmp;\n";
     s += "    .reg .b64 %Q,%K,%V,%O,%qbase,%kbase,%vbase,%obase,%laneoff,%off;\n";
 
     s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
     s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    // row = ctaid.x*W + warpId (W independent rows per CTA); lane = tid.x & 31.
     s += &format!(
-        "    mov.u32 %row,%ctaid.x;\n    setp.ge.u32 %p0,%row,%S;\n    @%p0 bra RET_{name};\n"
+        "    mov.u32 %tmp,%tid.x;\n    shr.u32 %warpid,%tmp,5;\n    and.b32 %lane,%tmp,31;\n    mov.u32 %row,%ctaid.x;\n    mul.lo.u32 %row,%row,{warps};\n    add.u32 %row,%row,%warpid;\n    setp.ge.u32 %p0,%row,%S;\n    @%p0 bra RET_{name};\n"
     );
-    s += "    mov.u32 %lane,%tid.x;\n    mul.wide.u32 %laneoff,%lane,4;\n";
+    s += "    mul.wide.u32 %laneoff,%lane,4;\n";
     // qbase = Q + row*D*4 ; preload q[r]
     s += &format!("    mul.lo.s32 %tmp,%row,{d};\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %qbase,%Q,%off;\n    add.s64 %qbase,%qbase,%laneoff;\n");
     for i in 0..r {
@@ -107,7 +123,7 @@ pub fn flash_ptx() -> &'static str {
     PTX.get_or_init(|| {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         for &d in &SUPPORTED_D {
-            m += &entry(d);
+            m += &entry(d, FLASH_WARPS);
         }
         m
     })

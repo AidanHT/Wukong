@@ -485,7 +485,7 @@ impl CublasChainLayer {
         let mut attn = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
         let scale = 1.0f32 / (self.d as f32).sqrt();
         let ss = self.s as u32;
-        let cfg = LaunchConfig { grid_dim: (self.s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = crate::gpu::flash_launch_cfg(self.s);
         let mut bld = self.stream.launch_builder(&self.f_flash);
         bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
         unsafe { bld.launch(cfg)? };
