@@ -1668,6 +1668,69 @@ pub fn transformer_layer_f16(
     ResidentLayerF16::new(g, w, s, d, dff)?.forward(x)
 }
 
+/// A **stack of N [`ResidentLayerF16`] layers, whole-model GPU-resident** — the M13 shape. Every layer's
+/// weights upload once at construction; [`forward`](Self::forward) uploads the input `[S,D]` **once**,
+/// runs all N layers via [`forward_device`](ResidentLayerF16::forward_device) so each layer's output is
+/// the next layer's input **without ever leaving the GPU**, and copies the final `[S,D]` back **once**.
+/// So an N-layer forward is `N×(13 launches)` with exactly one H2D + one D2H — no per-layer weight
+/// re-upload, no intermediate host round-trip. The fixed input/output transfer amortizes over the N
+/// layers, so the per-layer cost falls toward the pure resident compute as depth grows (the residency
+/// win that a per-call library chain, re-staging weights and activations through HBM, cannot capture).
+pub struct ResidentModelF16 {
+    stream: Arc<CudaStream>,
+    layers: Vec<ResidentLayerF16>,
+    s: usize,
+    d: usize,
+}
+
+impl ResidentModelF16 {
+    /// Build the N resident layers (one [`ResidentLayerF16::new`] per weight set) — all share the one
+    /// device stream, so the whole stack enqueues in order on a single timeline.
+    pub fn new(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        s: usize,
+        d: usize,
+        dff: usize,
+    ) -> Result<Self, DriverError> {
+        assert!(!weights.is_empty(), "model needs at least one layer");
+        let mut layers = Vec::with_capacity(weights.len());
+        for w in weights {
+            layers.push(ResidentLayerF16::new(g, w, s, d, dff)?);
+        }
+        let stream = g.stream.clone();
+        Ok(Self { stream, layers, s, d })
+    }
+
+    /// Number of transformer layers in the stack.
+    pub fn depth(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Run the whole stack on a **resident** `[S,D]` buffer, returning the resident final output — the
+    /// pure on-device N-layer chain, no host transfer. Each layer consumes the prior layer's device
+    /// output directly.
+    pub fn forward_device(
+        &self,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+    ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        let mut cur = self.layers[0].forward_device(x_d)?;
+        for layer in &self.layers[1..] {
+            cur = layer.forward_device(&cur)?;
+        }
+        Ok(cur)
+    }
+
+    /// One-shot host call: upload `x` once, run the whole resident stack, copy the final `[S,D]` back
+    /// once — the whole-model forward with a single H2D at the front and a single D2H at the end.
+    pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, DriverError> {
+        assert_eq!(x.len(), self.s * self.d, "x must be S×D");
+        let x_d = self.stream.memcpy_stod(x)?;
+        let out = self.forward_device(&x_d)?;
+        self.stream.memcpy_dtov(&out)
+    }
+}
+
 /// One **fp8 (E4M3) tensor-core tile** `D = A·B` via `mma.sync.m16n8k32` (Ada has no WMMA fp8): `a`
 /// is `16×32` row-major, `b_col` is `32×8` **column-major** (the `.col` operand), both arrive as f32
 /// and are rounded to E4M3 on the host; `D` is `16×8` f32 (the mixed-precision accumulate). Validates
@@ -2942,6 +3005,22 @@ mod tests {
         x1.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
     }
 
+    /// CPU f64 reference for [`ResidentModelF16`] — apply the per-layer f16 reference N times, each
+    /// layer's output feeding the next (exactly what the resident stack does on the device).
+    fn ref_model_f16(
+        x: &[f32],
+        weights: &[TransformerWeights],
+        s: usize,
+        d: usize,
+        dff: usize,
+    ) -> Vec<f32> {
+        let mut cur = x.to_vec();
+        for w in weights {
+            cur = ref_transformer_layer_f16(&cur, w, s, d, dff);
+        }
+        cur
+    }
+
     /// CPU f64 reference for [`ffn_fused`] — RMSNorm, then the two projections with **f16-rounded
     /// inputs** (matching the kernel's cast + WMMA f16 fragments) and SiLU between, then the f32
     /// residual added in full precision (the kernel seeds it via wmma.load.c, also f32).
@@ -3058,6 +3137,57 @@ mod tests {
                 bits(&again),
                 "fp16 GPU-resident transformer layer must be deterministic"
             );
+        });
+    }
+
+    /// [`ResidentModelF16`] (a stack of N fp16 layers, whole-model GPU-resident) vs its f64 reference
+    /// (the per-layer f16 reference applied N times). Each layer's RMSNorm re-normalizes the residual
+    /// stream, so the fp16 error stays bounded across depth rather than compounding — a 4-layer stack is
+    /// still a tight tolerance. Also asserts the whole model is bit-reproducible run-to-run.
+    #[test]
+    fn resident_model_f16_matches_reference_within_tol() {
+        with_gpu("resident_model_f16", |g| {
+            let mut rng = crate::diff::Rng::new(0x7A14);
+            let (s, d, dff, depth) = (128usize, 64usize, 256usize, 4usize);
+            let x = rng.vec(s * d, -1.0, 1.0);
+            // N independent layers' weights (owned), then borrowed into TransformerWeights.
+            let wdata: Vec<[Vec<f32>; 6]> = (0..depth)
+                .map(|_| {
+                    [
+                        rng.vec(d * d, -0.1, 0.1),
+                        rng.vec(d * d, -0.1, 0.1),
+                        rng.vec(d * d, -0.1, 0.1),
+                        rng.vec(d * d, -0.1, 0.1),
+                        rng.vec(dff * d, -0.1, 0.1),
+                        rng.vec(d * dff, -0.1, 0.1),
+                    ]
+                })
+                .collect();
+            let weights: Vec<TransformerWeights> = wdata
+                .iter()
+                .map(|wl| TransformerWeights {
+                    wq: wl[0].as_slice(),
+                    wk: wl[1].as_slice(),
+                    wv: wl[2].as_slice(),
+                    wo: wl[3].as_slice(),
+                    w1: wl[4].as_slice(),
+                    w2: wl[5].as_slice(),
+                })
+                .collect();
+            let model = ResidentModelF16::new(g, &weights, s, d, dff).unwrap();
+            let got = model.forward(&x).unwrap();
+            let oracle = ref_model_f16(&x, &weights, s, d, dff);
+            // Tight ABSOLUTE bound (the residual stream is O(1) and RMSNorm bounds error growth, so 4
+            // layers land at ~5e-4 max_abs); rel is a loose fallback only for near-zero elements where a
+            // tiny abs diff blows up the ratio.
+            let st = crate::diff::assert_close("resident_model_f16", &got, &oracle, 5e-3, 1e-1);
+            eprintln!(
+                "resident_model_f16 depth={depth} S={s} D={d} Dff={dff} (whole-model GPU-resident, {}×13 launches, 1 H2D + 1 D2H): max_abs={:.2e} max_rel={:.2e}",
+                depth, st.max_abs, st.max_rel
+            );
+            let again = model.forward(&x).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&again), "resident model must be deterministic run-to-run");
         });
     }
 
@@ -3190,12 +3320,16 @@ mod tests {
             let wb = rng.vec(1024 * 1024, -1.0, 1.0);
             macro_rules! pin_clock {
                 () => {{
-                    for _ in 0..25 {
+                    for _ in 0..40 {
                         gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
                     }
                 }};
             }
-            pin_clock!();
+            // Heavy initial boost from cold (the clock ramps over hundreds of ms of sustained load); the
+            // per-measurement pins then bridge the short host gaps so all three stay in one clock regime.
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
             const ROUNDS: usize = 5;
 
             for s in [256usize, 512, 1024] {
@@ -3270,6 +3404,99 @@ mod tests {
                     t_res * 1e3,
                     s as f64 / t_res,
                     t_f32 / t_res,
+                );
+            }
+        });
+    }
+
+    /// **Whole-model GPU residency scales linearly and amortizes transfer** — [`ResidentModelF16`] across
+    /// depths 1/2/4/8. Each depth reports the resident forward (the whole N-layer chain on device, one
+    /// sync) as total ms, ms/layer, and tok/s, plus the full-call total (one H2D + one D2H for the entire
+    /// stack, weights already resident). The point: resident **ms/layer is flat** across depth (no
+    /// per-layer host overhead — pure on-device chaining), and the full-call's fixed activation transfer
+    /// amortizes, so full→resident converges as depth grows. Clock re-pinned before each measurement.
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn resident_model_throughput() {
+        with_gpu("resident_model_throughput", |g| {
+            let mut rng = crate::diff::Rng::new(0x7A15);
+            let (s, d, dff) = (512usize, 64usize, 256usize);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin_clock {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            // Heavy initial boost from cold: the laptop GPU clock ramps over hundreds of ms of sustained
+            // load, so a handful of GEMMs won't do it (a too-light warmup left depth=1 reading ~8× slow).
+            // Once boosted, the measurements themselves sustain it and the per-measurement pins bridge the
+            // short host gaps.
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            for depth in [1usize, 2, 4, 8] {
+                let wdata: Vec<[Vec<f32>; 6]> = (0..depth)
+                    .map(|_| {
+                        [
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(d * d, -0.1, 0.1),
+                            rng.vec(dff * d, -0.1, 0.1),
+                            rng.vec(d * dff, -0.1, 0.1),
+                        ]
+                    })
+                    .collect();
+                let weights: Vec<TransformerWeights> = wdata
+                    .iter()
+                    .map(|wl| TransformerWeights {
+                        wq: wl[0].as_slice(),
+                        wk: wl[1].as_slice(),
+                        wv: wl[2].as_slice(),
+                        wo: wl[3].as_slice(),
+                        w1: wl[4].as_slice(),
+                        w2: wl[5].as_slice(),
+                    })
+                    .collect();
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let model = ResidentModelF16::new(g, &weights, s, d, dff).unwrap();
+                model.forward(&x).unwrap(); // warm (JIT + caches)
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+                model.forward_device(&x_d).unwrap();
+
+                let iters = 40;
+                pin_clock!();
+                let t_full = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        model.forward(&x).unwrap();
+                    }
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_res = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = model.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let dl = depth as f64;
+                eprintln!(
+                    "resident_model depth={depth} S={s} D={d} Dff={dff}: \
+                     full {:.3} ms ({:.3} ms/layer) | resident {:.3} ms ({:.3} ms/layer, {:.0} tok/s)",
+                    t_full * 1e3,
+                    t_full * 1e3 / dl,
+                    t_res * 1e3,
+                    t_res * 1e3 / dl,
+                    s as f64 / t_res,
                 );
             }
         });
