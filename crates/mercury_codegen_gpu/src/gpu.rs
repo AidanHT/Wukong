@@ -727,6 +727,52 @@ pub fn gemm_nt_bf16(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// `C = act(A·Bᵀ)` in **bf16 inputs / f32 accumulate**, fused in one cp.async-pipelined WMMA kernel —
+/// the bf16 twin of [`gemm_nt_f16_fused`], for the precision transformers train in. `entry` is a
+/// `wmma_nt_bf16_sm_db_*` name. Requires `M%SM_BM==0`, `N%SM_BN==0`, `K%16==0`; tolerance-gated.
+fn gemm_nt_bf16_fused(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::bf16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+    let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), entry)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = relu(A·Bᵀ)` fused, bf16 inputs (see [`gemm_nt_bf16_fused`]).
+pub fn gemm_nt_bf16_sm_db_relu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_relu")
+}
+/// `C = silu(A·Bᵀ)` fused, bf16 inputs — the SwiGLU FFN up-projection (see [`gemm_nt_bf16_fused`]).
+pub fn gemm_nt_bf16_sm_db_silu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_silu")
+}
+/// `C = gelu(A·Bᵀ)` fused, bf16 inputs (see [`gemm_nt_bf16_fused`]).
+pub fn gemm_nt_bf16_sm_db_gelu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_gelu")
+}
+
 /// Measure the **fp16 tensor-core roofline** in FLOP/s: `warps` warps each issue `iters·ROOFLINE_ACC`
 /// `wmma.mma`s on register-resident fragments (one global load, no hot-loop memory traffic), so the
 /// achieved rate is the practical TC ceiling on this GPU. Best-of-`reps` to ride out clock dips. This
@@ -1629,6 +1675,58 @@ mod tests {
                     );
                     eprintln!(
                         "wmma_f16_sm_db_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
+                }
+            }
+        });
+    }
+
+    /// The **bf16** fused epilogues (`wmma_nt_bf16_sm_db_{relu,silu,gelu}`) — the same precision-generic
+    /// pipelined+fused kernel exercised in the dtype transformers *train* in. bf16's wider exponent /
+    /// fewer mantissa bits don't change the epilogue (it acts on the f32 accumulator); each fused output
+    /// must equal the activation of the bf16-rounded reference GEMM. This also gates the bf16 `_sm_db`
+    /// path itself (new — bf16 previously had only the single-tile and `_mt` variants).
+    #[test]
+    fn wmma_bf16_sm_db_fused_match_reference_within_tol() {
+        use half::bf16;
+        with_gpu("wmma_bf16_sm_db_fused", |g| {
+            let mut rng = crate::diff::Rng::new(0xBF16);
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let base = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
+                for (name, got, refv) in [
+                    (
+                        "relu",
+                        gemm_nt_bf16_sm_db_relu(g, &a, &b, m, k, n).unwrap(),
+                        base.iter().map(|&x| x.max(0.0)).collect::<Vec<_>>(),
+                    ),
+                    (
+                        "silu",
+                        gemm_nt_bf16_sm_db_silu(g, &a, &b, m, k, n).unwrap(),
+                        base.iter().map(|&x| silu(x)).collect::<Vec<_>>(),
+                    ),
+                    (
+                        "gelu",
+                        gemm_nt_bf16_sm_db_gelu(g, &a, &b, m, k, n).unwrap(),
+                        base.iter().map(|&x| gelu(x)).collect::<Vec<_>>(),
+                    ),
+                ] {
+                    let s = crate::diff::assert_close(
+                        &format!("wmma_bf16_sm_db_{name} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        5e-2,
+                        2e-2,
+                    );
+                    eprintln!(
+                        "wmma_bf16_sm_db_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
                         s.max_abs, s.max_rel
                     );
                 }

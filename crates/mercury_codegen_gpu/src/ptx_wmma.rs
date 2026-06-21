@@ -654,13 +654,29 @@ pub fn wmma_f16_ptx() -> &'static str {
     .as_str()
 }
 
-/// bf16 tensor-core GEMM module: `wmma_nt_bf16` + `wmma_nt_bf16_mt`.
+/// bf16 tensor-core GEMM module: `wmma_nt_bf16` (single tile), `wmma_nt_bf16_mt` (fragment-reuse), the
+/// `cp.async` double-buffered `wmma_nt_bf16_sm_db`, and the fused-epilogue `wmma_nt_bf16_sm_db_{relu,
+/// silu,gelu}`. The pipelined + fused generators are precision-generic (`entry_smem_db` keys the
+/// fragment width / mma type off `ty`), so bf16 — the dominant *training* precision — gets the same
+/// beat-the-cuBLAS-chain fusion as fp16.
 pub fn wmma_bf16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         m += &entry("wmma_nt_bf16", "bf16", 1, 1);
         m += &entry("wmma_nt_bf16_mt", "bf16", TM_TILES, TN_TILES);
+        m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None);
+        for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
+            m += &entry_smem_db(
+                &format!("wmma_nt_bf16_sm_db_{suffix}"),
+                "bf16",
+                SM_BM,
+                SM_BN,
+                SM_WARPS_M,
+                SM_WARPS_N,
+                act,
+            );
+        }
         m
     })
     .as_str()
