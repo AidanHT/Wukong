@@ -870,6 +870,59 @@ pub fn gemm_nt_bf16_sm_db_gelu(g: &mut Gpu, a: &[f32], b: &[f32], m: usize, k: u
     gemm_nt_bf16_fused(g, a, b, m, k, n, "wmma_nt_bf16_sm_db_gelu")
 }
 
+/// `C = act(A·Bᵀ + bias)` in **bf16 inputs / f32 accumulate**, fused — the bf16 twin of
+/// [`gemm_nt_f16_fused_bias`] (the bias epilogue acts on the f32 accumulator, so it is identical across
+/// dtypes; only the input quantization differs). `entry` is a `wmma_nt_bf16_sm_db_bias*` name.
+fn gemm_nt_bf16_fused_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::bf16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+    let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), entry)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ + bias` fused, bf16 inputs (affine Linear) — see [`gemm_nt_bf16_fused_bias`].
+pub fn gemm_nt_bf16_sm_db_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias")
+}
+/// `C = relu(A·Bᵀ + bias)` fused, bf16 inputs (see [`gemm_nt_bf16_fused_bias`]).
+pub fn gemm_nt_bf16_sm_db_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias_relu")
+}
+/// `C = silu(A·Bᵀ + bias)` fused, bf16 inputs (see [`gemm_nt_bf16_fused_bias`]).
+pub fn gemm_nt_bf16_sm_db_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias_silu")
+}
+/// `C = gelu(A·Bᵀ + bias)` fused, bf16 inputs (see [`gemm_nt_bf16_fused_bias`]).
+pub fn gemm_nt_bf16_sm_db_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_bf16_sm_db_bias_gelu")
+}
+
 /// Measure the **fp16 tensor-core roofline** in FLOP/s: `warps` warps each issue `iters·ROOFLINE_ACC`
 /// `wmma.mma`s on register-resident fragments (one global load, no hot-loop memory traffic), so the
 /// achieved rate is the practical TC ceiling on this GPU. Best-of-`reps` to ride out clock dips. This
@@ -1884,6 +1937,69 @@ mod tests {
                         "gelu",
                         gemm_nt_bf16_sm_db_gelu(g, &a, &b, m, k, n).unwrap(),
                         base.iter().map(|&x| gelu(x)).collect::<Vec<_>>(),
+                    ),
+                ] {
+                    let s = crate::diff::assert_close(
+                        &format!("wmma_bf16_sm_db_{name} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        5e-2,
+                        2e-2,
+                    );
+                    eprintln!(
+                        "wmma_bf16_sm_db_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
+                }
+            }
+        });
+    }
+
+    /// The **bf16** fused bias kernels `C = act(A·Bᵀ + bias)` — the bf16 (training-dtype) twin of
+    /// `wmma_sm_db_bias_match_reference_within_tol`. The bias epilogue acts on the f32 accumulator
+    /// (dtype-independent), so this also confirms the bf16 `_sm_db_bias*` entries are wired and the
+    /// per-column bias maps correctly under the bf16 input quantization.
+    #[test]
+    fn wmma_bf16_sm_db_bias_match_reference_within_tol() {
+        use half::bf16;
+        with_gpu("wmma_bf16_sm_db_bias", |g| {
+            let mut rng = crate::diff::Rng::new(0xBB1A);
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                let base = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
+                let with_bias = |act: &dyn Fn(f32) -> f32| -> Vec<f32> {
+                    let mut r = base.clone();
+                    for i in 0..m {
+                        for j in 0..n {
+                            r[i * n + j] = act(r[i * n + j] + bias[j]);
+                        }
+                    }
+                    r
+                };
+                let id = |x: f32| x;
+                for (name, got, refv) in [
+                    ("bias", gemm_nt_bf16_sm_db_bias(g, &a, &b, &bias, m, k, n).unwrap(), with_bias(&id)),
+                    (
+                        "bias_relu",
+                        gemm_nt_bf16_sm_db_bias_relu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&|x| x.max(0.0)),
+                    ),
+                    (
+                        "bias_silu",
+                        gemm_nt_bf16_sm_db_bias_silu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&silu),
+                    ),
+                    (
+                        "bias_gelu",
+                        gemm_nt_bf16_sm_db_bias_gelu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&gelu),
                     ),
                 ] {
                     let s = crate::diff::assert_close(
