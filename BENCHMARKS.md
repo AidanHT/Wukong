@@ -638,6 +638,21 @@ The cuBLAS path is, if anything, *generous* (it gets Mercury's fast fused flash 
 structural loss is the GEMM-epilogue fusion). Run: `… --ignored --nocapture cublas_chain_vs_mercury` and
 `… resident_model_vs_cublas` (needs the redist DLLs on PATH; skips otherwise).
 
+**PyTorch (Tier C) — the harder bar, not yet cleared (honest).** The same layer in PyTorch
+(`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls + fused **SDPA flash
+attention**, f32 norm/softmax, verified against an f64 reference of the identical function on the same
+RTX 4050) runs at **~0.97 ms/layer at S=256, ~1.00 at S=512, ~0.91 at S=1024** — essentially *flat* in
+S (launch/overhead-bound at these small sizes). Mercury's per-layer time *grows* with S (1.00 → 1.98 →
+4.10 ms), so PyTorch eager is **~par at S=256, ~2× faster at S=512, ~4.5× at S=1024**. This does **not**
+contradict the cuBLAS result — it explains it: the cuBLAS call-chain runs Mercury's *own* attention
+(it cancels, exposing Mercury's GEMM + fusion edge), whereas PyTorch brings a far better **tiled flash
+SDPA** against Mercury's warp-per-query-row flash kernel (whose latency grows with sequence length),
+plus a caching allocator that makes per-call buffers free where Mercury re-stages them through HBM. So
+M13's "beat PyTorch" is **not yet met**: the GEMM + epilogue fusion is competitive, but the **attention
+kernel and the small-op / allocation efficiency are the gap** — the honest next levers. (torch.compile /
+Inductor, the fusing bar, needs Triton, which has no working install on this Windows box, so only eager
+is measured.) Measuring against the strongest peer is exactly what surfaces the real bottleneck.
+
 **Determinism, every kernel (M12).** Not just the layer: `gpu_kernels_bit_reproducible` asserts every
 reduction-bearing family — `gemm_nt_f16` and its `_sm`/`_sm_db` variants, the three fused row norms,
 flash-attention, conv2d, and the sum/dot reductions — returns **bit-identical** output across runs on
