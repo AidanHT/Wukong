@@ -598,6 +598,15 @@ is conservative): **1.33 ms/layer at S=256, 3.13 at S=512, 6.07 at S=1024** (~16
 The layer is **deterministic** — bit-identical run-to-run, since every kernel uses a fixed grid and
 warp-butterfly reductions with no atomics.
 
+**Determinism, every kernel (M12).** Not just the layer: `gpu_kernels_bit_reproducible` asserts every
+reduction-bearing family — `gemm_nt_f16` and its `_sm`/`_sm_db` variants, the three fused row norms,
+flash-attention, conv2d, and the sum/dot reductions — returns **bit-identical** output across runs on
+identical inputs (fixed grids, atomic-free, fixed-order reductions). cuBLAS offers no such contract:
+`reproducibility_vs_cublas` shows Mercury's fp16 GEMM bit-identical across three runs *by construction*,
+while cuBLAS's reproducibility is incidental — NVIDIA documents none across library versions, GPU
+architecture, or its heuristic algorithm/split-K selection. Reproducible-by-default matters for
+regression gates, debugging, and regulated training.
+
 **Other op categories** (all emit+execute, tolerance-gated on the 4050): elementwise (saxpy/vadd),
 deterministic reductions (sum/dot/max — bit-exact for max, tolerance for the f32 sums), activations
 (relu/exp/sigmoid/tanh/silu/gelu via SFU), fused row norms (softmax/LayerNorm/RMSNorm, one warp per
