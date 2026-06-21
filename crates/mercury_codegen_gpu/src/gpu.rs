@@ -653,6 +653,103 @@ pub fn gemm_nt_f16_sm_db_gelu(
     gemm_nt_f16_fused(g, a, b, m, k, n, "wmma_nt_f16_sm_db_gelu")
 }
 
+/// `C = act(A·Bᵀ + bias)` (fp16-in, f32-out; `bias[N]` is f32) in **one kernel** via a
+/// `wmma_nt_f16_sm_db_bias*` entry — the canonical `nn.Linear`/FFN epilogue. A per-column bias needs the
+/// WMMA fragment's column index, which is opaque, so the kernel stores each tile to SMEM and re-reads it
+/// by explicit (row,col) to add `bias` (then the activation) before writing C. cuBLAS needs a *second*
+/// kernel to apply bias+activation (round-tripping C through HBM); this folds both into the GEMM store.
+/// Requires `M%SM_BM==0`, `N%SM_BN==0`, `K%16==0`; tolerance-gated against `act(A·Bᵀ + bias)`.
+fn gemm_nt_f16_fused_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), entry)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&bias_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ + bias` fused (affine Linear, no activation) — see [`gemm_nt_f16_fused_bias`].
+pub fn gemm_nt_f16_sm_db_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_f16_sm_db_bias")
+}
+
+/// `C = relu(A·Bᵀ + bias)` fused — the canonical Linear+ReLU (see [`gemm_nt_f16_fused_bias`]).
+pub fn gemm_nt_f16_sm_db_bias_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_f16_sm_db_bias_relu")
+}
+
+/// `C = silu(A·Bᵀ + bias)` fused — SiLU/SwiGLU up-projection with bias (see [`gemm_nt_f16_fused_bias`]).
+pub fn gemm_nt_f16_sm_db_bias_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_f16_sm_db_bias_silu")
+}
+
+/// `C = gelu(A·Bᵀ + bias)` fused — the canonical transformer FFN first layer (see [`gemm_nt_f16_fused_bias`]).
+pub fn gemm_nt_f16_sm_db_bias_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_fused_bias(g, a, b, bias, m, k, n, "wmma_nt_f16_sm_db_bias_gelu")
+}
+
 /// `C = A·Bᵀ` (fp16-in, f32-out) via the **128×128 CTA-tile + `cp.async` double-buffered** kernel
 /// `wmma_nt_f16_sm128_db` — the cuBLAS recipe: a big tile cuts redundant inter-CTA global traffic
 /// *and* software pipelining hides what's left, the combination aimed at the large-GEMM regime where
@@ -1664,6 +1761,77 @@ mod tests {
                         "gelu",
                         gemm_nt_f16_sm_db_gelu(g, &a, &b, m, k, n).unwrap(),
                         base.iter().map(|&x| gelu(x)).collect::<Vec<_>>(),
+                    ),
+                ] {
+                    let s = crate::diff::assert_close(
+                        &format!("wmma_f16_sm_db_{name} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        5e-2,
+                        1e-2,
+                    );
+                    eprintln!(
+                        "wmma_f16_sm_db_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
+                }
+            }
+        });
+    }
+
+    /// The fused **bias (+ activation)** kernels `C = act(A·Bᵀ + bias)` — the canonical `nn.Linear`/FFN
+    /// epilogue. Unlike the activation-only fused path (which acts on accumulator *registers*), a
+    /// per-column bias needs the WMMA fragment's column index, so these route each tile through SMEM and
+    /// re-read it by explicit (row,col). Each output must equal the activation of (f16-rounded reference
+    /// GEMM + bias[col]); a wrong (row,col)→bias map, a dropped SMEM barrier, or a clobbered scratch slot
+    /// scrambles outputs by O(|bias|) ≫ tol and fails wide. Bias is added *before* the activation (the
+    /// `act(x·Wᵀ+bias)` order). The identity case (`bias`) is affine Linear; the rest are Linear+act.
+    #[test]
+    fn wmma_sm_db_bias_match_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_sm_db_bias", |g| {
+            let mut rng = crate::diff::Rng::new(0xB1A5);
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 256, 128), (256, 128, 512)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                // Reference: (f16-rounded GEMM) + bias[col], then the activation — per the kernel order.
+                let base = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let with_bias = |act: &dyn Fn(f32) -> f32| -> Vec<f32> {
+                    let mut r = base.clone();
+                    for i in 0..m {
+                        for j in 0..n {
+                            r[i * n + j] = act(r[i * n + j] + bias[j]);
+                        }
+                    }
+                    r
+                };
+                let id = |x: f32| x;
+                for (name, got, refv) in [
+                    (
+                        "bias",
+                        gemm_nt_f16_sm_db_bias(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&id),
+                    ),
+                    (
+                        "bias_relu",
+                        gemm_nt_f16_sm_db_bias_relu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&|x| x.max(0.0)),
+                    ),
+                    (
+                        "bias_silu",
+                        gemm_nt_f16_sm_db_bias_silu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&silu),
+                    ),
+                    (
+                        "bias_gelu",
+                        gemm_nt_f16_sm_db_bias_gelu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&gelu),
                     ),
                 ] {
                     let s = crate::diff::assert_close(
