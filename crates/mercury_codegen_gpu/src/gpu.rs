@@ -3042,6 +3042,83 @@ mod tests {
         });
     }
 
+    /// **Standalone `mma.sync.m16n8k16` fp16 fragment-layout probe** — the de-risking step for a
+    /// register-resident flash (where O lives in registers, not SMEM). Unlike WMMA (opaque fragments),
+    /// `mma.sync` requires the A/B/C fragments hand-placed in the *exact* PTX-ISA per-lane layout, and a
+    /// wrong layout JITs fine while mis-addressing → scattered O(1) error. This computes one
+    /// `D[16×8] = A[16×16]·B[16×8]` with small integer inputs (f16-exact) and checks it bit-against a CPU
+    /// matmul, so the layout is *proven* before any kernel is built on it. Layout (groupID=lane»2,
+    /// tg=lane&3, tg2=tg·2): A.row a0/a1/a2/a3 = rows {grp,grp+8}×cols {tg2..,tg2+8..}; B.col b0/b1 = col
+    /// grp, K-rows {tg2,tg2+8}; D.f32 d0..d3 = rows {grp,grp+8}×cols {tg2,tg2+1}.
+    #[test]
+    fn mma_m16n8k16_layout_verifies() {
+        use half::f16;
+        const MMA_TEST_PTX: &str = "\
+.version 7.8\n.target sm_89\n.address_size 64\n\
+.visible .entry mma_test(.param .u64 pA, .param .u64 pB, .param .u64 pC)\n{\n\
+    .reg .b32 %lane,%grp,%tg,%tg2,%r,%c;\n\
+    .reg .b32 %a0,%a1,%a2,%a3,%b0,%b1;\n\
+    .reg .f32 %d0,%d1,%d2,%d3;\n\
+    .reg .b64 %A,%B,%C,%p,%off;\n\
+    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n\
+    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n\
+    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n\
+    mul.lo.s32 %r,%grp,16;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,2;\n    add.s64 %p,%A,%off;\n    ld.global.b32 %a0,[%p];\n\
+    add.s32 %r,%grp,8;\n    mul.lo.s32 %r,%r,16;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,2;\n    add.s64 %p,%A,%off;\n    ld.global.b32 %a1,[%p];\n\
+    mul.lo.s32 %r,%grp,16;\n    add.s32 %r,%r,%tg2;\n    add.s32 %r,%r,8;\n    mul.wide.u32 %off,%r,2;\n    add.s64 %p,%A,%off;\n    ld.global.b32 %a2,[%p];\n\
+    add.s32 %r,%grp,8;\n    mul.lo.s32 %r,%r,16;\n    add.s32 %r,%r,%tg2;\n    add.s32 %r,%r,8;\n    mul.wide.u32 %off,%r,2;\n    add.s64 %p,%A,%off;\n    ld.global.b32 %a3,[%p];\n\
+    mul.lo.s32 %c,%grp,16;\n    add.s32 %c,%c,%tg2;\n    mul.wide.u32 %off,%c,2;\n    add.s64 %p,%B,%off;\n    ld.global.b32 %b0,[%p];\n\
+    mul.lo.s32 %c,%grp,16;\n    add.s32 %c,%c,%tg2;\n    add.s32 %c,%c,8;\n    mul.wide.u32 %off,%c,2;\n    add.s64 %p,%B,%off;\n    ld.global.b32 %b1,[%p];\n\
+    mov.f32 %d0,0f00000000;\n    mov.f32 %d1,0f00000000;\n    mov.f32 %d2,0f00000000;\n    mov.f32 %d3,0f00000000;\n\
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3},{%a0,%a1,%a2,%a3},{%b0,%b1},{%d0,%d1,%d2,%d3};\n\
+    mul.lo.s32 %r,%grp,8;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,4;\n    add.s64 %p,%C,%off;\n    st.global.f32 [%p],%d0;\n    st.global.f32 [%p+4],%d1;\n\
+    add.s32 %r,%grp,8;\n    mul.lo.s32 %r,%r,8;\n    add.s32 %r,%r,%tg2;\n    mul.wide.u32 %off,%r,4;\n    add.s64 %p,%C,%off;\n    st.global.f32 [%p],%d2;\n    st.global.f32 [%p+4],%d3;\n\
+    ret;\n}\n";
+        with_gpu("mma_test", |g| {
+            // A 16×16 row-major; B 16×8 stored col-major (b_mem[n*16+k] = B[k][n]); small ints (f16-exact).
+            let mut a = vec![0f32; 16 * 16];
+            for i in 0..16 {
+                for k in 0..16 {
+                    a[i * 16 + k] = ((i + k) % 5) as f32;
+                }
+            }
+            let mut b = vec![0f32; 16 * 8];
+            for k in 0..16 {
+                for n in 0..8 {
+                    b[n * 16 + k] = ((2 * k + n) % 4) as f32;
+                }
+            }
+            let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+            let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+            let a_d = g.stream.memcpy_stod(&a16).unwrap();
+            let b_d = g.stream.memcpy_stod(&b16).unwrap();
+            let mut c_d = g.stream.alloc_zeros::<f32>(16 * 8).unwrap();
+            let f = g.function("mma_test", MMA_TEST_PTX, "mma_test").unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&a_d).arg(&b_d).arg(&mut c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+            let got = g.stream.memcpy_dtov(&c_d).unwrap();
+            // reference C[i][n] = Σ_k A[i][k]·B[k][n]
+            let mut refc = vec![0f32; 16 * 8];
+            for i in 0..16 {
+                for n in 0..8 {
+                    let mut acc = 0f32;
+                    for k in 0..16 {
+                        acc += a[i * 16 + k] * b[n * 16 + k];
+                    }
+                    refc[i * 8 + n] = acc;
+                }
+            }
+            let st = crate::diff::assert_close("mma_m16n8k16", &got, &refc, 1e-3, 1e-3);
+            eprintln!("mma.sync.m16n8k16 fp16 layout VERIFIED: max_abs={:.2e}", st.max_abs);
+        });
+    }
+
     /// Gate for the **tensor-core (WMMA) flash** kernel `flash_d64_w` (experiment). Q/K/V are f16 (the
     /// tensor-core dtype), so the reference is `ref_attn` over the *same* f16-rounded-back-to-f32 inputs
     /// — isolating the kernel's compute error (f32 accumulation order + the f16 P round-trip), not the
