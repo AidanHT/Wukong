@@ -618,40 +618,49 @@ is built scrupulously fair — cuBLAS runs f16-in / **f32-out** (`cublasGemmEx`,
 `COMPUTE_32F`) so it pays the **same** casts as Mercury's WMMA (neither pays a post-GEMM cast), and it
 reuses Mercury's *identical* norm/flash/cast/SiLU/add kernels, so the only difference measured is the
 GEMM + the epilogue fusion. Both stacks are tolerance-gated against the same f64 oracle before any speed
-counts. Measured same-machine, same-buffers, same-run, clock-pinned (`d=64`, `dff=256`, resident):
+counts. Both also pipeline their kernel chain on one stream: every intermediate is an `alloc_zeros`
+(async device memset) rather than an `memcpy_stod(vec![0;n])` (a *synchronous* H2D that used to stall the
+stream ~13× per layer and dominated the cost — removing it cut the layer ~3×). Measured same-machine,
+same-buffers, same-run, clock-pinned (`d=64`, `dff=256`, resident):
 
 | case | Mercury fused | cuBLAS call-chain | **Mercury faster** |
 |---|---|---|---|
-| single layer, S=256 | 1.00 ms | 1.23 ms | **1.23×** |
-| single layer, S=512 | 1.98 ms | 2.99 ms | **1.51×** |
-| single layer, S=1024 | 4.10 ms | 6.17 ms | **1.50×** |
-| stack, depth 4 (S=512) | 6.94 ms (1.73 ms/layer) | 11.56 ms (2.89 ms/layer) | **1.67×** |
-| stack, depth 8 (S=512) | 12.51 ms (1.56 ms/layer) | 19.24 ms (2.40 ms/layer) | **1.54×** |
+| stack, depth 2 (S=512) | 0.51 ms/layer | 0.70 ms/layer | **1.37×** |
+| stack, depth 4 (S=512) | 0.53 ms/layer | 0.74 ms/layer | **1.40×** |
+| stack, depth 8 (S=512) | 0.56 ms/layer | 0.68 ms/layer | **1.21×** |
+| single layer, S=256 | 0.31 ms | 0.62 ms | **2.0×** |
+| single layer, S=1024 | 1.34 ms | 1.48 ms | **1.09×** |
 
-The gap **widens with depth**: Mercury holds a flat ~1.5–1.8 ms/layer while the cuBLAS chain's per-layer
-cost grows (1.77 → 2.89 ms/layer) — the per-call dispatch + the separate add/SiLU launches are paid at
-every layer, and the resident model amortizes them away. Decomposed at the single-layer level: Mercury's
-WMMA GEMM alone (*unfused*, identical glue) is **1.10–1.14×** over cuBLAS — *regime-specific*: cuBLAS is
-latency-bound by per-call dispatch at these small-K (64/256) projection shapes, whereas at large K
-(≥2048³, the GEMM table above) cuBLAS still wins — and the epilogue fusion adds another **1.11–1.35×**.
-The cuBLAS path is, if anything, *generous* (it gets Mercury's fast fused flash for free; its only
-structural loss is the GEMM-epilogue fusion). Run: `… --ignored --nocapture cublas_chain_vs_mercury` and
-`… resident_model_vs_cublas` (needs the redist DLLs on PATH; skips otherwise).
+The **stack is the clean signal** (longer runs, less clock jitter than the sub-ms single layer): Mercury
+holds a flat ~0.5 ms/layer while the cuBLAS chain pays ~0.7 ms/layer — the per-call dispatch + the
+separate add/SiLU launches, paid at every layer, that the resident fused model folds away (the gap is
+widest mid-depth; single-layer S=512 is ~par within noise). The win is **GEMM + epilogue fusion**:
+Mercury's WMMA GEMM alone (*unfused*, identical glue) ≈ cuBLAS at these small-K (64/256) shapes — *regime
+specific*, cuBLAS still wins the isolated large-K GEMM (≥2048³, the GEMM table above) — and the fused
+epilogues add the rest. The cuBLAS path is, if anything, *generous* (it runs Mercury's own fused flash
+for free). Run: `… --ignored --nocapture cublas_chain_vs_mercury` / `resident_model_vs_cublas`.
 
-**PyTorch (Tier C) — the harder bar, not yet cleared (honest).** The same layer in PyTorch
+**PyTorch (Tier C) — cleared at the realistic sizes (honest).** The same layer in PyTorch
 (`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls + fused **SDPA flash
 attention**, f32 norm/softmax, verified against an f64 reference of the identical function on the same
-RTX 4050) runs at **~0.97 ms/layer at S=256, ~1.00 at S=512, ~0.91 at S=1024** — essentially *flat* in
-S (launch/overhead-bound at these small sizes). Mercury's per-layer time *grows* with S (1.00 → 1.98 →
-4.10 ms), so PyTorch eager is **~par at S=256, ~2× faster at S=512, ~4.5× at S=1024**. This does **not**
-contradict the cuBLAS result — it explains it: the cuBLAS call-chain runs Mercury's *own* attention
-(it cancels, exposing Mercury's GEMM + fusion edge), whereas PyTorch brings a far better **tiled flash
-SDPA** against Mercury's warp-per-query-row flash kernel (whose latency grows with sequence length),
-plus a caching allocator that makes per-call buffers free where Mercury re-stages them through HBM. So
-M13's "beat PyTorch" is **not yet met**: the GEMM + epilogue fusion is competitive, but the **attention
-kernel and the small-op / allocation efficiency are the gap** — the honest next levers. (torch.compile /
-Inductor, the fusing bar, needs Triton, which has no working install on this Windows box, so only eager
-is measured.) Measuring against the strongest peer is exactly what surfaces the real bottleneck.
+RTX 4050) runs **~flat at ~1.0–1.3 ms/layer** (launch/dispatch-bound at these small sizes). Mercury, after
+the pipelining fix, is **0.31 ms at S=256, 0.72 at S=512, ~1.3 at S=1024** and **~0.5 ms/layer across a
+depth-8 stack**, so:
+
+| case | Mercury | PyTorch eager | **Mercury faster** |
+|---|---|---|---|
+| single layer, S=256 | 0.31 ms | 1.05 ms | **3.4×** |
+| single layer, S=512 | 0.72 ms | 1.01 ms | **1.4×** |
+| single layer, S=1024 | 1.34 ms | ~0.9–1.3 ms | **~par** |
+| stack (S=512, depth 1–8) | ~0.5–0.6 ms/layer | ~1.0–1.1 ms/layer | **~1.8–2.0×** |
+
+So M13's "beat PyTorch" is **met for eager** — clearly at S≤512 and across the multi-layer stack (the
+realistic serving shape), where Mercury's fused resident chain (no per-op Python dispatch, fused
+epilogues, one stream) is ~2× PyTorch's. The **one place it is only ~par is the single layer at S=1024**,
+where Mercury's `O(S²)` warp-per-query-row flash catches up — tiling that kernel is the lever to extend the
+win to longer sequences. Honest caveats: this is **eager** PyTorch (torch.compile / Inductor, the fusing
+bar, needs Triton, which has no working install on this Windows box); and it is a cross-process comparison
+(both warmed, best-of-N, same GPU), like the C/Rust CPU baselines, not a same-buffer in-process gate.
 
 **Determinism, every kernel (M12).** Not just the layer: `gpu_kernels_bit_reproducible` asserts every
 reduction-bearing family — `gemm_nt_f16` and its `_sm`/`_sm_db` variants, the three fused row norms,
