@@ -643,22 +643,25 @@ for free). Run: `… --ignored --nocapture cublas_chain_vs_mercury` / `resident_
 **PyTorch (Tier C) — cleared at the realistic sizes (honest).** The same layer in PyTorch
 (`bench/pytorch/transformer_layer_peer.py`, fp16 eager — tensor-core matmuls + fused **SDPA flash
 attention**, f32 norm/softmax, verified against an f64 reference of the identical function on the same
-RTX 4050) runs **~flat at ~1.0–1.3 ms/layer** (launch/dispatch-bound at these small sizes). Mercury, after
-the pipelining fix, is **0.31 ms at S=256, 0.72 at S=512, ~1.3 at S=1024** and **~0.5 ms/layer across a
-depth-8 stack**, so:
+RTX 4050) runs **~flat at ~0.9–1.2 ms/layer** (launch/dispatch-bound at these small sizes). Mercury, after
+the pipelining + flash-occupancy fixes, is **~0.35 ms at S=256, ~0.55 at S=512, ~1.07 at S=1024** and
+**~0.4–0.5 ms/layer across a depth-8 stack**, so:
 
 | case | Mercury | PyTorch eager | **Mercury faster** |
 |---|---|---|---|
-| single layer, S=256 | 0.31 ms | 1.05 ms | **3.4×** |
-| single layer, S=512 | 0.72 ms | 1.01 ms | **1.4×** |
-| single layer, S=1024 | 1.34 ms | ~0.9–1.3 ms | **~par** |
-| stack (S=512, depth 1–8) | ~0.5–0.6 ms/layer | ~1.0–1.1 ms/layer | **~1.8–2.0×** |
+| single layer, S=256 | ~0.35 ms | ~0.94 ms | **~2.7×** |
+| single layer, S=512 | ~0.55 ms | ~0.92 ms | **~1.7×** |
+| single layer, S=1024 | ~1.07 ms | ~0.97 ms | **~par** |
+| stack (S=512, depth 1–8) | ~0.4–0.5 ms/layer | ~0.9–1.2 ms/layer | **~1.9–2.8×** |
 
 So M13's "beat PyTorch" is **met for eager** — clearly at S≤512 and across the multi-layer stack (the
 realistic serving shape), where Mercury's fused resident chain (no per-op Python dispatch, fused
 epilogues, one stream) is ~2× PyTorch's. The **one place it is only ~par is the single layer at S=1024**,
-where Mercury's `O(S²)` warp-per-query-row flash catches up — tiling that kernel is the lever to extend the
-win to longer sequences. Honest caveats: this is **eager** PyTorch (torch.compile / Inductor, the fusing
+where Mercury's `O(S²)` flash catches up. That kernel was already given an occupancy fix — it packs
+[`FLASH_WARPS`]=2 independent query-row warps per CTA to break Ada's blocks-per-SM cap (1.2–1.8× the
+kernel, which narrowed S=1024 from 1.34→~1.07 ms) — so the *remaining* long-sequence lever is **key-block
+tiling** (cut the O(S²) work / HBM-reuse K/V in SMEM, the real flash-attention recipe), not occupancy.
+Honest caveats: this is **eager** PyTorch (torch.compile / Inductor, the fusing
 bar, needs Triton, which has no working install on this Windows box); and it is a cross-process comparison
 (both warmed, best-of-N, same GPU), like the C/Rust CPU baselines, not a same-buffer in-process gate.
 
