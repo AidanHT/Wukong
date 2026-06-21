@@ -1442,6 +1442,160 @@ pub fn transformer_layer(
     stream.memcpy_dtov(&x)
 }
 
+/// One **pre-norm transformer layer on the fp16 tensor cores** — the fast, fused sibling of
+/// [`transformer_layer`]. Same math (`x + Attn(RMSNorm(x))·Woᵀ`, then `x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ`),
+/// but every `A·Bᵀ` projection runs on the WMMA tensor cores (fp16 in, f32 accumulate) instead of the
+/// scalar register-blocked f32 GEMM, and the two epilogues a GEMM library *cannot* fuse are folded into
+/// the projections that produce them:
+///
+/// ```text
+///   h1   = RMSNorm(x)                      f32 [S,D]    ptx_norm
+///   Q,K,V= (f16 h1)·{Wq,Wk,Wv}ᵀ           f32 [S,D]    wmma_nt_f16_sm_db          (tensor-core ×3)
+///   A    = FlashAttention(Q,K,V,1/√D)      f32 [S,D]    ptx_flash (f32 online softmax)
+///   x    = (f16 A)·Woᵀ + x                 f32 [S,D]    wmma_nt_f16_sm_db_residual (residual FUSED)
+///   h2   = RMSNorm(x)                      f32 [S,D]    ptx_norm
+///   f1   = SiLU((f16 h2)·W1ᵀ)              f32 [S,Dff]  wmma_nt_f16_sm_db_silu     (SiLU FUSED)
+///   x    = (f16 f1)·W2ᵀ + x                f32 [S,D]    wmma_nt_f16_sm_db_residual (residual FUSED)
+/// ```
+///
+/// The weights upload **once** (pre-narrowed to f16) and the whole layer stays GPU-resident — only the
+/// `[S,D]` output copies back. The f32↔f16 stage boundaries (norm/flash run f32; the GEMMs want f16
+/// fragments) are cheap `cast_f32_f16` memory passes. Flash stays f32 because its online softmax needs
+/// the dynamic range. `Wq/Wk/Wv/Wo` are `[D,D]`, `W1` is `[Dff,D]`, `W2` is `[D,Dff]`; requires
+/// `S%64==0, D%64==0, Dff%64==0` (the WMMA tile) and `D` a flash head dim (64/128). fp16-GEMM precision
+/// ⇒ tolerance-gated against the f64 reference of the same layer with f16-rounded GEMM inputs.
+pub fn transformer_layer_f16(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &TransformerWeights,
+    s: usize,
+    d: usize,
+    dff: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), s * d, "x must be S×D");
+    for (name, wt, len) in [
+        ("wq", w.wq, d * d),
+        ("wk", w.wk, d * d),
+        ("wv", w.wv, d * d),
+        ("wo", w.wo, d * d),
+        ("w1", w.w1, dff * d),
+        ("w2", w.w2, d * dff),
+    ] {
+        assert_eq!(wt.len(), len, "{name} wrong size");
+    }
+    assert!(
+        s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
+        "transformer_layer_f16 needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
+    );
+    assert!(
+        crate::ptx_flash::SUPPORTED_D.contains(&d),
+        "transformer_layer_f16: head dim {d} unsupported by flash (need {:?})",
+        crate::ptx_flash::SUPPORTED_D
+    );
+
+    // Preload every kernel once (the only `&mut g` use); device work then runs through the cloned
+    // stream Arc with no further borrow of g. The three WMMA entries share one JITed module.
+    let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
+    let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+    let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &format!("flash_d{d}"))?;
+    let ptx = crate::ptx_wmma::wmma_f16_ptx();
+    let f_gemm = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db")?;
+    let f_silu = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_silu")?;
+    let f_resid = g.function("wmma_f16", ptx, "wmma_nt_f16_sm_db_residual")?;
+    let stream = g.stream.clone();
+
+    // Upload input (f32) + weights (pre-narrowed to f16 once).
+    let x_d = stream.memcpy_stod(x)?;
+    let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
+    let wq = stream.memcpy_stod(&to16(w.wq))?;
+    let wk = stream.memcpy_stod(&to16(w.wk))?;
+    let wv = stream.memcpy_stod(&to16(w.wv))?;
+    let wo = stream.memcpy_stod(&to16(w.wo))?;
+    let w1 = stream.memcpy_stod(&to16(w.w1))?;
+    let w2 = stream.memcpy_stod(&to16(w.w2))?;
+
+    let eps = 1e-5f32;
+    let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+
+    // RMSNorm a `[rows, d]` f32 buffer into a fresh f32 buffer (one warp per row).
+    let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
+        let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
+        let (r, c) = (rows as u32, d as u32);
+        let mut bld = stream.launch_builder(&f_norm);
+        bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
+        unsafe { bld.launch(norm_cfg)? };
+        Ok(out)
+    };
+    // device f32 → device f16 narrowing (the stage-boundary cast between norm/flash and the WMMA GEMMs).
+    let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
+        let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+        let nn = n as u32;
+        let mut b = stream.launch_builder(&f_cast);
+        b.arg(&nn).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
+    };
+    // C = A·Bᵀ (fp16-in, f32-out) via a chosen WMMA entry (`f_gemm` plain, or `f_silu` SiLU-fused).
+    let gemm16 = |f: &cudarc::driver::CudaFunction,
+                  a: &cudarc::driver::CudaSlice<f16>,
+                  b: &cudarc::driver::CudaSlice<f16>,
+                  m: usize,
+                  k: usize,
+                  n: usize|
+     -> Result<_, DriverError> {
+        let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+        let mut bld = stream.launch_builder(f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
+        unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+        Ok(c)
+    };
+    // C = A·Bᵀ + residual (fp16-in; f32 residual seeded via wmma.load.c) — the skip connection fused
+    // into the GEMM accumulator (no separate add kernel, no HBM round-trip).
+    let resid_gemm = |a: &cudarc::driver::CudaSlice<f16>,
+                      b: &cudarc::driver::CudaSlice<f16>,
+                      residual: &cudarc::driver::CudaSlice<f32>,
+                      m: usize,
+                      k: usize,
+                      n: usize|
+     -> Result<_, DriverError> {
+        let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+        let mut bld = stream.launch_builder(&f_resid);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c).arg(residual);
+        unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+        Ok(c)
+    };
+
+    // --- attention block: fp16 tensor-core Q/K/V/O projections, f32 flash, residual fused into O ---
+    let h1 = norm(&x_d, s)?;
+    let h1_16 = cast(&h1, s * d)?;
+    let q = gemm16(&f_gemm, &h1_16, &wq, s, d, d)?;
+    let k = gemm16(&f_gemm, &h1_16, &wk, s, d, d)?;
+    let v = gemm16(&f_gemm, &h1_16, &wv, s, d, d)?;
+    let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
+    {
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let ss = s as u32;
+        let flash_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut bld = stream.launch_builder(&f_flash);
+        bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut attn);
+        unsafe { bld.launch(flash_cfg)? };
+    }
+    let attn_16 = cast(&attn, s * d)?;
+    let x1 = resid_gemm(&attn_16, &wo, &x_d, s, d, d)?; // x + A·Woᵀ  (residual 1, fused)
+
+    // --- FFN block: RMSNorm → SiLU up-projection (fused) → down-projection with residual (fused) ---
+    let h2 = norm(&x1, s)?;
+    let h2_16 = cast(&h2, s * d)?;
+    let f1 = gemm16(&f_silu, &h2_16, &w1, s, d, dff)?; // SiLU(h2·W1ᵀ)  [S,Dff], activation fused
+    let f1_16 = cast(&f1, s * dff)?;
+    let out = resid_gemm(&f1_16, &w2, &x1, s, dff, d)?; // x1 + f1·W2ᵀ  (residual 2, fused)
+
+    stream.memcpy_dtov(&out)
+}
+
 /// One **fp8 (E4M3) tensor-core tile** `D = A·B` via `mma.sync.m16n8k32` (Ada has no WMMA fp8): `a`
 /// is `16×32` row-major, `b_col` is `32×8` **column-major** (the `.col` operand), both arrive as f32
 /// and are rounded to E4M3 on the host; `D` is `16×8` f32 (the mixed-precision accumulate). Validates
@@ -2689,6 +2843,33 @@ mod tests {
         x1.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
     }
 
+    /// CPU f64 reference for [`transformer_layer_f16`] — identical to [`ref_transformer_layer`] but
+    /// every projection rounds its inputs to f16 first (matching the kernel's `cast`+WMMA f16
+    /// fragments). RMSNorm, flash, and the two residual adds stay full-precision (the kernel runs those
+    /// f32 / f32-accumulate), so only the four GEMM input quantizations differ from the f32 oracle.
+    fn ref_transformer_layer_f16(
+        x: &[f32],
+        w: &TransformerWeights,
+        s: usize,
+        d: usize,
+        dff: usize,
+    ) -> Vec<f32> {
+        let eps = 1e-5f32;
+        let round = |v: f32| half::f16::from_f32(v).to_f32();
+        let h1 = ref_rmsnorm(x, s, d, eps);
+        let q = ref_nt_rounded(&h1, w.wq, s, d, d, round);
+        let k = ref_nt_rounded(&h1, w.wk, s, d, d, round);
+        let v = ref_nt_rounded(&h1, w.wv, s, d, d, round);
+        let a = ref_attn(&q, &k, &v, s, d, 1.0 / (d as f32).sqrt());
+        let o = ref_nt_rounded(&a, w.wo, s, d, d, round);
+        let x1: Vec<f32> = x.iter().zip(&o).map(|(&a, &b)| a + b).collect();
+        let h2 = ref_rmsnorm(&x1, s, d, eps);
+        let f1 = ref_nt_rounded(&h2, w.w1, s, d, dff, round);
+        let f1act: Vec<f32> = f1.iter().map(|&z| ref_silu(z)).collect();
+        let f2 = ref_nt_rounded(&f1act, w.w2, s, dff, d, round);
+        x1.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
+    }
+
     /// CPU f64 reference for [`ffn_fused`] — RMSNorm, then the two projections with **f16-rounded
     /// inputs** (matching the kernel's cast + WMMA f16 fragments) and SiLU between, then the f32
     /// residual added in full precision (the kernel seeds it via wmma.load.c, also f32).
@@ -2763,6 +2944,47 @@ mod tests {
                 bits(&got),
                 bits(&again),
                 "GPU-resident transformer layer must be deterministic"
+            );
+        });
+    }
+
+    /// [`transformer_layer_f16`] (the fp16 tensor-core, fused-epilogue layer) vs its f64 reference with
+    /// f16-rounded GEMM inputs. Small weights keep activations O(1) (RMSNorm gives unit-RMS rows) so the
+    /// fp16 error across the four projections + flash + two residuals stays well inside tolerance. Also
+    /// asserts run-to-run bit-reproducibility (fixed grids + warp-butterfly reductions, no atomics).
+    #[test]
+    fn transformer_layer_f16_matches_reference_within_tol() {
+        with_gpu("transformer_layer_f16", |g| {
+            let mut rng = crate::diff::Rng::new(0x7A13);
+            let (s, d, dff) = (128usize, 64usize, 256usize); // S,D,Dff all %64 for the WMMA tile
+            let x = rng.vec(s * d, -1.0, 1.0);
+            let wq = rng.vec(d * d, -0.1, 0.1);
+            let wk = rng.vec(d * d, -0.1, 0.1);
+            let wv = rng.vec(d * d, -0.1, 0.1);
+            let wo = rng.vec(d * d, -0.1, 0.1);
+            let w1 = rng.vec(dff * d, -0.1, 0.1);
+            let w2 = rng.vec(d * dff, -0.1, 0.1);
+            let w = TransformerWeights {
+                wq: &wq,
+                wk: &wk,
+                wv: &wv,
+                wo: &wo,
+                w1: &w1,
+                w2: &w2,
+            };
+            let got = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
+            let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
+            let st = crate::diff::assert_close("transformer_layer_f16", &got, &oracle, 5e-2, 5e-2);
+            eprintln!(
+                "transformer_layer_f16 S={s} D={d} Dff={dff} (fp16 tensor-core, fused residual+SiLU, 13 launches): max_abs={:.2e} max_rel={:.2e}",
+                st.max_abs, st.max_rel
+            );
+            let again = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got),
+                bits(&again),
+                "fp16 GPU-resident transformer layer must be deterministic"
             );
         });
     }
@@ -2870,8 +3092,14 @@ mod tests {
     }
 
     /// End-to-end latency of the GPU-resident transformer layer (full call: weights H2D + the kernel
-    /// chain + result D2H). Reported as ms/layer and tokens/s. A real model keeps weights resident, so
-    /// this is a conservative (transfer-inclusive) figure.
+    /// chain + result D2H), the **fp16 tensor-core fused path vs the f32 scalar chain** — both Mercury,
+    /// same machine, same buffers, measured same-run (this is an internal optimized-vs-naive speedup,
+    /// NOT a cross-vendor claim). The fp16 path runs every projection on the WMMA tensor cores and folds
+    /// the two residual adds + the SiLU into the GEMMs; the f32 path is the register-blocked scalar GEMM
+    /// chain with separate add/SiLU launches. Reported as ms/layer + tokens/s for each, plus the ratio.
+    /// The laptop GPU clock is warmed first and each figure is `best_of(ROUNDS)` (min time = peak-clock
+    /// sample), or the ~7× boost ramp would corrupt the ratio. Each size is also correctness-gated
+    /// against the f64 oracle before its speed is reported (the correctness-before-speed law).
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
     #[ignore = "throughput bench; run explicitly"]
@@ -2879,6 +3107,18 @@ mod tests {
         with_gpu("transformer_layer_throughput", |g| {
             let mut rng = crate::diff::Rng::new(0x7A12);
             let (d, dff) = (64usize, 256usize);
+
+            // Warm the laptop GPU clock (it boosts ~7× under sustained load); a cold first call reads
+            // slow and would make the f32-vs-f16 ratio a clock artifact rather than a kernel difference.
+            {
+                let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+                let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+                for _ in 0..30 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            }
+            const ROUNDS: usize = 4;
+
             for s in [256usize, 512, 1024] {
                 let x = rng.vec(s * d, -1.0, 1.0);
                 let wq = rng.vec(d * d, -0.1, 0.1);
@@ -2895,17 +3135,37 @@ mod tests {
                     w1: &w1,
                     w2: &w2,
                 };
-                transformer_layer(g, &x, &w, s, d, dff).unwrap(); // warm up (JIT + cache modules)
+                // JIT + module-cache warmup for both paths, then correctness-gate the fp16 path at this
+                // shape (speed is only reported for an output that matches the f64 oracle).
+                transformer_layer(g, &x, &w, s, d, dff).unwrap();
+                let got16 = transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
+                let oracle = ref_transformer_layer_f16(&x, &w, s, d, dff);
+                crate::diff::assert_close(&format!("tl_f16 S={s}"), &got16, &oracle, 5e-2, 5e-2);
+
                 let iters = 50;
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    transformer_layer(g, &x, &w, s, d, dff).unwrap();
-                }
-                let spi = t0.elapsed().as_secs_f64() / iters as f64;
+                let t_f32 = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        transformer_layer(g, &x, &w, s, d, dff).unwrap();
+                    }
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_f16 = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        transformer_layer_f16(g, &x, &w, s, d, dff).unwrap();
+                    }
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
                 eprintln!(
-                    "transformer_layer S={s} D={d} Dff={dff}: {:.2} ms/layer, {:.0} tokens/s",
-                    spi * 1e3,
-                    s as f64 / spi
+                    "transformer_layer S={s} D={d} Dff={dff} (same-run, both Mercury):\n  \
+                     f32 scalar chain (gemm_nt_rb) : {:.3} ms/layer, {:>7.0} tokens/s\n  \
+                     fp16 tensor-core fused        : {:.3} ms/layer, {:>7.0} tokens/s  → {:.2}× faster",
+                    t_f32 * 1e3,
+                    s as f64 / t_f32,
+                    t_f16 * 1e3,
+                    s as f64 / t_f16,
+                    t_f32 / t_f16,
                 );
             }
         });
