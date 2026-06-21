@@ -685,6 +685,11 @@ pub fn wmma_f16_ptx() -> &'static str {
         m += &entry("wmma_nt_f16", "f16", 1, 1);
         m += &entry("wmma_nt_f16_mt", "f16", TM_TILES, TN_TILES);
         m += &entry_smem("wmma_nt_f16_sm", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N);
+        // Single-buffered 128×128 tile (no cp.async pipeline). At L2-spilling sizes the double-buffered
+        // kernels are occupancy-bound and LOSE to the un-pipelined ones (measured: _sm beats _sm_db at
+        // 2048³); the big tile halves redundant inter-CTA traffic while single-buffering avoids the
+        // pipeline's extra SMEM + bar.syncs — the large-GEMM candidate the clean scoreboard motivates.
+        m += &entry_smem("wmma_nt_f16_sm128", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N);
         m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false);
         m += &entry_smem_db(
             "wmma_nt_f16_sm128_db",
