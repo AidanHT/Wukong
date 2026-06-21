@@ -621,6 +621,10 @@ skips cleanly with no GPU) and `… --release -- --ignored --nocapture` (through
 backend: `mercuryc --features gpu --backend=gpu --run foo.mer` tree-walks the program on an
 *offloading interpreter* and runs recognized GEMM / activation / reduction / fused-norm calls on the
 device (an `Accelerator` seam in `mercury_interp` that the driver fills with `mercury_codegen_gpu`).
+**Fusion reaches the source level:** a Mercury `act(matmul(x,w))` folds to `mercury_sgemm_nt_epi`,
+which the GPU seam routes to the *single fused WMMA kernel* (`gemm_nt_f16_sm_db_{relu,silu,gelu}`, the
+one that beats the cuBLAS GEMM+activation chain) — so the fusion win is a compiler feature, not just a
+host API call (`gpu_backend_fused_epilogue_matches_interp`, offload-fired + tolerance-gated).
 With no accelerator — the differential oracle and every other caller — the interpreter path is
 byte-for-byte unchanged, so the toolchain-free core is untouched and the bit-exact CPU gate is intact.
 The CPU↔GPU boundary stays a tolerance differential: the `gpu_backend_*` driver tests run each family
