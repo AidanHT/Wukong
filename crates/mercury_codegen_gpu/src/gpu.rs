@@ -1418,11 +1418,7 @@ pub fn transformer_layer(
     {
         let scale = 1.0f32 / (d as f32).sqrt();
         let ss = s as u32;
-        let flash_cfg = LaunchConfig {
-            grid_dim: (s as u32, 1, 1),
-            block_dim: (32, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let flash_cfg = flash_launch_cfg(s);
         let mut bld = stream.launch_builder(&f_flash);
         bld.arg(&ss)
             .arg(&scale)
@@ -2938,11 +2934,7 @@ mod tests {
                 let mut o_d = g.stream.memcpy_stod(&vec![0f32; seq * d]).unwrap();
                 let scale = 1.0f32 / (d as f32).sqrt();
                 let s = seq as u32;
-                let cfg = LaunchConfig {
-                    grid_dim: (s, 1, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                };
+                let cfg = flash_launch_cfg(seq);
                 let launch = |o_d: &mut cudarc::driver::CudaSlice<f32>| {
                     let mut bld = g.stream.launch_builder(&f);
                     bld.arg(&s)
