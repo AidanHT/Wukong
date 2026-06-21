@@ -3724,6 +3724,86 @@ mod tests {
         });
     }
 
+    /// **Diagnostic: which kernel makes the layer scale with S** (the PyTorch gap, M13). The fp16 fused
+    /// layer's per-layer time grows ~linearly with S while PyTorch eager's is flat — so *something* in the
+    /// layer scales badly. This times the kernels **resident** (buffers uploaded once, the kernel
+    /// re-launched in a tight loop, a single trailing sync — so it isolates *pure kernel compute*, no
+    /// per-call H2D/D2H), across S: the **flash attention** (one warp per query row, serial over keys —
+    /// `grid=(S,1,1)`, `block=32`, so O(S) latency/row *and* one warp per CTA = poor occupancy) vs a
+    /// representative **WMMA GEMM** (the FFN up-projection `S×64×256`, throughput-bound). Steeper flash
+    /// scaling ⇒ the attention kernel is the lever to match PyTorch's tiled SDPA; comparable scaling ⇒ the
+    /// gap is broad small-op/occupancy overhead and the lever is the megakernel (fewer launches). Run:
+    /// `… --ignored --nocapture flash_vs_gemm_scaling`.
+    #[test]
+    #[ignore = "diagnostic bench; run explicitly"]
+    fn flash_vs_gemm_scaling() {
+        use half::f16;
+        with_gpu("flash_vs_gemm_scaling", |g| {
+            let mut rng = crate::diff::Rng::new(0x0CB4);
+            let (d, dff) = (64usize, 256usize);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64").unwrap();
+            let f_gemm = g
+                .function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db")
+                .unwrap();
+            let to16 = |v: &[f32]| -> Vec<f16> { v.iter().map(|&x| f16::from_f32(x)).collect() };
+            for s in [256usize, 512, 1024] {
+                // resident buffers — uploaded once, reused every launch (no per-call transfer/alloc).
+                let q = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let k = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let v = g.stream.memcpy_stod(&rng.vec(s * d, -1.0, 1.0)).unwrap();
+                let mut o = g.stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
+                let a16 = g.stream.memcpy_stod(&to16(&rng.vec(s * d, -1.0, 1.0))).unwrap();
+                let b16 = g.stream.memcpy_stod(&to16(&rng.vec(dff * d, -1.0, 1.0))).unwrap();
+                let mut c = g.stream.memcpy_stod(&vec![0f32; s * dff]).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let flash_cfg = LaunchConfig { grid_dim: (ss, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+                pin!();
+                let t_flash = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_flash);
+                        bld.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                        unsafe { bld.launch(flash_cfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                let (mm, nn, kk) = (s as u32, dff as u32, d as u32);
+                let gemm_cfg = wmma_sm_cfg(s, dff);
+                pin!();
+                let t_gemm = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_gemm);
+                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a16).arg(&b16).arg(&mut c);
+                        unsafe { bld.launch(gemm_cfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                eprintln!(
+                    "S={s} (resident, pure kernel): flash {:.4} ms | WMMA gemm S×{d}×{dff} {:.4} ms | flash/gemm {:.1}×",
+                    t_flash * 1e3,
+                    t_gemm * 1e3,
+                    t_flash / t_gemm,
+                );
+            }
+        });
+    }
+
     /// **What fusion buys at the full-layer level** — the same [`ResidentLayerF16`], resident, timed two
     /// ways same-run: `forward_device` (the 2 residual adds + SiLU folded into the GEMMs) vs
     /// `forward_device_unfused` (identical WMMA GEMMs but 3 separate `vadd`/`silu` launches, each
