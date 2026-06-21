@@ -694,6 +694,45 @@ pub fn gemm_nt_f16_sm_db_gelu(
     gemm_nt_f16_fused(g, a, b, m, k, n, "wmma_nt_f16_sm_db_gelu")
 }
 
+/// `C = A·Bᵀ + residual` (fp16-in, f32-out; `residual[M·N]` is f32) in **one kernel** via
+/// `wmma_nt_f16_sm_db_residual` — the transformer skip connection fused into the GEMM. The kernel seeds
+/// each accumulator with `residual` (wmma.load.c, the inverse of the store-d fragment layout) and the
+/// K-loop adds A·Bᵀ on top, so the residual add is free at f32 accumulate and never round-trips through
+/// HBM. The library call-chain instead pays a separate add kernel (or a beta=1 C pre-fill) for it — an
+/// M13 megakernel building block. Requires `M%SM_BM==0`, `N%SM_BN==0`, `K%16==0`; tolerance-gated.
+pub fn gemm_nt_f16_sm_db_residual(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM_BM, SM_BN};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(residual.len(), m * n, "residual must be M×N");
+    assert!(
+        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        "wmma_nt_f16_sm_db_residual requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f =
+        g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db_residual")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let resid_d = g.stream.memcpy_stod(residual)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&resid_d);
+    unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// `C = act(A·Bᵀ + bias)` (fp16-in, f32-out; `bias[N]` is f32) in **one kernel** via a
 /// `wmma_nt_f16_sm_db_bias*` entry — the canonical `nn.Linear`/FFN epilogue. A per-column bias needs the
 /// WMMA fragment's column index, which is opaque, so the kernel stores each tile to SMEM and re-reads it
@@ -1787,6 +1826,45 @@ mod tests {
                 );
                 eprintln!(
                     "wmma_f16_sm128 {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+            }
+        });
+    }
+
+    /// The fused-residual kernel (`wmma_nt_f16_sm_db_residual`) must match `A·Bᵀ + residual` on the
+    /// f16-rounded inputs. Seeding the accumulator via wmma.load.c must add the residual *exactly* — the
+    /// load.c and store.d fragment layouts are inverse, so the opaque (lane,reg)→(row,col) map cancels; a
+    /// wrong layout would scatter the O(1) residual to the wrong element and blow the abs tolerance.
+    #[test]
+    fn wmma_sm_db_residual_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_sm_db_residual", |g| {
+            let mut rng = crate::diff::Rng::new(0x6E51);
+            let shapes = [
+                (64usize, 16usize, 64usize),
+                (64, 128, 128),
+                (128, 256, 256),
+                (256, 128, 192),
+            ];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let resid = rng.vec(m * n, -1.0, 1.0);
+                let mut r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                for (ri, &res) in r.iter_mut().zip(resid.iter()) {
+                    *ri += res;
+                }
+                let c = gemm_nt_f16_sm_db_residual(g, &a, &b, &resid, m, k, n).unwrap();
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16_sm_db_residual {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!(
+                    "wmma_f16_sm_db_residual {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
                     s.max_abs, s.max_rel
                 );
             }

@@ -387,6 +387,7 @@ fn entry_smem_db(
     warps_n: usize,
     act: Act,
     bias: bool,
+    residual: bool,
 ) -> String {
     assert_eq!(bm, bn, "the double-buffered kernel uses one buffer-offset reg for A and B");
     let mma_ty = if ty == "f16" {
@@ -408,17 +409,28 @@ fn entry_smem_db(
             "fused-bias epilogue scratch (smemA reuse) too small for the warp grid"
         );
     }
+    if residual {
+        // The residual fuses by *seeding* the f32 accumulator with `residual[tile]` (wmma.load.c) and
+        // letting the K-loop add A·Bᵀ on top → out = residual + A·Bᵀ. A post-accumulate bias/activation
+        // would then wrongly act on the residual too, so residual is offered only for the plain GEMM.
+        assert!(
+            matches!(act, Act::None) && !bias,
+            "residual epilogue is incompatible with a fused bias/activation"
+        );
+    }
     let a_chunks = bm * SM_BK / (threads * 8);
     let b_chunks = bn * SM_BK / (threads * 8);
     let wn_shift = warps_n.trailing_zeros();
     let wm = (16 * tm) as i64;
     let wn = (16 * tn) as i64;
 
-    // The fused-bias variant takes an extra `bias[N]` (f32) param read in the store-back epilogue.
+    // The fused-bias variant takes an extra `bias[N]` (f32) param read in the store-back epilogue; the
+    // residual variant takes a `residual[M,N]` (f32) param used to seed the accumulator (wmma.load.c).
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
+    let resid_param = if residual { ",\n    .param .u64 pResidual" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
     );
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{}];\n", 2 * tile_bytes);
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{}];\n", 2 * tile_bytes);
@@ -443,6 +455,9 @@ fn entry_smem_db(
         s += "    .reg .f32 %bval,%biasv;\n";
         s += "    .reg .b64 %Bias,%scptr;\n";
     }
+    if residual {
+        s += "    .reg .b64 %Resid;\n"; // residual[M,N] base pointer (seeds the accumulator)
+    }
     let mut decl_ab = String::new();
     for ti in 0..tm {
         for r in 0..nab {
@@ -466,10 +481,29 @@ fn entry_smem_db(
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
     s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
     s += &format!("    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
-    for ti in 0..tm {
-        for tj in 0..tn {
-            for r in 0..8 {
-                s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+    if residual {
+        // Residual fusion: seed each accumulator from residual[tile] with wmma.load.c — the SAME
+        // fragment layout the final wmma.store.d uses, so the opaque (lane,reg)→(row,col) map cancels.
+        // The K-loop then adds A·Bᵀ on top → out = residual + A·Bᵀ at f32 accumulate, no HBM round-trip
+        // for the residual (cuBLAS needs a beta=1 pre-fill or a separate add kernel). Stride = N.
+        s += "    ld.param.u64 %Resid,[pResidual];\n    cvta.to.global.u64 %Resid,%Resid;\n";
+        for ti in 0..tm {
+            for tj in 0..tn {
+                let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+                s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%Resid,%off;\n";
+                s += &format!("    wmma.load.c.sync.aligned.m16n16k16.row.f32 {cc}, [%cptr], %N;\n");
+            }
+        }
+    } else {
+        for ti in 0..tm {
+            for tj in 0..tn {
+                for r in 0..8 {
+                    s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+                }
             }
         }
     }
@@ -690,7 +724,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         // 2048³); the big tile halves redundant inter-CTA traffic while single-buffering avoids the
         // pipeline's extra SMEM + bar.syncs — the large-GEMM candidate the clean scoreboard motivates.
         m += &entry_smem("wmma_nt_f16_sm128", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N);
-        m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false);
+        m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         m += &entry_smem_db(
             "wmma_nt_f16_sm128_db",
             "f16",
@@ -699,6 +733,7 @@ pub fn wmma_f16_ptx() -> &'static str {
             SM128_WARPS_M,
             SM128_WARPS_N,
             Act::None,
+            false,
             false,
         );
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
@@ -717,6 +752,7 @@ pub fn wmma_f16_ptx() -> &'static str {
                 SM_WARPS_M,
                 SM_WARPS_N,
                 act,
+                false,
                 false,
             );
         }
@@ -738,8 +774,24 @@ pub fn wmma_f16_ptx() -> &'static str {
                 SM_WARPS_N,
                 act,
                 true,
+                false,
             );
         }
+        // Fused **residual** epilogue `C = A·Bᵀ + residual` — the transformer skip connection (both
+        // `x + attn·Woᵀ` and `x + ffn(x)·W2ᵀ`). Seeds the f32 accumulator from the residual via
+        // wmma.load.c so the add costs nothing extra; the library call-chain pays a separate add (or a
+        // beta=1 pre-fill) launch + HBM round-trip for it. This is an M13 megakernel building block.
+        m += &entry_smem_db(
+            "wmma_nt_f16_sm_db_residual",
+            "f16",
+            SM_BM,
+            SM_BN,
+            SM_WARPS_M,
+            SM_WARPS_N,
+            Act::None,
+            false,
+            true,
+        );
         m
     })
     .as_str()
@@ -756,7 +808,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         m += &entry("wmma_nt_bf16", "bf16", 1, 1);
         m += &entry("wmma_nt_bf16_mt", "bf16", TM_TILES, TN_TILES);
-        m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false);
+        m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
             m += &entry_smem_db(
                 &format!("wmma_nt_bf16_sm_db_{suffix}"),
@@ -766,6 +818,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 SM_WARPS_M,
                 SM_WARPS_N,
                 act,
+                false,
                 false,
             );
         }
@@ -787,6 +840,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 SM_WARPS_N,
                 act,
                 true,
+                false,
             );
         }
         m
