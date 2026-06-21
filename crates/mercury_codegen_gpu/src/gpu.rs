@@ -1573,7 +1573,7 @@ impl ResidentLayerF16 {
 
         // RMSNorm a `[rows, d]` f32 buffer into a fresh f32 buffer (one warp per row).
         let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
-            let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
+            let mut out = stream.alloc_zeros::<f32>(rows * d)?;
             let (r, c) = (rows as u32, d as u32);
             let mut bld = stream.launch_builder(&self.f_norm);
             bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
@@ -1582,7 +1582,7 @@ impl ResidentLayerF16 {
         };
         // device f32 -> device f16 narrowing (the stage boundary between norm/flash and the WMMA GEMMs).
         let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
-            let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+            let mut dst = stream.alloc_zeros::<f16>(n)?;
             let nn = n as u32;
             let mut b = stream.launch_builder(&self.f_cast);
             b.arg(&nn).arg(src).arg(&mut dst);
@@ -1597,7 +1597,7 @@ impl ResidentLayerF16 {
                       k: usize,
                       n: usize|
          -> Result<_, DriverError> {
-            let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+            let mut c = stream.alloc_zeros::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(f);
             bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
@@ -1613,7 +1613,7 @@ impl ResidentLayerF16 {
                           k: usize,
                           n: usize|
          -> Result<_, DriverError> {
-            let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+            let mut c = stream.alloc_zeros::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(&self.f_resid);
             bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c).arg(residual);
@@ -1627,7 +1627,7 @@ impl ResidentLayerF16 {
         let q = gemm16(&self.f_gemm, &h1_16, &self.wq, s, d, d)?;
         let k = gemm16(&self.f_gemm, &h1_16, &self.wk, s, d, d)?;
         let v = gemm16(&self.f_gemm, &h1_16, &self.wv, s, d, d)?;
-        let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
+        let mut attn = stream.alloc_zeros::<f32>(s * d)?;
         {
             let scale = 1.0f32 / (d as f32).sqrt();
             let ss = s as u32;
@@ -1665,7 +1665,7 @@ impl ResidentLayerF16 {
         let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
 
         let norm = |src: &cudarc::driver::CudaSlice<f32>, rows: usize| -> Result<_, DriverError> {
-            let mut out = stream.memcpy_stod(&vec![0f32; rows * d])?;
+            let mut out = stream.alloc_zeros::<f32>(rows * d)?;
             let (r, c) = (rows as u32, d as u32);
             let mut bld = stream.launch_builder(&self.f_norm);
             bld.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut out);
@@ -1673,7 +1673,7 @@ impl ResidentLayerF16 {
             Ok(out)
         };
         let cast = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<cudarc::driver::CudaSlice<f16>, DriverError> {
-            let mut dst = stream.memcpy_stod(&vec![f16::from_f32(0.0); n])?;
+            let mut dst = stream.alloc_zeros::<f16>(n)?;
             let nn = n as u32;
             let mut b = stream.launch_builder(&self.f_cast);
             b.arg(&nn).arg(src).arg(&mut dst);
@@ -1682,7 +1682,7 @@ impl ResidentLayerF16 {
         };
         // plain C = A*Bᵀ, no epilogue (always self.f_gemm) — the down/out projections do NOT fold residual.
         let gemm = |a: &cudarc::driver::CudaSlice<f16>, b: &cudarc::driver::CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<_, DriverError> {
-            let mut c = stream.memcpy_stod(&vec![0f32; m * n])?;
+            let mut c = stream.alloc_zeros::<f32>(m * n)?;
             let (mm, nn, kk) = (m as u32, n as u32, k as u32);
             let mut bld = stream.launch_builder(&self.f_gemm);
             bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut c);
@@ -1691,7 +1691,7 @@ impl ResidentLayerF16 {
         };
         // separate residual add `out = a + b` (the kernel the fused residual GEMM folds away).
         let vadd = |a: &cudarc::driver::CudaSlice<f32>, b: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<_, DriverError> {
-            let mut out = stream.memcpy_stod(&vec![0f32; n])?;
+            let mut out = stream.alloc_zeros::<f32>(n)?;
             let nn = n as u32;
             let mut bld = stream.launch_builder(&self.f_vadd);
             bld.arg(&nn).arg(a).arg(b).arg(&mut out);
@@ -1700,7 +1700,7 @@ impl ResidentLayerF16 {
         };
         // separate SiLU activation (the kernel the fused SiLU GEMM folds away).
         let silu = |src: &cudarc::driver::CudaSlice<f32>, n: usize| -> Result<_, DriverError> {
-            let mut out = stream.memcpy_stod(&vec![0f32; n])?;
+            let mut out = stream.alloc_zeros::<f32>(n)?;
             let nn = n as u32;
             let mut bld = stream.launch_builder(&self.f_act);
             bld.arg(&nn).arg(src).arg(&mut out);
@@ -1714,7 +1714,7 @@ impl ResidentLayerF16 {
         let q = gemm(&h1_16, &self.wq, s, d, d)?;
         let k = gemm(&h1_16, &self.wk, s, d, d)?;
         let v = gemm(&h1_16, &self.wv, s, d, d)?;
-        let mut attn = stream.memcpy_stod(&vec![0f32; s * d])?;
+        let mut attn = stream.alloc_zeros::<f32>(s * d)?;
         {
             let scale = 1.0f32 / (d as f32).sqrt();
             let ss = s as u32;
