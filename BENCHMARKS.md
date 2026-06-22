@@ -729,9 +729,25 @@ multi-head attention** at the **GPT-2 shape (D=768, H=12 heads of dh=64)**: the 
 output is bridged token-major↔head-major by two memory-bound transpose shims (`ptx::HEAD_TRANSPOSE_PTX`,
 with the f32→f16 cast folded into the forward one) around the existing `grid.y=H` tensor-core flash, so the
 production flash kernel is untouched. Gated bit-reproducibly against a **per-head** f64 reference at
-D=768/H=12/S=512 (`transformer_layer_mha_matches_reference_within_tol`, max_abs 8.05e-3). A same-run
-*throughput* re-measurement at this real shape — vs a **multi-head** cuBLAS-chain layer and PyTorch — is the
-follow-up that moves the M13 headline off the D=64 toy onto a genuine transformer layer.
+D=768/H=12/S=512 (`transformer_layer_mha_matches_reference_within_tol`, max_abs 8.05e-3). Same-run
+throughput at this real shape (`cublas_chain_vs_mercury_mha_layer_throughput`) — fused multi-head Mercury
+vs the **multi-head cuBLAS-chain layer** (attention common to both, so the gap is purely GEMM + epilogue
+fusion):
+
+| S | Mercury fused | cuBLAS chain | net | GEMM (Mercury-unfused / cuBLAS) | fusion |
+|---|---|---|---|---|---|
+| 512  | 1.073 ms | 1.020 ms | chain 1.05× | 0.90× | 1.05× |
+| 1024 | 2.402 ms | 2.360 ms | chain 1.02× | 0.90× | 1.09× |
+| 2048 | 6.389 ms | 6.422 ms | **Mercury 1.01×** | 0.92× | 1.09× |
+| 4096 | 18.26 ms | 17.61 ms | chain 1.04× | 0.93× | 1.03× |
+
+**Honest finding:** at the real GPT-2 shape the fused layer is **~par with the cuBLAS-chain layer
+(0.96–1.01×)** — *not* the clearer win the D=64 toy shows. The decomposition says why: Mercury's WMMA GEMM
+is **0.90–0.93× of cuBLAS at D=768** (the GEMM cliff — the same large-size gap `gemm_vs_peers` reports,
+~34% @4096³), and the fused residual/SiLU epilogues (**1.03–1.09×**, which cuBLAS structurally can't do)
+nearly but not fully offset it. **Closing the GEMM cliff flips this to a clear win** — the single
+highest-leverage GPU item, exactly what the parallel GEMM-cliff workstream targets. (A cross-process
+PyTorch comparison at this shape, like the D=64 table above, remains a documentation follow-up.)
 
 Honest caveats: **eager** PyTorch only — `torch.compile`/Inductor needs Triton, which has no working Windows
 install (`torch.compile` raised `Cannot find a working triton installation` here). Cross-process and
