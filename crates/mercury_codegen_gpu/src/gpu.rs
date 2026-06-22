@@ -2128,12 +2128,14 @@ fn int8_smdb_cfg(m: usize, n: usize, bm: usize, bn: usize, warps: usize) -> Laun
 }
 
 /// **SMEM-staged + `cp.async` double-buffered int8 GEMM** `C = A·Bᵀ` — the latency-hiding path
-/// (cooperative CTA tiles, software-pipelined K-loop). Uses the **64×64** tile (4 warps): measured
-/// across re-runs it holds ~2× the occupancy of the 128×128 variant (128 threads / 32 accumulators vs
-/// 256 / 64), which wins while the kernel is latency-bound (far from the int8 peak) — so it is the
-/// robust default. The 128×128 tile ([`crate::ptx_int8::int8_gemm_smdb128_ptx`]) is benched alongside
-/// in `int8_gemm_vs_peers` and helps only when reuse-bound. Same `u8`×`i8`→`i32` bit-exact contract as
-/// [`gemm_nt_int8`]. Requires M%64==0, N%64==0, K%INT8_BK==0.
+/// (cooperative CTA tiles, software-pipelined K-loop), **regime-aware** between two tiles (same split
+/// the fp16 `_sm_db`/`_sm128_db` dispatch uses). The **64×64** tile (4 warps) has ~2× the occupancy of
+/// the 128×128 variant (128 threads / 32 accumulators vs 256 / 64) and wins while the kernel is
+/// latency-bound (small/medium sizes); the **128×128** tile ([`crate::ptx_int8::int8_gemm_smdb128_ptx`])
+/// has higher A/B reuse per global load and wins once reuse-bound (large sizes). Measured same-run:
+/// 64×64 leads at 1024³/2048³ (~44%/53% of cuBLAS), 128×128 leads at 4096³ (~52% vs ~40%), so the
+/// dispatch picks 128×128 when M,N are both ≥ 4096 (and 128-divisible), else 64×64. Same `u8`×`i8`→`i32`
+/// bit-exact contract as [`gemm_nt_int8`]. Requires M%64==0, N%64==0, K%INT8_BK==0.
 pub fn gemm_nt_int8_smdb(
     g: &mut Gpu,
     a: &[u8],
@@ -2142,19 +2144,37 @@ pub fn gemm_nt_int8_smdb(
     k: usize,
     n: usize,
 ) -> Result<Vec<i32>, DriverError> {
-    use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+    use crate::ptx_int8::{
+        INT8_BK, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128,
+        INT8_WARPS_N, INT8_WARPS_N128,
+    };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
         m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
         "int8 smdb GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
-    let f = g.function(
-        "int8_gemm_smdb",
-        crate::ptx_int8::int8_gemm_smdb_ptx(),
-        "int8_gemm_nt_smdb",
-    )?;
-    let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+    // Reuse-bound at large sizes → the bigger 128×128 tile; latency-bound below → the 64×64 tile.
+    let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    let (f, cfg) = if use_128 {
+        (
+            g.function(
+                "int8_gemm_smdb128",
+                crate::ptx_int8::int8_gemm_smdb128_ptx(),
+                "int8_gemm_nt_smdb128",
+            )?,
+            int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128),
+        )
+    } else {
+        (
+            g.function(
+                "int8_gemm_smdb",
+                crate::ptx_int8::int8_gemm_smdb_ptx(),
+                "int8_gemm_nt_smdb",
+            )?,
+            int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N),
+        )
+    };
     let a_d = g.stream.memcpy_stod(a)?;
     let b_d = g.stream.memcpy_stod(b)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
