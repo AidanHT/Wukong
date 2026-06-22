@@ -54,9 +54,14 @@ toolkit — only **running** needs the driver + a device.
   GEMMs by size regime. The pipelined+fused generators are **precision-generic** (`entry_smem_db` keys
   fragment width/mma type off `ty`), so bf16 gets the same `wmma_nt_bf16_sm_db` + `_sm_db_{relu,silu,
   gelu}` (the training-dtype fusion; bias is fp16-only so far). See `entry_smem`/`entry_smem_db`.
-- `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM, single-tile and fragment-reuse
-  multi-tile (`_mt`, 2×4 16×8 tiles/warp — the fastest tensor-core path; no WMMA fp8 on sm_89, so the
-  fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
+- `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` GEMM (no WMMA fp8 on sm_89, so fragments are
+  hand-placed per the PTX-ISA lane layout). **Dispatched large-GEMM path (`gemm_nt_fp8` for %128/%128/%64
+  shapes): `fp8_pipe_entry`** — the f16/bf16 mma-pipeline recipe carried to E4M3 (multi-stage cp.async
+  staging + threadblock raster + 16-byte-padded conflict-free fragment loads; fp8 is 1 byte/elem so the
+  128×128 BK=64 tile is 40 KiB). Same-run: **~1.7–1.9× the old un-staged `_mt`** and **~1.79–1.98× the
+  fp16 mma kernel — the Ada 2× fp8-rate realized** (M2; `fp8_pipe_vs_peers`, checksum-cross-checked). Also
+  the single-tile and fragment-reuse `_mt` (2×4 16×8 tiles/warp) fallbacks + host E4M3 round/widen. (The
+  literal %-of-cuBLASLt-fp8 needs a raw-sys E4M3 peer — cudarc's safe `Matmul` is f32/f16/bf16 only.)
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
