@@ -1410,6 +1410,18 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
         m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false);
+        // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
+        // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
+        // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
+        for (suffix, act) in [("bias", Act::None), ("bias_relu", Act::Relu), ("bias_silu", Act::Silu), ("bias_gelu", Act::Gelu)] {
+            m += &entry_mma_pipe(
+                &format!("{}_{suffix}", v.name),
+                "bf16",
+                v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad,
+                act,
+                true,
+            );
+        }
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
             m += &entry_smem_db(

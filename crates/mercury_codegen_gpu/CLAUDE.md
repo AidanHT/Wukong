@@ -59,10 +59,15 @@ toolkit — only **running** needs the driver + a device.
   `fused_gemm_bias_act_vs_chain`, same-run interleaved). Honest gap: at **1024³ it's ~0.90×** (loses) —
   the mma workhorse isn't the per-regime GEMM winner there (the deep WMMA `pipe_64_s6` is, but its opaque
   fragment layout blocks register-level bias), so its GEMM deficit outweighs the saved epilogue round-trip.
-  `gemm_nt_f16` dispatches the plain GEMMs by size regime. The pipelined+fused generators are
-  **precision-generic** (`entry_smem_db` keys fragment width/mma type off `ty`), so bf16 gets the same
-  `wmma_nt_bf16_sm_db` + `_sm_db_{relu,silu,gelu}` (the training-dtype fusion; bias is fp16-only so far).
-  See `entry_smem`/`entry_smem_db`/`entry_mma_pipe`.
+  `gemm_nt_f16` dispatches the plain GEMMs by size regime. **All the fused generators are
+  precision-generic** (`entry_smem_db` and `entry_mma_pipe` key fragment width / mma type and the bias/act
+  epilogue off `ty`), so **bf16 — the training precision — gets the identical fusion suite**: the WMMA
+  `wmma_nt_bf16_sm_db{,_relu,_silu,_gelu}` + `_sm_db_bias{,_relu,_silu,_gelu}` *and* the fast-mma
+  `mma_nt_bf16_128_bk32_s2_r16_bias{,_relu,_silu,_gelu}` (`gemm_nt_bf16_mma_bias*`). Speed for the bf16
+  fast-mma fused path is inherited (Ada runs bf16 and fp16 `mma.sync` at the same TC rate, byte-identical
+  generator); it is correctness-gated (`wmma_bf16_mma_bias_match_reference_within_tol`) but has no same-run
+  speed headline of its own — cudarc exposes no cuBLAS bf16 peer here. See
+  `entry_smem`/`entry_smem_db`/`entry_mma_pipe`.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` GEMM (no WMMA fp8 on sm_89, so fragments are
   hand-placed per the PTX-ISA lane layout). **Dispatched large-GEMM path (`gemm_nt_fp8` for %128/%128/%64
   shapes): `fp8_pipe_entry`** — the f16/bf16 mma-pipeline recipe carried to E4M3 (multi-stage cp.async
