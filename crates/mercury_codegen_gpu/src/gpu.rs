@@ -2030,6 +2030,94 @@ pub fn gemm_nt_fp8(
     g.stream.memcpy_dtov(&c_d)
 }
 
+// ---------------------------------------------------------------------------------------------------
+// int8 (W8A8) tensor-core GEMM (M3) — `u8` activations × `i8` weights → `i32`, the quantized nn.Linear.
+// Mirrors the fp8 launchers ([`fp8_tile`]/[`gemm_nt_fp8`]); int8 shares fp8's `m16n8k32` 8-bit fragment
+// layout, retyped `.s32.u8.s8.s32`. The integer accumulate is exact mod 2³² → these are **bit-exact**
+// against a CPU `i32` reference, a stronger gate than the float kernels. See [`crate::ptx_int8`].
+// ---------------------------------------------------------------------------------------------------
+
+/// One **int8 (W8A8) tensor-core tile** `D = A·B` via `mma.sync.m16n8k32.s32.u8.s8.s32` (Ada has no
+/// WMMA int8, same as fp8): `a` is `16×32` **u8** row-major, `b_col` is `32×8` **i8** column-major (the
+/// `.col` operand); `D` is `16×8` **i32**. Validates the manual fragment layout — the core a full int8
+/// GEMM tiles over. The int8 twin of [`fp8_tile`].
+pub fn int8_tile(g: &mut Gpu, a: &[u8], b_col: &[i8]) -> Result<Vec<i32>, DriverError> {
+    assert_eq!(a.len(), 16 * 32, "A must be 16×32 (u8)");
+    assert_eq!(b_col.len(), 32 * 8, "B must be 32×8 column-major (i8)");
+    let f = g.function("int8_tile", crate::ptx_int8::INT8_TILE, "int8_tile")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b_col)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; 16 * 8])?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Full **int8 (W8A8) tensor-core `C = A·Bᵀ`** (quantized nn.Linear): `A` (m×k) is **u8** activations,
+/// `B` (n×k) is **i8** weights, `C` is **i32** (exact mod 2³² accumulate — bit-exact, no tolerance).
+/// Each warp computes a 16×8 tile via `mma.sync.m16n8k32`; the fragment-reuse multi-tile kernel runs
+/// when the block divides evenly (the fast path), else the single-tile kernel. Requires m%16==0,
+/// n%8==0, k%32==0. Ada's int8 tensor cores run at ~4× the fp16 rate — the lowest-precision inference
+/// path. The int8 twin of [`gemm_nt_fp8`].
+pub fn gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, DriverError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % 16 == 0 && n % 8 == 0 && k % 32 == 0,
+        "int8 GEMM needs M%16==0, N%8==0, K%32==0"
+    );
+    use crate::ptx_int8::{INT8_TM, INT8_TN};
+    let (f, cfg) = if m % (16 * INT8_TM) == 0 && n % (8 * INT8_TN) == 0 {
+        (
+            g.function(
+                "int8_gemm_mt",
+                crate::ptx_int8::int8_gemm_mt_ptx(),
+                "int8_gemm_nt_mt",
+            )?,
+            LaunchConfig {
+                grid_dim: ((n / (8 * INT8_TN)) as u32, (m / (16 * INT8_TM)) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    } else {
+        (
+            g.function("int8_gemm", crate::ptx_int8::int8_gemm_ptx(), "int8_gemm_nt")?,
+            LaunchConfig {
+                grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    };
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6015,5 +6103,63 @@ mod tests {
         }
         g.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    // ===============================================================================================
+    // int8 (W8A8) tensor-core GEMM (M3) — bit-exact gate + peer scoreboard.
+    // ===============================================================================================
+
+    /// Exact `i32` reference for `C = A·Bᵀ`: `A` is `[M,K]` **u8**, `B` is `[N,K]` **i8**, accumulation
+    /// is **wrapping** `i32` (matching the tensor core's mod-2³² accumulate exactly — no rounding, no
+    /// reassociation). This is the bit-exact oracle: the GPU must equal it lane-for-lane.
+    fn ref_nt_int8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize) -> Vec<i32> {
+        let mut c = vec![0i32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc: i32 = 0;
+                for kk in 0..k {
+                    let av = a[i * k + kk] as i32; // u8 → i32 (0..255)
+                    let bv = b[j * k + kk] as i32; // i8 → i32 (-128..127)
+                    acc = acc.wrapping_add(av.wrapping_mul(bv));
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    /// **M3 bit-exact gate.** int8 W8A8 GEMM (`u8`×`i8`→`i32`) must equal the wrapping-`i32` CPU
+    /// reference **exactly** (not within tolerance) over the full output, at shapes hitting both the
+    /// single-tile kernel (16×8 / non-`_mt`-divisible) and the fragment-reuse `_mt` kernel. Asymmetric
+    /// data (a u8 ramp × an i8 ±ramp incl. negatives) so a lane/sign/transpose slip can't hide.
+    #[test]
+    fn int8_gemm_matches_reference() {
+        with_gpu("int8_gemm", |g| {
+            let mut rng = crate::diff::Rng::new(0x1278);
+            // (m,k,n): the first two are `_mt`-divisible (m%32==0,n%32==0); the 16×8×32 and (48,32,40)
+            // shapes fall to the single-tile kernel (n%32!=0 or m%32!=0) — both paths gated.
+            for (m, k, n) in [
+                (16usize, 32usize, 8usize),
+                (48, 32, 40),
+                (64, 64, 64),
+                (128, 256, 96),
+            ] {
+                // u8 activations in [0,255], i8 weights in [-128,127] — full range, deterministic.
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
+                let got = gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
+                let want = ref_nt_int8(&a, &b, m, k, n);
+                assert_eq!(
+                    got, want,
+                    "int8_gemm {m}x{k}x{n}: GPU output must equal the i32 reference bit-for-bit"
+                );
+                let checksum = got.iter().map(|&x| x as i64).sum::<i64>();
+                eprintln!("int8_gemm {m}x{k}x{n}: bit-exact ✓ (checksum {checksum})");
+            }
+        });
     }
 }
