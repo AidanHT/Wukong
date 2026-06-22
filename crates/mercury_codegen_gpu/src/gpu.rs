@@ -1143,18 +1143,14 @@ pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
     d == 64 && s % 16 == 0 && s >= 512
 }
 
-/// Tensor-core flash entry name for this seq: the **wide 64-key kernel** (`flash_d64_w4`) when
-/// `S % 64 == 0` — it stages 64 keys per online-softmax step instead of 16, cutting the serial KB
-/// dependency chain (and its SMEM round-trips) 4× for **~2× the throughput** of the 16-key `flash_d64_w`
-/// (`flash_tiled_vs_untiled`: wmma4/wmma ~0.45–0.61× across S). Falls back to the 16-key kernel for the
-/// `S % 16 == 0` but not `% 64` seqs (the layer is always `% 64`, so it always gets the wide path). Both
-/// share [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA).
-pub(crate) fn wmma_flash_entry(s: usize) -> &'static str {
-    if s % (16 * crate::ptx_flash::WMMA_FLASH_NKB) == 0 {
-        "flash_d64_w4"
-    } else {
-        "flash_d64_w"
-    }
+/// Tensor-core flash entry name: the **register-resident `mma.sync` kernel** `flash_d64_m` — O/m/l in
+/// registers, no SMEM round-trip. It supersedes the WMMA `flash_d64_w`/`_w4` (which `wmma.store.d` every
+/// fragment to SMEM): the same-run A/B `flash_mma_vs_wmma` measures `m/w4` 0.68×→0.17× across
+/// S=256→4096 (1.5–5.9× faster, the margin growing with context). Only needs `S % 16 == 0` (the
+/// query-block stride; the older `_w4` needed `% 64`), which [`wmma_flash_applies`] already guarantees.
+/// Shares [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA). `_w`/`_w4` are retained for the A/B bench.
+pub(crate) fn wmma_flash_entry(_s: usize) -> &'static str {
+    "flash_d64_m"
 }
 
 /// Launch config for the tensor-core flash kernels (`flash_d64_w`/`_w4`): one warp per 16-query-row block.
