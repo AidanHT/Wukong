@@ -723,6 +723,16 @@ because it pays none of torch's launch/dispatch overhead and fuses the epilogues
 attention is itself **3.6–5.0× the cuBLAS unfused chain** (the table above), so the layer lead rests on a
 flash that already beats the gold-standard library attention.
 
+**Real GPT-2 multi-head shape (new).** The table above is a single-head D=64 layer — useful for the
+fusion/residency comparison, but not a real transformer. `ResidentLayerF16::new_mha` now runs **true
+multi-head attention** at the **GPT-2 shape (D=768, H=12 heads of dh=64)**: the QKV projection's `[S,D]`
+output is bridged token-major↔head-major by two memory-bound transpose shims (`ptx::HEAD_TRANSPOSE_PTX`,
+with the f32→f16 cast folded into the forward one) around the existing `grid.y=H` tensor-core flash, so the
+production flash kernel is untouched. Gated bit-reproducibly against a **per-head** f64 reference at
+D=768/H=12/S=512 (`transformer_layer_mha_matches_reference_within_tol`, max_abs 8.05e-3). A same-run
+*throughput* re-measurement at this real shape — vs a **multi-head** cuBLAS-chain layer and PyTorch — is the
+follow-up that moves the M13 headline off the D=64 toy onto a genuine transformer layer.
+
 Honest caveats: **eager** PyTorch only — `torch.compile`/Inductor needs Triton, which has no working Windows
 install (`torch.compile` raised `Cannot find a working triton installation` here). Cross-process and
 **clock-noisy** at this ~1–2 ms scale (the laptop GPU boosts ~7×), so treat the ratios as order-of-magnitude
