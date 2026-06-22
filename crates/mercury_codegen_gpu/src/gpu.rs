@@ -1297,7 +1297,7 @@ pub fn conv2d(
 /// `WMMA_BM×WMMA_BN` output tile (`grid = (ceil(N/BN), ceil(M/BM), 1)`, `block = (32,1,1)`), with
 /// `M=K`, `N=P*Q`. Shared by the launcher and the `conv_vs_peers` bench.
 pub(crate) fn conv_wmma_cfg(h: usize, width: usize, k: usize, r: usize, s: usize) -> LaunchConfig {
-    use crate::ptx_conv::{WMMA_BM, WMMA_BN};
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
     let (p, q) = (h - r + 1, width - s + 1);
     let (m, n) = (k, p * q);
     LaunchConfig {
@@ -1306,7 +1306,7 @@ pub(crate) fn conv_wmma_cfg(h: usize, width: usize, k: usize, r: usize, s: usize
             (m as u32).div_ceil(WMMA_BM as u32),
             1,
         ),
-        block_dim: (32, 1, 1),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
