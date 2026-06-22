@@ -3461,6 +3461,59 @@ mod tests {
         });
     }
 
+    /// Gate for the **multi-warp-CTA** pipelined flash `flash_d64_mp4` / `flash_d64_mp8` (W warps share
+    /// one CTA and its cooperatively-staged K/V block; each warp owns its own 16-query-row block). Same
+    /// math as `flash_d64_mp` so it matches `ref_attn`; exercises the ragged final CTA (S=16 with W=4/8 →
+    /// only warp 0 active, the rest stage + barrier but skip compute) and the steady CTA (S=512). A
+    /// buffer-swap race, a missing barrier, or a botched active-warp predicate scatters O — caught here.
+    #[test]
+    fn mma_pipe_mw_flash_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("mma_pipe_mw_flash", |g| {
+            let mut rng = crate::diff::Rng::new(0x3FA57);
+            let d = 64usize;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for seq in [16usize, 64, 256, 512] {
+                let q16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let (qf, kf, vf) = (back(&q16), back(&k16), back(&v16));
+                let oracle = ref_attn(&qf, &kf, &vf, seq, d, scale);
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let s32 = seq as u32;
+                for (warps, entry) in [(4u32, "flash_d64_mp4"), (8, "flash_d64_mp8")] {
+                    let mut o_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
+                    let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                    let blocks = (seq / 16) as u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: (blocks.div_ceil(warps), 1, 1),
+                        block_dim: (32 * warps, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let st = crate::diff::assert_close(
+                        &format!("{entry} s={seq}"),
+                        &got,
+                        &oracle,
+                        2e-3,
+                        2e-2,
+                    );
+                    eprintln!(
+                        "{entry} s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
+                }
+            }
+        });
+    }
+
     /// **Same-process A/B: the `cp.async`-pipelined flash (`flash_d64_mp`) vs the global-load
     /// register-resident flash (`flash_d64_m`)** — single-head and multi-head (H=12, the GPU-filled
     /// regime where attention is per-warp latency-bound and the prefetch should pay off). One pinned
@@ -3564,6 +3617,90 @@ mod tests {
                         t_mp * 1e3,
                         gf / t_mp / 1e9,
                         t_mp / t_m,
+                    );
+                }
+            }
+        });
+    }
+
+    /// **Same-process A/B: multi-warp-CTA flash (`flash_d64_mp4` / `_mp8`) vs the 1-warp pipelined
+    /// `flash_d64_mp`** — does sharing one cooperatively-staged K/V block across W warps (cutting K/V
+    /// global traffic W×) beat the 1-warp kernel once `cp.async` has hidden the latency? One pinned clock;
+    /// `mpW/mp` below 1.0 ⇒ the multi-warp kernel wins. Asserts all three agree first. Single-head and
+    /// the H=12 filled regime. Run: `… --features gpu --release -- --ignored --nocapture flash_mw_vs_mp`.
+    #[test]
+    #[ignore = "tuning bench; run explicitly"]
+    fn flash_mw_vs_mp() {
+        with_gpu("flash_mw_vs_mp", |g| {
+            let mut rng = crate::diff::Rng::new(0x317E5);
+            let d = 64usize;
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin {
+                () => {{ for _ in 0..40 { gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap(); } }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            let to16 = |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&v| half::f16::from_f32(v)).collect() };
+            // (entry, warps): warps=1 is the 1-warp baseline (block 32, grid.x = S/16).
+            let variants = [("flash_d64_mp", 1u32), ("flash_d64_mp4", 4), ("flash_d64_mp8", 8)];
+            let funcs: Vec<_> = variants
+                .iter()
+                .map(|(e, _)| g.function("flash", crate::ptx_flash::flash_ptx(), e).unwrap())
+                .collect();
+            let cfg_for = |w: u32, s: usize, heads: u32| LaunchConfig {
+                grid_dim: (((s / 16) as u32).div_ceil(w), heads, 1),
+                block_dim: (32 * w, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            for (heads, seqs) in [(1u32, &[512usize, 1024, 2048, 4096][..]), (12, &[512, 1024, 2048][..])] {
+                for &s in seqs {
+                    let n = heads as usize * s * d;
+                    let qf = rng.vec(n, -1.0, 1.0);
+                    let kf = rng.vec(n, -1.0, 1.0);
+                    let vf = rng.vec(n, -1.0, 1.0);
+                    let q16 = g.stream.memcpy_stod(&to16(&qf)).unwrap();
+                    let k16 = g.stream.memcpy_stod(&to16(&kf)).unwrap();
+                    let v16 = g.stream.memcpy_stod(&to16(&vf)).unwrap();
+                    let mut o = g.stream.memcpy_stod(&vec![0f32; n]).unwrap();
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let ss = s as u32;
+                    // launch helper as a macro (no closure capturing g across pin!()).
+                    macro_rules! launch {
+                        ($i:expr, $w:expr) => {{
+                            let mut b = g.stream.launch_builder(&funcs[$i]);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                            unsafe { b.launch(cfg_for($w, s, heads)).unwrap() };
+                        }};
+                    }
+                    // baseline = mp (1 warp); all variants must agree with it.
+                    launch!(0, 1);
+                    g.stream.synchronize().unwrap();
+                    let base = g.stream.memcpy_dtov(&o).unwrap();
+                    let mut times = vec![];
+                    for (i, (_, w)) in variants.iter().enumerate() {
+                        let w = *w;
+                        launch!(i, w);
+                        g.stream.synchronize().unwrap();
+                        let out = g.stream.memcpy_dtov(&o).unwrap();
+                        let dmax = base.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                        assert!(dmax < 5e-3, "H={heads} S={s} {}: disagree max_abs={dmax:.2e}", variants[i].0);
+                        pin!();
+                        let t = best_of(5, || {
+                            let t0 = Instant::now();
+                            for _ in 0..100 { launch!(i, w); }
+                            g.stream.synchronize().unwrap();
+                            t0.elapsed().as_secs_f64() / 100.0
+                        });
+                        times.push(t);
+                    }
+                    let gf = 4.0 * (s as f64) * (s as f64) * (d as f64) * (heads as f64);
+                    eprintln!(
+                        "H={heads:>2} S={s:>4}: mp {:.4} ({:>5.0}) | mp4 {:.4} ({:>5.0}) {:.2}x | mp8 {:.4} ({:>5.0}) {:.2}x  [ms (GFLOP/s) mpW/mp]",
+                        times[0] * 1e3, gf / times[0] / 1e9,
+                        times[1] * 1e3, gf / times[1] / 1e9, times[1] / times[0],
+                        times[2] * 1e3, gf / times[2] / 1e9, times[2] / times[0],
                     );
                 }
             }
