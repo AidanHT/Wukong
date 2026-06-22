@@ -466,19 +466,14 @@ pub fn gemm_nt_f16(
     // with the A+B working set vs the 24 MB L2 (see `PIPE_VARIANTS`):
     //   • L2-resident: a DEEP BK=16 pipeline wins (latency is low; depth keeps the tensor cores fed) —
     //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
-    //   • L2-thrashing (≳64 MB, e.g. 4096³ ≈ 134 MB): WIDE BK=32 + a big tile wins (amortize the
-    //     barrier/commit overhead, cut redundant inter-CTA traffic); the BK=16 pipes *collapse* there.
-    //     `pipe_256x64_bk32_s2` (~62%), `pipe_128_bk32_s2` as the %128 fallback.
+    //   • L2-thrashing (≳64 MB, e.g. 4096³ ≈ 134 MB): WIDE BK=32 + **threadblock rasterization** wins —
+    //     the GEMM is HBM-bound, so banding co-scheduled CTAs into a compact L2 footprint cuts effective
+    //     traffic (`pipe_128_bk32_s2_r8` ~72%); the BK=16 pipes *collapse* there.
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
-    if ws_bytes >= 64 * 1024 * 1024 && k % 32 == 0 {
-        if m % 256 == 0 && n % 64 == 0 {
-            return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_256x64_bk32_s2"));
-        }
-        if m % 128 == 0 && n % 128 == 0 {
-            return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_128_bk32_s2"));
-        }
+    if ws_bytes >= 64 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_128_bk32_s2_r8"));
     }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));
@@ -892,13 +887,16 @@ pub fn gemm_nt_f16_sm128_db(
 }
 
 /// Launch config for a multi-stage `cp.async` pipeline variant (`entry_smem_pipe`): `v.threads()` per
-/// CTA, one CTA per `bm×bn` output tile. Applies when `M%bm==0 && N%bn==0 && K%bk==0`.
+/// CTA. Without rasterization the grid is 2-D (one CTA per `bm×bn` output tile, mapped from ctaid.x/y);
+/// with `v.raster>0` the kernel remaps a **1-D** grid of `tiles_m·tiles_n` blocks into an L2-friendly
+/// tile order itself, so the grid must be 1-D. Applies when `M%bm==0 && N%bn==0 && K%bk==0`.
 fn pipe_cfg(v: &crate::ptx_wmma::PipeCfg, m: usize, n: usize) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: ((n / v.bn) as u32, (m / v.bm) as u32, 1),
-        block_dim: (v.threads() as u32, 1, 1),
-        shared_mem_bytes: 0,
-    }
+    let grid_dim = if v.raster > 0 {
+        (((m / v.bm) * (n / v.bn)) as u32, 1, 1)
+    } else {
+        ((n / v.bn) as u32, (m / v.bm) as u32, 1)
+    };
+    LaunchConfig { grid_dim, block_dim: (v.threads() as u32, 1, 1), shared_mem_bytes: 0 }
 }
 
 /// `C = A·Bᵀ` (fp16-in, f32-out) via a **multi-stage `cp.async` pipeline** variant `v` — the
