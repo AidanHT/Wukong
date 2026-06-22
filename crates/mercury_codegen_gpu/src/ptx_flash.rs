@@ -616,8 +616,197 @@ fn entry_wmma_wide(d: usize, nkb: usize) -> String {
     s
 }
 
-/// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, plus the
-/// tensor-core `flash_d64_w` (16-key tile) and the wide-key-tile `flash_d64_w4` (64-key tile).
+/// Generate the **register-resident `mma.sync` flash** kernel for head dim `d` (multiple of 16).
+/// Name = `flash_d{d}_m`. The FlashAttention-2 form on the Ada tensor cores with the output `O`, the
+/// running max `m`, and the denominator `l` held in **registers** across the whole K-loop — *no*
+/// per-step SMEM round-trip of S/P/PV/O. The [`entry_wmma`]/[`entry_wmma_wide`] kernels `wmma.store.d`
+/// every fragment to SMEM and keep `O` in SMEM (4 `bar.sync`s + several round-trips per key block),
+/// which caps them at ~21% occupancy and serializes on the SMEM traffic; this kernel removes all of it.
+///
+/// Built on the hand-placed `mma.sync.m16n8k16.row.col.f32.f16.f16.f32` layout **proven** by
+/// `gpu::tests::mma_m16n8k16_layout_verifies` (`grp=lane>>2`, `tg=lane&3`, `tg2=tg*2`). ONE warp owns a
+/// 16-query-row block (`qrow0=ctaid.x*16+grp`, `qrow1=qrow0+8`); `S%16==0` (the layer is `%64`). Q/K/V
+/// are f16 (the tensor-core dtype), O is f32. **Zero SMEM** in this first cut — K/V `mma` B-fragments are
+/// loaded straight from global per 16-key block (uncoalesced; the coalescing SMEM stage is the perf
+/// follow-up). The win here is purely the register-resident accumulator.
+///
+/// Per 16-key block (`kb`):
+///  1. `S = Q·Kᵀ`: `kt=D/16` contraction tiles × 2 key n-tiles of `mma.sync` → 8 score scalars/lane in
+///     the **D-accumulator layout** (lane owns rows {grp,grp+8} × keys {tg2,tg2+1, 8+tg2,8+tg2+1}). Q is
+///     the A.row operand (loaded once into registers); K is the `.col` B operand — K's natural
+///     `[key][hdim]` row-major *is* the required `[N=key][K=hdim]` layout, so each B-fragment is one
+///     clean `b32` global load.
+///  2. **Online softmax on the register scores**: per-row local max over the lane's 4 keys, then a
+///     `shfl.sync.bfly` reduction across the 4 lanes sharing `grp` (offsets 1,2) for the true row max;
+///     `corr=ex2((m-mnew)·log2e)`; **rescale the register O in place** (`o*=corr`); `l=l·corr+Σp`.
+///  3. **P→A with no reformat**: the score D-layout *is* the A.row layout that `O+=P·V` needs (the two
+///     key n-tiles' `d0..d3` map exactly onto `a0..a3`), so the softmax probabilities are just
+///     `cvt.rn.f16.f32`+packed in registers into the P A-fragment — **no SMEM bounce**.
+///  4. `O += P·V`: `D/8` output n-tiles of `mma.sync` accumulate directly into the register O. V is the
+///     `.col` B operand `[hdim][key]` (the transpose of V's natural layout), so each B-fragment is two
+///     `u16` loads packed — the only uncoalesced cost, removed by the SMEM stage later.
+///  Final `O[row][c] = o / l_row`. Tolerance-gated vs `ref_attn` (f16 in ⇒ same ~2e-2 rel as the WMMA
+///  flash; a mis-mapped fragment would scatter O(0.1+), which the gate catches).
+fn entry_mma_reg(d: usize) -> String {
+    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    let ktq = d / 16; // Q·Kᵀ contraction tiles (over hdim)
+    let nto = d / 8; // P·V output n-tiles (over hdim)
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = format!("flash_d{d}_m");
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0;\n";
+    // f32: scalars + 8 scores + 4 prob temps + O accumulators (nto×4)
+    let mut fr = String::from(
+        "%scale,%m0,%m1,%mnew0,%mnew1,%corr0,%corr1,%l0,%l1,%lmax0,%lmax1,%rt,%psum0,%psum1,%pp,%tp0,%tp1,%tp2,%tp3",
+    );
+    for nk in 0..2 {
+        for r in 0..4 {
+            fr += &format!(",%s{nk}_{r}");
+        }
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            fr += &format!(",%o{nt}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    // b32: Q A-fragments (ktq×4, loaded once) + P A-frag (4) + B-frag (2) + pack temps + indices
+    let mut br = String::new();
+    for kt in 0..ktq {
+        for r in 0..4 {
+            br += &format!("%qa{kt}_{r},");
+        }
+    }
+    br += "%a0,%a1,%a2,%a3,%b0,%b1,%h0,%h1,";
+    s += &format!(
+        "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp;\n"
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    // lane decomposition + the two query rows this lane owns
+    s += "    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n";
+
+    // Load Q A-fragments once (reused across every key block). qa{kt}_0=Q[qr0][16kt+tg2..],
+    // _1=Q[qr1][16kt+tg2..], _2=Q[qr0][16kt+tg2+8..], _3=Q[qr1][16kt+tg2+8..]  (each a packed f16 pair).
+    for kt in 0..ktq {
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_0,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_2,[%base];\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_1,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_3,[%base];\n");
+    }
+    // init O=0, m=-inf, l=0
+    for nt in 0..nto {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %o{nt}_{r},0f00000000;\n");
+        }
+    }
+    s += "    mov.f32 %m0,0fFF800000;\n    mov.f32 %m1,0fFF800000;\n    mov.f32 %l0,0f00000000;\n    mov.f32 %l1,0f00000000;\n";
+
+    // for kb in 0..S step 16
+    s += "    mov.u32 %kb,0;\n";
+    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+
+    // 1. S = Q·Kᵀ : two key n-tiles, each accumulating ktq contraction tiles into %s{nk}_{0..3}.
+    for nk in 0..2 {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
+        }
+        // gkey = kb + 8*nk + grp  (the key column n=grp for this n-tile)
+        s += &format!("    add.u32 %gkey,%kb,{};\n    add.u32 %gkey,%gkey,%grp;\n", nk * 8);
+        for kt in 0..ktq {
+            // b0=pack(K[gkey][16kt+tg2], K[gkey][16kt+tg2+1]); b1=pack(K[gkey][16kt+tg2+8],..+9)
+            s += &format!("    mul.lo.s32 %tmp,%gkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%K,%off;\n    ld.global.b32 %b0,[%base];\n", kt * 16);
+            s += "    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%K,%off;\n    ld.global.b32 %b1,[%base];\n";
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+        }
+    }
+
+    // 2. online softmax (register-resident). Lane owns 4 keys per row; the row max/sum need the 4 lanes
+    //    sharing grp (tg=0..3 cover all 16 keys) — reduce with shfl.bfly offsets 1,2 (stays in-group).
+    // qrow0 = scores _0,_1 ; qrow1 = scores _2,_3.
+    s += "    max.f32 %lmax0,%s0_0,%s0_1;\n    max.f32 %lmax0,%lmax0,%s1_0;\n    max.f32 %lmax0,%lmax0,%s1_1;\n    mul.f32 %lmax0,%lmax0,%scale;\n";
+    s += "    max.f32 %lmax1,%s0_2,%s0_3;\n    max.f32 %lmax1,%lmax1,%s1_2;\n    max.f32 %lmax1,%lmax1,%s1_3;\n    mul.f32 %lmax1,%lmax1,%scale;\n";
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax0,{off},0x1f,0xffffffff;\n    max.f32 %lmax0,%lmax0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax1,{off},0x1f,0xffffffff;\n    max.f32 %lmax1,%lmax1,%rt;\n");
+    }
+    s += &format!("    max.f32 %mnew0,%m0,%lmax0;\n    sub.f32 %corr0,%m0,%mnew0;\n    mul.f32 %corr0,%corr0,{log2e};\n    ex2.approx.f32 %corr0,%corr0;\n");
+    s += &format!("    max.f32 %mnew1,%m1,%lmax1;\n    sub.f32 %corr1,%m1,%mnew1;\n    mul.f32 %corr1,%corr1,{log2e};\n    ex2.approx.f32 %corr1,%corr1;\n");
+    // rescale register O (rows _0,_1 by corr0; _2,_3 by corr1)
+    for nt in 0..nto {
+        s += &format!("    mul.f32 %o{nt}_0,%o{nt}_0,%corr0;\n    mul.f32 %o{nt}_1,%o{nt}_1,%corr0;\n    mul.f32 %o{nt}_2,%o{nt}_2,%corr1;\n    mul.f32 %o{nt}_3,%o{nt}_3,%corr1;\n");
+    }
+    // probabilities p = ex2((scale·s - mnew)·log2e); pack into the P A-fragment; accumulate row sums.
+    // emit one prob into %tpX from score %sREG with running-max %mnewR:
+    let prob = |dst: &str, sreg: &str, mnew: &str| -> String {
+        format!("    mul.f32 %pp,{sreg},%scale;\n    sub.f32 %pp,%pp,{mnew};\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 {dst},%pp;\n")
+    };
+    // pack two f32 probs (lo,hi) into a b32 f16 pair (lo in low 16) for the mma A operand.
+    let pack = |dst: &str, lo: &str, hi: &str| -> String {
+        format!("    cvt.rn.f16.f32 %h0,{lo};\n    and.b32 %h0,%h0,65535;\n    cvt.rn.f16.f32 %h1,{hi};\n    shl.b32 %h1,%h1,16;\n    or.b32 {dst},%h0,%h1;\n")
+    };
+    // qrow0: tp0=p(s0_0), tp1=p(s0_1), tp2=p(s1_0), tp3=p(s1_1)
+    s += &prob("%tp0", "%s0_0", "%mnew0");
+    s += &prob("%tp1", "%s0_1", "%mnew0");
+    s += &prob("%tp2", "%s1_0", "%mnew0");
+    s += &prob("%tp3", "%s1_1", "%mnew0");
+    s += "    add.f32 %psum0,%tp0,%tp1;\n    add.f32 %psum0,%psum0,%tp2;\n    add.f32 %psum0,%psum0,%tp3;\n";
+    s += &pack("%a0", "%tp0", "%tp1"); // n-tile0 keys tg2,tg2+1 (row grp)
+    s += &pack("%a2", "%tp2", "%tp3"); // n-tile1 keys 8+tg2,8+tg2+1 (row grp)
+    // qrow1: tp0=p(s0_2), tp1=p(s0_3), tp2=p(s1_2), tp3=p(s1_3)
+    s += &prob("%tp0", "%s0_2", "%mnew1");
+    s += &prob("%tp1", "%s0_3", "%mnew1");
+    s += &prob("%tp2", "%s1_2", "%mnew1");
+    s += &prob("%tp3", "%s1_3", "%mnew1");
+    s += "    add.f32 %psum1,%tp0,%tp1;\n    add.f32 %psum1,%psum1,%tp2;\n    add.f32 %psum1,%psum1,%tp3;\n";
+    s += &pack("%a1", "%tp0", "%tp1"); // n-tile0 keys tg2,tg2+1 (row grp+8)
+    s += &pack("%a3", "%tp2", "%tp3"); // n-tile1 keys 8+tg2,8+tg2+1 (row grp+8)
+    // reduce the per-lane partial row sums across the tg-group, then l = l·corr + Σp.
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum0,{off},0x1f,0xffffffff;\n    add.f32 %psum0,%psum0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum1,{off},0x1f,0xffffffff;\n    add.f32 %psum1,%psum1,%rt;\n");
+    }
+    s += "    fma.rn.f32 %l0,%l0,%corr0,%psum0;\n    fma.rn.f32 %l1,%l1,%corr1,%psum1;\n";
+    s += "    mov.f32 %m0,%mnew0;\n    mov.f32 %m1,%mnew1;\n";
+
+    // 4. O += P·V : nto output n-tiles, each one k-tile (16 keys). V is the .col B operand [hdim][key];
+    //    b0=pack(V[kb+tg2][8nt+grp], V[kb+tg2+1][8nt+grp]); b1=pack(V[kb+tg2+8][..], V[kb+tg2+9][..]).
+    for nt in 0..nto {
+        s += &format!("    add.u32 %idx,%grp,{};\n", nt * 8); // hdim column = 8nt+grp
+        // b0: keys kb+tg2, kb+tg2+1 (stride d in global ⇒ two u16 loads)
+        s += "    add.u32 %gkey,%kb,%tg2;\n";
+        s += &format!("    mul.lo.s32 %tmp,%gkey,{d};\n    add.u32 %tmp,%tmp,%idx;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%V,%off;\n    ld.global.u16 %h0,[%base];\n");
+        s += &format!("    add.u32 %tmp,%tmp,{d};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%V,%off;\n    ld.global.u16 %h1,[%base];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n");
+        // b1: keys kb+tg2+8, kb+tg2+9
+        s += "    add.u32 %gkey,%kb,%tg2;\n    add.u32 %gkey,%gkey,8;\n";
+        s += &format!("    mul.lo.s32 %tmp,%gkey,{d};\n    add.u32 %tmp,%tmp,%idx;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%V,%off;\n    ld.global.u16 %h0,[%base];\n");
+        s += &format!("    add.u32 %tmp,%tmp,{d};\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%V,%off;\n    ld.global.u16 %h1,[%base];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b1,%h0,%h1;\n");
+        s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+    }
+    s += &format!("    add.u32 %kb,%kb,16;\n    bra KB_{name};\n");
+
+    // store O[row][c] = o / l_row.  o_nt_{0,1}=qr0 cols 8nt+{tg2,tg2+1}; o_nt_{2,3}=qr1 cols 8nt+{tg2,tg2+1}.
+    s += &format!("DONE_{name}:\n");
+    for nt in 0..nto {
+        s += &format!("    div.rn.f32 %o{nt}_0,%o{nt}_0,%l0;\n    div.rn.f32 %o{nt}_1,%o{nt}_1,%l0;\n    div.rn.f32 %o{nt}_2,%o{nt}_2,%l1;\n    div.rn.f32 %o{nt}_3,%o{nt}_3,%l1;\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_0;\n    st.global.f32 [%base+4],%o{nt}_1;\n", nt * 8);
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_2;\n    st.global.f32 [%base+4],%o{nt}_3;\n", nt * 8);
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
+/// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, the
+/// tensor-core `flash_d64_w` (16-key tile) and wide-key `flash_d64_w4` (64-key tile), plus the
+/// register-resident `flash_d64_m` (hand-placed `mma.sync`, O/m/l in registers — no SMEM round-trip).
 pub fn flash_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
@@ -628,6 +817,7 @@ pub fn flash_ptx() -> &'static str {
         }
         m += &entry_wmma(64);
         m += &entry_wmma_wide(64, WMMA_FLASH_NKB);
+        m += &entry_mma_reg(64);
         m
     })
     .as_str()
