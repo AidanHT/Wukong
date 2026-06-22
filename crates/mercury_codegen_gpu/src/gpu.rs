@@ -1224,13 +1224,13 @@ pub(crate) fn flash_attn_run(
 /// (`grid = (ceil(Q/TQ), ceil(P/TP), K)`, `block = (TQ, TP, 1)`). Shared mem is the kernel's own static
 /// `.shared` array, so `shared_mem_bytes = 0`. Shared by the launcher and the `conv_vs_peers` bench.
 pub(crate) fn conv_tiled_cfg(h: usize, width: usize, k: usize, r: usize, s: usize) -> LaunchConfig {
-    use crate::ptx_conv::{TILE_P, TILE_Q};
+    use crate::ptx_conv::{kblock, TILE_P, TILE_Q};
     let (p, q) = (h - r + 1, width - s + 1);
     LaunchConfig {
         grid_dim: (
             (q as u32).div_ceil(TILE_Q as u32),
             (p as u32).div_ceil(TILE_P as u32),
-            k as u32,
+            (k / kblock(k)) as u32,
         ),
         block_dim: (TILE_Q as u32, TILE_P as u32, 1),
         shared_mem_bytes: 0,
@@ -3899,6 +3899,112 @@ mod tests {
                 eprintln!(
                     "conv2d C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// **M6 for conv2d** — Mercury's SMEM-tiled, static-shape-specialized conv vs the **naive CUDA-C
+    /// conv** a programmer writes first (one thread per output, the whole `c,r,s` window streamed from
+    /// global), both JIT-loaded through the same driver and timed **same-run** over identical buffers.
+    /// Correctness gates speed: the naive peer is cross-checked against the f64 oracle, and Mercury's
+    /// tiled output is checksum-cross-checked against the peer at every shape before any ratio counts.
+    /// Needs the CUDA redist DLLs on PATH (see `gemm_vs_peers` / `peer_env_hint`).
+    #[test]
+    #[ignore = "throughput bench; needs CUDA NVRTC redist DLLs on PATH; run explicitly"]
+    fn conv_vs_peers() {
+        use crate::baselines::{
+            conv_flop, nvrtc_naive_conv, peer_env_hint, peers_available, time_nvrtc_naive_conv,
+        };
+        with_gpu("conv_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0xC04F1E);
+
+            // --- Correctness first: naive CUDA-C conv matches the f64 oracle on small shapes. ---
+            for (c, h, wd, k, r, s) in [(3usize, 16usize, 16usize, 8usize, 3usize, 3usize), (16, 24, 24, 8, 5, 5)] {
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((8.0 * ((c * r * s) as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+                crate::diff::assert_close(&format!("naive conv C{c} {r}x{s}"), &naive, &oracle, 1e-4, rel);
+            }
+            eprintln!("[gate] naive CUDA-C conv matches the f64 oracle ✓");
+
+            // --- Clock warmup (peak-vs-peak, same-run): hammer a GEMM until the mobile clock settles. ---
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            // DL-style conv shapes (C, H, W, K, R, S): a ResNet-ish stack of 3x3 layers + a 5x5.
+            let cases = [
+                (3usize, 64usize, 64usize, 64usize, 3usize, 3usize),
+                (64, 56, 56, 64, 3, 3),
+                (128, 28, 28, 128, 3, 3),
+                (256, 14, 14, 256, 3, 3),
+                (32, 32, 32, 32, 5, 5),
+            ];
+            for (c, h, wd, k, r, s) in cases {
+                assert!(crate::ptx_conv::tiled_applies(c, h, wd, k, r, s), "shape not tiled");
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+
+                // Mercury tiled conv: load the shape-specialized module once, keep buffers resident.
+                let ptx = crate::ptx_conv::conv2d_ptx(c, h, wd, k, r, s);
+                let module = g.load_module_cached(&ptx).unwrap();
+                let f = module.load_function("conv2d").unwrap();
+                let cfg = conv_tiled_cfg(h, wd, k, r, s);
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+                let w_d = g.stream.memcpy_stod(&w).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let launch = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&x_d).arg(&w_d).arg(o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                };
+
+                // Checksum cross-check vs naive peer (same f32 buffers, same fma math, different order).
+                launch(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let (cs_m, cs_n) = (csum(&out_m), csum(&naive));
+                assert!(
+                    (cs_m - cs_n).abs() / cs_n.max(1.0) < 2e-2,
+                    "C{c} {h}x{wd} K{k} {r}x{s}: tiled vs naive checksum disagree: m={cs_m:.3e} n={cs_n:.3e}"
+                );
+
+                // Speed, same-run. Naive is O(C·R·S)/thread so far slower at large C → fewer iters.
+                let iters = 50usize;
+                let t_m = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch(g, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let naive_iters = if c >= 128 { 10 } else { 30 };
+                let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, r, s, naive_iters).unwrap();
+
+                let flop = conv_flop(c, h, wd, k, r, s);
+                let (g_m, g_n) = (flop / t_m, flop / t_n);
+                eprintln!(
+                    "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} (same-run): Mercury tiled {:.4} ms ({:>6.0} GFLOP/s) | naive CUDA-C {:.4} ms ({:>5.0} GFLOP/s) || Mercury {:>5.1}× vs naive",
+                    t_m * 1e3,
+                    g_m / 1e9,
+                    t_n * 1e3,
+                    g_n / 1e9,
+                    g_m / g_n,
                 );
             }
         });

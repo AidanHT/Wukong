@@ -22,24 +22,41 @@ pub const TILE_P: usize = 16;
 /// Output-tile width a tiled-conv CTA computes (threads in `x`).
 pub const TILE_Q: usize = 16;
 
-/// Whether the SMEM-tiled generator applies to this shape. The staged halo + weights must fit a
-/// conservative shared-memory budget, and `H>=R`, `W>=S` (a valid conv). Falls back to [`CONV2D`]
+/// Output channels each thread accumulates in registers (channel register-block). The loaded input
+/// halo is **independent of `k`**, so blocking `KB` output channels per CTA reuses each staged input
+/// pixel across `KB` weights from registers and amortizes the per-input-channel barriers `KB×` — the
+/// lever that turns the SMEM tile from a loss into a win. Largest power-of-two-ish divisor of `K`
+/// (≤8) so the grid divides evenly with no `k` tail.
+pub fn kblock(k: usize) -> usize {
+    for kb in [8usize, 4, 2] {
+        if k % kb == 0 {
+            return kb;
+        }
+    }
+    1
+}
+
+/// Whether the SMEM-tiled generator applies to this shape. The staged halo + `KB` weight windows must
+/// fit a conservative shared-memory budget, and `H>=R`, `W>=S` (a valid conv). Falls back to [`CONV2D`]
 /// otherwise so every shape stays runnable.
-pub fn tiled_applies(c: usize, h: usize, w: usize, _k: usize, r: usize, s: usize) -> bool {
-    if h < r || w < s {
+pub fn tiled_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> bool {
+    if h < r || w < s || c < 1 || k < 1 {
         return false;
     }
     let halo = (TILE_P + r - 1) * (TILE_Q + s - 1);
-    let smem_bytes = (halo + r * s) * 4;
+    let smem_bytes = (halo + kblock(k) * r * s) * 4;
     // Stay well under the 48 KB default static-SMEM ceiling (no opt-in to the larger Ada banks).
-    c >= 1 && smem_bytes <= 44 * 1024
+    smem_bytes <= 44 * 1024
 }
 
-/// Emit the SMEM-tiled conv kernel specialized to `[C,H,W] (*) [K,C,R,S] -> [K,P,Q]`. Entry name is
-/// `conv2d`. Launch with block `(TILE_Q, TILE_P, 1)` and grid `(ceil(Q/TILE_Q), ceil(P/TILE_P), K)`.
+/// Emit the SMEM-tiled, **channel-register-blocked** conv kernel specialized to
+/// `[C,H,W] (*) [K,C,R,S] -> [K,P,Q]`. Entry name is `conv2d`. One CTA computes a `TILE_P×TILE_Q`
+/// output tile for `KB=`[`kblock`]`(K)` output channels at once; each thread holds `KB` f32
+/// accumulators. Launch with block `(TILE_Q, TILE_P, 1)` and grid `(ceil(Q/TQ), ceil(P/TP), K/KB)`.
 pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
     use std::fmt::Write as _;
     let (tp, tq) = (TILE_P, TILE_Q);
+    let kb = kblock(k);
     let p = h - r + 1;
     let q = w - s + 1;
     let halo_h = tp + r - 1;
@@ -47,11 +64,12 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let halo = halo_h * halo_w; // input elements staged per channel
     let nthreads = tp * tq;
     let rs = r * s;
-    let smem_elems = halo + rs;
-    let smem_bytes = smem_elems * 4;
+    let c_rs = c * rs; // stride between successive output channels in W
+    let pq = p * q;
+    let smem_bytes = (halo + kb * rs) * 4;
     let row_iters = halo_h.div_ceil(tp); // halo rows each thread strides over
     let col_iters = halo_w.div_ceil(tq);
-    let w_iters = rs.div_ceil(nthreads); // weight loads per thread
+    let w_iters = rs.div_ceil(nthreads); // weight loads per (kk, thread)
 
     let mut b = String::new();
     let _ = writeln!(b, ".version 7.8");
@@ -59,7 +77,7 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, ".address_size 64");
     let _ = writeln!(b);
     let _ = writeln!(b, "// SMEM-tiled conv2d specialized to C={c} H={h} W={w} K={k} R={r} S={s}");
-    let _ = writeln!(b, "// tile {tp}x{tq}, halo {halo_h}x{halo_w}, smem {smem_bytes} B");
+    let _ = writeln!(b, "// tile {tp}x{tq}, kblock {kb}, halo {halo_h}x{halo_w}, smem {smem_bytes} B");
     let _ = writeln!(b, ".visible .entry conv2d(");
     let _ = writeln!(b, "    .param .u64 pXin,");
     let _ = writeln!(b, "    .param .u64 pWt,");
@@ -67,8 +85,8 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, ")");
     let _ = writeln!(b, "{{");
     let _ = writeln!(b, "    .reg .pred %p<8>;");
-    let _ = writeln!(b, "    .reg .b32  %r<48>;");
-    let _ = writeln!(b, "    .reg .f32  %f<8>;");
+    let _ = writeln!(b, "    .reg .b32  %r<64>;");
+    let _ = writeln!(b, "    .reg .f32  %f<32>;");
     let _ = writeln!(b, "    .reg .b64  %rd<12>;");
     let _ = writeln!(b, "    .shared .align 4 .b8 smem[{smem_bytes}];");
     let _ = writeln!(b);
@@ -85,7 +103,7 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    mov.u32 %r2,%tid.y;          // ty in [0,{tp})");
     let _ = writeln!(b, "    mov.u32 %r3,%ctaid.x;");
     let _ = writeln!(b, "    mov.u32 %r4,%ctaid.y;");
-    let _ = writeln!(b, "    mov.u32 %r5,%ctaid.z;        // k (output channel)");
+    let _ = writeln!(b, "    mov.u32 %r5,%ctaid.z;        // k-block index");
     let _ = writeln!(b, "    mul.lo.s32 %r6,%r3,{tq};     // q0");
     let _ = writeln!(b, "    mul.lo.s32 %r7,%r4,{tp};     // p0");
     let _ = writeln!(b, "    add.s32 %r8,%r6,%r1;         // oq = q0+tx");
@@ -97,17 +115,20 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    add.s32 %r12,%r10,%r11;      // smem compute base for (ty,tx)");
     // tlin = ty*tq + tx
     let _ = writeln!(b, "    mad.lo.s32 %r13,%r2,{tq},%r1;      // tlin");
-    // weight base for this k: k*C*R*S
-    let _ = writeln!(b, "    mul.lo.s32 %r14,%r5,{};      // woff_k = k*C*R*S", c * rs);
-    let _ = writeln!(b, "    mov.f32 %f1,0f00000000;      // acc");
+    // k0 = kblock * KB  ;  woff_k0 = k0*C*R*S
+    let _ = writeln!(b, "    mul.lo.s32 %r14,%r5,{};      // woff_k0 = (kb_idx*KB)*C*R*S", kb * c_rs);
+    // accumulators acc[kk] = %f{8+kk} := 0
+    for kk in 0..kb {
+        let _ = writeln!(b, "    mov.f32 %f{},0f00000000;", 8 + kk);
+    }
     let _ = writeln!(b, "    mov.u32 %r15,0;              // c = 0");
     let _ = writeln!(b, "CLOOP:");
     let _ = writeln!(b, "    setp.ge.u32 %p0,%r15,{c};");
     let _ = writeln!(b, "    @%p0 bra CEND;");
     let _ = writeln!(b, "    mul.lo.s32 %r16,%r15,{};     // rXc = c*H*W", h * w);
-    let _ = writeln!(b, "    mad.lo.s32 %r17,%r15,{rs},%r14;    // wbase_c = woff_k + c*R*S");
+    let _ = writeln!(b, "    mad.lo.s32 %r17,%r15,{rs},%r14;    // base_c = woff_k0 + c*R*S");
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- cooperative halo load (X channel c) ----");
+    let _ = writeln!(b, "    // ---- cooperative halo load (X channel c, shared by all KB channels) ----");
     for i in 0..row_iters {
         let hy_base = i * tp;
         let _ = writeln!(b, "    add.s32 %r18,%r2,{hy_base};        // hy");
@@ -127,40 +148,47 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
             let _ = writeln!(b, "    add.s32 %r23,%r20,%r22;          // Xelem = gy*W+rXc+gx");
             let _ = writeln!(b, "    mul.wide.s32 %rd4,%r23,4;");
             let _ = writeln!(b, "    add.s64 %rd4,%rd1,%rd4;");
-            let _ = writeln!(b, "    mov.f32 %f2,0f00000000;");
-            let _ = writeln!(b, "    @%p4 ld.global.f32 %f2,[%rd4];");
+            let _ = writeln!(b, "    mov.f32 %f1,0f00000000;");
+            let _ = writeln!(b, "    @%p4 ld.global.f32 %f1,[%rd4];");
             let _ = writeln!(b, "    mad.lo.s32 %r24,%r18,{halo_w},%r21;  // smem elem = hy*halo_w+hx");
             let _ = writeln!(b, "    shl.b32 %r24,%r24,2;");
             let _ = writeln!(b, "    add.s32 %r24,%r10,%r24;");
-            let _ = writeln!(b, "    @%p3 st.shared.f32 [%r24],%f2;");
+            let _ = writeln!(b, "    @%p3 st.shared.f32 [%r24],%f1;");
         }
     }
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- cooperative weight load (k,c window) ----");
-    for j in 0..w_iters {
-        let base = j * nthreads;
-        let _ = writeln!(b, "    add.s32 %r25,%r13,{base};         // weight slot = tlin + {base}");
-        let _ = writeln!(b, "    setp.lt.u32 %p1,%r25,{rs};");
-        let _ = writeln!(b, "    add.s32 %r26,%r25,%r17;          // global weight elem");
-        let _ = writeln!(b, "    mul.wide.s32 %rd5,%r26,4;");
-        let _ = writeln!(b, "    add.s64 %rd5,%rd2,%rd5;");
-        let _ = writeln!(b, "    mov.f32 %f3,0f00000000;");
-        let _ = writeln!(b, "    @%p1 ld.global.f32 %f3,[%rd5];");
-        let _ = writeln!(b, "    add.s32 %r27,%r25,{halo};        // smem weight elem");
-        let _ = writeln!(b, "    shl.b32 %r27,%r27,2;");
-        let _ = writeln!(b, "    add.s32 %r27,%r10,%r27;");
-        let _ = writeln!(b, "    @%p1 st.shared.f32 [%r27],%f3;");
+    let _ = writeln!(b, "    // ---- cooperative weight load: KB windows of R*S, channel c ----");
+    for kk in 0..kb {
+        // global base of (k0+kk, c) window = base_c + kk*(C*R*S)
+        let _ = writeln!(b, "    add.s32 %r28,%r17,{};        // wbase (k0+{kk},c)", kk * c_rs);
+        let smem_w_base = halo + kk * rs; // smem element offset of this window
+        for j in 0..w_iters {
+            let base = j * nthreads;
+            let _ = writeln!(b, "    add.s32 %r25,%r13,{base};        // weight slot");
+            let _ = writeln!(b, "    setp.lt.u32 %p1,%r25,{rs};");
+            let _ = writeln!(b, "    add.s32 %r26,%r25,%r28;         // global weight elem");
+            let _ = writeln!(b, "    mul.wide.s32 %rd5,%r26,4;");
+            let _ = writeln!(b, "    add.s64 %rd5,%rd2,%rd5;");
+            let _ = writeln!(b, "    mov.f32 %f1,0f00000000;");
+            let _ = writeln!(b, "    @%p1 ld.global.f32 %f1,[%rd5];");
+            let _ = writeln!(b, "    add.s32 %r27,%r25,{smem_w_base};    // smem weight elem");
+            let _ = writeln!(b, "    shl.b32 %r27,%r27,2;");
+            let _ = writeln!(b, "    add.s32 %r27,%r10,%r27;");
+            let _ = writeln!(b, "    @%p1 st.shared.f32 [%r27],%f1;");
+        }
     }
     let _ = writeln!(b);
     let _ = writeln!(b, "    bar.sync 0;");
-    let _ = writeln!(b, "    // ---- unrolled R*S reduction from SMEM ----");
+    let _ = writeln!(b, "    // ---- unrolled R*S reduction; each X reused across KB channels ----");
     for rr in 0..r {
         for ss in 0..s {
             let x_off = (rr * halo_w + ss) * 4; // bytes from compute base %r12
-            let w_off = (halo + rr * s + ss) * 4; // bytes from smem base %r10
-            let _ = writeln!(b, "    ld.shared.f32 %f2,[%r12+{x_off}];");
-            let _ = writeln!(b, "    ld.shared.f32 %f3,[%r10+{w_off}];");
-            let _ = writeln!(b, "    fma.rn.f32 %f1,%f2,%f3,%f1;");
+            let _ = writeln!(b, "    ld.shared.f32 %f1,[%r12+{x_off}];   // X[ty+{rr},tx+{ss}]");
+            for kk in 0..kb {
+                let w_off = (halo + kk * rs + rr * s + ss) * 4; // bytes from smem base %r10
+                let _ = writeln!(b, "    ld.shared.f32 %f2,[%r10+{w_off}];");
+                let _ = writeln!(b, "    fma.rn.f32 %f{a},%f1,%f2,%f{a};", a = 8 + kk);
+            }
         }
     }
     let _ = writeln!(b, "    bar.sync 0;");
@@ -172,12 +200,16 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     let _ = writeln!(b, "    setp.lt.u32 %p1,%r8,{q};");
     let _ = writeln!(b, "    and.pred %p0,%p0,%p1;");
     let _ = writeln!(b, "    @!%p0 bra RET;");
-    // oidx = (k*P + op)*Q + oq
-    let _ = writeln!(b, "    mad.lo.s32 %r28,%r5,{p},%r9;       // k*P + op");
-    let _ = writeln!(b, "    mad.lo.s32 %r28,%r28,{q},%r8;      // *Q + oq");
-    let _ = writeln!(b, "    mul.wide.s32 %rd6,%r28,4;");
-    let _ = writeln!(b, "    add.s64 %rd6,%rd3,%rd6;");
-    let _ = writeln!(b, "    st.global.f32 [%rd6],%f1;");
+    // spat = op*Q + oq  ;  o0 = (k0)*P*Q + spat  ;  k0 = kb_idx*KB
+    let _ = writeln!(b, "    mad.lo.s32 %r30,%r9,{q},%r8;       // spat = op*Q + oq");
+    let _ = writeln!(b, "    mul.lo.s32 %r31,%r5,{};           // k0*P*Q", kb * pq);
+    let _ = writeln!(b, "    add.s32 %r31,%r31,%r30;           // o0 = k0*P*Q + spat");
+    for kk in 0..kb {
+        let _ = writeln!(b, "    add.s32 %r32,%r31,{};         // oidx for channel +{kk}", kk * pq);
+        let _ = writeln!(b, "    mul.wide.s32 %rd6,%r32,4;");
+        let _ = writeln!(b, "    add.s64 %rd6,%rd3,%rd6;");
+        let _ = writeln!(b, "    st.global.f32 [%rd6],%f{};", 8 + kk);
+    }
     let _ = writeln!(b, "RET:");
     let _ = writeln!(b, "    ret;");
     let _ = writeln!(b, "}}");
