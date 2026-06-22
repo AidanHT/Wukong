@@ -2993,6 +2993,36 @@ mod tests {
         o
     }
 
+    /// f64 reference for **causal** single-head attention: query `i` attends only to keys `j ≤ i`
+    /// (`scores[j>i] = -∞` → `exp = 0`). The independent oracle for `flash_d{d}_mc`.
+    fn ref_attn_causal(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize, scale: f32) -> Vec<f32> {
+        let mut o = vec![0.0f32; seq * d];
+        for i in 0..seq {
+            let mut scores = vec![f64::NEG_INFINITY; seq];
+            for (j, sc) in scores.iter_mut().enumerate().take(i + 1) {
+                let mut acc = 0.0f64;
+                for t in 0..d {
+                    acc += q[i * d + t] as f64 * k[j * d + t] as f64;
+                }
+                *sc = acc * scale as f64;
+            }
+            let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut l = 0.0f64;
+            for sc in &mut scores {
+                *sc = (*sc - m).exp(); // masked (−∞) keys → 0
+                l += *sc;
+            }
+            for t in 0..d {
+                let mut acc = 0.0f64;
+                for (j, &p) in scores.iter().enumerate() {
+                    acc += p * v[j * d + t] as f64;
+                }
+                o[i * d + t] = (acc / l) as f32;
+            }
+        }
+        o
+    }
+
     #[test]
     fn flash_attention_matches_reference_within_tol() {
         with_gpu("flash_attention", |g| {
@@ -3253,6 +3283,61 @@ mod tests {
                 );
                 eprintln!(
                     "mma_reg flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// Gate for the **causal** register-resident flash `flash_d64_mc`: query `i` attends only to keys
+    /// `j ≤ i`. Same f16-in setup as the non-causal gate, but vs `ref_attn_causal`. Exercises both the
+    /// diagonal-block per-score mask and the upper-block skip (the loop stops at `kb==row`); a wrong mask
+    /// or an off-by-one in the key/query index comparison shifts the causal boundary and the gate fails.
+    #[test]
+    fn mma_reg_flash_causal_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("mma_reg_flash_causal", |g| {
+            let mut rng = crate::diff::Rng::new(0xCA05A1);
+            let d = 64usize;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for seq in [16usize, 64, 256, 512] {
+                let q16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mc")
+                    .unwrap();
+                let s32 = seq as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((seq / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let oracle = ref_attn_causal(&back(&q16), &back(&k16), &back(&v16), seq, d, scale);
+                let st = crate::diff::assert_close(
+                    &format!("mma_reg causal flash s={seq}"),
+                    &got,
+                    &oracle,
+                    2e-3,
+                    2e-2,
+                );
+                eprintln!(
+                    "mma_reg causal flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
                 );
             }
