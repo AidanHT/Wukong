@@ -76,6 +76,13 @@ toolkit — only **running** needs the driver + a device.
   fp16 mma kernel — the Ada 2× fp8-rate realized** (M2; `fp8_pipe_vs_peers`, checksum-cross-checked). Also
   the single-tile and fragment-reuse `_mt` (2×4 16×8 tiles/warp) fallbacks + host E4M3 round/widen. (The
   literal %-of-cuBLASLt-fp8 needs a raw-sys E4M3 peer — cudarc's safe `Matmul` is f32/f16/bf16 only.)
+  **Fused epilogue carried to fp8 — the fastest fused inference path:** `fp8_pipe_entry` takes the same
+  `act`/`bias` args as `entry_mma_pipe` (the `m16n8k32` D-fragment column map matches `m16n8k16`, so the
+  register-level `bias[col]` add + `Act::epilogue` are reused verbatim) → `fp8_gemm_pipe_bias{,_relu,_silu,
+  _gelu}` (`gemm_nt_fp8_mma_bias*`). `C = act(x·Wᵀ + bias)` at the Ada 2× fp8 TC rate is the fastest fused
+  Linear/FFN; correctness-gated (`fp8_mma_bias_match_reference_within_tol`, max_abs ≤7e-3 vs an
+  `act(e4m3-rounded(A·Bᵀ)+bias)` f64 ref). Speed inherits the plain fp8-pipe's 2×-fp16 standing (no fp8
+  cuBLAS peer here for a fused-chain ratio).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
