@@ -5337,6 +5337,112 @@ mod tests {
         });
     }
 
+    /// **M13 at the real GPT-2 shape: multi-head, D=768, H=12, Dff=3072.** The single-head
+    /// `cublas_chain_vs_mercury_layer_throughput` runs a D=64 toy; this is a genuine transformer layer.
+    /// Mercury's fused multi-head [`ResidentLayerF16`] vs the **multi-head** cuBLAS-chain layer
+    /// ([`CublasChainLayer::new_mha`]) — attention is *common* to both (the same `grid.y=H` flash +
+    /// transpose shims), so the same-run gap is purely (cuBLAS-vs-WMMA GEMM) + (the residual/SiLU epilogue
+    /// fusion cuBLAS can't do). Correctness gates speed: both match the per-head f64 reference first.
+    /// Same-run only (clock pinned by a GEMM hammer + `best_of`). Needs the cuBLAS redist DLL on PATH;
+    /// skips if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture cublas_chain_vs_mercury_mha`.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn cublas_chain_vs_mercury_mha_layer_throughput() {
+        use crate::baselines::{peer_env_hint, peers_available, CublasChainLayer};
+        with_gpu("cublas_chain_vs_mercury_mha", |g| {
+            if !peers_available(g) {
+                eprintln!(
+                    "[skip] cublas_chain_vs_mercury_mha_layer_throughput: cuBLAS not loadable.\n{}",
+                    peer_env_hint()
+                );
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0x60C2);
+            let (d, dff, heads) = (768usize, 3072usize, 12usize); // GPT-2 base: 12 heads × 64, 4× FFN
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin_clock {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            for s in [512usize, 1024, 2048, 4096] {
+                let x = rng.vec(s * d, -1.0, 1.0);
+                let wq = rng.vec(d * d, -0.1, 0.1);
+                let wk = rng.vec(d * d, -0.1, 0.1);
+                let wv = rng.vec(d * d, -0.1, 0.1);
+                let wo = rng.vec(d * d, -0.1, 0.1);
+                let w1 = rng.vec(dff * d, -0.1, 0.1);
+                let w2 = rng.vec(d * dff, -0.1, 0.1);
+                let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+                let mer = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap();
+                let chain = CublasChainLayer::new_mha(g, &w, s, d, dff, heads).unwrap();
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                // Correctness before speed: both stacks vs the per-head f64 oracle at the real shape.
+                let oracle = ref_transformer_layer_f16_mha(&x, &w, s, d, dff, heads);
+                let mer_out = g.stream.memcpy_dtov(&mer.forward_device(&x_d).unwrap()).unwrap();
+                let chain_out = g.stream.memcpy_dtov(&chain.forward_device(&x_d).unwrap()).unwrap();
+                crate::diff::assert_close(&format!("Mercury fused MHA S={s}"), &mer_out, &oracle, 5e-2, 5e-2);
+                crate::diff::assert_close(&format!("cuBLAS chain MHA S={s}"), &chain_out, &oracle, 5e-2, 5e-2);
+
+                let iters = if s >= 2048 { 20 } else { 50 };
+                pin_clock!();
+                let t_fused = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = mer.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_unf = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = mer.forward_device_unfused(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                pin_clock!();
+                let t_chain = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = chain.forward_device(&x_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+
+                let (hdl_lbl, hdl) = if t_chain >= t_fused {
+                    ("Mercury fused faster", t_chain / t_fused)
+                } else {
+                    ("cuBLAS chain faster", t_fused / t_chain)
+                };
+                eprintln!(
+                    "M13 GPT-2 layer S={s} D={d} H={heads} Dff={dff} (resident, same-run): \
+                     Mercury fused {:.3} ms ({:.0} tok/s) | Mercury unfused {:.3} ms | cuBLAS chain {:.3} ms \
+                     || {hdl_lbl} {hdl:.2}× | GEMM-quality (Mercury-unfused vs cuBLAS) {:.2}× | fusion {:.2}×",
+                    t_fused * 1e3,
+                    s as f64 / t_fused,
+                    t_unf * 1e3,
+                    t_chain * 1e3,
+                    t_chain / t_unf,
+                    t_unf / t_fused,
+                );
+            }
+        });
+    }
+
     #[test]
     fn fp8_tensorcore_tile_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
