@@ -190,6 +190,11 @@ pub struct PipeCfg {
     pub wm: usize,
     pub wn: usize,
     pub stages: usize,
+    /// Threadblock-rasterization group width (in N-tiles). `0` = no rasterization (the CTA grid maps
+    /// directly to output tiles). `G>0` launches a 1-D grid and remaps each block to a tile via a
+    /// column-band-of-`G` order, so co-scheduled CTAs share a compact A/B footprint in L2 — the cuBLAS
+    /// trick that cuts effective HBM traffic at L2-thrashing sizes (4096³). Requires `bm`,`bn` powers of 2.
+    pub raster: usize,
 }
 
 impl PipeCfg {
@@ -202,23 +207,26 @@ impl PipeCfg {
     }
 }
 
-/// The fp16 multi-stage-pipeline GEMM variants, **trimmed to the per-regime winners** after a 12-config
-/// sweep against cuBLAS (same-run, full-clock). Two axes drove the result and split cleanly by whether
-/// A+B fit the 24 MB L2:
+/// The fp16 multi-stage-pipeline GEMM variants, **trimmed to the per-regime winners** after sweeping ~20
+/// configs against cuBLAS (same-run, full-clock). The binding constraint splits cleanly by whether A+B fit
+/// the 24 MB L2:
 ///   * **L2-resident (≤ ~2048³): a deep BK=16 pipeline wins** — data is hot in L2 so latency is low, and
-///     more SMEM buffers keep the tensor cores fed (`pipe_128_s4` reached ~94% of cuBLAS at 2048³, the
-///     small `pipe_64_s6` ~90% at 1024³). Wider BK there only wastes SMEM.
-///   * **L2-thrashing (≥ 4096³): wide BK=32 + a big tile wins** — every miss goes to HBM, so amortizing
-///     the barrier/commit overhead over a 32-wide K-slice and cutting redundant inter-CTA traffic with a
-///     256-row tile matters far more than depth (`pipe_256x64_bk32_s2` ~62%, vs the BK=16 pipes' ~27%
-///     *collapse* at 4096³). Pushing past ~62% needs tiles beyond the 48 KiB static-SMEM cap (dynamic).
-/// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (The
-/// dropped probes — narrow-N, BK=64-on-narrow-tile, role-swaps — never won at any size.)
+///     more SMEM buffers keep the tensor cores fed (`pipe_64_s6` ~90% of cuBLAS at 1024³, `pipe_128_s4`
+///     ~87–94% at 2048³). Wider BK there only wastes SMEM.
+///   * **L2-thrashing (≥ ~4096³): the GEMM is HBM-bound, so threadblock rasterization wins** — banding
+///     co-scheduled CTAs into a compact L2 footprint cuts effective traffic. `pipe_128_bk32_s2_r8` reached
+///     ~72% of cuBLAS at 4096³ (vs 56% un-rasterized and the BK=16 pipes' ~27% *collapse*). Bigger
+///     dynamic-SMEM tiles (256×128, 256×64-bk64) and deeper pipes there *lost* to the occupancy drop.
+/// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (~72% is
+/// near the WMMA ceiling on this part; the cuBLAS-class `mma.sync`+`ldmatrix` path is the next lever.)
 pub const PIPE_VARIANTS: &[PipeCfg] = &[
-    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6 }, // 24 KiB — ≤1024³
-    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4 }, // 32 KiB — ~2048³
-    PipeCfg { name: "wmma_nt_f16_pipe_128_bk32_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2 }, // 32 KiB — spilling, %128 fallback
-    PipeCfg { name: "wmma_nt_f16_pipe_256x64_bk32_s2", bm: 256, bn: 64, bk: 32, wm: 4, wn: 2, stages: 2 }, // 40 KiB — spilling champion
+    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6, raster: 0 }, // 24 KiB — ≤1024³
+    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4, raster: 0 }, // 32 KiB — ~2048³
+    // Spilling champion: a 128×128 BK=32 tile with **threadblock rasterization** (r8). At 4096³ the GEMM
+    // is HBM-bound (~2.7 GB of A/B reads ≫ the 134 MB minimum), so banding co-scheduled CTAs into a compact
+    // L2 footprint cut effective traffic: 56% → 72% of cuBLAS (a 12-config raster sweep found the optimum
+    // broad over r8..r16; depth beyond s2 and the 256×64 tile both lost). %128, K%32.
+    PipeCfg { name: "wmma_nt_f16_pipe_128_bk32_s2_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 8 }, // 32 KiB
 ];
 
 /// Look up a [`PipeCfg`] by its entry name (the `gemm_nt_f16` dispatcher selects variants this way, so a
@@ -726,10 +734,15 @@ fn entry_smem_pipe(
     warps_m: usize,
     warps_n: usize,
     stages: usize,
+    raster: usize,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages (1 prefetch in flight)");
     assert!(bk % 16 == 0, "bk must be a multiple of the WMMA k16 step");
     assert!((bk / 8).is_power_of_two(), "bk/8 must be a power of two (shift-based staging address math)");
+    assert!(
+        raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()),
+        "{name}: rasterization needs bm,bn powers of two (tiles_m/n via shift)"
+    );
     let mma_ty = if ty == "f16" {
         "f32.f32".to_string()
     } else {
@@ -767,6 +780,9 @@ fn entry_smem_pipe(
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%bufcA,%bufcB,%bufwA,%bufwB;\n";
+    if raster > 0 {
+        s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grp,%rem,%col0,%gw,%trow,%tcol;\n";
+    }
     let mut decl_c = String::new();
     for ti in 0..tm {
         for tj in 0..tn {
@@ -793,8 +809,22 @@ fn entry_smem_pipe(
     s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
-    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
-    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    if raster == 0 {
+        s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+        s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    } else {
+        // Threadblock rasterization (1-D grid): remap the linear block id into a column-band-of-`raster`
+        // tile order. tiles_n = N/bn, tiles_m = M/bm (bm,bn powers of two ⇒ shifts). Within a band of
+        // `raster` N-tile columns, sweep all M-tile rows before the next band, so the CTAs co-resident on
+        // the SMs touch a compact `raster·bn`-wide A/B footprint that stays hot in L2. Edge bands narrower
+        // than `raster` are handled by the runtime group width `gw` (one div/rem per CTA, in the prologue).
+        let (bn_sh, bm_sh) = (bn.trailing_zeros(), bm.trailing_zeros());
+        s += &format!("    mov.u32 %lin,%ctaid.x;\n    shr.u32 %tn,%N,{bn_sh};\n    shr.u32 %tm,%M,{bm_sh};\n");
+        s += &format!("    mul.lo.s32 %gsz,%tm,{raster};\n    div.u32 %grp,%lin,%gsz;\n    rem.u32 %rem,%lin,%gsz;\n");
+        s += &format!("    mul.lo.s32 %col0,%grp,{raster};\n    sub.u32 %gw,%tn,%col0;\n    min.u32 %gw,%gw,{raster};\n");
+        s += "    div.u32 %trow,%rem,%gw;\n    rem.u32 %tcol,%rem,%gw;\n    add.u32 %tcol,%tcol,%col0;\n";
+        s += &format!("    mul.lo.s32 %baseRow,%trow,{bm};\n    mul.lo.s32 %baseCol,%tcol,{bn};\n");
+    }
     s += &format!("    mov.u32 %ldm,{bk};\n"); // SMEM tile leading dim = bk (wmma stride operand)
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
     s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
@@ -1000,7 +1030,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         // wider staged BK than the 2-stage `_sm*_db`). Swept by `gemm_pipe_sweep`; the winner per size is
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
-            m += &entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages);
+            m += &entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster);
         }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
