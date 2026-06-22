@@ -951,6 +951,12 @@ pub fn gemm_nt_bf16(
         m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
         "WMMA requires 16-multiple dims"
     );
+    // Large bf16 GEMM (A+B ≳ L2): the mma.sync workhorse, the bf16 twin of the f16 dispatch — the cliff
+    // fix for the training precision, which otherwise fell through to the un-staged `_mt` path below.
+    let ws_bytes = (m * k + n * k) * 2;
+    if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        return gemm_nt_bf16_pipe(g, a, b, m, k, n);
+    }
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
     let (entry, cfg) = wmma_pick("wmma_nt_bf16", m, n);
@@ -967,6 +973,41 @@ pub fn gemm_nt_bf16(
         .arg(&b_d)
         .arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ` (bf16-in, f32-out) via the bf16 `mma.sync` large-GEMM kernel [`crate::ptx_wmma::PIPE_BF16`]
+/// — the bf16 twin of [`gemm_nt_f16_pipe`] (padded conflict-free SMEM + r16 rasterization). Requires
+/// `M%128==0`, `N%128==0`, `K%32==0`; numerically identical to the other bf16 GEMMs (f32 accumulate),
+/// tolerance-gated. Static 40 KiB SMEM ⇒ no dynamic-shared opt-in needed.
+pub fn gemm_nt_bf16_pipe(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::PIPE_BF16;
+    use half::bf16;
+    let v = &PIPE_BF16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "{} requires M%{}==0, N%{}==0, K%{}==0",
+        v.name, v.bm, v.bn, v.bk
+    );
+    let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+    let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), v.name)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -2513,6 +2554,28 @@ mod tests {
                         v.smem_bytes()
                     );
                 }
+            }
+        });
+    }
+
+    /// The bf16 `mma.sync` large-GEMM kernel (`PIPE_BF16`, dispatched by `gemm_nt_bf16` for A+B ≳ L2) must
+    /// match the bf16-rounded f64 reference. Same generator as the f16 mma kernel (precision-generic), so
+    /// this confirms the bf16 fragment/mma-type tag and the padded staging↔load consistency at the wider
+    /// bf16 tolerance. Shapes hit the %128/%32 divisibility, a single K-tile (prologue guard), the ring
+    /// wrap, and a rectangular multi-CTA case.
+    #[test]
+    fn wmma_bf16_pipe_matches_reference_within_tol() {
+        use half::bf16;
+        with_gpu("wmma_bf16_pipe", |g| {
+            let mut rng = crate::diff::Rng::new(0xB16E);
+            let shapes = [(128usize, 32usize, 128usize), (128, 64, 128), (256, 256, 256), (128, 160, 384)];
+            for (m, k, n) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
+                let c = gemm_nt_bf16_pipe(g, &a, &b, m, k, n).unwrap();
+                let s = crate::diff::assert_close(&format!("bf16 mma {m}x{k}x{n}"), &c, &r, 2e-2, 1e-2);
+                eprintln!("bf16 mma {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
             }
         });
     }

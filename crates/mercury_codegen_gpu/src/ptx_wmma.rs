@@ -246,6 +246,24 @@ pub const PIPE_VARIANTS: &[PipeCfg] = &[
     PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, mma: true, pad: 8 }, // 40 KiB
 ];
 
+/// The bf16 large-GEMM workhorse — the bf16 twin of the f16 spilling champion `mma_nt_f16_128_bk32_s2_r16`
+/// (`mma.sync.m16n8k16` is precision-generic: bf16 packs into the same 4×b32 A / 2×b32 B fragments, only
+/// the mma type tag changes). Generated into the bf16 module; `gemm_nt_bf16` dispatches A+B ≳ L2 to it,
+/// replacing the un-staged `_mt` path bf16 large GEMM used before (no pipeline at all). bf16 is the
+/// dominant *training* precision, so this carries the cliff fix to training-shaped GEMMs.
+pub const PIPE_BF16: PipeCfg = PipeCfg {
+    name: "mma_nt_bf16_128_bk32_s2_r16",
+    bm: 128,
+    bn: 128,
+    bk: 32,
+    wm: 2,
+    wn: 4,
+    stages: 2,
+    raster: 16,
+    mma: true,
+    pad: 8,
+};
+
 /// Look up a [`PipeCfg`] by its entry name (the `gemm_nt_f16` dispatcher selects variants this way, so a
 /// renamed/removed table row fails loudly at the call site rather than silently mis-dispatching).
 pub fn pipe_variant(name: &str) -> &'static PipeCfg {
@@ -1342,6 +1360,10 @@ pub fn wmma_bf16_ptx() -> &'static str {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         m += &entry("wmma_nt_bf16", "bf16", 1, 1);
         m += &entry("wmma_nt_bf16_mt", "bf16", TM_TILES, TN_TILES);
+        // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
+        // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
+        let v = PIPE_BF16;
+        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad);
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
             m += &entry_smem_db(
