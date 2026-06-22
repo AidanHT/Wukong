@@ -71,8 +71,19 @@ toolkit — only **running** needs the driver + a device.
   `mma_nt_bf16_128_bk32_s2_r16_bias{,_relu,_silu,_gelu}` (`gemm_nt_bf16_mma_bias*`). Speed for the bf16
   fast-mma fused path is inherited (Ada runs bf16 and fp16 `mma.sync` at the same TC rate, byte-identical
   generator); it is correctness-gated (`wmma_bf16_mma_bias_match_reference_within_tol`) but has no same-run
-  speed headline of its own — cudarc exposes no cuBLAS bf16 peer here. See
-  `entry_smem`/`entry_smem_db`/`entry_mma_pipe`.
+  speed headline of its own — cudarc exposes no cuBLAS bf16 peer here. **Gated-FFN (GLU-family) fusion**
+  rides the same fast base through a dedicated dual-B generator (`entry_mma_gate`): `out = act(x·Wgᵀ) ⊙
+  (x·Wuᵀ)` — the **SwiGLU** (silu) / **GeGLU** (gelu) / bilinear-GLU FFN gate every modern LLM runs, fp16 +
+  bf16, five variants each (±per-column gate/up bias). A **128×64** tile holds TWO accumulator sets at the
+  same 64 f32 D-regs/thread and three staged tiles (A + Wg + Wu) at the same 40 KiB as the single-B 128×128
+  workhorse (register- and SMEM-neutral), so one staged `x` tile feeds both GEMMs (x read **once** via shared
+  A fragments) and the gate (activation on the gate branch + the elementwise product) folds into the store.
+  cuBLAS structurally needs **three** kernels for this (two GEMMs + an elementwise multiply, both `[M,N]`
+  intermediates round-tripped through HBM) — same-run vs that chain (`fused_swiglu_gate_vs_chain`, interleaved
+  best-of-6, 3 runs): **512³ ~1.25–1.31×, 1024³ ~1.01–1.10×, 2048³ ~1.01–1.03× faster** (preloading both B
+  tiles + interleaving the gate/up mma recovered the ILP — the serialized first form *lost* 0.96–0.97× at
+  1024³/2048³). Gated by `swiglu_gate_match_reference_within_tol` (max_abs ≤ 4.3e-4 fp16 / 1.9e-4 bf16). See
+  `entry_smem`/`entry_smem_db`/`entry_mma_pipe`/`entry_mma_gate`.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` GEMM (no WMMA fp8 on sm_89, so fragments are
   hand-placed per the PTX-ISA lane layout). **Dispatched large-GEMM path (`gemm_nt_fp8` for %128/%128/%64
   shapes): `fp8_pipe_entry`** — the f16/bf16 mma-pipeline recipe carried to E4M3 (multi-stage cp.async
