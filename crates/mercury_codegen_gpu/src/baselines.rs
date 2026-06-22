@@ -680,6 +680,10 @@ pub struct CublasChainLayer {
     f_flash_w: Option<(CudaFunction, LaunchConfig)>,
     f_silu: CudaFunction,
     f_vadd: CudaFunction,
+    /// Multi-head layout shims — identical to `ResidentLayerF16`'s, so attention stays *common* to both
+    /// stacks at `heads > 1` too (forward f32 `[S,H·dh]`→f16 `[H,S,dh]`, inverse f32 back).
+    f_qkv_trans: CudaFunction,
+    f_attn_trans: CudaFunction,
     wq: CudaSlice<f16>,
     wk: CudaSlice<f16>,
     wv: CudaSlice<f16>,
@@ -688,6 +692,8 @@ pub struct CublasChainLayer {
     w2: CudaSlice<f16>,
     s: usize,
     d: usize,
+    heads: usize,
+    dh: usize,
     dff: usize,
     eps: f32,
 }
@@ -697,12 +703,30 @@ impl CublasChainLayer {
     /// [`ResidentLayerF16::new`]'s shape constraints (S,D,Dff multiples of 64; `d` a supported flash head
     /// dim) and reuses the *same* kernel keys (`norm`/`cast`/`flash`/`vmath`/`vadd`) so those kernels are
     /// literally identical between the two stacks — only the GEMM differs.
+    /// Single-head — the original API, unchanged; delegates to [`new_mha`](Self::new_mha) with `heads=1`.
     pub fn new(
         g: &mut Gpu,
         w: &TransformerWeights,
         s: usize,
         d: usize,
         dff: usize,
+    ) -> Result<Self, PeerError> {
+        Self::new_mha(g, w, s, d, dff, 1)
+    }
+
+    /// **Multi-head** cuBLAS-chain layer — the Tier-B peer to [`ResidentLayerF16::new_mha`]. `heads`
+    /// attention heads of `dh = d/heads`; the six projections still run on cuBLAS, and attention reuses
+    /// **the same** multi-head flash path as the Mercury layer (cast-transpose Q/K/V to head-major f16,
+    /// `grid.y=heads` tensor-core flash, transpose back), so attention stays *common* to both stacks and
+    /// the measured gap remains purely cuBLAS-vs-WMMA GEMM + epilogue fusion. `heads>1` requires the
+    /// tensor-core flash (`dh=64`, `S≥512`); `heads==1` is the original single-head chain.
+    pub fn new_mha(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
     ) -> Result<Self, PeerError> {
         for (name, wt, len) in [
             ("wq", w.wq, d * d),
@@ -718,17 +742,25 @@ impl CublasChainLayer {
             s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
             "CublasChainLayer needs S,D,Dff multiples of 64 (to match the WMMA peer's tiles)"
         );
+        assert!(heads >= 1 && d % heads == 0, "d={d} must be divisible by heads={heads}");
+        let dh = d / heads;
         assert!(
-            crate::ptx_flash::SUPPORTED_D.contains(&d),
-            "CublasChainLayer: head dim {d} unsupported by flash (need {:?})",
+            crate::ptx_flash::SUPPORTED_D.contains(&dh),
+            "CublasChainLayer: head dim dh={dh} (d={d}/heads={heads}) unsupported by flash (need {:?})",
             crate::ptx_flash::SUPPORTED_D
+        );
+        assert!(
+            heads == 1 || crate::gpu::wmma_flash_applies(dh, s),
+            "multi-head chain needs the tensor-core flash: dh=64, S>=512, S%16==0 (got dh={dh}, S={s})"
         );
         let blas = CudaBlas::new(g.stream.clone())?;
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-        let (flash_name, flash_cfg) = crate::gpu::flash_plan(d, s);
+        let f_qkv_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "cast_transpose_qkv")?;
+        let f_attn_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "transpose_attn_out")?;
+        let (flash_name, flash_cfg) = crate::gpu::flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
-        let f_flash_w = if crate::gpu::wmma_flash_applies(d, s) {
+        let f_flash_w = if crate::gpu::wmma_flash_applies(dh, s) {
             let f = g.function("flash", crate::ptx_flash::flash_ptx(), crate::gpu::wmma_flash_entry(s))?;
             Some((f, crate::gpu::wmma_flash_cfg(s)))
         } else {
@@ -754,6 +786,8 @@ impl CublasChainLayer {
             f_flash_w,
             f_silu,
             f_vadd,
+            f_qkv_trans,
+            f_attn_trans,
             wq,
             wk,
             wv,
@@ -762,6 +796,8 @@ impl CublasChainLayer {
             w2,
             s,
             d,
+            heads,
+            dh,
             dff,
             eps: 1e-5,
         })
@@ -803,36 +839,74 @@ impl CublasChainLayer {
         Ok(c)
     }
 
-    /// Fused flash-attention over `[S,D]` Q/K/V (Mercury's exact flash kernel — tensor-core `flash_d64_w`
-    /// when `wmma_flash_applies`, else the f32 `flash_d{D}`) → `[S,D]` f32. Identical to
-    /// `ResidentLayerF16::run_attn` so the attention is common to both stacks.
+    /// Fused flash-attention over `[S,D]` Q/K/V → `[S,D]` f32, **identical to `ResidentLayerF16::run_attn`**
+    /// so the attention is common to both stacks. Single-head (`heads==1`): Mercury's flash directly
+    /// (tensor-core when `wmma_flash_applies`, else f32). Multi-head: cast-transpose Q/K/V to head-major
+    /// f16, `grid.y=heads` tensor-core flash, transpose back. `scale = 1/√dh`.
     fn flash(
         &self,
         q: &CudaSlice<f32>,
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, DriverError> {
-        let mut attn = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
-        let scale = 1.0f32 / (self.d as f32).sqrt();
+        let scale = 1.0f32 / (self.dh as f32).sqrt();
         let ss = self.s as u32;
-        if let Some((f_w, cfg_w)) = &self.f_flash_w {
-            let q16 = self.cast16(q)?;
-            let k16 = self.cast16(k)?;
-            let v16 = self.cast16(v)?;
-            let mut bld = self.stream.launch_builder(f_w);
-            bld.arg(&ss)
-                .arg(&scale)
-                .arg(&q16)
-                .arg(&k16)
-                .arg(&v16)
-                .arg(&mut attn);
-            unsafe { bld.launch(*cfg_w)? };
+        if self.heads == 1 {
+            let mut attn = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
+            if let Some((f_w, cfg_w)) = &self.f_flash_w {
+                let q16 = self.cast16(q)?;
+                let k16 = self.cast16(k)?;
+                let v16 = self.cast16(v)?;
+                let mut bld = self.stream.launch_builder(f_w);
+                bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut attn);
+                unsafe { bld.launch(*cfg_w)? };
+            } else {
+                let mut bld = self.stream.launch_builder(&self.f_flash);
+                bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
+                unsafe { bld.launch(self.flash_cfg)? };
+            }
+            Ok(attn)
         } else {
-            let mut bld = self.stream.launch_builder(&self.f_flash);
-            bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
-            unsafe { bld.launch(self.flash_cfg)? };
+            let (f_w, _) = self.f_flash_w.as_ref().expect("multi-head requires the tensor-core flash");
+            let q_hsd = self.cast_transpose(q)?;
+            let k_hsd = self.cast_transpose(k)?;
+            let v_hsd = self.cast_transpose(v)?;
+            let mut attn_hsd = self.stream.alloc_zeros::<f32>(self.s * self.d)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((self.s / 16) as u32, self.heads as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut bld = self.stream.launch_builder(f_w);
+            bld.arg(&ss).arg(&scale).arg(&q_hsd).arg(&k_hsd).arg(&v_hsd).arg(&mut attn_hsd);
+            unsafe { bld.launch(cfg)? };
+            self.transpose_back(&attn_hsd)
         }
-        Ok(attn)
+    }
+
+    /// f32 `[S,H·dh]` → f16 `[H,S,dh]` (cast folded in) — the multi-head flash input layout shim
+    /// (`ptx::HEAD_TRANSPOSE_PTX`), identical to `ResidentLayerF16`'s.
+    fn cast_transpose(&self, src: &CudaSlice<f32>) -> Result<CudaSlice<f16>, DriverError> {
+        let n = self.s * self.d;
+        let mut dst = self.stream.alloc_zeros::<f16>(n)?;
+        let (nn, dd, dhh, sdh) =
+            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let mut b = self.stream.launch_builder(&self.f_qkv_trans);
+        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
+    }
+
+    /// f32 `[H,S,dh]` → f32 `[S,H·dh]` — the multi-head flash output layout shim (`transpose_attn_out`).
+    fn transpose_back(&self, src: &CudaSlice<f32>) -> Result<CudaSlice<f32>, DriverError> {
+        let n = self.s * self.d;
+        let mut dst = self.stream.alloc_zeros::<f32>(n)?;
+        let (nn, dd, dhh, sdh) =
+            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let mut b = self.stream.launch_builder(&self.f_attn_trans);
+        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
     }
 
     /// Narrow a device `[S·D]` f32 buffer to f16 (the tensor-core flash input dtype) via `f_cast`.
