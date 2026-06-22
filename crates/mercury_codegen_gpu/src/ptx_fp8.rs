@@ -158,7 +158,10 @@ fn fp8_pipe_entry(
     stages: usize,
     raster: usize,
     pad: usize,
+    act: crate::ptx_wmma::Act,
+    bias: bool,
 ) -> String {
+    use crate::ptx_wmma::Act;
     assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
     assert!(bm % (16 * warps_m) == 0 && bn % (8 * warps_n) == 0);
     assert!(raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()));
@@ -179,14 +182,25 @@ fn fp8_pipe_entry(
     let wn_shift = warps_n.trailing_zeros();
     let (wmr, wnc) = (bm / warps_m, bn / warps_n);
 
+    // The fused-bias variant takes a `bias[N]` (f32) param applied per output column in the store
+    // epilogue — the canonical `act(A·Bᵀ + bias)` fp8 Linear/FFN form (cuBLAS needs a 2nd kernel for it).
+    let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}\n)\n{{\n"
     );
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufcB,%bufwA,%bufwB,%lane,%grp,%tg,%tg4,%tg2,%laneoff,%warpMrow,%warpNcol,%aptr,%bptr,%grow,%gcol;\n";
+    // Fused-epilogue scratch: %act0/%act1 for the transcendental activations, %biasv0/%biasv1 for the two
+    // bias columns this lane's D fragment spans, %Bias for the bias base pointer (cf. entry_mma_pipe).
+    if !matches!(act, Act::None) {
+        s += "    .reg .f32 %act0,%act1;\n";
+    }
+    if bias {
+        s += "    .reg .f32 %biasv0,%biasv1;\n    .reg .b64 %Bias;\n";
+    }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
     }
@@ -216,6 +230,9 @@ fn fp8_pipe_entry(
     s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    if bias {
+        s += "    ld.param.u64 %Bias,[pBias];\n    cvta.to.global.u64 %Bias,%Bias;\n";
+    }
     if raster == 0 {
         s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
         s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
@@ -320,6 +337,19 @@ fn fp8_pipe_entry(
         for ni in 0..tn {
             s += &format!("    add.u32 %grow,%baseRow,%warpMrow;\n    add.u32 %grow,%grow,{};\n    add.u32 %grow,%grow,%grp;\n", mi * 16);
             s += &format!("    add.u32 %gcol,%baseCol,%warpNcol;\n    add.u32 %gcol,%gcol,{};\n    add.u32 %gcol,%gcol,%tg2;\n", ni * 8);
+            // Fused epilogue (identical to entry_mma_pipe — the m16n8k32 D-fragment column map matches
+            // m16n8k16): C = act(A·Bᵀ + bias). d0,d2 sit at column gcol, d1,d3 at gcol+1.
+            if bias {
+                s += "    mul.wide.u32 %off,%gcol,4;\n    add.s64 %cptr,%Bias,%off;\n";
+                s += "    ld.global.f32 %biasv0,[%cptr];\n    ld.global.f32 %biasv1,[%cptr+4];\n";
+                s += &format!("    add.f32 %d{mi}_{ni}_0,%d{mi}_{ni}_0,%biasv0;\n    add.f32 %d{mi}_{ni}_1,%d{mi}_{ni}_1,%biasv1;\n");
+                s += &format!("    add.f32 %d{mi}_{ni}_2,%d{mi}_{ni}_2,%biasv0;\n    add.f32 %d{mi}_{ni}_3,%d{mi}_{ni}_3,%biasv1;\n");
+            }
+            if !matches!(act, Act::None) {
+                for r in 0..4 {
+                    s += &act.epilogue(&format!("%d{mi}_{ni}_{r}"));
+                }
+            }
             s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
             s += &format!("    st.global.f32 [%cptr],%d{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%d{mi}_{ni}_1;\n");
             s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
@@ -334,6 +364,7 @@ fn fp8_pipe_entry(
 pub fn fp8_pipe_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
+        use crate::ptx_wmma::Act;
         let mut m = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
         m += &fp8_pipe_entry(
             "fp8_gemm_pipe",
@@ -345,7 +376,33 @@ pub fn fp8_pipe_ptx() -> &'static str {
             FP8_PIPE_STAGES,
             FP8_PIPE_RASTER,
             FP8_PIPE_PAD,
+            Act::None,
+            false,
         );
+        // Fused-epilogue fp8 variants — the beat-cuBLAS fusion carried to the **fastest** precision (Ada
+        // 2× TC rate), so `C = act(x·Wᵀ + bias)` fp8 Linear/FFN is the fastest fused inference path. The
+        // m16n8k32 D-fragment column map matches m16n8k16, so the register-level bias+act epilogue (no
+        // SMEM scratch) is reused verbatim from `entry_mma_pipe` via `Act::epilogue`.
+        for (suffix, act) in [
+            ("bias", Act::None),
+            ("bias_relu", Act::Relu),
+            ("bias_silu", Act::Silu),
+            ("bias_gelu", Act::Gelu),
+        ] {
+            m += &fp8_pipe_entry(
+                &format!("fp8_gemm_pipe_{suffix}"),
+                FP8_PIPE_BM,
+                FP8_PIPE_BN,
+                FP8_PIPE_BK,
+                FP8_PIPE_WM,
+                FP8_PIPE_WN,
+                FP8_PIPE_STAGES,
+                FP8_PIPE_RASTER,
+                FP8_PIPE_PAD,
+                act,
+                true,
+            );
+        }
         m
     })
     .as_str()

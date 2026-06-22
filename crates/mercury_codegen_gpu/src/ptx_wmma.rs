@@ -437,7 +437,8 @@ impl Act {
     /// same formulas + constants** as the standalone `ptx::vmath_ptx` kernels, so a fused `silu(A·Bᵀ)`
     /// equals the unfused `silu(gemm)` and inherits its tolerance gate. Scratch lives in `%act0`/`%act1`
     /// (declared by `entry_smem_db`); each accumulator is processed sequentially so the scratch reuses.
-    fn epilogue(self, reg: &str) -> String {
+    /// `pub(crate)` so the fp8 mma generator (`ptx_fp8::fp8_pipe_entry`) reuses the identical epilogue.
+    pub(crate) fn epilogue(self, reg: &str) -> String {
         let hexf = |x: f32| format!("0f{:08X}", x.to_bits());
         match self {
             Act::None => String::new(),

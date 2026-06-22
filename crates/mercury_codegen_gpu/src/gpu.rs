@@ -2324,6 +2324,66 @@ pub fn gemm_nt_fp8_pipe(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// `C = act(A·Bᵀ + bias)` (fp8 E4M3 in, f32 out) fused into the pipelined fp8 workhorse store epilogue —
+/// the **fastest fused inference path** (Ada runs fp8 `mma.sync` at 2× the fp16 TC rate). `entry` selects
+/// the variant (`fp8_gemm_pipe_bias{,_relu,_silu,_gelu}`); bias is added to the f32 accumulators
+/// register-level (the m16n8k32 D-fragment column map matches m16n8k16) then the activation, before the
+/// store — the canonical fp8 Linear/FFN epilogue cuBLAS needs a 2nd kernel for. Requires `M%128==0`,
+/// `N%128==0`, `K%64==0`; tolerance-gated against an `act(e4m3-rounded(A·Bᵀ)+bias)` f64 reference.
+fn gemm_nt_fp8_pipe_fused_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert!(
+        m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        "{entry} requires M%{FP8_PIPE_BM}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
+    );
+    let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), entry)?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let cfg = LaunchConfig {
+        grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1), // 1-D rasterized grid
+        block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ + bias` fused, fp8 inputs (affine Linear) — see [`gemm_nt_fp8_pipe_fused_bias`].
+pub fn gemm_nt_fp8_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias")
+}
+/// `C = relu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
+pub fn gemm_nt_fp8_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_relu")
+}
+/// `C = silu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
+pub fn gemm_nt_fp8_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_silu")
+}
+/// `C = gelu(A·Bᵀ + bias)` fused, fp8 inputs (see [`gemm_nt_fp8_pipe_fused_bias`]).
+pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_gelu")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5497,6 +5557,78 @@ mod tests {
                 let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
                 let st = crate::diff::assert_close(&format!("fp8_pipe {m}x{k}x{n}"), &c, &r, 1e-2, rel);
                 eprintln!("fp8_pipe {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+            }
+        });
+    }
+
+    /// The fused `C = act(A·Bᵀ + bias)` epilogues on the **fp8 mma workhorse**
+    /// (`gemm_nt_fp8_mma_bias{,_relu,_silu,_gelu}`) — the fastest fused inference path (Ada runs fp8
+    /// `mma.sync` at 2× the fp16 TC rate). The register-level bias epilogue acts on the f32 accumulator
+    /// (the m16n8k32 D-fragment column map matches m16n8k16), so each output must equal
+    /// `act(e4m3-rounded(A·Bᵀ) + bias)`; fp8's coarse E4M3 quantization sets the tolerance (same as the
+    /// plain fp8 pipe gate). Workhorse shape constraints: M%128, N%128, K%64.
+    #[test]
+    fn fp8_mma_bias_match_reference_within_tol() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_mma_bias", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8B2);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                // Reference: (e4m3-rounded GEMM) + bias[col], then the activation — per the kernel order.
+                let base = ref_nt_rounded(&a, &b, m, k, n, round);
+                let with_bias = |act: &dyn Fn(f32) -> f32| -> Vec<f32> {
+                    let mut r = base.clone();
+                    for i in 0..m {
+                        for j in 0..n {
+                            r[i * n + j] = act(r[i * n + j] + bias[j]);
+                        }
+                    }
+                    r
+                };
+                let id = |x: f32| x;
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                for (name, got, refv) in [
+                    (
+                        "bias",
+                        gemm_nt_fp8_mma_bias(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&id),
+                    ),
+                    (
+                        "bias_relu",
+                        gemm_nt_fp8_mma_bias_relu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&|x| x.max(0.0)),
+                    ),
+                    (
+                        "bias_silu",
+                        gemm_nt_fp8_mma_bias_silu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&silu),
+                    ),
+                    (
+                        "bias_gelu",
+                        gemm_nt_fp8_mma_bias_gelu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&gelu),
+                    ),
+                ] {
+                    let s = crate::diff::assert_close(
+                        &format!("fp8_mma_{name} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        1e-2,
+                        rel,
+                    );
+                    eprintln!(
+                        "fp8_mma_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
+                }
             }
         });
     }
