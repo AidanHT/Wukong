@@ -617,7 +617,8 @@ fn entry_wmma_wide(d: usize, nkb: usize) -> String {
 }
 
 /// Generate the **register-resident `mma.sync` flash** kernel for head dim `d` (multiple of 16).
-/// Name = `flash_d{d}_m`. The FlashAttention-2 form on the Ada tensor cores with the output `O`, the
+/// Name = `flash_d{d}_m` (or `flash_d{d}_mc` when `causal`). The FlashAttention-2 form on the Ada
+/// tensor cores with the output `O`, the
 /// running max `m`, and the denominator `l` held in **registers** across the whole K-loop — *no*
 /// per-step SMEM round-trip of S/P/PV/O. The [`entry_wmma`]/[`entry_wmma_wide`] kernels `wmma.store.d`
 /// every fragment to SMEM and keep `O` in SMEM (4 `bar.sync`s + several round-trips per key block),
@@ -647,12 +648,22 @@ fn entry_wmma_wide(d: usize, nkb: usize) -> String {
 ///     `u16` loads packed — the only uncoalesced cost, removed by the SMEM stage later.
 ///  Final `O[row][c] = o / l_row`. Tolerance-gated vs `ref_attn` (f16 in ⇒ same ~2e-2 rel as the WMMA
 ///  flash; a mis-mapped fragment would scatter O(0.1+), which the gate catches).
-fn entry_mma_reg(d: usize) -> String {
+///
+/// **Causal** (`flash_d{d}_mc`): a decoder masks key `j > query i`. Two parts — (a) **skip** every key
+/// block strictly above the query block's diagonal (the loop stops at `kb == row`, the ~½-work FA2 win
+/// for long context), and (b) within the diagonal block set `s = -inf` for the per-lane scores whose key
+/// exceeds their query (a `setp`/`selp` per score); the online softmax then drops them (`ex2(-inf)=0`).
+/// Every query keeps its diagonal key (`key = query`), so `l > 0` always. Gated vs `ref_attn_causal`.
+fn entry_mma_reg(d: usize, causal: bool) -> String {
     assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
     let ktq = d / 16; // Q·Kᵀ contraction tiles (over hdim)
     let nto = d / 8; // P·V output n-tiles (over hdim)
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
-    let name = format!("flash_d{d}_m");
+    let name = if causal {
+        format!("flash_d{d}_mc")
+    } else {
+        format!("flash_d{d}_m")
+    };
 
     let mut s = String::new();
     s += &format!(
@@ -682,6 +693,9 @@ fn entry_mma_reg(d: usize) -> String {
         }
     }
     br += "%a0,%a1,%a2,%a3,%b0,%b1,%h0,%h1,";
+    if causal {
+        br += "%ck0,%ck1,%ck8,%ck9,";
+    }
     s += &format!(
         "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp;\n"
     );
@@ -710,9 +724,13 @@ fn entry_mma_reg(d: usize) -> String {
     }
     s += "    mov.f32 %m0,0fFF800000;\n    mov.f32 %m1,0fFF800000;\n    mov.f32 %l0,0f00000000;\n    mov.f32 %l1,0f00000000;\n";
 
-    // for kb in 0..S step 16
+    // for kb in 0..S step 16 (causal: stop at the diagonal block kb==row — skip the masked-only blocks).
     s += "    mov.u32 %kb,0;\n";
-    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+    if causal {
+        s += &format!("KB_{name}:\n    setp.gt.u32 %p0,%kb,%row;\n    @%p0 bra DONE_{name};\n");
+    } else {
+        s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+    }
 
     // 1. S = Q·Kᵀ : two key n-tiles, each accumulating ktq contraction tiles into %s{nk}_{0..3}.
     for nk in 0..2 {
@@ -726,6 +744,22 @@ fn entry_mma_reg(d: usize) -> String {
             s += &format!("    mul.lo.s32 %tmp,%gkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%K,%off;\n    ld.global.b32 %b0,[%base];\n", kt * 16);
             s += "    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%K,%off;\n    ld.global.b32 %b1,[%base];\n";
             s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+        }
+    }
+
+    // causal mask: set s = -inf where the key index exceeds the query index. Keys this lane owns are
+    // k0=kb+tg2, k1=kb+tg2+1 (n-tile 0) and k8=kb+8+tg2, k9=kb+8+tg2+1 (n-tile 1); queries are qr0,qr1.
+    // s{0,1}_{0,1} are qr0, s{0,1}_{2,3} are qr1 (the D-fragment row map). Only the diagonal block kb==row
+    // actually trips a mask (lower blocks have every key < query); the loop already skips kb>row.
+    if causal {
+        s += "    add.u32 %ck0,%kb,%tg2;\n    add.u32 %ck1,%ck0,1;\n    add.u32 %ck8,%ck0,8;\n    add.u32 %ck9,%ck8,1;\n";
+        for (sreg, key, qr) in [
+            ("%s0_0", "%ck0", "%qr0"), ("%s0_1", "%ck1", "%qr0"),
+            ("%s0_2", "%ck0", "%qr1"), ("%s0_3", "%ck1", "%qr1"),
+            ("%s1_0", "%ck8", "%qr0"), ("%s1_1", "%ck9", "%qr0"),
+            ("%s1_2", "%ck8", "%qr1"), ("%s1_3", "%ck9", "%qr1"),
+        ] {
+            s += &format!("    setp.gt.u32 %p0,{key},{qr};\n    selp.f32 {sreg},0fFF800000,{sreg},%p0;\n");
         }
     }
 
@@ -817,7 +851,8 @@ pub fn flash_ptx() -> &'static str {
         }
         m += &entry_wmma(64);
         m += &entry_wmma_wide(64, WMMA_FLASH_NKB);
-        m += &entry_mma_reg(64);
+        m += &entry_mma_reg(64, false);
+        m += &entry_mma_reg(64, true);
         m
     })
     .as_str()
