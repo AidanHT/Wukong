@@ -4447,6 +4447,12 @@ mod tests {
             let wc = rng.vec(kc * c * r * s, -1.0, 1.0);
             twice_eq!("conv2d", conv2d(g, &xc, &wc, c, h, wd, kc, r, s).unwrap());
 
+            // Conv2d (fp16 tensor-core implicit GEMM) — fixed grid, no atomics ⇒ bit-reproducible.
+            let (c2, h2, w2, k2, r2, s2) = (16usize, 16usize, 16usize, 32usize, 3usize, 3usize);
+            let xw = rng.vec(c2 * h2 * w2, -1.0, 1.0);
+            let ww = rng.vec(k2 * c2 * r2 * s2, -1.0, 1.0);
+            twice_eq!("conv2d_wmma", conv2d_wmma(g, &xw, &ww, c2, h2, w2, k2, r2, s2).unwrap());
+
             // Reductions — fixed grid + fixed ascending host combine.
             let xr = rng.vec(1 << 16, 0.0, 1.0);
             let yr = rng.vec(1 << 16, 0.0, 1.0);
