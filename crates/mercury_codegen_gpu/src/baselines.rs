@@ -783,3 +783,131 @@ impl CublasChainModel {
         Ok(self.stream.memcpy_dtov(&out)?)
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Tier A — naive CUDA-C conv2d, compiled by NVRTC (the "beat the hand-written C conv" baseline).
+// ---------------------------------------------------------------------------------------------------
+
+/// The idiomatic conv a programmer writes first: **one thread per output element** `(k,p,q)`, looping
+/// the whole `c,r,s` window with a fused-multiply-add chain, no shared memory, no tiling, no tensor
+/// cores — the GPU twin of Mercury's *old* naive PTX conv. Single batch, stride 1, no padding (valid
+/// cross-correlation): input `X[C,H,W]`, weights `W[K,C,R,S]`, output `O[K,P,Q]` with `P=H-R+1`,
+/// `Q=W-S+1`. NVRTC compiles this CUDA-C to PTX at runtime; the driver JITs it to SASS just like
+/// Mercury's own PTX, so the comparison is pure kernel quality (tiling/SMEM/tensor-cores vs none).
+const NAIVE_CONV_CUDA: &str = r#"
+extern "C" __global__ void naive_conv(int C, int H, int W, int K, int R, int S, int P, int Q,
+                                      const float* X, const float* Wt, float* O) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; // linear (k,p,q)
+    int total = K * P * Q;
+    if (idx >= total) return;
+    int q = idx % Q;
+    int t = idx / Q;
+    int p = t % P;
+    int k = t / P;
+    float acc = 0.0f;
+    for (int c = 0; c < C; ++c)
+        for (int r = 0; r < R; ++r)
+            for (int s = 0; s < S; ++s) {
+                int ih = p + r, iw = q + s;
+                acc += X[(c * H + ih) * W + iw] * Wt[((k * C + c) * R + r) * S + s];
+            }
+    O[idx] = acc;
+}
+"#;
+
+fn nvrtc_naive_conv_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions {
+        arch: Some("compute_89"),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(NAIVE_CONV_CUDA, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+fn naive_conv_cfg(k: usize, p: usize, q: usize) -> LaunchConfig {
+    let total = (k * p * q) as u32;
+    LaunchConfig {
+        grid_dim: (total.div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Run the naive CUDA-C conv once and copy `O` back — the correctness-gate entry. `X`/`W` are the same
+/// f32 buffers Mercury's conv is cross-checked against (`[C,H,W]` / `[K,C,R,S]`).
+#[allow(clippy::too_many_arguments)]
+pub fn nvrtc_naive_conv(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(x.len(), c * h * width);
+    assert_eq!(w.len(), k * c * r * s);
+    let (p, q) = (h - r + 1, width - s + 1);
+    let module = nvrtc_naive_conv_module(g)?;
+    let f = module.load_function("naive_conv")?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let w_d = g.stream.memcpy_stod(w)?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
+    let dims = [c, h, width, k, r, s, p, q].map(|v| v as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    for d in &dims {
+        bld.arg(d);
+    }
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(naive_conv_cfg(k, p, q))? };
+    Ok(g.stream.memcpy_dtov(&o_d)?)
+}
+
+/// Time the naive CUDA-C conv: `iters` resident launches bracketed by one sync, after a warm-up — the
+/// identical timing shape Mercury's own conv bench uses, so the ratio is apples-to-apples. Seconds/launch.
+#[allow(clippy::too_many_arguments)]
+pub fn time_nvrtc_naive_conv(
+    g: &mut Gpu,
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let (p, q) = (h - r + 1, width - s + 1);
+    let module = nvrtc_naive_conv_module(g)?;
+    let f = module.load_function("naive_conv")?;
+    let x_d = g.stream.memcpy_stod(&vec![0.01f32; c * h * width])?;
+    let w_d = g.stream.memcpy_stod(&vec![0.01f32; k * c * r * s])?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
+    let dims = [c, h, width, k, r, s, p, q].map(|v| v as i32);
+    let cfg = naive_conv_cfg(k, p, q);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        for d in &dims {
+            bld.arg(d);
+        }
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// `2·K·P·Q·C·R·S` — conv2d FLOPs (each output is a `C·R·S` MAC reduction), for turning
+/// seconds/launch into FLOP/s.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_flop(c: usize, h: usize, width: usize, k: usize, r: usize, s: usize) -> f64 {
+    let (p, q) = (h - r + 1, width - s + 1);
+    2.0 * k as f64 * p as f64 * q as f64 * c as f64 * r as f64 * s as f64
+}

@@ -1220,10 +1220,29 @@ pub(crate) fn flash_attn_run(
     g.stream.memcpy_dtov(&o_d)
 }
 
-/// Direct 2D **convolution** on the GPU (single batch, stride 1, no padding): input `x` is `[C,H,W]`,
+/// Launch grid/block for the SMEM-tiled conv: one CTA per `TILE_P×TILE_Q` output tile per channel `k`
+/// (`grid = (ceil(Q/TQ), ceil(P/TP), K)`, `block = (TQ, TP, 1)`). Shared mem is the kernel's own static
+/// `.shared` array, so `shared_mem_bytes = 0`. Shared by the launcher and the `conv_vs_peers` bench.
+pub(crate) fn conv_tiled_cfg(h: usize, width: usize, k: usize, r: usize, s: usize) -> LaunchConfig {
+    use crate::ptx_conv::{TILE_P, TILE_Q};
+    let (p, q) = (h - r + 1, width - s + 1);
+    LaunchConfig {
+        grid_dim: (
+            (q as u32).div_ceil(TILE_Q as u32),
+            (p as u32).div_ceil(TILE_P as u32),
+            k as u32,
+        ),
+        block_dim: (TILE_Q as u32, TILE_P as u32, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// 2D **convolution** on the GPU (single batch, stride 1, no padding): input `x` is `[C,H,W]`,
 /// weights `w` are `[K,C,R,S]`, output is `[K,P,Q]` with `P=H-R+1`, `Q=W-S+1` — the valid
-/// cross-correlation deep-learning calls conv2d. One thread per output element. Tolerance-gated
-/// (the GPU `fma`-accumulates the C·R·S window in a different order than a serial reference).
+/// cross-correlation deep-learning calls conv2d. Dispatches the **SMEM-tiled, static-shape-specialized**
+/// generator ([`crate::ptx_conv::conv2d_ptx`]) when the staged halo fits shared memory, else falls back
+/// to the naive one-thread-per-output kernel. Tolerance-gated (the GPU `fma`-accumulates the C·R·S
+/// window in a different order than a serial reference).
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d(
     g: &mut Gpu,
@@ -1241,23 +1260,36 @@ pub fn conv2d(
     assert!(h >= r && width >= s, "kernel larger than input");
     let p = h - r + 1;
     let q = width - s + 1;
-    let total = (k * p * q) as u32;
-    let f = g.function("conv2d", crate::ptx_conv::CONV2D, "conv2d")?;
     let x_d = g.stream.memcpy_stod(x)?;
     let w_d = g.stream.memcpy_stod(w)?;
     let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
-    let dims = [c, h, width, k, r, s, p, q].map(|v| v as u32);
-    let cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(256), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut bld = g.stream.launch_builder(&f);
-    for d in &dims {
-        bld.arg(d);
+
+    if crate::ptx_conv::tiled_applies(c, h, width, k, r, s) {
+        // Shape-specialized PTX: cache by PTX hash (the in-process module map keys by &'static str,
+        // which would alias different shapes), then launch the tiled grid.
+        let ptx = crate::ptx_conv::conv2d_ptx(c, h, width, k, r, s);
+        let module = g.load_module_cached(&ptx)?;
+        let f = module.load_function("conv2d")?;
+        let cfg = conv_tiled_cfg(h, width, k, r, s);
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg)? };
+    } else {
+        let total = (k * p * q) as u32;
+        let f = g.function("conv2d_naive", crate::ptx_conv::CONV2D, "conv2d")?;
+        let dims = [c, h, width, k, r, s, p, q].map(|v| v as u32);
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bld = g.stream.launch_builder(&f);
+        for d in &dims {
+            bld.arg(d);
+        }
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg)? };
     }
-    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
-    unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&o_d)
 }
 
@@ -3839,10 +3871,16 @@ mod tests {
     fn conv2d_matches_reference_within_tol() {
         with_gpu("conv2d", |g| {
             let mut rng = crate::diff::Rng::new(0xC0FFEE);
-            // (C, H, W, K, R, S) — a 3×3 over 3 channels, and a 5×5 over 16 channels
+            // (C, H, W, K, R, S) — sweep the tiled generator: partial tiles (P,Q not a tile multiple),
+            // an exact single full tile (P=Q=16), a 1×1 conv (halo == tile), and a larger multi-tile
+            // image so the grid spans many CTAs.
             let cases = [
-                (3usize, 16usize, 16usize, 8usize, 3usize, 3usize),
-                (16, 32, 32, 4, 5, 5),
+                (3usize, 16usize, 16usize, 8usize, 3usize, 3usize), // P=Q=14 (partial tile)
+                (16, 32, 32, 4, 5, 5),                              // P=Q=28 (partial tile)
+                (8, 18, 18, 12, 3, 3),                              // P=Q=16 (one full tile)
+                (32, 28, 28, 16, 1, 1),                             // 1×1 conv (halo == tile)
+                (8, 64, 64, 16, 3, 3),                              // P=Q=62 (16 tiles, multi-CTA)
+                (4, 24, 40, 6, 3, 5),                               // non-square image + kernel
             ];
             for (c, h, width, k, r, s) in cases {
                 let x = rng.vec(c * h * width, -1.0, 1.0);
