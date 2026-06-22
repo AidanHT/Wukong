@@ -3344,6 +3344,60 @@ mod tests {
         });
     }
 
+    /// **Multi-head** gate for `flash_d64_m`: launch `grid.y = H` heads over a `[H,S,D]` buffer; each
+    /// head's `[S,D]` slice must match the single-head f64 oracle. Confirms the `ctaid.y · S · D`
+    /// head-base-offset addressing — the occupancy lever that fills the GPU at small S (where one head's
+    /// `S/16` blocks can't). H heads share nothing, so head `h`'s output depends only on its own slice.
+    #[test]
+    fn mma_reg_flash_multihead_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("mma_reg_flash_mh", |g| {
+            let mut rng = crate::diff::Rng::new(0x4EAD5);
+            let d = 64usize;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for (heads, seq) in [(4usize, 64usize), (12, 128), (8, 256)] {
+                let n = heads * seq * d;
+                let q16 = to16(&rng.vec(n, -1.0, 1.0));
+                let k16 = to16(&rng.vec(n, -1.0, 1.0));
+                let v16 = to16(&rng.vec(n, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
+                    .unwrap();
+                let s32 = seq as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((seq / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let (qf, kf, vf) = (back(&q16), back(&k16), back(&v16));
+                let mut max_abs = 0f64;
+                for h in 0..heads {
+                    let sl = h * seq * d..(h + 1) * seq * d;
+                    let oracle = ref_attn(&qf[sl.clone()], &kf[sl.clone()], &vf[sl.clone()], seq, d, scale);
+                    let st = crate::diff::assert_close(
+                        &format!("mh flash H={heads} s={seq} h={h}"),
+                        &got[sl],
+                        &oracle,
+                        2e-3,
+                        2e-2,
+                    );
+                    max_abs = max_abs.max(st.max_abs);
+                }
+                eprintln!("mh flash H={heads} s={seq} d={d}: max_abs={max_abs:.2e}");
+            }
+        });
+    }
+
     /// Flash-attention throughput at increasing context length, kernel-resident (no per-iter copies).
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
