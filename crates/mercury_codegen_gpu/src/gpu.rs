@@ -466,14 +466,14 @@ pub fn gemm_nt_f16(
     // with the A+B working set vs the 24 MB L2 (see `PIPE_VARIANTS`):
     //   • L2-resident: a DEEP BK=16 pipeline wins (latency is low; depth keeps the tensor cores fed) —
     //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
-    //   • L2-thrashing (≳64 MB, e.g. 4096³ ≈ 134 MB): WIDE BK=32 + **threadblock rasterization** wins —
-    //     the GEMM is HBM-bound, so banding co-scheduled CTAs into a compact L2 footprint cuts effective
-    //     traffic (`pipe_128_bk32_s2_r8` ~72%); the BK=16 pipes *collapse* there.
+    //   • Larger (≥ ~2048³, A+B ≳ L2): the `mma.sync.m16n8k16` kernel with conflict-free padded SMEM and
+    //     threadblock rasterization wins both the L2-resident (2048³ ~92%, padding-bound) and the
+    //     HBM-bound (4096³ ~74%, raster-bound) sub-regimes — `mma_nt_f16_128_bk32_s2_r8`.
     // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
-    if ws_bytes >= 64 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
-        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_128_bk32_s2_r8"));
+    if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("mma_nt_f16_128_bk32_s2_r8"));
     }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));

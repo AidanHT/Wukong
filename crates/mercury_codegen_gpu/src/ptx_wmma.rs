@@ -195,6 +195,11 @@ pub struct PipeCfg {
     /// column-band-of-`G` order, so co-scheduled CTAs share a compact A/B footprint in L2 — the cuBLAS
     /// trick that cuts effective HBM traffic at L2-thrashing sizes (4096³). Requires `bm`,`bn` powers of 2.
     pub raster: usize,
+    /// `true` ⇒ generate the kernel with `mma.sync.m16n8k16` + hand-placed (optionally XOR-swizzled) SMEM
+    /// fragment loads ([`entry_mma_pipe`]) instead of the opaque-layout `wmma.load`/`wmma.mma`
+    /// ([`entry_smem_pipe`]). Same CTA tiling / pipeline / launch; only the inner tensor-core path differs
+    /// — the route past the WMMA ceiling (conflict-free swizzled SMEM the `wmma.load` path cannot express).
+    pub mma: bool,
 }
 
 impl PipeCfg {
@@ -220,13 +225,17 @@ impl PipeCfg {
 /// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (~72% is
 /// near the WMMA ceiling on this part; the cuBLAS-class `mma.sync`+`ldmatrix` path is the next lever.)
 pub const PIPE_VARIANTS: &[PipeCfg] = &[
-    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6, raster: 0 }, // 24 KiB — ≤1024³
-    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4, raster: 0 }, // 32 KiB — ~2048³
+    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6, raster: 0, mma: false }, // 24 KiB — ≤1024³
+    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4, raster: 0, mma: false }, // 32 KiB — ~2048³
     // Spilling champion: a 128×128 BK=32 tile with **threadblock rasterization** (r8). At 4096³ the GEMM
     // is HBM-bound (~2.7 GB of A/B reads ≫ the 134 MB minimum), so banding co-scheduled CTAs into a compact
     // L2 footprint cut effective traffic: 56% → 72% of cuBLAS (a 12-config raster sweep found the optimum
     // broad over r8..r16; depth beyond s2 and the 256×64 tile both lost). %128, K%32.
-    PipeCfg { name: "wmma_nt_f16_pipe_128_bk32_s2_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 8 }, // 32 KiB
+    // The workhorse for everything ≥ 2048³: `mma.sync.m16n8k16` with hand-placed, **bank-conflict-free**
+    // (8-padded SMEM) fragment loads + rasterization. Beats the WMMA path at both regimes — 2048³ ~92% of
+    // cuBLAS (padding kills the 4-way fragment-load conflict in the L2-resident/compute-bound regime) and
+    // 4096³ ~74% (HBM-bound there, so padding is neutral but raster + mma scheduling still lead). %128, K%32.
+    PipeCfg { name: "mma_nt_f16_128_bk32_s2_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 8, mma: true }, // 40 KiB
 ];
 
 /// Look up a [`PipeCfg`] by its entry name (the `gemm_nt_f16` dispatcher selects variants this way, so a
@@ -931,6 +940,221 @@ fn entry_smem_pipe(
     s
 }
 
+/// Generate an **`mma.sync.m16n8k16`** multi-stage `cp.async` GEMM (`_mma`) — the route past the WMMA
+/// ceiling. Same CTA tiling, cp.async pipeline, and rasterization as [`entry_smem_pipe`], but the inner
+/// tensor-core path uses the native Ada `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` with
+/// **hand-placed SMEM fragment loads** instead of the opaque `wmma.load`/`wmma.mma`. The fragment
+/// lane→register layout is the PTX-ISA standard (cross-checked against the proven flash kernel):
+/// `groupID = lane/4`, `tid = lane%4`; per m16n8k16 tile a lane holds A = 4×b32 (rows {groupID,
+/// groupID+8} × k-pairs {2tid, 2tid+8}), B = 2×b32 (row groupID × the same k-pairs), D = 4×f32
+/// (rows {groupID, groupID+8} × cols {2tid, 2tid+1}). Loading fragments by explicit address (vs WMMA's
+/// hidden pattern) is what lets a later XOR swizzle make the SMEM reads conflict-free.
+///
+/// Per-warp tile is `(bm/wm)×(bn/wn)` = `tm` m16-blocks × `tn` n8-blocks; accumulators are `tm·tn·4`
+/// f32. Requires `M%bm==0`, `N%bn==0`, `K%bk==0`, `bk%16==0`, `bk/8` a power of two, `bm%(16·wm)==0`,
+/// `bn%(8·wn)==0`, and the [`entry_smem_pipe`] staging constraints. Total static SMEM ≤ 48 KiB.
+fn entry_mma_pipe(
+    name: &str,
+    ty: &str,
+    bm: usize,
+    bn: usize,
+    bk: usize,
+    warps_m: usize,
+    warps_n: usize,
+    stages: usize,
+    raster: usize,
+) -> String {
+    assert!(stages >= 2, "the pipeline needs at least 2 stages");
+    assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
+    assert!(bm % (16 * warps_m) == 0, "{name}: bm must be a multiple of 16·warps_m (m16 sub-tiles)");
+    assert!(bn % (8 * warps_n) == 0, "{name}: bn must be a multiple of 8·warps_n (n8 sub-tiles)");
+    assert!(
+        raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()),
+        "{name}: rasterization needs bm,bn powers of two"
+    );
+    let mma_ty = format!("f32.{ty}.{ty}.f32"); // f16 or bf16, f32 accumulate
+    let threads = warps_m * warps_n * 32;
+    let tm = bm / (16 * warps_m); // m16 sub-tiles per warp
+    let tn = bn / (8 * warps_n); //  n8 sub-tiles per warp
+    let nks = bk / 16; // k16 steps fed by one staged tile
+    let wmr = bm / warps_m; // per-warp M rows (WM)
+    let wnc = bn / warps_n; // per-warp N cols (WN)
+    // SMEM rows are padded by 8 f16 (`ldp` leading dim): a b32 fragment load by lane (grp,tid) hits bank
+    // (grp·ldp/2 + tid) mod 32, and ldp/2 = (bk+8)/2 ≡ 4·(odd) makes grp·(ldp/2) span all eight multiples
+    // of 4, so the 8 grp × 4 tid = 32 lanes hit 32 distinct banks — conflict-free (vs the 4-way conflict at
+    // stride bk where grp and grp+2 alias). Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
+    let pad = 8;
+    let ldp = bk + pad; // padded SMEM row stride (elements)
+    let tile_a = bm * ldp * 2;
+    let tile_b = bn * ldp * 2;
+    let smem_a = stages * tile_a;
+    let smem_b = stages * tile_b;
+    assert!(smem_a + smem_b <= 48 * 1024, "{name}: static SMEM {} B exceeds 48 KiB", smem_a + smem_b);
+    let a_chunks = bm * bk / (threads * 8);
+    let b_chunks = bn * bk / (threads * 8);
+    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
+    let bk_chunks = bk / 8;
+    let row_shift = bk_chunks.trailing_zeros();
+    let col_mask = bk_chunks - 1;
+    let wn_shift = warps_n.trailing_zeros();
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n"
+    );
+    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+    s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    s += "    .reg .pred %p0,%pmore;\n";
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufcB,%bufwA,%bufwB,%lane,%grp,%tg,%tg2,%laneoff,%warpMrow,%warpNcol,%aptr,%bptr,%grow,%gcol;\n";
+    if raster > 0 {
+        s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
+    }
+    let mut decl_d = String::new();
+    for mi in 0..tm {
+        for ni in 0..tn {
+            for r in 0..4 {
+                decl_d += &format!("%d{mi}_{ni}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .f32 {};\n", decl_d.trim_end_matches(','));
+    let mut decl_ab = String::new();
+    for mi in 0..tm {
+        for r in 0..4 {
+            decl_ab += &format!("%a{mi}_{r},");
+        }
+    }
+    for ni in 0..tn {
+        for r in 0..2 {
+            decl_ab += &format!("%b{ni}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
+    s += "    .reg .b64 %A,%B,%C,%off,%gptr,%cptr,%cptr2;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    if raster == 0 {
+        s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+        s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    } else {
+        let (bn_sh, bm_sh) = (bn.trailing_zeros(), bm.trailing_zeros());
+        s += &format!("    mov.u32 %lin,%ctaid.x;\n    shr.u32 %tn,%N,{bn_sh};\n    shr.u32 %tm,%M,{bm_sh};\n");
+        s += &format!("    mul.lo.s32 %gsz,%tm,{raster};\n    div.u32 %grpr,%lin,%gsz;\n    rem.u32 %rem,%lin,%gsz;\n");
+        s += &format!("    mul.lo.s32 %col0,%grpr,{raster};\n    sub.u32 %gw,%tn,%col0;\n    min.u32 %gw,%gw,{raster};\n");
+        s += "    div.u32 %trow,%rem,%gw;\n    rem.u32 %tcol,%rem,%gw;\n    add.u32 %tcol,%tcol,%col0;\n";
+        s += &format!("    mul.lo.s32 %baseRow,%trow,{bm};\n    mul.lo.s32 %baseCol,%tcol,{bn};\n");
+    }
+    // lane decomposition: grp = lane/4 (0..7), tg = lane%4 (0..3), tg2 = 2·tg.
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
+    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    // Per-lane SMEM byte offset shared by A and B fragment loads: (grp·ldp + tg2)·2 (padded row stride).
+    s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg2;\n    shl.b32 %laneoff,%laneoff,1;\n");
+    for mi in 0..tm {
+        for ni in 0..tn {
+            for r in 0..4 {
+                s += &format!("    mov.f32 %d{mi}_{ni}_{r},0f00000000;\n");
+            }
+        }
+    }
+
+    // cp.async staging into the **padded** SMEM layout (row stride `ldp`): same global read as
+    // entry_smem_pipe, but the shared dest is `bufoff + row·ldp·2 + col·2` (row=%r, col=%c, both 8-aligned)
+    // instead of the contiguous `e·16`, so the fragment reads land conflict-free.
+    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+        for li in 0..chunks {
+            if li == 0 {
+                *s += "    mov.u32 %e,%tix;\n";
+            } else {
+                *s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+            }
+            *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,3;\n");
+            *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
+            *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gbase_ptr},%off;\n");
+            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
+            *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
+            *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
+        }
+    };
+
+    for st in 0..(stages - 1) {
+        s += &format!("    mov.u32 %kcol,{};\n", st * bk);
+        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
+        s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
+        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+        s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
+    }
+    s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
+    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b);
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
+    s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
+    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
+    stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+    s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
+
+    // Compute: for each k16 step build A/B fragment base pointers (smem + buffer + warp + lane + ks·16),
+    // then `ld.shared.b32` the hand-placed fragments and issue tm·tn `mma.sync` m16n8k16 ops.
+    for ks in 0..nks {
+        // A base ptr = smemA + bufcA + (warpMrow·ldp)·2 + laneoff + (ks·16)·2  (ldp = padded row stride).
+        s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
+        s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
+        s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+        for mi in 0..tm {
+            let base = mi * 16 * ldp * 2; // m16-block row offset (bytes, padded stride)
+            let r8 = 8 * ldp * 2; // +8 rows
+            s += &format!("    ld.shared.b32 %a{mi}_0,[%aptr+{}];\n", base);
+            s += &format!("    ld.shared.b32 %a{mi}_2,[%aptr+{}];\n", base + 16); // k+8 (not padded)
+            s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
+            s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
+        }
+        // B base ptr = smemB + bufcB + (warpNcol·ldp)·2 + laneoff + (ks·16)·2.
+        s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n");
+        s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
+        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+        for ni in 0..tn {
+            let base = ni * 8 * ldp * 2; // n8-block row offset (bytes, padded stride)
+            s += &format!("    ld.shared.b32 %b{ni}_0,[%bptr+{}];\n", base);
+            s += &format!("    ld.shared.b32 %b{ni}_1,[%bptr+{}];\n", base + 16); // k+8 (not padded)
+        }
+        for mi in 0..tm {
+            for ni in 0..tn {
+                s += &format!(
+                    "    mma.sync.aligned.m16n8k16.row.col.{mma_ty} {{%d{mi}_{ni}_0,%d{mi}_{ni}_1,%d{mi}_{ni}_2,%d{mi}_{ni}_3}},{{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},{{%b{ni}_0,%b{ni}_1}},{{%d{mi}_{ni}_0,%d{mi}_{ni}_1,%d{mi}_{ni}_2,%d{mi}_{ni}_3}};\n"
+                );
+            }
+        }
+    }
+    s += &format!("    add.u32 %bufcA,%bufcA,{tile_a};\n    setp.ge.u32 %pmore,%bufcA,{smem_a};\n    @%pmore sub.u32 %bufcA,%bufcA,{smem_a};\n");
+    s += &format!("    add.u32 %bufcB,%bufcB,{tile_b};\n    setp.ge.u32 %pmore,%bufcB,{smem_b};\n    @%pmore sub.u32 %bufcB,%bufcB,{smem_b};\n");
+    s += &format!("    add.u32 %bufwA,%bufwA,{tile_a};\n    setp.ge.u32 %pmore,%bufwA,{smem_a};\n    @%pmore sub.u32 %bufwA,%bufwA,{smem_a};\n");
+    s += &format!("    add.u32 %bufwB,%bufwB,{tile_b};\n    setp.ge.u32 %pmore,%bufwB,{smem_b};\n    @%pmore sub.u32 %bufwB,%bufwB,{smem_b};\n");
+    s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
+
+    // Store: D fragment → C. Lane holds C[grow0..][gcol0..]: d0=(grp,2tg) d1=(grp,2tg+1)
+    // d2=(grp+8,2tg) d3=(grp+8,2tg+1), per (mi,ni) sub-tile.
+    s += &format!("KEND_{name}:\n");
+    for mi in 0..tm {
+        for ni in 0..tn {
+            s += &format!("    add.u32 %grow,%baseRow,%warpMrow;\n    add.u32 %grow,%grow,{};\n    add.u32 %grow,%grow,%grp;\n", mi * 16);
+            s += &format!("    add.u32 %gcol,%baseCol,%warpNcol;\n    add.u32 %gcol,%gcol,{};\n    add.u32 %gcol,%gcol,%tg2;\n", ni * 8);
+            // row grp: C[grow·N+gcol] = d0, [+1] = d1
+            s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            s += &format!("    st.global.f32 [%cptr],%d{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%d{mi}_{ni}_1;\n");
+            // row grp+8: C[(grow+8)·N+gcol] = d2, [+1] = d3
+            s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
+            s += &format!("    st.global.f32 [%cptr2],%d{mi}_{ni}_2;\n    st.global.f32 [%cptr2+4],%d{mi}_{ni}_3;\n");
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
 /// Number of independent accumulator fragments the roofline kernel keeps in flight (ILP to hide MMA
 /// latency so the loop measures tensor-core *throughput*, not the dependent-chain latency).
 pub const ROOFLINE_ACC: usize = 4;
@@ -1030,7 +1254,11 @@ pub fn wmma_f16_ptx() -> &'static str {
         // wider staged BK than the 2-stage `_sm*_db`). Swept by `gemm_pipe_sweep`; the winner per size is
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
-            m += &entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster);
+            m += &if v.mma {
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
+            } else {
+                entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
+            };
         }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
