@@ -176,6 +176,130 @@ pub fn time_nvrtc_naive_gemm_nt(
 }
 
 // ---------------------------------------------------------------------------------------------------
+// Tier A — naive CUDA-C attention, compiled by NVRTC (the "beat the hand-written C flash" baseline).
+// ---------------------------------------------------------------------------------------------------
+
+/// The idiomatic attention a programmer writes first: **one thread per (head, query row)**, a two-pass
+/// online-stable softmax streamed over the keys, no shared memory, no tensor cores, the `S×S` scores
+/// never materialized (recomputed in pass 2 rather than stored — the natural way to keep it O(D) state
+/// per thread). `O = softmax(scale·Q·Kᵀ)·V`, all of Q/K/V/O laid out `[H, S, D]` (head-major). This is
+/// the GPU twin of the scalar CPU baseline: NVRTC compiles it to PTX, the driver JITs it like Mercury's
+/// own PTX, so the gap is pure kernel quality (tensor cores + register-resident accumulation vs none).
+const NAIVE_ATTN_CUDA: &str = r#"
+extern "C" __global__ void naive_attn(int H, int S, int D, float scale,
+                                      const float* Q, const float* K, const float* V, float* O) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // query row
+    int h = blockIdx.y;                            // head
+    if (i >= S) return;
+    const float* q  = Q + ((long)h * S + i) * D;
+    const float* Kh = K + (long)h * S * D;
+    const float* Vh = V + (long)h * S * D;
+    float* o = O + ((long)h * S + i) * D;
+    float m = -1e30f;
+    for (int j = 0; j < S; ++j) {
+        float s = 0.0f;
+        for (int t = 0; t < D; ++t) s += q[t] * Kh[(long)j * D + t];
+        s *= scale;
+        if (s > m) m = s;
+    }
+    for (int t = 0; t < D; ++t) o[t] = 0.0f;
+    float l = 0.0f;
+    for (int j = 0; j < S; ++j) {
+        float s = 0.0f;
+        for (int t = 0; t < D; ++t) s += q[t] * Kh[(long)j * D + t];
+        float p = __expf(s * scale - m);
+        l += p;
+        for (int t = 0; t < D; ++t) o[t] += p * Vh[(long)j * D + t];
+    }
+    float inv = 1.0f / l;
+    for (int t = 0; t < D; ++t) o[t] *= inv;
+}
+"#;
+
+fn nvrtc_naive_attn_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions {
+        arch: Some("compute_89"),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(NAIVE_ATTN_CUDA, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+fn naive_attn_cfg(h: usize, s: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((s as u32).div_ceil(128), h as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Run the naive CUDA-C attention once and copy `O` back — the correctness-gate entry. Q/K/V are the
+/// same f32 buffers Mercury's flash is cross-checked against (`[H,S,D]`, head-major).
+pub fn nvrtc_naive_attn(
+    g: &mut Gpu,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    h: usize,
+    s: usize,
+    d: usize,
+    scale: f32,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(q.len(), h * s * d);
+    assert_eq!(k.len(), h * s * d);
+    assert_eq!(v.len(), h * s * d);
+    let module = nvrtc_naive_attn_module(g)?;
+    let f = module.load_function("naive_attn")?;
+    let q_d = g.stream.memcpy_stod(q)?;
+    let k_d = g.stream.memcpy_stod(k)?;
+    let v_d = g.stream.memcpy_stod(v)?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; h * s * d])?;
+    let (hh, ss, dd) = (h as i32, s as i32, d as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&hh).arg(&ss).arg(&dd).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+    unsafe { bld.launch(naive_attn_cfg(h, s))? };
+    Ok(g.stream.memcpy_dtov(&o_d)?)
+}
+
+/// Time the naive CUDA-C attention: `iters` resident launches bracketed by one sync, after a warm-up —
+/// the identical timing shape Mercury's flash benches use, so the ratio is apples-to-apples. Seconds/launch.
+pub fn time_nvrtc_naive_attn(
+    g: &mut Gpu,
+    h: usize,
+    s: usize,
+    d: usize,
+    scale: f32,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let module = nvrtc_naive_attn_module(g)?;
+    let f = module.load_function("naive_attn")?;
+    let q_d = g.stream.memcpy_stod(&vec![0.01f32; h * s * d])?;
+    let k_d = g.stream.memcpy_stod(&vec![0.01f32; h * s * d])?;
+    let v_d = g.stream.memcpy_stod(&vec![0.01f32; h * s * d])?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; h * s * d])?;
+    let (hh, ss, dd) = (h as i32, s as i32, d as i32);
+    let cfg = naive_attn_cfg(h, s);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&hh).arg(&ss).arg(&dd).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// `4·H·S²·D` — attention FLOPs (QKᵀ `2·H·S²·D` + P·V `2·H·S²·D`), for turning seconds into FLOP/s.
+pub fn attn_flop(h: usize, s: usize, d: usize) -> f64 {
+    4.0 * h as f64 * s as f64 * s as f64 * d as f64
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Tier B — cuBLAS fp16 GEMM (the gold-standard peer; Mercury reports as a % of this).
 // ---------------------------------------------------------------------------------------------------
 

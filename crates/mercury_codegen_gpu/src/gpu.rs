@@ -5152,6 +5152,116 @@ mod tests {
         });
     }
 
+    /// **M5/M6: register-resident flash vs the Tier-A naive CUDA-C attention**, same-run, single head,
+    /// D=64. The literal "beat the hand-written C flash on the GPU" (M6) — the GPU twin of beating
+    /// scalar CPU-C. Mercury's `flash_d64_m` (tensor-core `mma.sync`, O/m/l in registers, online softmax)
+    /// vs `naive_attn` (one thread per query row, two-pass softmax, no SMEM/tensor cores) over identical
+    /// buffers. Reports GFLOP/s (`4·S²·D`) and Mercury × vs naive at S∈{512..4096}. (A Tier-B FA2-class
+    /// CUDA-C peer for the %-of-FA2 number is the follow-up; this nails the Tier-A win first.)
+    ///
+    /// Correctness gates speed (the first law): both `naive_attn` and `flash_d64_m` are first cross-checked
+    /// against the f64 `ref_attn` oracle, and at every S their output checksums must agree. Same-run only
+    /// (the ~7× laptop clock swing makes cross-run flash numbers meaningless): a clock warmup + `best_of`.
+    /// Needs the NVRTC redist DLL on PATH; skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture flash_vs_peers`.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn flash_vs_peers() {
+        use crate::baselines::{
+            attn_flop, nvrtc_naive_attn, peer_env_hint, peers_available, time_nvrtc_naive_attn,
+        };
+        use half::f16;
+        with_gpu("flash_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] flash_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let d = 64usize;
+            let mut rng = crate::diff::Rng::new(0xF1A57E5);
+
+            // --- Correctness first: naive (f32 in) and Mercury flash (f16 in) both match the f64 oracle. ---
+            for s in [64usize, 256] {
+                let qf = rng.vec(s * d, -1.0, 1.0);
+                let kf = rng.vec(s * d, -1.0, 1.0);
+                let vf = rng.vec(s * d, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let oracle = ref_attn(&qf, &kf, &vf, s, d, scale);
+                let naive = nvrtc_naive_attn(g, &qf, &kf, &vf, 1, s, d, scale).unwrap();
+                let rel_f32 = ((8.0 * (d as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+                crate::diff::assert_close(&format!("naive attn s={s}"), &naive, &oracle, 1e-3, rel_f32);
+            }
+            eprintln!("[gate] naive CUDA-C attention matches the f64 oracle ✓");
+
+            // --- Clock warmup (peak-vs-peak, same-run). Hammer a GEMM until the mobile clock settles. ---
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            let f_m = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
+                .unwrap();
+            let to16 =
+                |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            for s in [512usize, 1024, 2048, 4096] {
+                let qf = rng.vec(s * d, -1.0, 1.0);
+                let kf = rng.vec(s * d, -1.0, 1.0);
+                let vf = rng.vec(s * d, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q16 = g.stream.memcpy_stod(&to16(&qf)).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&kf)).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&vf)).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                let ss = s as u32;
+                let cfg = wmma_flash_cfg(s);
+
+                // Checksum cross-check: Mercury flash vs naive (f16-vs-f32 input ⇒ ~f16 tol on the sum).
+                {
+                    let mut bld = g.stream.launch_builder(&f_m);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
+                let naive = nvrtc_naive_attn(g, &qf, &kf, &vf, 1, s, d, scale).unwrap();
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let (cs_m, cs_n) = (csum(&out_m), csum(&naive));
+                assert!(
+                    (cs_m - cs_n).abs() / cs_n.max(1.0) < 3e-2,
+                    "S={s}: flash vs naive checksum disagree: mma={cs_m:.3e} naive={cs_n:.3e}"
+                );
+
+                // Speed (same-run, peak clock). Naive is O(S²D)/thread → very slow at long S; fewer iters.
+                let t_m = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut bld = g.stream.launch_builder(&f_m);
+                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                        unsafe { bld.launch(cfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                let naive_iters = if s >= 2048 { 3 } else { 10 };
+                let t_n = time_nvrtc_naive_attn(g, 1, s, d, scale, naive_iters).unwrap();
+
+                let flop = attn_flop(1, s, d);
+                let (g_m, g_n) = (flop / t_m, flop / t_n);
+                eprintln!(
+                    "S={s:>4} D={d} (1 head, same-run): Mercury flash {:.4} ms ({:>6.0} GFLOP/s) | naive CUDA-C {:.4} ms ({:>5.0} GFLOP/s) || Mercury {:>5.1}× vs naive",
+                    t_m * 1e3,
+                    g_m / 1e9,
+                    t_n * 1e3,
+                    g_n / 1e9,
+                    g_m / g_n,
+                );
+            }
+        });
+    }
+
     /// **The beat-cuBLAS lever: fusion**, across the activations a real network uses (relu / **silu**,
     /// the SwiGLU FFN gate / gelu). `act(A·Bᵀ)` as a single fused kernel vs the two-kernel call chains
     /// cuBLAS forces (GEMM writes C to HBM, a second kernel reads it back, applies the activation, writes
