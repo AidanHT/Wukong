@@ -45,9 +45,13 @@ HALF = torch.float16
 # rigorous long-context claim is the same-process flash A/B + cuBLAS same-run bench, not this ratio.
 MERCURY_MS_PER_LAYER = {256: 0.633, 512: 0.813, 1024: 0.745, 2048: 1.151, 4096: 1.250}  # one run, REGISTER-RESIDENT mma.sync flash (flash_d64_m)
 MERCURY_STACK_MS_PER_LAYER = {1: 0.34, 2: 0.34, 4: 0.34, 8: 0.34}  # depth sweep, S=512 (WMMA flash)
-# Mercury isolated single-head flash_d64_m GFLOP/s (from the Rust flash_vs_peers bench, same GPU):
-# the register-resident mma.sync flash. For the M5 isolated-attention %-of-(torch SDPA / FA2) column.
-MERCURY_FLASH_GFLOPS = {512: 895.0, 1024: 2618.0, 2048: 5090.0, 4096: 8222.0}
+# Mercury isolated single-head flash_d64_mp GFLOP/s — the cp.async-pipelined mma.sync flash, at PEAK
+# clock from the Rust flash_pipe_vs_mma A/B (1500-iter GEMM warmup, no slow-peer interleaving; the
+# flash_vs_peers absolutes are lower only because its naive peer's 100-600 ms runs cool the GPU between
+# Mercury timings). For the M5 %-of-(torch SDPA / FA2) column. Cross-process ⇒ clock-approximate (~7×
+# swing) — the rigorous attention metrics are the same-run flash_pipe_vs_mma (mp 1.1–3.6× m) and the
+# flash_vs_peers M6 (205–738× naive CUDA-C), not this ratio.
+MERCURY_FLASH_GFLOPS = {512: 3371.0, 1024: 5726.0, 2048: 6794.0, 4096: 7003.0}
 
 
 def rmsnorm_f32(x):
@@ -161,9 +165,10 @@ def main():
     torch.cuda.synchronize()
 
     # --- M5: isolated single-head attention vs torch SDPA (FlashAttention-2 backend), the FA2 peer. ---
-    # Mercury's flash_d64_m is single-head D=64; torch SDPA on [1,1,S,D] dispatches its fused flash /
+    # Mercury's flash_d64_mp is single-head D=64; torch SDPA on [1,1,S,D] dispatches its fused flash /
     # mem-efficient kernel (production FA2-class). Same shape, same fp16 in. GFLOP/s = 4·S²·D. The
-    # Mercury column is the Rust flash_vs_peers number (same GPU); the ratio is Mercury %-of-(torch SDPA).
+    # Mercury column is the Rust flash_pipe_vs_mma peak number (same GPU); the ratio is %-of-(torch SDPA),
+    # cross-process so clock-approximate (peak-vs-peak), not a same-run figure.
     print("\n== isolated attention, single head D=64 (M5: vs torch SDPA / FA2) ==")
     for S in (512, 1024, 2048, 4096):
         q = (torch.rand(1, 1, S, D, device=dev) * 2 - 1).to(HALF)

@@ -617,11 +617,16 @@ honest figure). **The `cp.async` pipeline — the lever this section previously 
 now implemented and shipping.** `flash_pipe_vs_mma` times `flash_d64_mp` against `flash_d64_m` back-to-back
 under one pinned clock: **0.28× / 0.34× / 0.53× / 0.88× the time single-head at S=512 / 1024 / 2048 / 4096**
 (1.14–3.6× faster, largest where the warp was purely latency-bound) and **0.84–0.90× at the H=12 filled
-regime** (1.1–1.2×, the per-warp latency bound). That lifts **M5 (vs FlashAttention-2)** above the prior
-**59–77% of torch SDPA** baseline (the table above, measured on `flash_d64_m`) by the same-run factor — so
-roughly **65–85%** at the filled regime; a fresh cross-process %-of-FA2 re-measure and a clean **≥90%** are
-the `ldmatrix` + multi-warp-CTA work below. The register-resident core was itself already **1.5–5.9× the
-prior WMMA flash** (`flash_mma_vs_wmma`), so `flash_d64_mp` compounds both wins.
+regime** (1.1–1.2×, the per-warp latency bound). For **M5 (vs FlashAttention-2)** a fresh cross-process
+re-measure against torch SDPA proved **uninterpretable on this power-capped mobile part**: torch's *own*
+SDPA throughput swung **~2× between two runs minutes apart** (single-head 7.4 → 10.5 TFLOP/s @4096;
+multi-head H=12 ~7 → 13 TFLOP/s), so `flash_d64_mp`'s %-of-torch read **66% one run vs 112% the next** on
+clock state alone — not a reportable number (the mandate's reason for forbidding cross-process headlines).
+A defensible %-of-FA2 needs a **same-run, in-process FA2-class peer** (an NVRTC CUDA-C flash timed
+back-to-back with Mercury, the way `gemm_vs_peers` times cuBLAS); that, plus the `ldmatrix` + multi-warp-CTA
+levers below, is the path to a clean **≥90%**. The register-resident core was itself already **1.5–5.9× the
+prior WMMA flash** (`flash_mma_vs_wmma`), so `flash_d64_mp` compounds both wins; the firm same-run results
+stand — **1.1–3.6× `flash_d64_m`** and **205–738× naive CUDA-C** (M6).
 
 **Multi-head** (`grid.y = H`, the kernel folds head `ctaid.y`'s `[H,S,D]` base offset into the pointers —
 zero extra params, single-head stays `grid.y=1`). At small S one head's `S/16` blocks can't fill 36 SMs
@@ -822,8 +827,9 @@ abs on this box). A device error surfaces as an error, never a silent CPU fallba
   fp16/bf16 in the same run (realizing Ada's ~2× fp8 rate once it's compute-bound). **`cp.async`-pipelined
   register-resident `mma.sync` flash-attention** (online softmax, O/m/l in registers, K/V prefetched into
   double-buffered SMEM under the MMA) runs **1.1–3.6× the un-pipelined kernel same-run**
-  (`flash_pipe_vs_mma`) and **205–738× a naive CUDA-C flash** (M6), ~65–85% of PyTorch's SDPA
-  (FlashAttention-2) at the GPU-filled regime; a **whole pre-norm transformer layer runs end-to-end GPU-resident**
+  (`flash_pipe_vs_mma`) and **205–738× a naive CUDA-C flash** (M6); a same-run in-process FA2 peer is the
+  honest path to a %-of-FA2 (cross-process torch SDPA swings ~2× run-to-run here, so that ratio is not
+  reportable); a **whole pre-norm transformer layer runs end-to-end GPU-resident**
   (matching a CPU f64 reference to max_rel 2.7e-4, deterministic run-to-run) and now **beats PyTorch eager
   at every S, including S=4096 (1.35×)**. Numbers are honest for a power-capped 6 GB
   mobile GPU, not a datacenter part. The CPU↔GPU differential is a `c·√K·ε` tolerance over the full output.
