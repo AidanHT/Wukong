@@ -207,17 +207,61 @@ pub const INT8_WARPS_N: usize = 2;
 pub fn int8_gemm_smdb_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| {
-        let (bm, bn, bk) = (INT8_BM, INT8_BN, INT8_BK);
-        let (wm, wn) = (INT8_WARPS_M, INT8_WARPS_N);
+        gen_int8_smdb(
+            "int8_gemm_nt_smdb",
+            INT8_BM,
+            INT8_BN,
+            INT8_WARPS_M,
+            INT8_WARPS_N,
+        )
+    })
+    .as_str()
+}
+
+/// CTA macro-tile for the **128×128** SMEM-staged kernel — the bigger-tile / higher-reuse variant for
+/// large GEMMs (8 warps, `INT8_BK`-deep K-slab). Each warp owns a 32×64 block (TM=2 16-row × TN=8
+/// 8-col subtiles, 16 `mma`s/K-step). 256 threads = `tile_bytes/16` cp.async chunks (one per thread).
+pub const INT8_BM128: usize = 128;
+pub const INT8_BN128: usize = 128;
+pub const INT8_WARPS_M128: usize = 4;
+pub const INT8_WARPS_N128: usize = 2;
+
+/// **128×128 SMEM-staged + `cp.async` int8 GEMM** (`int8_gemm_nt_smdb128`) — same pipeline as
+/// [`int8_gemm_smdb_ptx`] with a larger CTA tile (more A/B reuse per global load → higher arithmetic
+/// intensity at large sizes). Requires M%128==0, N%128==0, K%INT8_BK==0.
+pub fn int8_gemm_smdb128_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        gen_int8_smdb(
+            "int8_gemm_nt_smdb128",
+            INT8_BM128,
+            INT8_BN128,
+            INT8_WARPS_M128,
+            INT8_WARPS_N128,
+        )
+    })
+    .as_str()
+}
+
+/// Generate an SMEM-staged + `cp.async` double-buffered int8 GEMM entry for a `bm×bn` CTA tile computed
+/// by `warps_m×warps_n` warps. `bm`,`bn` must be multiples of `16*warps_m` / `8*warps_n`; the staging
+/// assumes `INT8_BK==32` (16-byte chunks = half a K-slab row) and `threads <= bm*BK/16` so every chunk
+/// has a thread. Each generated module owns its own `smemA`/`smemB` (no cross-module symbol clash).
+fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize) -> String {
+    {
+        let bk = INT8_BK;
         let threads = wm * wn * 32;
         let tm = bm / (16 * wm); // 16-row A subtiles per warp
         let tn = bn / (8 * wn); //  8-col B subtiles per warp
         let tile_bytes = bm * bk; // one A (== one B) tile in bytes (u8); a power of two ⇒ XOR toggles
         debug_assert!(tile_bytes.is_power_of_two());
+        assert!(
+            threads * 16 <= bm * bk && (bm * bk) % (threads * 16) == 0,
+            "smdb staging needs threads*16 to divide the tile bytes"
+        );
         let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
         let b_chunks = bn * bk / (threads * 16);
         let wn_shift = wn.trailing_zeros();
-        let name = "int8_gemm_nt_smdb";
 
         let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
         s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n");
@@ -353,8 +397,7 @@ pub fn int8_gemm_smdb_ptx() -> &'static str {
         }
         s += "    ret;\n}\n";
         s
-    })
-    .as_str()
+    }
 }
 
 /// Full **int8 (W8A8) tensor-core GEMM** `C = A·Bᵀ` (the quantized nn.Linear form): A is `[M,K]` **u8**

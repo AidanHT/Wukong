@@ -2118,21 +2118,22 @@ pub fn gemm_nt_int8(
     g.stream.memcpy_dtov(&c_d)
 }
 
-/// Launch config for the SMEM-staged + `cp.async` int8 kernel: one CTA per `INT8_BM×INT8_BN` C tile,
-/// `INT8_WARPS_M·INT8_WARPS_N` warps (32 threads each).
-fn int8_smdb_cfg(m: usize, n: usize) -> LaunchConfig {
-    use crate::ptx_int8::{INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+/// Launch config for an SMEM-staged + `cp.async` int8 kernel with a `bm×bn` CTA tile and `warps` warps.
+fn int8_smdb_cfg(m: usize, n: usize, bm: usize, bn: usize, warps: usize) -> LaunchConfig {
     LaunchConfig {
-        grid_dim: ((n / INT8_BN) as u32, (m / INT8_BM) as u32, 1),
-        block_dim: ((INT8_WARPS_M * INT8_WARPS_N * 32) as u32, 1, 1),
+        grid_dim: ((n / bn) as u32, (m / bm) as u32, 1),
+        block_dim: ((warps * 32) as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
 
-/// **SMEM-staged + `cp.async` double-buffered int8 GEMM** `C = A·Bᵀ` (`int8_gemm_nt_smdb`) — the
-/// latency-hiding path for large sizes (cooperative CTA tiles, software-pipelined K-loop). Same
-/// `u8`×`i8`→`i32` bit-exact contract as [`gemm_nt_int8`]. Requires M%INT8_BM==0, N%INT8_BN==0,
-/// K%INT8_BK==0.
+/// **SMEM-staged + `cp.async` double-buffered int8 GEMM** `C = A·Bᵀ` — the latency-hiding path
+/// (cooperative CTA tiles, software-pipelined K-loop). Uses the **64×64** tile (4 warps): measured
+/// across re-runs it holds ~2× the occupancy of the 128×128 variant (128 threads / 32 accumulators vs
+/// 256 / 64), which wins while the kernel is latency-bound (far from the int8 peak) — so it is the
+/// robust default. The 128×128 tile ([`crate::ptx_int8::int8_gemm_smdb128_ptx`]) is benched alongside
+/// in `int8_gemm_vs_peers` and helps only when reuse-bound. Same `u8`×`i8`→`i32` bit-exact contract as
+/// [`gemm_nt_int8`]. Requires M%64==0, N%64==0, K%INT8_BK==0.
 pub fn gemm_nt_int8_smdb(
     g: &mut Gpu,
     a: &[u8],
@@ -2141,7 +2142,7 @@ pub fn gemm_nt_int8_smdb(
     k: usize,
     n: usize,
 ) -> Result<Vec<i32>, DriverError> {
-    use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN};
+    use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
@@ -2153,6 +2154,7 @@ pub fn gemm_nt_int8_smdb(
         crate::ptx_int8::int8_gemm_smdb_ptx(),
         "int8_gemm_nt_smdb",
     )?;
+    let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
     let a_d = g.stream.memcpy_stod(a)?;
     let b_d = g.stream.memcpy_stod(b)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
@@ -2164,7 +2166,7 @@ pub fn gemm_nt_int8_smdb(
         .arg(&a_d)
         .arg(&b_d)
         .arg(&mut c_d);
-    unsafe { bld.launch(int8_smdb_cfg(m, n))? };
+    unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -6351,12 +6353,27 @@ mod tests {
                 };
                 let s_st = best_of(ROUNDS, || time_gemm_int8(g, &f_st, cfg_st, dims, &a_d, &b_d, &mut c_d, 50));
 
-                // Mercury SMEM-staged + cp.async double-buffered path (the latency-hiding lever).
+                // Mercury SMEM-staged + cp.async double-buffered paths (the latency-hiding lever): 64×64
+                // and the bigger-reuse 128×128 tile. Report the better as `_smdb`.
+                use crate::ptx_int8::{
+                    INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128,
+                    INT8_WARPS_N, INT8_WARPS_N128,
+                };
                 let f_smdb = g
                     .function("int8_gemm_smdb", crate::ptx_int8::int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb")
                     .unwrap();
-                let cfg_smdb = int8_smdb_cfg(m, n);
-                let s_smdb = best_of(ROUNDS, || time_gemm_int8(g, &f_smdb, cfg_smdb, dims, &a_d, &b_d, &mut c_d, 50));
+                let cfg_smdb = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+                let s_smdb64 = best_of(ROUNDS, || time_gemm_int8(g, &f_smdb, cfg_smdb, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_smdb128 = if m % INT8_BM128 == 0 && n % INT8_BN128 == 0 {
+                    let f = g
+                        .function("int8_gemm_smdb128", crate::ptx_int8::int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128")
+                        .unwrap();
+                    let cfg = int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128);
+                    best_of(ROUNDS, || time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50))
+                } else {
+                    f64::INFINITY
+                };
+                let s_smdb = s_smdb64.min(s_smdb128);
 
                 // Peers. Naive is slow → fewer iters; dp4a is the strong hand-written baseline; cuBLAS
                 // int8 IMMA is the Tier-B gold standard (Mercury reported as % of it).
@@ -6377,17 +6394,23 @@ mod tests {
                     "{sz}³ int8 checksum disagreement: mt={cs_mt} smdb={cs_smdb} naive={cs_n} dp4a={cs_d} cublas={cs_c}"
                 );
 
-                let (g_mt, g_st, g_smdb, g_naive, g_dp4a, g_cub) = (
-                    flop / s_mt, flop / s_st, flop / s_smdb, flop / s_naive, flop / s_dp4a, flop / s_cub,
+                let (g_mt, g_st, g_smdb64, g_smdb128, g_naive, g_dp4a, g_cub) = (
+                    flop / s_mt, flop / s_st, flop / s_smdb64, flop / s_smdb128,
+                    flop / s_naive, flop / s_dp4a, flop / s_cub,
                 );
+                let g_smdb = flop / s_smdb;
                 eprintln!(
                     "\n{sz}³ int8 W8A8 GEMM (same-run, 2·M·N·K MAC-FLOP):\n  \
-                     Mercury _smdb    : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a | {:>5.2}× vs _mt\n  \
+                     Mercury _smdb128 : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS\n  \
+                     Mercury _smdb64  : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS\n  \
+                     Mercury _smdb*   : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a | {:>5.2}× vs _mt\n  \
                      Mercury _mt      : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
                      Mercury single   : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
                      cuBLAS int8 IMMA : {:>8.0} GFLOP/s  | Tier-B gold standard\n  \
                      dp4a CUDA-C      : {:>8.0} GFLOP/s  | strong hand-written int8 peer\n  \
                      naive CUDA-C     : {:>8.0} GFLOP/s  | Tier-A floor",
+                    g_smdb128 / 1e9, 100.0 * g_smdb128 / g_cub,
+                    g_smdb64 / 1e9, 100.0 * g_smdb64 / g_cub,
                     g_smdb / 1e9, 100.0 * g_smdb / g_cub, g_smdb / g_naive, g_smdb / g_dp4a, g_smdb / g_mt,
                     g_mt / 1e9, 100.0 * g_mt / g_cub, g_mt / g_naive, g_mt / g_dp4a,
                     g_st / 1e9, 100.0 * g_st / g_cub, g_st / g_naive, g_st / g_dp4a,
