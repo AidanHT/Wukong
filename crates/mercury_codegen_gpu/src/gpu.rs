@@ -3458,6 +3458,115 @@ mod tests {
         });
     }
 
+    /// **Same-process A/B: the `cp.async`-pipelined flash (`flash_d64_mp`) vs the global-load
+    /// register-resident flash (`flash_d64_m`)** — single-head and multi-head (H=12, the GPU-filled
+    /// regime where attention is per-warp latency-bound and the prefetch should pay off). One pinned
+    /// clock (the only honest comparison; ~7x laptop clock swing). Both kernels are bit-identical in
+    /// math, so it first asserts they agree, then reports `mp/m` (below 1.0 ⇒ the pipeline wins) and
+    /// each kernel's GFLOP/s (`4·S²·D·H`). Run:
+    /// `… --features gpu --release -- --ignored --nocapture flash_pipe_vs_mma`.
+    #[test]
+    #[ignore = "tuning bench; run explicitly"]
+    fn flash_pipe_vs_mma() {
+        with_gpu("flash_pipe_vs_mma", |g| {
+            let mut rng = crate::diff::Rng::new(0x717E5);
+            let d = 64usize;
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            let f_m = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
+                .unwrap();
+            let f_mp = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
+                .unwrap();
+            let to16 =
+                |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&v| half::f16::from_f32(v)).collect() };
+            // (heads, [seq lengths]) — single-head sweep, then the H=12 GPU-filled sweep.
+            for (heads, seqs) in [(1usize, &[512usize, 1024, 2048, 4096][..]), (12, &[512, 1024, 2048][..])] {
+                for &s in seqs {
+                    let n = heads * s * d;
+                    let qf = rng.vec(n, -1.0, 1.0);
+                    let kf = rng.vec(n, -1.0, 1.0);
+                    let vf = rng.vec(n, -1.0, 1.0);
+                    let q16 = g.stream.memcpy_stod(&to16(&qf)).unwrap();
+                    let k16 = g.stream.memcpy_stod(&to16(&kf)).unwrap();
+                    let v16 = g.stream.memcpy_stod(&to16(&vf)).unwrap();
+                    let mut o = g.stream.memcpy_stod(&vec![0f32; n]).unwrap();
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let ss = s as u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((s / 16) as u32, heads as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // correctness: m and mp must agree (bit-identical math, SMEM vs global load only).
+                    {
+                        let mut b = g.stream.launch_builder(&f_m);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    let out_m = g.stream.memcpy_dtov(&o).unwrap();
+                    {
+                        let mut b = g.stream.launch_builder(&f_mp);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    let out_mp = g.stream.memcpy_dtov(&o).unwrap();
+                    let dmax = out_m
+                        .iter()
+                        .zip(&out_mp)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(dmax < 5e-3, "H={heads} S={s}: mp vs m disagree, max_abs={dmax:.2e}");
+
+                    pin!();
+                    let t_m = best_of(5, || {
+                        let t0 = Instant::now();
+                        for _ in 0..100 {
+                            let mut b = g.stream.launch_builder(&f_m);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 100.0
+                    });
+                    pin!();
+                    let t_mp = best_of(5, || {
+                        let t0 = Instant::now();
+                        for _ in 0..100 {
+                            let mut b = g.stream.launch_builder(&f_mp);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 100.0
+                    });
+                    let gf = 4.0 * (s as f64) * (s as f64) * (d as f64) * (heads as f64);
+                    eprintln!(
+                        "H={heads:>2} S={s:>4}: m {:.4} ({:>6.0} GFLOP/s) | mp {:.4} ({:>6.0} GFLOP/s) || mp/m {:.2}x",
+                        t_m * 1e3,
+                        gf / t_m / 1e9,
+                        t_mp * 1e3,
+                        gf / t_mp / 1e9,
+                        t_mp / t_m,
+                    );
+                }
+            }
+        });
+    }
+
     /// Flash-attention throughput at increasing context length, kernel-resident (no per-iter copies).
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
