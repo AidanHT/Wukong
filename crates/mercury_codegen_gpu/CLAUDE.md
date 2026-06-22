@@ -32,9 +32,18 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx.rs` — base PTX (saxpy/vadd/vmath/reduce/simple GEMM) + `COPY_V4`, the vectorized streaming
   copy (128-bit `ld/st.global.v4` with 4× ILP) that drives the M9 HBM-bandwidth bench; target `sm_89`.
 - `src/ptx_gemm.rs` — register-blocked f32 GEMM generator (64×64 tile, 4×4/thread).
-- `src/ptx_wmma.rs` — WMMA fp16/bf16 tensor-core GEMM generators: single-tile, fragment-reuse `_mt`,
-  shared-memory-staged `_sm` (cooperative CTA tiles, vectorized 128-bit loads), **`cp.async`
-  double-buffered** `_sm_db`/`_sm128_db` (pipelined K-loop; `_sm_db` ≈ cuBLAS at 1024³), and a **fused
+- `src/ptx_wmma.rs` — fp16/bf16 tensor-core GEMM generators. **Large-GEMM path (the dispatched workhorse,
+  per the `gemm_nt_f16`/`gemm_nt_bf16` size-regime dispatch):** an **N-stage `cp.async` software pipeline**
+  with configurable staged BK and **threadblock rasterization** (`entry_smem_pipe`, WMMA; `entry_mma_pipe`,
+  native `mma.sync.m16n8k16` with hand-placed **bank-conflict-free (8-padded) SMEM** fragment loads — the
+  route past the ~72% WMMA ceiling). The `PipeCfg`/`PIPE_VARIANTS` table drives the generator, gate
+  (`wmma_pipe_matches_reference`), sweep (`gemm_pipe_sweep`), and dispatch from one source. Same-run vs
+  cuBLAS on the RTX 4050 (clock-/contention-sensitive — only %-of-peer is reportable): **≤1024³ ~90%**
+  (deep BK=16 WMMA pipe `pipe_64_s6`), **2048³ ~90–97%** and **4096³ ~77%** (`mma_*_r16`, padded + r16
+  raster; up from a pre-pipeline 79%/66%/32%). 4096³ is HBM-bound — bigger dynamic-SMEM tiles, 2-D raster,
+  and non-padded occupancy were all swept and *lost*; ~77% is near the PTX-`mma.sync` ceiling (cuBLAS's
+  remaining edge is SASS-level). Also: single-tile/`_mt`, `_sm`, **`cp.async` double-buffered** `_sm_db`/
+  `_sm128_db` (the older 64×64/128×128 staged kernels, now fallbacks), and a **fused
   activation epilogue** (`Act` enum — relu/silu/gelu applied to the f32 accumulators before the C store;
   the transcendentals reuse `vmath`'s exact SFU formulas → `_sm_db_{relu,silu,gelu}` beat the cuBLAS
   GEMM+activation chain ~1.1–1.4×, the thing cuBLAS can't fuse), plus a **fused bias epilogue**
