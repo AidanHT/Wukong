@@ -6734,6 +6734,49 @@ mod tests {
                         cub_chain / t_fused,
                     );
                 }
+
+                // Residual arm: out = A·Bᵀ + bias + residual (the down-proj / attention output-proj). The
+                // plain-cuBLAS chain runs the GEMM then a residual-add kernel that reads C, adds bias[col]
+                // and the residual, writes out — a 3·M·N round-trip (read C + read residual + write),
+                // proxied by `time_vadd`. The fused mma kernel folds both adds into the GEMM store. Same
+                // interleaved same-run methodology as the activation arm above.
+                {
+                    let resid = rng.vec(m * n, -1.0, 1.0);
+                    let resid_d = g.stream.memcpy_stod(&resid).unwrap();
+                    let fused = gemm_nt_f16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                    let refout: Vec<f32> =
+                        cub_out.iter().enumerate().map(|(i, &x)| x + bias[i % n] + resid[i]).collect();
+                    crate::diff::assert_close(
+                        &format!("fused bias_residual vs cuBLAS chain {sz}³"),
+                        &fused,
+                        &refout,
+                        5e-2,
+                        2e-2,
+                    );
+                    let f_fused = g
+                        .function("wmma_f16", ptx, "mma_nt_f16_128_bk32_s2_r16_bias_residual")
+                        .unwrap();
+                    let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
+                    let (mut bc, mut be, mut bf) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                    for _ in 0..6 {
+                        bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, 20).unwrap());
+                        be = be.min(time_vadd(g, &f_vadd, m * n, 20));
+                        bf = bf.min(time_wmma_bias_residual(
+                            g, &f_fused, cfg, dims, &a_d, &b_d, &mut c_d, &bias_d, &resid_d, 20,
+                        ));
+                    }
+                    let (t_cub, t_epi, t_fused) = (bc, be, bf);
+                    let cub_chain = t_cub + t_epi;
+                    eprintln!(
+                        "  bias_residual: fused {:>7.3} ms ({:>6.0} GFLOP/s) | cuBLAS GEMM {:>6.3} + residual-add {:>5.3} = {:>7.3} ms (fused {:>4.2}× faster)",
+                        t_fused * 1e3,
+                        flop / t_fused / 1e9,
+                        t_cub * 1e3,
+                        t_epi * 1e3,
+                        cub_chain * 1e3,
+                        cub_chain / t_fused,
+                    );
+                }
             }
         });
     }
@@ -7076,6 +7119,37 @@ mod tests {
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
             bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(bias_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Per-iter device time of a fused bias+residual mma GEMM (`..._bias_residual`), which takes both
+    /// `bias[N]` and `residual[M,N]` (f32) as the 7th and 8th params after C. Same warmup+loop as
+    /// [`time_wmma`].
+    fn time_wmma_bias_residual<T: cudarc::driver::DeviceRepr>(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<T>,
+        b_d: &cudarc::driver::CudaSlice<T>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        bias_d: &cudarc::driver::CudaSlice<f32>,
+        resid_d: &cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(bias_d).arg(resid_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);
