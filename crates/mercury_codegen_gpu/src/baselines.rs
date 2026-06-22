@@ -300,6 +300,196 @@ pub fn attn_flop(h: usize, s: usize, d: usize) -> f64 {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// Tier B — cuBLAS **unfused attention chain** (the gold-standard library bar for M5). This is the
+// canonical *pre-FlashAttention* attention: run the two matmuls on tensor-core cuBLAS and **materialize
+// the S×S score matrix to HBM** in between (write S1, read it for softmax, write P, read it for P·V).
+// That HBM round-trip of the S×S scores is exactly what Mercury's *fused* flash never pays — so the gap
+// the bench measures is the value of fusion (and grows with S, since S² dwarfs the S·D I/O). cuBLAS
+// provides no softmax/cast, so — exactly as `CublasChainLayer` does for the layer — those two glue
+// kernels are Mercury's own (identical in both stacks); the only thing being compared is fused-vs-not.
+// A genuinely *fused* FA2-class CUDA-C peer is not buildable here: NVRTC on this toolkit-free box has no
+// header search path at all (even `#include <cuda_fp16.h>` fails), so `nvcuda::wmma` can't be compiled
+// (see the `nvrtc_wmma_probe` capability test). The cuBLAS chain is the strongest library peer available.
+// ---------------------------------------------------------------------------------------------------
+
+/// cuBLAS `O[M×N] = A[M×K]·B[K×N]` — the **NN** (no-transpose) product `P·V` needs — f16 in / f32 out
+/// (`CUDA_R_16F` data, `CUDA_R_32F` C, `CUBLAS_COMPUTE_32F`), tensor cores via the default algorithm:
+/// the same f32-accumulate / f32-store boundary Mercury's flash uses. Row-major→col-major identity for a
+/// plain product: row-major `O[M,N]` is col-major `Oᵀ[N,M] = Bᵀ·Aᵀ`, and the stored row-major buffers
+/// *are* `Bᵀ`/`Aᵀ` when read column-major — so pass **B first** (its `[K,N]` buffer, ld=N) and **A
+/// second** (its `[M,K]` buffer, ld=K), both `OP_N`, with `m,n` swapped. (Symmetric to [`cublas_nt_cfg`]'s
+/// trick but both-N; the f64 gate on the full chain catches any slip.)
+///
+/// # Safety
+/// `a_d`,`b_d`,`c_d` must be valid device buffers of length `m*k`, `k*n`, `m*n`; the handle/stream live.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_ex_nn_f16_f32out(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    a_d: &CudaSlice<f16>,
+    b_d: &CudaSlice<f16>,
+    c_d: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), PeerError> {
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let (ap, _ra) = a_d.device_ptr(stream);
+    let (bp, _rb) = b_d.device_ptr(stream);
+    let (cp, _rc) = c_d.device_ptr_mut(stream);
+    cublas_result::gemm_ex(
+        *blas.handle(),
+        cublasOperation_t::CUBLAS_OP_N, // B as [N,K] col-major view (= Bᵀ)
+        cublasOperation_t::CUBLAS_OP_N, // A as [K,M] col-major view (= Aᵀ)
+        n as i32,                       // rows of Oᵀ
+        m as i32,                       // cols of Oᵀ
+        k as i32,
+        (&alpha) as *const f32 as *const _,
+        bp as *const _,
+        cudaDataType_t::CUDA_R_16F,
+        n as i32, // lda: B is K×N row-major ⇒ N-wide
+        ap as *const _,
+        cudaDataType_t::CUDA_R_16F,
+        k as i32, // ldb: A is M×K row-major ⇒ K-wide
+        (&beta) as *const f32 as *const _,
+        cp as *mut _,
+        cudaDataType_t::CUDA_R_32F,
+        n as i32, // ldc: Oᵀ is N×M col-major ⇒ N-wide
+        cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+    )?;
+    Ok(())
+}
+
+/// One run of the unfused attention chain over **resident** single-head buffers, no allocation/sync —
+/// the timing-loop body: `S1 = (scale·Q)·Kᵀ` (cuBLAS NT) → `P = softmax_row(S1)` (Mercury's warp-per-row
+/// softmax glue) → `P16 = f16(P)` (cast glue) → `O = P·V` (cuBLAS NN). `scale` is pre-folded into `q_d`
+/// by the caller (cuBLAS `gemm_ex` runs α=1), so the softmax sees `scale·Q·Kᵀ`.
+///
+/// # Safety
+/// All slices must be valid resident buffers of the documented `[S,D]`/`[S,S]` sizes; handle/stream live.
+#[allow(clippy::too_many_arguments)]
+unsafe fn cublas_attn_chain_once(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    f_softmax: &CudaFunction,
+    f_cast: &CudaFunction,
+    q_d: &CudaSlice<f16>,
+    k_d: &CudaSlice<f16>,
+    v_d: &CudaSlice<f16>,
+    o_d: &mut CudaSlice<f32>,
+    s1_d: &mut CudaSlice<f32>,
+    p_d: &mut CudaSlice<f32>,
+    p16_d: &mut CudaSlice<f16>,
+    s: usize,
+    d: usize,
+) -> Result<(), PeerError> {
+    // (1) scores S1[S,S] = (scale·Q)·Kᵀ — tensor-core cuBLAS, f32 out (reuses the NT helper).
+    unsafe { gemm_ex_nt_f16_f32out(blas, stream, q_d, k_d, s1_d, s, d, s)? };
+    // (2) P[S,S] = softmax over each of the S rows — Mercury's exact warp-per-row softmax (cuBLAS has
+    //     none); `eps` is ignored by the softmax arm of the shared norm signature.
+    {
+        let (r, c) = (s as u32, s as u32);
+        let eps = 0.0f32;
+        let cfg = LaunchConfig { grid_dim: (r, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut bld = stream.launch_builder(f_softmax);
+        bld.arg(&r).arg(&c).arg(&eps).arg(&*s1_d).arg(&mut *p_d);
+        unsafe { bld.launch(cfg)? };
+    }
+    // (3) narrow P→f16 for the tensor-core second GEMM — the inter-stage cast cuBLAS forces.
+    {
+        let n = (s * s) as u32;
+        let mut bld = stream.launch_builder(f_cast);
+        bld.arg(&n).arg(&*p_d).arg(&mut *p16_d);
+        unsafe { bld.launch(LaunchConfig::for_num_elems(n))? };
+    }
+    // (4) O[S,D] = P·V — tensor-core cuBLAS NN, f32 out.
+    unsafe { gemm_ex_nn_f16_f32out(blas, stream, &*p16_d, v_d, o_d, s, s, d)? };
+    Ok(())
+}
+
+/// Run the cuBLAS **unfused attention chain** (single head) once and copy `O` back — the correctness
+/// gate entry. `O = softmax(scale·Q·Kᵀ)·V`, Q/K/V `[S,D]` row-major, the two matmuls on tensor-core
+/// cuBLAS with Mercury's softmax+cast as the glue cuBLAS can't provide. Cross-checked against the same
+/// f64 oracle Mercury's flash is, so a transpose slip or wrong config shows as a gross mismatch.
+pub fn cublas_attn_chain(
+    g: &mut Gpu,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    s: usize,
+    d: usize,
+    scale: f32,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(q.len(), s * d);
+    assert_eq!(k.len(), s * d);
+    assert_eq!(v.len(), s * d);
+    let f_softmax = g.function("norm", crate::ptx_norm::norm_ptx(), "softmax")?;
+    let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let stream = g.stream.clone();
+    // Fold scale into Q (cuBLAS gemm_ex uses α=1, so the softmax must see scale·Q·Kᵀ).
+    let q16: Vec<f16> = q.iter().map(|&x| f16::from_f32(x * scale)).collect();
+    let k16: Vec<f16> = k.iter().map(|&x| f16::from_f32(x)).collect();
+    let v16: Vec<f16> = v.iter().map(|&x| f16::from_f32(x)).collect();
+    let q_d = stream.memcpy_stod(&q16)?;
+    let k_d = stream.memcpy_stod(&k16)?;
+    let v_d = stream.memcpy_stod(&v16)?;
+    let mut o_d = stream.alloc_zeros::<f32>(s * d)?;
+    let mut s1_d = stream.alloc_zeros::<f32>(s * s)?;
+    let mut p_d = stream.alloc_zeros::<f32>(s * s)?;
+    let mut p16_d = stream.alloc_zeros::<f16>(s * s)?;
+    unsafe {
+        cublas_attn_chain_once(
+            &blas, &stream, &f_softmax, &f_cast, &q_d, &k_d, &v_d, &mut o_d, &mut s1_d, &mut p_d,
+            &mut p16_d, s, d,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(stream.memcpy_dtov(&o_d)?)
+}
+
+/// Time the cuBLAS unfused attention chain (single head): `iters` resident chain runs bracketed by one
+/// sync after a warm-up — the same timing shape Mercury's flash benches use, so the ratio is same-run
+/// apples-to-apples. Scratch (S1, P, P16) is allocated once and reused. Returns seconds per chain.
+pub fn time_cublas_attn_chain(
+    g: &mut Gpu,
+    s: usize,
+    d: usize,
+    _scale: f32, // dummy data ⇒ scale doesn't affect timing
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let f_softmax = g.function("norm", crate::ptx_norm::norm_ptx(), "softmax")?;
+    let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let stream = g.stream.clone();
+    let q_d = stream.memcpy_stod(&vec![f16::from_f32(0.01); s * d])?;
+    let k_d = stream.memcpy_stod(&vec![f16::from_f32(0.01); s * d])?;
+    let v_d = stream.memcpy_stod(&vec![f16::from_f32(0.01); s * d])?;
+    let mut o_d = stream.alloc_zeros::<f32>(s * d)?;
+    let mut s1_d = stream.alloc_zeros::<f32>(s * s)?;
+    let mut p_d = stream.alloc_zeros::<f32>(s * s)?;
+    let mut p16_d = stream.alloc_zeros::<f16>(s * s)?;
+    let mut once = || -> Result<(), PeerError> {
+        unsafe {
+            cublas_attn_chain_once(
+                &blas, &stream, &f_softmax, &f_cast, &q_d, &k_d, &v_d, &mut o_d, &mut s1_d, &mut p_d,
+                &mut p16_d, s, d,
+            )
+        }
+    };
+    once()?; // warm up
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        once()?;
+    }
+    stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Tier B — cuBLAS fp16 GEMM (the gold-standard peer; Mercury reports as a % of this).
 // ---------------------------------------------------------------------------------------------------
 

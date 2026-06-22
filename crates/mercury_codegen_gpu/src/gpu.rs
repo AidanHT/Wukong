@@ -5600,24 +5600,83 @@ mod tests {
         });
     }
 
-    /// **M5/M6: register-resident flash vs the Tier-A naive CUDA-C attention**, same-run, single head,
-    /// D=64. The literal "beat the hand-written C flash on the GPU" (M6) — the GPU twin of beating
-    /// scalar CPU-C. Mercury's `flash_d64_mp` (tensor-core `mma.sync`, O/m/l in registers, `cp.async`-
-    /// staged double-buffered K/V, online softmax) vs `naive_attn` (one thread per query row, two-pass
-    /// softmax, no SMEM/tensor cores) over identical buffers. Reports GFLOP/s (`4·S²·D`) and Mercury × vs
-    /// naive at S∈{512..4096}. (A Tier-B FA2-class CUDA-C peer for the %-of-FA2 number is the follow-up;
-    /// this nails the Tier-A win first.)
+    /// **Capability probe (not a perf or correctness gate): can NVRTC compile `nvcuda::wmma` here?**
+    /// Decides whether a *genuinely FA2-class* (tensor-core, fused) attention peer can be written in
+    /// CUDA-C and compiled by the redist NVRTC — vs. falling back to a cuBLAS unfused attention chain.
+    /// This toolkit-free box has no `mma.h` on disk, so this asks empirically whether NVRTC bundles it
+    /// (it is known to bundle `cuda_fp16.h`). Informational: prints PASS/FAIL + the compile error;
+    /// never fails the suite (skips without NVRTC). The result picks which Tier-B M5 peer to build.
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu -- --ignored --nocapture nvrtc_wmma_probe`.
+    #[test]
+    #[ignore = "capability probe; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn nvrtc_wmma_probe() {
+        use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+        with_gpu("nvrtc_wmma_probe", |g| {
+            if !crate::baselines::peers_available(g) {
+                eprintln!("[skip] nvrtc_wmma_probe: NVRTC not loadable.");
+                return;
+            }
+            let opts = || CompileOptions {
+                arch: Some("compute_89"),
+                ..Default::default()
+            };
+            // (1) Does NVRTC bundle cuda_fp16.h? (expected yes — sanity for the header mechanism.)
+            let fp16_src = "#include <cuda_fp16.h>\nextern \"C\" __global__ void p(__half* x){ x[0] = __float2half(1.0f); }";
+            match compile_ptx_with_opts(fp16_src, opts()) {
+                Ok(_) => eprintln!("[probe] cuda_fp16.h: COMPILES OK"),
+                Err(e) => eprintln!("[probe] cuda_fp16.h: FAILS -- {e}"),
+            }
+            // (2) The decisive one: nvcuda::wmma via mma.h. If this compiles, a real fused tensor-core
+            //     flash peer (the FA2-class M5 denominator) is feasible with zero toolkit install.
+            let wmma_src = r#"
+#include <mma.h>
+using namespace nvcuda;
+extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+    wmma::load_matrix_sync(fa, a, 16);
+    wmma::load_matrix_sync(fb, b, 16);
+    wmma::mma_sync(acc, fa, fb, acc);
+    wmma::store_matrix_sync(c, acc, 16, wmma::mem_row_major);
+}
+"#;
+            match compile_ptx_with_opts(wmma_src, opts()) {
+                Ok(_) => eprintln!(
+                    "[probe] nvcuda::wmma (mma.h): COMPILES OK -- FA2-class fused CUDA-C peer is FEASIBLE."
+                ),
+                Err(e) => eprintln!(
+                    "[probe] nvcuda::wmma (mma.h): FAILS -- fall back to the cuBLAS unfused chain peer.\n  {e}"
+                ),
+            }
+        });
+    }
+
+    /// **M5/M6: register-resident flash vs two peers — Tier-A naive CUDA-C *and* the Tier-B cuBLAS
+    /// unfused attention chain**, same-run, single head, D=64. Mercury's `flash_d64_mp` (tensor-core
+    /// `mma.sync`, O/m/l in registers, `cp.async`-staged double-buffered K/V, online softmax) vs:
+    /// (A) `naive_attn` (one thread per query row, two-pass softmax, no SMEM/tensor cores) — the M6
+    /// "beat the hand-written C flash" bar; and (B) `cublas_attn_chain` (QKᵀ and P·V on tensor-core
+    /// cuBLAS, the S×S scores **materialized to HBM** with a softmax in between) — the M5 gold-standard
+    /// *library* bar. Mercury's fused flash never spills the S×S scores, so the cuBLAS-chain gap **is**
+    /// the value of fusion and grows with S. Reports GFLOP/s (`4·S²·D`) and Mercury × vs each at
+    /// S∈{512..4096}. (A genuinely *fused* FA2-class CUDA-C peer is not buildable on this toolkit-free
+    /// box — NVRTC has no header path, so `nvcuda::wmma` won't compile; see `nvrtc_wmma_probe`. The
+    /// cuBLAS chain is the strongest library peer obtainable here.)
     ///
-    /// Correctness gates speed (the first law): both `naive_attn` and `flash_d64_mp` are first cross-checked
-    /// against the f64 `ref_attn` oracle, and at every S their output checksums must agree. Same-run only
-    /// (the ~7× laptop clock swing makes cross-run flash numbers meaningless): a clock warmup + `best_of`.
-    /// Needs the NVRTC redist DLL on PATH; skips (never fails) if absent. Run:
+    /// Correctness gates speed (the first law): `naive_attn`, `cublas_attn_chain`, and `flash_d64_mp` are
+    /// all first cross-checked against the f64 `ref_attn` oracle, and at every S their output checksums
+    /// must agree. Same-run only (the ~7× laptop clock swing makes cross-run flash numbers meaningless):
+    /// a clock warmup + `best_of`. Needs the NVRTC + cuBLAS redist DLLs on PATH; skips (never fails) if
+    /// absent. Run:
     /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture flash_vs_peers`.
     #[test]
     #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
     fn flash_vs_peers() {
         use crate::baselines::{
-            attn_flop, nvrtc_naive_attn, peer_env_hint, peers_available, time_nvrtc_naive_attn,
+            attn_flop, cublas_attn_chain, nvrtc_naive_attn, peer_env_hint, peers_available,
+            time_cublas_attn_chain, time_nvrtc_naive_attn,
         };
         use half::f16;
         with_gpu("flash_vs_peers", |g| {
@@ -5639,8 +5698,12 @@ mod tests {
                 let naive = nvrtc_naive_attn(g, &qf, &kf, &vf, 1, s, d, scale).unwrap();
                 let rel_f32 = ((8.0 * (d as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
                 crate::diff::assert_close(&format!("naive attn s={s}"), &naive, &oracle, 1e-3, rel_f32);
+                // cuBLAS chain takes f16 Q/K/V (the tensor-core dtype) ⇒ ~f16 tol; loose enough that only
+                // a transpose/config slip (O(0.1+) scatter) trips it, tight enough to catch one.
+                let chain = cublas_attn_chain(g, &qf, &kf, &vf, s, d, scale).unwrap();
+                crate::diff::assert_close(&format!("cublas attn chain s={s}"), &chain, &oracle, 3e-2, 5e-2);
             }
-            eprintln!("[gate] naive CUDA-C attention matches the f64 oracle ✓");
+            eprintln!("[gate] naive CUDA-C + cuBLAS-chain attention both match the f64 oracle ✓");
 
             // --- Clock warmup (peak-vs-peak, same-run). Hammer a GEMM until the mobile clock settles. ---
             let wa = rng.vec(1024 * 1024, -1.0, 1.0);
@@ -5697,14 +5760,27 @@ mod tests {
                 let naive_iters = if s >= 2048 { 3 } else { 10 };
                 let t_n = time_nvrtc_naive_attn(g, 1, s, d, scale, naive_iters).unwrap();
 
+                // Tier-B cuBLAS unfused chain: cross-check vs naive (same f16-vs-f32 sum tol), then time
+                // same-run. Heavier than the fused flash (materializes S×S) but far lighter than naive.
+                let chain_out = cublas_attn_chain(g, &qf, &kf, &vf, s, d, scale).unwrap();
+                let cs_c = csum(&chain_out);
+                assert!(
+                    (cs_c - cs_n).abs() / cs_n.max(1.0) < 3e-2,
+                    "S={s}: cuBLAS chain vs naive checksum disagree: chain={cs_c:.3e} naive={cs_n:.3e}"
+                );
+                let t_c = time_cublas_attn_chain(g, s, d, scale, if s >= 2048 { 10 } else { 30 }).unwrap();
+
                 let flop = attn_flop(1, s, d);
-                let (g_m, g_n) = (flop / t_m, flop / t_n);
+                let (g_m, g_n, g_c) = (flop / t_m, flop / t_n, flop / t_c);
                 eprintln!(
-                    "S={s:>4} D={d} (1 head, same-run): Mercury flash {:.4} ms ({:>6.0} GFLOP/s) | naive CUDA-C {:.4} ms ({:>5.0} GFLOP/s) || Mercury {:>5.1}× vs naive",
+                    "S={s:>4} D={d} (1 head, same-run): Mercury flash {:.4} ms ({:>6.0} GF/s) | cuBLAS chain {:.4} ms ({:>6.0} GF/s) | naive {:.4} ms ({:>5.0} GF/s) || Mercury {:>4.1}× vs cuBLAS-chain, {:>5.1}× vs naive",
                     t_m * 1e3,
                     g_m / 1e9,
+                    t_c * 1e3,
+                    g_c / 1e9,
                     t_n * 1e3,
                     g_n / 1e9,
+                    g_m / g_c,
                     g_m / g_n,
                 );
             }
