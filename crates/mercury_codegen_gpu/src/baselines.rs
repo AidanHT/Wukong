@@ -948,3 +948,110 @@ fn time_int8_peer(
     g.stream.synchronize()?;
     Ok(t0.elapsed().as_secs_f64() / iters as f64)
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Tier B — cuBLAS **int8 IMMA** GEMM via `cublasGemmEx` (the gold-standard int8 peer; Mercury reports
+// as a % of this). `CUDA_R_8I` data, `CUDA_R_32I` output, `CUBLAS_COMPUTE_32I` (the Ada int8 tensor
+// cores). cuBLASLt's *safe* cudarc wrapper only impls `Matmul` for f32/f16/bf16 (no int8), and the raw
+// IMMA path needs fiddly COL32/COL4 memory ordering — so `cublasGemmEx` is the robust binding here.
+//
+// **Signedness caveat (honesty law):** classic `cublasGemmEx` int8 is **s8×s8→s32**; there is no mixed
+// `u8×s8` form (that lives only in cuBLASLt's specially-ordered IMMA). Mercury's contract is `u8×s8`.
+// To make all three implementations compute the *identical* matrix for the bit-exact cross-check, the
+// int8 peer comparison restricts **activations to `[0,127]`** (where the `u8` and `s8` reinterpretations
+// coincide); weights keep the full `[-128,127]`. The tensor-core *work* is identical regardless of
+// signedness, so the **timing** is a faithful int8-IMMA measurement; only the test data is range-bound.
+// ---------------------------------------------------------------------------------------------------
+
+/// Column-major transpose mapping for Mercury's row-major `C[M×N] = A[M×K]·B[N×K]ᵀ` on cuBLAS — the
+/// int8 twin of [`cublas_nt_cfg`]/[`gemm_ex_nt_f16_f32out`]: `Cᵀ = B̌ᵀ·Ǎ`, so B is the first operand
+/// transposed and A the second untransposed, with `m,n` swapped, `lda=ldb=K`, `ldc=N`. K (=lda=ldb) is
+/// a multiple of 32 and N (=ldc) a multiple of 8 — both satisfy IMMA's multiple-of-4 leading-dim rule.
+///
+/// # Safety
+/// `a_d`/`b_d` (i8) and `c_d` (i32) must be valid device buffers of length `m*k`, `n*k`, `m*n`; the
+/// cuBLAS handle and stream must be live. The device-pointer guards are held across the call.
+unsafe fn gemm_ex_nt_int8(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    a_d: &CudaSlice<i8>,
+    b_d: &CudaSlice<i8>,
+    c_d: &mut CudaSlice<i32>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), PeerError> {
+    let alpha: i32 = 1;
+    let beta: i32 = 0;
+    let (ap, _ra) = a_d.device_ptr(stream);
+    let (bp, _rb) = b_d.device_ptr(stream);
+    let (cp, _rc) = c_d.device_ptr_mut(stream);
+    cublas_result::gemm_ex(
+        *blas.handle(),
+        cublasOperation_t::CUBLAS_OP_T, // B̌ transposed (Mercury's B, first operand)
+        cublasOperation_t::CUBLAS_OP_N, // Ǎ untransposed (Mercury's A, second operand)
+        n as i32,                       // rows of Cᵀ
+        m as i32,                       // cols of Cᵀ
+        k as i32,
+        (&alpha) as *const i32 as *const _,
+        bp as *const _,
+        cudaDataType_t::CUDA_R_8I,
+        k as i32, // lda: B̌ is K×N col-major
+        ap as *const _,
+        cudaDataType_t::CUDA_R_8I,
+        k as i32, // ldb: Ǎ is K×M col-major
+        (&beta) as *const i32 as *const _,
+        cp as *mut _,
+        cudaDataType_t::CUDA_R_32I,
+        n as i32, // ldc: Cᵀ is N×M col-major
+        cublasComputeType_t::CUBLAS_COMPUTE_32I,
+        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+    )?;
+    Ok(())
+}
+
+/// Run cuBLAS int8 (`cublasGemmEx`, IMMA tensor cores) once and return the `i32` result — the
+/// correctness-gate entry. `a` activations must be in `[0,127]` (see the signedness caveat above) so
+/// the `s8×s8` cuBLAS computes the same matrix as Mercury's `u8×s8`; passed here as `i8`.
+pub fn cublas_gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time cuBLAS int8 GEMM: `iters` resident `cublasGemmEx` calls, one warm-up, one trailing sync —
+/// matching the Mercury/NVRTC timing shape. Returns seconds per call.
+pub fn time_cublas_gemm_nt_int8(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(&vec![1i8; m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![1i8; n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? }; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
