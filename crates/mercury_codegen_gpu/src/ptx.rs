@@ -151,6 +151,134 @@ DONE:
 }
 "#;
 
+/// **Multi-head attention layout shims.** A transformer's QKV projection produces activations laid out
+/// `[S, H·dh]` (token-major: row `s` holds all `H` heads' `dh`-vectors interleaved), but the tensor-core
+/// flash kernel reads each head as a contiguous `[S, dh]` block — i.e. it wants `[H, S, dh]` (head-major),
+/// addressing head `h` at element `h·S·dh` (`ptx_flash`'s `hoff = ctaid.y·S·dh`). These two kernels bridge
+/// the layouts with one thread per element, so the production flash kernel itself stays untouched:
+///
+/// * **`cast_transpose_qkv`** — forward: f32 `[S, H·dh]` → f16 `[H, S, dh]`. **Folds the f32→f16 narrowing
+///   into the transpose** (the flash inputs are f16 anyway), so Q/K/V cost one pass, not a cast *plus* a
+///   transpose. Indexed by the contiguous *input* element `t` (coalesced load): `row=t/D`, `col=t%D`,
+///   `head=col/dh`, `i=col%dh`; scattered f16 store at `head·sdh + row·dh + i` (`D=H·dh`, `sdh=S·dh`).
+/// * **`transpose_attn_out`** — inverse: f32 `[H, S, dh]` → f32 `[S, H·dh]`, to put the flash output back
+///   into the token-major layout the O-projection GEMM consumes. Indexed by the contiguous input `t` over
+///   `[H,S,dh]`: `head=t/sdh`, `row=(t%sdh)/dh`, `i=t%dh`; store at `row·D + head·dh + i`.
+///
+/// Both are memory-bound (the integer div/rem for the index decode is free against HBM); `H=1` makes the
+/// forward kernel a plain cast and the inverse a plain copy. Gated by `head_transpose_round_trips`.
+pub const HEAD_TRANSPOSE_PTX: &str = r#"
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry cast_transpose_qkv(
+    .param .u32 n,
+    .param .u32 D,
+    .param .u32 dh,
+    .param .u32 sdh,
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .pred  %p<2>;
+    .reg .f32   %f<2>;
+    .reg .b16   %h<2>;
+    .reg .b32   %r<16>;
+    .reg .b64   %rd<7>;
+
+    ld.param.u32    %r1, [n];
+    ld.param.u32    %r2, [D];
+    ld.param.u32    %r3, [dh];
+    ld.param.u32    %r4, [sdh];
+    ld.param.u64    %rd1, [src];
+    ld.param.u64    %rd2, [dst];
+
+    mov.u32     %r5, %ntid.x;
+    mov.u32     %r6, %ctaid.x;
+    mov.u32     %r7, %tid.x;
+    mad.lo.s32  %r5, %r6, %r5, %r7;        // t = global thread id (over the [S, H*dh] input)
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra    DONE;
+
+    div.u32     %r8, %r5, %r2;             // row = t / D
+    mul.lo.s32  %r9, %r8, %r2;
+    sub.s32     %r10, %r5, %r9;            // col = t - row*D
+    div.u32     %r11, %r10, %r3;           // head = col / dh
+    mul.lo.s32  %r12, %r11, %r3;
+    sub.s32     %r13, %r10, %r12;          // i = col - head*dh
+    mul.lo.s32  %r14, %r11, %r4;           // head*sdh
+    mul.lo.s32  %r15, %r8, %r3;            // row*dh
+    add.s32     %r14, %r14, %r15;
+    add.s32     %r14, %r14, %r13;          // idx_out = head*sdh + row*dh + i
+
+    cvta.to.global.u64  %rd1, %rd1;
+    cvta.to.global.u64  %rd2, %rd2;
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64     %rd4, %rd1, %rd3;
+    ld.global.f32   %f1, [%rd4];
+    cvt.rn.f16.f32  %h1, %f1;
+    mul.wide.u32 %rd5, %r14, 2;
+    add.s64     %rd6, %rd2, %rd5;
+    st.global.b16   [%rd6], %h1;
+
+DONE:
+    ret;
+}
+
+.visible .entry transpose_attn_out(
+    .param .u32 n,
+    .param .u32 D,
+    .param .u32 dh,
+    .param .u32 sdh,
+    .param .u64 src,
+    .param .u64 dst
+)
+{
+    .reg .pred  %p<2>;
+    .reg .f32   %f<2>;
+    .reg .b32   %r<16>;
+    .reg .b64   %rd<7>;
+
+    ld.param.u32    %r1, [n];
+    ld.param.u32    %r2, [D];
+    ld.param.u32    %r3, [dh];
+    ld.param.u32    %r4, [sdh];
+    ld.param.u64    %rd1, [src];
+    ld.param.u64    %rd2, [dst];
+
+    mov.u32     %r5, %ntid.x;
+    mov.u32     %r6, %ctaid.x;
+    mov.u32     %r7, %tid.x;
+    mad.lo.s32  %r5, %r6, %r5, %r7;        // t = global thread id (over the [H, S, dh] input)
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra    DONE;
+
+    div.u32     %r8, %r5, %r4;             // head = t / sdh
+    mul.lo.s32  %r9, %r8, %r4;
+    sub.s32     %r10, %r5, %r9;            // rem = t - head*sdh  (= row*dh + i)
+    div.u32     %r11, %r10, %r3;           // row = rem / dh
+    mul.lo.s32  %r12, %r11, %r3;
+    sub.s32     %r13, %r10, %r12;          // i = rem - row*dh
+    mul.lo.s32  %r14, %r11, %r2;           // row*D
+    mul.lo.s32  %r15, %r8, %r3;            // head*dh
+    add.s32     %r14, %r14, %r15;
+    add.s32     %r14, %r14, %r13;          // idx_out = row*D + head*dh + i
+
+    cvta.to.global.u64  %rd1, %rd1;
+    cvta.to.global.u64  %rd2, %rd2;
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64     %rd4, %rd1, %rd3;
+    ld.global.f32   %f1, [%rd4];
+    mul.wide.u32 %rd5, %r14, 4;
+    add.s64     %rd6, %rd2, %rd5;
+    st.global.f32   [%rd6], %f1;
+
+DONE:
+    ret;
+}
+"#;
+
 /// `dst[i] = src[i]` — a pure streaming **copy**, the canonical memory-bandwidth kernel (milestone
 /// M9). Vectorized 128-bit access (`ld.global.v4.f32` / `st.global.v4.f32` = 4 floats/op) with **4×
 /// ILP**: each thread issues four *independent* float4 loads (distinct registers + grid-stride-spaced
