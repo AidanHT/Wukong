@@ -1234,6 +1234,274 @@ fn entry_mma_pipe(
     s
 }
 
+/// Generate a **fused gated-FFN ("GLU-family")** `mma.sync.m16n8k16` kernel computing
+/// `out = act(x·Wgᵀ [+ bg]) ⊙ (x·Wuᵀ [+ bu])` — the **SwiGLU** (act=silu) / **GeGLU** (act=gelu) /
+/// bilinear-GLU (act=none) FFN gate that every modern LLM (Llama, Mistral, Gemma, …) runs. It shares ONE
+/// staged A tile (the activations `x`) between **two** B matrices — the gate weight `Wg` and the up
+/// weight `Wu` — keeps two accumulator sets, applies the activation to only the gate branch, and folds
+/// the elementwise product into the store. cuBLAS structurally needs **three** kernels for this (two
+/// GEMMs + an elementwise multiply) and round-trips both `[M,N]` intermediates through HBM; here `x` is
+/// read from global **once** (the shared A fragments feed both `mma` chains) and only the gated product
+/// touches HBM — a fusion that is *not* PTX-ceiling-bound the way the plain GEMM is.
+///
+/// Tile is **128×64** (not the workhorse's 128×128): two accumulator sets at 128×64 cost the SAME
+/// `tm·tn·4·2 = 64` f32 D-regs/thread as one set at 128×128 (register-neutral), and three staged tiles
+/// (A `128×bk` + Wg `64×bk` + Wu `64×bk` = `stages·(bm+2·bn)·ldp·2`) fit the same 40 KiB the single-B
+/// 128×128 uses (SMEM-neutral). The two GEMMs share the proven [`entry_mma_pipe`] recipe — `cp.async`
+/// pipeline, padded conflict-free SMEM fragment loads, threadblock raster — and the D-fragment column map
+/// is identical for both, so the per-column bias add and the SFU activation reuse [`Act::epilogue`]
+/// verbatim. Same shape constraints as [`entry_mma_pipe`]; `bias` adds per-column `bg[N]`,`bu[N]` params.
+fn entry_mma_gate(
+    name: &str,
+    ty: &str,
+    bm: usize,
+    bn: usize,
+    bk: usize,
+    warps_m: usize,
+    warps_n: usize,
+    stages: usize,
+    raster: usize,
+    pad: usize,
+    gate_act: Act,
+    bias: bool,
+) -> String {
+    assert!(stages >= 2, "the pipeline needs at least 2 stages");
+    assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
+    assert!(bm % (16 * warps_m) == 0, "{name}: bm must be a multiple of 16·warps_m");
+    assert!(bn % (8 * warps_n) == 0, "{name}: bn must be a multiple of 8·warps_n");
+    assert!(
+        raster == 0 || (bm.is_power_of_two() && bn.is_power_of_two()),
+        "{name}: rasterization needs bm,bn powers of two"
+    );
+    assert!(pad % 8 == 0, "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)");
+    let mma_ty = format!("f32.{ty}.{ty}.f32");
+    let threads = warps_m * warps_n * 32;
+    let tm = bm / (16 * warps_m); // m16 sub-tiles per warp
+    let tn = bn / (8 * warps_n); //  n8 sub-tiles per warp
+    let nks = bk / 16;
+    let wmr = bm / warps_m;
+    let wnc = bn / warps_n;
+    let ldp = bk + pad;
+    let tile_a = bm * ldp * 2;
+    let tile_b = bn * ldp * 2; // one Wg (== one Wu) tile
+    let smem_a = stages * tile_a;
+    let smem_b = stages * tile_b;
+    // Three ring buffers: A + Wg + Wu. 128×64/bk32/pad8/s2 ⇒ 20480 + 2·10240 = 40 KiB (= single-B 128×128).
+    assert!(smem_a + 2 * smem_b <= 48 * 1024, "{name}: static SMEM {} B exceeds 48 KiB", smem_a + 2 * smem_b);
+    let a_chunks = bm * bk / (threads * 8);
+    let b_chunks = bn * bk / (threads * 8);
+    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
+    let bk_chunks = bk / 8;
+    let row_shift = bk_chunks.trailing_zeros();
+    let col_mask = bk_chunks - 1;
+    let wn_shift = warps_n.trailing_zeros();
+
+    // The fused-bias variant takes per-column gate/up biases `bg[N]`,`bu[N]` (f32), added in the store
+    // epilogue (the `silu(x·Wg+bg) ⊙ (x·Wu+bu)` form; biasless is the Llama-style no-bias gate).
+    let bias_param = if bias { ",\n    .param .u64 pBiasG,\n    .param .u64 pBiasU" } else { "" };
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pBg,\n    .param .u64 pBu,\n    .param .u64 pC{bias_param}\n)\n{{\n"
+    );
+    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+    s += &format!("    .shared .align 16 .b8 smemBg_{name}[{smem_b}];\n");
+    s += &format!("    .shared .align 16 .b8 smemBu_{name}[{smem_b}];\n");
+    s += "    .reg .pred %p0,%pmore;\n";
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufcBg,%bufcBu,%bufwA,%bufwBg,%bufwBu,%lane,%grp,%tg,%tg2,%laneoff,%warpMrow,%warpNcol,%aptr,%bptr,%grow,%gcol;\n";
+    if !matches!(gate_act, Act::None) {
+        s += "    .reg .f32 %act0,%act1;\n";
+    }
+    if bias {
+        s += "    .reg .f32 %biasg0,%biasg1,%biasu0,%biasu1;\n    .reg .b64 %BiasG,%BiasU;\n";
+    }
+    if raster > 0 {
+        s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
+    }
+    // Two accumulator sets (gate %dg, up %du) — same per-warp tm×tn×4 layout, so they share the lane→
+    // (row,col) map and combine register-for-register in the epilogue product.
+    let mut decl_d = String::new();
+    for mi in 0..tm {
+        for ni in 0..tn {
+            for r in 0..4 {
+                decl_d += &format!("%dg{mi}_{ni}_{r},%du{mi}_{ni}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .f32 {};\n", decl_d.trim_end_matches(','));
+    let mut decl_ab = String::new();
+    for mi in 0..tm {
+        for r in 0..4 {
+            decl_ab += &format!("%a{mi}_{r},");
+        }
+    }
+    for ni in 0..tn {
+        for r in 0..2 {
+            decl_ab += &format!("%bg{ni}_{r},%bu{ni}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
+    s += "    .reg .b64 %A,%Bg,%Bu,%C,%off,%gptr,%cptr,%cptr2;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %Bg,[pBg];\n    ld.param.u64 %Bu,[pBu];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %Bg,%Bg;\n    cvta.to.global.u64 %Bu,%Bu;\n    cvta.to.global.u64 %C,%C;\n";
+    if bias {
+        s += "    ld.param.u64 %BiasG,[pBiasG];\n    cvta.to.global.u64 %BiasG,%BiasG;\n";
+        s += "    ld.param.u64 %BiasU,[pBiasU];\n    cvta.to.global.u64 %BiasU,%BiasU;\n";
+    }
+    if raster == 0 {
+        s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+        s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    } else {
+        let (bn_sh, bm_sh) = (bn.trailing_zeros(), bm.trailing_zeros());
+        s += &format!("    mov.u32 %lin,%ctaid.x;\n    shr.u32 %tn,%N,{bn_sh};\n    shr.u32 %tm,%M,{bm_sh};\n");
+        s += &format!("    mul.lo.s32 %gsz,%tm,{raster};\n    div.u32 %grpr,%lin,%gsz;\n    rem.u32 %rem,%lin,%gsz;\n");
+        s += &format!("    mul.lo.s32 %col0,%grpr,{raster};\n    sub.u32 %gw,%tn,%col0;\n    min.u32 %gw,%gw,{raster};\n");
+        s += "    div.u32 %trow,%rem,%gw;\n    rem.u32 %tcol,%rem,%gw;\n    add.u32 %tcol,%tcol,%col0;\n";
+        s += &format!("    mul.lo.s32 %baseRow,%trow,{bm};\n    mul.lo.s32 %baseCol,%tcol,{bn};\n");
+    }
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
+    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg2;\n    shl.b32 %laneoff,%laneoff,1;\n");
+    for mi in 0..tm {
+        for ni in 0..tn {
+            for r in 0..4 {
+                s += &format!("    mov.f32 %dg{mi}_{ni}_{r},0f00000000;\n    mov.f32 %du{mi}_{ni}_{r},0f00000000;\n");
+            }
+        }
+    }
+
+    // cp.async staging into padded SMEM (row stride `ldp`) — identical to entry_mma_pipe's `stage`.
+    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+        for li in 0..chunks {
+            if li == 0 {
+                *s += "    mov.u32 %e,%tix;\n";
+            } else {
+                *s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+            }
+            *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,3;\n");
+            *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
+            *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gbase_ptr},%off;\n");
+            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
+            *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
+            *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
+        }
+    };
+
+    // Prologue: prefetch tiles 0..stages-2 of A, Wg, Wu (one cp.async group per K-tile).
+    for st in 0..(stages - 1) {
+        s += &format!("    mov.u32 %kcol,{};\n", st * bk);
+        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n", st * tile_a, st * tile_b, st * tile_b);
+        s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
+        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
+        stage("%baseCol", "%Bg", &format!("smemBg_{name}"), "%bufwBg", b_chunks, &mut s);
+        stage("%baseCol", "%Bu", &format!("smemBu_{name}"), "%bufwBu", b_chunks, &mut s);
+        s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
+    }
+    s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcBg,0;\n    mov.u32 %bufcBu,0;\n";
+    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwBg,{};\n    mov.u32 %bufwBu,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b, (stages - 1) * tile_b);
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
+    s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
+    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
+    stage("%baseCol", "%Bg", &format!("smemBg_{name}"), "%bufwBg", b_chunks, &mut s);
+    stage("%baseCol", "%Bu", &format!("smemBu_{name}"), "%bufwBu", b_chunks, &mut s);
+    s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
+
+    // Compute: load A fragments ONCE (smem + buffer + warp + lane + ks·16), then issue the gate `mma`s
+    // (A×Wg → %dg) and the up `mma`s (A×Wu → %du, A fragments reused) — the load-x-once arithmetic win.
+    for ks in 0..nks {
+        s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
+        s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
+        s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+        for mi in 0..tm {
+            let base = mi * 16 * ldp * 2;
+            let r8 = 8 * ldp * 2;
+            s += &format!("    ld.shared.b32 %a{mi}_0,[%aptr+{}];\n", base);
+            s += &format!("    ld.shared.b32 %a{mi}_2,[%aptr+{}];\n", base + 16);
+            s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
+            s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
+        }
+        // Gate B (Wg) fragments + gate mma.
+        s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n");
+        s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
+        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+        for ni in 0..tn {
+            let base = ni * 8 * ldp * 2;
+            s += &format!("    ld.shared.b32 %bg{ni}_0,[%bptr+{}];\n", base);
+            s += &format!("    ld.shared.b32 %bg{ni}_1,[%bptr+{}];\n", base + 16);
+        }
+        for mi in 0..tm {
+            for ni in 0..tn {
+                s += &format!(
+                    "    mma.sync.aligned.m16n8k16.row.col.{mma_ty} {{%dg{mi}_{ni}_0,%dg{mi}_{ni}_1,%dg{mi}_{ni}_2,%dg{mi}_{ni}_3}},{{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},{{%bg{ni}_0,%bg{ni}_1}},{{%dg{mi}_{ni}_0,%dg{mi}_{ni}_1,%dg{mi}_{ni}_2,%dg{mi}_{ni}_3}};\n"
+                );
+            }
+        }
+        // Up B (Wu) fragments + up mma (reusing the A fragments already in registers).
+        s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n");
+        s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
+        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+        for ni in 0..tn {
+            let base = ni * 8 * ldp * 2;
+            s += &format!("    ld.shared.b32 %bu{ni}_0,[%bptr+{}];\n", base);
+            s += &format!("    ld.shared.b32 %bu{ni}_1,[%bptr+{}];\n", base + 16);
+        }
+        for mi in 0..tm {
+            for ni in 0..tn {
+                s += &format!(
+                    "    mma.sync.aligned.m16n8k16.row.col.{mma_ty} {{%du{mi}_{ni}_0,%du{mi}_{ni}_1,%du{mi}_{ni}_2,%du{mi}_{ni}_3}},{{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},{{%bu{ni}_0,%bu{ni}_1}},{{%du{mi}_{ni}_0,%du{mi}_{ni}_1,%du{mi}_{ni}_2,%du{mi}_{ni}_3}};\n"
+                );
+            }
+        }
+    }
+    s += &format!("    add.u32 %bufcA,%bufcA,{tile_a};\n    setp.ge.u32 %pmore,%bufcA,{smem_a};\n    @%pmore sub.u32 %bufcA,%bufcA,{smem_a};\n");
+    s += &format!("    add.u32 %bufcBg,%bufcBg,{tile_b};\n    setp.ge.u32 %pmore,%bufcBg,{smem_b};\n    @%pmore sub.u32 %bufcBg,%bufcBg,{smem_b};\n");
+    s += &format!("    add.u32 %bufcBu,%bufcBu,{tile_b};\n    setp.ge.u32 %pmore,%bufcBu,{smem_b};\n    @%pmore sub.u32 %bufcBu,%bufcBu,{smem_b};\n");
+    s += &format!("    add.u32 %bufwA,%bufwA,{tile_a};\n    setp.ge.u32 %pmore,%bufwA,{smem_a};\n    @%pmore sub.u32 %bufwA,%bufwA,{smem_a};\n");
+    s += &format!("    add.u32 %bufwBg,%bufwBg,{tile_b};\n    setp.ge.u32 %pmore,%bufwBg,{smem_b};\n    @%pmore sub.u32 %bufwBg,%bufwBg,{smem_b};\n");
+    s += &format!("    add.u32 %bufwBu,%bufwBu,{tile_b};\n    setp.ge.u32 %pmore,%bufwBu,{smem_b};\n    @%pmore sub.u32 %bufwBu,%bufwBu,{smem_b};\n");
+    s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
+
+    // Epilogue: gate = act(gate [+bg]); up = up [+bu]; out = gate ⊙ up. The lane's 4 D regs span two
+    // columns (d0,d2 @ gcol; d1,d3 @ gcol+1) and rows {grp, grp+8} — same map for %dg and %du, so the
+    // product is register-for-register and the per-column bias hits the matching pair.
+    s += &format!("KEND_{name}:\n");
+    for mi in 0..tm {
+        for ni in 0..tn {
+            s += &format!("    add.u32 %grow,%baseRow,%warpMrow;\n    add.u32 %grow,%grow,{};\n    add.u32 %grow,%grow,%grp;\n", mi * 16);
+            s += &format!("    add.u32 %gcol,%baseCol,%warpNcol;\n    add.u32 %gcol,%gcol,{};\n    add.u32 %gcol,%gcol,%tg2;\n", ni * 8);
+            if bias {
+                s += "    mul.wide.u32 %off,%gcol,4;\n    add.s64 %cptr,%BiasG,%off;\n";
+                s += "    ld.global.f32 %biasg0,[%cptr];\n    ld.global.f32 %biasg1,[%cptr+4];\n";
+                s += &format!("    add.f32 %dg{mi}_{ni}_0,%dg{mi}_{ni}_0,%biasg0;\n    add.f32 %dg{mi}_{ni}_1,%dg{mi}_{ni}_1,%biasg1;\n");
+                s += &format!("    add.f32 %dg{mi}_{ni}_2,%dg{mi}_{ni}_2,%biasg0;\n    add.f32 %dg{mi}_{ni}_3,%dg{mi}_{ni}_3,%biasg1;\n");
+                s += "    add.s64 %cptr,%BiasU,%off;\n";
+                s += "    ld.global.f32 %biasu0,[%cptr];\n    ld.global.f32 %biasu1,[%cptr+4];\n";
+                s += &format!("    add.f32 %du{mi}_{ni}_0,%du{mi}_{ni}_0,%biasu0;\n    add.f32 %du{mi}_{ni}_1,%du{mi}_{ni}_1,%biasu1;\n");
+                s += &format!("    add.f32 %du{mi}_{ni}_2,%du{mi}_{ni}_2,%biasu0;\n    add.f32 %du{mi}_{ni}_3,%du{mi}_{ni}_3,%biasu1;\n");
+            }
+            if !matches!(gate_act, Act::None) {
+                for r in 0..4 {
+                    s += &gate_act.epilogue(&format!("%dg{mi}_{ni}_{r}"));
+                }
+            }
+            for r in 0..4 {
+                s += &format!("    mul.f32 %dg{mi}_{ni}_{r},%dg{mi}_{ni}_{r},%du{mi}_{ni}_{r};\n");
+            }
+            s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            s += &format!("    st.global.f32 [%cptr],%dg{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%dg{mi}_{ni}_1;\n");
+            s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
+            s += &format!("    st.global.f32 [%cptr2],%dg{mi}_{ni}_2;\n    st.global.f32 [%cptr2+4],%dg{mi}_{ni}_3;\n");
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
 /// Number of independent accumulator fragments the roofline kernel keeps in flight (ILP to hide MMA
 /// latency so the loop measures tensor-core *throughput*, not the dependent-chain latency).
 pub const ROOFLINE_ACC: usize = 4;
@@ -1369,6 +1637,20 @@ pub fn wmma_f16_ptx() -> &'static str {
             true,
             true,
         );
+        // Fused **gated-FFN (GLU-family)** kernels `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the SwiGLU/GeGLU gate
+        // every modern LLM FFN runs, the fusion cuBLAS needs THREE kernels + two HBM round-trips for. The
+        // 128×64 dual-B tile holds two accumulator sets at the SAME 64 D-regs/thread and the SAME 40 KiB
+        // SMEM as the single-B 128×128 workhorse (register- and SMEM-neutral), sharing one staged x tile
+        // between Wg and Wu. silu→SwiGLU, gelu→GeGLU, none→bilinear GLU; `_bias` adds the per-column biases.
+        for (suffix, act, gbias) in [
+            ("gate_silu", Act::Silu, false),
+            ("gate_gelu", Act::Gelu, false),
+            ("gate_glu", Act::None, false),
+            ("gate_silu_bias", Act::Silu, true),
+            ("gate_gelu_bias", Act::Gelu, true),
+        ] {
+            m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias);
+        }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
         // particular fuses the SwiGLU FFN up-projection (`silu(x·W1ᵀ)`) into one kernel.
@@ -1467,6 +1749,17 @@ pub fn wmma_bf16_ptx() -> &'static str {
             true,
             true,
         );
+        // bf16 gated-FFN (GLU-family) gate `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — SwiGLU/GeGLU carried to the
+        // training dtype (the dual-B generator is precision-generic, keying the mma type off `ty`).
+        for (suffix, act, gbias) in [
+            ("gate_silu", Act::Silu, false),
+            ("gate_gelu", Act::Gelu, false),
+            ("gate_glu", Act::None, false),
+            ("gate_silu_bias", Act::Silu, true),
+            ("gate_gelu_bias", Act::Gelu, true),
+        ] {
+            m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias);
+        }
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
             m += &entry_smem_db(

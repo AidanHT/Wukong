@@ -1078,6 +1078,130 @@ pub fn gemm_nt_f16_mma_bias_residual(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// Launch config for the **128×64 dual-B gated-FFN** kernel ([`crate::ptx_wmma::entry_mma_gate`], raster=16,
+/// 256 threads): a 1-D grid of `(M/128)·(N/64)` blocks the kernel itself rasterizes into an L2-friendly
+/// tile order (`raster=16`), matching the workhorse's [`pipe_cfg`] shape but for the 128×64 gate tile.
+fn gate_cfg(m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (((m / 128) * (n / 64)) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `out = act(x·Wgᵀ [+ bg]) ⊙ (x·Wuᵀ [+ bu])` — the fused **SwiGLU / GeGLU** FFN gate on the 128×64
+/// dual-B `mma.sync` kernel ([`crate::ptx_wmma::entry_mma_gate`], fp16). `x` is `[M,K]` activations, the
+/// gate/up weights `Wg`,`Wu` are `[N,K]` (the `A·Bᵀ` Linear layout — no host transpose), output `[M,N]`.
+/// One staged `x` tile feeds both GEMMs (read once) and the gate fuses into the store, so cuBLAS's
+/// three-kernel chain (two GEMMs + an elementwise multiply, both `[M,N]` intermediates round-tripped
+/// through HBM) collapses to one kernel — a fusion cuBLAS structurally cannot do. `entry` selects
+/// silu/gelu/glu and the bias variant; `bias` carries `(bg[N], bu[N])` for the `*_bias` entries. Requires
+/// `M%128==0`, `N%64==0`, `K%32==0`; tolerance-gated vs an `act(x·Wgᵀ+bg)⊙(x·Wuᵀ+bu)` f64 reference.
+fn gemm_nt_f16_gate(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    bias: Option<(&[f32], &[f32])>,
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), m * k);
+    assert_eq!(wg.len(), n * k);
+    assert_eq!(wu.len(), n * k);
+    assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let wg16: Vec<f16> = wg.iter().map(|&v| f16::from_f32(v)).collect();
+    let wu16: Vec<f16> = wu.iter().map(|&v| f16::from_f32(v)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), entry)?;
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let wg_d = g.stream.memcpy_stod(&wg16)?;
+    let wu_d = g.stream.memcpy_stod(&wu16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&x_d).arg(&wg_d).arg(&wu_d).arg(&mut c_d);
+    // The `*_bias` entries take two extra params (pBiasG, pBiasU); the device buffers must outlive launch.
+    let (bg_d, bu_d);
+    if let Some((bg, bu)) = bias {
+        assert_eq!(bg.len(), n, "gate bias bg must have length N");
+        assert_eq!(bu.len(), n, "up bias bu must have length N");
+        bg_d = g.stream.memcpy_stod(bg)?;
+        bu_d = g.stream.memcpy_stod(bu)?;
+        bld.arg(&bg_d).arg(&bu_d);
+        unsafe { bld.launch(gate_cfg(m, n))? };
+    } else {
+        unsafe { bld.launch(gate_cfg(m, n))? };
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// bf16 twin of [`gemm_nt_f16_gate`] — the gated-FFN gate carried to the training dtype (the dual-B
+/// generator is precision-generic). Entries are `mma_nt_bf16_128x64_gate_*`.
+fn gemm_nt_bf16_gate(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    bias: Option<(&[f32], &[f32])>,
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use half::bf16;
+    assert_eq!(x.len(), m * k);
+    assert_eq!(wg.len(), n * k);
+    assert_eq!(wu.len(), n * k);
+    assert!(m % 128 == 0 && n % 64 == 0 && k % 32 == 0, "{entry} requires M%128==0, N%64==0, K%32==0");
+    let xb: Vec<bf16> = x.iter().map(|&v| bf16::from_f32(v)).collect();
+    let wgb: Vec<bf16> = wg.iter().map(|&v| bf16::from_f32(v)).collect();
+    let wub: Vec<bf16> = wu.iter().map(|&v| bf16::from_f32(v)).collect();
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), entry)?;
+    let x_d = g.stream.memcpy_stod(&xb)?;
+    let wg_d = g.stream.memcpy_stod(&wgb)?;
+    let wu_d = g.stream.memcpy_stod(&wub)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&x_d).arg(&wg_d).arg(&wu_d).arg(&mut c_d);
+    let (bg_d, bu_d);
+    if let Some((bg, bu)) = bias {
+        assert_eq!(bg.len(), n, "gate bias bg must have length N");
+        assert_eq!(bu.len(), n, "up bias bu must have length N");
+        bg_d = g.stream.memcpy_stod(bg)?;
+        bu_d = g.stream.memcpy_stod(bu)?;
+        bld.arg(&bg_d).arg(&bu_d);
+        unsafe { bld.launch(gate_cfg(m, n))? };
+    } else {
+        unsafe { bld.launch(gate_cfg(m, n))? };
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Fused **SwiGLU** FFN gate (fp16): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the Llama/Mistral/Gemma FFN gate, one kernel.
+pub fn gemm_nt_f16_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_f16_128x64_gate_silu")
+}
+
+/// Fused **GeGLU** FFN gate (fp16): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)` (the GLU-with-GELU FFN gate).
+pub fn gemm_nt_f16_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_f16_128x64_gate_gelu")
+}
+
+/// Fused **SwiGLU** FFN gate (bf16, the training dtype): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
+pub fn gemm_nt_bf16_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_bf16_128x64_gate_silu")
+}
+
+/// Fused **GeGLU** FFN gate (bf16): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
+pub fn gemm_nt_bf16_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_bf16_128x64_gate_gelu")
+}
+
 /// `C = A·Bᵀ + bias + residual` fused into the fast **bf16** mma workhorse — the training-dtype twin of
 /// [`gemm_nt_f16_mma_bias_residual`] (the down-proj / output-proj sublayer output).
 pub fn gemm_nt_bf16_mma_bias_residual(
@@ -3423,6 +3547,88 @@ mod tests {
                     "wmma_bf16_mma_bias_residual {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
                     s.max_abs, s.max_rel
                 );
+            }
+        });
+    }
+
+    /// The fused **gated-FFN (SwiGLU/GeGLU/GLU)** kernel `out = act(x·Wgᵀ [+bg]) ⊙ (x·Wuᵀ [+bu])` must
+    /// equal the f64 reference computed from the dtype-rounded inputs: `act(round(x·Wgᵀ)[+bg])` times
+    /// `round(x·Wuᵀ)[+bu]`. This is the one binding correctness law for the dual-B gate kernel — two
+    /// GEMMs sharing one staged A tile, two accumulator sets, the activation on only the gate branch, the
+    /// elementwise product fused into the store. The tolerance is looser than a plain GEMM's because the
+    /// product of two ~√K-magnitude factors **compounds** their relative errors (and the SFU silu/gelu
+    /// approx adds its own ε); the `OR` semantics let large-magnitude lanes pass on relative error and
+    /// near-zero lanes on absolute. Exercised for all five variants (silu/gelu/glu, ± bias) in fp16 + bf16.
+    #[test]
+    fn swiglu_gate_match_reference_within_tol() {
+        use half::{bf16, f16};
+        with_gpu("swiglu_gate", |g| {
+            let mut rng = crate::diff::Rng::new(0x5_71_6C_55);
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            let id = |x: f32| x;
+            // M%128, N%64, K%32 — incl. a rectangular case (N=320 stresses the raster edge band).
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 320)] {
+                let x = rng.vec(m * k, -1.0, 1.0);
+                let wg = rng.vec(n * k, -1.0, 1.0);
+                let wu = rng.vec(n * k, -1.0, 1.0);
+                let bg = rng.vec(n, -0.5, 0.5);
+                let bu = rng.vec(n, -0.5, 0.5);
+                // out[i,j] = act(round(x·Wgᵀ)[i,j] + (bg[j] if bias)) · (round(x·Wuᵀ)[i,j] + (bu[j] if bias))
+                let gate_ref = |round: &dyn Fn(f32) -> f32, act: &dyn Fn(f32) -> f32, with_bias: bool| -> Vec<f32> {
+                    let gp = ref_nt_rounded(&x, &wg, m, k, n, round);
+                    let up = ref_nt_rounded(&x, &wu, m, k, n, round);
+                    let mut out = vec![0f32; m * n];
+                    for i in 0..m {
+                        for j in 0..n {
+                            let (mut gv, mut uv) = (gp[i * n + j], up[i * n + j]);
+                            if with_bias {
+                                gv += bg[j];
+                                uv += bu[j];
+                            }
+                            out[i * n + j] = act(gv) * uv;
+                        }
+                    }
+                    out
+                };
+                // fp16 (inference): all five gate variants.
+                let f16r = |x: f32| f16::from_f32(x).to_f32();
+                let f16_cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 5] = [
+                    ("mma_nt_f16_128x64_gate_silu", &silu, false),
+                    ("mma_nt_f16_128x64_gate_gelu", &gelu, false),
+                    ("mma_nt_f16_128x64_gate_glu", &id, false),
+                    ("mma_nt_f16_128x64_gate_silu_bias", &silu, true),
+                    ("mma_nt_f16_128x64_gate_gelu_bias", &gelu, true),
+                ];
+                for (entry, act, wb) in f16_cases {
+                    let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
+                    let got = gemm_nt_f16_gate(g, &x, &wg, &wu, bias, m, k, n, entry).unwrap();
+                    let refv = gate_ref(&f16r, act, wb);
+                    // Measured max_abs ≤ 4.3e-4 over these shapes; 5e-3 keeps ~10× margin (every lane
+                    // passes on abs), with rel as a secondary guard for any future large-K shape.
+                    let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 5e-3, 2e-2);
+                    eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                }
+                // bf16 (training): the precision-generic twin.
+                let bf16r = |x: f32| bf16::from_f32(x).to_f32();
+                let bf16_cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 5] = [
+                    ("mma_nt_bf16_128x64_gate_silu", &silu, false),
+                    ("mma_nt_bf16_128x64_gate_gelu", &gelu, false),
+                    ("mma_nt_bf16_128x64_gate_glu", &id, false),
+                    ("mma_nt_bf16_128x64_gate_silu_bias", &silu, true),
+                    ("mma_nt_bf16_128x64_gate_gelu_bias", &gelu, true),
+                ];
+                for (entry, act, wb) in bf16_cases {
+                    let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
+                    let got = gemm_nt_bf16_gate(g, &x, &wg, &wu, bias, m, k, n, entry).unwrap();
+                    let refv = gate_ref(&bf16r, act, wb);
+                    // Measured max_abs ≤ 1.9e-4; 1e-2 keeps wide margin (every lane passes on abs).
+                    let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 1e-2, 3e-2);
+                    eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                }
             }
         });
     }
