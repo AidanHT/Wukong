@@ -213,6 +213,29 @@ pub fn int8_gemm_smdb_ptx() -> &'static str {
             INT8_BN,
             INT8_WARPS_M,
             INT8_WARPS_N,
+            false,
+        )
+    })
+    .as_str()
+}
+
+/// **SMEM-staged int8 GEMM with a fused per-channel dequant epilogue** (`int8_gemm_nt_smdb_deq`):
+/// `out[i,j] = f32(Σ u8·i8) · scale[j]`, the per-output-channel symmetric-quant dequant. The `i32`
+/// accumulators are converted to f32 and scaled by a per-column `scale[N]` **in registers, folded into
+/// the C store** — so the f32 result lands in one pass with no extra HBM round-trip. This is the
+/// epilogue cuBLAS int8 (which outputs raw `i32`) structurally **cannot fuse**: it needs a second
+/// dequant kernel reading C back from HBM. Same 64×64 pipeline as [`int8_gemm_smdb_ptx`]; C is f32.
+/// Requires M%64==0, N%64==0, K%INT8_BK==0.
+pub fn int8_gemm_smdb_deq_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        gen_int8_smdb(
+            "int8_gemm_nt_smdb_deq",
+            INT8_BM,
+            INT8_BN,
+            INT8_WARPS_M,
+            INT8_WARPS_N,
+            true,
         )
     })
     .as_str()
@@ -238,6 +261,7 @@ pub fn int8_gemm_smdb128_ptx() -> &'static str {
             INT8_BN128,
             INT8_WARPS_M128,
             INT8_WARPS_N128,
+            false,
         )
     })
     .as_str()
@@ -247,7 +271,7 @@ pub fn int8_gemm_smdb128_ptx() -> &'static str {
 /// by `warps_m×warps_n` warps. `bm`,`bn` must be multiples of `16*warps_m` / `8*warps_n`; the staging
 /// assumes `INT8_BK==32` (16-byte chunks = half a K-slab row) and `threads <= bm*BK/16` so every chunk
 /// has a thread. Each generated module owns its own `smemA`/`smemB` (no cross-module symbol clash).
-fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize) -> String {
+fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant: bool) -> String {
     {
         let bk = INT8_BK;
         let threads = wm * wn * 32;
@@ -263,12 +287,17 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize) -> Stri
         let b_chunks = bn * bk / (threads * 16);
         let wn_shift = wn.trailing_zeros();
 
+        // The fused-dequant variant takes an extra `scale[N]` (f32) per-output-channel scale param.
+        let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
         let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
-        s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n");
+        s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
         s += &format!("    .shared .align 16 .b8 smemA[{}];\n", 2 * tile_bytes);
         s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * tile_bytes);
         s += "    .reg .pred %p0,%pmore;\n";
         s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufc,%bufp,%lane,%grp,%tg4,%tg2,%ab,%cc;\n";
+        if dequant {
+            s += "    .reg .b32 %col;\n    .reg .f32 %f0,%f1,%f2,%f3,%sc0,%sc1;\n    .reg .b64 %Scale,%scp;\n";
+        }
         // accumulators d[ti][tj][0..3], A frags a[ti][0..3], B frags b[tj][0..1]
         let mut accregs = String::new();
         for ti in 0..tm {
@@ -296,6 +325,9 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize) -> Stri
         s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
         s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
         s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+        if dequant {
+            s += "    ld.param.u64 %Scale,[pScale];\n    cvta.to.global.u64 %Scale,%Scale;\n";
+        }
         s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
         s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
         s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
@@ -388,11 +420,28 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize) -> Stri
                 s += &format!("    mul.lo.s32 %tmp,%warpRow,{};\n    add.u32 %tmp,%tmp,{};\n", 16 * tm, ti * 16);
                 s += "    add.u32 %tmp,%tmp,%baseRow;\n    add.u32 %tmp,%tmp,%grp;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
                 s += &format!("    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n", 8 * tn, tj * 8);
-                s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp2,%tmp2,%tg2;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+                s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp2,%tmp2,%tg2;\n";
+                if dequant {
+                    s += "    mov.u32 %col,%tmp2;\n"; // global output column of d0/d2 (d1/d3 = col+1)
+                }
+                s += "    add.u32 %tmp,%tmp,%tmp2;\n";
                 s += "    shl.b32 %tmp,%tmp,2;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%C,%off;\n";
-                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
-                s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n");
-                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
+                if dequant {
+                    // Fold the per-channel dequant into the store: out = f32(acc)·scale[col]. The i32→f32
+                    // cvt and the f32 mul round identically to the CPU reference (acc as f32)·scale[col],
+                    // so the result is exact-to-1-rounding (gated at a tight tolerance).
+                    s += "    mul.wide.u32 %off,%col,4;\n    add.s64 %scp,%Scale,%off;\n";
+                    s += "    ld.global.f32 %sc0,[%scp];\n    ld.global.f32 %sc1,[%scp+4];\n";
+                    s += &format!("    cvt.rn.f32.s32 %f0,%d{ti}_{tj}_0;\n    mul.f32 %f0,%f0,%sc0;\n    st.global.f32 [%cp],%f0;\n");
+                    s += &format!("    cvt.rn.f32.s32 %f1,%d{ti}_{tj}_1;\n    mul.f32 %f1,%f1,%sc1;\n    st.global.f32 [%cp+4],%f1;\n");
+                    s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
+                    s += &format!("    cvt.rn.f32.s32 %f2,%d{ti}_{tj}_2;\n    mul.f32 %f2,%f2,%sc0;\n    st.global.f32 [%cp],%f2;\n");
+                    s += &format!("    cvt.rn.f32.s32 %f3,%d{ti}_{tj}_3;\n    mul.f32 %f3,%f3,%sc1;\n    st.global.f32 [%cp+4],%f3;\n");
+                } else {
+                    s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
+                    s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n");
+                    s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
+                }
             }
         }
         s += "    ret;\n}\n";
