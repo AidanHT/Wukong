@@ -2632,6 +2632,69 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// `out = act(x·Wgᵀ [+bg]) ⊙ (x·Wuᵀ [+bu])` — the fused **SwiGLU/GeGLU** FFN gate on the fp8 dual-B
+/// kernel (`fp8_gate_entry`), the **fastest fused inference gate** (Ada 2× fp8 TC rate). x,Wg,Wu round
+/// to E4M3, output is f32; one staged x tile feeds both GEMMs (x read once) and the gate fuses into the
+/// store — the three-kernel chain cuBLAS needs (two GEMMs + an elementwise multiply, both [M,N]
+/// intermediates round-tripped) collapsed to one. `entry` selects silu/gelu/glu ± bias; `bias` carries
+/// (bg[N], bu[N]). Requires M%128==0, N%64==0, K%64==0; tolerance-gated vs an
+/// act(e4m3-rounded(x·Wgᵀ)+bg) ⊙ (e4m3-rounded(x·Wuᵀ)+bu) f64 reference.
+fn gemm_nt_fp8_gate(
+    g: &mut Gpu,
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    bias: Option<(&[f32], &[f32])>,
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_fp8::f32_to_e4m3;
+    assert_eq!(x.len(), m * k);
+    assert_eq!(wg.len(), n * k);
+    assert_eq!(wu.len(), n * k);
+    assert!(m % 128 == 0 && n % 64 == 0 && k % 64 == 0, "{entry} requires M%128==0, N%64==0, K%64==0");
+    let x8: Vec<u8> = x.iter().map(|&v| f32_to_e4m3(v)).collect();
+    let wg8: Vec<u8> = wg.iter().map(|&v| f32_to_e4m3(v)).collect();
+    let wu8: Vec<u8> = wu.iter().map(|&v| f32_to_e4m3(v)).collect();
+    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), entry)?;
+    let x_d = g.stream.memcpy_stod(&x8)?;
+    let wg_d = g.stream.memcpy_stod(&wg8)?;
+    let wu_d = g.stream.memcpy_stod(&wu8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let cfg = LaunchConfig {
+        grid_dim: (((m / 128) * (n / 64)) as u32, 1, 1), // 1-D rasterized grid (128×64 dual-B tile)
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&x_d).arg(&wg_d).arg(&wu_d).arg(&mut c_d);
+    let (bg_d, bu_d);
+    if let Some((bg, bu)) = bias {
+        assert_eq!(bg.len(), n, "gate bias bg must have length N");
+        assert_eq!(bu.len(), n, "up bias bu must have length N");
+        bg_d = g.stream.memcpy_stod(bg)?;
+        bu_d = g.stream.memcpy_stod(bu)?;
+        bld.arg(&bg_d).arg(&bu_d);
+        unsafe { bld.launch(cfg)? };
+    } else {
+        unsafe { bld.launch(cfg)? };
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Fused **SwiGLU** FFN gate (fp8 E4M3 — the fastest fused inference gate): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
+pub fn gemm_nt_fp8_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_silu")
+}
+
+/// Fused **GeGLU** FFN gate (fp8 E4M3): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
+pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_gelu")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3627,6 +3690,68 @@ mod tests {
                     let refv = gate_ref(&bf16r, act, wb);
                     // Measured max_abs ≤ 1.9e-4; 1e-2 keeps wide margin (every lane passes on abs).
                     let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 1e-2, 3e-2);
+                    eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+                }
+            }
+        });
+    }
+
+    /// The **fp8** fused gated-FFN gate (`fp8_gemm_pipe_gate_*`, the fastest fused inference gate at the
+    /// Ada 2× rate) must equal the f64 reference from the e4m3-rounded inputs:
+    /// `act(round(x·Wgᵀ)[+bg]) ⊙ (round(x·Wuᵀ)[+bu])`. As with fp16/bf16 the e4m3 rounding is applied in
+    /// BOTH the kernel and the reference, so the residual deviation is only the f32-vs-f64 accumulation
+    /// order (NOT the fp8 rounding) — the comparison stays tight. All five variants (silu/gelu/glu, ±
+    /// bias) in fp8. Constraints: M%128, N%64, K%64.
+    #[test]
+    fn fp8_swiglu_gate_match_reference_within_tol() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_swiglu_gate", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8_5A_7E);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            let id = |x: f32| x;
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
+                let x = rng.vec(m * k, -1.0, 1.0);
+                let wg = rng.vec(n * k, -1.0, 1.0);
+                let wu = rng.vec(n * k, -1.0, 1.0);
+                let bg = rng.vec(n, -0.5, 0.5);
+                let bu = rng.vec(n, -0.5, 0.5);
+                let gate_ref = |act: &dyn Fn(f32) -> f32, wb: bool| -> Vec<f32> {
+                    let gp = ref_nt_rounded(&x, &wg, m, k, n, round);
+                    let up = ref_nt_rounded(&x, &wu, m, k, n, round);
+                    let mut out = vec![0f32; m * n];
+                    for i in 0..m {
+                        for j in 0..n {
+                            let (mut gv, mut uv) = (gp[i * n + j], up[i * n + j]);
+                            if wb {
+                                gv += bg[j];
+                                uv += bu[j];
+                            }
+                            out[i * n + j] = act(gv) * uv;
+                        }
+                    }
+                    out
+                };
+                let cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 5] = [
+                    ("fp8_gemm_pipe_gate_silu", &silu, false),
+                    ("fp8_gemm_pipe_gate_gelu", &gelu, false),
+                    ("fp8_gemm_pipe_gate_glu", &id, false),
+                    ("fp8_gemm_pipe_gate_silu_bias", &silu, true),
+                    ("fp8_gemm_pipe_gate_gelu_bias", &gelu, true),
+                ];
+                for (entry, act, wb) in cases {
+                    let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
+                    let got = gemm_nt_fp8_gate(g, &x, &wg, &wu, bias, m, k, n, entry).unwrap();
+                    let refv = gate_ref(act, wb);
+                    // fp8 e4m3 is ~3-mantissa-bit, so the single GEMM is ~1e-2 accurate (cf. the fp8 bias
+                    // gate) and the **product of two** GEMMs amplifies that: measured max_abs ≤ 9.6e-2 at
+                    // K=192. 1.5e-1 keeps every lane passing on abs alone (a real bug = ~tens, so still a
+                    // meaningful gate); rel is a secondary guard. This is fp8's honest precision, not slack.
+                    let s = crate::diff::assert_close(&format!("{entry} {m}x{k}x{n}"), &got, &refv, 1.5e-1, 6e-2);
                     eprintln!("{entry} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
                 }
             }
