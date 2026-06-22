@@ -3398,6 +3398,66 @@ mod tests {
         });
     }
 
+    /// Gate for the **`cp.async`-pipelined, SMEM-staged** register-resident flash kernels `flash_d64_mp`
+    /// (non-causal) and `flash_d64_mpc` (causal). Same f16-in setup and tolerance as
+    /// `mma_reg_flash_matches_reference_within_tol`; the pipelined kernel does identical math to
+    /// `flash_d64_m` but reads K/V from `cp.async`-staged shared memory with a double-buffered prefetch,
+    /// so a wrong SMEM address, a buffer-swap bug, or a missed `cp.async.wait_group`/`bar.sync` would
+    /// scatter O — this catches it. Exercises S=16 (single block, no prefetch) through S=512 (the
+    /// steady-state pipeline), both query-block parities.
+    #[test]
+    fn mma_pipe_flash_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("mma_pipe_flash", |g| {
+            let mut rng = crate::diff::Rng::new(0x9117E);
+            let d = 64usize;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for seq in [16usize, 64, 256, 512] {
+                let q16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let (qf, kf, vf) = (back(&q16), back(&k16), back(&v16));
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let s32 = seq as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((seq / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                for (entry, causal) in [("flash_d64_mp", false), ("flash_d64_mpc", true)] {
+                    let mut o_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
+                    let f = g
+                        .function("flash", crate::ptx_flash::flash_ptx(), entry)
+                        .unwrap();
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let oracle = if causal {
+                        ref_attn_causal(&qf, &kf, &vf, seq, d, scale)
+                    } else {
+                        ref_attn(&qf, &kf, &vf, seq, d, scale)
+                    };
+                    let st = crate::diff::assert_close(
+                        &format!("{entry} s={seq}"),
+                        &got,
+                        &oracle,
+                        2e-3,
+                        2e-2,
+                    );
+                    eprintln!(
+                        "{entry} s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
+                }
+            }
+        });
+    }
+
     /// Flash-attention throughput at increasing context length, kernel-resident (no per-iter copies).
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
