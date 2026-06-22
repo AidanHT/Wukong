@@ -3206,6 +3206,63 @@ mod tests {
         });
     }
 
+    /// Gate for the **register-resident `mma.sync` flash** kernel `flash_d64_m` — the FA2 form with
+    /// O/m/l in registers (no SMEM round-trip), hand-placed `mma.sync.m16n8k16` per the layout
+    /// `mma_m16n8k16_layout_verifies` proves. Same f16-in setup as `wmma_flash_matches_reference_within_tol`
+    /// (reference = `ref_attn` over the f16-rounded inputs, isolating the kernel's compute error). A
+    /// mis-placed fragment in the QKᵀ→softmax→PV register dataflow scatters O(0.1+); this catches it.
+    /// `S % 16 == 0` (the kernel's query-block stride).
+    #[test]
+    fn mma_reg_flash_matches_reference_within_tol() {
+        use half::f16;
+        with_gpu("mma_reg_flash", |g| {
+            let mut rng = crate::diff::Rng::new(0x9D2);
+            let d = 64usize;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for seq in [16usize, 64, 256, 512] {
+                let q16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(seq * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(seq * d).unwrap();
+                let f = g
+                    .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
+                    .unwrap();
+                let s32 = seq as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((seq / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32)
+                    .arg(&scale)
+                    .arg(&q_d)
+                    .arg(&k_d)
+                    .arg(&v_d)
+                    .arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), seq, d, scale);
+                let st = crate::diff::assert_close(
+                    &format!("mma_reg flash s={seq}"),
+                    &got,
+                    &oracle,
+                    2e-3,
+                    2e-2,
+                );
+                eprintln!(
+                    "mma_reg flash s={seq} d={d}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
     /// Flash-attention throughput at increasing context length, kernel-resident (no per-iter copies).
     /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture`.
     #[test]
