@@ -100,7 +100,12 @@ toolkit — only **running** needs the driver + a device.
   residual kept f32). `C = act(x·Wᵀ + bias)` at the Ada 2× fp8 TC rate is the fastest fused Linear/FFN;
   correctness-gated (`fp8_mma_bias{,_residual}_match_reference_within_tol`, max_abs ≤7e-3 vs an
   `act(e4m3-rounded(A·Bᵀ)+bias)[+residual]` f64 ref). Speed inherits the plain fp8-pipe's 2×-fp16 standing
-  (no fp8 cuBLAS peer here for a fused-chain ratio).
+  (no fp8 cuBLAS peer here for a fused-chain ratio). **Gated-FFN gate carried to fp8 too** (`fp8_gate_entry`,
+  the dual-B twin of `entry_mma_gate`): `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the **fastest fused inference gate**
+  (SwiGLU/GeGLU at the Ada 2× fp8 rate), `fp8_gemm_pipe_gate_{silu,gelu,glu}{,_bias}` (`gemm_nt_fp8_swiglu`/
+  `_geglu`). 128×64 dual-B tile (fp8 = 1 byte/elem ⇒ three staged tiles fit 40 KiB); gated by
+  `fp8_swiglu_gate_match_reference_within_tol` (max_abs ≤ 9.6e-2 at K=192 — the single fp8 GEMM's ~1e-2
+  precision amplified by the product, honest fp8). Completes fp16/bf16/fp8 parity for the gated FFN.
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
