@@ -187,6 +187,176 @@ pub fn int8_gemm_mt_ptx() -> &'static str {
     .as_str()
 }
 
+/// CTA macro-tile for the SMEM-staged kernel: `BM×BN` C block per CTA, `BK` K-slab per pipeline step
+/// (one `mma.sync.m16n8k32` K-step). 64×64 with a 32-deep K-slab; `WARPS_M×WARPS_N` warps cooperate.
+pub const INT8_BM: usize = 64;
+pub const INT8_BN: usize = 64;
+pub const INT8_BK: usize = 32;
+pub const INT8_WARPS_M: usize = 2;
+pub const INT8_WARPS_N: usize = 2;
+
+/// **SMEM-staged + `cp.async` double-buffered int8 GEMM** — the latency-hiding path that closes the gap
+/// to cuBLAS at large sizes. A `BM×BN` CTA tile is computed by `WARPS_M×WARPS_N` warps; each K-step the
+/// CTA cooperatively `cp.async`-copies the next `A[BM×BK]` and `B[BN×BK]` slabs into the *alternate* of
+/// two SMEM buffers **while the tensor cores consume the current one**, then waits only on the current
+/// copy (`wait_group 1`). Fragments are loaded from SMEM (`ld.shared.b32`) in the hand-placed
+/// `m16n8k32` per-lane layout (the same addressing as the global path, rebased to the SMEM tile). This
+/// is the int8 analogue of `ptx_wmma.rs`'s `entry_smem_db`, but the manual `mma.sync` fragments are
+/// loaded by explicit `ld.shared` (there is no `wmma.load` for int8). f32→s32 retype, exact mod 2³².
+/// Entry `int8_gemm_nt_smdb`; requires M%BM==0, N%BN==0, K%BK==0.
+pub fn int8_gemm_smdb_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        let (bm, bn, bk) = (INT8_BM, INT8_BN, INT8_BK);
+        let (wm, wn) = (INT8_WARPS_M, INT8_WARPS_N);
+        let threads = wm * wn * 32;
+        let tm = bm / (16 * wm); // 16-row A subtiles per warp
+        let tn = bn / (8 * wn); //  8-col B subtiles per warp
+        let tile_bytes = bm * bk; // one A (== one B) tile in bytes (u8); a power of two ⇒ XOR toggles
+        debug_assert!(tile_bytes.is_power_of_two());
+        let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
+        let b_chunks = bn * bk / (threads * 16);
+        let wn_shift = wn.trailing_zeros();
+        let name = "int8_gemm_nt_smdb";
+
+        let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+        s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n");
+        s += &format!("    .shared .align 16 .b8 smemA[{}];\n", 2 * tile_bytes);
+        s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * tile_bytes);
+        s += "    .reg .pred %p0,%pmore;\n";
+        s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufc,%bufp,%lane,%grp,%tg4,%tg2,%ab,%cc;\n";
+        // accumulators d[ti][tj][0..3], A frags a[ti][0..3], B frags b[tj][0..1]
+        let mut accregs = String::new();
+        for ti in 0..tm {
+            for tj in 0..tn {
+                for r in 0..4 {
+                    accregs += &format!("%d{ti}_{tj}_{r},");
+                }
+            }
+        }
+        s += &format!("    .reg .b32 {};\n", accregs.trim_end_matches(','));
+        let mut abregs = String::new();
+        for ti in 0..tm {
+            for r in 0..4 {
+                abregs += &format!("%a{ti}_{r},");
+            }
+        }
+        for tj in 0..tn {
+            for r in 0..2 {
+                abregs += &format!("%b{tj}_{r},");
+            }
+        }
+        s += &format!("    .reg .b32 {};\n", abregs.trim_end_matches(','));
+        s += "    .reg .b64 %A,%B,%C,%off,%gptr,%cp;\n";
+
+        s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+        s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+        s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+        s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+        s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+        s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
+        s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
+        s += &format!("    and.b32 %warpCol,%warpId,{};\n", wn - 1);
+        s += "    and.b32 %lane,%tix,31;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg4,%lane,3;\n";
+        s += "    shl.b32 %tg2,%tg4,1;\n    shl.b32 %tg4,%tg4,2;\n";
+        // zero accumulators
+        for ti in 0..tm {
+            for tj in 0..tn {
+                for r in 0..4 {
+                    s += &format!("    mov.u32 %d{ti}_{tj}_{r},0;\n");
+                }
+            }
+        }
+        s += "    mov.u32 %bufc,0;\n";
+        s += &format!("    mov.u32 %bufp,{tile_bytes};\n");
+
+        // Stage the `%kcol` A/B slab into the SMEM buffer at byte offset `bufoff` via cp.async (16-byte
+        // chunks). Chunk e: row r=e·16/BK, col c=(e·16)%BK within the slab; src 16 bytes are contiguous
+        // in the global row (BK=32 ⇒ c∈{0,16}, c+15<32). dst is the shared u32 address smem+bufoff+e·16.
+        let stage = |g_base: &str, gptr_base: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+            for li in 0..chunks {
+                if li == 0 {
+                    *s += "    mov.u32 %e,%tix;\n";
+                } else {
+                    *s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+                }
+                // r = e*16/BK, c = (e*16)%BK. For BK=32: r=e>>1, c=(e&1)*16.
+                *s += "    shr.u32 %r,%e,1;\n    and.b32 %c,%e,1;\n    shl.b32 %c,%c,4;\n";
+                *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
+                *s += &format!("    cvt.u64.u32 %off,%tmp;\n    add.s64 %gptr,{gptr_base},%off;\n");
+                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n");
+                *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
+            }
+        };
+
+        // Prologue: prefetch slab 0 into buffer 0.
+        s += "    mov.u32 %kcol,0;\n";
+        stage("%baseRow", "%A", "smemA", "%bufc", a_chunks, &mut s);
+        stage("%baseCol", "%B", "smemB", "%bufc", b_chunks, &mut s);
+        s += "    cp.async.commit_group;\n";
+
+        s += "    mov.u32 %kt,0;\n";
+        s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+        // Prefetch the next slab into the alternate buffer (if any), then wait on the current slab only.
+        s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,%K;\n");
+        s += &format!("    @!%pmore bra LAST_{name};\n");
+        s += "    mov.u32 %kcol,%ktn;\n";
+        stage("%baseRow", "%A", "smemA", "%bufp", a_chunks, &mut s);
+        stage("%baseCol", "%B", "smemB", "%bufp", b_chunks, &mut s);
+        s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n";
+        s += &format!("    bra SYNC_{name};\nLAST_{name}:\n    cp.async.wait_group 0;\nSYNC_{name}:\n");
+        s += "    bar.sync 0;\n";
+
+        // Load this warp's A fragments from smemA[bufc] (row-major BM×BK). For subtile ti: tile-row base
+        // = warpRow*(16*tm) + ti*16; a0=[row grp], a1=[row grp+8], a2/a3 = +16 cols (the k32 pack).
+        for ti in 0..tm {
+            s += "    mov.u32 %ab,smemA;\n    add.u32 %ab,%ab,%bufc;\n";
+            s += &format!("    mul.lo.s32 %tmp,%warpRow,{};\n    add.u32 %tmp,%tmp,{};\n", 16 * tm, ti * 16);
+            s += "    add.u32 %tmp,%tmp,%grp;\n";
+            s += &format!("    mul.lo.s32 %tmp,%tmp,{bk};\n    add.u32 %tmp,%tmp,%tg4;\n    add.u32 %ab,%ab,%tmp;\n");
+            s += &format!("    ld.shared.b32 %a{ti}_0,[%ab];\n    ld.shared.b32 %a{ti}_2,[%ab+16];\n");
+            s += &format!("    ld.shared.b32 %a{ti}_1,[%ab+{}];\n    ld.shared.b32 %a{ti}_3,[%ab+{}];\n", 8 * bk, 8 * bk + 16);
+        }
+        // Load this warp's B fragments from smemB[bufc] (row-major BN×BK). For subtile tj: tile-col base
+        // (n index) = warpCol*(8*tn) + tj*8; b0=[col grp, k tg4], b1=[+16 k].
+        for tj in 0..tn {
+            s += "    mov.u32 %ab,smemB;\n    add.u32 %ab,%ab,%bufc;\n";
+            s += &format!("    mul.lo.s32 %tmp,%warpCol,{};\n    add.u32 %tmp,%tmp,{};\n", 8 * tn, tj * 8);
+            s += "    add.u32 %tmp,%tmp,%grp;\n";
+            s += &format!("    mul.lo.s32 %tmp,%tmp,{bk};\n    add.u32 %tmp,%tmp,%tg4;\n    add.u32 %ab,%ab,%tmp;\n");
+            s += &format!("    ld.shared.b32 %b{tj}_0,[%ab];\n    ld.shared.b32 %b{tj}_1,[%ab+16];\n");
+        }
+        // mma all subtiles (A frag reused across N, B frag reused across M).
+        for ti in 0..tm {
+            for tj in 0..tn {
+                s += &format!("    mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32\n        {{%d{ti}_{tj}_0,%d{ti}_{tj}_1,%d{ti}_{tj}_2,%d{ti}_{tj}_3}}, {{%a{ti}_0,%a{ti}_1,%a{ti}_2,%a{ti}_3}}, {{%b{tj}_0,%b{tj}_1}}, {{%d{ti}_{tj}_0,%d{ti}_{tj}_1,%d{ti}_{tj}_2,%d{ti}_{tj}_3}};\n");
+            }
+        }
+        s += "    bar.sync 0;\n"; // all warps done reading bufc before a later step overwrites it
+        s += &format!("    xor.b32 %bufc,%bufc,{tile_bytes};\n    xor.b32 %bufp,%bufp,{tile_bytes};\n");
+        s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
+
+        // Epilogue: store each subtile's 16×8 i32 result. global row = baseRow + warpRow*16tm + ti*16 +
+        // grp (d0/d1) / +8 (d2/d3); global col = baseCol + warpCol*8tn + tj*8 + tg2 (d0/d2) / +1 (d1/d3).
+        s += &format!("KEND_{name}:\n");
+        for ti in 0..tm {
+            for tj in 0..tn {
+                s += &format!("    mul.lo.s32 %tmp,%warpRow,{};\n    add.u32 %tmp,%tmp,{};\n", 16 * tm, ti * 16);
+                s += "    add.u32 %tmp,%tmp,%baseRow;\n    add.u32 %tmp,%tmp,%grp;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n", 8 * tn, tj * 8);
+                s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp2,%tmp2,%tg2;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+                s += "    shl.b32 %tmp,%tmp,2;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%C,%off;\n";
+                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
+                s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n");
+                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
+            }
+        }
+        s += "    ret;\n}\n";
+        s
+    })
+    .as_str()
+}
+
 /// Full **int8 (W8A8) tensor-core GEMM** `C = A·Bᵀ` (the quantized nn.Linear form): A is `[M,K]` **u8**
 /// row-major (activations), B is `[N,K]` **i8** row-major (weights) — which *is* the `K×N` column-major
 /// layout the `mma` `.col` operand wants, so `A·Bᵀ` maps straight onto `mma.row.col` with no transpose.
