@@ -2078,6 +2078,12 @@ pub fn gemm_nt_fp8(
         m % 16 == 0 && n % 8 == 0 && k % 32 == 0,
         "fp8 GEMM needs M%16==0, N%8==0, K%32==0"
     );
+    // Pipelined fp8 path (cp.async SMEM staging + padded conflict-free fragments + raster) — the cliff fix
+    // carrying the f16/bf16 mma-pipeline recipe to E4M3; takes over once the tile divides the shape.
+    use crate::ptx_fp8::{FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN};
+    if m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0 {
+        return gemm_nt_fp8_pipe(g, a, b, m, k, n);
+    }
     let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
     let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
     // Fragment-reuse multi-tile kernel when the block divides evenly (the fast path), else single-tile.
@@ -2116,6 +2122,44 @@ pub fn gemm_nt_fp8(
         .arg(&a_d)
         .arg(&b_d)
         .arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ` (fp8 E4M3 in, f32 out) via the **pipelined** fp8 kernel (`fp8_gemm_pipe`, see
+/// [`crate::ptx_fp8::fp8_pipe_entry`]) — cp.async SMEM staging + padded conflict-free `m16n8k32` fragment
+/// loads + r16 rasterization, the E4M3 twin of the f16/bf16 mma-pipeline workhorse. Requires
+/// `M%128==0`, `N%128==0`, `K%64==0`; numerically identical to the other fp8 GEMMs (f32 accumulate),
+/// tolerance-gated. 1-D rasterized grid; static 40 KiB SMEM.
+pub fn gemm_nt_fp8_pipe(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        "fp8_gemm_pipe requires M%{FP8_PIPE_BM}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
+    );
+    let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe")?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let cfg = LaunchConfig {
+        grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1), // 1-D rasterized grid
+        block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&c_d)
 }
@@ -5135,6 +5179,29 @@ mod tests {
         });
     }
 
+    /// The **pipelined fp8 kernel** (`fp8_gemm_pipe`, dispatched by `gemm_nt_fp8` for %128/%128/%64
+    /// shapes) must match the E4M3-rounded f64 reference — same `m16n8k32` layout as the proven single/mt
+    /// fp8 kernels, only now staged through a padded conflict-free SMEM ring with rasterization. Shapes
+    /// exercise the %128/%64 divisibility, a single K-tile (BK=64 ⇒ prologue guard), the ring wrap
+    /// (K > stages·BK), and a rectangular multi-CTA case.
+    #[test]
+    fn fp8_pipe_matches_reference_within_tol() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_pipe", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8B1);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            for (m, k, n) in [(128usize, 64usize, 128usize), (128, 128, 128), (256, 256, 256), (128, 192, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = gemm_nt_fp8_pipe(g, &a, &b, m, k, n).unwrap();
+                let r = ref_nt_rounded(&a, &b, m, k, n, round);
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                let st = crate::diff::assert_close(&format!("fp8_pipe {m}x{k}x{n}"), &c, &r, 1e-2, rel);
+                eprintln!("fp8_pipe {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+            }
+        });
+    }
+
     /// Time `iters` resident launches of a GEMM `(M,N,K, A,B,C)` kernel; returns seconds/iter.
     fn time_gemm(
         g: &Gpu,
@@ -5289,6 +5356,84 @@ mod tests {
                     s_rb / s_fp8,
                     flop / s_fp8m / 1e9,
                     s_rb / s_fp8m,
+                );
+            }
+        });
+    }
+
+    /// **M2: the pipelined fp8 (E4M3) GEMM** — the cliff fix carried to fp8 — measured same-run against
+    /// (a) the old un-staged `fp8_gemm_nt_mt` (the speedup the cp.async pipeline + padded conflict-free
+    /// SMEM + raster buys) and (b) the dispatched **fp16** mma kernel (the **Ada 2× fp8-rate** check — fp8
+    /// tensor cores run ~2× the fp16 rate, so fp8 GFLOP/s should be ~2× fp16's at the same shape). Same
+    /// buffers' worth of work, `best_of` peak-clock sampling, with a checksum cross-check (fp8-pipe must
+    /// equal fp8-mt). No cuBLASLt fp8 peer (cudarc's safe `Matmul` is f32/f16/bf16 only; a raw-sys E4M3
+    /// peer with scale descriptors is the follow-up for the literal %-of-cuBLASLt number).
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn fp8_pipe_vs_peers() {
+        use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS, FP8_TM, FP8_TN};
+        use half::f16;
+        with_gpu("fp8_pipe_vs_peers", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8FE);
+            // Clock warmup (peak-vs-peak; absolutes swing ~7× with boost on this part).
+            let wa = rng.vec(2048 * 2048, -1.0, 1.0);
+            let wb = rng.vec(2048 * 2048, -1.0, 1.0);
+            for _ in 0..15 {
+                let _ = gemm_nt_fp8_pipe(g, &wa, &wb, 2048, 2048, 2048).unwrap();
+            }
+            let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+            for sz in [2048usize, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * k as f64 * n as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let a8_d = g.stream.memcpy_stod(&a8).unwrap();
+                let b8_d = g.stream.memcpy_stod(&b8).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+
+                // fp8 pipelined (new) — 1-D rasterized grid.
+                let f_pipe = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe").unwrap();
+                let cfg_pipe = LaunchConfig {
+                    grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1),
+                    block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_pipe = best_of(4, || time_wmma(g, &f_pipe, cfg_pipe, dims, &a8_d, &b8_d, &mut c_d, 50));
+                let cs_pipe = csum(&g.stream.memcpy_dtov(&c_d).unwrap());
+
+                // fp8 fragment-reuse multi-tile (old, un-staged global loads).
+                let f_mt = g.function("fp8_gemm_mt", crate::ptx_fp8::fp8_gemm_mt_ptx(), "fp8_gemm_nt_mt").unwrap();
+                let cfg_mt = LaunchConfig {
+                    grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_mt = best_of(4, || time_wmma(g, &f_mt, cfg_mt, dims, &a8_d, &b8_d, &mut c_d, 50));
+                let cs_mt = csum(&g.stream.memcpy_dtov(&c_d).unwrap());
+                assert!(
+                    (cs_pipe - cs_mt).abs() / cs_mt.max(1.0) < 3e-2,
+                    "{sz}³ fp8 pipe/mt checksum mismatch: {cs_pipe:.3e} vs {cs_mt:.3e}"
+                );
+
+                // fp16 dispatched mma kernel (Ada 2× rate reference) — same matrix.
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a16_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let v = crate::ptx_wmma::pipe_variant("mma_nt_f16_128_bk32_s2_r16");
+                let f16f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name).unwrap();
+                let s_f16 = best_of(4, || time_wmma(g, &f16f, pipe_cfg(v, m, n), dims, &a16_d, &b16_d, &mut c_d, 50));
+
+                eprintln!(
+                    "{sz}³ fp8 (same-run): pipe {:>7.0} GFLOP/s | {:>4.2}× vs fp8-mt ({:.0}) | {:>4.2}× vs fp16 (Ada 2× rate: fp16 {:.0})",
+                    flop / s_pipe / 1e9,
+                    s_mt / s_pipe,
+                    flop / s_mt / 1e9,
+                    s_f16 / s_pipe,
+                    flop / s_f16 / 1e9,
                 );
             }
         });
