@@ -50,10 +50,19 @@ toolkit — only **running** needs the driver + a device.
   `C = act(A·Bᵀ + bias)` (`entry_smem_db`'s `bias` flag → `_sm_db_bias{,_relu,_silu,_gelu}`). The WMMA
   fragment→column map is opaque, so the bias path `wmma.store.d`s each tile into a per-warp SMEM scratch
   (reusing the freed staging buffer) and re-reads by explicit (row,col) to add `bias[col]` — the
-  canonical `nn.Linear`/FFN epilogue cuBLAS needs a 2nd kernel for. `gemm_nt_f16` dispatches the plain
-  GEMMs by size regime. The pipelined+fused generators are **precision-generic** (`entry_smem_db` keys
-  fragment width/mma type off `ty`), so bf16 gets the same `wmma_nt_bf16_sm_db` + `_sm_db_{relu,silu,
-  gelu}` (the training-dtype fusion; bias is fp16-only so far). See `entry_smem`/`entry_smem_db`.
+  canonical `nn.Linear`/FFN epilogue cuBLAS needs a 2nd kernel for. The **same fused epilogue also rides
+  the fast `mma.sync` workhorse** (`entry_mma_pipe`'s `act`/`bias` args → `mma_nt_f16_128_bk32_s2_r16_bias
+  {,_relu,_silu,_gelu}`): the mma kernel's D-fragment column map is *known*, so `bias[col]` is added to the
+  f32 accumulators **register-level** (no SMEM scratch the opaque WMMA path needs) then the activation,
+  before the store. This fuses onto the *fastest* GEMM base (not the slower `_sm_db`), so it beats the
+  plain-cuBLAS GEMM+epilogue chain **~1.1–1.4× at 512³ and 2048³** (the FFN-relevant regime — large K,N;
+  `fused_gemm_bias_act_vs_chain`, same-run interleaved). Honest gap: at **1024³ it's ~0.90×** (loses) —
+  the mma workhorse isn't the per-regime GEMM winner there (the deep WMMA `pipe_64_s6` is, but its opaque
+  fragment layout blocks register-level bias), so its GEMM deficit outweighs the saved epilogue round-trip.
+  `gemm_nt_f16` dispatches the plain GEMMs by size regime. The pipelined+fused generators are
+  **precision-generic** (`entry_smem_db` keys fragment width/mma type off `ty`), so bf16 gets the same
+  `wmma_nt_bf16_sm_db` + `_sm_db_{relu,silu,gelu}` (the training-dtype fusion; bias is fp16-only so far).
+  See `entry_smem`/`entry_smem_db`/`entry_mma_pipe`.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` GEMM (no WMMA fp8 on sm_89, so fragments are
   hand-placed per the PTX-ISA lane layout). **Dispatched large-GEMM path (`gemm_nt_fp8` for %128/%128/%64
   shapes): `fp8_pipe_entry`** — the f16/bf16 mma-pipeline recipe carried to E4M3 (multi-stage cp.async

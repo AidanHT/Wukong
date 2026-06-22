@@ -934,6 +934,108 @@ pub fn gemm_nt_f16_pipe(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// The fp16 `mma.sync` workhorse config (`mma_nt_f16_128_bk32_s2_r16`) — the fastest large-GEMM base, and
+/// thus the one the fused `act(A·Bᵀ+bias)` epilogues build on (`gemm_nt_f16_pipe_fused_bias`).
+fn mma_workhorse() -> &'static crate::ptx_wmma::PipeCfg {
+    crate::ptx_wmma::pipe_variant("mma_nt_f16_128_bk32_s2_r16")
+}
+
+/// `C = act(A·Bᵀ + bias)` fused into the **fast `mma.sync` workhorse** store epilogue (the r16-raster
+/// pipeline `mma_nt_f16_128_bk32_s2_r16`, the fastest large-GEMM base). `entry` selects the variant
+/// (`..._bias{,_relu,_silu,_gelu}`). This is the canonical nn.Linear / FFN epilogue, the thing cuBLAS
+/// structurally cannot do (it computes only `A·Bᵀ`, so the bias add + activation need a *second* kernel
+/// that round-trips C through HBM) — fusing it onto the fastest GEMM base is the beat-cuBLAS lever on
+/// real transformer workloads. Bias is applied per output column to the f32 accumulators before the
+/// store, then the activation, register-level (no SMEM scratch the WMMA bias path needs). Requires
+/// `M%128==0`, `N%128==0`, `K%32==0`; tolerance-gated against an `act(A·Bᵀ+bias)` f64 reference.
+fn gemm_nt_f16_pipe_fused_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &'static str,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    let wh = mma_workhorse();
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert!(
+        m % wh.bm == 0 && n % wh.bn == 0 && k % wh.bk == 0,
+        "{entry} requires M%{}==0, N%{}==0, K%{}==0",
+        wh.bm, wh.bn, wh.bk
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), entry)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d);
+    unsafe { bld.launch(pipe_cfg(wh, m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ + bias` (affine Linear, no activation) fused into the fast mma workhorse — see
+/// [`gemm_nt_f16_pipe_fused_bias`]. The fp16 fast-path twin of [`gemm_nt_f16_sm_db_bias`] (slow WMMA base).
+pub fn gemm_nt_f16_mma_bias(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias")
+}
+
+/// `C = relu(A·Bᵀ + bias)` fused into the fast mma workhorse — Linear+ReLU (see [`gemm_nt_f16_pipe_fused_bias`]).
+pub fn gemm_nt_f16_mma_bias_relu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_relu")
+}
+
+/// `C = silu(A·Bᵀ + bias)` fused into the fast mma workhorse — SiLU FFN (see [`gemm_nt_f16_pipe_fused_bias`]).
+pub fn gemm_nt_f16_mma_bias_silu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_silu")
+}
+
+/// `C = gelu(A·Bᵀ + bias)` fused into the fast mma workhorse — the canonical transformer FFN first layer
+/// (BERT/GPT-2 style; see [`gemm_nt_f16_pipe_fused_bias`]).
+pub fn gemm_nt_f16_mma_bias_gelu(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_gelu")
+}
+
 /// Tensor-core `C = A·Bᵀ` in **bf16 inputs with f32 accumulate**. Same contract as [`gemm_nt_f16`]
 /// but bf16 (wider range, fewer mantissa bits) — the precision modern transformers train in.
 pub fn gemm_nt_bf16(
@@ -2881,6 +2983,76 @@ mod tests {
                     );
                     eprintln!(
                         "wmma_f16_sm_db_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                        s.max_abs, s.max_rel
+                    );
+                }
+            }
+        });
+    }
+
+    /// The fused `C = act(A·Bᵀ + bias)` epilogues on the **fast `mma.sync` workhorse**
+    /// (`gemm_nt_f16_mma_bias{,_relu,_silu,_gelu}`) — the same affine-Linear/FFN forms as
+    /// `wmma_sm_db_bias_match_reference_within_tol`, but on the r16-raster mma base (the fastest large-GEMM
+    /// path). This is the gate that lets the beat-cuBLAS fused bench trust the fast path: the kernel adds
+    /// `bias[col]` to the f32 accumulators (known D-fragment column map) then the activation, so each
+    /// output must equal `act(f16-rounded(A·Bᵀ) + bias)`. Workhorse shape constraints: M%128, N%128, K%32.
+    #[test]
+    fn wmma_mma_bias_match_reference_within_tol() {
+        use half::f16;
+        with_gpu("wmma_mma_bias", |g| {
+            let mut rng = crate::diff::Rng::new(0x3B1A);
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 512)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                // Reference: (f16-rounded GEMM) + bias[col], then the activation — per the kernel order.
+                let base = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let with_bias = |act: &dyn Fn(f32) -> f32| -> Vec<f32> {
+                    let mut r = base.clone();
+                    for i in 0..m {
+                        for j in 0..n {
+                            r[i * n + j] = act(r[i * n + j] + bias[j]);
+                        }
+                    }
+                    r
+                };
+                let id = |x: f32| x;
+                for (name, got, refv) in [
+                    (
+                        "bias",
+                        gemm_nt_f16_mma_bias(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&id),
+                    ),
+                    (
+                        "bias_relu",
+                        gemm_nt_f16_mma_bias_relu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&|x| x.max(0.0)),
+                    ),
+                    (
+                        "bias_silu",
+                        gemm_nt_f16_mma_bias_silu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&silu),
+                    ),
+                    (
+                        "bias_gelu",
+                        gemm_nt_f16_mma_bias_gelu(g, &a, &b, &bias, m, k, n).unwrap(),
+                        with_bias(&gelu),
+                    ),
+                ] {
+                    let s = crate::diff::assert_close(
+                        &format!("wmma_f16_mma_{name} {m}x{k}x{n}"),
+                        &got,
+                        &refv,
+                        5e-2,
+                        1e-2,
+                    );
+                    eprintln!(
+                        "wmma_f16_mma_{name} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
                         s.max_abs, s.max_rel
                     );
                 }
@@ -6048,6 +6220,128 @@ mod tests {
         });
     }
 
+    /// **Beat-cuBLAS via fusion, on the FAST `mma.sync` workhorse**: `C = act(A·Bᵀ + bias)` — the
+    /// canonical nn.Linear / transformer-FFN epilogue — as ONE kernel vs the two-kernel chain plain cuBLAS
+    /// forces (cuBLAS sgemm writes C to HBM; a second epilogue kernel reads it back, adds `bias[col]`,
+    /// applies the activation, writes again). Where [`fused_gemm_activation_vs_chain`] fuses onto the
+    /// slower `_sm_db` WMMA base, this fuses onto the **r16-raster mma workhorse** — the *fastest*
+    /// large-GEMM path (~90–97% of cuBLAS ≤2048³) — so the comparison is the honest one: a near-cuBLAS
+    /// GEMM **plus a free epilogue** vs cuBLAS GEMM **plus a mandatory HBM round-trip**. (cuBLASLt *can*
+    /// fuse a bias+gelu epilogue, but cudarc exposes only plain cublas Matmul — f32/f16/bf16 — so the
+    /// honest peer with this toolchain is the two-kernel chain; the epilogue's cost is its 2·M·N f32
+    /// round-trip, proxied by a `time_vmath` pass.) Correctness gates speed: the fused output must equal
+    /// `act(cuBLAS GEMM + bias)` at every shape. Redist DLLs on PATH (see `gemm_vs_peers`).
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn fused_gemm_bias_act_vs_chain() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
+        use half::f16;
+        with_gpu("fused_bias_act", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] fused_gemm_bias_act_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let gelu = |x: f32| {
+                let c0 = (2.0f32 / std::f32::consts::PI).sqrt();
+                0.5 * x * (1.0 + (c0 * (x + 0.044715 * x * x * x)).tanh())
+            };
+            let wh = mma_workhorse();
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let mut rng = crate::diff::Rng::new(0xB1A5_F0ED);
+            // Warm the clock (cf. fused_gemm_activation_vs_chain / gemm_vs_peers): the cuBLAS baseline is
+            // measured first (cold) and the fused kernel later (warm), so without a warmup the laptop GPU's
+            // load-ramp boost would inflate the ratio — a cold-vs-warm artifact, not an honest peak-vs-peak.
+            for _ in 0..30 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            for sz in [512usize, 1024, 2048] {
+                let (m, k, n) = (sz, sz, sz);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let bias_d = g.stream.memcpy_stod(&bias).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let dims = (m as u32, n as u32, k as u32);
+                let cfg = pipe_cfg(wh, m, n);
+                let flop = gemm_flop(m, n, k);
+
+                // cuBLAS GEMM output — the chain's first kernel and the correctness-reference base.
+                let cub_out = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap();
+                eprintln!("\n{sz}³ act(A·Bᵀ + bias) on the mma workhorse (same-run, on-device):");
+
+                for act in ["bias", "bias_relu", "bias_silu", "bias_gelu"] {
+                    let entry: &'static str = match act {
+                        "bias" => "mma_nt_f16_128_bk32_s2_r16_bias",
+                        "bias_relu" => "mma_nt_f16_128_bk32_s2_r16_bias_relu",
+                        "bias_silu" => "mma_nt_f16_128_bk32_s2_r16_bias_silu",
+                        _ => "mma_nt_f16_128_bk32_s2_r16_bias_gelu",
+                    };
+                    // Correctness: the fused output must equal act(cuBLAS GEMM + bias[col]).
+                    let fused = match act {
+                        "bias" => gemm_nt_f16_mma_bias(g, &a, &b, &bias, m, k, n),
+                        "bias_relu" => gemm_nt_f16_mma_bias_relu(g, &a, &b, &bias, m, k, n),
+                        "bias_silu" => gemm_nt_f16_mma_bias_silu(g, &a, &b, &bias, m, k, n),
+                        _ => gemm_nt_f16_mma_bias_gelu(g, &a, &b, &bias, m, k, n),
+                    }
+                    .unwrap();
+                    let act_fn = |x: f32| match act {
+                        "bias" => x,
+                        "bias_relu" => x.max(0.0),
+                        "bias_silu" => silu(x),
+                        _ => gelu(x),
+                    };
+                    let refout: Vec<f32> =
+                        cub_out.iter().enumerate().map(|(i, &x)| act_fn(x + bias[i % n])).collect();
+                    crate::diff::assert_close(
+                        &format!("fused {act} vs cuBLAS chain {sz}³"),
+                        &fused,
+                        &refout,
+                        5e-2,
+                        2e-2,
+                    );
+
+                    // Timing: the fused one-kernel vs cuBLAS GEMM + a separate bias+activation epilogue.
+                    // The epilogue's cost is its 2·M·N f32 HBM round-trip, proxied by a vmath pass (the
+                    // plain-bias variant has no activation, so its epilogue is just the round-trip — relu's
+                    // vmath time stands in: same memory traffic, a slight over-charge for the no-op math).
+                    let f_fused = g.function("wmma_f16", ptx, entry).unwrap();
+                    let proxy_act = if act == "bias" { "relu" } else { &act[5..] };
+                    let f_act = g.function("vmath", crate::ptx::vmath_ptx(), proxy_act).unwrap();
+                    // Contention-robust same-run timing: interleave the cuBLAS GEMM, the epilogue round-trip,
+                    // and the fused kernel round-by-round, taking each kernel's min across rounds, so all
+                    // three see the same least-contended clock window. The parallel flash session bursts the
+                    // GPU; a once-per-size cuBLAS baseline would go stale against a later fused sample (the
+                    // cliff sweep hit exactly this). The min-of-rounds is the peak-clock, least-throttled read.
+                    let (mut bc, mut be, mut bf) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                    for _ in 0..6 {
+                        bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, 20).unwrap());
+                        be = be.min(time_vmath(g, &f_act, m * n, 20));
+                        bf = bf.min(time_wmma_bias(g, &f_fused, cfg, dims, &a_d, &b_d, &mut c_d, &bias_d, 20));
+                    }
+                    let (t_cub, t_epi, t_fused) = (bc, be, bf);
+                    let cub_chain = t_cub + t_epi;
+                    eprintln!(
+                        "  {act:>9}: fused {:>7.3} ms ({:>6.0} GFLOP/s) | cuBLAS GEMM {:>6.3} + epilogue {:>5.3} = {:>7.3} ms (fused {:>4.2}× faster)",
+                        t_fused * 1e3,
+                        flop / t_fused / 1e9,
+                        t_cub * 1e3,
+                        t_epi * 1e3,
+                        cub_chain * 1e3,
+                        cub_chain / t_fused,
+                    );
+                }
+            }
+        });
+    }
+
     /// **M13 — the megakernel beats the call-chain, at the FFN-block level.** Times the resident
     /// [`ffn_fused`] (5 launches: norm, cast, SiLU-GEMM, cast, residual-GEMM — the SiLU folded into the
     /// up-proj store, the residual into the down-proj accumulator) against the unfused chain the same
@@ -6356,6 +6650,36 @@ mod tests {
         let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
             let mut bld = g.stream.launch_builder(f);
             bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(resid_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Per-iter device time of a fused-bias mma GEMM (`mma_nt_f16_128_bk32_s2_r16_bias{,_relu,_silu,
+    /// _gelu}`), which takes `bias[N]` (f32) as a 7th param after C. Same warmup+loop shape as
+    /// [`time_wmma`]; the launch is identical to the residual timer's but the trailing buffer is length-N.
+    fn time_wmma_bias<T: cudarc::driver::DeviceRepr>(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<T>,
+        b_d: &cudarc::driver::CudaSlice<T>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        bias_d: &cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d).arg(bias_d);
             unsafe { bld.launch(cfg).unwrap() };
         };
         launch(c_d);

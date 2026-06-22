@@ -990,6 +990,8 @@ fn entry_mma_pipe(
     stages: usize,
     raster: usize,
     pad: usize,
+    act: Act,
+    bias: bool,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1026,14 +1028,25 @@ fn entry_mma_pipe(
     let col_mask = bk_chunks - 1;
     let wn_shift = warps_n.trailing_zeros();
 
+    // The fused-bias variant takes a `bias[N]` (f32) param applied per output column in the store
+    // epilogue — the canonical `act(A·Bᵀ + bias)` Linear/FFN form. cuBLAS needs a 2nd kernel for it.
+    let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}\n)\n{{\n"
     );
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufcB,%bufwA,%bufwB,%lane,%grp,%tg,%tg2,%laneoff,%warpMrow,%warpNcol,%aptr,%bptr,%grow,%gcol;\n";
+    // Fused-epilogue scratch: %act0/%act1 for the transcendental activations, %biasv0/%biasv1 for the
+    // two bias columns this lane's D fragment spans, %Bias for the bias base pointer.
+    if !matches!(act, Act::None) {
+        s += "    .reg .f32 %act0,%act1;\n";
+    }
+    if bias {
+        s += "    .reg .f32 %biasv0,%biasv1;\n    .reg .b64 %Bias;\n";
+    }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
     }
@@ -1063,6 +1076,9 @@ fn entry_mma_pipe(
     s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    if bias {
+        s += "    ld.param.u64 %Bias,[pBias];\n    cvta.to.global.u64 %Bias,%Bias;\n";
+    }
     if raster == 0 {
         s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
         s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
@@ -1171,6 +1187,20 @@ fn entry_mma_pipe(
         for ni in 0..tn {
             s += &format!("    add.u32 %grow,%baseRow,%warpMrow;\n    add.u32 %grow,%grow,{};\n    add.u32 %grow,%grow,%grp;\n", mi * 16);
             s += &format!("    add.u32 %gcol,%baseCol,%warpNcol;\n    add.u32 %gcol,%gcol,{};\n    add.u32 %gcol,%gcol,%tg2;\n", ni * 8);
+            // Fused epilogue, applied to the f32 accumulators before the store: bias add then activation,
+            // i.e. C = act(A·Bᵀ + bias). The lane's four D regs span two columns — d0,d2 at gcol and
+            // d1,d3 at gcol+1 — so bias[gcol]→biasv0 hits d0,d2 and bias[gcol+1]→biasv1 hits d1,d3.
+            if bias {
+                s += "    mul.wide.u32 %off,%gcol,4;\n    add.s64 %cptr,%Bias,%off;\n";
+                s += "    ld.global.f32 %biasv0,[%cptr];\n    ld.global.f32 %biasv1,[%cptr+4];\n";
+                s += &format!("    add.f32 %d{mi}_{ni}_0,%d{mi}_{ni}_0,%biasv0;\n    add.f32 %d{mi}_{ni}_1,%d{mi}_{ni}_1,%biasv1;\n");
+                s += &format!("    add.f32 %d{mi}_{ni}_2,%d{mi}_{ni}_2,%biasv0;\n    add.f32 %d{mi}_{ni}_3,%d{mi}_{ni}_3,%biasv1;\n");
+            }
+            if !matches!(act, Act::None) {
+                for r in 0..4 {
+                    s += &act.epilogue(&format!("%d{mi}_{ni}_{r}"));
+                }
+            }
             // row grp: C[grow·N+gcol] = d0, [+1] = d1
             s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
             s += &format!("    st.global.f32 [%cptr],%d{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%d{mi}_{ni}_1;\n");
@@ -1283,10 +1313,26 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad)
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false)
             } else {
                 entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
             };
+        }
+        // Fused-epilogue variants on the **fast `mma.sync` workhorse** — the structural beat-cuBLAS lever.
+        // `C = act(x·Wᵀ + bias)` is the canonical nn.Linear / FFN epilogue: cuBLAS computes only `x·Wᵀ`, so
+        // the bias add + activation need a *second* kernel that round-trips C through HBM. Here they fold
+        // into the store, applied register-level to the f32 accumulators (the mma kernel's D-fragment
+        // column map is known, so bias[col] is added without any SMEM scratch the WMMA path needs). Built
+        // on the r16 mma champion (the fastest base): bias alone (Linear) + bias·{relu,silu,gelu} (FFN).
+        let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
+        for (suffix, act) in [("bias", Act::None), ("bias_relu", Act::Relu), ("bias_silu", Act::Silu), ("bias_gelu", Act::Gelu)] {
+            m += &entry_mma_pipe(
+                &format!("{}_{suffix}", wh.name),
+                "f16",
+                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
+                act,
+                true,
+            );
         }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
@@ -1363,7 +1409,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
-        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad);
+        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false);
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
             m += &entry_smem_db(
