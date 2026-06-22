@@ -56,7 +56,12 @@ toolkit — only **running** needs the driver + a device.
   f32 accumulators **register-level** (no SMEM scratch the opaque WMMA path needs) then the activation,
   before the store. This fuses onto the *fastest* GEMM base (not the slower `_sm_db`), so it beats the
   plain-cuBLAS GEMM+epilogue chain **~1.1–1.4× at 512³ and 2048³** (the FFN-relevant regime — large K,N;
-  `fused_gemm_bias_act_vs_chain`, same-run interleaved). Honest gap: at **1024³ it's ~0.90×** (loses) —
+  `fused_gemm_bias_act_vs_chain`, same-run interleaved). `entry_mma_pipe`'s third epilogue flag `residual`
+  adds a per-element `residual[M,N]` to the post-activation accumulators → `out = act(A·Bᵀ+bias)+residual`
+  (`mma_nt_{f16,bf16}_128_bk32_s2_r16_bias_residual` / `gemm_nt_{f16,bf16}_mma_bias_residual`): the
+  transformer **down-proj / attention output-proj** sublayer output, folding the bias-add AND the
+  skip-connection-add (the two `+residual` points per block) into the GEMM store. Honest gap: at **1024³
+  it's ~0.90×** (loses) —
   the mma workhorse isn't the per-regime GEMM winner there (the deep WMMA `pipe_64_s6` is, but its opaque
   fragment layout blocks register-level bias), so its GEMM deficit outweighs the saved epilogue round-trip.
   `gemm_nt_f16` dispatches the plain GEMMs by size regime. **All the fused generators are

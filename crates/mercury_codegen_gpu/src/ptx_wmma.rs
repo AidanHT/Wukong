@@ -993,6 +993,7 @@ fn entry_mma_pipe(
     pad: usize,
     act: Act,
     bias: bool,
+    residual: bool,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1031,10 +1032,14 @@ fn entry_mma_pipe(
 
     // The fused-bias variant takes a `bias[N]` (f32) param applied per output column in the store
     // epilogue — the canonical `act(A·Bᵀ + bias)` Linear/FFN form. cuBLAS needs a 2nd kernel for it.
+    // The fused-residual variant takes a `residual[M,N]` (f32) param added per element AFTER the
+    // activation — `out = act(A·Bᵀ + bias) + residual`, the transformer down-proj / attention output-proj
+    // sublayer output (the skip connection); fusing it folds the otherwise-separate residual-add kernel.
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
+    let resid_param = if residual { ",\n    .param .u64 pResid" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
     );
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
@@ -1047,6 +1052,9 @@ fn entry_mma_pipe(
     }
     if bias {
         s += "    .reg .f32 %biasv0,%biasv1;\n    .reg .b64 %Bias;\n";
+    }
+    if residual {
+        s += "    .reg .f32 %resv0,%resv1;\n    .reg .b64 %Resid;\n";
     }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
@@ -1079,6 +1087,9 @@ fn entry_mma_pipe(
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
     if bias {
         s += "    ld.param.u64 %Bias,[pBias];\n    cvta.to.global.u64 %Bias,%Bias;\n";
+    }
+    if residual {
+        s += "    ld.param.u64 %Resid,[pResid];\n    cvta.to.global.u64 %Resid,%Resid;\n";
     }
     if raster == 0 {
         s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
@@ -1202,11 +1213,20 @@ fn entry_mma_pipe(
                     s += &act.epilogue(&format!("%d{mi}_{ni}_{r}"));
                 }
             }
-            // row grp: C[grow·N+gcol] = d0, [+1] = d1
+            // row grp: C[grow·N+gcol] = d0, [+1] = d1. With residual, add residual[grow,gcol..+1] to the
+            // post-activation accumulators (scratch in the still-free %cptr2): out = act(A·Bᵀ+bias)+residual.
             s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            if residual {
+                s += "    add.s64 %cptr2,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr2];\n    ld.global.f32 %resv1,[%cptr2+4];\n";
+                s += &format!("    add.f32 %d{mi}_{ni}_0,%d{mi}_{ni}_0,%resv0;\n    add.f32 %d{mi}_{ni}_1,%d{mi}_{ni}_1,%resv1;\n");
+            }
             s += &format!("    st.global.f32 [%cptr],%d{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%d{mi}_{ni}_1;\n");
-            // row grp+8: C[(grow+8)·N+gcol] = d2, [+1] = d3
+            // row grp+8: C[(grow+8)·N+gcol] = d2, [+1] = d3 (residual scratch in the now-free %cptr).
             s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
+            if residual {
+                s += "    add.s64 %cptr,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr];\n    ld.global.f32 %resv1,[%cptr+4];\n";
+                s += &format!("    add.f32 %d{mi}_{ni}_2,%d{mi}_{ni}_2,%resv0;\n    add.f32 %d{mi}_{ni}_3,%d{mi}_{ni}_3,%resv1;\n");
+            }
             s += &format!("    st.global.f32 [%cptr2],%d{mi}_{ni}_2;\n    st.global.f32 [%cptr2+4],%d{mi}_{ni}_3;\n");
         }
     }
@@ -1314,7 +1334,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false)
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false)
             } else {
                 entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
             };
@@ -1333,8 +1353,22 @@ pub fn wmma_f16_ptx() -> &'static str {
                 wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
                 act,
                 true,
+                false,
             );
         }
+        // Fused **bias + residual** (no activation) on the same fast mma workhorse — the transformer
+        // down-proj / attention output-proj sublayer output `out = x·Wᵀ + bias + residual` (the residual
+        // added to the post-bias accumulators before the store). This folds BOTH the bias-add and the
+        // residual-add kernels a cuBLAS chain runs separately into the GEMM store — the two `+residual`
+        // points in every transformer block, the megakernel-beats-call-chain lever on the fastest base.
+        m += &entry_mma_pipe(
+            &format!("{}_bias_residual", wh.name),
+            "f16",
+            wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
+            Act::None,
+            true,
+            true,
+        );
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
         // particular fuses the SwiGLU FFN up-projection (`silu(x·W1ᵀ)`) into one kernel.
@@ -1410,7 +1444,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
-        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false);
+        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false);
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
         // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
@@ -1421,8 +1455,18 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad,
                 act,
                 true,
+                false,
             );
         }
+        // bf16 fused bias + residual (training down-proj / output-proj): out = x·Wᵀ + bias + residual.
+        m += &entry_mma_pipe(
+            &format!("{}_bias_residual", v.name),
+            "bf16",
+            v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad,
+            Act::None,
+            true,
+            true,
+        );
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
             m += &entry_smem_db(

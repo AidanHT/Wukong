@@ -1036,6 +1036,87 @@ pub fn gemm_nt_f16_mma_bias_gelu(
     gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_gelu")
 }
 
+/// `C = A·Bᵀ + bias + residual` fused into the fast mma workhorse (`mma_nt_f16_128_bk32_s2_r16_bias_
+/// residual`) — the transformer **down-proj / attention output-proj** sublayer output: the bias-add AND
+/// the residual (skip-connection) add both fold into the GEMM store (the residual added to the post-bias
+/// f32 accumulators, addressed identically to the C store), so the two HBM-round-tripping kernels a
+/// cuBLAS chain runs after the GEMM collapse into the GEMM. `residual` is the [M,N] skip tensor. Requires
+/// `M%128==0`, `N%128==0`, `K%32==0`; tolerance-gated vs an `(A·Bᵀ + bias) + residual` f64 reference.
+pub fn gemm_nt_f16_mma_bias_residual(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    let wh = mma_workhorse();
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert_eq!(residual.len(), m * n, "residual must have length M·N");
+    assert!(
+        m % wh.bm == 0 && n % wh.bn == 0 && k % wh.bk == 0,
+        "mma_nt_f16_128_bk32_s2_r16_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
+        wh.bm, wh.bn, wh.bk
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "mma_nt_f16_128_bk32_s2_r16_bias_residual")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let resid_d = g.stream.memcpy_stod(residual)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    unsafe { bld.launch(pipe_cfg(wh, m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// `C = A·Bᵀ + bias + residual` fused into the fast **bf16** mma workhorse — the training-dtype twin of
+/// [`gemm_nt_f16_mma_bias_residual`] (the down-proj / output-proj sublayer output).
+pub fn gemm_nt_bf16_mma_bias_residual(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::PIPE_BF16;
+    use half::bf16;
+    let v = &PIPE_BF16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert_eq!(residual.len(), m * n, "residual must have length M·N");
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "mma_nt_bf16_128_bk32_s2_r16_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
+        v.bm, v.bn, v.bk
+    );
+    let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+    let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), "mma_nt_bf16_128_bk32_s2_r16_bias_residual")?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let resid_d = g.stream.memcpy_stod(residual)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    unsafe { bld.launch(pipe_cfg(v, m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// Tensor-core `C = A·Bᵀ` in **bf16 inputs with f32 accumulate**. Same contract as [`gemm_nt_f16`]
 /// but bf16 (wider range, fewer mantissa bits) — the precision modern transformers train in.
 pub fn gemm_nt_bf16(
@@ -3243,6 +3324,62 @@ mod tests {
                         s.max_abs, s.max_rel
                     );
                 }
+            }
+        });
+    }
+
+    /// The fused `out = A·Bᵀ + bias + residual` epilogue on the fast mma workhorse (fp16 **and** bf16) —
+    /// the transformer down-proj / attention output-proj sublayer output. The residual is added to the
+    /// post-bias f32 accumulators (addressed per-element identically to the C store), so each output must
+    /// equal `(rounded(A·Bᵀ) + bias[col]) + residual[i]`. This gates BOTH the per-column bias map and the
+    /// per-element residual addressing under the mma D-fragment layout. M%128, N%128, K%32.
+    #[test]
+    fn wmma_mma_bias_residual_match_reference_within_tol() {
+        use half::{bf16, f16};
+        with_gpu("wmma_mma_bias_residual", |g| {
+            let mut rng = crate::diff::Rng::new(0x3B1A_5E51);
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 512)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                let resid = rng.vec(m * n, -1.0, 1.0);
+                // Reference: (rounded GEMM) + bias[col] + residual[i] — per the kernel order.
+                let reference = |round: &dyn Fn(f32) -> f32| -> Vec<f32> {
+                    let mut r = ref_nt_rounded(&a, &b, m, k, n, round);
+                    for i in 0..m {
+                        for j in 0..n {
+                            r[i * n + j] += bias[j] + resid[i * n + j];
+                        }
+                    }
+                    r
+                };
+                let f16r = reference(&|x| f16::from_f32(x).to_f32());
+                let got_f16 = gemm_nt_f16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                let s = crate::diff::assert_close(
+                    &format!("wmma_f16_mma_bias_residual {m}x{k}x{n}"),
+                    &got_f16,
+                    &f16r,
+                    5e-2,
+                    1e-2,
+                );
+                eprintln!(
+                    "wmma_f16_mma_bias_residual {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
+
+                let bf16r = reference(&|x| bf16::from_f32(x).to_f32());
+                let got_bf16 = gemm_nt_bf16_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                let s = crate::diff::assert_close(
+                    &format!("wmma_bf16_mma_bias_residual {m}x{k}x{n}"),
+                    &got_bf16,
+                    &bf16r,
+                    5e-2,
+                    2e-2,
+                );
+                eprintln!(
+                    "wmma_bf16_mma_bias_residual {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
             }
         });
     }
