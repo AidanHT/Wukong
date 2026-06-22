@@ -176,6 +176,60 @@ pub const SM128_WARPS_M: usize = 2;
 pub const SM128_WARPS_N: usize = 4;
 pub const SM128_THREADS: usize = SM128_WARPS_M * SM128_WARPS_N * 32;
 
+/// One multi-stage `cp.async` pipeline GEMM config (see [`entry_smem_pipe`]). `name` is both the PTX
+/// entry symbol and the bench label; `bm×bn` is the CTA macro-tile, `bk` the staged K-tile width, `wm×wn`
+/// the warp grid, `stages` the pipeline depth (SMEM buffers). The generator, the correctness gate, the
+/// `gemm_pipe_sweep` bench, and the `gemm_nt_f16` dispatch all iterate this single table — add a row and
+/// it is generated, gated, swept, and dispatchable at once.
+#[derive(Clone, Copy)]
+pub struct PipeCfg {
+    pub name: &'static str,
+    pub bm: usize,
+    pub bn: usize,
+    pub bk: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub stages: usize,
+}
+
+impl PipeCfg {
+    pub const fn threads(&self) -> usize {
+        self.wm * self.wn * 32
+    }
+    /// Static SMEM bytes this config needs (`stages·(bm+bn)·bk·2`); must be ≤ 48 KiB.
+    pub const fn smem_bytes(&self) -> usize {
+        self.stages * (self.bm + self.bn) * self.bk * 2
+    }
+}
+
+/// The fp16 multi-stage-pipeline GEMM variants, **trimmed to the per-regime winners** after a 12-config
+/// sweep against cuBLAS (same-run, full-clock). Two axes drove the result and split cleanly by whether
+/// A+B fit the 24 MB L2:
+///   * **L2-resident (≤ ~2048³): a deep BK=16 pipeline wins** — data is hot in L2 so latency is low, and
+///     more SMEM buffers keep the tensor cores fed (`pipe_128_s4` reached ~94% of cuBLAS at 2048³, the
+///     small `pipe_64_s6` ~90% at 1024³). Wider BK there only wastes SMEM.
+///   * **L2-thrashing (≥ 4096³): wide BK=32 + a big tile wins** — every miss goes to HBM, so amortizing
+///     the barrier/commit overhead over a 32-wide K-slice and cutting redundant inter-CTA traffic with a
+///     256-row tile matters far more than depth (`pipe_256x64_bk32_s2` ~62%, vs the BK=16 pipes' ~27%
+///     *collapse* at 4096³). Pushing past ~62% needs tiles beyond the 48 KiB static-SMEM cap (dynamic).
+/// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (The
+/// dropped probes — narrow-N, BK=64-on-narrow-tile, role-swaps — never won at any size.)
+pub const PIPE_VARIANTS: &[PipeCfg] = &[
+    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6 }, // 24 KiB — ≤1024³
+    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4 }, // 32 KiB — ~2048³
+    PipeCfg { name: "wmma_nt_f16_pipe_128_bk32_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2 }, // 32 KiB — spilling, %128 fallback
+    PipeCfg { name: "wmma_nt_f16_pipe_256x64_bk32_s2", bm: 256, bn: 64, bk: 32, wm: 4, wn: 2, stages: 2 }, // 40 KiB — spilling champion
+];
+
+/// Look up a [`PipeCfg`] by its entry name (the `gemm_nt_f16` dispatcher selects variants this way, so a
+/// renamed/removed table row fails loudly at the call site rather than silently mis-dispatching).
+pub fn pipe_variant(name: &str) -> &'static PipeCfg {
+    PIPE_VARIANTS
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("unknown pipe variant {name:?}"))
+}
+
 /// Generate a shared-memory-staged WMMA GEMM entry computing `C = A·Bᵀ`. `ty` is "f16" or "bf16"; the
 /// CTA stages a `bm×SM_BK` tile of A and a `bn×SM_BK` tile of B, with a `warps_m×warps_n` warp grid
 /// each owning a `(bm/warps_m)×(bn/warps_n)` sub-tile. `bm`,`bn` must be 16-multiples and the staging
@@ -641,6 +695,212 @@ fn entry_smem_db(
     s
 }
 
+/// Generate an **N-stage `cp.async` software-pipelined** SMEM-staged WMMA GEMM (`_pipe`). This is the
+/// large-GEMM-cliff lever. [`entry_smem_db`] is a *2-stage, BK=16* pipeline: it prefetches exactly one
+/// 16-wide K-slice ahead, i.e. ~16 K-values, far short of the ~400–800-cycle HBM latency, so at
+/// L2-spilling sizes (4096³ ≈ 67 MB ≫ 24 MB L2) the tensor cores starve on global loads and the GEMM
+/// collapses to ~30% of cuBLAS. cuBLAS hides that latency with a *deeper* pipeline; this generalizes the
+/// recipe along two axes:
+///   * **`stages` SMEM buffers (depth ≥ 2):** the K-loop keeps `stages-1` `cp.async` groups in flight,
+///     so each tile's global load is launched `stages-1` iterations before it is consumed — a prefetch
+///     window deep enough to cover HBM latency. `cp.async.wait_group stages-2` gates on the oldest group.
+///   * **`bk` (staged K-tile width, a 16-multiple):** one staged tile feeds `bk/16` WMMA k-steps, so a
+///     wider `bk` amortizes the per-tile barrier and load-issue overhead over more tensor-core work.
+///
+/// **One `bar.sync` per K-iteration** (vs the 2-stage kernel's two): placed right after `wait_group`, it
+/// fences both the just-arrived buffer (RAW: producers→consumers) and the about-to-be-overwritten buffer
+/// (WAR: this iteration's consumers of buffer `b` finish before iteration `j+1`'s `cp.async` rewrites
+/// `b`). The prefetch is *issued after* that barrier and *before* the MMAs, so the async copy flies under
+/// the tensor cores. A/B keep independent buffer-offset registers, so `bm != bn` is allowed (unlike the
+/// db kernel). Plain GEMM, no fused epilogue — the isolated-vs-cuBLAS path; fusion stays on `_sm_db`.
+///
+/// Requires `M%bm==0`, `N%bn==0`, `K%bk==0`, `bk%16==0`, `bk/8` a power of two, and `bm·bk`, `bn·bk` each
+/// a multiple of `threads·8` (128-bit vectorized staging). Total static SMEM `stages·(bm+bn)·bk·2` must
+/// be ≤ 48 KiB (the static-shared cap; beyond it needs dynamic shared + the max-dyn-smem attribute).
+fn entry_smem_pipe(
+    name: &str,
+    ty: &str,
+    bm: usize,
+    bn: usize,
+    bk: usize,
+    warps_m: usize,
+    warps_n: usize,
+    stages: usize,
+) -> String {
+    assert!(stages >= 2, "the pipeline needs at least 2 stages (1 prefetch in flight)");
+    assert!(bk % 16 == 0, "bk must be a multiple of the WMMA k16 step");
+    assert!((bk / 8).is_power_of_two(), "bk/8 must be a power of two (shift-based staging address math)");
+    let mma_ty = if ty == "f16" {
+        "f32.f32".to_string()
+    } else {
+        format!("f32.{ty}.{ty}.f32")
+    };
+    let nab = if ty == "f16" { 8 } else { 4 };
+    let threads = warps_m * warps_n * 32;
+    let tm = bm / (16 * warps_m);
+    let tn = bn / (16 * warps_n);
+    let nks = bk / 16; // WMMA k-steps fed by one staged tile
+    let tile_a = bm * bk * 2; // bytes per A buffer
+    let tile_b = bn * bk * 2; // bytes per B buffer
+    let smem_a = stages * tile_a;
+    let smem_b = stages * tile_b;
+    assert!(
+        smem_a + smem_b <= 48 * 1024,
+        "{name}: static SMEM {} B (stages={stages} bk={bk} {bm}x{bn}) exceeds the 48 KiB cap",
+        smem_a + smem_b
+    );
+    let a_chunks = bm * bk / (threads * 8);
+    let b_chunks = bn * bk / (threads * 8);
+    assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
+    let bk_chunks = bk / 8; // 8-element (128-bit) chunks per staged row
+    let row_shift = bk_chunks.trailing_zeros(); // flat-chunk e → row = e >> row_shift
+    let col_mask = bk_chunks - 1; //              col8 = (e & col_mask) << 3
+    let wn_shift = warps_n.trailing_zeros();
+    let wm = (16 * tm) as i64;
+    let wn = (16 * tn) as i64;
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n"
+    );
+    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+    s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    s += "    .reg .pred %p0,%pmore;\n";
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%bufcA,%bufcB,%bufwA,%bufwB;\n";
+    let mut decl_c = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..8 {
+                decl_c += &format!("%c{ti}_{tj}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    let mut decl_ab = String::new();
+    for ti in 0..tm {
+        for r in 0..nab {
+            decl_ab += &format!("%a{ti}_{r},");
+        }
+    }
+    for tj in 0..tn {
+        for r in 0..nab {
+            decl_ab += &format!("%b{tj}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
+    s += "    .reg .b64 %A,%B,%C,%off,%gp,%gptr,%cptr;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    s += &format!("    mov.u32 %ldm,{bk};\n"); // SMEM tile leading dim = bk (wmma stride operand)
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
+    s += &format!("    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..8 {
+                s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+            }
+        }
+    }
+
+    // cp.async staging of one BM×BK (or BN×BK) tile at K-column `%kcol` into the buffer at byte offset
+    // `bufoff` within `smem`. Each thread copies `chunks` 128-bit (8×f16) groups: flat chunk e=tix+li·T,
+    // row r=e>>row_shift, col8=(e&col_mask)<<3 (BK row-major), so SMEM dest byte = bufoff + e·16 and the
+    // global element is (g_base+r)·K + kcol + col8. 16-byte aligned (every term is an 8-multiple).
+    let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+        for li in 0..chunks {
+            if li == 0 {
+                *s += "    mov.u32 %e,%tix;\n";
+            } else {
+                *s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+            }
+            *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,3;\n");
+            *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
+            *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gbase_ptr},%off;\n");
+            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n");
+            *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
+        }
+    };
+
+    // Prologue: prefetch tiles 0..stages-2 into buffers 0..stages-2 (one cp.async group each, committed
+    // even when guarded off for tiny K so the wait_group accounting stays uniform).
+    for st in 0..(stages - 1) {
+        s += &format!("    mov.u32 %kcol,{};\n", st * bk);
+        s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", st * tile_a, st * tile_b);
+        s += &format!("    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra PRO_{name}_{st};\n");
+        stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
+        stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+        s += &format!("PRO_{name}_{st}:\n    cp.async.commit_group;\n");
+    }
+
+    // Compute buffer starts at offset 0; the write (prefetch) buffer trails by stages-1 buffers.
+    s += "    mov.u32 %bufcA,0;\n    mov.u32 %bufcB,0;\n";
+    s += &format!("    mov.u32 %bufwA,{};\n    mov.u32 %bufwB,{};\n", (stages - 1) * tile_a, (stages - 1) * tile_b);
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    // Drain the oldest in-flight group (the tile we are about to read), then the single fence.
+    s += &format!("    cp.async.wait_group {};\n    bar.sync 0;\n", stages - 2);
+    // Issue the prefetch for the tile (stages-1) ahead into the write buffer, if it exists; commit.
+    s += &format!("    add.u32 %kcol,%kt,{};\n    setp.lt.u32 %pmore,%kcol,%K;\n    @!%pmore bra NOPRE_{name};\n", (stages - 1) * bk);
+    stage("%baseRow", "%A", &format!("smemA_{name}"), "%bufwA", a_chunks, &mut s);
+    stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
+    s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
+    // Compute the current tile from buffer `%bufc`: bk/16 WMMA k-steps, fragment reuse across tm×tn.
+    for ks in 0..nks {
+        for ti in 0..tm {
+            s += &format!("    mov.u32 %tmp,smemA_{name};\n    add.u32 %tmp,%tmp,%bufcA;\n");
+            s += &format!("    mul.lo.s32 %tmp2,%warpRow,{};\n    add.u32 %tmp2,%tmp2,{};\n", wm * bk as i64, ti * 16 * bk);
+            s += &format!("    add.u32 %tmp2,%tmp2,{};\n    shl.b32 %tmp2,%tmp2,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ks * 16);
+            s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
+            let ra = veclist(&format!("a{ti}_"), nab);
+            s += &format!("    wmma.load.a.sync.aligned.m16n16k16.row.{ty} {ra}, [%gp], %ldm;\n");
+        }
+        for tj in 0..tn {
+            s += &format!("    mov.u32 %tmp,smemB_{name};\n    add.u32 %tmp,%tmp,%bufcB;\n");
+            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n", wn * bk as i64, tj * 16 * bk);
+            s += &format!("    add.u32 %tmp2,%tmp2,{};\n    shl.b32 %tmp2,%tmp2,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ks * 16);
+            s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
+            let rb = veclist(&format!("b{tj}_"), nab);
+            s += &format!("    wmma.load.b.sync.aligned.m16n16k16.col.{ty} {rb}, [%gp], %ldm;\n");
+        }
+        for ti in 0..tm {
+            let ra = veclist(&format!("a{ti}_"), nab);
+            for tj in 0..tn {
+                let rb = veclist(&format!("b{tj}_"), nab);
+                let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+                s += &format!(
+                    "    wmma.mma.sync.aligned.row.col.m16n16k16.{mma_ty} {cc}, {ra}, {rb}, {cc};\n"
+                );
+            }
+        }
+    }
+    // Advance compute + write buffers by one tile, wrapping the ring of `stages` buffers.
+    s += &format!("    add.u32 %bufcA,%bufcA,{tile_a};\n    setp.ge.u32 %pmore,%bufcA,{smem_a};\n    @%pmore sub.u32 %bufcA,%bufcA,{smem_a};\n");
+    s += &format!("    add.u32 %bufcB,%bufcB,{tile_b};\n    setp.ge.u32 %pmore,%bufcB,{smem_b};\n    @%pmore sub.u32 %bufcB,%bufcB,{smem_b};\n");
+    s += &format!("    add.u32 %bufwA,%bufwA,{tile_a};\n    setp.ge.u32 %pmore,%bufwA,{smem_a};\n    @%pmore sub.u32 %bufwA,%bufwA,{smem_a};\n");
+    s += &format!("    add.u32 %bufwB,%bufwB,{tile_b};\n    setp.ge.u32 %pmore,%bufwB,{smem_b};\n    @%pmore sub.u32 %bufwB,%bufwB,{smem_b};\n");
+    s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
+
+    s += &format!("KEND_{name}:\n");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+            s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+            s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+            s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+            s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
 /// Number of independent accumulator fragments the roofline kernel keeps in flight (ILP to hide MMA
 /// latency so the loop measures tensor-core *throughput*, not the dependent-chain latency).
 pub const ROOFLINE_ACC: usize = 4;
@@ -736,6 +996,12 @@ pub fn wmma_f16_ptx() -> &'static str {
             false,
             false,
         );
+        // Multi-stage `cp.async` pipeline variants — the large-GEMM-cliff lever (deeper prefetch window +
+        // wider staged BK than the 2-stage `_sm*_db`). Swept by `gemm_pipe_sweep`; the winner per size is
+        // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
+        for v in PIPE_VARIANTS {
+            m += &entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages);
+        }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
         // particular fuses the SwiGLU FFN up-projection (`silu(x·W1ᵀ)`) into one kernel.
