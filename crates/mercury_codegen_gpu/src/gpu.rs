@@ -1293,6 +1293,62 @@ pub fn conv2d(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// Launch grid/block for the fp16 tensor-core implicit-GEMM conv: one warp per CTA owns a
+/// `WMMA_BM×WMMA_BN` output tile (`grid = (ceil(N/BN), ceil(M/BM), 1)`, `block = (32,1,1)`), with
+/// `M=K`, `N=P*Q`. Shared by the launcher and the `conv_vs_peers` bench.
+pub(crate) fn conv_wmma_cfg(h: usize, width: usize, k: usize, r: usize, s: usize) -> LaunchConfig {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN};
+    let (p, q) = (h - r + 1, width - s + 1);
+    let (m, n) = (k, p * q);
+    LaunchConfig {
+        grid_dim: (
+            (n as u32).div_ceil(WMMA_BN as u32),
+            (m as u32).div_ceil(WMMA_BM as u32),
+            1,
+        ),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// **fp16 tensor-core implicit-GEMM** conv2d (single batch, stride 1, no padding). Same contract as
+/// [`conv2d`] but the multiplies run on the tensor cores in fp16 with f32 accumulate (so `X`,`W` are
+/// rounded to f16 on the host — the price the tensor-core path pays), staging the weights and an
+/// on-the-fly im2col of `X` through shared memory ([`crate::ptx_conv::conv_wmma_ptx`]). Tolerance-gated
+/// at fp16 precision against the f64 reference.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let p = h - r + 1;
+    let q = width - s + 1;
+    let ptx = crate::ptx_conv::conv_wmma_ptx(c, h, width, k, r, s);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = conv_wmma_cfg(h, width, k, r, s);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -3904,6 +3960,44 @@ mod tests {
         });
     }
 
+    #[test]
+    fn conv2d_wmma_matches_reference_within_tol() {
+        with_gpu("conv2d_wmma", |g| {
+            let mut rng = crate::diff::Rng::new(0x3CA1B0);
+            // (C,H,W,K,R,S) — exercise M/N/GK that are NOT tile multiples (guards must zero-pad):
+            // K not %32, P*Q not %32, C*R*S not %16, plus a 1×1 and a clean shape.
+            let cases = [
+                (3usize, 32usize, 32usize, 16usize, 3usize, 3usize), // GK=27, N=900 (both non-mult)
+                (16, 28, 28, 32, 3, 3),                              // GK=144, N=676
+                (8, 16, 16, 48, 5, 5),                               // K=48, GK=200, N=144
+                (32, 14, 14, 64, 1, 1),                              // 1×1: GK=32, N=196
+                (4, 24, 24, 24, 3, 3),                               // K=24 (not %32), GK=36
+            ];
+            for (c, h, width, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma(g, &x, &w, c, h, width, k, r, s).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                // fp16 inputs: relative error ~ 2^-10 per element, grows with the C·R·S reduction.
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let st = crate::diff::assert_close(
+                    &format!("conv2d_wmma C{c} {h}x{width} K{k} {r}x{s}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv2d_wmma C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
     /// **M6 for conv2d** — Mercury's SMEM-tiled, static-shape-specialized conv vs the **naive CUDA-C
     /// conv** a programmer writes first (one thread per output, the whole `c,r,s` window streamed from
     /// global), both JIT-loaded through the same driver and timed **same-run** over identical buffers.
@@ -3951,45 +4045,65 @@ mod tests {
                 (256, 14, 14, 256, 3, 3),
                 (32, 32, 32, 32, 5, 5),
             ];
+            use half::f16;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
             for (c, h, wd, k, r, s) in cases {
                 assert!(crate::ptx_conv::tiled_applies(c, h, wd, k, r, s), "shape not tiled");
+                assert!(crate::ptx_conv::wmma_applies(c, h, wd, k, r, s), "shape not wmma");
                 let (p, q) = (h - r + 1, wd - s + 1);
                 let x = rng.vec(c * h * wd, -1.0, 1.0);
                 let w = rng.vec(k * c * r * s, -1.0, 1.0);
-
-                // Mercury tiled conv: load the shape-specialized module once, keep buffers resident.
-                let ptx = crate::ptx_conv::conv2d_ptx(c, h, wd, k, r, s);
-                let module = g.load_module_cached(&ptx).unwrap();
-                let f = module.load_function("conv2d").unwrap();
-                let cfg = conv_tiled_cfg(h, wd, k, r, s);
-                let x_d = g.stream.memcpy_stod(&x).unwrap();
-                let w_d = g.stream.memcpy_stod(&w).unwrap();
-                let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
-                let launch = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
-                    let mut bld = g.stream.launch_builder(&f);
-                    bld.arg(&x_d).arg(&w_d).arg(o_d);
-                    unsafe { bld.launch(cfg).unwrap() };
-                };
-
-                // Checksum cross-check vs naive peer (same f32 buffers, same fma math, different order).
-                launch(g, &mut o_d);
-                g.stream.synchronize().unwrap();
-                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
                 let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
-                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
-                let (cs_m, cs_n) = (csum(&out_m), csum(&naive));
-                assert!(
-                    (cs_m - cs_n).abs() / cs_n.max(1.0) < 2e-2,
-                    "C{c} {h}x{wd} K{k} {r}x{s}: tiled vs naive checksum disagree: m={cs_m:.3e} n={cs_n:.3e}"
-                );
+                let cs_n = csum(&naive);
 
-                // Speed, same-run. Naive is O(C·R·S)/thread so far slower at large C → fewer iters.
+                // --- Mercury f32 SMEM-tiled conv (resident; module loaded once) ---
+                let ptx_t = crate::ptx_conv::conv2d_ptx(c, h, wd, k, r, s);
+                let mod_t = g.load_module_cached(&ptx_t).unwrap();
+                let f_t = mod_t.load_function("conv2d").unwrap();
+                let cfg_t = conv_tiled_cfg(h, wd, k, r, s);
+                let xt_d = g.stream.memcpy_stod(&x).unwrap();
+                let wt_d = g.stream.memcpy_stod(&w).unwrap();
+                let mut ot_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let launch_t = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&f_t);
+                    b.arg(&xt_d).arg(&wt_d).arg(o);
+                    unsafe { b.launch(cfg_t).unwrap() };
+                };
+                launch_t(g, &mut ot_d);
+                g.stream.synchronize().unwrap();
+                let cs_t = csum(&g.stream.memcpy_dtov(&ot_d).unwrap());
+                assert!((cs_t - cs_n).abs() / cs_n.max(1.0) < 2e-2, "tiled checksum: t={cs_t:.3e} n={cs_n:.3e}");
+
+                // --- Mercury fp16 tensor-core implicit-GEMM conv (resident; f16 X/W) ---
+                let ptx_w = crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s);
+                let mod_w = g.load_module_cached(&ptx_w).unwrap();
+                let f_w = mod_w.load_function("conv2d_wmma").unwrap();
+                let cfg_w = conv_wmma_cfg(h, wd, k, r, s);
+                let xw_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let ww_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut ow_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let launch_w = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&f_w);
+                    b.arg(&xw_d).arg(&ww_d).arg(o);
+                    unsafe { b.launch(cfg_w).unwrap() };
+                };
+                launch_w(g, &mut ow_d);
+                g.stream.synchronize().unwrap();
+                let cs_w = csum(&g.stream.memcpy_dtov(&ow_d).unwrap());
+                assert!((cs_w - cs_n).abs() / cs_n.max(1.0) < 6e-2, "wmma checksum: w={cs_w:.3e} n={cs_n:.3e}");
+
+                // Speed, same-run.
                 let iters = 50usize;
-                let t_m = best_of(ROUNDS, || {
+                let t_t = best_of(ROUNDS, || {
                     let t0 = Instant::now();
-                    for _ in 0..iters {
-                        launch(g, &mut o_d);
-                    }
+                    for _ in 0..iters { launch_t(g, &mut ot_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_w = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { launch_w(g, &mut ow_d); }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
@@ -3997,14 +4111,16 @@ mod tests {
                 let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, r, s, naive_iters).unwrap();
 
                 let flop = conv_flop(c, h, wd, k, r, s);
-                let (g_m, g_n) = (flop / t_m, flop / t_n);
+                let (g_t, g_w, g_n) = (flop / t_t, flop / t_w, flop / t_n);
                 eprintln!(
-                    "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} (same-run): Mercury tiled {:.4} ms ({:>6.0} GFLOP/s) | naive CUDA-C {:.4} ms ({:>5.0} GFLOP/s) || Mercury {:>5.1}× vs naive",
-                    t_m * 1e3,
-                    g_m / 1e9,
+                    "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: tiled {:>6.0} GF ({:>4.1}×) | WMMA {:.4} ms {:>6.0} GF ({:>4.1}×) | naive {:.4} ms {:>5.0} GF",
+                    g_t / 1e9,
+                    g_t / g_n,
+                    t_w * 1e3,
+                    g_w / 1e9,
+                    g_w / g_n,
                     t_n * 1e3,
                     g_n / 1e9,
-                    g_m / g_n,
                 );
             }
         });
