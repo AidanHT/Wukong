@@ -473,7 +473,7 @@ pub fn gemm_nt_f16(
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
-        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("mma_nt_f16_128_bk32_s2_r8"));
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("mma_nt_f16_128_bk32_s2_r16"));
     }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));

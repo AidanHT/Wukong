@@ -238,10 +238,12 @@ pub const PIPE_VARIANTS: &[PipeCfg] = &[
     // L2 footprint cut effective traffic: 56% → 72% of cuBLAS (a 12-config raster sweep found the optimum
     // broad over r8..r16; depth beyond s2 and the 256×64 tile both lost). %128, K%32.
     // The workhorse for everything ≥ 2048³: `mma.sync.m16n8k16` with hand-placed, **bank-conflict-free**
-    // (8-padded SMEM) fragment loads + rasterization. Beats the WMMA path at both regimes — 2048³ ~92% of
-    // cuBLAS (padding kills the 4-way fragment-load conflict in the L2-resident/compute-bound regime) and
-    // 4096³ ~74% (HBM-bound there, so padding is neutral but raster + mma scheduling still lead). %128, K%32.
-    PipeCfg { name: "mma_nt_f16_128_bk32_s2_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 8, mma: true, pad: 8 }, // 40 KiB
+    // (8-padded SMEM) fragment loads + **wide (r16) threadblock rasterization**. Beats the WMMA path at
+    // both regimes — 2048³ ~97% of cuBLAS (≥ the M1 target; padding kills the 4-way fragment-load conflict
+    // in the L2-resident/compute-bound regime, the r16 band maximizes L2 reuse) and 4096³ ~72–75%
+    // (HBM-bound). The r16 raster beat r8 at both sizes for the mma kernel (a 6-config sweep); the smaller
+    // 64-tile and 128×64 tile both lost. %128, K%32.
+    PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, mma: true, pad: 8 }, // 40 KiB
 ];
 
 /// Look up a [`PipeCfg`] by its entry name (the `gemm_nt_f16` dispatcher selects variants this way, so a
