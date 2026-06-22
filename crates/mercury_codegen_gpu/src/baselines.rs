@@ -783,3 +783,168 @@ impl CublasChainModel {
         Ok(self.stream.memcpy_dtov(&out)?)
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Tier A — int8 (W8A8) CUDA-C peers, compiled by NVRTC (the "beat the hand-written C int8" baselines).
+//
+// Two peers of escalating quality, both `C = A·Bᵀ` with `u8` activations × `i8` weights → `i32`
+// (Mercury's quantized-nn.Linear contract, exact mod 2³²), so all three implementations compute the
+// *identical* integer matrix and cross-check bit-for-bit:
+//   * `naive_gemm_nt_int8` — one thread per output, scalar `(int)A·(int)B` chain. The idiomatic kernel
+//     a programmer writes first; the M6 wide-win floor.
+//   * `dp4a_gemm_nt_int8`  — one thread per output, but the K-loop uses the **`dp4a.u32.s32`** 4-way
+//     byte dot-product (the SIMD int8 instruction a programmer reaches for next; mixed u8×s8 via inline
+//     PTX, which the `__dp4a` C intrinsic doesn't expose). A much stronger hand-written baseline than
+//     naive — the honest "beat the optimized C int8" bar short of a tensor-core library.
+// Both NVRTC-compile to PTX and the driver JITs them to SASS exactly like Mercury's PTX, so the gap is
+// pure kernel quality (tensor cores + fragment reuse vs none).
+// ---------------------------------------------------------------------------------------------------
+
+const NAIVE_GEMM_NT_INT8_CUDA: &str = r#"
+extern "C" __global__ void naive_gemm_nt_int8(int M, int N, int K,
+        const unsigned char* A, const signed char* B, int* C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // n index
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // m index
+    if (row < M && col < N) {
+        int acc = 0;
+        for (int k = 0; k < K; ++k)
+            acc += (int)A[row * K + k] * (int)B[col * K + k];
+        C[row * N + col] = acc;
+    }
+}
+"#;
+
+/// `dp4a.u32.s32` 4-way dot product: each step consumes 4 `u8` of A and 4 `s8` of B (packed as one
+/// `int` each) and accumulates the four products into the `s32` accumulator in a single instruction —
+/// the SIMD int8 primitive on Ada short of the tensor core. Mixed `u8×s8` is expressed via inline PTX
+/// because the `__dp4a` C intrinsic only exposes the same-signedness forms. K must be a multiple of 4.
+const DP4A_GEMM_NT_INT8_CUDA: &str = r#"
+extern "C" __global__ void dp4a_gemm_nt_int8(int M, int N, int K,
+        const int* A, const int* B, int* C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // n index
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // m index
+    if (row < M && col < N) {
+        int acc = 0;
+        int K4 = K >> 2;
+        const int* a = A + row * K4;   // A reinterpreted as packed 4×u8 per int
+        const int* b = B + col * K4;   // B reinterpreted as packed 4×s8 per int
+        for (int k = 0; k < K4; ++k) {
+            int av = a[k], bv = b[k];
+            asm("dp4a.u32.s32 %0, %1, %2, %0;" : "+r"(acc) : "r"(av), "r"(bv));
+        }
+        C[row * N + col] = acc;
+    }
+}
+"#;
+
+fn nvrtc_int8_module(g: &Gpu, src: &str) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions {
+        arch: Some("compute_89"),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(src, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+/// Run the naive int8 CUDA-C GEMM once and copy the `i32` result back — the correctness-gate entry.
+pub fn nvrtc_naive_gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let module = nvrtc_int8_module(g, NAIVE_GEMM_NT_INT8_CUDA)?;
+    let f = module.load_function("naive_gemm_nt_int8")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(naive_cfg(m, n))? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Run the `dp4a` int8 CUDA-C GEMM once and copy the `i32` result back — the stronger-peer gate entry.
+pub fn nvrtc_dp4a_gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(k % 4, 0, "dp4a peer needs K%4==0");
+    let module = nvrtc_int8_module(g, DP4A_GEMM_NT_INT8_CUDA)?;
+    let f = module.load_function("dp4a_gemm_nt_int8")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(naive_cfg(m, n))? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time the naive int8 CUDA-C GEMM: `iters` resident launches bracketed by one sync, after a warm-up —
+/// the identical timing shape Mercury's GEMM benches use, so the ratio is apples-to-apples. Sec/launch.
+pub fn time_nvrtc_naive_gemm_nt_int8(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    time_int8_peer(g, NAIVE_GEMM_NT_INT8_CUDA, "naive_gemm_nt_int8", m, k, n, iters)
+}
+
+/// Time the `dp4a` int8 CUDA-C GEMM (same timing shape as the naive peer). Seconds per launch.
+pub fn time_nvrtc_dp4a_gemm_nt_int8(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    time_int8_peer(g, DP4A_GEMM_NT_INT8_CUDA, "dp4a_gemm_nt_int8", m, k, n, iters)
+}
+
+/// Shared timing harness for the int8 CUDA-C peers: upload once (dummy bytes), `iters` resident
+/// launches after a warm-up, one trailing sync. Both peers take the same `(M,N,K,A,B,C)` signature.
+fn time_int8_peer(
+    g: &mut Gpu,
+    src: &str,
+    entry: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let module = nvrtc_int8_module(g, src)?;
+    let f = module.load_function(entry)?;
+    let a_d = g.stream.memcpy_stod(&vec![1u8; m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![1i8; n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let cfg = naive_cfg(m, n);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}

@@ -6162,4 +6162,155 @@ mod tests {
             }
         });
     }
+
+    /// Time `iters` resident launches of an int8 GEMM kernel `(M,N,K, A:u8, B:i8, C:i32)`; sec/iter.
+    fn time_gemm_int8(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<u8>,
+        b_d: &cudarc::driver::CudaSlice<i8>,
+        c_d: &mut cudarc::driver::CudaSlice<i32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<i32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Deterministic int8 test buffers: `A` u8 `[M,K]`, `B` i8 `[N,K]` (full range, incl. negatives).
+    fn int8_inputs(rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize) -> (Vec<u8>, Vec<i8>) {
+        let a: Vec<u8> = (0..m * k)
+            .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+            .collect();
+        let b: Vec<i8> = (0..n * k)
+            .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+            .collect();
+        (a, b)
+    }
+
+    /// **M3/M6: int8 (W8A8) tensor-core GEMM vs the Tier-A int8 CUDA-C peers**, same-run. Mercury's
+    /// fragment-reuse `int8_gemm_nt_mt` (`mma.sync.m16n8k32.s32.u8.s8.s32`, A-fragment reused across the
+    /// N tiles) vs **naive** int8 CUDA-C (one thread/output, scalar `(int)A·(int)B`) and **dp4a** int8
+    /// CUDA-C (one thread/output, the 4-way `dp4a.u32.s32` byte dot-product — the strong hand-written
+    /// SIMD-int8 baseline). The literal "beat the hand-written C int8 on the GPU" (M6) plus the strongest
+    /// non-library int8 peer this box can compile (a cuBLASLt IMMA Tier-B peer is the follow-up; this
+    /// nails the Tier-A wins and the dp4a bar first). Reports int8-MAC GFLOP/s (`2·M·N·K`) and Mercury
+    /// × vs each peer.
+    ///
+    /// Correctness gates speed (the first law, here **bit-exact**): both peers are first cross-checked
+    /// to **equal** the wrapping-`i32` CPU reference, and at every size all three outputs' checksums must
+    /// agree exactly. Same-run only (the ~7× laptop clock swing): a clock warmup + `best_of`. Needs the
+    /// NVRTC redist DLL on PATH (see `gemm_vs_peers`); skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_gemm_vs_peers`
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn int8_gemm_vs_peers() {
+        use crate::baselines::{
+            gemm_flop, nvrtc_dp4a_gemm_nt_int8, nvrtc_naive_gemm_nt_int8, peer_env_hint,
+            peers_available, time_nvrtc_dp4a_gemm_nt_int8, time_nvrtc_naive_gemm_nt_int8,
+        };
+        use crate::ptx_int8::{INT8_TM, INT8_TN};
+        with_gpu("int8_gemm_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] int8_gemm_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+
+            // --- Correctness first: both peers must EQUAL the i32 oracle (bit-exact) at a small shape. ---
+            let mut rng = crate::diff::Rng::new(0x1287);
+            for (m, k, n) in [(256usize, 256usize, 256usize), (128, 320, 96)] {
+                let (a, b) = int8_inputs(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                let merc = gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
+                assert_eq!(merc, r, "Mercury int8 {m}x{k}x{n} != i32 oracle");
+                let naive = nvrtc_naive_gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
+                assert_eq!(naive, r, "naive int8 CUDA-C {m}x{k}x{n} != i32 oracle");
+                let dp4a = nvrtc_dp4a_gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
+                assert_eq!(dp4a, r, "dp4a int8 CUDA-C {m}x{k}x{n} != i32 oracle");
+            }
+            eprintln!("[gate] Mercury + naive + dp4a int8 all equal the i32 oracle bit-for-bit ✓");
+
+            // --- Clock warmup (cf. gemm_vs_peers): boost the clock before sampling so each size's ratio
+            // is peak-vs-peak. Hammer the dp4a peer (cheap, compute-heavy) until the clock settles. ---
+            for _ in 0..40 {
+                let _ = time_nvrtc_dp4a_gemm_nt_int8(g, 2048, 2048, 2048, 5);
+            }
+            const ROUNDS: usize = 4;
+
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k); // 2·M·N·K int8 MACs
+                let dims = (m as u32, n as u32, k as u32);
+                let (a, b) = int8_inputs(&mut rng, m, k, n);
+
+                // Mercury fragment-reuse _mt path (the fast int8 kernel).
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let f_mt = g
+                    .function("int8_gemm_mt", crate::ptx_int8::int8_gemm_mt_ptx(), "int8_gemm_nt_mt")
+                    .unwrap();
+                let cfg_mt = LaunchConfig {
+                    grid_dim: ((n / (8 * INT8_TN)) as u32, (m / (16 * INT8_TM)) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_mt = best_of(ROUNDS, || time_gemm_int8(g, &f_mt, cfg_mt, dims, &a_d, &b_d, &mut c_d, 50));
+
+                // Mercury single-tile path (one 16×8 tile/warp — the pre-fragment-reuse baseline).
+                let f_st = g
+                    .function("int8_gemm", crate::ptx_int8::int8_gemm_ptx(), "int8_gemm_nt")
+                    .unwrap();
+                let cfg_st = LaunchConfig {
+                    grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_st = best_of(ROUNDS, || time_gemm_int8(g, &f_st, cfg_st, dims, &a_d, &b_d, &mut c_d, 50));
+
+                // Peers. Naive is slow → fewer iters; dp4a is the strong baseline.
+                let naive_iters = if sz >= 4096 { 3 } else { 10 };
+                let s_naive = time_nvrtc_naive_gemm_nt_int8(g, m, k, n, naive_iters).unwrap();
+                let s_dp4a = best_of(ROUNDS, || time_nvrtc_dp4a_gemm_nt_int8(g, m, k, n, 20).unwrap());
+
+                // Checksum cross-check at this shape: all paths compute the same matrix.
+                let csum = |v: &[i32]| v.iter().map(|&x| x as i64).sum::<i64>();
+                let cs_mt = csum(&gemm_nt_int8(g, &a, &b, m, k, n).unwrap());
+                let cs_n = csum(&nvrtc_naive_gemm_nt_int8(g, &a, &b, m, k, n).unwrap());
+                let cs_d = csum(&nvrtc_dp4a_gemm_nt_int8(g, &a, &b, m, k, n).unwrap());
+                assert!(
+                    cs_mt == cs_n && cs_mt == cs_d,
+                    "{sz}³ int8 checksum disagreement: mt={cs_mt} naive={cs_n} dp4a={cs_d}"
+                );
+
+                let (g_mt, g_st, g_naive, g_dp4a) =
+                    (flop / s_mt, flop / s_st, flop / s_naive, flop / s_dp4a);
+                eprintln!(
+                    "\n{sz}³ int8 W8A8 GEMM (same-run, 2·M·N·K MAC-FLOP):\n  \
+                     Mercury _mt      : {:>8.0} GFLOP/s  | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     Mercury single   : {:>8.0} GFLOP/s  | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     dp4a CUDA-C      : {:>8.0} GFLOP/s  | strong hand-written int8 peer\n  \
+                     naive CUDA-C     : {:>8.0} GFLOP/s  | Tier-A floor",
+                    g_mt / 1e9, g_mt / g_naive, g_mt / g_dp4a,
+                    g_st / 1e9, g_st / g_naive, g_st / g_dp4a,
+                    g_dp4a / 1e9,
+                    g_naive / 1e9,
+                );
+            }
+        });
+    }
 }
