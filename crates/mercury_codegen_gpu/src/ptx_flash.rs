@@ -697,13 +697,19 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
         br += "%ck0,%ck1,%ck8,%ck9,";
     }
     s += &format!(
-        "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp;\n"
+        "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp,%hoff;\n"
     );
     s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
 
     s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
     s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    // multi-head: head = ctaid.y, whose Q/K/V/O start at element ctaid.y·S·D ([H,S,D] layout). Fold the
+    // head base into the (cvta'd) pointers so the per-row addressing below is unchanged. Single-head
+    // callers launch grid.y=1 ⇒ ctaid.y=0 ⇒ headoff=0, so this is a no-op for them.
+    s += &format!("    mov.u32 %hoff,%ctaid.y;\n    mul.lo.u32 %hoff,%hoff,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+    s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+    s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
     // lane decomposition + the two query rows this lane owns
     s += "    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
     s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n";
