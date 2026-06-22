@@ -160,6 +160,7 @@ fn fp8_pipe_entry(
     pad: usize,
     act: crate::ptx_wmma::Act,
     bias: bool,
+    residual: bool,
 ) -> String {
     use crate::ptx_wmma::Act;
     assert!(stages >= 2 && bk % 32 == 0 && (bk / 16).is_power_of_two() && pad % 16 == 0);
@@ -185,9 +186,12 @@ fn fp8_pipe_entry(
     // The fused-bias variant takes a `bias[N]` (f32) param applied per output column in the store
     // epilogue — the canonical `act(A·Bᵀ + bias)` fp8 Linear/FFN form (cuBLAS needs a 2nd kernel for it).
     let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
+    // Fused-residual: a `residual[M,N]` (f32) added to the post-activation accumulators before the store,
+    // out = act(A·Bᵀ + bias) + residual — the fp8 transformer down-proj / output-proj (cf. entry_mma_pipe).
+    let resid_param = if residual { ",\n    .param .u64 pResid" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
     );
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
@@ -200,6 +204,9 @@ fn fp8_pipe_entry(
     }
     if bias {
         s += "    .reg .f32 %biasv0,%biasv1;\n    .reg .b64 %Bias;\n";
+    }
+    if residual {
+        s += "    .reg .f32 %resv0,%resv1;\n    .reg .b64 %Resid;\n";
     }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
@@ -232,6 +239,9 @@ fn fp8_pipe_entry(
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
     if bias {
         s += "    ld.param.u64 %Bias,[pBias];\n    cvta.to.global.u64 %Bias,%Bias;\n";
+    }
+    if residual {
+        s += "    ld.param.u64 %Resid,[pResid];\n    cvta.to.global.u64 %Resid,%Resid;\n";
     }
     if raster == 0 {
         s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
@@ -351,8 +361,16 @@ fn fp8_pipe_entry(
                 }
             }
             s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            if residual {
+                s += "    add.s64 %cptr2,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr2];\n    ld.global.f32 %resv1,[%cptr2+4];\n";
+                s += &format!("    add.f32 %d{mi}_{ni}_0,%d{mi}_{ni}_0,%resv0;\n    add.f32 %d{mi}_{ni}_1,%d{mi}_{ni}_1,%resv1;\n");
+            }
             s += &format!("    st.global.f32 [%cptr],%d{mi}_{ni}_0;\n    st.global.f32 [%cptr+4],%d{mi}_{ni}_1;\n");
             s += "    add.u32 %tmp,%grow,8;\n    mul.lo.s32 %tmp,%tmp,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr2,%C,%off;\n";
+            if residual {
+                s += "    add.s64 %cptr,%Resid,%off;\n    ld.global.f32 %resv0,[%cptr];\n    ld.global.f32 %resv1,[%cptr+4];\n";
+                s += &format!("    add.f32 %d{mi}_{ni}_2,%d{mi}_{ni}_2,%resv0;\n    add.f32 %d{mi}_{ni}_3,%d{mi}_{ni}_3,%resv1;\n");
+            }
             s += &format!("    st.global.f32 [%cptr2],%d{mi}_{ni}_2;\n    st.global.f32 [%cptr2+4],%d{mi}_{ni}_3;\n");
         }
     }
@@ -378,6 +396,7 @@ pub fn fp8_pipe_ptx() -> &'static str {
             FP8_PIPE_PAD,
             Act::None,
             false,
+            false,
         );
         // Fused-epilogue fp8 variants — the beat-cuBLAS fusion carried to the **fastest** precision (Ada
         // 2× TC rate), so `C = act(x·Wᵀ + bias)` fp8 Linear/FFN is the fastest fused inference path. The
@@ -401,8 +420,25 @@ pub fn fp8_pipe_ptx() -> &'static str {
                 FP8_PIPE_PAD,
                 act,
                 true,
+                false,
             );
         }
+        // fp8 fused bias + residual (no act) — the fastest down-proj / output-proj: out = x·Wᵀ + bias +
+        // residual at the Ada 2× fp8 rate (the residual stream stays f32, fp8 only the GEMM operands).
+        m += &fp8_pipe_entry(
+            "fp8_gemm_pipe_bias_residual",
+            FP8_PIPE_BM,
+            FP8_PIPE_BN,
+            FP8_PIPE_BK,
+            FP8_PIPE_WM,
+            FP8_PIPE_WN,
+            FP8_PIPE_STAGES,
+            FP8_PIPE_RASTER,
+            FP8_PIPE_PAD,
+            Act::None,
+            true,
+            true,
+        );
         m
     })
     .as_str()

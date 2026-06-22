@@ -2465,6 +2465,49 @@ pub fn gemm_nt_fp8_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32]
     gemm_nt_fp8_pipe_fused_bias(g, a, b, bias, m, k, n, "fp8_gemm_pipe_bias_gelu")
 }
 
+/// `C = A·Bᵀ + bias + residual` fused, fp8 inputs (E4M3 in, f32 out) — the **fastest down-proj /
+/// attention output-proj** (Ada 2× fp8 TC rate); the residual stays f32 (the residual stream), only the
+/// GEMM operands are fp8. Bias and residual both fold into the workhorse store; `residual` is the [M,N]
+/// skip tensor. Requires `M%128==0`, `N%128==0`, `K%64==0`; tolerance-gated.
+pub fn gemm_nt_fp8_mma_bias_residual(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(bias.len(), n, "bias must have length N");
+    assert_eq!(residual.len(), m * n, "residual must have length M·N");
+    assert!(
+        m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        "fp8_gemm_pipe_bias_residual requires M%{FP8_PIPE_BM}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
+    );
+    let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe_bias_residual")?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let bias_d = g.stream.memcpy_stod(bias)?;
+    let resid_d = g.stream.memcpy_stod(residual)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let cfg = LaunchConfig {
+        grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1),
+        block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&bias_d).arg(&resid_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5766,6 +5809,45 @@ mod tests {
                         s.max_abs, s.max_rel
                     );
                 }
+            }
+        });
+    }
+
+    /// The fused `out = A·Bᵀ + bias + residual` epilogue on the fp8 workhorse
+    /// (`gemm_nt_fp8_mma_bias_residual`) — the fastest down-proj / output-proj (Ada 2× fp8 rate, residual
+    /// kept f32). Each output must equal `(e4m3-rounded(A·Bᵀ) + bias[col]) + residual[i]`. Gates the
+    /// per-column bias map AND the per-element residual addressing under the fp8 m16n8k32 D-fragment
+    /// layout. Workhorse shape constraints: M%128, N%128, K%64.
+    #[test]
+    fn fp8_mma_bias_residual_match_reference_within_tol() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_mma_bias_residual", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8B3);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 192, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let bias = rng.vec(n, -0.5, 0.5);
+                let resid = rng.vec(m * n, -1.0, 1.0);
+                let mut refv = ref_nt_rounded(&a, &b, m, k, n, round);
+                for i in 0..m {
+                    for j in 0..n {
+                        refv[i * n + j] += bias[j] + resid[i * n + j];
+                    }
+                }
+                let got = gemm_nt_fp8_mma_bias_residual(g, &a, &b, &bias, &resid, m, k, n).unwrap();
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                let s = crate::diff::assert_close(
+                    &format!("fp8_mma_bias_residual {m}x{k}x{n}"),
+                    &got,
+                    &refv,
+                    1e-2,
+                    rel,
+                );
+                eprintln!(
+                    "fp8_mma_bias_residual {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    s.max_abs, s.max_rel
+                );
             }
         });
     }
