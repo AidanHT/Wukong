@@ -5600,6 +5600,68 @@ mod tests {
         });
     }
 
+    /// **Gate for the multi-head layout shims** (`ptx::HEAD_TRANSPOSE_PTX`): `cast_transpose_qkv`
+    /// (f32 `[S,H·dh]` → f16 `[H,S,dh]`, folding the narrowing in) and `transpose_attn_out` (f32
+    /// `[H,S,dh]` → f32 `[S,H·dh]`) must match a CPU reference **bit-for-bit** — the forward with
+    /// `f16::from_f32` rounding, the inverse exactly. Covers `H=1` (degenerates to cast/copy) and the
+    /// GPT-2 `H=12,dh=64` shape. These shims are what let `ResidentLayerF16` run true multi-head attention
+    /// on the head-major flash kernel without touching the kernel; a layout bug would scatter the heads.
+    #[test]
+    fn head_transpose_round_trips() {
+        use half::f16;
+        with_gpu("head_transpose_round_trips", |g| {
+            let mut rng = crate::diff::Rng::new(0x7AB1E5);
+            for &(s, heads, dh) in &[(16usize, 1usize, 64usize), (64, 12, 64), (32, 4, 32), (16, 2, 128)] {
+                let d = heads * dh;
+                let (n, dd, dhh, sdh) = ((s * d) as u32, d as u32, dh as u32, (s * dh) as u32);
+
+                // --- forward: token-major [S,H·dh] f32 -> head-major [H,S,dh] f16 (with f16 rounding) ---
+                let src = rng.vec(s * d, -1.0, 1.0);
+                let mut want_fwd = vec![f16::from_f32(0.0); s * d];
+                for row in 0..s {
+                    for head in 0..heads {
+                        for i in 0..dh {
+                            want_fwd[head * s * dh + row * dh + i] = f16::from_f32(src[row * d + head * dh + i]);
+                        }
+                    }
+                }
+                let f_fwd = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "cast_transpose_qkv").unwrap();
+                let src_d = g.stream.memcpy_stod(&src).unwrap();
+                let mut dst_d = g.stream.alloc_zeros::<f16>(s * d).unwrap();
+                let mut b = g.stream.launch_builder(&f_fwd);
+                b.arg(&n).arg(&dd).arg(&dhh).arg(&sdh).arg(&src_d).arg(&mut dst_d);
+                unsafe { b.launch(LaunchConfig::for_num_elems(n)).unwrap() };
+                g.stream.synchronize().unwrap();
+                let got_fwd = g.stream.memcpy_dtov(&dst_d).unwrap();
+                for (idx, (a, e)) in got_fwd.iter().zip(want_fwd.iter()).enumerate() {
+                    assert_eq!(a.to_bits(), e.to_bits(), "fwd mismatch s={s} h={heads} dh={dh} idx={idx}");
+                }
+
+                // --- inverse: head-major [H,S,dh] f32 -> token-major [S,H·dh] f32 (exact) ---
+                let hsd = rng.vec(s * d, -1.0, 1.0);
+                let f_inv = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "transpose_attn_out").unwrap();
+                let hsd_d = g.stream.memcpy_stod(&hsd).unwrap();
+                let mut out_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                let mut b2 = g.stream.launch_builder(&f_inv);
+                b2.arg(&n).arg(&dd).arg(&dhh).arg(&sdh).arg(&hsd_d).arg(&mut out_d);
+                unsafe { b2.launch(LaunchConfig::for_num_elems(n)).unwrap() };
+                g.stream.synchronize().unwrap();
+                let got_inv = g.stream.memcpy_dtov(&out_d).unwrap();
+                for head in 0..heads {
+                    for row in 0..s {
+                        for i in 0..dh {
+                            assert_eq!(
+                                got_inv[row * d + head * dh + i],
+                                hsd[head * s * dh + row * dh + i],
+                                "inv mismatch s={s} h={heads} dh={dh}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// **Capability probe (not a perf or correctness gate): can NVRTC compile `nvcuda::wmma` here?**
     /// Decides whether a *genuinely FA2-class* (tensor-core, fused) attention peer can be written in
     /// CUDA-C and compiled by the redist NVRTC — vs. falling back to a cuBLAS unfused attention chain.
