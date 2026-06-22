@@ -1143,14 +1143,17 @@ pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
     d == 64 && s % 16 == 0 && s >= 512
 }
 
-/// Tensor-core flash entry name: the **register-resident `mma.sync` kernel** `flash_d64_m` — O/m/l in
-/// registers, no SMEM round-trip. It supersedes the WMMA `flash_d64_w`/`_w4` (which `wmma.store.d` every
-/// fragment to SMEM): the same-run A/B `flash_mma_vs_wmma` measures `m/w4` 0.68×→0.17× across
-/// S=256→4096 (1.5–5.9× faster, the margin growing with context). Only needs `S % 16 == 0` (the
-/// query-block stride; the older `_w4` needed `% 64`), which [`wmma_flash_applies`] already guarantees.
-/// Shares [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA). `_w`/`_w4` are retained for the A/B bench.
+/// Tensor-core flash entry name: the **`cp.async`-pipelined register-resident `mma.sync` kernel**
+/// `flash_d64_mp` — O/m/l in registers (no SMEM round-trip) *and* the K/V key blocks `cp.async`-staged
+/// into double-buffered shared memory so block `kb+1` prefetches under block `kb`'s tensor-core compute.
+/// It supersedes `flash_d64_m` (which loaded K/V straight from global and stalled per-block on that
+/// latency): the same-run A/B `flash_pipe_vs_mma` measures `mp/m` 0.28×→0.88× single-head S=512→4096
+/// (1.14–3.6×, latency-dominated at small S) and 0.84–0.90× at the H=12 GPU-filled regime (the per-warp
+/// latency bound). Bit-identical math to `flash_d64_m`, so the gate cross-checks both. Only needs
+/// `S % 16 == 0`, which [`wmma_flash_applies`] guarantees; static 16 KB SMEM (no launch param). Shares
+/// [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA). `flash_d64_m`/`_w`/`_w4` are retained for the A/B bench.
 pub(crate) fn wmma_flash_entry(_s: usize) -> &'static str {
-    "flash_d64_m"
+    "flash_d64_mp"
 }
 
 /// Launch config for the tensor-core flash kernels (`flash_d64_w`/`_w4`): one warp per 16-query-row block.
@@ -5462,12 +5465,13 @@ mod tests {
 
     /// **M5/M6: register-resident flash vs the Tier-A naive CUDA-C attention**, same-run, single head,
     /// D=64. The literal "beat the hand-written C flash on the GPU" (M6) — the GPU twin of beating
-    /// scalar CPU-C. Mercury's `flash_d64_m` (tensor-core `mma.sync`, O/m/l in registers, online softmax)
-    /// vs `naive_attn` (one thread per query row, two-pass softmax, no SMEM/tensor cores) over identical
-    /// buffers. Reports GFLOP/s (`4·S²·D`) and Mercury × vs naive at S∈{512..4096}. (A Tier-B FA2-class
-    /// CUDA-C peer for the %-of-FA2 number is the follow-up; this nails the Tier-A win first.)
+    /// scalar CPU-C. Mercury's `flash_d64_mp` (tensor-core `mma.sync`, O/m/l in registers, `cp.async`-
+    /// staged double-buffered K/V, online softmax) vs `naive_attn` (one thread per query row, two-pass
+    /// softmax, no SMEM/tensor cores) over identical buffers. Reports GFLOP/s (`4·S²·D`) and Mercury × vs
+    /// naive at S∈{512..4096}. (A Tier-B FA2-class CUDA-C peer for the %-of-FA2 number is the follow-up;
+    /// this nails the Tier-A win first.)
     ///
-    /// Correctness gates speed (the first law): both `naive_attn` and `flash_d64_m` are first cross-checked
+    /// Correctness gates speed (the first law): both `naive_attn` and `flash_d64_mp` are first cross-checked
     /// against the f64 `ref_attn` oracle, and at every S their output checksums must agree. Same-run only
     /// (the ~7× laptop clock swing makes cross-run flash numbers meaningless): a clock warmup + `best_of`.
     /// Needs the NVRTC redist DLL on PATH; skips (never fails) if absent. Run:
@@ -5510,7 +5514,7 @@ mod tests {
             const ROUNDS: usize = 5;
 
             let f_m = g
-                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp")
                 .unwrap();
             let to16 =
                 |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
