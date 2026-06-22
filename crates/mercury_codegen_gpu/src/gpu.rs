@@ -1552,6 +1552,10 @@ pub struct ResidentLayerF16 {
     /// epilogues buy. The fused [`forward_device`](Self::forward_device) never launches them.
     f_act: CudaFunction,
     f_vadd: CudaFunction,
+    /// Multi-head layout shims (`ptx::HEAD_TRANSPOSE_PTX`): forward f32 `[S,H·dh]`→f16 `[H,S,dh]` (cast
+    /// folded in) and inverse f32 `[H,S,dh]`→f32 `[S,H·dh]`. Launched only when `heads > 1`.
+    f_qkv_trans: CudaFunction,
+    f_attn_trans: CudaFunction,
     wq: cudarc::driver::CudaSlice<half::f16>,
     wk: cudarc::driver::CudaSlice<half::f16>,
     wv: cudarc::driver::CudaSlice<half::f16>,
@@ -1560,6 +1564,10 @@ pub struct ResidentLayerF16 {
     w2: cudarc::driver::CudaSlice<half::f16>,
     s: usize,
     d: usize,
+    /// Attention heads and per-head dim `dh = d / heads` (the flash head dim). `heads == 1` is the
+    /// original single-head layer (`dh == d`); `heads > 1` runs the tensor-core flash per head.
+    heads: usize,
+    dh: usize,
     dff: usize,
     eps: f32,
 }
@@ -1567,12 +1575,32 @@ pub struct ResidentLayerF16 {
 impl ResidentLayerF16 {
     /// Upload the weights (narrowed to f16) and preload the kernels — the one-time, `&mut Gpu` setup.
     /// The three WMMA entries (`_sm_db`, `_sm_db_silu`, `_sm_db_residual`) share one JITed module.
+    /// Single-head layer — the original API, unchanged. Delegates to [`new_mha`](Self::new_mha) with
+    /// `heads = 1` (`dh == d`), preserving every existing caller and the original attention path.
     pub fn new(
         g: &mut Gpu,
         w: &TransformerWeights,
         s: usize,
         d: usize,
         dff: usize,
+    ) -> Result<Self, DriverError> {
+        Self::new_mha(g, w, s, d, dff, 1)
+    }
+
+    /// **Multi-head** pre-norm layer: `heads` attention heads of `dh = d / heads`. The QKV/O projections
+    /// are still the full `[D,D]` GEMMs (heads are a reinterpretation of the `D` columns); only attention
+    /// runs per-head. Multi-head (`heads > 1`) requires the **tensor-core flash** (`dh == 64`, `S ≥ 512`,
+    /// `S % 16 == 0`): that kernel carries the `grid.y = head` offset (`hoff = ctaid.y·S·dh`), while the
+    /// f32 fallback flash is single-head only. `heads == 1` is the original single-head layer (`dh == d`,
+    /// any supported flash head dim). Q/K/V are bridged token-major↔head-major by the
+    /// [`HEAD_TRANSPOSE_PTX`](crate::ptx::HEAD_TRANSPOSE_PTX) shims, so the flash kernel stays untouched.
+    pub fn new_mha(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
     ) -> Result<Self, DriverError> {
         use half::f16;
         for (name, wt, len) in [
@@ -1589,16 +1617,24 @@ impl ResidentLayerF16 {
             s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
             "ResidentLayerF16 needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
         );
+        assert!(heads >= 1 && d % heads == 0, "d={d} must be divisible by heads={heads}");
+        let dh = d / heads;
         assert!(
-            crate::ptx_flash::SUPPORTED_D.contains(&d),
-            "ResidentLayerF16: head dim {d} unsupported by flash (need {:?})",
+            crate::ptx_flash::SUPPORTED_D.contains(&dh),
+            "ResidentLayerF16: head dim dh={dh} (d={d}/heads={heads}) unsupported by flash (need {:?})",
             crate::ptx_flash::SUPPORTED_D
+        );
+        assert!(
+            heads == 1 || wmma_flash_applies(dh, s),
+            "multi-head (heads={heads}) needs the tensor-core flash: dh must be 64, S>=512, S%16==0 (got dh={dh}, S={s})"
         );
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
-        let (flash_name, flash_cfg) = flash_plan(d, s);
+        let f_qkv_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "cast_transpose_qkv")?;
+        let f_attn_trans = g.function("htrans", crate::ptx::HEAD_TRANSPOSE_PTX, "transpose_attn_out")?;
+        let (flash_name, flash_cfg) = flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
-        let f_flash_w = if wmma_flash_applies(d, s) {
+        let f_flash_w = if wmma_flash_applies(dh, s) {
             let f = g.function("flash", crate::ptx_flash::flash_ptx(), wmma_flash_entry(s))?;
             Some((f, wmma_flash_cfg(s)))
         } else {
@@ -1630,6 +1666,8 @@ impl ResidentLayerF16 {
             f_resid,
             f_act,
             f_vadd,
+            f_qkv_trans,
+            f_attn_trans,
             wq,
             wk,
             wv,
@@ -1638,6 +1676,8 @@ impl ResidentLayerF16 {
             w2,
             s,
             d,
+            heads,
+            dh,
             dff,
             eps: 1e-5,
         })
@@ -1657,38 +1697,90 @@ impl ResidentLayerF16 {
         Ok(dst)
     }
 
-    /// `O = softmax(scale·Q·Kᵀ)·V` over the resident f32 Q/K/V. Dispatches the **tensor-core** flash
-    /// (`f_flash_w`, casting Q/K/V to f16) when [`wmma_flash_applies`], else the f32 `f_flash` (untiled
-    /// or SMEM-tiled). Returns a fresh f32 `attn` buffer. The seam both forward paths share.
+    /// f32 `[S, H·dh]` (token-major) → f16 `[H, S, dh]` (head-major) — the layout the tensor-core flash
+    /// reads, with the f32→f16 narrowing folded in (`cast_transpose_qkv`). One pass for each of Q/K/V.
+    fn cast_transpose(
+        &self,
+        src: &cudarc::driver::CudaSlice<f32>,
+    ) -> Result<cudarc::driver::CudaSlice<half::f16>, DriverError> {
+        let n = self.s * self.d;
+        let mut dst = self.stream.alloc_zeros::<half::f16>(n)?;
+        let (nn, dd, dhh, sdh) =
+            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let mut b = self.stream.launch_builder(&self.f_qkv_trans);
+        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
+    }
+
+    /// f32 `[H, S, dh]` (the flash output, head-major) → f32 `[S, H·dh]` (token-major) — the layout the
+    /// O-projection GEMM consumes (`transpose_attn_out`).
+    fn transpose_back(
+        &self,
+        src: &cudarc::driver::CudaSlice<f32>,
+    ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
+        let n = self.s * self.d;
+        let mut dst = self.stream.alloc_zeros::<f32>(n)?;
+        let (nn, dd, dhh, sdh) =
+            (n as u32, self.d as u32, self.dh as u32, (self.s * self.dh) as u32);
+        let mut b = self.stream.launch_builder(&self.f_attn_trans);
+        b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut dst);
+        unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+        Ok(dst)
+    }
+
+    /// `O = softmax(scale·Q·Kᵀ)·V` over the resident f32 Q/K/V `[S,D]`, returning a fresh f32 `[S,D]`;
+    /// `scale = 1/√dh`. **Single-head** (`heads == 1`): the original path — cast Q/K/V to f16 for the
+    /// tensor-core flash, or run the f32 flash directly. **Multi-head** (`heads > 1`): cast-transpose
+    /// Q/K/V to head-major f16 `[H,S,dh]`, run the tensor-core flash with `grid.y = heads` (each head an
+    /// independent CTA column via the kernel's `hoff = ctaid.y·S·dh`), then transpose the `[H,S,dh]`
+    /// output back to `[S,D]`. The seam both forward paths share.
     fn run_attn(
         &self,
         q: &cudarc::driver::CudaSlice<f32>,
         k: &cudarc::driver::CudaSlice<f32>,
         v: &cudarc::driver::CudaSlice<f32>,
         s: usize,
-        d: usize,
+        _d: usize,
     ) -> Result<cudarc::driver::CudaSlice<f32>, DriverError> {
-        let scale = 1.0f32 / (d as f32).sqrt();
+        let scale = 1.0f32 / (self.dh as f32).sqrt();
         let ss = s as u32;
-        let mut attn = self.stream.alloc_zeros::<f32>(s * d)?;
-        if let Some((f_w, cfg_w)) = &self.f_flash_w {
-            let q16 = self.cast16(q, s * d)?;
-            let k16 = self.cast16(k, s * d)?;
-            let v16 = self.cast16(v, s * d)?;
-            let mut bld = self.stream.launch_builder(f_w);
-            bld.arg(&ss)
-                .arg(&scale)
-                .arg(&q16)
-                .arg(&k16)
-                .arg(&v16)
-                .arg(&mut attn);
-            unsafe { bld.launch(*cfg_w)? };
+        if self.heads == 1 {
+            let mut attn = self.stream.alloc_zeros::<f32>(s * self.d)?;
+            if let Some((f_w, cfg_w)) = &self.f_flash_w {
+                let q16 = self.cast16(q, s * self.d)?;
+                let k16 = self.cast16(k, s * self.d)?;
+                let v16 = self.cast16(v, s * self.d)?;
+                let mut bld = self.stream.launch_builder(f_w);
+                bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut attn);
+                unsafe { bld.launch(*cfg_w)? };
+            } else {
+                let mut bld = self.stream.launch_builder(&self.f_flash);
+                bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
+                unsafe { bld.launch(self.flash_cfg)? };
+            }
+            Ok(attn)
         } else {
-            let mut bld = self.stream.launch_builder(&self.f_flash);
-            bld.arg(&ss).arg(&scale).arg(q).arg(k).arg(v).arg(&mut attn);
-            unsafe { bld.launch(self.flash_cfg)? };
+            // Multi-head: the WMMA flash is guaranteed present (asserted in new_mha). Q/K/V are
+            // cast-transposed to head-major f16, flashed with grid.y = heads, then transposed back.
+            let (f_w, _) = self
+                .f_flash_w
+                .as_ref()
+                .expect("multi-head requires the tensor-core flash");
+            let q_hsd = self.cast_transpose(q)?;
+            let k_hsd = self.cast_transpose(k)?;
+            let v_hsd = self.cast_transpose(v)?;
+            let mut attn_hsd = self.stream.alloc_zeros::<f32>(s * self.d)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((s / 16) as u32, self.heads as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut bld = self.stream.launch_builder(f_w);
+            bld.arg(&ss).arg(&scale).arg(&q_hsd).arg(&k_hsd).arg(&v_hsd).arg(&mut attn_hsd);
+            unsafe { bld.launch(cfg)? };
+            self.transpose_back(&attn_hsd)
         }
-        Ok(attn)
     }
 
     /// Run the layer on a **resident** `[S,D]` f32 activation buffer, returning a fresh resident `[S,D]`
@@ -4190,6 +4282,54 @@ mod tests {
         x1.iter().zip(&f2).map(|(&a, &b)| a + b).collect()
     }
 
+    /// CPU f64 reference for the **multi-head** fp16 layer — identical to [`ref_transformer_layer_f16`]
+    /// but attention runs per-head over the `D` columns split into `heads` blocks of `dh = d/heads`:
+    /// each head gathers `q/k/v[:, h·dh .. (h+1)·dh]` into a contiguous `[S,dh]`, runs the single-head
+    /// `ref_attn` at `scale = 1/√dh`, and scatters the result back into `a[:, h·dh ..]`. `heads == 1`
+    /// reduces exactly to [`ref_transformer_layer_f16`].
+    fn ref_transformer_layer_f16_mha(
+        x: &[f32],
+        w: &TransformerWeights,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
+    ) -> Vec<f32> {
+        let eps = 1e-5f32;
+        let round = |v: f32| half::f16::from_f32(v).to_f32();
+        let dh = d / heads;
+        let h1 = ref_rmsnorm(x, s, d, eps);
+        let q = ref_nt_rounded(&h1, w.wq, s, d, d, round);
+        let k = ref_nt_rounded(&h1, w.wk, s, d, d, round);
+        let v = ref_nt_rounded(&h1, w.wv, s, d, d, round);
+        let mut a = vec![0.0f32; s * d];
+        let scale = 1.0 / (dh as f32).sqrt();
+        for head in 0..heads {
+            let (mut qh, mut kh, mut vh) =
+                (vec![0.0f32; s * dh], vec![0.0f32; s * dh], vec![0.0f32; s * dh]);
+            for row in 0..s {
+                for i in 0..dh {
+                    qh[row * dh + i] = q[row * d + head * dh + i];
+                    kh[row * dh + i] = k[row * d + head * dh + i];
+                    vh[row * dh + i] = v[row * d + head * dh + i];
+                }
+            }
+            let ah = ref_attn(&qh, &kh, &vh, s, dh, scale);
+            for row in 0..s {
+                for i in 0..dh {
+                    a[row * d + head * dh + i] = ah[row * dh + i];
+                }
+            }
+        }
+        let o = ref_nt_rounded(&a, w.wo, s, d, d, round);
+        let x1: Vec<f32> = x.iter().zip(&o).map(|(&p, &q)| p + q).collect();
+        let h2 = ref_rmsnorm(&x1, s, d, eps);
+        let f1 = ref_nt_rounded(&h2, w.w1, s, d, dff, round);
+        let f1act: Vec<f32> = f1.iter().map(|&z| ref_silu(z)).collect();
+        let f2 = ref_nt_rounded(&f1act, w.w2, s, dff, d, round);
+        x1.iter().zip(&f2).map(|(&p, &q)| p + q).collect()
+    }
+
     /// CPU f64 reference for [`ResidentModelF16`] — apply the per-layer f16 reference N times, each
     /// layer's output feeding the next (exactly what the resident stack does on the device).
     fn ref_model_f16(
@@ -4281,6 +4421,39 @@ mod tests {
                 bits(&again),
                 "GPU-resident transformer layer must be deterministic"
             );
+        });
+    }
+
+    /// **Multi-head layer gate** — `ResidentLayerF16::new_mha` at the real GPT-2 shape (D=768, **H=12**
+    /// heads of dh=64) vs the per-head f64 reference. Exercises the full multi-head path: QKV projections,
+    /// the `cast_transpose_qkv` token→head-major shim, the `grid.y=12` tensor-core flash, the
+    /// `transpose_attn_out` shim back, and the fused O-proj/FFN. S=512 (the tensor-core flash minimum).
+    /// Tolerance is the f16-GEMM band; also re-asserts run-to-run determinism (fixed grids, no atomics).
+    #[test]
+    fn transformer_layer_mha_matches_reference_within_tol() {
+        with_gpu("transformer_layer_mha", |g| {
+            let mut rng = crate::diff::Rng::new(0x6457A);
+            let (s, d, dff, heads) = (512usize, 768usize, 1024usize, 12usize); // GPT-2: 12 heads × 64
+            let x = rng.vec(s * d, -1.0, 1.0);
+            let wq = rng.vec(d * d, -0.1, 0.1);
+            let wk = rng.vec(d * d, -0.1, 0.1);
+            let wv = rng.vec(d * d, -0.1, 0.1);
+            let wo = rng.vec(d * d, -0.1, 0.1);
+            let w1 = rng.vec(dff * d, -0.1, 0.1);
+            let w2 = rng.vec(d * dff, -0.1, 0.1);
+            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+            let got = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap().forward(&x).unwrap();
+            let oracle = ref_transformer_layer_f16_mha(&x, &w, s, d, dff, heads);
+            let st = crate::diff::assert_close("transformer_layer_mha", &got, &oracle, 3e-2, 3e-2);
+            eprintln!(
+                "transformer_layer_mha S={s} D={d} H={heads} dh={} Dff={dff}: max_abs={:.2e} max_rel={:.2e}",
+                d / heads,
+                st.max_abs,
+                st.max_rel
+            );
+            let again = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap().forward(&x).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|z| z.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&again), "multi-head layer must be deterministic");
         });
     }
 
