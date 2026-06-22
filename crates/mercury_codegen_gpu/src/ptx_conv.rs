@@ -347,9 +347,15 @@ RET:
 // multiples are zero-padded by the staging guards and masked at the store, so any shape is legal.
 
 /// WMMA implicit-GEMM CTA output-tile rows (M = output channels K direction).
-pub const WMMA_BM: usize = 32;
+pub const WMMA_BM: usize = 64;
 /// WMMA implicit-GEMM CTA output-tile cols (N = output spatial P*Q direction).
-pub const WMMA_BN: usize = 32;
+pub const WMMA_BN: usize = 64;
+/// Warp grid in the M direction (each warp owns `WMMA_BM/WMMA_WM` rows).
+pub const WMMA_WM: usize = 2;
+/// Warp grid in the N direction (each warp owns `WMMA_BN/WMMA_WN` cols). Power of two (`warpCol` via mask).
+pub const WMMA_WN: usize = 2;
+/// CTA thread count for the WMMA implicit-GEMM conv (one warp per (WM,WN) cell).
+pub const WMMA_THREADS: usize = WMMA_WM * WMMA_WN * 32;
 
 /// Whether the fp16 tensor-core implicit-GEMM conv is worth dispatching for this shape. It is *correct*
 /// for any valid conv (guards zero-pad partial tiles), but only pays off once the GEMM has enough
@@ -365,9 +371,10 @@ pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) 
 }
 
 /// Emit the fp16 tensor-core implicit-GEMM conv specialized to `[C,H,W] (*) [K,C,R,S] -> [K,P,Q]`.
-/// Entry `conv2d_wmma`. **Inputs are f16** (`X`,`W`); output is f32. One warp per CTA owns a
-/// `WMMA_BM x WMMA_BN` output tile as a `2x2` grid of `m16n16k16` tiles. Launch with block `(32,1,1)`
-/// and grid `(ceil(N/WMMA_BN), ceil(M/WMMA_BM), 1)` where `M=K`, `N=P*Q`.
+/// Entry `conv2d_wmma`. **Inputs are f16** (`X`,`W`); output is f32. A CTA of `WMMA_WM×WMMA_WN` warps
+/// stages a `WMMA_BM×16` weight tile and a `16×WMMA_BN` im2col tile into SMEM each K-step (reused by
+/// all warps), then every warp computes its `tm×tn` grid of `m16n16k16` tiles out of SMEM. Launch with
+/// block `(WMMA_THREADS,1,1)` and grid `(ceil(N/WMMA_BN), ceil(M/WMMA_BM), 1)` where `M=K`, `N=P*Q`.
 pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
     use std::fmt::Write as _;
     let p = h - r + 1;
@@ -378,11 +385,17 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let rs = r * s;
     let hw = h * w;
     let (bm, bn) = (WMMA_BM, WMMA_BN);
-    let tm = bm / 16; // 2
-    let tn = bn / 16; // 2
-    let a_per = bm * 16 / 32; // A elements staged per thread (BM*BK / 32 threads)
-    let b_per = 16 * bn / 32; // B elements staged per thread
-    let c_per = bm * bn / 32; // C elements written per thread
+    let (warps_m, warps_n) = (WMMA_WM, WMMA_WN);
+    let threads = WMMA_THREADS;
+    let wm = bm / warps_m; // rows owned by a warp
+    let wn = bn / warps_n; // cols owned by a warp
+    let tm = wm / 16; // 16×16 tiles per warp, M
+    let tn = wn / 16; // 16×16 tiles per warp, N
+    let wn_shift = warps_n.trailing_zeros(); // warpId / warps_n
+    let bn_shift = bn.trailing_zeros();
+    let a_per = bm * 16 / threads; // A elements staged per thread
+    let b_per = 16 * bn / threads; // B elements staged per thread
+    let c_per = bm * bn / threads; // C elements written per thread
     let smem_a = bm * 16 * 2; // f16 bytes
     let smem_b = 16 * bn * 2;
     let smem_c = bm * bn * 4; // f32 store scratch
@@ -398,7 +411,7 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b, ".address_size 64");
     let _ = writeln!(b);
     let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv: C{c} H{h} W{w} K{k} R{r} S{s}");
-    let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn} (one warp, 2x2 m16n16k16)");
+    let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}");
     let _ = writeln!(b, ".visible .entry conv2d_wmma(");
     let _ = writeln!(b, "    .param .u64 pXin,");
     let _ = writeln!(b, "    .param .u64 pWt,");
@@ -412,7 +425,7 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b, "    .reg .b16 %hv;");
     let _ = writeln!(
         b,
-        "    .reg .b32 %tix,%m0,%n0,%kt,%e,%li,%mm,%gkk,%ncol,%gkv,%nn,%cc,%rem,%rr,%ss,%pp,%qq,%ih,%iw,%xidx,%widx,%tmp,%tmp2,%saddr;"
+        "    .reg .b32 %tix,%m0,%n0,%kt,%e,%mm,%gkk,%ncol,%gkv,%nn,%cc,%rem,%rr,%ss,%pp,%qq,%ih,%iw,%xidx,%widx,%tmp,%tmp2,%saddr,%warpId,%wrb,%wcb;"
     );
     // accumulator + a/b fragments
     let mut decl = String::new();
@@ -448,6 +461,12 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b, "    mul.lo.s32 %m0,%tmp,{bm};      // CTA row base (M)");
     let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.x;");
     let _ = writeln!(b, "    mul.lo.s32 %n0,%tmp,{bn};      // CTA col base (N)");
+    // warp partition: warpId -> (warpRow, warpCol); warpRowBase = warpRow*wm, warpColBase = warpCol*wn
+    let _ = writeln!(b, "    shr.u32 %warpId,%tix,5;");
+    let _ = writeln!(b, "    shr.u32 %tmp,%warpId,{wn_shift};       // warpRow");
+    let _ = writeln!(b, "    mul.lo.s32 %wrb,%tmp,{wm};            // warpRowBase");
+    let _ = writeln!(b, "    and.b32 %tmp,%warpId,{};             // warpCol", warps_n - 1);
+    let _ = writeln!(b, "    mul.lo.s32 %wcb,%tmp,{wn};            // warpColBase");
     // zero accumulators
     for ti in 0..tm {
         for tj in 0..tn {
@@ -463,7 +482,7 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b);
     let _ = writeln!(b, "    // ---- stage A (weights [M,GK]) into smemA[BM][16] ----");
     for li in 0..a_per {
-        let off = li * 32;
+        let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
         let _ = writeln!(b, "    shr.u32 %mm,%e,4;             // m = e/16");
         let _ = writeln!(b, "    and.b32 %gkk,%e,15;          // gkk = e%16");
@@ -485,9 +504,9 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b);
     let _ = writeln!(b, "    // ---- stage B (im2col of X) into smemB[16][BN] ----");
     for li in 0..b_per {
-        let off = li * 32;
+        let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
-        let _ = writeln!(b, "    shr.u32 %gkk,%e,{};          // gkk = e/BN", bn.trailing_zeros());
+        let _ = writeln!(b, "    shr.u32 %gkk,%e,{bn_shift};          // gkk = e/BN");
         let _ = writeln!(b, "    and.b32 %ncol,%e,{};         // ncol = e%BN", bn - 1);
         let _ = writeln!(b, "    add.u32 %gkv,%kt,%gkk;       // gk = gk0+gkk");
         let _ = writeln!(b, "    add.u32 %nn,%n0,%ncol;       // n = n0+ncol");
@@ -517,21 +536,25 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     }
     let _ = writeln!(b);
     let _ = writeln!(b, "    bar.sync 0;");
-    // load A fragments (row, ldm=16)
+    // load A fragments (row, ldm=16): warp row base = warpRowBase + ti*16
     let _ = writeln!(b, "    mov.u32 %tmp,16;");
     for ti in 0..tm {
-        let _ = writeln!(b, "    mov.u32 %tmp2,smemA;");
-        let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,{};", ti * 16 * 16 * 2);
+        let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};        // smem row = warpRowBase+{}", ti * 16, ti * 16);
+        let _ = writeln!(b, "    mul.lo.s32 %tmp2,%tmp2,32;    // *16*2 bytes");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemA;");
+        let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
         let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
         let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
         let ra = veclist(&format!("a{ti}_"));
         let _ = writeln!(b, "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;");
     }
-    // load B fragments (row, ldm=BN)
+    // load B fragments (row, ldm=BN): warp col base = warpColBase + tj*16
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for tj in 0..tn {
-        let _ = writeln!(b, "    mov.u32 %tmp2,smemB;");
-        let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,{};", tj * 16 * 2);
+        let _ = writeln!(b, "    add.u32 %tmp2,%wcb,{};        // smem col = warpColBase+{}", tj * 16, tj * 16);
+        let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,1;        // *2 bytes");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemB;");
+        let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
         let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
         let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
         let rb = veclist(&format!("b{tj}_"));
@@ -552,13 +575,17 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b, "    add.u32 %kt,%kt,16;");
     let _ = writeln!(b, "    bra KLOOP;");
     let _ = writeln!(b, "KEND:");
-    // store each tile to smemC (row-major BM x BN, ldm=BN), then guarded copy to global O.
+    // store each warp tile to smemC[BM][BN] (ldm=BN) at (warpRowBase+ti*16, warpColBase+tj*16).
     let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
     for ti in 0..tm {
         for tj in 0..tn {
-            let _ = writeln!(b, "    mov.u32 %tmp2,smemC;");
-            let elem = (ti * 16) * bn + tj * 16;
-            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,{};", elem * 4);
+            let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};        // row = warpRowBase+{}", ti * 16, ti * 16);
+            let _ = writeln!(b, "    mul.lo.s32 %tmp2,%tmp2,{bn};   // row*BN");
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%wcb;     // + warpColBase");
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,{};        // + tj*16", tj * 16);
+            let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,2;        // *4 bytes");
+            let _ = writeln!(b, "    mov.u32 %saddr,smemC;");
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
             let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
             let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
             let cc = veclist(&format!("c{ti}_{tj}_"));
@@ -567,9 +594,9 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     }
     let _ = writeln!(b, "    bar.sync 0;");
     for li in 0..c_per {
-        let off = li * 32;
+        let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
-        let _ = writeln!(b, "    shr.u32 %mm,%e,{};           // m = e/BN", bn.trailing_zeros());
+        let _ = writeln!(b, "    shr.u32 %mm,%e,{bn_shift};           // m = e/BN");
         let _ = writeln!(b, "    and.b32 %ncol,%e,{};         // n = e%BN", bn - 1);
         let _ = writeln!(b, "    add.u32 %tmp,%m0,%mm;        // gm");
         let _ = writeln!(b, "    add.u32 %nn,%n0,%ncol;       // gn");
