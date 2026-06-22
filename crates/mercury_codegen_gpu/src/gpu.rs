@@ -461,24 +461,30 @@ pub fn gemm_nt_f16(
         m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
         "WMMA requires 16-multiple dims"
     );
-    // Regime-aware dispatch among the SMEM-staged kernels (all identical numerics; chosen by same-run,
-    // best-of-N measurement on the RTX 4050). The binding constraint flips with the A+B working set vs
-    // L2 (~24 MB on this part):
-    //   • L2-resident (≤1024³, ~4 MB): cp.async pipelining wins — the 64×64 double-buffered kernel
-    //     reaches ~99% of cuBLAS at 1024³.
-    //   • Spills L2 (≳24 MB, e.g. 4096³ ≈ 67 MB): the GEMM goes occupancy-bound and the pipeline's
-    //     extra SMEM + bar.syncs make it LOSE — the single-buffered 128 tile (big tile halves redundant
-    //     inter-CTA traffic, no pipeline overhead) is best (4096³: 35% of cuBLAS vs db's 28%, same-run).
-    //   • In between (~2048³, L2-fitting): the 128 double-buffered pipeline still edges ahead.
+    // Regime-aware dispatch among the multi-stage `cp.async` pipeline kernels (all numerically identical;
+    // winners picked by `gemm_pipe_sweep`, same-run vs cuBLAS at full clock). The binding constraint flips
+    // with the A+B working set vs the 24 MB L2 (see `PIPE_VARIANTS`):
+    //   • L2-resident: a DEEP BK=16 pipeline wins (latency is low; depth keeps the tensor cores fed) —
+    //     `pipe_64_s6` ≤1024³ (~90% of cuBLAS), `pipe_128_s4` ~2048³ (~94%).
+    //   • L2-thrashing (≳64 MB, e.g. 4096³ ≈ 134 MB): WIDE BK=32 + a big tile wins (amortize the
+    //     barrier/commit overhead, cut redundant inter-CTA traffic); the BK=16 pipes *collapse* there.
+    //     `pipe_256x64_bk32_s2` (~62%), `pipe_128_bk32_s2` as the %128 fallback.
+    // Anything not matching a pipeline variant's divisibility falls through to the older SMEM kernels.
+    use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
+    if ws_bytes >= 64 * 1024 * 1024 && k % 32 == 0 {
+        if m % 256 == 0 && n % 64 == 0 {
+            return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_256x64_bk32_s2"));
+        }
+        if m % 128 == 0 && n % 128 == 0 {
+            return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_128_bk32_s2"));
+        }
+    }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
-        return gemm_nt_f16_sm_db(g, a, b, m, k, n);
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));
     }
-    if ws_bytes >= 24 * 1024 * 1024 && m % SM128_BM == 0 && n % SM128_BN == 0 {
-        return gemm_nt_f16_sm128(g, a, b, m, k, n);
-    }
-    if m >= 2048 && n >= 2048 && m % SM128_BM == 0 && n % SM128_BN == 0 {
-        return gemm_nt_f16_sm128_db(g, a, b, m, k, n);
+    if m % SM128_BM == 0 && n % SM128_BN == 0 {
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_128_s4"));
     }
     if m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_sm(g, a, b, m, k, n);
@@ -882,6 +888,51 @@ pub fn gemm_nt_f16_sm128_db(
         .arg(&b_d)
         .arg(&mut c_d);
     unsafe { bld.launch(wmma_sm128_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Launch config for a multi-stage `cp.async` pipeline variant (`entry_smem_pipe`): `v.threads()` per
+/// CTA, one CTA per `bm×bn` output tile. Applies when `M%bm==0 && N%bn==0 && K%bk==0`.
+fn pipe_cfg(v: &crate::ptx_wmma::PipeCfg, m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n / v.bn) as u32, (m / v.bm) as u32, 1),
+        block_dim: (v.threads() as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `C = A·Bᵀ` (fp16-in, f32-out) via a **multi-stage `cp.async` pipeline** variant `v` — the
+/// large-GEMM-cliff path. `v` selects the macro-tile / staged-BK / pipeline-depth (see
+/// [`crate::ptx_wmma::PipeCfg`] and [`crate::ptx_wmma::PIPE_VARIANTS`]); all share the precision-generic
+/// `entry_smem_pipe` generator and are numerically identical to the other WMMA GEMMs (f32 accumulate).
+/// Requires `M%v.bm==0`, `N%v.bn==0`, `K%v.bk==0`; tolerance-gated.
+pub fn gemm_nt_f16_pipe(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    v: &crate::ptx_wmma::PipeCfg,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        "{} requires M%{}==0, N%{}==0, K%{}==0",
+        v.name, v.bm, v.bn, v.bk
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name)?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(pipe_cfg(v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -2420,6 +2471,50 @@ mod tests {
                     "wmma_f16_sm128_db {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
                     s.max_abs, s.max_rel
                 );
+            }
+        });
+    }
+
+    /// Every multi-stage `cp.async` pipeline variant (`entry_smem_pipe`, the large-GEMM-cliff lever) must
+    /// match the f16-rounded f64 reference to the same tolerance as the other WMMA GEMMs — they compute
+    /// identical math, only with a deeper SMEM ring and (some) a wider staged BK. Per-variant shapes
+    /// (divisible by that variant's bm/bn/bk) deliberately stress the corners the pipeline math is most
+    /// likely to get wrong: a **single K-tile** (the prologue guards every prefetch but tile 0), a couple
+    /// K-tiles, a **deep steady-state K with more tiles than stages** (the ring-buffer offset wrap), and a
+    /// rectangular multi-CTA shape (per-warp store indexing + 256/128-thread vectorized staging).
+    #[test]
+    fn wmma_pipe_matches_reference_within_tol() {
+        use crate::ptx_wmma::PIPE_VARIANTS;
+        use half::f16;
+        with_gpu("wmma_pipe", |g| {
+            let mut rng = crate::diff::Rng::new(0x9176);
+            for v in PIPE_VARIANTS {
+                assert!(
+                    v.smem_bytes() <= 48 * 1024,
+                    "{}: {}B static SMEM exceeds 48 KiB",
+                    v.name,
+                    v.smem_bytes()
+                );
+                let shapes = [
+                    (v.bm, v.bk, v.bn),                          // 1 CTA, 1 K-tile (full prologue guard)
+                    (v.bm, v.bk * 2, v.bn),                      // 1 CTA, 2 K-tiles
+                    (2 * v.bm, v.bk * (v.stages + 3), 2 * v.bn), // 4 CTAs, ring wrap (K-tiles > stages)
+                    (v.bm, v.bk * (v.stages + 1), 3 * v.bn),     // rectangular, multi-tile
+                ];
+                for (m, k, n) in shapes {
+                    let a = rng.vec(m * k, -1.0, 1.0);
+                    let b = rng.vec(n * k, -1.0, 1.0);
+                    let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                    let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v).unwrap();
+                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
+                    eprintln!(
+                        "{} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e} (smem={}B)",
+                        v.name,
+                        s.max_abs,
+                        s.max_rel,
+                        v.smem_bytes()
+                    );
+                }
             }
         });
     }
@@ -5347,6 +5442,111 @@ mod tests {
                     g_naive / 1e9,
                     roof / 1e9, 100.0 * g_sm128s / roof, 100.0 * g_sm128 / roof, 100.0 * g_cub / roof,
                 );
+            }
+        });
+    }
+
+    /// **Multi-stage `cp.async` pipeline sweep** — the large-GEMM-cliff lever, measured same-run against
+    /// cuBLAS at 1024³/2048³/4096³. Every [`crate::ptx_wmma::PIPE_VARIANTS`] entry (depth × staged-BK ×
+    /// macro-tile) whose dims divide the size is timed back-to-back with cuBLAS using the identical clock
+    /// warmup + `best_of` peak-clock sampling as [`gemm_vs_peers`], so each %-of-cuBLAS is clock-invariant.
+    /// This is the diagnostic that picks the per-size winner the `gemm_nt_f16` dispatch then routes to.
+    ///
+    /// Correctness gates speed (first law): each variant is cross-checked against the f64 oracle at a small
+    /// shape, and at every timing size all variants' checksums must agree with cuBLAS. Needs the cuBLAS
+    /// redist DLL on PATH; skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture gemm_pipe_sweep`.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn gemm_pipe_sweep() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
+        use crate::ptx_wmma::PIPE_VARIANTS;
+        use half::f16;
+        with_gpu("gemm_pipe_sweep", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] gemm_pipe_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+
+            // --- Correctness first: every variant matches the f64 oracle at a small valid shape. ---
+            let mut rng = crate::diff::Rng::new(0x5177E);
+            for v in PIPE_VARIANTS {
+                let (m, k, n) = (v.bm * 2, v.bk * (v.stages + 2), v.bn * 2);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let r = ref_nt(&a, &b, m, k, n);
+                let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v).unwrap();
+                crate::diff::assert_close(&format!("{} gate", v.name), &c, &r, 5e-2, 2e-2);
+            }
+            eprintln!("[gate] all {} pipe variants match the f64 oracle ✓", PIPE_VARIANTS.len());
+
+            // --- Clock warmup (same-run peak-vs-peak; cf. gemm_vs_peers). ---
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            // Each variant's cuBLAS baseline is sampled *adjacent* to it via `best_pair` (not once for the
+            // whole sweep), so a parallel session sharing the GPU can't make a stale baseline inflate or
+            // deflate the ratio (the run-to-run swing this sweep exposed). More rounds → more chances to
+            // catch a low-contention sample for both.
+            const ROUNDS: usize = 6;
+
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a16_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let cs_c = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+
+                eprintln!("\n{sz}³ fp16 GEMM pipe sweep (same-run, cuBLAS-adjacent best_pair):");
+                let mut best: Option<(&str, f64)> = None;
+                for v in PIPE_VARIANTS {
+                    if m % v.bm != 0 || n % v.bn != 0 || k % v.bk != 0 {
+                        continue;
+                    }
+                    let f = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), v.name).unwrap();
+                    let cfg = pipe_cfg(v, m, n);
+                    // Interleave variant and cuBLAS round-by-round (inlined, not a 2-closure helper: the
+                    // variant borrows `g` shared via time_wmma, cuBLAS borrows it mutably — they can't be
+                    // captured by two live closures, but the sequential calls' borrows end at each return).
+                    let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..ROUNDS {
+                        s_v = s_v.min(time_wmma(g, &f, cfg, dims, &a16_d, &b16_d, &mut c_d, 50));
+                        s_cub = s_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap());
+                    }
+                    // Checksum cross-check at this size: the timed kernel computes cuBLAS's matrix.
+                    let cs = gemm_nt_f16_pipe(g, &a, &b, m, k, n, v).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                    assert!(
+                        (cs - cs_c).abs() / cs_c.max(1.0) < 3e-2,
+                        "{sz}³ {} checksum {cs:.3e} vs cuBLAS {cs_c:.3e}",
+                        v.name
+                    );
+                    let (gf, g_cub) = (flop / s_v, flop / s_cub);
+                    let pct = 100.0 * gf / g_cub;
+                    eprintln!(
+                        "  {:<30}: {:>7.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})  (smem={}KiB, {} warps)",
+                        v.name,
+                        gf / 1e9,
+                        pct,
+                        g_cub / 1e9,
+                        v.smem_bytes() / 1024,
+                        v.threads() / 32,
+                    );
+                    if best.map_or(true, |(_, p)| pct > p) {
+                        best = Some((v.name, pct));
+                    }
+                }
+                if let Some((name, pct)) = best {
+                    eprintln!("  → best @{sz}³: {name} at {pct:.1}% of cuBLAS");
+                }
             }
         });
     }
