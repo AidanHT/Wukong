@@ -446,6 +446,11 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
             decl += &format!("%b{tj}_{rr},");
         }
     }
+    // Per B-staging slot: the K-independent im2col decode (n=n0+ncol, and xpart=p*W+q) hoisted out of
+    // the K-loop -- each slot's (ncol) is fixed across K-steps, so p,q (a div+rem) need computing once.
+    for li in 0..b_per {
+        decl += &format!("%bnv{li},%bxp{li},");
+    }
     let _ = writeln!(b, "    .reg .f32 %cf;");
     let _ = writeln!(b, "    .reg .b32 {};", decl.trim_end_matches(','));
     let _ = writeln!(b, "    .reg .b64 %X,%W,%O,%off,%gp,%ptr;");
@@ -475,6 +480,17 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
             }
         }
     }
+    // Hoisted im2col decode: per B-staging slot compute nn=n0+ncol and xpart=p*W+q once (K-independent).
+    let _ = writeln!(b, "    // ---- hoist K-independent im2col decode (n -> p,q -> xpart) ----");
+    for li in 0..b_per {
+        let off = li * threads;
+        let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
+        let _ = writeln!(b, "    and.b32 %ncol,%e,{};         // ncol = e%BN", bn - 1);
+        let _ = writeln!(b, "    add.u32 %bnv{li},%n0,%ncol;   // nn = n0+ncol");
+        let _ = writeln!(b, "    div.u32 %pp,%bnv{li},{q};     // p = nn/Q");
+        let _ = writeln!(b, "    rem.u32 %qq,%bnv{li},{q};     // q = nn%Q");
+        let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{w},%qq;   // xpart = p*W + q");
+    }
     let _ = writeln!(b, "    mov.u32 %kt,0;              // gk0");
     let _ = writeln!(b, "KLOOP:");
     let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,{gk};");
@@ -502,29 +518,24 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
         let _ = writeln!(b, "    st.shared.u16 [%saddr],%hv;");
     }
     let _ = writeln!(b);
-    let _ = writeln!(b, "    // ---- stage B (im2col of X) into smemB[16][BN] ----");
+    let _ = writeln!(b, "    // ---- stage B (im2col of X) into smemB[16][BN]; n-decode is hoisted ----");
     for li in 0..b_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
         let _ = writeln!(b, "    shr.u32 %gkk,%e,{bn_shift};          // gkk = e/BN");
-        let _ = writeln!(b, "    and.b32 %ncol,%e,{};         // ncol = e%BN", bn - 1);
         let _ = writeln!(b, "    add.u32 %gkv,%kt,%gkk;       // gk = gk0+gkk");
-        let _ = writeln!(b, "    add.u32 %nn,%n0,%ncol;       // n = n0+ncol");
         let _ = writeln!(b, "    setp.lt.u32 %pv,%gkv,{gk};");
-        let _ = writeln!(b, "    setp.lt.u32 %p0,%nn,{n};");
+        let _ = writeln!(b, "    setp.lt.u32 %p0,%bnv{li},{n};   // nn<N (nn precomputed)");
         let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
-        // decode gk -> (c,r,s); n -> (p,q)
+        // decode only gk -> (c,r,s); (p,q) already folded into xpart=p*W+q.
         let _ = writeln!(b, "    div.u32 %cc,%gkv,{rs};       // c = gk/(R*S)");
         let _ = writeln!(b, "    rem.u32 %rem,%gkv,{rs};      // rem = gk%(R*S)");
         let _ = writeln!(b, "    div.u32 %rr,%rem,{s};        // r = rem/S");
         let _ = writeln!(b, "    rem.u32 %ss,%rem,{s};        // s = rem%S");
-        let _ = writeln!(b, "    div.u32 %pp,%nn,{q};         // p = n/Q");
-        let _ = writeln!(b, "    rem.u32 %qq,%nn,{q};         // q = n%Q");
-        let _ = writeln!(b, "    add.u32 %ih,%pp,%rr;         // ih = p+r");
-        let _ = writeln!(b, "    add.u32 %iw,%qq,%ss;         // iw = q+s");
-        let _ = writeln!(b, "    mad.lo.s32 %xidx,%cc,{hw},0;   // c*H*W");
-        let _ = writeln!(b, "    mad.lo.s32 %xidx,%ih,{w},%xidx;  // + ih*W");
-        let _ = writeln!(b, "    add.u32 %xidx,%xidx,%iw;     // + iw");
+        // xidx = c*H*W + (p+r)*W + (q+s) = c*H*W + xpart + r*W + s
+        let _ = writeln!(b, "    mad.lo.s32 %xidx,%cc,{hw},%bxp{li};   // c*H*W + xpart");
+        let _ = writeln!(b, "    mad.lo.s32 %xidx,%rr,{w},%xidx;  // + r*W");
+        let _ = writeln!(b, "    add.u32 %xidx,%xidx,%ss;     // + s");
         let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,2;");
         let _ = writeln!(b, "    add.s64 %ptr,%X,%off;");
         let _ = writeln!(b, "    mov.u16 %hv,0;");

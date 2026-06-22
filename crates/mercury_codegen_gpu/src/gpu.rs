@@ -3998,12 +3998,19 @@ mod tests {
         });
     }
 
-    /// **M6 for conv2d** — Mercury's SMEM-tiled, static-shape-specialized conv vs the **naive CUDA-C
-    /// conv** a programmer writes first (one thread per output, the whole `c,r,s` window streamed from
-    /// global), both JIT-loaded through the same driver and timed **same-run** over identical buffers.
-    /// Correctness gates speed: the naive peer is cross-checked against the f64 oracle, and Mercury's
-    /// tiled output is checksum-cross-checked against the peer at every shape before any ratio counts.
-    /// Needs the CUDA redist DLLs on PATH (see `gemm_vs_peers` / `peer_env_hint`).
+    /// **M6 for conv2d** — Mercury's fp16 tensor-core implicit-GEMM conv (and the f32 SMEM-tiled conv)
+    /// vs the **naive CUDA-C conv** a programmer writes first (one thread per output, the whole `c,r,s`
+    /// window streamed from global), all JIT-loaded through the same driver and timed **same-run** over
+    /// identical buffers. Correctness gates speed: the naive peer is cross-checked against the f64
+    /// oracle, and both Mercury kernels are checksum-cross-checked against the peer at every shape
+    /// before any ratio counts. Needs the CUDA redist DLLs on PATH (see `gemm_vs_peers` /
+    /// `peer_env_hint`).
+    ///
+    /// **cuDNN (Tier-B gold standard) status:** *not bound here.* `cudarc`'s cuDNN module needs the
+    /// cuDNN redist (separate from the NVRTC/cuBLAS wheels these benches already dlopen) and a fragile
+    /// descriptor-graph setup; rather than fake a peer, the honest headline is the **wide Tier-A win
+    /// over naive CUDA-C** (1.3–5.8× same-run across these shapes, ≥3 reruns). Binding cuDNN to report
+    /// a % is the next peer-side TODO.
     #[test]
     #[ignore = "throughput bench; needs CUDA NVRTC redist DLLs on PATH; run explicitly"]
     fn conv_vs_peers() {
