@@ -614,6 +614,16 @@ WMMA flash**, same-run (`flash_mma_vs_wmma`: `m/w4` 0.68×→0.17× across S=512
 context as the WMMA path's SMEM round-trips — store S → softmax → store P → store/accumulate O, 4 `bar.sync`s
 per key block — came to dominate).
 
+**Multi-head** (`grid.y = H`, the kernel folds head `ctaid.y`'s `[H,S,D]` base offset into the pointers —
+zero extra params, single-head stays `grid.y=1`). At small S one head's `S/16` blocks can't fill 36 SMs
+(S=512 → 32 warps total); batching the GPT-2 `H=12` heads does. Same-run (`flash_vs_peers`, so
+clock-invariant): multi-head holds a **flat ~860 GFLOP/s across S** while single-head climbs 117→438 at the
+same clock — i.e. multi-head is **7.4× / 3.7× / 2.0× the single-head throughput at S=512 / 1024 / 2048**,
+and **294–340× a naive multi-head CUDA-C flash**. The flat saturation says the filled GPU is then
+per-warp **latency**-bound (~860 GFLOP/s at that run's clock), which is also the residual ~60–77%-of-FA2
+gap: FA2 hides that latency with a `cp.async` software-pipelined K-loop + `ldmatrix` fragment loads, the
+documented next lever (this kernel's K/V come straight from global, unpipelined).
+
 **Whole transformer layer, GPU-resident.** A complete pre-norm encoder layer — RMSNorm → Q/K/V
 projections → flash-attention → output projection → residual → RMSNorm → FFN (SiLU) → residual —
 runs entirely on the device: inputs/weights upload once, every op reads/writes device buffers with no

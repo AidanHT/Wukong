@@ -5398,6 +5398,63 @@ mod tests {
                     g_m / g_n,
                 );
             }
+
+            // --- Multi-head (GPT-2 shape: H=12, dh=64): grid.y=H fills the GPU the single-head case
+            //     starves at small S. [H,S,D] layout; Mercury launches grid (S/16, H, 1). ---
+            let heads = 12usize;
+            for s in [512usize, 1024, 2048] {
+                let n = heads * s * d;
+                let qf = rng.vec(n, -1.0, 1.0);
+                let kf = rng.vec(n, -1.0, 1.0);
+                let vf = rng.vec(n, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q16 = g.stream.memcpy_stod(&to16(&qf)).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&kf)).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&vf)).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // checksum cross-check vs naive multi-head
+                {
+                    let mut bld = g.stream.launch_builder(&f_m);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
+                let naive = nvrtc_naive_attn(g, &qf, &kf, &vf, heads, s, d, scale).unwrap();
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let (cs_m, cs_n) = (csum(&out_m), csum(&naive));
+                assert!(
+                    (cs_m - cs_n).abs() / cs_n.max(1.0) < 3e-2,
+                    "H={heads} S={s}: flash vs naive checksum disagree: mma={cs_m:.3e} naive={cs_n:.3e}"
+                );
+                let t_m = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..50 {
+                        let mut bld = g.stream.launch_builder(&f_m);
+                        bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o_d);
+                        unsafe { bld.launch(cfg).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 50.0
+                });
+                let t_n = time_nvrtc_naive_attn(g, heads, s, d, scale, if s >= 2048 { 2 } else { 5 }).unwrap();
+                let flop = attn_flop(heads, s, d);
+                let (g_m, g_n) = (flop / t_m, flop / t_n);
+                eprintln!(
+                    "H={heads} S={s:>4} D={d} (same-run): Mercury flash {:.4} ms ({:>6.0} GFLOP/s) | naive CUDA-C {:.4} ms ({:>5.0} GFLOP/s) || Mercury {:>5.1}× vs naive",
+                    t_m * 1e3,
+                    g_m / 1e9,
+                    t_n * 1e3,
+                    g_n / 1e9,
+                    g_m / g_n,
+                );
+            }
         });
     }
 

@@ -178,6 +178,20 @@ def main():
         tail = f"| Mercury flash {mer:.0f} GFLOP/s | Mercury {mer / gflops * 100:.0f}% of torch SDPA" if mer else ""
         print(f"  S={S}: torch SDPA {ms:.4f} ms ({gflops:.0f} GFLOP/s) {tail}")
 
+    # Multi-head (GPT-2 shape H=12, dh=64): the representative attention shape, and the one that fills
+    # the GPU at small S. Mercury multi-head GFLOP/s come from the Rust flash_vs_peers multi-head sweep.
+    print("\n== isolated attention, H=12 heads dh=64 (M5 multi-head: vs torch SDPA / FA2) ==")
+    H = 12
+    for S in (512, 1024, 2048):
+        q = (torch.rand(1, H, S, D, device=dev) * 2 - 1).to(HALF)
+        k = (torch.rand(1, H, S, D, device=dev) * 2 - 1).to(HALF)
+        v = (torch.rand(1, H, S, D, device=dev) * 2 - 1).to(HALF)
+        scale = 1.0 / (D ** 0.5)
+        sdpa = lambda: F.scaled_dot_product_attention(q, k, v, scale=scale, is_causal=False)
+        ms = best_ms(sdpa, warmup=100, iters=100, rounds=5, repin=40)
+        gflops = (4.0 * H * S * S * D) / (ms * 1e-3) / 1e9
+        print(f"  H={H} S={S}: torch SDPA {ms:.4f} ms ({gflops:.0f} GFLOP/s)")
+
     print("\n== single layer (D=64, Dff=256, resident, fp16 eager) ==")
     # 2048/4096 = long context: attention (O(S²·D), torch's flash SDPA vs Mercury's WMMA flash)
     # dominates the FFN, so these sizes test the flash kernels head-to-head — the regime where torch's
