@@ -6190,15 +6190,24 @@ mod tests {
         t0.elapsed().as_secs_f64() / iters as f64
     }
 
-    /// Deterministic int8 test buffers: `A` u8 `[M,K]`, `B` i8 `[N,K]` (full range, incl. negatives).
-    fn int8_inputs(rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize) -> (Vec<u8>, Vec<i8>) {
-        let a: Vec<u8> = (0..m * k)
-            .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+    /// Deterministic int8 peer-bench buffers with **activations in `[0,127]`** (the range where `u8` and
+    /// `s8` reinterpretations coincide, so Mercury's `u8×s8`, the NVRTC peers, and cuBLAS's `s8×s8` all
+    /// compute the *identical* matrix and cross-check bit-for-bit — see the cuBLAS signedness caveat in
+    /// `baselines.rs`). Returns A both as `u8` (Mercury/naive/dp4a) and as `i8` (cuBLAS), plus i8 B.
+    fn int8_inputs_a127(
+        rng: &mut crate::diff::Rng,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> (Vec<u8>, Vec<i8>, Vec<i8>) {
+        let a_u8: Vec<u8> = (0..m * k)
+            .map(|_| (rng.f32_range(0.0, 128.0) as u32 & 0x7f) as u8)
             .collect();
+        let a_i8: Vec<i8> = a_u8.iter().map(|&x| x as i8).collect(); // x<128 → same bits/value
         let b: Vec<i8> = (0..n * k)
             .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
             .collect();
-        (a, b)
+        (a_u8, a_i8, b)
     }
 
     /// **M3/M6: int8 (W8A8) tensor-core GEMM vs the Tier-A int8 CUDA-C peers**, same-run. Mercury's
@@ -6219,35 +6228,35 @@ mod tests {
     #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
     fn int8_gemm_vs_peers() {
         use crate::baselines::{
-            gemm_flop, nvrtc_dp4a_gemm_nt_int8, nvrtc_naive_gemm_nt_int8, peer_env_hint,
-            peers_available, time_nvrtc_dp4a_gemm_nt_int8, time_nvrtc_naive_gemm_nt_int8,
+            cublas_gemm_nt_int8, gemm_flop, nvrtc_dp4a_gemm_nt_int8, nvrtc_naive_gemm_nt_int8,
+            peer_env_hint, peers_available, time_cublas_gemm_nt_int8, time_nvrtc_dp4a_gemm_nt_int8,
+            time_nvrtc_naive_gemm_nt_int8,
         };
         use crate::ptx_int8::{INT8_TM, INT8_TN};
         with_gpu("int8_gemm_vs_peers", |g| {
             if !peers_available(g) {
-                eprintln!("[skip] int8_gemm_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                eprintln!("[skip] int8_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
                 return;
             }
             eprintln!("device: {}", g.device_name());
 
-            // --- Correctness first: both peers must EQUAL the i32 oracle (bit-exact) at a small shape. ---
+            // --- Correctness first: all four paths must EQUAL the i32 oracle (bit-exact) at a small
+            // shape. Activations in [0,127] (see int8_inputs_a127) so cuBLAS's s8×s8 == Mercury's u8×s8.
             let mut rng = crate::diff::Rng::new(0x1287);
             for (m, k, n) in [(256usize, 256usize, 256usize), (128, 320, 96)] {
-                let (a, b) = int8_inputs(&mut rng, m, k, n);
-                let r = ref_nt_int8(&a, &b, m, k, n);
-                let merc = gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
-                assert_eq!(merc, r, "Mercury int8 {m}x{k}x{n} != i32 oracle");
-                let naive = nvrtc_naive_gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
-                assert_eq!(naive, r, "naive int8 CUDA-C {m}x{k}x{n} != i32 oracle");
-                let dp4a = nvrtc_dp4a_gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
-                assert_eq!(dp4a, r, "dp4a int8 CUDA-C {m}x{k}x{n} != i32 oracle");
+                let (a_u8, a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a_u8, &b, m, k, n);
+                assert_eq!(gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "Mercury int8 {m}x{k}x{n}");
+                assert_eq!(nvrtc_naive_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "naive {m}x{k}x{n}");
+                assert_eq!(nvrtc_dp4a_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "dp4a {m}x{k}x{n}");
+                assert_eq!(cublas_gemm_nt_int8(g, &a_i8, &b, m, k, n).unwrap(), r, "cuBLAS {m}x{k}x{n}");
             }
-            eprintln!("[gate] Mercury + naive + dp4a int8 all equal the i32 oracle bit-for-bit ✓");
+            eprintln!("[gate] Mercury + naive + dp4a + cuBLAS int8 all equal the i32 oracle bit-for-bit ✓");
 
             // --- Clock warmup (cf. gemm_vs_peers): boost the clock before sampling so each size's ratio
-            // is peak-vs-peak. Hammer the dp4a peer (cheap, compute-heavy) until the clock settles. ---
+            // is peak-vs-peak. Hammer cuBLAS int8 (the heaviest) until the clock settles. ---
             for _ in 0..40 {
-                let _ = time_nvrtc_dp4a_gemm_nt_int8(g, 2048, 2048, 2048, 5);
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
             }
             const ROUNDS: usize = 4;
 
@@ -6255,10 +6264,10 @@ mod tests {
                 let (m, k, n) = (sz, sz, sz);
                 let flop = gemm_flop(m, n, k); // 2·M·N·K int8 MACs
                 let dims = (m as u32, n as u32, k as u32);
-                let (a, b) = int8_inputs(&mut rng, m, k, n);
+                let (a_u8, a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
 
                 // Mercury fragment-reuse _mt path (the fast int8 kernel).
-                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
                 let b_d = g.stream.memcpy_stod(&b).unwrap();
                 let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                 let f_mt = g
@@ -6282,31 +6291,36 @@ mod tests {
                 };
                 let s_st = best_of(ROUNDS, || time_gemm_int8(g, &f_st, cfg_st, dims, &a_d, &b_d, &mut c_d, 50));
 
-                // Peers. Naive is slow → fewer iters; dp4a is the strong baseline.
+                // Peers. Naive is slow → fewer iters; dp4a is the strong hand-written baseline; cuBLAS
+                // int8 IMMA is the Tier-B gold standard (Mercury reported as % of it).
                 let naive_iters = if sz >= 4096 { 3 } else { 10 };
                 let s_naive = time_nvrtc_naive_gemm_nt_int8(g, m, k, n, naive_iters).unwrap();
                 let s_dp4a = best_of(ROUNDS, || time_nvrtc_dp4a_gemm_nt_int8(g, m, k, n, 20).unwrap());
+                let s_cub = best_of(ROUNDS, || time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
 
                 // Checksum cross-check at this shape: all paths compute the same matrix.
                 let csum = |v: &[i32]| v.iter().map(|&x| x as i64).sum::<i64>();
-                let cs_mt = csum(&gemm_nt_int8(g, &a, &b, m, k, n).unwrap());
-                let cs_n = csum(&nvrtc_naive_gemm_nt_int8(g, &a, &b, m, k, n).unwrap());
-                let cs_d = csum(&nvrtc_dp4a_gemm_nt_int8(g, &a, &b, m, k, n).unwrap());
+                let cs_mt = csum(&gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_n = csum(&nvrtc_naive_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_d = csum(&nvrtc_dp4a_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_c = csum(&cublas_gemm_nt_int8(g, &a_i8, &b, m, k, n).unwrap());
                 assert!(
-                    cs_mt == cs_n && cs_mt == cs_d,
-                    "{sz}³ int8 checksum disagreement: mt={cs_mt} naive={cs_n} dp4a={cs_d}"
+                    cs_mt == cs_n && cs_mt == cs_d && cs_mt == cs_c,
+                    "{sz}³ int8 checksum disagreement: mt={cs_mt} naive={cs_n} dp4a={cs_d} cublas={cs_c}"
                 );
 
-                let (g_mt, g_st, g_naive, g_dp4a) =
-                    (flop / s_mt, flop / s_st, flop / s_naive, flop / s_dp4a);
+                let (g_mt, g_st, g_naive, g_dp4a, g_cub) =
+                    (flop / s_mt, flop / s_st, flop / s_naive, flop / s_dp4a, flop / s_cub);
                 eprintln!(
                     "\n{sz}³ int8 W8A8 GEMM (same-run, 2·M·N·K MAC-FLOP):\n  \
-                     Mercury _mt      : {:>8.0} GFLOP/s  | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
-                     Mercury single   : {:>8.0} GFLOP/s  | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     Mercury _mt      : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     Mercury single   : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     cuBLAS int8 IMMA : {:>8.0} GFLOP/s  | Tier-B gold standard\n  \
                      dp4a CUDA-C      : {:>8.0} GFLOP/s  | strong hand-written int8 peer\n  \
                      naive CUDA-C     : {:>8.0} GFLOP/s  | Tier-A floor",
-                    g_mt / 1e9, g_mt / g_naive, g_mt / g_dp4a,
-                    g_st / 1e9, g_st / g_naive, g_st / g_dp4a,
+                    g_mt / 1e9, 100.0 * g_mt / g_cub, g_mt / g_naive, g_mt / g_dp4a,
+                    g_st / 1e9, 100.0 * g_st / g_cub, g_st / g_naive, g_st / g_dp4a,
+                    g_cub / 1e9,
                     g_dp4a / 1e9,
                     g_naive / 1e9,
                 );
