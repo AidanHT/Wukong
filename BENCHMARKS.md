@@ -636,9 +636,13 @@ same clock — i.e. multi-head is **7.4× / 3.7× / 2.0× the single-head throug
 and **275–322× a naive multi-head CUDA-C flash**. The flat saturation said the filled GPU was per-warp
 **latency**-bound — which the `cp.async` software-pipelined K-loop now attacks directly: the production
 `flash_d64_mp` prefetches the next K/V block under the current block's MMA, for a same-run **1.1–1.2×** at
-this filled regime (and up to 3.6× single-head, where the latency was unhidden). The remaining levers
-toward a clean **≥90% of FA2** are `ldmatrix` fragment loads (conflict-free SMEM reads — the strided V
-`u16` pairs are the prime suspect) and multi-warp-per-CTA K/V sharing.
+this filled regime (and up to 3.6× single-head, where the latency was unhidden). **Multi-warp-per-CTA K/V
+sharing was then tried** (`flash_d64_mp4`/`_mp8`, W warps sharing one cooperatively-staged K/V block;
+`flash_mw_vs_mp`) and is **only marginal** — ~6–8% at the H=12 filled regime and a *regression* single-head
+— so the kernel is **not** strongly K/V-bandwidth-bound (`mp`'s per-warp pipelining already captures it).
+The remaining candidate toward ≥90% of FA2 is `ldmatrix` conflict-free fragment loads: the strided V `u16`
+pairs at a 128-byte SMEM stride are the prime bank-conflict suspect — a *per-warp throughput* issue, which
+is consistent with the not-bandwidth-bound finding.
 
 **Whole transformer layer, GPU-resident.** A complete pre-norm encoder layer — RMSNorm → Q/K/V
 projections → flash-attention → output projection → residual → RMSNorm → FFN (SiLU) → residual —
