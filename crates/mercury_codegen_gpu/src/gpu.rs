@@ -2170,6 +2170,51 @@ pub fn gemm_nt_int8_smdb(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **int8 GEMM + fused per-channel dequant** `out[i,j] = f32(Σ u8·i8) · scale[j]` → **f32** output, in
+/// one pass (the SMEM-staged 64×64 kernel with the dequant epilogue folded into the C store). `scale`
+/// is the per-output-channel `[N]` f32 scale (symmetric quant). The HBM round-trip cuBLAS int8 needs
+/// (separate i32→f32 dequant kernel) is eliminated — the cuBLAS-can't-fuse *beat* lever. Requires
+/// M%64==0, N%64==0, K%INT8_BK==0.
+pub fn gemm_nt_int8_smdb_dequant(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    scale: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(scale.len(), n, "per-channel scale must be length N");
+    assert!(
+        m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
+        "int8 smdb-dequant GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
+    );
+    let f = g.function(
+        "int8_gemm_smdb_deq",
+        crate::ptx_int8::int8_gemm_smdb_deq_ptx(),
+        "int8_gemm_nt_smdb_deq",
+    )?;
+    let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let scale_d = g.stream.memcpy_stod(scale)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&scale_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6221,6 +6266,104 @@ mod tests {
                 }
                 let checksum = got.iter().map(|&x| x as i64).sum::<i64>();
                 eprintln!("int8_gemm {m}x{k}x{n}: bit-exact ✓ (checksum {checksum})");
+            }
+        });
+    }
+
+    /// **Fused per-channel dequant epilogue gate.** `out[i,j] = f32(Σ u8·i8)·scale[j]` (the
+    /// cuBLAS-can't-fuse path) must equal the CPU reference — the exact `i32` accumulate converted to
+    /// f32 and multiplied by the per-column scale, both sides rounding identically (i32→f32 cvt.rn +
+    /// one f32 mul). Tight tolerance (essentially exact: the only rounding is the shared final mul).
+    #[test]
+    fn int8_dequant_matches_reference() {
+        with_gpu("int8_dequant", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DE9);
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 128), (64, 256, 192)] {
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
+                // per-channel scales spanning a realistic quant range (~1/127 .. small).
+                let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
+                let acc = ref_nt_int8(&a, &b, m, k, n);
+                let want: Vec<f32> = (0..m * n).map(|t| acc[t] as f32 * scale[t % n]).collect();
+                let got = gemm_nt_int8_smdb_dequant(g, &a, &b, &scale, m, k, n).unwrap();
+                let st = crate::diff::assert_close(
+                    &format!("int8_dequant {m}x{k}x{n}"),
+                    &got,
+                    &want,
+                    1e-3,
+                    1e-6,
+                );
+                eprintln!(
+                    "int8_dequant {m}x{k}x{n}: fused i32→f32·scale[j] ✓ max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// **Fused-dequant cost bench.** Times the SMEM-staged int8 GEMM with the per-channel dequant
+    /// epilogue (`int8_gemm_nt_smdb_deq`, f32 out) against the plain i32-output kernel
+    /// (`int8_gemm_nt_smdb`), same GEMM. The dequant is computed **in registers at the C store**, so the
+    /// two times are ~equal → Mercury gets the `i32→f32·scale[j]` dequant at ≈0 marginal cost. A cuBLAS
+    /// int8 pipeline (raw `i32` out) must instead launch a *separate* dequant kernel that re-reads the
+    /// whole `M×N` `i32` matrix from HBM and writes `M×N` f32 — a round-trip + launch this fusion
+    /// removes. Same-run; clock-warmed + best_of. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_dequant_fusion`
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn int8_dequant_fusion() {
+        with_gpu("int8_dequant_fusion", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DEF);
+            // warm the clock
+            for _ in 0..20 {
+                let (a, b) = (vec![1u8; 2048 * 2048], vec![1i8; 2048 * 2048]);
+                let _ = gemm_nt_int8_smdb(g, &a, &b, 2048, 2048, 2048);
+            }
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * n as f64 * k as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let scale_d = g.stream.memcpy_stod(&scale).unwrap();
+                use crate::ptx_int8::{INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+                let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+
+                // plain i32-output kernel
+                let f_i32 = g.function("int8_gemm_smdb", crate::ptx_int8::int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb").unwrap();
+                let mut ci_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let s_i32 = best_of(4, || time_gemm_int8(g, &f_i32, cfg, dims, &a_d, &b_d, &mut ci_d, 50));
+
+                // fused dequant kernel (f32 out + scale) — time its resident launches.
+                let f_deq = g.function("int8_gemm_smdb_deq", crate::ptx_int8::int8_gemm_smdb_deq_ptx(), "int8_gemm_nt_smdb_deq").unwrap();
+                let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let time_deq = || {
+                    let launch = |c: &mut cudarc::driver::CudaSlice<f32>| {
+                        let (mm, nn, kk) = dims;
+                        let mut bld = g.stream.launch_builder(&f_deq);
+                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(c).arg(&scale_d);
+                        unsafe { bld.launch(cfg).unwrap() };
+                    };
+                    launch(&mut cf_d);
+                    g.stream.synchronize().unwrap();
+                    let t0 = Instant::now();
+                    for _ in 0..50 { launch(&mut cf_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 50.0
+                };
+                let s_deq = best_of(4, time_deq);
+
+                eprintln!(
+                    "{sz}³ int8: plain-i32 {:.0} GFLOP/s | fused-dequant(f32) {:.0} GFLOP/s | dequant overhead {:+.1}% (fused at ~0 cost; cuBLAS pays a separate i32→f32 kernel + HBM round-trip)",
+                    flop / s_i32 / 1e9, flop / s_deq / 1e9, 100.0 * (s_deq - s_i32) / s_i32,
+                );
             }
         });
     }
