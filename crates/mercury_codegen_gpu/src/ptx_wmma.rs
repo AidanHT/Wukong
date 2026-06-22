@@ -1425,7 +1425,11 @@ fn entry_mma_gate(
             s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
             s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
         }
-        // Gate B (Wg) fragments + gate mma.
+        // Preload BOTH B tiles' fragments (Wg into %bg, Wu into %bu) before issuing any mma, so the
+        // 2·tm·tn mma's below — which write disjoint accumulators (%dg vs %du) and so are all mutually
+        // independent — form one pipeline-able block with every operand already in registers (matches the
+        // single-B workhorse's clean N-independent-mma schedule; the serialized load/mma/load/mma form
+        // left the up mma's waiting on the Wu loads).
         s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
         s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
@@ -1434,14 +1438,6 @@ fn entry_mma_gate(
             s += &format!("    ld.shared.b32 %bg{ni}_0,[%bptr+{}];\n", base);
             s += &format!("    ld.shared.b32 %bg{ni}_1,[%bptr+{}];\n", base + 16);
         }
-        for mi in 0..tm {
-            for ni in 0..tn {
-                s += &format!(
-                    "    mma.sync.aligned.m16n8k16.row.col.{mma_ty} {{%dg{mi}_{ni}_0,%dg{mi}_{ni}_1,%dg{mi}_{ni}_2,%dg{mi}_{ni}_3}},{{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},{{%bg{ni}_0,%bg{ni}_1}},{{%dg{mi}_{ni}_0,%dg{mi}_{ni}_1,%dg{mi}_{ni}_2,%dg{mi}_{ni}_3}};\n"
-                );
-            }
-        }
-        // Up B (Wu) fragments + up mma (reusing the A fragments already in registers).
         s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n");
         s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
         s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
@@ -1450,8 +1446,13 @@ fn entry_mma_gate(
             s += &format!("    ld.shared.b32 %bu{ni}_0,[%bptr+{}];\n", base);
             s += &format!("    ld.shared.b32 %bu{ni}_1,[%bptr+{}];\n", base + 16);
         }
+        // Interleave gate and up mma per (mi,ni): adjacent independent ops (different accumulators) give
+        // the issue stage maximal ILP. A fragments are shared (loaded once above) → the load-x-once win.
         for mi in 0..tm {
             for ni in 0..tn {
+                s += &format!(
+                    "    mma.sync.aligned.m16n8k16.row.col.{mma_ty} {{%dg{mi}_{ni}_0,%dg{mi}_{ni}_1,%dg{mi}_{ni}_2,%dg{mi}_{ni}_3}},{{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},{{%bg{ni}_0,%bg{ni}_1}},{{%dg{mi}_{ni}_0,%dg{mi}_{ni}_1,%dg{mi}_{ni}_2,%dg{mi}_{ni}_3}};\n"
+                );
                 s += &format!(
                     "    mma.sync.aligned.m16n8k16.row.col.{mma_ty} {{%du{mi}_{ni}_0,%du{mi}_{ni}_1,%du{mi}_{ni}_2,%du{mi}_{ni}_3}},{{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},{{%bu{ni}_0,%bu{ni}_1}},{{%du{mi}_{ni}_0,%du{mi}_{ni}_1,%du{mi}_{ni}_2,%du{mi}_{ni}_3}};\n"
                 );

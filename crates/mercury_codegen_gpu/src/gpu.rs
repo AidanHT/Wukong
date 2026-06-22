@@ -7450,6 +7450,115 @@ mod tests {
         t0.elapsed().as_secs_f64() / iters as f64
     }
 
+    /// Per-iter device time of the fused gated-FFN kernel (`mma_nt_{f16,bf16}_128x64_gate_*`, no-bias
+    /// variants): the dual-B gate takes x, Wg, Wu (half-precision) and writes the f32 gated output C —
+    /// seven args (M,N,K,x,Wg,Wu,C). Same warmup+loop shape as [`time_wmma`].
+    fn time_gate<T: cudarc::driver::DeviceRepr>(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        x_d: &cudarc::driver::CudaSlice<T>,
+        wg_d: &cudarc::driver::CudaSlice<T>,
+        wu_d: &cudarc::driver::CudaSlice<T>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(x_d).arg(wg_d).arg(wu_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// **Beat-cuBLAS via gated-FFN fusion**: the SwiGLU gate `out = silu(x·Wgᵀ) ⊙ (x·Wuᵀ)` as ONE dual-B
+    /// kernel vs the **three-kernel** chain a GEMM library must run — GEMM `x·Wgᵀ`, GEMM `x·Wuᵀ`, then an
+    /// elementwise `silu(gate)⊙up` kernel (a 3·M·N HBM round-trip: read gate, read up, write out — proxied
+    /// by `time_vadd`, identical traffic). The fused kernel reads `x` ONCE (shared A fragments feed both
+    /// GEMMs) and never materializes the two `[M,N]` intermediates, so it folds away both the redundant
+    /// `x` read and the 4·M·N intermediate round-trip cuBLAS cannot avoid (it has no fused-gate path).
+    /// Same contention-robust **interleaved best-of-6** same-run methodology as
+    /// [`fused_gemm_bias_act_vs_chain`] — a once-per-size baseline goes stale under the parallel flash
+    /// session's bursts. GFLOP/s counts both GEMMs (the gate's real work). The in-bench check is a loose
+    /// gross-error guard (the two f16-accumulation orders' silu-product compounds at large K); the binding
+    /// correctness proof is [`swiglu_gate_match_reference_within_tol`] vs an exact f64 reference.
+    #[test]
+    #[ignore]
+    fn fused_swiglu_gate_vs_chain() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
+        use half::f16;
+        with_gpu("swiglu_gate_bench", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] fused_swiglu_gate_vs_chain: cuBLAS/NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let silu = |x: f32| x / (1.0 + (-x).exp());
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let mut rng = crate::diff::Rng::new(0x5_71_6C_BE);
+            // Warm the clock: cuBLAS is measured before the fused kernel (cf. fused_gemm_bias_act_vs_chain).
+            for _ in 0..30 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            for sz in [512usize, 1024, 2048] {
+                let (m, k, n) = (sz, sz, sz);
+                let x = rng.vec(m * k, -1.0, 1.0);
+                let wg = rng.vec(n * k, -1.0, 1.0);
+                let wu = rng.vec(n * k, -1.0, 1.0);
+                let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+                let wg16: Vec<f16> = wg.iter().map(|&v| f16::from_f32(v)).collect();
+                let wu16: Vec<f16> = wu.iter().map(|&v| f16::from_f32(v)).collect();
+                let x_d = g.stream.memcpy_stod(&x16).unwrap();
+                let wg_d = g.stream.memcpy_stod(&wg16).unwrap();
+                let wu_d = g.stream.memcpy_stod(&wu16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let dims = (m as u32, n as u32, k as u32);
+                let cfg = gate_cfg(m, n);
+                let flop = 2.0 * gemm_flop(m, n, k); // the gate is two GEMMs' worth of FLOPs
+
+                // In-bench gross-error guard: fused ≈ silu(cuBLAS x·Wgᵀ) ⊙ (cuBLAS x·Wuᵀ). Loose tol — the
+                // products reach |·|~225 at K=2048 and two f16-accumulation orders compound there.
+                let gate_cub = cublas_gemm_nt_f16(g, &x, &wg, m, k, n).unwrap();
+                let up_cub = cublas_gemm_nt_f16(g, &x, &wu, m, k, n).unwrap();
+                let fused = gemm_nt_f16_swiglu(g, &x, &wg, &wu, m, k, n).unwrap();
+                let refout: Vec<f32> =
+                    gate_cub.iter().zip(&up_cub).map(|(&gv, &uv)| silu(gv) * uv).collect();
+                crate::diff::assert_close(&format!("fused swiglu vs cuBLAS chain {sz}³"), &fused, &refout, 2e-1, 5e-2);
+
+                // Timing: fused one-kernel vs 2 cuBLAS GEMMs + 1 elementwise silu⊙ (vadd proxy, 3·M·N).
+                let f_fused = g.function("wmma_f16", ptx, "mma_nt_f16_128x64_gate_silu").unwrap();
+                let f_vadd = g.function("vadd", crate::ptx::VADD, "vadd").unwrap();
+                let (mut bc, mut be, mut bf) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                for _ in 0..6 {
+                    bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, 20).unwrap());
+                    be = be.min(time_vadd(g, &f_vadd, m * n, 20));
+                    bf = bf.min(time_gate(g, &f_fused, cfg, dims, &x_d, &wg_d, &wu_d, &mut c_d, 20));
+                }
+                let chain = 2.0 * bc + be; // two GEMMs + the elementwise combine
+                eprintln!(
+                    "  {sz}³ swiglu: fused {:>7.3} ms ({:>6.0} GFLOP/s) | cuBLAS 2×GEMM {:>6.3} + silu⊙ {:>5.3} = {:>7.3} ms (fused {:>4.2}× faster)",
+                    bf * 1e3,
+                    flop / bf / 1e9,
+                    2.0 * bc * 1e3,
+                    be * 1e3,
+                    chain * 1e3,
+                    chain / bf,
+                );
+            }
+        });
+    }
+
     /// Per-iter device time of one `vadd` (`out = x + y`, the residual add a call-chain pays as a
     /// separate kernel) over `n` f32 — 3N traffic (read x, read y, write out), on resident buffers.
     /// `f` is the prefetched `vadd` entry.
