@@ -3484,6 +3484,127 @@ mod tests {
         });
     }
 
+    /// **Same-process A/B: register-resident `mma.sync` flash (`flash_d64_m`) vs the SMEM-round-trip
+    /// WMMA flash (`flash_d64_w4`) and the f32 tiled flash (`flash_d64_t`)** across sequence length under
+    /// one pinned clock — the only honest flash comparison (a cross-*run* one is corrupted by the ~7×
+    /// laptop-GPU clock swing). All single-head, D=64, 1 warp/CTA. Asserts `flash_d64_m` agrees with the
+    /// f32 reference at every S (far past the gate's sizes), then reports `m/w4` — below 1.0 means the
+    /// register-resident form wins. Run: `… --features gpu --release -- --ignored --nocapture flash_mma_vs_wmma`.
+    #[test]
+    #[ignore = "tuning bench; run explicitly"]
+    fn flash_mma_vs_wmma() {
+        with_gpu("flash_mma_vs_wmma", |g| {
+            let mut rng = crate::diff::Rng::new(0x3E9157);
+            let d = 64usize;
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            macro_rules! pin {
+                () => {{
+                    for _ in 0..40 {
+                        gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                    }
+                }};
+            }
+            for _ in 0..1500 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            let f_til = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_t")
+                .unwrap();
+            let f_w4 = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_w4")
+                .unwrap();
+            let f_m = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m")
+                .unwrap();
+            let to16 =
+                |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&v| half::f16::from_f32(v)).collect() };
+            for s in [256usize, 512, 1024, 2048, 4096] {
+                let qf = rng.vec(s * d, -1.0, 1.0);
+                let kf = rng.vec(s * d, -1.0, 1.0);
+                let vf = rng.vec(s * d, -1.0, 1.0);
+                let q = g.stream.memcpy_stod(&qf).unwrap();
+                let k = g.stream.memcpy_stod(&kf).unwrap();
+                let v = g.stream.memcpy_stod(&vf).unwrap();
+                let q16 = g.stream.memcpy_stod(&to16(&qf)).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&kf)).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&vf)).unwrap();
+                let mut o = g.stream.memcpy_stod(&vec![0f32; s * d]).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let (_, cfg_til) = flash_plan_forced(d, s, true);
+                let cfg_w = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // f32 reference (tiled), then assert the register-resident mma flash agrees (f16-in tol).
+                {
+                    let mut b = g.stream.launch_builder(&f_til);
+                    b.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                    unsafe { b.launch(cfg_til).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_ref = g.stream.memcpy_dtov(&o).unwrap();
+                {
+                    let mut b = g.stream.launch_builder(&f_m);
+                    b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                    unsafe { b.launch(cfg_w).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o).unwrap();
+                let mdiff = out_ref
+                    .iter()
+                    .zip(&out_m)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(mdiff < 5e-2, "S={s}: mma flash vs f32 ref disagree, max_abs={mdiff:.2e}");
+
+                pin!();
+                let t_til = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut b = g.stream.launch_builder(&f_til);
+                        b.arg(&ss).arg(&scale).arg(&q).arg(&k).arg(&v).arg(&mut o);
+                        unsafe { b.launch(cfg_til).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                pin!();
+                let t_w4 = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut b = g.stream.launch_builder(&f_w4);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                pin!();
+                let t_m = best_of(5, || {
+                    let t0 = Instant::now();
+                    for _ in 0..100 {
+                        let mut b = g.stream.launch_builder(&f_m);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut o);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 100.0
+                });
+                eprintln!(
+                    "S={s:>4}: tiled {:.4} | wmma4 {:.4} | mma {:.4} ms || m/w4 {:.2}× | m/tiled {:.2}×",
+                    t_til * 1e3,
+                    t_w4 * 1e3,
+                    t_m * 1e3,
+                    t_m / t_w4,
+                    t_m / t_til,
+                );
+            }
+        });
+    }
+
     /// f64 reference for direct conv2d (single batch, stride 1, no padding): `X[C,H,W]`, `W[K,C,R,S]`
     /// → `O[K,P,Q]`, `P=H-R+1`, `Q=W-S+1`. The independent oracle for the GPU kernel.
     #[allow(clippy::too_many_arguments)]
