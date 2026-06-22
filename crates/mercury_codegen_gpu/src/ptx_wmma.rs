@@ -200,15 +200,21 @@ pub struct PipeCfg {
     /// ([`entry_smem_pipe`]). Same CTA tiling / pipeline / launch; only the inner tensor-core path differs
     /// — the route past the WMMA ceiling (conflict-free swizzled SMEM the `wmma.load` path cannot express).
     pub mma: bool,
+    /// SMEM row padding in f16 elements (`mma` kernels only). `8` makes the b32 fragment loads
+    /// bank-conflict-free (wins the L2-resident/compute-bound regime) but adds SMEM ⇒ fewer CTAs/SM; `0`
+    /// keeps the conflicts but the smaller footprint fits more CTAs ⇒ more occupancy to hide HBM latency
+    /// (can win the HBM-bound regime). Ignored when `mma == false`.
+    pub pad: usize,
 }
 
 impl PipeCfg {
     pub const fn threads(&self) -> usize {
         self.wm * self.wn * 32
     }
-    /// Static SMEM bytes this config needs (`stages·(bm+bn)·bk·2`); must be ≤ 48 KiB.
+    /// Static SMEM bytes this config needs (`stages·(bm+bn)·(bk+pad)·2`, the padded row stride for mma
+    /// kernels; `pad==0` for WMMA gives the plain `bk`); must be ≤ 48 KiB.
     pub const fn smem_bytes(&self) -> usize {
-        self.stages * (self.bm + self.bn) * self.bk * 2
+        self.stages * (self.bm + self.bn) * (self.bk + self.pad) * 2
     }
 }
 
@@ -225,8 +231,8 @@ impl PipeCfg {
 /// `gemm_nt_f16` dispatches among these by working-set size; `gemm_pipe_sweep` re-measures them. (~72% is
 /// near the WMMA ceiling on this part; the cuBLAS-class `mma.sync`+`ldmatrix` path is the next lever.)
 pub const PIPE_VARIANTS: &[PipeCfg] = &[
-    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6, raster: 0, mma: false }, // 24 KiB — ≤1024³
-    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4, raster: 0, mma: false }, // 32 KiB — ~2048³
+    PipeCfg { name: "wmma_nt_f16_pipe_64_s6", bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, stages: 6, raster: 0, mma: false, pad: 0 }, // 24 KiB — ≤1024³
+    PipeCfg { name: "wmma_nt_f16_pipe_128_s4", bm: 128, bn: 128, bk: 16, wm: 2, wn: 4, stages: 4, raster: 0, mma: false, pad: 0 }, // 32 KiB — ~2048³
     // Spilling champion: a 128×128 BK=32 tile with **threadblock rasterization** (r8). At 4096³ the GEMM
     // is HBM-bound (~2.7 GB of A/B reads ≫ the 134 MB minimum), so banding co-scheduled CTAs into a compact
     // L2 footprint cut effective traffic: 56% → 72% of cuBLAS (a 12-config raster sweep found the optimum
@@ -235,7 +241,7 @@ pub const PIPE_VARIANTS: &[PipeCfg] = &[
     // (8-padded SMEM) fragment loads + rasterization. Beats the WMMA path at both regimes — 2048³ ~92% of
     // cuBLAS (padding kills the 4-way fragment-load conflict in the L2-resident/compute-bound regime) and
     // 4096³ ~74% (HBM-bound there, so padding is neutral but raster + mma scheduling still lead). %128, K%32.
-    PipeCfg { name: "mma_nt_f16_128_bk32_s2_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 8, mma: true }, // 40 KiB
+    PipeCfg { name: "mma_nt_f16_128_bk32_s2_r8", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 8, mma: true, pad: 8 }, // 40 KiB
 ];
 
 /// Look up a [`PipeCfg`] by its entry name (the `gemm_nt_f16` dispatcher selects variants this way, so a
@@ -963,6 +969,7 @@ fn entry_mma_pipe(
     warps_n: usize,
     stages: usize,
     raster: usize,
+    pad: usize,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -979,11 +986,12 @@ fn entry_mma_pipe(
     let nks = bk / 16; // k16 steps fed by one staged tile
     let wmr = bm / warps_m; // per-warp M rows (WM)
     let wnc = bn / warps_n; // per-warp N cols (WN)
-    // SMEM rows are padded by 8 f16 (`ldp` leading dim): a b32 fragment load by lane (grp,tid) hits bank
-    // (grp·ldp/2 + tid) mod 32, and ldp/2 = (bk+8)/2 ≡ 4·(odd) makes grp·(ldp/2) span all eight multiples
-    // of 4, so the 8 grp × 4 tid = 32 lanes hit 32 distinct banks — conflict-free (vs the 4-way conflict at
-    // stride bk where grp and grp+2 alias). Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
-    let pad = 8;
+    // SMEM rows padded by `pad` f16 (`ldp` leading dim): a b32 fragment load by lane (grp,tid) hits bank
+    // (grp·ldp/2 + tid) mod 32. pad=8 ⇒ ldp/2 = (bk+8)/2 ≡ 4·(odd), so grp·(ldp/2) spans all eight
+    // multiples of 4 and the 8 grp × 4 tid = 32 lanes hit 32 distinct banks — conflict-free (vs the 4-way
+    // conflict at stride bk where grp and grp+2 alias). pad=0 keeps the conflict but a smaller footprint ⇒
+    // more CTAs/SM. Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
+    assert!(pad % 8 == 0, "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)");
     let ldp = bk + pad; // padded SMEM row stride (elements)
     let tile_a = bm * ldp * 2;
     let tile_b = bn * ldp * 2;
@@ -1255,7 +1263,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad)
             } else {
                 entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
             };
