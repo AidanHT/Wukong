@@ -43,8 +43,11 @@ HALF = torch.float16
 # runs — a ~1.7× clock swing), so the torch/Mercury *ratio* is order-of-magnitude only, not precise. The
 # whole set below is ONE consistent run (so the Mercury column is at least self-consistent across S); the
 # rigorous long-context claim is the same-process flash A/B + cuBLAS same-run bench, not this ratio.
-MERCURY_MS_PER_LAYER = {256: 0.526, 512: 0.605, 1024: 0.601, 2048: 1.617, 4096: 3.961}  # one run, WIDE WMMA flash (w4) >=512
+MERCURY_MS_PER_LAYER = {256: 0.633, 512: 0.813, 1024: 0.745, 2048: 1.151, 4096: 1.250}  # one run, REGISTER-RESIDENT mma.sync flash (flash_d64_m)
 MERCURY_STACK_MS_PER_LAYER = {1: 0.34, 2: 0.34, 4: 0.34, 8: 0.34}  # depth sweep, S=512 (WMMA flash)
+# Mercury isolated single-head flash_d64_m GFLOP/s (from the Rust flash_vs_peers bench, same GPU):
+# the register-resident mma.sync flash. For the M5 isolated-attention %-of-(torch SDPA / FA2) column.
+MERCURY_FLASH_GFLOPS = {512: 895.0, 1024: 2618.0, 2048: 5090.0, 4096: 8222.0}
 
 
 def rmsnorm_f32(x):
@@ -156,6 +159,24 @@ def main():
     for _ in range(400):
         _ = wa @ wa
     torch.cuda.synchronize()
+
+    # --- M5: isolated single-head attention vs torch SDPA (FlashAttention-2 backend), the FA2 peer. ---
+    # Mercury's flash_d64_m is single-head D=64; torch SDPA on [1,1,S,D] dispatches its fused flash /
+    # mem-efficient kernel (production FA2-class). Same shape, same fp16 in. GFLOP/s = 4·S²·D. The
+    # Mercury column is the Rust flash_vs_peers number (same GPU); the ratio is Mercury %-of-(torch SDPA).
+    print("\n== isolated attention, single head D=64 (M5: vs torch SDPA / FA2) ==")
+    for S in (512, 1024, 2048, 4096):
+        q = (torch.rand(1, 1, S, D, device=dev) * 2 - 1).to(HALF)
+        k = (torch.rand(1, 1, S, D, device=dev) * 2 - 1).to(HALF)
+        v = (torch.rand(1, 1, S, D, device=dev) * 2 - 1).to(HALF)
+        scale = 1.0 / (D ** 0.5)
+        sdpa = lambda: F.scaled_dot_product_attention(q, k, v, scale=scale, is_causal=False)
+        ms = best_ms(sdpa, warmup=100, iters=100, rounds=5, repin=40)
+        flop = 4.0 * S * S * D
+        gflops = flop / (ms * 1e-3) / 1e9
+        mer = MERCURY_FLASH_GFLOPS.get(S)
+        tail = f"| Mercury flash {mer:.0f} GFLOP/s | Mercury {mer / gflops * 100:.0f}% of torch SDPA" if mer else ""
+        print(f"  S={S}: torch SDPA {ms:.4f} ms ({gflops:.0f} GFLOP/s) {tail}")
 
     print("\n== single layer (D=64, Dff=256, resident, fp16 eager) ==")
     # 2048/4096 = long context: attention (O(S²·D), torch's flash SDPA vs Mercury's WMMA flash)
