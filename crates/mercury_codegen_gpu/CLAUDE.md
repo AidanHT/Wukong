@@ -48,6 +48,21 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM, single-tile and fragment-reuse
   multi-tile (`_mt`, 2×4 16×8 tiles/warp — the fastest tensor-core path; no WMMA fp8 on sm_89, so the
   fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
+- `src/ptx_int8.rs` — **int8 (W8A8) tensor-core GEMM** (M3): `u8` activations × `i8` weights → `i32`,
+  `mma.sync.m16n8k32.s32.u8.s8.s32`. Same 8-bit `m16n8k32` fragment layout as fp8 (no WMMA int8 on
+  sm_89), so it mirrors `ptx_fp8.rs`: `INT8_TILE` (single hand-placed tile), `int8_gemm_ptx`
+  (single-tile/warp), `int8_gemm_mt_ptx` (fragment-reuse 2×4 `_mt`), and `gen_int8_smdb` (SMEM-staged +
+  `cp.async` double-buffered, 64×64 default / 128×128 large-size variant, the int8 analogue of
+  `ptx_wmma.rs::entry_smem_db` but loading manual `mma` fragments via `ld.shared`). A `dequant` flag
+  emits the **fused per-channel dequant epilogue** (`int8_gemm_nt_smdb_deq`): `out = f32(Σ u8·i8)·scale[j]`
+  folded into the C store — the round-trip cuBLAS int8 (raw `i32` out) structurally can't fuse. Integer
+  accumulate is exact mod 2³² ⇒ the gate is **bit-exact** (`==`), stronger than the float tolerance gate.
+  Launchers `gemm_nt_int8`/`_smdb`/`_smdb_dequant` + `int8_tile` in `gpu.rs`; peers (naive + `dp4a` CUDA-C
+  via NVRTC, cuBLAS int8 IMMA `cublasGemmEx`) in `baselines.rs`; `int8_gemm_vs_peers` scoreboard. Standing
+  (same-run, RTX 4050): **180–237× vs naive**, **33–58× vs dp4a**, **~44/53/52% of cuBLAS** at 1024/2048/4096
+  (gap = multi-stage `cp.async` + `ldmatrix` + SMEM swizzle, the remaining levers). cuBLAS int8 is s8×s8
+  only, so the peer cross-check uses `[0,127]` activations (where u8≡s8); the full-range `[0,255]` gate is
+  separate. Owned by the int8 slice (`gpu-int8-gemm`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
