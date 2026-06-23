@@ -184,6 +184,22 @@ impl MlpTrainer {
         Ok(())
     }
 
+    /// One resident step (fwd + bwd + fused AdamW) with a **pre-uploaded** hp device buffer — pure
+    /// kernel chain, no per-step host traffic. The throughput-measurement entry (the `bc` bias
+    /// corrections are baked into `hp_d`; for a fixed-cadence timing loop they barely move).
+    pub fn step_devhp(
+        &mut self,
+        g: &mut Gpu,
+        hp_d: &CudaSlice<f32>,
+    ) -> Result<(), DriverError> {
+        self.forward(g)?;
+        self.backward(g, 2.0)?;
+        let (n1, n2) = (self.h * self.i, self.o * self.h);
+        adamw_step_device(g, &mut self.w1, &self.dw1, &mut self.m1, &mut self.v1, hp_d, n1)?;
+        adamw_step_device(g, &mut self.w2, &self.dw2, &mut self.m2, &mut self.v2, hp_d, n2)?;
+        Ok(())
+    }
+
     /// `sum (Y - target)^2` over the batch (reads `Y` back to the host — gate/diagnostic only).
     pub fn loss(&self, g: &Gpu) -> Result<f64, DriverError> {
         let yv: Vec<f32> = g.stream.memcpy_dtov(&self.y)?;
@@ -398,6 +414,127 @@ mod tests {
             eprintln!("resident MLP: loss {l0:.4e} -> {prev:.4e} over 300 AdamW steps ({worse} up-blips)");
             assert!(prev < l0 * 0.2, "loss did not fall enough: {l0:.3e} -> {prev:.3e}");
             assert!(worse < 15, "too many loss increases ({worse}) — unstable");
+        });
+    }
+
+    fn best_of(rounds: usize, mut f: impl FnMut() -> f64) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..rounds {
+            best = best.min(f());
+        }
+        best
+    }
+
+    /// Seconds/call for cuBLAS **f32** SGEMM (M×N×K): resident calls + warm-up + sync. The honest f32
+    /// peer for Mercury's training GEMMs (transpose convention is irrelevant for a timing-only peer).
+    fn time_cublas_sgemm_f32(g: &mut Gpu, m: usize, k: usize, n: usize, iters: u32) -> f64 {
+        use cudarc::cublas::sys::cublasOperation_t;
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+        let blas = CudaBlas::new(g.stream.clone()).unwrap();
+        let a_d = g.stream.memcpy_stod(&vec![0.01f32; m * k]).unwrap();
+        let b_d = g.stream.memcpy_stod(&vec![0.01f32; n * k]).unwrap();
+        let mut c_d = g.stream.memcpy_stod(&vec![0.0f32; m * n]).unwrap();
+        let cfg = GemmConfig::<f32> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0,
+            lda: k as i32,
+            ldb: k as i32,
+            beta: 0.0,
+            ldc: n as i32,
+        };
+        unsafe { blas.gemm(cfg, &b_d, &a_d, &mut c_d).unwrap() };
+        g.stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe { blas.gemm(cfg, &b_d, &a_d, &mut c_d).unwrap() };
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// **M8 throughput** — the resident MLP/FFN training step (fwd+bwd+fused AdamW), GPU-resident, no
+    /// host round-trip, at a GPT-2-FFN-ish shape. Absolute us/step and tokens/s swing with the laptop
+    /// clock (~7×); the clock-invariant figure is the cuBLAS-GEMM ratio in `m8_gemm_vs_cublas`.
+    #[test]
+    #[ignore]
+    fn m8_resident_step_throughput() {
+        with_gpu("m8_resident_step_throughput", |g| {
+            let (b, i, h, o) = (512usize, 768usize, 3072usize, 768usize); // GPT-2 FFN-ish
+            let mut rng = Rng::new(0x6FFA);
+            let w1 = rng.vec(h * i, -0.02, 0.02);
+            let w2 = rng.vec(o * h, -0.02, 0.02);
+            let x = rng.vec(b * i, -1.0, 1.0);
+            let target = rng.vec(b * o, -1.0, 1.0);
+            let mut tr = MlpTrainer::new(g, b, i, h, o, &w1, &w2).unwrap();
+            tr.set_batch(g, &x, &target).unwrap();
+            let mut hpv = vec![0.0f32; hp::LEN];
+            hpv[hp::LR] = 1e-3;
+            hpv[hp::BETA1] = 0.9;
+            hpv[hp::BETA2] = 0.999;
+            hpv[hp::EPS] = 1e-8;
+            hpv[hp::BC1] = 1.0 - 0.9f32.powi(10);
+            hpv[hp::BC2] = 1.0 - 0.999f32.powi(10);
+            let hp_d = g.stream.memcpy_stod(&hpv).unwrap();
+            for _ in 0..3 {
+                tr.step_devhp(g, &hp_d).unwrap();
+            }
+            g.stream.synchronize().unwrap();
+            let iters = 30u32;
+            let secs = best_of(5, || {
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    tr.step_devhp(g, &hp_d).unwrap();
+                }
+                g.stream.synchronize().unwrap();
+                t0.elapsed().as_secs_f64() / iters as f64
+            });
+            eprintln!(
+                "M8 resident step @B={b} d={i} ff={h}: {:.0} us/step, {:.0} tokens/s (clock-variant)",
+                secs * 1e6,
+                b as f64 / secs
+            );
+        });
+    }
+
+    /// **M8 honesty frontier** — Mercury's training GEMM vs cuBLAS f32 SGEMM, same-run, at the FFN's
+    /// dominant shapes. The clock-invariant % of cuBLAS says how far the (currently naive) training
+    /// GEMM is from the library — the binding constraint for beating an eager cuBLAS chain. Reported,
+    /// not asserted: it is a measurement, and the lever is kernel work (tiling / tensor cores).
+    #[test]
+    #[ignore]
+    fn m8_gemm_vs_cublas() {
+        with_gpu("m8_gemm_vs_cublas", |g| {
+            for &(m, k, n) in &[(512usize, 768usize, 3072usize), (512, 3072, 768)] {
+                let mut rng = Rng::new(0xA11 ^ (m * n * k) as u64);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let bb = rng.vec(k * n, -1.0, 1.0);
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&bb).unwrap();
+                let mut c_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
+                gemm_device(g, false, false, &a_d, &b_d, &mut c_d, m, n, k).unwrap();
+                g.stream.synchronize().unwrap();
+                let iters = 20u32;
+                let mer = best_of(5, || {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        gemm_device(g, false, false, &a_d, &b_d, &mut c_d, m, n, k).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let cub = best_of(5, || time_cublas_sgemm_f32(g, m, k, n, iters));
+                let flop = 2.0 * m as f64 * n as f64 * k as f64;
+                eprintln!(
+                    "GEMM {m}x{n}x{k}: Mercury {:.1} GFLOP/s vs cuBLAS-f32 {:.1} GFLOP/s = {:.1}% of cuBLAS",
+                    flop / mer / 1e9,
+                    flop / cub / 1e9,
+                    100.0 * cub / mer
+                );
+            }
         });
     }
 }

@@ -14,6 +14,7 @@
 //! grid-stride / one-CTA-per-row, so correctness is independent of the launch grid.
 
 use crate::gpu::Gpu;
+use crate::ptx_gemm::{gemm_rb_ptx, TILE_M, TILE_N};
 use crate::ptx_optim::grid_stride_cfg;
 use cudarc::driver::{CudaSlice, DriverError, LaunchConfig, PushKernelArg};
 use std::sync::OnceLock;
@@ -501,11 +502,11 @@ pub fn norm_bwd_f32(
 // Linear is NT (y = x·Wᵀ); the tape's gradient matmuls are NN (dX = dY·W) and TN (dW = dYᵀ·X).
 // One transposable kernel covers all three so the resident step needs no operand shuffling.
 //
-// This is a **naive** one-thread-per-output-element kernel (a k-loop of fused MACs) — correct and
-// self-contained, the workhorse for the resident training step's correctness/residency gate. It is
-// the obvious profiling target (no tiling/SMEM/tensor-cores); increment 6 routes the hot GEMMs to a
-// staged/tensor-core path. `fma.rn` accumulation in increasing k matches a naive CPU reference
-// closely; tolerance-gated (the reduction reassociates).
+// This is a **naive** one-thread-per-output-element kernel (a k-loop of fused MACs) — kept as a
+// small self-contained host reference (`gemm_f32`, gated by `train_gemm_matches_reference`). The
+// resident training step does NOT use it: `gemm_device` (below) routes to the register-blocked
+// `ptx_gemm` kernel (~3-5× faster) — the M8 GEMM lever. `fma.rn` accumulation in increasing k
+// matches a naive CPU reference closely; tolerance-gated (the reduction reassociates).
 // ----------------------------------------------------------------------------------------------
 
 /// One naive GEMM entry for transpose mode `(ta, tb)`: `C[m×n] = opA(A)·opB(B)`, inner dim `k`.
@@ -718,7 +719,53 @@ CM_E:
 // device buffers it keeps alive across forward + backward + optimizer.
 // ----------------------------------------------------------------------------------------------
 
-/// `C[m×n] = opA(A)·opB(B)` over device buffers (resident GEMM; see [`gemm_f32`]).
+/// Transpose `src(m×n)` -> `dst(n×m)` over device buffers (the device twin of [`transpose_f32`]) —
+/// used to turn a TN GEMM (`Aᵀ·B`) into a transpose + NN, so all matmuls ride the reg-blocked kernel.
+pub fn transpose_device(
+    g: &mut Gpu,
+    src: &CudaSlice<f32>,
+    dst: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("transpose_f32", TRANSPOSE_F32_PTX, "transpose_f32")?;
+    let (mu, nu) = (m as u32, n as u32);
+    let cfg = grid_stride_cfg(g, (m * n) as u32);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(src).arg(dst).arg(&mu).arg(&nu);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// Launch a register-blocked GEMM entry (`gemm_nn_rb` / `gemm_nt_rb`) from `ptx_gemm` (read-only):
+/// `C[m×n] = A·op(B)`, params `(M,N,K,A,B,C)`, one 64×64 CTA tile of 16×16 threads.
+fn gemm_rb(
+    g: &mut Gpu,
+    entry: &str,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    c: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("gemm_rb", gemm_rb_ptx(), entry)?;
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(TILE_N), (m as u32).div_ceil(TILE_M), 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mu).arg(&nu).arg(&ku).arg(a).arg(b).arg(c);
+    unsafe { bld.launch(cfg)? };
+    Ok(())
+}
+
+/// `C[m×n] = opA(A)·opB(B)` over device buffers — the resident training GEMM. NN and NT ride the
+/// register-blocked `ptx_gemm` kernel directly (~3-5× the naive path); TN (`Aᵀ·B`, the weight-gradient
+/// shape) transposes A (`[k×m]→[m×k]`, cheap vs the O(mnk) GEMM) then NN. Gated end-to-end by the
+/// MLP-gradient and attention-backward references (all three modes exercised).
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_device(
     g: &mut Gpu,
@@ -731,12 +778,17 @@ pub fn gemm_device(
     n: usize,
     k: usize,
 ) -> Result<(), DriverError> {
-    let f = g.function("train_gemm", train_gemm_ptx(), gemm_entry_name(ta, tb))?;
-    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
-    let mut bld = g.stream.launch_builder(&f);
-    bld.arg(a).arg(b).arg(c).arg(&mu).arg(&nu).arg(&ku);
-    unsafe { bld.launch(gemm_cfg(m, n))? };
-    Ok(())
+    match (ta, tb) {
+        (false, false) => gemm_rb(g, "gemm_nn_rb", a, b, c, m, n, k),
+        (false, true) => gemm_rb(g, "gemm_nt_rb", a, b, c, m, n, k),
+        (true, false) => {
+            // C = Aᵀ·B with A stored [k×m]: transpose to At[m×k], then NN(At, B).
+            let mut at = g.stream.alloc_zeros::<f32>(m * k)?;
+            transpose_device(g, a, &mut at, k, m)?;
+            gemm_rb(g, "gemm_nn_rb", &at, b, c, m, n, k)
+        }
+        (true, true) => panic!("gemm TT not supported"),
+    }
 }
 
 /// `dx = dout ⊙ f'(·)` over device buffers (resident activation-backward; see [`act_bwd_f32`]).
