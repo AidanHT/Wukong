@@ -46,5 +46,10 @@ pub mod ptx_conv;
 #[cfg(feature = "gpu")]
 pub mod ptx_fp8;
 
+// M7 runtime (Phase 7): device memory pool + CUDA-graph capture/replay. New, single-owner files;
+// they wrap the existing launchers without touching a kernel.
+#[cfg(feature = "gpu")]
+pub mod pool;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
