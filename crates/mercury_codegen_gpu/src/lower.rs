@@ -1573,6 +1573,9 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
         }
         "mercury_norm_f32" | "mercury_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM),
         "mercury_vmath_f32" => ("mrt_vmath", None, PTX_VMATH),
+        "mercury_sgemm_nt_epi" | "mercury_sgemm_nt_epi_parallel" => {
+            ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI)
+        }
         _ => return None,
     };
     Some(RtHelper { ptx_name, ret, def })
@@ -2148,6 +2151,102 @@ VM_ST:
     add.s64 %rd4, %rd4, 1;
     bra VM_LOOP;
 VM_DONE:
+    ret;
+}
+"#;
+
+/// `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)`: fused `C = act(A.Bt [+ bias])` (the
+/// nn.Linear/FFN epilogue). `bias` is null (passed as integer 0) for no bias; `act` is
+/// identity(0)/relu(1)/gelu(2)/silu(3). silu/gelu reuse the SFU forms from mrt_vmath; tolerance-gated.
+const PTX_SGEMM_NT_EPI: &str = r#".func mrt_sgemm_nt_epi (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta, .param .b64 pbias, .param .b64 pact)
+{
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<12>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    ld.param.u64 %rd6, [pbeta];
+    ld.param.u64 %rd16, [pbias];
+    ld.param.u64 %rd17, [pact];
+    mov.b64 %rd7, 0;
+EPI_LI:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra EPI_EI;
+    mov.b64 %rd8, 0;
+EPI_LJ:
+    setp.ge.s64 %p1, %rd8, %rd5;
+    @%p1 bra EPI_EJ;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    add.s64 %rd9, %rd0, %rd9;
+    mul.lo.s64 %rd10, %rd8, %rd4;
+    shl.b64 %rd10, %rd10, 2;
+    add.s64 %rd10, %rd1, %rd10;
+    mov.b64 %rd11, 0;
+EPI_LL:
+    setp.ge.s64 %p2, %rd11, %rd4;
+    @%p2 bra EPI_EL;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    add.s64 %rd14, %rd10, %rd12;
+    ld.f32 %f2, [%rd14];
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd11, %rd11, 1;
+    bra EPI_LL;
+EPI_EL:
+    mul.lo.s64 %rd15, %rd7, %rd5;
+    add.s64 %rd15, %rd15, %rd8;
+    shl.b64 %rd15, %rd15, 2;
+    add.s64 %rd15, %rd2, %rd15;
+    setp.eq.s64 %p3, %rd6, 0;
+    @%p3 bra EPI_NOACC;
+    ld.f32 %f3, [%rd15];
+    add.rn.f32 %f0, %f0, %f3;
+EPI_NOACC:
+    setp.eq.s64 %p3, %rd16, 0;
+    @%p3 bra EPI_NOBIAS;
+    shl.b64 %rd18, %rd8, 2;
+    add.s64 %rd18, %rd16, %rd18;
+    ld.f32 %f3, [%rd18];
+    add.rn.f32 %f0, %f0, %f3;
+EPI_NOBIAS:
+    setp.eq.s64 %p3, %rd17, 1;
+    @%p3 bra EPI_RELU;
+    setp.eq.s64 %p3, %rd17, 2;
+    @%p3 bra EPI_GELU;
+    setp.eq.s64 %p3, %rd17, 3;
+    @%p3 bra EPI_SILU;
+    bra EPI_ST;
+EPI_RELU:
+    max.f32 %f0, %f0, 0f00000000;
+    bra EPI_ST;
+EPI_SILU:
+    neg.f32 %f4, %f0; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f4, 0f3F800000; mov.f32 %f5, 0f3F800000; div.rn.f32 %f5, %f5, %f4;
+    mul.f32 %f0, %f0, %f5;
+    bra EPI_ST;
+EPI_GELU:
+    mul.f32 %f4, %f0, %f0; mul.f32 %f4, %f4, %f0;
+    fma.rn.f32 %f4, %f4, 0f3D372713, %f0; mul.f32 %f4, %f4, 0f3F4C422A;
+    add.f32 %f5, %f4, %f4; mul.f32 %f5, %f5, 0f3FB8AA3B; ex2.approx.f32 %f5, %f5;
+    add.f32 %f5, %f5, 0f3F800000; mov.f32 %f6, 0f40000000; div.rn.f32 %f6, %f6, %f5;
+    mov.f32 %f7, 0f3F800000; sub.f32 %f7, %f7, %f6; add.f32 %f7, %f7, 0f3F800000;
+    mul.f32 %f0, %f0, %f7; mul.f32 %f0, %f0, 0f3F000000;
+    bra EPI_ST;
+EPI_ST:
+    st.f32 [%rd15], %f0;
+    add.s64 %rd8, %rd8, 1;
+    bra EPI_LJ;
+EPI_EJ:
+    add.s64 %rd7, %rd7, 1;
+    bra EPI_LI;
+EPI_EI:
     ret;
 }
 "#;
