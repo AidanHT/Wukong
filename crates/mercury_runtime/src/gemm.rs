@@ -588,6 +588,122 @@ pub unsafe extern "C" fn mercury_sgemm_f16_nt_epi_parallel(
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, crate::f16_bits_to_f32);
 }
 
+/// `C = Aᵀ·B` with **half-precision inputs** (`bf16`/`f16`, stored as `u16`) and an **f32 accumulator**
+/// — the mixed-precision **weight-gradient** GEMM of a training backward pass (`dW = dYᵀ·X`). A is
+/// stored `[k, m]` (its logical `[m, k]` operand is the transpose of storage), B is `[k, n]`, C is
+/// `[m, n]` f32.
+///
+/// Like the f32 `Aᵀ·B` and the half `A·Bᵀ` kernels, this is a cheap prepass feeding the *identical*
+/// proven kernel: widen A and B into f32 scratch (lossless — `O(k·m + k·n)`, dwarfed by the
+/// `O(m·n·k)` GEMM), then delegate to the f32 `mercury_sgemm_tn`, which transposes A once and runs the
+/// tuned `C = A·B` microkernel. Because the widen is lossless, the result is bit-for-bit the f32 TN
+/// GEMM on the widened values — exactly the differential contract the interpreter marshals (no new
+/// accumulation order). gcc/rustc lose twice on the naive half nest: the inline `bf16→f32` widen won't
+/// vectorize *and* A's column-strided reads (the contraction is A's outer index) defeat vectorization.
+///
+/// # Safety
+/// `a` valid for `k*m`, `b` for `k*n` `u16`; `c` for `m*n` `f32`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn gemm_lowp_tn(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    par: bool,
+    widen: fn(u16) -> f32,
+) {
+    if m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    let mut af = vec![0.0f32; ku * mu];
+    let mut bf = vec![0.0f32; ku * nu];
+    widen_into_f32(a, af.as_mut_ptr(), ku * mu, widen);
+    widen_into_f32(b, bf.as_mut_ptr(), ku * nu, widen);
+    // Delegate to the f32 TN entry point on the widened operands (transpose A prepass + the tuned
+    // C = A·B kernel) — so the half TN GEMM is bit-for-bit the f32 TN GEMM on the widened values.
+    if par {
+        mercury_sgemm_tn_parallel(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta);
+    } else {
+        mercury_sgemm_tn(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta);
+    }
+}
+
+/// `C = Aᵀ·B` with `bf16` inputs (f32 accumulate), single-threaded. See [`gemm_lowp_tn`].
+///
+/// # Safety
+/// `a` valid for `k*m`, `b` for `k*n` `bf16` (`u16`); `c` for `m*n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_bf16_tn(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    gemm_lowp_tn(a, b, c, m, k, n, beta, false, crate::bf16_bits_to_f32);
+}
+
+/// Multi-threaded `C = Aᵀ·B` with `bf16` inputs. The widen + transpose prepass is serial (small); the
+/// GEMM runs across cores with the same per-(i,j) order as the serial kernel, so serial == parallel
+/// == interpreter bit-for-bit.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm_bf16_tn`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_bf16_tn_parallel(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    gemm_lowp_tn(a, b, c, m, k, n, beta, true, crate::bf16_bits_to_f32);
+}
+
+/// `C = Aᵀ·B` with IEEE `f16` inputs (f32 accumulate), single-threaded. The widen is F16C-exact;
+/// otherwise identical to the bf16 twin. See [`gemm_lowp_tn`].
+///
+/// # Safety
+/// `a` valid for `k*m`, `b` for `k*n` `f16` (`u16`); `c` for `m*n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_f16_tn(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    gemm_lowp_tn(a, b, c, m, k, n, beta, false, crate::f16_bits_to_f32);
+}
+
+/// Multi-threaded `C = Aᵀ·B` with `f16` inputs.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm_f16_tn`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_f16_tn_parallel(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    gemm_lowp_tn(a, b, c, m, k, n, beta, true, crate::f16_bits_to_f32);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -1639,6 +1755,54 @@ mod tests {
             assert_eq!(got_bf, got_bf_par, "bf16 nt serial vs parallel ({m}x{k}x{n})");
             assert_eq!(got_h, ref_h, "f16 nt must equal f32 nt on widened operands ({m}x{k}x{n})");
             assert_eq!(got_h, got_h_par, "f16 nt serial vs parallel ({m}x{k}x{n})");
+        }
+    }
+
+    /// `C = Aᵀ·B` with bf16/f16 inputs (the mixed-precision weight-gradient GEMM) must equal the f32 TN
+    /// kernel on the **losslessly-widened** operands (the widen prepass is the only difference from the
+    /// differential-contract kernel), and serial must equal parallel — bit-for-bit, deterministically.
+    #[test]
+    fn sgemm_lowp_tn_matches_widened_f32_and_parallel() {
+        for (m, k, n) in [
+            (1, 1, 1),
+            (5, 7, 3),
+            (64, 64, 64),
+            (100, 130, 96),
+            (128, 256, 64),
+            (520, 264, 540), // > PAR_MIN_MACS so the multicore path runs
+        ] {
+            let a = fill(51, k * m); // A stored [k, m]
+            let b = fill(52, k * n); // B stored [k, n]
+            let a_bf: Vec<u16> = a.iter().map(|&x| crate::f32_to_bf16_bits(x)).collect();
+            let b_bf: Vec<u16> = b.iter().map(|&x| crate::f32_to_bf16_bits(x)).collect();
+            let a_bf_f32: Vec<f32> = a.iter().map(|&x| crate::round_bf16(x)).collect();
+            let b_bf_f32: Vec<f32> = b.iter().map(|&x| crate::round_bf16(x)).collect();
+            let a_h: Vec<u16> = a.iter().map(|&x| crate::f32_to_f16_bits(x)).collect();
+            let b_h: Vec<u16> = b.iter().map(|&x| crate::f32_to_f16_bits(x)).collect();
+            let a_h_f32: Vec<f32> = a.iter().map(|&x| crate::round_f16(x)).collect();
+            let b_h_f32: Vec<f32> = b.iter().map(|&x| crate::round_f16(x)).collect();
+
+            let mut ref_bf = vec![0.0f32; m * n];
+            let mut ref_h = vec![0.0f32; m * n];
+            let mut got_bf = vec![0.0f32; m * n];
+            let mut got_bf_par = vec![0.0f32; m * n];
+            let mut got_h = vec![0.0f32; m * n];
+            let mut got_h_par = vec![0.0f32; m * n];
+            let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            unsafe {
+                // Reference: the exact f32 TN kernel on the widened operands.
+                mercury_sgemm_tn(a_bf_f32.as_ptr(), b_bf_f32.as_ptr(), ref_bf.as_mut_ptr(), mi, ki, ni, 0);
+                mercury_sgemm_tn(a_h_f32.as_ptr(), b_h_f32.as_ptr(), ref_h.as_mut_ptr(), mi, ki, ni, 0);
+                // bf16 / f16 TN kernels on the stored half-width bits.
+                mercury_sgemm_bf16_tn(a_bf.as_ptr(), b_bf.as_ptr(), got_bf.as_mut_ptr(), mi, ki, ni, 0);
+                mercury_sgemm_bf16_tn_parallel(a_bf.as_ptr(), b_bf.as_ptr(), got_bf_par.as_mut_ptr(), mi, ki, ni, 0);
+                mercury_sgemm_f16_tn(a_h.as_ptr(), b_h.as_ptr(), got_h.as_mut_ptr(), mi, ki, ni, 0);
+                mercury_sgemm_f16_tn_parallel(a_h.as_ptr(), b_h.as_ptr(), got_h_par.as_mut_ptr(), mi, ki, ni, 0);
+            }
+            assert_eq!(got_bf, ref_bf, "bf16 tn must equal f32 tn on widened operands ({m}x{k}x{n})");
+            assert_eq!(got_bf, got_bf_par, "bf16 tn serial vs parallel ({m}x{k}x{n})");
+            assert_eq!(got_h, ref_h, "f16 tn must equal f32 tn on widened operands ({m}x{k}x{n})");
+            assert_eq!(got_h, got_h_par, "f16 tn serial vs parallel ({m}x{k}x{n})");
         }
     }
 
