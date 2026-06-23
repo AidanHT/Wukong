@@ -36,6 +36,7 @@ use mercury_mir::{BasicBlock, BinOp, Function, Inst, MirType, Op, Terminator, Va
 use mercury_span::{Interner, Symbol};
 use std::collections::{HashMap, HashSet};
 
+pub mod optim;
 mod tape;
 use tape::Syms;
 

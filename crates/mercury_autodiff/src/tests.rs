@@ -1083,3 +1083,171 @@ fn mlp2_kernel_sgd_decreases_loss() {
         "kernel MLP SGD did not converge: loss {l0} -> {last}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// AdamW optimizer kernel (optim::build_adamw_step): gate the fused MIR update against an f64
+// reference, then train the two-layer MLP with it (loss decreases).
+// ---------------------------------------------------------------------------------------------
+
+use crate::optim::{build_adamw_step, hp};
+
+/// f64 reference AdamW update (in place on `w`, `m`, `v`).
+#[allow(clippy::too_many_arguments)]
+fn adamw_ref_f64(
+    w: &mut [f64],
+    g: &[f64],
+    m: &mut [f64],
+    v: &mut [f64],
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1: f64,
+    bc2: f64,
+) {
+    for i in 0..w.len() {
+        m[i] = beta1 * m[i] + (1.0 - beta1) * g[i];
+        v[i] = beta2 * v[i] + (1.0 - beta2) * g[i] * g[i];
+        let mhat = m[i] / bc1;
+        let vhat = v[i] / bc2;
+        w[i] -= lr * (mhat / (vhat.sqrt() + eps) + wd * w[i]);
+    }
+}
+
+#[test]
+fn adamw_step_matches_reference() {
+    let n = 16;
+    let mut it = Interner::default();
+    let f = build_adamw_step(&mut it, n);
+    let name = f.name;
+    let prog = Program {
+        funcs: vec![f],
+        level: mercury_mir::MirLevel::Low,
+    };
+
+    let mut seed = 0x4D11u64;
+    let mut w = rand_vec(&mut seed, n);
+    let g = rand_vec(&mut seed, n);
+    let mut m = vec![0.0f32; n];
+    let mut v = vec![0.0f32; n];
+
+    let (lr, beta1, beta2, eps, wd) = (0.01f64, 0.9f64, 0.999f64, 1e-8f64, 0.01f64);
+    let mut wr: Vec<f64> = w.iter().map(|&x| x as f64).collect();
+    let gr: Vec<f64> = g.iter().map(|&x| x as f64).collect();
+    let mut mr = vec![0.0f64; n];
+    let mut vr = vec![0.0f64; n];
+
+    // Several steps with a fixed gradient exercise the moment accumulation + bias correction.
+    for t in 1..=5i32 {
+        let bc1 = 1.0 - beta1.powi(t);
+        let bc2 = 1.0 - beta2.powi(t);
+        let mut hpbuf = vec![0.0f32; hp::LEN];
+        hpbuf[hp::LR] = lr as f32;
+        hpbuf[hp::BETA1] = beta1 as f32;
+        hpbuf[hp::BETA2] = beta2 as f32;
+        hpbuf[hp::EPS] = eps as f32;
+        hpbuf[hp::WD] = wd as f32;
+        hpbuf[hp::BC1] = bc1 as f32;
+        hpbuf[hp::BC2] = bc2 as f32;
+
+        let mut bufs = vec![w.clone(), g.clone(), m.clone(), v.clone(), hpbuf];
+        let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+        run_kernel_f32(&prog, name, &mut views, &it).expect("adamw run failed");
+        w = bufs[0].clone();
+        m = bufs[2].clone();
+        v = bufs[3].clone();
+
+        adamw_ref_f64(&mut wr, &gr, &mut mr, &mut vr, lr, beta1, beta2, eps, wd, bc1, bc2);
+
+        for (j, (&wk, &wref)) in w.iter().zip(&wr).enumerate() {
+            assert!(
+                (wk as f64 - wref).abs() <= 1e-4 + 1e-4 * wref.abs(),
+                "step {t} w[{j}]: kernel {wk} vs ref {wref}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mlp2_adamw_decreases_loss() {
+    let mut it = Interner::default();
+    let fwd = build_mlp2(&mut it);
+    let (gprog, gname) = build(&fwd.func, &[1, 2], &mut it);
+    let n1 = MHID * MIN;
+    let n2 = MOUT * MHID;
+    // One AdamW kernel per parameter-tensor size (here both layers differ).
+    let adamw1 = build_adamw_step(&mut it, n1);
+    let a1name = adamw1.name;
+    let adamw2 = build_adamw_step(&mut it, n2);
+    let a2name = adamw2.name;
+    let aprog = Program {
+        funcs: vec![adamw1, adamw2],
+        level: mercury_mir::MirLevel::Low,
+    };
+
+    let mut seed = 0xADA3u64;
+    let xb = rand_vec(&mut seed, B * MIN);
+    // A teacher with larger weights makes a non-trivial target; the student starts near zero, so the
+    // initial loss is substantial (real optimization work, not a lucky near-optimal init).
+    let teach_w1: Vec<f32> = rand_vec(&mut seed, n1).iter().map(|v| v * 2.0).collect();
+    let teach_w2: Vec<f32> = rand_vec(&mut seed, n2).iter().map(|v| v * 2.0).collect();
+    let tb: Vec<f32> = {
+        let p1 = matmul_nt_f64(&xb, &teach_w1, B, MIN, MHID);
+        let h: Vec<f32> = p1.iter().map(|&v| v.max(0.0) as f32).collect();
+        matmul_nt_f64(&h, &teach_w2, B, MHID, MOUT)
+            .iter()
+            .map(|&v| v as f32)
+            .collect()
+    };
+    let mut w1: Vec<f32> = rand_vec(&mut seed, n1).iter().map(|v| v * 0.1).collect();
+    let mut w2: Vec<f32> = rand_vec(&mut seed, n2).iter().map(|v| v * 0.1).collect();
+    let mut m1 = vec![0.0f32; n1];
+    let mut v1 = vec![0.0f32; n1];
+    let mut m2 = vec![0.0f32; n2];
+    let mut v2 = vec![0.0f32; n2];
+
+    let loss_now = |w1: &[f32], w2: &[f32], it: &Interner| -> f64 {
+        let mut bufs = vec![xb.clone(), w1.to_vec(), w2.to_vec(), tb.clone(), vec![0.0]];
+        loss_at_f32(&gprog, fwd.func.name, &mut bufs, 4, it)
+    };
+    let run_adamw =
+        |name: Symbol, w: &mut Vec<f32>, g: &[f32], m: &mut Vec<f32>, v: &mut Vec<f32>, hpbuf: &[f32], it: &Interner| {
+            let mut bufs = vec![w.clone(), g.to_vec(), m.clone(), v.clone(), hpbuf.to_vec()];
+            let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+            run_kernel_f32(&aprog, name, &mut views, it).expect("adamw run");
+            *w = bufs[0].clone();
+            *m = bufs[2].clone();
+            *v = bufs[3].clone();
+        };
+
+    let (lr, beta1, beta2, eps, wd) = (0.01f64, 0.9f64, 0.999f64, 1e-8f64, 0.0f64);
+    let l0 = loss_now(&w1, &w2, &it);
+    assert!(l0 > 0.1, "test setup: initial loss should be substantial, got {l0}");
+    let mut last = l0;
+    for t in 1..=300i32 {
+        let inputs = vec![xb.clone(), w1.clone(), w2.clone(), tb.clone(), vec![0.0]];
+        let g = analytic_grad_f32(&gprog, gname, &fwd, &inputs, &[1, 2], &it);
+        let g1: Vec<f32> = g[0].iter().map(|&x| x as f32).collect();
+        let g2: Vec<f32> = g[1].iter().map(|&x| x as f32).collect();
+        let bc1 = 1.0 - beta1.powi(t);
+        let bc2 = 1.0 - beta2.powi(t);
+        let mut hpbuf = vec![0.0f32; hp::LEN];
+        hpbuf[hp::LR] = lr as f32;
+        hpbuf[hp::BETA1] = beta1 as f32;
+        hpbuf[hp::BETA2] = beta2 as f32;
+        hpbuf[hp::EPS] = eps as f32;
+        hpbuf[hp::WD] = wd as f32;
+        hpbuf[hp::BC1] = bc1 as f32;
+        hpbuf[hp::BC2] = bc2 as f32;
+        run_adamw(a1name, &mut w1, &g1, &mut m1, &mut v1, &hpbuf, &it);
+        run_adamw(a2name, &mut w2, &g2, &mut m2, &mut v2, &hpbuf, &it);
+        last = loss_now(&w1, &w2, &it);
+    }
+    // AdamW's normalized step oscillates near the optimum (it won't reach ~0 with a fixed lr), but a
+    // large, stable reduction shows the fused kernel optimizes correctly with the autodiff gradients.
+    assert!(
+        last.is_finite() && last < 0.4 * l0,
+        "AdamW did not reduce the loss enough: {l0} -> {last}"
+    );
+}
