@@ -146,19 +146,29 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
     // functions that call them. (Recognized-op dispatch to the *tuned* launchers is a later phase.)
     {
         let mut seen = std::collections::HashSet::new();
+        let mut needs_fmod = false;
         for f in &program.funcs {
             for b in &f.blocks {
                 for inst in &b.insts {
-                    if let Op::Call { func, .. } = &inst.op {
-                        if let Some(h) = rt_helper(interner.resolve(*func)) {
-                            if seen.insert(h.ptx_name) {
-                                out.push_str(&h.def);
-                                out.push('\n');
+                    match &inst.op {
+                        Op::Call { func, .. } => {
+                            if let Some(h) = rt_helper(interner.resolve(*func)) {
+                                if seen.insert(h.ptx_name) {
+                                    out.push_str(&h.def);
+                                    out.push('\n');
+                                }
                             }
                         }
+                        // Float `%` lowers to a call to the device fmod helper (below).
+                        Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
+                        _ => {}
                     }
                 }
             }
+        }
+        if needs_fmod {
+            out.push_str(PTX_FMOD);
+            out.push('\n');
         }
     }
 
@@ -609,13 +619,34 @@ impl<'a> FnEmit<'a> {
                 FSub => self.emit(&format!("sub.rn.{sfx} {d}, {a}, {b};")),
                 FMul => self.emit(&format!("mul.rn.{sfx} {d}, {a}, {b};")),
                 FDiv => self.emit(&format!("div.rn.{sfx} {d}, {a}, {b};")),
-                // No PTX frem, and the `a - trunc(a/b)*b` identity loses precision past the mantissa's
-                // integer range (`1e18 % 3` -> 0, not 1), so it cannot meet the differential gate. A
-                // true device fmod is a later increment; decline cleanly for now.
+                // No PTX frem op, and the `a - trunc(a/b)*b` identity loses precision past the
+                // mantissa's integer range (`1e18 % 3` -> 0, not 1). Call the exact device fmod
+                // helper instead; compute in f64 (exact for f32 inputs) and narrow the f32 result.
                 FRem => {
-                    return Err(format!(
-                        "{UNSUPPORTED} float `%` (fmod) not yet lowered to PTX (needs a true fmod)"
-                    ))
+                    let (af, bf) = if rc_of(rty) == RC::F64 {
+                        (a.to_string(), b.to_string())
+                    } else {
+                        let ta = self.fresh(RC::F64);
+                        self.emit(&format!("cvt.f64.f32 {ta}, {a};"));
+                        let tb = self.fresh(RC::F64);
+                        self.emit(&format!("cvt.f64.f32 {tb}, {b};"));
+                        (ta, tb)
+                    };
+                    let rr = self.fresh(RC::F64);
+                    self.emit("{");
+                    self.emit(".param .f64 _fa;");
+                    self.emit(".param .f64 _fb;");
+                    self.emit(".param .f64 _fr;");
+                    self.emit(&format!("st.param.f64 [_fa], {af};"));
+                    self.emit(&format!("st.param.f64 [_fb], {bf};"));
+                    self.emit("call.uni (_fr), mrt_fmod, (_fa, _fb);");
+                    self.emit(&format!("ld.param.f64 {rr}, [_fr];"));
+                    self.emit("}");
+                    if rc_of(rty) == RC::F64 {
+                        self.emit(&format!("mov.f64 {d}, {rr};"));
+                    } else {
+                        self.emit(&format!("cvt.rn.f32.f64 {d}, {rr};"));
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -2524,6 +2555,45 @@ VE_LOOP:
     add.s64 %rd7, %rd7, 1;
     bra VE_LOOP;
 VE_DONE:
+    ret;
+}
+"#;
+
+/// `mrt_fmod(a, b) -> a % b` (true IEEE fmod, f64), the helper float `%` calls. Exact via binary
+/// scaling: align `rb·2^k` just below `ra=|a|`, then subtract-and-halve down to `rb` — every step
+/// (`*2`, `*0.5`, `ra-=m`) is exact, so the result is the exact remainder regardless of magnitude
+/// (the `a-trunc(a/b)*b` identity fails past 2^53). f32 `%` widens to f64 here and narrows the result.
+const PTX_FMOD: &str = r#".func (.param .f64 _r) mrt_fmod (.param .f64 pa, .param .f64 pb)
+{
+    .reg .f64 %fd<6>;
+    .reg .pred %p<3>;
+    ld.param.f64 %fd0, [pa];
+    ld.param.f64 %fd1, [pb];
+    abs.f64 %fd2, %fd0;
+    abs.f64 %fd3, %fd1;
+    setp.eq.f64 %p0, %fd3, 0d0000000000000000;
+    @%p0 bra FMOD_RET;
+    setp.lt.f64 %p0, %fd2, %fd3;
+    @%p0 bra FMOD_RET;
+    mov.f64 %fd4, %fd3;
+FMOD_UP:
+    add.f64 %fd5, %fd4, %fd4;
+    setp.gt.f64 %p1, %fd5, %fd2;
+    @%p1 bra FMOD_LOOP;
+    mov.f64 %fd4, %fd5;
+    bra FMOD_UP;
+FMOD_LOOP:
+    setp.lt.f64 %p1, %fd2, %fd4;
+    @%p1 bra FMOD_SKIP;
+    sub.f64 %fd2, %fd2, %fd4;
+FMOD_SKIP:
+    setp.eq.f64 %p1, %fd4, %fd3;
+    @%p1 bra FMOD_RET;
+    mul.f64 %fd4, %fd4, 0d3FE0000000000000;
+    bra FMOD_LOOP;
+FMOD_RET:
+    copysign.f64 %fd2, %fd0, %fd2;
+    st.param.f64 [_r], %fd2;
     ret;
 }
 "#;
