@@ -57,5 +57,10 @@ pub mod ptx_int8;
 #[cfg(feature = "gpu")]
 pub mod ptx_fp8_train;
 
+// Phase 10: per-(op, shape, dtype) autotuning + on-disk config cache + regression mode. Picks the
+// fastest of the int8 GEMM kernel variants (swz / hand-placed × tiles × split-K) per shape, same-run.
+#[cfg(feature = "gpu")]
+pub mod autotune;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
