@@ -51,6 +51,9 @@ pub use lowp::{
     mercury_reduce_f16, mercury_sum_bf16, mercury_sum_f16,
 };
 
+mod transpose;
+pub use transpose::{mercury_transpose_f32, mercury_transpose_f32_parallel};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
