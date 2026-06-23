@@ -1138,6 +1138,44 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_colsum_f32[_parallel](x, out, rows, cols)` — the SIMD column reduction
+            // (`out[j] = Σ_i x[i*cols+j]`) a recognized column-sum nest lowers to. Marshal the
+            // `rows*cols` f32 from x, call the *serial* runtime kernel (bit-identical to the parallel
+            // one — each column summed in the same i-order, disjoint stripes), write the `cols`-long
+            // result to out.
+            "mercury_colsum_f32" | "mercury_colsum_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("colsum operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; cols];
+                // SAFETY: xbuf is rows*cols, obuf is cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_colsum_f32(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("colsum output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath2_f32(x, y, out, n, op)` — the two-input 256-bit kernel (pow/atan2/hypot)
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the

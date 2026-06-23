@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 18
+// EXPECT-OUT: 21
+// EXPECT-OUT: 24
+module tests.run.colsum
+
+// Column reduction out[j] = Σ_i x[i,j] — the sum over the outer (batch/row) axis of a [M=3, N=4]
+// matrix into a per-column [N=4] result (the bias gradient db = Σ_batch dY, batch sum, reduce-along-
+// axis-0). The data index x[i*N+j] strides by N over the inner loop, so gcc/rustc leave it scalar
+// (verified: no packed vaddps at -O3); the recognizer dispatches to the SIMD mercury_colsum_f32, which
+// streams x row-major + 8 columns at a time. The accumulation is i-ascending per column — exactly the
+// scalar nest's order — so the kernel is bit-exact: the differential gate (interp == native, -O0 ==
+// -O3) holds by construction (no reassociation).
+fn main() -> i32 {
+    // x is [3,4] row-major: [[1,2,3,4],[5,6,7,8],[9,10,11,12]].
+    let mut x: [f32; 12] = [0.0; 12];
+    for t in 0..12 {
+        x[t] = (t + 1) as f32;
+    }
+    let mut out: [f32; 4] = [0.0; 4];
+
+    for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for i in 0..3 {
+            s = s + x[i * 4 + j];
+        }
+        out[j] = s;
+    }
+    print(out[0] as i32); // 1 + 5 + 9   = 15
+    print(out[1] as i32); // 2 + 6 + 10  = 18
+    print(out[2] as i32); // 3 + 7 + 11  = 21
+    print(out[3] as i32); // 4 + 8 + 12  = 24
+    return 0;
+}
