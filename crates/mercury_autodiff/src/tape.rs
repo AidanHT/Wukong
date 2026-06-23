@@ -22,8 +22,10 @@ const VM_EXP: i64 = 0;
 const VM_TANH: i64 = 2;
 const VM_SIGMOID: i64 = 3;
 const VM_RELU: i64 = 4;
-const RED_SUM: i64 = 2;
+const RED_DOT: i64 = 0;
 const RED_SSD: i64 = 1;
+const RED_SUM: i64 = 2;
+const NORM_SOFTMAX: i64 = 0;
 /// velem activation: identity (`out = a*x + b*y + c`).
 const VE_ID: i64 = 0;
 /// OR'd into a velem op when `y` is read (`b` may be non-zero).
@@ -41,6 +43,7 @@ pub(crate) struct Syms {
     pub vmath: Symbol,
     pub sreduce: Symbol,
     pub velem: Symbol,
+    pub norm: Symbol,
 }
 
 impl Syms {
@@ -51,6 +54,7 @@ impl Syms {
             vmath: it.intern("mercury_vmath_f32"),
             sreduce: it.intern("mercury_sreduce_f32"),
             velem: it.intern("mercury_velem_f32"),
+            norm: it.intern("mercury_norm_f32"),
         }
     }
 }
@@ -72,6 +76,7 @@ impl<'a> Vjp<'a> {
             || func == self.syms.vmath
             || func == self.syms.sreduce
             || func == self.syms.velem
+            || func == self.syms.norm
     }
 
     /// Differentiate one recognized kernel call. `args`/`result` are the forward (old) value ids.
@@ -89,6 +94,8 @@ impl<'a> Vjp<'a> {
             self.diff_vmath(args)
         } else if func == self.syms.velem {
             self.diff_velem(args)
+        } else if func == self.syms.norm {
+            self.diff_norm(args)
         } else {
             Err("autodiff: kernel call has no VJP rule".to_string())
         }
@@ -113,6 +120,20 @@ impl<'a> Vjp<'a> {
                 if let Some(gx) = self.grad_target(x)? {
                     self.single(x)?;
                     self.fill_buf(gx, n, g);
+                }
+            }
+            RED_DOT => {
+                // loss = sum(x[i] y[i]).  dx = g*y, dy = g*x.
+                let (x, y) = (args[0], args[1]);
+                let xn = self.remap_v(x);
+                let yn = self.remap_v(y);
+                if let Some(gx) = self.grad_target(x)? {
+                    self.single(x)?;
+                    self.velem_scale(gx, yn, g, n);
+                }
+                if let Some(gy) = self.grad_target(y)? {
+                    self.single(y)?;
+                    self.velem_scale(gy, xn, g, n);
                 }
             }
             RED_SSD => {
@@ -237,6 +258,63 @@ impl<'a> Vjp<'a> {
                 self.velem_scale(dy, dout, b, n);
             }
         }
+        Ok(())
+    }
+
+    // --- row-wise normalization (softmax) ------------------------------------------------------
+
+    /// `norm(x, out, rows, cols, eps_bits, op)` row-normalizes `x`. For **softmax** (`out = y`), the
+    /// VJP per row is `dx = y (.) (dy - sum_j dy_j y_j)`: a per-row dot (`sreduce`, riding the tuned
+    /// reduction) then an elementwise combine — emitted as nested counted loops (rows x cols).
+    fn diff_norm(&mut self, args: &[ValueId]) -> Result<(), String> {
+        let (x, out) = (args[0], args[1]);
+        let op = self.const_i64(args[5])?;
+        if op != NORM_SOFTMAX {
+            return Err(format!(
+                "autodiff: only the softmax norm VJP is implemented (op {op}); LayerNorm/RMSNorm \
+                 backward are not yet supported"
+            ));
+        }
+        let dy = match self.buf_adj.get(&out).copied() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let dx = match self.grad_target(x)? {
+            Some(dx) => dx,
+            None => return Ok(()),
+        };
+        self.single(x)?;
+        let y = self.remap_v(out); // the forward softmax output
+        let rows = self.remap_v(args[2]);
+        let cols = self.remap_v(args[3]);
+        let dotop = self.cint(RED_DOT);
+        let sreduce = self.syms.sreduce;
+
+        // for r in 0..rows:
+        let outer = self.open_loop(rows);
+        let r = outer.idx;
+        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols)); // row base offset
+        let dy_row = self.gep(dy, rc);
+        let y_row = self.gep(y, rc);
+        // s = sum_j dy[r,j] * y[r,j]   (per-row dot)
+        let s = self.b.build(
+            F32,
+            Op::Call {
+                func: sreduce,
+                args: vec![dy_row, y_row, cols, dotop],
+            },
+        );
+        // for j in 0..cols: dx[r,j] = y[r,j] * (dy[r,j] - s)
+        let inner = self.open_loop(cols);
+        let j = inner.idx;
+        let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
+        let yv = self.load_at(y, idx);
+        let dyv = self.load_at(dy, idx);
+        let diff = self.b.build(F32, Op::Bin(BinOp::FSub, dyv, s));
+        let dxv = self.b.build(F32, Op::Bin(BinOp::FMul, yv, diff));
+        self.store_at(dx, idx, dxv);
+        self.close_loop(inner);
+        self.close_loop(outer);
         Ok(())
     }
 
@@ -453,6 +531,18 @@ impl<'a> Vjp<'a> {
     }
 
     // --- small helpers -------------------------------------------------------------------------
+
+    /// `&base[idx]` as an `f32` element pointer.
+    fn gep(&mut self, base: ValueId, idx: ValueId) -> ValueId {
+        self.b.build(
+            PTR,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: F32,
+            },
+        )
+    }
 
     /// Load `base[idx]` as an `f32` (`gep` then `load`).
     fn load_at(&mut self, base: ValueId, idx: ValueId) -> ValueId {
