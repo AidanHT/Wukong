@@ -114,6 +114,32 @@ pub fn jit_run(
             interner.resolve(entry)
         ));
     }
+
+    // Fast path: an eligible program runs as the cooperative megakernel (whole program, one launch,
+    // recognized ops cooperative across the block). Anything it can't accelerate returns `Ok(None)`
+    // and falls through to the correct single-thread lowering below — the universal reference. The
+    // `MERCURY_GPU_NO_MEGA` escape hatch forces the single-thread path (for A/B timing / debugging).
+    if std::env::var_os("MERCURY_GPU_NO_MEGA").is_none() {
+        match crate::megakernel::try_run(program, entry, interner)? {
+            Some(r) => return Ok(r),
+            None => {}
+        }
+    }
+
+    jit_run_single(program, entry, interner)
+}
+
+/// The single-thread lowering only — bypasses the cooperative megakernel. This is the universal
+/// correctness reference (any program, any control flow) and the A/B baseline the megakernel speedup
+/// is measured against same-run. Public so benches can time the two paths back-to-back.
+pub fn jit_run_single(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    let entry_fn = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
     let ptx = emit_ptx(program, entry, interner)?;
     let ret = entry_fn.ret.clone();
 
