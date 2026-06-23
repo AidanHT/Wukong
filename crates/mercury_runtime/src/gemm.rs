@@ -283,6 +283,77 @@ pub unsafe extern "C" fn mercury_sgemm_nt_epi_parallel(
     gemm_dispatch(a, b, c, m, k, n, beta, true, true, Some(epi));
 }
 
+/// Transpose a row-major `[rows, cols]` matrix `src` into a row-major `[cols, rows]` matrix `dst`
+/// (`dst[c*rows + r] = src[r*cols + c]`). Reads each source row contiguously; a one-time
+/// O(rows·cols) reorg used by the `C = Aᵀ·B` GEMM below.
+///
+/// # Safety
+/// `src` and `dst` must each be valid for `rows*cols` `f32`, and must not overlap.
+#[inline]
+unsafe fn transpose_into(src: *const f32, dst: *mut f32, rows: usize, cols: usize) {
+    for r in 0..rows {
+        let s = src.add(r * cols);
+        for c in 0..cols {
+            *dst.add(c * rows + r) = *s.add(c);
+        }
+    }
+}
+
+/// `C = Aᵀ·B` — A is stored row-major as `[k, m]` (`a[p*m + i]`), B row-major `[k, n]` (`b[p*n + j]`),
+/// C is `[m, n]`. This is the **weight-gradient** GEMM of a training backward pass (`dW = dYᵀ·X`): the
+/// contraction axis (the batch) is the *outer* index of both inputs, so A's logical `[m, k]` operand
+/// is the transpose of its storage. gcc/rustc compile the naive nest with column-strided A reads that
+/// defeat vectorization (one cache line per element); Mercury transposes A into scratch once — O(m·k),
+/// ~1/n of the O(m·n·k) GEMM — then runs the identical tuned `C = A·B` kernel. Reusing *that exact
+/// kernel* means it is bit-for-bit the differential contract the interpreter marshals (no new
+/// accumulation order to keep in sync). `beta`: 0 overwrites C, else accumulates.
+///
+/// # Safety
+/// `a` valid for `k*m`, `b` for `k*n`, `c` for `m*n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_tn(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    if m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+    let (mu, ku) = (m as usize, k as usize);
+    let mut at = vec![0.0f32; mu * ku];
+    transpose_into(a, at.as_mut_ptr(), ku, mu); // [k, m] -> [m, k]
+    gemm_dispatch(at.as_ptr(), b, c, m, k, n, beta, false, false, None);
+}
+
+/// Multi-threaded `C = Aᵀ·B` (the `@parallel` weight-gradient GEMM). Transposes A serially (the small
+/// O(m·k) prepass), then runs the multicore `C = A·B` kernel — whose per-(i,j) accumulation order
+/// matches the serial one, so serial == parallel == interpreter bit-for-bit (the differential gate).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm_tn`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_tn_parallel(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+) {
+    if m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+    let (mu, ku) = (m as usize, k as usize);
+    let mut at = vec![0.0f32; mu * ku];
+    transpose_into(a, at.as_mut_ptr(), ku, mu);
+    gemm_dispatch(at.as_ptr(), b, c, m, k, n, beta, false, true, None);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -1198,6 +1269,92 @@ mod tests {
                 );
             }
             assert_eq!(got, got_par, "nt serial vs parallel ({m}x{k}x{n})");
+        }
+    }
+
+    /// Naive `C = Aᵀ·B`: A stored row-major `[k, m]`, B `[k, n]`, C `[m, n]`.
+    fn naive_tn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for p in 0..k {
+                    s += a[p * m + i] * b[p * n + j];
+                }
+                c[i * n + j] = s;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn sgemm_tn_matches_naive_and_transposed_nn() {
+        // The last tuple exceeds PAR_MIN_MACS (~74M MACs) so the multicore tn path actually runs;
+        // the rest straddle the MR=6 / NR=16 remainders.
+        for (m, k, n) in [
+            (1, 1, 1),
+            (5, 7, 3),
+            (64, 64, 64),
+            (100, 130, 96),
+            (128, 256, 64),
+            (520, 264, 540),
+        ] {
+            let a = fill(21, k * m); // A stored [k, m]
+            let b = fill(22, k * n); // B stored [k, n]
+            let want = naive_tn(&a, &b, m, k, n);
+            let mut got = vec![0.0f32; m * n];
+            let mut got_par = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm_tn(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                );
+                mercury_sgemm_tn_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                );
+            }
+            let tol = 1e-3 * (k as f32).sqrt();
+            for i in 0..m * n {
+                assert!(
+                    (got[i] - want[i]).abs() <= tol + 1e-4 * want[i].abs(),
+                    "tn ({m}x{k}x{n}) idx {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
+            // Bit-exact against the NN kernel on a manually-transposed A — proves the only difference
+            // from the differential-contract kernel is the (deterministic) transpose prepass.
+            let mut at = vec![0.0f32; m * k];
+            for p in 0..k {
+                for i in 0..m {
+                    at[i * k + p] = a[p * m + i];
+                }
+            }
+            let mut nn = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm(
+                    at.as_ptr(),
+                    b.as_ptr(),
+                    nn.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    0,
+                );
+            }
+            assert_eq!(got, nn, "tn must equal NN on manually-transposed A ({m}x{k}x{n})");
+            assert_eq!(got, got_par, "tn serial vs parallel ({m}x{k}x{n})");
         }
     }
 
