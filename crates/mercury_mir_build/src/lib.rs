@@ -80,6 +80,8 @@ pub fn lower_program(
         reduce_f16: interner.intern("mercury_reduce_f16"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
         axpby_f16: interner.intern("mercury_axpby_f16"),
+        transpose: interner.intern("mercury_transpose_f32"),
+        transpose_par: interner.intern("mercury_transpose_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -112,6 +114,16 @@ pub fn lower_program(
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
                 {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function matrix transpose: intercept before the elementwise
+                // outliner (which would outline it into per-row scalar loops and lose the blocked
+                // kernel). Lower it normally with `parallel = true`; the embedded `match_transpose` in
+                // `lower_for` then emits the multicore `mercury_transpose_f32_parallel`. A non-`@parallel`
+                // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
+                if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -595,6 +607,13 @@ struct GemmSyms {
     axpby_bf16: Symbol,
     /// `mercury_axpby_f16` — the F16C twin of `axpby_bf16` (f16 inputs widened with `vcvtph2ps`).
     axpby_f16: Symbol,
+    /// `mercury_transpose_f32[_parallel](src, dst, rows, cols)` — the cache-blocked matrix transpose
+    /// (`dst[j,i] = src[i,j]`, `[rows,cols]` → `[cols,rows]`). A recognized transpose nest dispatches
+    /// here; it is pure data movement (a permutation), so bit-identical to the scalar nest on both
+    /// backends (no reassociation — the differential gate is trivial). The `_parallel` form spreads
+    /// the independent row blocks across cores.
+    transpose: Symbol,
+    transpose_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2244,6 +2263,29 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_transpose_f32[_parallel](src, dst, rows, cols)` call for a recognized matrix
+    /// transpose. Bails (false) if an operand/dim is unbound at the call site (the caller then lowers
+    /// the scalar nest). `parallel` selects the multicore kernel (the row blocks write disjoint `dst`
+    /// columns → bit-identical to the serial one, which is a plain permutation the interpreter marshals).
+    fn emit_transpose(&mut self, nest: &TransposeNest, parallel: bool) -> bool {
+        let (Some((src, _)), Some((dst, _))) = (self.lookup(nest.src), self.lookup(nest.dst)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.transpose_par
+        } else {
+            self.gemm.transpose
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![src, dst, rows, cols],
+        });
+        true
+    }
+
     /// Emit the fused `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)`
     /// call for a recognized bf16/f16 `nn.Linear`+epilogue (`C = act(A·Bᵀ + bias)`, half inputs / f32
     /// output). Bails (false) if any operand/dim is unbound at the call site, so the caller lowers the
@@ -3462,6 +3504,14 @@ impl FnLowerer<'_> {
         // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
         if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
             if self.emit_lowp_gemm(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Matrix transpose `for i { for j { dst[j*R+i] = src[i*C+j] } }` → the cache-blocked
+        // `mercury_transpose_f32` (the `_parallel` one in a `@parallel` function). Pure data movement,
+        // bit-identical to the scalar nest; the block tiling is the win `-O3` won't do for a transpose.
+        if let Some(nest) = match_transpose(pat, iter, body, self.sema, self.interner) {
+            if self.emit_transpose(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -9781,6 +9831,115 @@ fn lowp_matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Optio
         return None;
     };
     match_matmul_lowp(pat, iter, lb, sema, interner)
+}
+
+/// A recognized matrix transpose `dst = srcᵀ` (`src` is `[rows, cols]`, `dst` is `[cols, rows]`).
+struct TransposeNest {
+    src: Symbol,
+    dst: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// Recognize the matrix-transpose nest and dispatch it to the cache-blocked `mercury_transpose_f32`:
+///
+/// ```text
+/// for i in 0..R { for j in 0..C { dst[j*R + i] = src[i*C + j]; } }
+/// ```
+///
+/// `dst` (`[C, R]`) is written as the transpose of `src` (`[R, C]`). Both must be f32 arrays and
+/// **distinct** (an in-place transpose aliases — a different computation the kernel does not do). The
+/// store index is `j*R + i` (column-major in `src`'s frame), the load `i*C + j` (row-major); the
+/// strides pin `R`/`C` to the loop bounds, so it never misfires. Pure data movement (a permutation),
+/// so the kernel is bit-identical to this nest on both backends — no reassociation, the differential
+/// gate is trivial. Naive C/Rust write `dst` with stride `R` (a cache miss per element for large `R`);
+/// the blocked kernel keeps a tile L1-resident, which `-O3` does not do for a transpose.
+fn match_transpose(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<TransposeNest> {
+    // for i in 0..R { <single inner for> }
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (rs, re) = range_bounds(iter)?;
+    if as_int_lit(rs, interner)? != 0 {
+        return None;
+    }
+    let rows = as_dim(re, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    // for j in 0..C { <single assignment> }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let col = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (cs, ce) = range_bounds(jiter)?;
+    if as_int_lit(cs, interner)? != 0 {
+        return None;
+    }
+    let cols = as_dim(ce, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.len() != 1 {
+        return None;
+    }
+    // dst[j*R + i] = src[i*C + j];
+    let StmtKind::Assign {
+        target,
+        op: ast::AssignOp::Assign,
+        value,
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let (dbase, didx) = as_index1(target)?;
+    let (sbase, sidx) = as_index1(value)?;
+    // dst index `j*R + i` (col outer, stride R) and src index `i*C + j` (row outer, stride C), both
+    // offset-free; the strides must equal the opposite loop bound.
+    let (sd, d_off) = match_row_col_off(didx, col, row, interner)?;
+    let (ss, s_off) = match_row_col_off(sidx, row, col, interner)?;
+    if !d_off.is_empty() || !s_off.is_empty() || sd != rows || ss != cols {
+        return None;
+    }
+    // Both operands f32, and distinct (an input aliasing the output is an in-place transpose hazard).
+    if scalar_of(target, sema) != Some(mercury_types::Scalar::F32)
+        || scalar_of(value, sema) != Some(mercury_types::Scalar::F32)
+        || sbase == dbase
+    {
+        return None;
+    }
+    Some(TransposeNest {
+        src: sbase,
+        dst: dbase,
+        rows,
+        cols,
+    })
+}
+
+/// Is the whole function body a single transpose nest? Used to intercept a `@parallel` transpose
+/// *before* the elementwise outliner (which would outline it into per-row *scalar* loops and lose the
+/// blocked kernel). Detection only — the function is then lowered normally (`lower_fn`, `parallel =
+/// true`) and the embedded recognizer in `lower_for` emits the multicore transpose. Mirrors the
+/// sgemm/norm whole-function interceptions.
+fn transpose_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<TransposeNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_transpose(pat, iter, lb, sema, interner)
 }
 
 /// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base
