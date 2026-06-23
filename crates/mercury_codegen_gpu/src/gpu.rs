@@ -3038,6 +3038,211 @@ pub fn gemm_nt_fp8_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usiz
     gemm_nt_fp8_gate(g, x, wg, wu, None, m, k, n, "fp8_gemm_pipe_gate_gelu")
 }
 
+// ---------------------------------------------------------------------------------------------------
+// int8 (W8A8) tensor-core GEMM (M3) — `u8` activations × `i8` weights → `i32`, the quantized nn.Linear.
+// Mirrors the fp8 launchers ([`fp8_tile`]/[`gemm_nt_fp8`]); int8 shares fp8's `m16n8k32` 8-bit fragment
+// layout, retyped `.s32.u8.s8.s32`. The integer accumulate is exact mod 2³² → these are **bit-exact**
+// against a CPU `i32` reference, a stronger gate than the float kernels. See [`crate::ptx_int8`].
+// ---------------------------------------------------------------------------------------------------
+
+/// One **int8 (W8A8) tensor-core tile** `D = A·B` via `mma.sync.m16n8k32.s32.u8.s8.s32` (Ada has no
+/// WMMA int8, same as fp8): `a` is `16×32` **u8** row-major, `b_col` is `32×8` **i8** column-major (the
+/// `.col` operand); `D` is `16×8` **i32**. Validates the manual fragment layout — the core a full int8
+/// GEMM tiles over. The int8 twin of [`fp8_tile`].
+pub fn int8_tile(g: &mut Gpu, a: &[u8], b_col: &[i8]) -> Result<Vec<i32>, DriverError> {
+    assert_eq!(a.len(), 16 * 32, "A must be 16×32 (u8)");
+    assert_eq!(b_col.len(), 32 * 8, "B must be 32×8 column-major (i8)");
+    let f = g.function("int8_tile", crate::ptx_int8::INT8_TILE, "int8_tile")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b_col)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; 16 * 8])?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Full **int8 (W8A8) tensor-core `C = A·Bᵀ`** (quantized nn.Linear): `A` (m×k) is **u8** activations,
+/// `B` (n×k) is **i8** weights, `C` is **i32** (exact mod 2³² accumulate — bit-exact, no tolerance).
+/// Each warp computes a 16×8 tile via `mma.sync.m16n8k32`; the fragment-reuse multi-tile kernel runs
+/// when the block divides evenly (the fast path), else the single-tile kernel. Requires m%16==0,
+/// n%8==0, k%32==0. Ada's int8 tensor cores run at ~4× the fp16 rate — the lowest-precision inference
+/// path. The int8 twin of [`gemm_nt_fp8`].
+pub fn gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, DriverError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % 16 == 0 && n % 8 == 0 && k % 32 == 0,
+        "int8 GEMM needs M%16==0, N%8==0, K%32==0"
+    );
+    use crate::ptx_int8::{INT8_TM, INT8_TN};
+    let (f, cfg) = if m % (16 * INT8_TM) == 0 && n % (8 * INT8_TN) == 0 {
+        (
+            g.function(
+                "int8_gemm_mt",
+                crate::ptx_int8::int8_gemm_mt_ptx(),
+                "int8_gemm_nt_mt",
+            )?,
+            LaunchConfig {
+                grid_dim: ((n / (8 * INT8_TN)) as u32, (m / (16 * INT8_TM)) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    } else {
+        (
+            g.function("int8_gemm", crate::ptx_int8::int8_gemm_ptx(), "int8_gemm_nt")?,
+            LaunchConfig {
+                grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    };
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// Launch config for an SMEM-staged + `cp.async` int8 kernel with a `bm×bn` CTA tile and `warps` warps.
+fn int8_smdb_cfg(m: usize, n: usize, bm: usize, bn: usize, warps: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n / bn) as u32, (m / bm) as u32, 1),
+        block_dim: ((warps * 32) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// **SMEM-staged + `cp.async` double-buffered int8 GEMM** `C = A·Bᵀ` — the latency-hiding path
+/// (cooperative CTA tiles, software-pipelined K-loop), **regime-aware** between two tiles (same split
+/// the fp16 `_sm_db`/`_sm128_db` dispatch uses). The **64×64** tile (4 warps) has ~2× the occupancy of
+/// the 128×128 variant (128 threads / 32 accumulators vs 256 / 64) and wins while the kernel is
+/// latency-bound (small/medium sizes); the **128×128** tile ([`crate::ptx_int8::int8_gemm_smdb128_ptx`])
+/// has higher A/B reuse per global load and wins once reuse-bound (large sizes). Measured same-run:
+/// 64×64 leads at 1024³/2048³ (~44%/53% of cuBLAS), 128×128 leads at 4096³ (~52% vs ~40%), so the
+/// dispatch picks 128×128 when M,N are both ≥ 4096 (and 128-divisible), else 64×64. Same `u8`×`i8`→`i32`
+/// bit-exact contract as [`gemm_nt_int8`]. Requires M%64==0, N%64==0, K%INT8_BK==0.
+pub fn gemm_nt_int8_smdb(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, DriverError> {
+    use crate::ptx_int8::{
+        INT8_BK, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128,
+        INT8_WARPS_N, INT8_WARPS_N128,
+    };
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(
+        m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
+        "int8 smdb GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
+    );
+    // Reuse-bound at large sizes → the bigger 128×128 tile; latency-bound below → the 64×64 tile.
+    let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    let (f, cfg) = if use_128 {
+        (
+            g.function(
+                "int8_gemm_smdb128",
+                crate::ptx_int8::int8_gemm_smdb128_ptx(),
+                "int8_gemm_nt_smdb128",
+            )?,
+            int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128),
+        )
+    } else {
+        (
+            g.function(
+                "int8_gemm_smdb",
+                crate::ptx_int8::int8_gemm_smdb_ptx(),
+                "int8_gemm_nt_smdb",
+            )?,
+            int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N),
+        )
+    };
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// **int8 GEMM + fused per-channel dequant** `out[i,j] = f32(Σ u8·i8) · scale[j]` → **f32** output, in
+/// one pass (the SMEM-staged 64×64 kernel with the dequant epilogue folded into the C store). `scale`
+/// is the per-output-channel `[N]` f32 scale (symmetric quant). The HBM round-trip cuBLAS int8 needs
+/// (separate i32→f32 dequant kernel) is eliminated — the cuBLAS-can't-fuse *beat* lever. Requires
+/// M%64==0, N%64==0, K%INT8_BK==0.
+pub fn gemm_nt_int8_smdb_dequant(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    scale: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(scale.len(), n, "per-channel scale must be length N");
+    assert!(
+        m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
+        "int8 smdb-dequant GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
+    );
+    let f = g.function(
+        "int8_gemm_smdb_deq",
+        crate::ptx_int8::int8_gemm_smdb_deq_ptx(),
+        "int8_gemm_nt_smdb_deq",
+    )?;
+    let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let scale_d = g.stream.memcpy_stod(scale)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm)
+        .arg(&nn)
+        .arg(&kk)
+        .arg(&a_d)
+        .arg(&b_d)
+        .arg(&mut c_d)
+        .arg(&scale_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9193,6 +9398,369 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     wb_int4 / 1e6,
                     wb_fp16 / 1e6,
                     wb_fp16 / wb_int4,
+                );
+            }
+        });
+    }
+
+    // ===============================================================================================
+    // int8 (W8A8) tensor-core GEMM (M3) — bit-exact gate + peer scoreboard.
+    // ===============================================================================================
+
+    /// Exact `i32` reference for `C = A·Bᵀ`: `A` is `[M,K]` **u8**, `B` is `[N,K]` **i8**, accumulation
+    /// is **wrapping** `i32` (matching the tensor core's mod-2³² accumulate exactly — no rounding, no
+    /// reassociation). This is the bit-exact oracle: the GPU must equal it lane-for-lane.
+    fn ref_nt_int8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize) -> Vec<i32> {
+        let mut c = vec![0i32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc: i32 = 0;
+                for kk in 0..k {
+                    let av = a[i * k + kk] as i32; // u8 → i32 (0..255)
+                    let bv = b[j * k + kk] as i32; // i8 → i32 (-128..127)
+                    acc = acc.wrapping_add(av.wrapping_mul(bv));
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    /// **M3 bit-exact gate.** int8 W8A8 GEMM (`u8`×`i8`→`i32`) must equal the wrapping-`i32` CPU
+    /// reference **exactly** (not within tolerance) over the full output, at shapes hitting both the
+    /// single-tile kernel (16×8 / non-`_mt`-divisible) and the fragment-reuse `_mt` kernel. Asymmetric
+    /// data (a u8 ramp × an i8 ±ramp incl. negatives) so a lane/sign/transpose slip can't hide.
+    #[test]
+    fn int8_gemm_matches_reference() {
+        with_gpu("int8_gemm", |g| {
+            let mut rng = crate::diff::Rng::new(0x1278);
+            // (m,k,n): the first two are `_mt`-divisible (m%32==0,n%32==0); the 16×8×32 and (48,32,40)
+            // shapes fall to the single-tile kernel (n%32!=0 or m%32!=0) — both paths gated.
+            for (m, k, n) in [
+                (16usize, 32usize, 8usize),
+                (48, 32, 40),
+                (64, 64, 64),
+                (128, 256, 96),
+                (128, 128, 128), // multi-CTA, multi-K-step — exercises the smdb pipeline
+            ] {
+                // u8 activations in [0,255], i8 weights in [-128,127] — full range, deterministic.
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
+                let got = gemm_nt_int8(g, &a, &b, m, k, n).unwrap();
+                let want = ref_nt_int8(&a, &b, m, k, n);
+                assert_eq!(
+                    got, want,
+                    "int8_gemm {m}x{k}x{n}: GPU output must equal the i32 reference bit-for-bit"
+                );
+                // SMEM-staged + cp.async path (when CTA-tile-divisible) — same bit-exact contract.
+                use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN};
+                if m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0 {
+                    let got_smdb = gemm_nt_int8_smdb(g, &a, &b, m, k, n).unwrap();
+                    assert_eq!(
+                        got_smdb, want,
+                        "int8_gemm_smdb {m}x{k}x{n}: SMEM-staged output must equal the i32 reference"
+                    );
+                }
+                let checksum = got.iter().map(|&x| x as i64).sum::<i64>();
+                eprintln!("int8_gemm {m}x{k}x{n}: bit-exact ✓ (checksum {checksum})");
+            }
+        });
+    }
+
+    /// **Fused per-channel dequant epilogue gate.** `out[i,j] = f32(Σ u8·i8)·scale[j]` (the
+    /// cuBLAS-can't-fuse path) must equal the CPU reference — the exact `i32` accumulate converted to
+    /// f32 and multiplied by the per-column scale, both sides rounding identically (i32→f32 cvt.rn +
+    /// one f32 mul). Tight tolerance (essentially exact: the only rounding is the shared final mul).
+    #[test]
+    fn int8_dequant_matches_reference() {
+        with_gpu("int8_dequant", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DE9);
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 128), (64, 256, 192)] {
+                let a: Vec<u8> = (0..m * k)
+                    .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
+                    .collect();
+                let b: Vec<i8> = (0..n * k)
+                    .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+                    .collect();
+                // per-channel scales spanning a realistic quant range (~1/127 .. small).
+                let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
+                let acc = ref_nt_int8(&a, &b, m, k, n);
+                let want: Vec<f32> = (0..m * n).map(|t| acc[t] as f32 * scale[t % n]).collect();
+                let got = gemm_nt_int8_smdb_dequant(g, &a, &b, &scale, m, k, n).unwrap();
+                let st = crate::diff::assert_close(
+                    &format!("int8_dequant {m}x{k}x{n}"),
+                    &got,
+                    &want,
+                    1e-3,
+                    1e-6,
+                );
+                eprintln!(
+                    "int8_dequant {m}x{k}x{n}: fused i32→f32·scale[j] ✓ max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// **Fused-dequant cost bench.** Times the SMEM-staged int8 GEMM with the per-channel dequant
+    /// epilogue (`int8_gemm_nt_smdb_deq`, f32 out) against the plain i32-output kernel
+    /// (`int8_gemm_nt_smdb`), same GEMM. The dequant is computed **in registers at the C store**, so the
+    /// two times are ~equal → Mercury gets the `i32→f32·scale[j]` dequant at ≈0 marginal cost. A cuBLAS
+    /// int8 pipeline (raw `i32` out) must instead launch a *separate* dequant kernel that re-reads the
+    /// whole `M×N` `i32` matrix from HBM and writes `M×N` f32 — a round-trip + launch this fusion
+    /// removes. Same-run; clock-warmed + best_of. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_dequant_fusion`
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn int8_dequant_fusion() {
+        with_gpu("int8_dequant_fusion", |g| {
+            let mut rng = crate::diff::Rng::new(0x0DEF);
+            // warm the clock
+            for _ in 0..20 {
+                let (a, b) = (vec![1u8; 2048 * 2048], vec![1i8; 2048 * 2048]);
+                let _ = gemm_nt_int8_smdb(g, &a, &b, 2048, 2048, 2048);
+            }
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * n as f64 * k as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let scale_d = g.stream.memcpy_stod(&scale).unwrap();
+                use crate::ptx_int8::{INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+                let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+
+                // plain i32-output kernel
+                let f_i32 = g.function("int8_gemm_smdb", crate::ptx_int8::int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb").unwrap();
+                let mut ci_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let s_i32 = best_of(4, || time_gemm_int8(g, &f_i32, cfg, dims, &a_d, &b_d, &mut ci_d, 50));
+
+                // fused dequant kernel (f32 out + scale) — time its resident launches.
+                let f_deq = g.function("int8_gemm_smdb_deq", crate::ptx_int8::int8_gemm_smdb_deq_ptx(), "int8_gemm_nt_smdb_deq").unwrap();
+                let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let time_deq = || {
+                    let launch = |c: &mut cudarc::driver::CudaSlice<f32>| {
+                        let (mm, nn, kk) = dims;
+                        let mut bld = g.stream.launch_builder(&f_deq);
+                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(c).arg(&scale_d);
+                        unsafe { bld.launch(cfg).unwrap() };
+                    };
+                    launch(&mut cf_d);
+                    g.stream.synchronize().unwrap();
+                    let t0 = Instant::now();
+                    for _ in 0..50 { launch(&mut cf_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / 50.0
+                };
+                let s_deq = best_of(4, time_deq);
+
+                eprintln!(
+                    "{sz}³ int8: plain-i32 {:.0} GFLOP/s | fused-dequant(f32) {:.0} GFLOP/s | dequant overhead {:+.1}% (fused at ~0 cost; cuBLAS pays a separate i32→f32 kernel + HBM round-trip)",
+                    flop / s_i32 / 1e9, flop / s_deq / 1e9, 100.0 * (s_deq - s_i32) / s_i32,
+                );
+            }
+        });
+    }
+
+    /// Time `iters` resident launches of an int8 GEMM kernel `(M,N,K, A:u8, B:i8, C:i32)`; sec/iter.
+    fn time_gemm_int8(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<u8>,
+        b_d: &cudarc::driver::CudaSlice<i8>,
+        c_d: &mut cudarc::driver::CudaSlice<i32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<i32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(b_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Deterministic int8 peer-bench buffers with **activations in `[0,127]`** (the range where `u8` and
+    /// `s8` reinterpretations coincide, so Mercury's `u8×s8`, the NVRTC peers, and cuBLAS's `s8×s8` all
+    /// compute the *identical* matrix and cross-check bit-for-bit — see the cuBLAS signedness caveat in
+    /// `baselines.rs`). Returns A both as `u8` (Mercury/naive/dp4a) and as `i8` (cuBLAS), plus i8 B.
+    fn int8_inputs_a127(
+        rng: &mut crate::diff::Rng,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> (Vec<u8>, Vec<i8>, Vec<i8>) {
+        let a_u8: Vec<u8> = (0..m * k)
+            .map(|_| (rng.f32_range(0.0, 128.0) as u32 & 0x7f) as u8)
+            .collect();
+        let a_i8: Vec<i8> = a_u8.iter().map(|&x| x as i8).collect(); // x<128 → same bits/value
+        let b: Vec<i8> = (0..n * k)
+            .map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8)
+            .collect();
+        (a_u8, a_i8, b)
+    }
+
+    /// **M3/M6: int8 (W8A8) tensor-core GEMM vs the Tier-A int8 CUDA-C peers**, same-run. Mercury's
+    /// fragment-reuse `int8_gemm_nt_mt` (`mma.sync.m16n8k32.s32.u8.s8.s32`, A-fragment reused across the
+    /// N tiles) vs **naive** int8 CUDA-C (one thread/output, scalar `(int)A·(int)B`) and **dp4a** int8
+    /// CUDA-C (one thread/output, the 4-way `dp4a.u32.s32` byte dot-product — the strong hand-written
+    /// SIMD-int8 baseline). The literal "beat the hand-written C int8 on the GPU" (M6) plus the strongest
+    /// non-library int8 peer this box can compile (a cuBLASLt IMMA Tier-B peer is the follow-up; this
+    /// nails the Tier-A wins and the dp4a bar first). Reports int8-MAC GFLOP/s (`2·M·N·K`) and Mercury
+    /// × vs each peer.
+    ///
+    /// Correctness gates speed (the first law, here **bit-exact**): both peers are first cross-checked
+    /// to **equal** the wrapping-`i32` CPU reference, and at every size all three outputs' checksums must
+    /// agree exactly. Same-run only (the ~7× laptop clock swing): a clock warmup + `best_of`. Needs the
+    /// NVRTC redist DLL on PATH (see `gemm_vs_peers`); skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_gemm_vs_peers`
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn int8_gemm_vs_peers() {
+        use crate::baselines::{
+            cublas_gemm_nt_int8, gemm_flop, nvrtc_dp4a_gemm_nt_int8, nvrtc_naive_gemm_nt_int8,
+            peer_env_hint, peers_available, time_cublas_gemm_nt_int8, time_nvrtc_dp4a_gemm_nt_int8,
+            time_nvrtc_naive_gemm_nt_int8,
+        };
+        use crate::ptx_int8::{INT8_TM, INT8_TN};
+        with_gpu("int8_gemm_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] int8_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+
+            // --- Correctness first: all four paths must EQUAL the i32 oracle (bit-exact) at a small
+            // shape. Activations in [0,127] (see int8_inputs_a127) so cuBLAS's s8×s8 == Mercury's u8×s8.
+            let mut rng = crate::diff::Rng::new(0x1287);
+            for (m, k, n) in [(256usize, 256usize, 256usize), (128, 320, 96)] {
+                let (a_u8, a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a_u8, &b, m, k, n);
+                assert_eq!(gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "Mercury int8 {m}x{k}x{n}");
+                assert_eq!(nvrtc_naive_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "naive {m}x{k}x{n}");
+                assert_eq!(nvrtc_dp4a_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap(), r, "dp4a {m}x{k}x{n}");
+                assert_eq!(cublas_gemm_nt_int8(g, &a_i8, &b, m, k, n).unwrap(), r, "cuBLAS {m}x{k}x{n}");
+            }
+            eprintln!("[gate] Mercury + naive + dp4a + cuBLAS int8 all equal the i32 oracle bit-for-bit ✓");
+
+            // --- Clock warmup (cf. gemm_vs_peers): boost the clock before sampling so each size's ratio
+            // is peak-vs-peak. Hammer cuBLAS int8 (the heaviest) until the clock settles. ---
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 4;
+
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k); // 2·M·N·K int8 MACs
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+
+                // Mercury fragment-reuse _mt path (the fast int8 kernel).
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let f_mt = g
+                    .function("int8_gemm_mt", crate::ptx_int8::int8_gemm_mt_ptx(), "int8_gemm_nt_mt")
+                    .unwrap();
+                let cfg_mt = LaunchConfig {
+                    grid_dim: ((n / (8 * INT8_TN)) as u32, (m / (16 * INT8_TM)) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_mt = best_of(ROUNDS, || time_gemm_int8(g, &f_mt, cfg_mt, dims, &a_d, &b_d, &mut c_d, 50));
+
+                // Mercury single-tile path (one 16×8 tile/warp — the pre-fragment-reuse baseline).
+                let f_st = g
+                    .function("int8_gemm", crate::ptx_int8::int8_gemm_ptx(), "int8_gemm_nt")
+                    .unwrap();
+                let cfg_st = LaunchConfig {
+                    grid_dim: ((n / 8) as u32, (m / 16) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_st = best_of(ROUNDS, || time_gemm_int8(g, &f_st, cfg_st, dims, &a_d, &b_d, &mut c_d, 50));
+
+                // Mercury SMEM-staged + cp.async double-buffered paths (the latency-hiding lever): 64×64
+                // and the bigger-reuse 128×128 tile. Report the better as `_smdb`.
+                use crate::ptx_int8::{
+                    INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128,
+                    INT8_WARPS_N, INT8_WARPS_N128,
+                };
+                let f_smdb = g
+                    .function("int8_gemm_smdb", crate::ptx_int8::int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb")
+                    .unwrap();
+                let cfg_smdb = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+                let s_smdb64 = best_of(ROUNDS, || time_gemm_int8(g, &f_smdb, cfg_smdb, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_smdb128 = if m % INT8_BM128 == 0 && n % INT8_BN128 == 0 {
+                    let f = g
+                        .function("int8_gemm_smdb128", crate::ptx_int8::int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128")
+                        .unwrap();
+                    let cfg = int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128);
+                    best_of(ROUNDS, || time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50))
+                } else {
+                    f64::INFINITY
+                };
+                let s_smdb = s_smdb64.min(s_smdb128);
+
+                // Peers. Naive is slow → fewer iters; dp4a is the strong hand-written baseline; cuBLAS
+                // int8 IMMA is the Tier-B gold standard (Mercury reported as % of it).
+                let naive_iters = if sz >= 4096 { 3 } else { 10 };
+                let s_naive = time_nvrtc_naive_gemm_nt_int8(g, m, k, n, naive_iters).unwrap();
+                let s_dp4a = best_of(ROUNDS, || time_nvrtc_dp4a_gemm_nt_int8(g, m, k, n, 20).unwrap());
+                let s_cub = best_of(ROUNDS, || time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+
+                // Checksum cross-check at this shape: all paths compute the same matrix.
+                let csum = |v: &[i32]| v.iter().map(|&x| x as i64).sum::<i64>();
+                let cs_mt = csum(&gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_smdb = csum(&gemm_nt_int8_smdb(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_n = csum(&nvrtc_naive_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_d = csum(&nvrtc_dp4a_gemm_nt_int8(g, &a_u8, &b, m, k, n).unwrap());
+                let cs_c = csum(&cublas_gemm_nt_int8(g, &a_i8, &b, m, k, n).unwrap());
+                assert!(
+                    cs_mt == cs_n && cs_mt == cs_d && cs_mt == cs_c && cs_mt == cs_smdb,
+                    "{sz}³ int8 checksum disagreement: mt={cs_mt} smdb={cs_smdb} naive={cs_n} dp4a={cs_d} cublas={cs_c}"
+                );
+
+                let (g_mt, g_st, g_smdb64, g_smdb128, g_naive, g_dp4a, g_cub) = (
+                    flop / s_mt, flop / s_st, flop / s_smdb64, flop / s_smdb128,
+                    flop / s_naive, flop / s_dp4a, flop / s_cub,
+                );
+                let g_smdb = flop / s_smdb;
+                eprintln!(
+                    "\n{sz}³ int8 W8A8 GEMM (same-run, 2·M·N·K MAC-FLOP):\n  \
+                     Mercury _smdb128 : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS\n  \
+                     Mercury _smdb64  : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS\n  \
+                     Mercury _smdb*   : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a | {:>5.2}× vs _mt\n  \
+                     Mercury _mt      : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     Mercury single   : {:>8.0} GFLOP/s  | {:>6.1}% of cuBLAS | {:>6.1}× vs naive | {:>5.2}× vs dp4a\n  \
+                     cuBLAS int8 IMMA : {:>8.0} GFLOP/s  | Tier-B gold standard\n  \
+                     dp4a CUDA-C      : {:>8.0} GFLOP/s  | strong hand-written int8 peer\n  \
+                     naive CUDA-C     : {:>8.0} GFLOP/s  | Tier-A floor",
+                    g_smdb128 / 1e9, 100.0 * g_smdb128 / g_cub,
+                    g_smdb64 / 1e9, 100.0 * g_smdb64 / g_cub,
+                    g_smdb / 1e9, 100.0 * g_smdb / g_cub, g_smdb / g_naive, g_smdb / g_dp4a, g_smdb / g_mt,
+                    g_mt / 1e9, 100.0 * g_mt / g_cub, g_mt / g_naive, g_mt / g_dp4a,
+                    g_st / 1e9, 100.0 * g_st / g_cub, g_st / g_naive, g_st / g_dp4a,
+                    g_cub / 1e9,
+                    g_dp4a / 1e9,
+                    g_naive / 1e9,
                 );
             }
         });

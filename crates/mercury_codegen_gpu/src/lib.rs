@@ -50,4 +50,7 @@ pub mod ptx_fp8;
 pub mod ptx_int4;
 
 #[cfg(feature = "gpu")]
+pub mod ptx_int8;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
