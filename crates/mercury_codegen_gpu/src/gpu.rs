@@ -3240,11 +3240,15 @@ pub fn gemm_nt_int8_smdb_dequant(
         m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
         "int8 smdb-dequant GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
-    let f = g.function(
-        "int8_gemm_smdb_deq",
-        crate::ptx_int8::int8_gemm_smdb_deq_ptx(),
-        "int8_gemm_nt_smdb_deq",
-    )?;
+    // Same ldmatrix+swizzle win as the plain int8 GEMM, carried to the fused-dequant epilogue: prefer
+    // the conflict-free `_swz_deq` kernel when K%64==0, fall back to the hand-placed BK=32 deq otherwise.
+    // Both fold the identical `f32(acc)·scale[j]` store, so the result is unchanged — purely throughput.
+    let (ptx, entry) = if k % 64 == 0 {
+        (crate::ptx_int8::int8_gemm_smdb_swz_deq_ptx(), "int8_gemm_nt_smdb_swz_deq")
+    } else {
+        (crate::ptx_int8::int8_gemm_smdb_deq_ptx(), "int8_gemm_nt_smdb_deq")
+    };
+    let f = g.function(entry, ptx, entry)?;
     let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
     let a_d = g.stream.memcpy_stod(a)?;
     let b_d = g.stream.memcpy_stod(b)?;
@@ -9688,7 +9692,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn int8_dequant_matches_reference() {
         with_gpu("int8_dequant", |g| {
             let mut rng = crate::diff::Rng::new(0x0DE9);
-            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 128), (64, 256, 192)] {
+            // K=64/128/256 take the swz_deq path (K%64==0); K=96 is K%32==0 only → hand-placed deq fallback.
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 128), (64, 256, 192), (64, 96, 128)] {
                 let a: Vec<u8> = (0..m * k)
                     .map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8)
                     .collect();
