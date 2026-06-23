@@ -1060,9 +1060,11 @@ impl CublasChainModel {
 // the strongest *measurable* int4 peer on this box is this naive kernel, and M4 is a documented lead.
 // ---------------------------------------------------------------------------------------------------
 
-/// Naive **symmetric** W4A16: `C[M×N] = A·dequant(W)ᵀ`, `A` `[M,K]` f32, `Bq` packed signed int4
-/// `[N,K/8]` (8 nibbles/word), `S` per-group f32 scales `[N,K/group]`. One thread per output, full
-/// K-loop with an on-the-fly unpack — the "beat the hand-written int4 decode kernel" baseline.
+/// Naive **symmetric** W4A16: `C[M×N] = A·dequant(W)ᵀ`, `A` `[M,K]` f32, `Bq` packed int4 `[N,K/8]`
+/// (8 nibbles/word, Marlin-**interleaved** `nibble_pos(j)=(j/2)*4+(j%2)*16`, offset-binary `u=q+8`), `S`
+/// per-group f32 scales `[N,K/group]`. One thread per output, full K-loop with an on-the-fly unpack
+/// (`w = (u-8)*scale`) — the "beat the hand-written int4 decode kernel" baseline. Reads the *same*
+/// packed layout Mercury's kernel consumes, so the comparison is pure kernel quality on identical bytes.
 const NAIVE_W4A16_CUDA: &str = r#"
 extern "C" __global__ void naive_w4a16(int M, int N, int K, int group,
         const float* A, const unsigned* Bq, const float* S, float* C) {
@@ -1074,9 +1076,10 @@ extern "C" __global__ void naive_w4a16(int M, int N, int K, int group,
         float acc = 0.0f;
         for (int k = 0; k < K; ++k) {
             unsigned word = Bq[col * KW + (k >> 3)];
-            int nib = (word >> (4 * (k & 7))) & 0xF;
-            int q = (nib >= 8) ? nib - 16 : nib;            // sign-extend the 4-bit two's-complement
-            float w = (float)q * S[col * KG + k / group];   // per-group scale
+            int j = k & 7;
+            int pos = (j >> 1) * 4 + (j & 1) * 16;          // interleaved nibble position
+            int u = (word >> pos) & 0xF;                    // unsigned nibble (offset-binary)
+            float w = (float)(u - 8) * S[col * KG + k / group]; // dequant: (u-8)*scale
             acc += A[row * K + k] * w;
         }
         C[row * N + col] = acc;
