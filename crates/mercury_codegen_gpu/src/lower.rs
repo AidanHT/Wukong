@@ -1552,6 +1552,7 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
         "mercury_i8gemm_nt" | "mercury_i8gemm_nt_parallel" => {
             ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT)
         }
+        "mercury_norm_f32" | "mercury_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM),
         _ => return None,
     };
     Some(RtHelper { ptx_name, ret, def })
@@ -1782,6 +1783,165 @@ I8_EJ:
     add.s64 %rd6, %rd6, 1;
     bra I8_LI;
 I8_EI:
+    ret;
+}
+"#;
+
+/// `mercury_norm_f32(x, out, rows, cols, eps_bits, op)`: row-wise softmax(0)/layernorm(1)/rmsnorm(2)
+/// over an `[rows, cols]` matrix. `exp` uses the SFU `ex2.approx` (matches the offload path; the
+/// CPU oracle's Cephes `exp` differs by <~1e-6, inside the tolerance gate). `eps_bits` is the f32
+/// bits of epsilon. Sequential per-row reductions (CPU uses an 8-lane tree) — tolerance-gated.
+const PTX_NORM: &str = r#".func mrt_norm (.param .b64 px, .param .b64 pout, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop)
+{
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [prows];
+    ld.param.u64 %rd3, [pcols];
+    ld.param.u64 %rd4, [peps];
+    ld.param.u64 %rd5, [pop];
+    cvt.u32.u64 %r0, %rd4;
+    mov.b32 %f15, %r0;
+    mov.b64 %rd6, 0;
+NORM_ROW:
+    setp.ge.s64 %p0, %rd6, %rd2;
+    @%p0 bra NORM_DONE;
+    mul.lo.s64 %rd7, %rd6, %rd3;
+    shl.b64 %rd8, %rd7, 2;
+    add.s64 %rd9, %rd0, %rd8;
+    add.s64 %rd10, %rd1, %rd8;
+    setp.eq.s64 %p1, %rd5, 0;
+    @%p1 bra NORM_SM;
+    setp.eq.s64 %p1, %rd5, 1;
+    @%p1 bra NORM_LN;
+    bra NORM_RMS;
+NORM_SM:
+    mov.f32 %f0, 0fFF800000;
+    mov.b64 %rd11, 0;
+SM_MAX:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra SM_MAXE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    max.f32 %f0, %f0, %f1;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_MAX;
+SM_MAXE:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+SM_EXP:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra SM_EXPE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f0;
+    mul.f32 %f3, %f3, 0f3FB8AA3B;
+    ex2.approx.f32 %f4, %f3;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f4;
+    add.f32 %f2, %f2, %f4;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_EXP;
+SM_EXPE:
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f5, %f6, %f2;
+    mov.b64 %rd11, 0;
+SM_NORM:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd14, %rd10, %rd12;
+    ld.f32 %f4, [%rd14];
+    mul.f32 %f4, %f4, %f5;
+    st.f32 [%rd14], %f4;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_NORM;
+NORM_LN:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+LN_S1:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LN_S1E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    add.f32 %f2, %f2, %f1;
+    add.s64 %rd11, %rd11, 1;
+    bra LN_S1;
+LN_S1E:
+    cvt.rn.f32.s64 %f7, %rd3;
+    div.rn.f32 %f8, %f2, %f7;
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+LN_S2:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LN_S2E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f8;
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s64 %rd11, %rd11, 1;
+    bra LN_S2;
+LN_S2E:
+    div.rn.f32 %f9, %f2, %f7;
+    add.f32 %f9, %f9, %f15;
+    sqrt.rn.f32 %f9, %f9;
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f10, %f6, %f9;
+    mov.b64 %rd11, 0;
+LN_S3:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f8;
+    mul.f32 %f3, %f3, %f10;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra LN_S3;
+NORM_RMS:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+RMS_S1:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra RMS_S1E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    fma.rn.f32 %f2, %f1, %f1, %f2;
+    add.s64 %rd11, %rd11, 1;
+    bra RMS_S1;
+RMS_S1E:
+    cvt.rn.f32.s64 %f7, %rd3;
+    div.rn.f32 %f9, %f2, %f7;
+    add.f32 %f9, %f9, %f15;
+    sqrt.rn.f32 %f9, %f9;
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f10, %f6, %f9;
+    mov.b64 %rd11, 0;
+RMS_S3:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    mul.f32 %f3, %f1, %f10;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra RMS_S3;
+NORM_NEXT:
+    add.s64 %rd6, %rd6, 1;
+    bra NORM_ROW;
+NORM_DONE:
     ret;
 }
 "#;
