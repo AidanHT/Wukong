@@ -126,6 +126,20 @@ impl MlpTrainer {
         Ok(())
     }
 
+    /// Recompute the hidden activations (`H_pre = X·W1ᵀ`, `H = relu(H_pre)`) from the current
+    /// weights — the **gradient-checkpointing** path. Instead of stashing `H_pre`/`H` from the
+    /// forward (the bulk of an MLP/FFN's activation memory), the backward regenerates them right
+    /// before it needs them. Deterministic, so the gradients are bit-identical to the stashed path
+    /// (gated). Only the small output `Y` (for the loss/`dY`) need stay resident. The attention
+    /// backward is checkpointed the same way — it recomputes `P` rather than stashing the `S×S`
+    /// matrix (see [`crate::ptx_autodiff_bwd::attention_backward`]).
+    pub fn recompute_activations(&mut self, g: &mut Gpu) -> Result<(), DriverError> {
+        let (b, i, h) = (self.b, self.i, self.h);
+        gemm_device(g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
+        relu_fwd_device(g, &self.h_pre, &mut self.hact, b * h)?;
+        Ok(())
+    }
+
     /// Backward: seed `dY = scale*(Y - target)`, then `dW2 = dYᵀ·H`, `dH = dY·W2`,
     /// `dH_pre = dH ⊙ relu'(H_pre)`, `dW1 = dH_preᵀ·X` — all resident. `scale = 2` reproduces the
     /// `sum (y-t)^2` loss the autodiff tape differentiates.
@@ -292,6 +306,40 @@ mod tests {
             let (rdw1, rdw2) = mlp_backprop_ref(b, i, h, o, &x, &w1, &w2, &target);
             assert_close("resident dW1", &dw1, &rdw1, 1e-3, 2e-3);
             assert_close("resident dW2", &dw2, &rdw2, 1e-3, 2e-3);
+        });
+    }
+
+    /// **The checkpointing gate:** gradients are **bit-identical** whether the hidden activations are
+    /// stashed from the forward or recomputed in the backward. The recomputed path first poisons the
+    /// stashed `H_pre`/`H` (only `Y` is kept), proving the backward truly reconstructs them.
+    #[test]
+    fn resident_mlp_checkpointing_bit_identical() {
+        with_gpu("resident_mlp_checkpointing_bit_identical", |g| {
+            let (b, i, h, o) = (24usize, 18usize, 32usize, 12usize);
+            let mut rng = Rng::new(0xC4EC);
+            let w1 = rng.vec(h * i, -0.4, 0.4);
+            let w2 = rng.vec(o * h, -0.4, 0.4);
+            let x = rng.vec(b * i, -1.0, 1.0);
+            let target = rng.vec(b * o, -1.0, 1.0);
+
+            let mut tr = MlpTrainer::new(g, b, i, h, o, &w1, &w2).unwrap();
+            tr.set_batch(g, &x, &target).unwrap();
+            // Stashed path.
+            tr.forward(g).unwrap();
+            tr.backward(g, 2.0).unwrap();
+            let (a1, a2) = tr.grads_host(g).unwrap();
+            // Checkpointed path: keep Y, poison the stashed hidden activations, recompute, backward.
+            tr.h_pre = g.stream.memcpy_stod(&vec![1e30f32; b * h]).unwrap();
+            tr.hact = g.stream.memcpy_stod(&vec![-7e29f32; b * h]).unwrap();
+            tr.recompute_activations(g).unwrap();
+            tr.backward(g, 2.0).unwrap();
+            let (c1, c2) = tr.grads_host(g).unwrap();
+            for (k, (s, r)) in a1.iter().zip(&c1).enumerate() {
+                assert_eq!(s.to_bits(), r.to_bits(), "dW1[{k}] stashed vs checkpointed");
+            }
+            for (k, (s, r)) in a2.iter().zip(&c2).enumerate() {
+                assert_eq!(s.to_bits(), r.to_bits(), "dW2[{k}] stashed vs checkpointed");
+            }
         });
     }
 
