@@ -216,6 +216,18 @@ impl AutotuneCache {
         self.map.insert(Self::int8_key(m, n, k), entry);
     }
 
+    fn w4a16_key(m: usize, n: usize, k: usize) -> String {
+        format!("w4a16 {m} {n} {k}")
+    }
+
+    pub fn get_w4a16(&self, m: usize, n: usize, k: usize) -> Option<&CacheEntry> {
+        self.map.get(&Self::w4a16_key(m, n, k))
+    }
+
+    pub fn insert_w4a16(&mut self, m: usize, n: usize, k: usize, entry: CacheEntry) {
+        self.map.insert(Self::w4a16_key(m, n, k), entry);
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -361,6 +373,171 @@ pub fn launch_int8_tuned(
     g.stream.memcpy_dtov(&c_d)
 }
 
+// ============================ W4A16 (int4 decode) autotuning ============================
+// The int4 decode path's tunable axis is the **split-K count** (sk): sk=1 is the un-split kernel, sk>1 is
+// the gridDim.z=sk split-K GEMM + the fixed-order reduction. Which wins is shape-dependent (split-K wins
+// hugely — up to ~6.4× — when a thin-M/small-N grid starves the SMs, marginal when the grid saturates),
+// so it's exactly an autotune axis. Unlike int8 the candidates aren't bit-exact (fp16 accumulate), so the
+// search cross-checks within the fp16 tolerance instead of `==`.
+
+const W4A16_SK_CANDS: [usize; 4] = [1, 2, 4, 8];
+
+fn w4a16_token(sk: usize) -> String {
+    if sk == 1 {
+        "w4a16".to_string()
+    } else {
+        format!("w4a16_sk{sk}")
+    }
+}
+
+/// Parse a W4A16 config token to its split count (`"w4a16"` → 1, `"w4a16_skN"` → N).
+fn w4a16_sk_of(token: &str) -> usize {
+    token.strip_prefix("w4a16_sk").and_then(|s| s.parse().ok()).unwrap_or(1)
+}
+
+/// **Search the W4A16 split counts for `m×n×k` and rank them.** sk=1 (un-split) vs split-K (sk∈{2,4,8}:
+/// `gridDim.z=sk` GEMM + the fixed-order reduction kernel, both timed). Uploads inputs once; runs each
+/// candidate once for a **tolerance cross-check** against the un-split output (all are the same W4A16 math,
+/// differing only by the f32 reduction order — a candidate outside fp16 tolerance panics, never cached),
+/// then times each best-of-N. Symmetric (no zero-point) weights. Fastest first.
+pub fn tune_w4a16_gemm(
+    g: &mut Gpu,
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<TuneResult, DriverError> {
+    use crate::ptx_int4::{GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+    use half::f16;
+    assert_eq!(qw.n, n);
+    assert_eq!(qw.k, k);
+    assert_eq!(qw.group, GROUP_SIZE);
+    assert!(qw.zeros.is_none(), "w4a16 autotune is the symmetric split-K path");
+    assert!(
+        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        "w4a16 tune needs M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
+    );
+    let a: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 8.0)).collect();
+    let a_d = g.stream.memcpy_stod(&a)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let scl_d = g.stream.memcpy_stod(&qw.scales)?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let flop = 2.0 * m as f64 * n as f64 * k as f64;
+    let f_base = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")?;
+    let f_sk = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "gemm_nt_w4a16_sk")?;
+    let f_red = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "w4a16_splitk_reduce")?;
+    let cfg1 = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
+    let rcfg = LaunchConfig { grid_dim: (256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let mut reference: Option<Vec<f32>> = None;
+    let mut ranked: Vec<Ranked> = Vec::new();
+    for &sk in W4A16_SK_CANDS.iter().filter(|&&sk| k % (sk * GROUP_SIZE) == 0) {
+        let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+        let (out, secs) = if sk == 1 {
+            {
+                let mut b = g.stream.launch_builder(&f_base);
+                b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                unsafe { b.launch(cfg1)? };
+            }
+            let out = g.stream.memcpy_dtov(&c_d)?;
+            let mut s = f64::INFINITY;
+            for _ in 0..6 {
+                let t0 = Instant::now();
+                for _ in 0..50 {
+                    let mut b = g.stream.launch_builder(&f_base);
+                    b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                    unsafe { b.launch(cfg1)? };
+                }
+                g.stream.synchronize().unwrap();
+                s = s.min(t0.elapsed().as_secs_f64() / 50.0);
+            }
+            (out, s)
+        } else {
+            let mut part_d = g.stream.memcpy_stod(&vec![0f32; sk * m * n])?;
+            let cfg_sk = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
+            let (mnp, skk) = ((m * n) as u32, sk as u32);
+            {
+                let mut b = g.stream.launch_builder(&f_sk);
+                b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+                unsafe { b.launch(cfg_sk)? };
+            }
+            {
+                let mut b = g.stream.launch_builder(&f_red);
+                b.arg(&mnp).arg(&skk).arg(&part_d).arg(&mut c_d);
+                unsafe { b.launch(rcfg)? };
+            }
+            let out = g.stream.memcpy_dtov(&c_d)?;
+            let mut s = f64::INFINITY;
+            for _ in 0..6 {
+                let t0 = Instant::now();
+                for _ in 0..50 {
+                    {
+                        let mut b = g.stream.launch_builder(&f_sk);
+                        b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+                        unsafe { b.launch(cfg_sk)? };
+                    }
+                    {
+                        let mut b = g.stream.launch_builder(&f_red);
+                        b.arg(&mnp).arg(&skk).arg(&part_d).arg(&mut c_d);
+                        unsafe { b.launch(rcfg)? };
+                    }
+                }
+                g.stream.synchronize().unwrap();
+                s = s.min(t0.elapsed().as_secs_f64() / 50.0);
+            }
+            (out, s)
+        };
+        // tolerance cross-check vs the un-split reference (same products, only the f32 reduction differs).
+        match &reference {
+            None => reference = Some(out),
+            Some(r) => {
+                let bad = out.iter().zip(r).any(|(&x, &y)| (x - y).abs() > 1e-2 + 2e-3 * y.abs());
+                assert!(!bad, "autotune w4a16: sk={sk} disagrees with the un-split output beyond fp16 tolerance at {m}x{n}x{k}");
+            }
+        }
+        ranked.push(Ranked { name: w4a16_token(sk), secs, gflops: flop / secs / 1e9 });
+    }
+    ranked.sort_by(|x, y| x.secs.partial_cmp(&y.secs).unwrap());
+    Ok(TuneResult { best: ranked[0].name.clone(), ranked })
+}
+
+/// Look up the tuned W4A16 split count for `m×n×k`, tuning + caching on a miss. Returns the config token.
+pub fn tune_w4a16_cached(
+    g: &mut Gpu,
+    cache: &mut AutotuneCache,
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<String, DriverError> {
+    if let Some(e) = cache.get_w4a16(m, n, k) {
+        return Ok(e.config.clone());
+    }
+    let r = tune_w4a16_gemm(g, qw, m, k, n)?;
+    cache.insert_w4a16(m, n, k, CacheEntry { config: r.best.clone(), gflops: r.ranked[0].gflops });
+    Ok(r.best)
+}
+
+/// **Run W4A16 with the autotuned split count** — looks up (or tunes + caches) the best `sk` for the
+/// shape, then calls the matching launcher ([`crate::gpu::gemm_nt_w4a16`] for sk=1, else
+/// [`crate::gpu::gemm_nt_w4a16_splitk`]). Numerically equals the un-split kernel within fp16 tolerance.
+pub fn launch_w4a16_tuned(
+    g: &mut Gpu,
+    cache: &mut AutotuneCache,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    let token = tune_w4a16_cached(g, cache, qw, m, k, n)?;
+    let sk = w4a16_sk_of(&token);
+    if sk == 1 {
+        crate::gpu::gemm_nt_w4a16(g, a, qw, m, k, n)
+    } else {
+        crate::gpu::gemm_nt_w4a16_splitk(g, a, qw, m, k, n, sk)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +630,41 @@ mod tests {
         // revalidate the freshly-tuned shape: the cached config was just measured best → no regression.
         assert!(revalidate_int8(g, &cache, 64, 128, 8192).unwrap().is_none());
         eprintln!("[gate] autotune int8: search bit-exact + tuned launch correct + cache round-trip + no false regression ✓");
+    }
+
+    /// **GPU: the W4A16 split-K search picks a valid config and the tuned launch is correct.** Skips
+    /// without a device. Tunes decode-like shapes (small M, large K), asserts the winner is a `w4a16`
+    /// token and the tuned launch matches the f64 dequant reference within fp16 tolerance; both shapes
+    /// land in the cache and round-trip through text. (Operationalizes the up-to-6.4× int4 split-K decode
+    /// win — the autotuner now picks `sk` per shape automatically.)
+    #[test]
+    fn tune_and_launch_w4a16_on_device() {
+        use crate::ptx_int4::{quantize_weight_symmetric, reference_w4a16, GROUP_SIZE};
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            eprintln!("[skip] tune_and_launch_w4a16_on_device: no CUDA device reachable");
+            return;
+        };
+        let mut rng = crate::diff::Rng::new(0x4A07);
+        let mut cache = AutotuneCache::new();
+        for (m, n, k) in [(64usize, 256usize, 1024usize), (128, 128, 2048)] {
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let w = rng.vec(n * k, -0.8, 0.8);
+            let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
+            let r = tune_w4a16_gemm(g, &qw, m, k, n).unwrap();
+            assert!(!r.ranked.is_empty(), "w4a16 ranking must be non-empty for {m}x{n}x{k}");
+            assert!(r.best == "w4a16" || r.best.starts_with("w4a16_sk"), "best `{}` must be a w4a16 token", r.best);
+            let want = reference_w4a16(&a, &qw, m);
+            let got = launch_w4a16_tuned(g, &mut cache, &a, &qw, m, k, n).unwrap();
+            let s = crate::diff::assert_close(&format!("w4a16 tuned {m}x{n}x{k}"), &got, &want, 1e-2, 2e-3);
+            eprintln!("[autotune] w4a16 {m}x{n}x{k}: best = {} ({:.0} GFLOP/s); max_abs={:.1e}", r.best, r.ranked[0].gflops, s.max_abs);
+        }
+        assert_eq!(cache.len(), 2, "both tuned w4a16 shapes should be cached");
+        let reloaded = AutotuneCache::from_text(&cache.to_text());
+        assert_eq!(
+            reloaded.get_w4a16(64, 256, 1024).map(|e| e.config.clone()),
+            cache.get_w4a16(64, 256, 1024).map(|e| e.config.clone())
+        );
+        eprintln!("[gate] autotune w4a16: search tolerance-checked + tuned launch correct + cache round-trip ✓");
     }
 }
