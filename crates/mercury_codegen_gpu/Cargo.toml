@@ -27,6 +27,11 @@ cudarc = { version = "0.16", default-features = false, features = [
     # nvcuda.dll — so *building* still needs no toolkit; only *running the peer benches* needs the
     # DLLs reachable (we point at a local `tools/cuda-redist` via PATH; see baselines.rs).
     "cublas",
+    # cuBLASLt — the only cuBLAS surface that does **fp8 (E4M3) matmul** (`cublasLtMatmul`); the
+    # classic `cublasGemmEx` (the `cublas` feature) has no fp8 path. cudarc's *safe* LT wrapper is
+    # f32/f16/bf16-only, so the fp8 peer (baselines.rs) drives the raw `cublaslt::{sys,result}` layer
+    # directly. dlopens `cublasLt64_12.dll` like the others — building still needs no toolkit.
+    "cublaslt",
     "nvrtc",
 ], optional = true }
 # Used (only under `gpu`) by the tolerance harness as the CPU oracle: the GPU kernels are diffed
