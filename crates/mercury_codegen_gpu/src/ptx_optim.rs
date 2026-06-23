@@ -17,7 +17,7 @@
 //! any element count.
 
 use crate::gpu::Gpu;
-use cudarc::driver::{DriverError, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, DriverError, LaunchConfig, PushKernelArg};
 
 /// Hyperparameter-buffer layout (an f32 vector), mirroring [`mercury_autodiff::optim::hp`]. The
 /// caller fills these each step — the bias corrections `bc1 = 1 - beta1^t`, `bc2 = 1 - beta2^t`
@@ -255,6 +255,27 @@ pub fn adamw_step(
     w.copy_from_slice(&g.stream.memcpy_dtov(&w_d)?);
     m.copy_from_slice(&g.stream.memcpy_dtov(&m_d)?);
     v.copy_from_slice(&g.stream.memcpy_dtov(&v_d)?);
+    Ok(())
+}
+
+/// Device-buffer **AdamW** step (no host round-trip) — the resident-training entry point. Updates
+/// `w`, `m`, `v` in place on the device from the device gradient `grad` and hyperparameters `hp`.
+/// One launch over a contiguous `(w,g,m,v)` updates every parameter it spans.
+pub fn adamw_step_device(
+    g: &mut Gpu,
+    w: &mut CudaSlice<f32>,
+    grad: &CudaSlice<f32>,
+    m: &mut CudaSlice<f32>,
+    v: &mut CudaSlice<f32>,
+    hp: &CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("adamw_step", ADAMW_STEP_PTX, "adamw_step")?;
+    let n_u = n as u32;
+    let cfg = grid_stride_cfg(g, n_u);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(w).arg(grad).arg(m).arg(v).arg(hp).arg(&n_u);
+    unsafe { b.launch(cfg)? };
     Ok(())
 }
 
