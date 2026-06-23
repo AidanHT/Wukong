@@ -140,16 +140,22 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx_int8.rs` — **int8 (W8A8) tensor-core GEMM** (M3): `u8` activations × `i8` weights → `i32`,
   `mma.sync.m16n8k32.s32.u8.s8.s32`. Same 8-bit `m16n8k32` fragment layout as fp8 (no WMMA int8 on
   sm_89), so it mirrors `ptx_fp8.rs`: `INT8_TILE` (single hand-placed tile), `int8_gemm_ptx`
-  (single-tile/warp), `int8_gemm_mt_ptx` (fragment-reuse 2×4 `_mt`), and `gen_int8_smdb` (SMEM-staged +
-  `cp.async` double-buffered, 64×64 default / 128×128 large-size variant, the int8 analogue of
-  `ptx_wmma.rs::entry_smem_db` but loading manual `mma` fragments via `ld.shared`). A `dequant` flag
-  emits the **fused per-channel dequant epilogue** (`int8_gemm_nt_smdb_deq`): `out = f32(Σ u8·i8)·scale[j]`
+  (single-tile/warp), `int8_gemm_mt_ptx` (fragment-reuse 2×4 `_mt`), `gen_int8_smdb` (SMEM-staged +
+  `cp.async` double-buffered, BK=32, 64×64 / 128×128 variants), and **`gen_int8_smdb_swz`** — the
+  **default** path: `ldmatrix.x4`/`.x2` gathers from XOR-swizzled (conflict-free, BK=64) SMEM, the int8
+  port of `ptx_wmma.rs`'s proven fp16 swz kernel (byte-geometry of the 16×32-u8 tile == fp16's 16×16, so
+  the swizzle/ldmatrix math is byte-for-byte identical). A `dequant` flag (on either kernel) emits the
+  **fused per-channel dequant epilogue** (`…_smdb_deq`/`…_smdb_swz_deq`): `out = f32(Σ u8·i8)·scale[j]`
   folded into the C store — the round-trip cuBLAS int8 (raw `i32` out) structurally can't fuse. Integer
   accumulate is exact mod 2³² ⇒ the gate is **bit-exact** (`==`), stronger than the float tolerance gate.
-  Launchers `gemm_nt_int8`/`_smdb`/`_smdb_dequant` + `int8_tile` in `gpu.rs`; peers (naive + `dp4a` CUDA-C
-  via NVRTC, cuBLAS int8 IMMA `cublasGemmEx`) in `baselines.rs`; `int8_gemm_vs_peers` scoreboard. Standing
-  (same-run, RTX 4050): **180–237× vs naive**, **33–58× vs dp4a**, **~44/53/52% of cuBLAS** at 1024/2048/4096
-  (gap = multi-stage `cp.async` + `ldmatrix` + SMEM swizzle, the remaining levers). cuBLAS int8 is s8×s8
+  Launchers `gemm_nt_int8`/`_smdb`/`_smdb_dequant` + `int8_tile` in `gpu.rs` (the `_smdb`/`_dequant`
+  dispatch prefers swz when K%64==0, falls back to the BK=32 hand-placed kernel otherwise — both
+  bit-exact, choice is purely throughput); peers (naive + `dp4a` CUDA-C via NVRTC, cuBLAS int8 IMMA
+  `cublasGemmEx`) in `baselines.rs`; `int8_gemm_vs_peers` scoreboard. Standing (same-run, RTX 4050):
+  **180–237× vs naive**, **33–58× vs dp4a**; the hand-placed path was **~44/53/52% of cuBLAS** at
+  1024/2048/4096, and **`ldmatrix`+swizzle is a further ~1.2–1.5× internal win** (`int8_swz_vs_handplaced`
+  same-run A/B, 12/12 across two runs — the lever was conflict-free SMEM, *not* multi-stage depth, which
+  is occupancy-bound; remaining lever toward parity is split-K for thin-M). cuBLAS int8 is s8×s8
   only, so the peer cross-check uses `[0,127]` activations (where u8≡s8); the full-range `[0,255]` gate is
   separate. Owned by the int8 slice (`gpu-int8-gemm`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
