@@ -569,6 +569,8 @@ const VE_ID: i64 = 0; // out = a·x (+ b·y) + c
 const VE_RELU: i64 = 1; // out = max(.., 0)
 const VE_RELU6: i64 = 2; // out = min(max(.., 0), 6)
 const VE_USE_Y: i64 = 256;
+const VE_HADAMARD: i64 = 512; // out = act(x·y) — Hadamard product (kernel reads y)
+const VE_DIV: i64 = 1024; // out = act(x / y) — elementwise quotient
 
 /// One additive term of a recognized streaming affine body. `Scaled(arr, s)` is `arr[j]` (`s = None`,
 /// coefficient 1) or `s·arr[j]` / `arr[j]·s` for a loop-invariant f32 scalar `s`; `Const(s)` is a
@@ -3371,6 +3373,51 @@ impl FnLowerer<'_> {
         })
     }
 
+    /// Recognize a streaming elementwise **binary** map — one statement `out[j] = x[j] op y[j]` for
+    /// `op ∈ {*, /}`: the **Hadamard product** (gating, attention masks, residual scaling, RoPE) and
+    /// the elementwise **quotient** (normalize-by-per-element-scale). Both operands are unit-stride f32
+    /// reads of the loop var, so the affine matcher (which requires one factor to be a loop-invariant
+    /// coefficient) declines them — they would otherwise drop to Cranelift's 128-bit vectorizer.
+    /// Dispatches to `mercury_velem_f32` with `VE_HADAMARD`/`VE_DIV` (256-bit + non-temporal stores).
+    /// `act` is supplied by the caller (`VE_ID`, or a peeled ReLU/ReLU6). `x` may equal `y`
+    /// (`x[j]*x[j]` = square). Pure. The interpreter marshals the identical kernel, so it stays exact.
+    fn match_velem_binary<'b>(
+        &self,
+        j: Symbol,
+        value: &'b Expr,
+        target: &Expr,
+        act: i64,
+    ) -> Option<VElemPlan<'b>> {
+        let out_sym = self.index_by_loopvar(target, j)?;
+        if self.expr_mir(value) != MirType::F32 {
+            return None;
+        }
+        let ExprKind::Binary { op, lhs, rhs } = &value.kind else {
+            return None;
+        };
+        let bin = match op {
+            ast::BinOp::Mul => VE_HADAMARD,
+            ast::BinOp::Div => VE_DIV,
+            _ => return None,
+        };
+        // Both sides must be unit-stride f32 reads `x[j]`/`y[j]` (a coefficient·array form is the
+        // affine matcher's job and is tried first, so only a both-mention-`j` product reaches here).
+        let x_sym = self.index_by_loopvar(lhs, j)?;
+        let y_sym = self.index_by_loopvar(rhs, j)?;
+        if self.expr_mir(lhs) != MirType::F32 || self.expr_mir(rhs) != MirType::F32 {
+            return None;
+        }
+        Some(VElemPlan {
+            out: self.lookup(out_sym)?.0,
+            x: self.lookup(x_sym)?.0,
+            y: Some(self.lookup(y_sym)?.0),
+            a: None,
+            b: None,
+            c: None,
+            op: act | bin | VE_USE_Y,
+        })
+    }
+
     /// Peel a ReLU / ReLU6 activation wrapper off `value`, returning the inner (affine) expr and the
     /// `VE_RELU`/`VE_RELU6` code. ReLU is the idiomatic `if INNER > 0.0 { INNER } else { 0.0 }`
     /// (`max(INNER, 0)`); ReLU6 is `if INNER < 6.0 { <ReLU of INNER> } else { 6.0 }` (`clamp(INNER,
@@ -3427,8 +3474,14 @@ impl FnLowerer<'_> {
         if let Some(plan) = self.match_velem_affine(j, value, target, VE_ID) {
             return Some(plan);
         }
+        if let Some(plan) = self.match_velem_binary(j, value, target, VE_ID) {
+            return Some(plan);
+        }
         let (inner, act) = self.peel_velem_act(value)?;
-        self.match_velem_affine(j, inner, target, act)
+        if let Some(plan) = self.match_velem_affine(j, inner, target, act) {
+            return Some(plan);
+        }
+        self.match_velem_binary(j, inner, target, act)
     }
 
     /// Lower a coefficient expr (or a default constant when absent) to an f32 ValueId.

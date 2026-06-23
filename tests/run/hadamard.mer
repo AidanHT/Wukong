@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1224
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 594
+// EXPECT-OUT: 0
+module tests.run.hadamard
+
+// Elementwise binary maps dispatch to the 256-bit `mercury_velem_f32` kernel (VE_HADAMARD / VE_DIV),
+// the width Cranelift's generic vectorizer can't reach — the same domain-aware lowering as the affine
+// saxpy form. Hadamard `x*y` is the gating / attention-mask / residual-scaling primitive; the quotient
+// `x/y` is normalize-by-per-element-scale; an activation may wrap the product (`relu(x*y)`). Both
+// backends marshal the identical kernel, so the differential oracle stays bit-for-bit exact.
+fn main() -> i32 {
+    let mut x: [f32; 128] = [0.0; 128];
+    let mut y: [f32; 128] = [0.0; 128];
+    let mut out: [f32; 128] = [0.0; 128];
+    for i in 0..128 {
+        x[i] = (i as f32) - 64.0; // -64 .. 63
+        y[i] = (i as f32) * 0.5 - 16.0; // -16 .. 47.5
+    }
+    // Hadamard product x*y.
+    for i in 0..128 {
+        out[i] = x[i] * y[i];
+    }
+    print(out[100] as i32); // 36 * 34 = 1224
+
+    // Elementwise quotient x/y.
+    for i in 0..128 {
+        out[i] = x[i] / y[i];
+    }
+    print((out[96] * 1000.0) as i32); // 32 / 32 = 1.0 -> 1000
+
+    // ReLU of the Hadamard product — the activation wraps the binary op.
+    for i in 0..128 {
+        out[i] = if x[i] * y[i] > 0.0 { x[i] * y[i] } else { 0.0 };
+    }
+    print(out[10] as i32); // (-54)*(-11) = 594 (positive) -> 594
+    print(out[40] as i32); // (-24)*4 = -96 (negative) -> 0
+
+    return 0;
+}
