@@ -34,6 +34,30 @@ cudarc = { version = "0.16", default-features = false, features = [
 mercury_runtime = { workspace = true, optional = true }
 # f16/bf16 host-side conversion for the tensor-core path (low-precision in, f32 accumulate).
 half = { version = "2", optional = true }
+# General MIR->PTX lowering (`src/lower.rs`, Phase 4): consume MIR and implement the `Backend`
+# seam, so *any* Mercury program runs on the GPU (not just the recognizer-offload kernel menu).
+# Behind the `gpu` feature so plain `cargo test` stays toolchain-free and the crate is ~empty.
+mercury_mir = { workspace = true, optional = true }
+mercury_backend = { workspace = true, optional = true }
+mercury_span = { workspace = true, optional = true }
 
 [features]
-gpu = ["dep:cudarc", "dep:mercury_runtime", "dep:half"]
+gpu = [
+    "dep:cudarc",
+    "dep:mercury_runtime",
+    "dep:half",
+    "dep:mercury_mir",
+    "dep:mercury_backend",
+    "dep:mercury_span",
+]
+
+# The MIR->PTX lowering gate (`src/lower.rs` tests) builds programs from `.mer` source, so it needs
+# the front-end + the interpreter oracle. These are dev-only and pure-Rust (no toolchain), and the
+# test module is `#[cfg(all(test, feature = "gpu"))]`, so a plain `cargo test` ignores them.
+[dev-dependencies]
+mercury_lexer = { workspace = true }
+mercury_parser = { workspace = true }
+mercury_sema = { workspace = true }
+mercury_mir_build = { workspace = true }
+mercury_opt = { workspace = true }
+mercury_interp = { workspace = true }

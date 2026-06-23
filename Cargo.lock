@@ -474,7 +474,16 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "half",
+ "mercury_backend",
+ "mercury_interp",
+ "mercury_lexer",
+ "mercury_mir",
+ "mercury_mir_build",
+ "mercury_opt",
+ "mercury_parser",
  "mercury_runtime",
+ "mercury_sema",
+ "mercury_span",
 ]
 
 [[package]]
