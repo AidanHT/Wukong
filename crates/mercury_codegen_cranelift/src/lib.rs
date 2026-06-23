@@ -101,6 +101,8 @@ const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
 const RT_TRANSPOSE_PAR: &str = "mercury_transpose_f32_parallel";
+const RT_TRANSPOSE_U16: &str = "mercury_transpose_u16";
+const RT_TRANSPOSE_U16_PAR: &str = "mercury_transpose_u16_parallel";
 const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
@@ -857,7 +859,11 @@ impl<'a> FnTranslator<'a> {
         }
         // The cache-blocked transpose: mercury_transpose_f32[_parallel](src, dst, rows, cols) — two
         // pointers and two i64. Same (ptr, ptr, i64, i64) signature as vmath; route by name.
-        if (name == RT_TRANSPOSE || name == RT_TRANSPOSE_PAR) && args.len() == 4 {
+        if matches!(
+            name,
+            RT_TRANSPOSE | RT_TRANSPOSE_PAR | RT_TRANSPOSE_U16 | RT_TRANSPOSE_U16_PAR
+        ) && args.len() == 4
+        {
             let src = self.val(args[0]);
             let dst = self.val(args[1]);
             let rows = self.coerce_to_i64(args[2]);
@@ -1168,6 +1174,8 @@ struct RtFuncs {
     vmath_f16: FuncId,
     transpose: FuncId,
     transpose_par: FuncId,
+    transpose_u16: FuncId,
+    transpose_u16_par: FuncId,
     velem: FuncId,
     vhorner: FuncId,
     sred: FuncId,
@@ -1486,6 +1494,12 @@ fn populate_module<M: Module>(
         transpose_par: module
             .declare_function(RT_TRANSPOSE_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        transpose_u16: module
+            .declare_function(RT_TRANSPOSE_U16, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        transpose_u16_par: module
+            .declare_function(RT_TRANSPOSE_U16_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         velem: module
             .declare_function(RT_VELEM, Linkage::Import, &sig_velem)
             .map_err(|e| e.to_string())?,
@@ -1708,6 +1722,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_TRANSPOSE_PAR,
                 module.declare_func_in_func(rt.transpose_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_TRANSPOSE_U16,
+                module.declare_func_in_func(rt.transpose_u16, builder.func),
+            );
+            rt_refs.insert(
+                RT_TRANSPOSE_U16_PAR,
+                module.declare_func_in_func(rt.transpose_u16_par, builder.func),
             );
             rt_refs.insert(
                 RT_VELEM,
@@ -2002,6 +2024,14 @@ pub fn jit_compile(
         RT_TRANSPOSE_PAR,
         mercury_runtime::mercury_transpose_f32_parallel as *const u8,
     );
+    builder.symbol(
+        RT_TRANSPOSE_U16,
+        mercury_runtime::mercury_transpose_u16 as *const u8,
+    );
+    builder.symbol(
+        RT_TRANSPOSE_U16_PAR,
+        mercury_runtime::mercury_transpose_u16_parallel as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
@@ -2234,6 +2264,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_TRANSPOSE_PAR,
         mercury_runtime::mercury_transpose_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_TRANSPOSE_U16,
+        mercury_runtime::mercury_transpose_u16 as *const u8,
+    );
+    builder.symbol(
+        RT_TRANSPOSE_U16_PAR,
+        mercury_runtime::mercury_transpose_u16_parallel as *const u8,
     );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(

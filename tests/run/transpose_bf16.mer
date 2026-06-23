@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+module tests.run.transpose_bf16
+
+// bf16 matrix transpose dst = srcᵀ: src is [R=2, C=3], dst is [C=3, R=2], both bf16. A transpose moves
+// the raw 16-bit values (a direct copy, no cast), so the recognizer dispatches the bf16 nest to the
+// precision-agnostic mercury_transpose_u16 — the same cache-blocked kernel as f32, half the bytes per
+// element (gcc/rustc do not tile a transpose at -O3, at any precision). Pure data movement (a
+// permutation), so bit-identical to the scalar nest: the differential gate (interp == native, -O0 ==
+// -O3) is trivial. (The f32 form is transpose_f32.mer.)
+fn main() -> i32 {
+    let mut src: [bf16; 6] = [0.0 as bf16; 6];
+    let mut dst: [bf16; 6] = [0.0 as bf16; 6];
+    for i in 0..6 {
+        src[i] = ((i + 1) as f32) as bf16; // [[1,2,3],[4,5,6]]
+    }
+    for i in 0..2 {
+        for j in 0..3 {
+            dst[j * 2 + i] = src[i * 3 + j];
+        }
+    }
+    // dst = srcᵀ = [[1,4],[2,5],[3,6]] = [1,4, 2,5, 3,6].
+    print((dst[0] as f32) as i32); // 1
+    print((dst[1] as f32) as i32); // 4
+    print((dst[3] as f32) as i32); // 5
+    print((dst[5] as f32) as i32); // 6
+    return 0;
+}

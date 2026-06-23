@@ -82,6 +82,8 @@ pub fn lower_program(
         axpby_f16: interner.intern("mercury_axpby_f16"),
         transpose: interner.intern("mercury_transpose_f32"),
         transpose_par: interner.intern("mercury_transpose_f32_parallel"),
+        transpose_u16: interner.intern("mercury_transpose_u16"),
+        transpose_u16_par: interner.intern("mercury_transpose_u16_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -623,6 +625,11 @@ struct GemmSyms {
     /// the independent row blocks across cores.
     transpose: Symbol,
     transpose_par: Symbol,
+    /// The 16-bit (`bf16`/`f16`, stored as `u16`) transpose (`mercury_transpose_u16[_parallel]`): a
+    /// transpose nest over a half-precision array dispatches here — the same cache-blocked kernel, half
+    /// the bytes. A transpose moves the raw bits, so one `u16` kernel serves both bf16 and f16.
+    transpose_u16: Symbol,
+    transpose_u16_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2283,10 +2290,11 @@ impl FnLowerer<'_> {
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
             return false;
         };
-        let func = if parallel {
-            self.gemm.transpose_par
-        } else {
-            self.gemm.transpose
+        let func = match (parallel, nest.elem_u16) {
+            (false, false) => self.gemm.transpose,
+            (true, false) => self.gemm.transpose_par,
+            (false, true) => self.gemm.transpose_u16,
+            (true, true) => self.gemm.transpose_u16_par,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -10059,6 +10067,8 @@ struct TransposeNest {
     dst: Symbol,
     rows: Dim,
     cols: Dim,
+    /// `true` for a 16-bit (`bf16`/`f16`) transpose (→ `mercury_transpose_u16`), `false` for f32.
+    elem_u16: bool,
 }
 
 /// Recognize the matrix-transpose nest and dispatch it to the cache-blocked `mercury_transpose_f32`:
@@ -10126,18 +10136,24 @@ fn match_transpose(
     if !d_off.is_empty() || !s_off.is_empty() || sd != rows || ss != cols {
         return None;
     }
-    // Both operands f32, and distinct (an input aliasing the output is an in-place transpose hazard).
-    if scalar_of(target, sema) != Some(mercury_types::Scalar::F32)
-        || scalar_of(value, sema) != Some(mercury_types::Scalar::F32)
-        || sbase == dbase
-    {
+    // Both operands the SAME scalar type (a transpose is a copy), and distinct (an input aliasing the
+    // output is an in-place transpose hazard). f32 → the f32 kernel; bf16/f16 (16-bit storage, no cast
+    // in the copy) → the precision-agnostic u16 kernel.
+    let st = scalar_of(target, sema);
+    if st != scalar_of(value, sema) || sbase == dbase {
         return None;
     }
+    let elem_u16 = match st {
+        Some(mercury_types::Scalar::F32) => false,
+        Some(mercury_types::Scalar::Bf16) | Some(mercury_types::Scalar::F16) => true,
+        _ => return None,
+    };
     Some(TransposeNest {
         src: sbase,
         dst: dbase,
         rows,
         cols,
+        elem_u16,
     })
 }
 
