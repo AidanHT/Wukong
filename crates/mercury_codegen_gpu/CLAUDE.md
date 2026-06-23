@@ -166,6 +166,14 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
 - `src/diff.rs` — tolerance harness (`Rng`, `assert_close`/`assert_scalar_close`).
+- `src/autotune.rs` — **Phase 10 per-(op,shape,dtype) autotuner**: searches the int8 GEMM candidate set
+  (`smdb`/`swz` × {64,64}/{128,128} + split-K `swz64` sk∈{2,4,8}), **bit-exact cross-checks** every
+  candidate against the first before timing (a disagreement panics — never caches a wrong winner), ranks
+  by best-of-N same-run time (the same-family ratio cancels the shared clock → honest under contention).
+  `AutotuneCache` is a tiny hand-rolled text file (no serde); `tune_int8_cached` = lookup-or-tune,
+  `launch_int8_tuned` = run the winner, `revalidate_int8` = regression mode (flag when a different config
+  is now >10% faster; the decision is a pure, unit-tested fn). On-device it really discriminates
+  (256³→swz64_sk2, 64×128×8192→swz64_sk8, 128×128×256→smdb64). The proper home for sk / tile selection.
 
 ## Key facts / gotchas
 - **One process-wide `Gpu` behind a `Mutex`.** `cargo` runs tests on many threads and a CUDA context
