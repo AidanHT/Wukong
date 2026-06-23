@@ -783,4 +783,196 @@ mod tests {
             );
         });
     }
+
+    // ---- Eager cuBLAS-fp16 training-chain peer — the M8 "beat eager" beat/no-beat verdict --------
+    // The honest peer is the SAME resident step with cuBLAS substituted for the five GEMMs: same f32
+    // master weights, same just-in-time f16 narrow before each GEMM (the dtype contract both pay), the
+    // same relu/mse/act_bwd/fused-AdamW kernels — only the matmul differs. Crucially cuBLAS transposes
+    // internally, so the eager path needs NO explicit transpose kernel where Mercury's NT-only WMMA
+    // path pays a transpose HBM pass for every NN/TN GEMM. So this measures exactly: (cuBLAS-vs-WMMA
+    // GEMM quality) + (the transpose overhead NT-only forces). Reuses MlpTrainer's buffers directly
+    // (the tests submodule sees its private fields). #[ignore] — needs the cuBLAS redist on PATH.
+    use crate::ptx_autodiff_bwd::{cast_f32_to_f16_device, gemm_f16};
+    use cudarc::cublas::result as cublas_result;
+    use cudarc::cublas::sys::{
+        cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t,
+    };
+    use cudarc::cublas::CudaBlas;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use half::f16;
+
+    /// Row-major `C[m×n] = opA(A)·opB(B)` via cuBLAS **fp16-in / f32-out** (`cublasGemmEx`, the exact
+    /// dtype contract of Mercury's WMMA GEMM): narrows A,B to f16 just-in-time (the price both stacks
+    /// pay) and lets cuBLAS do the transpose internally — no explicit transpose kernel. `ta`/`tb` use
+    /// `gemm_device`'s convention. The column-major op/ld mapping is derived from the tested NT config
+    /// in `baselines::gemm_ex_nt_f16_f32out` and cross-checked vs the gated `gemm_f16` below.
+    #[allow(clippy::too_many_arguments)]
+    fn cublas_gemm_rm_narrow(
+        blas: &CudaBlas,
+        g: &mut Gpu,
+        ta: bool,
+        tb: bool,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let mut a16 = g.stream.alloc_zeros::<f16>(m * k).unwrap();
+        let mut b16 = g.stream.alloc_zeros::<f16>(k * n).unwrap();
+        cast_f32_to_f16_device(g, a, &mut a16, m * k).unwrap();
+        cast_f32_to_f16_device(g, b, &mut b16, k * n).unwrap();
+        let (alpha, beta) = (1.0f32, 0.0f32);
+        // First cuBLAS operand is Mercury's B, second is Mercury's A; computing column-major Cᵀ[n×m].
+        let op_b = if tb {
+            cublasOperation_t::CUBLAS_OP_T
+        } else {
+            cublasOperation_t::CUBLAS_OP_N
+        };
+        let op_a = if ta {
+            cublasOperation_t::CUBLAS_OP_T
+        } else {
+            cublasOperation_t::CUBLAS_OP_N
+        };
+        let lda = if tb { k } else { n }; // B's row-major leading dim
+        let ldb = if ta { m } else { k }; // A's row-major leading dim
+        let stream = g.stream.clone();
+        let (ap, _ra) = a16.device_ptr(&stream);
+        let (bp, _rb) = b16.device_ptr(&stream);
+        let (cp, _rc) = c.device_ptr_mut(&stream);
+        unsafe {
+            cublas_result::gemm_ex(
+                *blas.handle(),
+                op_b,
+                op_a,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha) as *const f32 as *const _,
+                bp as *const _,
+                cudaDataType_t::CUDA_R_16F,
+                lda as i32,
+                ap as *const _,
+                cudaDataType_t::CUDA_R_16F,
+                ldb as i32,
+                (&beta) as *const f32 as *const _,
+                cp as *mut _,
+                cudaDataType_t::CUDA_R_32F,
+                n as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .unwrap();
+        }
+    }
+
+    /// One eager-chain resident step on `tr`'s buffers: cuBLAS for the 5 GEMMs, Mercury's own kernels
+    /// for relu/mse/act_bwd/fused-AdamW. Mirrors `MlpTrainer::step_devhp` op-for-op except the matmul.
+    fn eager_f16_step(g: &mut Gpu, blas: &CudaBlas, tr: &mut MlpTrainer, hp_d: &CudaSlice<f32>) {
+        let (b, i, h, o) = (tr.b, tr.i, tr.h, tr.o);
+        cublas_gemm_rm_narrow(blas, g, false, true, &tr.x, &tr.w1, &mut tr.h_pre, b, h, i);
+        relu_fwd_device(g, &tr.h_pre, &mut tr.hact, b * h).unwrap();
+        cublas_gemm_rm_narrow(blas, g, false, true, &tr.hact, &tr.w2, &mut tr.y, b, o, h);
+        mse_grad_device(g, &tr.y, &tr.target, &mut tr.dy, b * o, 2.0).unwrap();
+        cublas_gemm_rm_narrow(blas, g, true, false, &tr.dy, &tr.hact, &mut tr.dw2, o, h, b);
+        cublas_gemm_rm_narrow(blas, g, false, false, &tr.dy, &tr.w2, &mut tr.dh, b, h, o);
+        act_bwd_device(g, VM_RELU, &tr.dh, &tr.h_pre, &tr.hact, &mut tr.dh_pre, b * h).unwrap();
+        cublas_gemm_rm_narrow(blas, g, true, false, &tr.dh_pre, &tr.x, &mut tr.dw1, h, i, b);
+        adamw_step_device(g, &mut tr.w1, &tr.dw1, &mut tr.m1, &mut tr.v1, hp_d, h * i).unwrap();
+        adamw_step_device(g, &mut tr.w2, &tr.dw2, &mut tr.m2, &mut tr.v2, hp_d, o * h).unwrap();
+    }
+
+    /// **The M8 verdict bench** — Mercury's fused WMMA resident step vs the eager cuBLAS-fp16 chain,
+    /// same-run, at a compute-bound (large FFN) and a launch-bound (small-batch / decode-ish) shape.
+    /// First cross-checks the cuBLAS row-major configs (NT/NN/TN) against the gated `gemm_f16`, then
+    /// times both. `fused/eager` > 1 means Mercury wins. Honest expectation: Mercury trails at the
+    /// compute-bound shape (WMMA < cuBLAS + the NT-only transpose passes); the launch-bound shape is
+    /// where the gap should narrow (GEMMs tiny, both pay ~equal launch counts). Reported, not asserted.
+    #[test]
+    #[ignore]
+    fn m8_resident_step_eager_vs_fused() {
+        with_gpu("m8_resident_step_eager_vs_fused", |g| {
+            let blas = CudaBlas::new(g.stream.clone()).unwrap();
+            // (1) Correctness: the cuBLAS row-major configs vs the gated gemm_f16 (both f16-in/f32-out).
+            for &(ta, tb) in &[(false, true), (false, false), (true, false)] {
+                let (m, n, k) = (64usize, 128usize, 96usize);
+                let mut rng = Rng::new(0xEA6E ^ (ta as u64) << 1 ^ tb as u64);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let bb = rng.vec(k * n, -1.0, 1.0);
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&bb).unwrap();
+                let mut c_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
+                cublas_gemm_rm_narrow(&blas, g, ta, tb, &a_d, &b_d, &mut c_d, m, n, k);
+                let got = g.stream.memcpy_dtov(&c_d).unwrap();
+                let want = gemm_f16(g, ta, tb, &a, &bb, m, n, k).unwrap();
+                assert_close(&format!("eager cuBLAS cfg ta={ta} tb={tb}"), &got, &want, 5e-2, 1e-2);
+            }
+            // (2) Timing: fused (Mercury WMMA) vs eager (cuBLAS), compute-bound then launch-bound.
+            for &(b, i, h, o) in &[(512usize, 768usize, 3072usize, 768usize), (64, 768, 3072, 768)] {
+                let mut rng = Rng::new(0x57A1 ^ b as u64);
+                let w1 = rng.vec(h * i, -0.02, 0.02);
+                let w2 = rng.vec(o * h, -0.02, 0.02);
+                let x = rng.vec(b * i, -1.0, 1.0);
+                let target = rng.vec(b * o, -1.0, 1.0);
+                let mut hpv = vec![0.0f32; hp::LEN];
+                hpv[hp::LR] = 1e-3;
+                hpv[hp::BETA1] = 0.9;
+                hpv[hp::BETA2] = 0.999;
+                hpv[hp::EPS] = 1e-8;
+                hpv[hp::BC1] = 1.0 - 0.9f32.powi(10);
+                hpv[hp::BC2] = 1.0 - 0.999f32.powi(10);
+                let hp_d = g.stream.memcpy_stod(&hpv).unwrap();
+                let iters = 30u32;
+
+                let mut fused = MlpTrainer::new(g, b, i, h, o, &w1, &w2)
+                    .unwrap()
+                    .with_precision(Precision::F16Mixed);
+                fused.set_batch(g, &x, &target).unwrap();
+                for _ in 0..3 {
+                    fused.step_devhp(g, &hp_d).unwrap();
+                }
+                g.stream.synchronize().unwrap();
+                let sf = best_of(5, || {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        fused.step_devhp(g, &hp_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+
+                let mut eager = MlpTrainer::new(g, b, i, h, o, &w1, &w2).unwrap();
+                eager.set_batch(g, &x, &target).unwrap();
+                for _ in 0..3 {
+                    eager_f16_step(g, &blas, &mut eager, &hp_d);
+                }
+                g.stream.synchronize().unwrap();
+                let se = best_of(5, || {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        eager_f16_step(g, &blas, &mut eager, &hp_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let ratio = se / sf; // >1 ⇒ fused (Mercury) is faster
+                // ±10% is within the measured run-to-run swing on this box (contention-noisy clocks),
+                // so call that band parity rather than flip "win"/"trail" on noise (the honesty law).
+                let verdict = if ratio >= 1.10 {
+                    "Mercury wins"
+                } else if ratio <= 0.90 {
+                    "Mercury trails"
+                } else {
+                    "~parity (within noise)"
+                };
+                eprintln!(
+                    "M8 verdict @B={b} d={i} ff={h}: fused-WMMA {:.0} us | eager-cuBLAS {:.0} us \
+                     => fused is {ratio:.2}x eager ({verdict})",
+                    sf * 1e6,
+                    se * 1e6,
+                );
+            }
+        });
+    }
 }
