@@ -406,4 +406,88 @@ fn main() -> i32 {{
             single_t / mega_t,
         );
     }
+
+    /// Same-run A/B for the **row-chunked-cooperative GEMM** path: `C[M,N] = A[M,K]·Bᵀ` reduced
+    /// `REPEAT` times. The megakernel partitions the M output rows across the block (each thread runs
+    /// the serial `mrt_sgemm_nt` over its rows); the single-thread path does all M rows in one lane.
+    /// Output cross-checked mega==single==oracle before the ratio is reported.
+    #[test]
+    #[ignore = "perf bench; run with --ignored --nocapture"]
+    fn mega_vs_single_gemm() {
+        use std::time::Instant;
+        if crate::gpu::gpu().is_none() {
+            eprintln!("skip mega_vs_single_gemm: no CUDA device");
+            return;
+        }
+        // M rows chunked across the 256-thread block; K/N kept modest so the single-thread .local
+        // frame fits. Constant inputs -> out[i,j]=K, acc=REPEAT*K exactly (no precision drift).
+        const M: usize = 256;
+        const K: usize = 64;
+        const N: usize = 64;
+        const REPEAT: usize = 16;
+        let src = format!(
+            r#"module bench
+fn linear(x: [f32; {mk}], w: [f32; {nk}], out: [f32; {mn}]) {{
+    for i in 0..{M} {{
+        for j in 0..{N} {{
+            let mut s: f32 = 0.0;
+            for p in 0..{K} {{ s = s + x[i * {K} + p] * w[j * {K} + p]; }}
+            out[i * {N} + j] = s;
+        }}
+    }}
+}}
+fn main() -> i32 {{
+    let x: [f32; {mk}] = [1.0; {mk}];
+    let w: [f32; {nk}] = [1.0; {nk}];
+    let mut out: [f32; {mn}] = [0.0; {mn}];
+    let mut acc: f32 = 0.0;
+    let mut r: i32 = 0;
+    while r < {REPEAT} {{ linear(x, w, out); acc = acc + out[0]; r = r + 1; }}
+    print(acc as i32);
+    return 0;
+}}
+"#,
+            mk = M * K,
+            nk = N * K,
+            mn = M * N,
+        );
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        if !crate::fusion::analyze(&program, entry, &interner).eligible {
+            eprintln!("skip mega_vs_single_gemm: not eligible (recognizer/opt shape)");
+            return;
+        }
+        let mega0 = try_run(&program, entry, &interner).expect("mega").expect("eligible");
+        let single0 = lower::jit_run_single(&program, entry, &interner).expect("single");
+        let oracle = mercury_interp::run_with_output(&program, entry, &interner).expect("interp");
+        assert!(outputs_match(&mega0.1, &single0.1), "mega vs single differ");
+        assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle differ");
+        eprintln!("checksum (mega==single==oracle): {}", String::from_utf8_lossy(&mega0.1).trim());
+
+        let _ = try_run(&program, entry, &interner);
+        let _ = lower::jit_run_single(&program, entry, &interner);
+        let best = |f: &dyn Fn()| {
+            let mut b = f64::INFINITY;
+            for _ in 0..8 {
+                let t = Instant::now();
+                f();
+                b = b.min(t.elapsed().as_secs_f64());
+            }
+            b
+        };
+        let mega_t = best(&|| {
+            let _ = try_run(&program, entry, &interner).unwrap().unwrap();
+        });
+        let single_t = best(&|| {
+            let _ = lower::jit_run_single(&program, entry, &interner).unwrap();
+        });
+        eprintln!(
+            "\n=== mega_vs_single_gemm  M={M} K={K} N={N} REPEAT={REPEAT} ({} fma) ===\n\
+             single-thread: {:.3} ms   megakernel(256t): {:.3} ms   speedup: {:.2}x (same-run ratio)",
+            (M * K * N * REPEAT) as f64,
+            single_t * 1e3,
+            mega_t * 1e3,
+            single_t / mega_t,
+        );
+    }
 }
