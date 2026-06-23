@@ -908,3 +908,178 @@ fn linear_tanh_sum_vjp() {
     let inputs = vec![xb, wb, vec![0.0]];
     tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
 }
+
+// ---------------------------------------------------------------------------------------------
+// A real two-layer kernel MLP: P1 = X.W1^T; H = relu(P1); P2 = H.W2^T; loss = sum((P2 - T)^2).
+// Chains two sgemm_nt matmuls through a relu and an MSE loss — the full backward path the engine
+// emits (two transposes, a masked relu loop, two NN GEMMs, the SSD affine). Gated by the f64
+// closed form, then trained with SGD to confirm the loss decreases.
+// ---------------------------------------------------------------------------------------------
+
+const B: usize = 2;
+const MIN: usize = 3; // input features
+const MHID: usize = 4;
+const MOUT: usize = 2;
+
+fn build_mlp2(it: &mut Interner) -> Fwd {
+    let sgemm_nt = it.intern("mercury_sgemm_nt");
+    let vmath = it.intern("mercury_vmath_f32");
+    let sreduce = it.intern("mercury_sreduce_f32");
+    let mut b = Builder::new(it.intern("mlp2"), MirType::Void);
+    let x = b.add_param(PTR); // B x MIN
+    let w1 = b.add_param(PTR); // MHID x MIN
+    let w2 = b.add_param(PTR); // MOUT x MHID
+    let t = b.add_param(PTR); // B x MOUT
+    let out = b.add_param(PTR);
+
+    let p1 = b.alloca(arr(B * MHID));
+    let h = b.alloca(arr(B * MHID));
+    let p2 = b.alloca(arr(B * MOUT));
+    let zero = ci(&mut b, 0);
+
+    // P1 = X . W1^T   (m=B, k=MIN, n=MHID)
+    let (bv, inv, hidv) = (
+        ci(&mut b, B as i64),
+        ci(&mut b, MIN as i64),
+        ci(&mut b, MHID as i64),
+    );
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![x, w1, p1, bv, inv, hidv, zero],
+    });
+    // H = relu(P1)
+    let bhid = ci(&mut b, (B * MHID) as i64);
+    let reluop = ci(&mut b, VM_RELU);
+    b.build_void(Op::Call {
+        func: vmath,
+        args: vec![p1, h, bhid, reluop],
+    });
+    // P2 = H . W2^T   (m=B, k=MHID, n=MOUT)
+    let outv = ci(&mut b, MOUT as i64);
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![h, w2, p2, bv, hidv, outv, zero],
+    });
+    // loss = sum((P2 - T)^2)
+    let bout = ci(&mut b, (B * MOUT) as i64);
+    let ssdop = ci(&mut b, RED_SSD);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![p2, t, bout, ssdop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![B * MIN, MHID * MIN, MOUT * MHID, B * MOUT, 1],
+        loss_out: 4,
+    }
+}
+
+/// f64 reference forward + backward for the two-layer MLP. Returns (loss, dW1, dW2).
+fn mlp2_reference(x: &[f32], w1: &[f32], w2: &[f32], t: &[f32]) -> (f64, Vec<f64>, Vec<f64>) {
+    let p1 = matmul_nt_f64(x, w1, B, MIN, MHID); // B x MHID
+    let h: Vec<f32> = p1.iter().map(|&v| v.max(0.0) as f32).collect();
+    let p2 = matmul_nt_f64(&h, w2, B, MHID, MOUT); // B x MOUT
+    let loss: f64 = p2
+        .iter()
+        .zip(t)
+        .map(|(&pv, &tv)| (pv - tv as f64).powi(2))
+        .sum();
+    let dp2: Vec<f64> = p2
+        .iter()
+        .zip(t)
+        .map(|(&pv, &tv)| 2.0 * (pv - tv as f64))
+        .collect();
+    let (dh, dw2) = matmul_nt_backward(&dp2, &h, w2, B, MHID, MOUT);
+    let dp1: Vec<f64> = dh
+        .iter()
+        .zip(&p1)
+        .map(|(&g, &pv)| if pv > 0.0 { g } else { 0.0 })
+        .collect();
+    let (_dx, dw1) = matmul_nt_backward(&dp1, x, w1, B, MIN, MHID);
+    (loss, dw1, dw2)
+}
+
+#[test]
+fn mlp2_kernel_gradient() {
+    let mut it = Interner::default();
+    let fwd = build_mlp2(&mut it);
+    // Data with the hidden pre-activations away from the relu kink (valid finite difference).
+    let mut seed = 0xBEEFu64;
+    let (xb, w1b, w2b, tb) = loop {
+        let xb = rand_vec(&mut seed, B * MIN);
+        let w1b = rand_vec(&mut seed, MHID * MIN);
+        let w2b = rand_vec(&mut seed, MOUT * MHID);
+        let tb = rand_vec(&mut seed, B * MOUT);
+        let p1 = matmul_nt_f64(&xb, &w1b, B, MIN, MHID);
+        if p1.iter().all(|&v| v.abs() > 0.2)
+            && p1.iter().any(|&v| v > 0.0)
+            && p1.iter().any(|&v| v < 0.0)
+        {
+            break (xb, w1b, w2b, tb);
+        }
+    };
+    let (_loss, dw1, dw2) = mlp2_reference(&xb, &w1b, &w2b, &tb);
+    let inputs = vec![xb, w1b, w2b, tb, vec![0.0]];
+    tape_gate(&fwd, &[1, 2], &inputs, &[dw1, dw2], &mut it);
+}
+
+#[test]
+fn mlp2_kernel_sgd_decreases_loss() {
+    let mut it = Interner::default();
+    let fwd = build_mlp2(&mut it);
+    let (prog, gname) = build(&fwd.func, &[1, 2], &mut it);
+
+    // A reachable target: the output of a "teacher" net on this input. The student (different init)
+    // can in principle fit it, so SGD should drive the loss down substantially.
+    let mut seed = 0xD00Du64;
+    let xb = rand_vec(&mut seed, B * MIN);
+    let teach_w1 = rand_vec(&mut seed, MHID * MIN);
+    let teach_w2 = rand_vec(&mut seed, MOUT * MHID);
+    let tb: Vec<f32> = {
+        let p1 = matmul_nt_f64(&xb, &teach_w1, B, MIN, MHID);
+        let h: Vec<f32> = p1.iter().map(|&v| v.max(0.0) as f32).collect();
+        matmul_nt_f64(&h, &teach_w2, B, MHID, MOUT)
+            .iter()
+            .map(|&v| v as f32)
+            .collect()
+    };
+    let mut w1 = rand_vec(&mut seed, MHID * MIN);
+    let mut w2 = rand_vec(&mut seed, MOUT * MHID);
+
+    let loss_now = |w1: &[f32], w2: &[f32], it: &Interner| -> f64 {
+        let mut bufs = vec![xb.clone(), w1.to_vec(), w2.to_vec(), tb.clone(), vec![0.0]];
+        loss_at_f32(&prog, fwd.func.name, &mut bufs, 4, it)
+    };
+
+    let lr = 0.05f32;
+    let l0 = loss_now(&w1, &w2, &it);
+    let mut prev = l0;
+    let mut last = l0;
+    for step in 0..1000 {
+        let inputs = vec![xb.clone(), w1.clone(), w2.clone(), tb.clone(), vec![0.0]];
+        let g = analytic_grad_f32(&prog, gname, &fwd, &inputs, &[1, 2], &it);
+        for (wi, gi) in w1.iter_mut().zip(&g[0]) {
+            *wi -= lr * *gi as f32;
+        }
+        for (wi, gi) in w2.iter_mut().zip(&g[1]) {
+            *wi -= lr * *gi as f32;
+        }
+        last = loss_now(&w1, &w2, &it);
+        // Full-batch GD with a small step descends monotonically (allow f32 rounding slack).
+        assert!(
+            last <= prev + 1e-5,
+            "loss rose at step {step}: {prev} -> {last}"
+        );
+        prev = last;
+    }
+    // The autodiff gradients drive real learning toward the teacher's target.
+    assert!(
+        last < 0.1 * l0,
+        "kernel MLP SGD did not converge: loss {l0} -> {last}"
+    );
+}
