@@ -254,6 +254,8 @@ struct FnEmit<'a> {
     n_p: u32,
     // ValueId -> assigned register name (assigned lazily, once, on first use).
     vreg: HashMap<u32, String>,
+    // ValueId -> its N lane registers, for SIMD `<N x T>` values (scalarized per lane).
+    vlanes: HashMap<u32, Vec<String>>,
     // Unique label counter (for cond-branch edge fixups).
     n_lbl: u32,
 
@@ -285,6 +287,7 @@ impl<'a> FnEmit<'a> {
             n_fd: 0,
             n_p: 0,
             vreg: HashMap::new(),
+            vlanes: HashMap::new(),
             n_lbl: 0,
             frame_off: HashMap::new(),
             frame_bytes: 0,
@@ -445,14 +448,10 @@ impl<'a> FnEmit<'a> {
             .ok_or_else(|| format!("{UNSUPPORTED} value-less op {:?}", inst.op))?;
         let rty = self.ty(r);
 
-        // Reject vectorized MIR (`<N x T>`): the AST-level vectorizer fires even at -O0 on array
-        // loops, producing Vec `Load`/`Bin`/`Round`/`Select` ops. Per-lane scalarization is a later
-        // increment; until then decline cleanly rather than silently mis-lowering a Vec as a scalar.
+        // Vectorized MIR (`<N x T>`): the AST-level vectorizer fires even at -O0 on array loops.
+        // Scalarize each lane through the same reg-based `*_into` emitters the scalar path uses.
         if rty.is_vector() {
-            return Err(format!(
-                "{UNSUPPORTED} vectorized result {} (SIMD MIR not yet lowered to PTX)",
-                rty.display()
-            ));
+            return self.lower_vec_inst(inst, r, &rty);
         }
 
         match &inst.op {
@@ -473,18 +472,12 @@ impl<'a> FnEmit<'a> {
             Op::Neg(v) => {
                 let x = self.reg(*v);
                 let d = self.reg(r);
-                if rty.is_float() {
-                    self.emit(&format!("neg.{} {d}, {x};", float_suffix(&rty)));
-                } else {
-                    self.emit(&format!("neg.s64 {d}, {x};"));
-                    self.mask_int(&d, &rty);
-                }
+                self.neg_into(&d, &x, &rty);
             }
             Op::Not(v) => {
                 let x = self.reg(*v);
                 let d = self.reg(r);
-                self.emit(&format!("not.b64 {d}, {x};"));
-                self.mask_int(&d, &rty);
+                self.not_into(&d, &x, &rty);
             }
             Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to, r)?,
             Op::Select(c, a, b) => self.lower_select(*c, *a, *b, &rty, r),
@@ -508,33 +501,24 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("add.s64 {d}, {base}, {off};"));
             }
             Op::Fma(a, b, c) => {
-                let sfx = float_suffix(&rty);
                 let rc = rc_of(&rty);
                 let av = self.coerce_float(*a, rc);
                 let bv = self.coerce_float(*b, rc);
                 let cv = self.coerce_float(*c, rc);
                 let d = self.reg(r);
-                self.emit(&format!("fma.rn.{sfx} {d}, {av}, {bv}, {cv};"));
+                self.fma_into(&d, &av, &bv, &cv, &rty);
             }
             Op::Sqrt(v) => {
-                let sfx = float_suffix(&rty);
                 let rc = rc_of(&rty);
                 let x = self.coerce_float(*v, rc);
                 let d = self.reg(r);
-                self.emit(&format!("sqrt.rn.{sfx} {d}, {x};"));
+                self.sqrt_into(&d, &x, &rty);
             }
             Op::Round(mode, v) => {
-                let sfx = float_suffix(&rty);
                 let rc = rc_of(&rty);
                 let x = self.coerce_float(*v, rc);
                 let d = self.reg(r);
-                let m = match mode {
-                    RoundMode::Nearest => "rni",
-                    RoundMode::Floor => "rmi",
-                    RoundMode::Ceil => "rpi",
-                    RoundMode::Trunc => "rzi",
-                };
-                self.emit(&format!("cvt.{m}.{sfx}.{sfx} {d}, {x};"));
+                self.round_into(&d, *mode, &x, &rty);
             }
             Op::Splat(_) => {
                 return Err(format!(
@@ -561,13 +545,22 @@ impl<'a> FnEmit<'a> {
         rty: &MirType,
         res: ValueId,
     ) -> Result<(), String> {
+        let (a, b) = if op.is_float() {
+            let rc = rc_of(rty);
+            (self.coerce_float(l, rc), self.coerce_float(r2, rc))
+        } else {
+            (self.reg(l), self.reg(r2))
+        };
+        let d = self.reg(res);
+        self.bin_into(&d, op, &a, &b, rty)
+    }
+
+    /// Emit `d = a OP b` for one (scalar or lane) value. Operands are registers already of the result
+    /// type; floats round per op (no auto-FMA), ints compute in 64-bit and mask to the result width.
+    fn bin_into(&mut self, d: &str, op: BinOp, a: &str, b: &str, rty: &MirType) -> Result<(), String> {
         use BinOp::*;
         if op.is_float() {
             let sfx = float_suffix(rty);
-            let rc = rc_of(rty);
-            let a = self.coerce_float(l, rc);
-            let b = self.coerce_float(r2, rc);
-            let d = self.reg(res);
             match op {
                 FAdd => self.emit(&format!("add.rn.{sfx} {d}, {a}, {b};")),
                 FSub => self.emit(&format!("sub.rn.{sfx} {d}, {a}, {b};")),
@@ -577,20 +570,15 @@ impl<'a> FnEmit<'a> {
                 // integer range (`1e18 % 3` -> 0, not 1), so it cannot meet the differential gate. A
                 // true device fmod is a later increment; decline cleanly for now.
                 FRem => {
-                    let _ = (a, b, d);
                     return Err(format!(
                         "{UNSUPPORTED} float `%` (fmod) not yet lowered to PTX (needs a true fmod)"
-                    ));
+                    ))
                 }
                 _ => unreachable!(),
             }
             return Ok(());
         }
-
-        let a = self.reg(l);
-        let b = self.reg(r2);
         let bits = int_bits(rty);
-        let d = self.reg(res);
         match op {
             Add => self.emit(&format!("add.s64 {d}, {a}, {b};")),
             Sub => self.emit(&format!("sub.s64 {d}, {a}, {b};")),
@@ -598,35 +586,68 @@ impl<'a> FnEmit<'a> {
             And => self.emit(&format!("and.b64 {d}, {a}, {b};")),
             Or => self.emit(&format!("or.b64 {d}, {a}, {b};")),
             Xor => self.emit(&format!("xor.b64 {d}, {a}, {b};")),
-            SDiv => self.guarded_divrem("div.s64", &a, &b, &d),
-            SRem => self.guarded_divrem("rem.s64", &a, &b, &d),
+            SDiv => self.guarded_divrem("div.s64", a, b, d),
+            SRem => self.guarded_divrem("rem.s64", a, b, d),
             UDiv => {
-                let au = self.mask_unsigned(&a, bits);
-                let bu = self.mask_unsigned(&b, bits);
-                self.guarded_divrem("div.u64", &au, &bu, &d);
+                let au = self.mask_unsigned(a, bits);
+                let bu = self.mask_unsigned(b, bits);
+                self.guarded_divrem("div.u64", &au, &bu, d);
             }
             URem => {
-                let au = self.mask_unsigned(&a, bits);
-                let bu = self.mask_unsigned(&b, bits);
-                self.guarded_divrem("rem.u64", &au, &bu, &d);
+                let au = self.mask_unsigned(a, bits);
+                let bu = self.mask_unsigned(b, bits);
+                self.guarded_divrem("rem.u64", &au, &bu, d);
             }
             Shl => {
-                let sc = self.shift_count(&b, bits);
+                let sc = self.shift_count(b, bits);
                 self.emit(&format!("shl.b64 {d}, {a}, {sc};"));
             }
             LShr => {
-                let au = self.mask_unsigned(&a, bits);
-                let sc = self.shift_count(&b, bits);
+                let au = self.mask_unsigned(a, bits);
+                let sc = self.shift_count(b, bits);
                 self.emit(&format!("shr.u64 {d}, {au}, {sc};"));
             }
             AShr => {
-                let sc = self.shift_count(&b, bits);
+                let sc = self.shift_count(b, bits);
                 self.emit(&format!("shr.s64 {d}, {a}, {sc};"));
             }
             FAdd | FSub | FMul | FDiv | FRem => unreachable!("handled above"),
         }
-        self.mask_int(&d, rty);
+        self.mask_int(d, rty);
         Ok(())
+    }
+
+    fn neg_into(&mut self, d: &str, a: &str, rty: &MirType) {
+        if rty.is_float() {
+            self.emit(&format!("neg.{} {d}, {a};", float_suffix(rty)));
+        } else {
+            self.emit(&format!("neg.s64 {d}, {a};"));
+            self.mask_int(d, rty);
+        }
+    }
+
+    fn not_into(&mut self, d: &str, a: &str, rty: &MirType) {
+        self.emit(&format!("not.b64 {d}, {a};"));
+        self.mask_int(d, rty);
+    }
+
+    fn fma_into(&mut self, d: &str, a: &str, b: &str, c: &str, rty: &MirType) {
+        self.emit(&format!("fma.rn.{} {d}, {a}, {b}, {c};", float_suffix(rty)));
+    }
+
+    fn sqrt_into(&mut self, d: &str, a: &str, rty: &MirType) {
+        self.emit(&format!("sqrt.rn.{} {d}, {a};", float_suffix(rty)));
+    }
+
+    fn round_into(&mut self, d: &str, mode: RoundMode, a: &str, rty: &MirType) {
+        let sfx = float_suffix(rty);
+        let m = match mode {
+            RoundMode::Nearest => "rni",
+            RoundMode::Floor => "rmi",
+            RoundMode::Ceil => "rpi",
+            RoundMode::Trunc => "rzi",
+        };
+        self.emit(&format!("cvt.{m}.{sfx}.{sfx} {d}, {a};"));
     }
 
     /// `d = (b == 0) ? 0 : (a OP b)` with `b` swapped to 1 in the divide so the hardware never sees a
@@ -683,28 +704,38 @@ impl<'a> FnEmit<'a> {
     // --- compares / select ---
 
     fn lower_cmp(&mut self, op: CmpOp, l: ValueId, r2: ValueId, res: ValueId) {
-        let p = self.fresh_pred();
-        if op.is_float() {
+        let (a, b, opnd_ty) = if op.is_float() {
             // Compare in the wider operand type (Cranelift's rule), which preserves order vs the
             // interpreter's f64 compare.
             let common = if matches!(self.ty(l), MirType::F64) || matches!(self.ty(r2), MirType::F64)
             {
-                RC::F64
+                MirType::F64
             } else {
-                RC::F32
+                MirType::F32
             };
-            let a = self.coerce_float(l, common);
-            let b = self.coerce_float(r2, common);
-            let sfx = if common == RC::F64 { "f64" } else { "f32" };
-            self.emit(&format!("setp.{}.{sfx} {p}, {a}, {b};", float_cc(op)));
+            let rc = rc_of(&common);
+            (self.coerce_float(l, rc), self.coerce_float(r2, rc), common)
         } else {
-            let a = self.reg(l);
-            let b = self.reg(r2);
+            (self.reg(l), self.reg(r2), self.ty(l))
+        };
+        let d = self.reg(res);
+        self.cmp_into(&d, op, &a, &b, &opnd_ty);
+    }
+
+    /// Emit `d = (a CMP b) ? 1 : 0` into a 64-bit `i1` holder. `opnd_ty` selects the compare width.
+    fn cmp_into(&mut self, d: &str, op: CmpOp, a: &str, b: &str, opnd_ty: &MirType) {
+        let p = self.fresh_pred();
+        if op.is_float() {
+            self.emit(&format!(
+                "setp.{}.{} {p}, {a}, {b};",
+                float_cc(op),
+                float_suffix(opnd_ty)
+            ));
+        } else {
             self.emit(&format!("setp.{} {p}, {a}, {b};", int_cc(op)));
         }
         let one = self.fresh(RC::Rd);
         let zero = self.fresh(RC::Rd);
-        let d = self.reg(res);
         self.emit(&format!("mov.b64 {one}, 1;"));
         self.emit(&format!("mov.b64 {zero}, 0;"));
         self.emit(&format!("selp.b64 {d}, {one}, {zero}, {p};"));
@@ -713,17 +744,23 @@ impl<'a> FnEmit<'a> {
     fn lower_select(&mut self, c: ValueId, a: ValueId, b: ValueId, rty: &MirType, res: ValueId) {
         let rc = rc_of(rty);
         let cc = self.reg(c);
-        let p = self.fresh_pred();
-        self.emit(&format!("setp.ne.s64 {p}, {cc}, 0;"));
         let (av, bv) = if rty.is_float() {
             (self.coerce_float(a, rc), self.coerce_float(b, rc))
         } else {
             (self.reg(a), self.reg(b))
         };
         let d = self.reg(res);
-        self.emit(&format!("selp.{} {d}, {av}, {bv}, {p};", mov_ty(rc)));
+        self.select_into(&d, &cc, &av, &bv, rty);
+    }
+
+    /// Emit `d = c ? a : b` for one (scalar or lane) value; `c` is a 64-bit `i1` (0/1).
+    fn select_into(&mut self, d: &str, c: &str, a: &str, b: &str, rty: &MirType) {
+        let rc = rc_of(rty);
+        let p = self.fresh_pred();
+        self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));
+        self.emit(&format!("selp.{} {d}, {a}, {b}, {p};", mov_ty(rc)));
         if !rty.is_float() {
-            self.mask_int(&d, rty);
+            self.mask_int(d, rty);
         }
     }
 
@@ -736,25 +773,33 @@ impl<'a> FnEmit<'a> {
         to: &MirType,
         res: ValueId,
     ) -> Result<(), String> {
-        use CastKind::*;
         let from = self.ty(v);
+        let x = self.reg(v);
+        let d = self.reg(res);
+        self.cast_into(&d, kind, &x, &from, to)
+    }
+
+    /// Emit a cast `d = (to)a` for one (scalar or lane) value, mirroring `mercury_interp::apply_cast`.
+    fn cast_into(
+        &mut self,
+        d: &str,
+        kind: CastKind,
+        x: &str,
+        from: &MirType,
+        to: &MirType,
+    ) -> Result<(), String> {
+        use CastKind::*;
         match kind {
             SExt | Trunc => {
-                let x = self.reg(v);
-                let d = self.reg(res);
                 self.emit(&format!("mov.b64 {d}, {x};"));
-                self.mask_int(&d, to);
+                self.mask_int(d, to);
             }
             ZExt => {
-                let x = self.reg(v);
-                let u = self.mask_unsigned(&x, int_bits(&from));
-                let d = self.reg(res);
+                let u = self.mask_unsigned(x, int_bits(from));
                 self.emit(&format!("mov.b64 {d}, {u};"));
-                self.mask_int(&d, to);
+                self.mask_int(d, to);
             }
             SiToFp => {
-                let x = self.reg(v);
-                let d = self.reg(res);
                 if matches!(to, MirType::F64) {
                     self.emit(&format!("cvt.rn.f64.s64 {d}, {x};"));
                 } else {
@@ -765,9 +810,7 @@ impl<'a> FnEmit<'a> {
                 }
             }
             UiToFp => {
-                let x = self.reg(v);
-                let u = self.mask_unsigned(&x, int_bits(&from));
-                let d = self.reg(res);
+                let u = self.mask_unsigned(x, int_bits(from));
                 if matches!(to, MirType::F64) {
                     self.emit(&format!("cvt.rn.f64.u64 {d}, {u};"));
                 } else {
@@ -776,13 +819,11 @@ impl<'a> FnEmit<'a> {
                     self.emit(&format!("cvt.rn.f32.f64 {d}, {t};"));
                 }
             }
-            FpToSi => self.lower_fp_to_int(v, to, res, true),
-            FpToUi => self.lower_fp_to_int(v, to, res, false),
+            FpToSi => self.fp_to_int_into(d, x, from, to, true),
+            FpToUi => self.fp_to_int_into(d, x, from, to, false),
             FpExt => {
                 // Widen to f64 (the only widening FpExt target here); narrowing is FpTrunc.
-                let x = self.reg(v);
-                let d = self.reg(res);
-                if rc_of(&from) == RC::F64 {
+                if rc_of(from) == RC::F64 {
                     self.emit(&format!("mov.f64 {d}, {x};"));
                 } else {
                     self.emit(&format!("cvt.f64.f32 {d}, {x};"));
@@ -790,9 +831,7 @@ impl<'a> FnEmit<'a> {
             }
             FpTrunc => {
                 if matches!(to, MirType::F32) {
-                    let x = self.reg(v);
-                    let d = self.reg(res);
-                    if rc_of(&from) == RC::F64 {
+                    if rc_of(from) == RC::F64 {
                         self.emit(&format!("cvt.rn.f32.f64 {d}, {x};"));
                     } else {
                         self.emit(&format!("mov.f32 {d}, {x};"));
@@ -804,19 +843,14 @@ impl<'a> FnEmit<'a> {
                     ));
                 }
             }
-            Bitcast => self.lower_bitcast(v, &from, to, res),
-            IntToPtr | PtrToInt => {
-                let x = self.reg(v);
-                let d = self.reg(res);
-                self.emit(&format!("mov.b64 {d}, {x};"));
-            }
+            Bitcast => self.bitcast_into(d, x, from, to),
+            IntToPtr | PtrToInt => self.emit(&format!("mov.b64 {d}, {x};")),
         }
         Ok(())
     }
 
-    fn lower_fp_to_int(&mut self, v: ValueId, to: &MirType, res: ValueId, signed: bool) {
-        let x = self.reg(v);
-        let fsfx = float_suffix(&self.ty(v));
+    fn fp_to_int_into(&mut self, d: &str, x: &str, from: &MirType, to: &MirType, signed: bool) {
+        let fsfx = float_suffix(from);
         let s = if signed { 's' } else { 'u' };
         let w = match to {
             MirType::I8 => 8,
@@ -824,19 +858,16 @@ impl<'a> FnEmit<'a> {
             MirType::I64 => 64,
             _ => 32,
         };
-        let d = self.reg(res);
         if w == 64 {
             self.emit(&format!("cvt.rzi.{s}64.{fsfx} {d}, {x};"));
         } else {
             // cvt saturates to the destination width; sign-extend into the 64-bit holder, then mask.
             self.emit(&format!("cvt.rzi.{s}{w}.{fsfx} {d}, {x};"));
-            self.mask_int(&d, to);
+            self.mask_int(d, to);
         }
     }
 
-    fn lower_bitcast(&mut self, v: ValueId, from: &MirType, to: &MirType, res: ValueId) {
-        let x = self.reg(v);
-        let d = self.reg(res);
+    fn bitcast_into(&mut self, d: &str, x: &str, from: &MirType, to: &MirType) {
         match (from, to) {
             (MirType::I32, MirType::F32) => {
                 let lo = self.fresh_r32();
@@ -863,6 +894,11 @@ impl<'a> FnEmit<'a> {
     fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) {
         let addr = self.reg(p);
         let d = self.reg(res);
+        self.load_into(&d, &addr, ty);
+    }
+
+    /// Load one (scalar or lane) value of MIR type `ty` from generic address `addr` into `d`.
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType) {
         match ty {
             MirType::F32 => self.emit(&format!("ld.f32 {d}, [{addr}];")),
             MirType::F64 => self.emit(&format!("ld.f64 {d}, [{addr}];")),
@@ -888,20 +924,36 @@ impl<'a> FnEmit<'a> {
 
     fn lower_store(&mut self, ptr: ValueId, value: ValueId) -> Result<(), String> {
         let vty = self.ty(value);
-        if vty.is_vector() {
-            return Err(format!(
-                "{UNSUPPORTED} vectorized store of {} (SIMD MIR not yet lowered to PTX)",
-                vty.display()
-            ));
-        }
         let addr = self.reg(ptr);
+        // Vector store: write each lane at addr + i*sizeof(lane).
+        if let MirType::Vec(elem, n) = &vty {
+            let elem = (**elem).clone();
+            let esz = size_of(&elem);
+            let lanes = self.lanes(value)?;
+            for (i, lv) in lanes.into_iter().enumerate().take(*n as usize) {
+                let la = if i == 0 {
+                    addr.clone()
+                } else {
+                    let t = self.fresh(RC::Rd);
+                    self.emit(&format!("add.s64 {t}, {addr}, {};", i as u64 * esz));
+                    t
+                };
+                self.store_into(&la, &lv, &elem)?;
+            }
+            return Ok(());
+        }
         let v = self.reg(value);
-        match vty {
+        self.store_into(&addr, &v, &vty)
+    }
+
+    /// Store one (scalar or lane) value `v` of MIR type `ty` to generic address `addr`.
+    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType) -> Result<(), String> {
+        match ty {
             MirType::F32 => self.emit(&format!("st.f32 [{addr}], {v};")),
             MirType::F64 => self.emit(&format!("st.f64 [{addr}], {v};")),
             MirType::I64 | MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),
             MirType::F16 | MirType::BF16 => {
-                return Err(format!("{UNSUPPORTED} store of {:?} (half precision)", vty))
+                return Err(format!("{UNSUPPORTED} store of {:?} (half precision)", ty))
             }
             // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.
             MirType::I8 => {
@@ -921,6 +973,168 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("st.u32 [{addr}], {w};"));
             }
         }
+        Ok(())
+    }
+
+    // --- SIMD (vector) lowering: scalarize each `<N x T>` op into N lane ops ---
+
+    /// The N lane registers of a SIMD value (materialized by the op that produced it).
+    fn lanes(&mut self, v: ValueId) -> Result<Vec<String>, String> {
+        self.vlanes.get(&v.0).cloned().ok_or_else(|| {
+            format!(
+                "{UNSUPPORTED} SIMD value v{} used before definition (vector block params not lowered)",
+                v.0
+            )
+        })
+    }
+
+    /// Address of lane `i` given a base address register and the lane byte size.
+    fn lane_addr(&mut self, base: &str, i: usize, esz: u64) -> String {
+        if i == 0 {
+            base.to_string()
+        } else {
+            let t = self.fresh(RC::Rd);
+            self.emit(&format!("add.s64 {t}, {base}, {};", i as u64 * esz));
+            t
+        }
+    }
+
+    /// Scalarize a vectorized (`<N x T>`) instruction into N lane operations, reusing the same
+    /// reg-based emitters the scalar path uses. Vector loads/stores stride by the lane size; a `Splat`
+    /// aliases the scalar across all lanes. (Vectorized values are produced and consumed within one
+    /// block, so there are no vector block params to thread.)
+    fn lower_vec_inst(
+        &mut self,
+        inst: &mercury_mir::Inst,
+        r: ValueId,
+        rty: &MirType,
+    ) -> Result<(), String> {
+        let n = match rty {
+            MirType::Vec(_, n) => *n as usize,
+            _ => unreachable!("lower_vec_inst on non-vector"),
+        };
+        let lane = rty.lane_type().clone();
+        let lane_rc = rc_of(&lane);
+
+        let out: Vec<String> = match &inst.op {
+            Op::Splat(s) => {
+                let sr = self.reg(*s);
+                vec![sr; n]
+            }
+            Op::Load(p, _) => {
+                let addr = self.reg(*p);
+                let esz = size_of(&lane);
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let la = self.lane_addr(&addr, i, esz);
+                    let d = self.fresh(lane_rc);
+                    self.load_into(&d, &la, &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Bin(op, l, r2) => {
+                let la = self.lanes(*l)?;
+                let lb = self.lanes(*r2)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.bin_into(&d, *op, &la[i], &lb[i], &lane)?;
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Fma(a, b, c) => {
+                let la = self.lanes(*a)?;
+                let lb = self.lanes(*b)?;
+                let lc = self.lanes(*c)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.fma_into(&d, &la[i], &lb[i], &lc[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Sqrt(v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.sqrt_into(&d, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Round(mode, v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.round_into(&d, *mode, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Neg(v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.neg_into(&d, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Not(v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.not_into(&d, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Cmp(op, l, r2) => {
+                let opnd_lane = self.ty(*l).lane_type().clone();
+                let la = self.lanes(*l)?;
+                let lb = self.lanes(*r2)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(RC::Rd);
+                    self.cmp_into(&d, *op, &la[i], &lb[i], &opnd_lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Select(c, a, b) => {
+                let lc = self.lanes(*c)?;
+                let la = self.lanes(*a)?;
+                let lb = self.lanes(*b)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.select_into(&d, &lc[i], &la[i], &lb[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Cast(kind, v, to) => {
+                let from_lane = self.ty(*v).lane_type().clone();
+                let to_lane = to.lane_type().clone();
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(rc_of(&to_lane));
+                    self.cast_into(&d, *kind, &lv[i], &from_lane, &to_lane)?;
+                    ls.push(d);
+                }
+                ls
+            }
+            other => return Err(format!("{UNSUPPORTED} SIMD op {other:?} not yet lowered to PTX")),
+        };
+        self.vlanes.insert(r.0, out);
         Ok(())
     }
 
