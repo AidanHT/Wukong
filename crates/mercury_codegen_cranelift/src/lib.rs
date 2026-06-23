@@ -87,6 +87,10 @@ const RT_SGEMM_F16_NT: &str = "mercury_sgemm_f16_nt";
 const RT_SGEMM_F16_NT_PARALLEL: &str = "mercury_sgemm_f16_nt_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_SGEMM_NT_EPI_PAR: &str = "mercury_sgemm_nt_epi_parallel";
+const RT_SGEMM_BF16_NT_EPI: &str = "mercury_sgemm_bf16_nt_epi";
+const RT_SGEMM_BF16_NT_EPI_PAR: &str = "mercury_sgemm_bf16_nt_epi_parallel";
+const RT_SGEMM_F16_NT_EPI: &str = "mercury_sgemm_f16_nt_epi";
+const RT_SGEMM_F16_NT_EPI_PAR: &str = "mercury_sgemm_f16_nt_epi_parallel";
 const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_VMATH2: &str = "mercury_vmath2_f32";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
@@ -800,8 +804,18 @@ impl<'a> FnTranslator<'a> {
         }
         // The fused-epilogue Linear: mercury_sgemm_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)
         // — three pointers, four i64 (m,k,n,beta), a bias pointer, and an i64 activation code. The
-        // `@parallel` variant shares the signature; resolve the ref by the actual symbol `name`.
-        if (name == RT_SGEMM_NT_EPI || name == RT_SGEMM_NT_EPI_PAR) && args.len() == 9 {
+        // `@parallel` variant and the bf16/f16 half-input twins (a/b are 2-byte-element pointers; the
+        // kernel widens losslessly) all share the identical 9-arg signature, so just route by `name`.
+        if matches!(
+            name,
+            RT_SGEMM_NT_EPI
+                | RT_SGEMM_NT_EPI_PAR
+                | RT_SGEMM_BF16_NT_EPI
+                | RT_SGEMM_BF16_NT_EPI_PAR
+                | RT_SGEMM_F16_NT_EPI
+                | RT_SGEMM_F16_NT_EPI_PAR
+        ) && args.len() == 9
+        {
             let a = self.val(args[0]);
             let b = self.val(args[1]);
             let c = self.val(args[2]);
@@ -1119,6 +1133,10 @@ struct RtFuncs {
     sgemm_f16_nt_parallel: FuncId,
     sgemm_nt_epi: FuncId,
     sgemm_nt_epi_par: FuncId,
+    sgemm_bf16_nt_epi: FuncId,
+    sgemm_bf16_nt_epi_par: FuncId,
+    sgemm_f16_nt_epi: FuncId,
+    sgemm_f16_nt_epi_par: FuncId,
     vmath: FuncId,
     vmath2: FuncId,
     vmath_bf16: FuncId,
@@ -1398,6 +1416,18 @@ fn populate_module<M: Module>(
         sgemm_nt_epi_par: module
             .declare_function(RT_SGEMM_NT_EPI_PAR, Linkage::Import, &sig_gemm_epi)
             .map_err(|e| e.to_string())?,
+        sgemm_bf16_nt_epi: module
+            .declare_function(RT_SGEMM_BF16_NT_EPI, Linkage::Import, &sig_gemm_epi)
+            .map_err(|e| e.to_string())?,
+        sgemm_bf16_nt_epi_par: module
+            .declare_function(RT_SGEMM_BF16_NT_EPI_PAR, Linkage::Import, &sig_gemm_epi)
+            .map_err(|e| e.to_string())?,
+        sgemm_f16_nt_epi: module
+            .declare_function(RT_SGEMM_F16_NT_EPI, Linkage::Import, &sig_gemm_epi)
+            .map_err(|e| e.to_string())?,
+        sgemm_f16_nt_epi_par: module
+            .declare_function(RT_SGEMM_F16_NT_EPI_PAR, Linkage::Import, &sig_gemm_epi)
+            .map_err(|e| e.to_string())?,
         vmath: module
             .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
@@ -1577,6 +1607,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_NT_EPI_PAR,
                 module.declare_func_in_func(rt.sgemm_nt_epi_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_BF16_NT_EPI,
+                module.declare_func_in_func(rt.sgemm_bf16_nt_epi, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_BF16_NT_EPI_PAR,
+                module.declare_func_in_func(rt.sgemm_bf16_nt_epi_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_F16_NT_EPI,
+                module.declare_func_in_func(rt.sgemm_f16_nt_epi, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_F16_NT_EPI_PAR,
+                module.declare_func_in_func(rt.sgemm_f16_nt_epi_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH,
@@ -1837,6 +1883,22 @@ pub fn jit_compile(
         RT_SGEMM_NT_EPI_PAR,
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
     );
+    builder.symbol(
+        RT_SGEMM_BF16_NT_EPI,
+        mercury_runtime::mercury_sgemm_bf16_nt_epi as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_BF16_NT_EPI_PAR,
+        mercury_runtime::mercury_sgemm_bf16_nt_epi_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_F16_NT_EPI,
+        mercury_runtime::mercury_sgemm_f16_nt_epi as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_F16_NT_EPI_PAR,
+        mercury_runtime::mercury_sgemm_f16_nt_epi_parallel as *const u8,
+    );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_VMATH2, mercury_runtime::mercury_vmath2_f32 as *const u8);
     builder.symbol(
@@ -2029,6 +2091,22 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SGEMM_NT_EPI_PAR,
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_BF16_NT_EPI,
+        mercury_runtime::mercury_sgemm_bf16_nt_epi as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_BF16_NT_EPI_PAR,
+        mercury_runtime::mercury_sgemm_bf16_nt_epi_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_F16_NT_EPI,
+        mercury_runtime::mercury_sgemm_f16_nt_epi as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_F16_NT_EPI_PAR,
+        mercury_runtime::mercury_sgemm_f16_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_VMATH2, mercury_runtime::mercury_vmath2_f32 as *const u8);

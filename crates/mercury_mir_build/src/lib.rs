@@ -64,6 +64,10 @@ pub fn lower_program(
         bf16_nt_par: interner.intern("mercury_sgemm_bf16_nt_parallel"),
         f16_nt: interner.intern("mercury_sgemm_f16_nt"),
         f16_nt_par: interner.intern("mercury_sgemm_f16_nt_parallel"),
+        bf16_nt_epi: interner.intern("mercury_sgemm_bf16_nt_epi"),
+        bf16_nt_epi_par: interner.intern("mercury_sgemm_bf16_nt_epi_parallel"),
+        f16_nt_epi: interner.intern("mercury_sgemm_f16_nt_epi"),
+        f16_nt_epi_par: interner.intern("mercury_sgemm_f16_nt_epi_parallel"),
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
         reduce_bf16: interner.intern("mercury_reduce_bf16"),
@@ -544,6 +548,16 @@ struct GemmSyms {
     bf16_nt_par: Symbol,
     f16_nt: Symbol,
     f16_nt_par: Symbol,
+    /// The fused-epilogue bf16/f16 mixed-precision GEMM kernels (`mercury_sgemm_{bf16,f16}_nt_epi[_
+    /// parallel](a, b, c, m, k, n, beta, bias, act)`): a bf16/f16 `C = A·Bᵀ` nest immediately followed
+    /// by its bias-add / activation loop folds here — the mixed-precision transformer FFN projection,
+    /// fused. The lossless widen prepass feeds the f32 `gemm_dispatch`, which applies the identical
+    /// `nt_epi` epilogue (bias + identity/ReLU/GELU/SiLU) in its C writeback, so the result is the f32
+    /// fused FFN on the widened operands — bit-for-bit across backends. The `f32` twin is `nt_epi`.
+    bf16_nt_epi: Symbol,
+    bf16_nt_epi_par: Symbol,
+    f16_nt_epi: Symbol,
+    f16_nt_epi_par: Symbol,
     /// The bf16 mixed-precision reduction kernels (`mercury_dot_bf16(x, y, n) -> f32` and
     /// `mercury_sum_bf16(x, n) -> f32`): a reduction loop `s += (x[k] as f32) [* (y[k] as f32)]` over
     /// `[bf16; _]` arrays with an f32 accumulator lowers to one of these — bf16 storage, f32
@@ -755,6 +769,14 @@ impl FnLowerer<'_> {
             // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
             // over C). Checked before the elementwise fusion below — they match disjoint shapes.
             if let Some(n) = self.try_fuse_matmul_epilogue(&b.stmts[i..]) {
+                i += n;
+                continue;
+            }
+            // The bf16/f16 twin: a half-precision `nn.Linear` matmul immediately followed by its
+            // bias-add / activation loop folds to one `mercury_sgemm_{bf16,f16}_nt_epi` call — the
+            // mixed-precision transformer FFN. Disjoint from the f32 epilogue above (half inputs, an
+            // `as f32` widen on each factor) and the int8 dequant below (a float matmul, not `u8×i8→i32`).
+            if let Some(n) = self.try_fuse_lowp_matmul_epilogue(&b.stmts[i..]) {
                 i += n;
                 continue;
             }
@@ -2203,6 +2225,87 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit the fused `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)`
+    /// call for a recognized bf16/f16 `nn.Linear`+epilogue (`C = act(A·Bᵀ + bias)`, half inputs / f32
+    /// output). Bails (false) if any operand/dim is unbound at the call site, so the caller lowers the
+    /// matmul and the epilogue loop separately. `beta = 0` (the dot-product form overwrites C). The
+    /// kernel widens A/B losslessly and runs the f32 `nt_epi` epilogue, so fused == the f32 fused FFN on
+    /// the widened operands; in a `@parallel` function the multicore kernel runs (each C tile owned by
+    /// one task → bit-identical to the serial kernel the interpreter marshals).
+    fn emit_lowp_gemm_epi(&mut self, nest: &LowpMatmulNest, bias: Option<Symbol>, act: u32) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.b),
+            self.lookup(nest.c),
+        ) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        // An absent bias is a null pointer, built as an integer `0` (a `Ptr`-typed `ConstInt` is invalid
+        // MIR): the kernel checks `bias.is_null()`, and the interpreter distinguishes the `Value::Int(0)`
+        // from a real array's `Value::Ptr` by variant — same convention as the f32 `nt_epi` epilogue.
+        let bias_ptr = match bias {
+            Some(s) => match self.lookup(s) {
+                Some((v, _)) => v,
+                None => return false,
+            },
+            None => self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+        };
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let act_v = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(act as i128, MirType::I64));
+        let func = match (self.parallel_fn, nest.f16) {
+            (false, false) => self.gemm.bf16_nt_epi,
+            (true, false) => self.gemm.bf16_nt_epi_par,
+            (false, true) => self.gemm.f16_nt_epi,
+            (true, true) => self.gemm.f16_nt_epi_par,
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, c, m, k, n, beta, bias_ptr, act_v],
+        });
+        true
+    }
+
+    /// Fuse a bf16/f16 `nn.Linear` matmul immediately followed by its bias-add / activation epilogue
+    /// into one `mercury_sgemm_{bf16,f16}_nt_epi` call (`C = act(A·Bᵀ + bias)`, half inputs / f32
+    /// output) — the mixed-precision transformer FFN projection. The half twin of
+    /// [`Self::try_fuse_matmul_epilogue`]: `match_matmul_lowp_nt` already enforces transposed-B with no
+    /// offsets, then the *identical* strict epilogue match (`match_bias_act_epilogue`, reused via the
+    /// `(m, n, c)` shape) and the same `EPI_ACT_*` codes. Returns the statements consumed (always 2),
+    /// else `None`. The kernel folds bias + activation into the widened-f32 GEMM writeback, so the fused
+    /// result equals the unfused half `matmul → [bias →] activation`, bit-for-bit across backends.
+    fn try_fuse_lowp_matmul_epilogue(&mut self, stmts: &[Stmt]) -> Option<usize> {
+        if stmts.len() < 2 {
+            return None;
+        }
+        let StmtKind::For {
+            pat, iter, body, ..
+        } = &stmts[0].kind
+        else {
+            return None;
+        };
+        let nest = match_matmul_lowp_nt(pat, iter, body, self.sema, self.interner)?;
+        let (bias, act) =
+            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
+        if self.emit_lowp_gemm_epi(&nest, bias, act) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
     /// Fuse a `nn.Linear` matmul immediately followed by its bias-add / activation epilogue into one
     /// `mercury_sgemm_nt_epi` call (`C = act(A·Bᵀ + bias)`), folding the epilogue into the GEMM's C
     /// writeback so C is written once instead of paying a separate read-modify-write pass. Fires only
@@ -2229,7 +2332,8 @@ impl FnLowerer<'_> {
         {
             return None;
         }
-        let (bias, act) = match_bias_act_epilogue(&stmts[1], &nest, self.interner)?;
+        let (bias, act) =
+            match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
         if self.emit_sgemm_epi(&nest, bias, act) {
             Some(2)
         } else {
@@ -8526,12 +8630,15 @@ fn match_epi_value(
 
 /// Match the bias/activation epilogue loop following a recognized `nn.Linear` matmul:
 /// `for i in 0..M { for j in 0..N { C[i*N+j] = act(C[i*N+j] [+ bias[j]]) } }`. `M`/`N`/the stride/the
-/// output array/the column index must all match `nest`, so it never misfires. Returns
-/// `(optional_bias_array, act_code)` (bias optional for the activation forms — see [`match_epi_value`]),
-/// else `None` (the loop is then lowered normally as a separate pass).
+/// output array/the column index must all match the matmul's `(m, n, c)`, so it never misfires.
+/// Returns `(optional_bias_array, act_code)` (bias optional for the activation forms — see
+/// [`match_epi_value`]), else `None` (the loop is then lowered normally as a separate pass). Takes the
+/// matmul shape as `(m, n, c)` rather than a `MatmulNest` so the bf16/f16 `LowpMatmulNest` reuses it.
 fn match_bias_act_epilogue(
     stmt: &Stmt,
-    nest: &MatmulNest<'_>,
+    m: Dim,
+    n: Dim,
+    c: Symbol,
     interner: &Interner,
 ) -> Option<(Option<Symbol>, u32)> {
     // for i in 0..M { <single nested loop> }
@@ -8541,7 +8648,7 @@ fn match_bias_act_epilogue(
         _ => return None,
     };
     let (istart, iend) = range_bounds(iiter)?;
-    if as_int_lit(istart, interner)? != 0 || as_dim(iend, interner)? != nest.m {
+    if as_int_lit(istart, interner)? != 0 || as_dim(iend, interner)? != m {
         return None;
     }
     if ibody.tail.is_some() || ibody.stmts.len() != 1 {
@@ -8554,7 +8661,7 @@ fn match_bias_act_epilogue(
         _ => return None,
     };
     let (jstart, jend) = range_bounds(jiter)?;
-    if as_int_lit(jstart, interner)? != 0 || as_dim(jend, interner)? != nest.n {
+    if as_int_lit(jstart, interner)? != 0 || as_dim(jend, interner)? != n {
         return None;
     }
     if jbody.tail.is_some() || jbody.stmts.len() != 1 {
@@ -8569,10 +8676,10 @@ fn match_bias_act_epilogue(
     else {
         return None;
     };
-    if !is_c_elem(target, nest.c, ivar, jvar, nest.n, interner) {
+    if !is_c_elem(target, c, ivar, jvar, n, interner) {
         return None;
     }
-    match_epi_value(value, nest.c, ivar, jvar, nest.n, interner)
+    match_epi_value(value, c, ivar, jvar, n, interner)
 }
 
 /// Flatten the multiplicative factors of `e`, recursing only through `*`. `(c as f32) * sa * sb[j]`
