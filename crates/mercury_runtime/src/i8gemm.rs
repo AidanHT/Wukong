@@ -521,6 +521,173 @@ pub unsafe extern "C" fn mercury_i8gemm_nt_parallel(
     });
 }
 
+/// Dequantize one i32 C row in place to `dst`: `dst[j] = act((src[j] as f32)·scale_a·scale_b[j]
+/// (+ bias[j]))`. The multiply order (`·scale_a·scale_b[j]`, left-associated) and the activation match
+/// the recognizer's canonical source form exactly, so the interpreter (which marshals this kernel) and
+/// the native backend agree bit-for-bit. `act`: 0 id / 1 ReLU / 2 GELU / 3 SiLU (GELU/SiLU reuse the
+/// `vmath` scalar twins, so fused == the unfused activation).
+#[inline]
+unsafe fn dequant_row(
+    src: *const i32,
+    dst: *mut f32,
+    n: usize,
+    scale_a: f32,
+    scale_b: *const f32,
+    bias: *const f32,
+    act: i64,
+) {
+    for j in 0..n {
+        let mut v = (*src.add(j) as f32) * scale_a * *scale_b.add(j);
+        if !bias.is_null() {
+            v += *bias.add(j);
+        }
+        v = match act {
+            1 => {
+                if v > 0.0 {
+                    v
+                } else {
+                    0.0
+                }
+            }
+            2 => crate::vmath::gelu1(v),
+            3 => crate::vmath::silu1(v),
+            _ => v,
+        };
+        *dst.add(j) = v;
+    }
+}
+
+/// Quantized `nn.Linear` with a **fused per-channel dequant epilogue**:
+/// `out_f32 = act(((A·Bᵀ) as f32)·scale_a·scale_b[j] (+ bias[j]))`. The i32 accumulator never round-
+/// trips through main memory: each C row is computed into a small L1-resident i32 scratch by the *same*
+/// proven `vpdpbusd` per-row helpers `mercury_i8gemm_nt` uses (so the integer GEMM stays bit-exact),
+/// then immediately dequantized to f32. gcc/cuBLAS **cannot** fuse this — their int8 GEMM emits i32 and
+/// the dequant is a separate kernel — so it is the decode-regime win, where the dequant pass is a
+/// non-trivial fraction of a thin-M GEMM. The 2-row VNNI tile is preserved (B-row loads feed both rows).
+///
+/// `scale_a` = per-tensor activation scale; `scale_b` = per-output-channel weight scale (length `n`);
+/// `bias` = per-output-channel (length `n`) or null; `act` = 0/1/2/3 (id/ReLU/GELU/SiLU).
+///
+/// # Safety
+/// `a` valid for `m*k` u8, `b` for `n*k` i8, `out` for `m*n` f32, `scale_b` for `n` f32, `bias` null or
+/// `n` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_i8gemm_nt_deq(
+    a: *const u8,
+    b: *const i8,
+    out: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    scale_a: f32,
+    scale_b: *const f32,
+    bias: *const f32,
+    act: i64,
+) {
+    if m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let mut rows = vec![0i32; 2 * n]; // L1-resident scratch for up to 2 C rows
+    let r0 = rows.as_mut_ptr();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avxvnni") {
+            let mut i = 0usize;
+            while i + 2 <= m {
+                gemm_2rows_nt_vnni(a.add(i * k), a.add((i + 1) * k), b, r0, r0.add(n), k, n);
+                dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
+                dequant_row(r0.add(n), out.add((i + 1) * n), n, scale_a, scale_b, bias, act);
+                i += 2;
+            }
+            if i < m {
+                gemm_row_nt_vnni(a.add(i * k), b, r0, k, n);
+                dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
+            }
+            return;
+        }
+        if is_x86_feature_detected!("avx2") {
+            for i in 0..m {
+                gemm_row_nt_avx2(a.add(i * k), b, r0, k, n);
+                dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
+            }
+            return;
+        }
+    }
+    for i in 0..m {
+        let arow = a.add(i * k);
+        for j in 0..n {
+            *r0.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
+        }
+        dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
+    }
+}
+
+/// Multicore fused-dequant `nn.Linear` — **bit-identical** to [`mercury_i8gemm_nt_deq`] (rows are
+/// independent; each maps to a core with its own i32 scratch row, dequantized by the identical
+/// `dequant_row`). The interpreter calls the serial form, so serial == parallel == interp.
+///
+/// # Safety
+/// Same as [`mercury_i8gemm_nt_deq`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_i8gemm_nt_deq_parallel(
+    a: *const u8,
+    b: *const i8,
+    out: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    scale_a: f32,
+    scale_b: *const f32,
+    bias: *const f32,
+    act: i64,
+) {
+    if m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let (au, bu, ou, sbu, biu) = (
+        a as usize,
+        b as usize,
+        out as usize,
+        scale_b as usize,
+        bias as usize,
+    );
+    #[cfg(target_arch = "x86_64")]
+    let vnni = is_x86_feature_detected!("avxvnni");
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = is_x86_feature_detected!("avx2");
+    (0..m).into_par_iter().for_each(|i| {
+        // SAFETY: disjoint output row i; per-row i32 scratch; pointers valid by contract.
+        unsafe {
+            let (a, b, out) = (au as *const u8, bu as *const i8, ou as *mut f32);
+            let (scale_b, bias) = (sbu as *const f32, biu as *const f32);
+            let mut row = vec![0i32; n];
+            let r = row.as_mut_ptr();
+            let arow = a.add(i * k);
+            #[cfg(target_arch = "x86_64")]
+            {
+                if vnni {
+                    gemm_row_nt_vnni(arow, b, r, k, n);
+                } else if avx2 {
+                    gemm_row_nt_avx2(arow, b, r, k, n);
+                } else {
+                    for j in 0..n {
+                        *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            for j in 0..n {
+                *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
+            }
+            dequant_row(r, out.add(i * n), n, scale_a, scale_b, bias, act);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +799,72 @@ mod tests {
                 want[col + 4] = unsafe { dot_i8_scalar(a1, bp(col), k) };
             }
             assert_eq!(got, want, "dot2x4_vnni != 8×scalar at k={k}");
+        }
+    }
+
+    #[test]
+    fn i8gemm_deq_matches_unfused_and_parallel() {
+        // The fused dequant kernel must equal: the i32 GEMM, then a separate scalar dequant pass —
+        // bit-for-bit, for every activation and bias setting, serial == parallel. This is the contract
+        // the recognizer relies on (the interp marshals this kernel; native JITs the same one).
+        for &(m, k, n) in &[
+            (1usize, 7usize, 5usize),
+            (2, 16, 8),
+            (3, 33, 4),
+            (5, 64, 9),
+            (8, 100, 16),
+        ] {
+            let a = fill_u8(m * k);
+            let b = fill_i8(n * k);
+            let scale_a = 0.018f32;
+            let scale_b: Vec<f32> = (0..n).map(|j| 0.003 + (j % 5) as f32 * 0.001).collect();
+            let bias: Vec<f32> = (0..n).map(|j| (j as f32) * 0.01 - 0.05).collect();
+            // i32 GEMM reference (the unfused path the dequant fuses).
+            let mut ci = vec![0i32; m * n];
+            unsafe {
+                mercury_i8gemm_nt(a.as_ptr(), b.as_ptr(), ci.as_mut_ptr(), m as i64, k as i64, n as i64);
+            }
+            for &act in &[0i64, 1, 2, 3] {
+                for use_bias in [false, true] {
+                    let bias_ptr = if use_bias { bias.as_ptr() } else { std::ptr::null() };
+                    let mut want = vec![0f32; m * n];
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut v = (ci[i * n + j] as f32) * scale_a * scale_b[j];
+                            if use_bias {
+                                v += bias[j];
+                            }
+                            v = match act {
+                                1 => {
+                                    if v > 0.0 {
+                                        v
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                                2 => crate::vmath::gelu1(v),
+                                3 => crate::vmath::silu1(v),
+                                _ => v,
+                            };
+                            want[i * n + j] = v;
+                        }
+                    }
+                    let mut got = vec![0f32; m * n];
+                    let mut got_par = vec![0f32; m * n];
+                    unsafe {
+                        mercury_i8gemm_nt_deq(
+                            a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), m as i64, k as i64, n as i64,
+                            scale_a, scale_b.as_ptr(), bias_ptr, act,
+                        );
+                        mercury_i8gemm_nt_deq_parallel(
+                            a.as_ptr(), b.as_ptr(), got_par.as_mut_ptr(), m as i64, k as i64, n as i64,
+                            scale_a, scale_b.as_ptr(), bias_ptr, act,
+                        );
+                    }
+                    assert_eq!(got, want, "fused deq != unfused (m={m} k={k} n={n} act={act} bias={use_bias})");
+                    assert_eq!(got, got_par, "deq serial != parallel (m={m} k={k} n={n} act={act} bias={use_bias})");
+                }
+            }
         }
     }
 

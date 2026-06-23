@@ -35,7 +35,10 @@ pub use norm::{
 };
 
 mod i8gemm;
-pub use i8gemm::{mercury_i8gemm_nt, mercury_i8gemm_nt_parallel};
+pub use i8gemm::{
+    mercury_i8gemm_nt, mercury_i8gemm_nt_deq, mercury_i8gemm_nt_deq_parallel,
+    mercury_i8gemm_nt_parallel,
+};
 
 mod lowp;
 pub use lowp::{
