@@ -60,11 +60,22 @@ toolkit — only **running** needs the driver + a device.
   adds a per-element `residual[M,N]` to the post-activation accumulators → `out = act(A·Bᵀ+bias)+residual`
   (`mma_nt_{f16,bf16}_128_bk32_s2_r16_bias_residual` / `gemm_nt_{f16,bf16}_mma_bias_residual`): the
   transformer **down-proj / attention output-proj** sublayer output, folding the bias-add AND the
-  skip-connection-add (the two `+residual` points per block) into the GEMM store. Honest gap: at **1024³
-  it's ~0.90×** (loses) —
-  the mma workhorse isn't the per-regime GEMM winner there (the deep WMMA `pipe_64_s6` is, but its opaque
-  fragment layout blocks register-level bias), so its GEMM deficit outweighs the saved epilogue round-trip.
-  `gemm_nt_f16` dispatches the plain GEMMs by size regime. **All the fused generators are
+  skip-connection-add (the two `+residual` points per block) into the GEMM store. The mma-workhorse base
+  wins 512³/2048³ but **lost at 1024³ (~0.90×)** — there the workhorse isn't the per-regime GEMM winner
+  (the deep WMMA `pipe_64_s6` is, ~90% of cuBLAS vs ~80%), so its GEMM deficit outweighs the saved
+  epilogue round-trip. **FIXED by porting the epilogue onto `pipe_64_s6`** (`entry_smem_pipe` gained the
+  same `act`/`bias`/`residual` args → `wmma_nt_f16_pipe_64_s6_bias{,_relu,_silu,_gelu,_residual}`): WMMA's
+  fragment column map is opaque, so the per-column bias routes through SMEM store-back scratch (the same
+  trick `entry_smem_db` uses — `smemA` is free post-K-loop, re-read by explicit (row,col)) and the
+  residual seeds the accumulator via `wmma.load.c`. A **size-aware `gemm_nt_f16_linear{,_relu,_silu,
+  _gelu}`** dispatcher routes `pipe_64_s6` ≤1024² and the mma workhorse larger, so the fused FFN/Linear/
+  down-proj now **beats the cuBLAS chain at EVERY size** (same-run, 3 runs): **1024³ pipe64 1.04–1.07×**
+  where the mma workhorse base is 0.89–0.93× (pipe64 ~12200 GFLOP/s vs the workhorse's ~10500); 512³
+  1.06–1.72×. Gated by `wmma_pipe64_bias_match_reference_within_tol` (5 variants, max_abs ≤ 2.3e-5).
+  This is **fp16-specific**: bf16/fp8 ride only the `mma.sync` workhorse (no deep WMMA pipe), so there is
+  no ≤1024³ champion base to fuse onto — the 1024³ GEMM gap is an fp16-internal competition (its WMMA pipe
+  vs its mma workhorse) that bf16/fp8 don't have. `gemm_nt_f16` dispatches the plain GEMMs by size regime.
+  **All the fused generators are
   precision-generic** (`entry_smem_db` and `entry_mma_pipe` key fragment width / mma type and the bias/act
   epilogue off `ty`), so **bf16 — the training precision — gets the identical fusion suite**: the WMMA
   `wmma_nt_bf16_sm_db{,_relu,_silu,_gelu}` + `_sm_db_bias{,_relu,_silu,_gelu}` *and* the fast-mma
