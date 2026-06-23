@@ -469,6 +469,8 @@ fn mlp_sgd_decreases_loss() {
 use mercury_interp::run_kernel_f32;
 
 // Runtime op codes (mirrored from mercury_runtime).
+const VM_TANH: i64 = 2;
+const VM_SIGMOID: i64 = 3;
 const VM_RELU: i64 = 4;
 const RED_SUM: i64 = 2;
 const RED_SSD: i64 = 1;
@@ -671,9 +673,9 @@ fn linear_sum_vjp() {
     tape_gate(&fwd, &[0, 1], &inputs, &[dx, dw], &mut it);
 }
 
-/// Build `loss = reduce(act(X . W^T))`: a sgemm_nt, an optional relu (vmath), then a reduction —
-/// sum, or SSD against a target buffer `T` (= MSE loss). Params: X, W, [T if mse], out.
-fn build_linear(it: &mut Interner, m: usize, k: usize, n: usize, relu: bool, mse: bool) -> Fwd {
+/// Build `loss = reduce(act(X . W^T))`: a sgemm_nt, an optional activation (vmath `act` op), then a
+/// reduction — sum, or SSD against a target buffer `T` (= MSE loss). Params: X, W, [T if mse], out.
+fn build_linear(it: &mut Interner, m: usize, k: usize, n: usize, act: Option<i64>, mse: bool) -> Fwd {
     let sgemm_nt = it.intern("mercury_sgemm_nt");
     let vmath = it.intern("mercury_vmath_f32");
     let sreduce = it.intern("mercury_sreduce_f32");
@@ -696,12 +698,12 @@ fn build_linear(it: &mut Interner, m: usize, k: usize, n: usize, relu: bool, mse
     });
     let mn = ci(&mut b, (m * n) as i64);
 
-    let activated = if relu {
+    let activated = if let Some(op) = act {
         let h = b.alloca(arr(m * n));
-        let reluop = ci(&mut b, VM_RELU);
+        let opv = ci(&mut b, op);
         b.build_void(Op::Call {
             func: vmath,
-            args: vec![p, h, mn, reluop],
+            args: vec![p, h, mn, opv],
         });
         h
     } else {
@@ -747,7 +749,7 @@ fn linear_relu_sum_vjp() {
     // loss = sum(relu(X . W^T))  ->  dP[i] = (P[i] > 0) ? 1 : 0.
     let (m, k, n) = (3, 4, 2);
     let mut it = Interner::default();
-    let fwd = build_linear(&mut it, m, k, n, true, false);
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_RELU), false);
     // Keep every pre-activation P comfortably away from the relu kink at 0, so the +-eps finite
     // difference never flips a mask (which would make the central difference invalid). Mixed signs
     // still exercise both the active and the zeroed gradient paths.
@@ -772,7 +774,7 @@ fn linear_mse_vjp() {
     // loss = sum((X . W^T - T)^2)  ->  dP[i] = 2 (P[i] - T[i]).  (the regression-training loss)
     let (m, k, n) = (3, 4, 2);
     let mut it = Interner::default();
-    let fwd = build_linear(&mut it, m, k, n, false, true);
+    let fwd = build_linear(&mut it, m, k, n, None, true);
     let mut seed = 0x9090u64;
     let xb = rand_vec(&mut seed, m * k);
     let wb = rand_vec(&mut seed, n * k);
@@ -853,4 +855,56 @@ fn residual_two_linears_vjp() {
     let dx: Vec<f64> = dx1.iter().zip(&dx2).map(|(a, b)| a + b).collect();
     let inputs = vec![xb, w1b, w2b, vec![0.0]];
     tape_gate(&fwd, &[0, 1, 2], &inputs, &[dx, dw1, dw2], &mut it);
+}
+
+/// FD-only tape gate, for smooth activations whose kernel uses an f32 polynomial approximation (so a
+/// tight f64 closed form is not available — the analytic VJP reuses the kernel's own f32 output).
+/// The activation is smooth (no kink), so the finite difference is reliable.
+fn tape_gate_fd(fwd: &Fwd, wrt: &[usize], inputs: &[Vec<f32>], it: &mut Interner) -> Vec<Vec<f64>> {
+    let (prog, gname) = build(&fwd.func, wrt, it);
+    let analytic = analytic_grad_f32(&prog, gname, fwd, inputs, wrt, it);
+    let fd = fd_grad_f32(&prog, fwd, inputs, wrt, 5e-3, it);
+    // Guard against a silently-zero gradient passing the FD check vacuously.
+    assert!(
+        analytic.iter().flatten().any(|&v| v.abs() > 1e-3),
+        "gradient is trivially zero — likely a missing VJP route"
+    );
+    for (gi, (a, f)) in analytic.iter().zip(fd.iter()).enumerate() {
+        for (j, (&av, &fv)) in a.iter().zip(f.iter()).enumerate() {
+            let tol = 1e-2 + 4e-2 * fv.abs();
+            assert!(
+                (av - fv).abs() <= tol,
+                "wrt#{gi}[{j}]: analytic {av} vs finite-diff {fv} (|d|={:.3e} > {:.3e})",
+                (av - fv).abs(),
+                tol
+            );
+        }
+    }
+    analytic
+}
+
+#[test]
+fn linear_sigmoid_sum_vjp() {
+    // loss = sum(sigmoid(X . W^T)); backward reuses the forward output: sigmoid' = y(1-y).
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_SIGMOID), false);
+    let mut seed = 0x3333u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_tanh_sum_vjp() {
+    // loss = sum(tanh(X . W^T)); backward reuses the forward output: tanh' = 1 - y^2.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_TANH), false);
+    let mut seed = 0x4444u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
 }
