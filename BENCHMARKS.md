@@ -468,6 +468,28 @@ line per element — so this compounds the bf16 widen win with the transpose-pre
 weight-gradient GEMM already documents (`~42–445×` idiomatic C there). `tests/run/matmul_{bf16,f16}_tn.mer`;
 the runtime twin pins both precisions == the f32 TN kernel on the widened operands, serial == parallel.
 
+### Matrix transpose — cache blocking the layout op
+
+`dst = srcᵀ` is the memory-bound layout op behind attention score transposes and weight-layout
+conversions. The naive `for i { for j { dst[j*R+i] = src[i*C+j] } }` writes `dst` with stride `R` — a
+fresh cache line per element once `R` is large, so the working set thrashes — and **gcc/rustc do not
+loop-tile a transpose at `-O3`** (tiling is a polyhedral pass outside it). Mercury folds the nest to
+the `B=32` cache-blocked **`mercury_transpose_f32`**, which keeps a `B×B` tile of both operands
+L1-resident. Transpose is a *permutation* (no arithmetic), so the cross-language check is **bit-exact**
+— a stronger bar than the GEMM tolerance gate.
+
+| size  | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+|-------|-----------|---------------|---------|------|-------------|---------------|
+| 1024² | ~2.1–2.2 | ~13.8–14.1 | ~1.4–1.6 | ~1.3–1.5 | **~1.35–1.49×** | **~8.8–10×** |
+| 2048² | ~2.0–2.2 | ~16.3–17.5 | ~1.2–1.4 | ~1.2 | **~1.52–1.65×** | **~11.4–14.2×** |
+
+(GB/s = `2·N²·4` bytes moved per call; higher is better.) The single-core lead is the cache-blocking
+win the naive compilers leave on the table; `@parallel` adds aggregate cross-core bandwidth on top
+(the op is latency-bound on the strided writes, so spreading the row blocks across cores hides it).
+Absolute GB/s is low precisely because a transpose is latency- not throughput-bound, so the **ratio**
+is the clock-invariant figure — it holds across runs. `tests/run/transpose_f32.mer`; the runtime test
+pins the blocked kernel == the naive transpose exactly (a permutation, serial == parallel).
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2

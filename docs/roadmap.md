@@ -67,6 +67,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   must be invariant in the matmul's own `i,j,k`) and the kernel call GEPs each base pointer by it, so
   every head runs the tuned microkernel instead of a scalar nest. Both the `Q·Kᵀ` and `P·V` matmuls of
   an MHA forward dispatch (see `tests/run/{batched_matmul,multi_head_attention}.mer`).
+- **Matrix transpose → cache-blocked kernel**: the nest `for i { for j { dst[j*R+i] = src[i*C+j] } }`
+  dispatches to a `B=32` cache-blocked `mercury_transpose_f32[_parallel]`. The naive transpose writes
+  `dst` with stride `R` (a cache miss per element for large `R`) and gcc/rustc do not loop-tile it at
+  `-O3`, so the blocked kernel wins ~1.5× single-core / ~9–14× `@parallel` on this memory-bound layout
+  op (attention score / weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
   dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
   its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full
