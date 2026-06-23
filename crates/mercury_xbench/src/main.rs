@@ -1970,6 +1970,32 @@ fn kernels() -> Vec<Kernel> {
                  r=r*v+0.0001; r=r*v+0.001; r=r*v+0.01; r=r*v+0.1; *out.add(i)=r; }",
             ),
         },
+        // Hadamard product `out = x*y` — gating / attention-mask / residual-scaling. Mercury dispatches
+        // it to the 256-bit `mercury_velem_f32` (VE_HADAMARD) with non-temporal stores; gcc/rustc also
+        // auto-vectorize a bare product, so at this L3-resident size it is a bandwidth tie (the NT-store
+        // edge shows >L3, like saxpy). Recognized where the affine matcher declines (both factors vary).
+        Kernel {
+            name: "hadamard",
+            bytes_per_call: 3 * N * 4,
+            note: "out = x*y (Hadamard): 256-bit velem (+NT store); gcc/rustc autovectorize too",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = x[i] * y[i]; }}")),
+            c: c_kernel("for(long i=0;i<N;i++) out[i]=x[i]*y[i];"),
+            rust: rust_kernel("for i in 0..N { *out.add(i)= *x.add(i)* *y.add(i); }"),
+        },
+        // SiLU written the textbook way, as a product `x*sigmoid(x)` (the form before the `silu()`
+        // intrinsic, and the value==gate SwiGLU case). Mercury folds the product to the 256-bit
+        // VMATH_SILU kernel; gcc/rustc must call scalar `expf` (no vectorized libm), so it stays serial
+        // — a compute-bound win like the bare transcendentals, not a bandwidth tie.
+        Kernel {
+            name: "gated_silu",
+            bytes_per_call: 2 * N * 4,
+            note: "out = x*sigmoid(x): product folded to 256-bit VMATH_SILU; C/Rust scalar expf",
+            mer: mer_kernel(&format!("for i in 0..{nlit} {{ out[i] = x[i] * sigmoid(x[i]); }}")),
+            c: c_kernel("for(long i=0;i<N;i++){ float v=x[i]; out[i]= v/(1.0f+expf(-v)); }"),
+            rust: rust_kernel(
+                "for i in 0..N { let v= *x.add(i); *out.add(i)= v/(1.0+(-v).exp()); }",
+            ),
+        },
         // Transcendentals: the regime a tensor compiler should dominate idiomatic scalar source.
         // Mercury lowers `exp` to a ~1-ULP f32 polynomial and auto-vectorizes it (128-bit x 4);
         // gcc/rustc call scalar libm `expf` per element and cannot vectorize a loop with a call
