@@ -49,5 +49,15 @@ pub mod ptx_fp8;
 #[cfg(feature = "gpu")]
 pub mod ptx_int8;
 
+// --- Session I (GPU-resident training / M8): owned, append-only ---------------------------------
+/// Fused optimizer-step GPU kernels (AdamW / SGD) — the device twin of `mercury_autodiff::optim`.
+#[cfg(feature = "gpu")]
+pub mod ptx_optim;
+
+/// Backward GPU kernels for the autodiff tape's synthesized loops (transpose / activation- and
+/// norm-backward) and the flash-attention backward (dQ/dK/dV).
+#[cfg(feature = "gpu")]
+pub mod ptx_autodiff_bwd;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};

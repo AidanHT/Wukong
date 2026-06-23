@@ -483,7 +483,11 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "half",
+ "mercury_autodiff",
+ "mercury_interp",
+ "mercury_mir",
  "mercury_runtime",
+ "mercury_span",
 ]
 
 [[package]]

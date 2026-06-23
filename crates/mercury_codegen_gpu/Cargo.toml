@@ -37,3 +37,15 @@ half = { version = "2", optional = true }
 
 [features]
 gpu = ["dep:cudarc", "dep:mercury_runtime", "dep:half"]
+
+# Gate references for the GPU training kernels (Session I / M8), compiled only for tests:
+#  - mercury_autodiff: builds the real fused AdamW MIR kernel + the backward we differentiate,
+#  - mercury_interp:   runs them on the interpreter oracle (run_kernel_f32 / _f64) so the GPU
+#    optimizer/backward kernels are diffed against the exact CPU autodiff reference.
+# Both are toolchain-free, so a plain `cargo test` still builds them; the gpu-gated tests that use
+# them are cfg'd out without `--features gpu`.
+[dev-dependencies]
+mercury_interp = { workspace = true }
+mercury_autodiff = { path = "../mercury_autodiff" }
+mercury_mir = { workspace = true }
+mercury_span = { workspace = true }
