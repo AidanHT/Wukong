@@ -2944,6 +2944,26 @@ impl FnLowerer<'_> {
             return None;
         };
         let out_sym = self.index_by_loopvar(target, j)?;
+        // Gated SiLU / swish written as a product — `out[j] = x[j] * sigmoid(x[j])` — the textbook
+        // definition a programmer writes before reaching for the `silu()` intrinsic (and the value==gate
+        // case of a SwiGLU gate). Dispatch to the existing 256-bit `VMATH_SILU` kernel, which *is*
+        // `x·sigmoid(x)` (`vmath::silu1`), so it is bit-identical to the inlined `emit_silu` the generic
+        // 128-bit vectorizer would otherwise lower it to. `tests/run/activations.mer` writes this form.
+        if let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &value.kind
+        {
+            if self.expr_mir(value) == MirType::F32 {
+                if let Some(x_sym) = self
+                    .match_gated_silu(lhs, rhs, j)
+                    .or_else(|| self.match_gated_silu(rhs, lhs, j))
+                {
+                    return Some((out_sym, x_sym, VMATH_SILU, MirType::F32));
+                }
+            }
+        }
         let ExprKind::Call { callee, args, .. } = &value.kind else {
             return None;
         };
@@ -3034,6 +3054,26 @@ impl FnLowerer<'_> {
         }
         let x_sym = self.index_by_loopvar(arg, j)?;
         Some((out_sym, x_sym, opcode, MirType::F32))
+    }
+
+    /// One ordering of the gated-SiLU product `out[j] = x[j] * sigmoid(x[j])`: `val` must be the
+    /// unit-stride f32 read `x[j]` and `gate` the call `sigmoid(x[j])` over the *same* array. Returns
+    /// that array's symbol, or `None`. Pure — used by [`match_vmath_stmt`] to fold the product form
+    /// into the `VMATH_SILU` dispatch (`silu(x) == x·sigmoid(x)`, bit-identical to the inlined form).
+    fn match_gated_silu(&self, val: &Expr, gate: &Expr, j: Symbol) -> Option<Symbol> {
+        let xs = self.index_by_loopvar(val, j)?;
+        if self.expr_mir(val) != MirType::F32 {
+            return None;
+        }
+        let ExprKind::Call { callee, args, .. } = &gate.kind else {
+            return None;
+        };
+        if args.len() != 1 || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Sigmoid))
+        {
+            return None;
+        }
+        let xs2 = self.index_by_loopvar(&args[0], j)?;
+        (xs == xs2).then_some(xs)
     }
 
     /// Match a transcendental-activation loop body: every statement must be an independent
