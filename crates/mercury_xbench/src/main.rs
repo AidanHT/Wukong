@@ -211,6 +211,9 @@ fn main() {
     if want("streaming") {
         bench_streaming_large(&cc, &dir);
     }
+    if want("transpose") {
+        bench_transpose(&cc, &dir);
+    }
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -738,6 +741,120 @@ fn rust_linear_bf16(ns: usize) -> String {
          \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
          \x20     for k in 0..NS {{ s += bf(*a.add(i*NS+k)) * bf(*b.add(j*NS+k)); }}\n\
          \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+    )
+}
+
+/// Matrix transpose `dst = srcᵀ` — the memory-bound layout op (attention score transposes, weight
+/// layout conversions). Mercury folds the `dst[j*R+i] = src[i*C+j]` nest to the cache-blocked
+/// `mercury_transpose_f32`; C/Rust are the idiomatic naive transpose at `-O3 -march=native`. The naive
+/// transpose writes `dst` with stride `R` — a fresh cache line per element once `R` is large — while
+/// the blocked kernel keeps a `B×B` tile L1-resident; gcc/rustc do not loop-tile a transpose at `-O3`.
+/// The kernels carry an unused middle pointer so they share the `(src, _, dst)` `KernelFn` ABI and the
+/// f32 harness. Square shapes large enough to spill L2 (where the cache pattern dominates), reported as
+/// GB/s (`2·N²·4` bytes moved per call: read `src` + write `dst`). Transpose is a permutation, so the
+/// cross-language check is **bit-exact** (no float reassociation — a stronger bar than the GEMM gate).
+fn bench_transpose(cc: &str, dir: &Path) {
+    for ns in [1024usize, 2048] {
+        let n2 = ns * ns;
+        let src: Vec<f32> = (0..n2).map(|i| (i % 1000) as f32 * 0.5 - 250.0).collect();
+        let dummy = vec![0.0f32; n2];
+        let mut dst = vec![0.0f32; n2];
+        let (sp, yp, dp) = (src.as_ptr(), dummy.as_ptr(), dst.as_mut_ptr());
+        let bytes = 2.0 * n2 as f64 * 4.0; // read src + write dst
+        let gbps = |m: &Option<Measure>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", bytes / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== transpose (dst = srcᵀ) {ns}x{ns} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_transpose(ns, false), &mut dst, sp, yp, dp);
+        let mer_par = bench_mercury(&mer_transpose(ns, true), &mut dst, sp, yp, dp);
+        let cm = bench_external(
+            "c",
+            &c_transpose(ns),
+            dir,
+            "transpose",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut dst,
+            sp,
+            yp,
+            dp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_transpose(ns),
+            dir,
+            "transpose",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut dst,
+            sp,
+            yp,
+            dp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            if m.out != c2.out {
+                println!("  ! transpose output mismatch vs C");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury transpose kernel: the idiomatic `dst[j*R+i] = src[i*C+j]` nest the `mir_build` recognizer
+/// folds to one `mercury_transpose_f32[_parallel]` call. `y` is an unused param so the signature
+/// matches the `(src, _, dst)` 3-pointer harness ABI.
+fn mer_transpose(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(src: [f32; {n2}], y: [f32; {n2}], dst: [f32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{ dst[j * {ns} + i] = src[i * {ns} + j]; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_transpose(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n\
+         __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+    )
+}
+
+fn rust_transpose(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
+         \x20 for i in 0..NS {{ for j in 0..NS {{ *dst.add(j*NS+i) = *src.add(i*NS+j); }} }}\n}}\n"
     )
 }
 
