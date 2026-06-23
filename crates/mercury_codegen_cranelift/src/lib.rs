@@ -79,6 +79,8 @@ const RT_SGEMM: &str = "mercury_sgemm";
 const RT_SGEMM_PARALLEL: &str = "mercury_sgemm_parallel";
 const RT_SGEMM_NT: &str = "mercury_sgemm_nt";
 const RT_SGEMM_NT_PARALLEL: &str = "mercury_sgemm_nt_parallel";
+const RT_SGEMM_TN: &str = "mercury_sgemm_tn";
+const RT_SGEMM_TN_PARALLEL: &str = "mercury_sgemm_tn_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_SGEMM_NT_EPI_PAR: &str = "mercury_sgemm_nt_epi_parallel";
 const RT_VMATH: &str = "mercury_vmath_f32";
@@ -767,7 +769,12 @@ impl<'a> FnTranslator<'a> {
         // (nn.Linear, C = A·Bᵀ) variants — all share the (ptr,ptr,ptr,i64,i64,i64,i64) signature.
         if matches!(
             name,
-            RT_SGEMM | RT_SGEMM_PARALLEL | RT_SGEMM_NT | RT_SGEMM_NT_PARALLEL
+            RT_SGEMM
+                | RT_SGEMM_PARALLEL
+                | RT_SGEMM_NT
+                | RT_SGEMM_NT_PARALLEL
+                | RT_SGEMM_TN
+                | RT_SGEMM_TN_PARALLEL
         ) && args.len() == 7
         {
             let a = self.val(args[0]);
@@ -1073,6 +1080,8 @@ struct RtFuncs {
     sgemm_parallel: FuncId,
     sgemm_nt: FuncId,
     sgemm_nt_parallel: FuncId,
+    sgemm_tn: FuncId,
+    sgemm_tn_parallel: FuncId,
     sgemm_nt_epi: FuncId,
     sgemm_nt_epi_par: FuncId,
     vmath: FuncId,
@@ -1315,6 +1324,12 @@ fn populate_module<M: Module>(
         sgemm_nt_parallel: module
             .declare_function(RT_SGEMM_NT_PARALLEL, Linkage::Import, &sig_gemm)
             .map_err(|e| e.to_string())?,
+        sgemm_tn: module
+            .declare_function(RT_SGEMM_TN, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
+        sgemm_tn_parallel: module
+            .declare_function(RT_SGEMM_TN_PARALLEL, Linkage::Import, &sig_gemm)
+            .map_err(|e| e.to_string())?,
         sgemm_nt_epi: module
             .declare_function(RT_SGEMM_NT_EPI, Linkage::Import, &sig_gemm_epi)
             .map_err(|e| e.to_string())?,
@@ -1462,6 +1477,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_NT_PARALLEL,
                 module.declare_func_in_func(rt.sgemm_nt_parallel, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_TN,
+                module.declare_func_in_func(rt.sgemm_tn, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_TN_PARALLEL,
+                module.declare_func_in_func(rt.sgemm_tn_parallel, builder.func),
             );
             rt_refs.insert(
                 RT_SGEMM_NT_EPI,
@@ -1693,6 +1716,11 @@ pub fn jit_compile(
         RT_SGEMM_NT_PARALLEL,
         mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
     );
+    builder.symbol(RT_SGEMM_TN, mercury_runtime::mercury_sgemm_tn as *const u8);
+    builder.symbol(
+        RT_SGEMM_TN_PARALLEL,
+        mercury_runtime::mercury_sgemm_tn_parallel as *const u8,
+    );
     builder.symbol(
         RT_SGEMM_NT_EPI,
         mercury_runtime::mercury_sgemm_nt_epi as *const u8,
@@ -1856,6 +1884,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SGEMM_NT_PARALLEL,
         mercury_runtime::mercury_sgemm_nt_parallel as *const u8,
+    );
+    builder.symbol(RT_SGEMM_TN, mercury_runtime::mercury_sgemm_tn as *const u8);
+    builder.symbol(
+        RT_SGEMM_TN_PARALLEL,
+        mercury_runtime::mercury_sgemm_tn_parallel as *const u8,
     );
     builder.symbol(
         RT_SGEMM_NT_EPI,

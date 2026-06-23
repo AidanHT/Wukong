@@ -1,0 +1,62 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 21
+// EXPECT-OUT: 5240
+module tests.run.matmul_tn
+
+// C = Aᵀ·B — the dW = dYᵀ·X weight-gradient GEMM of a training backward pass. A is stored [K, M]
+// (the contraction/batch axis K is the OUTER index of A's storage), so its logical [M, K] operand is
+// the transpose of its layout. The ijk recognizer detects `a[k*M + i] * b[k*N + j]` and dispatches to
+// mercury_sgemm_tn; gcc/rustc compile the column-strided A reads as a scalar loop. interp == native
+// and -O0 == -O3 (the differential gate) because both backends marshal the identical kernel, which is
+// the tuned NN kernel run on a once-transposed A.
+fn main() -> i32 {
+    // Small exact case (integers < 2^24, so f32 is exact in any reassociation): A=[K=2,M=3], B=[K=2,N=2].
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: [f32; 4] = [1.0, 0.0, 0.0, 1.0]; // 2x2 identity
+    let mut c: [f32; 6] = [0.0; 6];
+    for i in 0..3 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + a[k * 3 + i] * b[k * 2 + j];
+            }
+            c[i * 2 + j] = s;
+        }
+    }
+    // With B = I2, C stacks A's two stored rows as columns: C = [1,4, 2,5, 3,6], sum = 21.
+    let mut total: f32 = 0.0;
+    for i in 0..6 {
+        total = total + c[i];
+    }
+    print(total as i32); // 21
+
+    // Larger shape that straddles the kernel tiles: A=[K=8,M=5], B=[K=8,N=4].
+    let mut a2: [f32; 40] = [0.0; 40];
+    let mut b2: [f32; 32] = [0.0; 32];
+    for p in 0..8 {
+        for i in 0..5 {
+            a2[p * 5 + i] = (p + i) as f32;
+        }
+        for j in 0..4 {
+            b2[p * 4 + j] = (p + j) as f32;
+        }
+    }
+    let mut c2: [f32; 20] = [0.0; 20];
+    for i in 0..5 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..8 {
+                s = s + a2[k * 5 + i] * b2[k * 4 + j];
+            }
+            c2[i * 4 + j] = s;
+        }
+    }
+    // C2[i,j] = Σ_k (k+i)(k+j); Σ_i,j,k = Σ_k (5k+10)(4k+6) = 2800 + 1960 + 480 = 5240.
+    let mut total2: f32 = 0.0;
+    for i in 0..20 {
+        total2 = total2 + c2[i];
+    }
+    print(total2 as i32); // 5240
+    return 0;
+}
