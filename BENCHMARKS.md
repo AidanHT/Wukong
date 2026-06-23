@@ -765,6 +765,41 @@ while cuBLAS's reproducibility is incidental — NVIDIA documents none across li
 architecture, or its heuristic algorithm/split-K selection. Reproducible-by-default matters for
 regression gates, debugging, and regulated training.
 
+**W4A16 int4 weight-only decode (M4) — leading an immature field.** The LLM-decode workhorse: 4-bit
+weights (group-wise quantized, per-group fp16 scale + optional AWQ/GPTQ zero-point), fp16 activations.
+`gemm_nt_w4a16` reads the **packed int4 weight from global** (8 weights per `u32` — a **4× smaller
+weight footprint** than fp16, the bandwidth win that makes decode memory-bound-friendly), **unpacks
+int4→fp16 on the fly inside the K-loop** with the canonical Marlin/AWQ fast path (one `lop3` extracts an
+interleaved nibble *pair* straight into an `f16x2` of `1024+u`, then a single `sub.rn.f16x2` zero-offset
+and `mul.rn.f16x2` scale dequant **two weights per op** — no per-element convert), then runs the
+*identical* fp16 `wmma.mma.sync.m16n16k16` tensor-core tile as the dense path. The only deviation from an
+*exact* dequant is the same f32-accumulation tolerance the fp16 GEMM carries (~2e-3): the gate
+reconstructs the weight bit-for-bit on the CPU (`reference_w4a16`) and matmuls in f64; both the symmetric
+(offset-binary, `Z=8`) and asymmetric (`Z=zero[group]`) paths pass, and the kernel is deterministic
+run-to-run (M12).
+
+**No robust library int4-decode GEMM is bindable on this box** (cuBLASLt offers no general W4A16 decode),
+so M4 is a *documented lead*, stated honestly: the Tier-A peer is a **naive CUDA-C W4A16** kernel (NVRTC,
+one thread/output with an on-the-fly unpack). One representative back-to-back run (`int4_gemm_vs_peers`,
+clock-warmed, best-of-4, checksum-cross-checked vs the naive peer):
+
+| shape (M×K×N) | Mercury W4A16 | × vs naive CUDA-C | × vs Mercury fp16 (same tile) | weight HBM/pass |
+|---------------|--------------:|------------------:|------------------------------:|-----------------|
+| 64×4096×4096 (decode) | ~12.6 TFLOP/s | **~180–213×** | **~4.0–4.2×** | int4 8.4 MB vs fp16 33.6 MB (**4×**) |
+| 256×2048×2048 | ~14.9 TFLOP/s | ~165× | **~1.46×** | 2.1 vs 8.4 MB |
+| 64×2048×2048 | ~8.8 TFLOP/s | ~92× | ~1.00× | 2.1 vs 8.4 MB |
+| 512×512×512 | ~9.1 TFLOP/s | ~78× | ~1.00× | 0.13 vs 0.5 MB |
+
+The **4× weight-bandwidth reduction lands in the large-weight decode regime** (64×4096), where decode is
+weight-BW-bound and the fp16 path stalls on weight reads — Mercury is ~4× faster there. After the
+Marlin/AWQ `lop3` unpack made the dequant nearly free, **W4A16 is ≥ the fp16 path in *every* regime** (no
+int4 penalty anywhere; it even *beats* fp16 1.46× at 256×2048 because the 4× smaller weight tile fits L2
+far better). **Static-shape specialization** (Mercury's no-library lever — `w4a16_static_ptx` bakes M/N/K
+as constants so ptxas strength-reduces the strides to shifts) adds a further **1.05–1.30×** over the
+same-loaded dynamic kernel, bit-identical. The remaining headroom is in the thin-M decode shape, which is
+occupancy-bound (M=64 → few CTAs); split-K is the identified next lever (its deterministic reduction caps
+the net gain).
+
 **Other op categories** (all emit+execute, tolerance-gated on the 4050): elementwise (saxpy/vadd),
 deterministic reductions (sum/dot/max — bit-exact for max, tolerance for the f32 sums), activations
 (relu/exp/sigmoid/tanh/silu/gelu via SFU), fused row norms (softmax/LayerNorm/RMSNorm, one warp per

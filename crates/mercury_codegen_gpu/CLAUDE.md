@@ -48,6 +48,18 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM, single-tile and fragment-reuse
   multi-tile (`_mt`, 2×4 16×8 tiles/warp — the fastest tensor-core path; no WMMA fp8 on sm_89, so the
   fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
+- `src/ptx_int4.rs` — **W4A16 int4 weight-only decode** (M4 — the LLM-decode workhorse, an *immature*
+  GPU-library field so a documented lead). Host group-wise int4 quant (`quantize_weight_symmetric` /
+  `quantize_weight_asymmetric` — AWQ/GPTQ zero-point, group=128) into the **Marlin/AWQ-interleaved**
+  packed layout (`nibble_pos`), an exact-bit fp16 dequant reference (`dequant_weight`/`reference_w4a16`),
+  and the `gemm_nt_w4a16` PTX: a 64×64 SMEM-staged tensor-core tile that reads **packed int4 from global**
+  (8 weights/`u32` — 4× the fp16 weight-footprint shrink) and **unpacks to fp16 on the fly** with the
+  canonical fast path (one `lop3` extracts a pair into an `f16x2` of `1024+u`, then one `sub.rn.f16x2`
+  zero-offset + one `mul.rn.f16x2` scale dequant two weights/op), then runs the *identical* fp16
+  `wmma.mma.sync.m16n16k16` as the dense path. Symmetric (offset-binary, `Z=8`) and zero-point (`Z=zero`)
+  share one unpack. `w4a16_static_ptx` is the **static-shape** variant (dims baked → ptxas strength-reduces
+  the strides). Launchers `gemm_nt_w4a16` / `gemm_nt_w4a16_static` in `gpu.rs`; peer + scoreboard in
+  `baselines.rs` (`nvrtc_naive_w4a16`) / `gpu.rs` (`int4_gemm_vs_peers`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
