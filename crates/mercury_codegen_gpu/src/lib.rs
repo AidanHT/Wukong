@@ -47,4 +47,7 @@ pub mod ptx_conv;
 pub mod ptx_fp8;
 
 #[cfg(feature = "gpu")]
+pub mod ptx_int4;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};

@@ -1,0 +1,490 @@
+//! **W4A16 weight-only int4 decode** — the LLM-inference workhorse, and the one GPU metric where the
+//! library field is *immature* (there is no robust general cuBLAS/cuBLASLt int4-decode GEMM the way
+//! there is for fp16/int8), so Mercury can post a *documented lead* rather than chase a gold standard.
+//!
+//! The weights are 4-bit (group-wise quantized along K, with a per-group fp16 scale and an optional
+//! integer zero-point — GPTQ/AWQ style); the activations stay fp16. The kernel reads the **packed
+//! int4 weight from global** (8 weights per 32-bit word — a **4× smaller weight footprint** than fp16,
+//! the bandwidth win that makes decode memory-bound-friendly), **unpacks int4 → fp16 on the fly inside
+//! the K-loop** (`bfe` → `cvt.f16` → `mul.f16` by the group scale), stages the dequantized fp16 tile
+//! into shared memory, and then runs the **identical fp16 tensor-core MMA** as the dense `wmma`
+//! path (`wmma.mma.sync.m16n16k16`, f32 accumulate). So the only deviation from an *exact* dequant of
+//! the weight is the same f32-accumulation-order tolerance the fp16 GEMM already carries (~2e-3) — a
+//! kernel that dequantizes wrong is a miscompile, gated against an exact f64 dequant reference.
+//!
+//! Layout (mirrors the `nn.Linear` contract `C = A·Wᵀ`):
+//! * **A** activations `[M,K]` row-major fp16.
+//! * **W** weights `[N,K]` row-major, quantized group-wise along K (group `G`, default 128). The packed
+//!   form is `[N, K/8]` `u32` (8 signed 4-bit nibbles per word, little-nibble-first), plus per-group
+//!   fp16 **scales** `[N, K/G]` (and, for the asymmetric path, integer **zero-points** `[N, K/G]`).
+//! * **C** output `[M,N]` row-major f32.
+//!
+//! The dequant a single weight goes through — `w = (q - z)·scale` in fp16 — is reproduced *bit-for-bit*
+//! on the host by [`dequant_weight`] (so the gate's reference weight equals the kernel's reconstructed
+//! weight exactly); the host [`quantize_weight_symmetric`] / [`quantize_weight_asymmetric`] produce the
+//! packed layout the kernel consumes.
+
+use std::sync::OnceLock;
+
+use half::f16;
+
+/// Default group size along K (per-group scale/zero-point granularity). 128 is the GPTQ/AWQ default;
+/// it is a multiple of the 16-wide WMMA K-step, so a `wmma` K-tile never straddles two groups (one
+/// scale load serves the whole 16-strip).
+pub const GROUP_SIZE: usize = 128;
+
+/// A group-wise int4-quantized weight matrix `[N,K]` in the exact layout the W4A16 kernel consumes:
+/// packed 4-bit values (8 per `u32` word, `[N, K/8]`), per-group fp16 `scales` (`[N, K/G]`), and an
+/// optional per-group integer `zeros` (`[N, K/G]`, the asymmetric/AWQ path). `signed` records whether
+/// the nibbles are two's-complement `[-7,7]` (symmetric) or unsigned `[0,15]` offset by `zeros`.
+#[derive(Clone, Debug)]
+pub struct QuantWeight {
+    pub n: usize,
+    pub k: usize,
+    pub group: usize,
+    /// Packed nibbles, `[N, K/8]` row-major; nibble `kk%8` of word `[r, kk/8]` is weight `(r, kk)`.
+    pub packed: Vec<u32>,
+    /// Per-group fp16 scale, `[N, K/G]` row-major.
+    pub scales: Vec<f16>,
+    /// Per-group integer zero-point, `[N, K/G]` — `Some` for the asymmetric (unsigned-nibble) path.
+    pub zeros: Option<Vec<u8>>,
+    /// `true` ⇒ nibbles are signed two's-complement (symmetric); `false` ⇒ unsigned offset by `zeros`.
+    pub signed: bool,
+}
+
+impl QuantWeight {
+    /// Groups per row, `K/G`.
+    pub fn groups(&self) -> usize {
+        self.k / self.group
+    }
+    /// `u32` words per row, `K/8`.
+    pub fn words(&self) -> usize {
+        self.k / 8
+    }
+    /// Packed-weight bytes actually moved from HBM per full pass (`N·K/2`) — the figure whose 4×
+    /// shrink vs the fp16 weight (`N·K·2`) is the decode bandwidth win.
+    pub fn packed_bytes(&self) -> usize {
+        self.packed.len() * 4
+    }
+}
+
+/// Pack a signed nibble `q ∈ [-8,7]` into word `out` at position `kk%8` (little-nibble-first). The low
+/// 4 bits of the two's-complement value are stored; `bfe.s32`/the host sign-extend recover `q`.
+#[inline]
+fn pack_nibble(out: &mut u32, kk: usize, q: i32) {
+    *out |= ((q & 0xF) as u32) << (4 * (kk % 8));
+}
+
+/// **Symmetric** group-wise int4 quantization of an `[N,K]` fp16-range weight (no zero-point): per
+/// group, `scale = max|w| / 7` and `q = round(w/scale)` clamped to `[-7,7]` (two's-complement nibble).
+/// The scale is stored in fp16 and the quantization is done against that *stored* fp16 scale, so the
+/// dequant the kernel reconstructs is the best fp16 approximation of `w`. A zero-amax group gets
+/// `scale = 1` (all-zero weights). `K` must be a multiple of `group`, and `group` a multiple of 8.
+pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
+    assert_eq!(w.len(), n * k, "weight must be N*K");
+    assert!(k % group == 0, "K={k} must be a multiple of group={group}");
+    assert!(group % 8 == 0, "group={group} must be a multiple of 8 (nibble packing)");
+    let kg = k / group;
+    let kw = k / 8;
+    let mut packed = vec![0u32; n * kw];
+    let mut scales = vec![f16::ZERO; n * kg];
+    for r in 0..n {
+        for g in 0..kg {
+            let base = r * k + g * group;
+            let mut amax = 0.0f32;
+            for i in 0..group {
+                amax = amax.max(w[base + i].abs());
+            }
+            let scale16 = if amax > 0.0 { f16::from_f32(amax / 7.0) } else { f16::ONE };
+            scales[r * kg + g] = scale16;
+            let inv = 1.0f32 / scale16.to_f32();
+            for i in 0..group {
+                let kk = g * group + i;
+                let q = (w[base + i] * inv).round().clamp(-7.0, 7.0) as i32;
+                pack_nibble(&mut packed[r * kw + kk / 8], kk, q);
+            }
+        }
+    }
+    QuantWeight { n, k, group, packed, scales, zeros: None, signed: true }
+}
+
+/// **Asymmetric** (AWQ/GPTQ-style) group-wise int4 quantization: unsigned nibbles `q ∈ [0,15]` with a
+/// per-group fp16 `scale` *and* an integer `zero ∈ [0,15]` such that `w ≈ (q - zero)·scale`. Per group
+/// the value range is **extended to include 0** (`qlo = min(min,0)`, `qhi = max(max,0)`) so the
+/// zero-point — the `q` that maps to `w=0`, `zero = round(-qlo/scale)` — is always representable in
+/// `[0,15]` (the standard affine-quant convention; otherwise an all-positive group would push the grid
+/// off one end). `scale = (qhi-qlo)/15`, `q = round(w/scale)+zero` clamped to `[0,15]`. The kernel's
+/// `(q - zero)` subtract is one extra instruction on the unpack path.
+pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
+    assert_eq!(w.len(), n * k, "weight must be N*K");
+    assert!(k % group == 0, "K={k} must be a multiple of group={group}");
+    assert!(group % 8 == 0, "group={group} must be a multiple of 8 (nibble packing)");
+    let kg = k / group;
+    let kw = k / 8;
+    let mut packed = vec![0u32; n * kw];
+    let mut scales = vec![f16::ZERO; n * kg];
+    let mut zeros = vec![0u8; n * kg];
+    for r in 0..n {
+        for g in 0..kg {
+            let base = r * k + g * group;
+            let (mut lo, mut hi) = (0.0f32, 0.0f32); // seed with 0 so the grid spans 0 (zero-point in range)
+            for i in 0..group {
+                lo = lo.min(w[base + i]);
+                hi = hi.max(w[base + i]);
+            }
+            let scale16 = if hi > lo { f16::from_f32((hi - lo) / 15.0) } else { f16::ONE };
+            let s = scale16.to_f32();
+            let zero = (-lo / s).round().clamp(0.0, 15.0) as i32;
+            scales[r * kg + g] = scale16;
+            zeros[r * kg + g] = zero as u8;
+            let inv = 1.0f32 / s;
+            for i in 0..group {
+                let kk = g * group + i;
+                let q = ((w[base + i] * inv).round() as i32 + zero).clamp(0, 15);
+                pack_nibble(&mut packed[r * kw + kk / 8], kk, q);
+            }
+        }
+    }
+    QuantWeight { n, k, group, packed, scales, zeros: Some(zeros), signed: false }
+}
+
+/// Reconstruct the fp16 weight `[N,K]` **exactly as the kernel does** — `w = (q[-z])·scale` with the
+/// signed/unsigned nibble interpretation and the fp16 `mul`. `f16::from_f32(q as f32)` is exact for the
+/// small integer `q`, and the half-crate `f16*f16` is the correctly-rounded product, matching PTX
+/// `mul.rn.f16`. This is the gate's reference weight (so the only kernel error is f32 accumulation).
+pub fn dequant_weight(qw: &QuantWeight) -> Vec<f16> {
+    let (n, k, group) = (qw.n, qw.k, qw.group);
+    let (kg, kw) = (qw.groups(), qw.words());
+    let mut w = vec![f16::ZERO; n * k];
+    for r in 0..n {
+        for kk in 0..k {
+            let nib = ((qw.packed[r * kw + kk / 8] >> (4 * (kk % 8))) & 0xF) as i32;
+            let q = if qw.signed {
+                if nib >= 8 { nib - 16 } else { nib } // sign-extend the 4-bit two's-complement
+            } else {
+                nib - qw.zeros.as_ref().unwrap()[r * kg + kk / group] as i32
+            };
+            let scale = qw.scales[r * kg + kk / group];
+            w[r * k + kk] = f16::from_f32(q as f32) * scale;
+        }
+    }
+    w
+}
+
+/// f64 reference `C = A·dequant(W)ᵀ` with `A` pre-rounded to fp16 — the *exact* arithmetic the W4A16
+/// kernel performs (fp16 activations × fp16-dequantized weights, f32 accumulate), so the only deviation
+/// is the tensor-core f32 accumulation order. `A` is `[M,K]` f32 (rounded to f16 here, the price the
+/// fp16 path pays); the gate asserts the kernel matches this within the fp16-accumulate tolerance.
+pub fn reference_w4a16(a: &[f32], qw: &QuantWeight, m: usize) -> Vec<f32> {
+    let (k, n) = (qw.k, qw.n);
+    assert_eq!(a.len(), m * k, "A must be M*K");
+    let w = dequant_weight(qw);
+    let af: Vec<f64> = a.iter().map(|&x| f16::from_f32(x).to_f32() as f64).collect();
+    let wf: Vec<f64> = w.iter().map(|x| x.to_f32() as f64).collect();
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f64;
+            for kk in 0..k {
+                acc += af[i * k + kk] * wf[j * k + kk];
+            }
+            c[i * n + j] = acc as f32;
+        }
+    }
+    c
+}
+
+// ---- W4A16 PTX generator -------------------------------------------------------------------------
+// Mirrors `ptx_wmma::entry_smem` (the proven SMEM-staged fp16 tensor-core tile): a CTA of
+// warps_m×warps_n warps cooperatively stages an SM_BM×16 A tile and an SM_BN×16 *dequantized* B tile
+// into shared memory each K-step, then every warp computes its tm×tn grid of 16×16 WMMA tiles out of
+// shared memory. The ONE departure from the fp16 path is the B staging: instead of a 128-bit fp16
+// copy, each thread loads one packed int4 `u32` (8 weights) from global, unpacks `bfe`→`cvt.f16`→
+// `mul.f16`(group scale)[−zero], and stores 8 fp16 into the SMEM B tile in the identical row-major
+// `[bn,16]` layout `wmma.load.b.col` expects — so the global B traffic is 4-bit while the MMA is the
+// byte-identical fp16 tile. Requires M%bm==0, N%bn==0, K%group==0 (group a multiple of 16).
+
+/// SMEM B-tile K-width (the WMMA K-step). One scale serves the whole strip because group ≥ this.
+const BK: usize = 16;
+
+/// Generate a W4A16 SMEM-staged WMMA GEMM entry `C = A·dequant(W)ᵀ`. `group` is baked in (static-shape
+/// specialization: the scale/word strides become constant shifts). `zero_point` selects the asymmetric
+/// `(q-z)` unpack (extra `pZeros` param) over the symmetric signed path. `bm`,`bn` are 16-multiples;
+/// the A staging requires `bm·16` to be a whole multiple of `threads·8` (128-bit f16 loads) and the B
+/// staging requires `bn·16/8 = bn·2` to be a whole multiple of `threads` (one packed word per thread).
+fn entry_w4a16(
+    name: &str,
+    bm: usize,
+    bn: usize,
+    warps_m: usize,
+    warps_n: usize,
+    group: usize,
+    zero_point: bool,
+) -> String {
+    assert!(group.is_power_of_two() && group % BK == 0, "group must be a power of two ≥ {BK}");
+    let nab = 8; // f16 WMMA a/b fragment is 8×.b32
+    let threads = warps_m * warps_n * 32;
+    let tm = bm / (16 * warps_m);
+    let tn = bn / (16 * warps_n);
+    let smem_a = bm * BK * 2; // bytes
+    let smem_b = bn * BK * 2;
+    let a_chunks = bm * BK / (threads * 8); // 128-bit (8×f16) A chunks per thread
+    let b_words = bn * BK / 8; // packed int4 words in the B tile
+    let b_chunks = b_words / threads; // one packed word per thread per chunk
+    assert!(a_chunks * threads * 8 == bm * BK, "A staging must tile evenly");
+    assert!(b_chunks * threads == b_words, "B staging must tile evenly");
+    let wn_shift = warps_n.trailing_zeros();
+    let wm = (16 * tm) as i64;
+    let wn = (16 * tn) as i64;
+    let kw_shift = 3u32; // K/8, kt/8 (8 weights per word)
+    let kg_shift = group.trailing_zeros(); // K/group, kt/group
+
+    let veclist = |prefix: &str, n: usize| -> String {
+        let regs: Vec<String> = (0..n).map(|i| format!("%{prefix}{i}")).collect();
+        format!("{{{}}}", regs.join(","))
+    };
+
+    let zeros_param = if zero_point { ",\n    .param .u64 pZeros" } else { "" };
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    \
+         .param .u64 pA,\n    .param .u64 pBq,\n    .param .u64 pScales,\n    .param .u64 pC{zeros_param}\n)\n{{\n"
+    );
+    s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
+    s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
+    s += "    .reg .pred %p0;\n";
+    // %tix is the linear thread id (NOT %tid — that is the threadIdx special register; a user reg
+    // named %tid makes the assembler read %tid.x as a video selector and reject it).
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%v0,%v1,%v2,%v3;\n";
+    // int4 B-staging scratch.
+    s += "    .reg .b32 %nrow,%half,%nn,%sidx,%widx,%word,%v,%sbase,%kw,%ktw,%kgr,%ktg;\n";
+    s += "    .reg .b16 %sc,%wf;\n";
+    if zero_point {
+        s += "    .reg .b32 %zv;\n    .reg .b16 %zf;\n    .reg .b64 %Zeros,%zptr;\n";
+    }
+    // accumulator + a/b fragments.
+    let mut decl_c = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..8 {
+                decl_c += &format!("%c{ti}_{tj}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    let mut decl_ab = String::new();
+    for ti in 0..tm {
+        for r in 0..nab {
+            decl_ab += &format!("%a{ti}_{r},");
+        }
+    }
+    for tj in 0..tn {
+        for r in 0..nab {
+            decl_ab += &format!("%b{tj}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
+    s += "    .reg .b64 %A,%Bq,%Scl,%C,%off,%gp,%gptr,%cptr,%sptr,%wptr;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %Bq,[pBq];\n    ld.param.u64 %Scl,[pScales];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %Bq,%Bq;\n    cvta.to.global.u64 %Scl,%Scl;\n    cvta.to.global.u64 %C,%C;\n";
+    if zero_point {
+        s += "    ld.param.u64 %Zeros,[pZeros];\n    cvta.to.global.u64 %Zeros,%Zeros;\n";
+    }
+    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    s += "    mov.u32 %ldm,16;\n";
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
+    s += &format!("    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
+    // Constant-stride helpers (static-shape specialization: word/group strides are shifts of K).
+    s += &format!("    shr.u32 %kw,%K,{kw_shift};\n    shr.u32 %kgr,%K,{kg_shift};\n");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..8 {
+                s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+            }
+        }
+    }
+
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+
+    // --- Stage A: bm×16 f16 from global A[M,K], 128-bit (8×f16) chunks (identical to the fp16 path). ---
+    for li in 0..a_chunks {
+        if li == 0 {
+            s += "    mov.u32 %e,%tix;\n";
+        } else {
+            s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+        }
+        s += "    shr.u32 %r,%e,1;\n    and.b32 %c,%e,1;\n    shl.b32 %c,%c,3;\n";
+        s += "    add.u32 %tmp,%baseRow,%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kt;\n    add.u32 %tmp,%tmp,%c;\n";
+        s += "    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,%A,%off;\n";
+        s += "    ld.global.v4.u32 {%v0,%v1,%v2,%v3},[%gptr];\n";
+        s += &format!("    mov.u32 %tmp,smemA_{name};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n");
+        s += "    st.shared.v4.u32 [%tmp],{%v0,%v1,%v2,%v3};\n";
+    }
+
+    // --- Stage B: bn×16 dequantized f16, unpacked from packed int4 Bq[N,K/8] + scales[N,K/G]. ---
+    s += &format!("    shr.u32 %ktw,%kt,{kw_shift};\n    shr.u32 %ktg,%kt,{kg_shift};\n");
+    for li in 0..b_chunks {
+        if li == 0 {
+            s += "    mov.u32 %e,%tix;\n";
+        } else {
+            s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+        }
+        // n = e/2 (2 words per 16-wide row), half = e&1 (which 8-wide K sub-strip); nn = baseCol+n.
+        s += "    shr.u32 %nrow,%e,1;\n    and.b32 %half,%e,1;\n    add.u32 %nn,%baseCol,%nrow;\n";
+        // scale S[nn*(K/G) + kt/G]  (one fp16 per (row,group); the 16-strip is within one group).
+        s += "    mul.lo.s32 %sidx,%nn,%kgr;\n    add.u32 %sidx,%sidx,%ktg;\n";
+        s += "    mul.wide.u32 %off,%sidx,2;\n    add.s64 %sptr,%Scl,%off;\n    ld.global.b16 %sc,[%sptr];\n";
+        if zero_point {
+            // zero-point Z[nn*(K/G) + kt/G] (u8, 1 byte/elem ⇒ byte offset == sidx; widen to 64-bit
+            // for the pointer add), loaded zero-extended into %zv for the integer subtract.
+            s += "    cvt.u64.u32 %off,%sidx;\n    add.s64 %zptr,%Zeros,%off;\n    ld.global.u8 %zv,[%zptr];\n";
+        }
+        // packed word Bq[nn*(K/8) + kt/8 + half]  (8 nibbles).
+        s += "    mul.lo.s32 %widx,%nn,%kw;\n    add.u32 %widx,%widx,%ktw;\n    add.u32 %widx,%widx,%half;\n";
+        s += "    mul.wide.u32 %off,%widx,4;\n    add.s64 %wptr,%Bq,%off;\n    ld.global.u32 %word,[%wptr];\n";
+        // SMEM dest base byte = e*16 (chunk base); nibble j writes f16 at +2j (flat = e*8+j).
+        s += &format!("    mov.u32 %sbase,smemB_{name};\n    shl.b32 %tmp,%e,4;\n    add.u32 %sbase,%sbase,%tmp;\n");
+        for j in 0..8 {
+            if zero_point {
+                s += &format!("    bfe.u32 %v,%word,{},4;\n    sub.s32 %v,%v,%zv;\n", 4 * j);
+            } else {
+                s += &format!("    bfe.s32 %v,%word,{},4;\n", 4 * j); // signed 4-bit → s32
+            }
+            s += "    cvt.rn.f16.s32 %wf,%v;\n    mul.rn.f16 %wf,%wf,%sc;\n";
+            s += &format!("    st.shared.b16 [%sbase+{}],%wf;\n", 2 * j);
+        }
+    }
+    let _ = veclist; // (declared above for the fragment lists below)
+    s += "    bar.sync 0;\n";
+
+    // --- Compute: each warp loads its fragments from SMEM and accumulates (identical to fp16 path). ---
+    for ti in 0..tm {
+        s += &format!("    mov.u32 %tmp,smemA_{name};\n");
+        s += &format!("    mul.lo.s32 %tmp2,%warpRow,{wm};\n    add.u32 %tmp2,%tmp2,{};\n", ti * 16);
+        s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+        s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
+        let ra = veclist(&format!("a{ti}_"), nab);
+        s += &format!("    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %ldm;\n");
+    }
+    for tj in 0..tn {
+        s += &format!("    mov.u32 %tmp,smemB_{name};\n");
+        s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+        s += "    mul.lo.s32 %tmp2,%tmp2,32;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+        s += "    cvt.u64.u32 %gp,%tmp;\n    cvta.shared.u64 %gp,%gp;\n";
+        let rb = veclist(&format!("b{tj}_"), nab);
+        s += &format!("    wmma.load.b.sync.aligned.m16n16k16.col.f16 {rb}, [%gp], %ldm;\n");
+    }
+    for ti in 0..tm {
+        let ra = veclist(&format!("a{ti}_"), nab);
+        for tj in 0..tn {
+            let rb = veclist(&format!("b{tj}_"), nab);
+            let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+            s += &format!("    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};\n");
+        }
+    }
+    s += "    bar.sync 0;\n";
+    s += &format!("    add.u32 %kt,%kt,16;\n    bra KLOOP_{name};\n");
+
+    s += &format!("KEND_{name}:\n");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+            s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+            s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+            s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+            let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+            s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
+/// 64×64 CTA tile (2×2 warps, 128 threads) — the default W4A16 tile, matching the fp16 `_sm` config.
+pub const W4_BM: usize = 64;
+pub const W4_BN: usize = 64;
+pub const W4_WARPS_M: usize = 2;
+pub const W4_WARPS_N: usize = 2;
+pub const W4_THREADS: usize = W4_WARPS_M * W4_WARPS_N * 32;
+
+/// W4A16 module — entry `gemm_nt_w4a16` (symmetric signed int4) and `gemm_nt_w4a16_z` (asymmetric,
+/// zero-point), both the 64×64 SMEM-staged tensor-core tile with `GROUP_SIZE` baked in.
+pub fn w4a16_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false);
+        m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true);
+        m
+    })
+    .as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Host quant→dequant must be self-consistent and faithful: the symmetric reconstruction stays
+    /// within one quantization step of the original, and the packed/scale shapes are exactly the
+    /// kernel's expected layout. (Pure-CPU — runs under plain `cargo test --features gpu`.)
+    #[test]
+    fn symmetric_quant_roundtrip_is_faithful() {
+        let (n, k, group) = (8usize, 256usize, GROUP_SIZE);
+        let mut rng = crate::diff::Rng::new(0xA11CE);
+        let w = rng.vec(n * k, -2.0, 2.0);
+        let qw = quantize_weight_symmetric(&w, n, k, group);
+        assert_eq!(qw.packed.len(), n * k / 8);
+        assert_eq!(qw.scales.len(), n * k / group);
+        assert!(qw.zeros.is_none() && qw.signed);
+        let deq = dequant_weight(&qw);
+        // Each weight is within ~one step (scale) of the original — a faithful symmetric quantizer.
+        for r in 0..n {
+            for g in 0..(k / group) {
+                let scale = qw.scales[r * (k / group) + g].to_f32();
+                for i in 0..group {
+                    let kk = g * group + i;
+                    let err = (deq[r * k + kk].to_f32() - w[r * k + kk]).abs();
+                    assert!(err <= scale + 1e-3, "deq err {err} > step {scale}");
+                }
+            }
+        }
+    }
+
+    /// Asymmetric (zero-point) quantization must reconstruct within one step too, and carry a zeros
+    /// table of the right shape with unsigned nibbles.
+    #[test]
+    fn asymmetric_quant_roundtrip_is_faithful() {
+        let (n, k, group) = (4usize, 128usize, GROUP_SIZE);
+        let mut rng = crate::diff::Rng::new(0xB0B);
+        // A deliberately asymmetric range (all-positive) — where a zero-point earns its keep.
+        let w: Vec<f32> = (0..n * k).map(|_| rng.f32_range(0.5, 3.0)).collect();
+        let qw = quantize_weight_asymmetric(&w, n, k, group);
+        assert_eq!(qw.zeros.as_ref().unwrap().len(), n * k / group);
+        assert!(!qw.signed);
+        let deq = dequant_weight(&qw);
+        for r in 0..n {
+            let scale = qw.scales[r * (k / group)].to_f32();
+            for kk in 0..k {
+                let err = (deq[r * k + kk].to_f32() - w[r * k + kk]).abs();
+                assert!(err <= scale + 1e-3, "asym deq err {err} > step {scale}");
+            }
+        }
+    }
+
+    /// The generated PTX must be **pure ASCII** (a single non-ASCII byte is a `ptxas fatal` on this
+    /// box) and contain both entry points.
+    #[test]
+    fn w4a16_ptx_is_ascii_and_complete() {
+        let ptx = w4a16_ptx();
+        assert!(ptx.is_ascii(), "PTX must be ASCII");
+        assert!(ptx.contains(".visible .entry gemm_nt_w4a16("));
+        assert!(ptx.contains(".visible .entry gemm_nt_w4a16_z("));
+        assert!(ptx.contains("wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32"));
+    }
+}

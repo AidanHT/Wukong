@@ -2125,6 +2125,60 @@ pub fn gemm_nt_fp8(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **W4A16 weight-only int4 decode** `C = A·dequant(W)ᵀ` (the LLM-decode workhorse). `A` (`[M,K]`)
+/// arrives f32 and is rounded to f16; `W` is the group-wise int4-quantized weight `[N,K]` ([`QuantWeight`]
+/// from [`crate::ptx_int4`]) — packed 4-bit values, per-group fp16 scales, optional integer zero-points.
+/// The kernel reads the **packed int4 weight (4-bit/weight — 4× the fp16 footprint shrink), unpacks it to
+/// fp16 on the fly, and runs the identical fp16 tensor-core MMA**; `C` is `[M,N]` f32. Requires
+/// `M%64==0`, `N%64==0`, `K%GROUP_SIZE==0`, and `qw.group == GROUP_SIZE` (the kernel bakes the group
+/// size). Dispatches the symmetric (`gemm_nt_w4a16`) or asymmetric/zero-point (`gemm_nt_w4a16_z`) entry.
+pub fn gemm_nt_w4a16(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int4::{GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be M*K");
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
+    assert!(
+        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        "gemm_nt_w4a16 requires M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let scl_d = g.stream.memcpy_stod(&qw.scales)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+        block_dim: (W4_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match &qw.zeros {
+        None => {
+            let f = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")?;
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+            unsafe { bld.launch(cfg)? };
+        }
+        Some(zeros) => {
+            let z_d = g.stream.memcpy_stod(zeros)?;
+            let f = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16_z")?;
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d).arg(&z_d);
+            unsafe { bld.launch(cfg)? };
+        }
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2137,6 +2191,106 @@ mod tests {
             Some(g) => body(g),
             None => eprintln!("[skip] {name}: no CUDA device reachable"),
         }
+    }
+
+    /// **W4A16 correctness gate (the first law).** The int4-decode kernel must reproduce — within the
+    /// fp16-accumulate tolerance — an *exact* f64 dequant reference: dequantize the int4 weights with the
+    /// same group scales/zero-points on the CPU ([`crate::ptx_int4::reference_w4a16`]) and matmul in f64.
+    /// The only legitimate error is the tensor cores' f32 accumulation order (the weight itself is
+    /// reconstructed bit-for-bit), so the bound is the same `1e-2 abs / 2e-3 rel` the dense fp16 GEMM
+    /// carries — *not* a quantization fudge. Both the symmetric (signed) and asymmetric (zero-point)
+    /// paths are gated; a final repeat-run asserts byte-identical output (M12 determinism: fixed grid,
+    /// no atomics). A kernel that dequantizes wrong fails here before any speed number is taken.
+    #[test]
+    fn int4_gemm_matches_reference() {
+        use crate::ptx_int4::{
+            quantize_weight_asymmetric, quantize_weight_symmetric, reference_w4a16, GROUP_SIZE,
+        };
+        with_gpu("int4_w4a16", |g| {
+            let mut rng = crate::diff::Rng::new(0x174A);
+            // (M,N,K): M%64==0, N%64==0, K%128==0. Square-ish + decode-like (small M, big K) + rectangular.
+            let shapes = [
+                (64usize, 64usize, 128usize),
+                (64, 128, 256),
+                (128, 256, 256),
+                (192, 64, 128),
+                (64, 192, 512),
+                (256, 128, 384),
+            ];
+            for (m, n, k) in shapes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8); // weight [N,K]
+
+                // Symmetric (signed int4).
+                let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
+                let c = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
+                let r = reference_w4a16(&a, &qw, m);
+                let s = crate::diff::assert_close(
+                    &format!("w4a16 sym {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!("w4a16 sym  {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+
+                // Asymmetric (per-group zero-point) — the AWQ/GPTQ form.
+                let qwz = quantize_weight_asymmetric(&w, n, k, GROUP_SIZE);
+                let cz = gemm_nt_w4a16(g, &a, &qwz, m, k, n).unwrap();
+                let rz = reference_w4a16(&a, &qwz, m);
+                let sz = crate::diff::assert_close(
+                    &format!("w4a16 asym {m}x{k}x{n}"),
+                    &cz,
+                    &rz,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!("w4a16 asym {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", sz.max_abs, sz.max_rel);
+
+                // M12 determinism: a second launch is byte-identical (fixed grid, no nondeterministic atomics).
+                let c2 = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
+                assert!(
+                    c.iter().zip(&c2).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "w4a16 {m}x{k}x{n} not deterministic run-to-run"
+                );
+            }
+        });
+    }
+
+    /// Diagnostic: print the driver JIT error log for the W4A16 module (`ptx_int4::w4a16_ptx`) — the
+    /// `ptxas` line/error behind a bare `CUDA_ERROR_INVALID_PTX`. Also writes the PTX to a temp file.
+    /// `cargo test -p mercury_codegen_gpu --features gpu int4_jit_log -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic; prints the driver JIT log for the W4A16 PTX module"]
+    fn int4_jit_log() {
+        with_gpu("int4_jitlog", |g| {
+            use cudarc::driver::sys;
+            g.ctx.bind_to_thread().unwrap();
+            let ptx = crate::ptx_int4::w4a16_ptx();
+            let dump = std::env::temp_dir().join("mercury_w4a16.ptx");
+            let _ = std::fs::write(&dump, ptx);
+            eprintln!("wrote PTX to {}", dump.display());
+            let ptx_c = std::ffi::CString::new(ptx).unwrap();
+            let mut log = vec![0u8; 32768];
+            let mut opts = [
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            ];
+            let mut vals: [*mut std::ffi::c_void; 2] =
+                [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            let res = unsafe {
+                sys::cuModuleLoadDataEx(
+                    &mut module,
+                    ptx_c.as_ptr() as *const _,
+                    2,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                )
+            };
+            let s = String::from_utf8_lossy(&log);
+            eprintln!("=== JIT result {:?} ===\n{}", res, s.trim_end_matches('\0'));
+        });
     }
 
     #[test]
