@@ -246,4 +246,92 @@ mod tests {
         );
         assert!(ran > 0, "no eligible program ran on the megakernel — pipeline broken");
     }
+
+    /// Same-run latency A/B: the cooperative megakernel vs the single-thread lowering on a
+    /// reduction-heavy program (a `[N]` dot reduced `REPEAT` times). Both produce byte-identical
+    /// output (checksum cross-check) before any timing counts; we then report the clock-invariant
+    /// ratio (single / mega) best-of-N back-to-back in one process — never an absolute ms (≈7× clock
+    /// swing on this part, per the honesty law). The cooperative tree turns each reduction's O(N)
+    /// serial fold into O(N/block + log block), so the win grows with N·REPEAT.
+    #[test]
+    #[ignore = "perf bench; run with --ignored --nocapture"]
+    fn mega_vs_single_reduce() {
+        use std::time::Instant;
+        if crate::gpu::gpu().is_none() {
+            eprintln!("skip mega_vs_single_reduce: no CUDA device");
+            return;
+        }
+        // N small enough for the single-thread .local frame, REPEAT large enough that compute
+        // dominates fixed launch/alloc overhead. dot(ones,ones)=N, acc=N*REPEAT.
+        const N: usize = 4096;
+        const REPEAT: usize = 2000;
+        let src = format!(
+            r#"module bench
+@parallel
+fn dotp(x: [f32; {N}], y: [f32; {N}], o: [f32; 1]) {{
+    let mut s: f32 = 0.0;
+    for k in 0..{N} {{ s = s + x[k] * y[k]; }}
+    o[0] = s;
+}}
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [1.0; {N}];
+    let mut y: [f32; {N}] = [1.0; {N}];
+    let mut o: [f32; 1] = [0.0; 1];
+    let mut acc: f32 = 0.0;
+    let mut r: i32 = 0;
+    while r < {REPEAT} {{ dotp(x, y, o); acc = acc + o[0]; r = r + 1; }}
+    print(acc as i32);
+    return 0;
+}}
+"#
+        );
+        // -O2 so the @parallel `dotp` inlines into `main` (-> main calls the recognized reduce
+        // directly, making it megakernel-eligible). The opaque `mercury_sreduce_*` call has memory
+        // side effects, so LICM keeps it in the loop -> the reduce work happens REPEAT times (the
+        // timing below confirms it scales with REPEAT).
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        assert!(
+            crate::fusion::analyze(&program, entry, &interner).eligible,
+            "bench program must be megakernel-eligible"
+        );
+
+        // Correctness cross-check FIRST: mega and single-thread must agree (and with the oracle).
+        let mega0 = try_run(&program, entry, &interner).expect("mega run").expect("mega eligible");
+        let single0 = lower::jit_run_single(&program, entry, &interner).expect("single run");
+        let oracle = mercury_interp::run_with_output(&program, entry, &interner).expect("interp");
+        assert_eq!(mega0.0, single0.0, "exit codes differ");
+        assert!(outputs_match(&mega0.1, &single0.1), "mega vs single output differs");
+        assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle output differs");
+        eprintln!("checksum (mega==single==oracle): {}", String::from_utf8_lossy(&mega0.1).trim());
+
+        // Warm the JIT/module caches for both paths, then best-of-N (smallest = least contention).
+        let _ = try_run(&program, entry, &interner);
+        let _ = lower::jit_run_single(&program, entry, &interner);
+        let iters = 10;
+        let best = |f: &dyn Fn()| {
+            let mut b = f64::INFINITY;
+            for _ in 0..iters {
+                let t = Instant::now();
+                f();
+                b = b.min(t.elapsed().as_secs_f64());
+            }
+            b
+        };
+        let mega_t = best(&|| {
+            let _ = try_run(&program, entry, &interner).unwrap().unwrap();
+        });
+        let single_t = best(&|| {
+            let _ = lower::jit_run_single(&program, entry, &interner).unwrap();
+        });
+        eprintln!(
+            "\n=== mega_vs_single_reduce  N={N} REPEAT={REPEAT} ({} reductions, {} fma) ===\n\
+             single-thread: {:.3} ms   megakernel(256t): {:.3} ms   speedup: {:.2}x (same-run ratio)",
+            REPEAT,
+            (N * REPEAT) as f64,
+            single_t * 1e3,
+            mega_t * 1e3,
+            single_t / mega_t,
+        );
+    }
 }
