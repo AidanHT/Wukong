@@ -282,6 +282,9 @@ struct FnEmit<'a> {
     vlanes: HashMap<u32, Vec<String>>,
     // ValueId -> its constant integer value (for op-code dispatch of recognized kernel calls).
     const_ints: HashMap<u32, i128>,
+    // ValueId(`func_addr F`) -> F, so `mercury_parallel_for(n, func_addr F, ctx)` resolves to a
+    // direct call to F at compile time (PTX has no portable function pointers).
+    func_addr_of: HashMap<u32, Symbol>,
     // Unique label counter (for cond-branch edge fixups).
     n_lbl: u32,
 
@@ -316,6 +319,7 @@ impl<'a> FnEmit<'a> {
             vreg: HashMap::new(),
             vlanes: HashMap::new(),
             const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
             n_lbl: 0,
             frame_off: HashMap::new(),
             frame_bytes: 0,
@@ -564,10 +568,10 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} SIMD `Splat` (vectorized MIR) not yet lowered to PTX"
                 ))
             }
-            Op::FuncAddr(_) => {
-                return Err(format!(
-                    "{UNSUPPORTED} `FuncAddr` (@parallel outlined body) not yet lowered to PTX"
-                ))
+            Op::FuncAddr(sym) => {
+                // Record the target for the `mercury_parallel_for` special-case; the value itself is
+                // never materialized as a device function pointer, so emit no instruction.
+                self.func_addr_of.insert(r.0, *sym);
             }
             Op::Store { .. } | Op::Call { .. } => unreachable!("handled above"),
         }
@@ -1272,6 +1276,30 @@ impl<'a> FnEmit<'a> {
                     Err(format!("{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"))
                 }
             }
+            // `mercury_parallel_for(n, func_addr F, ctx)`: the @parallel outliner splits `[0,n)` into
+            // per-core chunks and runs `F(lo, hi, ctx)` on each. The chunking is deterministic and the
+            // outlined body is chunk-decomposable, so a single sequential chunk `F(0, n, ctx)` gives
+            // the same result as the interpreter (serial == parallel). (Grid-stride parallelism is a
+            // later performance increment; this is the correct, general lowering.)
+            "mercury_parallel_for" if args.len() == 3 => {
+                let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
+                    format!("{UNSUPPORTED} mercury_parallel_for target is not a func_addr")
+                })?;
+                let idx = *self.func_idx.get(&sym).ok_or_else(|| {
+                    format!(
+                        "{UNSUPPORTED} mercury_parallel_for target `{}` is not a known function",
+                        self.interner.resolve(sym)
+                    )
+                })?;
+                let zero = self.fresh(RC::Rd);
+                self.emit(&format!("mov.b64 {zero}, 0;"));
+                let n_reg = self.reg(args[0]);
+                let ctx_reg = self.reg(args[2]);
+                // F(lo=0, hi=n, ctx); all three args are 64-bit (i64 count / pointers).
+                let arg_regs = vec![(zero, "b64"), (n_reg, "b64"), (ctx_reg, "b64")];
+                self.emit_call_to(idx, &arg_regs, None);
+                Ok(())
+            }
             other => {
                 if let Some(h) = rt_helper(other) {
                     self.emit_helper_call(h.ptx_name, h.ret, args, result);
@@ -1331,15 +1359,27 @@ impl<'a> FnEmit<'a> {
         args: &[ValueId],
         result: Option<ValueId>,
     ) -> Result<(), String> {
-        let callee = &self.program.funcs[idx];
-        let ret = callee.ret.clone();
-        let has_ret = !matches!(ret, MirType::Void);
-
         // Snapshot arg regs/types before mutating the builder.
         let arg_regs: Vec<(String, &'static str)> = args
             .iter()
             .map(|a| (self.reg(*a), abi_ty(self.func.value_type(*a))))
             .collect();
+        self.emit_call_to(idx, &arg_regs, result);
+        Ok(())
+    }
+
+    /// Emit a call to user function `idx` with pre-built `(reg, abi)` arg pairs. Every `mfn_*` takes
+    /// the device context buffer as an implicit leading param (for print/assert/exit), followed by
+    /// the explicit args; the return (if any) is bound into `result`.
+    fn emit_call_to(
+        &mut self,
+        idx: usize,
+        arg_regs: &[(String, &'static str)],
+        result: Option<ValueId>,
+    ) {
+        let callee = &self.program.funcs[idx];
+        let ret = callee.ret.clone();
+        let has_ret = !matches!(ret, MirType::Void);
         let ctx = self.ctx_reg.clone();
 
         self.emit("{");
@@ -1370,7 +1410,6 @@ impl<'a> FnEmit<'a> {
             }
         }
         self.emit("}");
-        Ok(())
     }
 
     fn lower_print(&mut self, args: &[ValueId]) -> Result<(), String> {
