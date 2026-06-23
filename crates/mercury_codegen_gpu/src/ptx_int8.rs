@@ -464,7 +464,17 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 /// m3:r8-15/k16-31} = {a0,a1,a2,a3} — exactly the fp16 register order. Bit-exact mod 2³² vs the CPU i32
 /// reference (the swizzle only reorders SMEM; the integer arithmetic is untouched). Entry `name`;
 /// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0.
-fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant: bool, splitk: bool) -> String {
+#[allow(clippy::too_many_arguments)]
+fn gen_int8_smdb_swz(
+    name: &str,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    dequant: bool,
+    splitk: bool,
+    static_dims: Option<(usize, usize, usize)>,
+) -> String {
     let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
     let threads = wm * wn * 32;
     let tm = bm / (16 * wm); // 16-row A subtiles per warp
@@ -488,6 +498,12 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
     // integer add commutes, so the result is order-independent and bit-exact, unlike a float reduction).
     // The dequant epilogue can't combine with split-K (it would scale per-partial, not per-total).
     assert!(!(splitk && dequant), "{name}: split-K and the dequant epilogue are mutually exclusive");
+    // Static-shape specialization is incompatible with split-K (which derives kslice from runtime
+    // gridDim.z and the K param). The static dims must tile the kernel so the baked constants are exact.
+    assert!(!(splitk && static_dims.is_some()), "{name}: split-K uses the runtime K param (dynamic dims)");
+    if let Some((m, n, k)) = static_dims {
+        assert!(m % bm == 0 && n % bn == 0 && k % bk == 0, "{name}: static dims must tile the kernel");
+    }
     let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
     let b_chunks = bn * bk / (threads * 16);
 
@@ -528,7 +544,19 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
     s += &format!("    .reg .b32 {};\n", abregs.trim_end_matches(','));
     s += "    .reg .b64 %A,%B,%C,%off,%gptr,%cp;\n";
 
-    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    // Static-shape specialization (Mercury's compile-time-shapes lever, mirroring `entry_w4a16`): bake
+    // M/N/K as constants so ptxas constant-folds the hot-loop strides — every `mul.lo.s32 ...,%N` /
+    // `...,%K` becomes a constant multiply (strength-reduced to a shift when the dim is a power of two)
+    // and the K-loop trip count is known (unrollable). Dynamic loads them from params. The signature is
+    // identical either way (M/N/K params remain, just unused), so the launcher is unchanged.
+    match static_dims {
+        Some((m, n, k)) => {
+            s += &format!("    mov.u32 %M,{m};\n    mov.u32 %N,{n};\n    mov.u32 %K,{k};\n");
+        }
+        None => {
+            s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+        }
+    }
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
     if dequant {
@@ -672,7 +700,7 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
 /// for the int8→cuBLAS-IMMA gap. Same CTA tile / warp layout as [`int8_gemm_smdb_ptx`]; BK=64. Bit-exact.
 pub fn int8_gemm_smdb_swz_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false, false)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false, false, None)).as_str()
 }
 
 /// **64×64 `ldmatrix`+swizzle int8 GEMM with split-K** (`int8_gemm_nt_smdb_swz_sk`) — the thin-M / small-N
@@ -683,7 +711,7 @@ pub fn int8_gemm_smdb_swz_ptx() -> &'static str {
 /// K % (sk·64) == 0. Bit-exact vs the i32 oracle for any sk.
 pub fn int8_gemm_smdb_swz_splitk_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_sk", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false, true)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_sk", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false, true, None)).as_str()
 }
 
 /// **64×64 `ldmatrix`+swizzle int8 GEMM with fused per-channel dequant** (`int8_gemm_nt_smdb_swz_deq`) —
@@ -691,14 +719,33 @@ pub fn int8_gemm_smdb_swz_splitk_ptx() -> &'static str {
 /// [`int8_gemm_smdb_deq_ptx`]). Same dequant store, gated at the f32-scale tolerance.
 pub fn int8_gemm_smdb_swz_deq_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, true, false)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, true, false, None)).as_str()
 }
 
 /// **128×128 `ldmatrix`+swizzle int8 GEMM** (`int8_gemm_nt_smdb128_swz`) — the large-tile swizzle
 /// candidate (8 warps, BK=64). Same CTA tile as [`int8_gemm_smdb128_ptx`]. Bit-exact.
 pub fn int8_gemm_smdb128_swz_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, false, false)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, false, false, None)).as_str()
+}
+
+/// **Static-shape `ldmatrix`+swizzle int8 GEMM** — the M1 compile-time-shapes lever. Bakes `M/N/K` into
+/// the kernel so ptxas constant-folds/strength-reduces the hot-loop strides and knows the K trip count
+/// (the same win `w4a16_static_ptx` lands for int4). Builds the 64×64 (`int8_gemm_nt_smdb_swz_static`) or
+/// 128×128 (`int8_gemm_nt_smdb128_swz_static`) entry per `use_128`; returns an owned per-shape module
+/// (the caller caches it under a shape-keyed key). Same codegen as the dynamic swz kernel ⇒ **bit-exact**.
+pub fn int8_gemm_smdb_swz_static_ptx(m: usize, n: usize, k: usize, use_128: bool) -> String {
+    let (name, bm, bn, wm, wn) = if use_128 {
+        ("int8_gemm_nt_smdb128_swz_static", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128)
+    } else {
+        ("int8_gemm_nt_smdb_swz_static", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N)
+    };
+    gen_int8_smdb_swz(name, bm, bn, wm, wn, false, false, Some((m, n, k)))
+}
+
+/// Entry name for [`int8_gemm_smdb_swz_static_ptx`] at the matching `use_128`.
+pub fn int8_gemm_smdb_swz_static_entry(use_128: bool) -> &'static str {
+    if use_128 { "int8_gemm_nt_smdb128_swz_static" } else { "int8_gemm_nt_smdb_swz_static" }
 }
 
 /// Full **int8 (W8A8) tensor-core GEMM** `C = A·Bᵀ` (the quantized nn.Linear form): A is `[M,K]` **u8**

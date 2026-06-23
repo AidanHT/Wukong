@@ -3289,6 +3289,50 @@ pub fn gemm_nt_int8_smdb(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **Static-shape int8 (W8A8) GEMM** `C = A·Bᵀ` — the M1 compile-time-shapes lever for int8 (the twin
+/// of [`gemm_nt_w4a16_static`]). Bakes M/N/K into the `ldmatrix`+swizzle kernel
+/// ([`crate::ptx_int8::int8_gemm_smdb_swz_static_ptx`]) so ptxas constant-folds the hot-loop strides and
+/// knows the K trip count; picks the 64×64 / 128×128 swz tile by the same regime rule as
+/// [`gemm_nt_int8_smdb`]. **Bit-exact** vs the dynamic kernel (identical codegen, only the dims are
+/// constants), so it gates against the same i32 oracle. The per-shape PTX is built + raw-loaded here
+/// (not `g.function`-cached). Requires M%bm==0, N%bn==0, K%64==0 (the swz BK).
+pub fn gemm_nt_int8_static(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, DriverError> {
+    use crate::ptx_int8::{
+        INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N,
+        INT8_WARPS_N128,
+    };
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(k % 64 == 0, "gemm_nt_int8_static requires K%64==0 (the swz BK)");
+    // Same regime rule as the dynamic swz dispatch: the 128×128 tile once reuse-bound (≥4096²), else 64×64.
+    let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    let (bm, bn, warps) = if use_128 {
+        (INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128)
+    } else {
+        (INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N)
+    };
+    assert!(m % bm == 0 && n % bn == 0, "gemm_nt_int8_static requires M%{bm}==0, N%{bn}==0");
+    let ptx = crate::ptx_int8::int8_gemm_smdb_swz_static_ptx(m, n, k, use_128);
+    let module = g.ctx.load_module(ptx.as_str().into())?;
+    let f = module.load_function(crate::ptx_int8::int8_gemm_smdb_swz_static_entry(use_128))?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// **int8 (W8A8) GEMM with explicit split-K** `C = A·Bᵀ` for the thin-M / small-N decode regime, where
 /// the M,N grid alone leaves SMs idle. `sk` K-splits each compute a partial product and fold it into C
 /// by `red.global.add.u32` — **bit-exact and deterministic** (integer add commutes, unlike a float
@@ -10843,6 +10887,116 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 if gf[2].is_finite() && gf[3].is_finite() {
                     eprintln!("  → 128×128 swz/handplaced = {:.3}×", gf[3] / gf[2]);
                 }
+            }
+        });
+    }
+
+    /// **Static-shape int8 gate (M1, first law).** `gemm_nt_int8_static` bakes M/N/K into the swz kernel;
+    /// only the dim *constants* change vs the dynamic kernel — the u8×i8→i32 mod-2³² arithmetic is
+    /// identical — so it must match BOTH the i32 oracle and the dynamic `gemm_nt_int8_smdb` EXACTLY. The
+    /// 64×64 entry is gated through the public launcher; the 128×128 entry (the dispatch only picks it at
+    /// M,N≥4096, too big for a quick gate) is gated directly at a small shape. K multiples of 64.
+    #[test]
+    fn int8_static_matches_reference() {
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_static_entry, int8_gemm_smdb_swz_static_ptx, INT8_BM128, INT8_BN128,
+            INT8_WARPS_M128, INT8_WARPS_N128,
+        };
+        with_gpu("int8_static", |g| {
+            let mut rng = crate::diff::Rng::new(0x5777);
+            let gen = |rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize| {
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                (a, b)
+            };
+            // 64×64 static via the public launcher: == the i32 oracle AND the dynamic kernel, exactly.
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 128, 192), (192, 64, 128), (256, 192, 256)] {
+                let (a, b) = gen(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                let cs = gemm_nt_int8_static(g, &a, &b, m, k, n).unwrap();
+                assert_eq!(cs, r, "int8_static vs oracle {m}x{k}x{n}");
+                assert_eq!(cs, gemm_nt_int8_smdb(g, &a, &b, m, k, n).unwrap(), "int8_static vs dynamic {m}x{k}x{n}");
+            }
+            // 128×128 static entry directly (small shape; the dispatch only selects it at ≥4096²).
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256)] {
+                let (a, b) = gen(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                let ptx = int8_gemm_smdb_swz_static_ptx(m, n, k, true);
+                let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                let f = module.load_function(int8_gemm_smdb_swz_static_entry(true)).unwrap();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let cfg = int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, w128);
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                assert_eq!(g.stream.memcpy_dtov(&c_d).unwrap(), r, "int8_static128 {m}x{k}x{n}");
+            }
+            eprintln!("[gate] int8 static-shape (64 & 128) bit-exact vs i32 oracle AND the dynamic swz kernel ✓");
+        });
+    }
+
+    /// **Static-shape int8 A/B (M1 lever, contention-robust internal ratio).** Times the static-shape
+    /// kernel (M/N/K baked → ptxas constant-folds strides, knows the K trip count) against the dynamic
+    /// swz kernel, same-run. CRITICAL (the int4 confound): load BOTH via the *same* raw `load_module`
+    /// path — comparing a raw-loaded kernel to a `g.function`-cached one confounds the ptxas opt level
+    /// with the specialization. Bit-exact checksum cross-check before timing. Expect ≥1× (int4's static
+    /// lever measured 1.05–1.30×); the win is the strength-reduced strides on the power-of-two dims.
+    #[test]
+    #[ignore = "throughput A/B; run explicitly (GPU; no DLLs needed)"]
+    fn int8_static_vs_dynamic_ab() {
+        use crate::baselines::gemm_flop;
+        use crate::ptx_int8::{
+            int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_swz_ptx, int8_gemm_smdb_swz_static_entry,
+            int8_gemm_smdb_swz_static_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M,
+            INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+        };
+        with_gpu("int8_static_ab", |g| {
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x5817);
+            const ROUNDS: usize = 8;
+            // Square compute shapes + a decode-ish thin-M shape. K%64; the 4096² shape exercises the 128 tile.
+            for (m, k, n) in [(1024usize, 1024usize, 1024usize), (2048, 2048, 2048), (4096, 4096, 4096), (256, 4096, 4096)] {
+                let use_128 = m >= 4096 && n >= 4096;
+                let (bm, bn, warps, dyn_ptx, dyn_entry) = if use_128 {
+                    (INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128, int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz")
+                } else {
+                    (INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N, int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz")
+                };
+                if m % bm != 0 || n % bn != 0 {
+                    continue;
+                }
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
+                // bit-exact cross-check before timing (first law).
+                let csum = |v: &[i32]| v.iter().map(|&x| x as i64).sum::<i64>();
+                assert_eq!(
+                    csum(&gemm_nt_int8_static(g, &a_u8, &b, m, k, n).unwrap()),
+                    csum(&gemm_nt_int8_smdb(g, &a_u8, &b, m, k, n).unwrap()),
+                    "{m}x{k}x{n} static/dynamic checksum"
+                );
+                // Both raw-loaded (same JIT path) → the ratio isolates the baked-constants effect.
+                let ps = int8_gemm_smdb_swz_static_ptx(m, n, k, use_128);
+                let mod_s = g.ctx.load_module(ps.as_str().into()).unwrap();
+                let f_s = mod_s.load_function(int8_gemm_smdb_swz_static_entry(use_128)).unwrap();
+                let mod_d = g.ctx.load_module(dyn_ptx.into()).unwrap();
+                let f_d = mod_d.load_function(dyn_entry).unwrap();
+                let s_static = best_of(ROUNDS, || time_gemm_int8(g, &f_s, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_dyn = best_of(ROUNDS, || time_gemm_int8(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                eprintln!(
+                    "{m}x{k}x{n} int8 static-vs-dynamic (same raw-JIT load, M/N/K baked): dynamic {:>7.0} GFLOP/s | static {:>7.0} = {:.3}× speedup",
+                    flop / s_dyn / 1e9,
+                    flop / s_static / 1e9,
+                    s_dyn / s_static,
+                );
             }
         });
     }
