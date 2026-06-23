@@ -184,9 +184,10 @@ pub(crate) fn exp1(x: f32) -> f32 {
 }
 
 /// `ln(x)` for `x > 0` (≈1 ULP), Cephes single-precision: decompose `x = m·2^e`, a degree-8 minimax
-/// poly for `log(m)`, add back `e·ln2` with the same hi/lo split `exp` uses.
+/// poly for `log(m)`, add back `e·ln2` with the same hi/lo split `exp` uses. `pub(crate)` so the fused
+/// log-softmax kernel (`norm.rs`) can take the log of its row sum through the identical scalar log.
 #[inline]
-fn log1(x: f32) -> f32 {
+pub(crate) fn log1(x: f32) -> f32 {
     let bits = x.to_bits() as i32;
     let epart = bits & 0x7F80_0000;
     let efield = (epart as f32) * INV_2P23;
