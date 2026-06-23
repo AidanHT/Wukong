@@ -39,6 +39,14 @@ naively-written source:
   recognizer also handles the **batched** form (a matmul nest under a batch loop, each index carrying
   a per-batch offset `x[h*S*D + …]`) — so **multi-head attention** dispatches one tuned GEMM per head,
   for both its `Q·Kᵀ` and `P·V` matmuls.
+- **Transposed-A weight-gradient dispatch (`C = Aᵀ·B`).** The training backward pass needs
+  `dW = dYᵀ·X`, where the contraction (batch) axis is the *outer* index of both operands — so A's
+  logical `[m,k]` operand is the transpose of its `[k,m]` storage and the inner loop reads A
+  column-strided (one cache line per element), which gcc/rustc cannot vectorize. Mercury recognizes
+  `a[k*M+i]·b[k*N+j]` and dispatches to `mercury_sgemm_tn`, which transposes A into scratch once —
+  O(m·k), ~1/n of the O(m·n·k) GEMM — then runs the *same* tuned NN microkernel. The automatic
+  transpose-prepass-then-tile is precisely the lowering gcc won't do for the idiomatic nest; the
+  result is bit-for-bit the kernel the interpreter oracle marshals (no new accumulation order).
 - **int8 quantized `nn.Linear` dispatch.** The quantized-inference GEMM — `u8` activations × `i8`
   weights → an `i32` accumulator (`C = A·Bᵀ`, the QNNPACK/oneDNN layout) — is recognized and lowered
   to an **AVX-VNNI `vpdpbusd`** microkernel, register-blocked four B-rows at a time (and the
@@ -156,6 +164,27 @@ there (a measured fix — naive threading at that size was a net *loss*).
 C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 GFLOP/s, latency-bound),
 while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
 magnitude gap (caused by C's serial reduction, not a strided-access strawman; see Fairness notes).
+
+### Weight-gradient `C = Aᵀ·B` — the training backward GEMM Mercury dispatches, gcc cannot
+
+The backward pass computes `dW = dYᵀ·X`: the contraction (batch) axis is the **outer** index of both
+operands, so A is stored `[k,m]` and the idiomatic nest reads it **column-strided** (`a[k*M+i]`, one
+cache line per element). Mercury recognizes `a[k*M+i]·b[k*N+j]` and dispatches to `mercury_sgemm_tn`,
+which transposes A into scratch once (O(m·k), ~1/n of the GEMM) then runs the *same* tuned NN kernel.
+
+| size  | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+|-------|-----------|---------------|---------|------|-------------|---------------|
+| 256²  | ~46 | ~48 | ~1.1 | ~1.1 | **~42×** | **~44×** |
+| 512²  | ~55 | ~84 | ~1.1 | ~1.2 | **~48×** | **~74×** |
+| 1024² | ~39 | ~135 | ~0.3 | ~0.3 | **~128×** | **~445×** |
+
+Two effects compound here, and honesty requires separating them. The idiomatic C falls to ~0.3–1.1
+GFLOP/s because the column-strided A reads defeat vectorization **and** the dot-product reduction stays
+serial — so the raw ratio is inflated by the strided access. A *hand-transposed* C (transpose A first,
+the very thing Mercury does automatically) would recover the ~4–5 GFLOP/s serial-reduction baseline of
+the `nn.Linear` row — still ~10× behind Mercury's tiled kernel. So the durable domain-lowering win is
+~10× even against optimized C; the larger headline numbers are what you get versus the code a person
+actually writes for `dW`. (Single-run, clock-sensitive absolute GFLOP/s; the ratio is the stable part.)
 
 ### Convolution — im2col + GEMM vs idiomatic direct conv
 

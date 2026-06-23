@@ -48,7 +48,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   params/locals): the recognizer checks strides symbolically, so a general matmul function dispatches
   to the kernel, not just fixed-size benchmark kernels. The two factors may even be the **same array**
   (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` sharing a buffer) — both sides are read-only. The
-  interpreter calls the identical kernel (marshalling its memory), so the two stay bit-exact.
+  interpreter calls the identical kernel (marshalling its memory), so the two stay bit-exact. The
+  **transposed-A weight-gradient** form `C = Aᵀ·B` (`dW = dYᵀ·X`, A stored `[k,m]` with the
+  contraction axis outermost) is recognized too and dispatched to `mercury_sgemm_tn`, which transposes
+  A once then reuses the same NN microkernel — so the training backward pass leaves the scalar nest
+  (`tests/run/matmul_tn.mer`).
 - **Batched matmul → per-head GEMM dispatch**: a matmul nest wrapped in a batch loop, with each index
   carrying a per-batch base offset (`x[h*S*D + i*K + k]` — the shape of **multi-head attention**, one
   matmul per head), also dispatches. The recognizer peels the offset off each flattened index (it

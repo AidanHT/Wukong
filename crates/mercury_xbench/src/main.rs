@@ -189,6 +189,9 @@ fn main() {
     if want("linear") {
         bench_linear(&cc, &dir, roof);
     }
+    if want("matmul_tn") {
+        bench_matmul_tn(&cc, &dir, roof);
+    }
     if want("conv") {
         bench_conv(&cc, &dir);
     }
@@ -343,6 +346,142 @@ fn rust_matmul(ns: usize) -> String {
          \x20   for k in 0..NS {{\n\
          \x20     let aik=*a.add(i*NS+k);\n\
          \x20     for j in 0..NS {{ *c.add(i*NS+j)+=aik* *b.add(k*NS+j); }}\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
+    )
+}
+
+/// `C = Aᵀ·B` — the **weight-gradient** GEMM of a training backward pass (`dW = dYᵀ·X`). A is stored
+/// `[K, M]` (the contraction/batch axis is the OUTER index of A's storage), so its logical operand is
+/// the transpose of its layout. Mercury recognizes `a[k*M+i]*b[k*N+j]` and dispatches to
+/// `mercury_sgemm_tn` (transpose A once, then the tuned NN kernel); idiomatic C/Rust compile the
+/// column-strided A reads (one cache line per element) as a near-scalar k-loop gcc cannot vectorize —
+/// the regime the domain lowering should dominate hardest. Square M=K=N for the shared-buffer ABI.
+fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
+    let _ = roof;
+    for ns in [256usize, 512, 1024] {
+        let n2 = ns * ns;
+        let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+        let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
+        let mut c = vec![0.0f32; n2];
+        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+        let flops = 2.0 * (ns as f64).powi(3);
+        println!(
+            "=== matmul_tn {ns}x{ns} (C=Aᵀ·B, the dW weight-gradient; GFLOP/s, higher is better) ==="
+        );
+        let gflops = |m: &Option<Measure>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", flops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        let mer = bench_mercury(&mer_matmul_tn(ns, false), &mut c, ap, bp, cp);
+        let mer_par = bench_mercury(&mer_matmul_tn(ns, true), &mut c, ap, bp, cp);
+        let cm = bench_external(
+            "c",
+            &c_matmul_tn(ns),
+            dir,
+            "matmul_tn",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_matmul_tn(ns),
+            dir,
+            "matmul_tn",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GFLOP/s",
+            gflops(&mer),
+            gflops(&mer_par),
+            gflops(&cm),
+            gflops(&rm)
+        );
+        // Cross-language correctness: the transpose-once-then-NN result must match the naive nest.
+        if let (Some(m), Some(c)) = (&mer, &cm) {
+            let (rel, at) = max_rel_err(&m.out, &c.out);
+            if rel > 1e-3 {
+                println!(
+                    "  ! full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                    m.out[at], c.out[at], rel
+                );
+            }
+        }
+        if let (Some(ms), Some(c)) = (&mer, &cm) {
+            let r = c.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core (SIMD) is {:.2}x {} than C single-threaded",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c)) = (&mer_par, &cm) {
+            let r = c.ns_per_call / mp.ns_per_call;
+            println!(
+                "  -> Mercury @parallel is {:.2}x {} than idiomatic single-threaded C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        println!();
+    }
+}
+
+/// `ijk` dot-product `C = Aᵀ·B`: A indexed `a[k*NS+i]` (transposed — k is A's outer index), B
+/// `b[k*NS+j]` (normal). Mercury folds this to `mercury_sgemm_tn[_parallel]`. Optionally `@parallel`.
+fn mer_matmul_tn(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{\n\
+         \x20           let mut s: f32 = 0.0;\n\
+         \x20           for k in 0..{ns} {{\n\
+         \x20               s = s + a[k * {ns} + i] * b[k * {ns} + j];\n\
+         \x20           }}\n\
+         \x20           c[i * {ns} + j] = s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_matmul_tn(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         \x20 for (long i=0;i<NS;i++){{\n\
+         \x20   for (long j=0;j<NS;j++){{\n\
+         \x20     float s=0.0f;\n\
+         \x20     for (long k=0;k<NS;k++) s += a[k*NS+i]*b[k*NS+j];\n\
+         \x20     c[i*NS+j]=s;\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
+    )
+}
+
+fn rust_matmul_tn(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{\n\
+         \x20     let mut s=0.0f32;\n\
+         \x20     for k in 0..NS {{ s += *a.add(k*NS+i) * *b.add(k*NS+j); }}\n\
+         \x20     *c.add(i*NS+j)=s;\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
     )
