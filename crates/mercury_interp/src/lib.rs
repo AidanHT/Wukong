@@ -1539,21 +1539,29 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
-            // `mercury_sgemm_{bf16,f16}_nt[_parallel](a, b, c, m, k, n, beta)` — the low-precision
-            // `C = A·Bᵀ` GEMM (bf16/f16 inputs stored as `u16` bits, f32 accumulate, f32 output) a
-            // matmul nest over `[bf16; _]`/`[f16; _]` operands lowers to. Reconstruct the exact stored
-            // 16 bits of each input via `f32_to_{bf16,f16}_bits` (idempotent on an already-rounded
-            // value, so the buffer is bit-identical to the native backend's 2-byte storage — same as
-            // the bf16/f16 reductions/axpby), marshal the f32 `c` output exactly like `mercury_sgemm_nt`
-            // does, and call the *serial* runtime kernel for BOTH the serial and `_parallel` names: the
-            // runtime pins serial == parallel == interpreter bit-for-bit (rows independent, identical
-            // per-(i,j) accumulation order), and the interpreter is the oracle, so the differential gate
-            // stays exact despite the kernel's wider/reassociated accumulation.
+            // `mercury_sgemm_{bf16,f16}_{nt,tn}[_parallel](a, b, c, m, k, n, beta)` — the low-precision
+            // GEMM (bf16/f16 inputs stored as `u16` bits, f32 accumulate, f32 output) a matmul nest over
+            // `[bf16; _]`/`[f16; _]` operands lowers to: NT = `C = A·Bᵀ` (nn.Linear forward), TN =
+            // `C = Aᵀ·B` (the `dW = dYᵀ·X` weight gradient). The flat operand element counts are the
+            // same either way (A is m·k, B is n·k regardless of layout — only the kernel's stride
+            // interpretation differs), so the marshalling is identical; only the runtime fn called
+            // differs. Reconstruct the exact stored 16 bits of each input via `f32_to_{bf16,f16}_bits`
+            // (idempotent on an already-rounded value, so the buffer is bit-identical to the native
+            // backend's 2-byte storage — same as the bf16/f16 reductions/axpby), marshal the f32 `c`
+            // output exactly like `mercury_sgemm_nt`, and call the *serial* runtime kernel for BOTH the
+            // serial and `_parallel` names: the runtime pins serial == parallel == interpreter
+            // bit-for-bit, and the interpreter is the oracle, so the differential gate stays exact
+            // despite the kernel's wider/reassociated accumulation.
             "mercury_sgemm_bf16_nt"
             | "mercury_sgemm_bf16_nt_parallel"
             | "mercury_sgemm_f16_nt"
-            | "mercury_sgemm_f16_nt_parallel" => {
+            | "mercury_sgemm_f16_nt_parallel"
+            | "mercury_sgemm_bf16_tn"
+            | "mercury_sgemm_bf16_tn_parallel"
+            | "mercury_sgemm_f16_tn"
+            | "mercury_sgemm_f16_tn_parallel" => {
                 let is_f16 = name.contains("_f16");
+                let is_tn = name.contains("_tn");
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -1586,28 +1594,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                     bbuf.push(bits(b, t)?);
                 }
                 let mut cbuf = vec![0.0f32; m * n];
+                let (ai, ki, ni) = (m as i64, k as i64, n as i64);
+                let (ap, bp, cp) = (abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr());
                 // SAFETY: abuf is m*k, bbuf is n*k u16; cbuf is m*n f32 — the kernels' contract.
+                // (TN reads A as [k,m] and B as [k,n], but those have the same flat element counts.)
                 unsafe {
-                    if is_f16 {
-                        mercury_runtime::mercury_sgemm_f16_nt(
-                            abuf.as_ptr(),
-                            bbuf.as_ptr(),
-                            cbuf.as_mut_ptr(),
-                            m as i64,
-                            k as i64,
-                            n as i64,
-                            beta,
-                        );
-                    } else {
-                        mercury_runtime::mercury_sgemm_bf16_nt(
-                            abuf.as_ptr(),
-                            bbuf.as_ptr(),
-                            cbuf.as_mut_ptr(),
-                            m as i64,
-                            k as i64,
-                            n as i64,
-                            beta,
-                        );
+                    match (is_f16, is_tn) {
+                        (false, false) => mercury_runtime::mercury_sgemm_bf16_nt(ap, bp, cp, ai, ki, ni, beta),
+                        (true, false) => mercury_runtime::mercury_sgemm_f16_nt(ap, bp, cp, ai, ki, ni, beta),
+                        (false, true) => mercury_runtime::mercury_sgemm_bf16_tn(ap, bp, cp, ai, ki, ni, beta),
+                        (true, true) => mercury_runtime::mercury_sgemm_f16_tn(ap, bp, cp, ai, ki, ni, beta),
                     }
                 }
                 for (t, &val) in cbuf.iter().enumerate() {
