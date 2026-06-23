@@ -72,6 +72,8 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `dst` with stride `R` (a cache miss per element for large `R`) and gcc/rustc do not loop-tile it at
   `-O3`, so the blocked kernel wins ~1.5× single-core / ~9–14× `@parallel` on this memory-bound layout
   op (attention score / weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.mer`).
+  **bf16/f16** transposes dispatch to the same blocked kernel at 16-bit width (`mercury_transpose_u16`, one
+  kernel for both — a transpose moves the raw bits) for the half-precision KV/attention layouts (`transpose_bf16.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
   dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
   its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full
