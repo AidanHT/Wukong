@@ -253,6 +253,78 @@ pub fn quantize_e4m3_scaled(x: f32, recip: f32) -> u8 {
     crate::ptx_fp8::f32_to_e4m3(x * recip)
 }
 
+/// Generate a **device-resident delayed-scaling quantize** kernel `out[i] = fp8(x[i]·recip)` using Ada's
+/// hardware packed-fp8 converter `cvt.rn.satfinite.{fmt}.f32` (`fmt` = `e5m2x2` or `e4m3x2`) — two f32
+/// per `cvt` (a→high byte, b→low byte), so each thread handles an even pair and stores a `.b16` (the
+/// pair of fp8 bytes). Keeps the whole fp8 quantization on-GPU (no host round-trip) — the residency the
+/// fp8 training step needs. Grid-strided over `N/2` pairs; requires N even. Entry `{entry}`.
+fn gen_quantize_scaled(entry: &str, fmt: &str) -> String {
+    format!(
+        r#".version 8.4
+.target sm_89
+.address_size 64
+
+.visible .entry {entry}(
+    .param .u32 pN,
+    .param .u64 pX,
+    .param .u64 pOut,
+    .param .f32 pRecip
+)
+{{
+    .reg .pred %p;
+    .reg .b32 %n,%nh,%gid,%stride,%i2,%tix,%bid,%ntx,%nb;
+    .reg .f32 %recip,%va,%vb;
+    .reg .b16 %packed;
+    .reg .b64 %X,%O,%off,%ptr;
+    ld.param.u32 %n,[pN];
+    ld.param.u64 %X,[pX];
+    ld.param.u64 %O,[pOut];
+    ld.param.f32 %recip,[pRecip];
+    cvta.to.global.u64 %X,%X;
+    cvta.to.global.u64 %O,%O;
+    mov.u32 %tix,%tid.x;
+    mov.u32 %bid,%ctaid.x;
+    mov.u32 %ntx,%ntid.x;
+    mov.u32 %nb,%nctaid.x;
+    mul.lo.u32 %gid,%bid,%ntx;
+    add.u32 %gid,%gid,%tix;
+    mul.lo.u32 %stride,%nb,%ntx;
+    shr.u32 %nh,%n,1;
+Q_{entry}:
+    setp.ge.u32 %p,%gid,%nh;
+    @%p bra QE_{entry};
+    mul.lo.u32 %i2,%gid,2;
+    mul.wide.u32 %off,%i2,4;
+    add.s64 %ptr,%X,%off;
+    ld.global.f32 %vb,[%ptr];        // element 2*gid -> low byte of the pair
+    ld.global.f32 %va,[%ptr+4];      // element 2*gid+1 -> high byte
+    mul.f32 %vb,%vb,%recip;
+    mul.f32 %va,%va,%recip;
+    cvt.rn.satfinite.{fmt}.f32 %packed,%va,%vb;   // d[15:8]=fp8(va), d[7:0]=fp8(vb)
+    cvt.u64.u32 %off,%i2;            // 1 byte/elem => byte offset == element index
+    add.s64 %ptr,%O,%off;
+    st.global.b16 [%ptr],%packed;    // little-endian: out[2*gid]=fp8(vb), out[2*gid+1]=fp8(va)
+    add.u32 %gid,%gid,%stride;
+    bra Q_{entry};
+QE_{entry}:
+    ret;
+}}
+"#
+    )
+}
+
+/// Device delayed-scaling quantize to **E5M2** (`out[i] = e5m2(x[i]·recip)`, entry `quantize_scaled_e5m2`).
+pub fn quantize_scaled_e5m2_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_quantize_scaled("quantize_scaled_e5m2", "e5m2x2")).as_str()
+}
+
+/// Device delayed-scaling quantize to **E4M3** (`out[i] = e4m3(x[i]·recip)`, entry `quantize_scaled_e4m3`).
+pub fn quantize_scaled_e4m3_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_quantize_scaled("quantize_scaled_e4m3", "e4m3x2")).as_str()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
