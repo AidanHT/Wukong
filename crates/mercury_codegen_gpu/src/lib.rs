@@ -46,6 +46,11 @@ pub mod ptx_conv;
 #[cfg(feature = "gpu")]
 pub mod ptx_fp8;
 
+// M7 runtime (Phase 7): device memory pool + CUDA-graph capture/replay. New, single-owner files;
+// they wrap the existing launchers without touching a kernel.
+#[cfg(feature = "gpu")]
+pub mod pool;
+
 /// General MIR->PTX lowering (Phase 4): a real `Backend` that consumes MIR and emits PTX, so
 /// *arbitrary* Mercury programs run on the GPU — recognized ops still dispatch to the tuned kernels
 /// as a fast path, everything else lowers generally. Additive to the existing recognizer-offload
