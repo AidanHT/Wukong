@@ -562,6 +562,52 @@ pub fn gemm_nt_f16_sm(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **Static-shape fp16 SMEM-staged GEMM** `C = A·Bᵀ` — the M1 compile-time-shapes lever for fp16 (the
+/// twin of [`gemm_nt_w4a16_static`] / [`gemm_nt_int8_static`]). Bakes M/N/K into the `wmma_nt_f16_sm`
+/// kernel ([`crate::ptx_wmma::wmma_f16_sm_static_ptx`]) so ptxas constant-folds the hot-loop strides and
+/// knows the K trip count; picks the 64×64 / 128×128 tile by the large-size regime rule. **Bit-exact**
+/// vs the dynamic `_sm` kernel (identical codegen, only the dims are constants); per-shape PTX built +
+/// raw-loaded here. Requires M%bm==0, N%bn==0, K%16==0.
+pub fn gemm_nt_f16_static(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_wmma::{SM128_BM, SM128_BN, SM128_THREADS, SM_BM, SM_BN, SM_THREADS};
+    use half::f16;
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(k % 16 == 0, "gemm_nt_f16_static requires K%16==0");
+    let use_128 = m >= 4096 && n >= 4096 && m % SM128_BM == 0 && n % SM128_BN == 0;
+    let (bm, bn, threads) = if use_128 {
+        (SM128_BM, SM128_BN, SM128_THREADS)
+    } else {
+        (SM_BM, SM_BN, SM_THREADS)
+    };
+    assert!(m % bm == 0 && n % bn == 0, "gemm_nt_f16_static requires M%{bm}==0, N%{bn}==0");
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let ptx = crate::ptx_wmma::wmma_f16_sm_static_ptx(m, n, k, use_128);
+    let module = g.ctx.load_module(ptx.as_str().into())?;
+    let f = module.load_function(crate::ptx_wmma::wmma_f16_sm_static_entry(use_128))?;
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n / bn) as u32, (m / bm) as u32, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// `C = A·Bᵀ` (fp16-in, f32-out) via the **single-buffered 128×128** SMEM-staged kernel
 /// `wmma_nt_f16_sm128` — the big-tile, no-cp.async large-GEMM path. The clean scoreboard shows the
 /// double-buffered kernels are occupancy-bound and lose to the un-pipelined ones once A/B spill L2;
@@ -10993,6 +11039,123 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let s_dyn = best_of(ROUNDS, || time_gemm_int8(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50));
                 eprintln!(
                     "{m}x{k}x{n} int8 static-vs-dynamic (same raw-JIT load, M/N/K baked): dynamic {:>7.0} GFLOP/s | static {:>7.0} = {:.3}× speedup",
+                    flop / s_dyn / 1e9,
+                    flop / s_static / 1e9,
+                    s_dyn / s_static,
+                );
+            }
+        });
+    }
+
+    /// **Static-shape fp16 gate (M1, first law).** `gemm_nt_f16_static` bakes M/N/K into the SMEM-staged
+    /// `wmma_nt_f16_sm` kernel; only the dim *constants* change vs the dynamic kernel and the f32
+    /// accumulation order is unchanged, so it must match the dynamic `gemm_nt_f16_sm`/`_sm128` EXACTLY
+    /// (bit-for-bit). 64×64 via the public launcher; 128×128 entry directly (the dispatch only picks it
+    /// at M,N≥4096). K multiples of 16.
+    #[test]
+    fn f16_static_matches_reference() {
+        use crate::ptx_wmma::{
+            wmma_f16_sm_static_entry, wmma_f16_sm_static_ptx, SM128_BM, SM128_BN, SM128_THREADS,
+        };
+        use half::f16;
+        with_gpu("f16_static", |g| {
+            let mut rng = crate::diff::Rng::new(0x6111);
+            // 64×64 static via the public launcher == the dynamic _sm kernel, bit-exact (same f16 codegen).
+            for (m, k, n) in [(64usize, 16usize, 64usize), (128, 64, 192), (192, 32, 128), (256, 80, 256)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let cs = gemm_nt_f16_static(g, &a, &b, m, k, n).unwrap();
+                let cd = gemm_nt_f16_sm(g, &a, &b, m, k, n).unwrap();
+                assert_eq!(cs, cd, "f16_static vs dynamic _sm {m}x{k}x{n}");
+            }
+            // 128×128 static entry directly (small shape; the dispatch only selects it at ≥4096²).
+            for (m, k, n) in [(128usize, 16usize, 128usize), (256, 64, 256)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let cd = gemm_nt_f16_sm128(g, &a, &b, m, k, n).unwrap();
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let ptx = wmma_f16_sm_static_ptx(m, n, k, true);
+                let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                let f = module.load_function(wmma_f16_sm_static_entry(true)).unwrap();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let cfg = LaunchConfig {
+                    grid_dim: ((n / SM128_BN) as u32, (m / SM128_BM) as u32, 1),
+                    block_dim: (SM128_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                assert_eq!(g.stream.memcpy_dtov(&c_d).unwrap(), cd, "f16_static128 vs dynamic _sm128 {m}x{k}x{n}");
+            }
+            eprintln!("[gate] fp16 static-shape (64 & 128) bit-exact vs the dynamic _sm kernel ✓");
+        });
+    }
+
+    /// **Static-shape fp16 A/B (M1 lever, contention-robust internal ratio).** Times the static-shape
+    /// `_sm` kernel (M/N/K baked) against the dynamic one, same-run, BOTH raw-loaded the same way (the
+    /// int4 confound). Expect ≥1×, biggest in the latency-bound thin-M regime (the int8 twin measured
+    /// up to 1.37× there). f16 GEMM is deterministic so a checksum cross-check guards correctness first.
+    #[test]
+    #[ignore = "throughput A/B; run explicitly (GPU; no DLLs needed)"]
+    fn f16_static_vs_dynamic_ab() {
+        use crate::baselines::gemm_flop;
+        use crate::ptx_wmma::{
+            wmma_f16_ptx, wmma_f16_sm_static_entry, wmma_f16_sm_static_ptx, SM128_BM, SM128_BN,
+            SM128_THREADS, SM_BM, SM_BN, SM_THREADS,
+        };
+        use half::f16;
+        with_gpu("f16_static_ab", |g| {
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x6817);
+            const ROUNDS: usize = 8;
+            for (m, k, n) in [(1024usize, 1024usize, 1024usize), (2048, 2048, 2048), (4096, 4096, 4096), (256, 4096, 4096)] {
+                let use_128 = m >= 4096 && n >= 4096;
+                let (bm, bn, threads, dyn_entry) = if use_128 {
+                    (SM128_BM, SM128_BN, SM128_THREADS, "wmma_nt_f16_sm128")
+                } else {
+                    (SM_BM, SM_BN, SM_THREADS, "wmma_nt_f16_sm")
+                };
+                if m % bm != 0 || n % bn != 0 {
+                    continue;
+                }
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let cfg = LaunchConfig {
+                    grid_dim: ((n / bn) as u32, (m / bm) as u32, 1),
+                    block_dim: (threads as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // bit-exact checksum cross-check (static == dynamic) before timing.
+                let csum = |v: &[f32]| v.iter().map(|x| *x as f64).sum::<f64>();
+                assert!(
+                    (csum(&gemm_nt_f16_static(g, &a, &b, m, k, n).unwrap())
+                        - csum(&gemm_nt_f16_sm(g, &a, &b, m, k, n).unwrap()))
+                    .abs()
+                        < 1.0,
+                    "{m}x{k}x{n} f16 static/dynamic checksum"
+                );
+                // Both raw-loaded (same JIT path) → the ratio isolates the baked-constants effect.
+                let ps = wmma_f16_sm_static_ptx(m, n, k, use_128);
+                let mod_s = g.ctx.load_module(ps.as_str().into()).unwrap();
+                let f_s = mod_s.load_function(wmma_f16_sm_static_entry(use_128)).unwrap();
+                let mod_d = g.ctx.load_module(wmma_f16_ptx().into()).unwrap();
+                let f_d = mod_d.load_function(dyn_entry).unwrap();
+                let s_static = best_of(ROUNDS, || time_wmma(g, &f_s, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                let s_dyn = best_of(ROUNDS, || time_wmma(g, &f_d, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                eprintln!(
+                    "{m}x{k}x{n} f16 static-vs-dynamic (same raw-JIT load, M/N/K baked): dynamic {:>7.0} GFLOP/s | static {:>7.0} = {:.3}× speedup",
                     flop / s_dyn / 1e9,
                     flop / s_static / 1e9,
                     s_dyn / s_static,

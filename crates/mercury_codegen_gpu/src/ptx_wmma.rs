@@ -277,7 +277,18 @@ pub fn pipe_variant(name: &str) -> &'static PipeCfg {
 /// CTA stages a `bm×SM_BK` tile of A and a `bn×SM_BK` tile of B, with a `warps_m×warps_n` warp grid
 /// each owning a `(bm/warps_m)×(bn/warps_n)` sub-tile. `bm`,`bn` must be 16-multiples and the staging
 /// requires `bm·SM_BK` and `bn·SM_BK` to be whole multiples of `threads·8` (8 f16 per vectorized load).
-fn entry_smem(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, warps_n: usize) -> String {
+fn entry_smem(
+    name: &str,
+    ty: &str,
+    bm: usize,
+    bn: usize,
+    warps_m: usize,
+    warps_n: usize,
+    static_dims: Option<(usize, usize, usize)>,
+) -> String {
+    if let Some((m, n, k)) = static_dims {
+        assert!(m % bm == 0 && n % bn == 0 && k % SM_BK == 0, "{name}: static dims must tile the kernel");
+    }
     let mma_ty = if ty == "f16" {
         "f32.f32".to_string()
     } else {
@@ -330,7 +341,18 @@ fn entry_smem(name: &str, ty: &str, bm: usize, bn: usize, warps_m: usize, warps_
     s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
     s += "    .reg .b64 %A,%B,%C,%off,%gp,%gptr,%cptr;\n";
 
-    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    // Static-shape specialization (Mercury's compile-time-shapes lever): bake M/N/K as constants so
+    // ptxas constant-folds/strength-reduces the hot-loop strides (`×K`/`×N` → shifts for power-of-two
+    // dims) and knows the K-loop trip count. Dynamic loads from params. Identical signature ⇒ the
+    // launcher is unchanged; identical arithmetic ⇒ bit-exact vs the dynamic kernel.
+    match static_dims {
+        Some((m, n, k)) => {
+            s += &format!("    mov.u32 %M,{m};\n    mov.u32 %N,{n};\n    mov.u32 %K,{k};\n");
+        }
+        None => {
+            s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+        }
+    }
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
@@ -1739,6 +1761,26 @@ fn roofline_entry() -> String {
     s
 }
 
+/// **Static-shape fp16 SMEM-staged GEMM** — the M1 compile-time-shapes lever for fp16 (the twin of the
+/// int8/int4 static kernels). Bakes M/N/K into the `wmma_nt_f16_sm` tile so ptxas constant-folds the
+/// hot-loop strides (`×K`/`×N`) and knows the K trip count; 64×64 (`wmma_nt_f16_sm_static`) or 128×128
+/// (`wmma_nt_f16_sm128_static`) per `use_128`. Returns an owned per-shape module (the caller caches it
+/// under a shape-keyed key / raw-loads it). Identical codegen to the dynamic `_sm` kernel ⇒ **bit-exact**.
+pub fn wmma_f16_sm_static_ptx(m: usize, n: usize, k: usize, use_128: bool) -> String {
+    let mut s = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+    if use_128 {
+        s += &entry_smem("wmma_nt_f16_sm128_static", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N, Some((m, n, k)));
+    } else {
+        s += &entry_smem("wmma_nt_f16_sm_static", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Some((m, n, k)));
+    }
+    s
+}
+
+/// Entry name for [`wmma_f16_sm_static_ptx`] at the matching `use_128`.
+pub fn wmma_f16_sm_static_entry(use_128: bool) -> &'static str {
+    if use_128 { "wmma_nt_f16_sm128_static" } else { "wmma_nt_f16_sm_static" }
+}
+
 /// fp16 tensor-core GEMM module: `wmma_nt_f16` (single 16×16 tile/warp, any 16-multiple dims) and
 /// `wmma_nt_f16_mt` (2×4 tiles/warp = 32×64, fragment-reuse, the fast path for large GEMMs).
 pub fn wmma_f16_ptx() -> &'static str {
@@ -1747,12 +1789,12 @@ pub fn wmma_f16_ptx() -> &'static str {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         m += &entry("wmma_nt_f16", "f16", 1, 1);
         m += &entry("wmma_nt_f16_mt", "f16", TM_TILES, TN_TILES);
-        m += &entry_smem("wmma_nt_f16_sm", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N);
+        m += &entry_smem("wmma_nt_f16_sm", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, None);
         // Single-buffered 128×128 tile (no cp.async pipeline). At L2-spilling sizes the double-buffered
         // kernels are occupancy-bound and LOSE to the un-pipelined ones (measured: _sm beats _sm_db at
         // 2048³); the big tile halves redundant inter-CTA traffic while single-buffering avoids the
         // pipeline's extra SMEM + bar.syncs — the large-GEMM candidate the clean scoreboard motivates.
-        m += &entry_smem("wmma_nt_f16_sm128", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N);
+        m += &entry_smem("wmma_nt_f16_sm128", "f16", SM128_BM, SM128_BN, SM128_WARPS_M, SM128_WARPS_N, None);
         m += &entry_smem_db("wmma_nt_f16_sm_db", "f16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         m += &entry_smem_db(
             "wmma_nt_f16_sm128_db",
