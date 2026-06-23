@@ -98,6 +98,8 @@ const RT_NORM_AFFINE: &str = "mercury_norm_affine_f32";
 const RT_NORM_AFFINE_PARALLEL: &str = "mercury_norm_affine_f32_parallel";
 const RT_I8GEMM_NT: &str = "mercury_i8gemm_nt";
 const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
+const RT_I8GEMM_NT_DEQ: &str = "mercury_i8gemm_nt_deq";
+const RT_I8GEMM_NT_DEQ_PARALLEL: &str = "mercury_i8gemm_nt_deq_parallel";
 const RT_DOT_BF16: &str = "mercury_dot_bf16";
 const RT_SUM_BF16: &str = "mercury_sum_bf16";
 const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
@@ -975,6 +977,27 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[a, b, c, m, k, n]);
             return None;
         }
+        // The int8 quantized nn.Linear with fused dequant epilogue:
+        // mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n, scale_a, scale_b, bias, act) — three
+        // pointers, three i64, one f32 scalar (scale_a), two pointers (scale_b, bias; bias may be
+        // null), one i64 act code. Void.
+        if matches!(name, RT_I8GEMM_NT_DEQ | RT_I8GEMM_NT_DEQ_PARALLEL) && args.len() == 10 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let out = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let k = self.coerce_to_i64(args[4]);
+            let n = self.coerce_to_i64(args[5]);
+            let scale_a = self.val(args[6]);
+            let scale_b = self.val(args[7]);
+            let bias = self.val(args[8]);
+            let act = self.coerce_to_i64(args[9]);
+            let fref = self.rt_refs[name];
+            self.builder
+                .ins()
+                .call(fref, &[a, b, out, m, k, n, scale_a, scale_b, bias, act]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -1099,6 +1122,8 @@ struct RtFuncs {
     norm_affine_par: FuncId,
     i8nt: FuncId,
     i8nt_par: FuncId,
+    i8nt_deq: FuncId,
+    i8nt_deq_par: FuncId,
     dot_bf16: FuncId,
     sum_bf16: FuncId,
     reduce_bf16: FuncId,
@@ -1258,6 +1283,19 @@ fn populate_module<M: Module>(
     for _ in 0..3 {
         sig_i8gemm.params.push(AbiParam::new(types::I64));
     }
+    // mercury_i8gemm_nt_deq[_parallel](a, b, out: ptr, m, k, n: i64, scale_a: f32, scale_b, bias: ptr,
+    // act: i64) — int8 quantized nn.Linear with fused dequant epilogue (void).
+    let mut sig_i8gemm_deq = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_i8gemm_deq.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..3 {
+        sig_i8gemm_deq.params.push(AbiParam::new(types::I64));
+    }
+    sig_i8gemm_deq.params.push(AbiParam::new(types::F32));
+    sig_i8gemm_deq.params.push(AbiParam::new(ptr_ty));
+    sig_i8gemm_deq.params.push(AbiParam::new(ptr_ty));
+    sig_i8gemm_deq.params.push(AbiParam::new(types::I64));
     // mercury_dot_bf16(x, y: ptr, n: i64) -> f32 — bf16 mixed-precision dot (f32 accumulate).
     let mut sig_dot_bf16 = Signature::new(call_conv);
     sig_dot_bf16.params.push(AbiParam::new(ptr_ty));
@@ -1381,6 +1419,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         i8nt_par: module
             .declare_function(RT_I8GEMM_NT_PARALLEL, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        i8nt_deq: module
+            .declare_function(RT_I8GEMM_NT_DEQ, Linkage::Import, &sig_i8gemm_deq)
+            .map_err(|e| e.to_string())?,
+        i8nt_deq_par: module
+            .declare_function(RT_I8GEMM_NT_DEQ_PARALLEL, Linkage::Import, &sig_i8gemm_deq)
             .map_err(|e| e.to_string())?,
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
@@ -1550,6 +1594,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_I8GEMM_NT_PARALLEL,
                 module.declare_func_in_func(rt.i8nt_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_I8GEMM_NT_DEQ,
+                module.declare_func_in_func(rt.i8nt_deq, builder.func),
+            );
+            rt_refs.insert(
+                RT_I8GEMM_NT_DEQ_PARALLEL,
+                module.declare_func_in_func(rt.i8nt_deq_par, builder.func),
             );
             rt_refs.insert(
                 RT_AXPBY_BF16,
@@ -1777,6 +1829,14 @@ pub fn jit_compile(
         RT_I8GEMM_NT_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_parallel as *const u8,
     );
+    builder.symbol(
+        RT_I8GEMM_NT_DEQ,
+        mercury_runtime::mercury_i8gemm_nt_deq as *const u8,
+    );
+    builder.symbol(
+        RT_I8GEMM_NT_DEQ_PARALLEL,
+        mercury_runtime::mercury_i8gemm_nt_deq_parallel as *const u8,
+    );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
     builder.symbol(
@@ -1945,6 +2005,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_I8GEMM_NT_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_I8GEMM_NT_DEQ,
+        mercury_runtime::mercury_i8gemm_nt_deq as *const u8,
+    );
+    builder.symbol(
+        RT_I8GEMM_NT_DEQ_PARALLEL,
+        mercury_runtime::mercury_i8gemm_nt_deq_parallel as *const u8,
     );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
