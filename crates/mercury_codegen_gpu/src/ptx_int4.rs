@@ -241,6 +241,7 @@ const BK: usize = 16;
 /// `(q-z)` unpack (extra `pZeros` param) over the symmetric signed path. `bm`,`bn` are 16-multiples;
 /// the A staging requires `bm·16` to be a whole multiple of `threads·8` (128-bit f16 loads) and the B
 /// staging requires `bn·16/8 = bn·2` to be a whole multiple of `threads` (one packed word per thread).
+#[allow(clippy::too_many_arguments)]
 fn entry_w4a16(
     name: &str,
     bm: usize,
@@ -249,8 +250,12 @@ fn entry_w4a16(
     warps_n: usize,
     group: usize,
     zero_point: bool,
+    static_dims: Option<(usize, usize, usize)>,
 ) -> String {
     assert!(group.is_power_of_two() && group % BK == 0, "group must be a power of two ≥ {BK}");
+    if let Some((m, n, k)) = static_dims {
+        assert!(m % bm == 0 && n % bn == 0 && k % group == 0, "static dims must tile the kernel");
+    }
     let nab = 8; // f16 WMMA a/b fragment is 8×.b32
     let threads = warps_m * warps_n * 32;
     let tm = bm / (16 * warps_m);
@@ -318,7 +323,18 @@ fn entry_w4a16(
     s += &format!("    .reg .b32 {};\n", decl_ab.trim_end_matches(','));
     s += "    .reg .b64 %A,%Bq,%Scl,%C,%off,%gp,%gptr,%cptr,%sptr,%wptr;\n";
 
-    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    // Static-shape specialization (Mercury's compile-time-shapes lever): bake M/N/K as constants so
+    // ptxas constant-folds and strength-reduces the hot-loop strides — every `mul.lo.s32 ...,%K` /
+    // `...,%N` and the K/8, K/group shifts become shifts/constants (e.g. ×4096 → <<12). Dynamic loads
+    // the dims from params. The signature is identical either way (the launcher is unchanged).
+    match static_dims {
+        Some((m, n, k)) => {
+            s += &format!("    mov.u32 %M,{m};\n    mov.u32 %N,{n};\n    mov.u32 %K,{k};\n");
+        }
+        None => {
+            s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+        }
+    }
     s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %Bq,[pBq];\n    ld.param.u64 %Scl,[pScales];\n    ld.param.u64 %C,[pC];\n";
     s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %Bq,%Bq;\n    cvta.to.global.u64 %Scl,%Scl;\n    cvta.to.global.u64 %C,%C;\n";
     if zero_point {
@@ -457,16 +473,35 @@ pub const W4_WARPS_N: usize = 2;
 pub const W4_THREADS: usize = W4_WARPS_M * W4_WARPS_N * 32;
 
 /// W4A16 module — entry `gemm_nt_w4a16` (symmetric signed int4) and `gemm_nt_w4a16_z` (asymmetric,
-/// zero-point), both the 64×64 SMEM-staged tensor-core tile with `GROUP_SIZE` baked in.
+/// zero-point), both the 64×64 SMEM-staged tensor-core tile with `GROUP_SIZE` baked in (the dims M/N/K
+/// stay runtime params).
 pub fn w4a16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
-        m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false);
-        m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true);
+        m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None);
+        m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true, None);
         m
     })
     .as_str()
+}
+
+/// **Static-shape-specialized** W4A16 module for the exact compile-time dims `(m,n,k)` — Mercury's
+/// no-library lever (§1A.2): the dims are baked as constants, so ptxas strength-reduces every hot-loop
+/// stride (`×K`, `×N`, `K/8`, `K/group`) to shifts/immediates (for power-of-two dims like 4096→`<<12`),
+/// where the dynamic kernel must keep them as register multiplies. One entry `gemm_nt_w4a16_static`
+/// (`_z` for the zero-point path). Returns an owned module string (per-shape ⇒ not interned); the
+/// driver JIT + the persistent cubin cache (M10) make the per-shape compile a one-time, cached cost.
+pub fn w4a16_static_ptx(m: usize, n: usize, k: usize, zero_point: bool) -> String {
+    let name = if zero_point { "gemm_nt_w4a16_static_z" } else { "gemm_nt_w4a16_static" };
+    let mut s = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+    s += &entry_w4a16(name, W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, zero_point, Some((m, n, k)));
+    s
+}
+
+/// Entry name for the static-shape kernel ([`w4a16_static_ptx`]); `_z` suffix for the zero-point path.
+pub fn w4a16_static_entry(zero_point: bool) -> &'static str {
+    if zero_point { "gemm_nt_w4a16_static_z" } else { "gemm_nt_w4a16_static" }
 }
 
 #[cfg(test)]
@@ -529,5 +564,12 @@ mod tests {
         assert!(ptx.contains(".visible .entry gemm_nt_w4a16("));
         assert!(ptx.contains(".visible .entry gemm_nt_w4a16_z("));
         assert!(ptx.contains("wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32"));
+        assert!(ptx.contains("lop3.b32"), "fast Marlin/AWQ unpack must use lop3");
+        // Static-shape module: ASCII, the right entry, and the dims baked as `mov` constants (not loaded
+        // from params) so ptxas can strength-reduce — e.g. K=4096 appears as an immediate.
+        let st = w4a16_static_ptx(64, 4096, 4096, false);
+        assert!(st.is_ascii(), "static PTX must be ASCII");
+        assert!(st.contains(".visible .entry gemm_nt_w4a16_static("));
+        assert!(st.contains("mov.u32 %K,4096;"), "static kernel must bake K as a constant");
     }
 }
