@@ -490,4 +490,113 @@ fn main() -> i32 {{
             single_t / mega_t,
         );
     }
+
+    /// **M13 — the megakernel's structural win: one launch vs the per-op library chain.** A workload
+    /// of `REPEAT` reductions is run two ways, same-run, same launcher (`try_run`), so the only
+    /// difference is launch structure:
+    ///  - **megakernel**: the whole `REPEAT`-loop program in ONE launch, data resident in the shared
+    ///    frame across every reduction (zero per-op launches / re-marshaling);
+    ///  - **per-op chain (the offload / library model)**: a single-reduction program launched `REPEAT`
+    ///    times — each op its own launch that re-materializes its inputs, exactly what the
+    ///    `--backend=gpu` `GpuAccel` path does (per-call H2D + launch + D2H, no residency).
+    ///
+    /// The ratio (chain / mega) is the launch-overhead + residency win a kernel library *cannot* get
+    /// without fusing the whole graph (Mirage/FlashFormer-class). Reported as a clock-invariant ratio
+    /// only; correctness is the loop program's `acc = REPEAT*N` vs the chain's per-launch `N` summed.
+    #[test]
+    #[ignore = "perf bench (M13); run with --ignored --nocapture"]
+    fn mega_vs_chain_reduce() {
+        use std::time::Instant;
+        if crate::gpu::gpu().is_none() {
+            eprintln!("skip mega_vs_chain_reduce: no CUDA device");
+            return;
+        }
+        const N: usize = 4096;
+        const REPEAT: usize = 400;
+        // Loop program: the whole chain in one megakernel launch. acc = REPEAT*N (dot of ones).
+        let loop_src = format!(
+            r#"module bench
+@parallel
+fn dotp(x: [f32; {N}], y: [f32; {N}], o: [f32; 1]) {{
+    let mut s: f32 = 0.0;
+    for k in 0..{N} {{ s = s + x[k] * y[k]; }}
+    o[0] = s;
+}}
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [1.0; {N}];
+    let mut y: [f32; {N}] = [1.0; {N}];
+    let mut o: [f32; 1] = [0.0; 1];
+    let mut acc: f32 = 0.0;
+    let mut r: i32 = 0;
+    while r < {REPEAT} {{ dotp(x, y, o); acc = acc + o[0]; r = r + 1; }}
+    print(acc as i32);
+    return 0;
+}}
+"#
+        );
+        // Single-op program: one reduction per launch (the per-op chain element). prints N.
+        let one_src = format!(
+            r#"module bench
+@parallel
+fn dotp(x: [f32; {N}], y: [f32; {N}], o: [f32; 1]) {{
+    let mut s: f32 = 0.0;
+    for k in 0..{N} {{ s = s + x[k] * y[k]; }}
+    o[0] = s;
+}}
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [1.0; {N}];
+    let mut y: [f32; {N}] = [1.0; {N}];
+    let mut o: [f32; 1] = [0.0; 1];
+    dotp(x, y, o);
+    print(o[0] as i32);
+    return 0;
+}}
+"#
+        );
+        let (loop_p, mut li) = build(&loop_src, 2).expect("frontend");
+        let loop_e = li.intern("main");
+        let (one_p, mut oi) = build(&one_src, 2).expect("frontend");
+        let one_e = oi.intern("main");
+        assert!(crate::fusion::analyze(&loop_p, loop_e, &li).eligible);
+        assert!(crate::fusion::analyze(&one_p, one_e, &oi).eligible);
+
+        // Correctness: megakernel computes the whole chain (acc=REPEAT*N); each chain element computes
+        // N; the two agree when the chain elements are summed -> the megakernel fused them losslessly.
+        let mega0 = try_run(&loop_p, loop_e, &li).expect("mega").expect("eligible");
+        let one0 = try_run(&one_p, one_e, &oi).expect("one").expect("eligible");
+        let mega_val: i64 = String::from_utf8_lossy(&mega0.1).trim().parse().unwrap();
+        let one_val: i64 = String::from_utf8_lossy(&one0.1).trim().parse().unwrap();
+        assert_eq!(mega_val, one_val * REPEAT as i64, "mega chain != sum of per-op results");
+        eprintln!("checksum: megakernel acc={mega_val} == {REPEAT} * per-op {one_val}");
+
+        // Warm both, then best-of-N.
+        let _ = try_run(&loop_p, loop_e, &li);
+        let _ = try_run(&one_p, one_e, &oi);
+        let best = |f: &dyn Fn()| {
+            let mut b = f64::INFINITY;
+            for _ in 0..6 {
+                let t = Instant::now();
+                f();
+                b = b.min(t.elapsed().as_secs_f64());
+            }
+            b
+        };
+        let mega_t = best(&|| {
+            let _ = try_run(&loop_p, loop_e, &li).unwrap().unwrap();
+        });
+        // The per-op chain: REPEAT separate launches, each re-marshaling its inputs (offload model).
+        let chain_t = best(&|| {
+            for _ in 0..REPEAT {
+                let _ = try_run(&one_p, one_e, &oi).unwrap().unwrap();
+            }
+        });
+        eprintln!(
+            "\n=== M13 mega_vs_chain_reduce  N={N} REPEAT={REPEAT} ===\n\
+             per-op chain ({REPEAT} launches): {:.3} ms   megakernel (1 launch): {:.3} ms   \
+             win: {:.2}x (same-run ratio)",
+            chain_t * 1e3,
+            mega_t * 1e3,
+            chain_t / mega_t,
+        );
+    }
 }
