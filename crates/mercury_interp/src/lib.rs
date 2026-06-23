@@ -1225,6 +1225,29 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 Ok(Value::Float(r as f64))
             }
+            // `mercury_argreduce_f32(x, n, op) -> i64` — the deterministic argmax/argmin a recognized
+            // `for k { if x[k] CMP bv { bv=x[k]; bi=k } }` loop reconciles against. Read `n` f32 from x
+            // and call the *serial* kernel (bit-identical to the parallel one — fixed RCHUNK, ascending
+            // index-order combine, lowest-index tie-break), returning the index. CPU-only (no
+            // accelerator seam), so the differential oracle is unaffected.
+            "mercury_argreduce_f32" | "mercury_argreduce_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let n = args[1].as_int() as usize;
+                let op = args[2].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("argreduce operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                // SAFETY: xbuf is exactly n f32 long — the kernel's contract.
+                let r =
+                    unsafe { mercury_runtime::mercury_argreduce_f32(xbuf.as_ptr(), n as i64, op) };
+                Ok(Value::Int(r as i128))
+            }
             // `mercury_dot_bf16(x, y, n) -> f32` / `mercury_sum_bf16(x, n) -> f32` — the bf16
             // mixed-precision reduction a `s += (x[k] as f32) [* (y[k] as f32)]` loop over `[bf16; _]`
             // arrays lowers to (bf16 storage, f32 accumulate). The interpreter stores bf16 as the

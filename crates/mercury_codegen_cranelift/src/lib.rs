@@ -89,6 +89,7 @@ const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
 const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
+const RT_ARGREDUCE: &str = "mercury_argreduce_f32";
 const RT_NORM: &str = "mercury_norm_f32";
 const RT_NORM_PARALLEL: &str = "mercury_norm_f32_parallel";
 const RT_NORM_AFFINE: &str = "mercury_norm_affine_f32";
@@ -866,6 +867,17 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, y, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
+        // The deterministic arg-reduction: mercury_argreduce_f32(x, n, op) -> i64 (the argmax/argmin a
+        // recognized `if x[k] CMP bv {...}` loop reconciles against). One pointer, two i64, an i64
+        // index result — bind the result like the sreduce kernel above.
+        if name == RT_ARGREDUCE && args.len() == 3 {
+            let x = self.val(args[0]);
+            let n = self.coerce_to_i64(args[1]);
+            let op = self.coerce_to_i64(args[2]);
+            let fref = self.rt_refs[name];
+            let call = self.builder.ins().call(fref, &[x, n, op]);
+            return self.builder.inst_results(call).first().copied();
+        }
         // The bf16 mixed-precision reductions: mercury_dot_bf16(x, y, n) -> f32 (3 args) and
         // mercury_sum_bf16(x, n) -> f32 (2 args). bf16 storage, f32 accumulate; both return the
         // accumulated f32, so bind the call result like the sreduce kernel above.
@@ -1071,6 +1083,7 @@ struct RtFuncs {
     vhorner: FuncId,
     sred: FuncId,
     sred_par: FuncId,
+    argreduce: FuncId,
     norm: FuncId,
     norm_par: FuncId,
     norm_affine: FuncId,
@@ -1207,6 +1220,12 @@ fn populate_module<M: Module>(
     sig_sreduce.params.push(AbiParam::new(types::I64));
     sig_sreduce.params.push(AbiParam::new(types::I64));
     sig_sreduce.returns.push(AbiParam::new(types::F32));
+    // mercury_argreduce_f32(x: ptr, n, op: i64) -> i64 — the deterministic argmax/argmin index.
+    let mut sig_argreduce = Signature::new(call_conv);
+    sig_argreduce.params.push(AbiParam::new(ptr_ty));
+    sig_argreduce.params.push(AbiParam::new(types::I64));
+    sig_argreduce.params.push(AbiParam::new(types::I64));
+    sig_argreduce.returns.push(AbiParam::new(types::I64));
     // mercury_norm_f32[_parallel](x, out: ptr, rows, cols, eps_bits, op: i64) — fused row-wise norm.
     let mut sig_norm = Signature::new(call_conv);
     sig_norm.params.push(AbiParam::new(ptr_ty));
@@ -1326,6 +1345,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sred_par: module
             .declare_function(RT_SREDUCE_PARALLEL, Linkage::Import, &sig_sreduce)
+            .map_err(|e| e.to_string())?,
+        argreduce: module
+            .declare_function(RT_ARGREDUCE, Linkage::Import, &sig_argreduce)
             .map_err(|e| e.to_string())?,
         norm: module
             .declare_function(RT_NORM, Linkage::Import, &sig_norm)
@@ -1480,6 +1502,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SREDUCE_PARALLEL,
                 module.declare_func_in_func(rt.sred_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_ARGREDUCE,
+                module.declare_func_in_func(rt.argreduce, builder.func),
             );
             rt_refs.insert(RT_NORM, module.declare_func_in_func(rt.norm, builder.func));
             rt_refs.insert(
@@ -1698,6 +1724,10 @@ pub fn jit_compile(
         RT_SREDUCE_PARALLEL,
         mercury_runtime::mercury_sreduce_f32_parallel as *const u8,
     );
+    builder.symbol(
+        RT_ARGREDUCE,
+        mercury_runtime::mercury_argreduce_f32 as *const u8,
+    );
     builder.symbol(RT_NORM, mercury_runtime::mercury_norm_f32 as *const u8);
     builder.symbol(
         RT_NORM_PARALLEL,
@@ -1857,6 +1887,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SREDUCE_PARALLEL,
         mercury_runtime::mercury_sreduce_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ARGREDUCE,
+        mercury_runtime::mercury_argreduce_f32 as *const u8,
     );
     builder.symbol(RT_NORM, mercury_runtime::mercury_norm_f32 as *const u8);
     builder.symbol(

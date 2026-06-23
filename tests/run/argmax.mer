@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+module tests.run.argmax
+
+// argmax / argmin reductions -> mercury_argreduce_f32 (a branchless reconcile of the deterministic
+// kernel result against the running best). Lowest index wins on ties (serial == parallel == interp).
+// The greedy-decode hot path: next_token = argmax(logits). gcc/rustc run a branchy scalar loop.
+fn main() -> i32 {
+    let mut x: [f32; 10] = [0.0; 10];
+    for i in 0..10 {
+        x[i] = (i as f32) - 4.0; // -4 .. 5: max at index 9, min at index 0
+    }
+    let mut bv: f32 = x[0];
+    let mut bi: i64 = 0;
+    for k in 0..10 {
+        if x[k] > bv {
+            bv = x[k];
+            bi = k as i64;
+        }
+    }
+    print(bi as i32); // 9 (argmax)
+
+    let mut cv: f32 = x[0];
+    let mut ci: i64 = 0;
+    for k in 0..10 {
+        if x[k] < cv {
+            cv = x[k];
+            ci = k as i64;
+        }
+    }
+    print(ci as i32); // 0 (argmin)
+
+    // Tie: a flat region with the max value appearing at two indices; the lowest (3) must win.
+    let mut y: [f32; 8] = [1.0; 8];
+    y[3] = 9.0;
+    y[5] = 9.0;
+    let mut dv: f32 = y[0];
+    let mut di: i64 = 0;
+    for k in 0..8 {
+        if y[k] > dv {
+            dv = y[k];
+            di = k as i64;
+        }
+    }
+    print(di as i32); // 3 (lowest index wins)
+    return 0;
+}
