@@ -17,7 +17,15 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 ## Key types & entry points
 - `main` — runs the elementwise kernel table (saxpy/dot/relu/poly + `@parallel` variants incl.
   relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`,
-  `bench_linear`, `bench_conv`, `bench_norm`, `bench_norm_batched`, and `bench_i8gemm`.
+  `bench_linear`, `bench_linear_bf16`, `bench_matmul_tn`, `bench_conv`, `bench_norm`,
+  `bench_norm_batched`, `bench_i8gemm`, `bench_bf16`, `bench_streaming_large`, and `bench_transpose`.
+- `bench_transpose` (+ `mer_transpose`/`c_transpose`/`rust_transpose`) — `dst = srcᵀ` at 1024²/2048²,
+  reported as GB/s (`2·N²·4` bytes/call). Mercury folds the nest to the cache-blocked
+  `mercury_transpose_f32[_parallel]`; C/Rust are the naive transpose at `-O3 -march=native` (which do
+  not loop-tile it). The kernels carry an unused middle pointer so they reuse the `(src, _, dst)`
+  3-pointer `KernelFn` harness. Transpose is a permutation, so the full-buffer cross-check is **bit-exact**.
+  Measured ~1.35–1.65× single-core (cache blocking) and ~8.8–14× `@parallel` vs naive C; the op is
+  latency-bound (low absolute GB/s), so the ratio is the clock-invariant figure.
 - `bench_i8gemm` (+ `mer_i8gemm`/`c_i8gemm`/`rust_i8gemm`) — int8 quantized `nn.Linear` (`C = A·Bᵀ`,
   `u8`×`i8`→`i32`) at 512²/1024². The Mercury source is the `ijk` dot-product the `mir_build`
   recognizer folds to one `mercury_i8gemm_nt[_parallel]` call (AVX-VNNI `vpdpbusd`); C/Rust are the
