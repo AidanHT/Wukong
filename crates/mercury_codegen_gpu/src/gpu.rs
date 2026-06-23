@@ -7131,4 +7131,325 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             });
         });
     }
+
+    // ============================================================================================
+    // M7 runtime (Phase 7): multi-stream copy/compute overlap + pinned host memory.
+    // ============================================================================================
+
+    /// A double-buffered, two-stream pipeline that processes a batch of independent `[S,D]` inputs
+    /// through the resident layer, overlapping **H2D(next) ‖ compute(cur) ‖ D2H(prev)**. Inputs/outputs
+    /// stage through **pinned** host memory (so the copies are truly async on the copy stream while the
+    /// compute stream runs), and ordering across the two streams is enforced by explicit CUDA events.
+    /// Must be built/run inside [`with_event_tracking_disabled`] (so cudarc inserts no implicit
+    /// cross-stream waits — this pipeline owns all the ordering).
+    struct OverlapPipeline<'a> {
+        layer: &'a ResidentLayerF16,
+        cs: Arc<CudaStream>, // compute stream
+        cp: Arc<CudaStream>, // copy stream (H2D + D2H)
+        nb: usize,           // double-buffer slots
+        x_d: Vec<cudarc::driver::CudaSlice<f32>>,
+        out_d: Vec<cudarc::driver::CudaSlice<f32>>,
+        pool: Vec<crate::pool::DevicePool>,
+        h2d_done: Vec<cudarc::driver::CudaEvent>,
+        comp_done: Vec<cudarc::driver::CudaEvent>,
+        d2h_done: Vec<cudarc::driver::CudaEvent>,
+        pin_in: Vec<crate::graph::PinnedBuf<f32>>,
+        pin_out: Vec<crate::graph::PinnedBuf<f32>>,
+        b: usize,
+    }
+
+    impl<'a> OverlapPipeline<'a> {
+        fn new(
+            g: &Gpu,
+            layer: &'a ResidentLayerF16,
+            inputs: &[Vec<f32>],
+            s: usize,
+            d: usize,
+            cap_bytes: usize,
+        ) -> Self {
+            let nb = 2;
+            let cs = g.ctx.new_stream().unwrap();
+            let cp = g.ctx.new_stream().unwrap();
+            let x_d = (0..nb).map(|_| cs.alloc_zeros::<f32>(s * d).unwrap()).collect();
+            let out_d = (0..nb).map(|_| cs.alloc_zeros::<f32>(s * d).unwrap()).collect();
+            let pool = (0..nb)
+                .map(|_| crate::pool::DevicePool::new(cs.clone(), cap_bytes).unwrap())
+                .collect();
+            let ev = || g.ctx.new_event(None).unwrap();
+            let h2d_done = (0..nb).map(|_| ev()).collect();
+            let comp_done = (0..nb).map(|_| ev()).collect();
+            let d2h_done = (0..nb).map(|_| ev()).collect();
+            let mut pin_in = Vec::with_capacity(inputs.len());
+            let mut pin_out = Vec::with_capacity(inputs.len());
+            for inp in inputs {
+                let mut pi = crate::graph::PinnedBuf::<f32>::alloc(&g.ctx, s * d).unwrap();
+                pi.copy_from_slice(inp).unwrap();
+                pin_in.push(pi);
+                pin_out.push(crate::graph::PinnedBuf::<f32>::alloc(&g.ctx, s * d).unwrap());
+            }
+            // Weights uploaded on the NULL stream must be visible to the compute stream.
+            g.stream.synchronize().unwrap();
+            let _ = (s, d); // shapes are captured by the device buffers; not stored.
+            Self {
+                layer, cs, cp, nb, x_d, out_d, pool, h2d_done, comp_done, d2h_done, pin_in, pin_out,
+                b: inputs.len(),
+            }
+        }
+
+        /// **Serial baseline:** one stream, one buffer set — H2D, compute, D2H fully ordered with no
+        /// overlap. Even with pinned memory, a single stream cannot overlap its own copies and compute.
+        fn run_serial(&mut self) {
+            for i in 0..self.b {
+                self.cs.memcpy_htod(&*self.pin_in[i], &mut self.x_d[0]).unwrap();
+                self.pool[0].reset();
+                self.layer
+                    .forward_device_pooled_on(&self.cs, &mut self.pool[0], &self.x_d[0], &mut self.out_d[0])
+                    .unwrap();
+                self.cs.memcpy_dtoh(&self.out_d[0], &mut *self.pin_out[i]).unwrap();
+            }
+            self.cs.synchronize().unwrap();
+        }
+
+        /// **Overlapped:** H2D(next) on the copy stream runs while the compute stream runs the current
+        /// forward and D2H(prev) drains the previous result — double-buffered, with events guarding
+        /// every read-after-write and write-after-read hazard across the two streams.
+        fn run_overlapped(&mut self) {
+            let nb = self.nb;
+            for i in 0..self.b {
+                let b = i % nb;
+                // WAR on x_d[b]: don't overwrite until compute(i-nb), which read it, has finished.
+                if i >= nb {
+                    self.cp.wait(&self.comp_done[b]).unwrap();
+                }
+                self.cp.memcpy_htod(&*self.pin_in[i], &mut self.x_d[b]).unwrap();
+                self.h2d_done[b].record(&self.cp).unwrap();
+                // Compute waits for its input (RAW on x_d[b]); WAR on out_d[b]: don't overwrite until
+                // D2H(i-nb), which read it, has finished.
+                self.cs.wait(&self.h2d_done[b]).unwrap();
+                if i >= nb {
+                    self.cs.wait(&self.d2h_done[b]).unwrap();
+                }
+                self.pool[b].reset();
+                self.layer
+                    .forward_device_pooled_on(&self.cs, &mut self.pool[b], &self.x_d[b], &mut self.out_d[b])
+                    .unwrap();
+                self.comp_done[b].record(&self.cs).unwrap();
+                // D2H waits for compute (RAW on out_d[b]).
+                self.cp.wait(&self.comp_done[b]).unwrap();
+                self.cp.memcpy_dtoh(&self.out_d[b], &mut *self.pin_out[i]).unwrap();
+                self.d2h_done[b].record(&self.cp).unwrap();
+            }
+            self.cs.synchronize().unwrap();
+            self.cp.synchronize().unwrap();
+        }
+
+        /// Collect the `B` pinned output buffers into host `Vec`s.
+        fn collect(&self) -> Vec<Vec<f32>> {
+            self.pin_out.iter().map(|p| p.to_vec().unwrap()).collect()
+        }
+    }
+
+    /// Best (lowest) per-batch wall times of two self-synchronizing batch runs `a` and `b`, measured in
+    /// **interleaved** rounds so both see the same drifting clock/contention state (this laptop GPU
+    /// swings ~7× with memory-clock throttling, and the parallel sessions add contention — timing the
+    /// two paths in separate phases makes the ratio meaningless). Returns `(best_a, best_b)` in seconds.
+    fn best_batch_pair(mut a: impl FnMut(), mut b: impl FnMut()) -> (f64, f64) {
+        const WARMUP: usize = 4;
+        const ROUNDS: usize = 16;
+        for _ in 0..WARMUP {
+            a();
+            b();
+        }
+        let (mut best_a, mut best_b) = (f64::MAX, f64::MAX);
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            a();
+            best_a = best_a.min(t0.elapsed().as_secs_f64());
+            let t1 = Instant::now();
+            b();
+            best_b = best_b.min(t1.elapsed().as_secs_f64());
+        }
+        (best_a, best_b)
+    }
+
+    /// **Identical-numerics gate for multi-stream overlap (the first law).** The overlapped pipeline
+    /// must produce, for every input in the batch, output **bit-for-bit** equal to the serial
+    /// single-stream pipeline — the overlap changes *when* copies/compute run and *on which stream*,
+    /// never the math (M12 determinism holds). Also checks the serial path ties the eager
+    /// `forward_device` reference. Covers single-head, multi-head, and the GPT-2 layer.
+    #[test]
+    fn multistream_overlap_matches_serial() {
+        with_gpu("multistream_overlap_matches_serial", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
+                    let (layer, _x) = pool_layer_fixture(g, s, d, dff, heads, 0xB001 + ci as u64);
+                    let mut rng = crate::diff::Rng::new(0x00C0_FFEE + ci as u64);
+                    let bsz = 12usize;
+                    let inputs: Vec<Vec<f32>> = (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
+                    let cap_bytes = 64 * 1024 * 1024;
+
+                    let mut serial = OverlapPipeline::new(g, &layer, &inputs, s, d, cap_bytes);
+                    serial.run_serial();
+                    let serial_out = serial.collect();
+
+                    let mut over = OverlapPipeline::new(g, &layer, &inputs, s, d, cap_bytes);
+                    over.run_overlapped();
+                    let over_out = over.collect();
+
+                    for i in 0..bsz {
+                        for j in 0..s * d {
+                            assert_eq!(
+                                over_out[i][j].to_bits(),
+                                serial_out[i][j].to_bits(),
+                                "overlap != serial at input {i} elem {j} (S={s} D={d} Dff={dff} heads={heads})"
+                            );
+                        }
+                    }
+                    // Sanity: the serial path ties the established eager reference for input 0.
+                    let x_d = g.stream.memcpy_stod(&inputs[0]).unwrap();
+                    let eager = g.stream.memcpy_dtov(&layer.forward_device(&x_d).unwrap()).unwrap();
+                    for j in 0..s * d {
+                        assert_eq!(
+                            serial_out[0][j].to_bits(),
+                            eager[j].to_bits(),
+                            "serial != eager at elem {j} (S={s} D={d})"
+                        );
+                    }
+                    eprintln!(
+                        "overlap==serial==eager bit-identical: S={s} D={d} Dff={dff} heads={heads}, B={bsz} \
+                         ({} KiB I/O per item, pinned, 2-stream)",
+                        s * d * 4 / 1024
+                    );
+                }
+            });
+        });
+    }
+
+    /// **M7 same-run throughput — multi-stream copy/compute overlap vs serial.** Both process `B`
+    /// independent inputs; the overlapped path runs H2D/compute/D2H on two streams with pinned staging
+    /// so copies can hide under compute. Measured with interleaved timing (shared clock state). Honest
+    /// finding on this box: **~1.0× at both shapes** — the resident layer is strongly compute-bound, so
+    /// even the GPT-2 shape's 1.5 MiB/item transfer is a small, largely overhead-bound fraction of the
+    /// ~1.2 ms compute and there is little to hide. The mechanism is correct (gated bit-identical); the
+    /// throughput lever for the *underutilized decode* regime is concurrent forwards, not copy overlap
+    /// (see `concurrent_forwards_throughput`). Pinned + overlap matter most when transfers genuinely
+    /// rival compute (large prompts / a slower link) — not realized here.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn overlap_throughput() {
+        with_gpu("overlap_throughput", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 768, 3072, 12)];
+                let bsz = 16usize;
+                for &(s, d, dff, heads) in &cases {
+                    let (layer, _x) = pool_layer_fixture(g, s, d, dff, heads, 0x7777);
+                    let mut rng = crate::diff::Rng::new(0x5EED);
+                    let inputs: Vec<Vec<f32>> = (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
+                    // Two pipelines so serial and overlapped can be timed interleaved (shared clock).
+                    let mut pipe_s = OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
+                    let mut pipe_o = OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
+
+                    let (serial, over) =
+                        best_batch_pair(|| pipe_s.run_serial(), || pipe_o.run_overlapped());
+                    let bf = bsz as f64;
+                    eprintln!(
+                        "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: serial {:7.1} us/item | overlapped {:7.1} us/item \
+                         → overlap {:.2}x  (B={bsz}, {} KiB I/O per item, pinned)",
+                        serial / bf * 1e6,
+                        over / bf * 1e6,
+                        serial / over,
+                        s * d * 4 / 1024
+                    );
+                }
+            });
+        });
+    }
+
+    /// Best (lowest) per-iteration wall time of `run` while synchronizing **all** of `streams` to
+    /// retire the work (the multi-stream analogue of `min_latency`).
+    fn min_latency_multi(streams: &[Arc<CudaStream>], mut run: impl FnMut()) -> f64 {
+        const WARMUP: usize = 20;
+        const ROUNDS: usize = 12;
+        const ITERS: usize = 30;
+        for _ in 0..WARMUP {
+            run();
+        }
+        for st in streams {
+            st.synchronize().unwrap();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                run();
+            }
+            for st in streams {
+                st.synchronize().unwrap();
+            }
+            best = best.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+        }
+        best
+    }
+
+    /// **M7 same-run throughput — concurrent forwards on K streams vs serial.** A single small (decode)
+    /// layer launches far too few CTAs to fill the GPU, so the SMs sit idle. Running `K` independent
+    /// requests on `K` streams lets the scheduler co-resident them and reclaim that idle capacity — the
+    /// real multi-stream lever for small-batch *serving*. Compared back-to-back: `K` forwards serialized
+    /// on one stream vs one forward on each of `K` streams (each its own event-free pool + buffers, so
+    /// nothing cross-stream serializes them). The win shrinks as the layer grows to fill the GPU on its
+    /// own (the GPT-2 shape already saturates).
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn concurrent_forwards_throughput() {
+        with_gpu("concurrent_forwards_throughput", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let kk = 4usize;
+                for &(s, d, dff, heads) in &cases {
+                    let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x9999);
+                    let streams: Vec<Arc<CudaStream>> = (0..kk).map(|_| g.ctx.new_stream().unwrap()).collect();
+                    let mut pools: Vec<crate::pool::DevicePool> = streams
+                        .iter()
+                        .map(|st| crate::pool::DevicePool::new(st.clone(), 64 * 1024 * 1024).unwrap())
+                        .collect();
+                    let x_ds: Vec<cudarc::driver::CudaSlice<f32>> =
+                        streams.iter().map(|st| st.memcpy_stod(&x).unwrap()).collect();
+                    let mut out_ds: Vec<cudarc::driver::CudaSlice<f32>> =
+                        streams.iter().map(|st| st.alloc_zeros::<f32>(s * d).unwrap()).collect();
+                    g.stream.synchronize().unwrap();
+
+                    // serial: K forwards back-to-back on ONE stream.
+                    let serial = min_latency(&streams[0], || {
+                        for _ in 0..kk {
+                            pools[0].reset();
+                            layer
+                                .forward_device_pooled_on(&streams[0], &mut pools[0], &x_ds[0], &mut out_ds[0])
+                                .unwrap();
+                        }
+                    });
+                    // concurrent: one forward on each of K streams, all retired together.
+                    let sync_streams: Vec<Arc<CudaStream>> = streams.clone();
+                    let concurrent = min_latency_multi(&sync_streams, || {
+                        for k in 0..kk {
+                            pools[k].reset();
+                            layer
+                                .forward_device_pooled_on(&streams[k], &mut pools[k], &x_ds[k], &mut out_ds[k])
+                                .unwrap();
+                        }
+                    });
+
+                    eprintln!(
+                        "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: {kk} fwds serial {:7.1} us | concurrent {:7.1} us \
+                         → concurrent {:.2}x throughput (K={kk} streams)",
+                        serial * 1e6,
+                        concurrent * 1e6,
+                        serial / concurrent,
+                    );
+                }
+            });
+        });
+    }
 }
