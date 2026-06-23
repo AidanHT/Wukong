@@ -1101,6 +1101,7 @@ fn entry_mma_pipe(
     act: Act,
     bias: bool,
     residual: bool,
+    swz: bool,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1123,7 +1124,20 @@ fn entry_mma_pipe(
     // conflict at stride bk where grp and grp+2 alias). pad=0 keeps the conflict but a smaller footprint ⇒
     // more CTAs/SM. Pad keeps 16-byte alignment for cp.async. K-offsets stay bk-based.
     assert!(pad % 8 == 0, "{name}: pad must be a multiple of 8 (16-byte cp.async alignment)");
-    let ldp = bk + pad; // padded SMEM row stride (elements)
+    // The **`swz` (ldmatrix + XOR-swizzle + no-pad)** path drops the padding (smaller footprint ⇒ more
+    // CTAs/SM — 3 vs the padded 2 at this tile, the occupancy the HBM-bound 4096³ needs) and instead makes
+    // both the cp.async stores and the `ldmatrix` gathers conflict-free via an XOR swizzle on the 16-byte
+    // chunk column: chunk_col ↦ chunk_col XOR ((row>>1) & (nc-1)), nc = bk/8 chunks per row. Derived for
+    // bk=32 (nc=4): the row stride contributes only row%2 to the bank, so the (row>>1)&3 phase spreads the
+    // 8 rows of an ldmatrix matrix across 32 distinct banks. The phase reduces to a per-lane constant on the
+    // read side because warpMrow / mi·16 / warpNcol / ni·8 are all ≡ 0 (mod 8) ⇒ vanish under (·>>1)&3.
+    let nc = bk / 8; // 16-byte (8×f16) chunks per SMEM row
+    let nc_mask = nc - 1;
+    if swz {
+        assert!(bk == 32, "{name}: the swz swizzle phase is derived for bk=32 (nc=4)");
+        assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs warp row/col bases ≡ 0 (mod 8)");
+    }
+    let ldp = if swz { bk } else { bk + pad }; // swz: no pad (the swizzle, not padding, gives conflict-free)
     let tile_a = bm * ldp * 2;
     let tile_b = bn * ldp * 2;
     let smem_a = stages * tile_a;
@@ -1162,6 +1176,12 @@ fn entry_mma_pipe(
     }
     if residual {
         s += "    .reg .f32 %resv0,%resv1;\n    .reg .b64 %Resid;\n";
+    }
+    if swz {
+        // %phaseA/%phaseB: per-lane swizzle phases; %arowb/%browb: this lane's A/B row byte-base
+        // ((warp+lane)·bk·2); %la16=lane>>4 (A x4 chunk selector), %lb8=(lane>>3)&1 (B x2 selector);
+        // %swztmp: chunk-offset scratch; %tmp3: staging dest scratch.
+        s += "    .reg .b32 %phaseA,%phaseB,%arowb,%browb,%la16,%lb8,%swztmp,%tmp3;\n";
     }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
@@ -1216,6 +1236,18 @@ fn entry_mma_pipe(
     s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
     // Per-lane SMEM byte offset shared by A and B fragment loads: (grp·ldp + tg2)·2 (padded row stride).
     s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg2;\n    shl.b32 %laneoff,%laneoff,1;\n");
+    if swz {
+        // A ldmatrix.x4: row R = warpMrow + mi·16 + (lane&15); arowb = (warpMrow + (lane&15))·bk·2 (the
+        // mi·16 part is added per sub-tile). phaseA = ((lane&15)>>1)&(nc-1). la16 = lane>>4 (chunk selector).
+        s += &format!("    and.b32 %tmp,%lane,15;\n    add.u32 %tmp2,%tmp,%warpMrow;\n    mul.lo.s32 %arowb,%tmp2,{};\n", bk * 2);
+        s += &format!("    shr.u32 %tmp2,%tmp,1;\n    and.b32 %phaseA,%tmp2,{nc_mask};\n");
+        s += "    shr.u32 %la16,%lane,4;\n";
+        // B ldmatrix.x2: row R = warpNcol + ni·8 + (lane&7); browb = (warpNcol + (lane&7))·bk·2.
+        // phaseB = ((lane&7)>>1)&(nc-1). lb8 = (lane>>3)&1 (chunk selector).
+        s += &format!("    and.b32 %tmp,%lane,7;\n    add.u32 %tmp2,%tmp,%warpNcol;\n    mul.lo.s32 %browb,%tmp2,{};\n", bk * 2);
+        s += &format!("    shr.u32 %tmp2,%tmp,1;\n    and.b32 %phaseB,%tmp2,{nc_mask};\n");
+        s += "    shr.u32 %tmp,%lane,3;\n    and.b32 %lb8,%tmp,1;\n";
+    }
     for mi in 0..tm {
         for ni in 0..tn {
             for r in 0..4 {
@@ -1224,9 +1256,10 @@ fn entry_mma_pipe(
         }
     }
 
-    // cp.async staging into the **padded** SMEM layout (row stride `ldp`): same global read as
-    // entry_smem_pipe, but the shared dest is `bufoff + row·ldp·2 + col·2` (row=%r, col=%c, both 8-aligned)
-    // instead of the contiguous `e·16`, so the fragment reads land conflict-free.
+    // cp.async staging into the SMEM tile. Non-swz: **padded** row-major (`bufoff + row·ldp·2 + col·2`,
+    // ldp=bk+pad) — the layout the hand-placed b32 fragment loads read conflict-free. swz: **no-pad +
+    // XOR-swizzle** (`bufoff + row·bk·2 + (chunk XOR ((row>>1)&nc_mask))·16`) — the layout the `ldmatrix`
+    // gathers read conflict-free, at the higher occupancy the dropped padding buys. Same global read either way.
     let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
@@ -1237,8 +1270,15 @@ fn entry_mma_pipe(
             *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,3;\n");
             *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
             *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gbase_ptr},%off;\n");
-            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
-            *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
+            if swz {
+                // chunk_col = %c>>3 (col8→chunk); chunk_swz = chunk XOR ((row>>1)&nc_mask); dest = smem +
+                // bufoff + row·bk·2 + chunk_swz·16 — the swizzle the ldmatrix reads invert (write/read agree).
+                *s += &format!("    shr.u32 %swztmp,%c,3;\n    shr.u32 %tmp2,%r,1;\n    and.b32 %tmp2,%tmp2,{nc_mask};\n    xor.b32 %swztmp,%swztmp,%tmp2;\n    shl.b32 %swztmp,%swztmp,4;\n");
+                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n", bk * 2);
+            } else {
+                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
+                *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
+            }
             *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
         }
     };
@@ -1261,29 +1301,49 @@ fn entry_mma_pipe(
     stage("%baseCol", "%B", &format!("smemB_{name}"), "%bufwB", b_chunks, &mut s);
     s += &format!("NOPRE_{name}:\n    cp.async.commit_group;\n");
 
-    // Compute: for each k16 step build A/B fragment base pointers (smem + buffer + warp + lane + ks·16),
-    // then `ld.shared.b32` the hand-placed fragments and issue tm·tn `mma.sync` m16n8k16 ops.
+    // Compute: for each k16 step load the A/B fragments — swz: one `ldmatrix.x4`/`.x2` warp-cooperative
+    // gather per sub-tile from the XOR-swizzled (conflict-free, no-pad) SMEM; non-swz: hand-placed
+    // `ld.shared.b32` from the padded SMEM — then issue tm·tn `mma.sync` m16n8k16 ops (identical either way).
     for ks in 0..nks {
-        // A base ptr = smemA + bufcA + (warpMrow·ldp)·2 + laneoff + (ks·16)·2  (ldp = padded row stride).
-        s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
-        s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
-        s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
-        for mi in 0..tm {
-            let base = mi * 16 * ldp * 2; // m16-block row offset (bytes, padded stride)
-            let r8 = 8 * ldp * 2; // +8 rows
-            s += &format!("    ld.shared.b32 %a{mi}_0,[%aptr+{}];\n", base);
-            s += &format!("    ld.shared.b32 %a{mi}_2,[%aptr+{}];\n", base + 16); // k+8 (not padded)
-            s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
-            s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
-        }
-        // B base ptr = smemB + bufcB + (warpNcol·ldp)·2 + laneoff + (ks·16)·2.
-        s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n");
-        s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
-        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
-        for ni in 0..tn {
-            let base = ni * 8 * ldp * 2; // n8-block row offset (bytes, padded stride)
-            s += &format!("    ld.shared.b32 %b{ni}_0,[%bptr+{}];\n", base);
-            s += &format!("    ld.shared.b32 %b{ni}_1,[%bptr+{}];\n", base + 16); // k+8 (not padded)
+        if swz {
+            // A: aptr = smemA + bufcA + arowb (this lane's row base). chunk_off = ((ks·2 | la16) XOR phaseA)·16
+            // (per-ks, per-lane); per mi add mi·16·bk·2 → ldmatrix.x4 {A00,A10,A01,A11} = the mma A regs.
+            s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n    add.u32 %aptr,%aptr,%arowb;\n");
+            s += &format!("    or.b32 %swztmp,%la16,{};\n    xor.b32 %swztmp,%swztmp,%phaseA;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+            for mi in 0..tm {
+                let mibase = mi * 16 * bk * 2;
+                s += &format!("    add.u32 %tmp,%aptr,%swztmp;\n    add.u32 %tmp,%tmp,{mibase};\n    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},[%tmp];\n");
+            }
+            // B: bptr = smemB + bufcB + browb. chunk_off = ((ks·2 | lb8) XOR phaseB)·16; per ni add ni·8·bk·2
+            // → ldmatrix.x2 {B0,B1} = the mma B regs.
+            s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n    add.u32 %bptr,%bptr,%browb;\n");
+            s += &format!("    or.b32 %swztmp,%lb8,{};\n    xor.b32 %swztmp,%swztmp,%phaseB;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+            for ni in 0..tn {
+                let nibase = ni * 8 * bk * 2;
+                s += &format!("    add.u32 %tmp,%bptr,%swztmp;\n    add.u32 %tmp,%tmp,{nibase};\n    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{%b{ni}_0,%b{ni}_1}},[%tmp];\n");
+            }
+        } else {
+            // A base ptr = smemA + bufcA + (warpMrow·ldp)·2 + laneoff + (ks·16)·2  (ldp = padded row stride).
+            s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
+            s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
+            s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+            for mi in 0..tm {
+                let base = mi * 16 * ldp * 2; // m16-block row offset (bytes, padded stride)
+                let r8 = 8 * ldp * 2; // +8 rows
+                s += &format!("    ld.shared.b32 %a{mi}_0,[%aptr+{}];\n", base);
+                s += &format!("    ld.shared.b32 %a{mi}_2,[%aptr+{}];\n", base + 16); // k+8 (not padded)
+                s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
+                s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
+            }
+            // B base ptr = smemB + bufcB + (warpNcol·ldp)·2 + laneoff + (ks·16)·2.
+            s += &format!("    mov.u32 %bptr,smemB_{name};\n    add.u32 %bptr,%bptr,%bufcB;\n");
+            s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
+            s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+            for ni in 0..tn {
+                let base = ni * 8 * ldp * 2; // n8-block row offset (bytes, padded stride)
+                s += &format!("    ld.shared.b32 %b{ni}_0,[%bptr+{}];\n", base);
+                s += &format!("    ld.shared.b32 %b{ni}_1,[%bptr+{}];\n", base + 16); // k+8 (not padded)
+            }
         }
         for mi in 0..tm {
             for ni in 0..tn {
@@ -1710,10 +1770,25 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false)
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false)
             } else {
                 entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, Act::None, false, false)
             };
+        }
+        // **`ldmatrix` + XOR-swizzle + no-pad workhorse** (`_swz`) — the full CUTLASS recipe for the
+        // HBM-bound 4096³: dropping the padding shrinks the tile (32 KiB ⇒ 3 CTAs/SM vs the padded 40 KiB's
+        // 2), and the XOR swizzle keeps both the cp.async stores and the `ldmatrix.x4`/`.x2` gathers
+        // conflict-free at that higher occupancy. Numerically identical to the hand-placed workhorse; swept
+        // same-run by `mma_swizzle_vs_handplaced` (the padded-`ldmatrix` variant already LOST — this tests
+        // whether the proper swizzle+occupancy pairing reclaims it where the biggest deficit lives).
+        {
+            let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
+            m += &entry_mma_pipe(
+                &format!("{}_swz", wh.name),
+                "f16",
+                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
+                Act::None, false, false, true,
+            );
         }
         // Fused epilogues on the **deep WMMA pipe `pipe_64_s6`** — the ≤1024³ GEMM champion. The `mma.sync`
         // workhorse the *other* fused epilogues ride is beaten there (`pipe_64_s6` ~90% of cuBLAS vs the
@@ -1762,6 +1837,7 @@ pub fn wmma_f16_ptx() -> &'static str {
                 act,
                 true,
                 false,
+                false,
             );
         }
         // Fused **bias + residual** (no activation) on the same fast mma workhorse — the transformer
@@ -1776,6 +1852,7 @@ pub fn wmma_f16_ptx() -> &'static str {
             Act::None,
             true,
             true,
+            false,
         );
         // Fused **gated-FFN (GLU-family)** kernels `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the SwiGLU/GeGLU gate
         // every modern LLM FFN runs, the fusion cuBLAS needs THREE kernels + two HBM round-trips for. The
@@ -1866,7 +1943,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
-        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false);
+        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false);
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
         // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
@@ -1878,6 +1955,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 act,
                 true,
                 false,
+                false,
             );
         }
         // bf16 fused bias + residual (training down-proj / output-proj): out = x·Wᵀ + bias + residual.
@@ -1888,6 +1966,7 @@ pub fn wmma_bf16_ptx() -> &'static str {
             Act::None,
             true,
             true,
+            false,
         );
         // bf16 gated-FFN (GLU-family) gate `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — SwiGLU/GeGLU carried to the
         // training dtype (the dual-B generator is precision-generic, keying the mma type off `ty`).
