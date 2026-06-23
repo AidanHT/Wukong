@@ -1381,6 +1381,11 @@ pub fn gemm_nt_bf16(
     // fix for the training precision, which otherwise fell through to the un-staged `_mt` path below.
     let ws_bytes = (m * k + n * k) * 2;
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+        // Deeply HBM-bound (≥4096³): the no-pad ldmatrix+swizzle twin (3 CTAs/SM) — the fp16 4096³ win
+        // carried to the training dtype. L2-resident 2048³ keeps the padded hand-placed base.
+        if ws_bytes >= 48 * 1024 * 1024 {
+            return gemm_nt_bf16_pipe_entry(g, a, b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz");
+        }
         return gemm_nt_bf16_pipe(g, a, b, m, k, n);
     }
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -1414,6 +1419,21 @@ pub fn gemm_nt_bf16_pipe(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
+    gemm_nt_bf16_pipe_entry(g, a, b, m, k, n, crate::ptx_wmma::PIPE_BF16.name)
+}
+
+/// `C = A·Bᵀ` (bf16) via a named `mma.sync` workhorse `entry` launched with the [`crate::ptx_wmma::PIPE_BF16`]
+/// config (same tile/raster/threads). `entry` is `mma_nt_bf16_128_bk32_s2_r16` (padded hand-placed) or
+/// `…_swz` (the no-pad ldmatrix+XOR-swizzle twin that wins the HBM-bound 4096³); `gemm_nt_bf16` picks by regime.
+fn gemm_nt_bf16_pipe_entry(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    entry: &str,
+) -> Result<Vec<f32>, DriverError> {
     use crate::ptx_wmma::PIPE_BF16;
     use half::bf16;
     let v = &PIPE_BF16;
@@ -1426,7 +1446,7 @@ pub fn gemm_nt_bf16_pipe(
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
-    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), v.name)?;
+    let f = g.function("wmma_bf16", crate::ptx_wmma::wmma_bf16_ptx(), entry)?;
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
@@ -3279,6 +3299,16 @@ mod tests {
                 let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &swz).unwrap();
                 let s = crate::diff::assert_close(&format!("swz {m}x{k}x{n}"), &c, &r, 1e-2, 2e-3);
                 eprintln!("mma_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+            }
+            // bf16 swizzle twin — the same swz path keyed to bf16 (precision-generic); the HBM-bound-4096³
+            // win carried to the training dtype. bf16-rounded reference, the wider bf16 tolerance.
+            for (m, k, n) in [(128usize, 32usize, 128usize), (256, 160, 256), (128, 96, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| half::bf16::from_f32(x).to_f32());
+                let c = gemm_nt_bf16_pipe_entry(g, &a, &b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz").unwrap();
+                let s = crate::diff::assert_close(&format!("bf16 swz {m}x{k}x{n}"), &c, &r, 5e-2, 2e-2);
+                eprintln!("mma_bf16_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
             }
         });
     }
