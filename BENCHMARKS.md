@@ -850,6 +850,59 @@ streams reclaim idle SMs for **~1.3×** decode-serving throughput (and ~1.0× at
 already saturates). Reproduce: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored
 --nocapture pool_graph_vs_unpooled decode_stack_latency overlap_throughput concurrent_forwards_throughput`.
 
+### End-to-end models — GPT-2 & Llama blocks authored in `.mer` (Phase 9)
+
+Two real transformer blocks now exist as Mercury *source*: `examples/gpt2.mer` (a pre-LayerNorm GPT-2
+decoder block — multi-head causal attention + GELU MLP + residuals) and `examples/llama_block.mer` (a
+pre-RMSNorm Llama block — RoPE + multi-head causal attention + SwiGLU FFN + residuals). They are
+written **entirely in the recognized op-forms**, so the *same source* dispatches to the tuned kernels
+on every backend rather than to a naive nest:
+
+| model | recognized dispatch (`--emit=mir`) | oracle gate |
+|---|---|---|
+| `gpt2.mer`        | 2× `mercury_norm_affine_f32` (LayerNorm) + **6× `mercury_sgemm_nt`** (Q/K/V/O + FFN up/down) + streaming residual `velem` | `--run` **-O0 == -O3**, deterministic |
+| `llama_block.mer` | 2× `mercury_norm_affine_f32` (RMSNorm) + **7× `mercury_sgemm_nt`** (Q/K/V/O + SwiGLU gate/up/down) + `silu` vmath + streaming `velem` | `--run` **-O0 == -O3**, deterministic |
+
+(The per-head attention `Q·Kᵀ`/`P·V` matmuls carry a head-column offset, so on the CPU oracle they run
+as general nests; on the GPU they are the hand-coded flash kernel inside the resident layer below.)
+Both run end-to-end on the interpreter oracle at a small-but-structurally-exact config (S=8, D=64,
+H=4, Dff=256 — the 124M / 7B configs are harness-driven, since a `--run` stack cannot hold the
+weights) and are differentially gated **`-O0 == -O3`** (deterministic, byte-for-byte).
+
+**Compile latency on a real model (M10).** Best-of-15, release `mercuryc`, this RTX-4050 box, full
+source → optimized MIR (`mercuryc --emit=mir -O2 <model>`):
+
+| model | source → optimized MIR (wall, best-of-15) | vs the JIT field's cold compile |
+|---|---|---|
+| `gpt2.mer` (200 lines)        | **~12.8 ms** (≈7.5 ms is a fixed process-startup floor → ≈5 ms compile work) | **~2,300–9,400×** faster |
+| `llama_block.mer` (195 lines) | **~14.6 ms** (≈7 ms compile over the same floor)                             | **~2,000–8,200×** faster |
+
+The denominator is the **documented Triton / TorchInductor cold-compile of 30–120 s** for a model (one
+reported Triton kernel alone: 151 s), which includes the runtime autotuning search Mercury skips
+outright — its shapes are compile-time-known (in the type system), so it emits a bespoke kernel with no
+search. Mercury compiles a *whole transformer block's definition* source → runnable IR in **single-digit
+-to-teens of milliseconds**; the per-kernel PTX→SASS step is then the already-measured driver JIT
+(**0.76 ms cold, 0.16 ms warm cubin**, M10 above). This compile-latency gap is the one place an
+orders-of-magnitude **absolute** claim is fair, and these authored models confirm it end-to-end.
+
+**GPU-resident execution = the resident-layer benches above.** The math these `.mer` blocks express is
+exactly the resident `transformer_layer` / `ResidentLayerF16` benched in this section — RMSNorm →
+Q/K/V → flash-attention → O-proj + residual → norm → FFN → residual: M7 reports **1.33 ms/layer @S=256**
+(~160–190 K tokens/s) and M13 reports the fp16 fused layer **beating the cuBLAS call-chain at D=64,
+~par at the real GPT-2 D=768/H=12 shape**, with the Phase-7 pool+graph runtime folding a 12-layer
+decode into **one `cuGraphLaunch` (~6.5–6.9× eager)**.
+
+**Honest status & what is pending (the honesty law).** Authored + oracle-gated + compile-latency-measured
+here; the GPU-resident *inference* numbers are the resident-layer benches above (same computation, same
+device). **Not yet measured, so not claimed:** the full 124M-GPT-2 / 7B-Llama run driven straight from
+these `.mer` files through the general lowerer (recognized-op GPU dispatch is the Phase-4 *perf* tail,
+owned by a sibling session); a **training-step** tokens/s vs PyTorch-eager (the autodiff engine is built
+but its branch is not yet integrated on this trunk); the **whole-model megakernel** path (Phase 8, not
+started); and a **PyTorch-eager / TensorRT-LLM** same-run peer for the full model. This trunk
+(`gpu-integrate`) currently integrates the general MIR→PTX lowerer, the Phase-7 device pool + CUDA
+graphs, and the conv2d slice; the int8 / autodiff / large-GEMM-fusion branches are pending coordinated
+integration.
+
 ## Honest summary
 
 - **Compile time:** ~100–260× faster than gcc/rustc (geomean ~135–155×). Robust every run; the metric
