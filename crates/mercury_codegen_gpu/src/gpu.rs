@@ -2179,6 +2179,61 @@ pub fn gemm_nt_w4a16(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **Static-shape-specialized** W4A16 (Mercury's no-library lever, §1A.2): JIT-load a kernel with M/N/K
+/// **baked as compile-time constants** for this exact shape, then launch it. Numerically identical to
+/// [`gemm_nt_w4a16`] (gated against the same f64 reference), but ptxas strength-reduces the baked strides
+/// (`×K`, `×N`, `K/8`, `K/group`) to shifts/immediates — the runtime-multiply overhead a library, which
+/// never sees the shape at compile time, cannot remove. Loads a fresh module per call here (the per-shape
+/// compile is the static-shape tradeoff; the persistent cubin cache (M10) amortizes it across runs).
+pub fn gemm_nt_w4a16_static(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int4::{GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be M*K");
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
+    assert!(
+        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        "gemm_nt_w4a16_static requires M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
+    );
+    let zero_point = qw.zeros.is_some();
+    let ptx = crate::ptx_int4::w4a16_static_ptx(m, n, k, zero_point);
+    let module = g.ctx.load_module(ptx.as_str().into())?;
+    let f = module.load_function(crate::ptx_int4::w4a16_static_entry(zero_point))?;
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let scl_d = g.stream.memcpy_stod(&qw.scales)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+        block_dim: (W4_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match &qw.zeros {
+        None => {
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+            unsafe { bld.launch(cfg)? };
+        }
+        Some(zeros) => {
+            let z_d = g.stream.memcpy_stod(zeros)?;
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d).arg(&z_d);
+            unsafe { bld.launch(cfg)? };
+        }
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2217,7 +2272,7 @@ mod tests {
                 (64, 192, 512),
                 (256, 128, 384),
             ];
-            for (m, n, k) in shapes {
+            for (idx, (m, n, k)) in shapes.into_iter().enumerate() {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let w = rng.vec(n * k, -0.8, 0.8); // weight [N,K]
 
@@ -2253,6 +2308,23 @@ mod tests {
                     c.iter().zip(&c2).all(|(x, y)| x.to_bits() == y.to_bits()),
                     "w4a16 {m}x{k}x{n} not deterministic run-to-run"
                 );
+
+                // Static-shape specialization must be bit-identical to the dynamic kernel (same math,
+                // only baked constants). Gated on the first 2 shapes (each JIT-compiles a per-shape
+                // module) for both the symmetric and zero-point paths.
+                if idx < 2 {
+                    let cs = gemm_nt_w4a16_static(g, &a, &qw, m, k, n).unwrap();
+                    assert!(
+                        c.iter().zip(&cs).all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "w4a16 static {m}x{k}x{n} (sym) differs from the dynamic kernel"
+                    );
+                    let csz = gemm_nt_w4a16_static(g, &a, &qwz, m, k, n).unwrap();
+                    assert!(
+                        cz.iter().zip(&csz).all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "w4a16 static {m}x{k}x{n} (asym) differs from the dynamic kernel"
+                    );
+                    eprintln!("w4a16 static {m}x{k}x{n}: bit-identical to dynamic (sym + asym) ✓");
+                }
             }
         });
     }
@@ -6955,6 +7027,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     time_w4a16(g, &f_w4, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
                 });
 
+                // Static-shape-specialized kernel (M/N/K baked) — Mercury's no-library lever. ptxas
+                // strength-reduces the baked strides (`×K`/`×N` → shifts for the power-of-2 dims here);
+                // the dynamic kernel keeps them as register multiplies. To isolate the *baked-constants*
+                // effect, time the static kernel against a DYNAMIC kernel loaded the SAME raw-JIT way
+                // (the headline s_w4 above uses the cubin cache, a different ptxas opt level — comparing
+                // to it would confound the loading path with the specialization).
+                let ptx_s = crate::ptx_int4::w4a16_static_ptx(m, n, k, false);
+                let mod_s = g.ctx.load_module(ptx_s.as_str().into()).unwrap();
+                let f_s = mod_s.load_function(crate::ptx_int4::w4a16_static_entry(false)).unwrap();
+                let s_static = best_of(ROUNDS, || {
+                    time_w4a16(g, &f_s, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                });
+                let mod_dyn_raw = g.ctx.load_module(crate::ptx_int4::w4a16_ptx().into()).unwrap();
+                let f_dyn_raw = mod_dyn_raw.load_function("gemm_nt_w4a16").unwrap();
+                let s_dyn_raw = best_of(ROUNDS, || {
+                    time_w4a16(g, &f_dyn_raw, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                });
+
                 // Mercury fp16 on the SAME 64×64 tile (`wmma_nt_f16_sm`) — full fp16 weights. The only
                 // difference vs W4A16 is the B-load (fp16 vs packed int4), so s_f16/s_w4 IS the
                 // weight-bandwidth win in the decode regime.
@@ -6981,16 +7071,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
                 // Weight bytes moved from HBM per pass: int4 = N·K/2, fp16 = N·K·2 (the structural 4×).
                 let (wb_int4, wb_fp16) = ((n * k / 2) as f64, (n * k * 2) as f64);
-                let (g_w4, g_f16, g_naive) = (flop / s_w4, flop / s_f16, flop / s_naive);
+                let (g_w4, g_static, g_dyn_raw, g_f16, g_naive) = (
+                    flop / s_w4,
+                    flop / s_static,
+                    flop / s_dyn_raw,
+                    flop / s_f16,
+                    flop / s_naive,
+                );
                 eprintln!(
                     "\n{m}x{k}x{n} W4A16 (same-run):\n  \
-                     Mercury W4A16 : {:>8.0} GFLOP/s | {:>6.1}× vs naive CUDA-C | {:>5.2}× vs Mercury fp16 (same tile)\n  \
-                     Mercury fp16  : {:>8.0} GFLOP/s | full fp16 weights — the HBM traffic int4 avoids\n  \
-                     naive CUDA-C  : {:>8.0} GFLOP/s | Tier-A int4 baseline (no robust library peer exists)\n  \
+                     Mercury W4A16     : {:>8.0} GFLOP/s | {:>6.1}× vs naive CUDA-C | {:>5.2}× vs Mercury fp16 (same tile)\n  \
+                     Mercury W4A16 stat: {:>8.0} GFLOP/s | {:>5.2}× vs dynamic (same raw-JIT load; M/N/K baked)\n  \
+                     Mercury fp16      : {:>8.0} GFLOP/s | full fp16 weights — the HBM traffic int4 avoids\n  \
+                     naive CUDA-C      : {:>8.0} GFLOP/s | Tier-A int4 baseline (no robust library peer exists)\n  \
                      weight HBM/pass: int4 {:.1} MB vs fp16 {:.1} MB ({:.1}× less weight traffic)",
                     g_w4 / 1e9,
                     g_w4 / g_naive,
                     g_w4 / g_f16,
+                    g_static / 1e9,
+                    g_static / g_dyn_raw,
                     g_f16 / 1e9,
                     g_naive / 1e9,
                     wb_int4 / 1e6,
