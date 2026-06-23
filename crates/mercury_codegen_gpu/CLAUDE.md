@@ -83,6 +83,12 @@ toolkit — only **running** needs the driver + a device.
   This is **fp16-specific**: bf16/fp8 ride only the `mma.sync` workhorse (no deep WMMA pipe), so there is
   no ≤1024³ champion base to fuse onto — the 1024³ GEMM gap is an fp16-internal competition (its WMMA pipe
   vs its mma workhorse) that bf16/fp8 don't have. `gemm_nt_f16` dispatches the plain GEMMs by size regime.
+  **Static-shape (M1, completing the int4/int8/fp16 set):** `entry_smem(static_dims=…)` bakes M/N/K as
+  constants → `wmma_f16_sm_static_ptx` / launcher `gemm_nt_f16_static`; **bit-exact** vs the dynamic `_sm`
+  (`f16_static_matches_reference`, 64 & 128 tiles). HONEST: the same-run win is **modest and
+  contention-noisy (~1.0–1.2×, `f16_static_vs_dynamic_ab`)** — materially smaller than int8's clean 1.34×
+  thin-M, because the fp16 `_sm` hot loop is wmma-dense with little per-iteration integer-stride math to
+  constant-fold (the lever pays off most on the quantized dequant/swizzle paths, less on dense fp16).
   **All the fused generators are
   precision-generic** (`entry_smem_db` and `entry_mma_pipe` key fragment width / mma type and the bias/act
   epilogue off `ty`), so **bf16 — the training precision — gets the identical fusion suite**: the WMMA
@@ -175,7 +181,11 @@ toolkit — only **running** needs the driver + a device.
   has a **split-K** mode (`int8_gemm_nt_smdb_swz_sk`, `gridDim.z=sk`, partials folded by
   `red.global.add.u32` — order-independent ⇒ bit-exact *and* deterministic, a float split-K can't be):
   up to **~2.5×** vs un-split when starved (M64 N128 K8192, 2 CTAs → sk=8), marginal once saturated
-  (`int8_splitk_occupancy`). cuBLAS int8 is s8×s8
+  (`int8_splitk_occupancy`). **Static-shape (M1, the int4 twin):** `gen_int8_smdb_swz(static_dims=…)` bakes
+  M/N/K as constants (ptxas constant-folds the strides + knows the K trip count) → `int8_gemm_smdb_swz_static_ptx`
+  / launcher `gemm_nt_int8_static`; **bit-exact** vs the dynamic kernel (`int8_static_matches_reference`,
+  64 & 128 tiles), same-run **1.02× square / up to 1.34–1.37× thin-M decode** (`int8_static_vs_dynamic_ab`,
+  both kernels raw-loaded — the int4 confound: never compare a raw-load vs a cubin-cached kernel). cuBLAS int8 is s8×s8
   only, so the peer cross-check uses `[0,127]` activations (where u8≡s8); the full-range `[0,255]` gate is
   separate. Owned by the int8 slice (`gpu-int8-gemm`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
