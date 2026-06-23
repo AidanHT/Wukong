@@ -715,7 +715,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             "mercury_sgemm"
             | "mercury_sgemm_parallel"
             | "mercury_sgemm_nt"
-            | "mercury_sgemm_nt_parallel" => {
+            | "mercury_sgemm_nt_parallel"
+            | "mercury_sgemm_tn"
+            | "mercury_sgemm_tn_parallel" => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -738,6 +740,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let bbuf = read(&self.memory, b, k * n)?;
                 let mut cbuf = read(&self.memory, c, m * n)?;
                 let transposed = name.contains("_nt");
+                // `_tn` is `C = Aᵀ·B` (A stored `[k,m]`, B `[k,n]`); element counts m*k / k*n / m*n
+                // match the plain/`_nt` reads above, so only the kernel differs. The kernel handles
+                // the transpose internally; the GPU offload below is `A·Bᵀ`-only (transposed) so it
+                // correctly declines `_tn` and this falls through to the CPU kernel.
+                let tn = name.contains("_tn");
                 // Offload to the accelerator (GPU) for the `C = A·Bᵀ` overwrite form it covers; any
                 // other shape (beta != 0, non-transposed) or a declined call falls back to the CPU
                 // kernel. With no accelerator (the oracle) this is always the CPU path.
@@ -753,7 +760,20 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Some(Err(e)) => return Err(e),
                     // SAFETY: buffers are exactly m*k, k*n (= n*k), m*n long — the kernel's contract.
                     None => unsafe {
-                        if transposed {
+                        if tn {
+                            // C = Aᵀ·B. Serial kernel for both serial/parallel names — `_tn`'s serial
+                            // and parallel forms are numerically identical (rows independent), so the
+                            // differential oracle (interp-serial vs native-parallel) stays bit-exact.
+                            mercury_runtime::mercury_sgemm_tn(
+                                abuf.as_ptr(),
+                                bbuf.as_ptr(),
+                                cbuf.as_mut_ptr(),
+                                m as i64,
+                                k as i64,
+                                n as i64,
+                                beta,
+                            );
+                        } else if transposed {
                             mercury_runtime::mercury_sgemm_nt(
                                 abuf.as_ptr(),
                                 bbuf.as_ptr(),

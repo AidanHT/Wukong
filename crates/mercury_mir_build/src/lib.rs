@@ -40,6 +40,8 @@ pub fn lower_program(
         mm_par: interner.intern("mercury_sgemm_parallel"),
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
+        tn: interner.intern("mercury_sgemm_tn"),
+        tn_par: interner.intern("mercury_sgemm_tn_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
@@ -444,6 +446,13 @@ struct GemmSyms {
     mm_par: Symbol,
     nt: Symbol,
     nt_par: Symbol,
+    /// The transposed-A weight-gradient kernel (`mercury_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
+    /// stored `[k, m]` (the `dW = dYᵀ·X` training backward GEMM — the contraction/batch axis is the
+    /// outer index of both operands). gcc/rustc compile the naive nest with column-strided A reads that
+    /// defeat vectorization; the kernel transposes A once and reuses the NN microkernel, so it is the
+    /// same differential contract the interpreter marshals. Only the `ijk` dot-product form emits it.
+    tn: Symbol,
+    tn_par: Symbol,
     /// The fused-epilogue `nn.Linear` kernel (`mercury_sgemm_nt_epi`): `C = act(A·Bᵀ + bias)`. A
     /// matmul immediately followed by a bias-add / ReLU loop over its output lowers to this.
     nt_epi: Symbol,
@@ -2037,6 +2046,17 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // `C = Aᵀ·B` (TN) has a kernel only for the plain 2-D form: a batched transposed-A nest would
+        // need a per-batch transpose the kernel doesn't do, and `Aᵀ·Bᵀ` has no kernel at all. Decline
+        // those to the scalar nest (bail before emitting any GEP). The common `dW = Aᵀ·B` is 2-D.
+        if nest.transposed_a
+            && (nest.transposed
+                || !nest.a_off.is_empty()
+                || !nest.b_off.is_empty()
+                || !nest.c_off.is_empty())
+        {
+            return false;
+        }
         // Apply any per-operand base offset (the batch/head index of a batched matmul) as a pointer
         // GEP; a plain 2-D matmul has empty offsets and passes the array base straight through. The
         // inner matmul is identical under a constant base shift, so both backends stay bit-exact.
@@ -2056,11 +2076,15 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
-        let func = match (parallel, nest.transposed) {
-            (false, false) => self.gemm.mm,
-            (true, false) => self.gemm.mm_par,
-            (false, true) => self.gemm.nt,
-            (true, true) => self.gemm.nt_par,
+        let func = match (parallel, nest.transposed_a, nest.transposed) {
+            (false, false, false) => self.gemm.mm,
+            (true, false, false) => self.gemm.mm_par,
+            (false, false, true) => self.gemm.nt,
+            (true, false, true) => self.gemm.nt_par,
+            (false, true, false) => self.gemm.tn,
+            (true, true, false) => self.gemm.tn_par,
+            // `Aᵀ·Bᵀ` (both transposed) has no kernel; the guard above already declined it.
+            (_, true, true) => return false,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -7842,6 +7866,11 @@ struct MatmulNest<'a> {
     beta: i64,
     /// `true` for `C = A·Bᵀ` (B indexed `[j,k]` instead of `[k,j]`).
     transposed: bool,
+    /// `true` for `C = Aᵀ·B` (A indexed `[k,i]` instead of `[i,k]`) — the `dW = dYᵀ·X` weight-gradient
+    /// GEMM. Only the `ijk` dot-product form recognizes it, and `emit_sgemm` requires it be mutually
+    /// exclusive with `transposed` and offset-free (the both-transposed `Aᵀ·Bᵀ` and a batched
+    /// transposed-A have no kernel, so they fall back to the scalar nest).
+    transposed_a: bool,
     /// Per-operand base offsets: the additive index terms left over after the 2-D `row*stride + col`
     /// is peeled off — e.g. the batch/head term `h*S*D` of a **batched** matmul (multi-head
     /// attention is one matmul per head: `scores[h] = Q[h]·K[h]ᵀ`). Each term is verified invariant
@@ -8096,16 +8125,23 @@ fn match_product_ab(
     pair(f1, f2).or_else(|| pair(f2, f1))
 }
 
-/// An A factor `A[row*sa + k (+ off)]` of the inline `ijk` product. Returns `(base, sa, offset)`.
+/// An A factor of the inline `ijk` product: `A[row*sa + k (+ off)]` (normal) or `A[k*sa + row (+ off)]`
+/// (transposed — the `dW = Aᵀ·B` weight-gradient spelling, where the contraction `k` is the outer
+/// index of A's storage). Returns `(base, sa, offset, transposed_a)`.
 fn match_a_factor<'a>(
     f: &'a Expr,
     row: Symbol,
     kvar: Symbol,
     interner: &Interner,
-) -> Option<(Symbol, Dim, Vec<&'a Expr>)> {
+) -> Option<(Symbol, Dim, Vec<&'a Expr>, bool)> {
     let (abase, aidx) = as_index1(f)?;
-    let (sa, off) = match_row_col_off(aidx, row, kvar, interner)?;
-    Some((abase, sa, off))
+    if let Some((sa, off)) = match_row_col_off(aidx, row, kvar, interner) {
+        return Some((abase, sa, off, false));
+    }
+    if let Some((sa, off)) = match_row_col_off(aidx, kvar, row, interner) {
+        return Some((abase, sa, off, true));
+    }
+    None
 }
 
 /// A B factor of the inline `ijk` product: `B[k*sb + j (+ off)]` (normal) or `B[j*sb + k (+ off)]`
@@ -8128,7 +8164,7 @@ fn match_b_factor<'a>(
 
 /// Like [`match_product_ab`] but for the inline `ijk` form (A read directly, never via an `aik`
 /// binding) and tolerant of a per-operand **base offset** (the batch/head index of a batched matmul).
-/// Returns `(a, sa, a_off, b, sb, b_off, transposed)`.
+/// Returns `(a, sa, a_off, b, sb, b_off, transposed, transposed_a)`.
 #[allow(clippy::type_complexity)]
 fn match_product_ab_off<'a>(
     prod: &'a Expr,
@@ -8136,7 +8172,7 @@ fn match_product_ab_off<'a>(
     kvar: Symbol,
     jvar: Symbol,
     interner: &Interner,
-) -> Option<(Symbol, Dim, Vec<&'a Expr>, Symbol, Dim, Vec<&'a Expr>, bool)> {
+) -> Option<(Symbol, Dim, Vec<&'a Expr>, Symbol, Dim, Vec<&'a Expr>, bool, bool)> {
     let ExprKind::Binary {
         op: ast::BinOp::Mul,
         lhs: f1,
@@ -8147,11 +8183,11 @@ fn match_product_ab_off<'a>(
     };
     // Either factor order: `A*B` or `B*A`.
     for (fa, fb) in [(f1, f2), (f2, f1)] {
-        if let (Some((a, sa, aoff)), Some((b, sb, boff, t))) = (
+        if let (Some((a, sa, aoff, ta)), Some((b, sb, boff, t))) = (
             match_a_factor(fa, row, kvar, interner),
             match_b_factor(fb, kvar, jvar, interner),
         ) {
-            return Some((a, sa, aoff, b, sb, boff, t));
+            return Some((a, sa, aoff, b, sb, boff, t, ta));
         }
     }
     None
@@ -8498,14 +8534,16 @@ fn match_matmul_i8_nt(
         let mut found = None;
         for (fa, fb) in [(f1, f2), (f2, f1)] {
             let (ai, bi) = (peel_cast(fa), peel_cast(fb));
-            let Some((a_sym, sa, a_off)) = match_a_factor(ai, row, kvar, interner) else {
+            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, interner) else {
                 continue;
             };
             let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
             else {
                 continue;
             };
-            if !transposed || !a_off.is_empty() || !b_off.is_empty() {
+            // int8 has only the `C = A·Bᵀ` (NT) kernel — a transposed A (`A[k*M+i]`) has no int8
+            // variant, so decline it to the scalar nest.
+            if !transposed || a_trans || !a_off.is_empty() || !b_off.is_empty() {
                 continue;
             }
             if scalar_of(ai, sema) != Some(mercury_types::Scalar::U8)
@@ -8651,7 +8689,7 @@ fn match_matmul_ijk<'a>(
     // The inline `ijk` form tolerates a per-operand base offset (a batch/head index): A, B and C may
     // each be indexed `… + h*S*D`, the hallmark of a batched matmul (multi-head attention is one
     // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
-    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed) =
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
         match_product_ab_off(prod, row, kvar, jvar, interner)?;
     // Final store: c[i*N + j (+ off)] = s.
     let StmtKind::Assign {
@@ -8667,8 +8705,11 @@ fn match_matmul_ijk<'a>(
     }
     let (cbase, cidx) = as_index1(ct)?;
     let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
+    // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
+    // (`A[k*M+i]`). Normal B's is N; transposed B's is K.
+    let sa_ok = if transposed_a { sa == m } else { sa == kdim };
     let sb_ok = if transposed { sb == kdim } else { sb == n };
-    if sa != kdim || !sb_ok || sc != n {
+    if !sa_ok || !sb_ok || sc != n {
         return None;
     }
     // Every base offset must be invariant in the matmul's own `(i,j,k)` — otherwise it is not a
@@ -8697,6 +8738,7 @@ fn match_matmul_ijk<'a>(
         n,
         beta: 0,
         transposed,
+        transposed_a,
         a_off,
         b_off,
         c_off,
@@ -8852,6 +8894,9 @@ fn match_matmul<'a>(
         n,
         beta,
         transposed,
+        // The `ikj` accumulate form binds `let aik = A[i*K+k]` with the 2-term `match_row_col`, which
+        // matches only the normal A layout — a transposed `A[k*M+i]` falls through to the scalar nest.
+        transposed_a: false,
         // The `ikj` accumulate form parses its A/C indices with the 2-term `match_row_col`, so a
         // batched (offset) index falls back to the scalar nest; offsets are always empty here.
         a_off: Vec::new(),
