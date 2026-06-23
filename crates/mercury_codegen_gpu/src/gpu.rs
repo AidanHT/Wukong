@@ -473,7 +473,17 @@ pub fn gemm_nt_f16(
     use crate::ptx_wmma::pipe_variant;
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
-        return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("mma_nt_f16_128_bk32_s2_r16"));
+        let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
+        // **Deeply HBM-bound (A+B ≳ 2×L2, e.g. ≥4096³):** the no-pad `ldmatrix`+XOR-swizzle workhorse
+        // wins (weakly dominant ~1.02–1.07× same-run, occasionally to 1.14×) — dropping the padding gives
+        // 3 CTAs/SM (vs the padded 2) to hide the HBM latency, and the swizzle keeps the gathers
+        // conflict-free at that occupancy. The L2-resident 2048³ (≈16 MB) keeps the padded hand-placed base
+        // (there the extra occupancy thrashes L2 and swz loses ~0.86×). Threshold validated at 4096³.
+        if ws_bytes >= 48 * 1024 * 1024 {
+            let swz = crate::ptx_wmma::PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..*wh };
+            return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz);
+        }
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, wh);
     }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));
@@ -3238,6 +3248,37 @@ mod tests {
                         v.smem_bytes()
                     );
                 }
+            }
+        });
+    }
+
+    /// The **`ldmatrix` + XOR-swizzle + no-pad workhorse** (`mma_nt_f16_128_bk32_s2_r16_swz`) must match the
+    /// f16-rounded f64 oracle bit-equivalently to the hand-placed/padded workhorse — same `mma.sync`, but the
+    /// SMEM is laid out with the XOR swizzle (`chunk ↦ chunk XOR ((row>>1)&3)`, no padding) that the
+    /// `ldmatrix.x4`/`.x2` gathers read conflict-free. This gate proves the **staging swizzle and the read
+    /// swizzle invert each other** (write/read agree) and the ldmatrix lane→operand contract holds, before
+    /// any speed claim. Shapes hit a single K-tile (prologue guard), two K-tiles, a 4-CTA ring wrap, and a
+    /// rectangular multi-tile — the same coverage as the hand-placed pipe gate.
+    #[test]
+    fn mma_swizzle_matches_reference_within_tol() {
+        use crate::ptx_wmma::{pipe_variant, PipeCfg};
+        use half::f16;
+        with_gpu("mma_swizzle", |g| {
+            let mut rng = crate::diff::Rng::new(0x5712_BEEF);
+            let wh = *pipe_variant("mma_nt_f16_128_bk32_s2_r16");
+            let swz = PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..wh };
+            for (m, k, n) in [
+                (128usize, 32usize, 128usize),
+                (128, 64, 128),
+                (256, 32 * (wh.stages + 3), 256),
+                (128, 32 * 3, 384),
+            ] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let c = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &swz).unwrap();
+                let s = crate::diff::assert_close(&format!("swz {m}x{k}x{n}"), &c, &r, 1e-2, 2e-3);
+                eprintln!("mma_swz {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
             }
         });
     }
@@ -6928,6 +6969,74 @@ mod tests {
                 if let Some((name, pct)) = best {
                     eprintln!("  → best @{sz}³: {name} at {pct:.1}% of cuBLAS");
                 }
+            }
+        });
+    }
+
+    /// **`ldmatrix` + XOR-swizzle + no-pad vs the hand-placed/padded workhorse** — the bet that the *proper*
+    /// CUTLASS pairing (`mma_nt_f16_128_bk32_s2_r16_swz`: conflict-free gathers AT 3 CTAs/SM, vs the padded
+    /// 2) reclaims the HBM-bound 4096³ the naive padded-`ldmatrix` lost. **Identical** tile / pipeline /
+    /// raster / `mma.sync`; only the SMEM layout + fragment load differ. Same-run interleaved, cuBLAS-adjacent
+    /// (the only honest metric under the shared-GPU clock swing); %-of-cuBLAS for both + the swz/hand ratio.
+    #[test]
+    #[ignore]
+    fn mma_swizzle_vs_handplaced() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16};
+        use crate::ptx_wmma::{pipe_variant, PipeCfg};
+        use half::f16;
+        with_gpu("mma_swizzle_bench", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] mma_swizzle_vs_handplaced: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let wh = *pipe_variant("mma_nt_f16_128_bk32_s2_r16");
+            let swz = PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..wh };
+            eprintln!(
+                "SMEM/CTA: hand-placed (padded) {} KiB → {} CTAs/SM | swz (no-pad) {} KiB → {} CTAs/SM",
+                wh.smem_bytes() / 1024,
+                100 * 1024 / wh.smem_bytes().max(1),
+                swz.smem_bytes() / 1024,
+                100 * 1024 / swz.smem_bytes().max(1),
+            );
+            let ptx = crate::ptx_wmma::wmma_f16_ptx();
+            let mut rng = crate::diff::Rng::new(0x5712_0B57);
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let cs_hp = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &wh).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_sz = gemm_nt_f16_pipe(g, &a, &b, m, k, n, &swz).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                assert!((cs_hp - cs_sz).abs() / cs_hp.max(1.0) < 1e-3, "{sz}³ swz checksum {cs_sz:.3e} vs hand-placed {cs_hp:.3e}");
+                let f_hp = g.function("wmma_f16", ptx, wh.name).unwrap();
+                let f_sz = g.function("wmma_f16", ptx, swz.name).unwrap();
+                let cfg = pipe_cfg(&wh, m, n);
+                let (mut s_hp, mut s_sz, mut s_cub) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                for _ in 0..ROUNDS {
+                    s_hp = s_hp.min(time_wmma(g, &f_hp, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                    s_sz = s_sz.min(time_wmma(g, &f_sz, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                    s_cub = s_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, 50).unwrap());
+                }
+                let g_cub = flop / s_cub;
+                eprintln!(
+                    "  {sz}³: hand-placed {:>6.0} GFLOP/s ({:>5.1}% cuBLAS) | swizzle {:>6.0} GFLOP/s ({:>5.1}% cuBLAS) | swz/hand {:>4.2}×",
+                    flop / s_hp / 1e9,
+                    100.0 * (flop / s_hp) / g_cub,
+                    flop / s_sz / 1e9,
+                    100.0 * (flop / s_sz) / g_cub,
+                    s_hp / s_sz,
+                );
             }
         });
     }
