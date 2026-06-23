@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -458
+// EXPECT-OUT: -1458
+// EXPECT-OUT: -15458
+// EXPECT-OUT: 632
+module tests.run.log_softmax_fused
+
+// In-place numerically-stable log-softmax — the classification / LM-training loss epilogue. The
+// 6-statement window (max → Σexp(x-m) → log → (x-m)-ls) folds to ONE mercury_norm_f32(NORM_LOGSOFTMAX)
+// call: each row loaded once, 256-bit AVX2, the hand-vectorized exp, and one scalar log of the row
+// sum. gcc/rustc keep the float reductions serial and call scalar expf/logf. Both backends marshal
+// the identical kernel, so the differential oracle stays bit-for-bit exact.
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) - 8.0; // -8 .. 7
+    }
+    let mut m: f32 = x[0];
+    for i in 0..16 {
+        m = fmax(m, x[i]); // row max = 7
+    }
+    let mut s: f32 = 0.0;
+    for i in 0..16 {
+        s += exp(x[i] - m); // sum of exp(x - m)
+    }
+    let ls: f32 = log(s); // log-sum-exp
+    for i in 0..16 {
+        x[i] = (x[i] - m) - ls; // out = (x - m) - ls
+    }
+    print((x[15] * 1000.0) as i32); // log p(max)
+    print((x[14] * 1000.0) as i32); // log p(2nd)
+    print((x[0] * 1000.0) as i32); // log p(min)
+    print((exp(x[15]) * 1000.0) as i32); // p(max)
+    return 0;
+}
