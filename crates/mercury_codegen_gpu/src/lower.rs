@@ -366,6 +366,15 @@ fn const_to_u64(v: i128, ty: &MirType) -> u64 {
     sext as u64
 }
 
+/// Per-unit byte stride of a chunked pointer argument (see `FnEmit::emit_chunked_call`): a
+/// compile-time constant (elementwise: 4 B f32 / 2 B bf16), or `args[d] * c` bytes — a runtime
+/// dimension scaled by an element size (a GEMM C-row is `n` elements * 4 B, an int8 A-row is `k` * 1 B).
+#[derive(Clone, Copy)]
+enum Stride {
+    Const(u64),
+    Arg(usize, u64),
+}
+
 // ============================================================================================
 // Per-function PTX emission
 // ============================================================================================
@@ -1613,18 +1622,91 @@ impl<'a> FnEmit<'a> {
             CoopKind::Vmath => {
                 let in_esz = if name == "mercury_vmath_f32" { 4 } else { 2 };
                 let h = rt_helper(name).expect("vmath helper");
-                self.emit_chunked_call(h.ptx_name, h.ret, args, result, 2, &[(0, in_esz), (1, 4)]);
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    2,
+                    &[(0, Stride::Const(in_esz)), (1, Stride::Const(4))],
+                );
             }
             CoopKind::Vmath2 => {
                 let h = rt_helper(name).expect("vmath2 helper");
-                self.emit_chunked_call(h.ptx_name, h.ret, args, result, 3, &[(0, 4), (1, 4), (2, 4)]);
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[(0, Stride::Const(4)), (1, Stride::Const(4)), (2, Stride::Const(4))],
+                );
             }
             CoopKind::Velem => {
                 let h = rt_helper(name).expect("velem helper");
-                self.emit_chunked_call(h.ptx_name, h.ret, args, result, 3, &[(0, 4), (1, 4), (2, 4)]);
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[(0, Stride::Const(4)), (1, Stride::Const(4)), (2, Stride::Const(4))],
+                );
+            }
+            // GEMM: the output rows are independent, so chunk `m` (rows). C[i,:] = A[i,:]·Bᵀ (+epi):
+            // each thread owns a contiguous A-row / C-row block; B / bias / beta / act are shared. A-row
+            // = `k` elems, C-row = `n` elems. (a=0, b=1, c=2, m=3, k=4, n=5, ...)
+            CoopKind::Gemm | CoopKind::GemmNt | CoopKind::GemmNtEpi => {
+                let h = rt_helper(name).expect("gemm helper");
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[(0, Stride::Arg(4, 4)), (2, Stride::Arg(5, 4))],
+                );
+            }
+            // int8 GEMM: A rows are u8 (`k`*1 B), C rows are i32 (`n`*4 B).
+            CoopKind::I8GemmNt => {
+                let h = rt_helper(name).expect("i8gemm helper");
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[(0, Stride::Arg(4, 1)), (2, Stride::Arg(5, 4))],
+                );
+            }
+            // Row-wise norm: each row's softmax/LayerNorm/RMSNorm is independent -> chunk `rows`.
+            // (x=0, out=1, rows=2, cols=3, ...); each row is `cols` f32.
+            CoopKind::Norm => {
+                let h = rt_helper(name).expect("norm helper");
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    2,
+                    &[(0, Stride::Arg(3, 4)), (1, Stride::Arg(3, 4))],
+                );
+            }
+            // Affine norm: (x=0, out=1, gamma=2, beta=3, rows=4, cols=5, ...); gamma/beta are
+            // per-column (shared across rows), so only x/out are row-offset by `cols`*4 B.
+            CoopKind::NormAffine => {
+                let h = rt_helper(name).expect("norm_affine helper");
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    4,
+                    &[(0, Stride::Arg(5, 4)), (1, Stride::Arg(5, 4))],
+                );
             }
             // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later for
-            // GEMM/norm/axpby — the row-chunked variants).
+            // the remaining ops — e.g. axpby).
             _ => {
                 let h = rt_helper(name).ok_or_else(|| {
                     format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
@@ -1714,9 +1796,9 @@ impl<'a> FnEmit<'a> {
 
     /// Emit a **chunked-cooperative** call of a recognized op: partition `[0, count)` (the arg at
     /// `count_idx` — elements for elementwise, rows for GEMM/norm) into contiguous per-thread chunks,
-    /// offset each pointer arg in `ptr_strides` (`(arg_idx, bytes_per_unit)`) by `lo*stride`, and have
-    /// every thread call the *existing serial* `mrt_*` over its own disjoint sub-range. No new kernel,
-    /// no internal barrier (chunks are disjoint), no races; the caller's `bar.sync` bracket orders it
+    /// offset each pointer arg in `ptr_strides` (`(arg_idx, Stride)`) by `lo*stride`, and have every
+    /// thread call the *existing serial* `mrt_*` over its own disjoint sub-range. No new kernel, no
+    /// internal barrier (chunks are disjoint), no races; the caller's `bar.sync` bracket orders it
     /// against neighbours. This is the GPU analogue of `mercury_runtime::parallel_for`'s fixed
     /// chunking, so it is deterministic and serial==parallel.
     fn emit_chunked_call(
@@ -1726,7 +1808,7 @@ impl<'a> FnEmit<'a> {
         args: &[ValueId],
         result: Option<ValueId>,
         count_idx: usize,
-        ptr_strides: &[(usize, u64)],
+        ptr_strides: &[(usize, Stride)],
     ) {
         // tid / ntid as 64-bit.
         let tid32 = self.fresh_r32();
@@ -1760,10 +1842,25 @@ impl<'a> FnEmit<'a> {
             if i == count_idx {
                 arg_regs.push((cnt.clone(), "b64"));
             } else if let Some((_, stride)) = ptr_strides.iter().find(|(idx, _)| *idx == i) {
+                // Per-unit byte stride: a constant, or a runtime dim (`args[d]`) times a constant
+                // (a GEMM row = `k` elements * 4 B, an int8-GEMM A-row = `k` * 1 B, ...).
+                let stride_bytes = match *stride {
+                    Stride::Const(c) => {
+                        let s = self.fresh(RC::Rd);
+                        self.emit(&format!("mov.b64 {s}, {c};"));
+                        s
+                    }
+                    Stride::Arg(d, c) => {
+                        let dim = self.reg(args[d]);
+                        let s = self.fresh(RC::Rd);
+                        self.emit(&format!("mul.lo.s64 {s}, {dim}, {c};"));
+                        s
+                    }
+                };
                 let base = self.reg(*a);
                 let off = self.fresh(RC::Rd);
                 let np = self.fresh(RC::Rd);
-                self.emit(&format!("mul.lo.s64 {off}, {lo}, {stride};"));
+                self.emit(&format!("mul.lo.s64 {off}, {lo}, {stride_bytes};"));
                 self.emit(&format!("add.s64 {np}, {base}, {off};"));
                 arg_regs.push((np, "b64"));
             } else {
