@@ -31,7 +31,78 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{result, sys, CudaStream, DriverError};
+use cudarc::driver::{
+    result, sys, CudaContext, CudaStream, DeviceRepr, DriverError, PinnedHostSlice, ValidAsZeroBits,
+};
+
+/// A page-locked (**pinned**) host staging buffer for truly-async H2D/D2H.
+///
+/// Copies from *pageable* host memory force the driver to bounce through an internal pinned staging
+/// buffer and typically serialize against compute; copies from **pinned** memory run concurrently on a
+/// dedicated copy stream while another stream computes — the basis of [copy/compute
+/// overlap](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/#asynchronous-transfers-and-overlapping-transfers-with-computation).
+/// Wraps cudarc's `alloc_pinned` (write-combined — ideal for the H2D upload direction; D2H readback
+/// also works, only host *reads* of the result pay the write-combined penalty, outside any timed loop).
+pub struct PinnedBuf<T> {
+    inner: PinnedHostSlice<T>,
+}
+
+impl<T: DeviceRepr + ValidAsZeroBits> PinnedBuf<T> {
+    /// Allocate `len` elements of page-locked host memory.
+    pub fn alloc(ctx: &Arc<CudaContext>, len: usize) -> Result<Self, DriverError> {
+        // SAFETY: the memory is left uninitialized; we always fill it (`copy_from_slice`) before any
+        // device read, and only read it back after a D2H completes.
+        let inner = unsafe { ctx.alloc_pinned::<T>(len)? };
+        Ok(Self { inner })
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// True iff empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl<T: DeviceRepr + ValidAsZeroBits + Copy> PinnedBuf<T> {
+    /// Fill the pinned buffer from a host slice (host-side copy; syncs the buffer's event first).
+    pub fn copy_from_slice(&mut self, src: &[T]) -> Result<(), DriverError> {
+        assert_eq!(src.len(), self.inner.len(), "PinnedBuf::copy_from_slice length mismatch");
+        let dst = self.inner.as_mut_ptr()?;
+        // SAFETY: `dst` has room for `len` elements (asserted); `src` is a valid host slice.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        Ok(())
+    }
+
+    /// Read the pinned buffer into a host `Vec` (host-side copy; syncs the buffer's event first).
+    pub fn to_vec(&self) -> Result<Vec<T>, DriverError> {
+        let src = self.inner.as_ptr()?;
+        let mut out = Vec::with_capacity(self.inner.len());
+        // SAFETY: `src` points at `len` initialized elements once a prior D2H has completed (the
+        // caller synchronizes the copy stream before calling this).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), self.inner.len());
+            out.set_len(self.inner.len());
+        }
+        Ok(out)
+    }
+}
+
+impl<T> std::ops::Deref for PinnedBuf<T> {
+    type Target = PinnedHostSlice<T>;
+    fn deref(&self) -> &PinnedHostSlice<T> {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for PinnedBuf<T> {
+    fn deref_mut(&mut self) -> &mut PinnedHostSlice<T> {
+        &mut self.inner
+    }
+}
 
 /// A captured, instantiated, replayable launch sequence. Replay with [`launch`](Self::launch); the
 /// `CUgraph` + `CUgraphExec` are destroyed on drop. Not internally synchronized (the whole GPU harness
