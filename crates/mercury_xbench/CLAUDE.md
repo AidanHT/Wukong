@@ -18,7 +18,14 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 - `main` — runs the elementwise kernel table (saxpy/dot/relu/poly + `@parallel` variants incl.
   relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`,
   `bench_linear`, `bench_linear_bf16`, `bench_matmul_tn`, `bench_conv`, `bench_norm`,
-  `bench_norm_batched`, `bench_i8gemm`, `bench_bf16`, `bench_streaming_large`, and `bench_transpose`.
+  `bench_norm_batched`, `bench_i8gemm`, `bench_bf16`, `bench_streaming_large`, `bench_transpose`, and
+  `bench_colsum`.
+- `bench_colsum` (+ `mer_colsum`/`c_colsum`/`rust_colsum`) — the column reduction `out[j] = Σ_i x[i,j]`
+  (bias gradient / batch sum) at 1024×1024 / 4096×1024, reported as GB/s (`M·N·4`, the matrix read once).
+  Mercury folds the nest to `mercury_colsum_f32[_parallel]` (SIMD + row-major streaming); C/Rust are the
+  naive strided column-outer sum, which gcc/rustc leave **scalar** (verified: no packed `vaddps`). Reuses
+  the `(x, _, out)` 3-pointer harness via an unused middle pointer. Bit-exact cross-check (both sum each
+  column i-ascending).
 - `bench_transpose` (+ `mer_transpose`/`c_transpose`/`rust_transpose`) — `dst = srcᵀ` at 1024²/2048²,
   reported as GB/s (`2·N²·4` bytes/call). Mercury folds the nest to the cache-blocked
   `mercury_transpose_f32[_parallel]`; C/Rust are the naive transpose at `-O3 -march=native` (which do
