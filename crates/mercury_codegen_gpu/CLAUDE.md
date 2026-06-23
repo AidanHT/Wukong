@@ -52,6 +52,28 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
 - `src/diff.rs` — tolerance harness (`Rng`, `assert_close`/`assert_scalar_close`).
+- `src/lower.rs` — **general MIR→PTX lowering** (Phase 4, `--backend=gpu-native`): lowers an *arbitrary*
+  Mercury program to one PTX kernel (SSA→vregs, block params→register copies, control flow→predicated
+  `bra`, allocas→a `.local`/`.global` frame, print/assert→a device record buffer replayed host-side).
+  `jit_run` tries the **megakernel** first, else the single-thread lowering (`jit_run_single`, the
+  universal reference). Matches the interp oracle on **97/97 of `tests/run`** (-O0==-O3). Also owns the
+  mega lowering (`emit_mega_ptx`, `FnEmit::lower_mega`) + the cooperative reduce PTX + `emit_chunked_call`.
+- `src/fusion.rs` — **op-graph analysis** (no device): `classify_call` (every `mercury_*` symbol →
+  `CoopKind`), `mem_tainted` (fixpoint memory-dependence), and `analyze` → the megakernel **safety gate**
+  (a program is eligible only if its control flow is *data-independent* — no `CondBr` reads memory — so
+  the SPMD cooperative kernel can't diverge and deadlock a `bar.sync`), plus the recognized-op inventory.
+- `src/megakernel.rs` — **whole-program cooperative megakernel** (Phase 8 / M13): compile an eligible
+  program into ONE `.visible .entry` kernel run by a 256-thread block — the alloca frame is one shared
+  `.global` buffer, every store/side-effect is `tid==0`-guarded, and each recognized op runs cooperatively
+  (`mrt_sreduce_coop` tree; elementwise/GEMM/norm via `emit_chunked_call`'s per-thread chunked decomposition
+  reusing the serial `mrt_*` kernels) bracketed by `bar.sync`. `try_run` gates via `fusion::analyze`,
+  launches one block, decodes the same print/exit buffer → byte-identical output, else `Ok(None)` →
+  single-thread fallback. Measured same-run (checksum-cross-checked, clock-invariant): cooperative vs
+  single-thread reduce ~73× / silu ~107–120× / GEMM ~38×; **M13 one-launch vs the per-op offload chain
+  ~285×** (`mega_vs_chain_reduce` — launch-overhead + residency elimination, vs Mercury's own
+  `--backend=gpu` model, not a library). The `.local`→`.global` frame is the lever that lets the block
+  cooperate (a per-thread `.local` frame can't be work-split); the data-independence gate is what makes
+  SPMD barriers deadlock-free.
 
 ## Key facts / gotchas
 - **One process-wide `Gpu` behind a `Mutex`.** `cargo` runs tests on many threads and a CUDA context
@@ -62,3 +84,11 @@ toolkit — only **running** needs the driver + a device.
   suite is green on GPU-less machines even when compiled `--features gpu`.
 - Verified box: NVIDIA RTX 4050 Laptop (Ada `sm_89`, 6 GB), driver 592.27, `cudarc` 0.16
   `dynamic-loading`. `nvcc`/`ptxas` absent — the driver JIT is what compiles the PTX.
+- **Megakernel chunked-cooperative pointer strides are per-pointer, not per-op.** `mrt_vmath_bf16/f16`
+  reads bf16 input (2 B) but writes **f32 output (4 B)** — a uniform stride-2 chunk made the f32 store
+  land at a 2-aligned (not 4-aligned) address → `CUDA_ERROR_MISALIGNED_ADDRESS`, which makes the context
+  *sticky*-errored so every later op (incl. JIT loads) fails the same way (looks like a cascade; the root
+  is one bad access). Encode each pointer's element size separately in `emit_chunked_call`'s strides.
+- **A `bar.sync` divergence-deadlock surfaces as a recoverable TDR launch error, not a permanent hang**
+  (Windows resets the GPU after ~2 s), so the mega gates are safe to run; the data-independence
+  eligibility gate (`fusion::analyze`) is what prevents the divergence in the first place.
