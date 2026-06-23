@@ -786,6 +786,35 @@ on the interp oracle and the GPU over identical buffers and require both that th
 fired* and that outputs match within `c·√K·ε` (GEMM bit-exact; silu ~5e-7, dot ~7e-7, softmax ~3e-8
 abs on this box). A device error surfaces as an error, never a silent CPU fallback.
 
+### M7 runtime — device memory pool + CUDA graphs + multi-stream (decode/small-batch latency)
+
+A resident transformer layer is ~13–16 individual kernel launches, each touching a few KB at decode
+sizes; per-op `cuMemAllocAsync`/free and per-kernel `cuLaunchKernel` then dominate. The Phase-7 runtime
+removes both — a **device memory pool** (`pool.rs`, a bump arena over one slab: no per-op alloc/free,
+no zeroing memset) and **CUDA-graph capture/replay** (`graph.rs`: capture the whole layer once, replay
+with one `cuGraphLaunch`). Every optimized path is gated **bit-identical** to the per-op-alloc +
+individual-launch baseline (the slab is poisoned `0xFF` first to expose any read-of-uninitialized
+scratch) and deterministic across replays; all numbers are **same-run** ratios (the ~7× laptop clock
+swing makes absolutes meaningless), reported as the best of ≥3 re-runs.
+
+| Workload (RTX 4050) | eager → pooled | eager → **graphed** | note |
+|---|---|---|---|
+| 1 layer, decode (S=64, D=64) | ~1.9–2.0× | **~4.5–6.4×** | graph adds ~2.2–3.3× on top of pooling |
+| 1 layer, S=512 D=128 | ~1.8–2.1× | ~3.2–3.5× | |
+| 1 layer, GPT-2 (S=512 D=768 H=12) | ~1.0× | ~1.1× | compute-bound; little overhead to remove |
+| **12-layer model, decode** | — | **~6.5–6.9×** | ~2.5 ms → ~380 µs; 156 launches → **1 cuGraphLaunch** |
+
+The whole-model win **compounds with depth** (more launches folded) while graphed latency scales
+linearly at ~32 µs/layer (pure compute + one launch), and the pool footprint stays at **one layer's
+232 KiB** for the whole stack (reset between layers). **Multi-stream:** copy/compute overlap with
+pinned host staging (`PinnedBuf`, 2 streams, event-ordered) is gated bit-identical to serial but is
+~1.0× here — the resident layer is strongly compute-bound, so even GPT-2's 1.5 MiB/item transfer is a
+small fraction of compute (the prefill/slow-link lever, not realized on this workload). The lever that
+*does* help the underutilized decode regime is **concurrent forwards** — K=4 independent requests on K
+streams reclaim idle SMs for **~1.3×** decode-serving throughput (and ~1.0× at the GPT-2 shape, which
+already saturates). Reproduce: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored
+--nocapture pool_graph_vs_unpooled decode_stack_latency overlap_throughput concurrent_forwards_throughput`.
+
 ## Honest summary
 
 - **Compile time:** ~100–260× faster than gcc/rustc (geomean ~135–155×). Robust every run; the metric
