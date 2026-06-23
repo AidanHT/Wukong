@@ -37,6 +37,11 @@ pub const RED_MAX: i64 = 4; // max(x[i])  — fold by fmax
 pub const RED_MIN: i64 = 5; // min(x[i])  — fold by fmin
 pub const RED_MAXABS: i64 = 6; // max(|x[i]|) — abs each element, fold by fmax (symmetric int8 quant)
 
+// Arg-reductions: return an *index* (not a value), so they ride a separate `-> i64` ABI
+// (`mercury_argreduce_f32`), not the `-> f32` `mercury_sreduce_f32`. Lowest index wins on ties.
+pub const RED_ARGMAX: i64 = 7; // argmax_i x[i] — greedy decode / classification top-1
+pub const RED_ARGMIN: i64 = 8; // argmin_i x[i]
+
 /// The fold identity: `0.0` for the additive ops, `∓∞` for max/min/maxabs so the first real element
 /// wins (`maxabs` folds by max, identity `−∞`).
 #[inline(always)]
@@ -264,6 +269,138 @@ pub unsafe extern "C" fn mercury_sreduce_f32_parallel(
     acc
 }
 
+// --- arg-reductions (argmax / argmin) -------------------------------------------------------------
+//
+// These return the INDEX of the extreme element, with **lowest index winning on a value tie** — the
+// tie-break that makes the fold associative over any chunk decomposition, so the fixed-`RCHUNK`
+// serial form, the multicore form, and the interpreter all return the same index regardless of how
+// many chunks/threads ran (the same determinism contract as `mercury_sreduce_f32`). NaN never
+// displaces the running candidate (strict `>`/`<`), matching the value reductions' NaN behavior.
+
+/// Combine two `(value, index)` candidates. A strictly-better value wins; on an exact value tie the
+/// LOWER index wins; else keep `a`. `is_max`: argmax (larger wins) vs argmin (smaller). Strict compare
+/// + explicit lower-index tie = a total order on the (unique-index) pairs, so the fold is associative
+/// and serial == parallel == interp.
+#[inline(always)]
+fn arg_fold(a: (f32, usize), b: (f32, usize), is_max: bool) -> (f32, usize) {
+    let b_better = if is_max { b.0 > a.0 } else { b.0 < a.0 };
+    if b_better {
+        b
+    } else if a.0 == b.0 && b.1 < a.1 {
+        b
+    } else {
+        a
+    }
+}
+
+/// Reduce `x[lo..hi]` to its `(extreme value, index)` under argmax/argmin. Pure function of the chunk
+/// (ascending scan + lowest-index tie-break), so every thread or the serial loop returns the same pair.
+/// Eight lane candidates give ILP without an AVX2 twin: at N=2^20 an argmax is memory-bound (one load
+/// stream), so the scalar fold already saturates load bandwidth and beats C's branchy `if (x>best)`
+/// loop (no mispredicts), and being scalar-only it is trivially bit-exact.
+///
+/// # Safety
+/// `x` valid for reads on `[lo, hi)`.
+#[inline]
+unsafe fn argreduce_chunk(x: *const f32, lo: usize, hi: usize, is_max: bool) -> (f32, usize) {
+    let ident_v = if is_max {
+        f32::NEG_INFINITY
+    } else {
+        f32::INFINITY
+    };
+    let mut acc = [(ident_v, usize::MAX); 8];
+    let len = hi - lo;
+    let nsteps = len / 8;
+    for s in 0..nsteps {
+        let base = lo + s * 8;
+        for (j, a) in acc.iter_mut().enumerate() {
+            let i = base + j;
+            *a = arg_fold(*a, (*x.add(i), i), is_max);
+        }
+    }
+    let tail = lo + nsteps * 8;
+    for (j, a) in acc.iter_mut().enumerate().take(len - nsteps * 8) {
+        let i = tail + j;
+        *a = arg_fold(*a, (*x.add(i), i), is_max);
+    }
+    // Fixed-order ascending lane collapse (0→7): on an all-equal chunk lane 0 holds the lowest index,
+    // and ascending `arg_fold` keeps it — so the lowest-index rule holds through the horizontal combine.
+    let mut r = acc[0];
+    for a in &acc[1..] {
+        r = arg_fold(r, *a, is_max);
+    }
+    r
+}
+
+/// `argmax`/`argmin` over `x[0..n]` (serial), lowest index on ties. Returns the index as `i64`
+/// (`-1` if `n <= 0`). Same fixed-`RCHUNK` decomposition as [`mercury_sreduce_f32`], so it is
+/// bit-identical to [`mercury_argreduce_f32_parallel`] and the interpreter.
+///
+/// # Safety
+/// `x` valid for `n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_argreduce_f32(x: *const f32, n: i64, op: i64) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    let n = n as usize;
+    let is_max = op == RED_ARGMAX;
+    let ident_v = if is_max {
+        f32::NEG_INFINITY
+    } else {
+        f32::INFINITY
+    };
+    let nchunks = n.div_ceil(RCHUNK);
+    let mut acc = (ident_v, usize::MAX);
+    for c in 0..nchunks {
+        let lo = c * RCHUNK;
+        let hi = ((c + 1) * RCHUNK).min(n);
+        // SAFETY: [lo, hi) ⊆ [0, n).
+        acc = arg_fold(acc, unsafe { argreduce_chunk(x, lo, hi, is_max) }, is_max);
+    }
+    acc.1 as i64
+}
+
+/// Multicore `argmax`/`argmin` — **bit-identical** to [`mercury_argreduce_f32`]. Partials are collected
+/// in chunk order (rayon's indexed `collect`) and folded ascending — the identical tree as the serial
+/// form — so the returned index never depends on thread count.
+///
+/// # Safety
+/// `x` valid for `n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_argreduce_f32_parallel(x: *const f32, n: i64, op: i64) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    let n = n as usize;
+    let is_max = op == RED_ARGMAX;
+    let ident_v = if is_max {
+        f32::NEG_INFINITY
+    } else {
+        f32::INFINITY
+    };
+    let nchunks = n.div_ceil(RCHUNK);
+    if nchunks < 2 {
+        // SAFETY: same contract.
+        return unsafe { mercury_argreduce_f32(x, n as i64, op) };
+    }
+    let xa = x as usize;
+    let partials: Vec<(f32, usize)> = (0..nchunks)
+        .into_par_iter()
+        .map(|c| {
+            let lo = c * RCHUNK;
+            let hi = ((c + 1) * RCHUNK).min(n);
+            // SAFETY: disjoint read-only chunk; pointer valid for n.
+            unsafe { argreduce_chunk(xa as *const f32, lo, hi, is_max) }
+        })
+        .collect();
+    let mut acc = (ident_v, usize::MAX);
+    for p in partials {
+        acc = arg_fold(acc, p, is_max);
+    }
+    acc.1 as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +494,53 @@ mod tests {
                 assert_eq!(s.to_bits(), v.to_bits(), "scalar != avx2 at n={n} op={op}");
             }
         }
+    }
+
+    #[test]
+    fn argreduce_serial_matches_parallel_and_naive() {
+        // Deterministic argmax/argmin: serial == parallel, and == a naive ascending scan with the same
+        // lowest-index tie-break — independent of how many RCHUNK chunks/threads ran.
+        for &n in &[1usize, 7, 8, 9, 8192, 8193, 3 * 8192 + 13, 100_003] {
+            let (x, _) = fill(n);
+            for &op in &[RED_ARGMAX, RED_ARGMIN] {
+                let s = unsafe { mercury_argreduce_f32(x.as_ptr(), n as i64, op) };
+                let p = unsafe { mercury_argreduce_f32_parallel(x.as_ptr(), n as i64, op) };
+                assert_eq!(s, p, "serial != parallel at n={n} op={op}");
+                let is_max = op == RED_ARGMAX;
+                let mut best = (
+                    if is_max {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    },
+                    usize::MAX,
+                );
+                for (i, &v) in x.iter().enumerate() {
+                    best = arg_fold(best, (v, i), is_max);
+                }
+                assert_eq!(s, best.1 as i64, "kernel != naive at n={n} op={op}");
+            }
+        }
+    }
+
+    #[test]
+    fn argreduce_duplicate_maxima_return_lowest_index() {
+        // The global max 9.0 appears at indices spanning multiple RCHUNK chunks; argmax must return
+        // the LOWEST such index, serial and parallel (the tie-break determinism guarantee).
+        let n = 5 * 8192;
+        let mut x = vec![1.0f32; n];
+        for &i in &[3usize, 8192 + 17, 2 * 8192 + 5, 4 * 8192 + 100] {
+            x[i] = 9.0;
+        }
+        let s = unsafe { mercury_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMAX) };
+        let p = unsafe { mercury_argreduce_f32_parallel(x.as_ptr(), n as i64, RED_ARGMAX) };
+        assert_eq!(s, 3, "argmax lowest index (serial)");
+        assert_eq!(p, 3, "argmax lowest index (parallel)");
+        // argmin: minimum 1.0 first appears at index 0.
+        assert_eq!(
+            unsafe { mercury_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMIN) },
+            0,
+            "argmin lowest index"
+        );
     }
 }

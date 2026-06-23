@@ -24,7 +24,8 @@ pub use velem::{mercury_velem_f32, mercury_vhorner_f32, VE_ID, VE_RELU, VE_RELU6
 
 mod reduce;
 pub use reduce::{
-    mercury_sreduce_f32, mercury_sreduce_f32_parallel, RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ,
+    mercury_argreduce_f32, mercury_argreduce_f32_parallel, mercury_sreduce_f32,
+    mercury_sreduce_f32_parallel, RED_ARGMAX, RED_ARGMIN, RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ,
 };
 
 mod norm;
