@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -40
+// EXPECT-OUT: 40
+// EXPECT-OUT: -8
+// EXPECT-OUT: 152
+module tests.run.linear_f16
+
+// IEEE f16 mixed-precision nn.Linear: C = A·Bᵀ with f16 activations and f16 weights widened to f32 and
+// accumulated in an f32 s. The f16 twin of linear_bf16 — same recognizer, dispatched to
+// mercury_sgemm_f16_nt (the widen is F16C-exact). Small integers are f16-exact, so the result is exact
+// and the differential gate is bit-for-bit. A is [3,4], B is [3,4], C is [3,3].
+fn main() -> i32 {
+    let mut a: [f16; 12] = [0.0 as f16; 12];
+    let mut b: [f16; 12] = [0.0 as f16; 12];
+    let mut c: [f32; 9] = [0.0; 9];
+    for i in 0..12 {
+        a[i] = ((i + 1) as f32) as f16; // 1 .. 12
+    }
+    for i in 0..12 {
+        b[i] = (((i as i32) - 6) as f32) as f16; // -6 .. 5
+    }
+
+    // C[i,j] = sum_k A[i,k] * B[j,k]   (f16 reads widen to f32; products + sums accumulate in f32)
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + (a[i * 4 + k] as f32) * (b[j * 4 + k] as f32);
+            }
+            c[i * 3 + j] = s;
+        }
+    }
+
+    print(c[0] as i32); // -40
+    print(c[2] as i32); //  40
+    print(c[4] as i32); //  -8
+    print(c[8] as i32); // 152
+    return 0;
+}

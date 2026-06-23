@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -40
+// EXPECT-OUT: 40
+// EXPECT-OUT: -8
+// EXPECT-OUT: 152
+module tests.run.linear_bf16
+
+// bf16 mixed-precision nn.Linear: C = A·Bᵀ with bf16 activations and bf16 weights, each widened to f32
+// and accumulated in an f32 s — the standard mixed-precision transformer matmul. The compiler
+// recognizes this dot-product nest (the half-precision twin of the f32 / int8 nn.Linear forms) and
+// dispatches it to the mercury_sgemm_bf16_nt kernel: a lossless widen prepass feeding the tuned AVX2
+// f32 GEMM. Without it the half nest falls to a scalar widening loop. Small integers are bf16-exact,
+// so the result is exact and the differential gate is bit-for-bit (interp == native, -O0 == -O3).
+// A is [3,4], B is [3,4] (its rows are the weight vectors), so C is [3,3].
+fn main() -> i32 {
+    let mut a: [bf16; 12] = [0.0 as bf16; 12];
+    let mut b: [bf16; 12] = [0.0 as bf16; 12];
+    let mut c: [f32; 9] = [0.0; 9];
+    for i in 0..12 {
+        a[i] = ((i + 1) as f32) as bf16; // 1 .. 12
+    }
+    for i in 0..12 {
+        b[i] = (((i as i32) - 6) as f32) as bf16; // -6 .. 5
+    }
+
+    // C[i,j] = sum_k A[i,k] * B[j,k]   (bf16 reads widen to f32; products + sums accumulate in f32)
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + (a[i * 4 + k] as f32) * (b[j * 4 + k] as f32);
+            }
+            c[i * 3 + j] = s;
+        }
+    }
+
+    print(c[0] as i32); // row0·col0: 1·-6 + 2·-5 + 3·-4 + 4·-3 = -40
+    print(c[2] as i32); // row0·col2: 1·2 + 2·3 + 3·4 + 4·5     =  40
+    print(c[4] as i32); // row1·col1: 5·-2 + 6·-1 + 7·0 + 8·1   =  -8
+    print(c[8] as i32); // row2·col2: 9·2 + 10·3 + 11·4 + 12·5  = 152
+    return 0;
+}
