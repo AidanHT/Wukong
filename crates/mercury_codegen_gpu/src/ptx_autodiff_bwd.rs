@@ -15,7 +15,13 @@
 
 use crate::gpu::Gpu;
 use crate::ptx_optim::grid_stride_cfg;
-use cudarc::driver::{DriverError, PushKernelArg};
+use cudarc::driver::{DriverError, LaunchConfig, PushKernelArg};
+use std::sync::OnceLock;
+
+// Row-norm op codes (mirror `mercury_autodiff::tape` / `mercury_runtime`).
+const NORM_SOFTMAX: i64 = 0;
+const NORM_LAYERNORM: i64 = 1;
+const NORM_RMSNORM: i64 = 2;
 
 // ----------------------------------------------------------------------------------------------
 // Transpose: dst(n×m) = src(m×n)ᵀ  (the `dB = dCᵀ·A` path's transpose, tape.rs::transpose)
@@ -283,6 +289,213 @@ pub fn act_bwd_f32(
     g.stream.memcpy_dtov(&dx_d)
 }
 
+// ----------------------------------------------------------------------------------------------
+// Row-norm backward: softmax / LayerNorm / RMSNorm (tape.rs::{softmax_back,layernorm_back,
+// rmsnorm_back}). One **warp per row** (block_dim=32, grid=rows): the 32 lanes stride the row to
+// form the per-row reductions, all-reduce them with `shfl.sync.bfly` (fixed butterfly order ->
+// deterministic), then a second strided pass writes `dx`. Math, per row:
+//   softmax:   dx = y * (dy - sum_j dy_j*y_j)
+//   layernorm: mu=mean(x), var=mean(x^2)-mu^2, sigma=sqrt(var+eps), inv=1/sigma,
+//              dx = inv*(dy - mean(dy) - y*mean(dy*y))           (sigma recomputed from x)
+//   rmsnorm:   r=sqrt(mean(x^2)+eps), inv=1/r,
+//              dx = inv*(dy - y*mean(dy*y))
+// Reductions reassociate vs the CPU tape, so this is tolerance-gated (c*sqrt(cols)*eps).
+// ----------------------------------------------------------------------------------------------
+
+/// Warp butterfly all-reduce (add) of `%{reg}`, scratch `%rt` — every lane ends with the row sum.
+fn allreduce_add(reg: &str) -> String {
+    let mut s = String::new();
+    for off in [16, 8, 4, 2, 1] {
+        s += &format!("    shfl.sync.bfly.b32 %rt, %{reg}, {off}, 0x1f, 0xffffffff;\n");
+        s += &format!("    add.f32 %{reg}, %{reg}, %rt;\n");
+    }
+    s
+}
+
+/// A strided pass `for (i = lane; i < cols; i += 32)` running `body`, which addresses element `i`
+/// via the byte offset `%off` added to a row-base pointer (`%dyp`/`%xp`/`%yp`/`%dxp`). `tag` makes
+/// labels unique.
+fn strided(tag: &str, body: &str) -> String {
+    format!(
+        "    mov.u32 %i,%lane;\nL_{tag}:\n    setp.ge.u32 %p0,%i,%cols;\n    @%p0 bra E_{tag};\n    mul.wide.u32 %off,%i,4;\n{body}    add.u32 %i,%i,32;\n    bra L_{tag};\nE_{tag}:\n"
+    )
+}
+
+/// Common backward prologue: one warp per row; loads `(rows, cols, eps)` and the four buffers
+/// `(dy, x, y, dx)`, computes the row-base pointers, bails if `row >= rows`.
+fn bwd_prologue(name: &str) -> String {
+    format!(
+        r#".visible .entry {name}(
+    .param .u32 pRows,
+    .param .u32 pCols,
+    .param .f32 pEps,
+    .param .u64 pDy,
+    .param .u64 pX,
+    .param .u64 pY,
+    .param .u64 pDx
+)
+{{
+    .reg .pred %p0;
+    .reg .f32 %rt,%vx,%vy,%vdy,%sx,%sx2,%sdy,%sdyy,%s,%mu,%ex2,%var,%denom,%inv,%mdy,%mdyy,%eps,%colsf,%t1,%res;
+    .reg .b32 %rows,%cols,%row,%lane,%i,%tmp;
+    .reg .b64 %DY,%X,%Y,%DX,%dyp,%xp,%yp,%dxp,%off,%a;
+    ld.param.u32 %rows,[pRows];
+    ld.param.u32 %cols,[pCols];
+    ld.param.f32 %eps,[pEps];
+    ld.param.u64 %DY,[pDy];
+    ld.param.u64 %X,[pX];
+    ld.param.u64 %Y,[pY];
+    ld.param.u64 %DX,[pDx];
+    cvta.to.global.u64 %DY,%DY;
+    cvta.to.global.u64 %X,%X;
+    cvta.to.global.u64 %Y,%Y;
+    cvta.to.global.u64 %DX,%DX;
+    mov.u32 %row,%ctaid.x;
+    setp.ge.u32 %p0,%row,%rows;
+    @%p0 bra RET_{name};
+    mov.u32 %lane,%tid.x;
+    cvt.rn.f32.u32 %colsf,%cols;
+    mul.lo.s32 %tmp,%row,%cols;
+    mul.wide.u32 %off,%tmp,4;
+    add.s64 %dyp,%DY,%off;
+    add.s64 %xp,%X,%off;
+    add.s64 %yp,%Y,%off;
+    add.s64 %dxp,%DX,%off;
+"#
+    )
+}
+
+/// softmax backward: `dx = y * (dy - sum_j dy_j*y_j)`.
+fn softmax_bwd() -> String {
+    let mut s = bwd_prologue("softmax_bwd");
+    s += "    mov.f32 %s,0f00000000;\n";
+    s += &strided(
+        "sbr",
+        "    add.s64 %a,%dyp,%off;\n    ld.global.f32 %vdy,[%a];\n    add.s64 %a,%yp,%off;\n    ld.global.f32 %vy,[%a];\n    fma.rn.f32 %s,%vdy,%vy,%s;\n",
+    );
+    s += &allreduce_add("s");
+    s += &strided(
+        "sbw",
+        "    add.s64 %a,%dyp,%off;\n    ld.global.f32 %vdy,[%a];\n    add.s64 %a,%yp,%off;\n    ld.global.f32 %vy,[%a];\n    sub.f32 %t1,%vdy,%s;\n    mul.f32 %res,%vy,%t1;\n    add.s64 %a,%dxp,%off;\n    st.global.f32 [%a],%res;\n",
+    );
+    s += "RET_softmax_bwd:\n    ret;\n}\n";
+    s
+}
+
+/// LayerNorm backward: `dx = (1/sigma)*(dy - mean(dy) - y*mean(dy*y))`, sigma recomputed from x.
+fn layernorm_bwd() -> String {
+    let mut s = bwd_prologue("layernorm_bwd");
+    s += "    mov.f32 %sx,0f00000000;\n    mov.f32 %sx2,0f00000000;\n    mov.f32 %sdy,0f00000000;\n    mov.f32 %sdyy,0f00000000;\n";
+    s += &strided(
+        "lbr",
+        "    add.s64 %a,%xp,%off;\n    ld.global.f32 %vx,[%a];\n    add.s64 %a,%dyp,%off;\n    ld.global.f32 %vdy,[%a];\n    add.s64 %a,%yp,%off;\n    ld.global.f32 %vy,[%a];\n    add.f32 %sx,%sx,%vx;\n    fma.rn.f32 %sx2,%vx,%vx,%sx2;\n    add.f32 %sdy,%sdy,%vdy;\n    fma.rn.f32 %sdyy,%vdy,%vy,%sdyy;\n",
+    );
+    s += &allreduce_add("sx");
+    s += &allreduce_add("sx2");
+    s += &allreduce_add("sdy");
+    s += &allreduce_add("sdyy");
+    s += "    div.rn.f32 %mu,%sx,%colsf;\n";
+    s += "    div.rn.f32 %ex2,%sx2,%colsf;\n";
+    s += "    mul.f32 %t1,%mu,%mu;\n    sub.f32 %var,%ex2,%t1;\n";
+    s += "    add.f32 %denom,%var,%eps;\n    sqrt.rn.f32 %denom,%denom;\n";
+    s += "    mov.f32 %t1,0f3F800000;\n    div.rn.f32 %inv,%t1,%denom;\n";
+    s += "    div.rn.f32 %mdy,%sdy,%colsf;\n";
+    s += "    div.rn.f32 %mdyy,%sdyy,%colsf;\n";
+    s += &strided(
+        "lbw",
+        "    add.s64 %a,%dyp,%off;\n    ld.global.f32 %vdy,[%a];\n    add.s64 %a,%yp,%off;\n    ld.global.f32 %vy,[%a];\n    mul.f32 %res,%vy,%mdyy;\n    sub.f32 %t1,%vdy,%mdy;\n    sub.f32 %t1,%t1,%res;\n    mul.f32 %res,%inv,%t1;\n    add.s64 %a,%dxp,%off;\n    st.global.f32 [%a],%res;\n",
+    );
+    s += "RET_layernorm_bwd:\n    ret;\n}\n";
+    s
+}
+
+/// RMSNorm backward: `dx = (1/r)*(dy - y*mean(dy*y))`, r recomputed from x.
+fn rmsnorm_bwd() -> String {
+    let mut s = bwd_prologue("rmsnorm_bwd");
+    s += "    mov.f32 %sx2,0f00000000;\n    mov.f32 %sdyy,0f00000000;\n";
+    s += &strided(
+        "rbr",
+        "    add.s64 %a,%xp,%off;\n    ld.global.f32 %vx,[%a];\n    add.s64 %a,%dyp,%off;\n    ld.global.f32 %vdy,[%a];\n    add.s64 %a,%yp,%off;\n    ld.global.f32 %vy,[%a];\n    fma.rn.f32 %sx2,%vx,%vx,%sx2;\n    fma.rn.f32 %sdyy,%vdy,%vy,%sdyy;\n",
+    );
+    s += &allreduce_add("sx2");
+    s += &allreduce_add("sdyy");
+    s += "    div.rn.f32 %ex2,%sx2,%colsf;\n";
+    s += "    add.f32 %denom,%ex2,%eps;\n    sqrt.rn.f32 %denom,%denom;\n";
+    s += "    mov.f32 %t1,0f3F800000;\n    div.rn.f32 %inv,%t1,%denom;\n";
+    s += "    div.rn.f32 %mdyy,%sdyy,%colsf;\n";
+    s += &strided(
+        "rbw",
+        "    add.s64 %a,%dyp,%off;\n    ld.global.f32 %vdy,[%a];\n    add.s64 %a,%yp,%off;\n    ld.global.f32 %vy,[%a];\n    mul.f32 %res,%vy,%mdyy;\n    sub.f32 %t1,%vdy,%res;\n    mul.f32 %res,%inv,%t1;\n    add.s64 %a,%dxp,%off;\n    st.global.f32 [%a],%res;\n",
+    );
+    s += "RET_rmsnorm_bwd:\n    ret;\n}\n";
+    s
+}
+
+/// The row-norm backward module (softmax / layernorm / rmsnorm), generated once and cached.
+pub fn norm_bwd_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        m += &softmax_bwd();
+        m += &layernorm_bwd();
+        m += &rmsnorm_bwd();
+        m
+    })
+    .as_str()
+}
+
+/// Whether [`norm_bwd_f32`] has a GPU kernel for row-norm backward op `op`.
+pub fn norm_bwd_supported(op: i64) -> bool {
+    op == NORM_SOFTMAX || op == NORM_LAYERNORM || op == NORM_RMSNORM
+}
+
+/// Row-norm backward on the GPU. `dy` is the output gradient, `x` the forward input (softmax ignores
+/// it), `y` the forward normalized output; returns `dx` (`rows*cols`). `eps` matches the forward
+/// norm (softmax ignores it). One warp per row.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_bwd_f32(
+    g: &mut Gpu,
+    op: i64,
+    dy: &[f32],
+    x: &[f32],
+    y: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<Vec<f32>, DriverError> {
+    let n = rows * cols;
+    assert_eq!(dy.len(), n, "norm_bwd: dy must be rows*cols");
+    assert_eq!(x.len(), n, "norm_bwd: x must be rows*cols");
+    assert_eq!(y.len(), n, "norm_bwd: y must be rows*cols");
+    let entry = match op {
+        NORM_SOFTMAX => "softmax_bwd",
+        NORM_LAYERNORM => "layernorm_bwd",
+        NORM_RMSNORM => "rmsnorm_bwd",
+        _ => panic!("norm_bwd op {op} not implemented"),
+    };
+    let f = g.function("norm_bwd", norm_bwd_ptx(), entry)?;
+    let dy_d = g.stream.memcpy_stod(dy)?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let y_d = g.stream.memcpy_stod(y)?;
+    let mut dx_d = g.stream.memcpy_stod(&vec![0f32; n])?;
+    let (rows_u, cols_u) = (rows as u32, cols as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (rows_u, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&rows_u)
+        .arg(&cols_u)
+        .arg(&eps)
+        .arg(&dy_d)
+        .arg(&x_d)
+        .arg(&y_d)
+        .arg(&mut dx_d);
+    unsafe { b.launch(cfg)? };
+    g.stream.memcpy_dtov(&dx_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +576,95 @@ mod tests {
                     })
                     .collect();
                 assert_close(&format!("act_bwd op {op}"), &got, &want, 1e-6, 1e-6);
+            }
+        });
+    }
+
+    #[test]
+    fn norm_bwd_matches_reference() {
+        with_gpu("norm_bwd_matches_reference", |g| {
+            let (rows, cols) = (16usize, 130usize); // cols not a multiple of 32 -> tail lanes
+            let eps = 1e-5f32;
+            let mut rng = Rng::new(0xBEEF);
+            let x = rng.vec(rows * cols, -2.0, 2.0);
+            let dy = rng.vec(rows * cols, -1.0, 1.0);
+
+            for &op in &[NORM_SOFTMAX, NORM_LAYERNORM, NORM_RMSNORM] {
+                // Forward output y per row (the value the backward reuses), computed in f64.
+                let mut y = vec![0f32; rows * cols];
+                for r in 0..rows {
+                    let row = &x[r * cols..(r + 1) * cols];
+                    match op {
+                        NORM_SOFTMAX => {
+                            let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let exps: Vec<f64> = row.iter().map(|&v| ((v - m) as f64).exp()).collect();
+                            let s: f64 = exps.iter().sum();
+                            for c in 0..cols {
+                                y[r * cols + c] = (exps[c] / s) as f32;
+                            }
+                        }
+                        NORM_LAYERNORM => {
+                            let mu = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+                            let var =
+                                row.iter().map(|&v| (v as f64 - mu).powi(2)).sum::<f64>() / cols as f64;
+                            let sigma = (var + eps as f64).sqrt();
+                            for c in 0..cols {
+                                y[r * cols + c] = ((row[c] as f64 - mu) / sigma) as f32;
+                            }
+                        }
+                        NORM_RMSNORM => {
+                            let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                            let rr = (ms + eps as f64).sqrt();
+                            for c in 0..cols {
+                                y[r * cols + c] = (row[c] as f64 / rr) as f32;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                let got = norm_bwd_f32(g, op, &dy, &x, &y, rows, cols, eps).unwrap();
+
+                // f64 reference of the exact tape backward formulas.
+                let mut want = vec![0f32; rows * cols];
+                for r in 0..rows {
+                    let xr = &x[r * cols..(r + 1) * cols];
+                    let dyr = &dy[r * cols..(r + 1) * cols];
+                    let yr = &y[r * cols..(r + 1) * cols];
+                    let dot = |a: &[f32], b: &[f32]| -> f64 {
+                        (0..cols).map(|c| a[c] as f64 * b[c] as f64).sum()
+                    };
+                    match op {
+                        NORM_SOFTMAX => {
+                            let s = dot(dyr, yr);
+                            for c in 0..cols {
+                                want[r * cols + c] = (yr[c] as f64 * (dyr[c] as f64 - s)) as f32;
+                            }
+                        }
+                        NORM_LAYERNORM => {
+                            let mu = xr.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+                            let ex2 = xr.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                            let inv = 1.0 / (ex2 - mu * mu + eps as f64).sqrt();
+                            let mdy = dyr.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+                            let mdyy = dot(dyr, yr) / cols as f64;
+                            for c in 0..cols {
+                                let v = inv * (dyr[c] as f64 - mdy - yr[c] as f64 * mdyy);
+                                want[r * cols + c] = v as f32;
+                            }
+                        }
+                        NORM_RMSNORM => {
+                            let ms = xr.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                            let inv = 1.0 / (ms + eps as f64).sqrt();
+                            let mdyy = dot(dyr, yr) / cols as f64;
+                            for c in 0..cols {
+                                let v = inv * (dyr[c] as f64 - yr[c] as f64 * mdyy);
+                                want[r * cols + c] = v as f32;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                assert_close(&format!("norm_bwd op {op}"), &got, &want, 1e-4, 1e-4);
             }
         });
     }
