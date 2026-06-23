@@ -444,6 +444,19 @@ across backends (`tests/run/linear_{bf16,f16}.mer`; the runtime twin test pins b
 widened-operands and serial == parallel). Single-run, clock-sensitive absolute GFLOP/s; the ratio is
 the stable part.
 
+**Fused FFN epilogue (`C = act(A·Bᵀ + bias)`) — bias + activation for free.** The mixed-precision
+transformer FFN projection — the half matmul immediately followed by its bias-add and an
+identity/ReLU/GELU/SiLU activation — folds into one **`mercury_sgemm_{bf16,f16}_nt_epi`** call: the
+lossless widen prepass feeds the f32 GEMM, which applies the bias + activation **in its C-tile
+writeback** instead of paying a separate read-modify-write pass over C. So the FFN runs at the bf16/f16
+GEMM throughput above (the epilogue is O(m·n), ~1/k of the matmul, and adds *no* extra memory pass) —
+the bias and activation cost ≈0. This is the same fusion the int8 dequant epilogue exploits and the one
+cuBLAS/oneDNN structurally can't express (they emit the GEMM, then a separate bias/activation kernel
+over the full output). Like the f32 `nt_epi`, the bias may be null (the bias-free SwiGLU projection).
+GELU/SiLU reuse the `vmath` scalar forms, so the fused result equals the unfused matmul → bias →
+activation bit-for-bit (`tests/run/linear_{bf16,f16}_ffn.mer`; the runtime twin pins it == the f32
+fused FFN on the widened operands across all four activations × bias on/off, serial == parallel).
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
