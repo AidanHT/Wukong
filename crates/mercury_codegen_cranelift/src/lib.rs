@@ -103,6 +103,8 @@ const RT_TRANSPOSE: &str = "mercury_transpose_f32";
 const RT_TRANSPOSE_PAR: &str = "mercury_transpose_f32_parallel";
 const RT_TRANSPOSE_U16: &str = "mercury_transpose_u16";
 const RT_TRANSPOSE_U16_PAR: &str = "mercury_transpose_u16_parallel";
+const RT_COLSUM: &str = "mercury_colsum_f32";
+const RT_COLSUM_PAR: &str = "mercury_colsum_f32_parallel";
 const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
@@ -872,6 +874,17 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[src, dst, rows, cols]);
             return None;
         }
+        // The SIMD column reduction: mercury_colsum_f32[_parallel](x, out, rows, cols) — two pointers
+        // and two i64. Same (ptr, ptr, i64, i64) signature; route by name.
+        if (name == RT_COLSUM || name == RT_COLSUM_PAR) && args.len() == 4 {
+            let x = self.val(args[0]);
+            let out = self.val(args[1]);
+            let rows = self.coerce_to_i64(args[2]);
+            let cols = self.coerce_to_i64(args[3]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[x, out, rows, cols]);
+            return None;
+        }
         // The two-input transcendental: mercury_vmath2_f32(x, y, out, n, op) — three pointers, two i64
         // (element count, op code). The 256-bit AVX2 kernel an `out[i]=pow/atan2/hypot(x[i],y[i])`
         // loop lowers to.
@@ -1176,6 +1189,8 @@ struct RtFuncs {
     transpose_par: FuncId,
     transpose_u16: FuncId,
     transpose_u16_par: FuncId,
+    colsum: FuncId,
+    colsum_par: FuncId,
     velem: FuncId,
     vhorner: FuncId,
     sred: FuncId,
@@ -1500,6 +1515,12 @@ fn populate_module<M: Module>(
         transpose_u16_par: module
             .declare_function(RT_TRANSPOSE_U16_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        colsum: module
+            .declare_function(RT_COLSUM, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colsum_par: module
+            .declare_function(RT_COLSUM_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         velem: module
             .declare_function(RT_VELEM, Linkage::Import, &sig_velem)
             .map_err(|e| e.to_string())?,
@@ -1730,6 +1751,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_TRANSPOSE_U16_PAR,
                 module.declare_func_in_func(rt.transpose_u16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLSUM,
+                module.declare_func_in_func(rt.colsum, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLSUM_PAR,
+                module.declare_func_in_func(rt.colsum_par, builder.func),
             );
             rt_refs.insert(
                 RT_VELEM,
@@ -2032,6 +2061,11 @@ pub fn jit_compile(
         RT_TRANSPOSE_U16_PAR,
         mercury_runtime::mercury_transpose_u16_parallel as *const u8,
     );
+    builder.symbol(RT_COLSUM, mercury_runtime::mercury_colsum_f32 as *const u8);
+    builder.symbol(
+        RT_COLSUM_PAR,
+        mercury_runtime::mercury_colsum_f32_parallel as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
@@ -2272,6 +2306,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_TRANSPOSE_U16_PAR,
         mercury_runtime::mercury_transpose_u16_parallel as *const u8,
+    );
+    builder.symbol(RT_COLSUM, mercury_runtime::mercury_colsum_f32 as *const u8);
+    builder.symbol(
+        RT_COLSUM_PAR,
+        mercury_runtime::mercury_colsum_f32_parallel as *const u8,
     );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(

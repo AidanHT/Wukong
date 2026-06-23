@@ -84,6 +84,8 @@ pub fn lower_program(
         transpose_par: interner.intern("mercury_transpose_f32_parallel"),
         transpose_u16: interner.intern("mercury_transpose_u16"),
         transpose_u16_par: interner.intern("mercury_transpose_u16_parallel"),
+        colsum: interner.intern("mercury_colsum_f32"),
+        colsum_par: interner.intern("mercury_colsum_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -126,6 +128,15 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_transpose_f32_parallel`. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function column reduction: intercept before the outliner (which
+                // would split it into per-column-chunk scalar loops and lose the SIMD kernel). Lower it
+                // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
+                // `mercury_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
+                if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -630,6 +641,12 @@ struct GemmSyms {
     /// the bytes. A transpose moves the raw bits, so one `u16` kernel serves both bf16 and f16.
     transpose_u16: Symbol,
     transpose_u16_par: Symbol,
+    /// The SIMD column reduction (`mercury_colsum_f32[_parallel](x, out, rows, cols)`): a `out[j] =
+    /// Σ_i x[i*cols+j]` nest (the bias gradient / batch sum, a reduce along axis 0) dispatches here.
+    /// The strided naive form gcc/rustc leave scalar; this streams `x` row-major + 8-wide. Bit-exact
+    /// (i-ascending per column, same order), so both backends marshal the identical kernel.
+    colsum: Symbol,
+    colsum_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2303,6 +2320,29 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_colsum_f32[_parallel](x, out, rows, cols)` call for a recognized column
+    /// reduction. Bails (false) if an operand/dim is unbound (the caller then lowers the scalar nest).
+    /// `parallel` selects the multicore kernel (disjoint column stripes → bit-identical to the serial
+    /// one, which sums each column in the same i-order the interpreter marshals).
+    fn emit_colsum(&mut self, nest: &ColSumNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.colsum_par
+        } else {
+            self.gemm.colsum
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
     /// Emit the fused `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)`
     /// call for a recognized bf16/f16 `nn.Linear`+epilogue (`C = act(A·Bᵀ + bias)`, half inputs / f32
     /// output). Bails (false) if any operand/dim is unbound at the call site, so the caller lowers the
@@ -3542,6 +3582,15 @@ impl FnLowerer<'_> {
         // bit-identical to the scalar nest; the block tiling is the win `-O3` won't do for a transpose.
         if let Some(nest) = match_transpose(pat, iter, body, self.sema, self.interner) {
             if self.emit_transpose(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Column reduction `for j { let s=0; for i { s += x[i*N+j] }; out[j] = s }` (the bias gradient
+        // / batch sum, a reduce along axis 0) → the SIMD `mercury_colsum_f32` (the `_parallel` one in a
+        // `@parallel` function). The strided naive form gcc leaves scalar; the kernel streams row-major
+        // + 8-wide. Bit-exact (i-ascending per column, same order as the scalar nest).
+        if let Some(nest) = match_colsum(pat, iter, body, self.sema, self.interner) {
+            if self.emit_colsum(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -10176,6 +10225,152 @@ fn transpose_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<
         return None;
     };
     match_transpose(pat, iter, lb, sema, interner)
+}
+
+/// A recognized column reduction `out[j] = Σ_i x[i, j]` (`x` is `[rows, cols]`, `out` is `[cols]`).
+struct ColSumNest {
+    x: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// Recognize the column-reduction nest and dispatch it to the SIMD `mercury_colsum_f32`:
+///
+/// ```text
+/// for j in 0..N { let mut s: f32 = 0.0; for i in 0..M { s = s + x[i*N + j]; } out[j] = s; }
+/// ```
+///
+/// — sum each column of `x` (`[M, N]`) over the outer/batch axis into `out` (`[N]`): the bias gradient
+/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0. The data index `i*N + j` strides by `N` over the
+/// inner loop, which gcc/rustc leave scalar; the kernel streams `x` row-major + 8-wide. The
+/// accumulation order is i-ascending per column — exactly the scalar nest's — so the kernel is
+/// bit-identical to it (no reassociation; the differential gate is by-construction exact). `x` and
+/// `out` must be distinct f32 arrays. The strides pin `N`/`M` to the loop bounds, so it never misfires.
+fn match_colsum(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<ColSumNest> {
+    // for j in 0..N { <3 stmts> }
+    let jvar = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(iter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let cols = as_dim(je, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 3 {
+        return None;
+    }
+    // [0] let mut s: f32 = 0.0;
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    // [1] for i in 0..M { s = s + x[i*N + j]; }
+    let (ipat, iiter, ibody) = fusable_for(&body.stmts[1])?;
+    let ivar = match &ipat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (is_, ie) = range_bounds(iiter)?;
+    if as_int_lit(is_, interner)? != 0 {
+        return None;
+    }
+    let rows = as_dim(ie, interner)?;
+    if ibody.tail.is_some() || ibody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &ibody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let addend = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    // The addend is `x[i*N + j]` (data index `i*cols + j`, stride `cols = N`, offset-free), f32.
+    let (xbase, xidx) = as_index1(addend)?;
+    let (stride, off) = match_row_col_off(xidx, ivar, jvar, interner)?;
+    if !off.is_empty() || stride != cols {
+        return None;
+    }
+    if scalar_of(addend, sema) != Some(mercury_types::Scalar::F32) {
+        return None;
+    }
+    // [2] out[j] = s;
+    let StmtKind::Assign {
+        target: ot,
+        op: ast::AssignOp::Assign,
+        value: ov,
+    } = &body.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(ov) != Some(s_sym) {
+        return None;
+    }
+    let obase = index_by_var(ot, jvar)?; // out[j]
+    if scalar_of(ot, sema) != Some(mercury_types::Scalar::F32) || xbase == obase {
+        return None;
+    }
+    Some(ColSumNest {
+        x: xbase,
+        out: obase,
+        rows,
+        cols,
+    })
+}
+
+/// Is the whole function body a single column-reduction nest? Used to intercept a `@parallel` column
+/// sum *before* the elementwise outliner (which would split it into per-column-chunk scalar loops and
+/// lose the SIMD kernel), mirroring the sgemm/norm/transpose interceptions.
+fn colsum_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<ColSumNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_colsum(pat, iter, lb, sema, interner)
 }
 
 /// Is the whole function body a single fused residual projection (`x = x + act(x·Wᵀ + bias)`)? Used to
