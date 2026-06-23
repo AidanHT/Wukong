@@ -334,4 +334,76 @@ fn main() -> i32 {{
             single_t / mega_t,
         );
     }
+
+    /// Same-run A/B for the **chunked-cooperative elementwise** path: a SiLU activation over `[N]`
+    /// applied `REPEAT` times (a feedback store keeps the optimizer from hoisting it). Output is
+    /// cross-checked mega==single==oracle (tolerance) before timing; the ratio (single/mega) is the
+    /// clock-invariant win of running the elementwise kernel across the block vs one thread.
+    #[test]
+    #[ignore = "perf bench; run with --ignored --nocapture"]
+    fn mega_vs_single_vmath() {
+        use std::time::Instant;
+        if crate::gpu::gpu().is_none() {
+            eprintln!("skip mega_vs_single_vmath: no CUDA device");
+            return;
+        }
+        const N: usize = 8192;
+        const REPEAT: usize = 600;
+        // o[i] = silu(x[i]) is recognized as mercury_vmath_f32; the feedback x[0]=o[0] makes the
+        // REPEAT loop non-hoistable so the elementwise work runs REPEAT times.
+        let src = format!(
+            r#"module bench
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [0.5; {N}];
+    let mut o: [f32; {N}] = [0.0; {N}];
+    let mut r: i32 = 0;
+    while r < {REPEAT} {{
+        for i in 0..{N} {{ o[i] = silu(x[i]); }}
+        x[0] = o[0];
+        r = r + 1;
+    }}
+    print((o[1] * 1000.0) as i32);
+    return 0;
+}}
+"#
+        );
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        if !crate::fusion::analyze(&program, entry, &interner).eligible {
+            eprintln!("skip mega_vs_single_vmath: program not eligible (recognizer/opt shape)");
+            return;
+        }
+        let mega0 = try_run(&program, entry, &interner).expect("mega").expect("eligible");
+        let single0 = lower::jit_run_single(&program, entry, &interner).expect("single");
+        let oracle = mercury_interp::run_with_output(&program, entry, &interner).expect("interp");
+        assert!(outputs_match(&mega0.1, &single0.1), "mega vs single differ");
+        assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle differ");
+        eprintln!("checksum (mega==single==oracle): {}", String::from_utf8_lossy(&mega0.1).trim());
+
+        let _ = try_run(&program, entry, &interner);
+        let _ = lower::jit_run_single(&program, entry, &interner);
+        let best = |f: &dyn Fn()| {
+            let mut b = f64::INFINITY;
+            for _ in 0..10 {
+                let t = Instant::now();
+                f();
+                b = b.min(t.elapsed().as_secs_f64());
+            }
+            b
+        };
+        let mega_t = best(&|| {
+            let _ = try_run(&program, entry, &interner).unwrap().unwrap();
+        });
+        let single_t = best(&|| {
+            let _ = lower::jit_run_single(&program, entry, &interner).unwrap();
+        });
+        eprintln!(
+            "\n=== mega_vs_single_vmath  N={N} REPEAT={REPEAT} ({} silu) ===\n\
+             single-thread: {:.3} ms   megakernel(256t): {:.3} ms   speedup: {:.2}x (same-run ratio)",
+            (N * REPEAT) as f64,
+            single_t * 1e3,
+            mega_t * 1e3,
+            single_t / mega_t,
+        );
+    }
 }

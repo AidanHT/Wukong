@@ -1605,7 +1605,26 @@ impl<'a> FnEmit<'a> {
             CoopKind::Reduce => {
                 self.emit_helper_call_pred("mrt_sreduce_coop", Some(RC::F32), args, result, false);
             }
-            // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later).
+            // Elementwise: each thread runs the serial `mrt_*` over a contiguous slice of the `n`
+            // elements. `mrt_vmath`(x,out,n,op) / `mrt_vmath2`(a,b,out,n,op) / `mrt_velem`(x,y,out,n,
+            // a,b,c,op). The vmath INPUT is f32 (4 B) or bf16/f16 storage (2 B), but its OUTPUT is
+            // *always* f32 (4 B) — the activation result is computed and stored in f32 — so the two
+            // pointers can have different per-element strides (a 2/4 mismatch was a misaligned store).
+            CoopKind::Vmath => {
+                let in_esz = if name == "mercury_vmath_f32" { 4 } else { 2 };
+                let h = rt_helper(name).expect("vmath helper");
+                self.emit_chunked_call(h.ptx_name, h.ret, args, result, 2, &[(0, in_esz), (1, 4)]);
+            }
+            CoopKind::Vmath2 => {
+                let h = rt_helper(name).expect("vmath2 helper");
+                self.emit_chunked_call(h.ptx_name, h.ret, args, result, 3, &[(0, 4), (1, 4), (2, 4)]);
+            }
+            CoopKind::Velem => {
+                let h = rt_helper(name).expect("velem helper");
+                self.emit_chunked_call(h.ptx_name, h.ret, args, result, 3, &[(0, 4), (1, 4), (2, 4)]);
+            }
+            // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later for
+            // GEMM/norm/axpby — the row-chunked variants).
             _ => {
                 let h = rt_helper(name).ok_or_else(|| {
                     format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
@@ -1642,28 +1661,41 @@ impl<'a> FnEmit<'a> {
         result: Option<ValueId>,
         tid0_guard: bool,
     ) {
+        let arg_regs: Vec<(String, &'static str)> = args
+            .iter()
+            .map(|a| (self.reg(*a), abi_ty(self.func.value_type(*a))))
+            .collect();
+        self.emit_helper_call_regs(ptx_name, ret, &arg_regs, result, tid0_guard);
+    }
+
+    /// As [`emit_helper_call_pred`] but with pre-built `(reg, abi)` argument pairs — lets the
+    /// chunked-cooperative path pass *adjusted* pointer/count registers (each thread's sub-range)
+    /// without re-deriving them from `ValueId`s.
+    fn emit_helper_call_regs(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        arg_regs: &[(String, &'static str)],
+        result: Option<ValueId>,
+        tid0_guard: bool,
+    ) {
         let g = if tid0_guard {
             format!("@{} ", self.tid0)
         } else {
             String::new()
         };
-        let abis: Vec<&'static str> = args
-            .iter()
-            .map(|a| abi_ty(self.func.value_type(*a)))
-            .collect();
-        let regs: Vec<String> = args.iter().map(|a| self.reg(*a)).collect();
         self.emit("{");
-        for (i, abi) in abis.iter().enumerate() {
+        for (i, (_, abi)) in arg_regs.iter().enumerate() {
             self.emit(&format!(".param .{abi} _a{i};"));
         }
         if let Some(rc) = ret {
             self.emit(&format!(".param .{} _r;", mov_ty(rc)));
         }
-        for (i, (r, abi)) in regs.iter().zip(&abis).enumerate() {
+        for (i, (r, abi)) in arg_regs.iter().enumerate() {
             self.emit(&format!("st.param.{abi} [_a{i}], {r};"));
         }
         let mut arglist = String::new();
-        for i in 0..args.len() {
+        for i in 0..arg_regs.len() {
             if i > 0 {
                 arglist.push_str(", ");
             }
@@ -1678,6 +1710,67 @@ impl<'a> FnEmit<'a> {
             self.emit(&format!("ld.param.{} {d}, [_r];", mov_ty(rc)));
         }
         self.emit("}");
+    }
+
+    /// Emit a **chunked-cooperative** call of a recognized op: partition `[0, count)` (the arg at
+    /// `count_idx` — elements for elementwise, rows for GEMM/norm) into contiguous per-thread chunks,
+    /// offset each pointer arg in `ptr_strides` (`(arg_idx, bytes_per_unit)`) by `lo*stride`, and have
+    /// every thread call the *existing serial* `mrt_*` over its own disjoint sub-range. No new kernel,
+    /// no internal barrier (chunks are disjoint), no races; the caller's `bar.sync` bracket orders it
+    /// against neighbours. This is the GPU analogue of `mercury_runtime::parallel_for`'s fixed
+    /// chunking, so it is deterministic and serial==parallel.
+    fn emit_chunked_call(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        args: &[ValueId],
+        result: Option<ValueId>,
+        count_idx: usize,
+        ptr_strides: &[(usize, u64)],
+    ) {
+        // tid / ntid as 64-bit.
+        let tid32 = self.fresh_r32();
+        let ntid32 = self.fresh_r32();
+        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));
+        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));
+        let tid = self.fresh(RC::Rd);
+        let ntid = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {tid}, {tid32};"));
+        self.emit(&format!("cvt.u64.u32 {ntid}, {ntid32};"));
+
+        let count = self.reg(args[count_idx]);
+        // chunk = (count + ntid - 1) / ntid   (ceil; count>0, ntid>0)
+        let chunk = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {chunk}, {count}, {ntid};"));
+        self.emit(&format!("sub.s64 {chunk}, {chunk}, 1;"));
+        self.emit(&format!("div.u64 {chunk}, {chunk}, {ntid};"));
+        // lo = tid*chunk ; hi = min(lo+chunk, count) ; cnt = max(hi-lo, 0)
+        let lo = self.fresh(RC::Rd);
+        self.emit(&format!("mul.lo.s64 {lo}, {tid}, {chunk};"));
+        let hi = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {hi}, {lo}, {chunk};"));
+        self.emit(&format!("min.s64 {hi}, {hi}, {count};"));
+        let cnt = self.fresh(RC::Rd);
+        self.emit(&format!("sub.s64 {cnt}, {hi}, {lo};"));
+        self.emit(&format!("max.s64 {cnt}, {cnt}, 0;"));
+
+        // Build the adjusted argument registers: pointers offset by lo*stride, count replaced by cnt.
+        let mut arg_regs: Vec<(String, &'static str)> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            if i == count_idx {
+                arg_regs.push((cnt.clone(), "b64"));
+            } else if let Some((_, stride)) = ptr_strides.iter().find(|(idx, _)| *idx == i) {
+                let base = self.reg(*a);
+                let off = self.fresh(RC::Rd);
+                let np = self.fresh(RC::Rd);
+                self.emit(&format!("mul.lo.s64 {off}, {lo}, {stride};"));
+                self.emit(&format!("add.s64 {np}, {base}, {off};"));
+                arg_regs.push((np, "b64"));
+            } else {
+                arg_regs.push((self.reg(*a), abi_ty(self.func.value_type(*a))));
+            }
+        }
+        self.emit_helper_call_regs(ptx_name, ret, &arg_regs, result, false);
     }
 
     fn lower_user_call(
