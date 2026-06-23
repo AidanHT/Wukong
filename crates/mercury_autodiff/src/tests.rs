@@ -916,12 +916,16 @@ fn linear_tanh_sum_vjp() {
 // ---------------------------------------------------------------------------------------------
 
 const NORM_SOFTMAX: i64 = 0;
+const NORM_LAYERNORM: i64 = 1;
+const NORM_RMSNORM: i64 = 2;
 const RED_DOT: i64 = 0;
 
-fn build_softmax_dot(it: &mut Interner, rows: usize, cols: usize) -> Fwd {
+/// Build `y = norm(x); loss = sum_i C[i]*y[i]` — a coefficient-weighted norm (so dy = C is
+/// non-trivial). Params: X, C, out; intermediate: y (alloca).
+fn build_norm_dot(it: &mut Interner, rows: usize, cols: usize, op: i64, eps_bits: i64) -> Fwd {
     let norm = it.intern("mercury_norm_f32");
     let sreduce = it.intern("mercury_sreduce_f32");
-    let mut b = Builder::new(it.intern("smax"), MirType::Void);
+    let mut b = Builder::new(it.intern("normdot"), MirType::Void);
     let x = b.add_param(PTR);
     let c = b.add_param(PTR);
     let out = b.add_param(PTR);
@@ -929,10 +933,10 @@ fn build_softmax_dot(it: &mut Interner, rows: usize, cols: usize) -> Fwd {
     let (rv, cv, epsv, smop) = (
         ci(&mut b, rows as i64),
         ci(&mut b, cols as i64),
-        ci(&mut b, 0),
-        ci(&mut b, NORM_SOFTMAX),
+        ci(&mut b, eps_bits),
+        ci(&mut b, op),
     );
-    // y = softmax(x) per row
+    // y = norm(x) per row
     b.build_void(Op::Call {
         func: norm,
         args: vec![x, y, rv, cv, epsv, smop],
@@ -973,7 +977,7 @@ fn softmax_f64(x: &[f32], rows: usize, cols: usize) -> Vec<f64> {
 fn softmax_dot_vjp() {
     let (rows, cols) = (3, 4);
     let mut it = Interner::default();
-    let fwd = build_softmax_dot(&mut it, rows, cols);
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_SOFTMAX, 0);
     let mut seed = 0x50F7u64;
     let xb = rand_vec(&mut seed, rows * cols);
     let cb = rand_vec(&mut seed, rows * cols);
@@ -987,6 +991,61 @@ fn softmax_dot_vjp() {
         for j in 0..cols {
             let idx = r * cols + j;
             dx[idx] = y[idx] * (cb[idx] as f64 - s);
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+#[test]
+fn layernorm_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_LAYERNORM, eps.to_bits() as i64);
+    let mut seed = 0x1A4Eu64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    // y = (x - mu)/sigma per row; dy = C; dx = (1/sigma)(dy - mean(dy) - y*mean(dy*y)).
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &xb[r * cols..(r + 1) * cols];
+        let nf = cols as f64;
+        let mu = row.iter().map(|&v| v as f64).sum::<f64>() / nf;
+        let var = row.iter().map(|&v| (v as f64 - mu).powi(2)).sum::<f64>() / nf;
+        let sigma = (var + eps as f64).sqrt();
+        let y: Vec<f64> = row.iter().map(|&v| (v as f64 - mu) / sigma).collect();
+        let mean_dy = (0..cols).map(|j| cb[r * cols + j] as f64).sum::<f64>() / nf;
+        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        for j in 0..cols {
+            dx[r * cols + j] =
+                (1.0 / sigma) * (cb[r * cols + j] as f64 - mean_dy - y[j] * mean_dyy);
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+#[test]
+fn rmsnorm_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_RMSNORM, eps.to_bits() as i64);
+    let mut seed = 0x71A3u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    // y = x/r, r = sqrt(mean(x^2)+eps); dy = C; dx = (1/r)(dy - y*mean(dy*y)).
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &xb[r * cols..(r + 1) * cols];
+        let nf = cols as f64;
+        let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / nf;
+        let rr = (ms + eps as f64).sqrt();
+        let y: Vec<f64> = row.iter().map(|&v| v as f64 / rr).collect();
+        let mean_dyy = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum::<f64>() / nf;
+        for j in 0..cols {
+            dx[r * cols + j] = (1.0 / rr) * (cb[r * cols + j] as f64 - y[j] * mean_dyy);
         }
     }
     let inputs = vec![xb, cb, vec![0.0]];

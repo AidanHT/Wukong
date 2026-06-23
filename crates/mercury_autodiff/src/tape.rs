@@ -14,7 +14,7 @@
 //! control flow is the counted loops this module synthesizes for transpose / activation-backward.
 
 use crate::Vjp;
-use mercury_mir::{BinOp, BlockId, CmpOp, MirType, Op, ValueId};
+use mercury_mir::{BinOp, BlockId, CastKind, CmpOp, MirType, Op, ValueId};
 use mercury_span::{Interner, Symbol};
 
 // --- runtime kernel op codes (mirrored from mercury_runtime; the interp dispatches the same) ------
@@ -25,7 +25,10 @@ const VM_RELU: i64 = 4;
 const RED_DOT: i64 = 0;
 const RED_SSD: i64 = 1;
 const RED_SUM: i64 = 2;
+const RED_SUMSQ: i64 = 3;
 const NORM_SOFTMAX: i64 = 0;
+const NORM_LAYERNORM: i64 = 1;
+const NORM_RMSNORM: i64 = 2;
 /// velem activation: identity (`out = a*x + b*y + c`).
 const VE_ID: i64 = 0;
 /// OR'd into a velem op when `y` is read (`b` may be non-zero).
@@ -263,18 +266,14 @@ impl<'a> Vjp<'a> {
 
     // --- row-wise normalization (softmax) ------------------------------------------------------
 
-    /// `norm(x, out, rows, cols, eps_bits, op)` row-normalizes `x`. For **softmax** (`out = y`), the
-    /// VJP per row is `dx = y (.) (dy - sum_j dy_j y_j)`: a per-row dot (`sreduce`, riding the tuned
-    /// reduction) then an elementwise combine — emitted as nested counted loops (rows x cols).
+    /// `norm(x, out, rows, cols, eps_bits, op)` row-normalizes `x` (softmax / LayerNorm / RMSNorm).
+    /// All three backward passes are per-row reductions (riding `sreduce`) plus an elementwise
+    /// combine, emitted as nested counted loops (rows x cols). LayerNorm/RMSNorm recompute the row
+    /// statistics from `x` (the forward kernel emits only `y`), so `x` must not be overwritten
+    /// in place by the forward norm.
     fn diff_norm(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, out) = (args[0], args[1]);
         let op = self.const_i64(args[5])?;
-        if op != NORM_SOFTMAX {
-            return Err(format!(
-                "autodiff: only the softmax norm VJP is implemented (op {op}); LayerNorm/RMSNorm \
-                 backward are not yet supported"
-            ));
-        }
         let dy = match self.buf_adj.get(&out).copied() {
             Some(d) => d,
             None => return Ok(()),
@@ -284,27 +283,40 @@ impl<'a> Vjp<'a> {
             None => return Ok(()),
         };
         self.single(x)?;
-        let y = self.remap_v(out); // the forward softmax output
+        let xn = self.remap_v(x);
+        let y = self.remap_v(out); // the forward normalized output
         let rows = self.remap_v(args[2]);
         let cols = self.remap_v(args[3]);
-        let dotop = self.cint(RED_DOT);
-        let sreduce = self.syms.sreduce;
+        match op {
+            NORM_SOFTMAX => self.softmax_back(dy, dx, y, rows, cols),
+            NORM_LAYERNORM | NORM_RMSNORM => {
+                // eps rides in as f32 bits in an i64; it is a compile-time constant here.
+                let eps_bits = self.const_i64(args[4])? as u32;
+                let eps = self.cf32(f32::from_bits(eps_bits) as f64);
+                if op == NORM_LAYERNORM {
+                    self.layernorm_back(dy, dx, xn, y, rows, cols, eps);
+                } else {
+                    self.rmsnorm_back(dy, dx, xn, y, rows, cols, eps);
+                }
+                Ok(())
+            }
+            other => Err(format!("autodiff: no VJP for norm op {other}")),
+        }
+    }
 
-        // for r in 0..rows:
+    /// softmax: `dx = y (.) (dy - sum_j dy_j y_j)` per row.
+    fn softmax_back(
+        &mut self,
+        dy: ValueId,
+        dx: ValueId,
+        y: ValueId,
+        rows: ValueId,
+        cols: ValueId,
+    ) -> Result<(), String> {
         let outer = self.open_loop(rows);
         let r = outer.idx;
-        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols)); // row base offset
-        let dy_row = self.gep(dy, rc);
-        let y_row = self.gep(y, rc);
-        // s = sum_j dy[r,j] * y[r,j]   (per-row dot)
-        let s = self.b.build(
-            F32,
-            Op::Call {
-                func: sreduce,
-                args: vec![dy_row, y_row, cols, dotop],
-            },
-        );
-        // for j in 0..cols: dx[r,j] = y[r,j] * (dy[r,j] - s)
+        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
+        let s = self.row_reduce(dy, y, rc, cols, RED_DOT); // sum_j dy_j y_j
         let inner = self.open_loop(cols);
         let j = inner.idx;
         let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
@@ -316,6 +328,113 @@ impl<'a> Vjp<'a> {
         self.close_loop(inner);
         self.close_loop(outer);
         Ok(())
+    }
+
+    /// LayerNorm: with `mu = mean(x)`, `sigma = sqrt(var + eps)`, `y = (x - mu)/sigma`,
+    /// `dx = (1/sigma) (dy - mean(dy) - y * mean(dy (.) y))` per row. var is recovered from
+    /// `E[x^2] - mu^2` (a SUM and a SUMSQ of the row).
+    #[allow(clippy::too_many_arguments)]
+    fn layernorm_back(
+        &mut self,
+        dy: ValueId,
+        dx: ValueId,
+        x: ValueId,
+        y: ValueId,
+        rows: ValueId,
+        cols: ValueId,
+        eps: ValueId,
+    ) {
+        let nf = self.b.build(F32, Op::Cast(CastKind::SiToFp, cols, F32));
+        let one = self.cf32(1.0);
+        let outer = self.open_loop(rows);
+        let r = outer.idx;
+        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
+        let sum_x = self.row_reduce(x, x, rc, cols, RED_SUM);
+        let sumsq_x = self.row_reduce(x, x, rc, cols, RED_SUMSQ);
+        let mu = self.fdiv(sum_x, nf, &F32);
+        let ex2 = self.fdiv(sumsq_x, nf, &F32);
+        let mu2 = self.fmul(mu, mu, &F32);
+        let var = self.b.build(F32, Op::Bin(BinOp::FSub, ex2, mu2));
+        let veps = self.fadd(var, eps, &F32);
+        let sigma = self.b.build(F32, Op::Sqrt(veps));
+        let inv = self.fdiv(one, sigma, &F32);
+        let sum_dy = self.row_reduce(dy, dy, rc, cols, RED_SUM);
+        let dot_dyy = self.row_reduce(dy, y, rc, cols, RED_DOT);
+        let mean_dy = self.fdiv(sum_dy, nf, &F32);
+        let mean_dyy = self.fdiv(dot_dyy, nf, &F32);
+        let inner = self.open_loop(cols);
+        let j = inner.idx;
+        let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
+        let dyv = self.load_at(dy, idx);
+        let yv = self.load_at(y, idx);
+        let ymdyy = self.fmul(yv, mean_dyy, &F32);
+        let t1 = self.b.build(F32, Op::Bin(BinOp::FSub, dyv, mean_dy));
+        let t2 = self.b.build(F32, Op::Bin(BinOp::FSub, t1, ymdyy));
+        let dxv = self.fmul(inv, t2, &F32);
+        self.store_at(dx, idx, dxv);
+        self.close_loop(inner);
+        self.close_loop(outer);
+    }
+
+    /// RMSNorm: with `r = sqrt(mean(x^2) + eps)`, `y = x/r`,
+    /// `dx = (1/r) (dy - y * mean(dy (.) y))` per row.
+    #[allow(clippy::too_many_arguments)]
+    fn rmsnorm_back(
+        &mut self,
+        dy: ValueId,
+        dx: ValueId,
+        x: ValueId,
+        y: ValueId,
+        rows: ValueId,
+        cols: ValueId,
+        eps: ValueId,
+    ) {
+        let nf = self.b.build(F32, Op::Cast(CastKind::SiToFp, cols, F32));
+        let one = self.cf32(1.0);
+        let outer = self.open_loop(rows);
+        let r = outer.idx;
+        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
+        let sumsq_x = self.row_reduce(x, x, rc, cols, RED_SUMSQ);
+        let ms = self.fdiv(sumsq_x, nf, &F32);
+        let mseps = self.fadd(ms, eps, &F32);
+        let rr = self.b.build(F32, Op::Sqrt(mseps));
+        let inv = self.fdiv(one, rr, &F32);
+        let dot_dyy = self.row_reduce(dy, y, rc, cols, RED_DOT);
+        let mean_dyy = self.fdiv(dot_dyy, nf, &F32);
+        let inner = self.open_loop(cols);
+        let j = inner.idx;
+        let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
+        let dyv = self.load_at(dy, idx);
+        let yv = self.load_at(y, idx);
+        let ymdyy = self.fmul(yv, mean_dyy, &F32);
+        let t = self.b.build(F32, Op::Bin(BinOp::FSub, dyv, ymdyy));
+        let dxv = self.fmul(inv, t, &F32);
+        self.store_at(dx, idx, dxv);
+        self.close_loop(inner);
+        self.close_loop(outer);
+    }
+
+    /// A per-row reduction over the `cols`-wide slice at offset `rc`: `sreduce(&a[rc], &b[rc], cols,
+    /// op)`. For SUM/SUMSQ `b` is ignored (pass `a`); for DOT it is the second operand.
+    fn row_reduce(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        rc: ValueId,
+        cols: ValueId,
+        op: i64,
+    ) -> ValueId {
+        let ap = self.gep(a, rc);
+        let bp = self.gep(b, rc);
+        let opv = self.cint(op);
+        let f = self.syms.sreduce;
+        self.b.build(
+            F32,
+            Op::Call {
+                func: f,
+                args: vec![ap, bp, cols, opv],
+            },
+        )
     }
 
     // --- activation derivatives (the loop body for diff_vmath) ---------------------------------
