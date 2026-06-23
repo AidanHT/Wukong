@@ -6837,4 +6837,167 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         g.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() / iters as f64
     }
+
+    /// Per-iter device time of the W4A16 decode kernel (`gemm_nt_w4a16`, symmetric): args
+    /// `(M,N,K, A_f16, Bq_u32, Scales_f16, C_f32)` over resident buffers. Same warmup+loop shape as
+    /// [`time_wmma`], so the ratio vs the fp16 path and the naive peer is same-run apples-to-apples.
+    #[allow(clippy::too_many_arguments)]
+    fn time_w4a16(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<half::f16>,
+        bq_d: &cudarc::driver::CudaSlice<u32>,
+        scl_d: &cudarc::driver::CudaSlice<half::f16>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(bq_d).arg(scl_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// **The honest W4A16 (int4 weight-only decode) scoreboard — M4 / M6.** Mercury's int4-decode GEMM
+    /// measured *same-run, same buffers* against (Tier A) a **naive CUDA-C W4A16** kernel compiled by
+    /// NVRTC — the literal "beat the hand-written int4 decode kernel" — and against Mercury's **own
+    /// fp16 GEMM on the identical 64×64 tile**, which isolates the weight-bandwidth win: the *only*
+    /// difference is the B-load (packed int4 vs full fp16), so the ratio is the value of moving 4× fewer
+    /// weight bytes. **Tier B is honestly empty:** there is no robust general W4A16-decode GEMM bindable
+    /// through `cudarc` (cuBLASLt offers none), so the strongest *measurable* int4 peer is the naive
+    /// kernel and M4 stands as a documented lead — stated in the output, not papered over.
+    ///
+    /// Correctness gates speed (first law): Mercury and the naive peer are first cross-checked against
+    /// the f64 dequant reference, and at each timing shape their checksums must agree. Needs the redist
+    /// DLLs on PATH; skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int4_gemm_vs_peers`
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn int4_gemm_vs_peers() {
+        use crate::baselines::{
+            gemm_flop, nvrtc_naive_w4a16, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+            time_nvrtc_naive_w4a16,
+        };
+        use crate::ptx_int4::{
+            quantize_weight_symmetric, reference_w4a16, GROUP_SIZE, W4_BM, W4_BN, W4_THREADS,
+        };
+        use half::f16;
+        with_gpu("int4_gemm_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] int4_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let group = GROUP_SIZE;
+
+            // --- Correctness first: Mercury W4A16 + the naive peer both match the f64 dequant oracle. ---
+            let mut rng = crate::diff::Rng::new(0x4B17);
+            for (m, n, k) in [(64usize, 128usize, 256usize), (128, 128, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8);
+                let qw = quantize_weight_symmetric(&w, n, k, group);
+                let r = reference_w4a16(&a, &qw, m);
+                let merc = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
+                crate::diff::assert_close(&format!("Mercury W4A16 {m}x{k}x{n}"), &merc, &r, 1e-2, 2e-3);
+                let naive = nvrtc_naive_w4a16(g, &a, &qw, m, k, n).unwrap();
+                crate::diff::assert_close(&format!("naive W4A16 {m}x{k}x{n}"), &naive, &r, 5e-2, 2e-2);
+            }
+            eprintln!("[gate] Mercury W4A16 + naive CUDA-C W4A16 both match the f64 dequant oracle ✓");
+            eprintln!(
+                "[peer] No robust library int4-decode GEMM is bindable here (cuBLASLt has no general \
+                 W4A16 decode), so naive CUDA-C is the honest Tier-A peer and M4 is a *documented lead*."
+            );
+
+            // --- Clock warmup (same-run peak-vs-peak; the ~7× boost ramp corrupts a cold first shape). ---
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 4;
+
+            // Shapes: decode-like (small M, big N=K) where weight-BW dominates → the int4 win shows;
+            // plus a squarer, more compute-leaning shape. All M%64==0, N%64==0, K%128==0.
+            for (m, k, n) in [
+                (64usize, 4096usize, 4096usize),
+                (64, 2048, 2048),
+                (256, 2048, 2048),
+                (512, 512, 512),
+            ] {
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8);
+                let qw = quantize_weight_symmetric(&w, n, k, group);
+
+                // Mercury W4A16 — resident packed int4 weights + fp16 activations.
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let bq_d = g.stream.memcpy_stod(&qw.packed).unwrap();
+                let scl_d = g.stream.memcpy_stod(&qw.scales).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let f_w4 = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16").unwrap();
+                let cfg_w4 = LaunchConfig {
+                    grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+                    block_dim: (W4_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_w4 = best_of(ROUNDS, || {
+                    time_w4a16(g, &f_w4, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                });
+
+                // Mercury fp16 on the SAME 64×64 tile (`wmma_nt_f16_sm`) — full fp16 weights. The only
+                // difference vs W4A16 is the B-load (fp16 vs packed int4), so s_f16/s_w4 IS the
+                // weight-bandwidth win in the decode regime.
+                let b16: Vec<f16> = w.iter().map(|&x| f16::from_f32(x)).collect();
+                let bf16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let f_f16 =
+                    g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm").unwrap();
+                let s_f16 = best_of(ROUNDS, || {
+                    time_wmma(g, &f_f16, wmma_sm_cfg(m, n), dims, &a_d, &bf16_d, &mut c_d, 50)
+                });
+
+                // Naive CUDA-C W4A16 (Tier A). Slow (one thread/output, full K-loop) → fewer iters.
+                let naive_iters = if (m * n * k) as u64 >= 500_000_000 { 3 } else { 10 };
+                let s_naive = time_nvrtc_naive_w4a16(g, m, k, n, group, naive_iters).unwrap();
+
+                // Checksum cross-check: Mercury and naive compute the same matrix (within the dequant gap).
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_w4 = csum(&gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap());
+                let cs_n = csum(&nvrtc_naive_w4a16(g, &a, &qw, m, k, n).unwrap());
+                assert!(
+                    (cs_w4 - cs_n).abs() / cs_n.max(1.0) < 3e-2,
+                    "{m}x{k}x{n} checksum disagreement: w4={cs_w4:.3e} naive={cs_n:.3e}"
+                );
+
+                // Weight bytes moved from HBM per pass: int4 = N·K/2, fp16 = N·K·2 (the structural 4×).
+                let (wb_int4, wb_fp16) = ((n * k / 2) as f64, (n * k * 2) as f64);
+                let (g_w4, g_f16, g_naive) = (flop / s_w4, flop / s_f16, flop / s_naive);
+                eprintln!(
+                    "\n{m}x{k}x{n} W4A16 (same-run):\n  \
+                     Mercury W4A16 : {:>8.0} GFLOP/s | {:>6.1}× vs naive CUDA-C | {:>5.2}× vs Mercury fp16 (same tile)\n  \
+                     Mercury fp16  : {:>8.0} GFLOP/s | full fp16 weights — the HBM traffic int4 avoids\n  \
+                     naive CUDA-C  : {:>8.0} GFLOP/s | Tier-A int4 baseline (no robust library peer exists)\n  \
+                     weight HBM/pass: int4 {:.1} MB vs fp16 {:.1} MB ({:.1}× less weight traffic)",
+                    g_w4 / 1e9,
+                    g_w4 / g_naive,
+                    g_w4 / g_f16,
+                    g_f16 / 1e9,
+                    g_naive / 1e9,
+                    wb_int4 / 1e6,
+                    wb_fp16 / 1e6,
+                    wb_fp16 / wb_int4,
+                );
+            }
+        });
+    }
 }

@@ -1047,3 +1047,110 @@ impl CublasChainModel {
         Ok(self.stream.memcpy_dtov(&out)?)
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Tier A — naive CUDA-C **W4A16** (int4 weight-only decode), compiled by NVRTC. The idiomatic kernel a
+// programmer writes for 4-bit weight decode: one thread per output element, unpack the int4 weight to
+// float on the fly (shift + mask + sign-extend, × the per-group scale), `acc += a·w`. No tiling, no
+// shared memory, no tensor cores, no fused unpack. NVRTC on this toolkit-free box has no fp16 headers
+// (even `#include <cuda_fp16.h>` fails — see the cuBLAS-chain note), so it dequantizes and accumulates
+// in **float**; the result is checksum-cross-checked against Mercury within the fp16-vs-fp32 dequant
+// gap. This is the M6 wide-win floor and — crucially — the honest M4 headline: there is **no robust
+// library int4-decode GEMM** bindable through `cudarc` (cuBLASLt offers no general W4A16 decode), so
+// the strongest *measurable* int4 peer on this box is this naive kernel, and M4 is a documented lead.
+// ---------------------------------------------------------------------------------------------------
+
+/// Naive **symmetric** W4A16: `C[M×N] = A·dequant(W)ᵀ`, `A` `[M,K]` f32, `Bq` packed signed int4
+/// `[N,K/8]` (8 nibbles/word), `S` per-group f32 scales `[N,K/group]`. One thread per output, full
+/// K-loop with an on-the-fly unpack — the "beat the hand-written int4 decode kernel" baseline.
+const NAIVE_W4A16_CUDA: &str = r#"
+extern "C" __global__ void naive_w4a16(int M, int N, int K, int group,
+        const float* A, const unsigned* Bq, const float* S, float* C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // n (weight row)
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // m (activation row)
+    if (row < M && col < N) {
+        int KW = K >> 3;        // u32 words per row (8 nibbles/word)
+        int KG = K / group;     // groups per row
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            unsigned word = Bq[col * KW + (k >> 3)];
+            int nib = (word >> (4 * (k & 7))) & 0xF;
+            int q = (nib >= 8) ? nib - 16 : nib;            // sign-extend the 4-bit two's-complement
+            float w = (float)q * S[col * KG + k / group];   // per-group scale
+            acc += A[row * K + k] * w;
+        }
+        C[row * N + col] = acc;
+    }
+}
+"#;
+
+fn nvrtc_naive_w4a16_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions { arch: Some("compute_89"), ..Default::default() };
+    let ptx = compile_ptx_with_opts(NAIVE_W4A16_CUDA, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+/// Run the naive CUDA-C W4A16 once and copy the result back — the peer correctness-gate entry. `qw`
+/// must be the **symmetric** quant (this peer's nibbles are signed); its fp16 scales are widened to f32
+/// for the NVRTC-no-fp16 kernel, so the peer's output differs from Mercury's f16-dequant only by the
+/// ~2⁻¹¹ dequant precision gap (checksum-cross-checked, and gated against the same f64 reference).
+pub fn nvrtc_naive_w4a16(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert!(qw.signed, "naive_w4a16 peer expects the symmetric (signed) quant");
+    let module = nvrtc_naive_w4a16_module(g)?;
+    let f = module.load_function("naive_w4a16")?;
+    let s_f32: Vec<f32> = qw.scales.iter().map(|x| x.to_f32()).collect();
+    let a_d = g.stream.memcpy_stod(a)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let s_d = g.stream.memcpy_stod(&s_f32)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk, gg) = (m as i32, n as i32, k as i32, qw.group as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&gg).arg(&a_d).arg(&bq_d).arg(&s_d).arg(&mut c_d);
+    unsafe { bld.launch(naive_cfg(m, n))? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time the naive CUDA-C W4A16: `iters` resident launches bracketed by one sync after a warm-up — the
+/// identical timing shape Mercury's W4A16 bench uses, so the ratio is same-run apples-to-apples. Dummy
+/// buffers of the correct `[M,K]` / `[N,K/8]` / `[N,K/group]` sizes (values don't affect timing).
+/// Returns seconds per launch.
+pub fn time_nvrtc_naive_w4a16(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    group: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let module = nvrtc_naive_w4a16_module(g)?;
+    let f = module.load_function("naive_w4a16")?;
+    let a_d = g.stream.memcpy_stod(&vec![0.01f32; m * k])?;
+    let bq_d = g.stream.memcpy_stod(&vec![0u32; n * (k / 8)])?;
+    let s_d = g.stream.memcpy_stod(&vec![0.01f32; n * (k / group)])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk, gg) = (m as i32, n as i32, k as i32, group as i32);
+    let cfg = naive_cfg(m, n);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(&gg).arg(&a_d).arg(&bq_d).arg(&s_d).arg(&mut c_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
