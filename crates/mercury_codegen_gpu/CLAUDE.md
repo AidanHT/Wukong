@@ -135,8 +135,13 @@ toolkit — only **running** needs the driver + a device.
   zero-offset + one `mul.rn.f16x2` scale dequant two weights/op), then runs the *identical* fp16
   `wmma.mma.sync.m16n16k16` as the dense path. Symmetric (offset-binary, `Z=8`) and zero-point (`Z=zero`)
   share one unpack. `w4a16_static_ptx` is the **static-shape** variant (dims baked → ptxas strength-reduces
-  the strides). Launchers `gemm_nt_w4a16` / `gemm_nt_w4a16_static` in `gpu.rs`; peer + scoreboard in
-  `baselines.rs` (`nvrtc_naive_w4a16`) / `gpu.rs` (`int4_gemm_vs_peers`).
+  the strides). `w4a16_splitk_ptx` is the **decode split-K** variant (`entry_w4a16(splitk=true)` +
+  `w4a16_splitk_reduce`): launched `gridDim.z = sk`, each CTA writes a partial to its own M×N plane (C
+  rebased by `ctaid.z·M·N`, disjoint — no atomics) and a **fixed-order** reduction kernel sums the planes
+  ⇒ deterministic (M12). Measured up to **~6.4×** vs un-split on thin-M / small-N decode (2-CTA grid,
+  sk=8; `int4_splitk_occupancy`) — int4 benefits *more* than int8 split-K (per-CTA dequant ⇒ more
+  occupancy-starved). Launchers `gemm_nt_w4a16` / `gemm_nt_w4a16_static` / `gemm_nt_w4a16_splitk` in
+  `gpu.rs`; peer + scoreboard in `baselines.rs` (`nvrtc_naive_w4a16`) / `gpu.rs` (`int4_gemm_vs_peers`).
 - `src/ptx_int8.rs` — **int8 (W8A8) tensor-core GEMM** (M3): `u8` activations × `i8` weights → `i32`,
   `mma.sync.m16n8k32.s32.u8.s8.s32`. Same 8-bit `m16n8k32` fragment layout as fp8 (no WMMA int8 on
   sm_89), so it mirrors `ptx_fp8.rs`: `INT8_TILE` (single hand-placed tile), `int8_gemm_ptx`
