@@ -68,6 +68,10 @@ pub fn lower_program(
         bf16_nt_epi_par: interner.intern("mercury_sgemm_bf16_nt_epi_parallel"),
         f16_nt_epi: interner.intern("mercury_sgemm_f16_nt_epi"),
         f16_nt_epi_par: interner.intern("mercury_sgemm_f16_nt_epi_parallel"),
+        bf16_tn: interner.intern("mercury_sgemm_bf16_tn"),
+        bf16_tn_par: interner.intern("mercury_sgemm_bf16_tn_parallel"),
+        f16_tn: interner.intern("mercury_sgemm_f16_tn"),
+        f16_tn_par: interner.intern("mercury_sgemm_f16_tn_parallel"),
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
         reduce_bf16: interner.intern("mercury_reduce_bf16"),
@@ -558,6 +562,15 @@ struct GemmSyms {
     bf16_nt_epi_par: Symbol,
     f16_nt_epi: Symbol,
     f16_nt_epi_par: Symbol,
+    /// The bf16/f16 mixed-precision **weight-gradient** GEMM kernels (`mercury_sgemm_{bf16,f16}_tn[_
+    /// parallel](a, b, c, m, k, n, beta)`): a bf16/f16 `C = Aᵀ·B` nest (A stored `[k,m]`, B `[k,n]` —
+    /// the `dW = dYᵀ·X` training backward) folds here. The lossless widen prepass feeds the f32
+    /// `mercury_sgemm_tn` (transpose A once + the tuned `C = A·B` kernel), so the result is bit-for-bit
+    /// the f32 TN GEMM on the widened operands. Same 7-arg ABI as the `nt` kernels; the `f32` twin is `tn`.
+    bf16_tn: Symbol,
+    bf16_tn_par: Symbol,
+    f16_tn: Symbol,
+    f16_tn_par: Symbol,
     /// The bf16 mixed-precision reduction kernels (`mercury_dot_bf16(x, y, n) -> f32` and
     /// `mercury_sum_bf16(x, n) -> f32`): a reduction loop `s += (x[k] as f32) [* (y[k] as f32)]` over
     /// `[bf16; _]` arrays with an f32 accumulator lowers to one of these — bf16 storage, f32
@@ -2212,11 +2225,17 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
-        let func = match (parallel, nest.f16) {
-            (false, false) => self.gemm.bf16_nt,
-            (true, false) => self.gemm.bf16_nt_par,
-            (false, true) => self.gemm.f16_nt,
-            (true, true) => self.gemm.f16_nt_par,
+        // NT (`C = A·Bᵀ`, nn.Linear forward) vs TN (`C = Aᵀ·B`, the `dW = dYᵀ·X` weight gradient) —
+        // the recognizer guarantees exactly one operand transposed, so `transposed_a` selects the kernel.
+        let func = match (parallel, nest.f16, nest.transposed_a) {
+            (false, false, false) => self.gemm.bf16_nt,
+            (true, false, false) => self.gemm.bf16_nt_par,
+            (false, true, false) => self.gemm.f16_nt,
+            (true, true, false) => self.gemm.f16_nt_par,
+            (false, false, true) => self.gemm.bf16_tn,
+            (true, false, true) => self.gemm.bf16_tn_par,
+            (false, true, true) => self.gemm.f16_tn,
+            (true, true, true) => self.gemm.f16_tn_par,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -2281,11 +2300,13 @@ impl FnLowerer<'_> {
     /// Fuse a bf16/f16 `nn.Linear` matmul immediately followed by its bias-add / activation epilogue
     /// into one `mercury_sgemm_{bf16,f16}_nt_epi` call (`C = act(A·Bᵀ + bias)`, half inputs / f32
     /// output) — the mixed-precision transformer FFN projection. The half twin of
-    /// [`Self::try_fuse_matmul_epilogue`]: `match_matmul_lowp_nt` already enforces transposed-B with no
-    /// offsets, then the *identical* strict epilogue match (`match_bias_act_epilogue`, reused via the
-    /// `(m, n, c)` shape) and the same `EPI_ACT_*` codes. Returns the statements consumed (always 2),
-    /// else `None`. The kernel folds bias + activation into the widened-f32 GEMM writeback, so the fused
-    /// result equals the unfused half `matmul → [bias →] activation`, bit-for-bit across backends.
+    /// [`Self::try_fuse_matmul_epilogue`]: `match_matmul_lowp` recognizes the half matmul, then the
+    /// *identical* strict epilogue match (`match_bias_act_epilogue`, reused via the `(m, n, c)` shape)
+    /// and the same `EPI_ACT_*` codes. Returns the statements consumed (always 2), else `None`. The
+    /// kernel folds bias + activation into the widened-f32 GEMM writeback, so the fused result equals
+    /// the unfused half `matmul → [bias →] activation`, bit-for-bit across backends. **NT only:** the
+    /// fused-epilogue kernel exists only for `C = A·Bᵀ`, so a transposed-A (TN) nest declines here and
+    /// lowers as a plain TN GEMM + a separate epilogue loop (no half TN epilogue kernel).
     fn try_fuse_lowp_matmul_epilogue(&mut self, stmts: &[Stmt]) -> Option<usize> {
         if stmts.len() < 2 {
             return None;
@@ -2296,7 +2317,12 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let nest = match_matmul_lowp_nt(pat, iter, body, self.sema, self.interner)?;
+        let nest = match_matmul_lowp(pat, iter, body, self.sema, self.interner)?;
+        // The fused epilogue kernel is NT-only (`mercury_sgemm_{bf16,f16}_nt_epi`); a TN weight-gradient
+        // nest has no epilogue kernel, so decline (it lowers as a plain TN GEMM + a separate epilogue).
+        if nest.transposed_a {
+            return None;
+        }
         let (bias, act) =
             match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner)?;
         if self.emit_lowp_gemm_epi(&nest, bias, act) {
@@ -3430,10 +3456,11 @@ impl FnLowerer<'_> {
                 return;
             }
         }
-        // bf16/f16 mixed-precision `C = A·Bᵀ` (half inputs widened to f32, f32 accumulate) → the half
-        // GEMM microkernel. The widen is lossless, so the kernel equals the scalar nest under the
-        // matmul reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
-        if let Some(nest) = match_matmul_lowp_nt(pat, iter, body, self.sema, self.interner) {
+        // bf16/f16 mixed-precision `C = A·Bᵀ` (NT, nn.Linear forward) or `C = Aᵀ·B` (TN, the
+        // `dW = dYᵀ·X` weight gradient) — half inputs widened to f32, f32 accumulate → the half GEMM
+        // microkernel. The widen is lossless, so the kernel equals the scalar nest under the matmul
+        // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
+        if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
             if self.emit_lowp_gemm(&nest, self.parallel_fn) {
                 return;
             }
@@ -9106,28 +9133,41 @@ struct LowpMatmulNest {
     k: Dim,
     n: Dim,
     f16: bool,
+    /// `false` → `C = A·Bᵀ` (NT, the `nn.Linear` weight layout — A `[m,k]`, B `[n,k]`); `true` →
+    /// `C = Aᵀ·B` (TN, the `dW = dYᵀ·X` weight-gradient — A stored `[k,m]`, B `[k,n]`). Exactly one
+    /// operand is transposed (the recognizer rejects plain `A·B` and `Aᵀ·Bᵀ`, which have no half kernel).
+    transposed_a: bool,
 }
 
-/// Recognize the bf16/f16 mixed-precision `C = A·Bᵀ` nest — the f32 `ijk` dot-product matmul but over
+/// Recognize the bf16/f16 mixed-precision matmul nest — the f32 `ijk` dot-product matmul but over
 /// `[bf16]`/`[f16]` operands widened to f32, with an f32 accumulator (the standard mixed-precision
-/// transformer matmul):
+/// transformer matmul). Two shapes, distinguished by which operand is transposed:
 ///
 /// ```text
+/// // NT (transposed_a = false): C = A·Bᵀ, the nn.Linear forward (A [m,k], B [n,k])
 /// for i in 0..M { for j in 0..N {
 ///   let mut s: f32 = 0.0;
 ///   for k in 0..K { s = s + (a[i*K + k] as f32) * (b[j*K + k] as f32); }
 ///   c[i*N + j] = s;
 /// } }
+/// // TN (transposed_a = true): C = Aᵀ·B, the dW = dYᵀ·X weight gradient (A [k,m], B [k,n])
+/// for i in 0..M { for j in 0..N {
+///   let mut s: f32 = 0.0;
+///   for p in 0..K { s = s + (a[p*M + i] as f32) * (b[p*N + j] as f32); }
+///   c[i*N + j] = s;
+/// } }
 /// ```
 ///
 /// Returns the nest iff A and B are the **same** low precision (both bf16 or both f16), the casts
-/// target f32, the product / accumulator / `c` are f32, B is transposed (`b[j*K+k]` — the `nn.Linear`
-/// weight layout), the strides are consistent (`sa = sb = K`, `sc = N`), and there are no batch
-/// offsets. The widen is lossless, so the kernel (a widen prepass + the tuned f32 GEMM) equals this
-/// nest under the documented matmul reassociation, bit-for-bit across backends. The naive nest
-/// otherwise falls to a scalar widening loop the autovectorizer can't reach. The int8 twin is
-/// [`match_matmul_i8_nt`]; this is its float-accumulator sibling.
-fn match_matmul_lowp_nt(
+/// target f32, the product / accumulator / `c` are f32, **exactly one** operand is transposed (NT: B
+/// is `b[j*K+k]`; TN: A is `a[k*M+i]`), the strides are consistent (NT: `sa = sb = K`; TN: `sa = M`,
+/// `sb = N`; both `sc = N`), and there are no batch offsets. Both shapes feed a lossless widen prepass
+/// then the *identical* proven f32 kernel (NT → `gemm_dispatch`, TN → `mercury_sgemm_tn`), so the
+/// result is bit-for-bit the f32 GEMM on the widened values across backends. The naive nest otherwise
+/// falls to a scalar widening loop the autovectorizer can't reach (and TN additionally has the
+/// column-strided A reads that defeat C/Rust). The int8 twin is [`match_matmul_i8_nt`]; this is its
+/// float-accumulator sibling. Plain `A·B` and `Aᵀ·Bᵀ` are rejected (no half kernel — the scalar nest).
+fn match_matmul_lowp(
     pat: &Pattern,
     iter: &ForIter,
     body: &Block,
@@ -9226,9 +9266,9 @@ fn match_matmul_lowp_nt(
         return None;
     };
     // Each factor is `(arr[idx] as f32)` over a `[bf16]`/`[f16]` array. Peel the cast (must target
-    // f32), identify A (row i) and B (row j, the transposed weight layout), require A and B the SAME
-    // precision, and reject a transposed A / batch offset (the kernel is NT-only), in either order.
-    let (a_sym, sa, b_sym, sb, f16) = {
+    // f32), classify A and B (each may be normal or transposed), require A and B the SAME precision,
+    // accept **exactly one** transposed (NT `A·Bᵀ` or TN `Aᵀ·B`) and reject batch offsets, either order.
+    let (a_sym, sa, b_sym, sb, f16, transposed_a) = {
         let mut found = None;
         for (fa, fb) in [(f1, f2), (f2, f1)] {
             if scalar_of(fa, sema) != Some(mercury_types::Scalar::F32)
@@ -9244,7 +9284,9 @@ fn match_matmul_lowp_nt(
             else {
                 continue;
             };
-            if !transposed || a_trans || !a_off.is_empty() || !b_off.is_empty() {
+            // Exactly one operand transposed: NT (A normal, B transposed) or TN (A transposed, B
+            // normal). Plain `A·B` and `Aᵀ·Bᵀ` have no half kernel — decline to the scalar nest.
+            if a_trans == transposed || !a_off.is_empty() || !b_off.is_empty() {
                 continue;
             }
             let af = match scalar_of(ai, sema) {
@@ -9260,7 +9302,7 @@ fn match_matmul_lowp_nt(
             if af != bf {
                 continue;
             }
-            found = Some((a_sym, sa, b_sym, sb, af));
+            found = Some((a_sym, sa, b_sym, sb, af, a_trans));
             break;
         }
         found?
@@ -9279,7 +9321,12 @@ fn match_matmul_lowp_nt(
     }
     let (cbase, cidx) = as_index1(ct)?;
     let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
-    if !c_off.is_empty() || sa != kdim || sb != kdim || sc != n {
+    // Normal A's contraction stride is K (`a[i*K+k]`), transposed A's is the output-row count M
+    // (`a[k*M+i]`); normal B's stride is N (`b[k*N+j]`), transposed B's is K (`b[j*K+k]`). Since
+    // exactly one is transposed, `transposed_a` picks both: TN → (sa=M, sb=N), NT → (sa=K, sb=K).
+    let sa_ok = if transposed_a { sa == m } else { sa == kdim };
+    let sb_ok = if transposed_a { sb == n } else { sb == kdim };
+    if !c_off.is_empty() || !sa_ok || !sb_ok || sc != n {
         return None;
     }
     if scalar_of(ct, sema) != Some(mercury_types::Scalar::F32) {
@@ -9298,6 +9345,7 @@ fn match_matmul_lowp_nt(
         k: kdim,
         n,
         f16,
+        transposed_a,
     })
 }
 
@@ -9713,12 +9761,12 @@ fn i8matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<I
     match_matmul_i8_nt(pat, iter, lb, sema, interner)
 }
 
-/// Is the whole function body a single bf16/f16 mixed-precision `C = A·Bᵀ` nest? Used to intercept a
-/// `@parallel` half-precision matmul *before* the elementwise outliner (which would outline the outer
-/// row loop into per-row scalar loops and lose the kernel dispatch). Detection only — the function is
-/// then lowered normally (`lower_fn`, `parallel = true`) and the embedded recognizer in `lower_for`
-/// emits the multicore half GEMM. A non-`@parallel` whole-function matmul reaches the serial kernel
-/// the same way via the ordinary `lower_fn` path, so it needs no interception.
+/// Is the whole function body a single bf16/f16 mixed-precision matmul nest (`C = A·Bᵀ` NT or
+/// `C = Aᵀ·B` TN)? Used to intercept a `@parallel` half-precision matmul *before* the elementwise
+/// outliner (which would outline the outer row loop into per-row scalar loops and lose the kernel
+/// dispatch). Detection only — the function is then lowered normally (`lower_fn`, `parallel = true`)
+/// and the embedded recognizer in `lower_for` emits the multicore half GEMM. A non-`@parallel`
+/// whole-function matmul reaches the serial kernel the same way via the ordinary `lower_fn` path.
 fn lowp_matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<LowpMatmulNest> {
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
@@ -9732,7 +9780,7 @@ fn lowp_matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Optio
     else {
         return None;
     };
-    match_matmul_lowp_nt(pat, iter, lb, sema, interner)
+    match_matmul_lowp(pat, iter, lb, sema, interner)
 }
 
 /// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base
