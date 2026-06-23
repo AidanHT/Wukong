@@ -34,7 +34,10 @@
 
 use mercury_mir::{BasicBlock, BinOp, Function, Inst, MirType, Op, Terminator, ValueId};
 use mercury_span::{Interner, Symbol};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+mod tape;
+use tape::Syms;
 
 /// Differentiate `func` with respect to the buffer parameters named by `wrt` (indices into
 /// `func.params`), returning a new function `{func.name}_grad`.
@@ -71,9 +74,12 @@ pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<F
     }
 
     let base = interner.resolve(func.name).to_string();
+    // Pre-intern the kernel symbols (forward recognition is by Symbol equality — interning dedups,
+    // so these match the symbols the forward calls were built with).
+    let syms = Syms::new(interner);
     let gname = interner.intern(&format!("{base}_grad"));
 
-    let mut vjp = Vjp::new(func, gname, wrt);
+    let mut vjp = Vjp::new(func, gname, wrt, syms);
     vjp.replay();
     vjp.seed()?;
     vjp.reverse()?;
@@ -90,12 +96,24 @@ struct Vjp<'a> {
     /// Defining op of each forward result value (for tracing `gep`/`load` pointer provenance).
     def_op: HashMap<ValueId, &'a Op>,
     fwd_to_new: HashMap<ValueId, ValueId>,
+    /// Scalar adjoints: a forward SSA value -> its accumulated-adjoint value in the new function.
     adj: HashMap<ValueId, ValueId>,
+    /// Gradient-output parameter for each `wrt` input buffer (the appended, caller-zeroed params).
     grad_buf: HashMap<ValueId, ValueId>,
+    /// Interned kernel symbols, for recognizing/emitting tensor-kernel calls (see `tape.rs`).
+    syms: Syms,
+    /// Buffer adjoints: a forward buffer pointer -> the new buffer holding its accumulated gradient.
+    /// The tensor-tape twin of `adj`; set by a consumer's VJP, read by the producer's VJP.
+    buf_adj: HashMap<ValueId, ValueId>,
+    /// Element count of each intermediate (alloca'd) forward buffer, for sizing its gradient buffer.
+    buf_count: HashMap<ValueId, u32>,
+    /// Buffers that have already received a gradient contribution — a second one would need
+    /// accumulation (handled per-op for matmul via `beta`; a loud error elsewhere until supported).
+    contributed: HashSet<ValueId>,
 }
 
 impl<'a> Vjp<'a> {
-    fn new(fwd: &'a Function, gname: Symbol, wrt: &[usize]) -> Vjp<'a> {
+    fn new(fwd: &'a Function, gname: Symbol, wrt: &[usize], syms: Syms) -> Vjp<'a> {
         // The gradient function returns nothing — it writes gradients into its appended buffers.
         let mut b = mercury_mir::Builder::new(gname, MirType::Void);
         let mut fwd_to_new = HashMap::new();
@@ -113,9 +131,15 @@ impl<'a> Vjp<'a> {
         }
         let block = &fwd.blocks[0];
         let mut def_op = HashMap::new();
+        let mut buf_count = HashMap::new();
         for inst in &block.insts {
             if let Some(r) = inst.result {
                 def_op.insert(r, &inst.op);
+                // Record the element count of each intermediate buffer (an array alloca), so its
+                // gradient buffer can be sized to match.
+                if let Op::Alloca(MirType::Array(_, count)) = &inst.op {
+                    buf_count.insert(r, *count);
+                }
             }
         }
         Vjp {
@@ -125,6 +149,10 @@ impl<'a> Vjp<'a> {
             fwd_to_new,
             adj: HashMap::new(),
             grad_buf,
+            syms,
+            buf_adj: HashMap::new(),
+            buf_count,
+            contributed: HashSet::new(),
         }
     }
 
@@ -187,6 +215,22 @@ impl<'a> Vjp<'a> {
     // --- the per-instruction VJP dispatch -------------------------------------------------
 
     fn diff_inst(&mut self, inst: &Inst) -> Result<(), String> {
+        // A recognized tensor-kernel call differentiates through the buffer-adjoint model (tape.rs).
+        // Its gradient flows through buffers (memory), not the scalar `adj` map.
+        if let Op::Call { func, args } = &inst.op {
+            if self.is_kernel(*func) {
+                return self.diff_kernel_call(*func, args, inst.result);
+            }
+            // An unrecognized call that writes buffers (void result) could feed a downstream
+            // gradient; we cannot prove its contribution is zero, so refuse rather than silently
+            // emit a wrong (zero) gradient. (Value-returning unknown calls fall through to the
+            // scalar path, which errors only if the value actually has a non-zero adjoint.)
+            if inst.result.is_none() {
+                return Err(
+                    "autodiff: unrecognized buffer-writing call has no VJP rule".to_string()
+                );
+            }
+        }
         // Stores are the loss sink (or an output write); they propagate no adjoint in the
         // SSA-temporaries model. (Read-after-write through intermediate memory is out of scope for
         // this iteration — the input is expected to be mem2reg'd.)
