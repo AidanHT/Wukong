@@ -1258,6 +1258,20 @@ impl<'a> FnEmit<'a> {
                     Err(format!("{UNSUPPORTED} vmath op {op} not yet lowered to PTX"))
                 }
             }
+            // Two-arg transcendentals: pow(0)/atan2(1)/hypot(2), dispatched on a compile-time op code.
+            "mercury_vmath2_f32" if args.len() == 5 => {
+                let op = self
+                    .const_ints
+                    .get(&args[4].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;
+                if matches!(op, 0..=2) {
+                    self.emit_helper_call("mrt_vmath2", None, args, None);
+                    Ok(())
+                } else {
+                    Err(format!("{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"))
+                }
+            }
             other => {
                 if let Some(h) = rt_helper(other) {
                     self.emit_helper_call(h.ptx_name, h.ret, args, result);
@@ -1665,15 +1679,17 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
             ptx_axpby_lowp("mrt_axpby_bf16", "bf16"),
         ),
         "mercury_axpby_f16" => ("mrt_axpby_f16", None, ptx_axpby_lowp("mrt_axpby_f16", "f16")),
+        // Two-arg transcendentals (pow/atan2/hypot), op-gated in lower_call.
+        "mercury_vmath2_f32" => ("mrt_vmath2", None, PTX_VMATH2.to_string()),
         _ => return None,
     };
     Some(RtHelper { ptx_name, ret, def })
 }
 
-/// Which `mercury_vmath_f32` op codes `mrt_vmath` implements. Excludes atan(25)/asin(33)/acos(34),
-/// which need an `atan` minimax polynomial PTX has no SFU for (a later increment).
+/// Which `mercury_vmath_f32` op codes `mrt_vmath` implements: the full single-arg set 0..=35
+/// (atan(25)/asin(33)/acos(34) use an inline minimax `atan` poly since PTX has no SFU for them).
 fn vmath_supported(op: i128) -> bool {
-    matches!(op, 0..=24 | 26..=32 | 35)
+    matches!(op, 0..=35)
 }
 
 /// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6).
@@ -2116,6 +2132,9 @@ VM_LOOP:
     setp.eq.s64 %p1, %rd3, 30; @%p1 bra VM30;
     setp.eq.s64 %p1, %rd3, 31; @%p1 bra VM31;
     setp.eq.s64 %p1, %rd3, 32; @%p1 bra VM32;
+    setp.eq.s64 %p1, %rd3, 25; @%p1 bra VM25;
+    setp.eq.s64 %p1, %rd3, 33; @%p1 bra VM33;
+    setp.eq.s64 %p1, %rd3, 34; @%p1 bra VM34;
     setp.eq.s64 %p1, %rd3, 35; @%p1 bra VM35;
     bra VM_DEF;
 VM0:
@@ -2232,6 +2251,36 @@ VM35:
     abs.f32 %f3, %f1; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
     mul.f32 %f3, %f3, 0f3EAAAAAB; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
     copysign.f32 %f2, %f1, %f3; bra VM_ST;
+VM25:
+    // atan(x): minimax poly atan(z)=z*P(z^2) on |z|<=1 (~1e-5 at z=1); reduce |x|>1 via pi/2-atan(1/|x|).
+    abs.f32 %f3, %f1; setp.gt.f32 %p1, %f3, 0f3F800000;
+    rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;
+    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;
+    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;
+    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;
+    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;
+    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f2, %f1, %f6; bra VM_ST;
+VM33:
+    // asin(x) = atan(x / sqrt(1-x^2)), sign preserved.
+    mul.f32 %f3, %f1, %f1; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f3; sqrt.rn.f32 %f4, %f4;
+    abs.f32 %f5, %f1; div.rn.f32 %f3, %f5, %f4;
+    setp.gt.f32 %p1, %f3, 0f3F800000; rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;
+    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;
+    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;
+    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;
+    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;
+    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f2, %f1, %f6; bra VM_ST;
+VM34:
+    // acos(x) = pi/2 - asin(x).
+    mul.f32 %f3, %f1, %f1; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f3; sqrt.rn.f32 %f4, %f4;
+    abs.f32 %f5, %f1; div.rn.f32 %f3, %f5, %f4;
+    setp.gt.f32 %p1, %f3, 0f3F800000; rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;
+    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;
+    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;
+    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;
+    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;
+    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f6, %f1, %f6;
+    mov.f32 %f7, 0f3FC90FDB; sub.f32 %f2, %f7, %f6; bra VM_ST;
 VM_DEF:
     mov.f32 %f2, %f1;
 VM_ST:
@@ -2240,6 +2289,59 @@ VM_ST:
     add.s64 %rd4, %rd4, 1;
     bra VM_LOOP;
 VM_DONE:
+    ret;
+}
+"#;
+
+/// `mercury_vmath2_f32(in1, in2, out, n, op)`: the two-arg transcendentals over f32 arrays —
+/// pow(0) = `in1^in2` = exp2(in2·log2(in1)); atan2(1) = angle of (in2, in1) = atan(in1/in2) +
+/// quadrant fix; hypot(2) = `sqrt(in1²+in2²)`. atan uses the same inline minimax poly as VM25; the
+/// CPU<->GPU tolerance gate covers the SFU/poly-vs-libm difference.
+const PTX_VMATH2: &str = r#".func mrt_vmath2 (.param .b64 p1, .param .b64 p2, .param .b64 pout, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<12>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [p1];
+    ld.param.u64 %rd1, [p2];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [pn];
+    ld.param.u64 %rd4, [pop];
+    mov.b64 %rd5, 0;
+V2_LOOP:
+    setp.ge.s64 %p0, %rd5, %rd3;
+    @%p0 bra V2_DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.s64 %rd7, %rd0, %rd6;
+    ld.f32 %f1, [%rd7];
+    add.s64 %rd7, %rd1, %rd6;
+    ld.f32 %f2, [%rd7];
+    setp.eq.s64 %p1, %rd4, 0; @%p1 bra V2_POW;
+    setp.eq.s64 %p1, %rd4, 1; @%p1 bra V2_ATAN2;
+    setp.eq.s64 %p1, %rd4, 2; @%p1 bra V2_HYPOT;
+    mov.f32 %f3, %f1; bra V2_ST;
+V2_POW:
+    lg2.approx.f32 %f3, %f1; mul.f32 %f3, %f3, %f2; ex2.approx.f32 %f3, %f3; bra V2_ST;
+V2_HYPOT:
+    mul.f32 %f3, %f1, %f1; fma.rn.f32 %f3, %f2, %f2, %f3; sqrt.rn.f32 %f3, %f3; bra V2_ST;
+V2_ATAN2:
+    div.rn.f32 %f4, %f1, %f2;
+    abs.f32 %f5, %f4; setp.gt.f32 %p1, %f5, 0f3F800000;
+    rcp.approx.f32 %f6, %f5; selp.f32 %f6, %f6, %f5, %p1;
+    mul.f32 %f7, %f6, %f6; mov.f32 %f3, 0f3CAAAE5F;
+    fma.rn.f32 %f3, %f3, %f7, 0fBDAE5A36; fma.rn.f32 %f3, %f3, %f7, 0f3E3876E2;
+    fma.rn.f32 %f3, %f3, %f7, 0fBEA91D04; fma.rn.f32 %f3, %f3, %f7, 0f3F7FF738;
+    mul.f32 %f3, %f3, %f6; mov.f32 %f8, 0f3FC90FDB; sub.f32 %f8, %f8, %f3;
+    selp.f32 %f3, %f8, %f3, %p1; copysign.f32 %f3, %f4, %f3;
+    setp.lt.f32 %p1, %f2, 0f00000000;
+    mov.f32 %f8, 0f40490FDB; copysign.f32 %f8, %f1, %f8; add.f32 %f9, %f3, %f8;
+    selp.f32 %f3, %f9, %f3, %p1; bra V2_ST;
+V2_ST:
+    add.s64 %rd7, %rd2, %rd6;
+    st.f32 [%rd7], %f3;
+    add.s64 %rd5, %rd5, 1;
+    bra V2_LOOP;
+V2_DONE:
     ret;
 }
 "#;
