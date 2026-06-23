@@ -1618,6 +1618,114 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)` — the
+            // fused-epilogue mixed-precision Linear (`C = act(A·Bᵀ + bias)`, half inputs / f32 output).
+            // Combines the bf16/f16 GEMM's u16-input marshalling (read each `[bf16]`/`[f16]` element back
+            // to its exact 16 stored bits via `f32_to_{bf16,f16}_bits`) with the `nt_epi` epilogue's
+            // bias/act marshalling (an absent bias arrives as `Value::Int(0)` → a null pointer). Calls
+            // the *serial* runtime kernel for both the serial and `_parallel` names (serial == parallel
+            // == interpreter bit-for-bit — rows independent, identical per-(i,j) order), so the
+            // differential gate stays exact despite the kernel's wider/reassociated accumulation.
+            "mercury_sgemm_bf16_nt_epi"
+            | "mercury_sgemm_bf16_nt_epi_parallel"
+            | "mercury_sgemm_f16_nt_epi"
+            | "mercury_sgemm_f16_nt_epi_parallel" => {
+                let is_f16 = name.contains("_f16");
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let c = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let beta = args[6].as_int() as i64;
+                // An absent bias arrives as a `Value::Int(0)` (the null built as an integer 0) vs a real
+                // array's `Value::Ptr` — distinguished by variant, like the f32 `nt_epi` epilogue.
+                let bias_idx = match args[7] {
+                    Value::Ptr(p) => Some(p),
+                    _ => None,
+                };
+                let act = args[8].as_int() as i64;
+                // Read a `[bf16]`/`[f16]` element (stored as its rounded f32 value) back to its exact 16
+                // stored bits — the same technique the bf16/f16 GEMM and reductions use.
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    let f = self
+                        .memory
+                        .get(idx + t)
+                        .ok_or("lowp sgemm_epi operand out of bounds")?
+                        .as_float() as f32;
+                    Ok(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    })
+                };
+                let mut abuf = Vec::with_capacity(m * k);
+                for t in 0..m * k {
+                    abuf.push(bits(a, t)?);
+                }
+                let mut bbuf = Vec::with_capacity(n * k);
+                for t in 0..n * k {
+                    bbuf.push(bits(b, t)?);
+                }
+                let mut cbuf = vec![0.0f32; m * n];
+                // The bias is f32 (the epilogue domain), read straight as f32 like `nt_epi`.
+                let biasbuf = match bias_idx {
+                    Some(base) => {
+                        let mut v = Vec::with_capacity(n);
+                        for t in 0..n {
+                            v.push(
+                                self.memory
+                                    .get(base + t)
+                                    .ok_or("lowp sgemm_epi bias out of bounds")?
+                                    .as_float() as f32,
+                            );
+                        }
+                        v
+                    }
+                    None => Vec::new(),
+                };
+                let bias_ptr = if bias_idx.is_some() {
+                    biasbuf.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                // SAFETY: abuf is m*k, bbuf is n*k u16; cbuf is m*n f32; bias is null or n long — the
+                // kernels' contract. The bf16/f16 kernels differ only in which runtime fn widens the bits.
+                unsafe {
+                    if is_f16 {
+                        mercury_runtime::mercury_sgemm_f16_nt_epi(
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
+                            bias_ptr,
+                            act,
+                        );
+                    } else {
+                        mercury_runtime::mercury_sgemm_bf16_nt_epi(
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
+                            bias_ptr,
+                            act,
+                        );
+                    }
+                }
+                for (t, &val) in cbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(c + t)
+                        .ok_or("lowp sgemm_epi output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)` — the fused row-wise
             // softmax / LayerNorm / RMSNorm kernel a recognized multi-pass norm lowers to. Marshal the
             // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel

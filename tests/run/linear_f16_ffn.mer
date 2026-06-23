@@ -1,0 +1,55 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: -2
+// EXPECT-OUT: 36
+// EXPECT-OUT: -11
+module tests.run.linear_f16_ffn
+
+// f16 mixed-precision fused FFN projection: C = A·Bᵀ + bias — an f16 nn.Linear matmul immediately
+// followed by its bias-add loop over the same C, with the identity activation (the bias-only
+// projection). The compiler fuses the two into one mercury_sgemm_f16_nt_epi call: the lossless f16
+// (F16C) widen prepass feeds the tuned f32 GEMM, which folds the bias into the C writeback. Identity
+// requires a bias (a bare C = C copy is a no-op), and unlike the ReLU sibling it keeps the negative
+// outputs — so this fixture exercises the f16 path AND the identity-with-bias epilogue. Small
+// integers are f16-exact, so the differential gate is bit-for-bit (interp == native, -O0 == -O3).
+// A is [2,3], B is [4,3] (rows are weight vectors), C is [2,4], bias is [4].
+fn main() -> i32 {
+    let mut a: [f16; 6] = [0.0 as f16; 6];
+    let mut b: [f16; 12] = [0.0 as f16; 12];
+    let mut c: [f32; 8] = [0.0; 8];
+    let bias: [f32; 4] = [10.0, 20.0, 30.0, 4.0];
+    for i in 0..6 {
+        a[i] = ((i + 1) as f32) as f16; // A = [[1,2,3],[4,5,6]]
+    }
+    // B rows (the weight vectors): e0, e1, e2, and -1·ones.
+    b[0] = 1.0 as f16;
+    b[4] = 1.0 as f16;
+    b[8] = 1.0 as f16;
+    b[9] = -1.0 as f16;
+    b[10] = -1.0 as f16;
+    b[11] = -1.0 as f16;
+
+    // C = A·Bᵀ   (f16 reads widen to f32 via F16C; products + sums accumulate in f32)
+    for i in 0..2 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..3 {
+                s = s + (a[i * 3 + k] as f32) * (b[j * 3 + k] as f32);
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+    // Fused epilogue: C = C + bias (identity activation).
+    for i in 0..2 {
+        for j in 0..4 {
+            c[i * 4 + j] = c[i * 4 + j] + bias[j];
+        }
+    }
+
+    print(c[0] as i32); // 1 + 10   = 11
+    print(c[3] as i32); // -6 + 4   = -2
+    print(c[6] as i32); // 6 + 30   = 36
+    print(c[7] as i32); // -15 + 4  = -11
+    return 0;
+}
