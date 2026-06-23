@@ -205,7 +205,8 @@ SGD_END:
 /// A grid that saturates the device for a memory-bound grid-stride kernel: 256-thread blocks, capped
 /// at `32·SM` blocks (enough resident waves to hide HBM latency on Ada), but never more blocks than
 /// elements. The grid-stride loop covers every element regardless, so this only sizes occupancy.
-fn grid_stride_cfg(g: &Gpu, n: u32) -> LaunchConfig {
+/// Shared with the backward kernels (`ptx_autodiff_bwd`), which are the same memory-bound shape.
+pub(crate) fn grid_stride_cfg(g: &Gpu, n: u32) -> LaunchConfig {
     let block = 256u32;
     let max_blocks = (g.sm_count() as u32).saturating_mul(32).max(1);
     let grid = n.div_ceil(block).clamp(1, max_blocks);
