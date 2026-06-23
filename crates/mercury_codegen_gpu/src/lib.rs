@@ -59,5 +59,10 @@ pub mod ptx_optim;
 #[cfg(feature = "gpu")]
 pub mod ptx_autodiff_bwd;
 
+/// GPU-resident MLP training step (forward + backward + fused AdamW, no host round-trip) — the M8
+/// vehicle benched against PyTorch eager.
+#[cfg(feature = "gpu")]
+pub mod train_resident;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};

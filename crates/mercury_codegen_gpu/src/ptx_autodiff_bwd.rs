@@ -15,7 +15,7 @@
 
 use crate::gpu::Gpu;
 use crate::ptx_optim::grid_stride_cfg;
-use cudarc::driver::{DriverError, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, DriverError, LaunchConfig, PushKernelArg};
 use std::sync::OnceLock;
 
 // Row-norm op codes (mirror `mercury_autodiff::tape` / `mercury_runtime`).
@@ -612,6 +612,141 @@ pub fn gemm_f32(
     bld.arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&mu).arg(&nu).arg(&ku);
     unsafe { bld.launch(gemm_cfg(m, n))? };
     g.stream.memcpy_dtov(&c_d)
+}
+
+// ----------------------------------------------------------------------------------------------
+// Forward elementwise glue the resident training step needs (relu forward; MSE-loss gradient seed).
+// ----------------------------------------------------------------------------------------------
+
+/// `relu_fwd(x, out, n)`: `out = max(x, 0)`. `mse_grad(y, t, dy, n, scale)`: `dy = scale*(y - t)` —
+/// the gradient of `scale/2 * sum (y-t)^2` (scale=2 reproduces the SSD loss the tape differentiates).
+pub const TRAIN_ELEM_PTX: &str = r#"
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry relu_fwd(.param .u64 rx, .param .u64 rout, .param .u32 rn)
+{
+    .reg .pred %p<2>;
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<6>;
+    .reg .f32  %f<3>;
+    ld.param.u64 %rd1,[rx]; ld.param.u64 %rd2,[rout]; ld.param.u32 %r1,[rn];
+    cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    mov.u32 %r2,%ntid.x; mov.u32 %r3,%ctaid.x; mov.u32 %r4,%tid.x;
+    mad.lo.s32 %r5,%r3,%r2,%r4; mov.u32 %r6,%nctaid.x; mul.lo.s32 %r7,%r2,%r6;
+RF_L:
+    setp.ge.s32 %p1,%r5,%r1; @%p1 bra RF_E;
+    mul.wide.s32 %rd3,%r5,4;
+    add.s64 %rd4,%rd1,%rd3; ld.global.f32 %f1,[%rd4];
+    max.f32 %f2,%f1,0f00000000;
+    add.s64 %rd5,%rd2,%rd3; st.global.f32 [%rd5],%f2;
+    add.s32 %r5,%r5,%r7; bra RF_L;
+RF_E:
+    ret;
+}
+
+.visible .entry mse_grad(.param .u64 my, .param .u64 mt, .param .u64 mdy, .param .u32 mn, .param .f32 ms)
+{
+    .reg .pred %p<2>;
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<5>;
+    ld.param.u64 %rd1,[my]; ld.param.u64 %rd2,[mt]; ld.param.u64 %rd3,[mdy];
+    ld.param.u32 %r1,[mn]; ld.param.f32 %f1,[ms];
+    cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    mov.u32 %r2,%ntid.x; mov.u32 %r3,%ctaid.x; mov.u32 %r4,%tid.x;
+    mad.lo.s32 %r5,%r3,%r2,%r4; mov.u32 %r6,%nctaid.x; mul.lo.s32 %r7,%r2,%r6;
+MG_L:
+    setp.ge.s32 %p1,%r5,%r1; @%p1 bra MG_E;
+    mul.wide.s32 %rd4,%r5,4;
+    add.s64 %rd5,%rd1,%rd4; ld.global.f32 %f2,[%rd5];
+    add.s64 %rd6,%rd2,%rd4; ld.global.f32 %f3,[%rd6];
+    sub.f32 %f4,%f2,%f3; mul.f32 %f4,%f1,%f4;
+    add.s64 %rd7,%rd3,%rd4; st.global.f32 [%rd7],%f4;
+    add.s32 %r5,%r5,%r7; bra MG_L;
+MG_E:
+    ret;
+}
+"#;
+
+// ----------------------------------------------------------------------------------------------
+// Device-pointer launch helpers (no host transfer) — the resident training step chains these over
+// device buffers it keeps alive across forward + backward + optimizer.
+// ----------------------------------------------------------------------------------------------
+
+/// `C[m×n] = opA(A)·opB(B)` over device buffers (resident GEMM; see [`gemm_f32`]).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_device(
+    g: &mut Gpu,
+    ta: bool,
+    tb: bool,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    c: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("train_gemm", train_gemm_ptx(), gemm_entry_name(ta, tb))?;
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(a).arg(b).arg(c).arg(&mu).arg(&nu).arg(&ku);
+    unsafe { bld.launch(gemm_cfg(m, n))? };
+    Ok(())
+}
+
+/// `dx = dout ⊙ f'(·)` over device buffers (resident activation-backward; see [`act_bwd_f32`]).
+pub fn act_bwd_device(
+    g: &mut Gpu,
+    op: i64,
+    dout: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    y: &CudaSlice<f32>,
+    dx: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("act_bwd", ACT_BWD_PTX, act_bwd_entry(op))?;
+    let n_u = n as u32;
+    let cfg = grid_stride_cfg(g, n_u);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(dout).arg(x).arg(y).arg(dx).arg(&n_u);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// `out = max(x, 0)` over device buffers (resident relu forward).
+pub fn relu_fwd_device(
+    g: &mut Gpu,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("train_elem", TRAIN_ELEM_PTX, "relu_fwd")?;
+    let n_u = n as u32;
+    let cfg = grid_stride_cfg(g, n_u);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(x).arg(out).arg(&n_u);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// `dy = scale*(y - t)` over device buffers (resident MSE-loss gradient seed).
+pub fn mse_grad_device(
+    g: &mut Gpu,
+    y: &CudaSlice<f32>,
+    t: &CudaSlice<f32>,
+    dy: &mut CudaSlice<f32>,
+    n: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = g.function("train_elem", TRAIN_ELEM_PTX, "mse_grad")?;
+    let n_u = n as u32;
+    let cfg = grid_stride_cfg(g, n_u);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(y).arg(t).arg(dy).arg(&n_u).arg(&scale);
+    unsafe { b.launch(cfg)? };
+    Ok(())
 }
 
 #[cfg(test)]
