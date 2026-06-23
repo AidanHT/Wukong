@@ -58,6 +58,8 @@ pub fn lower_program(
         norm_affine_par: interner.intern("mercury_norm_affine_f32_parallel"),
         i8nt: interner.intern("mercury_i8gemm_nt"),
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
+        i8deq: interner.intern("mercury_i8gemm_nt_deq"),
+        i8deq_par: interner.intern("mercury_i8gemm_nt_deq_parallel"),
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
         reduce_bf16: interner.intern("mercury_reduce_bf16"),
@@ -509,6 +511,14 @@ struct GemmSyms {
     /// naive loop bit-for-bit (no reassociation exception).
     i8nt: Symbol,
     i8nt_par: Symbol,
+    /// The fused int8 GEMM + dequant kernel (`mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n,
+    /// scale_a, scale_b, bias, act)`): an int8 `C = A·Bᵀ` nest immediately followed by a per-channel
+    /// dequant `out[i*N+j] = act((c[i*N+j] as f32) * scale_a * scale_b[j] [+ bias[j]])` folds to this
+    /// one call — the i32 accumulator never touches memory (the kernel dequants each tile in registers
+    /// straight to the f32 output). cuBLAS/oneDNN emit the i32 GEMM and the dequant as two passes; this
+    /// is the fusion they structurally can't express. Both backends marshal the identical kernel.
+    i8deq: Symbol,
+    i8deq_par: Symbol,
     /// The bf16 mixed-precision reduction kernels (`mercury_dot_bf16(x, y, n) -> f32` and
     /// `mercury_sum_bf16(x, n) -> f32`): a reduction loop `s += (x[k] as f32) [* (y[k] as f32)]` over
     /// `[bf16; _]` arrays with an f32 accumulator lowers to one of these — bf16 storage, f32
@@ -720,6 +730,13 @@ impl FnLowerer<'_> {
             // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
             // over C). Checked before the elementwise fusion below — they match disjoint shapes.
             if let Some(n) = self.try_fuse_matmul_epilogue(&b.stmts[i..]) {
+                i += n;
+                continue;
+            }
+            // int8 GEMM + per-channel dequant epilogue → one fused `mercury_i8gemm_nt_deq` call (the
+            // i32 accumulator is dequanted in registers, never materialized). Structurally disjoint
+            // from the f32 epilogue above (an int8 `u8×i8→i32` nest, not a float matmul).
+            if let Some(n) = self.try_fuse_i8matmul_dequant_epilogue(b, i) {
                 i += n;
                 continue;
             }
@@ -2202,6 +2219,112 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![a, b, c, m, k, n, beta, bias_ptr, act_v],
+        });
+        true
+    }
+
+    /// Fuse a recognized int8 GEMM immediately followed by its per-channel dequant epilogue into one
+    /// `mercury_i8gemm_nt_deq` call (`out = act((A·Bᵀ as f32)·scale_a·scale_b [+ bias])`). The i32
+    /// accumulator never reaches memory — the kernel dequants each output tile in registers straight
+    /// to the f32 output, the fusion cuBLAS/oneDNN can't express (they emit the i32 GEMM and the
+    /// dequant as two passes over a full i32 buffer). Fires only when the i32 accumulator `c` is a
+    /// `let`-local of this block that is **dead** after the dequant loop, so dropping its separate
+    /// materialization is sound. Returns the number of statements consumed (always 2), else `None`.
+    fn try_fuse_i8matmul_dequant_epilogue(&mut self, b: &Block, i: usize) -> Option<usize> {
+        if i + 1 >= b.stmts.len() {
+            return None;
+        }
+        // stmts[i]: the int8 `C = A·Bᵀ` nest, writing the i32 accumulator `c`.
+        let StmtKind::For {
+            pat, iter, body, ..
+        } = &b.stmts[i].kind
+        else {
+            return None;
+        };
+        let nest = match_matmul_i8_nt(pat, iter, body, self.sema, self.interner)?;
+        // stmts[i+1]: the dequant loop over the same `c`, writing the f32 output.
+        let (out, scale_a, scale_b, bias, act) =
+            match_i8_dequant_epilogue(&b.stmts[i + 1], &nest, self.sema, self.interner)?;
+        // Soundness: the fused kernel never writes `c` (it dequants in registers), so `c`'s separate
+        // materialization may be dropped only if `c` is provably dead afterward. Require `c` to be a
+        // `let`-local declared earlier in *this* block (lexical scoping then forbids it escaping to an
+        // outer scope) and unmentioned in every statement after the dequant loop (and the block tail).
+        if !block_declares_local(&b.stmts[..i], nest.c)
+            || block_mentions(&b.stmts[i + 2..], b.tail.as_deref(), nest.c)
+        {
+            return None;
+        }
+        if self.emit_i8gemm_deq(&nest, out, scale_a, scale_b, bias, act) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// Emit the fused `mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n, scale_a, scale_b, bias,
+    /// act)` call for a recognized int8 GEMM + dequant. `scale_a` is the per-tensor activation scale (a
+    /// scalar f32, loaded from its slot; `None` ⇒ the scale was folded into `scale_b`, so pass `1.0`).
+    /// A null bias is the integer `0` (a `Ptr`-typed const is invalid MIR — same convention as the
+    /// affine norm / fused-epilogue null params; the kernel checks `bias.is_null()` and the interpreter
+    /// distinguishes `Value::Int(0)` from a real array's `Value::Ptr` by variant). Bails (false) if an
+    /// operand/dim is unbound at the call site, so the caller lowers the GEMM and the dequant loop
+    /// separately (still correct, just unfused). `@parallel` selects the multicore kernel (rows
+    /// independent → bit-identical to the serial kernel the interpreter marshals).
+    fn emit_i8gemm_deq(
+        &mut self,
+        nest: &I8MatmulNest,
+        out: Symbol,
+        scale_a: Option<Symbol>,
+        scale_b: Symbol,
+        bias: Option<Symbol>,
+        act: u32,
+    ) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((out_v, _)), Some((sb, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.b),
+            self.lookup(out),
+            self.lookup(scale_b),
+        ) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        // scale_a: load the scalar (the kernel takes it by value as f32), or the literal 1.0 when the
+        // activation scale was folded into the per-channel scale_b.
+        let scale_a_v = match scale_a {
+            Some(s) => match self.lookup(s) {
+                Some((slot, ty)) => self.builder.build(ty.clone(), Op::Load(slot, ty)),
+                None => return false,
+            },
+            None => self
+                .builder
+                .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
+        };
+        let bias_ptr = match bias {
+            Some(s) => match self.lookup(s) {
+                Some((v, _)) => v,
+                None => return false,
+            },
+            None => self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+        };
+        let act_v = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(act as i128, MirType::I64));
+        let func = if self.parallel_fn {
+            self.gemm.i8deq_par
+        } else {
+            self.gemm.i8deq
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, out_v, m, k, n, scale_a_v, sb, bias_ptr, act_v],
         });
         true
     }
@@ -8380,6 +8503,209 @@ fn match_bias_act_epilogue(
         return None;
     }
     match_epi_value(value, nest.c, ivar, jvar, nest.n, interner)
+}
+
+/// Flatten the multiplicative factors of `e`, recursing only through `*`. `(c as f32) * sa * sb[j]`
+/// yields the three factors `[(c as f32), sa, sb[j]]` (left-association is irrelevant — the kernel is
+/// the oracle, so any recognized association maps to the same fused call). The int8 dequant analog of
+/// [`flatten_add_terms`].
+fn flatten_mul_terms<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    {
+        flatten_mul_terms(lhs, out);
+        flatten_mul_terms(rhs, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// If `e` is `base[var]` (single index exactly the path `var`), return `base`. The per-column access
+/// shape of the weight scale `scale_b[j]` / `bias[j]` in the int8 dequant.
+fn index_by_var(e: &Expr, var: Symbol) -> Option<Symbol> {
+    if let ExprKind::Index { base, indices } = &e.kind {
+        if indices.len() == 1 && single_path(&indices[0]) == Some(var) {
+            return single_path(base);
+        }
+    }
+    None
+}
+
+/// Peel an optional activation wrapper off the int8 dequant value: `fmax(inner, 0.0)` → ReLU,
+/// `gelu(inner)` / `silu(inner)` → that activation, else the expression itself (identity). Mirrors
+/// [`match_epi_value`]'s activation detection; the runtime `dequant_row` applies the identical scalar
+/// form (`vmath::{gelu1,silu1}`), so fused == unfused.
+fn peel_dequant_act<'a>(e: &'a Expr, interner: &Interner) -> (&'a Expr, u32) {
+    if let ExprKind::Call { callee, args, .. } = &e.kind {
+        if args.len() == 2
+            && single_path(callee).is_some_and(|s| interner.resolve(s) == "fmax")
+            && is_float_zero(&args[1], interner)
+        {
+            return (&args[0], EPI_ACT_RELU);
+        }
+        if args.len() == 1 {
+            match single_path(callee).map(|s| interner.resolve(s)) {
+                Some("gelu") => return (&args[0], EPI_ACT_GELU),
+                Some("silu") => return (&args[0], EPI_ACT_SILU),
+                _ => {}
+            }
+        }
+    }
+    (e, EPI_ACT_IDENTITY)
+}
+
+/// Peel an optional `+ bias[j]` (either addend order) off the int8 dequant value; return the
+/// remaining product and the bias array. `None` when there is no per-column add (bias-free decode).
+fn peel_bias_add<'a>(e: &'a Expr, jvar: Symbol) -> Option<(&'a Expr, Symbol)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    if let Some(b) = index_by_var(rhs, jvar) {
+        return Some((lhs, b));
+    }
+    if let Some(b) = index_by_var(lhs, jvar) {
+        return Some((rhs, b));
+    }
+    None
+}
+
+/// Does any statement bind `sym` via a `let` at this block level? A `let`-local cannot escape the
+/// block lexically, so — combined with "unmentioned after the window" (`block_mentions`) — it proves
+/// `sym` is dead, which is what makes dropping the int8 accumulator's materialization sound.
+fn block_declares_local(stmts: &[Stmt], sym: Symbol) -> bool {
+    stmts.iter().any(|s| {
+        matches!(&s.kind, StmtKind::Let { pat, .. }
+            if matches!(&pat.kind, ast::PatKind::Ident(b) if *b == sym))
+    })
+}
+
+/// Match the per-channel dequant epilogue that follows an int8 GEMM, decoding the i32 accumulator to
+/// f32:
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   out[i*N + j] = act((c[i*N + j] as f32) * scale_a * scale_b[j] [+ bias[j]]);
+/// } }
+/// ```
+///
+/// the standard quantized `nn.Linear` decode — a per-tensor activation scale `scale_a` (scalar), a
+/// per-channel weight scale `scale_b[j]`, an optional `bias[j]`, and an optional activation. `M`/`N`/
+/// the output stride / the i32 source array (`nest.c`) / the column index must all match `nest`, so it
+/// never misfires. The three multiplicative factors are matched in **any** association (the fused
+/// kernel is the differential oracle). `scale_a` may be **absent** (the scale folded into `scale_b` —
+/// only a `cast * scale_b[j]` product), in which case the emitter passes `1.0`. Returns the f32 output
+/// array, the optional scalar `scale_a` symbol, the per-channel `scale_b` array, the optional `bias`
+/// array, and the activation code.
+fn match_i8_dequant_epilogue(
+    stmt: &Stmt,
+    nest: &I8MatmulNest,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Option<Symbol>, Symbol, Option<Symbol>, u32)> {
+    // for i in 0..M { <single nested loop> }
+    let (ipat, iiter, ibody) = fusable_for(stmt)?;
+    let ivar = match &ipat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (istart, iend) = range_bounds(iiter)?;
+    if as_int_lit(istart, interner)? != 0 || as_dim(iend, interner)? != nest.m {
+        return None;
+    }
+    if ibody.tail.is_some() || ibody.stmts.len() != 1 {
+        return None;
+    }
+    // for j in 0..N { <single assignment> }
+    let (jpat, jiter, jbody) = fusable_for(&ibody.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (jstart, jend) = range_bounds(jiter)?;
+    if as_int_lit(jstart, interner)? != 0 || as_dim(jend, interner)? != nest.n {
+        return None;
+    }
+    if jbody.tail.is_some() || jbody.stmts.len() != 1 {
+        return None;
+    }
+    // out[i*N + j] = <dequant value>   (a different buffer than the i32 accumulator `c`)
+    let StmtKind::Assign {
+        target,
+        op: ast::AssignOp::Assign,
+        value,
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let (out_sym, oidx) = as_index1(target)?;
+    let (ostride, ocol) = match_row_col(oidx, ivar, interner)?;
+    if ostride != nest.n || ocol != jvar || out_sym == nest.c {
+        return None;
+    }
+    if scalar_of(target, sema) != Some(mercury_types::Scalar::F32) {
+        return None;
+    }
+    // Peel the optional activation, then the optional `+ bias[j]`.
+    let (core, act) = peel_dequant_act(value, interner);
+    let (prod, bias) = match peel_bias_add(core, jvar) {
+        Some((p, b)) => (p, Some(b)),
+        None => (core, None),
+    };
+    // The product must be `(c[i*N+j] as f32) * scale_a? * scale_b[j]` in any association: exactly one
+    // cast of the i32 output element, exactly one per-column `scale_b[j]`, and at most one scalar
+    // `scale_a`. Any other factor declines the fusion (the loop then lowers normally).
+    let mut factors = Vec::new();
+    flatten_mul_terms(prod, &mut factors);
+    if factors.len() < 2 || factors.len() > 3 {
+        return None;
+    }
+    let mut cast_seen = false;
+    let mut scale_b: Option<Symbol> = None;
+    let mut scale_a: Option<Symbol> = None;
+    for f in factors {
+        // `(c[i*N+j] as i32) as f32` — the dequant cast of the GEMM output element.
+        if let ExprKind::Cast { expr, .. } = &f.kind {
+            if is_c_elem(expr, nest.c, ivar, jvar, nest.n, interner)
+                && scalar_of(f, sema) == Some(mercury_types::Scalar::F32)
+            {
+                if cast_seen {
+                    return None;
+                }
+                cast_seen = true;
+                continue;
+            }
+        }
+        // `scale_b[j]` — a per-column array (the weight scale). Not the data or the output buffer.
+        if let Some(b) = index_by_var(f, jvar) {
+            if b == nest.c || b == out_sym || scale_b.is_some() {
+                return None;
+            }
+            scale_b = Some(b);
+            continue;
+        }
+        // `scale_a` — a scalar f32 (the per-tensor activation scale; the kernel takes it by value).
+        if let Some(s) = single_path(f) {
+            if scale_a.is_some() || scalar_of(f, sema) != Some(mercury_types::Scalar::F32) {
+                return None;
+            }
+            scale_a = Some(s);
+            continue;
+        }
+        return None;
+    }
+    if !cast_seen {
+        return None;
+    }
+    let scale_b = scale_b?;
+    Some((out_sym, scale_a, scale_b, bias, act))
 }
 
 /// A recognized int8 quantized `nn.Linear` nest: `C[m,n] (i32) = A[m,k] (u8) · B[n,k] (i8)ᵀ`.

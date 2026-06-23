@@ -1,0 +1,59 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -39
+// EXPECT-OUT: 13
+// EXPECT-OUT: 27
+// EXPECT-OUT: 41
+module tests.run.i8_linear_dequant
+
+// int8 quantized nn.Linear with a fused dequant epilogue: the i32 accumulator C = A·Bᵀ is decoded to
+// f32 in one pass — out[i,j] = (C[i,j] as f32) * scale_a * scale_b[j] + bias[j] — the standard
+// quantized-inference decode (per-tensor activation scale, per-channel weight scale, bias). The
+// compiler recognizes the int8 GEMM immediately followed by this per-channel dequant loop over the
+// same accumulator and fuses both into one mercury_i8gemm_nt_deq call: the i32 tile is dequanted in
+// registers, so it never touches memory (the fusion cuBLAS/oneDNN can't express — they emit the i32
+// GEMM and the dequant as two passes). Both backends marshal the identical kernel, so the differential
+// gate is exact and -O0 == -O3. A is [3,4] (u8), B is [3,4] (i8, rows = weight vectors), C is [3,3].
+fn main() -> i32 {
+    let mut a: [u8; 12] = [0 as u8; 12];
+    let mut b: [i8; 12] = [0 as i8; 12];
+    let mut c: [i32; 9] = [0; 9];
+    let mut out: [f32; 9] = [0.0; 9];
+    for i in 0..12 {
+        a[i] = (i + 1) as u8; // 1 .. 12
+    }
+    for i in 0..12 {
+        b[i] = ((i as i32) - 6) as i8; // -6 .. 5
+    }
+
+    // Per-tensor activation scale, per-channel weight scale, per-channel bias. Powers of two (and
+    // small integers) so the decode is exact in f32 — the printed values are unambiguous.
+    let scale_a: f32 = 0.5;
+    let mut scale_b: [f32; 3] = [2.0, 1.0, 0.5];
+    let mut bias: [f32; 3] = [1.0, 2.0, 3.0];
+
+    // C[i,j] = sum_k A[i,k] * B[j,k]   (the int8 GEMM — recognized, writes the i32 accumulator c)
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s: i32 = 0;
+            for k in 0..4 {
+                s = s + (a[i * 4 + k] as i32) * (b[j * 4 + k] as i32);
+            }
+            c[i * 3 + j] = s;
+        }
+    }
+
+    // Dequant epilogue over the same accumulator — fuses into the GEMM's writeback.
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i * 3 + j] = (c[i * 3 + j] as f32) * scale_a * scale_b[j] + bias[j];
+        }
+    }
+
+    // factor[j] = scale_a*scale_b[j] = {1.0, 0.5, 0.25}; out = C*factor[j] + bias[j].
+    print(round(out[0]) as i32); // C[0]=-40 → -40*1.0 + 1.0 = -39
+    print(round(out[2]) as i32); // C[2]= 40 →  40*0.25 + 3.0 = 13
+    print(round(out[5]) as i32); // C[5]= 96 →  96*0.25 + 3.0 = 27
+    print(round(out[8]) as i32); // C[8]=152 → 152*0.25 + 3.0 = 41
+    return 0;
+}

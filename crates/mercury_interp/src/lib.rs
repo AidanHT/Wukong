@@ -855,6 +855,98 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n, scale_a, scale_b, bias, act)` — the
+            // *fused-dequant* int8 `nn.Linear`: `out_f32 = act((A_u8·B_i8ᵀ as f32)·scale_a·scale_b[j]
+            // (+ bias[j]))`. Marshals the integer operands exactly like `mercury_i8gemm_nt` (each
+            // `Value::Int`'s low byte → `u8`/`i8`), plus a per-column `scale_b` f32 array (length `n`),
+            // an `f32` `scale_a` scalar (read like velem's affine scalars), and an *optional* `bias` f32
+            // array (length `n`): an absent bias lowers to a `Ptr`-typed `ConstInt(0)` → a `Value::Int(0)`
+            // here (distinct from a real array's `Value::Ptr`), so match the variant and pass a null
+            // pointer (same convention as the affine-norm gamma/beta and the epilogue GEMM bias). The
+            // result is f32 (rounding under dequant/activation), written back to the `out` buffer. Both
+            // names marshal through the *serial* runtime kernel (bit-identical — rows independent).
+            "mercury_i8gemm_nt_deq" | "mercury_i8gemm_nt_deq_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let scale_a = args[6].as_float() as f32;
+                let scale_b_idx = ptr(args[7])?;
+                let bias_idx = match args[8] {
+                    Value::Ptr(p) => Some(p),
+                    _ => None,
+                };
+                let act = args[9].as_int() as i64;
+                let mut abuf: Vec<u8> = Vec::with_capacity(m * k);
+                for t in 0..m * k {
+                    abuf.push(
+                        self.memory
+                            .get(a + t)
+                            .ok_or("i8gemm_deq a out of bounds")?
+                            .as_int() as u8,
+                    );
+                }
+                let mut bbuf: Vec<i8> = Vec::with_capacity(n * k);
+                for t in 0..n * k {
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("i8gemm_deq b out of bounds")?
+                            .as_int() as i8,
+                    );
+                }
+                let mut sbbuf: Vec<f32> = Vec::with_capacity(n);
+                for t in 0..n {
+                    sbbuf.push(
+                        self.memory
+                            .get(scale_b_idx + t)
+                            .ok_or("i8gemm_deq scale_b out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut biasbuf: Vec<f32> = Vec::new();
+                if let Some(bi) = bias_idx {
+                    for t in 0..n {
+                        biasbuf.push(
+                            self.memory
+                                .get(bi + t)
+                                .ok_or("i8gemm_deq bias out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                }
+                let bias_ptr = if bias_idx.is_some() {
+                    biasbuf.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let mut obuf = vec![0.0f32; m * n];
+                // SAFETY: abuf/bbuf/obuf are exactly m*k, n*k, m*n long; scale_b (and bias when present)
+                // are n long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_i8gemm_nt_deq(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                        scale_a,
+                        sbbuf.as_ptr(),
+                        bias_ptr,
+                        act,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("i8gemm_deq output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_sgemm_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)` — the fused-epilogue
             // Linear (`C = act(A·Bᵀ + bias)`). Like the plain GEMM, the interpreter marshals operands
             // into real f32 buffers and calls the *serial* runtime kernel as the oracle. The native
