@@ -393,6 +393,7 @@ unsafe fn gemm_lowp_nt(
     beta: i64,
     par: bool,
     widen: fn(u16) -> f32,
+    epi: Option<Epilogue>,
 ) {
     if m <= 0 || k <= 0 || n <= 0 {
         return;
@@ -402,7 +403,7 @@ unsafe fn gemm_lowp_nt(
     let mut bf = vec![0.0f32; nu * ku];
     widen_into_f32(a, af.as_mut_ptr(), mu * ku, widen);
     widen_into_f32(b, bf.as_mut_ptr(), nu * ku, widen);
-    gemm_dispatch(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta, true, par, None);
+    gemm_dispatch(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta, true, par, epi);
 }
 
 /// `C = A·Bᵀ` with `bf16` inputs (f32 accumulate), single-threaded. See [`gemm_lowp_nt`].
@@ -419,7 +420,7 @@ pub unsafe extern "C" fn mercury_sgemm_bf16_nt(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, false, crate::bf16_bits_to_f32);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, false, crate::bf16_bits_to_f32, None);
 }
 
 /// Multi-threaded `C = A·Bᵀ` with `bf16` inputs. The widen prepass is serial (small); the GEMM runs
@@ -438,7 +439,7 @@ pub unsafe extern "C" fn mercury_sgemm_bf16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, true, crate::bf16_bits_to_f32);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, true, crate::bf16_bits_to_f32, None);
 }
 
 /// `C = A·Bᵀ` with IEEE `f16` inputs (f32 accumulate), single-threaded. The widen is F16C-exact
@@ -456,7 +457,7 @@ pub unsafe extern "C" fn mercury_sgemm_f16_nt(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, false, crate::f16_bits_to_f32);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, false, crate::f16_bits_to_f32, None);
 }
 
 /// Multi-threaded `C = A·Bᵀ` with `f16` inputs.
@@ -473,7 +474,118 @@ pub unsafe extern "C" fn mercury_sgemm_f16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, true, crate::f16_bits_to_f32);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, true, crate::f16_bits_to_f32, None);
+}
+
+/// `C = act(A·Bᵀ + bias)` with **bf16/f16 inputs** (f32 accumulate) — the mixed-precision transformer
+/// FFN projection, fused. Same widen prepass as [`gemm_lowp_nt`], but the f32 GEMM folds the bias-add
+/// and activation into its C-tile writeback (the `Epilogue`), so C is written once. `bias` may be null
+/// and must otherwise be valid for `n` `f32`; `act` is 0 (identity), 1 (ReLU), 2 (GELU), or 3 (SiLU).
+/// Reuses the exact `mercury_sgemm_nt_epi` epilogue, so the fused result equals the unfused
+/// matmul → [bias →] activation bit-for-bit (the differential contract the interpreter marshals).
+///
+/// # Safety
+/// `a` valid for `m*k`, `b` for `n*k` `u16`; `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn gemm_lowp_nt_epi(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+    par: bool,
+    widen: fn(u16) -> f32,
+) {
+    let epi = Epilogue {
+        bias,
+        act: act as u32,
+    };
+    gemm_lowp_nt(a, b, c, m, k, n, beta, par, widen, Some(epi));
+}
+
+/// Fused-epilogue `C = act(A·Bᵀ + bias)` with `bf16` inputs, single-threaded. See [`gemm_lowp_nt_epi`].
+///
+/// # Safety
+/// `a`/`b` valid for `m*k`/`n*k` `bf16` (`u16`); `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_sgemm_bf16_nt_epi(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+) {
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, crate::bf16_bits_to_f32);
+}
+
+/// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `bf16` inputs.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm_bf16_nt_epi`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_sgemm_bf16_nt_epi_parallel(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+) {
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, crate::bf16_bits_to_f32);
+}
+
+/// Fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs, single-threaded. See [`gemm_lowp_nt_epi`].
+///
+/// # Safety
+/// `a`/`b` valid for `m*k`/`n*k` `f16` (`u16`); `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_sgemm_f16_nt_epi(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+) {
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, crate::f16_bits_to_f32);
+}
+
+/// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemm_f16_nt_epi`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mercury_sgemm_f16_nt_epi_parallel(
+    a: *const u16,
+    b: *const u16,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    bias: *const f32,
+    act: i64,
+) {
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, crate::f16_bits_to_f32);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1527,6 +1639,50 @@ mod tests {
             assert_eq!(got_bf, got_bf_par, "bf16 nt serial vs parallel ({m}x{k}x{n})");
             assert_eq!(got_h, ref_h, "f16 nt must equal f32 nt on widened operands ({m}x{k}x{n})");
             assert_eq!(got_h, got_h_par, "f16 nt serial vs parallel ({m}x{k}x{n})");
+        }
+    }
+
+    /// The fused-epilogue bf16/f16 GEMM (`C = act(A·Bᵀ + bias)`) must equal the f32 `nt_epi` kernel on
+    /// the losslessly-widened operands, for every (activation, bias-present) combination — the widen is
+    /// the only difference — and serial must equal parallel.
+    #[test]
+    fn sgemm_lowp_nt_epi_matches_widened_f32() {
+        let (m, k, n) = (40usize, 72, 48);
+        let a = fill(41, m * k);
+        let b = fill(42, n * k);
+        let bias = fill(43, n);
+        let a_bf: Vec<u16> = a.iter().map(|&x| crate::f32_to_bf16_bits(x)).collect();
+        let b_bf: Vec<u16> = b.iter().map(|&x| crate::f32_to_bf16_bits(x)).collect();
+        let a_bf_f32: Vec<f32> = a.iter().map(|&x| crate::round_bf16(x)).collect();
+        let b_bf_f32: Vec<f32> = b.iter().map(|&x| crate::round_bf16(x)).collect();
+        let a_h: Vec<u16> = a.iter().map(|&x| crate::f32_to_f16_bits(x)).collect();
+        let b_h: Vec<u16> = b.iter().map(|&x| crate::f32_to_f16_bits(x)).collect();
+        let a_h_f32: Vec<f32> = a.iter().map(|&x| crate::round_f16(x)).collect();
+        let b_h_f32: Vec<f32> = b.iter().map(|&x| crate::round_f16(x)).collect();
+        let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+        for act in 0i64..4 {
+            for use_bias in [false, true] {
+                let bptr = if use_bias { bias.as_ptr() } else { std::ptr::null() };
+                let mut ref_bf = vec![0.0f32; m * n];
+                let mut got_bf = vec![0.0f32; m * n];
+                let mut got_bf_par = vec![0.0f32; m * n];
+                let mut ref_h = vec![0.0f32; m * n];
+                let mut got_h = vec![0.0f32; m * n];
+                let mut got_h_par = vec![0.0f32; m * n];
+                unsafe {
+                    // Reference: the f32 fused-epilogue kernel on the widened operands.
+                    mercury_sgemm_nt_epi(a_bf_f32.as_ptr(), b_bf_f32.as_ptr(), ref_bf.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                    mercury_sgemm_bf16_nt_epi(a_bf.as_ptr(), b_bf.as_ptr(), got_bf.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                    mercury_sgemm_bf16_nt_epi_parallel(a_bf.as_ptr(), b_bf.as_ptr(), got_bf_par.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                    mercury_sgemm_nt_epi(a_h_f32.as_ptr(), b_h_f32.as_ptr(), ref_h.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                    mercury_sgemm_f16_nt_epi(a_h.as_ptr(), b_h.as_ptr(), got_h.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                    mercury_sgemm_f16_nt_epi_parallel(a_h.as_ptr(), b_h.as_ptr(), got_h_par.as_mut_ptr(), mi, ki, ni, 0, bptr, act);
+                }
+                assert_eq!(got_bf, ref_bf, "bf16 nt_epi act={act} bias={use_bias}");
+                assert_eq!(got_bf, got_bf_par, "bf16 nt_epi serial vs parallel act={act} bias={use_bias}");
+                assert_eq!(got_h, ref_h, "f16 nt_epi act={act} bias={use_bias}");
+                assert_eq!(got_h, got_h_par, "f16 nt_epi serial vs parallel act={act} bias={use_bias}");
+            }
         }
     }
 
