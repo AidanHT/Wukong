@@ -3313,10 +3313,76 @@ pub fn amax_f32(g: &mut Gpu, x: &[f32]) -> Result<f32, DriverError> {
     Ok(partials.iter().fold(0f32, |m, &v| m.max(v)))
 }
 
+/// **Device delayed-scaling quantize** `out[i] = fp8(x[i]·recip)` — E5M2 if `e5m2` else E4M3 — keeping
+/// the whole fp8 cast **on-GPU** via Ada's hardware `cvt.rn.satfinite.e{5m2,4m3}x2.f32` (no host
+/// round-trip), the residency the fp8 training step needs. `x.len()` must be even (the converter packs
+/// two f32 per `cvt`). Gated to land within one fp8 ULP of the true scaled value
+/// (`fp8_device_quantize_within_ulp`).
+pub fn quantize_scaled_fp8(
+    g: &mut Gpu,
+    x: &[f32],
+    recip: f32,
+    e5m2: bool,
+) -> Result<Vec<u8>, DriverError> {
+    let n = x.len();
+    assert!(n % 2 == 0, "device fp8 quantize needs an even element count");
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let (ptx, entry) = if e5m2 {
+        (crate::ptx_fp8_train::quantize_scaled_e5m2_ptx(), "quantize_scaled_e5m2")
+    } else {
+        (crate::ptx_fp8_train::quantize_scaled_e4m3_ptx(), "quantize_scaled_e4m3")
+    };
+    let x_d = g.stream.memcpy_stod(x)?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0u8; n])?;
+    let f = g.function(entry, ptx, entry)?;
+    let threads = 256usize;
+    let blocks = (n / 2).div_ceil(threads).clamp(1, 1024);
+    let nn = n as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&nn).arg(&x_d).arg(&mut o_d).arg(&recip);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// **Device fp8 quantize gate (first law).** The hw-`cvt`-based delayed-scaling quantize must land
+    /// each value within one fp8 ULP of `x·recip` after dequant+unscale (E5M2 ≤ ~1/8 relative, E4M3 ≤
+    /// ~1/16) — a round-to-nearest quantizer's guarantee, checked on-device over a sign/scale-mixed
+    /// tensor whose magnitude exceeds E4M3's range (so delayed scaling is exercised).
+    #[test]
+    fn fp8_device_quantize_within_ulp() {
+        use crate::ptx_fp8::e4m3_to_f32;
+        use crate::ptx_fp8_train::{delayed_scale_recip, e5m2_to_f32, E4M3_MAX, E5M2_MAX};
+        with_gpu("fp8_device_quantize", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8D);
+            let x = rng.vec(4096, -100.0, 100.0);
+            let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let r5 = delayed_scale_recip(amax, E5M2_MAX);
+            let q5 = quantize_scaled_fp8(g, &x, r5, true).unwrap();
+            for (i, &v) in x.iter().enumerate() {
+                let rec = e5m2_to_f32(q5[i]) / r5;
+                assert!((rec - v).abs() <= v.abs() * 0.13 + 1e-3, "e5m2 dev quant {v} -> {rec}");
+            }
+            let r4 = delayed_scale_recip(amax, E4M3_MAX);
+            let q4 = quantize_scaled_fp8(g, &x, r4, false).unwrap();
+            for (i, &v) in x.iter().enumerate() {
+                let rec = e4m3_to_f32(q4[i]) / r4;
+                assert!((rec - v).abs() <= v.abs() * 0.07 + 1e-3, "e4m3 dev quant {v} -> {rec}");
+            }
+            eprintln!("[gate] device fp8 quantize (hw cvt e5m2x2/e4m3x2) within ULP ✓");
+        });
+    }
 
     /// **amax gate (first law, exact).** The device per-tensor amax must **equal** the CPU max-abs —
     /// `max` reassociates without rounding, so this is a bit-exact `==` check, stronger than a tolerance.
