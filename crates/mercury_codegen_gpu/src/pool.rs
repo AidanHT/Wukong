@@ -188,6 +188,18 @@ impl DevicePool {
         self.offset = 0;
     }
 
+    /// Fill the **entire** slab with `byte` (a `cuMemsetD8Async` on the pool's stream). A correctness
+    /// aid: poison with a NaN-ish pattern (e.g. `0xFF`) before a pooled run so any buffer the run reads
+    /// *without* first fully writing it surfaces as a NaN mismatch against the per-op-`alloc_zeros`
+    /// baseline — i.e. it proves the [`alloc`](Self::alloc) (uninitialized) fast path is used only for
+    /// genuinely full-overwrite outputs. Steady-state replay leaves the slab dirty with the previous
+    /// iteration's data anyway, so this just makes that condition deterministic and hostile.
+    pub fn poison(&mut self, byte: u8) -> Result<(), DriverError> {
+        // SAFETY: `base`/`cap` describe the whole live slab; the memset is ordered on the pool's
+        // stream ahead of any later launch.
+        unsafe { result::memset_d8_async(self.base, byte, self.cap, self.stream.cu_stream()) }
+    }
+
     /// Peak bytes ever simultaneously live (the real footprint to budget against the 6 GB part).
     #[inline]
     pub fn high_water_bytes(&self) -> usize {
