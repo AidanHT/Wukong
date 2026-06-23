@@ -109,8 +109,19 @@ toolkit — only **running** needs the driver + a device.
   staging + threadblock raster + 16-byte-padded conflict-free fragment loads; fp8 is 1 byte/elem so the
   128×128 BK=64 tile is 40 KiB). Same-run: **~1.7–1.9× the old un-staged `_mt`** and **~1.79–1.98× the
   fp16 mma kernel — the Ada 2× fp8-rate realized** (M2; `fp8_pipe_vs_peers`, checksum-cross-checked). Also
-  the single-tile and fragment-reuse `_mt` (2×4 16×8 tiles/warp) fallbacks + host E4M3 round/widen. (The
-  literal %-of-cuBLASLt-fp8 needs a raw-sys E4M3 peer — cudarc's safe `Matmul` is f32/f16/bf16 only.)
+  the single-tile and fragment-reuse `_mt` (2×4 16×8 tiles/warp) fallbacks + host E4M3 round/widen.
+  **%-of-cuBLASLt-fp8 now bound (M2):** `baselines::cublaslt_gemm_nt_fp8_e4m3` drives the **raw-sys
+  `cublaslt::{sys,result}`** E4M3 `cublasLtMatmul` (cudarc's safe `Matmul` is f32/f16/bf16-only; the
+  `cublaslt` cudarc feature dlopens `cublasLt64_12.dll` like the other peers). The fp8 hardware TN
+  constraint (`transa=T,transb=N`) == the NT column-major mapping (`Cᵀ=B̌ᵀ·Ǎ`) the f16 peer already uses,
+  so it drops in; gated vs the same E4M3-rounded f64 ref (`cublaslt_fp8_matches_reference_within_tol`),
+  measured same-run by `fp8_vs_cublaslt_pct` (~70–85% of cuBLASLt; the **absolute % is contention-noisy** —
+  the cuBLASLt baseline alone swings ~1.5× run-to-run, so trust the internal A/B). **Regime lever
+  (`fp8_pipe_config_sweep_vs_cublaslt` found it):** `gemm_nt_fp8_pipe` now dispatches **M≤2048 to a 64×128
+  `fp8_gemm_pipe_m64` tile** (double the CTAs ⇒ higher occupancy), 128×128 for larger M. Clock-cancelling
+  internal A/B (`fp8_pipe_m64_vs_default_ab`): **1.07–1.15× over the 128×128 default at M≤2048**, ~0.98× at
+  4096³ (so 128×128 stays the large-M tile). Bit-identical accumulation (same codegen, only BM differs) ⇒
+  rides the same fp8 tolerance gate (`fp8_pipe_regime_matches_reference`, both entries + the 128∤M path).
   **Fused epilogue carried to fp8 — the fastest fused inference path:** `fp8_pipe_entry` takes the same
   `act`/`bias` args as `entry_mma_pipe` (the `m16n8k32` D-fragment column map matches `m16n8k16`, so the
   register-level `bias[col]` add + `Act::epilogue` are reused verbatim) → `fp8_gemm_pipe_bias{,_relu,_silu,
