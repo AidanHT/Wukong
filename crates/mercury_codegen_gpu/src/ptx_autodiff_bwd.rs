@@ -668,6 +668,49 @@ MG_L:
 MG_E:
     ret;
 }
+
+.visible .entry scale_inplace(.param .u64 sx, .param .u32 sn, .param .f32 ss)
+{
+    .reg .pred %p<2>;
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<5>;
+    .reg .f32  %f<3>;
+    ld.param.u64 %rd1,[sx]; ld.param.u32 %r1,[sn]; ld.param.f32 %f1,[ss];
+    cvta.to.global.u64 %rd1,%rd1;
+    mov.u32 %r2,%ntid.x; mov.u32 %r3,%ctaid.x; mov.u32 %r4,%tid.x;
+    mad.lo.s32 %r5,%r3,%r2,%r4; mov.u32 %r6,%nctaid.x; mul.lo.s32 %r7,%r2,%r6;
+SI_L:
+    setp.ge.s32 %p1,%r5,%r1; @%p1 bra SI_E;
+    mul.wide.s32 %rd2,%r5,4; add.s64 %rd3,%rd1,%rd2;
+    ld.global.f32 %f2,[%rd3]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd3],%f2;
+    add.s32 %r5,%r5,%r7; bra SI_L;
+SI_E:
+    ret;
+}
+
+.visible .entry causal_mask(.param .u64 cm, .param .u32 cs)
+{
+    .reg .pred %p<3>;
+    .reg .b32  %r<12>;
+    .reg .b64  %rd<5>;
+    .reg .f32  %f<2>;
+    ld.param.u64 %rd1,[cm]; ld.param.u32 %r1,[cs];
+    cvta.to.global.u64 %rd1,%rd1;
+    mul.lo.s32 %r2,%r1,%r1;
+    mov.u32 %r3,%ntid.x; mov.u32 %r4,%ctaid.x; mov.u32 %r5,%tid.x;
+    mad.lo.s32 %r6,%r4,%r3,%r5; mov.u32 %r7,%nctaid.x; mul.lo.s32 %r8,%r3,%r7;
+CM_L:
+    setp.ge.s32 %p1,%r6,%r2; @%p1 bra CM_E;
+    div.u32 %r9,%r6,%r1; mul.lo.s32 %r10,%r9,%r1; sub.s32 %r10,%r6,%r10; // row=idx/S, col=idx-row*S
+    setp.gt.s32 %p2,%r10,%r9;  // col > row -> mask
+    @!%p2 bra CM_N;
+    mul.wide.s32 %rd2,%r6,4; add.s64 %rd3,%rd1,%rd2;
+    mov.f32 %f1,0fFF800000; st.global.f32 [%rd3],%f1;
+CM_N:
+    add.s32 %r6,%r6,%r8; bra CM_L;
+CM_E:
+    ret;
+}
 "#;
 
 // ----------------------------------------------------------------------------------------------
@@ -747,6 +790,159 @@ pub fn mse_grad_device(
     b.arg(y).arg(t).arg(dy).arg(&n_u).arg(&scale);
     unsafe { b.launch(cfg)? };
     Ok(())
+}
+
+/// `x *= s` over a device buffer.
+pub fn scale_inplace_device(
+    g: &mut Gpu,
+    x: &mut CudaSlice<f32>,
+    n: usize,
+    s: f32,
+) -> Result<(), DriverError> {
+    let f = g.function("train_elem", TRAIN_ELEM_PTX, "scale_inplace")?;
+    let n_u = n as u32;
+    let cfg = grid_stride_cfg(g, n_u);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(x).arg(&n_u).arg(&s);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// Apply a causal mask to a square `s×s` score matrix in place: `S[i,j] = -inf` for `j > i` (each
+/// query attends only to keys at or before its position — the decoder mask).
+pub fn causal_mask_device(g: &mut Gpu, x: &mut CudaSlice<f32>, s: usize) -> Result<(), DriverError> {
+    let f = g.function("train_elem", TRAIN_ELEM_PTX, "causal_mask")?;
+    let s_u = s as u32;
+    let cfg = grid_stride_cfg(g, (s * s) as u32);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(x).arg(&s_u);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// Row-softmax **forward** over device buffers. Reuses `ptx_norm`'s softmax entry (read, never
+/// edited) so the attention backward recomputes P with the exact forward softmax.
+pub fn softmax_fwd_device(
+    g: &mut Gpu,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    rows: usize,
+    cols: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("norm_fwd", crate::ptx_norm::norm_ptx(), "softmax")?;
+    let (r, c, eps) = (rows as u32, cols as u32, 0f32);
+    let cfg = LaunchConfig {
+        grid_dim: (r, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&r).arg(&c).arg(&eps).arg(x).arg(out);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// Row-norm **backward** over device buffers (see [`norm_bwd_f32`]). For softmax, `x` is ignored.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_bwd_device(
+    g: &mut Gpu,
+    op: i64,
+    dy: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    y: &CudaSlice<f32>,
+    dx: &mut CudaSlice<f32>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<(), DriverError> {
+    let entry = match op {
+        NORM_SOFTMAX => "softmax_bwd",
+        NORM_LAYERNORM => "layernorm_bwd",
+        NORM_RMSNORM => "rmsnorm_bwd",
+        _ => panic!("norm_bwd op {op} not implemented"),
+    };
+    let f = g.function("norm_bwd", norm_bwd_ptx(), entry)?;
+    let (r, c) = (rows as u32, cols as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (r, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&r).arg(&c).arg(&eps).arg(dy).arg(x).arg(y).arg(dx);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------------
+// Flash-attention backward (dQ/dK/dV). With the forward S = scale·Q·Kᵀ, P = softmax(S), O = P·V,
+// the backward decomposes entirely into kernels we already have + the softmax backward:
+//   P  = softmax(scale·Q·Kᵀ)            (recomputed: gemm_nt + scale + ptx_norm softmax)
+//   dV = Pᵀ·dO                          (gemm_tn)
+//   dP = dO·Vᵀ                          (gemm_nt)
+//   dS = softmax_bwd(P, dP)             (the row-softmax backward kernel above)
+//   dQ = scale·(dS·K)                   (gemm_nn + scale)
+//   dK = scale·(dSᵀ·Q)                  (gemm_tn + scale)
+// This is the materialized (non-flash) form: correct, deterministic, built from gated primitives,
+// O(S²) workspace. The fused/tiled flash backward (no S×S materialization) is the perf/long-S lever.
+// ----------------------------------------------------------------------------------------------
+
+/// Flash-attention backward on the GPU. Inputs `q`/`k`/`v`/`do` are `[S×d]` row-major; `scale` is the
+/// forward's softmax scale (typically `1/sqrt(d)`); `causal` applies the decoder mask. Returns
+/// `(dQ, dK, dV)`, each `[S×d]`. Host-slice convenience wrapper (uploads, runs the resident kernel
+/// chain, downloads).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_backward(
+    g: &mut Gpu,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    d_o: &[f32],
+    s: usize,
+    d: usize,
+    scale: f32,
+    causal: bool,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), DriverError> {
+    let nd = s * d;
+    let n2 = s * s;
+    assert_eq!(q.len(), nd);
+    assert_eq!(k.len(), nd);
+    assert_eq!(v.len(), nd);
+    assert_eq!(d_o.len(), nd);
+    let st = g.stream.clone();
+    let q_d = st.memcpy_stod(q)?;
+    let k_d = st.memcpy_stod(k)?;
+    let v_d = st.memcpy_stod(v)?;
+    let do_d = st.memcpy_stod(d_o)?;
+    let mut s_d = st.alloc_zeros::<f32>(n2)?;
+    let mut p_d = st.alloc_zeros::<f32>(n2)?;
+    let mut dp_d = st.alloc_zeros::<f32>(n2)?;
+    let mut ds_d = st.alloc_zeros::<f32>(n2)?;
+    let mut dq_d = st.alloc_zeros::<f32>(nd)?;
+    let mut dk_d = st.alloc_zeros::<f32>(nd)?;
+    let mut dv_d = st.alloc_zeros::<f32>(nd)?;
+
+    // P = softmax(scale · Q·Kᵀ [+ causal mask])
+    gemm_device(g, false, true, &q_d, &k_d, &mut s_d, s, s, d)?;
+    scale_inplace_device(g, &mut s_d, n2, scale)?;
+    if causal {
+        causal_mask_device(g, &mut s_d, s)?;
+    }
+    softmax_fwd_device(g, &s_d, &mut p_d, s, s)?;
+    // dV = Pᵀ·dO
+    gemm_device(g, true, false, &p_d, &do_d, &mut dv_d, s, d, s)?;
+    // dP = dO·Vᵀ
+    gemm_device(g, false, true, &do_d, &v_d, &mut dp_d, s, s, d)?;
+    // dS = softmax_bwd(P, dP)
+    norm_bwd_device(g, NORM_SOFTMAX, &dp_d, &p_d, &p_d, &mut ds_d, s, s, 0.0)?;
+    // dQ = scale · dS·K
+    gemm_device(g, false, false, &ds_d, &k_d, &mut dq_d, s, d, s)?;
+    scale_inplace_device(g, &mut dq_d, nd, scale)?;
+    // dK = scale · dSᵀ·Q
+    gemm_device(g, true, false, &ds_d, &q_d, &mut dk_d, s, d, s)?;
+    scale_inplace_device(g, &mut dk_d, nd, scale)?;
+
+    Ok((st.memcpy_dtov(&dq_d)?, st.memcpy_dtov(&dk_d)?, st.memcpy_dtov(&dv_d)?))
 }
 
 #[cfg(test)]
@@ -946,6 +1142,98 @@ mod tests {
                 }
                 let mode = gemm_entry_name(ta, tb);
                 assert_close(mode, &got, &want, 1e-4, 1e-3);
+            }
+        });
+    }
+
+    /// **The attention-backward gate:** GPU `attention_backward` vs an f64 two-pass-softmax
+    /// reference computing dQ/dK/dV from the standard FA2 backward formulas, over the full tensors.
+    #[test]
+    fn attention_backward_matches_reference() {
+        with_gpu("attention_backward_matches_reference", |g| {
+            let (s, d) = (64usize, 64usize);
+            let scale = 1.0 / (d as f32).sqrt();
+            let mut rng = Rng::new(0xA77E);
+            let q = rng.vec(s * d, -1.0, 1.0);
+            let k = rng.vec(s * d, -1.0, 1.0);
+            let v = rng.vec(s * d, -1.0, 1.0);
+            let dout = rng.vec(s * d, -1.0, 1.0);
+            let sc = scale as f64;
+            for &causal in &[false, true] {
+                let (dq, dk, dv) =
+                    attention_backward(g, &q, &k, &v, &dout, s, d, scale, causal).unwrap();
+
+                // P = softmax(scale · Q·Kᵀ [+ causal mask]), two-pass, in f64.
+                let mut p = vec![0f64; s * s];
+                for i in 0..s {
+                    let mut row = vec![0f64; s];
+                    let mut mx = f64::NEG_INFINITY;
+                    for j in 0..s {
+                        if causal && j > i {
+                            row[j] = f64::NEG_INFINITY; // masked: P_ij = 0
+                            continue;
+                        }
+                        let mut acc = 0f64;
+                        for dd in 0..d {
+                            acc += q[i * d + dd] as f64 * k[j * d + dd] as f64;
+                        }
+                        row[j] = sc * acc;
+                        mx = mx.max(row[j]);
+                    }
+                    let mut sm = 0f64;
+                    for j in 0..s {
+                        row[j] = (row[j] - mx).exp();
+                        sm += row[j];
+                    }
+                    for j in 0..s {
+                        p[i * s + j] = row[j] / sm;
+                    }
+                }
+                // dS_ij = P_ij (dP_ij - D_i), dP_ij = dO_i·V_j, D_i = sum_j P_ij dP_ij.
+                let mut ds = vec![0f64; s * s];
+                for i in 0..s {
+                    let mut dp = vec![0f64; s];
+                    let mut di = 0f64;
+                    for j in 0..s {
+                        let mut acc = 0f64;
+                        for dd in 0..d {
+                            acc += dout[i * d + dd] as f64 * v[j * d + dd] as f64;
+                        }
+                        dp[j] = acc;
+                        di += p[i * s + j] * acc;
+                    }
+                    for j in 0..s {
+                        ds[i * s + j] = p[i * s + j] * (dp[j] - di);
+                    }
+                }
+                let mut rdv = vec![0f32; s * d];
+                let mut rdq = vec![0f32; s * d];
+                let mut rdk = vec![0f32; s * d];
+                for dd in 0..d {
+                    for j in 0..s {
+                        let mut acc = 0f64; // dV_jd = sum_i P_ij dO_id
+                        for i in 0..s {
+                            acc += p[i * s + j] * dout[i * d + dd] as f64;
+                        }
+                        rdv[j * d + dd] = acc as f32;
+                        let mut ak = 0f64; // dK_jd = scale sum_i dS_ij Q_id
+                        for i in 0..s {
+                            ak += ds[i * s + j] * q[i * d + dd] as f64;
+                        }
+                        rdk[j * d + dd] = (sc * ak) as f32;
+                    }
+                    for i in 0..s {
+                        let mut aq = 0f64; // dQ_id = scale sum_j dS_ij K_jd
+                        for j in 0..s {
+                            aq += ds[i * s + j] * k[j * d + dd] as f64;
+                        }
+                        rdq[i * d + dd] = (sc * aq) as f32;
+                    }
+                }
+                let tag = if causal { "causal" } else { "full" };
+                assert_close(&format!("attn dV {tag}"), &dv, &rdv, 2e-3, 3e-3);
+                assert_close(&format!("attn dQ {tag}"), &dq, &rdq, 2e-3, 3e-3);
+                assert_close(&format!("attn dK {tag}"), &dk, &rdk, 2e-3, 3e-3);
             }
         });
     }
