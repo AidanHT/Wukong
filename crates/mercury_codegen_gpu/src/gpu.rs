@@ -2906,21 +2906,33 @@ pub fn gemm_nt_fp8_pipe(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_THREADS};
+    use crate::ptx_fp8::{
+        f32_to_e4m3, FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS,
+    };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
+    // Regime-aware tile (see `fp8_pipe_config_sweep_vs_cublaslt`): the 64×128 `_m64` entry's higher
+    // occupancy wins for M≤2048 by a wide same-run margin and is the only legal entry when 128∤M but
+    // 64∣M; the 128×128 entry ties/wins for the larger M. Both share N%128==0, K%64==0; the chosen tile
+    // additionally needs M%BM==0. Same codegen, only BM differs ⇒ bit-identical accumulation.
+    let use_m64 = m % FP8_PIPE_BM != 0 || m <= 2048;
+    let (bm, entry) = if use_m64 {
+        (FP8_PIPE_M64_BM, "fp8_gemm_pipe_m64")
+    } else {
+        (FP8_PIPE_BM, "fp8_gemm_pipe")
+    };
     assert!(
-        m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
-        "fp8_gemm_pipe requires M%{FP8_PIPE_BM}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
+        m % bm == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        "fp8_gemm_pipe requires M%{bm}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
     );
     let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
     let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
-    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe")?;
+    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), entry)?;
     let a_d = g.stream.memcpy_stod(&a8)?;
     let b_d = g.stream.memcpy_stod(&b8)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let cfg = LaunchConfig {
-        grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1), // 1-D rasterized grid
+        grid_dim: (((m / bm) * (n / FP8_PIPE_BN)) as u32, 1, 1), // 1-D rasterized grid
         block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -7729,6 +7741,44 @@ mod tests {
         });
     }
 
+    /// Gate for the **regime-aware fp8 pipe dispatch** (M2 lever): `gemm_nt_fp8_pipe` now routes M≤2048
+    /// (and any M where 128∤M but 64∣M) to the 64×128 `fp8_gemm_pipe_m64` entry, and larger M to the
+    /// 128×128 entry — the higher-occupancy small-tile won the cuBLASLt-fp8 sweep at M≤2048. Both entries
+    /// must match the same E4M3-rounded f64 reference; the shapes straddle the M=2048 threshold and
+    /// include a 128∤M case, so each entry (and the dispatch boundary) is exercised. Same codegen, only
+    /// BM differs ⇒ bit-identical accumulation ⇒ the same fp8 `c·√K·ε` tolerance.
+    #[test]
+    fn fp8_pipe_regime_matches_reference() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("fp8_pipe_regime", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8D3);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            // (m, k, n): three M≤2048 (incl. 128∤M=192) → m64 entry; two M>2048 → 128×128 entry.
+            for (m, k, n) in [
+                (64usize, 128usize, 128usize),
+                (192, 128, 256),
+                (1024, 128, 256),
+                (2304, 128, 256),
+                (2560, 64, 128),
+            ] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = gemm_nt_fp8_pipe(g, &a, &b, m, k, n).unwrap();
+                let r = ref_nt_rounded(&a, &b, m, k, n, round);
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                let bm = if m % 128 != 0 || m <= 2048 { 64 } else { 128 };
+                let st = crate::diff::assert_close(
+                    &format!("fp8_pipe_regime {m}x{k}x{n} bm={bm}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    rel,
+                );
+                eprintln!("fp8_pipe_regime {m}x{k}x{n} (bm={bm}): max_abs={:.2e}", st.max_abs);
+            }
+        });
+    }
+
     /// The fused `C = act(A·Bᵀ + bias)` epilogues on the **fp8 mma workhorse**
     /// (`gemm_nt_fp8_mma_bias{,_relu,_silu,_gelu}`) — the fastest fused inference path (Ada runs fp8
     /// `mma.sync` at 2× the fp16 TC rate). The register-level bias epilogue acts on the f32 accumulator
@@ -8072,6 +8122,262 @@ mod tests {
                     flop / s_mt / 1e9,
                     s_f16 / s_pipe,
                     flop / s_f16 / 1e9,
+                );
+            }
+        });
+    }
+
+    /// **Correctness gate for the cuBLASLt fp8 peer** (M2) — gate first, measure second. Before any
+    /// speed number, the peer must agree with the *same* E4M3-rounded f64 reference Mercury's own fp8
+    /// kernels are gated against ([`fp8_pipe_matches_reference_within_tol`]). This confirms the
+    /// column-major transpose mapping (`Cᵀ = B̌ᵀ·Ǎ`, the fp8 "TN" form) and the E4M3/f32 dtype wiring
+    /// are right; tolerance is the fp8 `c·√K·ε` accumulation bound. Skips (never fails) when the redist
+    /// DLLs aren't on PATH, or when cuBLASLt reports no fp8 algo for the shape on this device.
+    #[test]
+    fn cublaslt_fp8_matches_reference_within_tol() {
+        use crate::baselines::{
+            cublaslt_available, cublaslt_gemm_nt_fp8_e4m3, peer_env_hint, peers_available,
+        };
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        with_gpu("cublaslt_fp8_gate", |g| {
+            if !peers_available(g) || !cublaslt_available() {
+                eprintln!("[skip] cublaslt_fp8_gate: cuBLASLt not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0xF8C7);
+            let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 256, 256), (128, 512, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let c = match cublaslt_gemm_nt_fp8_e4m3(g, &a, &b, m, k, n) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[skip] cuBLASLt fp8 unsupported for {m}x{k}x{n} on this device: {e}");
+                        return;
+                    }
+                };
+                let r = ref_nt_rounded(&a, &b, m, k, n, round);
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                let st = crate::diff::assert_close(
+                    &format!("cublaslt_fp8 {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    rel,
+                );
+                eprintln!(
+                    "cublaslt_fp8 {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// Mercury's fp8 (E4M3) GEMM as a **% of cuBLASLt fp8** — the real M2 peer (cuBLASLt is the *only*
+    /// cuBLAS surface with an fp8 matmul). Same-run, same E4M3 bytes fed to both, so the % is
+    /// clock-invariant (absolutes swing ~7× with Ada's boost). Reports both Mercury kernels: the
+    /// pipelined `fp8_gemm_pipe` and the fragment-reuse `_mt`. Needs the redist DLLs on PATH.
+    #[test]
+    #[ignore = "throughput bench; needs cublasLt64_12.dll on PATH; run explicitly"]
+    fn fp8_vs_cublaslt_pct() {
+        use crate::baselines::{
+            cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3,
+        };
+        use crate::ptx_fp8::{
+            f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS, FP8_TM, FP8_TN,
+        };
+        with_gpu("fp8_vs_cublaslt", |g| {
+            if !peers_available(g) || !cublaslt_available() {
+                eprintln!("[skip] fp8_vs_cublaslt: cuBLASLt not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let mut rng = crate::diff::Rng::new(0xF8C8);
+            // Clock warm-up (peak-vs-peak; absolutes swing ~7× with boost).
+            let wa = rng.vec(2048 * 2048, -1.0, 1.0);
+            let wb = rng.vec(2048 * 2048, -1.0, 1.0);
+            for _ in 0..15 {
+                let _ = gemm_nt_fp8_pipe(g, &wa, &wb, 2048, 2048, 2048).unwrap();
+            }
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * k as f64 * n as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let a8_d = g.stream.memcpy_stod(&a8).unwrap();
+                let b8_d = g.stream.memcpy_stod(&b8).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+
+                // cuBLASLt fp8 peer (plan built once inside, then 50 resident matmuls).
+                let s_lt = match time_cublaslt_gemm_nt_fp8_e4m3(g, &a8_d, &b8_d, &mut c_d, m, k, n, 50) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{sz}³ [skip] cuBLASLt fp8 unsupported: {e}");
+                        continue;
+                    }
+                };
+
+                // Mercury fp8 pipelined — the *dispatched* tile (`gemm_nt_fp8_pipe`'s regime rule:
+                // 64×128 for M≤2048, else 128×128), so the reported % reflects what ships.
+                let (pipe_entry, pipe_bm) = if m <= 2048 {
+                    ("fp8_gemm_pipe_m64", FP8_PIPE_M64_BM)
+                } else {
+                    ("fp8_gemm_pipe", FP8_PIPE_BM)
+                };
+                let f_pipe = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), pipe_entry).unwrap();
+                let cfg_pipe = LaunchConfig {
+                    grid_dim: (((m / pipe_bm) * (n / FP8_PIPE_BN)) as u32, 1, 1),
+                    block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_pipe = best_of(4, || time_wmma(g, &f_pipe, cfg_pipe, dims, &a8_d, &b8_d, &mut c_d, 50));
+
+                // Mercury fp8 fragment-reuse (_mt).
+                let f_mt = g.function("fp8_gemm_mt", crate::ptx_fp8::fp8_gemm_mt_ptx(), "fp8_gemm_nt_mt").unwrap();
+                let cfg_mt = LaunchConfig {
+                    grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_mt = best_of(4, || time_wmma(g, &f_mt, cfg_mt, dims, &a8_d, &b8_d, &mut c_d, 50));
+
+                eprintln!(
+                    "{sz}³ fp8 vs cuBLASLt (same-run): cuBLASLt {:>7.0} GFLOP/s | pipe {:>7.0} = {:>5.1}% of LT | mt {:>7.0} = {:>5.1}% of LT",
+                    flop / s_lt / 1e9,
+                    flop / s_pipe / 1e9,
+                    100.0 * s_lt / s_pipe,
+                    flop / s_mt / 1e9,
+                    100.0 * s_lt / s_mt,
+                );
+            }
+        });
+    }
+
+    /// **fp8 GEMM config sweep vs cuBLASLt** — the M2 "pull levers toward ≥90%" search. Times several
+    /// tile/pipeline configs of the same `fp8_gemm_pipe` kernel (the shipped default plus a
+    /// deeper-pipeline, a smaller-tile/higher-occupancy, a tighter-raster, and a wider-warp variant)
+    /// against the cuBLASLt fp8 peer, same-run, and prints each as a % of cuBLASLt. The per-size winner
+    /// says whether a regime-aware dispatch can close the gap, or whether (as for the fp16 cliff) the
+    /// default is already at the driver-JIT PTX ceiling. Needs the redist DLLs on PATH.
+    #[test]
+    #[ignore = "throughput sweep; needs cublasLt64_12.dll on PATH; run explicitly"]
+    fn fp8_pipe_config_sweep_vs_cublaslt() {
+        use crate::baselines::{
+            cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3,
+        };
+        use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
+        with_gpu("fp8_pipe_sweep", |g| {
+            if !peers_available(g) || !cublaslt_available() {
+                eprintln!("[skip] fp8_pipe_config_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            // (key, bm, bn, bk, warps_m, warps_n, stages, raster) — each ≤48 KiB SMEM.
+            let configs: [(&'static str, usize, usize, usize, usize, usize, usize, usize); 5] = [
+                ("fp8sw_def", 128, 128, 64, 2, 4, 2, 16),   // shipped default (40 KiB)
+                ("fp8sw_s3b32", 128, 128, 32, 2, 4, 3, 16), // deeper pipeline, shorter k-step (36 KiB)
+                ("fp8sw_m64", 64, 128, 64, 2, 4, 2, 16),    // smaller tile → more CTAs (30 KiB)
+                ("fp8sw_r8", 128, 128, 64, 2, 4, 2, 8),     // tighter rasterization
+                ("fp8sw_w44", 128, 128, 64, 4, 4, 2, 16),   // 16 warps/CTA → more ILP
+            ];
+            let mut rng = crate::diff::Rng::new(0xF8C9);
+            // Clock warm-up (peak-vs-peak).
+            let wa = rng.vec(2048 * 2048, -1.0, 1.0);
+            let wb = rng.vec(2048 * 2048, -1.0, 1.0);
+            for _ in 0..15 {
+                let _ = gemm_nt_fp8_pipe(g, &wa, &wb, 2048, 2048, 2048).unwrap();
+            }
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * k as f64 * n as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let a8_d = g.stream.memcpy_stod(&a8).unwrap();
+                let b8_d = g.stream.memcpy_stod(&b8).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let s_lt = match time_cublaslt_gemm_nt_fp8_e4m3(g, &a8_d, &b8_d, &mut c_d, m, k, n, 50) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{sz}³ [skip] cuBLASLt fp8: {e}");
+                        continue;
+                    }
+                };
+                eprint!("{sz}³ cuBLASLt {:>6.0} GFLOP/s |", flop / s_lt / 1e9);
+                for (key, bm, bn, bk, wm, wn, stg, ras) in configs {
+                    if m % bm != 0 || n % bn != 0 || k % bk != 0 {
+                        eprint!(" {key}:n/a");
+                        continue;
+                    }
+                    let ptx = fp8_pipe_cfg_ptx(bm, bn, bk, wm, wn, stg, ras);
+                    let f = g.function(key, &ptx, "fp8_gemm_pipe").unwrap();
+                    let cfg = LaunchConfig {
+                        grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1),
+                        block_dim: ((wm * wn * 32) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let s = best_of(4, || time_wmma(g, &f, cfg, dims, &a8_d, &b8_d, &mut c_d, 50));
+                    eprint!(" {key} {:>5.1}%", 100.0 * s_lt / s);
+                }
+                eprintln!();
+            }
+        });
+    }
+
+    /// **Internal same-family A/B: fp8 64×128 (`_m64`) vs the 128×128 default** — the contention-robust
+    /// metric (no cuBLASLt). The %-of-cuBLASLt swings with the shared clock (the baseline is sampled at a
+    /// different instant than Mercury), but timing the *two Mercury kernels back-to-back, interleaved
+    /// round-by-round*, cancels the clock entirely — the same A/B discipline the int8 swz comparison
+    /// uses. Confirms the dispatch lever: `_m64` should be ≥1× the default at M≤2048 (its higher
+    /// occupancy) and ~1× at 4096³ (where the default ties). Speedup >1 ⇒ m64 faster.
+    #[test]
+    #[ignore = "throughput A/B; run explicitly (GPU; no DLLs needed)"]
+    fn fp8_pipe_m64_vs_default_ab() {
+        use crate::ptx_fp8::{f32_to_e4m3, FP8_PIPE_BM, FP8_PIPE_BN, FP8_PIPE_M64_BM, FP8_PIPE_THREADS};
+        with_gpu("fp8_m64_ab", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8DA);
+            let wa = rng.vec(2048 * 2048, -1.0, 1.0);
+            let wb = rng.vec(2048 * 2048, -1.0, 1.0);
+            for _ in 0..15 {
+                let _ = gemm_nt_fp8_pipe(g, &wa, &wb, 2048, 2048, 2048).unwrap();
+            }
+            for sz in [512usize, 1024, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * k as f64 * n as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
+                let a8_d = g.stream.memcpy_stod(&a8).unwrap();
+                let b8_d = g.stream.memcpy_stod(&b8).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let f_def = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe").unwrap();
+                let f_m64 = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe_m64").unwrap();
+                let cfg_def = LaunchConfig {
+                    grid_dim: (((m / FP8_PIPE_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1),
+                    block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let cfg_m64 = LaunchConfig {
+                    grid_dim: (((m / FP8_PIPE_M64_BM) * (n / FP8_PIPE_BN)) as u32, 1, 1),
+                    block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // Interleaved best-of so default and m64 sample the same clock state.
+                let (mut bd, mut bm) = (f64::MAX, f64::MAX);
+                for _ in 0..6 {
+                    bd = bd.min(time_wmma(g, &f_def, cfg_def, dims, &a8_d, &b8_d, &mut c_d, 50));
+                    bm = bm.min(time_wmma(g, &f_m64, cfg_m64, dims, &a8_d, &b8_d, &mut c_d, 50));
+                }
+                eprintln!(
+                    "{sz}³ fp8 m64-vs-default (same-family A/B): default {:>6.0} GFLOP/s | m64 {:>6.0} = {:.3}× speedup",
+                    flop / bd / 1e9,
+                    flop / bm / 1e9,
+                    bd / bm,
                 );
             }
         });

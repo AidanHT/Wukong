@@ -125,6 +125,9 @@ pub const FP8_TILE: &str = r#".version 8.4
 /// (grp·(BK+16)/4 mod 32 spans every multiple of 4 ⇒ the 32 lanes hit 32 banks). fp8 SMEM is 1 byte/elem
 /// (half fp16's) so the padded 40 KiB tile fits the static-shared cap with room to spare.
 pub const FP8_PIPE_BM: usize = 128;
+/// Small/mid-M CTA tile height for the `fp8_gemm_pipe_m64` variant — half [`FP8_PIPE_BM`] doubles the
+/// CTA count; the higher occupancy wins for M≤2048 (see [`crate::gpu::gemm_nt_fp8_pipe`]'s dispatch).
+pub const FP8_PIPE_M64_BM: usize = 64;
 pub const FP8_PIPE_BN: usize = 128;
 pub const FP8_PIPE_BK: usize = 64;
 pub const FP8_PIPE_WM: usize = 2;
@@ -633,6 +636,27 @@ pub fn fp8_pipe_ptx() -> &'static str {
             false,
             false,
         );
+        // **Small/mid-M tile** (`fp8_gemm_pipe_m64`, 64×128) — the regime-aware win the cuBLASLt-fp8
+        // sweep found (`fp8_pipe_config_sweep_vs_cublaslt`): halving BM to 64 doubles the CTA count, and
+        // the higher occupancy beats the 128×128 default at M≤2048 by a wide same-run margin (e.g.
+        // 2048³ ~97% vs ~78% of cuBLASLt) while only tying at 4096³ — so [`crate::gpu::gemm_nt_fp8_pipe`]
+        // dispatches here for M≤2048 (and for any M where 128∤M but 64∣M) and to the 128×128 entry above
+        // for the larger sizes. Same kernel/codegen, only BM=64 → bit-identical accumulation, so it
+        // rides the same E4M3 tolerance gate.
+        m += &fp8_pipe_entry(
+            "fp8_gemm_pipe_m64",
+            FP8_PIPE_M64_BM,
+            FP8_PIPE_BN,
+            FP8_PIPE_BK,
+            FP8_PIPE_WM,
+            FP8_PIPE_WN,
+            FP8_PIPE_STAGES,
+            FP8_PIPE_RASTER,
+            FP8_PIPE_PAD,
+            Act::None,
+            false,
+            false,
+        );
         // Fused-epilogue fp8 variants — the beat-cuBLAS fusion carried to the **fastest** precision (Ada
         // 2× TC rate), so `C = act(x·Wᵀ + bias)` fp8 Linear/FFN is the fastest fused inference path. The
         // m16n8k32 D-fragment column map matches m16n8k16, so the register-level bias+act epilogue (no
@@ -690,6 +714,40 @@ pub fn fp8_pipe_ptx() -> &'static str {
         m
     })
     .as_str()
+}
+
+/// Build the pipelined fp8 GEMM (entry `fp8_gemm_pipe`) at an **arbitrary tile/pipeline config** — the
+/// sweep hook for chasing the cuBLASLt-fp8 % (M2). Identical kernel to [`fp8_pipe_ptx`]'s default
+/// entry, only with `bm/bn/bk/warps/stages/raster` chosen by the caller (pad fixed at [`FP8_PIPE_PAD`]).
+/// Returns an owned module string; the caller must cache it under a *distinct* key (the JIT cache keys
+/// by module key, so two configs sharing a key would collide). [`fp8_pipe_entry`]'s asserts enforce the
+/// divisibility/SMEM constraints, so an illegal config panics at build rather than miscompiling.
+pub fn fp8_pipe_cfg_ptx(
+    bm: usize,
+    bn: usize,
+    bk: usize,
+    warps_m: usize,
+    warps_n: usize,
+    stages: usize,
+    raster: usize,
+) -> String {
+    use crate::ptx_wmma::Act;
+    let mut m = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    m += &fp8_pipe_entry(
+        "fp8_gemm_pipe",
+        bm,
+        bn,
+        bk,
+        warps_m,
+        warps_n,
+        stages,
+        raster,
+        FP8_PIPE_PAD,
+        Act::None,
+        false,
+        false,
+    );
+    m
 }
 
 /// Multi-tile per warp for fp8: `M` direction tiles (each 16 rows) and `N` direction tiles (each 8
