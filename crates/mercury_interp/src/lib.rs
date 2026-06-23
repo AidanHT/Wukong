@@ -1072,6 +1072,43 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_transpose_f32[_parallel](src, dst, rows, cols)` — the cache-blocked transpose a
+            // recognized `dst[j,i] = src[i,j]` nest lowers to. Marshal the `rows*cols` f32 out of src,
+            // call the *serial* runtime kernel (a permutation, so serial == parallel bit-for-bit), write
+            // the `cols*rows` result to dst. Reading all of src first makes any overlap robust.
+            "mercury_transpose_f32" | "mercury_transpose_f32_parallel" => {
+                let src = ptr(args[0])?;
+                let dst = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let n = rows * cols;
+                let mut sbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    sbuf.push(
+                        self.memory
+                            .get(src + t)
+                            .ok_or("transpose operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut dbuf = vec![0.0f32; n];
+                // SAFETY: sbuf is rows*cols, dbuf is cols*rows = rows*cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_transpose_f32(
+                        sbuf.as_ptr(),
+                        dbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in dbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(dst + t)
+                        .ok_or("transpose output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath2_f32(x, y, out, n, op)` — the two-input 256-bit kernel (pow/atan2/hypot)
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the
