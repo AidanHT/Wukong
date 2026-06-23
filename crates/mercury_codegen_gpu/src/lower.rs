@@ -152,7 +152,7 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
                     if let Op::Call { func, .. } = &inst.op {
                         if let Some(h) = rt_helper(interner.resolve(*func)) {
                             if seen.insert(h.ptx_name) {
-                                out.push_str(h.def);
+                                out.push_str(&h.def);
                                 out.push('\n');
                             }
                         }
@@ -1237,14 +1237,22 @@ impl<'a> FnEmit<'a> {
             "assert" => self.lower_assert(args),
             // The elementwise transcendental kernel dispatches on a compile-time op code; only lower
             // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).
-            "mercury_vmath_f32" if args.len() == 4 => {
+            // The bf16/f16 variants share the op-switch (and the op gate) — only the input load differs.
+            "mercury_vmath_f32" | "mercury_vmath_bf16" | "mercury_vmath_f16"
+                if args.len() == 4 =>
+            {
                 let op = self
                     .const_ints
                     .get(&args[3].0)
                     .copied()
                     .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;
                 if vmath_supported(op) {
-                    self.emit_helper_call("mrt_vmath", None, args, None);
+                    let pname = match name.as_str() {
+                        "mercury_vmath_bf16" => "mrt_vmath_bf16",
+                        "mercury_vmath_f16" => "mrt_vmath_f16",
+                        _ => "mrt_vmath",
+                    };
+                    self.emit_helper_call(pname, None, args, None);
                     Ok(())
                 } else {
                     Err(format!("{UNSUPPORTED} vmath op {op} not yet lowered to PTX"))
@@ -1608,29 +1616,55 @@ fn emit_entry_kernel(entry_idx: usize, ret: &MirType) -> String {
 // ============================================================================================
 
 /// A device helper for a recognized runtime call: its PTX `.func` name, return register class, and
-/// the full `.func` definition text (emitted once per program when the symbol is called).
+/// the full `.func` definition text (emitted once per program when the symbol is called). `def` is
+/// owned because the mixed-precision helpers are generated per (op, precision).
 struct RtHelper {
     ptx_name: &'static str,
     ret: Option<RC>,
-    def: &'static str,
+    def: String,
 }
 
 /// Map a recognized runtime-symbol name to its device helper, or `None` for general lowering.
 fn rt_helper(name: &str) -> Option<RtHelper> {
-    let (ptx_name, ret, def): (&'static str, Option<RC>, &'static str) = match name {
+    let (ptx_name, ret, def): (&'static str, Option<RC>, String) = match name {
         "mercury_sreduce_f32" | "mercury_sreduce_f32_parallel" => {
-            ("mrt_sreduce", Some(RC::F32), PTX_SREDUCE)
+            ("mrt_sreduce", Some(RC::F32), PTX_SREDUCE.to_string())
         }
-        "mercury_sgemm_nt" | "mercury_sgemm_nt_parallel" => ("mrt_sgemm_nt", None, PTX_SGEMM_NT),
-        "mercury_sgemm" | "mercury_sgemm_parallel" => ("mrt_sgemm", None, PTX_SGEMM),
+        "mercury_sgemm_nt" | "mercury_sgemm_nt_parallel" => {
+            ("mrt_sgemm_nt", None, PTX_SGEMM_NT.to_string())
+        }
+        "mercury_sgemm" | "mercury_sgemm_parallel" => ("mrt_sgemm", None, PTX_SGEMM.to_string()),
         "mercury_i8gemm_nt" | "mercury_i8gemm_nt_parallel" => {
-            ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT)
+            ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT.to_string())
         }
-        "mercury_norm_f32" | "mercury_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM),
-        "mercury_vmath_f32" => ("mrt_vmath", None, PTX_VMATH),
+        "mercury_norm_f32" | "mercury_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM.to_string()),
+        "mercury_vmath_f32" => ("mrt_vmath", None, PTX_VMATH.to_string()),
         "mercury_sgemm_nt_epi" | "mercury_sgemm_nt_epi_parallel" => {
-            ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI)
+            ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())
         }
+        // Mixed-precision (bf16/f16 storage, f32 compute) — generated per precision.
+        "mercury_vmath_bf16" => ("mrt_vmath_bf16", None, ptx_vmath_lowp("mrt_vmath_bf16", "bf16")),
+        "mercury_vmath_f16" => ("mrt_vmath_f16", None, ptx_vmath_lowp("mrt_vmath_f16", "f16")),
+        "mercury_dot_bf16" => ("mrt_dot_bf16", Some(RC::F32), ptx_dot_lowp("mrt_dot_bf16", "bf16")),
+        "mercury_dot_f16" => ("mrt_dot_f16", Some(RC::F32), ptx_dot_lowp("mrt_dot_f16", "f16")),
+        "mercury_sum_bf16" => ("mrt_sum_bf16", Some(RC::F32), ptx_sum_lowp("mrt_sum_bf16", "bf16")),
+        "mercury_sum_f16" => ("mrt_sum_f16", Some(RC::F32), ptx_sum_lowp("mrt_sum_f16", "f16")),
+        "mercury_reduce_bf16" => (
+            "mrt_reduce_bf16",
+            Some(RC::F32),
+            ptx_reduce_lowp("mrt_reduce_bf16", "bf16"),
+        ),
+        "mercury_reduce_f16" => (
+            "mrt_reduce_f16",
+            Some(RC::F32),
+            ptx_reduce_lowp("mrt_reduce_f16", "f16"),
+        ),
+        "mercury_axpby_bf16" => (
+            "mrt_axpby_bf16",
+            None,
+            ptx_axpby_lowp("mrt_axpby_bf16", "bf16"),
+        ),
+        "mercury_axpby_f16" => ("mrt_axpby_f16", None, ptx_axpby_lowp("mrt_axpby_f16", "f16")),
         _ => return None,
     };
     Some(RtHelper { ptx_name, ret, def })
@@ -2209,6 +2243,209 @@ VM_DONE:
     ret;
 }
 "#;
+
+// --------------------------------------------------------------------------------------------
+// Mixed-precision (bf16/f16 storage, f32 compute) device helpers.
+//
+// These reproduce the `mercury_{vmath,dot,sum,reduce,axpby}_{bf16,f16}` CPU kernels: the storage is
+// 2-byte bf16/f16 (loaded with `ld.u16` + `cvt.f32.{bf16,f16}`, a lossless widen for the bf16-/f16-
+// exact corpus values), all math is f32, and outputs/accumulators are f32 (the standard ML
+// "low-precision storage, f32 accumulate" contract). PTX labels are function-scoped (verified), so
+// the bf16 and f16 variants reuse the same internal label names without colliding. `cvt` is
+// `"bf16"` or `"f16"`; the two variants differ only in that conversion suffix.
+// --------------------------------------------------------------------------------------------
+
+/// `mercury_vmath_{bf16,f16}(x, out, n, op)`: elementwise activation reading a bf16/f16 input array
+/// (2-byte stride) and writing f32 (4-byte stride). Reuses the f32 kernel's op-switch verbatim (the
+/// op codes and SFU formulas are identical; only the input load differs), so the result is bit-for-
+/// bit the f32 kernel run on the widened inputs.
+fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> String {
+    // Splice in the shared dispatch + op bodies (`setp …; VM0: …; VM_DEF: mov %f2,%f1`) from the
+    // committed f32 kernel so there is one source of truth for the ~30 activation formulas.
+    let s = PTX_VMATH;
+    let start = s
+        .find("    setp.eq.s64 %p1, %rd3, 0;")
+        .expect("vmath op dispatch");
+    let end = s.find("VM_ST:").expect("vmath store label");
+    let ops = &s[start..end];
+    format!(
+        r#".func {fn_name} (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop)
+{{
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<12>;
+    .reg .b16 %rs<1>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.b64 %rd4, 0;
+VM_LOOP:
+    setp.ge.s64 %p0, %rd4, %rd2;
+    @%p0 bra VM_DONE;
+    shl.b64 %rd5, %rd4, 1;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.u16 %rs0, [%rd6];
+    cvt.f32.{cvt} %f1, %rs0;
+{ops}VM_ST:
+    shl.b64 %rd8, %rd4, 2;
+    add.s64 %rd6, %rd1, %rd8;
+    st.f32 [%rd6], %f2;
+    add.s64 %rd4, %rd4, 1;
+    bra VM_LOOP;
+VM_DONE:
+    ret;
+}}
+"#
+    )
+}
+
+/// `mercury_dot_{bf16,f16}(x, y, n) -> f32`: `Σ widen(x[k])·widen(y[k])`, f32 accumulate.
+fn ptx_dot_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 py, .param .b64 pn)
+{{
+    .reg .b64 %rd<7>;
+    .reg .f32 %f<4>;
+    .reg .b16 %rs<2>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pn];
+    mov.b64 %rd3, 0;
+    mov.f32 %f0, 0f00000000;
+DOT_LOOP:
+    setp.ge.s64 %p0, %rd3, %rd2;
+    @%p0 bra DOT_DONE;
+    shl.b64 %rd4, %rd3, 1;
+    add.s64 %rd5, %rd0, %rd4;
+    ld.u16 %rs0, [%rd5];
+    cvt.f32.{cvt} %f1, %rs0;
+    add.s64 %rd6, %rd1, %rd4;
+    ld.u16 %rs1, [%rd6];
+    cvt.f32.{cvt} %f2, %rs1;
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd3, %rd3, 1;
+    bra DOT_LOOP;
+DOT_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}}
+"#
+    )
+}
+
+/// `mercury_sum_{bf16,f16}(x, n) -> f32`: `Σ widen(x[k])`, f32 accumulate.
+fn ptx_sum_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 pn)
+{{
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<2>;
+    .reg .b16 %rs<1>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pn];
+    mov.b64 %rd2, 0;
+    mov.f32 %f0, 0f00000000;
+SUM_LOOP:
+    setp.ge.s64 %p0, %rd2, %rd1;
+    @%p0 bra SUM_DONE;
+    shl.b64 %rd3, %rd2, 1;
+    add.s64 %rd4, %rd0, %rd3;
+    ld.u16 %rs0, [%rd4];
+    cvt.f32.{cvt} %f1, %rs0;
+    add.f32 %f0, %f0, %f1;
+    add.s64 %rd2, %rd2, 1;
+    bra SUM_LOOP;
+SUM_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}}
+"#
+    )
+}
+
+/// `mercury_reduce_{bf16,f16}(x, n, op) -> f32`: max(4)/min(5)/maxabs(6) fold over `widen(x[k])`.
+/// Order-independent and exact (no rounding), so it matches the CPU kernel's result for any order.
+fn ptx_reduce_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 pn, .param .b64 pop)
+{{
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<2>;
+    .reg .b16 %rs<1>;
+    .reg .pred %p<3>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pn];
+    ld.param.u64 %rd2, [pop];
+    mov.b64 %rd3, 0;
+    // init: -inf for max/maxabs, +inf for min.
+    mov.f32 %f0, 0fFF800000;
+    setp.eq.s64 %p1, %rd2, 5;
+    @%p1 mov.f32 %f0, 0f7F800000;
+RED_LOOP:
+    setp.ge.s64 %p0, %rd3, %rd1;
+    @%p0 bra RED_DONE;
+    shl.b64 %rd4, %rd3, 1;
+    add.s64 %rd5, %rd0, %rd4;
+    ld.u16 %rs0, [%rd5];
+    cvt.f32.{cvt} %f1, %rs0;
+    setp.eq.s64 %p2, %rd2, 6;
+    @%p2 abs.f32 %f1, %f1;
+    setp.eq.s64 %p1, %rd2, 5;
+    @%p1 min.f32 %f0, %f0, %f1;
+    @!%p1 max.f32 %f0, %f0, %f1;
+    add.s64 %rd3, %rd3, 1;
+    bra RED_LOOP;
+RED_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}}
+"#
+    )
+}
+
+/// `mercury_axpby_{bf16,f16}(x, y, out, n, a, b)`: `out[i] = a·widen(x[i]) + b·widen(y[i])` (bf16/f16
+/// in, f32 out, f32 math).
+fn ptx_axpby_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func {fn_name} (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb)
+{{
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<6>;
+    .reg .b16 %rs<2>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [pn];
+    ld.param.f32 %f4, [pa];
+    ld.param.f32 %f5, [pb];
+    mov.b64 %rd4, 0;
+AXPBY_LOOP:
+    setp.ge.s64 %p0, %rd4, %rd3;
+    @%p0 bra AXPBY_DONE;
+    shl.b64 %rd5, %rd4, 1;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.u16 %rs0, [%rd6];
+    cvt.f32.{cvt} %f1, %rs0;
+    add.s64 %rd6, %rd1, %rd5;
+    ld.u16 %rs1, [%rd6];
+    cvt.f32.{cvt} %f2, %rs1;
+    mul.f32 %f3, %f4, %f1;
+    fma.rn.f32 %f3, %f5, %f2, %f3;
+    shl.b64 %rd7, %rd4, 2;
+    add.s64 %rd6, %rd2, %rd7;
+    st.f32 [%rd6], %f3;
+    add.s64 %rd4, %rd4, 1;
+    bra AXPBY_LOOP;
+AXPBY_DONE:
+    ret;
+}}
+"#
+    )
+}
 
 /// `mercury_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)`: fused `C = act(A.Bt [+ bias])` (the
 /// nn.Linear/FFN epilogue). `bias` is null (passed as integer 0) for no bias; `act` is
