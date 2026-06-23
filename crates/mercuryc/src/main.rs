@@ -15,8 +15,9 @@ OPTIONS:
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, mir-high, mir, llvm-ir, obj, exe  (default: exe)
     --run              Compile and run (interpreter by default; see --backend)
-    --backend=<b>      Execution backend: interp, native, gpu  (default: interp)
-                       (gpu requires a build with --features gpu and a CUDA device)
+    --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
+                       (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
+                       recognizer offload, gpu-native lowers the whole program's MIR to PTX)
     -o <path>          Write output to <path>
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
@@ -91,9 +92,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     "interp" | "interpreter" => mercury_driver::BackendKind::Interp,
                     "native" | "cranelift" => mercury_driver::BackendKind::Native,
                     "gpu" | "cuda" => mercury_driver::BackendKind::Gpu,
+                    "gpu-native" | "gpu-lower" => mercury_driver::BackendKind::GpuLower,
                     other => {
                         return Err(format!(
-                            "unknown --backend value `{other}` (expected interp, native, or gpu)"
+                            "unknown --backend value `{other}` \
+                             (expected interp, native, gpu, or gpu-native)"
                         ))
                     }
                 };

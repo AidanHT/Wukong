@@ -46,5 +46,15 @@ pub mod ptx_conv;
 #[cfg(feature = "gpu")]
 pub mod ptx_fp8;
 
+/// General MIR->PTX lowering (Phase 4): a real `Backend` that consumes MIR and emits PTX, so
+/// *arbitrary* Mercury programs run on the GPU — recognized ops still dispatch to the tuned kernels
+/// as a fast path, everything else lowers generally. Additive to the existing recognizer-offload
+/// path (`--backend=gpu`); this is the separate `--backend=gpu-native` path.
+#[cfg(feature = "gpu")]
+pub mod lower;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
+
+#[cfg(feature = "gpu")]
+pub use lower::{jit_run as lower_jit_run, GpuLowerBackend};
