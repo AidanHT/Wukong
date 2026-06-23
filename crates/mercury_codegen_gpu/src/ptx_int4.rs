@@ -15,14 +15,18 @@
 //! Layout (mirrors the `nn.Linear` contract `C = A·Wᵀ`):
 //! * **A** activations `[M,K]` row-major fp16.
 //! * **W** weights `[N,K]` row-major, quantized group-wise along K (group `G`, default 128). The packed
-//!   form is `[N, K/8]` `u32` (8 signed 4-bit nibbles per word, little-nibble-first), plus per-group
-//!   fp16 **scales** `[N, K/G]` (and, for the asymmetric path, integer **zero-points** `[N, K/G]`).
+//!   form is `[N, K/8]` `u32` (8 unsigned 4-bit nibbles per word, **Marlin/AWQ-interleaved** —
+//!   [`nibble_pos`] — so the kernel extracts a *pair* with one `lop3` straight into an `f16x2`), plus
+//!   per-group fp16 **scales** `[N, K/G]` (and, for the asymmetric path, integer **zero-points**
+//!   `[N, K/G]`). Symmetric weights are stored **offset-binary** (`u = q+8`) so both paths dequant
+//!   uniformly as `(u - Z)·scale` with `Z = 8` (symmetric) or `Z = zero[group]` (asymmetric).
 //! * **C** output `[M,N]` row-major f32.
 //!
-//! The dequant a single weight goes through — `w = (q - z)·scale` in fp16 — is reproduced *bit-for-bit*
+//! The dequant a single weight goes through — `w = (u - Z)·scale` in fp16 — is reproduced *bit-for-bit*
 //! on the host by [`dequant_weight`] (so the gate's reference weight equals the kernel's reconstructed
-//! weight exactly); the host [`quantize_weight_symmetric`] / [`quantize_weight_asymmetric`] produce the
-//! packed layout the kernel consumes.
+//! weight exactly; every f16x2 intermediate `1024+u`, `1024+Z`, and their difference is exact in fp16);
+//! the host [`quantize_weight_symmetric`] / [`quantize_weight_asymmetric`] produce the packed layout the
+//! kernel consumes.
 
 use std::sync::OnceLock;
 
@@ -42,13 +46,15 @@ pub struct QuantWeight {
     pub n: usize,
     pub k: usize,
     pub group: usize,
-    /// Packed nibbles, `[N, K/8]` row-major; nibble `kk%8` of word `[r, kk/8]` is weight `(r, kk)`.
+    /// Packed unsigned nibbles, `[N, K/8]` row-major, in [`nibble_pos`] interleaved order (weight
+    /// `(r, kk)` is at bit `nibble_pos(kk%8)` of word `[r, kk/8]`); read with [`unpack_nibble`].
     pub packed: Vec<u32>,
     /// Per-group fp16 scale, `[N, K/G]` row-major.
     pub scales: Vec<f16>,
-    /// Per-group integer zero-point, `[N, K/G]` — `Some` for the asymmetric (unsigned-nibble) path.
+    /// Per-group integer zero-point, `[N, K/G]` — `Some` for the asymmetric path (`Z = zero[group]`).
     pub zeros: Option<Vec<u8>>,
-    /// `true` ⇒ nibbles are signed two's-complement (symmetric); `false` ⇒ unsigned offset by `zeros`.
+    /// `true` ⇒ symmetric, offset-binary nibbles (`u = q+8`, dequant `Z = 8`); `false` ⇒ asymmetric,
+    /// unsigned nibbles with per-group `zeros` (`Z = zero[group]`).
     pub signed: bool,
 }
 
@@ -68,18 +74,38 @@ impl QuantWeight {
     }
 }
 
-/// Pack a signed nibble `q ∈ [-8,7]` into word `out` at position `kk%8` (little-nibble-first). The low
-/// 4 bits of the two's-complement value are stored; `bfe.s32`/the host sign-extend recover `q`.
+/// Bit position of weight `j ∈ [0,8)` within its packed `u32` word, in the **Marlin/AWQ interleaved**
+/// order: even weights `2jj` go to bits `[4·jj, 4·jj+4)` (the low 16 bits) and odd weights `2jj+1` to
+/// bits `[16+4·jj, 16+4·jj+4)` (the high 16 bits). This is what lets the kernel extract a *pair* with a
+/// single `lop3` (`(word>>4jj) & 0x000F000F | 0x64006400`) straight into an `f16x2` — no per-element
+/// shift/convert. `nibble_pos(2jj)=4jj`, `nibble_pos(2jj+1)=16+4jj`.
 #[inline]
-fn pack_nibble(out: &mut u32, kk: usize, q: i32) {
-    *out |= ((q & 0xF) as u32) << (4 * (kk % 8));
+pub fn nibble_pos(j: usize) -> u32 {
+    ((j / 2) * 4 + (j % 2) * 16) as u32
+}
+
+/// Read the raw unsigned nibble (`[0,15]`) of weight `kk` from its packed row `word_row` (`[K/8]` u32),
+/// honoring the interleaved [`nibble_pos`] order — the host counterpart to the kernel's `lop3` extract.
+#[inline]
+pub fn unpack_nibble(word_row: &[u32], kk: usize) -> u32 {
+    (word_row[kk / 8] >> nibble_pos(kk % 8)) & 0xF
+}
+
+/// Pack an **unsigned** nibble `u ∈ [0,15]` for weight `kk` into `out` at its interleaved [`nibble_pos`].
+/// Symmetric weights are stored offset-binary (`u = q+8`); asymmetric ones store `q` directly — both
+/// dequant uniformly as `(u - Z)·scale` in the kernel (`Z = 8` symmetric, `Z = zero[group]` asymmetric).
+#[inline]
+fn pack_nibble(out: &mut u32, kk: usize, u: i32) {
+    *out |= ((u & 0xF) as u32) << nibble_pos(kk % 8);
 }
 
 /// **Symmetric** group-wise int4 quantization of an `[N,K]` fp16-range weight (no zero-point): per
-/// group, `scale = max|w| / 7` and `q = round(w/scale)` clamped to `[-7,7]` (two's-complement nibble).
-/// The scale is stored in fp16 and the quantization is done against that *stored* fp16 scale, so the
-/// dequant the kernel reconstructs is the best fp16 approximation of `w`. A zero-amax group gets
-/// `scale = 1` (all-zero weights). `K` must be a multiple of `group`, and `group` a multiple of 8.
+/// group, `scale = max|w| / 7` and `q = round(w/scale)` clamped to `[-7,7]`, stored **offset-binary**
+/// as the unsigned nibble `u = q + 8 ∈ [1,15]` (so the kernel's fast `lop3` unpack — which yields an
+/// unsigned `[0,15]` — dequants uniformly as `(u - 8)·scale`). The scale is stored in fp16 and the
+/// quantization is done against that *stored* fp16 scale, so the dequant the kernel reconstructs is the
+/// best fp16 approximation of `w`. A zero-amax group gets `scale = 1`. `K` must be a multiple of
+/// `group`, and `group` a multiple of 8.
 pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) -> QuantWeight {
     assert_eq!(w.len(), n * k, "weight must be N*K");
     assert!(k % group == 0, "K={k} must be a multiple of group={group}");
@@ -101,7 +127,7 @@ pub fn quantize_weight_symmetric(w: &[f32], n: usize, k: usize, group: usize) ->
             for i in 0..group {
                 let kk = g * group + i;
                 let q = (w[base + i] * inv).round().clamp(-7.0, 7.0) as i32;
-                pack_nibble(&mut packed[r * kw + kk / 8], kk, q);
+                pack_nibble(&mut packed[r * kw + kk / 8], kk, q + 8); // offset-binary u = q+8 ∈ [1,15]
             }
         }
     }
@@ -148,24 +174,27 @@ pub fn quantize_weight_asymmetric(w: &[f32], n: usize, k: usize, group: usize) -
     QuantWeight { n, k, group, packed, scales, zeros: Some(zeros), signed: false }
 }
 
-/// Reconstruct the fp16 weight `[N,K]` **exactly as the kernel does** — `w = (q[-z])·scale` with the
-/// signed/unsigned nibble interpretation and the fp16 `mul`. `f16::from_f32(q as f32)` is exact for the
-/// small integer `q`, and the half-crate `f16*f16` is the correctly-rounded product, matching PTX
-/// `mul.rn.f16`. This is the gate's reference weight (so the only kernel error is f32 accumulation).
+/// Reconstruct the fp16 weight `[N,K]` **exactly as the kernel does** — read the unsigned interleaved
+/// nibble `u`, subtract the unified zero-offset `Z` (`8` for the symmetric/offset-binary path,
+/// `zero[group]` for the asymmetric path), and scale: `w = (u - Z)·scale` in fp16. `f16::from_f32(v as
+/// f32)` is exact for the small integer `v = u-Z`, and the half-crate `f16*f16` is the correctly-rounded
+/// product (matching PTX `mul.rn.f16x2`), so the gate's reference weight equals the kernel's bit-for-bit
+/// and the only kernel error is the f32 accumulation order.
 pub fn dequant_weight(qw: &QuantWeight) -> Vec<f16> {
     let (n, k, group) = (qw.n, qw.k, qw.group);
     let (kg, kw) = (qw.groups(), qw.words());
     let mut w = vec![f16::ZERO; n * k];
     for r in 0..n {
+        let row = &qw.packed[r * kw..r * kw + kw];
         for kk in 0..k {
-            let nib = ((qw.packed[r * kw + kk / 8] >> (4 * (kk % 8))) & 0xF) as i32;
-            let q = if qw.signed {
-                if nib >= 8 { nib - 16 } else { nib } // sign-extend the 4-bit two's-complement
+            let u = unpack_nibble(row, kk) as i32;
+            let z = if qw.signed {
+                8
             } else {
-                nib - qw.zeros.as_ref().unwrap()[r * kg + kk / group] as i32
+                qw.zeros.as_ref().unwrap()[r * kg + kk / group] as i32
             };
             let scale = qw.scales[r * kg + kk / group];
-            w[r * k + kk] = f16::from_f32(q as f32) * scale;
+            w[r * k + kk] = f16::from_f32((u - z) as f32) * scale;
         }
     }
     w
@@ -256,11 +285,14 @@ fn entry_w4a16(
     // %tix is the linear thread id (NOT %tid — that is the threadIdx special register; a user reg
     // named %tid makes the assembler read %tid.x as a video selector and reject it).
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%v0,%v1,%v2,%v3;\n";
-    // int4 B-staging scratch.
-    s += "    .reg .b32 %nrow,%half,%nn,%sidx,%widx,%word,%v,%sbase,%kw,%ktw,%kgr,%ktg;\n";
-    s += "    .reg .b16 %sc,%wf;\n";
+    // int4 B-staging scratch. %pk0..%pk3 hold the 4 dequantized f16x2 pairs (8 weights) for one
+    // st.shared.v4; %scx2 / %zsub are the broadcast scale and zero-offset subtrahend for the f16x2
+    // dequant; %wsh is the shifted word feeding each pair's lop3. NB: not %p* — %p0 is the predicate
+    // register, and reusing the name makes ptxas read it as a pred.
+    s += "    .reg .b32 %nrow,%half,%nn,%sidx,%widx,%word,%wsh,%sbase,%kw,%ktw,%kgr,%ktg,%pk0,%pk1,%pk2,%pk3,%scx2,%zsub;\n";
+    s += "    .reg .b16 %sc;\n";
     if zero_point {
-        s += "    .reg .b32 %zv;\n    .reg .b16 %zf;\n    .reg .b64 %Zeros,%zptr;\n";
+        s += "    .reg .b32 %zv,%ztmp;\n    .reg .b64 %Zeros,%zptr;\n";
     }
     // accumulator + a/b fragments.
     let mut decl_c = String::new();
@@ -344,20 +376,31 @@ fn entry_w4a16(
             // for the pointer add), loaded zero-extended into %zv for the integer subtract.
             s += "    cvt.u64.u32 %off,%sidx;\n    add.s64 %zptr,%Zeros,%off;\n    ld.global.u8 %zv,[%zptr];\n";
         }
-        // packed word Bq[nn*(K/8) + kt/8 + half]  (8 nibbles).
+        // packed word Bq[nn*(K/8) + kt/8 + half]  (8 interleaved nibbles).
         s += "    mul.lo.s32 %widx,%nn,%kw;\n    add.u32 %widx,%widx,%ktw;\n    add.u32 %widx,%widx,%half;\n";
         s += "    mul.wide.u32 %off,%widx,4;\n    add.s64 %wptr,%Bq,%off;\n    ld.global.u32 %word,[%wptr];\n";
-        // SMEM dest base byte = e*16 (chunk base); nibble j writes f16 at +2j (flat = e*8+j).
-        s += &format!("    mov.u32 %sbase,smemB_{name};\n    shl.b32 %tmp,%e,4;\n    add.u32 %sbase,%sbase,%tmp;\n");
-        for j in 0..8 {
-            if zero_point {
-                s += &format!("    bfe.u32 %v,%word,{},4;\n    sub.s32 %v,%v,%zv;\n", 4 * j);
-            } else {
-                s += &format!("    bfe.s32 %v,%word,{},4;\n", 4 * j); // signed 4-bit → s32
-            }
-            s += "    cvt.rn.f16.s32 %wf,%v;\n    mul.rn.f16 %wf,%wf,%sc;\n";
-            s += &format!("    st.shared.b16 [%sbase+{}],%wf;\n", 2 * j);
+        // Broadcast the f16 scale to both f16x2 lanes; form the unified zero-offset subtrahend (0x6400|Z
+        // duplicated): symmetric Z=8 ⇒ const 0x6408 = fp16(1032); asymmetric Z=zero[group] ⇒ 0x6400|zero.
+        s += "    mov.b32 %scx2,{%sc,%sc};\n";
+        if zero_point {
+            s += "    or.b32 %zv,%zv,0x6400;\n    shl.b32 %ztmp,%zv,16;\n    or.b32 %zsub,%zv,%ztmp;\n";
+        } else {
+            s += "    mov.b32 %zsub,0x64086408;\n"; // fp16(1032) in both lanes
         }
+        // SMEM dest base byte = e*16 (chunk base). Fast Marlin/AWQ unpack: each `lop3` extracts an
+        // interleaved nibble PAIR as `(word>>4jj)&0x000F000F | 0x64006400` — an f16x2 of (1024+u) per
+        // lane — then `sub.f16x2` the zero-offset (→ u-Z) and `mul.f16x2` the scale dequant TWO weights
+        // per op, no per-element shift/convert. The 4 pairs write the 16-byte row with one st.shared.v4.
+        s += &format!("    mov.u32 %sbase,smemB_{name};\n    shl.b32 %tmp,%e,4;\n    add.u32 %sbase,%sbase,%tmp;\n");
+        for jj in 0..4 {
+            if jj == 0 {
+                s += "    lop3.b32 %pk0,%word,0x000f000f,0x64006400,0xea;\n";
+            } else {
+                s += &format!("    shr.b32 %wsh,%word,{};\n    lop3.b32 %pk{jj},%wsh,0x000f000f,0x64006400,0xea;\n", 4 * jj);
+            }
+            s += &format!("    sub.rn.f16x2 %pk{jj},%pk{jj},%zsub;\n    mul.rn.f16x2 %pk{jj},%pk{jj},%scx2;\n");
+        }
+        s += "    st.shared.v4.u32 [%sbase],{%pk0,%pk1,%pk2,%pk3};\n";
     }
     let _ = veclist; // (declared above for the fragment lists below)
     s += "    bar.sync 0;\n";
