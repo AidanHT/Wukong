@@ -1720,6 +1720,10 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
         "mercury_axpby_f16" => ("mrt_axpby_f16", None, ptx_axpby_lowp("mrt_axpby_f16", "f16")),
         // Two-arg transcendentals (pow/atan2/hypot), op-gated in lower_call.
         "mercury_vmath2_f32" => ("mrt_vmath2", None, PTX_VMATH2.to_string()),
+        // Streaming elementwise act(a*x + b*y + c) (residual add, fused bias/act).
+        "mercury_velem_f32" | "mercury_velem_f32_parallel" => {
+            ("mrt_velem", None, PTX_VELEM.to_string())
+        }
         _ => return None,
     };
     Some(RtHelper { ptx_name, ret, def })
@@ -2381,6 +2385,51 @@ V2_ST:
     add.s64 %rd5, %rd5, 1;
     bra V2_LOOP;
 V2_DONE:
+    ret;
+}
+"#;
+
+/// `mercury_velem_f32(x, y, out, n, a, b, c, op)`: streaming elementwise `out[i] = act(a·x[i] + inner)`
+/// where `inner = (op & 256) ? b·y[i] + c : c` and `act = op & 0xff` is identity(0)/relu(1)/relu6(2).
+/// The two-fma chain matches the CPU kernel (e.g. the residual add `x + y` is `op=256, a=b=1, c=0`).
+const PTX_VELEM: &str = r#".func mrt_velem (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb, .param .f32 pc, .param .b64 pop)
+{
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [pn];
+    ld.param.f32 %f4, [pa];
+    ld.param.f32 %f5, [pb];
+    ld.param.f32 %f6, [pc];
+    ld.param.u64 %rd4, [pop];
+    and.b64 %rd5, %rd4, 256;
+    and.b64 %rd6, %rd4, 255;
+    mov.b64 %rd7, 0;
+VE_LOOP:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra VE_DONE;
+    shl.b64 %rd8, %rd7, 2;
+    add.s64 %rd9, %rd0, %rd8;
+    ld.f32 %f1, [%rd9];
+    setp.ne.s64 %p1, %rd5, 0;
+    mov.f32 %f7, %f6;
+    @%p1 add.s64 %rd9, %rd1, %rd8;
+    @%p1 ld.f32 %f2, [%rd9];
+    @%p1 fma.rn.f32 %f7, %f5, %f2, %f6;
+    fma.rn.f32 %f3, %f4, %f1, %f7;
+    setp.eq.s64 %p1, %rd6, 1;
+    setp.eq.s64 %p2, %rd6, 2;
+    @%p1 max.f32 %f3, %f3, 0f00000000;
+    @%p2 max.f32 %f3, %f3, 0f00000000;
+    @%p2 min.f32 %f3, %f3, 0f40C00000;
+    add.s64 %rd9, %rd2, %rd8;
+    st.f32 [%rd9], %f3;
+    add.s64 %rd7, %rd7, 1;
+    bra VE_LOOP;
+VE_DONE:
     ret;
 }
 "#;
