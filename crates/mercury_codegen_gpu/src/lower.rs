@@ -139,6 +139,29 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
     let mut out = String::new();
     out.push_str(".version 7.8\n.target sm_89\n.address_size 64\n\n");
 
+    // Emit a device `.func` helper for each recognized runtime kernel the program calls (matmul /
+    // reduce / norm / int8 GEMM / elementwise). These reproduce the CPU microkernels' numeric
+    // contract as naive single-thread device loops, so the whole program runs on the GPU; the
+    // CPU<->GPU tolerance gate covers reduction-order / SFU differences. Emitted before the user
+    // functions that call them. (Recognized-op dispatch to the *tuned* launchers is a later phase.)
+    {
+        let mut seen = std::collections::HashSet::new();
+        for f in &program.funcs {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Op::Call { func, .. } = &inst.op {
+                        if let Some(h) = rt_helper(interner.resolve(*func)) {
+                            if seen.insert(h.ptx_name) {
+                                out.push_str(h.def);
+                                out.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Forward-declare every function so calls (incl. recursion / mutual recursion) resolve
     // regardless of definition order.
     for (i, f) in program.funcs.iter().enumerate() {
@@ -1153,8 +1176,57 @@ impl<'a> FnEmit<'a> {
         match name.as_str() {
             "print" | "println" => self.lower_print(args),
             "assert" => self.lower_assert(args),
-            other => Err(format!("{UNSUPPORTED} call to `{other}` not yet lowered to PTX")),
+            other => {
+                if let Some(h) = rt_helper(other) {
+                    self.emit_helper_call(h.ptx_name, h.ret, args, result);
+                    Ok(())
+                } else {
+                    Err(format!("{UNSUPPORTED} call to `{other}` not yet lowered to PTX"))
+                }
+            }
         }
+    }
+
+    /// Emit a call to a device-side runtime helper (`mrt_*`): declare a param scope, pass each arg by
+    /// its ABI type, call, and bind the return (if any). Same convention as a user-function call.
+    fn emit_helper_call(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) {
+        let abis: Vec<&'static str> = args
+            .iter()
+            .map(|a| abi_ty(self.func.value_type(*a)))
+            .collect();
+        let regs: Vec<String> = args.iter().map(|a| self.reg(*a)).collect();
+        self.emit("{");
+        for (i, abi) in abis.iter().enumerate() {
+            self.emit(&format!(".param .{abi} _a{i};"));
+        }
+        if let Some(rc) = ret {
+            self.emit(&format!(".param .{} _r;", mov_ty(rc)));
+        }
+        for (i, (r, abi)) in regs.iter().zip(&abis).enumerate() {
+            self.emit(&format!("st.param.{abi} [_a{i}], {r};"));
+        }
+        let mut arglist = String::new();
+        for i in 0..args.len() {
+            if i > 0 {
+                arglist.push_str(", ");
+            }
+            arglist.push_str(&format!("_a{i}"));
+        }
+        match ret {
+            Some(_) => self.emit(&format!("call.uni (_r), {ptx_name}, ({arglist});")),
+            None => self.emit(&format!("call.uni {ptx_name}, ({arglist});")),
+        }
+        if let (Some(rc), Some(res)) = (ret, result) {
+            let d = self.reg(res);
+            self.emit(&format!("ld.param.{} {d}, [_r];", mov_ty(rc)));
+        }
+        self.emit("}");
     }
 
     fn lower_user_call(
@@ -1450,6 +1522,269 @@ fn emit_entry_kernel(entry_idx: usize, ret: &MirType) -> String {
     s.push_str("    ret;\n}\n");
     s
 }
+
+// ============================================================================================
+// Recognized-kernel device helpers (`mrt_*`)
+//
+// One `.func` per recognized runtime symbol, reproducing the CPU microkernel's numeric contract as
+// a naive single-thread device loop (the host single-thread kernel calls them in place). Op codes
+// and formulas match `mercury_runtime` (reduce/gemm/i8gemm/...); the CPU<->GPU tolerance gate covers
+// reduction-order differences. Each helper is self-contained (no inter-helper calls) and uses
+// function-scoped labels prefixed per kernel so they never collide.
+// ============================================================================================
+
+/// A device helper for a recognized runtime call: its PTX `.func` name, return register class, and
+/// the full `.func` definition text (emitted once per program when the symbol is called).
+struct RtHelper {
+    ptx_name: &'static str,
+    ret: Option<RC>,
+    def: &'static str,
+}
+
+/// Map a recognized runtime-symbol name to its device helper, or `None` for general lowering.
+fn rt_helper(name: &str) -> Option<RtHelper> {
+    let (ptx_name, ret, def): (&'static str, Option<RC>, &'static str) = match name {
+        "mercury_sreduce_f32" | "mercury_sreduce_f32_parallel" => {
+            ("mrt_sreduce", Some(RC::F32), PTX_SREDUCE)
+        }
+        "mercury_sgemm_nt" | "mercury_sgemm_nt_parallel" => ("mrt_sgemm_nt", None, PTX_SGEMM_NT),
+        "mercury_sgemm" | "mercury_sgemm_parallel" => ("mrt_sgemm", None, PTX_SGEMM),
+        "mercury_i8gemm_nt" | "mercury_i8gemm_nt_parallel" => {
+            ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT)
+        }
+        _ => return None,
+    };
+    Some(RtHelper { ptx_name, ret, def })
+}
+
+/// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6).
+/// Sequential fold (not the CPU's fixed-chunk tree) — additive ops differ only by reduction order
+/// (tolerance-gated); max/min/maxabs are order-independent and exact.
+const PTX_SREDUCE: &str = r#".func (.param .f32 _r) mrt_sreduce (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<6>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.f32 %f0, 0f00000000;
+    setp.eq.s64 %p0, %rd3, 4;
+    setp.eq.s64 %p1, %rd3, 6;
+    or.pred %p0, %p0, %p1;
+    @%p0 mov.f32 %f0, 0fFF800000;
+    setp.eq.s64 %p1, %rd3, 5;
+    @%p1 mov.f32 %f0, 0f7F800000;
+    mov.b64 %rd4, 0;
+RED_LOOP:
+    setp.ge.s64 %p2, %rd4, %rd2;
+    @%p2 bra RED_DONE;
+    shl.b64 %rd5, %rd4, 2;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.f32 %f1, [%rd6];
+    add.s64 %rd7, %rd1, %rd5;
+    ld.f32 %f2, [%rd7];
+    setp.eq.s64 %p3, %rd3, 0;
+    @%p3 fma.rn.f32 %f0, %f1, %f2, %f0;
+    setp.eq.s64 %p3, %rd3, 1;
+    @%p3 sub.rn.f32 %f3, %f1, %f2;
+    @%p3 fma.rn.f32 %f0, %f3, %f3, %f0;
+    setp.eq.s64 %p3, %rd3, 2;
+    @%p3 add.rn.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 3;
+    @%p3 fma.rn.f32 %f0, %f1, %f1, %f0;
+    setp.eq.s64 %p3, %rd3, 4;
+    @%p3 max.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 5;
+    @%p3 min.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 6;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 max.f32 %f0, %f0, %f4;
+    add.s64 %rd4, %rd4, 1;
+    bra RED_LOOP;
+RED_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}
+"#;
+
+/// `mercury_sgemm_nt(a, b, c, m, k, n, beta)`: `C[i*n+j] = sum_p A[i*k+p]*B[j*k+p]`; `beta != 0`
+/// accumulates into the existing C (B is row-major `[n,k]`, i.e. transposed — the nn.Linear form).
+const PTX_SGEMM_NT: &str = r#".func mrt_sgemm_nt (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta)
+{
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    ld.param.u64 %rd6, [pbeta];
+    mov.b64 %rd7, 0;
+SNT_LI:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra SNT_EI;
+    mov.b64 %rd8, 0;
+SNT_LJ:
+    setp.ge.s64 %p1, %rd8, %rd5;
+    @%p1 bra SNT_EJ;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    add.s64 %rd9, %rd0, %rd9;
+    mul.lo.s64 %rd10, %rd8, %rd4;
+    shl.b64 %rd10, %rd10, 2;
+    add.s64 %rd10, %rd1, %rd10;
+    mov.b64 %rd11, 0;
+SNT_LL:
+    setp.ge.s64 %p2, %rd11, %rd4;
+    @%p2 bra SNT_EL;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    add.s64 %rd14, %rd10, %rd12;
+    ld.f32 %f2, [%rd14];
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd11, %rd11, 1;
+    bra SNT_LL;
+SNT_EL:
+    mul.lo.s64 %rd15, %rd7, %rd5;
+    add.s64 %rd15, %rd15, %rd8;
+    shl.b64 %rd15, %rd15, 2;
+    add.s64 %rd15, %rd2, %rd15;
+    setp.eq.s64 %p3, %rd6, 0;
+    @%p3 bra SNT_ST;
+    ld.f32 %f3, [%rd15];
+    add.rn.f32 %f0, %f0, %f3;
+SNT_ST:
+    st.f32 [%rd15], %f0;
+    add.s64 %rd8, %rd8, 1;
+    bra SNT_LJ;
+SNT_EJ:
+    add.s64 %rd7, %rd7, 1;
+    bra SNT_LI;
+SNT_EI:
+    ret;
+}
+"#;
+
+/// `mercury_sgemm(a, b, c, m, k, n, beta)`: `C[i*n+j] = sum_p A[i*k+p]*B[p*n+j]`; `beta != 0`
+/// accumulates (both A `[m,k]` and B `[k,n]` row-major).
+const PTX_SGEMM: &str = r#".func mrt_sgemm (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta)
+{
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    ld.param.u64 %rd6, [pbeta];
+    mov.b64 %rd7, 0;
+SM_LI:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra SM_EI;
+    mov.b64 %rd8, 0;
+SM_LJ:
+    setp.ge.s64 %p1, %rd8, %rd5;
+    @%p1 bra SM_EJ;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    add.s64 %rd9, %rd0, %rd9;
+    mov.b64 %rd11, 0;
+SM_LL:
+    setp.ge.s64 %p2, %rd11, %rd4;
+    @%p2 bra SM_EL;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    mul.lo.s64 %rd14, %rd11, %rd5;
+    add.s64 %rd14, %rd14, %rd8;
+    shl.b64 %rd14, %rd14, 2;
+    add.s64 %rd14, %rd1, %rd14;
+    ld.f32 %f2, [%rd14];
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_LL;
+SM_EL:
+    mul.lo.s64 %rd15, %rd7, %rd5;
+    add.s64 %rd15, %rd15, %rd8;
+    shl.b64 %rd15, %rd15, 2;
+    add.s64 %rd15, %rd2, %rd15;
+    setp.eq.s64 %p3, %rd6, 0;
+    @%p3 bra SM_ST;
+    ld.f32 %f3, [%rd15];
+    add.rn.f32 %f0, %f0, %f3;
+SM_ST:
+    st.f32 [%rd15], %f0;
+    add.s64 %rd8, %rd8, 1;
+    bra SM_LJ;
+SM_EJ:
+    add.s64 %rd7, %rd7, 1;
+    bra SM_LI;
+SM_EI:
+    ret;
+}
+"#;
+
+/// `mercury_i8gemm_nt(a, b, c, m, k, n)`: `C[i*n+j] = sum_p (u8 A[i*k+p]) * (i8 B[j*k+p])`, exact
+/// i32 (wrapping mod 2^32). A is `u8 [m,k]`, B is `i8 [n,k]`, C is `i32 [m,n]`.
+const PTX_I8GEMM_NT: &str = r#".func mrt_i8gemm_nt (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn)
+{
+    .reg .b64 %rd<24>;
+    .reg .b32 %r<8>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    mov.b64 %rd6, 0;
+I8_LI:
+    setp.ge.s64 %p0, %rd6, %rd3;
+    @%p0 bra I8_EI;
+    mov.b64 %rd7, 0;
+I8_LJ:
+    setp.ge.s64 %p1, %rd7, %rd5;
+    @%p1 bra I8_EJ;
+    mov.b32 %r0, 0;
+    mul.lo.s64 %rd8, %rd6, %rd4;
+    add.s64 %rd8, %rd0, %rd8;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    add.s64 %rd9, %rd1, %rd9;
+    mov.b64 %rd10, 0;
+I8_LL:
+    setp.ge.s64 %p2, %rd10, %rd4;
+    @%p2 bra I8_EL;
+    add.s64 %rd11, %rd8, %rd10;
+    ld.u8 %r1, [%rd11];
+    add.s64 %rd12, %rd9, %rd10;
+    ld.s8 %r2, [%rd12];
+    mad.lo.s32 %r0, %r1, %r2, %r0;
+    add.s64 %rd10, %rd10, 1;
+    bra I8_LL;
+I8_EL:
+    mul.lo.s64 %rd13, %rd6, %rd5;
+    add.s64 %rd13, %rd13, %rd7;
+    shl.b64 %rd13, %rd13, 2;
+    add.s64 %rd13, %rd2, %rd13;
+    st.u32 [%rd13], %r0;
+    add.s64 %rd7, %rd7, 1;
+    bra I8_LJ;
+I8_EJ:
+    add.s64 %rd6, %rd6, 1;
+    bra I8_LI;
+I8_EI:
+    ret;
+}
+"#;
 
 // ============================================================================================
 // Device execution
