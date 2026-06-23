@@ -52,7 +52,10 @@ pub use lowp::{
 };
 
 mod transpose;
-pub use transpose::{mercury_transpose_f32, mercury_transpose_f32_parallel};
+pub use transpose::{
+    mercury_transpose_f32, mercury_transpose_f32_parallel, mercury_transpose_u16,
+    mercury_transpose_u16_parallel,
+};
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
