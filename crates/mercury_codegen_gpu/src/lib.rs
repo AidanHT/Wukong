@@ -52,5 +52,10 @@ pub mod ptx_int4;
 #[cfg(feature = "gpu")]
 pub mod ptx_int8;
 
+// fp8 *training* kernels (Phase 6): E5M2 backward GEMM + amax + delayed scaling. Single-owner file;
+// reuses the proven E4M3 m16n8k32 fragment layout without touching the forward path.
+#[cfg(feature = "gpu")]
+pub mod ptx_fp8_train;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};

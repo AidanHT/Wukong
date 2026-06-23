@@ -3243,10 +3243,132 @@ pub fn gemm_nt_int8_smdb_dequant(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **fp8 backward GEMM** `C = dY·Wᵀ` — E5M2 gradient × E4M3 weight, f32 out (the `dX = dY·W` /
+/// `dW = dYᵀ·X` building block of an fp8 training step; Session I composes the backward from it). `dy`
+/// (`[M,K]`) rounds to E5M2 (wide-range gradient format), `w` (`[N,K]`) to E4M3; both upload as 1-byte
+/// fp8 and the tensor core decodes them in hardware. Requires M%(16·FP8_TM)==0, N%(8·FP8_TN)==0,
+/// K%32==0. Tolerance-gated vs an f64 reference that decodes the same bits (`fp8_bwd_gemm_matches_reference`).
+pub fn gemm_nt_fp8_bwd(
+    g: &mut Gpu,
+    dy: &[f32],
+    w: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_fp8::{FP8_TM, FP8_TN};
+    assert_eq!(dy.len(), m * k);
+    assert_eq!(w.len(), n * k);
+    assert!(
+        m % (16 * FP8_TM) == 0 && n % (8 * FP8_TN) == 0 && k % 32 == 0,
+        "fp8 backward GEMM needs M%{}==0, N%{}==0, K%32==0",
+        16 * FP8_TM,
+        8 * FP8_TN
+    );
+    let a8: Vec<u8> = dy.iter().map(|&x| crate::ptx_fp8_train::f32_to_e5m2(x)).collect();
+    let b8: Vec<u8> = w.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let f = g.function("fp8_bwd_gemm", crate::ptx_fp8_train::fp8_bwd_gemm_ptx(), "fp8_bwd_gemm_nt")?;
+    let a_d = g.stream.memcpy_stod(&a8)?;
+    let b_d = g.stream.memcpy_stod(&b8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n / (8 * FP8_TN)) as u32, (m / (16 * FP8_TM)) as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// **Per-tensor `amax`** = `maxᵢ |x[i]|` on-device — the delayed-scaling calibration statistic for fp8
+/// training. Launches [`crate::ptx_fp8_train::AMAX_PTX`] over a fixed grid (each thread grid-strides its
+/// share, one partial per thread) and takes the host max over the partials. **Deterministic** (fixed
+/// grid + exact `max`, no atomics — M12); the result is bit-identical run-to-run and exactly equals the
+/// CPU max-abs. (The host final-reduce over `≤1024·256` partials is negligible; a fully device-resident
+/// two-level reduce is a later refinement.)
+pub fn amax_f32(g: &mut Gpu, x: &[f32]) -> Result<f32, DriverError> {
+    let n = x.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+    let threads = 256usize;
+    let blocks = n.div_ceil(threads).clamp(1, 1024);
+    let total = blocks * threads;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let mut p_d = g.stream.memcpy_stod(&vec![0f32; total])?;
+    let f = g.function("amax_f32", crate::ptx_fp8_train::AMAX_PTX, "amax_f32")?;
+    let nn = n as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&nn).arg(&x_d).arg(&mut p_d);
+    unsafe { bld.launch(cfg)? };
+    let partials = g.stream.memcpy_dtov(&p_d)?;
+    Ok(partials.iter().fold(0f32, |m, &v| m.max(v)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// **amax gate (first law, exact).** The device per-tensor amax must **equal** the CPU max-abs —
+    /// `max` reassociates without rounding, so this is a bit-exact `==` check, stronger than a tolerance.
+    /// Sizes include `n < blockDim`, a non-grid-aligned `n`, and a large multi-block tensor.
+    #[test]
+    fn amax_matches_reference() {
+        with_gpu("amax", |g| {
+            let mut rng = crate::diff::Rng::new(0xAA);
+            for n in [1usize, 255, 257, 4096, 100_003] {
+                let x = rng.vec(n, -50.0, 50.0);
+                let want = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let got = amax_f32(g, &x).unwrap();
+                assert_eq!(got, want, "amax n={n}");
+            }
+            eprintln!("[gate] device amax == CPU max-abs (exact) ✓");
+        });
+    }
+    /// **fp8 backward GEMM gate (first law).** `gemm_nt_fp8_bwd` (E5M2·E4M3, f32 accumulate) must match
+    /// an f64 reference that decodes the *same* e5m2/e4m3 bits. The E5M2(3 sig-bit)×E4M3(4 sig-bit)
+    /// product is **exact in f32** (7 ≤ 24 bits), and the quantization rounding is matched on both sides,
+    /// so the only residual is the f32 accumulation reassociating vs f64 — the **same** honest
+    /// `c·√K·ε` bound the E4M3 forward gate uses (`fp8_gemm_matches_reference_within_tol`), **not** an
+    /// fp8-slack fudge. Data in [-1,1] (matching the forward gate's fixture); the wide-range benefit of
+    /// E5M2 is exercised by the host round-trip test, not this accumulation check.
+    #[test]
+    fn fp8_bwd_gemm_matches_reference() {
+        use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
+        use crate::ptx_fp8_train::{e5m2_to_f32, f32_to_e5m2};
+        with_gpu("fp8_bwd_gemm", |g| {
+            let mut rng = crate::diff::Rng::new(0xB17D);
+            for (m, k, n) in [(32usize, 64usize, 32usize), (64, 96, 64), (96, 128, 32)] {
+                let dy = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -1.0, 1.0);
+                let mut want = vec![0f32; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f64;
+                        for kk in 0..k {
+                            acc += e5m2_to_f32(f32_to_e5m2(dy[i * k + kk])) as f64
+                                * e4m3_to_f32(f32_to_e4m3(w[j * k + kk])) as f64;
+                        }
+                        want[i * n + j] = acc as f32;
+                    }
+                }
+                let got = gemm_nt_fp8_bwd(g, &dy, &w, m, k, n).unwrap();
+                let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
+                let st = crate::diff::assert_close(&format!("fp8_bwd {m}x{k}x{n}"), &got, &want, 1e-2, rel);
+                eprintln!("fp8_bwd {m}x{k}x{n} (E5M2·E4M3): max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+            }
+            eprintln!("[gate] fp8 backward GEMM (E5M2·E4M3) matches f64 reference ✓");
+        });
+    }
 
     /// Run `body` with the shared GPU, or skip (printing why) if none is present.
     fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
