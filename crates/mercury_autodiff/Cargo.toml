@@ -1,0 +1,16 @@
+[package]
+name = "mercury_autodiff"
+description = "Reverse-mode automatic differentiation as a MIR->MIR transform (the backward path for training)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mercury_mir = { workspace = true }
+mercury_span = { workspace = true }
+
+[dev-dependencies]
+# The finite-difference gradient gate runs forward + backward MIR on the interpreter oracle.
+mercury_interp = { workspace = true }
