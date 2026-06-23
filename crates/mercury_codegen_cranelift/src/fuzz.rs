@@ -710,6 +710,76 @@ fn vmath_kernels_match_f64_reference() {
             Regime::Normal,
             1e-6,
         ),
+        // --- Activations composed from exp/tanh (inherit exp's error, ≈1e-4) -----------------
+        // gelu (tanh approximation): 0.5x(1 + tanh(√(2/π)(x + 0.044715x³))).
+        (
+            "gelu",
+            |v| {
+                let x3 = v * v * v;
+                0.5 * v * (1.0 + (0.797_884_560_802_865_4 * (0.044_715 * x3 + v)).tanh())
+            },
+            Regime::Normal,
+            1e-4,
+        ),
+        // softplus = max(x,0) + ln(1 + e^−|x|) (the stable form the kernel uses).
+        (
+            "softplus",
+            |v| v.max(0.0) + (1.0 + (-v.abs()).exp()).ln(),
+            Regime::Normal,
+            1e-4,
+        ),
+        ("mish", |v| {
+            let sp = v.max(0.0) + (1.0 + (-v.abs()).exp()).ln();
+            v * sp.tanh()
+        }, Regime::Normal, 1e-4),
+        ("selu", |v| {
+            let (lam, alpha) = (1.050_700_987_355_480_5_f64, 1.673_263_242_354_377_3_f64);
+            lam * if v > 0.0 { v } else { alpha * (v.exp() - 1.0) }
+        }, Regime::Normal, 1e-4),
+        ("softsign", |v| v / (1.0 + v.abs()), Regime::Normal, 1e-4),
+        // logsigmoid(x) = ln σ(x) = −softplus(−x) = −(max(−x,0) + ln(1 + e^−|x|)).
+        ("logsigmoid", |v| -((-v).max(0.0) + (1.0 + (-v.abs()).exp()).ln()), Regime::Normal, 1e-4),
+        // hardsigmoid / hardswish are piecewise-linear clamps — exact bar f32 rounding.
+        ("hardsigmoid", |v| (v + 3.0).clamp(0.0, 6.0) / 6.0, Regime::Normal, 1e-4),
+        ("hardswish", |v| v * ((v + 3.0).clamp(0.0, 6.0) / 6.0), Regime::Normal, 1e-4),
+        // --- Trig / inverse-trig (Cephes ≈1 ULP; |x|>1 → NaN want is skipped by the loop) -----
+        ("sin", |v| v.sin(), Regime::Normal, 1e-4),
+        ("cos", |v| v.cos(), Regime::Normal, 1e-4),
+        ("atan", |v| v.atan(), Regime::Normal, 1e-4),
+        ("asin", |v| v.asin(), Regime::Normal, 1e-2), // derivative → ∞ at ±1
+        ("acos", |v| v.acos(), Regime::Normal, 1e-2),
+        // --- Hyperbolic + inverse (composed from exp; acosh needs x≥1 → Positive regime) -------
+        ("sinh", |v| v.sinh(), Regime::Normal, 1e-4),
+        ("cosh", |v| v.cosh(), Regime::Normal, 1e-4),
+        ("asinh", |v| v.asinh(), Regime::Normal, 1e-4),
+        ("acosh", |v| v.acosh(), Regime::Positive, 1e-2),
+        ("atanh", |v| v.atanh(), Regime::Normal, 1e-2), // blows up near ±1
+        // --- Base-2 / base-10 exp & log (exp/log compositions, ≈1e-4) -------------------------
+        ("exp2", |v| v.exp2(), Regime::Normal, 1e-4),
+        ("log2", |v| v.log2(), Regime::Positive, 1e-4),
+        ("exp10", |v| 10f64.powf(v), Regime::Normal, 1e-4),
+        ("log10", |v| v.log10(), Regime::Positive, 1e-4),
+        // --- Stable forms (log1p needs x>−1; near −1 it is ill-conditioned) -------------------
+        ("expm1", |v| v.exp_m1(), Regime::Normal, 1e-4),
+        ("log1p", |v| v.ln_1p(), Regime::Normal, 1e-3),
+        // erf: Abramowitz–Stegun 7.1.26 high-precision f64 reference (std f64 has no erf). Its own
+        // ≈1.5e-7 absolute error dominates near the x=0 zero, so the bound is 1e-3 (still catches
+        // any gross kernel error; the full-buffer fuzzer gates interp==native exactly).
+        ("erf", |v| {
+            let (a1, a2, a3, a4, a5, p) = (
+                0.254_829_592_f64, -0.284_496_736_f64, 1.421_413_741_f64,
+                -1.453_152_027_f64, 1.061_405_429_f64, 0.327_591_1_f64,
+            );
+            let sign = if v >= 0.0 { 1.0 } else { -1.0 };
+            let x = v.abs();
+            let t = 1.0 / (1.0 + p * x);
+            let y = 1.0 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * (-x * x).exp();
+            sign * y
+        }, Regime::Normal, 1e-3),
+        ("cbrt", |v| v.cbrt(), Regime::Normal, 1e-4),
+        // tan (pole at π/2 ∈ [−2,2)), tanhshrink and elu (catastrophic cancellation near 0) are
+        // intentionally omitted — their relative error is unbounded by construction, not by a kernel
+        // bug; the full-buffer fuzzer still gates their interp-vs-native equality.
     ];
     let n = 256usize;
     let mut rng = Rng(0x_5EED_2024);
