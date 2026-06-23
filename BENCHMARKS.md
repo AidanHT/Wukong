@@ -501,6 +501,29 @@ Absolute GB/s is low precisely because a transpose is latency- not throughput-bo
 is the clock-invariant figure — it holds across runs. `tests/run/transpose_f32.mer`; the runtime test
 pins the blocked kernel == the naive transpose exactly (a permutation, serial == parallel).
 
+### Column reduction — the strided sum gcc leaves scalar
+
+`out[j] = Σ_i x[i,j]` reduces a `[rows, cols]` matrix down its **outer** axis — the bias gradient
+`db = Σ_batch dY`, the batch sum/mean, a reduce-along-axis-0. The idiomatic column-outer nest
+`for j { for i { s += x[i*N+j] } }` strides `x` *down the rows* (stride `N` per step), so each access
+touches a fresh cache line, and — verified on the emitted assembly — **gcc/rustc leave it fully scalar**
+(`vaddss`, zero packed `vaddps`): they neither vectorize nor loop-interchange it. Mercury folds the nest
+to **`mercury_colsum_f32`**, which streams `x` *row-major* and accumulates eight columns at a time into
+a cache-resident `out[]` (`out[j..j+8] += x[i, j..j+8]`), winning on **both** SIMD width and cache
+behavior. Each `out[j]` still sums `x[0,j], x[1,j], …` in `i`-ascending order — identical to the scalar
+twin and the disjoint-stripe `@parallel` form — so the cross-language check is **bit-exact**.
+
+| size      | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+|-----------|-----------|---------------|---------|------|-------------|---------------|
+| 1024×1024 | ~19.4 | ~21.3 | ~0.4 | ~0.5 | **~47×** | **~52×** |
+| 4096×1024 | ~8.2 | ~15.7 | ~0.3 | ~0.3 | **~29×** | **~55×** |
+
+(GB/s = `M·N·4`, the matrix read once; higher is better.) The lead is large precisely because the
+naive baselines pay the strided-scalar penalty twice over — no SIMD *and* cache-line thrashing — while
+the recognized kernel pays neither. `tests/run/colsum.mer`; the runtime test pins the SIMD kernel ==
+the naive sum exactly. (The *row*-outer spelling `for i { for j { out[j] += x[i*N+j] } }` already
+auto-vectorizes — the column-outer form is the gap.)
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2

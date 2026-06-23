@@ -74,6 +74,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   op (attention score / weight-layout transposes). A permutation, so bit-exact (`tests/run/transpose_f32.mer`).
   **bf16/f16** transposes dispatch to the same blocked kernel at 16-bit width (`mercury_transpose_u16`, one
   kernel for both — a transpose moves the raw bits) for the half-precision KV/attention layouts (`transpose_bf16.mer`).
+- **Column reduction → SIMD colsum kernel**: the column-outer nest `for j { for i { s += x[i*N+j] }; out[j]=s }`
+  (the bias gradient `db = Σ_batch dY`, batch sum, reduce-along-axis-0) dispatches to
+  `mercury_colsum_f32[_parallel]`, which streams `x` row-major and accumulates eight columns at a time into
+  a cache-resident `out[]`. The naive form strides `x` down the rows *and* — verified on the emitted assembly —
+  gcc/rustc leave it fully scalar (no `vaddps`), so the kernel wins ~29–47× single-core / ~52–55× `@parallel`.
+  Each column sums in `i`-ascending order, so it is bit-exact (`tests/run/colsum.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
   dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
   its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full
