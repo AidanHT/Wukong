@@ -54,7 +54,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   A once then reuses the same NN microkernel — so the training backward pass leaves the scalar nest
   (`tests/run/matmul_tn.mer`). The **bf16/f16 mixed-precision** `nn.Linear` (`[bf16]`/`[f16]` inputs
   widened `as f32`, f32 accumulate) likewise dispatches to `mercury_sgemm_{bf16,f16}_nt` — a lossless
-  widen prepass then the same tuned kernel — ~25× the idiomatic bf16 C (`tests/run/linear_{bf16,f16}.mer`).
+  widen prepass then the same tuned kernel — ~25× the idiomatic bf16 C (`tests/run/linear_{bf16,f16}.mer`),
+  and its **fused FFN epilogue** (`act(A·Bᵀ + bias)`) folds to `mercury_sgemm_{bf16,f16}_nt_epi` — bias +
+  activation in the GEMM writeback for free (`tests/run/linear_{bf16,f16}_ffn.mer`; see epilogue fusion below).
 - **Batched matmul → per-head GEMM dispatch**: a matmul nest wrapped in a batch loop, with each index
   carrying a per-batch base offset (`x[h*S*D + i*K + k]` — the shape of **multi-head attention**, one
   matmul per head), also dispatches. The recognizer peels the offset off each flattened index (it
@@ -120,7 +122,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   (attention-output, down-projection). Serial; the activation set is identity (bias-only), **ReLU,
   GELU, and SiLU** — the transformer FFNs — with **bias optional**, so the bias-free `silu(x·Wᵀ)`
   **SwiGLU** projection (LLaMA/Mistral) fuses too. Both backends call the identical kernel, so it
-  stays bit-exact. See `tests/run/{linear_bias_relu,linear_bias_gelu,linear_silu}.mer`.
+  stays bit-exact. See `tests/run/{linear_bias_relu,linear_bias_gelu,linear_silu}.mer`. The
+  **bf16/f16 mixed-precision** FFN fuses the same way — a half matmul + its bias/activation loop folds
+  to `mercury_sgemm_{bf16,f16}_nt_epi` (the widen prepass feeds the identical f32 epilogue), so the
+  mixed-precision transformer FFN gets bias + activation for free (`tests/run/linear_{bf16,f16}_ffn.mer`).
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
 - Intrinsics `print`/`println`/`assert`.
