@@ -3163,26 +3163,46 @@ pub fn gemm_nt_int8_smdb(
         "int8 smdb GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
     // Reuse-bound at large sizes → the bigger 128×128 tile; latency-bound below → the 64×64 tile.
+    // The `ldmatrix` + XOR-swizzle (conflict-free SMEM, BK=64) path is a same-run ~1.2-1.5× internal
+    // win over the hand-placed fragment loads at every measured size/tile (`int8_swz_vs_handplaced`), so
+    // it is the default whenever K%64==0; a K that is only a 32-multiple falls back to the hand-placed
+    // BK=32 kernel. Both are bit-exact vs the same i32 oracle, so the choice is purely throughput. The
+    // 64×64 tile wins while latency-bound (small/medium), the 128×128 once reuse-bound (≥4096²).
     let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
-    let (f, cfg) = if use_128 {
-        (
-            g.function(
-                "int8_gemm_smdb128",
+    let swz = k % 64 == 0;
+    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) =
+        match (use_128, swz) {
+            (true, true) => (
+                crate::ptx_int8::int8_gemm_smdb128_swz_ptx(),
+                "int8_gemm_nt_smdb128_swz",
+                INT8_BM128,
+                INT8_BN128,
+                INT8_WARPS_M128 * INT8_WARPS_N128,
+            ),
+            (true, false) => (
                 crate::ptx_int8::int8_gemm_smdb128_ptx(),
                 "int8_gemm_nt_smdb128",
-            )?,
-            int8_smdb_cfg(m, n, INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128),
-        )
-    } else {
-        (
-            g.function(
-                "int8_gemm_smdb",
+                INT8_BM128,
+                INT8_BN128,
+                INT8_WARPS_M128 * INT8_WARPS_N128,
+            ),
+            (false, true) => (
+                crate::ptx_int8::int8_gemm_smdb_swz_ptx(),
+                "int8_gemm_nt_smdb_swz",
+                INT8_BM,
+                INT8_BN,
+                INT8_WARPS_M * INT8_WARPS_N,
+            ),
+            (false, false) => (
                 crate::ptx_int8::int8_gemm_smdb_ptx(),
                 "int8_gemm_nt_smdb",
-            )?,
-            int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N),
-        )
-    };
+                INT8_BM,
+                INT8_BN,
+                INT8_WARPS_M * INT8_WARPS_N,
+            ),
+        };
+    let f = g.function(entry, ptx, entry)?;
+    let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
     let a_d = g.stream.memcpy_stod(a)?;
     let b_d = g.stream.memcpy_stod(b)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
@@ -9629,7 +9649,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 (48, 32, 40),
                 (64, 64, 64),
                 (128, 256, 96),
-                (128, 128, 128), // multi-CTA, multi-K-step — exercises the smdb pipeline
+                (128, 128, 128), // multi-CTA, multi-K-step — exercises the smdb pipeline (swz, K%64==0)
+                (128, 96, 128),  // K%32==0 but K%64!=0 — exercises the smdb dispatch's hand-placed fallback
             ] {
                 // u8 activations in [0,255], i8 weights in [-128,127] — full range, deterministic.
                 let a: Vec<u8> = (0..m * k)
@@ -10093,8 +10114,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
         use crate::ptx_int8::{
             int8_gemm_smdb128_ptx, int8_gemm_smdb128_s3_ptx, int8_gemm_smdb128_s4_ptx,
-            int8_gemm_smdb_ptx, int8_gemm_smdb_s3_ptx, int8_gemm_smdb_s4_ptx, INT8_BM, INT8_BM128,
-            INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+            int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_ptx, int8_gemm_smdb_s3_ptx,
+            int8_gemm_smdb_s4_ptx, int8_gemm_smdb_swz_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128,
+            INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
         };
         with_gpu("int8_smdb_sweep", |g| {
             if !peers_available(g) {
@@ -10104,14 +10126,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             eprintln!("device: {}", g.device_name());
             let w64 = INT8_WARPS_M * INT8_WARPS_N;
             let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
-            // (label, ptx, entry, bm, bn, warps, needs_128_divisible)
-            let variants: [(&str, &'static str, &'static str, usize, usize, usize, bool); 6] = [
+            // (label, ptx, entry, bm, bn, warps, needs_128_divisible). The `_swz` rows are the
+            // ldmatrix+XOR-swizzle conflict-free-SMEM candidates (BK=64); same-run vs the s2/s3/s4
+            // hand-placed depths and cuBLAS picks the per-size winner.
+            let variants: [(&str, &'static str, &'static str, usize, usize, usize, bool); 8] = [
                 ("smdb64_s2", int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb", INT8_BM, INT8_BN, w64, false),
                 ("smdb64_s3", int8_gemm_smdb_s3_ptx(), "int8_gemm_nt_smdb_s3", INT8_BM, INT8_BN, w64, false),
                 ("smdb64_s4", int8_gemm_smdb_s4_ptx(), "int8_gemm_nt_smdb_s4", INT8_BM, INT8_BN, w64, false),
+                ("smdb64_swz", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w64, false),
                 ("smdb128_s2", int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128", INT8_BM128, INT8_BN128, w128, true),
                 ("smdb128_s3", int8_gemm_smdb128_s3_ptx(), "int8_gemm_nt_smdb128_s3", INT8_BM128, INT8_BN128, w128, true),
                 ("smdb128_s4", int8_gemm_smdb128_s4_ptx(), "int8_gemm_nt_smdb128_s4", INT8_BM128, INT8_BN128, w128, true),
+                ("smdb128_swz", int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, w128, true),
             ];
             let mut rng = crate::diff::Rng::new(0x5A8D5);
             for _ in 0..40 {
@@ -10161,6 +10187,80 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
                 if let Some((name, pct)) = best {
                     eprintln!("  → best @{sz}³: {name} at {pct:.1}% of cuBLAS");
+                }
+            }
+        });
+    }
+
+    /// **int8 `ldmatrix`+swizzle vs hand-placed, same-run internal A/B (M3 lever, contention-robust).**
+    /// Times the conflict-free-SMEM `_swz` kernels against the hand-placed `_smdb` baseline back-to-back
+    /// under one clock state and reports the **Mercury-internal** swz/handplaced ratio — which stays
+    /// honest even when the cuBLAS baseline is contention-corrupted (the documented measurement caveat is
+    /// specifically about the *cuBLAS* swing; an A/B of two adjacent same-family kernels cancels the
+    /// shared clock). Answers the real M3 question: does the `ldmatrix.x4`/`.x2` gather from swizzled
+    /// SMEM actually beat the 4+2 bank-conflicted `ld.shared.b32`? Bit-exact checksum cross-check first
+    /// (first law). **No cuBLAS dependency** — runs on any CUDA device. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_swz_vs_handplaced`
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn int8_swz_vs_handplaced() {
+        use crate::baselines::gemm_flop;
+        use crate::ptx_int8::{
+            int8_gemm_smdb128_ptx, int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_ptx,
+            int8_gemm_smdb_swz_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M,
+            INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+        };
+        with_gpu("int8_swz_vs_handplaced", |g| {
+            eprintln!("device: {}", g.device_name());
+            let w64 = INT8_WARPS_M * INT8_WARPS_N;
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            let mut rng = crate::diff::Rng::new(0x5217);
+            const ROUNDS: usize = 8;
+            // (label, ptx, entry, bm, bn, warps); rows 0/1 are the 64×64 pair, 2/3 the 128×128 pair.
+            let pairs: [(&str, &'static str, &'static str, usize, usize, usize); 4] = [
+                ("smdb64    ", int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb", INT8_BM, INT8_BN, w64),
+                ("smdb64_swz", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w64),
+                ("smdb128   ", int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128", INT8_BM128, INT8_BN128, w128),
+                ("smdb128swz", int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, w128),
+            ];
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                eprintln!("\n{sz}³ int8 swz-vs-handplaced (same-run, internal ratio):");
+                let mut gf = [f64::NAN; 4];
+                for (i, (label, ptx, entry, bm, bn, warps)) in pairs.iter().enumerate() {
+                    if m % bm != 0 || n % bn != 0 {
+                        continue;
+                    }
+                    let f = g.function(entry, ptx, entry).unwrap();
+                    let cfg = int8_smdb_cfg(m, n, *bm, *bn, *warps);
+                    // first law: bit-exact checksum cross-check at this size before timing.
+                    let cs: i64 = {
+                        let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(cfg).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                    };
+                    assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
+                    let mut s = f64::INFINITY;
+                    for _ in 0..ROUNDS {
+                        s = s.min(time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                    }
+                    gf[i] = flop / s;
+                    eprintln!("  {label}: {:>8.0} GFLOP/s", gf[i] / 1e9);
+                }
+                if gf[0].is_finite() && gf[1].is_finite() {
+                    eprintln!("  → 64×64   swz/handplaced = {:.3}×", gf[1] / gf[0]);
+                }
+                if gf[2].is_finite() && gf[3].is_finite() {
+                    eprintln!("  → 128×128 swz/handplaced = {:.3}×", gf[3] / gf[2]);
                 }
             }
         });
