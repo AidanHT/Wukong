@@ -771,6 +771,9 @@ fn entry_smem_pipe(
     warps_n: usize,
     stages: usize,
     raster: usize,
+    act: Act,
+    bias: bool,
+    residual: bool,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages (1 prefetch in flight)");
     assert!(bk % 16 == 0, "bk must be a multiple of the WMMA k16 step");
@@ -798,6 +801,25 @@ fn entry_smem_pipe(
         "{name}: static SMEM {} B (stages={stages} bk={bk} {bm}x{bn}) exceeds the 48 KiB cap",
         smem_a + smem_b
     );
+    if residual {
+        // The residual *seeds* the f32 accumulator (`out = residual + A·Bᵀ`, via wmma.load.c), so a
+        // post-accumulate activation would wrongly act on the residual too — residual ⇒ no activation.
+        // A per-column `bias` (added in the SMEM-scratch epilogue, post-accumulate, pre-store) IS allowed:
+        // `out = (residual + A·Bᵀ) + bias` is exactly the transformer down-proj / attention output-proj.
+        assert!(
+            matches!(act, Act::None),
+            "{name}: residual epilogue cannot also activate (act applies to A·Bᵀ+bias, not the residual)"
+        );
+    }
+    if bias {
+        // The fused-bias epilogue repurposes `smemA` (drained after the K-loop) as `num_warps` disjoint
+        // 16×16 f32 (1 KiB) store-back scratch slots — `smem_a` must hold them all (the deep pipe's
+        // multi-stage smemA is ≫ the 4–8 KiB needed, but assert it so a future shrink can't silently clobber).
+        assert!(
+            smem_a >= warps_m * warps_n * 16 * 16 * 4,
+            "{name}: fused-bias store-back scratch (smemA reuse) too small for the warp grid"
+        );
+    }
     let a_chunks = bm * bk / (threads * 8);
     let b_chunks = bn * bk / (threads * 8);
     assert!(a_chunks >= 1 && b_chunks >= 1, "{name}: tile too small for one 128-bit chunk per thread");
@@ -808,14 +830,29 @@ fn entry_smem_pipe(
     let wm = (16 * tm) as i64;
     let wn = (16 * tn) as i64;
 
+    // The fused-bias variant takes an extra `bias[N]` (f32) param read in the SMEM store-back epilogue;
+    // the residual variant takes a `residual[M,N]` (f32) used to seed the accumulator via wmma.load.c.
+    let bias_param = if bias { ",\n    .param .u64 pBias" } else { "" };
+    let resid_param = if residual { ",\n    .param .u64 pResidual" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
     );
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%ldm,%bufcA,%bufcB,%bufwA,%bufwB;\n";
+    if bias {
+        // Store-back epilogue scratch (mirrors `entry_smem_db`): %lane, %f (flat 0..256 elem), %grow/%gcol
+        // (this element's global row/col), %scbase (this warp's SMEM scratch base), %scld (=16, the scratch
+        // tile leading dim — distinct from the pipe's %ldm=bk), %bval/%biasv, %Bias / %scptr (bias/scratch ptr).
+        s += "    .reg .b32 %lane,%f,%grow,%gcol,%scbase,%scld;\n";
+        s += "    .reg .f32 %bval,%biasv;\n";
+        s += "    .reg .b64 %Bias,%scptr;\n";
+    }
+    if residual {
+        s += "    .reg .b64 %Resid;\n"; // residual[M,N] base pointer (seeds the accumulator via wmma.load.c)
+    }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grp,%rem,%col0,%gw,%trow,%tcol;\n";
     }
@@ -827,7 +864,13 @@ fn entry_smem_pipe(
             }
         }
     }
-    s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    // `%act0`/`%act1` are scratch for a fused transcendental epilogue (Act::Silu/Gelu, applied in the
+    // bias store-back); dropped by ptxas when unused (Act::None/Relu, or no bias).
+    if bias {
+        s += &format!("    .reg .f32 {},%act0,%act1;\n", decl_c.trim_end_matches(','));
+    } else {
+        s += &format!("    .reg .f32 {};\n", decl_c.trim_end_matches(','));
+    }
     let mut decl_ab = String::new();
     for ti in 0..tm {
         for r in 0..nab {
@@ -865,10 +908,28 @@ fn entry_smem_pipe(
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
     s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
     s += &format!("    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
-    for ti in 0..tm {
-        for tj in 0..tn {
-            for r in 0..8 {
-                s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+    if residual {
+        // Seed each accumulator from `residual[tile]` with wmma.load.c — the SAME opaque fragment layout
+        // the final wmma.store.d uses, so the (lane,reg)→(row,col) map cancels and the K-loop adds A·Bᵀ on
+        // top → out = residual + A·Bᵀ at f32 accumulate, no HBM round-trip for the residual. Stride = N.
+        s += "    ld.param.u64 %Resid,[pResidual];\n    cvta.to.global.u64 %Resid,%Resid;\n";
+        for ti in 0..tm {
+            for tj in 0..tn {
+                let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+                s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%Resid,%off;\n";
+                s += &format!("    wmma.load.c.sync.aligned.m16n16k16.row.f32 {cc}, [%cptr], %N;\n");
+            }
+        }
+    } else {
+        for ti in 0..tm {
+            for tj in 0..tn {
+                for r in 0..8 {
+                    s += &format!("    mov.f32 %c{ti}_{tj}_{r},0f00000000;\n");
+                }
             }
         }
     }
@@ -952,15 +1013,61 @@ fn entry_smem_pipe(
     s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
 
     s += &format!("KEND_{name}:\n");
-    for ti in 0..tm {
-        for tj in 0..tn {
-            s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
-            s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
-            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
-            s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
-            s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
-            let cc = veclist(&format!("c{ti}_{tj}_"), 8);
-            s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+    if bias {
+        // Fused **bias (+ activation)** store-back epilogue (mirrors `entry_smem_db`'s): WMMA's f32
+        // fragment→(row,col) map is opaque, so we cannot add a per-column bias to the accumulator
+        // *registers* (as the hand-placed mma.sync kernel does). Instead each warp `wmma.store.d`s its
+        // tile into a private 16×16 f32 SMEM scratch (canonical row-major), every lane re-reads its 8
+        // elements by explicit (row,col), adds `bias[globalCol]`, applies the activation (post-bias, the
+        // canonical `act(x·Wᵀ+bias)` order), and writes C. smemA is free here (the pipeline is drained
+        // just below) so it is reused as `num_warps` disjoint 1 KiB (256-f32) scratch slots. For the
+        // residual variant the accumulator already holds `residual + A·Bᵀ` and act is None, so this
+        // computes `residual + A·Bᵀ + bias` — the transformer down-proj / attention output-proj.
+        s += "    cp.async.wait_group 0;\n    bar.sync 0;\n"; // drain the pipe + fence before smemA reuse
+        s += "    ld.param.u64 %Bias,[pBias];\n    cvta.to.global.u64 %Bias,%Bias;\n";
+        s += "    mov.u32 %scld,16;\n"; // scratch tile leading dim (the pipe's %ldm holds bk, not 16)
+        s += "    and.b32 %lane,%tix,31;\n";
+        // This warp's scratch slot: smemA + warpId·1024 bytes (1024 = 16·16·4, one f32 tile).
+        s += &format!("    mov.u32 %scbase,smemA_{name};\n    mul.lo.s32 %tmp,%warpId,1024;\n    add.u32 %scbase,%scbase,%tmp;\n");
+        for ti in 0..tm {
+            for tj in 0..tn {
+                // Store this 16×16 tile's accumulator to the warp's scratch (row-major, leading dim 16).
+                let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+                s += "    cvt.u64.u32 %scptr,%scbase;\n    cvta.shared.u64 %scptr,%scptr;\n";
+                s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%scptr], {cc}, %scld;\n");
+                s += "    bar.sync 0;\n"; // tile fully written to scratch before any lane reads it
+                // Each lane owns 8 of the 256 elements: flat f = lane + u·32 ⇒ (row f/16, col f%16).
+                for u in 0..8 {
+                    if u == 0 {
+                        s += "    mov.u32 %f,%lane;\n";
+                    } else {
+                        s += &format!("    add.u32 %f,%lane,{};\n", u * 32);
+                    }
+                    s += "    shr.u32 %r,%f,4;\n    and.b32 %c,%f,15;\n";
+                    // Read scratch[f] (byte offset = scbase + f·4).
+                    s += "    shl.b32 %tmp,%f,2;\n    add.u32 %tmp,%tmp,%scbase;\n    ld.shared.f32 %bval,[%tmp];\n";
+                    // globalRow = baseRow + warpRow·wm + ti·16 + r ; globalCol = baseCol + warpCol·wn + tj·16 + c
+                    s += &format!("    mul.lo.s32 %grow,%warpRow,{wm};\n    add.u32 %grow,%grow,{};\n    add.u32 %grow,%grow,%baseRow;\n    add.u32 %grow,%grow,%r;\n", ti * 16);
+                    s += &format!("    mul.lo.s32 %gcol,%warpCol,{wn};\n    add.u32 %gcol,%gcol,{};\n    add.u32 %gcol,%gcol,%baseCol;\n    add.u32 %gcol,%gcol,%c;\n", tj * 16);
+                    // Add bias[globalCol] (f32), then activate, then store to C[globalRow·N + globalCol].
+                    s += "    mul.wide.u32 %off,%gcol,4;\n    add.s64 %scptr,%Bias,%off;\n    ld.global.f32 %biasv,[%scptr];\n    add.f32 %bval,%bval,%biasv;\n";
+                    s += &act.epilogue("%bval");
+                    s += "    mul.lo.s32 %tmp,%grow,%N;\n    add.u32 %tmp,%tmp,%gcol;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n    st.global.f32 [%cptr],%bval;\n";
+                }
+                s += "    bar.sync 0;\n"; // all lanes done reading scratch before the next tile overwrites it
+            }
+        }
+    } else {
+        for ti in 0..tm {
+            for tj in 0..tn {
+                s += &format!("    mul.lo.s32 %tmp,%warpRow,{wm};\n    add.u32 %tmp,%tmp,{};\n", ti * 16);
+                s += "    add.u32 %tmp,%tmp,%baseRow;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+                s += &format!("    mul.lo.s32 %tmp2,%warpCol,{wn};\n    add.u32 %tmp2,%tmp2,{};\n", tj * 16);
+                s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp,%tmp,%tmp2;\n";
+                s += "    mul.wide.u32 %off,%tmp,4;\n    add.s64 %cptr,%C,%off;\n";
+                let cc = veclist(&format!("c{ti}_{tj}_"), 8);
+                s += &format!("    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%cptr], {cc}, %N;\n");
+            }
         }
     }
     s += "    ret;\n}\n";
@@ -1605,9 +1712,41 @@ pub fn wmma_f16_ptx() -> &'static str {
             m += &if v.mma {
                 entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false)
             } else {
-                entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster)
+                entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, Act::None, false, false)
             };
         }
+        // Fused epilogues on the **deep WMMA pipe `pipe_64_s6`** — the ≤1024³ GEMM champion. The `mma.sync`
+        // workhorse the *other* fused epilogues ride is beaten there (`pipe_64_s6` ~90% of cuBLAS vs the
+        // workhorse's ~80%), so a fused epilogue built on the workhorse LOSES at 1024³ (its GEMM deficit
+        // exceeds the saved round-trip). Built on `pipe_64_s6` instead, the fused FFN/Linear/down-proj WINS
+        // there too. WMMA's fragment column map is opaque, so the per-column bias routes through `smemA`
+        // scratch (free post-K-loop) re-read by explicit (row,col); the residual seeds via wmma.load.c.
+        let p64 = pipe_variant("wmma_nt_f16_pipe_64_s6");
+        for (suffix, act) in [
+            ("bias", Act::None),
+            ("bias_relu", Act::Relu),
+            ("bias_silu", Act::Silu),
+            ("bias_gelu", Act::Gelu),
+        ] {
+            m += &entry_smem_pipe(
+                &format!("{}_{suffix}", p64.name),
+                "f16",
+                p64.bm, p64.bn, p64.bk, p64.wm, p64.wn, p64.stages, p64.raster,
+                act,
+                true,
+                false,
+            );
+        }
+        // `out = x·Wᵀ + bias + residual` (down-proj / attention output-proj) on the ≤1024³ champion: the
+        // residual seeds the accumulator, the bias adds in the store-back epilogue (no activation).
+        m += &entry_smem_pipe(
+            &format!("{}_bias_residual", p64.name),
+            "f16",
+            p64.bm, p64.bn, p64.bk, p64.wm, p64.wn, p64.stages, p64.raster,
+            Act::None,
+            true,
+            true,
+        );
         // Fused-epilogue variants on the **fast `mma.sync` workhorse** — the structural beat-cuBLAS lever.
         // `C = act(x·Wᵀ + bias)` is the canonical nn.Linear / FFN epilogue: cuBLAS computes only `x·Wᵀ`, so
         // the bias add + activation need a *second* kernel that round-trips C through HBM. Here they fold
