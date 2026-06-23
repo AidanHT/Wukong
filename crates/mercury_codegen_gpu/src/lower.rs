@@ -272,6 +272,7 @@ struct FnEmit<'a> {
     // Register counters per class (final values give the `.reg` declaration counts).
     n_rd: u32,
     n_r: u32, // 32-bit scratch (`%r`) for narrow loads/stores, shift counts, bitcasts
+    n_rs: u32, // 16-bit scratch (`%rs`) for bf16/f16 storage conversions
     n_f: u32,
     n_fd: u32,
     n_p: u32,
@@ -308,6 +309,7 @@ impl<'a> FnEmit<'a> {
             body: String::new(),
             n_rd: 0,
             n_r: 0,
+            n_rs: 0,
             n_f: 0,
             n_fd: 0,
             n_p: 0,
@@ -332,6 +334,9 @@ impl<'a> FnEmit<'a> {
         }
         if e.n_r > 0 {
             let _ = writeln!(out, "    .reg .b32 %r<{}>;", e.n_r);
+        }
+        if e.n_rs > 0 {
+            let _ = writeln!(out, "    .reg .b16 %rs<{}>;", e.n_rs);
         }
         if e.n_f > 0 {
             let _ = writeln!(out, "    .reg .f32 %f<{}>;", e.n_f);
@@ -382,6 +387,13 @@ impl<'a> FnEmit<'a> {
     fn fresh_r32(&mut self) -> String {
         let r = format!("%r{}", self.n_r);
         self.n_r += 1;
+        r
+    }
+
+    /// A fresh 16-bit scratch register (`%rs`), for bf16/f16 storage conversions.
+    fn fresh_r16(&mut self) -> String {
+        let r = format!("%rs{}", self.n_rs);
+        self.n_rs += 1;
         r
     }
 
@@ -848,26 +860,46 @@ impl<'a> FnEmit<'a> {
             }
             FpToSi => self.fp_to_int_into(d, x, from, to, true),
             FpToUi => self.fp_to_int_into(d, x, from, to, false),
-            FpExt => {
-                // Widen to f64 (the only widening FpExt target here); narrowing is FpTrunc.
-                if rc_of(from) == RC::F64 {
-                    self.emit(&format!("mov.f64 {d}, {x};"));
-                } else {
-                    self.emit(&format!("cvt.f64.f32 {d}, {x};"));
-                }
-            }
-            FpTrunc => {
-                if matches!(to, MirType::F32) {
+            FpExt => match to {
+                // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).
+                MirType::F64 => {
                     if rc_of(from) == RC::F64 {
-                        self.emit(&format!("cvt.rn.f32.f64 {d}, {x};"));
+                        self.emit(&format!("mov.f64 {d}, {x};"));
                     } else {
-                        self.emit(&format!("mov.f32 {d}, {x};"));
+                        self.emit(&format!("cvt.f64.f32 {d}, {x};"));
                     }
+                }
+                // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32
+                // register, so the widening to f32 is just a move (the value is already f32).
+                MirType::F32 => self.emit(&format!("mov.f32 {d}, {x};")),
+                _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),
+            },
+            FpTrunc => {
+                // Demote an f64 source to f32 first; the result reg is always f32 (rc_of bf16/f16/f32).
+                let src = if rc_of(from) == RC::F64 {
+                    let t = self.fresh(RC::F32);
+                    self.emit(&format!("cvt.rn.f32.f64 {t}, {x};"));
+                    t
                 } else {
-                    return Err(format!(
-                        "{UNSUPPORTED} FpTrunc to {:?} (bf16/f16 narrowing) not yet lowered",
-                        to
-                    ));
+                    x.to_string()
+                };
+                match to {
+                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {src};")),
+                    // Round to the bf16/f16 grid (RNE) and widen back to f32 — matches the
+                    // interpreter's round_bf16/round_f16 (tolerance-gated).
+                    MirType::BF16 => {
+                        let h = self.fresh_r16();
+                        self.emit(&format!("cvt.rn.bf16.f32 {h}, {src};"));
+                        self.emit(&format!("cvt.f32.bf16 {d}, {h};"));
+                    }
+                    MirType::F16 => {
+                        let h = self.fresh_r16();
+                        self.emit(&format!("cvt.rn.f16.f32 {h}, {src};"));
+                        self.emit(&format!("cvt.f32.f16 {d}, {h};"));
+                    }
+                    _ => {
+                        return Err(format!("{UNSUPPORTED} FpTrunc to {:?}", to));
+                    }
                 }
             }
             Bitcast => self.bitcast_into(d, x, from, to),
@@ -888,8 +920,12 @@ impl<'a> FnEmit<'a> {
         if w == 64 {
             self.emit(&format!("cvt.rzi.{s}64.{fsfx} {d}, {x};"));
         } else {
-            // cvt saturates to the destination width; sign-extend into the 64-bit holder, then mask.
-            self.emit(&format!("cvt.rzi.{s}{w}.{fsfx} {d}, {x};"));
+            // PTX `cvt` to a sub-64-bit integer type needs a matching-width destination register, so
+            // convert float -> 32-bit int in a 32-bit temp, then sign/zero-extend into the 64-bit
+            // holder and mask to the declared width (mirrors the interpreter's per-result `mask`).
+            let t = self.fresh_r32();
+            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
+            self.emit(&format!("cvt.{s}64.{s}32 {d}, {t};"));
             self.mask_int(d, to);
         }
     }
@@ -930,6 +966,17 @@ impl<'a> FnEmit<'a> {
             MirType::F32 => self.emit(&format!("ld.f32 {d}, [{addr}];")),
             MirType::F64 => self.emit(&format!("ld.f64 {d}, [{addr}];")),
             MirType::I64 | MirType::Ptr => self.emit(&format!("ld.u64 {d}, [{addr}];")),
+            // bf16/f16 storage is 2 bytes; load the 16 bits and widen to the f32 register.
+            MirType::BF16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("ld.u16 {h}, [{addr}];"));
+                self.emit(&format!("cvt.f32.bf16 {d}, {h};"));
+            }
+            MirType::F16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("ld.u16 {h}, [{addr}];"));
+                self.emit(&format!("cvt.f32.f16 {d}, {h};"));
+            }
             MirType::I8 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("ld.s8 {w}, [{addr}];"));
@@ -979,8 +1026,16 @@ impl<'a> FnEmit<'a> {
             MirType::F32 => self.emit(&format!("st.f32 [{addr}], {v};")),
             MirType::F64 => self.emit(&format!("st.f64 [{addr}], {v};")),
             MirType::I64 | MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),
-            MirType::F16 | MirType::BF16 => {
-                return Err(format!("{UNSUPPORTED} store of {:?} (half precision)", ty))
+            // bf16/f16 storage is 2 bytes; narrow the f32 value to 16 bits, store the raw u16.
+            MirType::BF16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("cvt.rn.bf16.f32 {h}, {v};"));
+                self.emit(&format!("st.u16 [{addr}], {h};"));
+            }
+            MirType::F16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("cvt.rn.f16.f32 {h}, {v};"));
+                self.emit(&format!("st.u16 [{addr}], {h};"));
             }
             // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.
             MirType::I8 => {
@@ -2474,5 +2529,47 @@ mod tests {
             mismatches.join("\n")
         );
         assert!(covered > 0, "no programs covered — pipeline broken");
+    }
+
+    /// Diagnostic: JIT the PTX file named by `MERCURY_PTX_FILE` with the driver error-log buffer
+    /// attached, printing ptxas's actual line/error. Run:
+    /// `MERCURY_PTX_FILE=... cargo test -p mercury_codegen_gpu --features gpu jit_log_file -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic; prints the driver JIT log for a PTX file"]
+    fn jit_log_file() {
+        let path = std::env::var("MERCURY_PTX_FILE").expect("set MERCURY_PTX_FILE");
+        let ptx = std::fs::read_to_string(&path).unwrap();
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            eprintln!("skip jit_log_file: no CUDA device");
+            return;
+        };
+        {
+            use cudarc::driver::sys;
+            g.ctx.bind_to_thread().unwrap();
+            let ptx_c = std::ffi::CString::new(ptx.as_str()).unwrap();
+            let mut log = vec![0u8; 32768];
+            let mut opts = [
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            ];
+            let mut vals: [*mut std::ffi::c_void; 2] =
+                [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            let res = unsafe {
+                sys::cuModuleLoadDataEx(
+                    &mut module,
+                    ptx_c.as_ptr() as *const _,
+                    2,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                )
+            };
+            eprintln!(
+                "=== JIT result {:?} ===\n{}",
+                res,
+                String::from_utf8_lossy(&log).trim_end_matches('\0')
+            );
+        }
     }
 }
