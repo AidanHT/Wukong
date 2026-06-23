@@ -449,6 +449,229 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
     }
 }
 
+/// **`ldmatrix` + XOR-swizzle int8 GEMM** (`_swz`) — the conflict-free-SMEM analogue of the proven
+/// fp16/bf16 `entry_mma_pipe` swz path ported to the 8-bit `m16n8k32` tile. The hand-placed
+/// [`gen_int8_smdb`] issues 4+2 `ld.shared.b32` per warp-subtile per K-step from a row-major SMEM tile
+/// that carries a **2-way bank conflict** (lanes `grp` and `grp+4` alias the same banks); this variant
+/// instead stages each **64-byte SMEM row** (BK=64 u8 ⇒ `nc=4` 16-byte chunks, two `m16n8k32` K-steps
+/// per slab) under the XOR swizzle `chunk ↦ chunk XOR ((row>>1)&3)` and gathers the A/B fragments with
+/// one warp-cooperative `ldmatrix.x4`/`.x2` from the conflict-free layout (HW-optimized, far fewer SMEM
+/// instructions per `mma`). At the byte level the 16×32-u8 A tile is the same 16-row × 32-byte shape as
+/// the fp16 16×16 A tile, so the swizzle/ldmatrix math is **byte-for-byte the fp16 derivation** (every
+/// `·bk` here equals fp16's `·bk·2` = 64 B/row); only the global `cp.async` stride (×1, u8), the
+/// chunk-column shift (`<<4`), and the `mma`/accumulator types (`.s32.u8.s8.s32`, s32) differ. The
+/// `ldmatrix` matrices map to the A operand as {m0:r0-7/k0-15, m1:r8-15/k0-15, m2:r0-7/k16-31,
+/// m3:r8-15/k16-31} = {a0,a1,a2,a3} — exactly the fp16 register order. Bit-exact mod 2³² vs the CPU i32
+/// reference (the swizzle only reorders SMEM; the integer arithmetic is untouched). Entry `name`;
+/// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0.
+fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant: bool) -> String {
+    let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
+    let threads = wm * wn * 32;
+    let tm = bm / (16 * wm); // 16-row A subtiles per warp
+    let tn = bn / (8 * wn); //  8-col B subtiles per warp
+    let nks = bk / 32; // m16n8k32 K-steps per staged slab (2)
+    let nc = bk / 16; // 16-byte chunks per SMEM row (4)
+    let nc_mask = nc - 1;
+    let wmr = bm / wm; // per-warp M rows
+    let wnc = bn / wn; // per-warp N cols
+    let tile_bytes = bm * bk; // one A (== one B for bm==bn) tile in bytes; power of two ⇒ XOR double-buffer
+    let row_shift = (nc as u32).trailing_zeros(); // e>>row_shift = SMEM row (nc chunks per row)
+    let col_mask = nc - 1;
+    let wn_shift = (wn as u32).trailing_zeros();
+    assert!(bk == 64, "{name}: swz swizzle phase is derived for BK=64 (nc=4)");
+    assert!(bm % (16 * wm) == 0 && bn % (8 * wn) == 0, "{name}: bm/bn must tile by 16*wm / 8*wn");
+    assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs per-warp row/col bases = 0 (mod 8)");
+    assert!(tile_bytes.is_power_of_two(), "{name}: tile bytes must be a power of two (XOR double-buffer)");
+    assert!(2 * (bm * bk) + 2 * (bn * bk) <= 48 * 1024, "{name}: static SMEM exceeds 48 KiB");
+    assert!((bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0, "{name}: threads*16 must divide the tile bytes");
+    let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
+    let b_chunks = bn * bk / (threads * 16);
+
+    let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
+    let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
+    s += &format!("    .shared .align 16 .b8 smemA[{}];\n", 2 * bm * bk);
+    s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * bn * bk);
+    s += "    .reg .pred %p0,%pmore;\n";
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tmp3,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufc,%bufp,%lane,%grp,%tg2,%warpMrow,%warpNcol,%aptr,%bptr,%phaseA,%phaseB,%arowb,%browb,%la16,%lb8,%swztmp;\n";
+    if dequant {
+        s += "    .reg .b32 %col;\n    .reg .f32 %f0,%f1,%f2,%f3,%sc0,%sc1;\n    .reg .b64 %Scale,%scp;\n";
+    }
+    // accumulators d[ti][tj][0..3] (s32), A frags a[ti][0..3], B frags b[tj][0..1]
+    let mut accregs = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..4 {
+                accregs += &format!("%d{ti}_{tj}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", accregs.trim_end_matches(','));
+    let mut abregs = String::new();
+    for ti in 0..tm {
+        for r in 0..4 {
+            abregs += &format!("%a{ti}_{r},");
+        }
+    }
+    for tj in 0..tn {
+        for r in 0..2 {
+            abregs += &format!("%b{tj}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", abregs.trim_end_matches(','));
+    s += "    .reg .b64 %A,%B,%C,%off,%gptr,%cp;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    if dequant {
+        s += "    ld.param.u64 %Scale,[pScale];\n    cvta.to.global.u64 %Scale,%Scale;\n";
+    }
+    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", wn - 1);
+    s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tmp,%lane,3;\n    shl.b32 %tg2,%tmp,1;\n";
+    s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
+    // swz per-lane phases / row byte-bases (every `·bk` = fp16 swz's `·bk·2` = 64 B/row). A: ldmatrix.x4
+    // row R = warpMrow + mi·16 + (lane&15); arowb = (warpMrow + (lane&15))·bk; phaseA = ((lane&15)>>1)&3;
+    // la16 = lane>>4 (the k16/k32 chunk-half selector). B: ldmatrix.x2, row = warpNcol + ni·8 + (lane&7).
+    s += &format!("    and.b32 %tmp,%lane,15;\n    add.u32 %tmp2,%tmp,%warpMrow;\n    mul.lo.s32 %arowb,%tmp2,{bk};\n");
+    s += &format!("    shr.u32 %tmp2,%tmp,1;\n    and.b32 %phaseA,%tmp2,{nc_mask};\n");
+    s += "    shr.u32 %la16,%lane,4;\n";
+    s += &format!("    and.b32 %tmp,%lane,7;\n    add.u32 %tmp2,%tmp,%warpNcol;\n    mul.lo.s32 %browb,%tmp2,{bk};\n");
+    s += &format!("    shr.u32 %tmp2,%tmp,1;\n    and.b32 %phaseB,%tmp2,{nc_mask};\n");
+    s += "    shr.u32 %tmp,%lane,3;\n    and.b32 %lb8,%tmp,1;\n";
+    // zero accumulators
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..4 {
+                s += &format!("    mov.u32 %d{ti}_{tj}_{r},0;\n");
+            }
+        }
+    }
+    s += "    mov.u32 %bufc,0;\n";
+    s += &format!("    mov.u32 %bufp,{tile_bytes};\n");
+
+    // cp.async staging into the **swizzled** SMEM tile (16-byte chunks). chunk e: r=e>>row_shift,
+    // chunk=e&col_mask, byte col c=chunk·16; src is 16 contiguous u8 of global row (g_base+r) at kcol+c;
+    // dst = smem+bufoff + r·bk + (chunk XOR ((r>>1)&nc_mask))·16 — the swizzle the ldmatrix read inverts.
+    let stage = |g_base: &str, gptr_base: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
+        for li in 0..chunks {
+            if li == 0 {
+                *s += "    mov.u32 %e,%tix;\n";
+            } else {
+                *s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+            }
+            *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,4;\n");
+            *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
+            *s += &format!("    cvt.u64.u32 %off,%tmp;\n    add.s64 %gptr,{gptr_base},%off;\n");
+            // dst = swizzled SMEM byte: chunk = %c>>4; chunk_swz = chunk XOR ((r>>1)&nc_mask).
+            *s += &format!("    shr.u32 %swztmp,%c,4;\n    shr.u32 %tmp2,%r,1;\n    and.b32 %tmp2,%tmp2,{nc_mask};\n    xor.b32 %swztmp,%swztmp,%tmp2;\n    shl.b32 %swztmp,%swztmp,4;\n");
+            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{bk};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n");
+            *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
+        }
+    };
+
+    // Prologue: prefetch slab 0 into buffer 0.
+    s += "    mov.u32 %kcol,0;\n";
+    stage("%baseRow", "%A", "smemA", "%bufc", a_chunks, &mut s);
+    stage("%baseCol", "%B", "smemB", "%bufc", b_chunks, &mut s);
+    s += "    cp.async.commit_group;\n";
+
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,%K;\n");
+    s += &format!("    @!%pmore bra LAST_{name};\n");
+    s += "    mov.u32 %kcol,%ktn;\n";
+    stage("%baseRow", "%A", "smemA", "%bufp", a_chunks, &mut s);
+    stage("%baseCol", "%B", "smemB", "%bufp", b_chunks, &mut s);
+    s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n";
+    s += &format!("    bra SYNC_{name};\nLAST_{name}:\n    cp.async.wait_group 0;\nSYNC_{name}:\n");
+    s += "    bar.sync 0;\n";
+
+    // Compute: per k32 step, one warp-cooperative `ldmatrix.x4` (A) / `.x2` (B) per subtile from the
+    // XOR-swizzled (conflict-free, no-pad) SMEM, then `tm·tn` `mma.sync.m16n8k32` (A frag reused across N,
+    // B across M). chunk_off = ((ks·2 | la16/lb8) XOR phase)·16 selects the k16/k32 half (per-lane const).
+    for ks in 0..nks {
+        s += "    mov.u32 %aptr,smemA;\n    add.u32 %aptr,%aptr,%bufc;\n    add.u32 %aptr,%aptr,%arowb;\n";
+        s += &format!("    or.b32 %swztmp,%la16,{};\n    xor.b32 %swztmp,%swztmp,%phaseA;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+        for mi in 0..tm {
+            let mibase = mi * 16 * bk;
+            s += &format!("    add.u32 %tmp,%aptr,%swztmp;\n    add.u32 %tmp,%tmp,{mibase};\n    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},[%tmp];\n");
+        }
+        s += "    mov.u32 %bptr,smemB;\n    add.u32 %bptr,%bptr,%bufc;\n    add.u32 %bptr,%bptr,%browb;\n";
+        s += &format!("    or.b32 %swztmp,%lb8,{};\n    xor.b32 %swztmp,%swztmp,%phaseB;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+        for ni in 0..tn {
+            let nibase = ni * 8 * bk;
+            s += &format!("    add.u32 %tmp,%bptr,%swztmp;\n    add.u32 %tmp,%tmp,{nibase};\n    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{%b{ni}_0,%b{ni}_1}},[%tmp];\n");
+        }
+        for ti in 0..tm {
+            for tj in 0..tn {
+                s += &format!("    mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32\n        {{%d{ti}_{tj}_0,%d{ti}_{tj}_1,%d{ti}_{tj}_2,%d{ti}_{tj}_3}}, {{%a{ti}_0,%a{ti}_1,%a{ti}_2,%a{ti}_3}}, {{%b{tj}_0,%b{tj}_1}}, {{%d{ti}_{tj}_0,%d{ti}_{tj}_1,%d{ti}_{tj}_2,%d{ti}_{tj}_3}};\n");
+            }
+        }
+    }
+    s += "    bar.sync 0;\n"; // all warps done reading bufc before a later step overwrites it
+    s += &format!("    xor.b32 %bufc,%bufc,{tile_bytes};\n    xor.b32 %bufp,%bufp,{tile_bytes};\n");
+    s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
+
+    // Epilogue: store each subtile's 16×8 i32 result (D-fragment layout is fixed by the `mma`, identical
+    // to the hand-placed kernel). global row = baseRow + warpRow·16tm + ti·16 + grp (d0/d1) / +8 (d2/d3);
+    // global col = baseCol + warpCol·8tn + tj·8 + tg2 (d0/d2) / +1 (d1/d3).
+    s += &format!("KEND_{name}:\n");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            s += &format!("    mul.lo.s32 %tmp,%warpRow,{};\n    add.u32 %tmp,%tmp,{};\n", 16 * tm, ti * 16);
+            s += "    add.u32 %tmp,%tmp,%baseRow;\n    add.u32 %tmp,%tmp,%grp;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n", 8 * tn, tj * 8);
+            s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp2,%tmp2,%tg2;\n";
+            if dequant {
+                s += "    mov.u32 %col,%tmp2;\n";
+            }
+            s += "    add.u32 %tmp,%tmp,%tmp2;\n";
+            s += "    shl.b32 %tmp,%tmp,2;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%C,%off;\n";
+            if dequant {
+                s += "    mul.wide.u32 %off,%col,4;\n    add.s64 %scp,%Scale,%off;\n";
+                s += "    ld.global.f32 %sc0,[%scp];\n    ld.global.f32 %sc1,[%scp+4];\n";
+                s += &format!("    cvt.rn.f32.s32 %f0,%d{ti}_{tj}_0;\n    mul.f32 %f0,%f0,%sc0;\n    st.global.f32 [%cp],%f0;\n");
+                s += &format!("    cvt.rn.f32.s32 %f1,%d{ti}_{tj}_1;\n    mul.f32 %f1,%f1,%sc1;\n    st.global.f32 [%cp+4],%f1;\n");
+                s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
+                s += &format!("    cvt.rn.f32.s32 %f2,%d{ti}_{tj}_2;\n    mul.f32 %f2,%f2,%sc0;\n    st.global.f32 [%cp],%f2;\n");
+                s += &format!("    cvt.rn.f32.s32 %f3,%d{ti}_{tj}_3;\n    mul.f32 %f3,%f3,%sc1;\n    st.global.f32 [%cp+4],%f3;\n");
+            } else {
+                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
+                s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
+                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
+            }
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
+/// **64×64 `ldmatrix`+swizzle int8 GEMM** (`int8_gemm_nt_smdb_swz`) — the conflict-free-SMEM candidate
+/// for the int8→cuBLAS-IMMA gap. Same CTA tile / warp layout as [`int8_gemm_smdb_ptx`]; BK=64. Bit-exact.
+pub fn int8_gemm_smdb_swz_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false)).as_str()
+}
+
+/// **64×64 `ldmatrix`+swizzle int8 GEMM with fused per-channel dequant** (`int8_gemm_nt_smdb_swz_deq`) —
+/// the swizzle path carrying the cuBLAS-can't-fuse `f32(Σ u8·i8)·scale[j]` epilogue (see
+/// [`int8_gemm_smdb_deq_ptx`]). Same dequant store, gated at the f32-scale tolerance.
+pub fn int8_gemm_smdb_swz_deq_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, true)).as_str()
+}
+
+/// **128×128 `ldmatrix`+swizzle int8 GEMM** (`int8_gemm_nt_smdb128_swz`) — the large-tile swizzle
+/// candidate (8 warps, BK=64). Same CTA tile as [`int8_gemm_smdb128_ptx`]. Bit-exact.
+pub fn int8_gemm_smdb128_swz_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, false)).as_str()
+}
+
 /// Full **int8 (W8A8) tensor-core GEMM** `C = A·Bᵀ` (the quantized nn.Linear form): A is `[M,K]` **u8**
 /// row-major (activations), B is `[N,K]` **i8** row-major (weights) — which *is* the `K×N` column-major
 /// layout the `mma` `.col` operand wants, so `A·Bᵀ` maps straight onto `mma.row.col` with no transpose.
