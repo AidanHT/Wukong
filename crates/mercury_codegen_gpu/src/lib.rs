@@ -58,6 +58,12 @@ pub mod pool;
 #[cfg(feature = "gpu")]
 pub mod lower;
 
+/// GPU op-graph fusion planner + megakernel **eligibility analysis** (Phase 3 general / Phase 8):
+/// pure MIR analysis (no device) deciding whether an entry function can be compiled into the
+/// cooperative single-block megakernel, and inventorying its recognized cooperative ops.
+#[cfg(feature = "gpu")]
+pub mod fusion;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
 
