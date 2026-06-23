@@ -2125,6 +2125,147 @@ pub fn gemm_nt_fp8(
     g.stream.memcpy_dtov(&c_d)
 }
 
+// ===================================================================================================
+// M7 runtime (Phase 7): pooled resident layer. New `impl` block, append-only — it reuses the struct's
+// already-preloaded kernels and uploaded weights and only changes *where* the per-op scratch lives
+// (a `DevicePool` bump arena instead of per-op `alloc_zeros`). The op sequence, kernels, launch
+// configs and dtypes are identical to `forward_device`, so the result is bit-identical (gated) while
+// the steady-state inner loop issues zero device alloc/free. This is also the alloc-free body that
+// CUDA-graph capture records as pure launches (see `crate::graph`).
+// ===================================================================================================
+impl ResidentLayerF16 {
+    /// [`forward_device`](Self::forward_device) with every intermediate sub-allocated from `pool` and
+    /// the `[S,D]` result written into the caller-owned **persistent** `out` (which, like `x_d`, lives
+    /// outside the pool so a per-iteration [`reset`](crate::pool::DevicePool::reset) never clobbers it —
+    /// the ping-pong a decode loop needs). Does **not** reset the pool; the caller owns the arena's
+    /// lifecycle. Every pooled buffer is a full-overwrite output, so the uninitialized
+    /// [`alloc`](crate::pool::DevicePool::alloc) fast path is used throughout — the
+    /// `resident_layer_pooled_matches_eager` gate proves it by poisoning the slab first.
+    pub fn forward_device_pooled(
+        &self,
+        pool: &mut crate::pool::DevicePool,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+        out: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<(), DriverError> {
+        use crate::pool::{DevicePool, PoolBuf};
+        use cudarc::driver::{CudaSlice, CudaFunction};
+        use half::f16;
+        let stream = &self.stream;
+        let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
+        assert_eq!(x_d.len(), s * d, "x_d must be S*D");
+        assert_eq!(out.len(), s * d, "out must be S*D");
+        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+
+        // Pooled equivalents of forward_device's closures. `pool` is threaded as a parameter (not
+        // captured) so several pool buffers can be live at once without aliasing a single `&mut`.
+        let norm = |pool: &mut DevicePool, src: &CudaSlice<f32>, rows: usize| -> Result<PoolBuf<f32>, DriverError> {
+            let mut o = pool.alloc::<f32>(rows * d)?;
+            let (r, c) = (rows as u32, d as u32);
+            let mut b = stream.launch_builder(&self.f_norm);
+            b.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut *o);
+            unsafe { b.launch(norm_cfg)? };
+            Ok(o)
+        };
+        let cast = |pool: &mut DevicePool, src: &CudaSlice<f32>, n: usize| -> Result<PoolBuf<f16>, DriverError> {
+            let mut dst = pool.alloc::<f16>(n)?;
+            let nn = n as u32;
+            let mut b = stream.launch_builder(&self.f_cast);
+            b.arg(&nn).arg(src).arg(&mut *dst);
+            unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+            Ok(dst)
+        };
+        let gemm16 = |pool: &mut DevicePool, f: &CudaFunction, a: &CudaSlice<f16>, b: &CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+            let mut c = pool.alloc::<f32>(m * n)?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut *c);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+        let resid_gemm = |pool: &mut DevicePool, a: &CudaSlice<f16>, b: &CudaSlice<f16>, residual: &CudaSlice<f32>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+            let mut c = pool.alloc::<f32>(m * n)?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(&self.f_resid);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut *c).arg(residual);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+
+        // --- attention: fp16 tensor-core Q/K/V/O projections, flash, residual fused into O ---
+        let h1 = norm(pool, x_d, s)?;
+        let h1_16 = cast(pool, &h1, s * d)?;
+        let q = gemm16(pool, &self.f_gemm, &h1_16, &self.wq, s, d, d)?;
+        let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, s, d, d)?;
+        let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, s, d, d)?;
+
+        // Pooled attention seam — mirrors `run_attn` exactly (single-head f32/tensor-core flash, or
+        // multi-head cast-transpose → tensor-core flash with grid.y=heads → transpose back).
+        let attn: PoolBuf<f32> = {
+            let scale = 1.0f32 / (self.dh as f32).sqrt();
+            let ss = s as u32;
+            if self.heads == 1 {
+                let mut attn = pool.alloc::<f32>(s * d)?;
+                if let Some((f_w, cfg_w)) = &self.f_flash_w {
+                    let q16 = cast(pool, &q, s * d)?;
+                    let k16 = cast(pool, &k, s * d)?;
+                    let v16 = cast(pool, &v, s * d)?;
+                    let mut bld = stream.launch_builder(f_w);
+                    bld.arg(&ss).arg(&scale).arg(&*q16).arg(&*k16).arg(&*v16).arg(&mut *attn);
+                    unsafe { bld.launch(*cfg_w)? };
+                } else {
+                    let mut bld = stream.launch_builder(&self.f_flash);
+                    bld.arg(&ss).arg(&scale).arg(&*q).arg(&*k).arg(&*v).arg(&mut *attn);
+                    unsafe { bld.launch(self.flash_cfg)? };
+                }
+                attn
+            } else {
+                let (f_w, _) = self.f_flash_w.as_ref().expect("multi-head requires the tensor-core flash");
+                let cast_transpose = |pool: &mut DevicePool, src: &CudaSlice<f32>| -> Result<PoolBuf<f16>, DriverError> {
+                    let n = s * d;
+                    let mut dst = pool.alloc::<f16>(n)?;
+                    let (nn, dd, dhh, sdh) = (n as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
+                    let mut b = stream.launch_builder(&self.f_qkv_trans);
+                    b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut *dst);
+                    unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+                    Ok(dst)
+                };
+                let q_hsd = cast_transpose(pool, &q)?;
+                let k_hsd = cast_transpose(pool, &k)?;
+                let v_hsd = cast_transpose(pool, &v)?;
+                let mut attn_hsd = pool.alloc::<f32>(s * d)?;
+                let cfg = LaunchConfig { grid_dim: ((s / 16) as u32, self.heads as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+                let mut bld = stream.launch_builder(f_w);
+                bld.arg(&ss).arg(&scale).arg(&*q_hsd).arg(&*k_hsd).arg(&*v_hsd).arg(&mut *attn_hsd);
+                unsafe { bld.launch(cfg)? };
+                // transpose the [H,S,dh] flash output back to token-major [S,H·dh].
+                let mut dst = pool.alloc::<f32>(s * d)?;
+                let (nn, dd, dhh, sdh) = ((s * d) as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
+                let mut b = stream.launch_builder(&self.f_attn_trans);
+                b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(&*attn_hsd).arg(&mut *dst);
+                unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+                dst
+            }
+        };
+
+        let attn_16 = cast(pool, &attn, s * d)?;
+        let x1 = resid_gemm(pool, &attn_16, &self.wo, x_d, s, d, d)?; // x + A·Woᵀ (residual 1, fused)
+
+        // --- FFN: RMSNorm → SiLU up-projection (fused) → down-projection with residual (fused) ---
+        let h2 = norm(pool, &x1, s)?;
+        let h2_16 = cast(pool, &h2, s * d)?;
+        let f1 = gemm16(pool, &self.f_silu, &h2_16, &self.w1, s, d, dff)?; // SiLU(h2·W1ᵀ), act fused
+        let f1_16 = cast(pool, &f1, s * dff)?;
+        // residual 2 into the persistent `out`: out = f1·W2ᵀ + x1 (fused), no pool buffer for the result.
+        {
+            let (mm, nn, kk) = (s as u32, d as u32, dff as u32);
+            let mut bld = stream.launch_builder(&self.f_resid);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&*f1_16).arg(&self.w2).arg(&mut *out).arg(&*x1);
+            unsafe { bld.launch(wmma_sm_cfg(s, d))? };
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6682,5 +6823,163 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         }
         g.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    // ============================================================================================
+    // M7 runtime (Phase 7): device memory pool + CUDA graphs. Gates assert the pooled / graphed /
+    // multi-stream path is **bit-identical** to the per-op-alloc + individual-launch baseline (the
+    // runtime changes when/where memory lives and how launches issue, not *what* is computed), and
+    // benches report the latency delta **same-run** at decode/small-batch shapes.
+    // ============================================================================================
+
+    /// Build a `ResidentLayerF16` and random `[S,D]` input for a `(s,d,dff,heads)` case — the shared
+    /// setup for the pool/graph gates and benches.
+    fn pool_layer_fixture(
+        g: &mut Gpu,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
+        seed: u64,
+    ) -> (ResidentLayerF16, Vec<f32>) {
+        let mut rng = crate::diff::Rng::new(seed);
+        let wq = rng.vec(d * d, -0.08, 0.08);
+        let wk = rng.vec(d * d, -0.08, 0.08);
+        let wv = rng.vec(d * d, -0.08, 0.08);
+        let wo = rng.vec(d * d, -0.08, 0.08);
+        let w1 = rng.vec(dff * d, -0.05, 0.05);
+        let w2 = rng.vec(d * dff, -0.05, 0.05);
+        let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+        let layer = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap();
+        let x = rng.vec(s * d, -1.0, 1.0);
+        (layer, x)
+    }
+
+    /// **Identical-numerics gate (the first law).** The pooled forward must produce output
+    /// **bit-for-bit** equal to the per-op-`alloc_zeros` eager forward — same kernels, same launch
+    /// order, only the scratch provenance differs. The slab is **poisoned with 0xFF (NaN-ish)** before
+    /// the pooled run, so any intermediate read before it is fully written would leak a NaN and fail
+    /// the equality — proving the uninitialized `alloc` fast path is only used on full-overwrite
+    /// outputs. Covers the single-head (f32 flash) and multi-head (tensor-core flash + transposes)
+    /// attention paths, plus the real GPT-2 layer shape.
+    #[test]
+    fn resident_layer_pooled_matches_eager() {
+        with_gpu("resident_layer_pooled_matches_eager", |g| {
+            // (S, D, Dff, heads): single-head small (f32 flash); multi-head (tensor-core flash);
+            // GPT-2 layer (D=768/H=12).
+            let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+            for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
+                let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x9001 + ci as u64);
+                let stream = g.stream.clone();
+                let x_d = stream.memcpy_stod(&x).unwrap();
+
+                // eager reference (per-op alloc_zeros + individual launches).
+                let ref_out = layer.forward_device(&x_d).unwrap();
+                let ref_host = stream.memcpy_dtov(&ref_out).unwrap();
+
+                // pooled: hostile (poisoned) slab + persistent out buffer outside the arena.
+                let cap = 256 * 1024 * 1024; // generous; high-water reports the real footprint.
+                let mut pool = crate::pool::DevicePool::new(stream.clone(), cap).unwrap();
+                pool.poison(0xFF).unwrap();
+                let mut out_d = stream.alloc_zeros::<f32>(s * d).unwrap();
+                layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
+                let pooled_host = stream.memcpy_dtov(&out_d).unwrap();
+
+                assert_eq!(pooled_host.len(), ref_host.len());
+                for i in 0..ref_host.len() {
+                    assert_eq!(
+                        pooled_host[i].to_bits(),
+                        ref_host[i].to_bits(),
+                        "pooled != eager at {i} (S={s} D={d} Dff={dff} heads={heads})"
+                    );
+                }
+                assert!(
+                    pool.high_water_bytes() <= cap,
+                    "pool overflowed: high_water {} > cap {}",
+                    pool.high_water_bytes(),
+                    cap
+                );
+                eprintln!(
+                    "pooled==eager bit-identical: S={s} D={d} Dff={dff} heads={heads}; \
+                     pool high-water {} KiB across {} sub-allocs (cap {} MiB)",
+                    pool.high_water_bytes() / 1024,
+                    pool.served(),
+                    cap / (1024 * 1024)
+                );
+            }
+        });
+    }
+
+    /// Best (lowest) per-iteration wall time of `run`, in seconds. Warms up to coax the boost clock,
+    /// then takes the fastest of several timed rounds — the least-throttled measurement, mirroring
+    /// `best_bw`'s reasoning for the ~7× laptop clock swing. Only **ratios** of two such numbers
+    /// measured back-to-back in one process are reported (the honesty law).
+    fn min_latency(g: &Gpu, mut run: impl FnMut()) -> f64 {
+        const WARMUP: usize = 30;
+        const ROUNDS: usize = 12;
+        const ITERS: usize = 40;
+        for _ in 0..WARMUP {
+            run();
+        }
+        g.stream.synchronize().unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                run();
+            }
+            g.stream.synchronize().unwrap();
+            best = best.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+        }
+        best
+    }
+
+    /// **M7 same-run latency — eager vs pooled** (the graphed column lands with `crate::graph`). Both
+    /// paths run the *identical* kernel sequence; the only difference is that the eager path issues a
+    /// `cuMemAllocAsync` + `cuMemsetD8Async` per intermediate and a `cuMemFreeAsync` on drop, while the
+    /// pooled path bumps a cursor (no driver call, and no zeroing memset since every buffer is a
+    /// full-overwrite output). Reported as a back-to-back ratio at decode/small-batch + GPT-2 shapes —
+    /// where this allocate/free/zero traffic is the largest fraction of a tiny layer's wall time.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn pool_graph_vs_unpooled() {
+        with_gpu("pool_graph_vs_unpooled", |g| {
+            eprintln!("device: {}", g.device_name());
+            let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+            for &(s, d, dff, heads) in &cases {
+                let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x7001);
+                let stream = g.stream.clone();
+                let x_d = stream.memcpy_stod(&x).unwrap();
+                let cap = 256 * 1024 * 1024;
+                let mut pool = crate::pool::DevicePool::new(stream.clone(), cap).unwrap();
+                let mut out_d = stream.alloc_zeros::<f32>(s * d).unwrap();
+
+                // One warm forward to count the per-forward sub-allocations the pool replaces (each is
+                // a cuMemAllocAsync + cuMemsetD8Async + cuMemFreeAsync in the eager path).
+                pool.reset();
+                layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
+                let allocs_per_fwd = pool.served();
+
+                // eager: per-op alloc_zeros (alloc + memset) + free-on-drop + individual launches.
+                let eager = min_latency(g, || {
+                    let _ = layer.forward_device(&x_d).unwrap();
+                });
+                // pooled: bump arena (no per-op alloc/free, no zeroing) + individual launches.
+                let pooled = min_latency(g, || {
+                    pool.reset();
+                    layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
+                });
+
+                eprintln!(
+                    "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: eager {:7.1} us | pooled {:7.1} us \
+                     → pooled {:.2}x  ({} device allocs/free/memset per forward removed; high-water {} KiB)",
+                    eager * 1e6,
+                    pooled * 1e6,
+                    eager / pooled,
+                    allocs_per_fwd,
+                    pool.high_water_bytes() / 1024,
+                );
+            }
+        });
     }
 }
