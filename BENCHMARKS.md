@@ -457,6 +457,17 @@ GELU/SiLU reuse the `vmath` scalar forms, so the fused result equals the unfused
 activation bit-for-bit (`tests/run/linear_{bf16,f16}_ffn.mer`; the runtime twin pins it == the f32
 fused FFN on the widened operands across all four activations × bias on/off, serial == parallel).
 
+**Mixed-precision weight-gradient (`C = Aᵀ·B`) — the training backward GEMM, in bf16/f16.** The
+`dW = dYᵀ·X` weight gradient (A stored `[k, m]`, the contraction the *outer* index of A's storage) is
+recognized in bf16/f16 too — `mercury_sgemm_{bf16,f16}_tn[_parallel]`, the half twin of the f32
+`mercury_sgemm_tn`. It widens A and B losslessly then delegates to that exact f32 TN kernel (transpose
+A once → the tuned `C = A·B` microkernel), so it is bit-for-bit the f32 TN GEMM on the widened values.
+The naive half TN nest loses **twice** in C/Rust — the inline `bf16→f32` widen won't vectorize *and*
+A's column-strided reads (the contraction is A's outer storage index) defeat vectorization one cache
+line per element — so this compounds the bf16 widen win with the transpose-prepass win the f32
+weight-gradient GEMM already documents (`~42–445×` idiomatic C there). `tests/run/matmul_{bf16,f16}_tn.mer`;
+the runtime twin pins both precisions == the f32 TN kernel on the widened operands, serial == parallel.
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
