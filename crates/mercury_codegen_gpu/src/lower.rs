@@ -1691,6 +1691,9 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
             ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT.to_string())
         }
         "mercury_norm_f32" | "mercury_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM.to_string()),
+        "mercury_norm_affine_f32" | "mercury_norm_affine_f32_parallel" => {
+            ("mrt_norm_affine", None, PTX_NORM_AFFINE.to_string())
+        }
         "mercury_vmath_f32" => ("mrt_vmath", None, PTX_VMATH.to_string()),
         "mercury_sgemm_nt_epi" | "mercury_sgemm_nt_epi_parallel" => {
             ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())
@@ -2119,6 +2122,97 @@ NORM_NEXT:
     add.s64 %rd6, %rd6, 1;
     bra NORM_ROW;
 NORM_DONE:
+    ret;
+}
+"#;
+
+/// `mercury_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op)`: per-row LayerNorm(1)/
+/// RMSNorm(2) with an affine writeback `out = norm·g + b`, where `g = gamma[col]` (1.0 if gamma is
+/// null) and `b = beta[col]` (0.0 if beta is null) — gamma/beta arrive as integer 0 when absent.
+/// (Softmax is never affine, so only op 1/2 reach here.) eps is the low 32 bits of `eps_bits`.
+const PTX_NORM_AFFINE: &str = r#".func mrt_norm_affine (.param .b64 px, .param .b64 pout, .param .b64 pgamma, .param .b64 pbeta, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop)
+{
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<16>;
+    .reg .b32 %r<3>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [pgamma];
+    ld.param.u64 %rd3, [pbeta];
+    ld.param.u64 %rd4, [prows];
+    ld.param.u64 %rd5, [pcols];
+    ld.param.u64 %rd6, [peps];
+    ld.param.u64 %rd7, [pop];
+    cvt.u32.u64 %r0, %rd6;
+    mov.b32 %f0, %r0;
+    cvt.rn.f32.s64 %f1, %rd5;
+    mov.b64 %rd8, 0;
+NA_ROW:
+    setp.ge.s64 %p0, %rd8, %rd4;
+    @%p0 bra NA_DONE;
+    mul.lo.s64 %rd9, %rd8, %rd5;
+    shl.b64 %rd10, %rd9, 2;
+    add.s64 %rd11, %rd0, %rd10;
+    add.s64 %rd12, %rd1, %rd10;
+    setp.eq.s64 %p1, %rd7, 1;
+    @%p1 bra NA_LN;
+    bra NA_RMS;
+NA_LN:
+    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;
+LNA1:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra LNA1E;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; add.f32 %f2, %f2, %f3;
+    add.s64 %rd13, %rd13, 1; bra LNA1;
+LNA1E:
+    div.rn.f32 %f4, %f2, %f1;
+    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;
+LNA2:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra LNA2E;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; sub.f32 %f3, %f3, %f4; fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s64 %rd13, %rd13, 1; bra LNA2;
+LNA2E:
+    div.rn.f32 %f5, %f2, %f1; add.f32 %f5, %f5, %f0; sqrt.rn.f32 %f5, %f5;
+    mov.f32 %f6, 0f3F800000; div.rn.f32 %f5, %f6, %f5;
+    mov.b64 %rd13, 0;
+LNA3:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra NA_NEXT;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; sub.f32 %f3, %f3, %f4; mul.f32 %f3, %f3, %f5;
+    mov.f32 %f7, 0f3F800000; setp.ne.s64 %p3, %rd2, 0;
+    @%p3 add.s64 %rd16, %rd2, %rd14; @%p3 ld.f32 %f7, [%rd16];
+    mov.f32 %f8, 0f00000000; setp.ne.s64 %p3, %rd3, 0;
+    @%p3 add.s64 %rd16, %rd3, %rd14; @%p3 ld.f32 %f8, [%rd16];
+    fma.rn.f32 %f3, %f3, %f7, %f8;
+    add.s64 %rd16, %rd12, %rd14; st.f32 [%rd16], %f3;
+    add.s64 %rd13, %rd13, 1; bra LNA3;
+NA_RMS:
+    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;
+RMA1:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra RMA1E;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s64 %rd13, %rd13, 1; bra RMA1;
+RMA1E:
+    div.rn.f32 %f5, %f2, %f1; add.f32 %f5, %f5, %f0; sqrt.rn.f32 %f5, %f5;
+    mov.f32 %f6, 0f3F800000; div.rn.f32 %f5, %f6, %f5;
+    mov.b64 %rd13, 0;
+RMA3:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra NA_NEXT;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; mul.f32 %f3, %f3, %f5;
+    mov.f32 %f7, 0f3F800000; setp.ne.s64 %p3, %rd2, 0;
+    @%p3 add.s64 %rd16, %rd2, %rd14; @%p3 ld.f32 %f7, [%rd16];
+    mov.f32 %f8, 0f00000000; setp.ne.s64 %p3, %rd3, 0;
+    @%p3 add.s64 %rd16, %rd3, %rd14; @%p3 ld.f32 %f8, [%rd16];
+    fma.rn.f32 %f3, %f3, %f7, %f8;
+    add.s64 %rd16, %rd12, %rd14; st.f32 [%rd16], %f3;
+    add.s64 %rd13, %rd13, 1; bra RMA3;
+NA_NEXT:
+    add.s64 %rd8, %rd8, 1; bra NA_ROW;
+NA_DONE:
     ret;
 }
 "#;
