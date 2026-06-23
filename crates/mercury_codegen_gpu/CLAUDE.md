@@ -148,14 +148,18 @@ toolkit — only **running** needs the driver + a device.
   **fused per-channel dequant epilogue** (`…_smdb_deq`/`…_smdb_swz_deq`): `out = f32(Σ u8·i8)·scale[j]`
   folded into the C store — the round-trip cuBLAS int8 (raw `i32` out) structurally can't fuse. Integer
   accumulate is exact mod 2³² ⇒ the gate is **bit-exact** (`==`), stronger than the float tolerance gate.
-  Launchers `gemm_nt_int8`/`_smdb`/`_smdb_dequant` + `int8_tile` in `gpu.rs` (the `_smdb`/`_dequant`
-  dispatch prefers swz when K%64==0, falls back to the BK=32 hand-placed kernel otherwise — both
-  bit-exact, choice is purely throughput); peers (naive + `dp4a` CUDA-C via NVRTC, cuBLAS int8 IMMA
+  Launchers `gemm_nt_int8`/`_smdb`/`_smdb_dequant`/`_splitk` + `int8_tile` in `gpu.rs` (the `_smdb`/
+  `_dequant` dispatch prefers swz when K%64==0, falls back to the BK=32 hand-placed kernel otherwise —
+  both bit-exact, choice is purely throughput); peers (naive + `dp4a` CUDA-C via NVRTC, cuBLAS int8 IMMA
   `cublasGemmEx`) in `baselines.rs`; `int8_gemm_vs_peers` scoreboard. Standing (same-run, RTX 4050):
   **180–237× vs naive**, **33–58× vs dp4a**; the hand-placed path was **~44/53/52% of cuBLAS** at
   1024/2048/4096, and **`ldmatrix`+swizzle is a further ~1.2–1.5× internal win** (`int8_swz_vs_handplaced`
   same-run A/B, 12/12 across two runs — the lever was conflict-free SMEM, *not* multi-stage depth, which
-  is occupancy-bound; remaining lever toward parity is split-K for thin-M). cuBLAS int8 is s8×s8
+  is occupancy-bound). For **thin-M / small-N decode** (M,N grid under-fills the SMs), `gen_int8_smdb_swz`
+  has a **split-K** mode (`int8_gemm_nt_smdb_swz_sk`, `gridDim.z=sk`, partials folded by
+  `red.global.add.u32` — order-independent ⇒ bit-exact *and* deterministic, a float split-K can't be):
+  up to **~2.5×** vs un-split when starved (M64 N128 K8192, 2 CTAs → sk=8), marginal once saturated
+  (`int8_splitk_occupancy`). cuBLAS int8 is s8×s8
   only, so the peer cross-check uses `[0,127]` activations (where u8≡s8); the full-range `[0,255]` gate is
   separate. Owned by the int8 slice (`gpu-int8-gemm`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
