@@ -496,6 +496,124 @@ pub fn norm_bwd_f32(
     g.stream.memcpy_dtov(&dx_d)
 }
 
+// ----------------------------------------------------------------------------------------------
+// Training GEMM: C[m×n] = op(A)·op(B), with per-operand transpose (NN / NT / TN). The forward
+// Linear is NT (y = x·Wᵀ); the tape's gradient matmuls are NN (dX = dY·W) and TN (dW = dYᵀ·X).
+// One transposable kernel covers all three so the resident step needs no operand shuffling.
+//
+// This is a **naive** one-thread-per-output-element kernel (a k-loop of fused MACs) — correct and
+// self-contained, the workhorse for the resident training step's correctness/residency gate. It is
+// the obvious profiling target (no tiling/SMEM/tensor-cores); increment 6 routes the hot GEMMs to a
+// staged/tensor-core path. `fma.rn` accumulation in increasing k matches a naive CPU reference
+// closely; tolerance-gated (the reduction reassociates).
+// ----------------------------------------------------------------------------------------------
+
+/// One naive GEMM entry for transpose mode `(ta, tb)`: `C[m×n] = opA(A)·opB(B)`, inner dim `k`.
+/// `A` is `[m×k]` (ta=false) or `[k×m]` (ta=true); `B` is `[k×n]` (tb=false) or `[n×k]` (tb=true).
+fn gemm_entry(tag: &str, ta: bool, tb: bool) -> String {
+    let aidx = if ta {
+        "    mad.lo.s32 %aidx, %l, %M, %row;\n" // A^T: A[l*M + row]
+    } else {
+        "    mad.lo.s32 %aidx, %row, %K, %l;\n" // A:   A[row*K + l]
+    };
+    let bidx = if tb {
+        "    mad.lo.s32 %bidx, %col, %K, %l;\n" // B^T: B[col*K + l]
+    } else {
+        "    mad.lo.s32 %bidx, %l, %N, %col;\n" // B:   B[l*N + col]
+    };
+    format!(
+        r#".visible .entry gemm_{tag}(
+    .param .u64 gA, .param .u64 gB, .param .u64 gC,
+    .param .u32 gM, .param .u32 gN, .param .u32 gK
+)
+{{
+    .reg .pred %p<4>;
+    .reg .b32 %M,%N,%K,%col,%row,%l,%tx,%ty,%cx,%cy,%ntx,%nty,%aidx,%bidx,%cidx;
+    .reg .b64 %A,%B,%C,%off,%a;
+    .reg .f32 %acc,%av,%bv;
+    ld.param.u64 %A,[gA]; ld.param.u64 %B,[gB]; ld.param.u64 %C,[gC];
+    ld.param.u32 %M,[gM]; ld.param.u32 %N,[gN]; ld.param.u32 %K,[gK];
+    cvta.to.global.u64 %A,%A; cvta.to.global.u64 %B,%B; cvta.to.global.u64 %C,%C;
+    mov.u32 %ntx,%ntid.x; mov.u32 %cx,%ctaid.x; mov.u32 %tx,%tid.x;
+    mad.lo.s32 %col,%cx,%ntx,%tx;
+    mov.u32 %nty,%ntid.y; mov.u32 %cy,%ctaid.y; mov.u32 %ty,%tid.y;
+    mad.lo.s32 %row,%cy,%nty,%ty;
+    setp.ge.u32 %p1,%row,%M; setp.ge.u32 %p2,%col,%N; or.pred %p3,%p1,%p2;
+    @%p3 bra GEMM_END_{tag};
+    mov.f32 %acc,0f00000000;
+    mov.u32 %l,0;
+GEMM_L_{tag}:
+    setp.ge.u32 %p1,%l,%K; @%p1 bra GEMM_W_{tag};
+{aidx}    mul.wide.u32 %off,%aidx,4; add.s64 %a,%A,%off; ld.global.f32 %av,[%a];
+{bidx}    mul.wide.u32 %off,%bidx,4; add.s64 %a,%B,%off; ld.global.f32 %bv,[%a];
+    fma.rn.f32 %acc,%av,%bv,%acc;
+    add.u32 %l,%l,1; bra GEMM_L_{tag};
+GEMM_W_{tag}:
+    mad.lo.s32 %cidx,%row,%N,%col;
+    mul.wide.u32 %off,%cidx,4; add.s64 %a,%C,%off; st.global.f32 [%a],%acc;
+GEMM_END_{tag}:
+    ret;
+}}
+"#
+    )
+}
+
+/// The training-GEMM module (gemm_nn / gemm_nt / gemm_tn), generated once and cached.
+pub fn train_gemm_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        m += &gemm_entry("nn", false, false);
+        m += &gemm_entry("nt", false, true);
+        m += &gemm_entry("tn", true, false);
+        m
+    })
+    .as_str()
+}
+
+/// PTX entry name for transpose mode `(ta, tb)` — only NN / NT / TN are generated.
+pub(crate) fn gemm_entry_name(ta: bool, tb: bool) -> &'static str {
+    match (ta, tb) {
+        (false, false) => "gemm_nn",
+        (false, true) => "gemm_nt",
+        (true, false) => "gemm_tn",
+        (true, true) => panic!("gemm_tt not generated"),
+    }
+}
+
+/// Launch config for the 16×16-tiled GEMM grid (one thread per output element).
+pub(crate) fn gemm_cfg(m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n.div_ceil(16)) as u32, (m.div_ceil(16)) as u32, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `C[m×n] = opA(A)·opB(B)` on the GPU (host-slice convenience wrapper). `ta`/`tb` transpose A/B.
+pub fn gemm_f32(
+    g: &mut Gpu,
+    ta: bool,
+    tb: bool,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), m * k, "gemm A must be m*k elements (whatever its layout)");
+    assert_eq!(b.len(), k * n, "gemm B must be k*n elements");
+    let f = g.function("train_gemm", train_gemm_ptx(), gemm_entry_name(ta, tb))?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&mu).arg(&nu).arg(&ku);
+    unsafe { bld.launch(gemm_cfg(m, n))? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +783,34 @@ mod tests {
                     }
                 }
                 assert_close(&format!("norm_bwd op {op}"), &got, &want, 1e-4, 1e-4);
+            }
+        });
+    }
+
+    #[test]
+    fn train_gemm_matches_reference() {
+        with_gpu("train_gemm_matches_reference", |g| {
+            // Non-multiples of 16 to exercise the grid edges.
+            let (m, n, k) = (33usize, 40usize, 50usize);
+            let mut rng = Rng::new(0x6E33);
+            for &(ta, tb) in &[(false, false), (false, true), (true, false)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(k * n, -1.0, 1.0);
+                let got = gemm_f32(g, ta, tb, &a, &b, m, n, k).unwrap();
+                let aref = |i: usize, l: usize| if ta { a[l * m + i] } else { a[i * k + l] } as f64;
+                let bref = |l: usize, j: usize| if tb { b[j * k + l] } else { b[l * n + j] } as f64;
+                let mut want = vec![0f32; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f64;
+                        for l in 0..k {
+                            acc += aref(i, l) * bref(l, j);
+                        }
+                        want[i * n + j] = acc as f32;
+                    }
+                }
+                let mode = gemm_entry_name(ta, tb);
+                assert_close(mode, &got, &want, 1e-4, 1e-3);
             }
         });
     }
