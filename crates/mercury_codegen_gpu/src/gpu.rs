@@ -7452,4 +7452,188 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             });
         });
     }
+
+    // ============================================================================================
+    // M7 / M13: the whole resident STACK captured into ONE graph — a whole-model forward replayed by
+    // a single cuGraphLaunch. The pool is reset between layers (so its footprint is one layer, not N),
+    // inter-layer activations ping-pong through two persistent buffers, and the N×(~13) launches fold
+    // into one driver call — the decode/small-batch latency lever where launch overhead dominates.
+    // ============================================================================================
+
+    /// Run an `N`-layer resident stack pooled on `stream`: layer 0 reads `x_d`, each later layer reads
+    /// the previous layer's output, every layer's intermediates come from `pool` (**reset between
+    /// layers**, so the slab holds one layer's scratch, not N), and inter-layer activations ping-pong
+    /// through `bufs[0]`/`bufs[1]` (persistent, outside the pool, so a reset never clobbers them). All
+    /// launches land on `stream`. Returns the index in `bufs` holding the final output.
+    fn forward_stack_pooled_on(
+        layers: &[ResidentLayerF16],
+        stream: &Arc<CudaStream>,
+        pool: &mut crate::pool::DevicePool,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+        bufs: &mut [cudarc::driver::CudaSlice<f32>; 2],
+    ) -> Result<usize, DriverError> {
+        let n = layers.len();
+        pool.reset();
+        layers[0].forward_device_pooled_on(stream, pool, x_d, &mut bufs[0])?;
+        for i in 1..n {
+            pool.reset();
+            let (lo, hi) = bufs.split_at_mut(1);
+            if (i - 1) % 2 == 0 {
+                layers[i].forward_device_pooled_on(stream, pool, &lo[0], &mut hi[0])?;
+            } else {
+                layers[i].forward_device_pooled_on(stream, pool, &hi[0], &mut lo[0])?;
+            }
+        }
+        Ok((n - 1) % 2)
+    }
+
+    /// Build `n` independent resident layers (distinct random weights each) + a random `[S,D]` input.
+    fn multi_layer_fixture(
+        g: &mut Gpu,
+        n: usize,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
+        seed: u64,
+    ) -> (Vec<ResidentLayerF16>, Vec<f32>) {
+        let mut rng = crate::diff::Rng::new(seed);
+        let mut layers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let wq = rng.vec(d * d, -0.08, 0.08);
+            let wk = rng.vec(d * d, -0.08, 0.08);
+            let wv = rng.vec(d * d, -0.08, 0.08);
+            let wo = rng.vec(d * d, -0.08, 0.08);
+            let w1 = rng.vec(dff * d, -0.05, 0.05);
+            let w2 = rng.vec(d * dff, -0.05, 0.05);
+            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+            layers.push(ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap());
+        }
+        let x = rng.vec(s * d, -1.0, 1.0);
+        (layers, x)
+    }
+
+    /// Capture the whole pooled `N`-layer stack into one graph on a dedicated stream. Returns the
+    /// stream, pool, persistent input + ping-pong buffers (all baked into the graph — keep alive), the
+    /// index of the result buffer, and the graph. **Must run inside [`with_event_tracking_disabled`].**
+    #[allow(clippy::type_complexity)]
+    fn capture_resident_stack(
+        g: &Gpu,
+        layers: &[ResidentLayerF16],
+        s: usize,
+        d: usize,
+        x: &[f32],
+        cap_bytes: usize,
+    ) -> (
+        Arc<CudaStream>,
+        crate::pool::DevicePool,
+        cudarc::driver::CudaSlice<f32>,
+        [cudarc::driver::CudaSlice<f32>; 2],
+        usize,
+        crate::graph::Graph,
+    ) {
+        let cap = g.ctx.new_stream().unwrap();
+        let mut pool = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
+        let x_d = cap.memcpy_stod(x).unwrap();
+        let mut bufs = [cap.alloc_zeros::<f32>(s * d).unwrap(), cap.alloc_zeros::<f32>(s * d).unwrap()];
+        g.stream.synchronize().unwrap();
+        // Warmup, then capture.
+        let _ = forward_stack_pooled_on(layers, &cap, &mut pool, &x_d, &mut bufs).unwrap();
+        cap.synchronize().unwrap();
+        let mut result_idx = 0usize;
+        let graph = crate::graph::Graph::capture(cap.clone(), || {
+            result_idx = forward_stack_pooled_on(layers, &cap, &mut pool, &x_d, &mut bufs)?;
+            Ok(())
+        })
+        .unwrap();
+        (cap, pool, x_d, bufs, result_idx, graph)
+    }
+
+    /// **Identical-numerics gate for the whole-model graph (the first law).** An `N`-layer resident
+    /// stack captured into one graph and replayed by a single `cuGraphLaunch` must produce output
+    /// **bit-for-bit** equal to the eager layer-by-layer `forward_device` chain, and be deterministic
+    /// across two replays (M12). The slab is poisoned 0xFF first; the pool is reset between layers, so
+    /// this also proves the inter-layer ping-pong + per-layer scratch reuse is correct under capture.
+    #[test]
+    fn resident_stack_graphed_matches_eager() {
+        with_gpu("resident_stack_graphed_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let (n, s, d, dff, heads) = (12usize, 64usize, 64usize, 256usize, 1usize);
+                let (layers, x) = multi_layer_fixture(g, n, s, d, dff, heads, 0xD00D);
+
+                // eager: layer-by-layer forward_device chain.
+                let x_d_ref = g.stream.memcpy_stod(&x).unwrap();
+                let mut cur = layers[0].forward_device(&x_d_ref).unwrap();
+                for l in &layers[1..] {
+                    cur = l.forward_device(&cur).unwrap();
+                }
+                let ref_host = g.stream.memcpy_dtov(&cur).unwrap();
+
+                // graphed whole stack.
+                let (cap, mut pool, _x_d, bufs, ridx, graph) =
+                    capture_resident_stack(g, &layers, s, d, &x, 64 * 1024 * 1024);
+                pool.poison(0xFF).unwrap();
+                graph.launch().unwrap();
+                cap.synchronize().unwrap();
+                let g1 = cap.memcpy_dtov(&bufs[ridx]).unwrap();
+                graph.launch().unwrap();
+                cap.synchronize().unwrap();
+                let g2 = cap.memcpy_dtov(&bufs[ridx]).unwrap();
+
+                assert_eq!(g1.len(), ref_host.len());
+                for i in 0..ref_host.len() {
+                    assert_eq!(g1[i].to_bits(), ref_host[i].to_bits(), "stack graphed != eager at {i}");
+                    assert_eq!(g1[i].to_bits(), g2[i].to_bits(), "stack replay non-deterministic at {i}");
+                }
+                eprintln!(
+                    "{n}-layer stack graphed==eager bit-identical & deterministic (S={s} D={d} Dff={dff}); \
+                     whole model = one cuGraphLaunch (high-water {} KiB, one layer's scratch)",
+                    pool.high_water_bytes() / 1024
+                );
+            });
+        });
+    }
+
+    /// **M7 decode latency — whole-model: eager `N`-layer chain vs one graph replay.** A token's forward
+    /// through an `N`-layer resident stack is `N×(~13)` individual launches eagerly; captured, it is a
+    /// **single `cuGraphLaunch`**. At the decode shape the launch overhead dominates, so folding the
+    /// whole stack collapses per-token latency. Same-run ratio across depths.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn decode_stack_latency() {
+        with_gpu("decode_stack_latency", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let (s, d, dff, heads) = (64usize, 64usize, 256usize, 1usize);
+                for &n in &[1usize, 6, 12] {
+                    let (layers, x) = multi_layer_fixture(g, n, s, d, dff, heads, 0xBEEF);
+
+                    // eager: per-op alloc + N*(~13) launches, layer by layer.
+                    let x_d = g.stream.memcpy_stod(&x).unwrap();
+                    let eager = min_latency(&g.stream, || {
+                        let mut cur = layers[0].forward_device(&x_d).unwrap();
+                        for l in &layers[1..] {
+                            cur = l.forward_device(&cur).unwrap();
+                        }
+                    });
+
+                    // graphed: the whole stack as one cuGraphLaunch.
+                    let (cap, _pool, _x_d, _bufs, _ridx, graph) =
+                        capture_resident_stack(g, &layers, s, d, &x, 64 * 1024 * 1024);
+                    let graphed = min_latency(&cap, || {
+                        graph.launch().unwrap();
+                    });
+
+                    eprintln!(
+                        "depth N={n:2} (S={s} D={d} Dff={dff}, decode): eager {:8.1} us | graphed {:7.1} us \
+                         → graphed {:.2}x  (~{} launches → 1 cuGraphLaunch)",
+                        eager * 1e6,
+                        graphed * 1e6,
+                        eager / graphed,
+                        n * 13
+                    );
+                }
+            });
+        });
+    }
 }
