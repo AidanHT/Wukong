@@ -1539,6 +1539,85 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_sgemm_{bf16,f16}_nt[_parallel](a, b, c, m, k, n, beta)` — the low-precision
+            // `C = A·Bᵀ` GEMM (bf16/f16 inputs stored as `u16` bits, f32 accumulate, f32 output) a
+            // matmul nest over `[bf16; _]`/`[f16; _]` operands lowers to. Reconstruct the exact stored
+            // 16 bits of each input via `f32_to_{bf16,f16}_bits` (idempotent on an already-rounded
+            // value, so the buffer is bit-identical to the native backend's 2-byte storage — same as
+            // the bf16/f16 reductions/axpby), marshal the f32 `c` output exactly like `mercury_sgemm_nt`
+            // does, and call the *serial* runtime kernel for BOTH the serial and `_parallel` names: the
+            // runtime pins serial == parallel == interpreter bit-for-bit (rows independent, identical
+            // per-(i,j) accumulation order), and the interpreter is the oracle, so the differential gate
+            // stays exact despite the kernel's wider/reassociated accumulation.
+            "mercury_sgemm_bf16_nt"
+            | "mercury_sgemm_bf16_nt_parallel"
+            | "mercury_sgemm_f16_nt"
+            | "mercury_sgemm_f16_nt_parallel" => {
+                let is_f16 = name.contains("_f16");
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let c = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let beta = args[6].as_int() as i64;
+                // Read a `[bf16]`/`[f16]` element (stored as the rounded f32 value) back to its exact
+                // 16 stored bits — the same technique the bf16/f16 reductions and axpby use. The bf16
+                // and f16 kernels differ ONLY in which runtime function widens these raw bits, so we
+                // store the bits identically here and branch on the call below.
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    let f = self
+                        .memory
+                        .get(idx + t)
+                        .ok_or("lowp sgemm operand out of bounds")?
+                        .as_float() as f32;
+                    Ok(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    })
+                };
+                let mut abuf = Vec::with_capacity(m * k);
+                for t in 0..m * k {
+                    abuf.push(bits(a, t)?);
+                }
+                let mut bbuf = Vec::with_capacity(n * k);
+                for t in 0..n * k {
+                    bbuf.push(bits(b, t)?);
+                }
+                let mut cbuf = vec![0.0f32; m * n];
+                // SAFETY: abuf is m*k, bbuf is n*k u16; cbuf is m*n f32 — the kernels' contract.
+                unsafe {
+                    if is_f16 {
+                        mercury_runtime::mercury_sgemm_f16_nt(
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
+                        );
+                    } else {
+                        mercury_runtime::mercury_sgemm_bf16_nt(
+                            abuf.as_ptr(),
+                            bbuf.as_ptr(),
+                            cbuf.as_mut_ptr(),
+                            m as i64,
+                            k as i64,
+                            n as i64,
+                            beta,
+                        );
+                    }
+                }
+                for (t, &val) in cbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(c + t)
+                        .ok_or("lowp sgemm output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)` — the fused row-wise
             // softmax / LayerNorm / RMSNorm kernel a recognized multi-pass norm lowers to. Marshal the
             // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel

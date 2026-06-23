@@ -60,6 +60,10 @@ pub fn lower_program(
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
         i8deq: interner.intern("mercury_i8gemm_nt_deq"),
         i8deq_par: interner.intern("mercury_i8gemm_nt_deq_parallel"),
+        bf16_nt: interner.intern("mercury_sgemm_bf16_nt"),
+        bf16_nt_par: interner.intern("mercury_sgemm_bf16_nt_parallel"),
+        f16_nt: interner.intern("mercury_sgemm_f16_nt"),
+        f16_nt_par: interner.intern("mercury_sgemm_f16_nt_parallel"),
         dot_bf16: interner.intern("mercury_dot_bf16"),
         sum_bf16: interner.intern("mercury_sum_bf16"),
         reduce_bf16: interner.intern("mercury_reduce_bf16"),
@@ -90,6 +94,17 @@ pub fn lower_program(
                     let parallel = has_parallel_attr(item, interner);
                     let func =
                         lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function bf16/f16 matmul: intercept before the elementwise
+                // outliner below (which would outline the outer row loop into per-row scalar loops and
+                // lose the kernel dispatch). Lower it normally with `parallel = true`; the embedded
+                // matmul recognizer in `lower_for` then emits the multicore half GEMM. A non-`@parallel`
+                // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
+                if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -519,6 +534,16 @@ struct GemmSyms {
     /// is the fusion they structurally can't express. Both backends marshal the identical kernel.
     i8deq: Symbol,
     i8deq_par: Symbol,
+    /// The bf16 / f16 mixed-precision GEMM kernels (`mercury_sgemm_{bf16,f16}_nt[_parallel](a, b, c,
+    /// m, k, n, beta)`): a `C = A·Bᵀ` nest whose `A`/`B` are `[bf16]`/`[f16]` arrays widened with
+    /// `as f32` and accumulated in an f32 `s` lowers here — the standard mixed-precision transformer
+    /// matmul. The kernel widens the half inputs (lossless) and runs the identical tuned f32 GEMM, so
+    /// the result is bit-for-bit the f32 GEMM on the widened values (the differential contract). The
+    /// naive half nest otherwise falls to a scalar widening loop the autovectorizer can't reach.
+    bf16_nt: Symbol,
+    bf16_nt_par: Symbol,
+    f16_nt: Symbol,
+    f16_nt_par: Symbol,
     /// The bf16 mixed-precision reduction kernels (`mercury_dot_bf16(x, y, n) -> f32` and
     /// `mercury_sum_bf16(x, n) -> f32`): a reduction loop `s += (x[k] as f32) [* (y[k] as f32)]` over
     /// `[bf16; _]` arrays with an f32 accumulator lowers to one of these — bf16 storage, f32
@@ -2141,6 +2166,43 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_sgemm_{bf16,f16}_nt[_parallel](a, b, c, m, k, n, beta)` call for a recognized
+    /// bf16/f16 mixed-precision `C = A·Bᵀ` (half inputs, f32 accumulate). `beta = 0` (the dot-product
+    /// form overwrites C). Bails (false) if an operand/dim is unbound at the call site, so the caller
+    /// lowers the scalar widening nest. `parallel` selects the multicore kernel (rows independent → it
+    /// is bit-identical to the serial one the interpreter marshals). The widen is lossless, so the
+    /// kernel equals the naive nest under the documented matmul reassociation.
+    fn emit_lowp_gemm(&mut self, nest: &LowpMatmulNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.b),
+            self.lookup(nest.c),
+        ) else {
+            return false;
+        };
+        let (Some(m), Some(k), Some(n)) = (
+            self.dim_value(nest.m),
+            self.dim_value(nest.k),
+            self.dim_value(nest.n),
+        ) else {
+            return false;
+        };
+        let beta = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let func = match (parallel, nest.f16) {
+            (false, false) => self.gemm.bf16_nt,
+            (true, false) => self.gemm.bf16_nt_par,
+            (false, true) => self.gemm.f16_nt,
+            (true, true) => self.gemm.f16_nt_par,
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, c, m, k, n, beta],
+        });
+        true
+    }
+
     /// Fuse a `nn.Linear` matmul immediately followed by its bias-add / activation epilogue into one
     /// `mercury_sgemm_nt_epi` call (`C = act(A·Bᵀ + bias)`), folding the epilogue into the GEMM's C
     /// writeback so C is written once instead of paying a separate read-modify-write pass. Fires only
@@ -3261,6 +3323,14 @@ impl FnLowerer<'_> {
         // multicore kernel is used (rows independent → deterministic, so the gate stays exact).
         if let Some(nest) = match_matmul_i8_nt(pat, iter, body, self.sema, self.interner) {
             if self.emit_i8gemm(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // bf16/f16 mixed-precision `C = A·Bᵀ` (half inputs widened to f32, f32 accumulate) → the half
+        // GEMM microkernel. The widen is lossless, so the kernel equals the scalar nest under the
+        // matmul reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
+        if let Some(nest) = match_matmul_lowp_nt(pat, iter, body, self.sema, self.interner) {
+            if self.emit_lowp_gemm(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -8917,6 +8987,213 @@ fn match_matmul_i8_nt(
     })
 }
 
+/// A recognized bf16/f16 mixed-precision `nn.Linear` nest: `C[m,n] (f32) = A[m,k] · B[n,k]ᵀ`, where A
+/// and B are `[bf16]` or `[f16]` (the same precision), each element widened `as f32`, accumulated in an
+/// f32 `s`. Same shape as [`I8MatmulNest`]; `f16` selects the storage format (bf16 widens via `<<16`,
+/// f16 via F16C).
+struct LowpMatmulNest {
+    a: Symbol,
+    b: Symbol,
+    c: Symbol,
+    m: Dim,
+    k: Dim,
+    n: Dim,
+    f16: bool,
+}
+
+/// Recognize the bf16/f16 mixed-precision `C = A·Bᵀ` nest — the f32 `ijk` dot-product matmul but over
+/// `[bf16]`/`[f16]` operands widened to f32, with an f32 accumulator (the standard mixed-precision
+/// transformer matmul):
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   let mut s: f32 = 0.0;
+///   for k in 0..K { s = s + (a[i*K + k] as f32) * (b[j*K + k] as f32); }
+///   c[i*N + j] = s;
+/// } }
+/// ```
+///
+/// Returns the nest iff A and B are the **same** low precision (both bf16 or both f16), the casts
+/// target f32, the product / accumulator / `c` are f32, B is transposed (`b[j*K+k]` — the `nn.Linear`
+/// weight layout), the strides are consistent (`sa = sb = K`, `sc = N`), and there are no batch
+/// offsets. The widen is lossless, so the kernel (a widen prepass + the tuned f32 GEMM) equals this
+/// nest under the documented matmul reassociation, bit-for-bit across backends. The naive nest
+/// otherwise falls to a scalar widening loop the autovectorizer can't reach. The int8 twin is
+/// [`match_matmul_i8_nt`]; this is its float-accumulator sibling.
+fn match_matmul_lowp_nt(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<LowpMatmulNest> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
+        return None;
+    }
+    // [0] let mut s: f32 = 0.0;
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    // [1] for k in 0..K { s = s + (a[..] as f32) * (b[..] as f32); }
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    // The product (hence the accumulator) must be f32 — the mixed-precision contract.
+    if !matches!(sema.types.get(&prod.id), Some(t) if mir_ty(t) == MirType::F32) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: f1,
+        rhs: f2,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    // Each factor is `(arr[idx] as f32)` over a `[bf16]`/`[f16]` array. Peel the cast (must target
+    // f32), identify A (row i) and B (row j, the transposed weight layout), require A and B the SAME
+    // precision, and reject a transposed A / batch offset (the kernel is NT-only), in either order.
+    let (a_sym, sa, b_sym, sb, f16) = {
+        let mut found = None;
+        for (fa, fb) in [(f1, f2), (f2, f1)] {
+            if scalar_of(fa, sema) != Some(mercury_types::Scalar::F32)
+                || scalar_of(fb, sema) != Some(mercury_types::Scalar::F32)
+            {
+                continue;
+            }
+            let (ai, bi) = (peel_cast(fa), peel_cast(fb));
+            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, interner) else {
+                continue;
+            };
+            let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
+            else {
+                continue;
+            };
+            if !transposed || a_trans || !a_off.is_empty() || !b_off.is_empty() {
+                continue;
+            }
+            let af = match scalar_of(ai, sema) {
+                Some(mercury_types::Scalar::Bf16) => false,
+                Some(mercury_types::Scalar::F16) => true,
+                _ => continue,
+            };
+            let bf = match scalar_of(bi, sema) {
+                Some(mercury_types::Scalar::Bf16) => false,
+                Some(mercury_types::Scalar::F16) => true,
+                _ => continue,
+            };
+            if af != bf {
+                continue;
+            }
+            found = Some((a_sym, sa, b_sym, sb, af));
+            break;
+        }
+        found?
+    };
+    // [2] c[i*N + j] = s;  (C must be f32, plain 2-D, strides consistent.)
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(cv) != Some(s_sym) {
+        return None;
+    }
+    let (cbase, cidx) = as_index1(ct)?;
+    let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
+    if !c_off.is_empty() || sa != kdim || sb != kdim || sc != n {
+        return None;
+    }
+    if scalar_of(ct, sema) != Some(mercury_types::Scalar::F32) {
+        return None;
+    }
+    // An input aliasing the output is a hazard (the kernel writes C in a different order). A == B is
+    // fine (both read-only).
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    Some(LowpMatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        f16,
+    })
+}
+
 /// Recognize the textbook `ijk` dot-product matmul:
 /// `for i { for j { let s = 0.0; for k { s = s + A[i,k]*B[..]; } c[i*N+j] = s; } }`. This is the
 /// natural way to write `C = A·Bᵀ` (both A and B read contiguously). Always `beta = 0` (s overwrites
@@ -9327,6 +9604,28 @@ fn i8matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<I
         return None;
     };
     match_matmul_i8_nt(pat, iter, lb, sema, interner)
+}
+
+/// Is the whole function body a single bf16/f16 mixed-precision `C = A·Bᵀ` nest? Used to intercept a
+/// `@parallel` half-precision matmul *before* the elementwise outliner (which would outline the outer
+/// row loop into per-row scalar loops and lose the kernel dispatch). Detection only — the function is
+/// then lowered normally (`lower_fn`, `parallel = true`) and the embedded recognizer in `lower_for`
+/// emits the multicore half GEMM. A non-`@parallel` whole-function matmul reaches the serial kernel
+/// the same way via the ordinary `lower_fn` path, so it needs no interception.
+fn lowp_matmul_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<LowpMatmulNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_matmul_lowp_nt(pat, iter, lb, sema, interner)
 }
 
 /// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base
