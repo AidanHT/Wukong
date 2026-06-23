@@ -62,6 +62,10 @@ pub enum BackendKind {
     /// GEMM / norm / activation / reduction calls on the local CUDA device. Tolerance-gated against
     /// the interpreter oracle (the CPU↔GPU boundary cannot be bit-exact).
     Gpu,
+    /// General GPU lowering (`--features gpu`, `--backend=gpu-native`): lowers the *whole* program's
+    /// MIR to PTX and runs it on the device (Phase 4) — not the recognizer offload. Additive to and
+    /// independent of [`BackendKind::Gpu`]; tolerance-gated against the interpreter oracle.
+    GpuLower,
 }
 
 /// Compiler invocation options, normally produced by the CLI.
@@ -199,6 +203,7 @@ pub fn compile(opts: &Options) -> i32 {
             BackendKind::Interp => mercury_interp::run_with_output(&program, main, &interner),
             BackendKind::Native => mercury_codegen_cranelift::jit_run(&program, main, &interner),
             BackendKind::Gpu => run_on_gpu(&program, main, &interner),
+            BackendKind::GpuLower => run_on_gpu_lower(&program, main, &interner),
         };
         return match result {
             Ok((exit_code, stdout)) => {
@@ -265,6 +270,31 @@ fn run_on_gpu(
 ) -> Result<(i64, Vec<u8>), String> {
     Err("this `mercuryc` was built without GPU support; rebuild with `--features gpu` (or, from the \
          workspace, `-p mercuryc --features gpu`) to use `--backend=gpu`"
+        .into())
+}
+
+/// Execute `entry` on the **general MIR→PTX** GPU backend (`--backend=gpu-native`, Phase 4): the
+/// whole program is lowered to PTX and run on the device — distinct from the recognizer offload
+/// ([`run_on_gpu`]), which it leaves untouched. Built only with `--features gpu`.
+#[cfg(feature = "gpu")]
+fn run_on_gpu_lower(
+    program: &mercury_mir::Program,
+    entry: mercury_span::Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    mercury_codegen_gpu::lower::jit_run(program, entry, interner)
+}
+
+/// Without the `gpu` feature, `--backend=gpu-native` is a clear build-capability error rather than a
+/// silent CPU fallback (mirrors [`run_on_gpu`]).
+#[cfg(not(feature = "gpu"))]
+fn run_on_gpu_lower(
+    _program: &mercury_mir::Program,
+    _entry: mercury_span::Symbol,
+    _interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    Err("this `mercuryc` was built without GPU support; rebuild with `--features gpu` (or, from the \
+         workspace, `-p mercuryc --features gpu`) to use `--backend=gpu-native`"
         .into())
 }
 
