@@ -16,6 +16,21 @@ untouched. Run GPU work with `cargo test -p mercury_codegen_gpu --features gpu`.
 toolkit — only **running** needs the driver + a device.
 
 ## Layout
+- `src/pool.rs` — **device memory pool** (M7): `DevicePool`, a bump arena over one `cuMemAllocAsync`
+  slab. `alloc`/`alloc_zeros` hand out a sub-range by bumping a cursor (no driver call), `reset()`
+  reclaims everything O(1), `high_water_bytes()` tracks the peak. Handouts are real `CudaSlice<T>`
+  (`leak()`→`upgrade_device_ptr()`), so they feed the existing launchers unchanged; `PoolBuf`
+  **leaks-not-frees** on drop (the slab owns the bytes). Kills per-op alloc/free/zeroing in the
+  resident loop **and** is the prerequisite for graph capture (a captured region must contain no
+  synchronizing alloc). `poison(byte)` dirties the slab so a gate can expose any read-of-uninit.
+- `src/graph.rs` — **CUDA graph capture/replay** (M7): `Graph::capture(stream, record)` records a fixed
+  launch sequence (raw `cuStreamBeginCapture`/`EndCapture` + `cuGraphInstantiateWithFlags(flags=0)`,
+  since cudarc's safe wrapper forces AUTO_FREE), `launch()` replays the whole thing with one
+  `cuGraphLaunch`; Drop-correct. Plus `PinnedBuf<T>` (page-locked host staging for async H2D/D2H). Two
+  gotchas it works around: cudarc's `default_stream()` is the **un-capturable NULL stream** (capture on
+  a dedicated `new_stream()`), and cudarc enables **event tracking by default** → once a 2nd stream
+  exists it inserts cross-stream waits capture rejects (build the layer + buffers with event tracking
+  disabled so nothing carries events; see `with_event_tracking_disabled` in `gpu.rs` tests).
 - `src/lib.rs` — crate root; `GPU_ENABLED` const; re-exports behind `#[cfg(feature = "gpu")]`.
 - `src/gpu.rs` — host harness: `Gpu` (context + default stream + PTX-module cache), the process-wide
   `gpu()` accessor (a `Mutex<Option<Gpu>>` — `None` means no device → tests *skip*, not fail), and the
@@ -24,7 +39,14 @@ toolkit — only **running** needs the driver + a device.
   (f32, simple + register-blocked), `gemm_nt_f16`/`_bf16` (WMMA tensor core), `gemm_nt_fp8` + `fp8_tile`
   (fp8 mma.sync), `norm` (softmax/LayerNorm/RMSNorm), `conv2d`, `flash_attn`, and `transformer_layer`
   (a whole pre-norm encoder layer, end-to-end GPU-resident — chains the above on device buffers with no
-  host round-trip; `TransformerWeights` bundles the six projections).
+  host round-trip; `TransformerWeights` bundles the six projections). **M7 additions (append-only):**
+  `ResidentLayerF16::forward_device_pooled{,_on}` (the pooled forward — same kernels/configs/dtypes as
+  `forward_device`, scratch from a `DevicePool`, result into a caller-owned persistent buffer; `_on`
+  takes an explicit capturable stream), and the test-module M7 gates/benches
+  (`resident_layer_{pooled,graphed}_matches_eager`, `resident_stack_graphed_matches_eager`,
+  `pool_graph_vs_unpooled`, `decode_stack_latency`, `overlap_throughput`,
+  `concurrent_forwards_throughput`) + the `forward_stack_pooled_on` / `capture_resident_{layer,stack}`
+  helpers that fold a whole N-layer stack into one `cuGraphLaunch`.
 - `src/cubin.rs` — persistent **cubin cache** (M10): `ptx_to_cubin` runs the driver's `cuLink*` JIT to
   emit SASS; `Gpu::load_module_cached` caches it on disk (keyed by PTX hash + driver version) so warm
   processes load precompiled cubins via `cuModuleLoad` instead of re-JITing. Graceful fallback to a
