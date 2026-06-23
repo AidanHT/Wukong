@@ -135,6 +135,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   **bf16/f16 mixed-precision** FFN fuses the same way — a half matmul + its bias/activation loop folds
   to `mercury_sgemm_{bf16,f16}_nt_epi` (the widen prepass feeds the identical f32 epilogue), so the
   mixed-precision transformer FFN gets bias + activation for free (`tests/run/linear_{bf16,f16}_ffn.mer`).
+  The **residual projection** `x = x + act(x·Wᵀ + bias)` (the transformer skip connection) also folds
+  to `mercury_sgemm_nt_epi`, with **beta = 1** so the kernel accumulates `act(x_residual + A·Bᵀ + bias)`
+  in its writeback. The accumulate store would otherwise block the matmul recognizer and drop the whole
+  nest to a scalar loop, so this recovers the full GEMM dispatch + the fused residual/bias/activation
+  with no backend change (`match_matmul_residual`, `tests/run/linear_residual{,_relu}.mer`).
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
 - Intrinsics `print`/`println`/`assert`.

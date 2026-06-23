@@ -168,6 +168,17 @@ C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 G
 while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
 magnitude gap (caused by C's serial reduction, not a strided-access strawman; see Fairness notes).
 
+**Residual projection (`x = x + act(x·Wᵀ + bias)`) — the transformer skip connection.** The output
+projection of every attention/FFN sub-layer adds its result back to its input. Written fused in one
+nest, the *accumulate* store `x[i*N+j] = act(x[i*N+j] + dot + bias[j])` (not the bare `x = dot`) would
+**block the matmul recognizer entirely** — so the whole nest, GEMM and all, falls to a scalar loop in a
+naive compiler. Mercury recognizes it and dispatches to **`mercury_sgemm_nt_epi` with `beta = 1`**: the
+kernel accumulates `act(beta·x_old + A·Bᵀ + bias)` = `act(x_residual + A·Bᵀ + bias)` straight in its
+C-tile writeback, so it gets the *same* ~19–26× single-core / ~52–104× parallel GEMM dispatch as the
+plain `nn.Linear` above, **plus** the residual-add and bias/activation folded in for free (the
+fused-epilogue kernel — no new symbol, no separate pass). This reuses the existing `nt_epi` kernel
+end-to-end, so it stays bit-exact across backends (`tests/run/linear_residual{,_relu}.mer`).
+
 ### Weight-gradient `C = Aᵀ·B` — the training backward GEMM Mercury dispatches, gcc cannot
 
 The backward pass computes `dW = dYᵀ·X`: the contraction (batch) axis is the **outer** index of both
