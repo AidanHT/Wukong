@@ -49,6 +49,7 @@ pub fn lower_program(
         velem: interner.intern("mercury_velem_f32"),
         vhorner: interner.intern("mercury_vhorner_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
+        argreduce: interner.intern("mercury_argreduce_f32"),
         norm: interner.intern("mercury_norm_f32"),
         norm_par: interner.intern("mercury_norm_f32_parallel"),
         norm_affine: interner.intern("mercury_norm_affine_f32"),
@@ -473,6 +474,10 @@ struct GemmSyms {
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
     sred_par: Symbol,
+    /// The deterministic argmax/argmin reduction (`mercury_argreduce_f32(x, n, op) -> i64`, lowest
+    /// index on ties). Serial form (bit-identical to the parallel one), which the interpreter also
+    /// calls — so a recognized argmax loop stays exact across backends.
+    argreduce: Symbol,
     /// The fused single-pass row-wise normalization kernel (`mercury_norm_f32(x, out, rows, cols,
     /// eps_bits, op)`): an idiomatic multi-pass softmax / LayerNorm / RMSNorm written in plain loops
     /// lowers to this one call. The interpreter marshals through the identical kernel.
@@ -603,6 +608,8 @@ const RED_SUM: i64 = 2; // sum(x[k])
 const RED_MAX: i64 = 4; // max(x[k])  — fold by fmax
 const RED_MIN: i64 = 5; // min(x[k])  — fold by fmin
 const RED_MAXABS: i64 = 6; // max(|x[k]|) — fmax(m, abs(x[k])), symmetric int8 quant absmax
+const RED_ARGMAX: i64 = 7; // argmax_i x[i] — greedy decode / top-1 (lowest index on ties)
+const RED_ARGMIN: i64 = 8; // argmin_i x[i]
 
 // Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
@@ -2358,6 +2365,185 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Recognize an argmax/argmin loop body `if x[k] CMP bv { bv = x[k]; bi = k; }` (strict `>` →
+    /// argmax / `<` → argmin; `bi = k` may be `k as <int>`). Returns `(bv, bi, op, x)`. The inner `if`
+    /// may be the body's single statement *or* its tail (a Unit-valued `if` with no else). Pure.
+    fn match_argreduce_kernel(
+        &self,
+        body: &Block,
+        k: Symbol,
+    ) -> Option<(Symbol, Symbol, i64, Symbol)> {
+        // The lone `if` may sit in `stmts` (followed by `;`) or be the block's tail expression.
+        let if_expr = match (body.stmts.as_slice(), &body.tail) {
+            ([only], None) => match &only.kind {
+                StmtKind::Expr(e) => e,
+                _ => return None,
+            },
+            ([], Some(e)) => e.as_ref(),
+            _ => return None,
+        };
+        let ExprKind::If {
+            cond,
+            then_branch,
+            else_branch: None,
+        } = &if_expr.kind
+        else {
+            return None;
+        };
+        let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+            return None;
+        };
+        // Canonical `x[k] CMP bv`: idx on the left, running-best scalar on the right.
+        let red_op = match op {
+            ast::BinOp::Gt => RED_ARGMAX,
+            ast::BinOp::Lt => RED_ARGMIN,
+            _ => return None,
+        };
+        let x = self.index_by_loopvar(lhs, k)?;
+        let bv = single_path(rhs)?;
+        // then-branch: exactly `bv = x[k]; bi = k;` (order-flexible), no tail value.
+        if then_branch.tail.is_some() || then_branch.stmts.len() != 2 {
+            return None;
+        }
+        let mut bi: Option<Symbol> = None;
+        let mut saw_val = false;
+        for s in &then_branch.stmts {
+            let StmtKind::Assign {
+                target,
+                op: ast::AssignOp::Assign,
+                value,
+            } = &s.kind
+            else {
+                return None;
+            };
+            let t = single_path(target)?;
+            if t == bv {
+                // bv = x[k]
+                if self.index_by_loopvar(value, k) != Some(x) {
+                    return None;
+                }
+                saw_val = true;
+            } else {
+                // bi = k  (or `bi = k as <int>`)
+                let is_k = single_path(value) == Some(k)
+                    || matches!(&value.kind, ExprKind::Cast { expr, .. } if single_path(expr) == Some(k));
+                if !is_k {
+                    return None;
+                }
+                bi = Some(t);
+            }
+        }
+        match (saw_val, bi) {
+            (true, Some(bi)) => Some((bv, bi, red_op, x)),
+            _ => None,
+        }
+    }
+
+    /// Lower a recognized argmax/argmin loop `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }`
+    /// to one `mercury_argreduce_f32(x, n, op)` call plus a branchless reconcile of the kernel's
+    /// (value, index) against the loop's running `(bv, bi)`: `(bv,bi) = arg_fold((bv,bi),(x[ki],ki))`.
+    /// Because `arg_fold` is associative (lowest-index tie-break, a total order) and the loop covers
+    /// `x[0..n]` (start 0), the loop result equals this reconcile for **any** seed — so the preceding
+    /// `let bv = …; let bi = …;` need not be inspected. Both backends marshal the identical kernel, so
+    /// the differential oracle stays exact. Returns false (fall back to the scalar loop) on any mismatch.
+    fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
+        // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
+        // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((bv, bi, op, xb)) = self.match_argreduce_kernel(body, *k) else {
+            return false;
+        };
+        // `bv` an in-scope f32 scalar slot; `bi` an in-scope integer slot; `x` an array base in scope.
+        let Some((bv_slot, MirType::F32)) = self.lookup(bv) else {
+            return false;
+        };
+        let Some((bi_slot, bi_ty)) = self.lookup(bi) else {
+            return false;
+        };
+        if !matches!(
+            bi_ty,
+            MirType::I64 | MirType::I32 | MirType::I16 | MirType::I8
+        ) {
+            return false;
+        }
+        let Some((xv, _)) = self.lookup(xb) else {
+            return false;
+        };
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        // ki = lowest-index argmax/argmin over x[0..n]; kv = x[ki].
+        let ki = self.builder.build(
+            MirType::I64,
+            Op::Call {
+                func: self.gemm.argreduce,
+                args: vec![xv, n, opv],
+            },
+        );
+        let kptr = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: xv,
+                index: ki,
+                elem: MirType::F32,
+            },
+        );
+        let kv = self.builder.build(MirType::F32, Op::Load(kptr, MirType::F32));
+        // Reconcile with the running (bv, bi): better = (kv CMP bv) || (kv == bv && ki < bi).
+        let bv_cur = self
+            .builder
+            .build(MirType::F32, Op::Load(bv_slot, MirType::F32));
+        let bi_cur = self
+            .builder
+            .build(bi_ty.clone(), Op::Load(bi_slot, bi_ty.clone()));
+        let pred = if op == RED_ARGMAX {
+            CmpOp::Fogt
+        } else {
+            CmpOp::Folt
+        };
+        let strictly = self
+            .builder
+            .build(MirType::I1, Op::Cmp(pred, kv, bv_cur));
+        let eq = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Foeq, kv, bv_cur));
+        let ki_bi = self.coerce_to(ki, &MirType::I64, &bi_ty, true);
+        let idx_lt = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, ki_bi, bi_cur));
+        let tie = self.builder.build(MirType::I1, Op::Bin(BinOp::And, eq, idx_lt));
+        let better = self
+            .builder
+            .build(MirType::I1, Op::Bin(BinOp::Or, strictly, tie));
+        let new_bv = self
+            .builder
+            .build(MirType::F32, Op::Select(better, kv, bv_cur));
+        let new_bi = self
+            .builder
+            .build(bi_ty.clone(), Op::Select(better, ki_bi, bi_cur));
+        self.builder.build_void(Op::Store {
+            ptr: bv_slot,
+            value: new_bv,
+        });
+        self.builder.build_void(Op::Store {
+            ptr: bi_slot,
+            value: new_bi,
+        });
+        true
+    }
+
     /// Lower a recognized `@parallel` reduction `for k in 0..n { s += f(x[k], y[k]) }` to one
     /// `s = s + mercury_sreduce_f32_parallel(x, y, n, op)`. The kernel returns the same value the loop
     /// would (a reassociation of the same terms), and the interpreter calls the identical *serial*
@@ -2970,6 +3156,13 @@ impl FnLowerer<'_> {
 
         let ity = self.expr_mir(start);
         let signed = self.signed(start);
+
+        // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
+        // `mercury_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
+        // would otherwise if-convert the branch into a scalar lane loop). The greedy-decode hot path.
+        if !inclusive && step.is_none() && self.try_emit_argreduce(pat, start, end, body) {
+            return;
+        }
 
         // Straight-line elementwise loops lower to SIMD (vector main loop + scalar remainder); this
         // is purely an optimization, so on any doubt it returns false and we lower scalar below.
