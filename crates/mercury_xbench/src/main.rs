@@ -940,6 +940,7 @@ fn bench_norm(cc: &str, dir: &Path) {
         );
         for op in [
             "softmax",
+            "logsoftmax",
             "layernorm",
             "rmsnorm",
             "layernorm_affine",
@@ -1025,6 +1026,14 @@ fn mer_norm(cols: usize, op: &str) -> String {
              let inv: f32 = 1.0 / s; \
              for i in 0..{cols} {{ out[i] = out[i] * inv; }}"
         ),
+        "logsoftmax" => format!(
+            "let mut m: f32 = out[0]; \
+             for i in 0..{cols} {{ m = fmax(m, out[i]); }} \
+             let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + exp(out[i] - m); }} \
+             let ls: f32 = log(s); \
+             for i in 0..{cols} {{ out[i] = (out[i] - m) - ls; }}"
+        ),
         "layernorm" => format!(
             "let mut s: f32 = 0.0; \
              for i in 0..{cols} {{ s = s + out[i]; }} \
@@ -1069,6 +1078,11 @@ fn c_norm(cols: usize, op: &str) -> String {
              float s=0.0f; for(long i=0;i<C;i++){ out[i]=expf(out[i]-m); s+=out[i]; } \
              float inv=1.0f/s; for(long i=0;i<C;i++) out[i]*=inv;"
         }
+        "logsoftmax" => {
+            "float m=out[0]; for(long i=0;i<C;i++) if(out[i]>m) m=out[i]; \
+             float s=0.0f; for(long i=0;i<C;i++) s+=expf(out[i]-m); \
+             float ls=logf(s); for(long i=0;i<C;i++) out[i]=(out[i]-m)-ls;"
+        }
         "layernorm" => {
             "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]; \
              float mean=s/(float)C; float v=0.0f; \
@@ -1106,6 +1120,11 @@ fn rust_norm(cols: usize, op: &str) -> String {
             "let mut m=*out.add(0); for i in 0..C { let v=*out.add(i); if v>m { m=v; } } \
              let mut s=0.0f32; for i in 0..C { let e=(*out.add(i)-m).exp(); *out.add(i)=e; s+=e; } \
              let inv=1.0f32/s; for i in 0..C { *out.add(i)*=inv; }"
+        }
+        "logsoftmax" => {
+            "let mut m=*out.add(0); for i in 0..C { let v=*out.add(i); if v>m { m=v; } } \
+             let mut s=0.0f32; for i in 0..C { s+=(*out.add(i)-m).exp(); } \
+             let ls=s.ln(); for i in 0..C { *out.add(i)=(*out.add(i)-m)-ls; }"
         }
         "layernorm" => {
             "let mut s=0.0f32; for i in 0..C { s+=*out.add(i); } \
@@ -1994,6 +2013,28 @@ fn kernels() -> Vec<Kernel> {
             c: c_kernel("for(long i=0;i<N;i++){ float v=x[i]; out[i]= v/(1.0f+expf(-v)); }"),
             rust: rust_kernel(
                 "for i in 0..N { let v= *x.add(i); *out.add(i)= v/(1.0+(-v).exp()); }",
+            ),
+        },
+        // argmax — the greedy-decode hot path (`next_token = argmax(logits)`). Mercury recognizes the
+        // `if x[k] > bv { bv = x[k]; bi = k }` loop and dispatches to the deterministic argreduce kernel
+        // (branchless 8-lane fold); gcc/rustc run a branchy scalar loop. Like `dot`, it writes only
+        // out[0] (the index), so the full-buffer cross-check sees the same single value in all three.
+        Kernel {
+            name: "argmax",
+            bytes_per_call: N * 4,
+            note: "out[0] = argmax(x): branchless argreduce kernel vs a branchy scalar loop",
+            mer: mer_kernel(&format!(
+                "let mut bv: f32 = x[0]; let mut bi: i64 = 0; \
+                 for k in 0..{nlit} {{ if x[k] > bv {{ bv = x[k]; bi = k as i64; }} }} \
+                 out[0] = bi as f32;"
+            )),
+            c: c_kernel(
+                "float bv=x[0]; long bi=0; \
+                 for(long k=0;k<N;k++){ if(x[k]>bv){ bv=x[k]; bi=k; } } out[0]=(float)bi;",
+            ),
+            rust: rust_kernel(
+                "let mut bv= *x.add(0); let mut bi=0i64; \
+                 for k in 0..N { let v= *x.add(k); if v>bv { bv=v; bi=k as i64; } } *out.add(0)=bi as f32;",
             ),
         },
         // Transcendentals: the regime a tensor compiler should dominate idiomatic scalar source.
