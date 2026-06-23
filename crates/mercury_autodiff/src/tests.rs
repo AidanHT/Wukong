@@ -328,3 +328,133 @@ fn relu_via_select() {
     let want: Vec<f64> = xs.iter().map(|&v| if v > 0.0 { 1.0 } else { 0.0 }).collect();
     assert_close(&g[0], &want, "d(sum relu)/dx");
 }
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end vertical slice: a small MLP, fully unrolled in scalar f64 MIR, differentiated w.r.t.
+// both weight matrices, gradients FD-gated, then trained by SGD with the loss asserted to fall.
+// matmul appears as FMA chains, relu as select; this proves the engine composes correctly into a
+// trainable network using only the scalar core — no tensor kernels yet.
+// ---------------------------------------------------------------------------------------------
+
+const IN: usize = 3;
+const HID: usize = 4;
+const OUT: usize = 2;
+
+/// Forward: `h = relu(W1 . x)`, `y = W2 . h`, `loss = sum_o (y[o] - t[o])^2` (MSE).
+/// Params: [W1 (HID*IN), x (IN), W2 (OUT*HID), t (OUT), out (1)]; differentiable inputs W1, W2.
+fn build_mlp(it: &mut Interner) -> Fwd {
+    let mut b = Builder::new(sym(it, "mlp"), MirType::Void);
+    let w1 = b.add_param(PTR);
+    let x = b.add_param(PTR);
+    let w2 = b.add_param(PTR);
+    let t = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let zero = b.build(F64, Op::ConstFloat(0.0, F64));
+
+    let xs: Vec<ValueId> = (0..IN as i64).map(|k| load_elem(&mut b, x, k)).collect();
+
+    // Hidden layer: h[j] = relu(sum_k W1[j*IN + k] * x[k]).
+    let mut h = Vec::with_capacity(HID);
+    for j in 0..HID {
+        let mut acc = b.build(F64, Op::ConstFloat(0.0, F64));
+        for k in 0..IN {
+            let w = load_elem(&mut b, w1, (j * IN + k) as i64);
+            acc = b.build(F64, Op::Fma(w, xs[k], acc));
+        }
+        let pos = b.build(MirType::I1, Op::Cmp(mercury_mir::CmpOp::Fogt, acc, zero));
+        h.push(b.build(F64, Op::Select(pos, acc, zero)));
+    }
+
+    // Output + MSE loss: loss = sum_o (sum_j W2[o*HID + j] * h[j] - t[o])^2.
+    let mut loss = b.build(F64, Op::ConstFloat(0.0, F64));
+    for o in 0..OUT {
+        let mut acc = b.build(F64, Op::ConstFloat(0.0, F64));
+        for j in 0..HID {
+            let w = load_elem(&mut b, w2, (o * HID + j) as i64);
+            acc = b.build(F64, Op::Fma(w, h[j], acc));
+        }
+        let to = load_elem(&mut b, t, o as i64);
+        let diff = b.build(F64, Op::Bin(BinOp::FSub, acc, to));
+        loss = b.build(F64, Op::Fma(diff, diff, loss)); // loss += diff^2
+    }
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![HID * IN, IN, OUT * HID, OUT, 1],
+        loss_out: 4,
+    }
+}
+
+/// Tiny deterministic LCG → values in roughly [-0.5, 0.5], for reproducible weight init.
+fn lcg(seed: &mut u64) -> f64 {
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*seed >> 40) as f64 / (1u64 << 24) as f64) - 0.5
+}
+
+#[test]
+fn mlp_gradient_matches_finite_difference() {
+    let mut it = Interner::default();
+    let fwd = build_mlp(&mut it);
+    let mut seed = 0x1234_5678u64;
+    let w1: Vec<f64> = (0..HID * IN).map(|_| lcg(&mut seed)).collect();
+    let w2: Vec<f64> = (0..OUT * HID).map(|_| lcg(&mut seed)).collect();
+    let x: Vec<f64> = vec![0.7, -0.3, 0.9];
+    let t: Vec<f64> = vec![0.4, -0.6];
+    let inputs = vec![w1, x, w2, t, vec![0.0]];
+    // Gradients w.r.t. both weight matrices, full buffer, gated against the central difference.
+    gate(&fwd, &[0, 2], &inputs, &mut it);
+}
+
+#[test]
+fn mlp_sgd_decreases_loss() {
+    let mut it = Interner::default();
+    let fwd = build_mlp(&mut it);
+    let (prog, gname) = build(&fwd.func, &[0, 2], &mut it);
+
+    let mut seed = 0xC0FFEEu64;
+    let mut w1: Vec<f64> = (0..HID * IN).map(|_| lcg(&mut seed)).collect();
+    let mut w2: Vec<f64> = (0..OUT * HID).map(|_| lcg(&mut seed)).collect();
+    let x: Vec<f64> = vec![0.5, 0.8, -0.4];
+    let t: Vec<f64> = vec![0.7, -0.2];
+
+    let loss_now = |w1: &[f64], w2: &[f64], it: &Interner| -> f64 {
+        let mut bufs = vec![
+            w1.to_vec(),
+            x.clone(),
+            w2.to_vec(),
+            t.clone(),
+            vec![0.0],
+        ];
+        loss_at(&prog, fwd.func.name, &mut bufs, 4, it)
+    };
+
+    let lr = 0.03;
+    let l0 = loss_now(&w1, &w2, &it);
+    let mut prev = l0;
+    let mut last = l0;
+    for step in 0..400 {
+        let inputs = vec![w1.clone(), x.clone(), w2.clone(), t.clone(), vec![0.0]];
+        let g = analytic_grad(&prog, gname, &fwd, &inputs, &[0, 2], &it);
+        for (wi, gi) in w1.iter_mut().zip(&g[0]) {
+            *wi -= lr * gi;
+        }
+        for (wi, gi) in w2.iter_mut().zip(&g[1]) {
+            *wi -= lr * gi;
+        }
+        last = loss_now(&w1, &w2, &it);
+        // Full-batch GD with a small step size descends monotonically here (allow ~rounding slack).
+        assert!(
+            last <= prev + 1e-9,
+            "loss rose at step {step}: {prev} -> {last}"
+        );
+        prev = last;
+    }
+    // And it should make substantial progress, not just inch down.
+    assert!(
+        last < 0.1 * l0,
+        "SGD did not converge: loss {l0} -> {last} after 400 steps"
+    );
+}
