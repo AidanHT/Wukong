@@ -1,0 +1,200 @@
+module examples.gpt2
+
+// =====================================================================================
+// GPT-2 transformer block, written in Mercury's surface as recognized op-forms.
+// =====================================================================================
+//
+// This is one **pre-LayerNorm** GPT-2 decoder block — the unit the 124M model stacks 12×:
+//
+//     a   = x + Wo · MHCausalAttn( LayerNorm1(x) )      // attention sublayer + residual
+//     out = a + W2 · GELU( W1 · LayerNorm2(a) )         // MLP sublayer       + residual
+//
+// Every sub-op is spelled in the form the compiler RECOGNIZES and dispatches to a tuned
+// kernel (the same lowering XLA/TVM use for a matmul/softmax/norm op, not the naive nest
+// gcc/rustc emit):
+//   * the LayerNorms are the batched `for r { mean; var; rsqrt; affine }` form  -> mercury_norm_affine_f32
+//   * the Q/K/V/O/FFN projections are the `nn.Linear` C = A·Bᵀ dot-product nest -> the tuned GEMM
+//   * the causal attention is Q·Kᵀ -> masked row-softmax -> P·V                 -> GEMM + fused norm
+//   * the GELU is the tanh-approximation elementwise loop                       -> the 256-bit vmath kernel
+//
+// Under `--run` the interpreter executes those same kernels (the differential oracle), and the
+// native / `--backend=gpu-native` backends must agree with it bit-for-bit / within tolerance.
+//
+// Config here is small enough to run on the interpreter oracle end-to-end (the 124M config —
+// D=768, H=12, Dff=3072, 12 layers, vocab=50257 — is driven by the host benchmark harness, which
+// allocates the device buffers a `--run` stack cannot hold). The *shapes are GPT-2's, scaled*:
+//
+//     S   = 8      tokens (sequence length)
+//     D   = 64     model / embedding dim
+//     H   = 4      attention heads        (head dim hd = D/H = 16)
+//     Dff = 256    FFN hidden dim         (= 4·D, the GPT-2 ratio)
+//
+// All buffers are flat row-major: a [S, D] tensor is `t[s*D + d]`.
+
+// -------------------------------------------------------------------------------------
+// One GPT-2 block. `x` and `out` are [S, D]; the weights are the six learned projections
+// plus the two LayerNorm affine pairs. Scratch is function-local (no host round-trip).
+// -------------------------------------------------------------------------------------
+fn gpt2_block(
+    x:    [f32; 512],     // [S=8, D=64]  input hidden states
+    ln1g: [f32; 64],  ln1b: [f32; 64],   // LayerNorm 1 gain / bias  (per-channel)
+    wq:   [f32; 4096], wk:  [f32; 4096],  // [D, D]  query / key projections (row j = neuron j)
+    wv:   [f32; 4096], wo:  [f32; 4096],  // [D, D]  value / output projections
+    ln2g: [f32; 64],  ln2b: [f32; 64],   // LayerNorm 2 gain / bias
+    w1:   [f32; 16384],   // [Dff=256, D=64]  MLP up-projection
+    w2:   [f32; 16384],   // [D=64, Dff=256]  MLP down-projection
+    out:  [f32; 512],     // [S, D]  output hidden states
+) {
+    let mut nrm:   [f32; 512]  = [0.0; 512];   // LayerNorm output [S, D]
+    let mut q:     [f32; 512]  = [0.0; 512];   // Q = nrm·Wqᵀ   [S, D]
+    let mut k:     [f32; 512]  = [0.0; 512];   // K = nrm·Wkᵀ   [S, D]
+    let mut v:     [f32; 512]  = [0.0; 512];   // V = nrm·Wvᵀ   [S, D]
+    let mut scores:[f32; 64]   = [0.0; 64];    // per-head attention scores [S, S]
+    let mut attn:  [f32; 512]  = [0.0; 512];   // concat( head outputs )    [S, D]
+    let mut a:     [f32; 512]  = [0.0; 512];   // residual stream after attention [S, D]
+    let mut ff1:   [f32; 2048] = [0.0; 2048];  // MLP hidden [S, Dff]
+
+    // ---- 1. LayerNorm1(x) -> nrm  (batched affine norm; copy in, normalize in place) ----
+    for i in 0..512 { nrm[i] = x[i]; }
+    for r in 0..8 {
+        let mut s: f32 = 0.0;
+        for i in 0..64 { s = s + nrm[r*64+i]; }
+        let mean: f32 = s / 64.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..64 { vv = vv + (nrm[r*64+i] - mean) * (nrm[r*64+i] - mean); }
+        let inv: f32 = rsqrt(vv / 64.0 + 0.00001);
+        for i in 0..64 { nrm[r*64+i] = (nrm[r*64+i] - mean) * inv * ln1g[i] + ln1b[i]; }
+    }
+
+    // ---- 2. Q, K, V projections:  Q = nrm·Wqᵀ, etc.  (nn.Linear, [S,D]·[D,D]ᵀ) ----
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wq[j*64+p]; }
+        q[i*64+j] = s;
+    } }
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wk[j*64+p]; }
+        k[i*64+j] = s;
+    } }
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wv[j*64+p]; }
+        v[i*64+j] = s;
+    } }
+
+    // ---- 3. Multi-head causal attention.  H=4 heads, hd=16, scale 1/sqrt(16) = 0.25 ----
+    // Each head h works over the column slice [h*16 .. h*16+16) of Q/K/V; the masked
+    // row-softmax makes token i attend only to tokens j <= i (autoregressive).
+    for h in 0..4 {
+        // scores = Qh · Khᵀ   (scaled)
+        for i in 0..8 { for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..16 { s = s + q[i*64 + h*16 + p] * k[j*64 + h*16 + p]; }
+            scores[i*8+j] = s * 0.25;
+        } }
+        // causal mask + numerically-stable row softmax (in place)
+        for i in 0..8 {
+            for j in 0..8 { if j > i { scores[i*8+j] = -1.0e30; } }
+            let mut m: f32 = scores[i*8+0];
+            for j in 0..8 { m = fmax(m, scores[i*8+j]); }
+            let mut sm: f32 = 0.0;
+            for j in 0..8 { let e: f32 = exp(scores[i*8+j] - m); scores[i*8+j] = e; sm = sm + e; }
+            let inv: f32 = 1.0 / sm;
+            for j in 0..8 { scores[i*8+j] = scores[i*8+j] * inv; }
+        }
+        // head output = scores · Vh   -> attn[:, h*16 ..]
+        for i in 0..8 { for j in 0..16 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + scores[i*8+p] * v[p*64 + h*16 + j]; }
+            attn[i*64 + h*16 + j] = s;
+        } }
+    }
+
+    // ---- 4. Output projection + residual:  a = x + attn·Woᵀ ----
+    // Projection is a pure nn.Linear (-> GEMM); the residual is a separate streaming add
+    // (-> vector add) — the split keeps each piece on its recognized fast path.
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + attn[i*64+p] * wo[j*64+p]; }
+        a[i*64+j] = s;
+    } }
+    for i in 0..512 { a[i] = x[i] + a[i]; }
+
+    // ---- 5. LayerNorm2(a) -> nrm ----
+    for i in 0..512 { nrm[i] = a[i]; }
+    for r in 0..8 {
+        let mut s: f32 = 0.0;
+        for i in 0..64 { s = s + nrm[r*64+i]; }
+        let mean: f32 = s / 64.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..64 { vv = vv + (nrm[r*64+i] - mean) * (nrm[r*64+i] - mean); }
+        let inv: f32 = rsqrt(vv / 64.0 + 0.00001);
+        for i in 0..64 { nrm[r*64+i] = (nrm[r*64+i] - mean) * inv * ln2g[i] + ln2b[i]; }
+    }
+
+    // ---- 6. MLP up-projection + GELU:  ff1 = gelu(nrm·W1ᵀ)   [S,D]·[Dff,D]ᵀ -> [S,Dff] ----
+    for i in 0..8 { for j in 0..256 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * w1[j*64+p]; }
+        ff1[i*256+j] = s;
+    } }
+    // GELU (tanh approximation), the bit-exact elementwise form -> 256-bit vmath kernel.
+    for i in 0..2048 {
+        let u: f32 = 0.7978845608 * (ff1[i] + 0.044715 * ff1[i] * ff1[i] * ff1[i]);
+        let t: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);
+        ff1[i] = 0.5 * ff1[i] * (1.0 + t);
+    }
+
+    // ---- 7. MLP down-projection + residual:  out = a + ff1·W2ᵀ   [S,Dff]·[D,Dff]ᵀ -> [S,D] ----
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..256 { s = s + ff1[i*256+p] * w2[j*256+p]; }
+        out[i*64+j] = s;
+    } }
+    for i in 0..512 { out[i] = a[i] + out[i]; }
+}
+
+// -------------------------------------------------------------------------------------
+// Driver: deterministic small inputs, one block, print a few rounded outputs so the
+// differential gate (interp == native, -O0 == -O3) has a stable signature to compare.
+// -------------------------------------------------------------------------------------
+fn main() -> i32 {
+    let mut x:    [f32; 512]  = [0.0; 512];
+    let mut ln1g: [f32; 64]   = [1.0; 64];
+    let mut ln1b: [f32; 64]   = [0.0; 64];
+    let mut wq:   [f32; 4096] = [0.0; 4096];
+    let mut wk:   [f32; 4096] = [0.0; 4096];
+    let mut wv:   [f32; 4096] = [0.0; 4096];
+    let mut wo:   [f32; 4096] = [0.0; 4096];
+    let mut ln2g: [f32; 64]   = [1.0; 64];
+    let mut ln2b: [f32; 64]   = [0.0; 64];
+    let mut w1:   [f32; 16384] = [0.0; 16384];
+    let mut w2:   [f32; 16384] = [0.0; 16384];
+    let mut out:  [f32; 512]  = [0.0; 512];
+
+    // hidden states ~ small, centered
+    for i in 0..512 { x[i] = ((i % 13) as f32) * 0.02 - 0.12; }
+    // projections ~ N(0, 0.02)-ish, deterministic
+    for i in 0..4096 {
+        wq[i] = ((i % 7)  as f32) * 0.01 - 0.03;
+        wk[i] = ((i % 11) as f32) * 0.008 - 0.04;
+        wv[i] = ((i % 5)  as f32) * 0.012 - 0.024;
+        wo[i] = ((i % 9)  as f32) * 0.009 - 0.036;
+    }
+    for i in 0..16384 {
+        w1[i] = ((i % 17) as f32) * 0.004 - 0.032;
+        w2[i] = ((i % 19) as f32) * 0.003 - 0.027;
+    }
+    // a couple of non-trivial LayerNorm gains/biases
+    for i in 0..64 { ln1g[i] = 1.0 + ((i % 3) as f32) * 0.1; ln2g[i] = 1.0 - ((i % 4) as f32) * 0.05; }
+
+    gpt2_block(x, ln1g, ln1b, wq, wk, wv, wo, ln2g, ln2b, w1, w2, out);
+
+    // Output rows are x + attention + MLP; print a few rounded signatures.
+    print(round(out[0]   * 10000.0) as i32);
+    print(round(out[64]  * 10000.0) as i32);   // row 1, col 0
+    print(round(out[256] * 10000.0) as i32);   // row 4, col 0
+    print(round(out[511] * 10000.0) as i32);   // last element
+    return 0;
+}
