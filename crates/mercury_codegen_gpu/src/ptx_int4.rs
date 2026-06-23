@@ -251,8 +251,10 @@ fn entry_w4a16(
     group: usize,
     zero_point: bool,
     static_dims: Option<(usize, usize, usize)>,
+    splitk: bool,
 ) -> String {
     assert!(group.is_power_of_two() && group % BK == 0, "group must be a power of two ≥ {BK}");
+    assert!(!(splitk && static_dims.is_some()), "{name}: split-K uses runtime M·N for the plane offset (dynamic dims)");
     if let Some((m, n, k)) = static_dims {
         assert!(m % bm == 0 && n % bn == 0 && k % group == 0, "static dims must tile the kernel");
     }
@@ -296,6 +298,9 @@ fn entry_w4a16(
     // register, and reusing the name makes ptxas read it as a pred.
     s += "    .reg .b32 %nrow,%half,%nn,%sidx,%widx,%word,%wsh,%sbase,%kw,%ktw,%kgr,%ktg,%pk0,%pk1,%pk2,%pk3,%scx2,%zsub;\n";
     s += "    .reg .b16 %sc;\n";
+    if splitk {
+        s += "    .reg .b32 %kbeg,%kend,%kslice;\n";
+    }
     if zero_point {
         s += "    .reg .b32 %zv,%ztmp;\n    .reg .b64 %Zeros,%zptr;\n";
     }
@@ -342,6 +347,16 @@ fn entry_w4a16(
     }
     s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    if splitk {
+        // K-split across gridDim.z: this CTA owns K-range [kbeg,kend) and writes its partial f32 tile to
+        // its OWN M×N plane of the partials buffer (C rebased by ctaid.z·M·N) — no overlap, no atomics ⇒
+        // deterministic. kslice = K/gridDim.z (host guarantees K%(sk·group)==0 ⇒ each split is whole
+        // groups, so the per-group scale indexing kt/group stays correct). A separate fixed-order
+        // reduction kernel (`w4a16_splitk_reduce`) then sums the gridDim.z planes into the final C.
+        s += "    mov.u32 %tmp,%nctaid.z;\n    div.u32 %kslice,%K,%tmp;\n";
+        s += "    mov.u32 %tmp,%ctaid.z;\n    mul.lo.s32 %kbeg,%tmp,%kslice;\n    add.u32 %kend,%kbeg,%kslice;\n";
+        s += "    mul.lo.s32 %tmp2,%M,%N;\n    mul.lo.s32 %tmp2,%tmp2,%tmp;\n    mul.wide.u32 %off,%tmp2,4;\n    add.s64 %C,%C,%off;\n";
+    }
     s += "    mov.u32 %ldm,16;\n";
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
     s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
@@ -356,8 +371,9 @@ fn entry_w4a16(
         }
     }
 
-    s += "    mov.u32 %kt,0;\n";
-    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    let (kstart, kstop) = if splitk { ("%kbeg", "%kend") } else { ("0", "%K") };
+    s += &format!("    mov.u32 %kt,{kstart};\n");
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,{kstop};\n    @%p0 bra KEND_{name};\n");
 
     // --- Stage A: bm×16 f16 from global A[M,K], 128-bit (8×f16) chunks (identical to the fp16 path). ---
     for li in 0..a_chunks {
@@ -479,8 +495,82 @@ pub fn w4a16_ptx() -> &'static str {
     static PTX: OnceLock<String> = OnceLock::new();
     PTX.get_or_init(|| {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
-        m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None);
-        m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true, None);
+        m += &entry_w4a16("gemm_nt_w4a16", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None, false);
+        m += &entry_w4a16("gemm_nt_w4a16_z", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, true, None, false);
+        m
+    })
+    .as_str()
+}
+
+/// **Deterministic fixed-order reduction kernel** for W4A16 split-K (`w4a16_splitk_reduce`): sums the
+/// `sk` partial f32 planes (`Part[z·MN + i]`, written disjointly by the split-K GEMM CTAs) into the
+/// final `C[i]`. One thread per output element, grid-stride; the inner `z = 0,1,…,sk-1` loop fixes the
+/// summation order, so the result is bit-identical run-to-run (M12) — the property a float `atomicAdd`
+/// reduction can't promise. Params: `pMN` (= M·N), `pSK` (= number of splits), `pPart`, `pC`.
+const W4A16_SPLITK_REDUCE: &str = r#"
+.visible .entry w4a16_splitk_reduce(
+    .param .u32 pMN,
+    .param .u32 pSK,
+    .param .u64 pPart,
+    .param .u64 pC
+)
+{
+    .reg .pred %p;
+    .reg .b32 %mn,%sk,%i,%stride,%z,%zi,%t,%b,%nt,%ng;
+    .reg .f32 %acc,%v;
+    .reg .b64 %Part,%C,%off,%pp,%cc;
+    ld.param.u32 %mn,[pMN];
+    ld.param.u32 %sk,[pSK];
+    ld.param.u64 %Part,[pPart];
+    ld.param.u64 %C,[pC];
+    cvta.to.global.u64 %Part,%Part;
+    cvta.to.global.u64 %C,%C;
+    mov.u32 %t,%tid.x;
+    mov.u32 %b,%ctaid.x;
+    mov.u32 %nt,%ntid.x;
+    mad.lo.s32 %i,%b,%nt,%t;
+    mov.u32 %ng,%nctaid.x;
+    mul.lo.s32 %stride,%ng,%nt;
+RLOOP:
+    setp.ge.u32 %p,%i,%mn;
+    @%p bra REND;
+    mov.f32 %acc,0f00000000;
+    mov.u32 %z,0;
+    mov.u32 %zi,%i;
+RZ:
+    setp.ge.u32 %p,%z,%sk;
+    @%p bra RZEND;
+    mul.wide.u32 %off,%zi,4;
+    add.s64 %pp,%Part,%off;
+    ld.global.f32 %v,[%pp];
+    add.f32 %acc,%acc,%v;
+    add.u32 %zi,%zi,%mn;
+    add.u32 %z,%z,1;
+    bra RZ;
+RZEND:
+    mul.wide.u32 %off,%i,4;
+    add.s64 %cc,%C,%off;
+    st.global.f32 [%cc],%acc;
+    add.u32 %i,%i,%stride;
+    bra RLOOP;
+REND:
+    ret;
+}
+"#;
+
+/// **W4A16 split-K module** for the thin-M / small-N decode regime (the dominant LLM-inference shape:
+/// tiny M, large K, the M·N grid leaves SMs idle). Launched with `gridDim.z = sk`, each CTA computes a
+/// partial over its K-range and writes it to its own plane of an `sk·M·N` f32 buffer; the bundled
+/// `w4a16_splitk_reduce` then sums the planes in fixed order → **deterministic** final C (a float
+/// `atomicAdd` split-K could not be). Symmetric (no zero-point) path; entry `gemm_nt_w4a16_sk`. Same
+/// fp16-accumulate tolerance as [`w4a16_ptx`] (the partials are the same products, only the cross-CTA
+/// K-partition differs). Requires K % (`sk`·`GROUP_SIZE`) == 0 so every split is whole quant groups.
+pub fn w4a16_splitk_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        m += &entry_w4a16("gemm_nt_w4a16_sk", W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, false, None, true);
+        m += W4A16_SPLITK_REDUCE;
         m
     })
     .as_str()
@@ -495,7 +585,7 @@ pub fn w4a16_ptx() -> &'static str {
 pub fn w4a16_static_ptx(m: usize, n: usize, k: usize, zero_point: bool) -> String {
     let name = if zero_point { "gemm_nt_w4a16_static_z" } else { "gemm_nt_w4a16_static" };
     let mut s = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
-    s += &entry_w4a16(name, W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, zero_point, Some((m, n, k)));
+    s += &entry_w4a16(name, W4_BM, W4_BN, W4_WARPS_M, W4_WARPS_N, GROUP_SIZE, zero_point, Some((m, n, k)), false);
     s
 }
 

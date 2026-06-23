@@ -2779,6 +2779,65 @@ pub fn gemm_nt_w4a16(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **W4A16 with split-K** for the thin-M / small-N decode regime — the dominant LLM-inference shape
+/// (tiny M, large K), where the M,N grid alone leaves the SMs idle. `sk` K-splits each compute a partial
+/// f32 tile into their **own plane** of an `sk·M·N` buffer (the GEMM CTAs write disjoint planes — no
+/// atomics), then a fixed-order reduction kernel sums the planes into C, so the result is **bit-identical
+/// run-to-run** (M12) — a float `atomicAdd` split-K could not be. Numerically equals [`gemm_nt_w4a16`]
+/// within the fp16-accumulate tolerance (the partials are the same products, only the K-partition
+/// differs). Symmetric (no zero-point) path. Requires M%64==0, N%64==0, **K % (sk·128) == 0**, `sk ≥ 1`.
+pub fn gemm_nt_w4a16_splitk(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+    sk: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int4::{GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be M*K");
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
+    assert!(qw.zeros.is_none(), "w4a16 split-K is the symmetric path (no zero-point)");
+    assert!(sk >= 1, "split count must be >= 1");
+    assert!(
+        m % W4_BM == 0 && n % W4_BN == 0 && k % (sk * GROUP_SIZE) == 0,
+        "gemm_nt_w4a16_splitk requires M%{W4_BM}==0, N%{W4_BN}==0, K%(sk*{GROUP_SIZE})==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let scl_d = g.stream.memcpy_stod(&qw.scales)?;
+    let mut part_d = g.stream.memcpy_stod(&vec![0f32; sk * m * n])?; // sk disjoint partial planes
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    // split-K GEMM: gridDim.z = sk, each CTA writes its own M×N plane of `part_d`.
+    let f = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "gemm_nt_w4a16_sk")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32),
+        block_dim: (W4_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+        unsafe { bld.launch(cfg)? };
+    }
+    // deterministic fixed-order reduction of the sk planes → final C (same cached module).
+    let red = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "w4a16_splitk_reduce")?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mn, skk) = ((m * n) as u32, sk as u32);
+    let rcfg = LaunchConfig { grid_dim: (256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    {
+        let mut bld = g.stream.launch_builder(&red);
+        bld.arg(&mn).arg(&skk).arg(&part_d).arg(&mut c_d);
+        unsafe { bld.launch(rcfg)? };
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// **Static-shape-specialized** W4A16 (Mercury's no-library lever, §1A.2): JIT-load a kernel with M/N/K
 /// **baked as compile-time constants** for this exact shape, then launch it. Numerically identical to
 /// [`gemm_nt_w4a16`] (gated against the same f64 reference), but ptxas strength-reduces the baked strides
@@ -3588,6 +3647,125 @@ mod tests {
                         "w4a16 static {m}x{k}x{n} (asym) differs from the dynamic kernel"
                     );
                     eprintln!("w4a16 static {m}x{k}x{n}: bit-identical to dynamic (sym + asym) ✓");
+                }
+            }
+        });
+    }
+
+    /// **W4A16 split-K gate (first law: tolerance + determinism).** The decode-regime split-K path
+    /// (`gemm_nt_w4a16_splitk`: `gridDim.z = sk` disjoint partial planes + a fixed-order reduction kernel)
+    /// must match the exact f64 dequant reference within the *same* fp16-accumulate tolerance the dense
+    /// W4A16 carries (`1e-2 abs / 2e-3 rel`) — the products are identical, only the K-partition and the
+    /// f32 reduction differ — AND be **byte-identical run-to-run**: the reduction sums the planes in fixed
+    /// z-order, so unlike a float `atomicAdd` split-K it is deterministic (M12). Shapes are decode-like
+    /// (small M, large K) with K % (sk·128) == 0 so each split is whole quant groups.
+    #[test]
+    fn int4_splitk_matches_reference() {
+        use crate::ptx_int4::{quantize_weight_symmetric, reference_w4a16, GROUP_SIZE};
+        with_gpu("int4_splitk", |g| {
+            let mut rng = crate::diff::Rng::new(0x4517);
+            for (m, n, k, sk) in [(64usize, 64usize, 256usize, 2usize), (64, 128, 512, 4), (128, 64, 1024, 8)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8);
+                let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
+                let r = reference_w4a16(&a, &qw, m);
+                let c = gemm_nt_w4a16_splitk(g, &a, &qw, m, k, n, sk).unwrap();
+                let s = crate::diff::assert_close(
+                    &format!("w4a16 splitk {m}x{k}x{n} sk={sk}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                // M12 determinism: fixed grid + fixed-order plane reduction ⇒ byte-identical.
+                let c2 = gemm_nt_w4a16_splitk(g, &a, &qw, m, k, n, sk).unwrap();
+                assert!(
+                    c.iter().zip(&c2).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "w4a16 splitk {m}x{k}x{n} sk={sk} not deterministic run-to-run"
+                );
+                eprintln!("w4a16 splitk {m}x{k}x{n} sk={sk}: max_abs={:.2e} max_rel={:.2e}; deterministic ✓", s.max_abs, s.max_rel);
+            }
+        });
+    }
+
+    /// **W4A16 split-K decode occupancy bench (contention-robust internal A/B).** Times the un-split
+    /// W4A16 GEMM (sk=1) against the split-K path (`gridDim.z=sk` GEMM **+ the reduction kernel**, both
+    /// counted) for decode-like shapes (small M, small-ish N, large K) where the M,N grid alone leaves the
+    /// SMs idle. Device-only timing (inputs uploaded once), best-of-N — the internal ratio cancels the
+    /// shared clock. The reduction overhead is included, so this is the honest end-to-end split-K speedup.
+    /// Run: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int4_splitk_occupancy`
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn int4_splitk_occupancy() {
+        use crate::ptx_int4::{quantize_weight_symmetric, GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+        use half::f16;
+        with_gpu("int4_splitk_occupancy", |g| {
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x4D0DE);
+            const ROUNDS: usize = 8;
+            const ITERS: usize = 50;
+            let f_base = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16").unwrap();
+            let f_sk = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "gemm_nt_w4a16_sk").unwrap();
+            let f_red = g.function("w4a16_sk", crate::ptx_int4::w4a16_splitk_ptx(), "w4a16_splitk_reduce").unwrap();
+            for (m, n, k) in [(64usize, 256usize, 4096usize), (64, 512, 4096), (128, 256, 8192), (64, 128, 8192)] {
+                let flop = 2.0 * m as f64 * n as f64 * k as f64;
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8);
+                let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let bq_d = g.stream.memcpy_stod(&qw.packed).unwrap();
+                let scl_d = g.stream.memcpy_stod(&qw.scales).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let mut part_d = g.stream.memcpy_stod(&vec![0f32; 8 * m * n]).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let base_ctas = (n / W4_BN) * (m / W4_BM);
+                eprintln!("\nM{m} N{n} K{k} (base grid = {base_ctas} CTAs):");
+                let cfg0 = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
+                {
+                    let mut b = g.stream.launch_builder(&f_base);
+                    b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                    unsafe { b.launch(cfg0).unwrap() };
+                }
+                g.stream.synchronize().unwrap();
+                let mut base = f64::INFINITY;
+                for _ in 0..ROUNDS {
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        let mut b = g.stream.launch_builder(&f_base);
+                        b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+                        unsafe { b.launch(cfg0).unwrap() };
+                    }
+                    g.stream.synchronize().unwrap();
+                    base = base.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+                }
+                eprintln!("  sk=1 (base): {:>7.0} GFLOP/s", flop / base / 1e9);
+                for sk in [2usize, 4, 8] {
+                    if k % (sk * GROUP_SIZE) != 0 {
+                        continue;
+                    }
+                    let cfg_sk = LaunchConfig { grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, sk as u32), block_dim: (W4_THREADS as u32, 1, 1), shared_mem_bytes: 0 };
+                    let rcfg = LaunchConfig { grid_dim: (256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    let (mn, skk) = ((m * n) as u32, sk as u32);
+                    let mut split = f64::INFINITY;
+                    for _ in 0..ROUNDS {
+                        let t0 = Instant::now();
+                        for _ in 0..ITERS {
+                            {
+                                let mut b = g.stream.launch_builder(&f_sk);
+                                b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut part_d);
+                                unsafe { b.launch(cfg_sk).unwrap() };
+                            }
+                            {
+                                let mut b = g.stream.launch_builder(&f_red);
+                                b.arg(&mn).arg(&skk).arg(&part_d).arg(&mut c_d);
+                                unsafe { b.launch(rcfg).unwrap() };
+                            }
+                        }
+                        g.stream.synchronize().unwrap();
+                        split = split.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+                    }
+                    eprintln!("  sk={sk} ({:>4} CTAs + reduce): {:>7.0} GFLOP/s  → {:.3}× base", base_ctas * sk, flop / split / 1e9, base / split);
                 }
             }
         });
