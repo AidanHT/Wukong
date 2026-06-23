@@ -608,6 +608,7 @@ const RED_MAXABS: i64 = 6; // max(|x[k]|) — fmax(m, abs(x[k])), symmetric int8
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
 const NORM_LAYERNORM: i64 = 1; // out = (x - mean) / sqrt(var + eps)
 const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
+const NORM_LOGSOFTMAX: i64 = 3; // out = (x - m) - log(sum(exp(x - m))) — stable log-softmax
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -711,6 +712,15 @@ impl FnLowerer<'_> {
             // Checked before the elementwise-fusion run so it sees the raw loop sequence, not a
             // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
             // sum-of-squares+scale), so probe order is immaterial.
+            // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
+            // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
+            // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
+            if let Some((n, arr, n_expr)) = self.match_logsoftmax(b, i, None) {
+                if self.emit_norm(arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
+                    i += n;
+                    continue;
+                }
+            }
             if let Some((n, arr, n_expr)) = self.match_softmax(b, i, None) {
                 if self.emit_norm(arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
@@ -1251,6 +1261,171 @@ impl FnLowerer<'_> {
             }
         }
         Some((7, x, n_expr.clone()))
+    }
+
+    /// Recognize a stable **log-softmax** window (6 statements), the classification / LM-training loss
+    /// epilogue: `let m = x[0]; for i { m = fmax(m, x[i]) }; let s = 0; for i { s += exp(x[i]-m) };
+    /// let ls = log(s); for i { x[i] = (x[i]-m) - ls }`. The first two passes are softmax's max +
+    /// sum-of-exp; the divergence is the scalar `log(s)` and the final subtract (no normalize-by-inv).
+    /// Folds to one `mercury_norm_f32(x, x, 1, N, 0, NORM_LOGSOFTMAX)`. Pure. `None` on any deviation
+    /// (the generic vectorizer + vmath path then lowers the loops). Batch-aware like `match_softmax`.
+    fn match_logsoftmax(
+        &self,
+        b: &Block,
+        at: usize,
+        batch: Option<Symbol>,
+    ) -> Option<(usize, Symbol, Expr)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 6 {
+            return None;
+        }
+        let (m, seed) = Self::let_init(&stmts[0])?;
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.match_max_reduce_body(body1, v1, m, data_batch)?;
+        if !self.is_max_seed(seed, x, data_batch) {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&stmts[2])?;
+        if !matches!(&s_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
+            return None;
+        }
+        let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        self.match_sumexp_sub_body(body3, v3, x, m, s, data_batch)?;
+        let ls = self.match_log_of(&stmts[4], s)?;
+        let (v5, n5, body5) = self.as_range0_for(&stmts[5])?;
+        if !exprs_struct_eq(n5, n_expr) {
+            return None;
+        }
+        self.match_logsoftmax_norm_body(body5, v5, x, m, ls, data_batch)?;
+        // The three internal scalars must not be read after the window — the kernel hides them.
+        let rest = &b.stmts[at + 6..];
+        let tail = b.tail.as_deref();
+        for sc in [m, s, ls] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((6, x, n_expr.clone()))
+    }
+
+    /// Body `s += exp(x[v] - m)` / `s = s + exp(x[v]-m)` (sum of exp-of-centered into scalar `s`,
+    /// reading `x[v]`, no in-place write — log-softmax overwrites `x` only in its final pass). Pure.
+    fn match_sumexp_sub_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        m: Symbol,
+        s: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(s) {
+            return None;
+        }
+        let addend: &Expr = match op {
+            ast::AssignOp::Add => value,
+            ast::AssignOp::Assign => match &value.kind {
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(lhs) == Some(s) => rhs,
+                ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } if single_path(rhs) == Some(s) => lhs,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if self.expr_mir(addend) != MirType::F32 {
+            return None;
+        }
+        let ExprKind::Call { callee, args, .. } = &addend.kind else {
+            return None;
+        };
+        if args.len() != 1
+            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Exp))
+        {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Sub,
+            lhs,
+            rhs,
+        } = &args[0].kind
+        else {
+            return None;
+        };
+        if self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(m) {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// `let name = log(s)` → name (the log-sum-exp binding; mirror of `match_recip`). Pure.
+    fn match_log_of(&self, stmt: &Stmt, s: Symbol) -> Option<Symbol> {
+        let (name, init) = Self::let_init(stmt)?;
+        let ExprKind::Call { callee, args, .. } = &init.kind else {
+            return None;
+        };
+        if args.len() == 1
+            && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Log))
+            && single_path(&args[0]) == Some(s)
+        {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Body `x[v] = (x[v] - m) - ls` (center, then subtract the log-sum-exp, in place). The outermost
+    /// `Sub` is by `ls`; the inner is the centered `x[v] - m` (`is_centered`). Pure.
+    fn match_logsoftmax_norm_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        m: Symbol,
+        ls: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<()> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if self.index_off(target, v, batch) != Some(x) {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Sub,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        if single_path(rhs) == Some(ls) && self.is_centered(lhs, v, x, m, batch) {
+            Some(())
+        } else {
+            None
+        }
     }
 
     /// Emit one in-place recognized norm: `mercury_norm_f32(x, x, 1, N, eps_bits, op)` for a plain
