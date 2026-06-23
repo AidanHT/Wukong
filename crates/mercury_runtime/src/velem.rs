@@ -31,6 +31,14 @@ pub const VE_RELU: i64 = 1;
 pub const VE_RELU6: i64 = 2;
 /// OR'd into `op` when the kernel must read `y` (`b` may be non-zero).
 pub const VE_USE_Y: i64 = 256;
+/// `out = act(x · y)` — the elementwise **Hadamard product** (gating, attention masks, residual
+/// scaling, RoPE). A distinct compute mode (a product of two arrays, not the affine `a·x+b·y+c`),
+/// so it bypasses the affine FMA. Implies the kernel reads `y` (no need to also set `VE_USE_Y`).
+/// Bit-exact across backends: `_mm256_mul_ps` lane == scalar `f32 * f32` (one IEEE rounding).
+pub const VE_HADAMARD: i64 = 512;
+/// `out = act(x / y)` — elementwise quotient (normalize-by-per-element-scale). Same convention as
+/// [`VE_HADAMARD`]; `_mm256_div_ps` lane == scalar `f32 / f32`, both correctly rounded.
+pub const VE_DIV: i64 = 1024;
 
 /// Total streamed bytes (all live arrays) at/above which the store goes non-temporal. Non-temporal
 /// stores pay off only once the working set spills L3: below it a normal cacheable store keeps the
@@ -92,7 +100,11 @@ fn act1(op: i64, v: f32) -> f32 {
 /// that left a pure `relu` a touch *behind* gcc's bare `maxps` loop at L3-resident sizes.
 #[inline]
 fn elem1(op: i64, x: f32, y: f32, a: f32, b: f32, c: f32) -> f32 {
-    let base = if op & VE_USE_Y == 0 && a == 1.0 && c == 0.0 {
+    let base = if op & VE_HADAMARD != 0 {
+        x * y
+    } else if op & VE_DIV != 0 {
+        x / y
+    } else if op & VE_USE_Y == 0 && a == 1.0 && c == 0.0 {
         x
     } else {
         let inner = if op & VE_USE_Y != 0 {
@@ -135,7 +147,7 @@ pub unsafe extern "C" fn mercury_velem_f32(
             return;
         }
     }
-    let use_y = op & VE_USE_Y != 0;
+    let use_y = op & (VE_USE_Y | VE_HADAMARD | VE_DIV) != 0;
     for i in 0..n {
         // SAFETY: i < n; buffers valid for n (y only when use_y).
         unsafe {
@@ -163,12 +175,15 @@ unsafe fn velem_avx2(
     let vc = _mm256_set1_ps(c);
     let zero = _mm256_setzero_ps();
     let six = _mm256_set1_ps(6.0);
-    let use_y = op & VE_USE_Y != 0;
+    // Binary compute modes (Hadamard `x·y` / quotient `x/y`) read `y` and bypass the affine FMA.
+    let had = op & VE_HADAMARD != 0;
+    let div = op & VE_DIV != 0;
+    let use_y = had || div || op & VE_USE_Y != 0;
     let act = op & 0xff;
     // Identity affine (`a == 1`, `c == 0`, no `y`): the FMA degenerates to `x`, so skip it — the case a
     // bare `relu`/`relu6`/copy hits. Hoisted here so the hot loop branches on a single invariant flag
     // (matching `elem1`'s scalar fast path), turning a recognized ReLU into gcc's bare `maxps` loop at
-    // true 256-bit width instead of paying a wasted multiply per 8 lanes.
+    // true 256-bit width instead of paying a wasted multiply per 8 lanes. (Never set for a binary op.)
     let id_affine = !use_y && a == 1.0 && c == 0.0;
     // Streams = output + x (+ y when read). The non-temporal decision keys on the whole working set,
     // so a 2-input saxpy spills L3 (and wants `vmovntps`) at a length where a 1-input map still fits.
@@ -189,7 +204,11 @@ unsafe fn velem_avx2(
     macro_rules! compute {
         ($off:expr) => {{
             let xv = _mm256_loadu_ps(x.add(i + $off));
-            let mut r = if id_affine {
+            let mut r = if had {
+                _mm256_mul_ps(xv, _mm256_loadu_ps(y.add(i + $off)))
+            } else if div {
+                _mm256_div_ps(xv, _mm256_loadu_ps(y.add(i + $off)))
+            } else if id_affine {
                 xv
             } else {
                 let inner = if use_y {
@@ -420,6 +439,8 @@ mod tests {
             (VE_RELU, 2.0, 0.0, 1.0),          // fused linear→relu
             (VE_RELU6, 1.0, 0.0, 0.0),         // relu6
             (VE_RELU6 | VE_USE_Y, 1.0, 1.0, 0.0),
+            (VE_HADAMARD, 1.0, 1.0, 0.0),      // hadamard x*y (a/b/c ignored)
+            (VE_RELU | VE_HADAMARD, 1.0, 1.0, 0.0), // relu(x*y)
         ];
         for &(op, a, b, c) in cases {
             let mut got = vec![0.0f32; n];
@@ -436,7 +457,12 @@ mod tests {
                 );
             }
             for i in 0..n {
-                let yi = if op & VE_USE_Y != 0 { y[i] } else { 0.0 };
+                // Binary ops (Hadamard/Div) read `y` too, matching the kernel's `use_y`.
+                let yi = if op & (VE_USE_Y | VE_HADAMARD | VE_DIV) != 0 {
+                    y[i]
+                } else {
+                    0.0
+                };
                 let want = elem1(op, x[i], yi, a, b, c);
                 assert_eq!(got[i].to_bits(), want.to_bits(), "op {op} i {i}");
             }
@@ -525,6 +551,34 @@ mod tests {
         }
         for i in 0..n {
             assert_eq!(got[i].to_bits(), (0.25f32 * x[i]).to_bits(), "i {i}");
+        }
+    }
+
+    /// Elementwise quotient `out = x / y`: the AVX2 `_mm256_div_ps` lanes and the scalar `f32 / f32`
+    /// twin must agree bit-for-bit (both correctly-rounded IEEE division). `y` is kept away from zero
+    /// so the test exercises the ordinary quotient (the kernel handles `x/0` → ±inf identically too,
+    /// but that is not the point being pinned here). Crosses the NT boundary + a non-mult-of-8 tail.
+    #[test]
+    fn velem_div_matches_lanes() {
+        let n = 1_500_001usize; // 3-stream (x,y,out) = 18 MiB > NT_MIN_BYTES: NT + prologue + tail
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 % 17.0) - 8.0).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i as f32 % 13.0) + 1.5).collect(); // 1.5..=13.5, never 0
+        let mut got = vec![0.0f32; n];
+        unsafe {
+            mercury_velem_f32(
+                x.as_ptr(),
+                y.as_ptr(),
+                got.as_mut_ptr(),
+                n as i64,
+                1.0,
+                1.0,
+                0.0,
+                VE_DIV,
+            );
+        }
+        for i in 0..n {
+            let want = elem1(VE_DIV, x[i], y[i], 1.0, 1.0, 0.0);
+            assert_eq!(got[i].to_bits(), want.to_bits(), "div i {i}");
         }
     }
 }
