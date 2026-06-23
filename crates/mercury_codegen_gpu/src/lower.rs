@@ -3037,6 +3037,10 @@ mod tests {
             eprintln!("skip run_corpus_matches_interp_oracle: no CUDA device");
             return;
         }
+        // The mission corpus: the e2e `tests/run` fixtures. (The example/bench kernels are
+        // compute-heavy perf benchmarks — e.g. fib(30) is ~2.7M calls — which the single-thread
+        // execution model can't run within the OS GPU watchdog; their *lowering* is correct, but
+        // running them needs the grid-parallel perf phase. They are not a lowering-correctness gate.)
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run");
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .expect("read tests/run")
