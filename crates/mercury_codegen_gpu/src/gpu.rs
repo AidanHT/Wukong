@@ -3218,6 +3218,49 @@ pub fn gemm_nt_int8_smdb(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **int8 (W8A8) GEMM with explicit split-K** `C = A·Bᵀ` for the thin-M / small-N decode regime, where
+/// the M,N grid alone leaves SMs idle. `sk` K-splits each compute a partial product and fold it into C
+/// by `red.global.add.u32` — **bit-exact and deterministic** (integer add commutes, unlike a float
+/// reduction), so this matches [`gemm_nt_int8`] exactly. Measured same-run (RTX 4050): up to ~2.5× over
+/// the un-split swz kernel when the base grid is severely under-filled (M64 N128 K8192, 2 CTAs → sk=8);
+/// ~1.9× at 8 CTAs / large K; marginal once the base grid already saturates, and over-splitting past
+/// saturation regresses (the `red.add` traffic). The caller (or the Phase-10 autotuner) picks `sk` per
+/// shape — rule of thumb `sk ≈ target_ctas / base_ctas`, clamped so each split keeps a few BK=64 slabs.
+/// Requires M%64==0, N%64==0, **K % (sk·64) == 0**, `sk ≥ 1`.
+pub fn gemm_nt_int8_splitk(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    sk: usize,
+) -> Result<Vec<i32>, DriverError> {
+    use crate::ptx_int8::{INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert!(sk >= 1, "split-K count must be >= 1");
+    assert!(
+        m % INT8_BM == 0 && n % INT8_BN == 0 && k % (sk * 64) == 0,
+        "int8 split-K GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%(sk*64)==0"
+    );
+    let f = g.function(
+        "int8_gemm_nt_smdb_swz_sk",
+        crate::ptx_int8::int8_gemm_smdb_swz_splitk_ptx(),
+        "int8_gemm_nt_smdb_swz_sk",
+    )?;
+    let mut cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+    cfg.grid_dim.2 = sk as u32; // gridDim.z K-splits, each folding a partial by red.global.add.u32
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?; // split-K accumulates → C must start zeroed
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// **int8 GEMM + fused per-channel dequant** `out[i,j] = f32(Σ u8·i8) · scale[j]` → **f32** output, in
 /// one pass (the SMEM-staged 64×64 kernel with the dequant epilogue folded into the C store). `scale`
 /// is the per-output-channel `[N]` f32 scale (symmetric quant). The HBM round-trip cuBLAS int8 needs
@@ -10107,6 +10150,55 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **int8 split-K gate (first law: bit-exact AND deterministic).** The split-K swz kernel
+    /// (`int8_gemm_nt_smdb_swz_sk`, launched with `gridDim.z = sk`) must reproduce the i32 reference
+    /// EXACTLY for every split count: each of the `sk` CTAs computes a partial product over its K-range
+    /// and folds it into the pre-zeroed C by `red.global.add.u32`. Integer add commutes, so the result is
+    /// **order-independent** — bit-exact and deterministic (M12) no matter how the CTAs interleave, the
+    /// property a float split-K reduction can't offer. K % (sk·64) == 0 (each split is whole BK=64 slabs).
+    #[test]
+    fn int8_smdb_swz_splitk_matches_reference() {
+        use crate::ptx_int8::{int8_gemm_smdb_swz_splitk_ptx, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+        with_gpu("int8_smdb_swz_sk", |g| {
+            let mut rng = crate::diff::Rng::new(0x5C0DE);
+            let entry = "int8_gemm_nt_smdb_swz_sk";
+            let f = g.function(entry, int8_gemm_smdb_swz_splitk_ptx(), entry).unwrap();
+            let warps = INT8_WARPS_M * INT8_WARPS_N;
+            // (m,k,n,sk): K % (sk·64) == 0; sk≥2 K-splits each fold a partial via red.global.add.u32.
+            for (m, k, n, sk) in [
+                (64usize, 128usize, 64usize, 2usize),
+                (64, 256, 128, 4),
+                (128, 512, 64, 8),
+                (64, 256, 192, 2),
+                (192, 128, 128, 2),
+            ] {
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let want = ref_nt_int8(&a, &b, m, k, n);
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap(); // split-K requires C pre-zeroed
+                let mut cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps);
+                cfg.grid_dim.2 = sk as u32; // gridDim.z = number of K-splits
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&c_d).unwrap();
+                assert_eq!(got, want, "smdb_swz_sk {m}x{k}x{n} sk={sk}");
+            }
+            // gate the public launcher wrapper (gemm_nt_int8_splitk) end-to-end too.
+            {
+                let (m, k, n, sk) = (128usize, 256usize, 128usize, 4usize);
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let want = ref_nt_int8(&a, &b, m, k, n);
+                assert_eq!(gemm_nt_int8_splitk(g, &a, &b, m, k, n, sk).unwrap(), want, "gemm_nt_int8_splitk {m}x{k}x{n} sk={sk}");
+            }
+            eprintln!("[gate] int8 split-K swz (red.global.add.u32, sk=2/4/8) bit-exact vs i32 oracle ✓");
+        });
+    }
+
     /// **int8 multi-stage `cp.async` depth sweep (M3 lever)** — same-run vs cuBLAS IMMA at 1024/2048/4096.
     /// Times the 2-buffer double-buffer (`_smdb`, stages=2) against the 3- and 4-stage rings
     /// (`_smdb_s{3,4}`) for both the 64×64 and 128×128 tiles, picks the per-size winner, reports % of
@@ -10266,6 +10358,86 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
                 if gf[2].is_finite() && gf[3].is_finite() {
                     eprintln!("  → 128×128 swz/handplaced = {:.3}×", gf[3] / gf[2]);
+                }
+            }
+        });
+    }
+
+    /// **int8 split-K occupancy bench (thin-M / small-N lever, contention-robust internal A/B).** When the
+    /// M,N grid alone leaves SMs idle (thin M, small N), split-K adds `sk×` more CTAs along K to fill the
+    /// GPU. Times the non-split swz kernel (sk=1) against the split-K kernel at sk∈{2,4,8} for small-N /
+    /// large-K shapes, same-run; the ratio is Mercury-internal (no cuBLAS) so it stays honest under
+    /// contention. Reports GFLOP/s alongside the launched CTA count so the saturation effect is visible.
+    /// Bit-exact checksum cross-check at each sk first (first law). Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_splitk_occupancy`
+    #[test]
+    #[ignore = "throughput bench; run explicitly"]
+    fn int8_splitk_occupancy() {
+        use crate::baselines::gemm_flop;
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_ptx, int8_gemm_smdb_swz_splitk_ptx, INT8_BM, INT8_BN, INT8_WARPS_M,
+            INT8_WARPS_N,
+        };
+        with_gpu("int8_splitk_occupancy", |g| {
+            eprintln!("device: {}", g.device_name());
+            let warps = INT8_WARPS_M * INT8_WARPS_N;
+            let mut rng = crate::diff::Rng::new(0x5C0FF);
+            const ROUNDS: usize = 8;
+            let f_base = g
+                .function("int8_gemm_nt_smdb_swz", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz")
+                .unwrap();
+            let f_sk = g
+                .function("int8_gemm_nt_smdb_swz_sk", int8_gemm_smdb_swz_splitk_ptx(), "int8_gemm_nt_smdb_swz_sk")
+                .unwrap();
+            for (m, n, k) in [(64usize, 256usize, 4096usize), (64, 512, 4096), (128, 256, 8192), (64, 128, 8192)] {
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let cs_ref: i64 = ref_nt_int8(&a, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let base_ctas = (n / INT8_BN) * (m / INT8_BM);
+                eprintln!("\nM{m} N{n} K{k}  (base grid = {base_ctas} CTAs):");
+                // base checksum + timing.
+                let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                {
+                    let mut bld = g.stream.launch_builder(&f_base);
+                    bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                    unsafe { bld.launch(int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps)).unwrap() };
+                }
+                assert_eq!(g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum::<i64>(), cs_ref, "base {m}x{k}x{n}");
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let base = {
+                    let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps);
+                    let mut s = f64::INFINITY;
+                    for _ in 0..ROUNDS {
+                        s = s.min(time_gemm_int8(g, &f_base, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                    }
+                    flop / s
+                };
+                eprintln!("  sk=1 (base): {:>7.0} GFLOP/s", base / 1e9);
+                for sk in [2usize, 4, 8] {
+                    if k % (sk * 64) != 0 {
+                        continue;
+                    }
+                    let mut cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, warps);
+                    cfg.grid_dim.2 = sk as u32;
+                    // split-K needs a zeroed C; verify the deterministic red.add sum equals the reference.
+                    let mut cz = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                    {
+                        let mut bld = g.stream.launch_builder(&f_sk);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cz);
+                        unsafe { bld.launch(cfg).unwrap() };
+                    }
+                    assert_eq!(g.stream.memcpy_dtov(&cz).unwrap().iter().map(|&x| x as i64).sum::<i64>(), cs_ref, "sk={sk} {m}x{k}x{n}");
+                    let mut c2 = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                    let mut s = f64::INFINITY;
+                    for _ in 0..ROUNDS {
+                        s = s.min(time_gemm_int8(g, &f_sk, cfg, dims, &a_d, &b_d, &mut c2, 50));
+                    }
+                    let gf = flop / s;
+                    eprintln!("  sk={sk} ({:>4} CTAs): {:>7.0} GFLOP/s  → {:.3}× base", base_ctas * sk, gf / 1e9, gf / base);
                 }
             }
         });

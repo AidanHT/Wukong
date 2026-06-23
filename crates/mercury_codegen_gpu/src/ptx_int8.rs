@@ -464,7 +464,7 @@ fn gen_int8_smdb(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant
 /// m3:r8-15/k16-31} = {a0,a1,a2,a3} — exactly the fp16 register order. Bit-exact mod 2³² vs the CPU i32
 /// reference (the swizzle only reorders SMEM; the integer arithmetic is untouched). Entry `name`;
 /// requires M%bm==0, N%bn==0, K%64==0, bm%(16·wm)==0, bn%(8·wn)==0, (bm/wm)%8==(bn/wn)%8==0.
-fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant: bool) -> String {
+fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, dequant: bool, splitk: bool) -> String {
     let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
     let threads = wm * wn * 32;
     let tm = bm / (16 * wm); // 16-row A subtiles per warp
@@ -484,6 +484,10 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
     assert!(tile_bytes.is_power_of_two(), "{name}: tile bytes must be a power of two (XOR double-buffer)");
     assert!(2 * (bm * bk) + 2 * (bn * bk) <= 48 * 1024, "{name}: static SMEM exceeds 48 KiB");
     assert!((bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0, "{name}: threads*16 must divide the tile bytes");
+    // split-K folds each CTA's partial product into C by `red.global.add.u32` (deterministic for i32 —
+    // integer add commutes, so the result is order-independent and bit-exact, unlike a float reduction).
+    // The dequant epilogue can't combine with split-K (it would scale per-partial, not per-total).
+    assert!(!(splitk && dequant), "{name}: split-K and the dequant epilogue are mutually exclusive");
     let a_chunks = bm * bk / (threads * 16); // 16-byte cp.async chunks per thread
     let b_chunks = bn * bk / (threads * 16);
 
@@ -494,6 +498,9 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
     s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * bn * bk);
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tmp3,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufc,%bufp,%lane,%grp,%tg2,%warpMrow,%warpNcol,%aptr,%bptr,%phaseA,%phaseB,%arowb,%browb,%la16,%lb8,%swztmp;\n";
+    if splitk {
+        s += "    .reg .b32 %kbeg,%kend,%kslice;\n";
+    }
     if dequant {
         s += "    .reg .b32 %col;\n    .reg .f32 %f0,%f1,%f2,%f3,%sc0,%sc1;\n    .reg .b64 %Scale,%scp;\n";
     }
@@ -529,6 +536,12 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
     }
     s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    if splitk {
+        // K-split across gridDim.z CTAs: this CTA owns K-range [kbeg, kend). kslice = K/gridDim.z
+        // (the host guarantees K % (gridDim.z · 64) == 0, so kslice is a 64-multiple = whole BK slabs).
+        s += "    mov.u32 %tmp,%nctaid.z;\n    div.u32 %kslice,%K,%tmp;\n";
+        s += "    mov.u32 %tmp,%ctaid.z;\n    mul.lo.s32 %kbeg,%tmp,%kslice;\n    add.u32 %kend,%kbeg,%kslice;\n";
+    }
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", wn - 1);
     s += "    shr.u32 %grp,%lane,2;\n    and.b32 %tmp,%lane,3;\n    shl.b32 %tg2,%tmp,1;\n";
@@ -573,15 +586,17 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
         }
     };
 
-    // Prologue: prefetch slab 0 into buffer 0.
-    s += "    mov.u32 %kcol,0;\n";
+    // Prologue: prefetch this CTA's first slab (kbeg, or 0 without split-K) into buffer 0.
+    let kstart = if splitk { "%kbeg" } else { "0" };
+    let kstop = if splitk { "%kend" } else { "%K" };
+    s += &format!("    mov.u32 %kcol,{kstart};\n");
     stage("%baseRow", "%A", "smemA", "%bufc", a_chunks, &mut s);
     stage("%baseCol", "%B", "smemB", "%bufc", b_chunks, &mut s);
     s += "    cp.async.commit_group;\n";
 
-    s += "    mov.u32 %kt,0;\n";
-    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
-    s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,%K;\n");
+    s += &format!("    mov.u32 %kt,{kstart};\n");
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,{kstop};\n    @%p0 bra KEND_{name};\n");
+    s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,{kstop};\n");
     s += &format!("    @!%pmore bra LAST_{name};\n");
     s += "    mov.u32 %kcol,%ktn;\n";
     stage("%baseRow", "%A", "smemA", "%bufp", a_chunks, &mut s);
@@ -640,9 +655,12 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
                 s += &format!("    cvt.rn.f32.s32 %f2,%d{ti}_{tj}_2;\n    mul.f32 %f2,%f2,%sc0;\n    st.global.f32 [%cp],%f2;\n");
                 s += &format!("    cvt.rn.f32.s32 %f3,%d{ti}_{tj}_3;\n    mul.f32 %f3,%f3,%sc1;\n    st.global.f32 [%cp+4],%f3;\n");
             } else {
-                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
+                // split-K: accumulate each CTA's partial into C by deterministic integer atomic add
+                // (i32 add commutes → order-independent, bit-exact); else a plain overwrite store.
+                let st = if splitk { "red.global.add.u32" } else { "st.global.u32" };
+                s += &format!("    {st} [%cp],%d{ti}_{tj}_0;\n    {st} [%cp+4],%d{ti}_{tj}_1;\n");
                 s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
-                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
+                s += &format!("    {st} [%cp],%d{ti}_{tj}_2;\n    {st} [%cp+4],%d{ti}_{tj}_3;\n");
             }
         }
     }
@@ -654,7 +672,18 @@ fn gen_int8_smdb_swz(name: &str, bm: usize, bn: usize, wm: usize, wn: usize, deq
 /// for the int8→cuBLAS-IMMA gap. Same CTA tile / warp layout as [`int8_gemm_smdb_ptx`]; BK=64. Bit-exact.
 pub fn int8_gemm_smdb_swz_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false, false)).as_str()
+}
+
+/// **64×64 `ldmatrix`+swizzle int8 GEMM with split-K** (`int8_gemm_nt_smdb_swz_sk`) — the thin-M / small-N
+/// occupancy lever. Launched with `gridDim.z = sk` K-splits; each CTA computes a partial `C` over its
+/// K-range and folds it in by `red.global.add.u32` (integer add commutes ⇒ the sum is order-independent
+/// and **bit-exact / deterministic**, the property a float split-K reduction lacks). Fills the GPU when
+/// the M,N grid alone leaves SMs idle (decode: tiny M, modest N). Requires C pre-zeroed and
+/// K % (sk·64) == 0. Bit-exact vs the i32 oracle for any sk.
+pub fn int8_gemm_smdb_swz_splitk_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_sk", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, false, true)).as_str()
 }
 
 /// **64×64 `ldmatrix`+swizzle int8 GEMM with fused per-channel dequant** (`int8_gemm_nt_smdb_swz_deq`) —
@@ -662,14 +691,14 @@ pub fn int8_gemm_smdb_swz_ptx() -> &'static str {
 /// [`int8_gemm_smdb_deq_ptx`]). Same dequant store, gated at the f32-scale tolerance.
 pub fn int8_gemm_smdb_swz_deq_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, true)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, true, false)).as_str()
 }
 
 /// **128×128 `ldmatrix`+swizzle int8 GEMM** (`int8_gemm_nt_smdb128_swz`) — the large-tile swizzle
 /// candidate (8 warps, BK=64). Same CTA tile as [`int8_gemm_smdb128_ptx`]. Bit-exact.
 pub fn int8_gemm_smdb128_swz_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, false)).as_str()
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, false, false)).as_str()
 }
 
 /// Full **int8 (W8A8) tensor-core GEMM** `C = A·Bᵀ` (the quantized nn.Linear form): A is `[M,K]` **u8**
