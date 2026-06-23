@@ -66,7 +66,10 @@ naively-written source:
   **~6–8×** for sum; and C/Rust can vectorize neither a `libm` call nor the half→f32 widen, so the
   activation gap is structural. Half storage is bit-exact across backends (f16 via shared `half`-crate
   shims, since Cranelift x64 lacks f16 convert lowering), and both call the identical kernel, so the gate
-  stays exact.
+  stays exact. The dispatch now reaches the **mixed-precision GEMM** too: a bf16/f16 `C = A·Bᵀ`
+  `nn.Linear` nest folds to `mercury_sgemm_{bf16,f16}_nt` (a lossless widen prepass + the tuned f32
+  microkernel), **~25× single-core / ~47–109× `@parallel`** vs the idiomatic bf16 C that leaves the
+  inline widen + reduction scalar (~10× vs a hand-optimized widen-then-tile bf16 C — the durable part).
 - **Reduction vectorization + multicore dispatch.** A naive f32 reduction (`s += x[i]*y[i]`) is one
   FMA down a single dependency chain — latency-bound. Mercury reassociates it across vector lanes ×
   unrolled accumulators (the standard BLAS reduction); gcc/rustc keep it strictly serial without
@@ -413,6 +416,33 @@ half-in/f32-out, ~1.3× ≫ L3), and the **36-op activation set** (`mercury_vmat
 cheap ops gain bandwidth and the transcendentals keep the full libm-vectorization win — C can vectorize
 neither the `libm` call nor the half→f32 widen). e2e: `tests/run/{f16,reduce_f16,reduce_bf16_minmax,
 vmath_{bf16,f16},axpby_f16}.mer`; all bit-exact interp == native.
+
+#### bf16 / f16 `nn.Linear` — the mixed-precision matmul Mercury dispatches, gcc leaves scalar
+
+The dominant modern transformer matmul: `C = A·Bᵀ` with **bf16/f16 inputs and an f32 accumulator**.
+Mercury recognizes the half-precision dot-product nest (`s += (a[..] as f32) * (b[..] as f32)` over
+`[bf16]`/`[f16]` arrays) and folds it to one **`mercury_sgemm_bf16_nt`** / **`_f16_nt`** call: a
+lossless widen prepass (O(m·k + n·k), ~1/n of the GEMM) feeding the *identical* tuned AVX2 f32 GEMM.
+C and Rust store bf16 as `uint16_t` and widen each element inline inside the triple loop.
+
+| size  | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+|-------|-----------|---------------|---------|------|-------------|---------------|
+| 512²  | ~52–53 | ~98–103 | ~2.1 | ~2.2 | **~24–25×** | **~47×** |
+| 1024² | ~50–55 | ~208–219 | ~2.0 | ~2.1 | **~25×** | **~98–109×** |
+
+As with the weight-gradient GEMM, two effects compound and honesty requires separating them. The
+idiomatic bf16 C falls to ~2 GFLOP/s because the inline `bf16→f32` widen won't vectorize **and** the
+dot-product reduction stays serial (no `-ffast-math`). A *hand-optimized* bf16 C — widen A/B into f32
+scratch first, then call a tuned sgemm, the very thing Mercury does automatically — would recover the
+~4–5 GFLOP/s `nn.Linear` serial baseline, still ~10× behind Mercury's tiled kernel. So the durable
+domain-lowering win is ~10× even against optimized bf16 C; the ~25× headline is versus the code a
+person actually writes. Mercury's single-core ~52 GFLOP/s is ~73% of the measured AVX2-FMA roofline —
+the f32 GEMM efficiency, since after the widen it *is* the f32 kernel. Without this dispatch the half
+nest would fall to a scalar widening loop (the `as f32` casts block the f32 matmul recognizer). The
+widen is lossless, so the kernel equals the nest under the documented matmul reassociation, bit-for-bit
+across backends (`tests/run/linear_{bf16,f16}.mer`; the runtime twin test pins bf16/f16 == f32-on-
+widened-operands and serial == parallel). Single-run, clock-sensitive absolute GFLOP/s; the ratio is
+the stable part.
 
 ### Single-threaded elementwise & reductions
 

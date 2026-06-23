@@ -52,7 +52,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   **transposed-A weight-gradient** form `C = Aᵀ·B` (`dW = dYᵀ·X`, A stored `[k,m]` with the
   contraction axis outermost) is recognized too and dispatched to `mercury_sgemm_tn`, which transposes
   A once then reuses the same NN microkernel — so the training backward pass leaves the scalar nest
-  (`tests/run/matmul_tn.mer`).
+  (`tests/run/matmul_tn.mer`). The **bf16/f16 mixed-precision** `nn.Linear` (`[bf16]`/`[f16]` inputs
+  widened `as f32`, f32 accumulate) likewise dispatches to `mercury_sgemm_{bf16,f16}_nt` — a lossless
+  widen prepass then the same tuned kernel — ~25× the idiomatic bf16 C (`tests/run/linear_{bf16,f16}.mer`).
 - **Batched matmul → per-head GEMM dispatch**: a matmul nest wrapped in a batch loop, with each index
   carrying a per-batch base offset (`x[h*S*D + i*K + k]` — the shape of **multi-head attention**, one
   matmul per head), also dispatches. The recognizer peels the offset off each flattened index (it
@@ -193,11 +195,14 @@ remaining stretch; today unrecognized ops execute on the CPU within the same off
 ## Known limitations / sharp edges
 
 - `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
-  symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above). On this
-  AVX2+F16C box (no AVX-512-BF16) a half-precision *GEMM* would widen to f32 and match f32 throughput
-  — a memory-footprint feature, not a FLOP/s win — so it is left at the proven correctness path
-  (`tests/run/matmul_bf16.mer`), not a tuned half kernel. A half-precision *output* on the streaming
-  ops (→ ~2×) needs a narrowing store and is still future work.
+  symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above) **and a
+  mixed-precision GEMM**: a bf16/f16 `C = A·Bᵀ` `nn.Linear` nest dispatches to `mercury_sgemm_{bf16,
+  f16}_nt[_parallel]` — a lossless widen prepass (`<<16` / F16C, ~1/n of the GEMM) feeding the tuned
+  AVX2 f32 microkernel (`tests/run/linear_{bf16,f16}.mer`). On this AVX2+F16C box (no AVX-512-BF16) the
+  GEMM itself runs in f32, so it is a *footprint* feature on the FLOPs — but it still beats the
+  idiomatic bf16 C **~25× single-core** (that C can vectorize neither the inline `bf16→f32` widen nor
+  the serial reduction), ~10× vs a hand-optimized widen-then-tile bf16 C. A half-precision *output* on
+  the streaming ops (→ ~2×) needs a narrowing store and is still future work.
 - The *general* vectorizer emits 128-bit SIMD (Cranelift's vector ISA rejects 256-bit `f32x8` —
   verified empirically on Cranelift 0.124). Compute-bound *elementwise* kernels therefore use 2× the
   FMA ports they could; 4× unrolling and auto-parallelism recover throughput, and the vectorized

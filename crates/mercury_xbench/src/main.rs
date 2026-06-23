@@ -189,6 +189,9 @@ fn main() {
     if want("linear") {
         bench_linear(&cc, &dir, roof);
     }
+    if want("linear_bf16") {
+        bench_linear_bf16(&cc, &dir);
+    }
     if want("matmul_tn") {
         bench_matmul_tn(&cc, &dir, roof);
     }
@@ -603,6 +606,141 @@ fn rust_linear(ns: usize) -> String {
 /// the cross-language check is bit-exact** — a stronger bar than the f32 kernels' tolerance. Reported
 /// as int8 GOP/s (2 ops per multiply-accumulate). The inputs stay within `i32` (no overflow at these
 /// sizes), so all three languages must agree exactly.
+/// bf16 mixed-precision `nn.Linear` (`C = A·Bᵀ`, bf16 inputs, f32 accumulate) — the standard
+/// transformer matmul. Mercury recognizes the half-precision dot-product nest and folds it to one
+/// `mercury_sgemm_bf16_nt[_parallel]` call (a lossless widen prepass + the tuned AVX2 f32 GEMM); the
+/// idiomatic C/Rust store bf16 as `uint16_t` and widen each element inline inside the triple loop —
+/// which they can't vectorize, and the sequential float reduction stays scalar (no `-ffast-math`),
+/// the same basis as the f32 `linear`/`dot` kernels. Reuses the `(u16, u16, f32)` bench ABI. The
+/// `out[0]` (= `c[0]`) cross-check is a sanity guard; the bit-exact correctness rests on the runtime
+/// twin test + the interp/native differential gate. The f16 twin (`mercury_sgemm_f16_nt`) is the same
+/// dispatch with an F16C-exact widen.
+fn bench_linear_bf16(cc: &str, dir: &Path) {
+    for ns in [512usize, 1024] {
+        let n2 = ns * ns;
+        // bf16 stored bits of small well-conditioned values (the cross-check is a tolerance anyway).
+        let a: Vec<u16> = (0..n2)
+            .map(|i| to_bf16_bits((i % 7) as f32 * 0.5 + 0.1))
+            .collect();
+        let b: Vec<u16> = (0..n2)
+            .map(|i| to_bf16_bits((i % 5) as f32 * 0.25 - 0.3))
+            .collect();
+        let mut c = vec![0.0f32; n2];
+        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+        let flops = 2.0 * (ns as f64).powi(3);
+        let gflops = |m: &Option<MeasureBf16>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", flops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "=== linear_bf16 (bf16 nn.Linear C=A·Bᵀ, f32 accumulate) {ns}x{ns} (GFLOP/s, higher is better) ==="
+        );
+        let mer = bench_mercury_bf16(&mer_linear_bf16(ns, false), &mut c, ap, bp, cp);
+        let mer_par = bench_mercury_bf16(&mer_linear_bf16(ns, true), &mut c, ap, bp, cp);
+        let cm = bench_external_bf16(
+            "c",
+            &c_linear_bf16(ns),
+            dir,
+            "linear_bf16",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        let rm = bench_external_bf16(
+            "rs",
+            &rust_linear_bf16(ns),
+            dir,
+            "linear_bf16",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GFLOP/s",
+            gflops(&mer),
+            gflops(&mer_par),
+            gflops(&cm),
+            gflops(&rm)
+        );
+        // Sanity cross-check on c[0] (the bf16 widen is lossless, so all three compute the same GEMM
+        // up to the documented float-reassociation tolerance).
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let rel = ((m.out - c2.out).abs() / c2.out.abs().max(1e-6)) as f64;
+            if rel > 1e-2 {
+                println!(
+                    "  ! c[0] mismatch vs C: Mer={} C={} (rel {:.2e})",
+                    m.out, c2.out, rel
+                );
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than idiomatic bf16 C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x faster than idiomatic single-threaded bf16 C");
+        }
+        println!();
+    }
+}
+
+/// Mercury bf16 `nn.Linear`, the idiomatic `ijk` dot-product `C = A·Bᵀ` with `[bf16]` operands widened
+/// `as f32` and an f32 accumulator — what the `mir_build` recognizer folds to `mercury_sgemm_bf16_nt`.
+fn mer_linear_bf16(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(a: [bf16; {n2}], b: [bf16; {n2}], c: [f32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{\n\
+         \x20           let mut s: f32 = 0.0;\n\
+         \x20           for k in 0..{ns} {{ s = s + (a[i * {ns} + k] as f32) * (b[j * {ns} + k] as f32); }}\n\
+         \x20           c[i * {ns} + j] = s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_linear_bf16(ns: usize) -> String {
+    format!(
+        "#include <stdint.h>\n#include <string.h>\n#define NS {ns}\n\
+         static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
+         __declspec(dllexport) void kbench(const uint16_t* a, const uint16_t* b, float* c){{\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
+         \x20     for (long k=0;k<NS;k++) s += bf(a[i*NS+k]) * bf(b[j*NS+k]);\n\
+         \x20     c[i*NS+j]=s; }}\n}}\n"
+    )
+}
+
+fn rust_linear_bf16(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[inline] fn bf(b:u16)->f32 {{ f32::from_bits((b as u32)<<16) }}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const u16, b:*const u16, c:*mut f32) {{\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
+         \x20     for k in 0..NS {{ s += bf(*a.add(i*NS+k)) * bf(*b.add(j*NS+k)); }}\n\
+         \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+    )
+}
+
 fn bench_i8gemm(cc: &str, dir: &Path) {
     for ns in [512usize, 1024] {
         let n2 = ns * ns;
