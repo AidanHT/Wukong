@@ -279,6 +279,8 @@ struct FnEmit<'a> {
     vreg: HashMap<u32, String>,
     // ValueId -> its N lane registers, for SIMD `<N x T>` values (scalarized per lane).
     vlanes: HashMap<u32, Vec<String>>,
+    // ValueId -> its constant integer value (for op-code dispatch of recognized kernel calls).
+    const_ints: HashMap<u32, i128>,
     // Unique label counter (for cond-branch edge fixups).
     n_lbl: u32,
 
@@ -311,6 +313,7 @@ impl<'a> FnEmit<'a> {
             n_p: 0,
             vreg: HashMap::new(),
             vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
             n_lbl: 0,
             frame_off: HashMap::new(),
             frame_bytes: 0,
@@ -479,6 +482,7 @@ impl<'a> FnEmit<'a> {
 
         match &inst.op {
             Op::ConstInt(v, ty) => {
+                self.const_ints.insert(r.0, *v);
                 let d = self.reg(r);
                 self.emit(&format!("mov.b64 {d}, {};", const_to_u64(*v, ty)));
             }
@@ -1176,6 +1180,21 @@ impl<'a> FnEmit<'a> {
         match name.as_str() {
             "print" | "println" => self.lower_print(args),
             "assert" => self.lower_assert(args),
+            // The elementwise transcendental kernel dispatches on a compile-time op code; only lower
+            // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).
+            "mercury_vmath_f32" if args.len() == 4 => {
+                let op = self
+                    .const_ints
+                    .get(&args[3].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;
+                if vmath_supported(op) {
+                    self.emit_helper_call("mrt_vmath", None, args, None);
+                    Ok(())
+                } else {
+                    Err(format!("{UNSUPPORTED} vmath op {op} not yet lowered to PTX"))
+                }
+            }
             other => {
                 if let Some(h) = rt_helper(other) {
                     self.emit_helper_call(h.ptx_name, h.ret, args, result);
@@ -1553,9 +1572,16 @@ fn rt_helper(name: &str) -> Option<RtHelper> {
             ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT)
         }
         "mercury_norm_f32" | "mercury_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM),
+        "mercury_vmath_f32" => ("mrt_vmath", None, PTX_VMATH),
         _ => return None,
     };
     Some(RtHelper { ptx_name, ret, def })
+}
+
+/// Which `mercury_vmath_f32` op codes `mrt_vmath` implements. Excludes atan(25)/asin(33)/acos(34),
+/// which need an `atan` minimax polynomial PTX has no SFU for (a later increment).
+fn vmath_supported(op: i128) -> bool {
+    matches!(op, 0..=24 | 26..=32 | 35)
 }
 
 /// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6).
@@ -1942,6 +1968,186 @@ NORM_NEXT:
     add.s64 %rd6, %rd6, 1;
     bra NORM_ROW;
 NORM_DONE:
+    ret;
+}
+"#;
+
+/// `mercury_vmath_f32(x, out, n, op)`: elementwise activation, dispatched on the compile-time op
+/// code (gated by `vmath_supported`). Transcendentals use the SFU (`ex2.approx`/`lg2.approx`/
+/// `sin.approx`/`cos.approx`) and the same closed forms as the CPU kernel; the CPU<->GPU tolerance
+/// gate covers the SFU-vs-Cephes difference (the offload path uses the identical SFU formulas).
+const PTX_VMATH: &str = r#".func mrt_vmath (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<12>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.b64 %rd4, 0;
+VM_LOOP:
+    setp.ge.s64 %p0, %rd4, %rd2;
+    @%p0 bra VM_DONE;
+    shl.b64 %rd5, %rd4, 2;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.f32 %f1, [%rd6];
+    setp.eq.s64 %p1, %rd3, 0;  @%p1 bra VM0;
+    setp.eq.s64 %p1, %rd3, 1;  @%p1 bra VM1;
+    setp.eq.s64 %p1, %rd3, 2;  @%p1 bra VM2;
+    setp.eq.s64 %p1, %rd3, 3;  @%p1 bra VM3;
+    setp.eq.s64 %p1, %rd3, 4;  @%p1 bra VM4;
+    setp.eq.s64 %p1, %rd3, 5;  @%p1 bra VM5;
+    setp.eq.s64 %p1, %rd3, 6;  @%p1 bra VM6;
+    setp.eq.s64 %p1, %rd3, 7;  @%p1 bra VM7;
+    setp.eq.s64 %p1, %rd3, 8;  @%p1 bra VM8;
+    setp.eq.s64 %p1, %rd3, 9;  @%p1 bra VM9;
+    setp.eq.s64 %p1, %rd3, 10; @%p1 bra VM10;
+    setp.eq.s64 %p1, %rd3, 11; @%p1 bra VM11;
+    setp.eq.s64 %p1, %rd3, 12; @%p1 bra VM12;
+    setp.eq.s64 %p1, %rd3, 13; @%p1 bra VM13;
+    setp.eq.s64 %p1, %rd3, 14; @%p1 bra VM14;
+    setp.eq.s64 %p1, %rd3, 15; @%p1 bra VM15;
+    setp.eq.s64 %p1, %rd3, 16; @%p1 bra VM16;
+    setp.eq.s64 %p1, %rd3, 17; @%p1 bra VM17;
+    setp.eq.s64 %p1, %rd3, 18; @%p1 bra VM18;
+    setp.eq.s64 %p1, %rd3, 19; @%p1 bra VM19;
+    setp.eq.s64 %p1, %rd3, 20; @%p1 bra VM20;
+    setp.eq.s64 %p1, %rd3, 21; @%p1 bra VM21;
+    setp.eq.s64 %p1, %rd3, 22; @%p1 bra VM22;
+    setp.eq.s64 %p1, %rd3, 23; @%p1 bra VM23;
+    setp.eq.s64 %p1, %rd3, 24; @%p1 bra VM24;
+    setp.eq.s64 %p1, %rd3, 26; @%p1 bra VM26;
+    setp.eq.s64 %p1, %rd3, 27; @%p1 bra VM27;
+    setp.eq.s64 %p1, %rd3, 28; @%p1 bra VM28;
+    setp.eq.s64 %p1, %rd3, 29; @%p1 bra VM29;
+    setp.eq.s64 %p1, %rd3, 30; @%p1 bra VM30;
+    setp.eq.s64 %p1, %rd3, 31; @%p1 bra VM31;
+    setp.eq.s64 %p1, %rd3, 32; @%p1 bra VM32;
+    setp.eq.s64 %p1, %rd3, 35; @%p1 bra VM35;
+    bra VM_DEF;
+VM0:
+    mul.f32 %f2, %f1, 0f3FB8AA3B; ex2.approx.f32 %f2, %f2; bra VM_ST;
+VM1:
+    lg2.approx.f32 %f2, %f1; mul.f32 %f2, %f2, 0f3F317218; bra VM_ST;
+VM2:
+    add.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f40000000; div.rn.f32 %f4, %f4, %f3;
+    mov.f32 %f2, 0f3F800000; sub.f32 %f2, %f2, %f4; bra VM_ST;
+VM3:
+    neg.f32 %f3, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f2, 0f3F800000; div.rn.f32 %f2, %f2, %f3; bra VM_ST;
+VM4:
+    max.f32 %f2, %f1, 0f00000000; bra VM_ST;
+VM5:
+    neg.f32 %f3, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f3F800000; div.rn.f32 %f4, %f4, %f3;
+    mul.f32 %f2, %f1, %f4; bra VM_ST;
+VM6:
+    mul.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, %f1;
+    fma.rn.f32 %f3, %f3, 0f3D372713, %f1; mul.f32 %f3, %f3, 0f3F4C422A;
+    add.f32 %f4, %f3, %f3; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f4, 0f3F800000; mov.f32 %f5, 0f40000000; div.rn.f32 %f5, %f5, %f4;
+    mov.f32 %f6, 0f3F800000; sub.f32 %f6, %f6, %f5; add.f32 %f6, %f6, 0f3F800000;
+    mul.f32 %f2, %f1, %f6; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;
+VM7:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f3, %f3, 0f3F800000;
+    setp.gt.f32 %p1, %f1, 0f00000000; selp.f32 %f2, %f1, %f3, %p1; bra VM_ST;
+VM8:
+    mul.f32 %f3, %f1, 0f3C23D70A; setp.gt.f32 %p1, %f1, 0f00000000;
+    selp.f32 %f2, %f1, %f3, %p1; bra VM_ST;
+VM9:
+    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    max.f32 %f4, %f1, 0f00000000; add.f32 %f2, %f4, %f3; bra VM_ST;
+VM10:
+    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    max.f32 %f4, %f1, 0f00000000; add.f32 %f5, %f4, %f3;
+    add.f32 %f6, %f5, %f5; mul.f32 %f6, %f6, 0f3FB8AA3B; ex2.approx.f32 %f6, %f6;
+    add.f32 %f6, %f6, 0f3F800000; mov.f32 %f7, 0f40000000; div.rn.f32 %f7, %f7, %f6;
+    mov.f32 %f8, 0f3F800000; sub.f32 %f8, %f8, %f7; mul.f32 %f2, %f1, %f8; bra VM_ST;
+VM11:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f3, %f3, 0f3F800000;
+    mul.f32 %f3, %f3, 0f3FD62D7D; setp.gt.f32 %p1, %f1, 0f00000000;
+    selp.f32 %f2, %f1, %f3, %p1; mul.f32 %f2, %f2, 0f3F867D5F; bra VM_ST;
+VM12:
+    add.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f40000000; div.rn.f32 %f4, %f4, %f3;
+    mov.f32 %f5, 0f3F800000; sub.f32 %f5, %f5, %f4; sub.f32 %f2, %f1, %f5; bra VM_ST;
+VM13:
+    add.f32 %f3, %f1, 0f40400000; mul.f32 %f3, %f3, 0f3E2AAAAB;
+    max.f32 %f3, %f3, 0f00000000; min.f32 %f2, %f3, 0f3F800000; bra VM_ST;
+VM14:
+    add.f32 %f3, %f1, 0f40400000; mul.f32 %f3, %f3, 0f3E2AAAAB;
+    max.f32 %f3, %f3, 0f00000000; min.f32 %f3, %f3, 0f3F800000; mul.f32 %f2, %f1, %f3; bra VM_ST;
+VM15:
+    sin.approx.f32 %f2, %f1; bra VM_ST;
+VM16:
+    cos.approx.f32 %f2, %f1; bra VM_ST;
+VM17:
+    abs.f32 %f3, %f1; fma.rn.f32 %f4, %f3, 0f3EA7BA05, 0f3F800000;
+    mov.f32 %f5, 0f3F800000; div.rn.f32 %f4, %f5, %f4;
+    mov.f32 %f6, 0f3F87DC22;
+    fma.rn.f32 %f6, %f6, %f4, 0fBFBA00E3;
+    fma.rn.f32 %f6, %f6, %f4, 0f3FB5F0E3;
+    fma.rn.f32 %f6, %f6, %f4, 0fBE91A98E;
+    fma.rn.f32 %f6, %f6, %f4, 0f3E827906;
+    mul.f32 %f6, %f6, %f4;
+    mul.f32 %f7, %f3, %f3; neg.f32 %f7, %f7; mul.f32 %f7, %f7, 0f3FB8AA3B; ex2.approx.f32 %f7, %f7;
+    mul.f32 %f6, %f6, %f7; mov.f32 %f2, 0f3F800000; sub.f32 %f2, %f2, %f6;
+    copysign.f32 %f2, %f1, %f2; bra VM_ST;
+VM18:
+    ex2.approx.f32 %f2, %f1; bra VM_ST;
+VM19:
+    lg2.approx.f32 %f2, %f1; bra VM_ST;
+VM20:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    neg.f32 %f4, %f1; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    sub.f32 %f2, %f3, %f4; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;
+VM21:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    neg.f32 %f4, %f1; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    add.f32 %f2, %f3, %f4; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;
+VM22:
+    abs.f32 %f3, %f1; fma.rn.f32 %f4, %f1, %f1, 0f3F800000; sqrt.rn.f32 %f4, %f4;
+    add.f32 %f4, %f3, %f4; lg2.approx.f32 %f4, %f4; mul.f32 %f4, %f4, 0f3F317218;
+    copysign.f32 %f2, %f1, %f4; bra VM_ST;
+VM23:
+    fma.rn.f32 %f4, %f1, %f1, 0fBF800000; sqrt.rn.f32 %f4, %f4; add.f32 %f4, %f1, %f4;
+    lg2.approx.f32 %f4, %f4; mul.f32 %f2, %f4, 0f3F317218; bra VM_ST;
+VM24:
+    add.f32 %f3, %f1, 0f3F800000; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f1;
+    div.rn.f32 %f3, %f3, %f4; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    mul.f32 %f2, %f3, 0f3F000000; bra VM_ST;
+VM26:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f2, %f3, 0f3F800000; bra VM_ST;
+VM27:
+    add.f32 %f3, %f1, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f2, %f3, 0f3F317218; bra VM_ST;
+VM28:
+    mul.f32 %f3, %f1, 0f40549A78; ex2.approx.f32 %f2, %f3; bra VM_ST;
+VM29:
+    lg2.approx.f32 %f3, %f1; mul.f32 %f2, %f3, 0f3E9A209B; bra VM_ST;
+VM30:
+    abs.f32 %f3, %f1; add.f32 %f3, %f3, 0f3F800000; div.rn.f32 %f2, %f1, %f3; bra VM_ST;
+VM31:
+    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    neg.f32 %f4, %f1; max.f32 %f4, %f4, 0f00000000; add.f32 %f3, %f4, %f3; neg.f32 %f2, %f3; bra VM_ST;
+VM32:
+    sin.approx.f32 %f3, %f1; cos.approx.f32 %f4, %f1; div.rn.f32 %f2, %f3, %f4; bra VM_ST;
+VM35:
+    abs.f32 %f3, %f1; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    mul.f32 %f3, %f3, 0f3EAAAAAB; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    copysign.f32 %f2, %f1, %f3; bra VM_ST;
+VM_DEF:
+    mov.f32 %f2, %f1;
+VM_ST:
+    add.s64 %rd6, %rd1, %rd5;
+    st.f32 [%rd6], %f2;
+    add.s64 %rd4, %rd4, 1;
+    bra VM_LOOP;
+VM_DONE:
     ret;
 }
 "#;
