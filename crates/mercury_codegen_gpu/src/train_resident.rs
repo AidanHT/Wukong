@@ -11,10 +11,43 @@
 //! loss (gate only). Gated: gradients vs an f64 closed-form backprop, and the loss strictly falls.
 
 use crate::gpu::Gpu;
-use crate::ptx_autodiff_bwd::{act_bwd_device, gemm_device, mse_grad_device, relu_fwd_device};
+use crate::ptx_autodiff_bwd::{
+    act_bwd_device, gemm_device, gemm_device_f16, mse_grad_device, relu_fwd_device,
+};
 use crate::ptx_optim::{adamw_step_device, hp};
 use cudarc::driver::{CudaSlice, DriverError};
 use mercury_runtime::VM_RELU;
+
+/// GEMM precision for the resident step. `F32` runs the reg-blocked CUDA-core kernel (the bit-tight
+/// default and oracle); `F16Mixed` runs the **fp16 tensor cores** — operands narrowed to f16
+/// just-in-time, products f32-accumulated, **master weights/grads kept f32** so there is no gradient
+/// underflow to chase and no loss scaling. The tensor-core path is the GEMM-bound step's headline
+/// perf lever (f32 CUDA-core GEMM is far below the Ada tensor-core roofline).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Precision {
+    F32,
+    F16Mixed,
+}
+
+/// Dispatch a resident GEMM by [`Precision`]: `C[m×n] = opA(A)·opB(B)` over f32 device buffers.
+#[allow(clippy::too_many_arguments)]
+fn gemm_dispatch(
+    prec: Precision,
+    g: &mut Gpu,
+    ta: bool,
+    tb: bool,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    c: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), DriverError> {
+    match prec {
+        Precision::F32 => gemm_device(g, ta, tb, a, b, c, m, n, k),
+        Precision::F16Mixed => gemm_device_f16(g, ta, tb, a, b, c, m, n, k),
+    }
+}
 
 /// Optimizer hyperparameters for the resident step.
 #[derive(Clone, Copy)]
@@ -45,6 +78,8 @@ pub struct MlpTrainer {
     pub i: usize,
     pub h: usize,
     pub o: usize,
+    /// GEMM precision — `F32` (default) or `F16Mixed` (tensor cores). Set via [`with_precision`].
+    pub prec: Precision,
     // parameters + their gradients + AdamW moments (per layer)
     w1: CudaSlice<f32>,
     w2: CudaSlice<f32>,
@@ -86,6 +121,7 @@ impl MlpTrainer {
             i,
             h,
             o,
+            prec: Precision::F32,
             w1: st.memcpy_stod(w1)?,
             w2: st.memcpy_stod(w2)?,
             dw1: st.alloc_zeros::<f32>(h * i)?,
@@ -106,6 +142,12 @@ impl MlpTrainer {
         })
     }
 
+    /// Select the GEMM precision (builder style), e.g. `MlpTrainer::new(...)?.with_precision(F16Mixed)`.
+    pub fn with_precision(mut self, p: Precision) -> Self {
+        self.prec = p;
+        self
+    }
+
     /// Upload the training batch (`x` is `[B×I]`, `target` is `[B×O]`). For a fixed-batch loop this is
     /// called once; the per-step compute never re-touches the host.
     pub fn set_batch(&mut self, g: &mut Gpu, x: &[f32], target: &[f32]) -> Result<(), DriverError> {
@@ -120,9 +162,9 @@ impl MlpTrainer {
     /// Forward: `H_pre = X·W1ᵀ`, `H = relu(H_pre)`, `Y = H·W2ᵀ` — all resident.
     pub fn forward(&mut self, g: &mut Gpu) -> Result<(), DriverError> {
         let (b, i, h, o) = (self.b, self.i, self.h, self.o);
-        gemm_device(g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
+        gemm_dispatch(self.prec, g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
         relu_fwd_device(g, &self.h_pre, &mut self.hact, b * h)?;
-        gemm_device(g, false, true, &self.hact, &self.w2, &mut self.y, b, o, h)?;
+        gemm_dispatch(self.prec, g, false, true, &self.hact, &self.w2, &mut self.y, b, o, h)?;
         Ok(())
     }
 
@@ -135,7 +177,7 @@ impl MlpTrainer {
     /// matrix (see [`crate::ptx_autodiff_bwd::attention_backward`]).
     pub fn recompute_activations(&mut self, g: &mut Gpu) -> Result<(), DriverError> {
         let (b, i, h) = (self.b, self.i, self.h);
-        gemm_device(g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
+        gemm_dispatch(self.prec, g, false, true, &self.x, &self.w1, &mut self.h_pre, b, h, i)?;
         relu_fwd_device(g, &self.h_pre, &mut self.hact, b * h)?;
         Ok(())
     }
@@ -147,13 +189,13 @@ impl MlpTrainer {
         let (b, i, h, o) = (self.b, self.i, self.h, self.o);
         mse_grad_device(g, &self.y, &self.target, &mut self.dy, b * o, scale)?;
         // dW2[O×H] = dYᵀ[O×B]·H[B×H]
-        gemm_device(g, true, false, &self.dy, &self.hact, &mut self.dw2, o, h, b)?;
+        gemm_dispatch(self.prec, g, true, false, &self.dy, &self.hact, &mut self.dw2, o, h, b)?;
         // dH[B×H] = dY[B×O]·W2[O×H]
-        gemm_device(g, false, false, &self.dy, &self.w2, &mut self.dh, b, h, o)?;
+        gemm_dispatch(self.prec, g, false, false, &self.dy, &self.w2, &mut self.dh, b, h, o)?;
         // dH_pre = dH ⊙ relu'(H_pre)
         act_bwd_device(g, VM_RELU, &self.dh, &self.h_pre, &self.hact, &mut self.dh_pre, b * h)?;
         // dW1[H×I] = dH_preᵀ[H×B]·X[B×I]
-        gemm_device(g, true, false, &self.dh_pre, &self.x, &mut self.dw1, h, i, b)?;
+        gemm_dispatch(self.prec, g, true, false, &self.dh_pre, &self.x, &mut self.dw1, h, i, b)?;
         Ok(())
     }
 
@@ -322,6 +364,95 @@ mod tests {
             let (rdw1, rdw2) = mlp_backprop_ref(b, i, h, o, &x, &w1, &w2, &target);
             assert_close("resident dW1", &dw1, &rdw1, 1e-3, 2e-3);
             assert_close("resident dW2", &dw2, &rdw2, 1e-3, 2e-3);
+        });
+    }
+
+    /// **The fp16 gradient gate:** the resident step with `Precision::F16Mixed` (tensor-core GEMMs) vs
+    /// the same f64 closed-form backprop, at an f16 tolerance — proving the mixed-precision routing
+    /// produces correct gradients end-to-end through all five GEMMs (NT/NN/TN). Dims are 64-multiples
+    /// so every GEMM rides the `_sm_db` tensor-core kernel (not the non-16 f32 fallback).
+    #[test]
+    fn resident_mlp_gradients_match_reference_f16() {
+        with_gpu("resident_mlp_gradients_match_reference_f16", |g| {
+            let (b, i, h, o) = (64usize, 64usize, 128usize, 64usize);
+            let mut rng = Rng::new(0x16AD);
+            let w1 = rng.vec(h * i, -0.4, 0.4);
+            let w2 = rng.vec(o * h, -0.4, 0.4);
+            let x = rng.vec(b * i, -1.0, 1.0);
+            let target = rng.vec(b * o, -1.0, 1.0);
+
+            let mut tr = MlpTrainer::new(g, b, i, h, o, &w1, &w2)
+                .unwrap()
+                .with_precision(Precision::F16Mixed);
+            tr.set_batch(g, &x, &target).unwrap();
+            tr.forward(g).unwrap();
+            tr.backward(g, 2.0).unwrap();
+            let (dw1, dw2) = tr.grads_host(g).unwrap();
+
+            let (rdw1, rdw2) = mlp_backprop_ref(b, i, h, o, &x, &w1, &w2, &target);
+            // f16 inputs to every GEMM (~5e-4 rel each) compound through the chain; dW1 rides 4 chained
+            // f16 GEMMs and a relu whose kink amplifies a few near-threshold lanes (measured worst-case
+            // ~4.3% rel). This is the genuine f16 precision cost — the GEMM kernel itself is bit-tight-
+            // gated separately (`fp16_gemm_matches_f64_reference`, 3e-3 rel). The job of THIS gate is to
+            // catch a miswiring of the 5 GEMMs (mode/operand/dim) — which is gross, orders past 8% rel.
+            assert_close("resident-f16 dW1", &dw1, &rdw1, 2e-1, 8e-2);
+            assert_close("resident-f16 dW2", &dw2, &rdw2, 2e-1, 8e-2);
+        });
+    }
+
+    /// **The fp16 training gate:** the tensor-core (`F16Mixed`) resident step actually learns — several
+    /// AdamW steps on a fixed teacher-generated batch drive the loss down. Confirms the mixed-precision
+    /// gradients are not just close but *useful* (no silent sign/scale corruption that a one-shot
+    /// gradient check at a single point could miss).
+    #[test]
+    fn resident_mlp_loss_decreases_f16() {
+        with_gpu("resident_mlp_loss_decreases_f16", |g| {
+            let (b, i, h, o) = (64usize, 64usize, 128usize, 64usize);
+            let mut rng = Rng::new(0x16ED);
+            let w1 = rng.vec(h * i, -0.1, 0.1);
+            let w2 = rng.vec(o * h, -0.1, 0.1);
+            let x = rng.vec(b * i, -1.0, 1.0);
+            let tw1 = rng.vec(h * i, -0.6, 0.6);
+            let tw2 = rng.vec(o * h, -0.6, 0.6);
+            let target = {
+                let (mut hpre, mut yv) = (vec![0f32; b * h], vec![0f32; b * o]);
+                for bi in 0..b {
+                    for j in 0..h {
+                        let mut a = 0f32;
+                        for ii in 0..i {
+                            a += x[bi * i + ii] * tw1[j * i + ii];
+                        }
+                        hpre[bi * h + j] = a.max(0.0);
+                    }
+                    for oo in 0..o {
+                        let mut a = 0f32;
+                        for j in 0..h {
+                            a += hpre[bi * h + j] * tw2[oo * h + j];
+                        }
+                        yv[bi * o + oo] = a;
+                    }
+                }
+                yv
+            };
+
+            let mut tr = MlpTrainer::new(g, b, i, h, o, &w1, &w2)
+                .unwrap()
+                .with_precision(Precision::F16Mixed);
+            tr.set_batch(g, &x, &target).unwrap();
+            let cfg = AdamWCfg {
+                lr: 5e-3,
+                ..Default::default()
+            };
+            tr.forward(g).unwrap();
+            let l0 = tr.loss(g).unwrap();
+            let mut prev = l0;
+            for t in 1..=200i32 {
+                tr.step(g, t, cfg).unwrap();
+                prev = tr.loss(g).unwrap();
+            }
+            eprintln!("resident MLP (f16): loss {l0:.4e} -> {prev:.4e} over 200 AdamW steps");
+            // Looser than the f32 gate (0.2): f16 rounding floors how far the loss can fall.
+            assert!(prev < l0 * 0.5, "f16 loss did not fall enough: {l0:.3e} -> {prev:.3e}");
         });
     }
 
@@ -538,6 +669,118 @@ mod tests {
                 // a revert to the naive kernel drops to ~7-10%. 20% catches that without flakiness.
                 assert!(pct >= 20.0, "training GEMM regressed to {pct:.1}% of cuBLAS (expected >=20%)");
             }
+        });
+    }
+
+    /// **M8 fp16 GEMM standing** — the tensor-core training GEMM (`gemm_device_f16`, NT, including the
+    /// just-in-time f16 narrow the resident step pays) vs both the f32 reg-blocked kernel and the
+    /// gold-standard cuBLAS **fp16** peer, same-run, at the FFN's dominant shapes. The clock-invariant
+    /// figures are the **f16/f32 speedup** (what the tensor cores bought) and the **% of cuBLAS-fp16**
+    /// (how far the kernel is from the library on the SAME precision). cuBLAS-fp16 is the honest peer
+    /// now that Mercury also uses the tensor cores. Reported, not asserted — it's a measurement.
+    #[test]
+    #[ignore]
+    fn m8_gemm_f16_vs_cublas_f16() {
+        with_gpu("m8_gemm_f16_vs_cublas_f16", |g| {
+            for &(m, k, n) in &[(512usize, 768usize, 3072usize), (512, 3072, 768)] {
+                let mut rng = Rng::new(0xF16B ^ (m * n * k) as u64);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let bb = rng.vec(n * k, -1.0, 1.0); // NT: B is n×k
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&bb).unwrap();
+                let mut c_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
+                // warm up both kernels
+                gemm_device(g, false, true, &a_d, &b_d, &mut c_d, m, n, k).unwrap();
+                gemm_device_f16(g, false, true, &a_d, &b_d, &mut c_d, m, n, k).unwrap();
+                g.stream.synchronize().unwrap();
+                let iters = 20u32;
+                let mer32 = best_of(5, || {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        gemm_device(g, false, true, &a_d, &b_d, &mut c_d, m, n, k).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let mer16 = best_of(5, || {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        gemm_device_f16(g, false, true, &a_d, &b_d, &mut c_d, m, n, k).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let cub16 = best_of(5, || {
+                    crate::baselines::time_cublas_gemm_nt_f16(g, m, k, n, iters).unwrap()
+                });
+                let flop = 2.0 * m as f64 * n as f64 * k as f64;
+                eprintln!(
+                    "GEMM {m}x{n}x{k}: f32 {:.1} | f16 {:.1} | cuBLAS-f16 {:.1} GFLOP/s  \
+                     => f16 is {:.2}x f32, {:.1}% of cuBLAS-f16",
+                    flop / mer32 / 1e9,
+                    flop / mer16 / 1e9,
+                    flop / cub16 / 1e9,
+                    mer32 / mer16,
+                    100.0 * cub16 / mer16,
+                );
+            }
+        });
+    }
+
+    /// **M8 resident-step f16 vs f32** — the whole resident MLP/FFN training step (fwd+bwd+fused AdamW)
+    /// timed in both precisions same-run at the GPT-2-FFN shape. The clock-invariant figure is the
+    /// **f16/f32 step speedup** (absolute us/step and tokens/s swing ~7× with the laptop clock). This
+    /// is the honest M8 perf delta the tensor-core routing buys end-to-end (the GEMMs dominate, so the
+    /// step speedup tracks the GEMM speedup minus the cast/transpose overhead the f16 path adds).
+    #[test]
+    #[ignore]
+    fn m8_resident_step_f16_vs_f32() {
+        with_gpu("m8_resident_step_f16_vs_f32", |g| {
+            let (b, i, h, o) = (512usize, 768usize, 3072usize, 768usize);
+            let mut rng = Rng::new(0x6FFB);
+            let w1 = rng.vec(h * i, -0.02, 0.02);
+            let w2 = rng.vec(o * h, -0.02, 0.02);
+            let x = rng.vec(b * i, -1.0, 1.0);
+            let target = rng.vec(b * o, -1.0, 1.0);
+            let mut hpv = vec![0.0f32; hp::LEN];
+            hpv[hp::LR] = 1e-3;
+            hpv[hp::BETA1] = 0.9;
+            hpv[hp::BETA2] = 0.999;
+            hpv[hp::EPS] = 1e-8;
+            hpv[hp::BC1] = 1.0 - 0.9f32.powi(10);
+            hpv[hp::BC2] = 1.0 - 0.999f32.powi(10);
+            let hp_d = g.stream.memcpy_stod(&hpv).unwrap();
+
+            let time_step = |g: &mut Gpu, prec: Precision| -> f64 {
+                let mut tr = MlpTrainer::new(g, b, i, h, o, &w1, &w2)
+                    .unwrap()
+                    .with_precision(prec);
+                tr.set_batch(g, &x, &target).unwrap();
+                for _ in 0..3 {
+                    tr.step_devhp(g, &hp_d).unwrap();
+                }
+                g.stream.synchronize().unwrap();
+                let iters = 30u32;
+                best_of(5, || {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        tr.step_devhp(g, &hp_d).unwrap();
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                })
+            };
+            let s32 = time_step(g, Precision::F32);
+            let s16 = time_step(g, Precision::F16Mixed);
+            eprintln!(
+                "M8 resident step @B={b} d={i} ff={h}: f32 {:.0} us ({:.0} tok/s) | f16 {:.0} us \
+                 ({:.0} tok/s) => f16 is {:.2}x f32 (clock-variant)",
+                s32 * 1e6,
+                b as f64 / s32,
+                s16 * 1e6,
+                b as f64 / s16,
+                s32 / s16,
+            );
         });
     }
 }
