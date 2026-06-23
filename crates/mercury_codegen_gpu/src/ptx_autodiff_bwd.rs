@@ -17,6 +17,7 @@ use crate::gpu::Gpu;
 use crate::ptx_gemm::{gemm_rb_ptx, TILE_M, TILE_N};
 use crate::ptx_optim::grid_stride_cfg;
 use cudarc::driver::{CudaSlice, DriverError, LaunchConfig, PushKernelArg};
+use half::f16;
 use std::sync::OnceLock;
 
 // Row-norm op codes (mirror `mercury_autodiff::tape` / `mercury_runtime`).
@@ -83,6 +84,68 @@ T_LOOP:
     add.s32         %r7, %r7, %r9;
     bra             T_LOOP;
 T_END:
+    ret;
+}
+"#;
+
+/// Transpose **and narrow to f16** in one pass: `dst (n×m) f16 = (src (m×n) f32)ᵀ`, with the same
+/// `didx = col*m + row` scatter as [`TRANSPOSE_F32_PTX`] but a `cvt.rn.f16.f32` (round-to-nearest-even,
+/// bit-exact to `half::f16::from_f32`) before a 2-byte store. This is the operand prep the NT-only WMMA
+/// tensor-core GEMM needs for an NN/TN matmul (it makes the contraction dim the inner one) — folding the
+/// transpose and the f32→f16 narrow into a single kernel keeps the resident step's launch count down.
+pub const TRANSPOSE_CAST_F32_F16_PTX: &str = r#"
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry transpose_cast_f32_f16(
+    .param .u64 tc_src,
+    .param .u64 tc_dst,
+    .param .u32 tc_m,
+    .param .u32 tc_n
+)
+{
+    .reg .pred  %p<2>;
+    .reg .b32   %r<12>;
+    .reg .b64   %rd<8>;
+    .reg .f32   %f<2>;
+    .reg .b16   %h<2>;
+
+    ld.param.u64    %rd1, [tc_src];
+    ld.param.u64    %rd2, [tc_dst];
+    ld.param.u32    %r1,  [tc_m];
+    ld.param.u32    %r2,  [tc_n];
+    cvta.to.global.u64  %rd1, %rd1;
+    cvta.to.global.u64  %rd2, %rd2;
+    mul.lo.s32      %r3, %r1, %r2;      // total = m*n
+
+    mov.u32         %r4, %ntid.x;
+    mov.u32         %r5, %ctaid.x;
+    mov.u32         %r6, %tid.x;
+    mad.lo.s32      %r7, %r5, %r4, %r6; // idx
+    mov.u32         %r8, %nctaid.x;
+    mul.lo.s32      %r9, %r4, %r8;      // stride
+
+TC_LOOP:
+    setp.ge.s32     %p1, %r7, %r3;
+    @%p1 bra        TC_END;
+
+    div.u32         %r10, %r7, %r2;     // row = idx / n
+    mul.lo.s32      %r11, %r10, %r2;
+    sub.s32         %r11, %r7, %r11;    // col = idx - row*n
+    mad.lo.s32      %r11, %r11, %r1, %r10; // didx = col*m + row
+
+    mul.wide.s32    %rd3, %r7,  4;
+    add.s64         %rd4, %rd1, %rd3;   // &src[idx]   (f32, 4 bytes)
+    ld.global.f32   %f1, [%rd4];
+    cvt.rn.f16.f32  %h1, %f1;
+    mul.wide.s32    %rd5, %r11, 2;
+    add.s64         %rd6, %rd2, %rd5;   // &dst[didx]  (f16, 2 bytes)
+    st.global.u16   [%rd6], %h1;
+
+    add.s32         %r7, %r7, %r9;
+    bra             TC_LOOP;
+TC_END:
     ret;
 }
 "#;
@@ -791,6 +854,180 @@ pub fn gemm_device(
     }
 }
 
+// ----------------------------------------------------------------------------------------------
+// Mixed-precision (fp16 tensor-core) training GEMM. The f32 reg-blocked `gemm_device` above sits at
+// ~⅓ of cuBLAS f32, and cuBLAS f32 is itself far below the Ada tensor-core roofline — so the GEMM-
+// bound training step's biggest lever is to run the matmuls on the fp16 tensor cores. This is the
+// standard mixed-precision contract: **master weights and gradients stay f32**, operands are narrowed
+// to f16 just-in-time, and the tensor cores accumulate the products in f32 (the WMMA kernel's C is
+// f32). Because nothing is *stored* in f16 (only the transient GEMM inputs), there is no gradient
+// underflow to chase and **no loss scaling is needed** — the only deviation from the f32 path is the
+// f16 rounding of each operand, exactly what the cuBLAS-fp16 peer ([`baselines::cublas_gemm_nt_f16`])
+// also pays. The kernels are the read-only `ptx_wmma::wmma_f16_ptx()`; we only narrow + launch.
+// ----------------------------------------------------------------------------------------------
+
+/// Narrow `src` (n f32) → `dst` (n f16) over device buffers — reuses the pub `ptx::CAST_F32_F16`
+/// kernel (round-to-nearest-even, bit-exact to `half::f16::from_f32`). One thread per element (the
+/// kernel does not grid-stride), so the grid is sized to cover `n`.
+pub fn cast_f32_to_f16_device(
+    g: &mut Gpu,
+    src: &CudaSlice<f32>,
+    dst: &mut CudaSlice<f16>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = g.function("cast_f32_f16", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
+    let n_u = n as u32;
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&n_u).arg(src).arg(dst);
+    unsafe { b.launch(LaunchConfig::for_num_elems(n_u))? };
+    Ok(())
+}
+
+/// Transpose-and-narrow `src(m×n) f32` → `dst(n×m) f16` in one launch (see
+/// [`TRANSPOSE_CAST_F32_F16_PTX`]).
+pub fn transpose_cast_device(
+    g: &mut Gpu,
+    src: &CudaSlice<f32>,
+    dst: &mut CudaSlice<f16>,
+    m: usize,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = g.function(
+        "transpose_cast_f32_f16",
+        TRANSPOSE_CAST_F32_F16_PTX,
+        "transpose_cast_f32_f16",
+    )?;
+    let (mu, nu) = (m as u32, n as u32);
+    let cfg = grid_stride_cfg(g, (m * n) as u32);
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(src).arg(dst).arg(&mu).arg(&nu);
+    unsafe { b.launch(cfg)? };
+    Ok(())
+}
+
+/// `C[m×n] = A·Bᵀ` with **f16 inputs, f32 accumulate/out** over device buffers — the tensor-core GEMM
+/// from the read-only `ptx_wmma::wmma_f16_ptx()`. Dispatches the `cp.async` double-buffered
+/// `wmma_nt_f16_sm_db` (64×64 CTA tile) when M,N are 64-multiples (the training shape), else the
+/// single-tile `wmma_nt_f16`. Both kernels declare their shared memory statically, so the launch
+/// config carries `shared_mem_bytes: 0`. Requires 16-multiple dims; `C` is overwritten.
+fn wmma_nt_device(
+    g: &mut Gpu,
+    a16: &CudaSlice<f16>,
+    b16: &CudaSlice<f16>,
+    c: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), DriverError> {
+    use crate::ptx_wmma::{wmma_f16_ptx, SM_BM, SM_BN, SM_THREADS};
+    assert!(
+        m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
+        "wmma_nt_device needs 16-multiple dims"
+    );
+    let (entry, cfg) = if m % SM_BM == 0 && n % SM_BN == 0 {
+        (
+            "wmma_nt_f16_sm_db",
+            LaunchConfig {
+                grid_dim: ((n / SM_BN) as u32, (m / SM_BM) as u32, 1),
+                block_dim: (SM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    } else {
+        (
+            "wmma_nt_f16",
+            LaunchConfig {
+                grid_dim: ((n / 16) as u32, (m / 16) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    };
+    let f = g.function("wmma_f16", wmma_f16_ptx(), entry)?;
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mu).arg(&nu).arg(&ku).arg(a16).arg(b16).arg(c);
+    unsafe { bld.launch(cfg)? };
+    Ok(())
+}
+
+/// `C[m×n] = opA(A)·opB(B)` over **f32** device buffers, computed on the **fp16 tensor cores** (mixed
+/// precision — operands narrowed to f16 just-in-time, products f32-accumulated). A drop-in for
+/// [`gemm_device`] in the resident training step; the GEMM-bound step's headline lever. WMMA is
+/// NT-only (`A·Bᵀ`, both operands contraction-last), so the contraction dim is made inner by a
+/// transpose+narrow where needed:
+///   * NT (`A·Bᵀ`): narrow A, B → one WMMA.
+///   * NN (`A·B`):  narrow A; transpose-narrow B (`[k×n]→[n×k]`); WMMA.
+///   * TN (`Aᵀ·B`): transpose-narrow A (`[k×m]→[m×k]`) and B (`[k×n]→[n×k]`); WMMA.
+/// The transposes are O(elements) (memory-bound, « the O(mnk) GEMM). Dims that aren't 16-multiples
+/// fall back to the (correct, slower) f32 [`gemm_device`]. Master weights/grads stay f32 → no loss
+/// scaling. Tolerance-gated vs cuBLAS-fp16 and vs the f32 closed-form MLP backprop at f16 tolerance.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_device_f16(
+    g: &mut Gpu,
+    ta: bool,
+    tb: bool,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    c: &mut CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), DriverError> {
+    if m % 16 != 0 || n % 16 != 0 || k % 16 != 0 {
+        return gemm_device(g, ta, tb, a, b, c, m, n, k);
+    }
+    match (ta, tb) {
+        (false, true) => {
+            // NT: A is [m×k], B is [n×k] — the WMMA-native layout.
+            let mut a16 = g.stream.alloc_zeros::<f16>(m * k)?;
+            let mut b16 = g.stream.alloc_zeros::<f16>(n * k)?;
+            cast_f32_to_f16_device(g, a, &mut a16, m * k)?;
+            cast_f32_to_f16_device(g, b, &mut b16, n * k)?;
+            wmma_nt_device(g, &a16, &b16, c, m, n, k)
+        }
+        (false, false) => {
+            // NN: A is [m×k], B is [k×n]; WMMA wants the B operand as [n×k] = Bᵀ.
+            let mut a16 = g.stream.alloc_zeros::<f16>(m * k)?;
+            let mut bt16 = g.stream.alloc_zeros::<f16>(n * k)?;
+            cast_f32_to_f16_device(g, a, &mut a16, m * k)?;
+            transpose_cast_device(g, b, &mut bt16, k, n)?;
+            wmma_nt_device(g, &a16, &bt16, c, m, n, k)
+        }
+        (true, false) => {
+            // TN: A is [k×m], B is [k×n]; WMMA wants A as [m×k]=Aᵀ and B as [n×k]=Bᵀ.
+            let mut at16 = g.stream.alloc_zeros::<f16>(m * k)?;
+            let mut bt16 = g.stream.alloc_zeros::<f16>(n * k)?;
+            transpose_cast_device(g, a, &mut at16, k, m)?;
+            transpose_cast_device(g, b, &mut bt16, k, n)?;
+            wmma_nt_device(g, &at16, &bt16, c, m, n, k)
+        }
+        (true, true) => panic!("gemm_device_f16: TT not supported"),
+    }
+}
+
+/// `C[m×n] = opA(A)·opB(B)` on the **fp16 tensor cores** — host-slice wrapper around
+/// [`gemm_device_f16`] (uploads f32 `a`/`b`, runs the mixed-precision GEMM, downloads f32 `C`). `a` is
+/// `m*k` elements in the layout `ta` implies, `b` is `k*n`. For gating + benches.
+pub fn gemm_f16(
+    g: &mut Gpu,
+    ta: bool,
+    tb: bool,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, DriverError> {
+    assert_eq!(a.len(), m * k, "gemm A must be m*k elements");
+    assert_eq!(b.len(), k * n, "gemm B must be k*n elements");
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.alloc_zeros::<f32>(m * n)?;
+    gemm_device_f16(g, ta, tb, &a_d, &b_d, &mut c_d, m, n, k)?;
+    g.stream.memcpy_dtov(&c_d)
+}
+
 /// `dx = dout ⊙ f'(·)` over device buffers (resident activation-backward; see [`act_bwd_f32`]).
 pub fn act_bwd_device(
     g: &mut Gpu,
@@ -1194,6 +1431,52 @@ mod tests {
                 }
                 let mode = gemm_entry_name(ta, tb);
                 assert_close(mode, &got, &want, 1e-4, 1e-3);
+            }
+        });
+    }
+
+    /// **The fp16 tensor-core GEMM gate.** `gemm_f16` (mixed precision) vs an f64 reference computed
+    /// from the **identically f16-rounded** operands — so the only deviation is f32-accumulate (GPU)
+    /// vs f64-accumulate (ref), not the f16 narrowing (both pay it). This proves the NT/NN/TN layout +
+    /// transpose-narrow routing and the WMMA dispatch are correct. A transpose slip shows as a gross
+    /// mismatch far outside tolerance. Dims cover the `_sm_db` 64-multiple path, a 16-not-64 single-tile
+    /// path, and a non-16 shape that must fall back to the f32 kernel.
+    #[test]
+    fn fp16_gemm_matches_f64_reference() {
+        with_gpu("fp16_gemm_matches_f64_reference", |g| {
+            let round16 = |x: &[f32]| -> Vec<f32> {
+                x.iter().map(|&v| f16::from_f32(v).to_f32()).collect()
+            };
+            for &(m, n, k) in &[
+                (64usize, 64usize, 64usize), // _sm_db
+                (128, 192, 256),             // _sm_db, K>tile
+                (64, 128, 80),               // _sm_db (M,N 64-mult), K 16-mult not 64
+                (48, 32, 48),                // 16-mult not 64 -> single-tile wmma_nt_f16
+                (33, 40, 50),                // non-16 -> f32 fallback (must still match)
+            ] {
+                let mut rng = Rng::new(0xF16A ^ (m as u64) << 20 ^ (n as u64) << 10 ^ k as u64);
+                for &(ta, tb) in &[(false, false), (false, true), (true, false)] {
+                    // Operands O(1) so f16 is well-conditioned. `a` is m*k, `b` is k*n (layout per ta/tb).
+                    let a = round16(&rng.vec(m * k, -1.0, 1.0));
+                    let b = round16(&rng.vec(k * n, -1.0, 1.0));
+                    let got = gemm_f16(g, ta, tb, &a, &b, m, n, k).unwrap();
+                    let aref = |i: usize, l: usize| if ta { a[l * m + i] } else { a[i * k + l] } as f64;
+                    let bref = |l: usize, j: usize| if tb { b[j * k + l] } else { b[l * n + j] } as f64;
+                    let mut want = vec![0f32; m * n];
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut acc = 0f64;
+                            for l in 0..k {
+                                acc += aref(i, l) * bref(l, j);
+                            }
+                            want[i * n + j] = acc as f32;
+                        }
+                    }
+                    let tag = format!("f16 {}x{}x{} {}", m, n, k, gemm_entry_name(ta, tb));
+                    // f32-accumulate vs f64-accumulate only (inputs already f16): abs absorbs tile-tree
+                    // reduction order; a layout bug is gross, far outside this.
+                    assert_close(&tag, &got, &want, 1e-2, 3e-3);
+                }
             }
         });
     }
