@@ -2147,10 +2147,25 @@ impl ResidentLayerF16 {
         x_d: &cudarc::driver::CudaSlice<f32>,
         out: &mut cudarc::driver::CudaSlice<f32>,
     ) -> Result<(), DriverError> {
+        let stream = self.stream.clone();
+        self.forward_device_pooled_on(&stream, pool, x_d, out)
+    }
+
+    /// As [`forward_device_pooled`](Self::forward_device_pooled) but issuing every launch on an
+    /// explicit `stream` (which may differ from the layer's own NULL default stream). The pool's
+    /// uninitialized `alloc` path issues no stream work, so *only* these launches land on `stream` —
+    /// exactly what [`crate::graph::Graph::capture`] needs: a capturable (non-NULL) stream carrying
+    /// nothing but the layer's launches.
+    pub fn forward_device_pooled_on(
+        &self,
+        stream: &Arc<CudaStream>,
+        pool: &mut crate::pool::DevicePool,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+        out: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<(), DriverError> {
         use crate::pool::{DevicePool, PoolBuf};
         use cudarc::driver::{CudaSlice, CudaFunction};
         use half::f16;
-        let stream = &self.stream;
         let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
         assert_eq!(x_d.len(), s * d, "x_d must be S*D");
         assert_eq!(out.len(), s * d, "out must be S*D");
@@ -6910,76 +6925,210 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// Best (lowest) per-iteration wall time of `run`, in seconds. Warms up to coax the boost clock,
-    /// then takes the fastest of several timed rounds — the least-throttled measurement, mirroring
-    /// `best_bw`'s reasoning for the ~7× laptop clock swing. Only **ratios** of two such numbers
-    /// measured back-to-back in one process are reported (the honesty law).
-    fn min_latency(g: &Gpu, mut run: impl FnMut()) -> f64 {
+    /// Run `f` with the shared context's event tracking **disabled**, re-enabling on the way out
+    /// (panic-safe). cudarc records per-buffer read/write events (on by default) and, once a second
+    /// stream exists, inserts a cross-stream `cuStreamWaitEvent` on every buffer use — which
+    /// `cuStreamBeginCapture` rejects as a dependency on uncaptured work. A buffer created while
+    /// tracking is off carries no events, so a multi-stream capture inserts no such waits. The whole
+    /// GPU suite is serialized under one process-wide mutex, so toggling the shared context here races
+    /// with nothing; the layer/buffers built inside `f` must be created here (so they are event-free),
+    /// and the caller is responsible for explicit stream synchronization (done in the helpers below).
+    fn with_event_tracking_disabled(g: &mut Gpu, f: impl FnOnce(&mut Gpu)) {
+        struct Reenable(Arc<CudaContext>);
+        impl Drop for Reenable {
+            fn drop(&mut self) {
+                unsafe { self.0.enable_event_tracking() };
+            }
+        }
+        let _guard = Reenable(g.ctx.clone());
+        unsafe { g.ctx.disable_event_tracking() };
+        f(g);
+    }
+
+    /// Capture `layer.forward_device_pooled_on` into a replayable CUDA graph on a fresh non-blocking
+    /// stream, with the scratch pool and persistent in/out buffers all event-free on that stream.
+    /// **Must run inside [`with_event_tracking_disabled`]** so the capture inserts no cross-stream
+    /// waits. Returns the capture stream, the pool, the persistent input/output device buffers (whose
+    /// pointers are baked into the graph — keep them alive and on this stream for replay), and the
+    /// graph. `x` seeds the input. A warmup forward on the capture stream precedes capture (primes
+    /// state; makes the NULL-stream-uploaded weights visible to the capture stream).
+    #[allow(clippy::type_complexity)]
+    fn capture_resident_layer(
+        g: &Gpu,
+        layer: &ResidentLayerF16,
+        s: usize,
+        d: usize,
+        x: &[f32],
+        cap_bytes: usize,
+    ) -> (
+        Arc<CudaStream>,
+        crate::pool::DevicePool,
+        cudarc::driver::CudaSlice<f32>,
+        cudarc::driver::CudaSlice<f32>,
+        crate::graph::Graph,
+    ) {
+        let cap = g.ctx.new_stream().unwrap();
+        let mut pool = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
+        let x_d = cap.memcpy_stod(x).unwrap();
+        let mut out_d = cap.alloc_zeros::<f32>(s * d).unwrap();
+        // Weights were uploaded on the NULL stream; make them visible to the capture stream.
+        g.stream.synchronize().unwrap();
+        // Warmup once on the capture stream, then capture into a graph.
+        pool.reset();
+        layer.forward_device_pooled_on(&cap, &mut pool, &x_d, &mut out_d).unwrap();
+        cap.synchronize().unwrap();
+        pool.reset();
+        let graph = crate::graph::Graph::capture(cap.clone(), || {
+            layer.forward_device_pooled_on(&cap, &mut pool, &x_d, &mut out_d)
+        })
+        .unwrap();
+        (cap, pool, x_d, out_d, graph)
+    }
+
+    /// **Identical-numerics gate for graph replay (the first law).** Capturing the pooled forward into
+    /// a CUDA graph and replaying it with a single `cuGraphLaunch` must produce output **bit-for-bit**
+    /// equal to the eager per-op forward — the graph changes *how* the same launches are issued, not
+    /// *what* they compute. Capture runs on a dedicated non-blocking stream (the layer's default stream
+    /// is the un-capturable NULL stream); the slab is poisoned 0xFF before replay (hostile dirty), and
+    /// a second replay must match the first **bit-for-bit** (M12 determinism — replay is deterministic
+    /// against stable baked-in pointers). Covers single-head, multi-head, and the GPT-2 layer.
+    #[test]
+    fn resident_layer_graphed_matches_eager() {
+        with_gpu("resident_layer_graphed_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
+                    let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0xA001 + ci as u64);
+
+                    // eager reference on the default stream (same kernels, same weights, same input).
+                    let x_d_ref = g.stream.memcpy_stod(&x).unwrap();
+                    let ref_host =
+                        g.stream.memcpy_dtov(&layer.forward_device(&x_d_ref).unwrap()).unwrap();
+
+                    // capture the pooled forward into a graph on a dedicated stream.
+                    let (cap, mut pool, _x_d, out_d, graph) =
+                        capture_resident_layer(g, &layer, s, d, &x, 256 * 1024 * 1024);
+
+                    // Poison the slab (ordered on `cap` before replay), then replay twice.
+                    pool.poison(0xFF).unwrap();
+                    graph.launch().unwrap();
+                    cap.synchronize().unwrap();
+                    let g1 = cap.memcpy_dtov(&out_d).unwrap();
+                    graph.launch().unwrap();
+                    cap.synchronize().unwrap();
+                    let g2 = cap.memcpy_dtov(&out_d).unwrap();
+
+                    assert_eq!(g1.len(), ref_host.len());
+                    for i in 0..ref_host.len() {
+                        assert_eq!(
+                            g1[i].to_bits(),
+                            ref_host[i].to_bits(),
+                            "graphed != eager at {i} (S={s} D={d} Dff={dff} heads={heads})"
+                        );
+                        assert_eq!(
+                            g1[i].to_bits(),
+                            g2[i].to_bits(),
+                            "graph replay non-deterministic at {i} (S={s} D={d} Dff={dff} heads={heads})"
+                        );
+                    }
+                    eprintln!(
+                        "graphed==eager bit-identical & replay deterministic: S={s} D={d} Dff={dff} \
+                         heads={heads}; one cuGraphLaunch replays the whole resident layer (high-water {} KiB)",
+                        pool.high_water_bytes() / 1024
+                    );
+                }
+            });
+        });
+    }
+
+    /// Best (lowest) per-iteration wall time of `run`, in seconds, synchronizing `sync_stream` to
+    /// retire the work. Warms up to coax the boost clock, then takes the fastest of several timed
+    /// rounds — the least-throttled measurement, mirroring `best_bw`'s reasoning for the ~7× laptop
+    /// clock swing. Only **ratios** of two such numbers measured back-to-back in one process are
+    /// reported (the honesty law).
+    fn min_latency(sync_stream: &Arc<CudaStream>, mut run: impl FnMut()) -> f64 {
         const WARMUP: usize = 30;
         const ROUNDS: usize = 12;
         const ITERS: usize = 40;
         for _ in 0..WARMUP {
             run();
         }
-        g.stream.synchronize().unwrap();
+        sync_stream.synchronize().unwrap();
         let mut best = f64::MAX;
         for _ in 0..ROUNDS {
             let t0 = Instant::now();
             for _ in 0..ITERS {
                 run();
             }
-            g.stream.synchronize().unwrap();
+            sync_stream.synchronize().unwrap();
             best = best.min(t0.elapsed().as_secs_f64() / ITERS as f64);
         }
         best
     }
 
-    /// **M7 same-run latency — eager vs pooled** (the graphed column lands with `crate::graph`). Both
-    /// paths run the *identical* kernel sequence; the only difference is that the eager path issues a
-    /// `cuMemAllocAsync` + `cuMemsetD8Async` per intermediate and a `cuMemFreeAsync` on drop, while the
-    /// pooled path bumps a cursor (no driver call, and no zeroing memset since every buffer is a
-    /// full-overwrite output). Reported as a back-to-back ratio at decode/small-batch + GPT-2 shapes —
-    /// where this allocate/free/zero traffic is the largest fraction of a tiny layer's wall time.
+    /// **M7 same-run latency — eager vs pooled vs graphed.** All three run the *identical* kernel
+    /// sequence; they differ only in runtime overhead:
+    /// - **eager**: a `cuMemAllocAsync`+`cuMemsetD8Async` per intermediate, a `cuMemFreeAsync` on drop,
+    ///   and one `cuLaunchKernel` per kernel.
+    /// - **pooled**: a host cursor bump per intermediate (no driver call, no zeroing) + per-kernel
+    ///   launches — removes the alloc/free/zero traffic.
+    /// - **graphed**: the whole captured layer replayed by a **single `cuGraphLaunch`** — also removes
+    ///   the per-kernel launch overhead.
+    ///
+    /// Reported back-to-back at decode/small-batch + GPT-2 shapes, where this allocate/free/zero/launch
+    /// overhead is the largest fraction of a tiny layer's wall time. eager runs on the default (NULL)
+    /// stream; pooled/graphed on a dedicated capture stream (event tracking off so capture inserts no
+    /// cross-stream waits — see `with_event_tracking_disabled`).
     #[test]
     #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
     fn pool_graph_vs_unpooled() {
         with_gpu("pool_graph_vs_unpooled", |g| {
             eprintln!("device: {}", g.device_name());
-            let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
-            for &(s, d, dff, heads) in &cases {
-                let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x7001);
-                let stream = g.stream.clone();
-                let x_d = stream.memcpy_stod(&x).unwrap();
-                let cap = 256 * 1024 * 1024;
-                let mut pool = crate::pool::DevicePool::new(stream.clone(), cap).unwrap();
-                let mut out_d = stream.alloc_zeros::<f32>(s * d).unwrap();
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let cap_bytes = 256 * 1024 * 1024;
+                for &(s, d, dff, heads) in &cases {
+                    let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x7001);
 
-                // One warm forward to count the per-forward sub-allocations the pool replaces (each is
-                // a cuMemAllocAsync + cuMemsetD8Async + cuMemFreeAsync in the eager path).
-                pool.reset();
-                layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
-                let allocs_per_fwd = pool.served();
+                    // eager on the default stream: per-op alloc_zeros + free-on-drop + N launches.
+                    let x_d_g = g.stream.memcpy_stod(&x).unwrap();
+                    let eager = min_latency(&g.stream, || {
+                        let _ = layer.forward_device(&x_d_g).unwrap();
+                    });
 
-                // eager: per-op alloc_zeros (alloc + memset) + free-on-drop + individual launches.
-                let eager = min_latency(g, || {
-                    let _ = layer.forward_device(&x_d).unwrap();
-                });
-                // pooled: bump arena (no per-op alloc/free, no zeroing) + individual launches.
-                let pooled = min_latency(g, || {
-                    pool.reset();
-                    layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
-                });
+                    // Capture the layer into a graph on a dedicated stream (keeps its pool + buffers).
+                    let (cap, pool, x_d_cap, _out_cap, graph) =
+                        capture_resident_layer(g, &layer, s, d, &x, cap_bytes);
 
-                eprintln!(
-                    "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: eager {:7.1} us | pooled {:7.1} us \
-                     → pooled {:.2}x  ({} device allocs/free/memset per forward removed; high-water {} KiB)",
-                    eager * 1e6,
-                    pooled * 1e6,
-                    eager / pooled,
-                    allocs_per_fwd,
-                    pool.high_water_bytes() / 1024,
-                );
-            }
+                    // pooled on the capture stream: bump arena, N individual launches (own pool/out).
+                    let mut pool2 = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
+                    let mut out2 = cap.alloc_zeros::<f32>(s * d).unwrap();
+                    pool2.reset();
+                    layer.forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2).unwrap();
+                    let allocs_per_fwd = pool2.served();
+                    let pooled = min_latency(&cap, || {
+                        pool2.reset();
+                        layer.forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2).unwrap();
+                    });
+
+                    // graphed on the capture stream: one cuGraphLaunch replays the whole layer.
+                    let graphed = min_latency(&cap, || {
+                        graph.launch().unwrap();
+                    });
+
+                    eprintln!(
+                        "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: eager {:7.1} | pooled {:7.1} | graphed {:7.1} us \
+                         → graphed {:.2}x vs eager, {:.2}x vs pooled  ({} pooled sub-allocs/fwd; high-water {} KiB)",
+                        eager * 1e6,
+                        pooled * 1e6,
+                        graphed * 1e6,
+                        eager / graphed,
+                        pooled / graphed,
+                        allocs_per_fwd,
+                        pool.high_water_bytes() / 1024,
+                    );
+                }
+            });
         });
     }
 }

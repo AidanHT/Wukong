@@ -52,4 +52,7 @@ pub mod ptx_fp8;
 pub mod pool;
 
 #[cfg(feature = "gpu")]
+pub mod graph;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
