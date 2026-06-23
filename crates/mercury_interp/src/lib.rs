@@ -1109,6 +1109,35 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_transpose_u16[_parallel](src, dst, rows, cols)` — the 16-bit (bf16/f16) transpose.
+            // A transpose is a permutation, so the interpreter moves the `Value`s directly (precision-
+            // agnostic): the bf16/f16 elements are stored as their rounded `Value::Float`, which the
+            // native u16 kernel's moved bits decode back to the same value — so interp == native without
+            // any bf16-vs-f16 bit conversion. Read all of src first so an overlapping case is robust.
+            "mercury_transpose_u16" | "mercury_transpose_u16_parallel" => {
+                let src = ptr(args[0])?;
+                let dst = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let mut buf = Vec::with_capacity(rows * cols);
+                for t in 0..rows * cols {
+                    buf.push(
+                        *self
+                            .memory
+                            .get(src + t)
+                            .ok_or("transpose operand out of bounds")?,
+                    );
+                }
+                for i in 0..rows {
+                    for j in 0..cols {
+                        *self
+                            .memory
+                            .get_mut(dst + j * rows + i)
+                            .ok_or("transpose output out of bounds")? = buf[i * cols + j];
+                    }
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath2_f32(x, y, out, n, op)` — the two-input 256-bit kernel (pow/atan2/hypot)
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the
