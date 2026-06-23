@@ -57,6 +57,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   widen prepass then the same tuned kernel — ~25× the idiomatic bf16 C (`tests/run/linear_{bf16,f16}.mer`),
   and its **fused FFN epilogue** (`act(A·Bᵀ + bias)`) folds to `mercury_sgemm_{bf16,f16}_nt_epi` — bias +
   activation in the GEMM writeback for free (`tests/run/linear_{bf16,f16}_ffn.mer`; see epilogue fusion below).
+  The mixed-precision **weight-gradient** `C = Aᵀ·B` (`dW = dYᵀ·X`, the training backward) is recognized
+  too → `mercury_sgemm_{bf16,f16}_tn` (widen prepass → the f32 `mercury_sgemm_tn`), closing the half
+  training-backward gap where the naive nest loses to both the un-vectorizable widen and the column-strided
+  A reads (`tests/run/matmul_{bf16,f16}_tn.mer`).
 - **Batched matmul → per-head GEMM dispatch**: a matmul nest wrapped in a batch loop, with each index
   carrying a per-batch base offset (`x[h*S*D + i*K + k]` — the shape of **multi-head attention**, one
   matmul per head), also dispatches. The recognizer peels the offset off each flattened index (it
