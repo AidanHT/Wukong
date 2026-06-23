@@ -528,12 +528,15 @@ mod tests {
                 });
                 let cub = best_of(5, || time_cublas_sgemm_f32(g, m, k, n, iters));
                 let flop = 2.0 * m as f64 * n as f64 * k as f64;
+                let pct = 100.0 * cub / mer;
                 eprintln!(
-                    "GEMM {m}x{n}x{k}: Mercury {:.1} GFLOP/s vs cuBLAS-f32 {:.1} GFLOP/s = {:.1}% of cuBLAS",
+                    "GEMM {m}x{n}x{k}: Mercury {:.1} GFLOP/s vs cuBLAS-f32 {:.1} GFLOP/s = {pct:.1}% of cuBLAS",
                     flop / mer / 1e9,
                     flop / cub / 1e9,
-                    100.0 * cub / mer
                 );
+                // Regression floor (clock-invariant ratio): the reg-blocked routing measures ~32-35%;
+                // a revert to the naive kernel drops to ~7-10%. 20% catches that without flakiness.
+                assert!(pct >= 20.0, "training GEMM regressed to {pct:.1}% of cuBLAS (expected >=20%)");
             }
         });
     }
