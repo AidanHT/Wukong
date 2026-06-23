@@ -214,6 +214,9 @@ fn main() {
     if want("transpose") {
         bench_transpose(&cc, &dir);
     }
+    if want("colsum") {
+        bench_colsum(&cc, &dir);
+    }
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -855,6 +858,119 @@ fn rust_transpose(ns: usize) -> String {
     format!(
         "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(src:*const f32, _y:*const f32, dst:*mut f32) {{\n\
          \x20 for i in 0..NS {{ for j in 0..NS {{ *dst.add(j*NS+i) = *src.add(i*NS+j); }} }}\n}}\n"
+    )
+}
+
+/// Column reduction `out[j] = Σ_i x[i, j]` — the sum over the outer (batch/row) axis (the bias gradient
+/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0). The naive `for j { for i { s += x[i*N+j] } }`
+/// reads `x` with stride `N` — a strided reduction gcc/rustc leave **scalar** (verified: no packed
+/// `vaddps` at `-O3 -march=native`). Mercury folds the nest to `mercury_colsum_f32`, which streams `x`
+/// row-major + 8 columns at a time. The kernels carry an unused middle pointer so they share the
+/// `(x, _, out)` 3-pointer harness. Reported as GB/s (`M·N·4` bytes — the matrix read once). Both
+/// languages sum each column i-ascending, so the cross-check is **bit-exact** (no reassociation).
+fn bench_colsum(cc: &str, dir: &Path) {
+    for (m, n) in [(1024usize, 1024usize), (4096, 1024)] {
+        let mn = m * n;
+        let x: Vec<f32> = (0..mn).map(|i| (i % 17) as f32 * 0.25 - 2.0).collect();
+        let dummy = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+        let bytes = mn as f64 * 4.0; // the matrix is read once
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== colsum (out[j] = Σ_i x[i,j]) {m}x{n} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_colsum(m, n, false), &mut out, xp, yp, op);
+        let mer_par = bench_mercury(&mer_colsum(m, n, true), &mut out, xp, yp, op);
+        let cm = bench_external(
+            "c",
+            &c_colsum(m, n),
+            dir,
+            "colsum",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_colsum(m, n),
+            dir,
+            "colsum",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        // Both sum each column in i-ascending order, so the full-buffer cross-check is bit equality.
+        if let (Some(a), Some(c2)) = (&mer, &cm) {
+            if a.out != c2.out {
+                println!("  ! colsum output mismatch vs C");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury column-sum kernel: the idiomatic `for j { let s=0; for i { s += x[i*N+j] }; out[j]=s }` the
+/// `mir_build` recognizer folds to one `mercury_colsum_f32[_parallel]` call. `y` is unused (the `(x, _,
+/// out)` 3-pointer harness ABI). `out` is the `[N]` result; `x` is the `[M, N]` matrix.
+fn mer_colsum(m: usize, n: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let mn = m * n;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for j in 0..{n} {{\n\
+         \x20       let mut s: f32 = 0.0;\n\
+         \x20       for i in 0..{m} {{ s = s + x[i * {n} + j]; }}\n\
+         \x20       out[j] = s;\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_colsum(m: usize, n: usize) -> String {
+    format!(
+        "#define M {m}\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
+    )
+}
+
+fn rust_colsum(m: usize, n: usize) -> String {
+    format!(
+        "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ s += *x.add(i*N+j); }} *out.add(j)=s; }}\n}}\n"
     )
 }
 
