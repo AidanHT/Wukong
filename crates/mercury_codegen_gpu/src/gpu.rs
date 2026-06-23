@@ -10035,6 +10035,52 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **`ldmatrix`+XOR-swizzle int8 gate (first law, bit-exact).** The conflict-free-SMEM variants
+    /// (`int8_gemm_nt_smdb_swz` 64×64 and `int8_gemm_nt_smdb128_swz` 128×128, BK=64) must reproduce the
+    /// wrapping-`i32` CPU reference EXACTLY: the XOR swizzle only reorders SMEM bytes and `ldmatrix`
+    /// only changes *how* the A/B fragments are gathered — the `u8`×`i8`→`i32` mod-2³² arithmetic is
+    /// identical to every other int8 kernel. Full-range `u8`/`i8`; K multiples of 64 (the swz slab is a
+    /// full 64-wide K-step). A wrong fragment/swizzle layout fails this `assert_eq!` unambiguously — the
+    /// exact oracle that lets the tricky ldmatrix derivation be validated independent of GPU contention.
+    #[test]
+    fn int8_smdb_swz_matches_reference() {
+        use crate::ptx_int8::{
+            int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_swz_ptx, INT8_BM, INT8_BM128, INT8_BN,
+            INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+        };
+        with_gpu("int8_smdb_swz", |g| {
+            let mut rng = crate::diff::Rng::new(0x5111);
+            let gen = |rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize| {
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                (a, b)
+            };
+            // 64×64 swz (M%64==0, N%64==0, K%64==0); 192/128 exercise the multi-CTA tail.
+            let w64 = INT8_WARPS_M * INT8_WARPS_N;
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 64, 192), (192, 128, 128)] {
+                let (a, b) = gen(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                assert_eq!(
+                    launch_int8_smdb(g, int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w64, m, k, n, &a, &b),
+                    r,
+                    "smdb_swz 64x64 {m}x{k}x{n}"
+                );
+            }
+            // 128×128 swz (M%128==0, N%128==0, K%64==0).
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            for (m, k, n) in [(128usize, 128usize, 128usize), (256, 128, 256)] {
+                let (a, b) = gen(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                assert_eq!(
+                    launch_int8_smdb(g, int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz", INT8_BM128, INT8_BN128, w128, m, k, n, &a, &b),
+                    r,
+                    "smdb128_swz {m}x{k}x{n}"
+                );
+            }
+            eprintln!("[gate] int8 ldmatrix+swizzle smdb_swz (64 & 128) bit-exact vs i32 oracle ✓");
+        });
+    }
+
     /// **int8 multi-stage `cp.async` depth sweep (M3 lever)** — same-run vs cuBLAS IMMA at 1024/2048/4096.
     /// Times the 2-buffer double-buffer (`_smdb`, stages=2) against the 3- and 4-stage rings
     /// (`_smdb_s{3,4}`) for both the 64×64 and 128×128 tiles, picks the per-size winner, reports % of
