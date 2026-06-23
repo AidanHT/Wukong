@@ -128,6 +128,15 @@ pub fn lower_program(
                     program.funcs.push(func);
                     continue;
                 }
+                // A `@parallel` whole-function residual projection (`x = x + act(x·Wᵀ + bias)`):
+                // intercept before the outliner (which would split it into per-row scalar loops and
+                // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
+                // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
+                if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner) {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
                 // A `@parallel` *batched norm* (`fn f(x){ for r in 0..R { <norm row r over x[r*C+i]> } }`)
                 // dispatches to the multicore `mercury_norm_f32_parallel`: rows are independent (so it
                 // is deterministic and bit-equal to the serial kernel the interpreter calls) and each
@@ -3487,6 +3496,19 @@ impl FnLowerer<'_> {
         // whole-function `@parallel` form is handled earlier in `lower_program`).
         if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
             if self.emit_sgemm(&nest, false) {
+                return;
+            }
+        }
+        // A fused residual projection `c[i*N+j] = act(c[i*N+j] + dot [+ bias[j]])` — the transformer
+        // skip connection `x = x + act(x·Wᵀ + bias)`, whose accumulate store blocks the bare matmul
+        // recognizer above (so without this the whole nest falls to a scalar loop). It dispatches to
+        // `mercury_sgemm_nt_epi` with beta=1 (the kernel accumulates the matmul into the residual
+        // already in C), reusing the fused-epilogue kernel with no backend change. Tried after the
+        // bare matmul (the two store forms — `c = s` vs `c = act(c + s + …)` — are disjoint).
+        if let Some((nest, bias, act)) =
+            match_matmul_residual(pat, iter, body, self.sema, self.interner)
+        {
+            if self.emit_sgemm_epi(&nest, bias, act) {
                 return;
             }
         }
@@ -9553,6 +9575,204 @@ fn match_matmul_ijk<'a>(
     })
 }
 
+/// Match the **residual** store value of a fused residual projection:
+/// `act(c[i*N+j] + s [+ bias[j]])` — the matmul output `c` read back and added to the fresh dot `s`,
+/// with an optional per-column bias and an optional activation wrapping the whole sum (the transformer
+/// skip connection). Flattens the additive terms in any association (so `c + s + bias`, `s + c`, … all
+/// match) and requires **exactly** one residual `c[i*N+j]` and one dot `s`, plus at most one `bias[j]`;
+/// any other term rejects. Returns `(optional_bias, act_code)`. The activation peeling and codes mirror
+/// the plain epilogue (`peel_dequant_act`), so the fused `nt_epi` (beta = 1) result is bit-identical to
+/// the unfused `c = act(c + matmul + bias)`.
+fn match_residual_store_value(
+    value: &Expr,
+    c_sym: Symbol,
+    ivar: Symbol,
+    jvar: Symbol,
+    n: Dim,
+    s_sym: Symbol,
+    interner: &Interner,
+) -> Option<(Option<Symbol>, u32)> {
+    let (inner, act) = peel_dequant_act(value, interner);
+    let mut terms = Vec::new();
+    flatten_add_terms(inner, &mut terms);
+    let (mut saw_c, mut saw_s) = (false, false);
+    let mut bias: Option<Symbol> = None;
+    for t in terms {
+        if is_c_elem(t, c_sym, ivar, jvar, n, interner) {
+            if saw_c {
+                return None; // the residual must appear exactly once
+            }
+            saw_c = true;
+        } else if single_path(t) == Some(s_sym) {
+            if saw_s {
+                return None;
+            }
+            saw_s = true;
+        } else if let Some(b) = index_by_var(t, jvar) {
+            if bias.is_some() {
+                return None; // at most one per-column (bias) term
+            }
+            bias = Some(b);
+        } else {
+            return None; // an unrecognized additive term — not a residual projection
+        }
+    }
+    if saw_c && saw_s {
+        Some((bias, act))
+    } else {
+        None
+    }
+}
+
+/// Recognize the **fused residual projection** — the textbook `ijk` `nn.Linear` (`A·Bᵀ`) nest whose
+/// store *accumulates* into its own output (the transformer skip connection `x = x + act(x·Wᵀ + bias)`):
+///
+/// ```text
+/// for i in 0..M { for j in 0..N {
+///   let mut s: f32 = 0.0;
+///   for k in 0..K { s = s + a[i*K+k] * b[j*K+k]; }
+///   c[i*N+j] = act(c[i*N+j] + s [+ bias[j]]);   // residual c + dot, optional bias, optional act
+/// } }
+/// ```
+///
+/// Identical to [`match_matmul_ijk`] except the store reads `c` back (`match_residual_store_value`), so
+/// it maps to `mercury_sgemm_nt_epi` with **beta = 1**: the kernel computes `act(beta·c_old + A·Bᵀ +
+/// bias)` = `act(c_residual + A·Bᵀ + bias)`, reusing the exact fused-epilogue kernel — *no new symbol,
+/// no backend change* (the interpreter already marshals `nt_epi` reading the old `c`, and beta flows
+/// through). Without this the accumulate store (not `c = s`) blocks the matmul recognizer and the whole
+/// nest falls to a scalar loop. **NT only, offset-free** (the epilogue kernel is the plain 2-D `A·Bᵀ`);
+/// returns the nest (`beta = 1`) plus the optional bias and the activation code.
+fn match_matmul_residual<'a>(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(MatmulNest<'a>, Option<Symbol>, u32)> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    // j body: [ let s = 0.0; for k {...}; c[i*N+j] = act(c[i*N+j] + s [+ bias[j]]) ].
+    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
+        match_product_ab_off(prod, row, kvar, jvar, interner)?;
+    // The fused-epilogue kernel is the plain 2-D `A·Bᵀ`: require transposed B, normal A, no batch
+    // offsets (a TN / batched residual has no epilogue kernel — fall back to the scalar nest).
+    if !transposed || transposed_a || !a_off.is_empty() || !b_off.is_empty() {
+        return None;
+    }
+    // The residual store: c[i*N+j] = act(c[i*N+j] + s [+ bias[j]]).
+    let StmtKind::Assign {
+        target: ct,
+        op: ast::AssignOp::Assign,
+        value: cv,
+    } = &jbody.stmts[2].kind
+    else {
+        return None;
+    };
+    let (cbase, cidx) = as_index1(ct)?;
+    let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
+    if sa != kdim || sb != kdim || sc != n || !c_off.is_empty() {
+        return None;
+    }
+    let (bias, act) = match_residual_store_value(cv, cbase, row, jvar, n, s_sym, interner)?;
+    // An input aliasing the output is a hazard (the blocked kernel writes C in a different order).
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    let nest = MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta: 1, // accumulate the matmul into the residual already in C
+        transposed,
+        transposed_a,
+        a_off,
+        b_off,
+        c_off,
+    };
+    Some((nest, bias, act))
+}
+
 /// Recognize the canonical f32 matmul nest rooted at `for row in 0..M { … }`. See [`MatmulNest`].
 fn match_matmul<'a>(
     pat: &Pattern,
@@ -9940,6 +10160,25 @@ fn transpose_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<
         return None;
     };
     match_transpose(pat, iter, lb, sema, interner)
+}
+
+/// Is the whole function body a single fused residual projection (`x = x + act(x·Wᵀ + bias)`)? Used to
+/// intercept a `@parallel` residual *before* the elementwise outliner (which would split it into
+/// per-row scalar loops and lose the fused-epilogue kernel), mirroring the sgemm/norm interceptions.
+fn matmul_residual_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    match_matmul_residual(pat, iter, lb, sema, interner).is_some()
 }
 
 /// Lower a recognized int8 matmul function to a thin wrapper that binds its array params to base

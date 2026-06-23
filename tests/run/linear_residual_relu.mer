@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 14
+module tests.run.linear_residual_relu
+
+// A residual projection wrapped in an activation: x = relu(x + h·Wᵀ + bias). The activation wraps the
+// whole residual sum, so it dispatches to mercury_sgemm_nt_epi with beta=1 AND act=ReLU (the kernel
+// applies relu(beta·x_old + h·Wᵀ + bias) in its writeback). One output goes negative before the relu,
+// so it exercises the fused clipping. Same shape as linear_residual.mer; small integers → exact, the
+// differential gate (interp == native, -O0 == -O3) is bit-for-bit. ReLU is written as fmax(_, 0).
+fn main() -> i32 {
+    let mut x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let h: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [[1,2,3],[4,5,6]]
+    let w: [f32; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 1.0]; // W rows: [1,0,0], [0,1,1]
+    let bias: [f32; 2] = [-5.0, -1.0];
+
+    // x[i,j] = relu(x[i,j] + Σ_k h[i,k]·W[j,k] + bias[j])
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..3 {
+                s = s + h[i * 3 + k] * w[j * 3 + k];
+            }
+            x[i * 2 + j] = fmax(x[i * 2 + j] + s + bias[j], 0.0);
+        }
+    }
+    print(x[0] as i32); // relu(1 + 1  - 5)  = relu(-3) = 0
+    print(x[1] as i32); // relu(2 + 5  - 1)  = relu(6)  = 6
+    print(x[2] as i32); // relu(3 + 4  - 5)  = relu(2)  = 2
+    print(x[3] as i32); // relu(4 + 11 - 1)  = relu(14) = 14
+    return 0;
+}
