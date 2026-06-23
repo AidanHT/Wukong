@@ -9765,4 +9765,170 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         });
     }
+
+    /// Launch one multi-stage int8 SMEM kernel and copy back the i32 result (gate/bench helper).
+    fn launch_int8_smdb(
+        g: &mut Gpu,
+        ptx: &'static str,
+        entry: &'static str,
+        bm: usize,
+        bn: usize,
+        warps: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[u8],
+        b: &[i8],
+    ) -> Vec<i32> {
+        let f = g.function(entry, ptx, entry).unwrap();
+        let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
+        let a_d = g.stream.memcpy_stod(a).unwrap();
+        let b_d = g.stream.memcpy_stod(b).unwrap();
+        let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        unsafe { bld.launch(cfg).unwrap() };
+        g.stream.memcpy_dtov(&c_d).unwrap()
+    }
+
+    /// **Multi-stage int8 gate (first law, bit-exact).** The deeper-pipeline `cp.async` variants
+    /// (`int8_gemm_nt_smdb_s{3,4}`, 64×64 and 128×128) must reproduce the wrapping-`i32` CPU reference
+    /// EXACTLY — identical `u8`×`i8`→`i32` mod-2³² contract as the 2-buffer kernel, only the pipeline
+    /// depth differs. Full-range activations (`u8` 0..255) and weights (`i8`), several shapes including a
+    /// non-128-divisible one (exercises the 64×64 tail) and the K-not-multiple-of-(stages·BK) cases.
+    #[test]
+    fn int8_smdb_ms_matches_reference() {
+        use crate::ptx_int8::{
+            int8_gemm_smdb128_s3_ptx, int8_gemm_smdb128_s4_ptx, int8_gemm_smdb_s3_ptx,
+            int8_gemm_smdb_s4_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M,
+            INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+        };
+        with_gpu("int8_smdb_ms", |g| {
+            let mut rng = crate::diff::Rng::new(0x5A8D);
+            let gen = |rng: &mut crate::diff::Rng, m: usize, k: usize, n: usize| {
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                (a, b)
+            };
+            // 64×64 variants (M%64==0, N%64==0, K%32==0); 160/96 exercise non-128 + short K.
+            let w64 = INT8_WARPS_M * INT8_WARPS_N;
+            for (m, k, n) in [(64usize, 64usize, 64usize), (128, 96, 192), (192, 160, 128)] {
+                let (a, b) = gen(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                for (ptx, entry) in [
+                    (int8_gemm_smdb_s3_ptx(), "int8_gemm_nt_smdb_s3"),
+                    (int8_gemm_smdb_s4_ptx(), "int8_gemm_nt_smdb_s4"),
+                ] {
+                    assert_eq!(
+                        launch_int8_smdb(g, ptx, entry, INT8_BM, INT8_BN, w64, m, k, n, &a, &b),
+                        r,
+                        "{entry} {m}x{k}x{n}"
+                    );
+                }
+            }
+            // 128×128 variants (M%128==0, N%128==0).
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            for (m, k, n) in [(128usize, 128usize, 128usize), (256, 96, 128)] {
+                let (a, b) = gen(&mut rng, m, k, n);
+                let r = ref_nt_int8(&a, &b, m, k, n);
+                for (ptx, entry) in [
+                    (int8_gemm_smdb128_s3_ptx(), "int8_gemm_nt_smdb128_s3"),
+                    (int8_gemm_smdb128_s4_ptx(), "int8_gemm_nt_smdb128_s4"),
+                ] {
+                    assert_eq!(
+                        launch_int8_smdb(g, ptx, entry, INT8_BM128, INT8_BN128, w128, m, k, n, &a, &b),
+                        r,
+                        "{entry} {m}x{k}x{n}"
+                    );
+                }
+            }
+            eprintln!("[gate] int8 smdb multi-stage s3/s4 (64 & 128) bit-exact vs i32 oracle ✓");
+        });
+    }
+
+    /// **int8 multi-stage `cp.async` depth sweep (M3 lever)** — same-run vs cuBLAS IMMA at 1024/2048/4096.
+    /// Times the 2-buffer double-buffer (`_smdb`, stages=2) against the 3- and 4-stage rings
+    /// (`_smdb_s{3,4}`) for both the 64×64 and 128×128 tiles, picks the per-size winner, reports % of
+    /// cuBLAS. Bit-exact checksum cross-check first (the first law). Needs the cuBLAS redist DLL on PATH;
+    /// skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int8_smdb_sweep`
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn int8_smdb_sweep() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::ptx_int8::{
+            int8_gemm_smdb128_ptx, int8_gemm_smdb128_s3_ptx, int8_gemm_smdb128_s4_ptx,
+            int8_gemm_smdb_ptx, int8_gemm_smdb_s3_ptx, int8_gemm_smdb_s4_ptx, INT8_BM, INT8_BM128,
+            INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+        };
+        with_gpu("int8_smdb_sweep", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] int8_smdb_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let w64 = INT8_WARPS_M * INT8_WARPS_N;
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            // (label, ptx, entry, bm, bn, warps, needs_128_divisible)
+            let variants: [(&str, &'static str, &'static str, usize, usize, usize, bool); 6] = [
+                ("smdb64_s2", int8_gemm_smdb_ptx(), "int8_gemm_nt_smdb", INT8_BM, INT8_BN, w64, false),
+                ("smdb64_s3", int8_gemm_smdb_s3_ptx(), "int8_gemm_nt_smdb_s3", INT8_BM, INT8_BN, w64, false),
+                ("smdb64_s4", int8_gemm_smdb_s4_ptx(), "int8_gemm_nt_smdb_s4", INT8_BM, INT8_BN, w64, false),
+                ("smdb128_s2", int8_gemm_smdb128_ptx(), "int8_gemm_nt_smdb128", INT8_BM128, INT8_BN128, w128, true),
+                ("smdb128_s3", int8_gemm_smdb128_s3_ptx(), "int8_gemm_nt_smdb128_s3", INT8_BM128, INT8_BN128, w128, true),
+                ("smdb128_s4", int8_gemm_smdb128_s4_ptx(), "int8_gemm_nt_smdb128_s4", INT8_BM128, INT8_BN128, w128, true),
+            ];
+            let mut rng = crate::diff::Rng::new(0x5A8D5);
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                eprintln!("\n{sz}³ int8 smdb depth sweep (same-run, cuBLAS-adjacent best-pair):");
+                let mut best: Option<(&str, f64)> = None;
+                for (label, ptx, entry, bm, bn, warps, needs128) in variants {
+                    if needs128 && (m % 128 != 0 || n % 128 != 0) {
+                        continue;
+                    }
+                    let f = g.function(entry, ptx, entry).unwrap();
+                    let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
+                    // bit-exact checksum cross-check at this size (first law).
+                    let cs: i64 = {
+                        let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(cfg).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                    };
+                    assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
+                    // Interleave the variant and cuBLAS round-by-round so each %-of-cuBLAS uses a
+                    // *contemporaneous* cuBLAS baseline (the clock/contention swing on this shared mobile
+                    // GPU makes a once-per-size baseline unreliable — cf. `gemm_pipe_sweep`).
+                    let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..ROUNDS {
+                        s_v = s_v.min(time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                        s_cub = s_cub.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                    }
+                    let (gf, g_cub) = (flop / s_v, flop / s_cub);
+                    let pct = 100.0 * gf / g_cub;
+                    eprintln!("  {label:<11}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, g_cub / 1e9);
+                    if best.map_or(true, |(_, p)| pct > p) {
+                        best = Some((label, pct));
+                    }
+                }
+                if let Some((name, pct)) = best {
+                    eprintln!("  → best @{sz}³: {name} at {pct:.1}% of cuBLAS");
+                }
+            }
+        });
+    }
 }

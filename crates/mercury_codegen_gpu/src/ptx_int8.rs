@@ -563,3 +563,229 @@ KEND:
     })
     .as_str()
 }
+
+/// **Multi-stage `cp.async` int8 GEMM** (`stages`-deep, ≥2) — deepens [`int8_gemm_smdb_ptx`]'s 2-buffer
+/// double-buffer into a `stages`-buffer SMEM ring that prefetches **`stages-1` K-slabs ahead**, so the
+/// `mma.sync` units never stall on the global→shared `cp.async` latency at large K (the canonical
+/// large-GEMM lever the 2-buffer scheme leaves on the table — the same multi-stage pipeline that lifted
+/// the fp16 cliff). It keeps the **2-barrier** structure of [`gen_int8_smdb`] verbatim (barrier 1 makes
+/// the just-arrived slab visible; barrier 2 fences the read of the current buffer before a future
+/// prefetch reuses it), so the overwrite ordering is provably safe at *any* depth — only the ring depth
+/// and the `cp.async.wait_group` keep-`stages-1`-in-flight count change. Same hand-placed
+/// `mma.sync.m16n8k32.s32.u8.s8.s32` fragments, `BK=32` slab, and bit-exact mod-2³² contract.
+fn gen_int8_smdb_ms(
+    name: &str,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    stages: usize,
+    dequant: bool,
+) -> String {
+    assert!(stages >= 2, "multi-stage needs >=2 buffers");
+    let bk = INT8_BK;
+    let threads = wm * wn * 32;
+    let tm = bm / (16 * wm);
+    let tn = bn / (8 * wn);
+    let tile_bytes = bm * bk;
+    let ring = stages * tile_bytes;
+    assert!(
+        threads * 16 <= bm * bk && (bm * bk) % (threads * 16) == 0,
+        "smdb_ms staging needs threads*16 to divide the tile bytes"
+    );
+    let a_chunks = bm * bk / (threads * 16);
+    let b_chunks = bn * bk / (threads * 16);
+    let wn_shift = wn.trailing_zeros();
+
+    let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
+    let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
+    s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
+    s += &format!("    .shared .align 16 .b8 smemA[{ring}];\n");
+    s += &format!("    .shared .align 16 .b8 smemB[{ring}];\n");
+    s += "    .reg .pred %p0,%pmore;\n";
+    s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%roff,%woff,%lane,%grp,%tg4,%tg2,%ab;\n";
+    if dequant {
+        s += "    .reg .b32 %col;\n    .reg .f32 %f0,%f1,%f2,%f3,%sc0,%sc1;\n    .reg .b64 %Scale,%scp;\n";
+    }
+    let mut accregs = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..4 {
+                accregs += &format!("%d{ti}_{tj}_{r},");
+            }
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", accregs.trim_end_matches(','));
+    let mut abregs = String::new();
+    for ti in 0..tm {
+        for r in 0..4 {
+            abregs += &format!("%a{ti}_{r},");
+        }
+    }
+    for tj in 0..tn {
+        for r in 0..2 {
+            abregs += &format!("%b{tj}_{r},");
+        }
+    }
+    s += &format!("    .reg .b32 {};\n", abregs.trim_end_matches(','));
+    s += "    .reg .b64 %A,%B,%C,%off,%gptr,%cp;\n";
+
+    s += "    ld.param.u32 %M,[pM];\n    ld.param.u32 %N,[pN];\n    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %A,[pA];\n    ld.param.u64 %B,[pB];\n    ld.param.u64 %C,[pC];\n";
+    s += "    cvta.to.global.u64 %A,%A;\n    cvta.to.global.u64 %B,%B;\n    cvta.to.global.u64 %C,%C;\n";
+    if dequant {
+        s += "    ld.param.u64 %Scale,[pScale];\n    cvta.to.global.u64 %Scale,%Scale;\n";
+    }
+    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %baseRow,%tmp,{bm};\n");
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %baseCol,%tmp,{bn};\n");
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpId,%tix,5;\n";
+    s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n");
+    s += &format!("    and.b32 %warpCol,%warpId,{};\n", wn - 1);
+    s += "    and.b32 %lane,%tix,31;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg4,%lane,3;\n";
+    s += "    shl.b32 %tg2,%tg4,1;\n    shl.b32 %tg4,%tg4,2;\n";
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for r in 0..4 {
+                s += &format!("    mov.u32 %d{ti}_{tj}_{r},0;\n");
+            }
+        }
+    }
+
+    // Stage the `%kcol` A/B slab into the SMEM buffer at byte offset `bufoff` via cp.async (16-byte
+    // chunks). Identical chunk math to `gen_int8_smdb` (BK=32 => r=e>>1, c=(e&1)*16).
+    let stage = |g_base: &str,
+                 gptr_base: &str,
+                 smem: &str,
+                 bufoff: &str,
+                 chunks: usize,
+                 s: &mut String| {
+        for li in 0..chunks {
+            if li == 0 {
+                *s += "    mov.u32 %e,%tix;\n";
+            } else {
+                *s += &format!("    add.u32 %e,%tix,{};\n", li * threads);
+            }
+            *s += "    shr.u32 %r,%e,1;\n    and.b32 %c,%e,1;\n    shl.b32 %c,%c,4;\n";
+            *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
+            *s += &format!("    cvt.u64.u32 %off,%tmp;\n    add.s64 %gptr,{gptr_base},%off;\n");
+            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    shl.b32 %tmp2,%e,4;\n    add.u32 %tmp,%tmp,%tmp2;\n");
+            *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
+        }
+    };
+
+    // Prologue: prefetch slabs 0..stages-2 into buffers 0..stages-2 (stages-1 committed groups).
+    for j in 0..(stages - 1) {
+        s += &format!("    mov.u32 %kcol,{};\n", j * bk);
+        let off = format!("{}", j * tile_bytes);
+        stage("%baseRow", "%A", "smemA", &off, a_chunks, &mut s);
+        stage("%baseCol", "%B", "smemB", &off, b_chunks, &mut s);
+        s += "    cp.async.commit_group;\n";
+    }
+    s += "    mov.u32 %roff,0;\n";
+    s += &format!("    mov.u32 %woff,{};\n", (stages - 1) * tile_bytes);
+
+    s += "    mov.u32 %kt,0;\n";
+    s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,%K;\n    @%p0 bra KEND_{name};\n");
+    // Prefetch slab (kt/bk + stages-1) into the alternate buffer (woff), if it exists.
+    s += &format!("    add.u32 %ktn,%kt,{};\n    setp.lt.u32 %pmore,%ktn,%K;\n", (stages - 1) * bk);
+    s += &format!("    @!%pmore bra NOSTAGE_{name};\n");
+    s += "    mov.u32 %kcol,%ktn;\n";
+    stage("%baseRow", "%A", "smemA", "%woff", a_chunks, &mut s);
+    stage("%baseCol", "%B", "smemB", "%woff", b_chunks, &mut s);
+    s += &format!("NOSTAGE_{name}:\n");
+    // Keep stages-1 groups in flight; wait until the current slab (roff) is the oldest-completed.
+    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group {};\n", stages - 1);
+    s += "    bar.sync 0;\n";
+
+    // Load this warp's A/B fragments from the current buffer (smem[roff]); same layout as gen_int8_smdb.
+    for ti in 0..tm {
+        s += "    mov.u32 %ab,smemA;\n    add.u32 %ab,%ab,%roff;\n";
+        s += &format!("    mul.lo.s32 %tmp,%warpRow,{};\n    add.u32 %tmp,%tmp,{};\n", 16 * tm, ti * 16);
+        s += "    add.u32 %tmp,%tmp,%grp;\n";
+        s += &format!("    mul.lo.s32 %tmp,%tmp,{bk};\n    add.u32 %tmp,%tmp,%tg4;\n    add.u32 %ab,%ab,%tmp;\n");
+        s += &format!("    ld.shared.b32 %a{ti}_0,[%ab];\n    ld.shared.b32 %a{ti}_2,[%ab+16];\n");
+        s += &format!("    ld.shared.b32 %a{ti}_1,[%ab+{}];\n    ld.shared.b32 %a{ti}_3,[%ab+{}];\n", 8 * bk, 8 * bk + 16);
+    }
+    for tj in 0..tn {
+        s += "    mov.u32 %ab,smemB;\n    add.u32 %ab,%ab,%roff;\n";
+        s += &format!("    mul.lo.s32 %tmp,%warpCol,{};\n    add.u32 %tmp,%tmp,{};\n", 8 * tn, tj * 8);
+        s += "    add.u32 %tmp,%tmp,%grp;\n";
+        s += &format!("    mul.lo.s32 %tmp,%tmp,{bk};\n    add.u32 %tmp,%tmp,%tg4;\n    add.u32 %ab,%ab,%tmp;\n");
+        s += &format!("    ld.shared.b32 %b{tj}_0,[%ab];\n    ld.shared.b32 %b{tj}_1,[%ab+16];\n");
+    }
+    for ti in 0..tm {
+        for tj in 0..tn {
+            s += &format!("    mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32\n        {{%d{ti}_{tj}_0,%d{ti}_{tj}_1,%d{ti}_{tj}_2,%d{ti}_{tj}_3}}, {{%a{ti}_0,%a{ti}_1,%a{ti}_2,%a{ti}_3}}, {{%b{tj}_0,%b{tj}_1}}, {{%d{ti}_{tj}_0,%d{ti}_{tj}_1,%d{ti}_{tj}_2,%d{ti}_{tj}_3}};\n");
+        }
+    }
+    s += "    bar.sync 0;\n"; // fence reads of roff before a future prefetch reuses this buffer
+    s += &format!("    add.u32 %roff,%roff,{tile_bytes};\n    setp.ge.u32 %pmore,%roff,{ring};\n    @%pmore sub.u32 %roff,%roff,{ring};\n");
+    s += &format!("    add.u32 %woff,%woff,{tile_bytes};\n    setp.ge.u32 %pmore,%woff,{ring};\n    @%pmore sub.u32 %woff,%woff,{ring};\n");
+    s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
+
+    s += &format!("KEND_{name}:\n");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            s += &format!("    mul.lo.s32 %tmp,%warpRow,{};\n    add.u32 %tmp,%tmp,{};\n", 16 * tm, ti * 16);
+            s += "    add.u32 %tmp,%tmp,%baseRow;\n    add.u32 %tmp,%tmp,%grp;\n    mul.lo.s32 %tmp,%tmp,%N;\n";
+            s += &format!("    mul.lo.s32 %tmp2,%warpCol,{};\n    add.u32 %tmp2,%tmp2,{};\n", 8 * tn, tj * 8);
+            s += "    add.u32 %tmp2,%tmp2,%baseCol;\n    add.u32 %tmp2,%tmp2,%tg2;\n";
+            if dequant {
+                s += "    mov.u32 %col,%tmp2;\n";
+            }
+            s += "    add.u32 %tmp,%tmp,%tmp2;\n";
+            s += "    shl.b32 %tmp,%tmp,2;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%C,%off;\n";
+            if dequant {
+                s += "    mul.wide.u32 %off,%col,4;\n    add.s64 %scp,%Scale,%off;\n";
+                s += "    ld.global.f32 %sc0,[%scp];\n    ld.global.f32 %sc1,[%scp+4];\n";
+                s += &format!("    cvt.rn.f32.s32 %f0,%d{ti}_{tj}_0;\n    mul.f32 %f0,%f0,%sc0;\n    st.global.f32 [%cp],%f0;\n");
+                s += &format!("    cvt.rn.f32.s32 %f1,%d{ti}_{tj}_1;\n    mul.f32 %f1,%f1,%sc1;\n    st.global.f32 [%cp+4],%f1;\n");
+                s += "    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n";
+                s += &format!("    cvt.rn.f32.s32 %f2,%d{ti}_{tj}_2;\n    mul.f32 %f2,%f2,%sc0;\n    st.global.f32 [%cp],%f2;\n");
+                s += &format!("    cvt.rn.f32.s32 %f3,%d{ti}_{tj}_3;\n    mul.f32 %f3,%f3,%sc1;\n    st.global.f32 [%cp+4],%f3;\n");
+            } else {
+                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_0;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_1;\n");
+                s += &format!("    mul.lo.s32 %tmp,%N,32;\n    cvt.u64.u32 %off,%tmp;\n    add.s64 %cp,%cp,%off;\n");
+                s += &format!("    st.global.u32 [%cp],%d{ti}_{tj}_2;\n    st.global.u32 [%cp+4],%d{ti}_{tj}_3;\n");
+            }
+        }
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
+/// **3-stage** `cp.async` int8 GEMM, 64×64 tile (entry `int8_gemm_nt_smdb_s3`) — see [`gen_int8_smdb_ms`].
+pub fn int8_gemm_smdb_s3_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        gen_int8_smdb_ms("int8_gemm_nt_smdb_s3", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, 3, false)
+    })
+    .as_str()
+}
+
+/// **4-stage** `cp.async` int8 GEMM, 64×64 tile (entry `int8_gemm_nt_smdb_s4`) — see [`gen_int8_smdb_ms`].
+pub fn int8_gemm_smdb_s4_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        gen_int8_smdb_ms("int8_gemm_nt_smdb_s4", INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, 4, false)
+    })
+    .as_str()
+}
+
+/// **3-stage** `cp.async` int8 GEMM, 128×128 tile (entry `int8_gemm_nt_smdb128_s3`) — see [`gen_int8_smdb_ms`].
+pub fn int8_gemm_smdb128_s3_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        gen_int8_smdb_ms("int8_gemm_nt_smdb128_s3", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, 3, false)
+    })
+    .as_str()
+}
+
+/// **4-stage** `cp.async` int8 GEMM, 128×128 tile (entry `int8_gemm_nt_smdb128_s4`) — see [`gen_int8_smdb_ms`].
+pub fn int8_gemm_smdb128_s4_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| {
+        gen_int8_smdb_ms("int8_gemm_nt_smdb128_s4", INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128, 4, false)
+    })
+    .as_str()
+}
