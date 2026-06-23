@@ -18,7 +18,7 @@
 //! same `[f32; 8]` the scalar twin builds and calls the *same* combine — so the AVX2 kernel and the
 //! scalar fallback agree bit-for-bit too (pinned by a unit test across partial-chunk / tail sizes).
 
-use crate::vmath::exp1;
+use crate::vmath::{exp1, log1};
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
 use rayon::prelude::*;
@@ -27,6 +27,7 @@ use rayon::prelude::*;
 pub const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row (numerically stable)
 pub const NORM_LAYERNORM: i64 = 1; // out = (x - mean) / sqrt(var + eps)
 pub const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
+pub const NORM_LOGSOFTMAX: i64 = 3; // out = (x - m) - log(sum(exp(x - m))) — stable log-softmax
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -84,6 +85,50 @@ unsafe fn softmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
     // 3) normalize (reads the just-written e values; independent multiply, order-immaterial).
     for i in 0..n {
         *out.add(i) *= inv;
+    }
+}
+
+/// Numerically-stable log-softmax of one row, scalar reference. `x`/`out` may alias.
+/// `out[i] = (x[i] - m) - log(s)`, where `m = max(x)` and `s = Σ exp(x[i]-m)`.
+///
+/// The max and sum passes are byte-identical to [`softmax_row_scalar`] (same `hmax8`, same `exp1`,
+/// same `hsum8`), so `m` and `s` are bit-identical to softmax's; the only new op is **one** scalar
+/// `log1(s)`. The final pass folds the two subtracts into `x[i] - (m + ls)` (one rounding), and the
+/// AVX2 twin uses the identical `off = m + ls` splat — so scalar and AVX2 agree lane-for-lane.
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+unsafe fn logsoftmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
+    let nb = n / 8;
+    let t = nb * 8;
+    // 1) row max — identical to softmax_row_scalar.
+    let mut mx = [f32::NEG_INFINITY; 8];
+    for s in 0..nb {
+        let b = s * 8;
+        for (j, mxj) in mx.iter_mut().enumerate() {
+            *mxj = mxj.max(*x.add(b + j));
+        }
+    }
+    for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
+        *mxj = mxj.max(*x.add(t + j));
+    }
+    let m = hmax8(mx);
+    // 2) s = Σ exp(x - m) — same lane structure as softmax's sum, but do NOT write `out` here (the
+    //    final pass below overwrites it reading `x`, so an in-place x==out row stays correct).
+    let mut sm = [0.0f32; 8];
+    for s in 0..nb {
+        let b = s * 8;
+        for (j, smj) in sm.iter_mut().enumerate() {
+            *smj += exp1(*x.add(b + j) - m);
+        }
+    }
+    for (j, smj) in sm.iter_mut().enumerate().take(n - t) {
+        *smj += exp1(*x.add(t + j) - m);
+    }
+    let off = m + log1(hsum8(sm)); // m + log-sum-exp; ONE scalar log — the bit-exact pivot.
+    // 3) out[i] = (x[i] - m) - ls == x[i] - off.
+    for i in 0..n {
+        *out.add(i) = *x.add(i) - off;
     }
 }
 
@@ -198,6 +243,56 @@ unsafe fn softmax_row_avx2(x: *const f32, out: *mut f32, n: usize) {
     }
     while i < n {
         *out.add(i) *= inv;
+        i += 1;
+    }
+}
+
+/// AVX2 log-softmax of one row. Max + Σexp passes are byte-identical to `softmax_row_avx2` (so `m`,
+/// `s` match bit-for-bit); the only new op is one scalar `log1` on the row sum. Final pass is `x - off`
+/// (`off = m + log(s)`), matching the scalar twin's single subtract per element.
+///
+/// # Safety
+/// `x`/`out` valid for `n` `f32`; AVX2+FMA available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn logsoftmax_row_avx2(x: *const f32, out: *mut f32, n: usize) {
+    use std::arch::x86_64::*;
+    // 1) max — identical to softmax_row_avx2.
+    let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut i = 0;
+    while i + 8 <= n {
+        mxv = _mm256_max_ps(mxv, _mm256_loadu_ps(x.add(i)));
+        i += 8;
+    }
+    let mut mx = [0.0f32; 8];
+    _mm256_storeu_ps(mx.as_mut_ptr(), mxv);
+    for (j, mxj) in mx.iter_mut().enumerate().take(n - i) {
+        *mxj = mxj.max(*x.add(i + j));
+    }
+    let m = hmax8(mx);
+    let mb = _mm256_set1_ps(m);
+    // 2) s = Σ exp(x - m) — exp8 lanes + exp1 tail, identical to softmax's accumulation, no out store.
+    let mut sv = _mm256_setzero_ps();
+    i = 0;
+    while i + 8 <= n {
+        sv = _mm256_add_ps(sv, exp8(_mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb)));
+        i += 8;
+    }
+    let mut sm = [0.0f32; 8];
+    _mm256_storeu_ps(sm.as_mut_ptr(), sv);
+    for (j, smj) in sm.iter_mut().enumerate().take(n - i) {
+        *smj += exp1(*x.add(i + j) - m);
+    }
+    let off = m + log1(hsum8(sm)); // same scalar log on the same sum bits as the scalar twin.
+    let offb = _mm256_set1_ps(off);
+    // 3) out = x - off.
+    i = 0;
+    while i + 8 <= n {
+        _mm256_storeu_ps(out.add(i), _mm256_sub_ps(_mm256_loadu_ps(x.add(i)), offb));
+        i += 8;
+    }
+    while i < n {
+        *out.add(i) = *x.add(i) - off;
         i += 1;
     }
 }
@@ -543,6 +638,7 @@ unsafe fn norm_row(x: *const f32, out: *mut f32, n: usize, eps: f32, op: i64) {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             match op {
                 NORM_SOFTMAX => return softmax_row_avx2(x, out, n),
+                NORM_LOGSOFTMAX => return logsoftmax_row_avx2(x, out, n),
                 NORM_LAYERNORM => return layernorm_row_avx2(x, out, n, eps),
                 NORM_RMSNORM => return rmsnorm_row_avx2(x, out, n, eps),
                 _ => return,
@@ -551,6 +647,7 @@ unsafe fn norm_row(x: *const f32, out: *mut f32, n: usize, eps: f32, op: i64) {
     }
     match op {
         NORM_SOFTMAX => softmax_row_scalar(x, out, n),
+        NORM_LOGSOFTMAX => logsoftmax_row_scalar(x, out, n),
         NORM_LAYERNORM => layernorm_row_scalar(x, out, n, eps),
         NORM_RMSNORM => rmsnorm_row_scalar(x, out, n, eps),
         _ => {}
@@ -705,7 +802,12 @@ pub unsafe extern "C" fn mercury_norm_affine_f32_parallel(
 mod tests {
     use super::*;
 
-    const OPS: [i64; 3] = [NORM_SOFTMAX, NORM_LAYERNORM, NORM_RMSNORM];
+    const OPS: [i64; 4] = [
+        NORM_SOFTMAX,
+        NORM_LOGSOFTMAX,
+        NORM_LAYERNORM,
+        NORM_RMSNORM,
+    ];
     const EPS: f32 = 1e-5;
 
     // Deterministic, mildly varied input (no RNG — reproducible).
@@ -848,6 +950,23 @@ mod tests {
             tot += sm[i] as f64;
         }
         assert!((tot - 1.0).abs() < 1e-4, "softmax sums to {tot}");
+
+        // log-softmax — reuse `mx` and `den` (= Σ exp(x-mx)) from the softmax block; ls = log(den).
+        let mut lsm = vec![0.0f32; n];
+        unsafe {
+            mercury_norm_f32(x.as_ptr(), lsm.as_mut_ptr(), 1, n as i64, 0, NORM_LOGSOFTMAX);
+        }
+        let ls = den.ln();
+        for i in 0..n {
+            let want = (xd[i] - mx) - ls;
+            assert!(
+                (lsm[i] as f64 - want).abs() < 1e-4,
+                "logsoftmax i={i}: {} vs {want}",
+                lsm[i]
+            );
+            // exp(log-softmax) must equal softmax — the two are consistent.
+            assert!(((lsm[i] as f64).exp() - sm[i] as f64).abs() < 1e-4, "exp(logsoftmax)!=softmax i={i}");
+        }
 
         // layernorm
         let mut ln = vec![0.0f32; n];

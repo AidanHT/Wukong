@@ -30,7 +30,7 @@ pub use reduce::{
 mod norm;
 pub use norm::{
     mercury_norm_affine_f32, mercury_norm_affine_f32_parallel, mercury_norm_f32,
-    mercury_norm_f32_parallel, NORM_LAYERNORM, NORM_RMSNORM, NORM_SOFTMAX,
+    mercury_norm_f32_parallel, NORM_LAYERNORM, NORM_LOGSOFTMAX, NORM_RMSNORM, NORM_SOFTMAX,
 };
 
 mod i8gemm;
