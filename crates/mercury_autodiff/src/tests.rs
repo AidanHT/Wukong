@@ -458,3 +458,399 @@ fn mlp_sgd_decreases_loss() {
         "SGD did not converge: loss {l0} -> {last} after 400 steps"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Tensor-tape tests: forward passes built from real runtime-kernel calls (sgemm_nt = nn.Linear,
+// vmath = activation, sreduce = reduction, velem = residual). These run in f32 (the kernels are
+// f32), so the gate pairs a looser f32 finite difference with a tight f64 closed-form cross-check
+// computed directly from the inputs — the closed form is the real correctness gate.
+// ---------------------------------------------------------------------------------------------
+
+use mercury_interp::run_kernel_f32;
+
+// Runtime op codes (mirrored from mercury_runtime).
+const VM_RELU: i64 = 4;
+const RED_SUM: i64 = 2;
+const RED_SSD: i64 = 1;
+const VE_ID: i64 = 0;
+const VE_USE_Y: i64 = 256;
+
+fn ci(b: &mut Builder, x: i64) -> ValueId {
+    b.build(MirType::I64, Op::ConstInt(x as i128, MirType::I64))
+}
+fn cf(b: &mut Builder, x: f64) -> ValueId {
+    b.build(MirType::F32, Op::ConstFloat(x, MirType::F32))
+}
+fn arr(n: usize) -> MirType {
+    MirType::Array(Box::new(MirType::F32), n as u32)
+}
+
+/// Run an f32 tape and return the scalar loss (`out[0]`).
+fn loss_at_f32(
+    prog: &Program,
+    name: Symbol,
+    bufs: &mut [Vec<f32>],
+    loss_out: usize,
+    it: &Interner,
+) -> f64 {
+    let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+    run_kernel_f32(prog, name, &mut views, it).expect("forward f32 run failed");
+    bufs[loss_out][0] as f64
+}
+
+/// Run the gradient tape, returning the gradient buffer (as f64) for each `wrt` input.
+fn analytic_grad_f32(
+    prog: &Program,
+    gname: Symbol,
+    fwd: &Fwd,
+    inputs: &[Vec<f32>],
+    wrt: &[usize],
+    it: &Interner,
+) -> Vec<Vec<f64>> {
+    let mut bufs: Vec<Vec<f32>> = inputs.to_vec();
+    for &wi in wrt {
+        bufs.push(vec![0.0; fwd.lens[wi]]);
+    }
+    let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+    run_kernel_f32(prog, gname, &mut views, it).expect("gradient f32 run failed");
+    let np = fwd.func.params.len();
+    (0..wrt.len())
+        .map(|i| bufs[np + i].iter().map(|&v| v as f64).collect())
+        .collect()
+}
+
+fn fd_grad_f32(
+    prog: &Program,
+    fwd: &Fwd,
+    inputs: &[Vec<f32>],
+    wrt: &[usize],
+    eps: f32,
+    it: &Interner,
+) -> Vec<Vec<f64>> {
+    let mut out = Vec::new();
+    for &wi in wrt {
+        let mut g = vec![0.0; fwd.lens[wi]];
+        for j in 0..fwd.lens[wi] {
+            let mut bufs = inputs.to_vec();
+            let orig = bufs[wi][j];
+            bufs[wi][j] = orig + eps;
+            let lp = loss_at_f32(prog, fwd.func.name, &mut bufs, fwd.loss_out, it);
+            bufs[wi][j] = orig - eps;
+            let lm = loss_at_f32(prog, fwd.func.name, &mut bufs, fwd.loss_out, it);
+            g[j] = (lp - lm) / (2.0 * eps as f64);
+        }
+        out.push(g);
+    }
+    out
+}
+
+/// Tensor-tape gate: analytic gradient vs (loose) f32 finite difference and vs (tight) f64 closed
+/// form. Returns the analytic gradients.
+fn tape_gate(
+    fwd: &Fwd,
+    wrt: &[usize],
+    inputs: &[Vec<f32>],
+    closed_form: &[Vec<f64>],
+    it: &mut Interner,
+) -> Vec<Vec<f64>> {
+    let (prog, gname) = build(&fwd.func, wrt, it);
+    let analytic = analytic_grad_f32(&prog, gname, fwd, inputs, wrt, it);
+    let fd = fd_grad_f32(&prog, fwd, inputs, wrt, 5e-3, it);
+    for (gi, (a, f)) in analytic.iter().zip(fd.iter()).enumerate() {
+        for (j, (&av, &fv)) in a.iter().zip(f.iter()).enumerate() {
+            let tol = 5e-3 + 3e-2 * fv.abs();
+            assert!(
+                (av - fv).abs() <= tol,
+                "wrt#{gi}[{j}]: analytic {av} vs finite-diff {fv} (|d|={:.3e} > {:.3e})",
+                (av - fv).abs(),
+                tol
+            );
+        }
+    }
+    for (gi, (a, c)) in analytic.iter().zip(closed_form.iter()).enumerate() {
+        for (j, (&av, &cv)) in a.iter().zip(c.iter()).enumerate() {
+            let tol = 3e-3 + 3e-3 * cv.abs();
+            assert!(
+                (av - cv).abs() <= tol,
+                "wrt#{gi}[{j}]: analytic {av} vs closed-form {cv} (|d|={:.3e} > {:.3e})",
+                (av - cv).abs(),
+                tol
+            );
+        }
+    }
+    analytic
+}
+
+// f64 reference matmul P[m,n] = sum_k X[m,k] * W[n,k]  (the nn.Linear C = X . W^T form).
+fn matmul_nt_f64(x: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
+    let mut p = vec![0.0; m * n];
+    for mm in 0..m {
+        for nn in 0..n {
+            let mut s = 0.0;
+            for kk in 0..k {
+                s += x[mm * k + kk] as f64 * w[nn * k + kk] as f64;
+            }
+            p[mm * n + nn] = s;
+        }
+    }
+    p
+}
+
+/// Given dP (the gradient of the M×N pre-reduction tensor), the matmul backward gradients:
+/// dX[m,k] = sum_n dP[m,n] W[n,k], dW[n,k] = sum_m dP[m,n] X[m,k].
+fn matmul_nt_backward(
+    dp: &[f64],
+    x: &[f32],
+    w: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut dx = vec![0.0; m * k];
+    let mut dw = vec![0.0; n * k];
+    for mm in 0..m {
+        for nn in 0..n {
+            let g = dp[mm * n + nn];
+            for kk in 0..k {
+                dx[mm * k + kk] += g * w[nn * k + kk] as f64;
+                dw[nn * k + kk] += g * x[mm * k + kk] as f64;
+            }
+        }
+    }
+    (dx, dw)
+}
+
+fn rand_vec(seed: &mut u64, n: usize) -> Vec<f32> {
+    (0..n).map(|_| lcg(seed) as f32).collect()
+}
+
+#[test]
+fn linear_sum_vjp() {
+    // loss = sum(X . W^T)  ->  dP = 1 everywhere.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "lin_sum"), MirType::Void);
+    let x = b.add_param(PTR);
+    let w = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let p = b.alloca(arr(m * n));
+    let (mv, kv, nv, beta) = (
+        ci(&mut b, m as i64),
+        ci(&mut b, k as i64),
+        ci(&mut b, n as i64),
+        ci(&mut b, 0),
+    );
+    let sgemm_nt = sym(&mut it, "mercury_sgemm_nt");
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![x, w, p, mv, kv, nv, beta],
+    });
+    let (mn, sumop) = (ci(&mut b, (m * n) as i64), ci(&mut b, RED_SUM));
+    let sreduce = sym(&mut it, "mercury_sreduce_f32");
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![p, p, mn, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![m * k, n * k, 1],
+        loss_out: 2,
+    };
+
+    let mut seed = 0xABCDu64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let dp = vec![1.0; m * n];
+    let (dx, dw) = matmul_nt_backward(&dp, &xb, &wb, m, k, n);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[dx, dw], &mut it);
+}
+
+/// Build `loss = reduce(act(X . W^T))`: a sgemm_nt, an optional relu (vmath), then a reduction —
+/// sum, or SSD against a target buffer `T` (= MSE loss). Params: X, W, [T if mse], out.
+fn build_linear(it: &mut Interner, m: usize, k: usize, n: usize, relu: bool, mse: bool) -> Fwd {
+    let sgemm_nt = it.intern("mercury_sgemm_nt");
+    let vmath = it.intern("mercury_vmath_f32");
+    let sreduce = it.intern("mercury_sreduce_f32");
+    let mut b = Builder::new(it.intern("lin"), MirType::Void);
+    let x = b.add_param(PTR);
+    let w = b.add_param(PTR);
+    let t = if mse { Some(b.add_param(PTR)) } else { None };
+    let out = b.add_param(PTR);
+
+    let p = b.alloca(arr(m * n));
+    let (mv, kv, nv, beta) = (
+        ci(&mut b, m as i64),
+        ci(&mut b, k as i64),
+        ci(&mut b, n as i64),
+        ci(&mut b, 0),
+    );
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![x, w, p, mv, kv, nv, beta],
+    });
+    let mn = ci(&mut b, (m * n) as i64);
+
+    let activated = if relu {
+        let h = b.alloca(arr(m * n));
+        let reluop = ci(&mut b, VM_RELU);
+        b.build_void(Op::Call {
+            func: vmath,
+            args: vec![p, h, mn, reluop],
+        });
+        h
+    } else {
+        p
+    };
+
+    let loss = if mse {
+        let ssdop = ci(&mut b, RED_SSD);
+        b.build(
+            MirType::F32,
+            Op::Call {
+                func: sreduce,
+                args: vec![activated, t.unwrap(), mn, ssdop],
+            },
+        )
+    } else {
+        let sumop = ci(&mut b, RED_SUM);
+        b.build(
+            MirType::F32,
+            Op::Call {
+                func: sreduce,
+                args: vec![activated, activated, mn, sumop],
+            },
+        )
+    };
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+
+    let (lens, loss_out) = if mse {
+        (vec![m * k, n * k, m * n, 1], 3)
+    } else {
+        (vec![m * k, n * k, 1], 2)
+    };
+    Fwd {
+        func: b.finish(),
+        lens,
+        loss_out,
+    }
+}
+
+#[test]
+fn linear_relu_sum_vjp() {
+    // loss = sum(relu(X . W^T))  ->  dP[i] = (P[i] > 0) ? 1 : 0.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, true, false);
+    // Keep every pre-activation P comfortably away from the relu kink at 0, so the +-eps finite
+    // difference never flips a mask (which would make the central difference invalid). Mixed signs
+    // still exercise both the active and the zeroed gradient paths.
+    let mut seed = 0x5151u64;
+    let (xb, wb, p) = loop {
+        let xb = rand_vec(&mut seed, m * k);
+        let wb = rand_vec(&mut seed, n * k);
+        let p = matmul_nt_f64(&xb, &wb, m, k, n);
+        if p.iter().all(|&v| v.abs() > 0.2) && p.iter().any(|&v| v > 0.0) && p.iter().any(|&v| v < 0.0)
+        {
+            break (xb, wb, p);
+        }
+    };
+    let dp: Vec<f64> = p.iter().map(|&v| if v > 0.0 { 1.0 } else { 0.0 }).collect();
+    let (dx, dw) = matmul_nt_backward(&dp, &xb, &wb, m, k, n);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[dx, dw], &mut it);
+}
+
+#[test]
+fn linear_mse_vjp() {
+    // loss = sum((X . W^T - T)^2)  ->  dP[i] = 2 (P[i] - T[i]).  (the regression-training loss)
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, false, true);
+    let mut seed = 0x9090u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let tb = rand_vec(&mut seed, m * n);
+    let p = matmul_nt_f64(&xb, &wb, m, k, n);
+    let dp: Vec<f64> = p
+        .iter()
+        .zip(&tb)
+        .map(|(&pv, &tv)| 2.0 * (pv - tv as f64))
+        .collect();
+    let (dx, dw) = matmul_nt_backward(&dp, &xb, &wb, m, k, n);
+    let inputs = vec![xb, wb, tb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[dx, dw], &mut it);
+}
+
+#[test]
+fn residual_two_linears_vjp() {
+    // loss = sum(X . W1^T + X . W2^T): a velem residual add, and X feeds BOTH matmuls — so its
+    // gradient must accumulate (matmul beta=1 on the second contribution).
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let sgemm_nt = sym(&mut it, "mercury_sgemm_nt");
+    let velem = sym(&mut it, "mercury_velem_f32");
+    let sreduce = sym(&mut it, "mercury_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "resid"), MirType::Void);
+    let x = b.add_param(PTR);
+    let w1 = b.add_param(PTR);
+    let w2 = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let p1 = b.alloca(arr(m * n));
+    let p2 = b.alloca(arr(m * n));
+    let z = b.alloca(arr(m * n));
+    let (mv, kv, nv, beta) = (
+        ci(&mut b, m as i64),
+        ci(&mut b, k as i64),
+        ci(&mut b, n as i64),
+        ci(&mut b, 0),
+    );
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![x, w1, p1, mv, kv, nv, beta],
+    });
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![x, w2, p2, mv, kv, nv, beta],
+    });
+    // z = 1*p1 + 1*p2  (velem identity, reads y)
+    let mn = ci(&mut b, (m * n) as i64);
+    let (one_a, one_b, zero_c) = (cf(&mut b, 1.0), cf(&mut b, 1.0), cf(&mut b, 0.0));
+    let veop = ci(&mut b, VE_ID | VE_USE_Y);
+    b.build_void(Op::Call {
+        func: velem,
+        args: vec![p1, p2, z, mn, one_a, one_b, zero_c, veop],
+    });
+    let sumop = ci(&mut b, RED_SUM);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![z, z, mn, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![m * k, n * k, n * k, 1],
+        loss_out: 3,
+    };
+
+    let mut seed = 0x7777u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let w1b = rand_vec(&mut seed, n * k);
+    let w2b = rand_vec(&mut seed, n * k);
+    let dp = vec![1.0; m * n];
+    let (dx1, dw1) = matmul_nt_backward(&dp, &xb, &w1b, m, k, n);
+    let (dx2, dw2) = matmul_nt_backward(&dp, &xb, &w2b, m, k, n);
+    let dx: Vec<f64> = dx1.iter().zip(&dx2).map(|(a, b)| a + b).collect();
+    let inputs = vec![xb, w1b, w2b, vec![0.0]];
+    tape_gate(&fwd, &[0, 1, 2], &inputs, &[dx, dw1, dw2], &mut it);
+}
