@@ -64,6 +64,12 @@ pub mod lower;
 #[cfg(feature = "gpu")]
 pub mod fusion;
 
+/// Whole-program **cooperative megakernel** (Phase 8 / M13): compile an eligible Mercury program into
+/// one persistent `.visible .entry` kernel run by a block of threads, recognized ops executed
+/// cooperatively across the block (no per-op launches, activations resident in one shared frame).
+#[cfg(feature = "gpu")]
+pub mod megakernel;
+
 #[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
 

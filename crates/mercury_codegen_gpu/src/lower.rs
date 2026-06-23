@@ -63,6 +63,10 @@ const RECORD_CAP: u64 = 1 << 16;
 /// The PTX name of the launched entry kernel (a thin `.visible .entry` wrapper).
 const KERNEL_NAME: &str = "mercury_kernel";
 
+/// The PTX name of the cooperative-megakernel entry (`megakernel.rs` launches a block of threads on
+/// it). Distinct from [`KERNEL_NAME`] so a program can have both lowerings cached side-by-side.
+pub const MEGA_KERNEL_NAME: &str = "mercury_mega";
+
 /// Prefix marking a *lowering decline* (an op/construct not yet handled) as opposed to a genuine
 /// JIT/launch failure — the coverage gate treats the former as "not yet covered" (skip) and the
 /// latter as a hard failure.
@@ -192,6 +196,74 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
     Ok(out)
 }
 
+/// Emit the **cooperative-megakernel** PTX module for `program` with `entry` as the single
+/// `.visible .entry mercury_mega` (run by a block of threads — see [`crate::megakernel`]). The entry
+/// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a cooperative
+/// (`mrt_sreduce_coop`) or `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Eligibility
+/// (`crate::fusion::analyze`) guarantees the entry calls no other user function, so no `mfn_*`
+/// bodies are emitted — only the helpers it uses + the kernel. Public so `megakernel.rs` and tooling
+/// can JIT / inspect it.
+pub fn emit_mega_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result<String, String> {
+    let entry_fn = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    if !entry_fn.params.is_empty() {
+        return Err(format!(
+            "{UNSUPPORTED} mega entry `{}` must take no parameters",
+            interner.resolve(entry)
+        ));
+    }
+
+    let mut func_idx: HashMap<Symbol, usize> = HashMap::new();
+    for (i, f) in program.funcs.iter().enumerate() {
+        func_idx.insert(f.name, i);
+    }
+
+    let mut out = String::new();
+    out.push_str(".version 7.8\n.target sm_89\n.address_size 64\n\n");
+
+    // Scan the entry for the helpers it needs: cooperative reduce (+ its shared scratch), the serial
+    // `mrt_*` defs for not-yet-cooperative recognized ops, and the device fmod for float `%`.
+    let mut needs_reduce_coop = false;
+    let mut needs_fmod = false;
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut serial_defs = String::new();
+    for b in &entry_fn.blocks {
+        for inst in &b.insts {
+            match &inst.op {
+                Op::Call { func, .. } => {
+                    let nm = interner.resolve(*func);
+                    use crate::fusion::{classify_call, CallClass, CoopKind};
+                    if matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce)) {
+                        needs_reduce_coop = true;
+                    } else if let Some(h) = rt_helper(nm) {
+                        if seen.insert(h.ptx_name) {
+                            serial_defs.push_str(&h.def);
+                            serial_defs.push('\n');
+                        }
+                    }
+                }
+                Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
+                _ => {}
+            }
+        }
+    }
+    if needs_reduce_coop {
+        out.push_str(PTX_MEGA_SMEM);
+        out.push_str(PTX_SREDUCE_COOP);
+        out.push('\n');
+    }
+    if needs_fmod {
+        out.push_str(PTX_FMOD);
+        out.push('\n');
+    }
+    out.push_str(&serial_defs);
+
+    let body = FnEmit::lower_mega(entry_fn, &func_idx, program, interner)?;
+    out.push_str(&body);
+    Ok(out)
+}
+
 // ============================================================================================
 // Register classes & type mapping
 // ============================================================================================
@@ -304,6 +376,16 @@ struct FnEmit<'a> {
     frame_base: String,
     // The cvta'd-to-global context-buffer base register (print/assert/exit live here).
     ctx_reg: String,
+
+    // --- cooperative-megakernel mode (see `megakernel.rs`) ---
+    // When set, this function is lowered as the `.visible .entry` megakernel run by a *block* of
+    // threads (SPMD): the frame lives in one shared `.global` buffer (not a per-thread `.local`
+    // frame), every `Store` / side-effect is predicated to `tid==0`, and every recognized op is
+    // bracketed by `bar.sync` (cooperative across the block, or `@tid0` serial). Default `false`
+    // keeps the single-thread `.func` path byte-for-byte unchanged.
+    mega: bool,
+    // The predicate register holding `threadIdx.x == 0` (only bound in `mega` mode).
+    tid0: String,
 }
 
 impl<'a> FnEmit<'a> {
@@ -335,6 +417,8 @@ impl<'a> FnEmit<'a> {
             frame_bytes: 0,
             frame_base: String::new(),
             ctx_reg: String::new(),
+            mega: false,
+            tid0: String::new(),
         };
         e.assign_frame();
         e.translate()?;
@@ -343,30 +427,82 @@ impl<'a> FnEmit<'a> {
         let mut out = String::new();
         out.push_str(&fn_signature(func, idx));
         out.push_str("\n{\n");
-        if e.n_rd > 0 {
-            let _ = writeln!(out, "    .reg .b64 %rd<{}>;", e.n_rd);
-        }
-        if e.n_r > 0 {
-            let _ = writeln!(out, "    .reg .b32 %r<{}>;", e.n_r);
-        }
-        if e.n_rs > 0 {
-            let _ = writeln!(out, "    .reg .b16 %rs<{}>;", e.n_rs);
-        }
-        if e.n_f > 0 {
-            let _ = writeln!(out, "    .reg .f32 %f<{}>;", e.n_f);
-        }
-        if e.n_fd > 0 {
-            let _ = writeln!(out, "    .reg .f64 %fd<{}>;", e.n_fd);
-        }
-        if e.n_p > 0 {
-            let _ = writeln!(out, "    .reg .pred %p<{}>;", e.n_p);
-        }
+        e.write_reg_decls(&mut out);
         if e.frame_bytes > 0 {
             let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);
         }
         out.push_str(&e.body);
         out.push_str("}\n");
         Ok(out)
+    }
+
+    /// Lower `func` as the cooperative-megakernel `.visible .entry` (mega mode). Same per-op emitters
+    /// as [`lower`](Self::lower), but the frame is a shared `.global` param (no `.local __frame`),
+    /// stores/side-effects are `tid==0`-guarded, and recognized ops are `bar.sync`-bracketed. The
+    /// entry takes no MIR params and returns via the context exit-code slot. Returns the `.entry` text.
+    fn lower_mega(
+        func: &'a Function,
+        func_idx: &'a HashMap<Symbol, usize>,
+        program: &'a Program,
+        interner: &'a Interner,
+    ) -> Result<String, String> {
+        let mut e = FnEmit {
+            func,
+            program,
+            interner,
+            func_idx,
+            body: String::new(),
+            n_rd: 0,
+            n_r: 0,
+            n_rs: 0,
+            n_f: 0,
+            n_fd: 0,
+            n_p: 0,
+            vreg: HashMap::new(),
+            vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
+            n_lbl: 0,
+            frame_off: HashMap::new(),
+            frame_bytes: 0,
+            frame_base: String::new(),
+            ctx_reg: String::new(),
+            mega: true,
+            tid0: String::new(),
+        };
+        e.assign_frame();
+        e.translate_mega()?;
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"
+        ));
+        e.write_reg_decls(&mut out);
+        out.push_str(&e.body);
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Emit the per-class `.reg` count declarations for the assembled function/kernel.
+    fn write_reg_decls(&self, out: &mut String) {
+        if self.n_rd > 0 {
+            let _ = writeln!(out, "    .reg .b64 %rd<{}>;", self.n_rd);
+        }
+        if self.n_r > 0 {
+            let _ = writeln!(out, "    .reg .b32 %r<{}>;", self.n_r);
+        }
+        if self.n_rs > 0 {
+            let _ = writeln!(out, "    .reg .b16 %rs<{}>;", self.n_rs);
+        }
+        if self.n_f > 0 {
+            let _ = writeln!(out, "    .reg .f32 %f<{}>;", self.n_f);
+        }
+        if self.n_fd > 0 {
+            let _ = writeln!(out, "    .reg .f64 %fd<{}>;", self.n_fd);
+        }
+        if self.n_p > 0 {
+            let _ = writeln!(out, "    .reg .pred %p<{}>;", self.n_p);
+        }
     }
 
     // --- register / temp allocation ---
@@ -475,6 +611,37 @@ impl<'a> FnEmit<'a> {
             self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
         }
 
+        self.emit_blocks()
+    }
+
+    /// Mega preamble (the `.visible .entry` cooperative megakernel): the frame lives in a shared
+    /// `.global` buffer passed as `p_frame` (one copy the whole block sub-allocates), `p_ctx` is the
+    /// same print/assert/exit record buffer, and `tid0` is the `threadIdx.x == 0` predicate that
+    /// guards every store / side effect. The entry takes no MIR params (eligibility enforces this).
+    fn translate_mega(&mut self) -> Result<(), String> {
+        let ctx_raw = self.fresh(RC::Rd);
+        self.ctx_reg = self.fresh(RC::Rd);
+        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));
+        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));
+
+        if self.frame_bytes > 0 {
+            let fr_raw = self.fresh(RC::Rd);
+            self.frame_base = self.fresh(RC::Rd);
+            self.emit(&format!("ld.param.u64 {fr_raw}, [p_frame];"));
+            self.emit(&format!("cvta.to.global.u64 {}, {fr_raw};", self.frame_base));
+        }
+
+        // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.
+        let tid = self.fresh_r32();
+        self.tid0 = self.fresh_pred();
+        self.emit(&format!("mov.u32 {tid}, %tid.x;"));
+        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));
+
+        self.emit_blocks()
+    }
+
+    /// The shared block-emitting loop used by both the single-thread `.func` path and the mega entry.
+    fn emit_blocks(&mut self) -> Result<(), String> {
         // Branch to the entry block, then emit blocks in id order.
         self.emit(&format!("bra BB{};", self.func.entry.0));
         let blocks = self.func.blocks.clone();
@@ -1055,39 +1222,51 @@ impl<'a> FnEmit<'a> {
         self.store_into(&addr, &v, &vty)
     }
 
+    /// A store predicate prefix: in mega mode every store targets the *shared* frame, so only
+    /// `tid==0` may write it (the SPMD threads otherwise race on identical data and multiply the
+    /// atomic print counter); in single-thread mode it is empty (unconditional).
+    fn st_guard(&self) -> String {
+        if self.mega {
+            format!("@{} ", self.tid0)
+        } else {
+            String::new()
+        }
+    }
+
     /// Store one (scalar or lane) value `v` of MIR type `ty` to generic address `addr`.
     fn store_into(&mut self, addr: &str, v: &str, ty: &MirType) -> Result<(), String> {
+        let g = self.st_guard();
         match ty {
-            MirType::F32 => self.emit(&format!("st.f32 [{addr}], {v};")),
-            MirType::F64 => self.emit(&format!("st.f64 [{addr}], {v};")),
-            MirType::I64 | MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),
+            MirType::F32 => self.emit(&format!("{g}st.f32 [{addr}], {v};")),
+            MirType::F64 => self.emit(&format!("{g}st.f64 [{addr}], {v};")),
+            MirType::I64 | MirType::Ptr => self.emit(&format!("{g}st.u64 [{addr}], {v};")),
             // bf16/f16 storage is 2 bytes; narrow the f32 value to 16 bits, store the raw u16.
             MirType::BF16 => {
                 let h = self.fresh_r16();
                 self.emit(&format!("cvt.rn.bf16.f32 {h}, {v};"));
-                self.emit(&format!("st.u16 [{addr}], {h};"));
+                self.emit(&format!("{g}st.u16 [{addr}], {h};"));
             }
             MirType::F16 => {
                 let h = self.fresh_r16();
                 self.emit(&format!("cvt.rn.f16.f32 {h}, {v};"));
-                self.emit(&format!("st.u16 [{addr}], {h};"));
+                self.emit(&format!("{g}st.u16 [{addr}], {h};"));
             }
             // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.
             MirType::I8 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
-                self.emit(&format!("st.u8 [{addr}], {w};"));
+                self.emit(&format!("{g}st.u8 [{addr}], {w};"));
             }
             MirType::I16 => {
                 let w = self.fresh_r32();
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
-                self.emit(&format!("st.u16 [{addr}], {w};"));
+                self.emit(&format!("{g}st.u16 [{addr}], {w};"));
             }
             _ => {
                 // i32 / i1
                 let w = self.fresh_r32();
                 self.emit(&format!("cvt.u32.u64 {w}, {v};"));
-                self.emit(&format!("st.u32 [{addr}], {w};"));
+                self.emit(&format!("{g}st.u32 [{addr}], {w};"));
             }
         }
         Ok(())
@@ -1267,9 +1446,18 @@ impl<'a> FnEmit<'a> {
             return self.lower_user_call(idx, args, result);
         }
         let name = self.interner.resolve(func).to_string();
+        // Side effects share both paths (their record/flag writes are mega-guarded internally).
         match name.as_str() {
-            "print" | "println" => self.lower_print(args),
-            "assert" => self.lower_assert(args),
+            "print" | "println" => return self.lower_print(args),
+            "assert" => return self.lower_assert(args),
+            _ => {}
+        }
+        // Mega mode: bracket every recognized op with `bar.sync` and run it cooperatively (or
+        // `tid==0`-serial) over the shared frame. The single-thread dispatch below is left intact.
+        if self.mega {
+            return self.lower_call_mega(&name, args, result);
+        }
+        match name.as_str() {
             // The elementwise transcendental kernel dispatches on a compile-time op code; only lower
             // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).
             // The bf16/f16 variants share the op-switch (and the op gate) — only the input load differs.
@@ -1342,6 +1530,67 @@ impl<'a> FnEmit<'a> {
         }
     }
 
+    /// Mega-mode dispatch of one recognized op: bracket it with `bar.sync` (so the cooperating
+    /// threads see the prior `tid==0` setup and the next `tid==0` read sees this op's output), and run
+    /// it either cooperatively across the block (reductions, broadcast result) or `tid==0`-serial
+    /// (everything else for now — a later increment adds their cooperative bodies). An unsupported op
+    /// code declines with `UNSUPPORTED:` so the whole program falls back to the single-thread path.
+    fn lower_call_mega(
+        &mut self,
+        name: &str,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) -> Result<(), String> {
+        use crate::fusion::{classify_call, CallClass, CoopKind};
+        let CallClass::Coop(kind) = classify_call(name) else {
+            return Err(format!("{UNSUPPORTED} mega call to `{name}` (not a cooperative op)"));
+        };
+        // Op-code gates, mirroring the single-thread dispatch.
+        match kind {
+            CoopKind::Vmath if args.len() == 4 => {
+                let op = self
+                    .const_ints
+                    .get(&args[3].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;
+                if !vmath_supported(op) {
+                    return Err(format!("{UNSUPPORTED} vmath op {op} not yet lowered to PTX"));
+                }
+            }
+            CoopKind::Vmath2 if args.len() == 5 => {
+                let op = self
+                    .const_ints
+                    .get(&args[4].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;
+                if !matches!(op, 0..=2) {
+                    return Err(format!("{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"));
+                }
+            }
+            CoopKind::ParallelFor => {
+                return Err(format!("{UNSUPPORTED} mercury_parallel_for not cooperative in mega"));
+            }
+            _ => {}
+        }
+
+        self.emit("bar.sync 0;");
+        match kind {
+            // Cooperative reduction across the whole block; the result is broadcast to every thread.
+            CoopKind::Reduce => {
+                self.emit_helper_call_pred("mrt_sreduce_coop", Some(RC::F32), args, result, false);
+            }
+            // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later).
+            _ => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_helper_call_pred(h.ptx_name, h.ret, args, result, true);
+            }
+        }
+        self.emit("bar.sync 0;");
+        Ok(())
+    }
+
     /// Emit a call to a device-side runtime helper (`mrt_*`): declare a param scope, pass each arg by
     /// its ABI type, call, and bind the return (if any). Same convention as a user-function call.
     fn emit_helper_call(
@@ -1351,6 +1600,27 @@ impl<'a> FnEmit<'a> {
         args: &[ValueId],
         result: Option<ValueId>,
     ) {
+        self.emit_helper_call_pred(ptx_name, ret, args, result, false);
+    }
+
+    /// As [`emit_helper_call`], but when `tid0_guard` the `call.uni` itself is predicated on
+    /// `tid==0` — the mega-mode "serial recognized op" path: a single thread runs the naive `mrt_*`
+    /// over the shared frame (bracketed by `bar.sync` at the call site), the rest idle. Arg marshaling
+    /// and result `ld.param` stay unpredicated (per-thread param space; non-zero threads' result is
+    /// discarded by the `tid==0`-guarded store that consumes it).
+    fn emit_helper_call_pred(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        args: &[ValueId],
+        result: Option<ValueId>,
+        tid0_guard: bool,
+    ) {
+        let g = if tid0_guard {
+            format!("@{} ", self.tid0)
+        } else {
+            String::new()
+        };
         let abis: Vec<&'static str> = args
             .iter()
             .map(|a| abi_ty(self.func.value_type(*a)))
@@ -1374,8 +1644,8 @@ impl<'a> FnEmit<'a> {
             arglist.push_str(&format!("_a{i}"));
         }
         match ret {
-            Some(_) => self.emit(&format!("call.uni (_r), {ptx_name}, ({arglist});")),
-            None => self.emit(&format!("call.uni {ptx_name}, ({arglist});")),
+            Some(_) => self.emit(&format!("{g}call.uni (_r), {ptx_name}, ({arglist});")),
+            None => self.emit(&format!("{g}call.uni {ptx_name}, ({arglist});")),
         }
         if let (Some(rc), Some(res)) = (ret, result) {
             let d = self.reg(res);
@@ -1467,6 +1737,9 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Append one `(tag, payload)` print record to the context buffer (atomic slot, bounds-guarded).
+    /// In mega mode the whole append is `tid==0`-only: the SPMD threads all compute the *same* record
+    /// (control flow is data-independent), so emitting once preserves byte-identical stdout — and the
+    /// atomic counter must advance exactly once, not once per thread.
     fn emit_record(&mut self, tag: u64, payload: &str) {
         let ctx = self.ctx_reg.clone();
         let idx = self.fresh(RC::Rd);
@@ -1474,8 +1747,14 @@ impl<'a> FnEmit<'a> {
         let addr = self.fresh(RC::Rd);
         let tagr = self.fresh(RC::Rd);
         let pw = self.fresh_pred();
-        self.emit(&format!("atom.global.add.u64 {idx}, [{ctx}+{CTX_COUNT_OFF}], 1;"));
+        let ag = self.st_guard(); // `@tid0 ` (mega) or empty
+        self.emit(&format!("{ag}atom.global.add.u64 {idx}, [{ctx}+{CTX_COUNT_OFF}], 1;"));
         self.emit(&format!("setp.lt.u64 {pw}, {idx}, {RECORD_CAP};"));
+        if self.mega {
+            // Fold tid0 into the bounds predicate so non-zero threads (whose `idx` is undefined,
+            // having skipped the guarded atomic) never store.
+            self.emit(&format!("and.pred {pw}, {pw}, {};", self.tid0));
+        }
         self.emit(&format!("mul.lo.s64 {off}, {idx}, {RECORD_BYTES};"));
         self.emit(&format!("add.s64 {addr}, {ctx}, {off};"));
         self.emit(&format!("add.s64 {addr}, {addr}, {CTX_RECORDS_OFF};"));
@@ -1500,6 +1779,10 @@ impl<'a> FnEmit<'a> {
         } else {
             self.emit(&format!("setp.eq.s64 {pz}, {cond}, 0;"));
         }
+        if self.mega {
+            // Only `tid==0` records the (identical, data-independent) assert outcome.
+            self.emit(&format!("and.pred {pz}, {pz}, {};", self.tid0));
+        }
         let one = self.fresh(RC::Rd);
         self.emit(&format!("mov.b64 {one}, 1;"));
         self.emit(&format!("@{pz} st.global.u64 [{ctx}+{CTX_ASSERT_OFF}], {one};"));
@@ -1510,6 +1793,17 @@ impl<'a> FnEmit<'a> {
 
     fn lower_term(&mut self, term: &Terminator) -> Result<(), String> {
         match term {
+            // In mega mode the entry *is* the kernel: a `Ret` writes the exit code into the context
+            // exit slot (tid==0) and returns, mirroring `emit_entry_kernel`'s wrapper.
+            Terminator::Ret(None) if self.mega => {
+                self.emit_mega_exit(None);
+                self.emit("ret;");
+            }
+            Terminator::Ret(Some(v)) if self.mega => {
+                let v = *v;
+                self.emit_mega_exit(Some(v));
+                self.emit("ret;");
+            }
             Terminator::Ret(None) => self.emit("ret;"),
             Terminator::Ret(Some(v)) => {
                 let abi = abi_ty(self.func.value_type(*v));
@@ -1543,6 +1837,27 @@ impl<'a> FnEmit<'a> {
             Terminator::Unreachable => self.emit("trap;"),
         }
         Ok(())
+    }
+
+    /// Store the megakernel exit code (the entry's return, truncated to i64) into the context exit
+    /// slot, `tid==0`-only. A void/`None` return exits 0 (matching the single-thread wrapper).
+    fn emit_mega_exit(&mut self, v: Option<ValueId>) {
+        let ctx = self.ctx_reg.clone();
+        let tid0 = self.tid0.clone();
+        let code = self.fresh(RC::Rd);
+        match v {
+            None => self.emit(&format!("mov.b64 {code}, 0;")),
+            Some(v) => {
+                let rc = rc_of(&self.ty(v));
+                let r = self.reg(v);
+                match rc {
+                    RC::Rd => self.emit(&format!("mov.b64 {code}, {r};")),
+                    RC::F32 => self.emit(&format!("cvt.rzi.s64.f32 {code}, {r};")),
+                    RC::F64 => self.emit(&format!("cvt.rzi.s64.f64 {code}, {r};")),
+                }
+            }
+        }
+        self.emit(&format!("@{tid0} st.global.u64 [{ctx}+{CTX_EXIT_OFF}], {code};"));
     }
 
     /// Realize the block-param convention for one edge: copy each arg into a temp, then each temp into
@@ -1816,6 +2131,102 @@ RED_LOOP:
     add.s64 %rd4, %rd4, 1;
     bra RED_LOOP;
 RED_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}
+"#;
+
+/// Block-shared scratch for the cooperative reduction tree (`mrt_sreduce_coop`). One f32 per thread;
+/// 1024 covers the largest block the megakernel launcher uses. Static `.shared` (4 KiB), so the
+/// launch needs no dynamic shared memory.
+const PTX_MEGA_SMEM: &str = ".shared .align 4 .b32 mrt_red_smem[1024];\n";
+
+/// **Cooperative** `mercury_sreduce_f32(x, y, n, op) -> f32` for the megakernel: every thread in the
+/// block folds a `tid`-strided slice of `[0,n)` into a private partial (the *same* per-element op as
+/// the single-thread `mrt_sreduce`), then a fixed shared-memory **tree** combines the partials and
+/// broadcasts the result to all threads. Deterministic (no atomics, M12); the tree's reassociation vs
+/// the sequential fold is covered by the CPU<->GPU tolerance gate. Block size must be a power of two
+/// (the launcher uses 256). Combine: add for dot/ssd/sum/sumsq (op<4), max for max/maxabs, min for min.
+const PTX_SREDUCE_COOP: &str = r#".func (.param .f32 _r) mrt_sreduce_coop (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<12>;
+    .reg .b32 %r<10>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<8>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.u32 %r0, %tid.x;
+    mov.u32 %r1, %ntid.x;
+    cvt.u64.u32 %rd4, %r0;
+    cvt.u64.u32 %rd5, %r1;
+    mov.f32 %f0, 0f00000000;
+    setp.eq.s64 %p0, %rd3, 4;
+    setp.eq.s64 %p1, %rd3, 6;
+    or.pred %p0, %p0, %p1;
+    @%p0 mov.f32 %f0, 0fFF800000;
+    setp.eq.s64 %p1, %rd3, 5;
+    @%p1 mov.f32 %f0, 0f7F800000;
+RC_LOOP:
+    setp.ge.s64 %p2, %rd4, %rd2;
+    @%p2 bra RC_DONE;
+    shl.b64 %rd6, %rd4, 2;
+    add.s64 %rd7, %rd0, %rd6;
+    ld.f32 %f1, [%rd7];
+    add.s64 %rd8, %rd1, %rd6;
+    ld.f32 %f2, [%rd8];
+    setp.eq.s64 %p3, %rd3, 0;
+    @%p3 fma.rn.f32 %f0, %f1, %f2, %f0;
+    setp.eq.s64 %p3, %rd3, 1;
+    @%p3 sub.rn.f32 %f3, %f1, %f2;
+    @%p3 fma.rn.f32 %f0, %f3, %f3, %f0;
+    setp.eq.s64 %p3, %rd3, 2;
+    @%p3 add.rn.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 3;
+    @%p3 fma.rn.f32 %f0, %f1, %f1, %f0;
+    setp.eq.s64 %p3, %rd3, 4;
+    @%p3 max.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 5;
+    @%p3 min.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 6;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 max.f32 %f0, %f0, %f4;
+    add.s64 %rd4, %rd4, %rd5;
+    bra RC_LOOP;
+RC_DONE:
+    shl.b32 %r2, %r0, 2;
+    mov.u32 %r3, mrt_red_smem;
+    add.s32 %r4, %r3, %r2;
+    st.shared.f32 [%r4], %f0;
+    bar.sync 0;
+    shr.u32 %r5, %r1, 1;
+RC_TREE:
+    setp.eq.s32 %p4, %r5, 0;
+    @%p4 bra RC_TREE_DONE;
+    setp.lt.u32 %p5, %r0, %r5;
+    @!%p5 bra RC_TREE_SYNC;
+    ld.shared.f32 %f5, [%r4];
+    add.u32 %r6, %r0, %r5;
+    shl.b32 %r6, %r6, 2;
+    add.u32 %r7, %r3, %r6;
+    ld.shared.f32 %f6, [%r7];
+    setp.eq.s64 %p6, %rd3, 4;
+    setp.eq.s64 %p7, %rd3, 6;
+    or.pred %p6, %p6, %p7;
+    @%p6 max.f32 %f5, %f5, %f6;
+    setp.eq.s64 %p7, %rd3, 5;
+    @%p7 min.f32 %f5, %f5, %f6;
+    setp.lt.s64 %p6, %rd3, 4;
+    @%p6 add.rn.f32 %f5, %f5, %f6;
+    st.shared.f32 [%r4], %f5;
+RC_TREE_SYNC:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra RC_TREE;
+RC_TREE_DONE:
+    mov.u32 %r8, mrt_red_smem;
+    ld.shared.f32 %f0, [%r8];
     st.param.f32 [_r], %f0;
     ret;
 }
@@ -2924,8 +3335,7 @@ fn run_on_device(
         format!("gpu-native JIT/load failed: {e:?}\n  (PTX written to {})", p.display())
     })?;
 
-    let ctx_len = 4 + 2 * RECORD_CAP as usize;
-    let host = vec![0u64; ctx_len];
+    let host = new_ctx_host();
     let mut ctx_d = g
         .stream
         .memcpy_stod(&host)
@@ -2947,6 +3357,19 @@ fn run_on_device(
         .memcpy_dtov(&ctx_d)
         .map_err(|e| format!("gpu-native readback failed: {e:?}"))?;
 
+    decode_ctx(&out)
+}
+
+/// The zeroed host mirror of the device context buffer (record count + assert flag + exit code +
+/// reserved, then `RECORD_CAP` two-u64 print records). Shared by the single-thread and mega launchers.
+pub(crate) fn new_ctx_host() -> Vec<u64> {
+    vec![0u64; 4 + 2 * RECORD_CAP as usize]
+}
+
+/// Decode a context buffer read back from the device into `(exit_code, stdout)` — the print records
+/// replayed with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses. Shared by
+/// `run_on_device` and the megakernel launcher so both produce byte-identical output.
+pub(crate) fn decode_ctx(out: &[u64]) -> Result<(i64, Vec<u8>), String> {
     let count = out[CTX_COUNT_OFF as usize / 8];
     let assert_failed = out[CTX_ASSERT_OFF as usize / 8];
     let exit = out[CTX_EXIT_OFF as usize / 8] as i64;
@@ -2973,6 +3396,23 @@ fn run_on_device(
         stdout.extend_from_slice(line.as_bytes());
     }
     Ok((exit, stdout))
+}
+
+/// Total bytes of `func`'s alloca frame (mirrors `FnEmit::assign_frame`'s slot sizing) — the size of
+/// the shared `.global` frame buffer the megakernel launcher allocates + zeroes for the whole block.
+pub fn mega_frame_bytes(func: &Function) -> u64 {
+    let mut off = 0u64;
+    for b in &func.blocks {
+        for inst in &b.insts {
+            if let Op::Alloca(ty) = &inst.op {
+                if inst.result.is_some() {
+                    let sz = size_of(ty).max(1);
+                    off += sz.div_ceil(8) * 8;
+                }
+            }
+        }
+    }
+    off
 }
 
 // ============================================================================================
