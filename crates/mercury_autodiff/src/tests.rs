@@ -910,6 +910,90 @@ fn linear_tanh_sum_vjp() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Softmax VJP: loss = sum_ij C[i,j] * softmax(X)[i,j] (a coefficient-weighted softmax). Backward
+// per row is dx = y (.) (dy - sum_j dy_j y_j) with dy = C — emitted as nested loops with a per-row
+// dot (sreduce). Gated by the f64 closed form.
+// ---------------------------------------------------------------------------------------------
+
+const NORM_SOFTMAX: i64 = 0;
+const RED_DOT: i64 = 0;
+
+fn build_softmax_dot(it: &mut Interner, rows: usize, cols: usize) -> Fwd {
+    let norm = it.intern("mercury_norm_f32");
+    let sreduce = it.intern("mercury_sreduce_f32");
+    let mut b = Builder::new(it.intern("smax"), MirType::Void);
+    let x = b.add_param(PTR);
+    let c = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let y = b.alloca(arr(rows * cols));
+    let (rv, cv, epsv, smop) = (
+        ci(&mut b, rows as i64),
+        ci(&mut b, cols as i64),
+        ci(&mut b, 0),
+        ci(&mut b, NORM_SOFTMAX),
+    );
+    // y = softmax(x) per row
+    b.build_void(Op::Call {
+        func: norm,
+        args: vec![x, y, rv, cv, epsv, smop],
+    });
+    // loss = sum_i C[i] * y[i]   (dot)
+    let (rc, dotop) = (ci(&mut b, (rows * cols) as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![c, y, rc, dotop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![rows * cols, rows * cols, 1],
+        loss_out: 2,
+    }
+}
+
+fn softmax_f64(x: &[f32], rows: usize, cols: usize) -> Vec<f64> {
+    let mut y = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exps: Vec<f64> = row.iter().map(|&v| (v as f64 - mx).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        for (j, e) in exps.iter().enumerate() {
+            y[r * cols + j] = e / sum;
+        }
+    }
+    y
+}
+
+#[test]
+fn softmax_dot_vjp() {
+    let (rows, cols) = (3, 4);
+    let mut it = Interner::default();
+    let fwd = build_softmax_dot(&mut it, rows, cols);
+    let mut seed = 0x50F7u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    // dy = C; dx[r,j] = y[r,j]*(C[r,j] - sum_k C[r,k] y[r,k]).
+    let y = softmax_f64(&xb, rows, cols);
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let s: f64 = (0..cols)
+            .map(|j| cb[r * cols + j] as f64 * y[r * cols + j])
+            .sum();
+        for j in 0..cols {
+            let idx = r * cols + j;
+            dx[idx] = y[idx] * (cb[idx] as f64 - s);
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+// ---------------------------------------------------------------------------------------------
 // A real two-layer kernel MLP: P1 = X.W1^T; H = relu(P1); P2 = H.W2^T; loss = sum((P2 - T)^2).
 // Chains two sgemm_nt matmuls through a relu and an MSE loss — the full backward path the engine
 // emits (two transposes, a masked relu loop, two NN GEMMs, the SSD affine). Gated by the f64
