@@ -129,6 +129,10 @@ const RT_COLARGMIN: &str = "mercury_colargmin_i32";
 const RT_COLARGMIN_PAR: &str = "mercury_colargmin_i32_parallel";
 const RT_CUMSUM: &str = "mercury_cumsum_f32";
 const RT_CUMSUM_PAR: &str = "mercury_cumsum_f32_parallel";
+const RT_CUMMAX: &str = "mercury_cummax_f32";
+const RT_CUMMAX_PAR: &str = "mercury_cummax_f32_parallel";
+const RT_CUMMIN: &str = "mercury_cummin_f32";
+const RT_CUMMIN_PAR: &str = "mercury_cummin_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -925,6 +929,10 @@ impl<'a> FnTranslator<'a> {
                 | RT_COLARGMIN_PAR
                 | RT_CUMSUM
                 | RT_CUMSUM_PAR
+                | RT_CUMMAX
+                | RT_CUMMAX_PAR
+                | RT_CUMMIN
+                | RT_CUMMIN_PAR
         ) && args.len() == 4
         {
             let x = self.val(args[0]);
@@ -1390,6 +1398,10 @@ struct RtFuncs {
     colargmin_par: FuncId,
     cumsum: FuncId,
     cumsum_par: FuncId,
+    cummax: FuncId,
+    cummax_par: FuncId,
+    cummin: FuncId,
+    cummin_par: FuncId,
     kd_loss: FuncId,
     kd_loss_par: FuncId,
     vmath_bf16: FuncId,
@@ -1824,6 +1836,18 @@ fn populate_module<M: Module>(
         cumsum_par: module
             .declare_function(RT_CUMSUM_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        cummax: module
+            .declare_function(RT_CUMMAX, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        cummax_par: module
+            .declare_function(RT_CUMMAX_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        cummin: module
+            .declare_function(RT_CUMMIN, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        cummin_par: module
+            .declare_function(RT_CUMMIN_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -2216,6 +2240,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_CUMSUM_PAR,
                 module.declare_func_in_func(rt.cumsum_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_CUMMAX,
+                module.declare_func_in_func(rt.cummax, builder.func),
+            );
+            rt_refs.insert(
+                RT_CUMMAX_PAR,
+                module.declare_func_in_func(rt.cummax_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_CUMMIN,
+                module.declare_func_in_func(rt.cummin, builder.func),
+            );
+            rt_refs.insert(
+                RT_CUMMIN_PAR,
+                module.declare_func_in_func(rt.cummin_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2698,6 +2738,16 @@ pub fn jit_compile(
         RT_CUMSUM_PAR,
         mercury_runtime::mercury_cumsum_f32_parallel as *const u8,
     );
+    builder.symbol(RT_CUMMAX, mercury_runtime::mercury_cummax_f32 as *const u8);
+    builder.symbol(
+        RT_CUMMAX_PAR,
+        mercury_runtime::mercury_cummax_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_CUMMIN, mercury_runtime::mercury_cummin_f32 as *const u8);
+    builder.symbol(
+        RT_CUMMIN_PAR,
+        mercury_runtime::mercury_cummin_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
@@ -3100,6 +3150,16 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_CUMSUM_PAR,
         mercury_runtime::mercury_cumsum_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_CUMMAX, mercury_runtime::mercury_cummax_f32 as *const u8);
+    builder.symbol(
+        RT_CUMMAX_PAR,
+        mercury_runtime::mercury_cummax_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_CUMMIN, mercury_runtime::mercury_cummin_f32 as *const u8);
+    builder.symbol(
+        RT_CUMMIN_PAR,
+        mercury_runtime::mercury_cummin_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,
