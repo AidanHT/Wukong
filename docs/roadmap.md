@@ -92,6 +92,15 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `vaddss` chain), so Mercury wins ~1.0–1.85× single-core (the apply is already vectorized in both) and
   ~5–6× `@parallel` (rows across cores). The dot reassociates (the reduction exception), so the differential
   gate is bit-exact while the cross-language check is a tolerance (`tests/run/softmax_bwd.mer`).
+- **Activation backward → 256-bit transcendental gradient**: a `for i { dx[i] = act_backward(x[i],
+  dy[i]) }` loop (`act` ∈ {`silu`,`gelu`,`sigmoid`,`tanh`} — the gradient through every FFN/attention/gate
+  nonlinearity in training) folds to one `mercury_vmath2_f32` call with a new two-input op code, fusing the
+  upstream `dy·` multiply into `dy·act'(x)`. The derivative is itself a transcendental (`silu'`/`sigmoid'`
+  fold a sigmoid, `gelu'`/`tanh'` a tanh — an `expf` C/Rust keep scalar), so the 256-bit kernel wins
+  **~5–11× single-core, ~10–25× `@parallel`** vs scalar C (`tanh_backward` the largest). Pure elementwise
+  (no reduction) → the kernel is bit-identical lane-for-lane, so the differential gate is trivial (no
+  reassociation exception); scalar twin / AVX2 / inlined-MIR fallback share one op sequence
+  (`tests/run/{silu,gelu,gate}_backward.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
   dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
   its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full
