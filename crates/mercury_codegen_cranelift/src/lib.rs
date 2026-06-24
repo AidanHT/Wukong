@@ -123,6 +123,10 @@ const RT_ROWARGMAX: &str = "mercury_rowargmax_i32";
 const RT_ROWARGMAX_PAR: &str = "mercury_rowargmax_i32_parallel";
 const RT_ROWARGMIN: &str = "mercury_rowargmin_i32";
 const RT_ROWARGMIN_PAR: &str = "mercury_rowargmin_i32_parallel";
+const RT_COLARGMAX: &str = "mercury_colargmax_i32";
+const RT_COLARGMAX_PAR: &str = "mercury_colargmax_i32_parallel";
+const RT_COLARGMIN: &str = "mercury_colargmin_i32";
+const RT_COLARGMIN_PAR: &str = "mercury_colargmin_i32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -913,6 +917,10 @@ impl<'a> FnTranslator<'a> {
                 | RT_ROWARGMAX_PAR
                 | RT_ROWARGMIN
                 | RT_ROWARGMIN_PAR
+                | RT_COLARGMAX
+                | RT_COLARGMAX_PAR
+                | RT_COLARGMIN
+                | RT_COLARGMIN_PAR
         ) && args.len() == 4
         {
             let x = self.val(args[0]);
@@ -1372,6 +1380,10 @@ struct RtFuncs {
     rowargmax_par: FuncId,
     rowargmin: FuncId,
     rowargmin_par: FuncId,
+    colargmax: FuncId,
+    colargmax_par: FuncId,
+    colargmin: FuncId,
+    colargmin_par: FuncId,
     kd_loss: FuncId,
     kd_loss_par: FuncId,
     vmath_bf16: FuncId,
@@ -1788,6 +1800,18 @@ fn populate_module<M: Module>(
         rowargmin_par: module
             .declare_function(RT_ROWARGMIN_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        colargmax: module
+            .declare_function(RT_COLARGMAX, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colargmax_par: module
+            .declare_function(RT_COLARGMAX_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colargmin: module
+            .declare_function(RT_COLARGMIN, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colargmin_par: module
+            .declare_function(RT_COLARGMIN_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -2156,6 +2180,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_ROWARGMIN_PAR,
                 module.declare_func_in_func(rt.rowargmin_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLARGMAX,
+                module.declare_func_in_func(rt.colargmax, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLARGMAX_PAR,
+                module.declare_func_in_func(rt.colargmax_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLARGMIN,
+                module.declare_func_in_func(rt.colargmin, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLARGMIN_PAR,
+                module.declare_func_in_func(rt.colargmin_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2618,6 +2658,22 @@ pub fn jit_compile(
         mercury_runtime::mercury_rowargmin_i32_parallel as *const u8,
     );
     builder.symbol(
+        RT_COLARGMAX,
+        mercury_runtime::mercury_colargmax_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMAX_PAR,
+        mercury_runtime::mercury_colargmax_i32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMIN,
+        mercury_runtime::mercury_colargmin_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMIN_PAR,
+        mercury_runtime::mercury_colargmin_i32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
@@ -2998,6 +3054,22 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_ROWARGMIN_PAR,
         mercury_runtime::mercury_rowargmin_i32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMAX,
+        mercury_runtime::mercury_colargmax_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMAX_PAR,
+        mercury_runtime::mercury_colargmax_i32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMIN,
+        mercury_runtime::mercury_colargmin_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_COLARGMIN_PAR,
+        mercury_runtime::mercury_colargmin_i32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,

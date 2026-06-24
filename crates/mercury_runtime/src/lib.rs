@@ -114,6 +114,12 @@ pub use rowarg::{
     mercury_rowargmin_i32_parallel,
 };
 
+mod colarg;
+pub use colarg::{
+    mercury_colargmax_i32, mercury_colargmax_i32_parallel, mercury_colargmin_i32,
+    mercury_colargmin_i32_parallel,
+};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
