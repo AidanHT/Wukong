@@ -813,6 +813,10 @@ const VMATH2_SIGMOID_BWD: u32 = 5;
 const VMATH2_TANH_BWD: u32 = 6;
 const VMATH2_ELU_BWD: u32 = 7;
 const VMATH2_SOFTPLUS_BWD: u32 = 8;
+// Gated-FFN activation `out = act(a)·b` (SwiGLU/GeGLU) — must match `mercury_runtime::vmath`'s
+// `VM2_{SILU,GELU}_GATE`. Inputs positional `(a, b)`.
+const VMATH2_SILU_GATE: u32 = 9;
+const VMATH2_GELU_GATE: u32 = 10;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -4532,6 +4536,42 @@ impl FnLowerer<'_> {
             return None;
         };
         let out_sym = self.index_by_loopvar(target, j)?;
+        // Gated-FFN activation `out[j] = act(a[j]) * b[j]` (SwiGLU/GeGLU): a Mul of a *one-arg*
+        // activation call (silu/gelu) on `a[j]` and a second unit-stride array read `b[j]` (either
+        // factor order). Folds to `mercury_vmath2_f32(a, b, out, n, VMATH2_*_GATE)` — the kernel
+        // computes act(a)·b, so the activated operand must be passed *first*. Tried before the 2-arg
+        // call shape below. The activation folds an exp C/Rust keep scalar, so the 256-bit gate wins.
+        if let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &value.kind
+        {
+            for (act_e, lin_e) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+                if let ExprKind::Call { callee, args, .. } = &act_e.kind {
+                    if args.len() == 1 {
+                        let gop = match self.vectorizable_intrinsic(callee) {
+                            Some(MathIntrinsic::Silu) => Some(VMATH2_SILU_GATE),
+                            Some(MathIntrinsic::Gelu) => Some(VMATH2_GELU_GATE),
+                            _ => None,
+                        };
+                        if let Some(gop) = gop {
+                            if self.expr_mir(value) == MirType::F32
+                                && self.expr_mir(&args[0]) == MirType::F32
+                                && self.expr_mir(lin_e) == MirType::F32
+                            {
+                                if let (Some(a), Some(b)) = (
+                                    self.index_by_loopvar(&args[0], j),
+                                    self.index_by_loopvar(lin_e, j),
+                                ) {
+                                    return Some((out_sym, a, b, gop));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let ExprKind::Call { callee, args, .. } = &value.kind else {
             return None;
         };

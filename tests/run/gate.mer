@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 731
+// EXPECT-OUT: 880
+// EXPECT-OUT: -806
+// EXPECT-OUT: 0
+// EXPECT-OUT: 841
+// EXPECT-OUT: 977
+// EXPECT-OUT: -476
+module tests.run.gate
+
+// Gated-FFN activation out[i] = act(a[i]) * b[i] — the SwiGLU (silu gate) / GeGLU (gelu gate) feed-
+// forward of Llama/PaLM/Gemma. The recognizer folds each `out[i] = act(a[i]) * b[i]` loop to one
+// mercury_vmath2_f32 call with a VM2_*_GATE op code (riding the existing two-input kernel — zero new
+// symbol, like the activation backwards). The activation folds an exp C/Rust keep scalar, so the
+// 256-bit gate wins. Pure elementwise → the differential gate (interp == native) is trivially exact.
+fn main() -> i32 {
+    let a: [f32; 4] = [0.0, 1.0, 2.0, -1.0];
+    let b: [f32; 4] = [2.0, 1.0, 0.5, 3.0];
+    let mut sg: [f32; 4] = [0.0; 4];
+    let mut gg: [f32; 4] = [0.0; 4];
+
+    for i in 0..4 { sg[i] = silu(a[i]) * b[i]; }
+    for i in 0..4 { gg[i] = gelu(a[i]) * b[i]; }
+
+    // silu(0)=0; silu(1)=0.731; silu(2)=1.762; silu(-1)=-0.269
+    for k in 0..4 { print((sg[k] * 1000.0) as i32); }
+    for k in 0..4 { print((gg[k] * 1000.0) as i32); }
+    return 0;
+}
