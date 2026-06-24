@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -967
+// EXPECT-OUT: 87
+// EXPECT-OUT: 236
+// EXPECT-OUT: 643
+// EXPECT-OUT: 534
+// EXPECT-OUT: 196
+// EXPECT-OUT: -927
+// EXPECT-OUT: 196
+module tests.run.xent_bwd
+
+// Softmax cross-entropy backward: dx[r,i] = softmax(x[r])[i] − onehot(target[r])[i] — the input
+// gradient of every classifier / LM training step. The recognizer folds the [R=2,C=4] nest to one
+// mercury_xent_bwd_f32 call: softmax's row-max + Σexp + recompute (which gcc/rustc keep scalar) then a
+// data-dependent scatter (−1 at the true class). Reductions reassociate (the documented exception —
+// both backends run the same kernel), so the differential gate (interp == native) holds.
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 0.0, 1.0];
+    let target: [i32; 2] = [0, 2];
+    let mut dx: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 { m = fmax(m, x[r * 4 + i]); }
+        let mut z: f32 = 0.0;
+        for i in 0..4 { z = z + exp(x[r * 4 + i] - m); }
+        let invz: f32 = 1.0 / z;
+        for i in 0..4 { dx[r * 4 + i] = exp(x[r * 4 + i] - m) * invz; }
+        dx[r * 4 + target[r]] = dx[r * 4 + target[r]] - 1.0;
+    }
+    // dx = softmax(x) − onehot(target); each row sums to ~0.
+    for k in 0..8 { print((dx[k] * 1000.0) as i32); }
+    return 0;
+}
