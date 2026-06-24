@@ -256,6 +256,9 @@ fn main() {
     if want("colarg") {
         bench_colarg(&cc, &dir);
     }
+    if want("cumsum") {
+        bench_cumsum(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1394,6 +1397,126 @@ fn bench_colarg(cc: &str, dir: &Path) {
             }
             println!();
         }
+    }
+}
+
+/// Mercury per-row inclusive prefix sum (cumsum): `for r { let acc=0; for i in 0..C { acc=acc+x[r*C+i];
+/// out[r*C+i]=acc } }` — folds to one `mercury_cumsum_f32[_parallel]`. The loop-carried `acc` recurrence
+/// is what gcc/rustc keep scalar; the SIMD Hillis-Steele scan vectorizes it. `y` is the unused middle.
+fn mer_cumsum(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut acc: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ acc = acc + x[r * {cols} + i]; out[r * {cols} + i] = acc; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_cumsum(rows: usize, cols: usize) -> String {
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long r=0;r<R;r++){{ float acc=0.0f; for (long i=0;i<C;i++){{ acc+=x[r*C+i]; out[r*C+i]=acc; }} }} }}\n"
+    )
+}
+
+fn rust_cumsum(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ let mut acc=0.0f32; for i in 0..C {{ acc += *x.add(r*C+i); *out.add(r*C+i)=acc; }} }} }}\n"
+    )
+}
+
+/// Per-row inclusive prefix sum (cumsum / scan). gcc/rustc keep the loop-carried `out[i]=out[i-1]+x[i]`
+/// recurrence SCALAR (a prefix sum does not auto-vectorize); Mercury folds it to the SIMD Hillis-Steele
+/// scan kernel. GB/s = `R·C·4·2` (read x + write out). The in-lane tree reassociates the float sum, so
+/// the cross-check is a tight magnitude-normalized tolerance (like the reductions), not exact.
+fn bench_cumsum(cc: &str, dir: &Path) {
+    for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
+        let n = rows * cols;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 31 + 7) % 101) as f32 * 0.01 - 0.5).collect();
+        let dummy = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+        let bytes = n as f64 * 4.0 * 2.0; // read x + write out
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== cumsum (out[r,i] = Sum_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_cumsum(rows, cols, false), &mut out, xp, yp, op);
+        let mer_par = bench_mercury(&mer_cumsum(rows, cols, true), &mut out, xp, yp, op);
+        let cm = bench_external(
+            "c",
+            &c_cumsum(rows, cols),
+            dir,
+            "cumsum",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_cumsum(rows, cols),
+            dir,
+            "cumsum",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        // The in-lane tree scan reassociates → a **magnitude-normalized** tolerance (max|Δ| over the
+        // largest prefix sum), not a pointwise relative one: a mean-zero input makes the prefix sum a
+        // random walk that crosses zero, where a pointwise ratio divides by ~0. Same basis as the norm
+        // / reduction cross-checks.
+        if let (Some(a), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+            let maxerr = a
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! cumsum mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+        }
+        println!();
     }
 }
 
