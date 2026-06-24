@@ -259,6 +259,9 @@ fn main() {
     if want("cumsum") {
         bench_cumsum(&cc, &dir);
     }
+    if want("cumminmax") {
+        bench_cumminmax(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1517,6 +1520,121 @@ fn bench_cumsum(cc: &str, dir: &Path) {
             println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
         }
         println!();
+    }
+}
+
+/// Mercury per-row cumulative max/min: `for r { let m=x[r*C]; for i { m=fmax(m,x[r*C+i]); out[r*C+i]=m } }`
+/// — folds to one `mercury_cum{max,min}_f32[_parallel]`. The loop-carried fmax/fmin recurrence is what
+/// gcc/rustc keep scalar; the SIMD in-lane max/min scan vectorizes it. `y` unused.
+fn mer_cumminmax(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    let f = if is_max { "fmax" } else { "fmin" };
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut m: f32 = x[r * {cols}];\n\
+         \x20       for i in 0..{cols} {{ m = {f}(m, x[r * {cols} + i]); out[r * {cols} + i] = m; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_cumminmax(rows: usize, cols: usize, is_max: bool) -> String {
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long r=0;r<R;r++){{ float m=x[r*C]; for (long i=0;i<C;i++){{ float v=x[r*C+i]; if (v {cmp} m) m=v; out[r*C+i]=m; }} }} }}\n"
+    )
+}
+
+fn rust_cumminmax(rows: usize, cols: usize, is_max: bool) -> String {
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ let mut m=*x.add(r*C); for i in 0..C {{ let v=*x.add(r*C+i); if v {cmp} m {{ m=v; }} *out.add(r*C+i)=m; }} }} }}\n"
+    )
+}
+
+/// Per-row cumulative max / min (running-extreme scan). gcc/rustc keep the loop-carried fmax/fmin
+/// recurrence SCALAR; Mercury folds it to the SIMD in-lane max/min scan kernel. GB/s = `R·C·4·2`. max/min
+/// select an input value (no float arithmetic, no reassociation), so the cross-check is **bit-exact**.
+fn bench_cumminmax(cc: &str, dir: &Path) {
+    for (is_max, label) in [(true, "cummax"), (false, "cummin")] {
+        for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
+            let n = rows * cols;
+            let x: Vec<f32> = (0..n).map(|i| ((i * 47 + 13) % 101) as f32 * 0.5 - 25.0).collect();
+            let dummy = vec![0.0f32; n];
+            let mut out = vec![0.0f32; n];
+            let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+            let bytes = n as f64 * 4.0 * 2.0; // read x + write out
+            let gbps = |v: &Option<Measure>| {
+                v.as_ref()
+                    .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let sym = if is_max { "max" } else { "min" };
+            println!("=== {label} (out[r,i] = {sym}_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
+            let mer = bench_mercury(&mer_cumminmax(rows, cols, is_max, false), &mut out, xp, yp, op);
+            let mer_par = bench_mercury(&mer_cumminmax(rows, cols, is_max, true), &mut out, xp, yp, op);
+            let cm = bench_external(
+                "c",
+                &c_cumminmax(rows, cols, is_max),
+                dir,
+                label,
+                cc,
+                &["-O3", "-march=native", "-shared"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            let rm = bench_external(
+                "rs",
+                &rust_cumminmax(rows, cols, is_max),
+                dir,
+                label,
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "GB/s",
+                gbps(&mer),
+                gbps(&mer_par),
+                gbps(&cm),
+                gbps(&rm)
+            );
+            // max/min select a value → bit-exact cross-check (no reassociation tolerance).
+            if let (Some(a), Some(c2)) = (&mer, &cm) {
+                if a.out != c2.out {
+                    println!("  ! {label} output mismatch vs C");
+                }
+            }
+            if let (Some(ms), Some(c2)) = (&mer, &cm) {
+                let r = c2.ns_per_call / ms.ns_per_call;
+                println!(
+                    "  -> Mercury single-core is {:.2}x {} than naive C",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                );
+            }
+            if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+                let r = c2.ns_per_call / mp.ns_per_call;
+                println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+            }
+            println!();
+        }
     }
 }
 
