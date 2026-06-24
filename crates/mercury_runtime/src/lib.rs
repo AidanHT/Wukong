@@ -81,6 +81,12 @@ pub use pool2d::{
     mercury_maxpool2d_f32_parallel,
 };
 
+mod xent;
+pub use xent::{mercury_xent_fwd_f32, mercury_xent_fwd_f32_parallel};
+
+mod rope;
+pub use rope::{mercury_rope_f32, mercury_rope_f32_parallel};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
