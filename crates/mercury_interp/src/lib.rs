@@ -1234,6 +1234,52 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_softmax_bwd_f32[_parallel](y, dy, dx, rows, cols)` — the fused softmax-backward
+            // (`dx = y·(dy − Σ y·dy)`) a recognized batched nest lowers to. Marshal `rows*cols` f32 from
+            // y AND dy, call the *serial* runtime kernel (bit-identical to the parallel one — rows are
+            // independent), write `dx`. Read both inputs first (in-place-safe with dy).
+            "mercury_softmax_bwd_f32" | "mercury_softmax_bwd_f32_parallel" => {
+                let y = ptr(args[0])?;
+                let dy = ptr(args[1])?;
+                let dx = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let n = rows * cols;
+                let mut ybuf = Vec::with_capacity(n);
+                let mut dybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    ybuf.push(
+                        self.memory
+                            .get(y + t)
+                            .ok_or("softmax_bwd operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    dybuf.push(
+                        self.memory
+                            .get(dy + t)
+                            .ok_or("softmax_bwd operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut dxbuf = vec![0.0f32; n];
+                // SAFETY: ybuf/dybuf/dxbuf are exactly rows*cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_softmax_bwd_f32(
+                        ybuf.as_ptr(),
+                        dybuf.as_ptr(),
+                        dxbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in dxbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(dx + t)
+                        .ok_or("softmax_bwd output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath_bf16(x, out, n, op)` — the bf16-input twin of `mercury_vmath_f32` an
             // `out[i] = f((x[i] as f32))` loop over a `[bf16]` array lowers to. Reconstruct the exact
             // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-

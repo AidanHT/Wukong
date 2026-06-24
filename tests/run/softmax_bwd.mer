@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: -34
+// EXPECT-OUT: -54
+// EXPECT-OUT: -76
+// EXPECT-OUT: -16
+// EXPECT-OUT: -7
+// EXPECT-OUT: -24
+// EXPECT-OUT: -7
+module tests.run.softmax_bwd
+
+// Batched softmax backward dx[r,i] = y[r,i] * (dy[r,i] - Σ_j y[r,j]*dy[r,j]) — the gradient through a
+// row softmax (every attention block / classification head in training). Each row needs a dot
+// (Σ y·dy) that gcc/rustc keep scalar (verified: no vaddps accumulator at -O3, they will not
+// reassociate the float sum), then an elementwise y·(dy - s). The recognizer folds the [R=2,C=4] nest
+// to one mercury_softmax_bwd_f32 call, which reuses the bit-exact sreduce dot + an 8-wide apply. The
+// dot reassociates (the documented reduction exception), but both backends run the same kernel, so the
+// differential gate (interp == native, -O0 == -O3) holds. Integer-valued inputs keep the dot exact.
+fn main() -> i32 {
+    // y, dy are [2,4] row-major (the softmax output and the upstream grad).
+    let y: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 3.0, 1.0];
+    let dy: [f32; 8] = [4.0, 3.0, 2.0, 1.0, 1.0, 2.0, 1.0, 2.0];
+    let mut dx: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        let mut s: f32 = 0.0;
+        for j in 0..4 {
+            s = s + y[r * 4 + j] * dy[r * 4 + j];
+        }
+        for i in 0..4 {
+            dx[r * 4 + i] = y[r * 4 + i] * (dy[r * 4 + i] - s);
+        }
+    }
+    // Row 0: s = 4+6+6+4 = 20 -> dx = [1*(4-20), 2*(3-20), 3*(2-20), 4*(1-20)] = [-16,-34,-54,-76]
+    // Row 1: s = 2+2+3+2 =  9 -> dx = [2*(1-9),  1*(2-9),  3*(1-9),  1*(2-9)]  = [-16,-7,-24,-7]
+    for k in 0..8 {
+        print(dx[k] as i32);
+    }
+    return 0;
+}

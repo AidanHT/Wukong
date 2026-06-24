@@ -92,6 +92,8 @@ pub fn lower_program(
         colmin_par: interner.intern("mercury_colmin_f32_parallel"),
         colmaxabs: interner.intern("mercury_colmaxabs_f32"),
         colmaxabs_par: interner.intern("mercury_colmaxabs_f32_parallel"),
+        softmax_bwd: interner.intern("mercury_softmax_bwd_f32"),
+        softmax_bwd_par: interner.intern("mercury_softmax_bwd_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -143,6 +145,15 @@ pub fn lower_program(
                 // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
                 // `mercury_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
                 if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function batched softmax-backward: intercept before the outliner
+                // (which would split the rows into scalar loops and lose the fused dot+apply kernel).
+                // The embedded `match_softmax_bwd` then emits the multicore `mercury_softmax_bwd_f32_parallel`
+                // (rows across cores, bit-equal to serial — rows independent).
+                if has_parallel_attr(item, interner) && softmax_bwd_fn(body, sema, interner).is_some() {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -667,6 +678,11 @@ struct GemmSyms {
     /// fold as colmax, with each element abs'd first (sign-mask `andnot`).
     colmaxabs: Symbol,
     colmaxabs_par: Symbol,
+    /// The fused softmax-backward (`mercury_softmax_bwd_f32[_parallel](y, dy, dx, rows, cols)`): a
+    /// `dx = y·(dy − Σ y·dy)` batched nest dispatches here. The per-row dot gcc/rustc keep scalar; the
+    /// kernel reuses the bit-exact `sreduce` dot + an 8-wide apply. Rows independent → serial == parallel.
+    softmax_bwd: Symbol,
+    softmax_bwd_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2368,6 +2384,31 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_softmax_bwd_f32[_parallel](y, dy, dx, rows, cols)` call for a recognized batched
+    /// softmax-backward. Bails (false) if an operand/dim is unbound (the caller lowers the scalar nest).
+    /// `parallel` selects the multicore kernel (rows across cores → bit-identical to the serial one the
+    /// interpreter marshals; rows are independent, no cross-row combine).
+    fn emit_softmax_bwd(&mut self, nest: &SoftmaxBwdNest, parallel: bool) -> bool {
+        let (Some((y, _)), Some((dy, _)), Some((dx, _))) =
+            (self.lookup(nest.y), self.lookup(nest.dy), self.lookup(nest.dx))
+        else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.softmax_bwd_par
+        } else {
+            self.gemm.softmax_bwd
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![y, dy, dx, rows, cols],
+        });
+        true
+    }
+
     /// Emit the fused `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)`
     /// call for a recognized bf16/f16 `nn.Linear`+epilogue (`C = act(A·Bᵀ + bias)`, half inputs / f32
     /// output). Bails (false) if any operand/dim is unbound at the call site, so the caller lowers the
@@ -3616,6 +3657,14 @@ impl FnLowerer<'_> {
         // + 8-wide. Bit-exact (i-ascending per column, same order as the scalar nest).
         if let Some(nest) = match_colsum(pat, iter, body, self.sema, self.interner) {
             if self.emit_colsum(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched softmax-backward `for r { let s=0; for j { s += y·dy }; for i { dx = y·(dy−s) } }`
+        // → the fused `mercury_softmax_bwd_f32` (the `_parallel` one in a `@parallel` function). The
+        // per-row dot gcc keeps scalar; the kernel reuses the bit-exact sreduce dot + an 8-wide apply.
+        if let Some(nest) = match_softmax_bwd(pat, iter, body, self.sema, self.interner) {
+            if self.emit_softmax_bwd(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -10518,6 +10567,222 @@ fn colsum_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<Col
         return None;
     };
     match_colsum(pat, iter, lb, sema, interner)
+}
+
+struct SoftmaxBwdNest {
+    y: Symbol,
+    dy: Symbol,
+    dx: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// Recognize the **batched softmax-backward** nest and dispatch it to `mercury_softmax_bwd_f32`:
+///
+/// ```text
+/// for r in 0..R {
+///     let mut s: f32 = 0.0;
+///     for j in 0..C { s = s + y[r*C + j] * dy[r*C + j]; }   // the per-row dot  Σ y·dy
+///     for i in 0..C { dx[r*C + i] = y[r*C + i] * (dy[r*C + i] - s); }
+/// }
+/// ```
+///
+/// — the Jacobian-vector product of the row softmax (`dx = y·(dy − Σ y·dy)`), the gradient through every
+/// attention block / classification head. The per-row dot is a reduction gcc/rustc keep **scalar**
+/// (verified: no `vaddps` accumulator at `-O3`); the kernel delegates it to the proven bit-exact
+/// `mercury_sreduce_f32(RED_DOT)` then applies `y·(dy − s)` 8-wide. `r*C + idx` indices are pinned by
+/// `match_row_col_off` (stride `C` = the inner bound). `y`/`dy`/`dx` are f32; `dx` distinct from `y`/`dy`
+/// (the apply reads them). The dot reassociates (the documented reduction exception — both backends run
+/// this same kernel), so the differential gate holds. `s` is loop-local, so it cannot leak.
+fn match_softmax_bwd(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<SoftmaxBwdNest> {
+    // for r in 0..R { <3 stmts> }
+    let ast::PatKind::Ident(rvar) = &pat.kind else {
+        return None;
+    };
+    let rvar = *rvar;
+    let (rs, re) = range_bounds(iter)?;
+    if as_int_lit(rs, interner)? != 0 {
+        return None;
+    }
+    let rows = as_dim(re, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 3 {
+        return None;
+    }
+    // [0] let mut s: f32 = 0.0;
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    let ast::PatKind::Ident(s_sym) = &sp.kind else {
+        return None;
+    };
+    let s_sym = *s_sym;
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    // [1] for j in 0..C { s = s + a[r*C+j] * b[r*C+j]; }  (the dot; a/b roles fixed by the apply below)
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[1])?;
+    let ast::PatKind::Ident(jvar) = &jpat.kind else {
+        return None;
+    };
+    let jvar = *jvar;
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let cols = as_dim(je, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &jbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    // prod = a[r*C+j] * b[r*C+j] — two row-major-indexed reads (order is symmetric; roles set below).
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: pa,
+        rhs: pb,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    let dot_a = index_rowmaj(pa, rvar, jvar, &cols, interner)?;
+    let dot_b = index_rowmaj(pb, rvar, jvar, &cols, interner)?;
+    if scalar_of(pa, sema) != Some(mercury_types::Scalar::F32) {
+        return None;
+    }
+    // [2] for i in 0..C { dx[r*C+i] = y[r*C+i] * (dy[r*C+i] - s); }
+    let (ipat, iiter, ibody) = fusable_for(&body.stmts[2])?;
+    let ast::PatKind::Ident(ivar) = &ipat.kind else {
+        return None;
+    };
+    let ivar = *ivar;
+    let (is_, ie) = range_bounds(iiter)?;
+    if as_int_lit(is_, interner)? != 0 || as_dim(ie, interner)? != cols {
+        return None;
+    }
+    if ibody.tail.is_some() || ibody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign {
+        target: dxt,
+        op: ast::AssignOp::Assign,
+        value: av,
+    } = &ibody.stmts[0].kind
+    else {
+        return None;
+    };
+    let dx = index_rowmaj(dxt, rvar, ivar, &cols, interner)?;
+    // av = y[r*C+i] * (dy[r*C+i] - s)  (Mul, either operand order: one Index, one Sub).
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: ml,
+        rhs: mr,
+    } = &av.kind
+    else {
+        return None;
+    };
+    // Identify the y factor (an index read) and the (dy - s) factor (a subtraction).
+    let (y_expr, sub_expr) = if matches!(&ml.kind, ExprKind::Index { .. }) {
+        (ml.as_ref(), mr.as_ref())
+    } else {
+        (mr.as_ref(), ml.as_ref())
+    };
+    let y = index_rowmaj(y_expr, rvar, ivar, &cols, interner)?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Sub,
+        lhs: dyl,
+        rhs: sref,
+    } = &sub_expr.kind
+    else {
+        return None;
+    };
+    if single_path(sref) != Some(s_sym) {
+        return None;
+    }
+    let dy = index_rowmaj(dyl, rvar, ivar, &cols, interner)?;
+    // The dot must be over the same two arrays {y, dy} (in either product order).
+    if !((dot_a == y && dot_b == dy) || (dot_a == dy && dot_b == y)) {
+        return None;
+    }
+    // dx must be distinct from the inputs (the apply reads y and dy while writing dx).
+    if dx == y || dx == dy {
+        return None;
+    }
+    Some(SoftmaxBwdNest {
+        y,
+        dy,
+        dx,
+        rows,
+        cols,
+    })
+}
+
+/// Helper: an `arr[row*C + col]` row-major read/write — return the base array symbol if `e` indexes
+/// `arr` by exactly `row*cols + col` (stride `cols`, no extra offset), else `None`.
+fn index_rowmaj(
+    e: &Expr,
+    row: Symbol,
+    col: Symbol,
+    cols: &Dim,
+    interner: &Interner,
+) -> Option<Symbol> {
+    let (base, idx) = as_index1(e)?;
+    let (stride, off) = match_row_col_off(idx, row, col, interner)?;
+    if !off.is_empty() || &stride != cols {
+        return None;
+    }
+    Some(base)
+}
+
+/// Is the whole function body a single batched softmax-backward nest? Intercepts a `@parallel` softmax
+/// backward *before* the elementwise outliner (which would split the rows into scalar loops and lose the
+/// fused dot+apply kernel), mirroring the colsum/sgemm/norm interceptions.
+fn softmax_bwd_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<SoftmaxBwdNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_softmax_bwd(pat, iter, lb, sema, interner)
 }
 
 /// Is the whole function body a single fused residual projection (`x = x + act(x·Wᵀ + bias)`)? Used to
