@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 49
+// EXPECT-OUT: 367
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 1213
+// EXPECT-OUT: 47
+// EXPECT-OUT: 268
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 731
+// EXPECT-OUT: 1761
+// EXPECT-OUT: 952
+// EXPECT-OUT: 1244
+// EXPECT-OUT: 755
+module tests.run.elu_softplus_backward
+
+// ELU/softplus backward — elu_backward(x,dy)=dy·(x>0?1:eˣ) and softplus_backward(x,dy)=dy·σ(x) (softplus'
+// is the sigmoid). Both fold an expf C/Rust keep scalar, so each elementwise loop folds to one 256-bit
+// mercury_vmath2_f32 call. elu_backward's branch is the same Cmp(Fogt)+Select the forward elu uses; pure
+// elementwise → bit-identical lane-for-lane, so the differential gate (interp == native, -O0 == -O3) is
+// trivial. Frozen deterministic kernel output (×1000, truncated).
+fn main() -> i32 {
+    let x: [f32; 8] = [-3.0, -1.0, 0.0, 1.0, 2.0, 3.0, 0.5, -0.5];
+    let dy: [f32; 8] = [1.0, 1.0, 4.0, 1.0, 2.0, 1.0, 2.0, 2.0];
+    let mut de: [f32; 8] = [0.0; 8];
+    let mut dp: [f32; 8] = [0.0; 8];
+
+    for i in 0..8 {
+        de[i] = elu_backward(x[i], dy[i]);
+    }
+    for i in 0..8 {
+        dp[i] = softplus_backward(x[i], dy[i]);
+    }
+
+    for k in 0..8 {
+        print((de[k] * 1000.0) as i32);
+    }
+    for k in 0..8 {
+        print((dp[k] * 1000.0) as i32);
+    }
+    return 0;
+}
