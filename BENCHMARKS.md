@@ -524,6 +524,23 @@ the recognized kernel pays neither. `tests/run/colsum.mer`; the runtime test pin
 the naive sum exactly. (The *row*-outer spelling `for i { for j { out[j] += x[i*N+j] } }` already
 auto-vectorizes — the column-outer form is the gap.)
 
+The same strided gap holds for the **max** and **min** down the outer axis (`out[j] = max/min_i x[i,j]`
+— per-channel quantization statistics, axis-0 max/min pooling): gcc/rustc leave those scalar too
+(verified: no packed `vmaxps`/`vminps` — `fmax`/`fmin` are non-associative, so the compilers will not
+reassociate the strided fold even with `-march=native`). Mercury folds them to **`mercury_colmax_f32`**
+/ **`mercury_colmin_f32`** (the first row seeds `out[]`, then the same row-major-streaming 8-wide fold
+with `_mm256_max_ps`/`_mm256_min_ps`), bit-exact with the scalar `s > v ? s : v` twin on finite data:
+
+| op | size | Mer 1-core | Mer @parallel | C (gcc) | 1-core vs C | parallel vs C |
+|----|------|-----------|---------------|---------|-------------|---------------|
+| max | 1024×1024 | ~18.2 | ~17.5 | ~0.5 | **~34×** | **~33×** |
+| max | 4096×1024 | ~10.0 | ~19.9 | ~0.2 | **~51×** | **~101×** |
+| min | 1024×1024 | ~18.0 | ~18.3 | ~0.7 | **~27×** | **~28×** |
+| min | 4096×1024 | ~8.2 | ~14.6 | ~0.2 | **~39×** | **~70×** |
+
+`tests/run/colmax.mer` / `colmin.mer`; the runtime test pins all three folds (sum/max/min) ==
+their naive strided reductions and serial == parallel.
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
