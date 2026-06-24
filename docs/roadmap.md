@@ -79,11 +79,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `mercury_colsum_f32[_parallel]`, which streams `x` row-major and accumulates eight columns at a time into
   a cache-resident `out[]`. The naive form strides `x` down the rows *and* — verified on the emitted assembly —
   gcc/rustc leave it fully scalar (no `vaddps`), so the kernel wins ~29–47× single-core / ~52–55× `@parallel`.
-  Each column sums in `i`-ascending order, so it is bit-exact (`tests/run/colsum.mer`). The **max**/**min**
-  down the same axis (`out[j] = max/min_i x[i,j]` — per-channel quant stats, axis-0 max/min pooling) dispatch
-  to `mercury_col{max,min}_f32[_parallel]` (first-row seed + `_mm256_max_ps`/`_mm256_min_ps` fold); the same
-  strided gap (gcc/rustc stay scalar — `fmax`/`fmin` are non-associative) gives ~27–51× / ~28–101×
-  (`tests/run/colmax.mer`, `colmin.mer`).
+  Each column sums in `i`-ascending order, so it is bit-exact (`tests/run/colsum.mer`). The **max**/**min**/
+  **abs-max** down the same axis (`out[j] = max/min_i x[i,j]`, `max_i |x[i,j]|` — per-channel quant stats,
+  axis-0 max/min pooling, and the symmetric int8-quant scale `amax_j`) dispatch to
+  `mercury_col{max,min,maxabs}_f32[_parallel]` (first-row seed + `_mm256_max_ps`/`_mm256_min_ps` fold, abs
+  via sign-mask `andnot`); the same strided gap (gcc/rustc stay scalar — `fmax`/`fmin` are non-associative)
+  gives ~34–50× single-core / ~37–107× `@parallel` (`tests/run/colmax.mer`, `colmin.mer`, `colmaxabs.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
   dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
   its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full
