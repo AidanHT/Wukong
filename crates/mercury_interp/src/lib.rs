@@ -1369,6 +1369,55 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_xent_fwd_f32[_parallel](x, target, loss, rows, cols)` — the fused softmax
+            // cross-entropy forward loss (`loss[r] = m + log(Σexp(x[r,·]−m)) − x[r, target[r]]`) a
+            // recognized batched nest lowers to. Marshal `rows*cols` f32 from x, the `rows` i32 labels
+            // from target (each `Value::Int`'s value), call the *serial* kernel (bit-identical to the
+            // parallel one — rows independent), write the `rows`-long loss vector.
+            "mercury_xent_fwd_f32" | "mercury_xent_fwd_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let target = ptr(args[1])?;
+                let loss = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("xent operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut tbuf = Vec::with_capacity(rows);
+                for t in 0..rows {
+                    tbuf.push(
+                        self.memory
+                            .get(target + t)
+                            .ok_or("xent target out of bounds")?
+                            .as_int() as i32,
+                    );
+                }
+                let mut lbuf = vec![0.0f32; rows];
+                // SAFETY: xbuf is rows*cols f32; tbuf/lbuf are rows long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_xent_fwd_f32(
+                        xbuf.as_ptr(),
+                        tbuf.as_ptr(),
+                        lbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in lbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(loss + t)
+                        .ok_or("xent output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath_bf16(x, out, n, op)` — the bf16-input twin of `mercury_vmath_f32` an
             // `out[i] = f((x[i] as f32))` loop over a `[bf16]` array lowers to. Reconstruct the exact
             // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-
