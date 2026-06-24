@@ -104,6 +104,8 @@ pub fn lower_program(
         softmax_bwd_par: interner.intern("mercury_softmax_bwd_f32_parallel"),
         rmsnorm_bwd: interner.intern("mercury_rmsnorm_bwd_f32"),
         rmsnorm_bwd_par: interner.intern("mercury_rmsnorm_bwd_f32_parallel"),
+        layernorm_bwd: interner.intern("mercury_layernorm_bwd_f32"),
+        layernorm_bwd_par: interner.intern("mercury_layernorm_bwd_f32_parallel"),
         xent: interner.intern("mercury_xent_fwd_f32"),
         xent_par: interner.intern("mercury_xent_fwd_f32_parallel"),
         xent_bwd: interner.intern("mercury_xent_bwd_f32"),
@@ -184,6 +186,14 @@ pub fn lower_program(
                 // `mercury_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
                 // independent, each row reduces over its own `C` columns).
                 if has_parallel_attr(item, interner) && rmsnorm_bwd_fn(body, sema, interner).is_some() {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function batched LayerNorm-backward: intercept before the outliner.
+                if has_parallel_attr(item, interner)
+                    && layernorm_bwd_fn(body, sema, interner).is_some()
+                {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -759,6 +769,10 @@ struct GemmSyms {
     /// per-row reductions gcc/rustc keep scalar; rows independent → serial == parallel.
     rmsnorm_bwd: Symbol,
     rmsnorm_bwd_par: Symbol,
+    /// The fused LayerNorm backward (`mercury_layernorm_bwd_f32[_parallel](x, dy, gamma, dx, rows,
+    /// cols, eps_bits)`): the input-gradient nest dispatches here. Same 7-arg ABI as rmsnorm_bwd.
+    layernorm_bwd: Symbol,
+    layernorm_bwd_par: Symbol,
     /// The fused softmax cross-entropy forward loss (`mercury_xent_fwd_f32[_parallel](x, target, loss,
     /// rows, cols)`): the `loss[r] = lse(x[r]) − x[r, target[r]]` nest dispatches here. C/Rust keep the
     /// `expf`/`logf` reduction scalar; rows independent → serial == parallel.
@@ -2914,6 +2928,36 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_layernorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` call for
+    /// a recognized batched LayerNorm backward. Same shape as `emit_rmsnorm_bwd`.
+    fn emit_layernorm_bwd(&mut self, nest: &LayerNormBwdNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((dy, _)), Some((gamma, _)), Some((dx, _))) = (
+            self.lookup(nest.x),
+            self.lookup(nest.dy),
+            self.lookup(nest.gamma),
+            self.lookup(nest.dx),
+        ) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let eps = self.builder.build(
+            MirType::I64,
+            Op::ConstInt(nest.eps_bits as i128, MirType::I64),
+        );
+        let func = if parallel {
+            self.gemm.layernorm_bwd_par
+        } else {
+            self.gemm.layernorm_bwd
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, dy, gamma, dx, rows, cols, eps],
+        });
+        true
+    }
+
     /// Emit one `mercury_xent_fwd_f32[_parallel](x, target, loss, rows, cols)` call for a recognized
     /// batched cross-entropy loss. Bails (false) if an operand/dim is unbound. `parallel` selects the
     /// multicore kernel (rows independent → bit-identical to serial).
@@ -4277,6 +4321,14 @@ impl FnLowerer<'_> {
         // reductions gcc keeps scalar; the kernel folds them 8-wide then applies the gradient.
         if let Some(nest) = match_rmsnorm_bwd(pat, iter, body, self.sema, self.interner) {
             if self.emit_rmsnorm_bwd(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched LayerNorm backward `for r { mean; var; rstd; Σg; Σg·xhat; apply }` →
+        // `mercury_layernorm_bwd_f32` (the `_parallel` one in a `@parallel` function). Four per-row
+        // reductions gcc keeps scalar; the kernel folds them 8-wide.
+        if let Some(nest) = match_layernorm_bwd(pat, iter, body, self.sema, self.interner) {
+            if self.emit_layernorm_bwd(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -12307,6 +12359,292 @@ fn rmsnorm_bwd_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Optio
         return None;
     };
     match_rmsnorm_bwd(pat, iter, lb, sema, interner)
+}
+
+/// A recognized batched LayerNorm-backward (input-gradient) nest (see [`match_layernorm_bwd`]). Same
+/// 7-arg ABI as [`RmsNormBwdNest`] — distinct struct for clarity.
+struct LayerNormBwdNest {
+    x: Symbol,
+    dy: Symbol,
+    gamma: Symbol,
+    dx: Symbol,
+    rows: Dim,
+    cols: Dim,
+    eps_bits: i64,
+}
+
+/// Is `e` the centered read `x[r*C+iv] - mean`?
+fn is_centered_sub(
+    e: &Expr,
+    x: Symbol,
+    mean: Symbol,
+    rvar: Symbol,
+    iv: Symbol,
+    cols: &Dim,
+    interner: &Interner,
+) -> bool {
+    matches!(&e.kind, ExprKind::Binary { op: ast::BinOp::Sub, lhs, rhs }
+        if index_rowmaj(lhs, rvar, iv, cols, interner) == Some(x) && single_path(rhs) == Some(mean))
+}
+
+/// Is `e` the normalized read `xhat = (x[r*C+iv] - mean) * rstd` (either factor order)?
+fn is_xhat(
+    e: &Expr,
+    x: Symbol,
+    mean: Symbol,
+    rstd: Symbol,
+    rvar: Symbol,
+    iv: Symbol,
+    cols: &Dim,
+    interner: &Interner,
+) -> bool {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return false;
+    };
+    (is_centered_sub(lhs, x, mean, rvar, iv, cols, interner) && single_path(rhs) == Some(rstd))
+        || (is_centered_sub(rhs, x, mean, rvar, iv, cols, interner) && single_path(lhs) == Some(rstd))
+}
+
+/// Recognize the **batched LayerNorm backward** (input gradient) and dispatch it to
+/// `mercury_layernorm_bwd_f32`. The canonical per-row form (`xhat = (x−mean)·rstd`, `g = dy·γ`):
+///
+/// ```text
+/// for r in 0..R {
+///     let mut sm = 0.0; for i { sm = sm + x[r*C+i]; }          let mean = sm / C;
+///     let mut vv = 0.0; for i { vv = vv + (x[r*C+i]-mean)*(x[r*C+i]-mean); }
+///     let rstd = 1.0 / sqrt(vv / C + eps);
+///     let mut s1 = 0.0; for i { s1 = s1 + dy[r*C+i]*gamma[i]; }
+///     let mut s2 = 0.0; for i { s2 = s2 + dy[r*C+i]*gamma[i]*((x[r*C+i]-mean)*rstd); }
+///     let m1 = s1 / C; let m2 = s2 / C;
+///     for i { dx[r*C+i] = rstd * (dy[r*C+i]*gamma[i] - m1 - ((x[r*C+i]-mean)*rstd)*m2); }
+/// }
+/// ```
+///
+/// — the gradient `dx = rstd·(g − mean(g) − xhat·mean(g·xhat))` that flows through every LayerNorm
+/// (GPT-2/BERT/ViT). Four per-row reductions (Σx, Σ(x−mean)², Σg, Σg·xhat) gcc/rustc keep scalar; the
+/// kernel folds them 8-wide. The reductions reassociate (the documented exception — both backends run
+/// this kernel), so the differential gate holds.
+fn match_layernorm_bwd(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<LayerNormBwdNest> {
+    let ast::PatKind::Ident(rvar) = &pat.kind else {
+        return None;
+    };
+    let rvar = *rvar;
+    let (rs, re) = range_bounds(iter)?;
+    if as_int_lit(rs, interner)? != 0 {
+        return None;
+    }
+    let rows = as_dim(re, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 13 {
+        return None;
+    }
+    // [0] let sm = 0.0;  [1] for i { sm = sm + x[r*C+i] }
+    let (sm, sm0) = stmt_let_init(&body.stmts[0])?;
+    if !is_float_zero(sm0, interner) {
+        return None;
+    }
+    let (iv1, ce, b1) = stmt_range0_for(&body.stmts[1], interner)?;
+    let cols = as_dim(ce, interner)?;
+    let x = index_rowmaj(match_add_accum(b1, sm)?, rvar, iv1, &cols, interner)?;
+    // [2] let mean = sm / C
+    let (mean, mean0) = stmt_let_init(&body.stmts[2])?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Div,
+        lhs: ml,
+        rhs: mr,
+    } = &mean0.kind
+    else {
+        return None;
+    };
+    if single_path(ml) != Some(sm) || !col_divisor_matches(mr, ce, interner) {
+        return None;
+    }
+    // [3] let vv = 0.0;  [4] for i { vv = vv + (x[r*C+i]-mean)*(x[r*C+i]-mean) }
+    let (vv, vv0) = stmt_let_init(&body.stmts[3])?;
+    if !is_float_zero(vv0, interner) {
+        return None;
+    }
+    let (iv4, ce4, b4) = stmt_range0_for(&body.stmts[4], interner)?;
+    if !exprs_struct_eq(ce4, ce) {
+        return None;
+    }
+    let sq = match_add_accum(b4, vv)?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: sql,
+        rhs: sqr,
+    } = &sq.kind
+    else {
+        return None;
+    };
+    if !is_centered_sub(sql, x, mean, rvar, iv4, &cols, interner)
+        || !is_centered_sub(sqr, x, mean, rvar, iv4, &cols, interner)
+    {
+        return None;
+    }
+    // [5] let rstd = 1.0/sqrt(vv/C + eps)
+    let (rstd, rstd0) = stmt_let_init(&body.stmts[5])?;
+    let eps_bits = match_rsqrt_meansq(rstd0, vv, ce, sema, interner)?;
+    // [6] let s1 = 0.0;  [7] for i { s1 = s1 + dy[r*C+i]*gamma[i] }
+    let (s1, s10) = stmt_let_init(&body.stmts[6])?;
+    if !is_float_zero(s10, interner) {
+        return None;
+    }
+    let (iv7, ce7, b7) = stmt_range0_for(&body.stmts[7], interner)?;
+    if !exprs_struct_eq(ce7, ce) {
+        return None;
+    }
+    let (dy, gamma) = match_dygamma(match_add_accum(b7, s1)?, rvar, iv7, &cols, interner)?;
+    // [8] let s2 = 0.0;  [9] for i { s2 = s2 + dy[r*C+i]*gamma[i] * ((x[r*C+i]-mean)*rstd) }
+    let (s2, s20) = stmt_let_init(&body.stmts[8])?;
+    if !is_float_zero(s20, interner) {
+        return None;
+    }
+    let (iv9, ce9, b9) = stmt_range0_for(&body.stmts[9], interner)?;
+    if !exprs_struct_eq(ce9, ce) {
+        return None;
+    }
+    let s2add = match_add_accum(b9, s2)?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: s2l,
+        rhs: s2r,
+    } = &s2add.kind
+    else {
+        return None;
+    };
+    // one factor is dy*gamma (== (dy,gamma)), the other is xhat
+    let s2_ok = (match_dygamma(s2l, rvar, iv9, &cols, interner) == Some((dy, gamma))
+        && is_xhat(s2r, x, mean, rstd, rvar, iv9, &cols, interner))
+        || (match_dygamma(s2r, rvar, iv9, &cols, interner) == Some((dy, gamma))
+            && is_xhat(s2l, x, mean, rstd, rvar, iv9, &cols, interner));
+    if !s2_ok {
+        return None;
+    }
+    // [10] let m1 = s1 / C;  [11] let m2 = s2 / C
+    let (m1, m10) = stmt_let_init(&body.stmts[10])?;
+    if !matches!(&m10.kind, ExprKind::Binary { op: ast::BinOp::Div, lhs, rhs }
+        if single_path(lhs) == Some(s1) && col_divisor_matches(rhs, ce, interner))
+    {
+        return None;
+    }
+    let (m2, m20) = stmt_let_init(&body.stmts[11])?;
+    if !matches!(&m20.kind, ExprKind::Binary { op: ast::BinOp::Div, lhs, rhs }
+        if single_path(lhs) == Some(s2) && col_divisor_matches(rhs, ce, interner))
+    {
+        return None;
+    }
+    // [12] for i { dx[r*C+i] = rstd * (dy[r*C+i]*gamma[i] - m1 - ((x[r*C+i]-mean)*rstd)*m2) }
+    let (iv12, ce12, b12) = stmt_range0_for(&body.stmts[12], interner)?;
+    if !exprs_struct_eq(ce12, ce) || b12.tail.is_some() || b12.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign {
+        target: dxt,
+        op: ast::AssignOp::Assign,
+        value: av,
+    } = &b12.stmts[0].kind
+    else {
+        return None;
+    };
+    let dx = index_rowmaj(dxt, rvar, iv12, &cols, interner)?;
+    // av = rstd * inner  (Mul, either order)
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: al,
+        rhs: ar,
+    } = &av.kind
+    else {
+        return None;
+    };
+    let inner = if single_path(al) == Some(rstd) {
+        ar.as_ref()
+    } else if single_path(ar) == Some(rstd) {
+        al.as_ref()
+    } else {
+        return None;
+    };
+    // inner = (g - m1) - xhat*m2   (left-assoc Sub of Sub)
+    let ExprKind::Binary {
+        op: ast::BinOp::Sub,
+        lhs: gm1,
+        rhs: xm2,
+    } = &inner.kind
+    else {
+        return None;
+    };
+    let ExprKind::Binary {
+        op: ast::BinOp::Sub,
+        lhs: g_e,
+        rhs: m1_e,
+    } = &gm1.kind
+    else {
+        return None;
+    };
+    if match_dygamma(g_e, rvar, iv12, &cols, interner) != Some((dy, gamma))
+        || single_path(m1_e) != Some(m1)
+    {
+        return None;
+    }
+    // xm2 = xhat * m2  (either order)
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: xl,
+        rhs: xr,
+    } = &xm2.kind
+    else {
+        return None;
+    };
+    let xm2_ok = (is_xhat(xl, x, mean, rstd, rvar, iv12, &cols, interner)
+        && single_path(xr) == Some(m2))
+        || (is_xhat(xr, x, mean, rstd, rvar, iv12, &cols, interner)
+            && single_path(xl) == Some(m2));
+    if !xm2_ok {
+        return None;
+    }
+    if dx == x || dx == dy || dx == gamma {
+        return None;
+    }
+    Some(LayerNormBwdNest {
+        x,
+        dy,
+        gamma,
+        dx,
+        rows,
+        cols,
+        eps_bits,
+    })
+}
+
+/// Whole-function `@parallel` LayerNorm-backward interceptor (before the outliner).
+fn layernorm_bwd_fn(
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<LayerNormBwdNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_layernorm_bwd(pat, iter, lb, sema, interner)
 }
 
 /// A recognized RoPE (rotary position embedding) nest (see [`match_rope`]). `backward` selects the
