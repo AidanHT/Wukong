@@ -26,6 +26,35 @@ boost, E-core scheduling, thermals). The harness reports the best of many batche
 interfered estimate); the ranges below span several runs. Treat them as representative, not exact —
 but the *ratios* (who wins, by roughly how much) are stable.
 
+## Scoreboard
+
+Headline ratios vs the **idiomatic** C/Rust baseline (`gcc -O3 -march=native` / `rustc -O -C
+target-cpu=native`), single-core and `@parallel`. Ranges span several runs and shapes; see the linked
+sections for the full tables, methodology, and caveats. This is an *honest* board — the ties and the
+modest wins are listed alongside the blowouts, and every row is gated bit-for-bit against the
+interpreter oracle (the cross-language check is exact for the integer/permutation kernels, a tight
+tolerance for the reassociated-float ones).
+
+| Kernel family | 1-core vs C | `@parallel` vs C | Why Mercury wins (what gcc/rustc won't do) |
+|---|---|---|---|
+| **f32 GEMM** (matmul / `nn.Linear`) | ~3–3.6× | up to ~100× | register-block + cache-tile + pack; they vectorize the inner loop but never tile |
+| **bf16/f16 GEMM** | ~25× (idiomatic) | large | lossless widen-prepass → the tuned f32 microkernel |
+| **TN weight-gradient** (`dW=dYᵀ·X`) | ~10× (hand-T C) | large | transpose-prepass; the idiomatic nest reads A column-strided (they can't vectorize) |
+| **int8 `nn.Linear`** (`vpdpbusd`) | ~1.5–2.5× | ~4.6–14.7× | 2×4 register tile halves B traffic (vs gcc's own `vpdpbusd`) |
+| **Column reductions** (sum/max/min/absmax) | **~29–50×** | **~37–107×** | the strided column-outer fold gcc/rustc leave *scalar* |
+| **Transpose** (f32 / bf16) | ~1.5× | ~9–14× | `B=32` cache tiling; `-O3` doesn't loop-tile a transpose |
+| **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
+| **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
+| **Activations** (35-op `vmath`) | ~2–13× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
+| **Softmax backward** (`y·(dy−Σy·dy)`) | ~1.0–2.0× | ~4.5–6.1× | vectorizes the per-row dot's accumulation (modest — they vectorize the apply) |
+| **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
+| relu / fused linear→relu | ≈tie | — | already bandwidth-bound; no headroom |
+
+The pattern: Mercury **heavily** exceeds C/Rust wherever domain knowledge lets a tensor compiler do
+what a scalar C compiler won't (tiling, packing, register-blocking, fusion, 256-bit transcendentals,
+vectorizing strided/reduction folds). On already-bandwidth-bound elementwise work it ties; on the
+recognized kernel surface it wins, often by one to two orders of magnitude.
+
 ## How Mercury wins: domain-aware lowering
 
 The headline wins come from a tensor compiler doing what a general C/C++ compiler will not do to
