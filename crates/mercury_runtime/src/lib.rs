@@ -59,7 +59,8 @@ pub use transpose::{
 
 mod colreduce;
 pub use colreduce::{
-    mercury_colmax_f32, mercury_colmax_f32_parallel, mercury_colmin_f32, mercury_colmin_f32_parallel,
+    mercury_colmax_f32, mercury_colmax_f32_parallel, mercury_colmaxabs_f32,
+    mercury_colmaxabs_f32_parallel, mercury_colmin_f32, mercury_colmin_f32_parallel,
     mercury_colsum_f32, mercury_colsum_f32_parallel,
 };
 

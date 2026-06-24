@@ -12,13 +12,16 @@
 //! its own bit-exact oracle (the interpreter marshals the serial form; the differential gate compares
 //! interp vs native, both folding the same `_mm256_add_ps`/`_mm256_max_ps`/`_mm256_min_ps` lane tree).
 
-/// Which column reduction to fold: `Sum` seeds `0` and folds rows `[0, rows)`; `Max`/`Min` seed the
-/// **first row** `x[0, j]` and fold rows `[1, rows)` (idempotent, so equivalent to folding from 0).
+/// Which column reduction to fold: `Sum` seeds `0` and folds rows `[0, rows)`; `Max`/`Min`/`MaxAbs`
+/// seed the **first row** (`x[0,j]`, or `|x[0,j]|` for `MaxAbs`) and fold rows `[1, rows)` (idempotent,
+/// so equivalent to folding from 0). `MaxAbs` is the per-channel symmetric-quantization scale
+/// `max_i |x[i,j]|`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColKind {
     Sum,
     Max,
     Min,
+    MaxAbs,
 }
 
 /// Fold rows `[0, rows)` of `x` into the column range `[j0, j1)` of `out` (`out[j] = ⊕_i x[i*cols+j]`),
@@ -40,7 +43,7 @@ unsafe fn colreduce_avx2(
     kind: ColKind,
 ) {
     use std::arch::x86_64::*;
-    // Seed: Sum -> 0; Max/Min -> first row x[0, j] (so the fold starts at row 1).
+    // Seed: Sum -> 0; Max/Min -> first row x[0, j]; MaxAbs -> |x[0, j]| (so the fold starts at row 1).
     let i0 = match kind {
         ColKind::Sum => {
             for j in j0..j1 {
@@ -54,7 +57,14 @@ unsafe fn colreduce_avx2(
             }
             1
         }
+        ColKind::MaxAbs => {
+            for j in j0..j1 {
+                *out.add(j) = (*x.add(j)).abs();
+            }
+            1
+        }
     };
+    let sign = _mm256_set1_ps(-0.0); // for MaxAbs: clear the sign bit with andnot
     // The fold loop, monomorphic per kind (the match is hoisted out of the row loop).
     match kind {
         ColKind::Sum => {
@@ -109,6 +119,26 @@ unsafe fn colreduce_avx2(
                 }
             }
         }
+        ColKind::MaxAbs => {
+            for i in i0..rows {
+                let xr = x.add(i * cols);
+                let mut j = j0;
+                while j + 8 <= j1 {
+                    let acc = _mm256_loadu_ps(out.add(j));
+                    // |v| = andnot(-0.0, v) (clear the sign bit), then fold by max — the same
+                    // sign-mask abs the RED_MAXABS reduction uses, so it agrees lane-for-lane.
+                    let v = _mm256_andnot_ps(sign, _mm256_loadu_ps(xr.add(j)));
+                    _mm256_storeu_ps(out.add(j), _mm256_max_ps(acc, v));
+                    j += 8;
+                }
+                while j < j1 {
+                    let a = *out.add(j);
+                    let v = (*xr.add(j)).abs();
+                    *out.add(j) = if a > v { a } else { v };
+                    j += 1;
+                }
+            }
+        }
     }
 }
 
@@ -141,6 +171,12 @@ unsafe fn colreduce_scalar(
             }
             1
         }
+        ColKind::MaxAbs => {
+            for j in j0..j1 {
+                *out.add(j) = (*x.add(j)).abs();
+            }
+            1
+        }
     };
     for i in i0..rows {
         let xr = x.add(i * cols);
@@ -158,6 +194,14 @@ unsafe fn colreduce_scalar(
                 }
                 ColKind::Min => {
                     if a < v {
+                        a
+                    } else {
+                        v
+                    }
+                }
+                ColKind::MaxAbs => {
+                    let v = v.abs();
+                    if a > v {
                         a
                     } else {
                         v
@@ -310,6 +354,33 @@ pub unsafe extern "C" fn mercury_colmin_f32_parallel(
     colreduce_parallel(x, out, rows, cols, ColKind::Min);
 }
 
+/// `out[j] = max_i |x[i, j]|` over a `[rows, cols]` row-major matrix, single-threaded — the per-channel
+/// **symmetric-quantization scale** (the int8 weight/activation scale `s_j = amax_j / 127`).
+///
+/// # Safety
+/// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colmaxabs_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::MaxAbs);
+}
+
+/// Multi-threaded `out[j] = max_i |x[i, j]|` (bit-identical to [`mercury_colmaxabs_f32`]).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_colmaxabs_f32`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colmaxabs_f32_parallel(
+    x: *const f32,
+    out: *mut f32,
+    rows: i64,
+    cols: i64,
+) {
+    colreduce_parallel(x, out, rows, cols, ColKind::MaxAbs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +390,8 @@ mod tests {
         for (j, o) in out.iter_mut().enumerate() {
             let mut s = match kind {
                 ColKind::Sum => 0.0f32,
-                _ => x[j], // first row
+                ColKind::MaxAbs => x[j].abs(), // |first row|
+                _ => x[j],                     // first row
             };
             let i0 = if kind == ColKind::Sum { 0 } else { 1 };
             for i in i0..rows {
@@ -335,6 +407,14 @@ mod tests {
                     }
                     ColKind::Min => {
                         if s < v {
+                            s
+                        } else {
+                            v
+                        }
+                    }
+                    ColKind::MaxAbs => {
+                        let v = v.abs();
+                        if s > v {
                             s
                         } else {
                             v
@@ -364,7 +444,7 @@ mod tests {
             // Distinct values per cell so max/min have a unique answer; an exact integer range so a
             // reordering (if any path had one) would show as a bit mismatch.
             let x: Vec<f32> = (0..rows * cols).map(|t| ((t * 7 + 3) % 101) as f32 - 50.0).collect();
-            for kind in [ColKind::Sum, ColKind::Max, ColKind::Min] {
+            for kind in [ColKind::Sum, ColKind::Max, ColKind::Min, ColKind::MaxAbs] {
                 let want = naive(&x, rows, cols, kind);
                 let mut got = vec![0.0f32; cols];
                 let mut got_par = vec![0.0f32; cols];
@@ -375,6 +455,7 @@ mod tests {
                     ColKind::Sum => (mercury_colsum_f32, mercury_colsum_f32_parallel),
                     ColKind::Max => (mercury_colmax_f32, mercury_colmax_f32_parallel),
                     ColKind::Min => (mercury_colmin_f32, mercury_colmin_f32_parallel),
+                    ColKind::MaxAbs => (mercury_colmaxabs_f32, mercury_colmaxabs_f32_parallel),
                 };
                 unsafe {
                     f(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
