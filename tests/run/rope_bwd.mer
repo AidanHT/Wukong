@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 3064
+// EXPECT-OUT: 3672
+// EXPECT-OUT: 779
+// EXPECT-OUT: 2551
+module tests.run.rope_bwd
+
+// RoPE backward (the gradient through the rotary embedding): the transpose/inverse rotation of the
+// upstream gradient g, dx[r,j] = a·c + b·s, dx[r,j+H] = b·c − a·s (vs the forward a·c−b·s / b·c+a·s).
+// The recognizer folds the [R=2,D=4] nest to one mercury_rope_bwd_f32 call (inline sin8/cos8 — C/Rust
+// keep sinf/cosf scalar). A rotation is pure data movement, bit-identical to the scalar nest, so the
+// differential gate (interp == native, -O0 == -O3) is trivial.
+fn main() -> i32 {
+    let g: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+    let inv_freq: [f32; 2] = [1.0, 0.5];
+    let mut dx: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        for j in 0..2 {
+            let theta: f32 = (r as f32) * inv_freq[j];
+            let c: f32 = cos(theta);
+            let s: f32 = sin(theta);
+            let a: f32 = g[r * 4 + j];
+            let b: f32 = g[r * 4 + j + 2];
+            dx[r * 4 + j] = a * c + b * s;
+            dx[r * 4 + j + 2] = b * c - a * s;
+        }
+    }
+    for k in 0..8 { print((dx[k] * 1000.0) as i32); }
+    return 0;
+}

@@ -1513,6 +1513,52 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_rope_bwd_f32[_parallel](g, inv_freq, dx, rows, half)` — the RoPE backward (the
+            // transpose/inverse rotation). Identical marshalling to the forward, only the kernel differs.
+            "mercury_rope_bwd_f32" | "mercury_rope_bwd_f32_parallel" => {
+                let g = ptr(args[0])?;
+                let inv_freq = ptr(args[1])?;
+                let dx = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let half = args[4].as_int() as usize;
+                let n = rows * 2 * half;
+                let mut gbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    gbuf.push(
+                        self.memory
+                            .get(g + t)
+                            .ok_or("rope_bwd operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut fbuf = Vec::with_capacity(half);
+                for t in 0..half {
+                    fbuf.push(
+                        self.memory
+                            .get(inv_freq + t)
+                            .ok_or("rope_bwd inv_freq out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: gbuf/obuf are rows*2*half f32; fbuf is half — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_rope_bwd_f32(
+                        gbuf.as_ptr(),
+                        fbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        half as i64,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(dx + t)
+                        .ok_or("rope_bwd output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_logsumexp_f32[_parallel](x, out, rows, cols)` — the batched log-partition a
             // recognized `out[r] = m + log(Σexp(x[r,·]−m))` nest lowers to. Marshal `rows*cols` f32 from
             // x, call the *serial* kernel (bit-identical to the parallel one — rows independent), write
