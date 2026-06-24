@@ -85,6 +85,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `mercury_col{max,min,maxabs}_f32[_parallel]` (first-row seed + `_mm256_max_ps`/`_mm256_min_ps` fold, abs
   via sign-mask `andnot`); the same strided gap (gcc/rustc stay scalar — `fmax`/`fmin` are non-associative)
   gives ~34–50× single-core / ~37–107× `@parallel` (`tests/run/colmax.mer`, `colmin.mer`, `colmaxabs.mer`).
+- **Softmax backward → fused dot+apply kernel**: the batched nest `for r { let s=0; for j { s += y·dy };
+  for i { dx = y·(dy−s) } }` (the gradient through a row softmax — attention + classifier training) folds to
+  `mercury_softmax_bwd_f32[_parallel]`, which delegates the per-row dot to the bit-exact `sreduce` (8 lane
+  accumulators) then applies `y·(dy−s)` 8-wide. gcc/rustc keep the dot's *accumulation* scalar (a serial
+  `vaddss` chain), so Mercury wins ~1.0–1.85× single-core (the apply is already vectorized in both) and
+  ~5–6× `@parallel` (rows across cores). The dot reassociates (the reduction exception), so the differential
+  gate is bit-exact while the cross-language check is a tolerance (`tests/run/softmax_bwd.mer`).
 - **Transformer building blocks compose**: a transformer FFN (`gelu(x·W1ᵀ)·W2ᵀ`), scaled
   dot-product attention (`softmax(Q·Kᵀ)·V`), **multi-head** attention (the batched per-head form) and
   its **causal** (decoder/autoregressive) variant, 2D convolution (im2col + matmul), and a full

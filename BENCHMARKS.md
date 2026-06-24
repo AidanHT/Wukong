@@ -545,6 +545,30 @@ row-major-streaming 8-wide fold with `_mm256_max_ps`/`_mm256_min_ps`; abs-max cl
 `tests/run/colmax.mer` / `colmin.mer` / `colmaxabs.mer`; the runtime test pins all four folds
 (sum/max/min/abs-max) == their naive strided reductions and serial == parallel.
 
+### Softmax backward — vectorizing the per-row dot
+
+`dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` is the gradient through a row softmax — the backward
+pass of every attention block and classification head. Each row is a **dot** `s = Σ y·dy` followed by an
+elementwise `y·(dy − s)`. gcc/rustc load and multiply `y·dy` wide but — verified — keep the
+**accumulation scalar** (a serial `vaddss` dependency chain, no `ymm` accumulator, because they won't
+reassociate the float sum), which is latency-bound (~one add per 4 cycles). Mercury folds the `[R,C]`
+nest to **`mercury_softmax_bwd_f32`**, which delegates the dot to the proven bit-exact
+`mercury_sreduce_f32` (eight *independent* lane accumulators, no dependency chain) then applies
+`y·(dy − s)` 8-wide. This is a **different gap** from the column reductions (the per-row dot, not a
+strided access), so the win is more modest — gcc already vectorizes the apply:
+
+| size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
+|------|-----------|---------------|---------|------|-------------|---------------|
+| 1024×1024 | ~45–49 | ~110–124 | ~24 | ~23 | **~1.9–2.0×** | **~4.5–5.2×** |
+| 4096×512 | ~22–26 | ~133–135 | ~21–22 | ~21 | **~1.0–1.2×** | **~6.1×** |
+
+(GB/s = `3·R·C·4` — the two reads + one write; higher is better.) Single-core is a modest win-to-tie
+(only the dot's accumulation is recovered); `@parallel` (rows across cores) scales to **~5–6×** on top.
+The dot reassociates (lane accumulators vs the C baseline's serial chain — the documented
+reassociated-reduction exception), so the cross-language check is a magnitude-normalized tolerance, not
+bit-exact; the differential gate (interp == native, both running this kernel) *is* bit-exact, and the
+runtime test pins the kernel to its delegated-dot reference and serial == parallel. `tests/run/softmax_bwd.mer`.
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
