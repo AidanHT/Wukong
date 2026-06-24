@@ -46,7 +46,7 @@ tolerance for the reassociated-float ones).
 | **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
 | **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
 | **Activations** (35-op `vmath`) | ~2–13× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
-| **Activation backward** (silu/gelu/sigmoid/tanh grad) | **~5–11×** | **~10–25×** | the derivative folds a sigmoid/tanh (`expf`) C/Rust keep scalar — the forward lever, applied to training |
+| **Activation backward** (6: silu/gelu/sigmoid/tanh/elu/softplus grad) | **~3–12×** | **~5.5–25×** | the derivative folds a sigmoid/tanh/exp (`expf`) C/Rust keep scalar — the forward lever, applied to training |
 | **Softmax backward** (`y·(dy−Σy·dy)`) | ~1.0–2.0× | ~4.5–6.1× | vectorizes the per-row dot's accumulation (modest — they vectorize the apply) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu | ≈tie | — | already bandwidth-bound; no headroom |
@@ -606,15 +606,18 @@ FFN/attention nonlinearity in training. The derivative is itself a **transcenden
 `sigmoid'` fold a sigmoid, `gelu'` and `tanh'` fold a tanh — each an `expf` that C/Rust call as scalar
 `libm` inside the loop, so the loop **cannot vectorize** (exactly the wall the forward activation
 dispatch clears). Mercury recognizes `dx[i] = act_backward(x[i], dy[i])` and folds it to one **256-bit**
-`mercury_vmath2_f32` call (`act_backward` ∈ {`silu`,`gelu`,`sigmoid`,`tanh`}, new two-input op codes on
-the same kernel as `pow`/`atan2`/`hypot`), fusing the upstream `dy·` multiply into the derivative — one pass.
+`mercury_vmath2_f32` call (`act_backward` ∈ {`silu`,`gelu`,`sigmoid`,`tanh`,`elu`,`softplus`}, new
+two-input op codes on the same kernel as `pow`/`atan2`/`hypot`), fusing the upstream `dy·` multiply into
+the derivative — one pass.
 
 | backward | 1-core vs scalar C | `@parallel` vs C | derivative |
 |----------|--------------------|------------------|------------|
-| `silu_backward`    | **~5.1–5.5×** | ~10–11×   | `s + x·s·(1−s)`, `s=σ(x)` |
-| `gelu_backward`    | **~7.3–8.1×** | ~15.6–20× | tanh-approx `g'`; more transcendental work → wider gap |
-| `sigmoid_backward` | **~5.4×**     | ~12×      | `σ(x)·(1−σ(x))` — the logistic gate |
-| `tanh_backward`    | **~11×**      | ~24×      | `1−tanh²(x)` — the largest; `tanhf` is costly scalar, trivial vectorized |
+| `silu_backward`     | **~5.1–5.5×** | ~9.6–11×   | `s + x·s·(1−s)`, `s=σ(x)` |
+| `gelu_backward`     | **~7.3–8.1×** | ~15.6–20×  | tanh-approx `g'`; more transcendental work → wider gap |
+| `sigmoid_backward`  | **~5.4–5.8×** | ~9–12×     | `σ(x)·(1−σ(x))` — the logistic gate |
+| `tanh_backward`     | **~11–12.5×** | ~21.8–24.6× | `1−tanh²(x)` — the largest; `tanhf` is costly scalar, trivial vectorized |
+| `elu_backward`      | **~3.0×**     | ~5.5×      | `x>0 ? 1 : eˣ` — the most modest (only x≤0 folds `exp`) |
+| `softplus_backward` | **~5.8×**     | ~8.3×      | `σ(x)` — softplus' is the sigmoid (VAE/flow/Mish nets) |
 
 (N = 2²⁰, the `(x, dy, dx)` three-pointer harness; absolute GB/s swings with the laptop clock, so the
 clock-invariant **ratio** is reported.) The derivative is **pure elementwise — no reduction** — so the
@@ -623,7 +626,9 @@ kernel is bit-identical lane-for-lane and the differential gate (interp == nativ
 magnitude-normalized tolerance only because the poly sigmoid/tanh differs from C's `libm` by ~1 ULP. The
 scalar twin, the AVX2 lanes, and the inlined-MIR fallback share one op sequence, so a dispatched loop, a
 `while`-loop fallback, and a standalone call all agree bit-for-bit.
-`tests/run/{silu,gelu,gate}_backward.mer`.
+`tests/run/{silu,gelu,gate,elu_softplus}_backward.mer`. (The non-transcendental backwards — `relu`,
+`leaky_relu` = a select on `x>0` — are **deliberately not added**: gcc/rustc vectorize those, so Mercury
+would only tie. The family is exactly the activations whose *derivative* is transcendental.)
 
 ### Single-threaded elementwise & reductions
 
