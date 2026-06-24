@@ -636,6 +636,38 @@ scalar twin, the AVX2 lanes, and the inlined-MIR fallback share one op sequence,
 `leaky_relu` = a select on `x>0` — are **deliberately not added**: gcc/rustc vectorize those, so Mercury
 would only tie. The family is exactly the activations whose *derivative* is transcendental.)
 
+### Argmax / argmin — the classification top-1 the `(value,index)` bookkeeping won't let gcc vectorize
+
+`out = {argmax,argmin}(x)` returning the **index** of the extreme element — the classification head /
+greedy-decode top-1, and the per-channel selection in routing/quant. Mercury recognizes two batched
+shapes and folds each to one i32-output kernel that tracks 8 `(value, index)` lanes via `_mm256_blendv_ps`
+(strict compare → lowest index wins on a tie):
+
+- **Per-row** `out[r] = argmax_j x[r,j]` → `mercury_rowarg{max,min}_i32`. The within-row `(value,index)`
+  scan keeps **both** gcc and rustc fully scalar (measured C ≡ Rust at ~4.1–4.5 GB/s — neither
+  auto-vectorizes an argmax), so Mercury wins outright:
+
+  | shape | argmax 1-core / `@parallel` | argmin 1-core / `@parallel` |
+  |---|---|---|
+  | 1024×1024  | **3.42×** / 11.5× | **3.23×** / 11.5× |
+  | 4096×1024  | **2.61×** / 18.7× | **2.88×** / 17.7× |
+
+- **Per-column** `out[j] = argmax_i x[i,j]` (strided axis-0) → `mercury_colarg{max,min}_i32`. Honest
+  caveat: here gcc *does* vectorize the strided column argmax (it bands 8 output columns the same way
+  Mercury does), so single-core is only a **tie** (~0.9–1.6×). But rustc leaves it scalar (~9× vs Rust),
+  and `@parallel` wins **3.7–10.5×** (Mercury auto-parallelizes; idiomatic C/Rust are single-threaded):
+
+  | shape | argmax 1-core / `@parallel` | argmin 1-core / `@parallel` |
+  |---|---|---|
+  | 1024×1024  | 1.09× / 4.16× | 0.90× / 3.69× |
+  | 4096×1024  | 1.62× / 10.5× | 1.27× / 7.57× |
+
+These are the **first recognized kernels with an i32 output buffer** (the interpreter marshals the result
+back as an integer, not a float). A per-row/column arg-selection is a deterministic permutation — no
+reassociation — so the differential gate is bit-exact and the cross-language check is **exact** (the
+output indices match bit-for-bit, reinterpreting the harness's f32 slots as i32), a stronger bar than the
+float kernels' tolerance. `tests/run/{rowargmax,colargmax}.mer`.
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
