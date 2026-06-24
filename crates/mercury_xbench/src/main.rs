@@ -235,6 +235,15 @@ fn main() {
     if want("rope") {
         bench_rope(&cc, &dir);
     }
+    if want("xent_bwd") {
+        bench_xent_bwd(&cc, &dir);
+    }
+    if want("rope_bwd") {
+        bench_rope_bwd(&cc, &dir);
+    }
+    if want("gate") {
+        bench_gate(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1722,6 +1731,266 @@ fn rust_rope(rows: usize, half: usize) -> String {
          \x20   let a=*x.add(r*D+j); let b=*x.add(r*D+j+H);\n\
          \x20   *out.add(r*D+j)=a*c-b*s; *out.add(r*D+j+H)=b*c+a*s; }} }} }}\n"
     )
+}
+
+/// Softmax cross-entropy **backward** `dx[r,i] = softmax(x[r])[i] − onehot(target[r])[i]` over
+/// `[rows, classes]` — the input gradient of every classifier/LM training step. The softmax max+Σexp+
+/// recompute that gcc/rustc keep scalar (expf reduction + per-element expf) → Mercury's fused 256-bit
+/// `mercury_xent_bwd_f32[_parallel]`. i32 labels ride the harness's middle f32 pointer (cast back).
+fn bench_xent_bwd(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
+        let n = r * c;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.3).collect();
+        let target: Vec<i32> = (0..r).map(|i| ((i * 7 + 3) % c) as i32).collect();
+        let mut dx = vec![0.0f32; n];
+        let xp = x.as_ptr();
+        let tp = target.as_ptr() as *const f32;
+        let dxp = dx.as_mut_ptr();
+        let bytes = (2.0 * n as f64 + r as f64) * 4.0; // x read + dx write + labels
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== xent_bwd (dx = softmax(x) − onehot) {r}x{c} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_xent_bwd(r, c, false), &mut dx, xp, tp, dxp);
+        let mer_par = bench_mercury(&mer_xent_bwd(r, c, true), &mut dx, xp, tp, dxp);
+        let cm = bench_external(
+            "c", &c_xent_bwd(r, c), dir, "xent_bwd", cc,
+            &["-O3", "-march=native", "-shared"], &mut dx, xp, tp, dxp,
+        );
+        let rm = bench_external(
+            "rs", &rust_xent_bwd(r, c), dir, "xent_bwd", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp, dxp,
+        );
+        report_ratio("xent_bwd", &mer, &mer_par, &cm, &rm, &gbps);
+    }
+}
+
+fn mer_xent_bwd(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], target: [i32; {rows}], dx: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut m: f32 = x[r * {cols}];\n\
+         \x20       for i in 0..{cols} {{ m = fmax(m, x[r * {cols} + i]); }}\n\
+         \x20       let mut z: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ z = z + exp(x[r * {cols} + i] - m); }}\n\
+         \x20       let invz: f32 = 1.0 / z;\n\
+         \x20       for i in 0..{cols} {{ dx[r * {cols} + i] = exp(x[r * {cols} + i] - m) * invz; }}\n\
+         \x20       dx[r * {cols} + target[r]] = dx[r * {cols} + target[r]] - 1.0;\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_xent_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* target_f, float* dx){{\n\
+         \x20 const int* target = (const int*)target_f;\n\
+         \x20 for (long r=0;r<R;r++){{\n\
+         \x20   float m=x[r*C]; for(long i=0;i<C;i++) if(x[r*C+i]>m) m=x[r*C+i];\n\
+         \x20   float z=0.0f; for(long i=0;i<C;i++) z+=expf(x[r*C+i]-m);\n\
+         \x20   float invz=1.0f/z; for(long i=0;i<C;i++) dx[r*C+i]=expf(x[r*C+i]-m)*invz;\n\
+         \x20   dx[r*C+target[r]] -= 1.0f; }}\n}}\n"
+    )
+}
+
+fn rust_xent_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, target_f:*const f32, dx:*mut f32) {{\n\
+         \x20 let target = target_f as *const i32;\n\
+         \x20 for r in 0..R {{\n\
+         \x20   let mut m=*x.add(r*C); for i in 0..C {{ let v=*x.add(r*C+i); if v>m {{ m=v; }} }}\n\
+         \x20   let mut z=0.0f32; for i in 0..C {{ z += (*x.add(r*C+i)-m).exp(); }}\n\
+         \x20   let invz=1.0f32/z; for i in 0..C {{ *dx.add(r*C+i)=(*x.add(r*C+i)-m).exp()*invz; }}\n\
+         \x20   *dx.add(r*C + *target.add(r) as usize) -= 1.0f32; }} }}\n"
+    )
+}
+
+/// RoPE **backward** (transpose rotation) over `[rows, D]` — pairs with the forward; the inline
+/// sin/cos gcc/rustc keep scalar → `mercury_rope_bwd_f32[_parallel]`. All-f32 3-pointer harness.
+fn bench_rope_bwd(cc: &str, dir: &Path) {
+    for (rows, half) in [(8192usize, 64usize), (16384, 32)] {
+        let d = 2 * half;
+        let n = rows * d;
+        let g: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
+        let inv_freq: Vec<f32> = (0..half).map(|k| 10000f32.powf(-(k as f32) / half as f32)).collect();
+        let mut dx = vec![0.0f32; n];
+        let (gp, fp, dxp) = (g.as_ptr(), inv_freq.as_ptr(), dx.as_mut_ptr());
+        let bytes = (2.0 * n as f64 + half as f64) * 4.0;
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== rope_bwd (transpose rotate) {rows}x{d} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_rope_bwd(rows, half, false), &mut dx, gp, fp, dxp);
+        let mer_par = bench_mercury(&mer_rope_bwd(rows, half, true), &mut dx, gp, fp, dxp);
+        let cm = bench_external(
+            "c", &c_rope_bwd(rows, half), dir, "rope_bwd", cc,
+            &["-O3", "-march=native", "-shared"], &mut dx, gp, fp, dxp,
+        );
+        let rm = bench_external(
+            "rs", &rust_rope_bwd(rows, half), dir, "rope_bwd", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, gp, fp, dxp,
+        );
+        report_ratio("rope_bwd", &mer, &mer_par, &cm, &rm, &gbps);
+    }
+}
+
+fn mer_rope_bwd(rows: usize, half: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let d = 2 * half;
+    let n = rows * d;
+    format!(
+        "module bench\n{attr}fn kbench(g: [f32; {n}], inv_freq: [f32; {half}], dx: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       for j in 0..{half} {{\n\
+         \x20           let theta: f32 = (r as f32) * inv_freq[j];\n\
+         \x20           let c: f32 = cos(theta);\n\
+         \x20           let s: f32 = sin(theta);\n\
+         \x20           let a: f32 = g[r * {d} + j];\n\
+         \x20           let b: f32 = g[r * {d} + j + {half}];\n\
+         \x20           dx[r * {d} + j] = a * c + b * s;\n\
+         \x20           dx[r * {d} + j + {half}] = b * c - a * s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_rope_bwd(rows: usize, half: usize) -> String {
+    let d = 2 * half;
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define H {half}\n#define D {d}\n\
+         __declspec(dllexport) void kbench(const float* g, const float* inv_freq, float* dx){{\n\
+         \x20 for (long r=0;r<R;r++) for (long j=0;j<H;j++){{\n\
+         \x20   float theta=(float)r*inv_freq[j]; float c=cosf(theta), s=sinf(theta);\n\
+         \x20   float a=g[r*D+j], b=g[r*D+j+H];\n\
+         \x20   dx[r*D+j]=a*c+b*s; dx[r*D+j+H]=b*c-a*s; }}\n}}\n"
+    )
+}
+
+fn rust_rope_bwd(rows: usize, half: usize) -> String {
+    let d = 2 * half;
+    format!(
+        "const R: usize = {rows};\nconst H: usize = {half};\nconst D: usize = {d};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(g:*const f32, inv_freq:*const f32, dx:*mut f32) {{\n\
+         \x20 for r in 0..R {{ for j in 0..H {{\n\
+         \x20   let theta=(r as f32)* *inv_freq.add(j); let c=theta.cos(); let s=theta.sin();\n\
+         \x20   let a=*g.add(r*D+j); let b=*g.add(r*D+j+H);\n\
+         \x20   *dx.add(r*D+j)=a*c+b*s; *dx.add(r*D+j+H)=b*c-a*s; }} }} }}\n"
+    )
+}
+
+/// Gated-FFN activation `out[i] = act(a[i]) * b[i]` (SwiGLU silu / GeGLU gelu) at N=2²⁰. The
+/// activation's exp gcc/rustc keep scalar → Mercury's 256-bit `mercury_vmath2_f32` gate op. The op is
+/// selected 0=silu/1=gelu. All-f32 3-pointer harness `(a, b, out)`.
+fn bench_gate(cc: &str, dir: &Path) {
+    let n = 1usize << 20;
+    let a: Vec<f32> = (0..n).map(|i| (i as f32 - (n / 2) as f32) * (12.0 / n as f32)).collect();
+    let b: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+    let mut out = vec![0.0f32; n];
+    let (ap, bp, op_) = (a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
+    let bytes = 3.0 * n as f64 * 4.0; // a + b read, out write
+    let gbps = |v: &Option<Measure>| {
+        v.as_ref()
+            .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    for (name, act) in [("silu (SwiGLU)", "silu"), ("gelu (GeGLU)", "gelu")] {
+        println!("=== gate {name}: out = {act}(a)*b, N=2^20 (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_gate(n, act, false), &mut out, ap, bp, op_);
+        let mer_par = bench_mercury(&mer_gate(n, act, true), &mut out, ap, bp, op_);
+        let cm = bench_external(
+            "c", &c_gate(n, act), dir, "gate", cc,
+            &["-O3", "-march=native", "-shared"], &mut out, ap, bp, op_,
+        );
+        let rm = bench_external(
+            "rs", &rust_gate(n, act), dir, "gate", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, ap, bp, op_,
+        );
+        report_ratio("gate", &mer, &mer_par, &cm, &rm, &gbps);
+    }
+}
+
+fn mer_gate(n: usize, act: &str, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for i in 0..{n} {{ out[i] = {act}(a[i]) * b[i]; }}\n}}\n"
+    )
+}
+
+fn c_gate(n: usize, act: &str) -> String {
+    // silu(x)=x/(1+e^-x); gelu(x)=0.5x(1+tanh(√(2/π)(x+0.044715x³))) — match Mercury's tanh-approx gelu.
+    let actexpr = if act == "silu" {
+        "x/(1.0f+expf(-x))"
+    } else {
+        "0.5f*x*(1.0f+tanhf(0.7978845608f*(x+0.044715f*x*x*x)))"
+    };
+    format!(
+        "#include <math.h>\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         \x20 for (long i=0;i<N;i++){{ float x=a[i]; out[i]=({actexpr})*b[i]; }}\n}}\n"
+    )
+}
+
+fn rust_gate(n: usize, act: &str) -> String {
+    let actexpr = if act == "silu" {
+        "x/(1.0f32+(-x).exp())"
+    } else {
+        "0.5f32*x*(1.0f32+(0.7978845608f32*(x+0.044715f32*x*x*x)).tanh())"
+    };
+    format!(
+        "const N: usize = {n};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, out:*mut f32) {{\n\
+         \x20 for i in 0..N {{ let x=*a.add(i); *out.add(i)=({actexpr})* *b.add(i); }} }}\n"
+    )
+}
+
+/// Shared 4-column ratio report for the backward/gate benches (Mer 1-core / Mer par / C / Rust + the
+/// single-core and @parallel ratios vs naive C). The cross-check (when both present) uses a magnitude-
+/// normalized tolerance, since the transcendental reductions reassociate / differ from libm by ~1 ULP.
+fn report_ratio(
+    label: &str,
+    mer: &Option<Measure>,
+    mer_par: &Option<Measure>,
+    cm: &Option<Measure>,
+    rm: &Option<Measure>,
+    gbps: &dyn Fn(&Option<Measure>) -> String,
+) {
+    println!(
+        "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+        "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+    );
+    println!(
+        "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+        "GB/s", gbps(mer), gbps(mer_par), gbps(cm), gbps(rm)
+    );
+    if let (Some(m), Some(c2)) = (mer, cm) {
+        let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+        let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+        let rel = (maxerr / maxabs) as f64;
+        if rel > 1e-3 {
+            println!("  ! {label} mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+        }
+    }
+    if let (Some(ms), Some(c2)) = (mer, cm) {
+        let r2 = c2.ns_per_call / ms.ns_per_call;
+        println!(
+            "  -> Mercury single-core is {:.2}x {} than naive C",
+            if r2 >= 1.0 { r2 } else { 1.0 / r2 },
+            if r2 >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    if let (Some(mp), Some(c2)) = (mer_par, cm) {
+        let r2 = c2.ns_per_call / mp.ns_per_call;
+        println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
+    }
+    println!();
 }
 
 /// Activation **backward** `dx[i] = dy[i]·act'(x[i])` (silu/gelu — the SiLU/GELU training gradient).
