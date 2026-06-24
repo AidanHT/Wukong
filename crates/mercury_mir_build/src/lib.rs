@@ -116,6 +116,12 @@ pub fn lower_program(
         rope_bwd_par: interner.intern("mercury_rope_bwd_f32_parallel"),
         logsumexp: interner.intern("mercury_logsumexp_f32"),
         logsumexp_par: interner.intern("mercury_logsumexp_f32_parallel"),
+        kldiv: interner.intern("mercury_kldiv_f32"),
+        kldiv_par: interner.intern("mercury_kldiv_f32_parallel"),
+        entropy: interner.intern("mercury_entropy_f32"),
+        entropy_par: interner.intern("mercury_entropy_f32_parallel"),
+        kd_loss: interner.intern("mercury_kd_loss_f32"),
+        kd_loss_par: interner.intern("mercury_kd_loss_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -223,6 +229,21 @@ pub fn lower_program(
                 }
                 // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
                 if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm) {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row loss reductions (KL / entropy / soft-label xent):
+                // intercept before the outliner, like the other per-row loss interceptors.
+                if has_parallel_attr(item, interner)
+                    && (probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_kldiv(pat, it, lb).is_some()
+                    }) || probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_entropy(pat, it, lb).is_some()
+                    }) || probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_kd_loss(pat, it, lb).is_some()
+                    }))
+                {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -794,6 +815,14 @@ struct GemmSyms {
     /// transcendental kernels. C/Rust keep the expf reduction scalar; rows independent → serial==parallel.
     logsumexp: Symbol,
     logsumexp_par: Symbol,
+    /// Per-row loss reductions (`mercury_kldiv_f32` / `mercury_entropy_f32` / `mercury_kd_loss_f32`,
+    /// each `[_parallel]`): KL divergence, Shannon entropy, soft-label cross-entropy. All log/exp-bound.
+    kldiv: Symbol,
+    kldiv_par: Symbol,
+    entropy: Symbol,
+    entropy_par: Symbol,
+    kd_loss: Symbol,
+    kd_loss_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2050,6 +2079,267 @@ impl FnLowerer<'_> {
         })
     }
 
+    /// Match `log(arr[r*C+v])` → the indexed array `arr` (a single-arg `log` call over a row-major read).
+    fn match_log_index(&self, e: &Expr, v: Symbol, batch: Option<(Symbol, &Expr)>) -> Option<Symbol> {
+        let ExprKind::Call { callee, args, .. } = &e.kind else {
+            return None;
+        };
+        if args.len() != 1 || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Log))
+        {
+            return None;
+        }
+        self.index_off(&args[0], v, batch)
+    }
+
+    /// The shared head of the per-row reduction losses: `for r in 0..R { let s = 0.0; for i in 0..C {
+    /// s = s + <term(i)> } <store> }` — returns `(r, rows, s, iv, n_expr, term, store_value)` where
+    /// `term` is the per-element addend and `store_value` is `<store>`'s RHS. Verifies the 3-statement
+    /// shape, the `0.0` seed, the inner `0..C` reduction, and that the store targets `out[r]`.
+    #[allow(clippy::type_complexity)]
+    fn match_row_reduce_head<'b>(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &'b Block,
+    ) -> Option<(Symbol, Dim, Symbol, Symbol, &'b Expr, Symbol, &'b Expr)> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 3 {
+            return None;
+        }
+        let (s, s0) = Self::let_init(&body.stmts[0])?;
+        if !matches!(&s0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+            return None;
+        }
+        let (iv, n_expr, b1) = self.as_range0_for(&body.stmts[1])?;
+        let term = match_add_accum(b1, s)?;
+        // [2] out[r] = s   OR   out[r] = -s  (caller checks the sign and binds out)
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[2].kind
+        else {
+            return None;
+        };
+        let out = index_by_var(target, r)?;
+        // Caller validates `value` (s or -s) and the term; we hand back the loop var/dims/term.
+        let _ = value;
+        Some((r, rows, s, iv, n_expr, out, term))
+    }
+
+    /// Recognize the **batched KL divergence** `out[r] = Σ_i p[r,i]·(log(p[r,i]) − log(q[r,i]))` (the
+    /// knowledge-distillation / VAE loss) and dispatch it to `mercury_kldiv_f32`. C/Rust keep the logf
+    /// reduction scalar. The reduction reassociates (the documented exception).
+    fn match_kldiv(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<KldivNest> {
+        let (r, rows, s, iv, n_expr, out, term) = self.match_row_reduce_head(pat, iter, body)?;
+        // store must be `out[r] = s`
+        let StmtKind::Assign { value, .. } = &body.stmts[2].kind else {
+            return None;
+        };
+        if single_path(value) != Some(s) {
+            return None;
+        }
+        let batch = Some((r, n_expr));
+        // term = p[r*C+iv] * (log(p[r*C+iv]) - log(q[r*C+iv]))
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &term.kind
+        else {
+            return None;
+        };
+        // Identify the `p[r*C+iv]` factor and the `(log p - log q)` factor.
+        let (p, diff) = if let Some(p) = self.index_off(lhs, iv, batch) {
+            (p, rhs.as_ref())
+        } else if let Some(p) = self.index_off(rhs, iv, batch) {
+            (p, lhs.as_ref())
+        } else {
+            return None;
+        };
+        let ExprKind::Binary {
+            op: ast::BinOp::Sub,
+            lhs: lp,
+            rhs: lq,
+        } = &diff.kind
+        else {
+            return None;
+        };
+        if self.match_log_index(lp, iv, batch) != Some(p) {
+            return None;
+        }
+        let q = self.match_log_index(lq, iv, batch)?;
+        let cols = as_dim(n_expr, self.interner)?;
+        if out == p || out == q {
+            return None;
+        }
+        Some(KldivNest {
+            p,
+            q,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// Recognize the **batched Shannon entropy** `out[r] = − Σ_i p[r,i]·log(p[r,i])` (RL policy entropy)
+    /// → `mercury_entropy_f32`. The store is `out[r] = -s`. C/Rust keep the logf reduction scalar.
+    fn match_entropy(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<EntropyNest> {
+        let (r, rows, s, iv, n_expr, out, term) = self.match_row_reduce_head(pat, iter, body)?;
+        // store must be `out[r] = -s` (unary negation of the accumulator)
+        let StmtKind::Assign { value, .. } = &body.stmts[2].kind else {
+            return None;
+        };
+        let ExprKind::Unary {
+            op: ast::UnOp::Neg,
+            expr,
+        } = &value.kind
+        else {
+            return None;
+        };
+        if single_path(expr) != Some(s) {
+            return None;
+        }
+        let batch = Some((r, n_expr));
+        // term = p[r*C+iv] * log(p[r*C+iv])
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &term.kind
+        else {
+            return None;
+        };
+        let p = if let Some(p) = self.index_off(lhs, iv, batch) {
+            if self.match_log_index(rhs, iv, batch) != Some(p) {
+                return None;
+            }
+            p
+        } else if let Some(p) = self.index_off(rhs, iv, batch) {
+            if self.match_log_index(lhs, iv, batch) != Some(p) {
+                return None;
+            }
+            p
+        } else {
+            return None;
+        };
+        let cols = as_dim(n_expr, self.interner)?;
+        if out == p {
+            return None;
+        }
+        Some(EntropyNest {
+            p,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// Recognize the **batched soft-label cross-entropy** (distillation loss) `out[r] = Σ_i q[r,i]·(lse
+    /// − x[r,i])`, `lse = m + log(Σexp(x[r,·]−m))` → `mercury_kd_loss_f32`. The hard-label `xent`'s
+    /// generalization to a full target distribution `q`. Reuses xent's max+Σexp+lse prefix. C/Rust keep
+    /// the expf/logf reductions scalar.
+    fn match_kd_loss(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<KdLossNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 8 {
+            return None;
+        }
+        // [0..4] the xent prefix: max + Σexp + lse = m + log(z)
+        let (m, seed) = Self::let_init(&body.stmts[0])?;
+        let (v1, n_expr, body1) = self.as_range0_for(&body.stmts[1])?;
+        let data_batch = Some((r, n_expr));
+        let x = self.match_max_reduce_body(body1, v1, m, data_batch)?;
+        if !self.is_max_seed(seed, x, data_batch) {
+            return None;
+        }
+        let (z, z0) = Self::let_init(&body.stmts[2])?;
+        if !matches!(&z0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+            return None;
+        }
+        let (v3, n3, body3) = self.as_range0_for(&body.stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        self.match_sumexp_sub_body(body3, v3, x, m, z, data_batch)?;
+        let (lse, lse0) = Self::let_init(&body.stmts[4])?;
+        self.match_m_plus_log(lse0, m, z)?;
+        // [5] let s = 0.0;  [6] for i { s = s + q[r*C+i]*(lse - x[r*C+i]) };  [7] out[r] = s
+        let (s, s0) = Self::let_init(&body.stmts[5])?;
+        if !matches!(&s0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+            return None;
+        }
+        let (v6, n6, body6) = self.as_range0_for(&body.stmts[6])?;
+        if !exprs_struct_eq(n6, n_expr) {
+            return None;
+        }
+        let term = match_add_accum(body6, s)?;
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &term.kind
+        else {
+            return None;
+        };
+        // one factor is q[r*C+v6], the other is (lse - x[r*C+v6])
+        let is_lse_sub = |e: &Expr| {
+            matches!(&e.kind, ExprKind::Binary { op: ast::BinOp::Sub, lhs, rhs }
+                if single_path(lhs) == Some(lse) && self.index_off(rhs, v6, data_batch) == Some(x))
+        };
+        let q = if let Some(q) = self.index_off(lhs, v6, data_batch) {
+            if !is_lse_sub(rhs) {
+                return None;
+            }
+            q
+        } else if let Some(q) = self.index_off(rhs, v6, data_batch) {
+            if !is_lse_sub(lhs) {
+                return None;
+            }
+            q
+        } else {
+            return None;
+        };
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[7].kind
+        else {
+            return None;
+        };
+        let out = index_by_var(target, r)?;
+        if single_path(value) != Some(s) {
+            return None;
+        }
+        let cols = as_dim(n_expr, self.interner)?;
+        if out == x || out == q {
+            return None;
+        }
+        Some(KdLossNest {
+            x,
+            q,
+            out,
+            rows,
+            cols,
+        })
+    }
+
     /// Body `x[v] = (x[v] - m) - ls` (center, then subtract the log-sum-exp, in place). The outermost
     /// `Sub` is by `ls`; the inner is the centered `x[v] - m` (`is_centered`). Pure.
     fn match_logsoftmax_norm_body(
@@ -3053,6 +3343,70 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_kldiv_f32[_parallel](p, q, out, rows, cols)` for a recognized KL-divergence nest.
+    fn emit_kldiv(&mut self, nest: &KldivNest, parallel: bool) -> bool {
+        let (Some((p, _)), Some((q, _)), Some((out, _))) =
+            (self.lookup(nest.p), self.lookup(nest.q), self.lookup(nest.out))
+        else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.kldiv_par
+        } else {
+            self.gemm.kldiv
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![p, q, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_entropy_f32[_parallel](p, out, rows, cols)` for a recognized row-entropy nest.
+    fn emit_entropy(&mut self, nest: &EntropyNest, parallel: bool) -> bool {
+        let (Some((p, _)), Some((out, _))) = (self.lookup(nest.p), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.entropy_par
+        } else {
+            self.gemm.entropy
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![p, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_kd_loss_f32[_parallel](x, q, out, rows, cols)` for a recognized soft-label xent nest.
+    fn emit_kd_loss(&mut self, nest: &KdLossNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((q, _)), Some((out, _))) =
+            (self.lookup(nest.x), self.lookup(nest.q), self.lookup(nest.out))
+        else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.kd_loss_par
+        } else {
+            self.gemm.kd_loss
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, q, out, rows, cols],
         });
         true
     }
@@ -4361,6 +4715,24 @@ impl FnLowerer<'_> {
         // (the `_parallel` one in a `@parallel` function). The expf reduction gcc keeps scalar.
         if let Some(nest) = self.match_logsumexp(pat, iter, body) {
             if self.emit_logsumexp(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Per-row loss reductions (KL divergence / Shannon entropy / soft-label cross-entropy) → the
+        // fused log/exp-bound kernels (the `_parallel` ones in a `@parallel` function). C keeps the
+        // logf/expf reductions scalar.
+        if let Some(nest) = self.match_kldiv(pat, iter, body) {
+            if self.emit_kldiv(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        if let Some(nest) = self.match_entropy(pat, iter, body) {
+            if self.emit_entropy(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        if let Some(nest) = self.match_kd_loss(pat, iter, body) {
+            if self.emit_kd_loss(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -11948,6 +12320,70 @@ fn logsumexp_fn(
         vec_loads: HashMap::new(),
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
+}
+
+/// A recognized batched KL-divergence nest (see [`FnLowerer::match_kldiv`]).
+struct KldivNest {
+    p: Symbol,
+    q: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// A recognized batched row-entropy nest (see [`FnLowerer::match_entropy`]).
+struct EntropyNest {
+    p: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// A recognized batched soft-label cross-entropy nest (see [`FnLowerer::match_kd_loss`]).
+struct KdLossNest {
+    x: Symbol,
+    q: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner
+/// loop — the shared `@parallel`-interceptor scaffold (the per-recognizer twin of [`is_batched_norm_fn`]).
+fn probe_single_for(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+    check: impl FnOnce(&FnLowerer, &Pattern, &ForIter, &Block) -> bool,
+) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    let mut diags = Vec::new();
+    let probe = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::I64),
+        sema,
+        interner,
+        diags: &mut diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+    };
+    check(&probe, pat, iter, lb)
 }
 
 /// The `f32` bit pattern of a non-negative float literal (the `eps` ABI slot), or `None`. Free twin of

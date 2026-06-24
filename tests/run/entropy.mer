@@ -1,0 +1,22 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 13862
+// EXPECT-OUT: 12798
+module tests.run.entropy
+
+// Batched Shannon entropy out[r] = − Σ_i p[r,i]·log p[r,i] — the RL policy entropy / uncertainty. The
+// recognizer folds the [R=2,C=4] nest to one mercury_entropy_f32 call (the logf reduction gcc/rustc
+// keep scalar). The reduction reassociates (the documented exception), so interp == native holds.
+fn main() -> i32 {
+    let p: [f32; 8] = [0.25, 0.25, 0.25, 0.25, 0.1, 0.2, 0.3, 0.4];
+    let mut out: [f32; 2] = [0.0; 2];
+
+    for r in 0..2 {
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + p[r * 4 + i] * log(p[r * 4 + i]); }
+        out[r] = -s;
+    }
+    // Row 0 uniform (1/4 each) → entropy = log(4) ≈ 1.3863
+    for k in 0..2 { print((out[k] * 10000.0) as i32); }
+    return 0;
+}
