@@ -247,6 +247,9 @@ fn main() {
     if want("gate") {
         bench_gate(&cc, &dir);
     }
+    if want("row_losses") {
+        bench_row_losses(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -2034,6 +2037,134 @@ fn rust_gate(n: usize, act: &str) -> String {
         "const N: usize = {n};\n#[no_mangle]\n\
          pub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, out:*mut f32) {{\n\
          \x20 for i in 0..N {{ let x=*a.add(i); *out.add(i)=({actexpr})* *b.add(i); }} }}\n"
+    )
+}
+
+/// Per-row **log/exp-bound loss reductions** — KL divergence `out[r]=Σ p·(log p−log q)`, Shannon
+/// entropy `out[r]=−Σ p·log p`, and soft-label cross-entropy `out[r]=Σ q·(lse(x)−x)` — over `[rows,
+/// cols]`. C/Rust keep the logf/expf reductions scalar; Mercury folds them 8-wide. All write a
+/// `rows`-length scalar output; the 3-pointer harness carries the inputs (entropy aliases its unused
+/// middle pointer). Magnitude-normalized cross-check (the reductions reassociate / differ ~1 ULP).
+fn bench_row_losses(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
+        let n = r * c;
+        // Strictly-positive "distributions" (un-normalized is fine for timing; log stays finite).
+        let p: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 + 1.0) * 0.05).collect();
+        let q: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 + 1.0) * 0.07).collect();
+        // logits for kd_loss
+        let x: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.3).collect();
+        let mut out = vec![0.0f32; r];
+        let (pp, qp, xp, op_) = (p.as_ptr(), q.as_ptr(), x.as_ptr(), out.as_mut_ptr());
+        let basis = move |reads: f64| (reads * n as f64 + r as f64) * 4.0;
+        for (label, src_m, src_c, src_r, p0, p1, reads) in [
+            (
+                "kldiv",
+                mer_row_loss(r, c, "kldiv", false),
+                c_row_loss(r, c, "kldiv"),
+                rust_row_loss(r, c, "kldiv"),
+                pp,
+                qp,
+                2.0,
+            ),
+            (
+                "entropy",
+                mer_row_loss(r, c, "entropy", false),
+                c_row_loss(r, c, "entropy"),
+                rust_row_loss(r, c, "entropy"),
+                pp,
+                pp,
+                1.0,
+            ),
+            (
+                "kd_loss",
+                mer_row_loss(r, c, "kd_loss", false),
+                c_row_loss(r, c, "kd_loss"),
+                rust_row_loss(r, c, "kd_loss"),
+                xp,
+                qp,
+                2.0,
+            ),
+        ] {
+            let bytes = basis(reads);
+            let gbps = move |v: &Option<Measure>| {
+                v.as_ref()
+                    .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let src_mp = mer_row_loss(r, c, label, true);
+            println!("=== {label} (per-row log/exp loss) {r}x{c} ===");
+            let mer = bench_mercury(&src_m, &mut out, p0, p1, op_);
+            let mer_par = bench_mercury(&src_mp, &mut out, p0, p1, op_);
+            let cm = bench_external(
+                "c", &src_c, dir, label, cc,
+                &["-O3", "-march=native", "-shared"], &mut out, p0, p1, op_,
+            );
+            let rm = bench_external(
+                "rs", &src_r, dir, label, "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, p0, p1, op_,
+            );
+            report_ratio(label, &mer, &mer_par, &cm, &rm, &gbps);
+        }
+    }
+}
+
+fn mer_row_loss(rows: usize, cols: usize, kind: &str, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    let body = match kind {
+        "kldiv" => format!(
+            "       let mut s: f32 = 0.0;\n\
+             \x20       for i in 0..{cols} {{ s = s + a[r * {cols} + i] * (log(a[r * {cols} + i]) - log(b[r * {cols} + i])); }}\n\
+             \x20       out[r] = s;"
+        ),
+        "entropy" => format!(
+            "       let mut s: f32 = 0.0;\n\
+             \x20       for i in 0..{cols} {{ s = s + a[r * {cols} + i] * log(a[r * {cols} + i]); }}\n\
+             \x20       out[r] = -s;"
+        ),
+        _ => format!(
+            "       let mut m: f32 = a[r * {cols}];\n\
+             \x20       for i in 0..{cols} {{ m = fmax(m, a[r * {cols} + i]); }}\n\
+             \x20       let mut z: f32 = 0.0;\n\
+             \x20       for i in 0..{cols} {{ z = z + exp(a[r * {cols} + i] - m); }}\n\
+             \x20       let lse: f32 = m + log(z);\n\
+             \x20       let mut s: f32 = 0.0;\n\
+             \x20       for i in 0..{cols} {{ s = s + b[r * {cols} + i] * (lse - a[r * {cols} + i]); }}\n\
+             \x20       out[r] = s;"
+        ),
+    };
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], out: [f32; {rows}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20{body}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_row_loss(rows: usize, cols: usize, kind: &str) -> String {
+    let body = match kind {
+        "kldiv" => "float s=0.0f; for(long i=0;i<C;i++) s+=a[r*C+i]*(logf(a[r*C+i])-logf(b[r*C+i])); out[r]=s;",
+        "entropy" => "float s=0.0f; for(long i=0;i<C;i++) s+=a[r*C+i]*logf(a[r*C+i]); out[r]=-s;",
+        _ => "float m=a[r*C]; for(long i=0;i<C;i++) if(a[r*C+i]>m) m=a[r*C+i]; float z=0.0f; for(long i=0;i<C;i++) z+=expf(a[r*C+i]-m); float lse=m+logf(z); float s=0.0f; for(long i=0;i<C;i++) s+=b[r*C+i]*(lse-a[r*C+i]); out[r]=s;",
+    };
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         \x20 for (long r=0;r<R;r++){{ {body} }}\n}}\n"
+    )
+}
+
+fn rust_row_loss(rows: usize, cols: usize, kind: &str) -> String {
+    let body = match kind {
+        "kldiv" => "let mut s=0.0f32; for i in 0..C { s+=*a.add(r*C+i)*((*a.add(r*C+i)).ln()-(*b.add(r*C+i)).ln()); } *out.add(r)=s;",
+        "entropy" => "let mut s=0.0f32; for i in 0..C { s+=*a.add(r*C+i)*(*a.add(r*C+i)).ln(); } *out.add(r)=-s;",
+        _ => "let mut m=*a.add(r*C); for i in 0..C { let v=*a.add(r*C+i); if v>m { m=v; } } let mut z=0.0f32; for i in 0..C { z+=(*a.add(r*C+i)-m).exp(); } let lse=m+z.ln(); let mut s=0.0f32; for i in 0..C { s+=*b.add(r*C+i)*(lse-*a.add(r*C+i)); } *out.add(r)=s;",
+    };
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         #[allow(unused_variables)]\n\
+         pub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ {body} }} }}\n"
     )
 }
 
