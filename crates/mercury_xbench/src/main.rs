@@ -226,6 +226,9 @@ fn main() {
     if want("softmax_bwd") {
         bench_softmax_bwd(&cc, &dir);
     }
+    if want("rmsnorm_bwd") {
+        bench_rmsnorm_bwd(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1384,6 +1387,117 @@ fn rust_softmax_bwd(rows: usize, cols: usize) -> String {
         "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(y:*const f32, dy:*const f32, dx:*mut f32) {{\n\
          \x20 for r in 0..R {{ let mut s=0.0f32; for j in 0..C {{ s += *y.add(r*C+j) * *dy.add(r*C+j); }}\n\
          \x20   for i in 0..C {{ *dx.add(r*C+i) = *y.add(r*C+i) * (*dy.add(r*C+i) - s); }} }}\n}}\n"
+    )
+}
+
+/// Batched **RMSNorm backward** (input gradient) `dx = r·(g − x·r²·(Σ g·x)/C)`, `g = dy·γ`,
+/// `r = 1/√(Σx²/C + eps)` over a `[rows, cols]` matrix — the gradient through every RMSNorm in a
+/// transformer's backward pass (Llama/Mistral/Qwen). Each row needs **two** reductions (`Σx²`, `Σ g·x`)
+/// that gcc/rustc keep scalar at `-O3` (they won't reassociate the float sums), then a fused
+/// elementwise apply. Mercury folds the nest to one `mercury_rmsnorm_bwd_f32[_parallel]` call (both
+/// reductions 8-wide, then the apply). Four buffers (`x, dy, gamma, dx`), so it uses the 4-pointer
+/// harness. The reductions reassociate, so the cross-check is a magnitude-normalized tolerance like
+/// the softmax-backward / norm benches.
+fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
+        let n = r * c;
+        // Well-conditioned: x ~ O(1) (non-zero mean-square), a small grad, gamma ~ 1.
+        let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 0.1 + 0.3).collect();
+        let dy: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
+        let gamma: Vec<f32> = (0..c).map(|i| (i % 11) as f32 * 0.05 + 0.7).collect();
+        let mut dx = vec![0.0f32; n];
+        let (xp, dyp, gp, dxp) = (x.as_ptr(), dy.as_ptr(), gamma.as_ptr(), dx.as_mut_ptr());
+        let bytes = (3.0 * n as f64 + c as f64) * 4.0; // x + dy read, gamma read, dx write
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== rmsnorm_bwd (dx = r·(g − x·r²·Σg·x/C)) {r}x{c} (GB/s, higher is better) ===");
+        let mer = bench_mercury4(&mer_rmsnorm_bwd(r, c, false), &mut dx, xp, dyp, gp, dxp);
+        let mer_par = bench_mercury4(&mer_rmsnorm_bwd(r, c, true), &mut dx, xp, dyp, gp, dxp);
+        let cm = bench_external4(
+            "c", &c_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd", cc,
+            &["-O3", "-march=native", "-shared"], &mut dx, xp, dyp, gp, dxp,
+        );
+        let rm = bench_external4(
+            "rs", &rust_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&rm)
+        );
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+            let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! rmsnorm_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r2 = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r2 >= 1.0 { r2 } else { 1.0 / r2 },
+                if r2 >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r2 = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury RMSNorm-backward: the batched nest the recognizer folds to one
+/// `mercury_rmsnorm_bwd_f32[_parallel]` call. The 4-pointer harness carries `(x, dy, gamma, dx)`.
+fn mer_rmsnorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], gamma: [f32; {cols}], dx: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut ms: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ ms = ms + x[r * {cols} + i] * x[r * {cols} + i]; }}\n\
+         \x20       let rinv: f32 = 1.0 / sqrt(ms / {cols}.0 + 0.00001);\n\
+         \x20       let mut sg: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ sg = sg + dy[r * {cols} + i] * gamma[i] * x[r * {cols} + i]; }}\n\
+         \x20       let coef: f32 = rinv * rinv * sg / {cols}.0;\n\
+         \x20       for i in 0..{cols} {{ dx[r * {cols} + i] = rinv * (dy[r * {cols} + i] * gamma[i] - x[r * {cols} + i] * coef); }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_rmsnorm_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* dy, const float* gamma, float* dx){{\n\
+         \x20 for (long r=0;r<R;r++){{\n\
+         \x20   float ms=0.0f; for(long i=0;i<C;i++) ms += x[r*C+i]*x[r*C+i];\n\
+         \x20   float rinv = 1.0f/sqrtf(ms/(float)C + 0.00001f);\n\
+         \x20   float sg=0.0f; for(long i=0;i<C;i++) sg += dy[r*C+i]*gamma[i]*x[r*C+i];\n\
+         \x20   float coef = rinv*rinv*sg/(float)C;\n\
+         \x20   for(long i=0;i<C;i++) dx[r*C+i] = rinv*(dy[r*C+i]*gamma[i] - x[r*C+i]*coef); }}\n}}\n"
+    )
+}
+
+fn rust_rmsnorm_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, dy:*const f32, gamma:*const f32, dx:*mut f32) {{\n\
+         \x20 for r in 0..R {{\n\
+         \x20   let mut ms=0.0f32; for i in 0..C {{ ms += *x.add(r*C+i) * *x.add(r*C+i); }}\n\
+         \x20   let rinv = 1.0f32/(ms/(C as f32) + 0.00001f32).sqrt();\n\
+         \x20   let mut sg=0.0f32; for i in 0..C {{ sg += *dy.add(r*C+i) * *gamma.add(i) * *x.add(r*C+i); }}\n\
+         \x20   let coef = rinv*rinv*sg/(C as f32);\n\
+         \x20   for i in 0..C {{ *dx.add(r*C+i) = rinv*(*dy.add(r*C+i) * *gamma.add(i) - *x.add(r*C+i) * coef); }} }}\n}}\n"
     )
 }
 
@@ -2568,6 +2682,136 @@ fn bench_external(
         let f: KernelFn = *sym;
         out.iter_mut().for_each(|v| *v = 0.0);
         let ns = time_ns(|| f(xp, yp, op));
+        let snapshot = out.to_vec();
+        Some(Measure {
+            compile,
+            ns_per_call: ns,
+            out: snapshot,
+        })
+    }
+}
+
+/// A 4-pointer kernel ABI `(p0, p1, p2: *const, op: *mut)` — for kernels that read three input buffers
+/// and write one output (e.g. the norm backwards `(x, dy, gamma) -> dx`), which don't fit the 3-pointer
+/// `KernelFn`. Same timing/snapshot protocol as [`bench_mercury`]/[`bench_external`].
+type KernelFn4 = unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32);
+
+/// 4-pointer twin of [`bench_mercury`].
+fn bench_mercury4(
+    src: &str,
+    out: &mut [f32],
+    p0: *const f32,
+    p1: *const f32,
+    p2: *const f32,
+    op: *mut f32,
+) -> Option<Measure> {
+    let t = Instant::now();
+    let mut interner = Interner::new();
+    let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    if pd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury parse error");
+        return None;
+    }
+    let (sema, sd) = mercury_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury sema error: {sd:?}");
+        return None;
+    }
+    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    if ld.iter().any(|d| d.is_error()) {
+        eprintln!("mercury lower error: {ld:?}");
+        return None;
+    }
+    mercury_opt::optimize(&mut program, 3);
+    let handle = match mercury_codegen_cranelift::jit_module(&program, &interner) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("mercury codegen error: {e}");
+            return None;
+        }
+    };
+    let sym = interner.intern("kbench");
+    let ptr = handle.func_ptr(sym)?;
+    let compile = t.elapsed();
+    let f: KernelFn4 = unsafe { std::mem::transmute(ptr) };
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let ns = time_ns(|| unsafe { f(p0, p1, p2, op) });
+    let snapshot = out.to_vec();
+    drop(handle);
+    Some(Measure {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// 4-pointer twin of [`bench_external`].
+#[allow(clippy::too_many_arguments)]
+fn bench_external4(
+    ext: &str,
+    src: &str,
+    dir: &Path,
+    name: &str,
+    compiler: &str,
+    args: &[&str],
+    out: &mut [f32],
+    p0: *const f32,
+    p1: *const f32,
+    p2: *const f32,
+    op: *mut f32,
+) -> Option<Measure> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let src_path = dir.join(format!("{safe}.{ext}"));
+    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
+    if std::fs::write(&src_path, src).is_err() {
+        return None;
+    }
+    let t = Instant::now();
+    let status = Command::new(compiler)
+        .args(args)
+        .arg("-o")
+        .arg(&dll)
+        .arg(&src_path)
+        .status();
+    let compile = t.elapsed();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("{compiler} failed to compile {name}.{ext}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("could not run `{compiler}` (skipping)");
+            return None;
+        }
+    }
+    unsafe {
+        let lib = match libloading::Library::new(&dll) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("load {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let sym: libloading::Symbol<KernelFn4> = match lib.get(b"kbench\0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("symbol kbench in {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let f: KernelFn4 = *sym;
+        out.iter_mut().for_each(|v| *v = 0.0);
+        let ns = time_ns(|| f(p0, p1, p2, op));
         let snapshot = out.to_vec();
         Some(Measure {
             compile,
