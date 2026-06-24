@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: -1984
+// EXPECT-OUT: -162
+// EXPECT-OUT: 2462
+// EXPECT-OUT: 4469
+module tests.run.rope
+
+// RoPE (rotary position embedding), the half-split Llama/GPT-NeoX form over x[R=2, D=4] (D = 2·H,
+// H=2): each (row r, pair j) rotates (x[r,j], x[r,j+H]) by the angle theta = r·inv_freq[j], with
+// cos/sin computed INLINE. Row 0 has theta=0 (identity); row 1 is a real rotation. The recognizer folds
+// the nest to one mercury_rope_f32 call (the 8-wide sin8/cos8 — C/Rust keep sinf/cosf scalar). A
+// rotation is pure data movement, so the kernel is bit-identical to the scalar nest; the differential
+// gate (interp == native, -O0 == -O3) is trivial.
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+    let inv_freq: [f32; 2] = [1.0, 0.5];
+    let mut out: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        for j in 0..2 {
+            let theta: f32 = (r as f32) * inv_freq[j];
+            let c: f32 = cos(theta);
+            let s: f32 = sin(theta);
+            let a: f32 = x[r * 4 + j];
+            let b: f32 = x[r * 4 + j + 2];
+            out[r * 4 + j] = a * c - b * s;
+            out[r * 4 + j + 2] = b * c + a * s;
+        }
+    }
+    // Row 0: theta=0 → cos=1,sin=0 → out[0..4] = x[0..4] = [1,2,3,4]
+    // Row 1: rotated by theta=1.0 (pair 0) and 0.5 (pair 1)
+    for k in 0..8 {
+        print((out[k] * 1000.0) as i32);
+    }
+    return 0;
+}

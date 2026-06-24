@@ -1418,6 +1418,54 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_rope_f32[_parallel](x, inv_freq, out, rows, half)` — the inline-sincos rotary
+            // position embedding a recognized RoPE nest lowers to. Marshal `rows*2*half` f32 from x and
+            // `half` f32 from inv_freq, call the *serial* kernel (bit-identical to the parallel one —
+            // rows independent), write `out` (reading x first, so in-place x==out is correct).
+            "mercury_rope_f32" | "mercury_rope_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let inv_freq = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let half = args[4].as_int() as usize;
+                let n = rows * 2 * half;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("rope operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut fbuf = Vec::with_capacity(half);
+                for t in 0..half {
+                    fbuf.push(
+                        self.memory
+                            .get(inv_freq + t)
+                            .ok_or("rope inv_freq out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/obuf are rows*2*half f32; fbuf is half — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_rope_f32(
+                        xbuf.as_ptr(),
+                        fbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        half as i64,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("rope output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath_bf16(x, out, n, op)` — the bf16-input twin of `mercury_vmath_f32` an
             // `out[i] = f((x[i] as f32))` loop over a `[bf16]` array lowers to. Reconstruct the exact
             // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-

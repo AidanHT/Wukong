@@ -106,6 +106,8 @@ pub fn lower_program(
         rmsnorm_bwd_par: interner.intern("mercury_rmsnorm_bwd_f32_parallel"),
         xent: interner.intern("mercury_xent_fwd_f32"),
         xent_par: interner.intern("mercury_xent_fwd_f32_parallel"),
+        rope: interner.intern("mercury_rope_f32"),
+        rope_par: interner.intern("mercury_rope_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -185,6 +187,14 @@ pub fn lower_program(
                 // kernel). The embedded `match_xent` then emits the multicore `mercury_xent_fwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function RoPE: intercept before the outliner (which would split
+                // the rows into scalar loops and lose the inline-sincos kernel). The embedded
+                // `match_rope` then emits the multicore `mercury_rope_f32_parallel` (rows independent).
+                if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -736,6 +746,10 @@ struct GemmSyms {
     /// `expf`/`logf` reduction scalar; rows independent → serial == parallel.
     xent: Symbol,
     xent_par: Symbol,
+    /// RoPE (`mercury_rope_f32[_parallel](x, inv_freq, out, rows, half)`): the inline-sin/cos rotary
+    /// embedding nest dispatches here. C/Rust keep sinf/cosf scalar; rows independent → serial==parallel.
+    rope: Symbol,
+    rope_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2680,6 +2694,32 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_rope_f32[_parallel](x, inv_freq, out, rows, half)` call for a recognized RoPE
+    /// nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore kernel (rows
+    /// independent → bit-identical to serial).
+    fn emit_rope(&mut self, nest: &RopeNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((inv_freq, _)), Some((out, _))) = (
+            self.lookup(nest.x),
+            self.lookup(nest.inv_freq),
+            self.lookup(nest.out),
+        ) else {
+            return false;
+        };
+        let (Some(rows), Some(half)) = (self.dim_value(nest.rows), self.dim_value(nest.half)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.rope_par
+        } else {
+            self.gemm.rope
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, inv_freq, out, rows, half],
+        });
+        true
+    }
+
     /// Emit the fused `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)`
     /// call for a recognized bf16/f16 `nn.Linear`+epilogue (`C = act(A·Bᵀ + bias)`, half inputs / f32
     /// output). Bails (false) if any operand/dim is unbound at the call site, so the caller lowers the
@@ -3952,6 +3992,14 @@ impl FnLowerer<'_> {
         // reduction gcc keeps scalar; the kernel folds it 8-wide and gathers the target logit.
         if let Some(nest) = self.match_xent(pat, iter, body) {
             if self.emit_xent(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // A RoPE nest `for r { for j { rotate x[r,j]/x[r,j+H] by inline cos/sin(r·inv_freq[j]) } }`
+        // → `mercury_rope_f32` (the `_parallel` one in a `@parallel` function). The inline sinf/cosf
+        // gcc keeps scalar; the kernel computes them 8-wide. Bit-identical (a rotation, no reassoc).
+        if let Some(nest) = match_rope(pat, iter, body, self.sema, self.interner) {
+            if self.emit_rope(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -11825,6 +11873,232 @@ fn rmsnorm_bwd_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Optio
     match_rmsnorm_bwd(pat, iter, lb, sema, interner)
 }
 
+/// A recognized RoPE (rotary position embedding) nest (see [`match_rope`]).
+struct RopeNest {
+    x: Symbol,
+    inv_freq: Symbol,
+    out: Symbol,
+    rows: Dim,
+    half: Dim,
+}
+
+/// `base[row*stride + col (+ extra…)]` — return `(base, stride, extra_offset_terms)`. The generic twin
+/// of `index_rowmaj` that *keeps* any leftover offset beyond `row*stride + col` (for RoPE's `+ half`).
+fn index_strided<'a>(
+    e: &'a Expr,
+    row: Symbol,
+    col: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Vec<&'a Expr>)> {
+    let (base, idx) = as_index1(e)?;
+    let (stride, off) = match_row_col_off(idx, row, col, interner)?;
+    Some((base, stride, off))
+}
+
+/// The store `out[row*stride + col (+ extra)] = value` — return `(out, value, stride, extra)`.
+fn assign_strided<'a>(
+    stmt: &'a Stmt,
+    row: Symbol,
+    col: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, &'a Expr, Dim, Vec<&'a Expr>)> {
+    let StmtKind::Assign {
+        target,
+        op: ast::AssignOp::Assign,
+        value,
+    } = &stmt.kind
+    else {
+        return None;
+    };
+    let (out, stride, off) = index_strided(target, row, col, interner)?;
+    Some((out, value, stride, off))
+}
+
+/// Is `e` the product `p · q` (either factor order, by single-segment path)?
+fn is_prod_of(e: &Expr, p: Symbol, q: Symbol) -> bool {
+    matches!(&e.kind,
+        ExprKind::Binary { op: ast::BinOp::Mul, lhs, rhs }
+            if (single_path(lhs) == Some(p) && single_path(rhs) == Some(q))
+                || (single_path(lhs) == Some(q) && single_path(rhs) == Some(p)))
+}
+
+/// Is `e` a single-arg call to the intrinsic `intr` over the path `arg`? (`cos(theta)` / `sin(theta)`.)
+fn is_unary_intrinsic_of(
+    e: &Expr,
+    intr: MathIntrinsic,
+    arg: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> bool {
+    matches!(&e.kind, ExprKind::Call { callee, args, .. }
+        if args.len() == 1
+            && intrinsic_callee(callee, sema, interner) == Some(intr)
+            && single_path(&args[0]) == Some(arg))
+}
+
+/// The single leftover term is the half offset — `exprs_struct_eq` to the inner loop bound `he`.
+fn offset_is_half(off: &[&Expr], he: &Expr) -> bool {
+    off.len() == 1 && exprs_struct_eq(off[0], he)
+}
+
+/// The stride `D` is twice the half `H` — both must be integer literals with `D == 2·H` (so the
+/// source's `[rows, 2·half]` layout matches what the kernel assumes; symbolic dims decline).
+fn stride_is_twice_half(stride: &Dim, half: &Dim) -> bool {
+    matches!((stride, half), (Dim::Lit(d), Dim::Lit(h)) if *d == 2 * *h)
+}
+
+/// Recognize the **RoPE (rotary position embedding)** nest and dispatch it to `mercury_rope_f32`. The
+/// canonical half-split (Llama/GPT-NeoX) form over `x[R, D]`, `D = 2·H`, `inv_freq[H]` (row `r`'s
+/// absolute position is the row index `r`):
+///
+/// ```text
+/// for r in 0..R {
+///     for j in 0..H {
+///         let theta = (r as f32) * inv_freq[j];
+///         let c = cos(theta);
+///         let s = sin(theta);
+///         let a = x[r*D + j];
+///         let b = x[r*D + j + H];
+///         out[r*D + j]     = a*c - b*s;
+///         out[r*D + j + H] = b*c + a*s;
+///     }
+/// }
+/// ```
+///
+/// The angles' `cos`/`sin` are computed **inline** per element, so C/Rust keep `sinf`/`cosf` scalar; the
+/// 256-bit kernel computes them 8-wide (the shared `sin8`/`cos8`), the win. `out` may alias `x` (each
+/// `(r,j)` touches only columns `j` and `j+H`, written after both are read). Pure data rotation, so the
+/// kernel is bit-identical to the scalar nest (no reassociation) — the differential gate is trivial.
+fn match_rope(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<RopeNest> {
+    let ast::PatKind::Ident(rvar) = &pat.kind else {
+        return None;
+    };
+    let rvar = *rvar;
+    let (rs, re) = range_bounds(iter)?;
+    if as_int_lit(rs, interner)? != 0 {
+        return None;
+    }
+    let rows = as_dim(re, interner)?;
+    // The outer body is exactly one inner `for j in 0..H` loop.
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jvar, he, inner) = stmt_range0_for(&body.stmts[0], interner)?;
+    let half = as_dim(he, interner)?;
+    if inner.tail.is_some() || inner.stmts.len() != 7 {
+        return None;
+    }
+    // [0] let theta = (r as f32) * inv_freq[j]
+    let (theta, t0) = stmt_let_init(&inner.stmts[0])?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: tl,
+        rhs: tr,
+    } = &t0.kind
+    else {
+        return None;
+    };
+    let is_r_cast = |e: &Expr| matches!(&e.kind, ExprKind::Cast { expr, .. } if single_path(expr) == Some(rvar));
+    let inv_freq = if is_r_cast(tl) {
+        index_by_var(tr, jvar)?
+    } else if is_r_cast(tr) {
+        index_by_var(tl, jvar)?
+    } else {
+        return None;
+    };
+    // [1] let c = cos(theta);  [2] let s = sin(theta)
+    let (c, c0) = stmt_let_init(&inner.stmts[1])?;
+    if !is_unary_intrinsic_of(c0, MathIntrinsic::Cos, theta, sema, interner) {
+        return None;
+    }
+    let (s, s0) = stmt_let_init(&inner.stmts[2])?;
+    if !is_unary_intrinsic_of(s0, MathIntrinsic::Sin, theta, sema, interner) {
+        return None;
+    }
+    // [3] let a = x[r*D + j];  [4] let b = x[r*D + j + H]
+    let (a, a0) = stmt_let_init(&inner.stmts[3])?;
+    let (x, stride, off_a) = index_strided(a0, rvar, jvar, interner)?;
+    if !off_a.is_empty() {
+        return None;
+    }
+    let (bb, b0) = stmt_let_init(&inner.stmts[4])?;
+    let (xb, stride_b, off_b) = index_strided(b0, rvar, jvar, interner)?;
+    if xb != x || stride_b != stride || !offset_is_half(&off_b, he) {
+        return None;
+    }
+    if !stride_is_twice_half(&stride, &half) {
+        return None;
+    }
+    // [5] out[r*D + j] = a*c - b*s
+    let (out, v5, stride5, off5) = assign_strided(&inner.stmts[5], rvar, jvar, interner)?;
+    if stride5 != stride || !off5.is_empty() {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Sub,
+        lhs: s5l,
+        rhs: s5r,
+    } = &v5.kind
+    else {
+        return None;
+    };
+    if !(is_prod_of(s5l, a, c) && is_prod_of(s5r, bb, s)) {
+        return None;
+    }
+    // [6] out[r*D + j + H] = b*c + a*s
+    let (out6, v6, stride6, off6) = assign_strided(&inner.stmts[6], rvar, jvar, interner)?;
+    if out6 != out || stride6 != stride || !offset_is_half(&off6, he) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs: s6l,
+        rhs: s6r,
+    } = &v6.kind
+    else {
+        return None;
+    };
+    let bc_as = (is_prod_of(s6l, bb, c) && is_prod_of(s6r, a, s))
+        || (is_prod_of(s6l, a, s) && is_prod_of(s6r, bb, c));
+    if !bc_as {
+        return None;
+    }
+    // inv_freq must be a distinct array (not x/out); x and out may alias (in-place RoPE is sound).
+    if inv_freq == x || inv_freq == out {
+        return None;
+    }
+    Some(RopeNest {
+        x,
+        inv_freq,
+        out,
+        rows,
+        half,
+    })
+}
+
+/// Is the whole function body a single RoPE nest? Intercepts a `@parallel` RoPE before the outliner.
+fn rope_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<RopeNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_rope(pat, iter, lb, sema, interner)
+}
+
 /// Is the whole function body a single fused residual projection (`x = x + act(x·Wᵀ + bias)`)? Used to
 /// intercept a `@parallel` residual *before* the elementwise outliner (which would split it into
 /// per-row scalar loops and lose the fused-epilogue kernel), mirroring the sgemm/norm interceptions.
@@ -12109,7 +12383,7 @@ enum RedOp {
 }
 
 /// The math builtins lowered directly to primitive MIR ops (not runtime calls).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MathIntrinsic {
     Sqrt,
     Rsqrt,
