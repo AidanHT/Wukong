@@ -719,6 +719,13 @@ unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
 pub const VM2_POW: i64 = 0;
 pub const VM2_ATAN2: i64 = 1;
 pub const VM2_HYPOT: i64 = 2;
+// Activation *backward* (training gradient `dx = dy · act'(x)`): the two inputs are `(x, dy)` — the
+// pre-activation input and the upstream gradient — and the kernel fuses the upstream multiply into the
+// 256-bit derivative, so a whole `dx[i] = act_backward(x[i], dy[i])` loop is one pass. The derivative
+// is a transcendental (silu' folds a sigmoid, gelu' a tanh), exactly the libm wall C/Rust can't
+// vectorize — so this wins for the same reason the *forward* activation dispatch does.
+pub const VM2_SILU_BWD: i64 = 3;
+pub const VM2_GELU_BWD: i64 = 4;
 
 /// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
 #[inline]
@@ -760,14 +767,57 @@ fn hypot_1(a: f32, b: f32) -> f32 {
     }
 }
 
+/// `silu_backward(x, dy) = dy · silu'(x)`, the SiLU/swish training gradient. With `s = σ(x)`,
+/// `silu'(x) = s + x·s·(1−s) = fma(x·s, 1−s, s)` (a single-rounded FMA, matching the AVX2 [`silu_bwd8`]
+/// and the inlined `emit_silu_backward` op-for-op). Reuses the shared [`sigmoid1`] (built on [`exp1`]),
+/// so it agrees with the forward `silu`/`sigmoid` dispatch and is bit-identical across the scalar
+/// twin / AVX2 lanes / inlined MIR. C/Rust compute `silu'` through a scalar `expf` (in the sigmoid),
+/// which a loop with the call won't vectorize — so the 256-bit kernel wins like the forward pass.
+#[inline]
+fn silu_bwd_2(x: f32, dy: f32) -> f32 {
+    let s = sigmoid1(x);
+    let oms = 1.0 - s;
+    let xs = x * s;
+    let g = xs.mul_add(oms, s); // x·s·(1−s) + s = silu'(x)
+    dy * g
+}
+
+/// `gelu_backward(x, dy) = dy · gelu'(x)` for the **tanh-approximation** GELU (paired with the forward
+/// [`gelu1`], so the activation and its gradient use the *same* approximation). With
+/// `I = c0·(x + c1·x³)`, `u = tanh(I)`:
+/// `gelu'(x) = ½·(1 + u) + ½·x·(1 − u²)·c0·(1 + 3·c1·x²)`.
+/// The inner `I`/`u` are computed exactly as [`gelu1`] (so `u` matches the forward dispatch), and the
+/// derivative's extra terms use only the *same* constants `c0`/`c1` (the `3·c1·x²` written as
+/// `fma(c1, 3·x², 1)` to avoid a new fragile constant) — all replicated op-for-op in the AVX2
+/// [`gelu_bwd8`] and the inlined `emit_gelu_backward`, so every path agrees bit-for-bit. The `tanh`
+/// (an `expf`) is the part C/Rust keep scalar, so the 256-bit kernel wins.
+#[inline]
+fn gelu_bwd_2(x: f32, dy: f32) -> f32 {
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let t = GELU_C1.mul_add(x3, x); // c1·x³ + x  (== gelu1's inner numerator)
+    let inner = GELU_C0 * t;
+    let u = tanh1(inner);
+    let half_onep = 0.5 * (1.0 + u); // ½·(1 + u)
+    let sech2 = 1.0 - u * u; // 1 − tanh²(I)
+    let di = GELU_C1.mul_add(3.0 * x2, 1.0); // c1·(3x²) + 1 = 1 + 3·c1·x²
+    let dinner = GELU_C0 * di; // I'(x)
+    let hx = 0.5 * x;
+    let term2 = hx * sech2 * dinner; // ½·x·(1−u²)·I'(x)
+    dy * (half_onep + term2)
+}
+
 /// Scalar dispatch for one element pair (the AVX2 tail and the no-AVX2 fallback). The two inputs are
-/// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot.
+/// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot, `(x, dy)` for the
+/// activation backwards.
 #[inline]
 fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
     match op {
         VM2_POW => pow2_1(x, y),
         VM2_ATAN2 => atan2_1(x, y),
         VM2_HYPOT => hypot_1(x, y),
+        VM2_SILU_BWD => silu_bwd_2(x, y),
+        VM2_GELU_BWD => gelu_bwd_2(x, y),
         _ => x,
     }
 }
@@ -822,6 +872,50 @@ unsafe fn hypot8_2(
     _mm256_blendv_ps(scaled, _mm256_setzero_ps(), mzero) // mzero ? 0 : scaled
 }
 
+/// `dy · silu'(x)` over 8 lanes — mirrors [`silu_bwd_2`] op-for-op (`silu'(x) = fma(x·s, 1−s, s)`,
+/// `s = sigmoid8(x)`), so the lanes, the scalar tail, and the inlined MIR all agree bit-for-bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu_bwd8(
+    x: std::arch::x86_64::__m256,
+    dy: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let s = sigmoid8(x);
+    let one = _mm256_set1_ps(1.0);
+    let oms = _mm256_sub_ps(one, s); // 1 − s
+    let xs = _mm256_mul_ps(x, s); // x·s
+    let g = _mm256_fmadd_ps(xs, oms, s); // x·s·(1−s) + s = silu'(x)
+    _mm256_mul_ps(dy, g)
+}
+
+/// `dy · gelu'(x)` (tanh approximation) over 8 lanes — mirrors [`gelu_bwd_2`] op-for-op (and reuses
+/// the same inner `I`/`tanh8` as the forward [`gelu8`]), so dispatched == composed == scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu_bwd8(
+    x: std::arch::x86_64::__m256,
+    dy: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let c0 = _mm256_set1_ps(GELU_C0);
+    let c1 = _mm256_set1_ps(GELU_C1);
+    let one = _mm256_set1_ps(1.0);
+    let x2 = _mm256_mul_ps(x, x);
+    let x3 = _mm256_mul_ps(x2, x);
+    let t = _mm256_fmadd_ps(c1, x3, x); // c1·x³ + x  (== gelu8's inner numerator)
+    let inner = _mm256_mul_ps(c0, t);
+    let u = tanh8(inner);
+    let half_onep = _mm256_mul_ps(_mm256_set1_ps(0.5), _mm256_add_ps(one, u)); // ½·(1 + u)
+    let sech2 = _mm256_sub_ps(one, _mm256_mul_ps(u, u)); // 1 − u²
+    let three_x2 = _mm256_mul_ps(_mm256_set1_ps(3.0), x2);
+    let di = _mm256_fmadd_ps(c1, three_x2, one); // c1·(3x²) + 1
+    let dinner = _mm256_mul_ps(c0, di); // I'(x)
+    let hx = _mm256_mul_ps(_mm256_set1_ps(0.5), x);
+    let term2 = _mm256_mul_ps(_mm256_mul_ps(hx, sech2), dinner); // ½·x·(1−u²)·I'(x)
+    _mm256_mul_ps(dy, _mm256_add_ps(half_onep, term2))
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn vmath2_8_for(
@@ -833,6 +927,8 @@ fn vmath2_8_for(
         VM2_POW => pow2_8,
         VM2_ATAN2 => atan2_8,
         VM2_HYPOT => hypot8_2,
+        VM2_SILU_BWD => silu_bwd8,
+        VM2_GELU_BWD => gelu_bwd8,
         _ => return None,
     })
 }
@@ -1822,6 +1918,57 @@ mod tests {
             for (i, &x) in xs.iter().enumerate() {
                 let s = apply1(op, x);
                 assert_eq!(full[i].to_bits(), s.to_bits(), "op {op} i {i} x {x}");
+            }
+        }
+    }
+
+    /// Activation **backward** kernels `dx = dy·act'(x)` (silu/gelu): (1) the kernel output equals the
+    /// scalar twin `apply2_1` bit-for-bit over a non-multiple-of-8 length — the AVX2 lanes == the scalar
+    /// tail, which is what lets the interpreter marshal through this kernel and still match native; and
+    /// (2) the scalar twin agrees with an independent f64 closed-form derivative to f32 grade, proving
+    /// the kernels compute the real gradient (not just a self-consistent one).
+    #[test]
+    fn vmath2_activation_backward() {
+        // Closed-form derivatives in f64 (independent of the kernel's poly path).
+        fn silu_grad_f64(x: f64) -> f64 {
+            let s = 1.0 / (1.0 + (-x).exp());
+            s + x * s * (1.0 - s)
+        }
+        fn gelu_grad_f64(x: f64) -> f64 {
+            let c0 = (2.0 / std::f64::consts::PI).sqrt();
+            let c1 = 0.044715f64;
+            let u = (c0 * (x + c1 * x * x * x)).tanh();
+            0.5 * (1.0 + u) + 0.5 * x * (1.0 - u * u) * c0 * (1.0 + 3.0 * c1 * x * x)
+        }
+        let n = 1003usize; // not a multiple of 8 → exercises the lane body and the scalar tail
+        let xs: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.011).collect();
+        let dys: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+        for (op, gref) in [
+            (VM2_SILU_BWD, silu_grad_f64 as fn(f64) -> f64),
+            (VM2_GELU_BWD, gelu_grad_f64 as fn(f64) -> f64),
+        ] {
+            let mut got = vec![0.0f32; n];
+            // SAFETY: xs/dys/got are exactly n f32 long — the kernel's contract.
+            unsafe {
+                mercury_vmath2_f32(xs.as_ptr(), dys.as_ptr(), got.as_mut_ptr(), n as i64, op);
+            }
+            for i in 0..n {
+                // (1) lanes == tail == scalar twin, bit-for-bit.
+                assert_eq!(
+                    got[i].to_bits(),
+                    apply2_1(op, xs[i], dys[i]).to_bits(),
+                    "op {op} i {i} x {}",
+                    xs[i]
+                );
+                // (2) ≈ dy · act'(x) from the f64 closed form.
+                let want = dys[i] as f64 * gref(xs[i] as f64);
+                assert!(
+                    (got[i] as f64 - want).abs() <= 1e-4 + 1e-4 * want.abs(),
+                    "op {op} backward({}, {}): got {} want {want}",
+                    xs[i],
+                    dys[i],
+                    got[i]
+                );
             }
         }
     }
