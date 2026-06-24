@@ -977,19 +977,22 @@ fn rust_colsum(m: usize, n: usize) -> String {
     )
 }
 
-/// Column max/min `out[j] = max/min_i x[i, j]` — per-channel statistics (the quantization range, axis-0
-/// max/min pooling), the max/min siblings of `colsum`. The naive `for j { let s=x[j]; for i { s =
-/// max(s, x[i*N+j]) } }` strides `x` by `N` and — verified — gcc/rustc leave it **scalar** (no packed
-/// `vmaxps`/`vminps` at `-O3 -march=native`: `fmax`/`fmin` are non-associative so they will not
-/// reassociate the strided fold). Mercury folds it to `mercury_col{max,min}_f32`, streaming `x`
-/// row-major + 8 columns at a time. Reported as GB/s (`M·N·4`, the matrix read once); the kernels carry
-/// an unused middle pointer to share the `(x, _, out)` 3-pointer harness. Both fold each column
-/// i-ascending (`s ⊕ v` mirrors `_mm256_{max,min}_ps`), so the cross-check is **bit-exact** on finite
-/// data.
+/// Column max / min / **abs-max** `out[j] = max/min_i x[i,j]` (and `max_i |x[i,j]|`, the per-channel
+/// symmetric-quant scale) — per-channel statistics / axis-0 pooling, the siblings of `colsum`. The naive
+/// `for j { let s=x[j]; for i { s = max(s, x[i*N+j]) } }` strides `x` by `N` and — verified — gcc/rustc
+/// leave all three **scalar** (no packed `vmaxps`/`vminps` at `-O3 -march=native`: `fmax`/`fmin` are
+/// non-associative so they will not reassociate the strided fold). Mercury folds them to
+/// `mercury_col{max,min,maxabs}_f32`, streaming `x` row-major + 8 columns at a time. Reported as GB/s
+/// (`M·N·4`, the matrix read once); the kernels carry an unused middle pointer to share the `(x, _, out)`
+/// 3-pointer harness. Both fold each column i-ascending (`s ⊕ v` mirrors `_mm256_{max,min}_ps`, abs via
+/// sign-mask == `fabsf`), so the cross-check is **bit-exact** on finite data.
 fn bench_colmax(cc: &str, dir: &Path) {
-    for is_max in [true, false] {
-        let label = if is_max { "colmax" } else { "colmin" };
-        let sym = if is_max { "max" } else { "min" };
+    // 0 = max, 1 = min, 2 = abs-max (the per-channel symmetric-quant scale).
+    for (opc, label, sym) in [
+        (0u8, "colmax", "max"),
+        (1, "colmin", "min"),
+        (2, "colmaxabs", "amax"),
+    ] {
         for (m, n) in [(1024usize, 1024usize), (4096, 1024)] {
             let mn = m * n;
             let x: Vec<f32> = (0..mn).map(|i| (i % 17) as f32 * 0.25 - 2.0).collect();
@@ -1002,12 +1005,13 @@ fn bench_colmax(cc: &str, dir: &Path) {
                     .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                     .unwrap_or_else(|| "n/a".into())
             };
-            println!("=== {label} (out[j] = {sym}_i x[i,j]) {m}x{n} (GB/s, higher is better) ===");
-            let mer = bench_mercury(&mer_colmax(m, n, false, is_max), &mut out, xp, yp, op);
-            let mer_par = bench_mercury(&mer_colmax(m, n, true, is_max), &mut out, xp, yp, op);
+            let desc = if opc == 2 { "|x[i,j]|" } else { "x[i,j]" };
+            println!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
+            let mer = bench_mercury(&mer_colmax(m, n, false, opc), &mut out, xp, yp, op);
+            let mer_par = bench_mercury(&mer_colmax(m, n, true, opc), &mut out, xp, yp, op);
             let cm = bench_external(
                 "c",
-                &c_colmax(m, n, is_max),
+                &c_colmax(m, n, opc),
                 dir,
                 label,
                 cc,
@@ -1019,7 +1023,7 @@ fn bench_colmax(cc: &str, dir: &Path) {
             );
             let rm = bench_external(
                 "rs",
-                &rust_colmax(m, n, is_max),
+                &rust_colmax(m, n, opc),
                 dir,
                 label,
                 "rustc",
@@ -1064,37 +1068,41 @@ fn bench_colmax(cc: &str, dir: &Path) {
     }
 }
 
-/// Mercury column max/min kernel: `for j { let s=x[j]; for i in 1..M { s = fmax/fmin(s, x[i*N+j]) }; out[j]=s }`
-/// the recognizer folds to one `mercury_col{max,min}_f32[_parallel]` call. `y` is unused (the 3-pointer harness).
-fn mer_colmax(m: usize, n: usize, parallel: bool, is_max: bool) -> String {
+/// Mercury column max/min/abs-max kernel: `for j { let s=⟨x[j]⟩; for i in 1..M { s = fmax/fmin(s, ⟨x[i*N+j]⟩) }; out[j]=s }`
+/// the recognizer folds to one `mercury_col{max,min,maxabs}_f32[_parallel]` call (`⟨·⟩` = `abs(·)` for
+/// op 2). `y` is unused (the 3-pointer harness). op: 0=max, 1=min, 2=abs-max.
+fn mer_colmax(m: usize, n: usize, parallel: bool, op: u8) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
-    let f = if is_max { "fmax" } else { "fmin" };
+    let f = if op == 1 { "fmin" } else { "fmax" };
+    let (lo, hi) = if op == 2 { ("abs(", ")") } else { ("", "") };
     let mn = m * n;
     format!(
         "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], out: [f32; {n}]) {{\n\
          \x20   for j in 0..{n} {{\n\
-         \x20       let mut s: f32 = x[j];\n\
-         \x20       for i in 1..{m} {{ s = {f}(s, x[i * {n} + j]); }}\n\
+         \x20       let mut s: f32 = {lo}x[j]{hi};\n\
+         \x20       for i in 1..{m} {{ s = {f}(s, {lo}x[i * {n} + j]{hi}); }}\n\
          \x20       out[j] = s;\n\
          \x20   }}\n}}\n"
     )
 }
 
-fn c_colmax(m: usize, n: usize, is_max: bool) -> String {
-    let cmp = if is_max { ">" } else { "<" };
+fn c_colmax(m: usize, n: usize, op: u8) -> String {
+    let cmp = if op == 1 { "<" } else { ">" };
+    let (lo, hi) = if op == 2 { ("fabsf(", ")") } else { ("", "") };
     format!(
-        "#define M {m}\n#define N {n}\n\
+        "#include <math.h>\n#define M {m}\n#define N {n}\n\
          __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
          \x20 (void)y;\n\
-         \x20 for (long j=0;j<N;j++){{ float s=x[j]; for (long i=1;i<M;i++){{ float v=x[i*N+j]; s = s{cmp}v?s:v; }} out[j]=s; }}\n}}\n"
+         \x20 for (long j=0;j<N;j++){{ float s={lo}x[j]{hi}; for (long i=1;i<M;i++){{ float v={lo}x[i*N+j]{hi}; s = s{cmp}v?s:v; }} out[j]=s; }}\n}}\n"
     )
 }
 
-fn rust_colmax(m: usize, n: usize, is_max: bool) -> String {
-    let cmp = if is_max { ">" } else { "<" };
+fn rust_colmax(m: usize, n: usize, op: u8) -> String {
+    let cmp = if op == 1 { "<" } else { ">" };
+    let (lo, hi) = if op == 2 { ("(", ").abs()") } else { ("", "") };
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
-         \x20 for j in 0..N {{ let mut s=*x.add(j); for i in 1..M {{ let v=*x.add(i*N+j); s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
+         \x20 for j in 0..N {{ let mut s={lo}*x.add(j){hi}; for i in 1..M {{ let v={lo}*x.add(i*N+j){hi}; s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
     )
 }
 
