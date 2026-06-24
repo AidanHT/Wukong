@@ -250,6 +250,9 @@ fn main() {
     if want("row_losses") {
         bench_row_losses(&cc, &dir);
     }
+    if want("rowarg") {
+        bench_rowarg(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1137,6 +1140,134 @@ fn rust_colmax(m: usize, n: usize, op: u8) -> String {
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
          \x20 for j in 0..N {{ let mut s={lo}*x.add(j){hi}; for i in 1..M {{ let v={lo}*x.add(i*N+j){hi}; s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
     )
+}
+
+/// Mercury per-row argmax/argmin returning an **i32 index**: `for r { let bv=x[r*C]; let bi=0; for j in
+/// 1..C { if x[r*C+j] >|< bv { bv=x[r*C+j]; bi=j } }; out[r]=bi }` — the recognizer folds it to one
+/// `mercury_rowarg{max,min}_i32[_parallel]` call. `out` is an i32 buffer (the harness passes its f32
+/// pointer; a pointer is a pointer). `y` is the unused middle of the 3-pointer harness. `is_max` picks
+/// argmax (`>`) vs argmin (`<`).
+fn mer_rowarg(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [i32; {rows}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut bv: f32 = x[r * {cols}];\n\
+         \x20       let mut bi: i32 = 0;\n\
+         \x20       for j in 1..{cols} {{ if x[r * {cols} + j] {cmp} bv {{ bv = x[r * {cols} + j]; bi = j; }} }}\n\
+         \x20       out[r] = bi;\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_rowarg(rows: usize, cols: usize, is_max: bool) -> String {
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, int* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long r=0;r<R;r++){{ float bv=x[r*C]; int bi=0;\n\
+         \x20   for (long j=1;j<C;j++){{ float v=x[r*C+j]; if (v {cmp} bv){{ bv=v; bi=j; }} }}\n\
+         \x20   out[r]=bi; }} }}\n"
+    )
+}
+
+fn rust_rowarg(rows: usize, cols: usize, is_max: bool) -> String {
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut i32) {{\n\
+         \x20 for r in 0..R {{ let mut bv=*x.add(r*C); let mut bi=0i32;\n\
+         \x20   for j in 1..C {{ let v=*x.add(r*C+j); if v {cmp} bv {{ bv=v; bi=j as i32; }} }}\n\
+         \x20   *out.add(r)=bi; }} }}\n"
+    )
+}
+
+/// Per-row argmax/argmin (classification-head / greedy-decode top-1) returning the index. The
+/// (value,index) bookkeeping defeats gcc/rustc auto-vectorization (verified: scalar inner loop), while
+/// Mercury's AVX2 kernel tracks 8 (value,index) lanes via blend. Output is an i32 index buffer, so the
+/// cross-check reinterprets the f32 harness slots as i32 and compares **exactly** (a selection, not a
+/// float reduction — no tolerance). GB/s = `R·C·4` (the matrix read once); latency-bound, so the ratio
+/// vs naive C is the reported figure.
+fn bench_rowarg(cc: &str, dir: &Path) {
+    for (is_max, label) in [(true, "rowargmax"), (false, "rowargmin")] {
+        for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
+            let n = rows * cols;
+            let x: Vec<f32> = (0..n).map(|i| ((i * 31 + 7) % 101) as f32 * 0.5 - 25.0).collect();
+            let dummy = vec![0.0f32; n];
+            let mut out = vec![0.0f32; rows];
+            let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+            let bytes = n as f64 * 4.0; // the matrix is read once
+            let gbps = |v: &Option<Measure>| {
+                v.as_ref()
+                    .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let sym = if is_max { "argmax" } else { "argmin" };
+            println!("=== {label} (out[r] = {sym}_j x[r,j]) {rows}x{cols} (GB/s, higher is better) ===");
+            let mer = bench_mercury(&mer_rowarg(rows, cols, is_max, false), &mut out, xp, yp, op);
+            let mer_par = bench_mercury(&mer_rowarg(rows, cols, is_max, true), &mut out, xp, yp, op);
+            let cm = bench_external(
+                "c",
+                &c_rowarg(rows, cols, is_max),
+                dir,
+                label,
+                cc,
+                &["-O3", "-march=native", "-shared"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            let rm = bench_external(
+                "rs",
+                &rust_rowarg(rows, cols, is_max),
+                dir,
+                label,
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "GB/s",
+                gbps(&mer),
+                gbps(&mer_par),
+                gbps(&cm),
+                gbps(&rm)
+            );
+            // Output is an i32 index buffer — reinterpret the f32 harness slots as i32 and compare exactly
+            // (no tolerance: a per-row arg-selection is deterministic, lowest index winning on a tie).
+            let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
+            if let (Some(a), Some(c2)) = (&mer, &cm) {
+                if as_i32(&a.out) != as_i32(&c2.out) {
+                    println!("  ! {label} index mismatch vs C");
+                }
+            }
+            if let (Some(ms), Some(c2)) = (&mer, &cm) {
+                let r = c2.ns_per_call / ms.ns_per_call;
+                println!(
+                    "  -> Mercury single-core is {:.2}x {} than naive C",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                );
+            }
+            if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+                let r = c2.ns_per_call / mp.ns_per_call;
+                println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+            }
+            println!();
+        }
+    }
 }
 
 /// Column **statistics** `out[j] = mean/sumsq/L2/RMS_i x[i,j]` — the per-channel BatchNorm mean, 2nd
