@@ -97,6 +97,8 @@ const RT_SGEMM_F16_NT_EPI: &str = "mercury_sgemm_f16_nt_epi";
 const RT_SGEMM_F16_NT_EPI_PAR: &str = "mercury_sgemm_f16_nt_epi_parallel";
 const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_VMATH2: &str = "mercury_vmath2_f32";
+const RT_SOFTMAX_BWD: &str = "mercury_softmax_bwd_f32";
+const RT_SOFTMAX_BWD_PAR: &str = "mercury_softmax_bwd_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -915,6 +917,18 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, y, out, n, op]);
             return None;
         }
+        // Fused softmax-backward: mercury_softmax_bwd_f32[_parallel](y, dy, dx, rows, cols) — three
+        // pointers, two i64. Same (ptr, ptr, ptr, i64, i64) shape as vmath2; route by name. Void.
+        if matches!(name, RT_SOFTMAX_BWD | RT_SOFTMAX_BWD_PAR) && args.len() == 5 {
+            let y = self.val(args[0]);
+            let dy = self.val(args[1]);
+            let dx = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[y, dy, dx, rows, cols]);
+            return None;
+        }
         // The streaming affine+activation kernel: mercury_velem_f32(x, y, out, n, a, b, c, op) — three
         // pointers, one i64 count, three f32 coefficients, one i64 op (256-bit AVX2 + non-temporal
         // stores, the saxpy/scale/add/bias/ReLU map a recognized streaming loop lowers to). Void.
@@ -1200,6 +1214,8 @@ struct RtFuncs {
     sgemm_f16_nt_epi_par: FuncId,
     vmath: FuncId,
     vmath2: FuncId,
+    softmax_bwd: FuncId,
+    softmax_bwd_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     transpose: FuncId,
@@ -1519,6 +1535,12 @@ fn populate_module<M: Module>(
         vmath2: module
             .declare_function(RT_VMATH2, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
+        softmax_bwd: module
+            .declare_function(RT_SOFTMAX_BWD, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        softmax_bwd_par: module
+            .declare_function(RT_SOFTMAX_BWD_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -1768,6 +1790,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VMATH2,
                 module.declare_func_in_func(rt.vmath2, builder.func),
+            );
+            rt_refs.insert(
+                RT_SOFTMAX_BWD,
+                module.declare_func_in_func(rt.softmax_bwd, builder.func),
+            );
+            rt_refs.insert(
+                RT_SOFTMAX_BWD_PAR,
+                module.declare_func_in_func(rt.softmax_bwd_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2103,6 +2133,14 @@ pub fn jit_compile(
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_VMATH2, mercury_runtime::mercury_vmath2_f32 as *const u8);
     builder.symbol(
+        RT_SOFTMAX_BWD,
+        mercury_runtime::mercury_softmax_bwd_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SOFTMAX_BWD_PAR,
+        mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
@@ -2366,6 +2404,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_VMATH, mercury_runtime::mercury_vmath_f32 as *const u8);
     builder.symbol(RT_VMATH2, mercury_runtime::mercury_vmath2_f32 as *const u8);
+    builder.symbol(
+        RT_SOFTMAX_BWD,
+        mercury_runtime::mercury_softmax_bwd_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SOFTMAX_BWD_PAR,
+        mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
