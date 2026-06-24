@@ -223,6 +223,9 @@ fn main() {
     if want("softmax_bwd") {
         bench_softmax_bwd(&cc, &dir);
     }
+    if want("act_backward") {
+        bench_act_backward(&cc, &dir);
+    }
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -1232,6 +1235,135 @@ fn rust_softmax_bwd(rows: usize, cols: usize) -> String {
         "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(y:*const f32, dy:*const f32, dx:*mut f32) {{\n\
          \x20 for r in 0..R {{ let mut s=0.0f32; for j in 0..C {{ s += *y.add(r*C+j) * *dy.add(r*C+j); }}\n\
          \x20   for i in 0..C {{ *dx.add(r*C+i) = *y.add(r*C+i) * (*dy.add(r*C+i) - s); }} }}\n}}\n"
+    )
+}
+
+/// Activation **backward** `dx[i] = dy[i]·act'(x[i])` (silu/gelu — the SiLU/GELU training gradient).
+/// Compute-bound: the derivative folds a sigmoid/tanh (an `expf`) that C/Rust call as scalar libm
+/// inside the loop, so they cannot vectorize it. Mercury folds the elementwise
+/// `dx[i]=act_backward(x[i],dy[i])` loop to one **256-bit** `mercury_vmath2_f32` call; the `@parallel`
+/// form spreads (128-bit) SIMD across cores. Same `(x, dy, dx)` 3-pointer harness as softmax_bwd (all
+/// three used). The poly derivative differs from C's libm by ~1 ULP, so the cross-check is a
+/// magnitude-normalized tolerance (`max|Δ|/max|C| < 1e-3`), like the norm/softmax benches.
+fn bench_act_backward(cc: &str, dir: &Path) {
+    let n = 1usize << 20;
+    // A realistic pre-activation range [-8, 8) and a small varying upstream gradient.
+    let x: Vec<f32> = (0..n)
+        .map(|i| (i as f32 - (n / 2) as f32) * (16.0 / n as f32))
+        .collect();
+    let dy: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+    let mut dx = vec![0.0f32; n];
+    let (xp, dyp, dxp) = (x.as_ptr(), dy.as_ptr(), dx.as_mut_ptr());
+    let bytes = 3.0 * n as f64 * 4.0; // x read + dy read + dx write
+    let gbps = |v: &Option<Measure>| {
+        v.as_ref()
+            .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    for op in ["silu", "gelu"] {
+        println!("=== {op}_backward (dx = dy·{op}'(x)) N={n} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_act_backward(n, op, false), &mut dx, xp, dyp, dxp);
+        let mer_par = bench_mercury(&mer_act_backward(n, op, true), &mut dx, xp, dyp, dxp);
+        let cm = bench_external(
+            "c",
+            &c_act_backward(n, op),
+            dir,
+            "act_backward",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut dx,
+            xp,
+            dyp,
+            dxp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_act_backward(n, op),
+            dir,
+            "act_backward",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut dx,
+            xp,
+            dyp,
+            dxp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        // Same magnitude-normalized check as softmax_bwd: the poly sigmoid/tanh differs from libm by
+        // ~1 ULP, and act'(x) has zeros where a per-element relative error is meaningless.
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+            let maxerr = m
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |a, (&p, &q)| a.max((p - q).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! {op}_backward mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r2 = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core (256-bit) is {:.2}x {} than scalar C",
+                if r2 >= 1.0 { r2 } else { 1.0 / r2 },
+                if r2 >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r2 = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r2:.2}x scalar single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury activation backward: the elementwise loop the recognizer folds to one
+/// `mercury_vmath2_f32(x, dy, dx, n, VM2_*_BWD)` call. The harness's `(x, y, out)` carry `(x, dy, dx)`.
+fn mer_act_backward(n: usize, op: &str, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], dx: [f32; {n}]) {{\n\
+         \x20   for i in 0..{n} {{ dx[i] = {op}_backward(x[i], dy[i]); }}\n}}\n"
+    )
+}
+
+/// C reference: the same derivative math written with scalar libm `expf`/`tanhf` — gcc keeps the loop
+/// scalar (it cannot vectorize a libm call), which is exactly the wall the 256-bit kernel clears.
+fn c_act_backward(n: usize, op: &str) -> String {
+    let body = match op {
+        "silu" => "float s=1.0f/(1.0f+expf(-v)); float g=s+v*s*(1.0f-s);",
+        _ => "float c0=0.7978845608f,c1=0.044715f; float u=tanhf(c0*(v+c1*v*v*v)); \
+              float g=0.5f*(1.0f+u)+0.5f*v*(1.0f-u*u)*c0*(1.0f+3.0f*c1*v*v);",
+    };
+    format!(
+        "#include <math.h>\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* dy, float* dx){{\n\
+         \x20 for (long i=0;i<N;i++){{ float v=x[i]; {body} dx[i]=dy[i]*g; }}\n}}\n"
+    )
+}
+
+fn rust_act_backward(n: usize, op: &str) -> String {
+    let body = match op {
+        "silu" => "let s=1.0f32/(1.0+(-v).exp()); let g=s+v*s*(1.0-s);",
+        _ => "let (c0,c1)=(0.7978845608f32,0.044715f32); let u=(c0*(v+c1*v*v*v)).tanh(); \
+              let g=0.5*(1.0+u)+0.5*v*(1.0-u*u)*c0*(1.0+3.0*c1*v*v);",
+    };
+    format!(
+        "const N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, dy:*const f32, dx:*mut f32) {{\n\
+         \x20 for i in 0..N {{ let v=*x.add(i); {body} *dx.add(i)=*dy.add(i)*g; }}\n}}\n"
     )
 }
 
