@@ -1303,7 +1303,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `dx`. Read all inputs first (so the in-place `dx==dy` aliasing the kernel allows is safe).
             // The recognizer always binds a real gamma, but a null (`Value::Int(0)`) is still handled by
             // variant, mirroring the affine-norm convention.
-            "mercury_rmsnorm_bwd_f32" | "mercury_rmsnorm_bwd_f32_parallel" => {
+            // LayerNorm backward shares the identical 7-arg ABI and marshalling; the kernel fn is
+            // selected by name below. (Both serial/parallel names route through the serial kernel —
+            // bit-identical, rows independent.)
+            "mercury_rmsnorm_bwd_f32"
+            | "mercury_rmsnorm_bwd_f32_parallel"
+            | "mercury_layernorm_bwd_f32"
+            | "mercury_layernorm_bwd_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let gamma_idx = match args[2] {
@@ -1349,9 +1355,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 let mut dxbuf = vec![0.0f32; n];
                 // SAFETY: xbuf/dybuf/dxbuf are exactly rows*cols f32; gamma (when present) is cols —
-                // the kernel's contract.
+                // the kernel's contract. The kernel fn is chosen by name (rmsnorm vs layernorm).
+                let kernel = if name.starts_with("mercury_layernorm_bwd") {
+                    mercury_runtime::mercury_layernorm_bwd_f32
+                } else {
+                    mercury_runtime::mercury_rmsnorm_bwd_f32
+                };
                 unsafe {
-                    mercury_runtime::mercury_rmsnorm_bwd_f32(
+                    kernel(
                         xbuf.as_ptr(),
                         dybuf.as_ptr(),
                         gptr,
