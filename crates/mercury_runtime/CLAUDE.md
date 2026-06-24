@@ -78,6 +78,19 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   parallel. Measured **~1.5–2.5× faster than gcc single-core** (`-O3 -march=native`, which also uses
   `vpdpbusd`) — the lead widens with size — and **~4.6–14.7× with `@parallel`** (clock-sensitive;
   absolute GOP/s swings ~2–3× with thermal state, so the ratio is what's reported).
+- **The training / inference auxiliary kernel family** (one file each, same `#[no_mangle] extern "C"` +
+  AVX2/scalar-twin/rayon `_parallel` + bit-exact-test discipline; each is the symbol a `mercury_mir_build`
+  recognizer dispatches to, and the interpreter marshals the *identical* function for the differential
+  gate): `transpose.rs` (cache-blocked `dst=srcᵀ`, f32 + `u16`), `colreduce.rs` (the strided column
+  `sum`/`max`/`min`/`maxabs`/`mean`/`sumsq`/`L2`/`RMS`), `softmax_bwd.rs`, `rmsnorm_bwd.rs`,
+  `layernorm_bwd.rs` (the norm/softmax backward gradients — reuse `sreduce`'s bit-exact dot), `vmath`'s
+  two-input twin `mercury_vmath2_f32` (`pow`/`atan2`/`hypot` + the 6 activation backwards + the
+  SwiGLU/GeGLU gate), `xent.rs` + `xent_bwd.rs` (softmax cross-entropy fwd/bwd, **i32 labels**),
+  `rope.rs` + `rope_bwd.rs` (rotary embedding — reuse `vmath`'s `sincos`), `logsoftmax.rs` (per-row
+  log-sum-exp), `kldiv.rs` + `entropy.rs` + `kd_loss.rs` (the per-row `logf`/`expf` losses), `rowarg.rs`
+  + `colarg.rs` (per-row/column argmax/argmin → an **i32 index** buffer; AVX2 tracks 8 `(value,index)`
+  lanes via blend), and `pool2d.rs` (2D max/avg pooling). The win on every one is the same lever: a
+  strided access or a transcendental that gcc/rustc leave scalar, folded into one 256-bit pass.
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
