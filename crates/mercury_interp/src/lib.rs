@@ -1418,6 +1418,53 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` — the softmax cross-entropy
+            // backward (`dx = softmax(x) − onehot(target)`). Marshal `rows*cols` f32 from x and `rows`
+            // i32 labels, call the *serial* kernel (bit-identical to parallel), write the `rows*cols` dx.
+            "mercury_xent_bwd_f32" | "mercury_xent_bwd_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let target = ptr(args[1])?;
+                let dx = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("xent_bwd operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut tbuf = Vec::with_capacity(rows);
+                for t in 0..rows {
+                    tbuf.push(
+                        self.memory
+                            .get(target + t)
+                            .ok_or("xent_bwd target out of bounds")?
+                            .as_int() as i32,
+                    );
+                }
+                let mut dxbuf = vec![0.0f32; n];
+                // SAFETY: xbuf/dxbuf are rows*cols f32; tbuf is rows — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_xent_bwd_f32(
+                        xbuf.as_ptr(),
+                        tbuf.as_ptr(),
+                        dxbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in dxbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(dx + t)
+                        .ok_or("xent_bwd output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_rope_f32[_parallel](x, inv_freq, out, rows, half)` — the inline-sincos rotary
             // position embedding a recognized RoPE nest lowers to. Marshal `rows*2*half` f32 from x and
             // `half` f32 from inv_freq, call the *serial* kernel (bit-identical to the parallel one —

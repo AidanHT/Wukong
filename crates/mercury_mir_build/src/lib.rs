@@ -106,6 +106,8 @@ pub fn lower_program(
         rmsnorm_bwd_par: interner.intern("mercury_rmsnorm_bwd_f32_parallel"),
         xent: interner.intern("mercury_xent_fwd_f32"),
         xent_par: interner.intern("mercury_xent_fwd_f32_parallel"),
+        xent_bwd: interner.intern("mercury_xent_bwd_f32"),
+        xent_bwd_par: interner.intern("mercury_xent_bwd_f32_parallel"),
         rope: interner.intern("mercury_rope_f32"),
         rope_par: interner.intern("mercury_rope_f32_parallel"),
         logsumexp: interner.intern("mercury_logsumexp_f32"),
@@ -189,6 +191,12 @@ pub fn lower_program(
                 // kernel). The embedded `match_xent` then emits the multicore `mercury_xent_fwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
+                if has_parallel_attr(item, interner) && xent_bwd_fn(f, body, sema, interner, gemm) {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -754,6 +762,10 @@ struct GemmSyms {
     /// `expf`/`logf` reduction scalar; rows independent → serial == parallel.
     xent: Symbol,
     xent_par: Symbol,
+    /// Softmax cross-entropy backward (`mercury_xent_bwd_f32[_parallel](x, target, dx, rows, cols)`):
+    /// the `dx = softmax(x) − onehot(target)` gradient nest dispatches here.
+    xent_bwd: Symbol,
+    xent_bwd_par: Symbol,
     /// RoPE (`mercury_rope_f32[_parallel](x, inv_freq, out, rows, half)`): the inline-sin/cos rotary
     /// embedding nest dispatches here. C/Rust keep sinf/cosf scalar; rows independent → serial==parallel.
     rope: Symbol,
@@ -1807,6 +1819,159 @@ impl FnLowerer<'_> {
         None
     }
 
+    /// Match `exp(x[r*C+v] - m)` (the recomputed centered exponential) — `true` if `e` is a single-arg
+    /// `exp` call whose argument is `x[r*C+v] - m`. Mirrors [`match_exp_sub_body`]'s inner shape.
+    fn is_exp_centered(
+        &self,
+        e: &Expr,
+        x: Symbol,
+        m: Symbol,
+        v: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> bool {
+        let ExprKind::Call { callee, args, .. } = &e.kind else {
+            return false;
+        };
+        if args.len() != 1
+            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Exp))
+        {
+            return false;
+        }
+        matches!(&args[0].kind, ExprKind::Binary { op: ast::BinOp::Sub, lhs, rhs }
+            if self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(m))
+    }
+
+    /// Body `dx[r*C+v] = exp(x[r*C+v] - m) * invZ` (the recompute-softmax write into a *separate* array
+    /// `dx`) — returns `dx`. The Mul's factors are the centered exp and the `invZ` reciprocal (either
+    /// order). Pure.
+    fn match_softmax_recompute_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        m: Symbol,
+        invz: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        let dx = self.index_off(target, v, batch)?;
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let ok = (self.is_exp_centered(lhs, x, m, v, batch) && single_path(rhs) == Some(invz))
+            || (self.is_exp_centered(rhs, x, m, v, batch) && single_path(lhs) == Some(invz));
+        if ok {
+            Some(dx)
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the **batched softmax cross-entropy backward** (input gradient) and dispatch it to
+    /// `mercury_xent_bwd_f32`. The canonical per-row form (logits `x[R,C]`, i32 labels `target[R]`,
+    /// gradient `dx[R,C]`):
+    ///
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut m = x[r*C];
+    ///     for i in 0..C { m = fmax(m, x[r*C+i]); }              // row max
+    ///     let mut Z = 0.0;
+    ///     for i in 0..C { Z = Z + exp(x[r*C+i] - m); }          // Σ exp(x−m)
+    ///     let invZ = 1.0 / Z;
+    ///     for i in 0..C { dx[r*C+i] = exp(x[r*C+i] - m) * invZ; } // softmax(x)[i]
+    ///     dx[r*C + target[r]] = dx[r*C + target[r]] - 1.0;        // − onehot(target) scatter
+    /// }
+    /// ```
+    ///
+    /// The gradient `softmax(x) − onehot(target)` of every classifier/LM training step. The softmax
+    /// (max + Σexp + recompute) reuses the shared matchers; the trailing **data-dependent scatter** is
+    /// new. C/Rust keep the expf reduction + per-element exp scalar, so the fused 256-bit kernel wins.
+    /// Reductions reassociate (the documented exception — both backends run the kernel).
+    fn match_xent_bwd(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<XentBwdNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 7 {
+            return None;
+        }
+        let (m, seed) = Self::let_init(&body.stmts[0])?;
+        let (v1, n_expr, body1) = self.as_range0_for(&body.stmts[1])?;
+        let data_batch = Some((r, n_expr));
+        let x = self.match_max_reduce_body(body1, v1, m, data_batch)?;
+        if !self.is_max_seed(seed, x, data_batch) {
+            return None;
+        }
+        let (z, z0) = Self::let_init(&body.stmts[2])?;
+        if !matches!(&z0.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0) {
+            return None;
+        }
+        let (v3, n3, body3) = self.as_range0_for(&body.stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        self.match_sumexp_sub_body(body3, v3, x, m, z, data_batch)?;
+        let invz = self.match_recip(&body.stmts[4], z)?;
+        let (v5, n5, body5) = self.as_range0_for(&body.stmts[5])?;
+        if !exprs_struct_eq(n5, n_expr) {
+            return None;
+        }
+        let dx = self.match_softmax_recompute_body(body5, v5, x, m, invz, data_batch)?;
+        // [6] dx[r*C + target[r]] = dx[r*C + target[r]] - 1.0
+        let StmtKind::Assign {
+            target: scat_t,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[6].kind
+        else {
+            return None;
+        };
+        let target = self.match_xent_gather(scat_t, dx, r, n_expr)?;
+        let ExprKind::Binary {
+            op: ast::BinOp::Sub,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        if !matches!(&rhs.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) {
+            return None;
+        }
+        if self.match_xent_gather(lhs, dx, r, n_expr)? != target {
+            return None;
+        }
+        let cols = as_dim(n_expr, self.interner)?;
+        if dx == x || dx == target || target == x {
+            return None;
+        }
+        Some(XentBwdNest {
+            x,
+            target,
+            dx,
+            rows,
+            cols,
+        })
+    }
+
     /// Recognize the **batched log-sum-exp** (the stable log-partition `out[r] = m + log(Σexp(x[r,·]−m))`,
     /// the softmax denominator in log space — CRF/structured prediction, mixture models, log-prob
     /// normalizers) and dispatch it to `mercury_logsumexp_f32`. It is `match_xent` minus the gather: the
@@ -2766,6 +2931,31 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![x, target, loss, rows, cols],
+        });
+        true
+    }
+
+    /// Emit one `mercury_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` call for a recognized
+    /// cross-entropy backward nest. Bails (false) if an operand/dim is unbound.
+    fn emit_xent_bwd(&mut self, nest: &XentBwdNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((target, _)), Some((dx, _))) = (
+            self.lookup(nest.x),
+            self.lookup(nest.target),
+            self.lookup(nest.dx),
+        ) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.xent_bwd_par
+        } else {
+            self.gemm.xent_bwd
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, target, dx, rows, cols],
         });
         true
     }
@@ -4089,6 +4279,13 @@ impl FnLowerer<'_> {
         // reduction gcc keeps scalar; the kernel folds it 8-wide and gathers the target logit.
         if let Some(nest) = self.match_xent(pat, iter, body) {
             if self.emit_xent(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched cross-entropy backward `for r { softmax(x) into dx; dx[target[r]] -= 1 }`
+        // → `mercury_xent_bwd_f32` (the `_parallel` one in a `@parallel` function).
+        if let Some(nest) = self.match_xent_bwd(pat, iter, body) {
+            if self.emit_xent_bwd(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -11563,6 +11760,52 @@ struct XentNest {
     loss: Symbol,   // f32 output [rows]
     rows: Dim,
     cols: Dim,
+}
+
+/// A recognized batched cross-entropy backward nest (see [`FnLowerer::match_xent_bwd`]).
+struct XentBwdNest {
+    x: Symbol,      // logits [rows, cols]
+    target: Symbol, // i32 labels [rows]
+    dx: Symbol,     // f32 gradient [rows, cols]
+    rows: Dim,
+    cols: Dim,
+}
+
+/// Is the whole function body a single batched cross-entropy **backward** nest? `@parallel` interceptor
+/// probe, like [`xent_fn`].
+fn xent_bwd_fn(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    let mut diags = Vec::new();
+    let probe = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::I64),
+        sema,
+        interner,
+        diags: &mut diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+    };
+    probe.match_xent_bwd(pat, iter, lb).is_some()
 }
 
 /// Is the whole function body a single batched cross-entropy nest? Intercepts a `@parallel` xent

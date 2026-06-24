@@ -103,6 +103,8 @@ const RT_RMSNORM_BWD: &str = "mercury_rmsnorm_bwd_f32";
 const RT_RMSNORM_BWD_PAR: &str = "mercury_rmsnorm_bwd_f32_parallel";
 const RT_XENT: &str = "mercury_xent_fwd_f32";
 const RT_XENT_PAR: &str = "mercury_xent_fwd_f32_parallel";
+const RT_XENT_BWD: &str = "mercury_xent_bwd_f32";
+const RT_XENT_BWD_PAR: &str = "mercury_xent_bwd_f32_parallel";
 const RT_ROPE: &str = "mercury_rope_f32";
 const RT_ROPE_PAR: &str = "mercury_rope_f32_parallel";
 const RT_LOGSUMEXP: &str = "mercury_logsumexp_f32";
@@ -976,6 +978,18 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, target, loss, rows, cols]);
             return None;
         }
+        // Cross-entropy backward: mercury_xent_bwd_f32[_parallel](x, target, dx, rows, cols) — same
+        // vmath2 shape (3 ptr + 2 i64). Void.
+        if matches!(name, RT_XENT_BWD | RT_XENT_BWD_PAR) && args.len() == 5 {
+            let x = self.val(args[0]);
+            let target = self.val(args[1]);
+            let dx = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[x, target, dx, rows, cols]);
+            return None;
+        }
         // RoPE: mercury_rope_f32[_parallel](x, inv_freq, out, rows, half) — three f32 pointers + two
         // i64, the same vmath2 shape. Void.
         if matches!(name, RT_ROPE | RT_ROPE_PAR) && args.len() == 5 {
@@ -1297,6 +1311,8 @@ struct RtFuncs {
     rmsnorm_bwd_par: FuncId,
     xent: FuncId,
     xent_par: FuncId,
+    xent_bwd: FuncId,
+    xent_bwd_par: FuncId,
     rope: FuncId,
     rope_par: FuncId,
     logsumexp: FuncId,
@@ -1655,6 +1671,12 @@ fn populate_module<M: Module>(
         xent_par: module
             .declare_function(RT_XENT_PAR, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
+        xent_bwd: module
+            .declare_function(RT_XENT_BWD, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        xent_bwd_par: module
+            .declare_function(RT_XENT_BWD_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
         rope: module
             .declare_function(RT_ROPE, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
@@ -1961,6 +1983,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_XENT_PAR,
                 module.declare_func_in_func(rt.xent_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_XENT_BWD,
+                module.declare_func_in_func(rt.xent_bwd, builder.func),
+            );
+            rt_refs.insert(
+                RT_XENT_BWD_PAR,
+                module.declare_func_in_func(rt.xent_bwd_par, builder.func),
             );
             rt_refs.insert(RT_ROPE, module.declare_func_in_func(rt.rope, builder.func));
             rt_refs.insert(
@@ -2361,6 +2391,14 @@ pub fn jit_compile(
         RT_XENT_PAR,
         mercury_runtime::mercury_xent_fwd_f32_parallel as *const u8,
     );
+    builder.symbol(
+        RT_XENT_BWD,
+        mercury_runtime::mercury_xent_bwd_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_XENT_BWD_PAR,
+        mercury_runtime::mercury_xent_bwd_f32_parallel as *const u8,
+    );
     builder.symbol(RT_ROPE, mercury_runtime::mercury_rope_f32 as *const u8);
     builder.symbol(
         RT_ROPE_PAR,
@@ -2681,6 +2719,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_XENT_PAR,
         mercury_runtime::mercury_xent_fwd_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_XENT_BWD,
+        mercury_runtime::mercury_xent_bwd_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_XENT_BWD_PAR,
+        mercury_runtime::mercury_xent_bwd_f32_parallel as *const u8,
     );
     builder.symbol(RT_ROPE, mercury_runtime::mercury_rope_f32 as *const u8);
     builder.symbol(
