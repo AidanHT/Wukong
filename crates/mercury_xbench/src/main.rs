@@ -1260,7 +1260,7 @@ fn bench_act_backward(cc: &str, dir: &Path) {
             .map(|m| format!("{:.1}", bytes / m.ns_per_call))
             .unwrap_or_else(|| "n/a".into())
     };
-    for op in ["silu", "gelu", "sigmoid", "tanh"] {
+    for op in ["silu", "gelu", "sigmoid", "tanh", "elu", "softplus"] {
         println!("=== {op}_backward (dx = dy·{op}'(x)) N={n} (GB/s, higher is better) ===");
         let mer = bench_mercury(&mer_act_backward(n, op, false), &mut dx, xp, dyp, dxp);
         let mer_par = bench_mercury(&mer_act_backward(n, op, true), &mut dx, xp, dyp, dxp);
@@ -1347,6 +1347,8 @@ fn c_act_backward(n: usize, op: &str) -> String {
         "silu" => "float s=1.0f/(1.0f+expf(-v)); float g=s+v*s*(1.0f-s);",
         "sigmoid" => "float s=1.0f/(1.0f+expf(-v)); float g=s*(1.0f-s);",
         "tanh" => "float t=tanhf(v); float g=1.0f-t*t;",
+        "elu" => "float g = v>0.0f ? 1.0f : expf(v);",
+        "softplus" => "float g=1.0f/(1.0f+expf(-v));",
         _ => "float c0=0.7978845608f,c1=0.044715f; float u=tanhf(c0*(v+c1*v*v*v)); \
               float g=0.5f*(1.0f+u)+0.5f*v*(1.0f-u*u)*c0*(1.0f+3.0f*c1*v*v);",
     };
@@ -1362,6 +1364,8 @@ fn rust_act_backward(n: usize, op: &str) -> String {
         "silu" => "let s=1.0f32/(1.0+(-v).exp()); let g=s+v*s*(1.0-s);",
         "sigmoid" => "let s=1.0f32/(1.0+(-v).exp()); let g=s*(1.0-s);",
         "tanh" => "let t=v.tanh(); let g=1.0f32-t*t;",
+        "elu" => "let g=if v>0.0 {1.0f32} else {v.exp()};",
+        "softplus" => "let g=1.0f32/(1.0+(-v).exp());",
         _ => "let (c0,c1)=(0.7978845608f32,0.044715f32); let u=(c0*(v+c1*v*v*v)).tanh(); \
               let g=0.5*(1.0+u)+0.5*v*(1.0-u*u)*c0*(1.0+3.0*c1*v*v);",
     };

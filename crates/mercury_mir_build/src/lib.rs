@@ -731,6 +731,8 @@ const VMATH2_SILU_BWD: u32 = 3;
 const VMATH2_GELU_BWD: u32 = 4;
 const VMATH2_SIGMOID_BWD: u32 = 5;
 const VMATH2_TANH_BWD: u32 = 6;
+const VMATH2_ELU_BWD: u32 = 7;
+const VMATH2_SOFTPLUS_BWD: u32 = 8;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -4119,6 +4121,8 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::GeluBackward) => VMATH2_GELU_BWD,
             Some(MathIntrinsic::SigmoidBackward) => VMATH2_SIGMOID_BWD,
             Some(MathIntrinsic::TanhBackward) => VMATH2_TANH_BWD,
+            Some(MathIntrinsic::EluBackward) => VMATH2_ELU_BWD,
+            Some(MathIntrinsic::SoftplusBackward) => VMATH2_SOFTPLUS_BWD,
             _ => return None,
         };
         // The kernel computes (and writes) f32; both operands must be unit-stride f32 array reads.
@@ -5123,7 +5127,9 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::SiluBackward
                     | MathIntrinsic::GeluBackward
                     | MathIntrinsic::SigmoidBackward
-                    | MathIntrinsic::TanhBackward,
+                    | MathIntrinsic::TanhBackward
+                    | MathIntrinsic::EluBackward
+                    | MathIntrinsic::SoftplusBackward,
                 ) => {
                     // Two-arg transcendentals (pow = exp(y·log(x)); atan2; hypot; the activation
                     // backwards `dy·act'(x)`); f32 lane only, same reason as exp/log — the IEEE surgery
@@ -5989,6 +5995,16 @@ impl FnLowerer<'_> {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let dy = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
                     self.emit_tanh_backward(x, dy, vty)
+                }
+                Some(MathIntrinsic::EluBackward) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let dy = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    self.emit_elu_backward(x, dy, vty)
+                }
+                Some(MathIntrinsic::SoftplusBackward) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let dy = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    self.emit_softplus_backward(x, dy, vty)
                 }
                 Some(MathIntrinsic::Erf) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -7009,6 +7025,22 @@ impl FnLowerer<'_> {
                 let dy = self.lower_expr(&args[1]);
                 Some(self.emit_tanh_backward(x, dy, &rty))
             }
+            MathIntrinsic::EluBackward => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let x = self.lower_expr(&args[0]);
+                let dy = self.lower_expr(&args[1]);
+                Some(self.emit_elu_backward(x, dy, &rty))
+            }
+            MathIntrinsic::SoftplusBackward => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let x = self.lower_expr(&args[0]);
+                let dy = self.lower_expr(&args[1]);
+                Some(self.emit_softplus_backward(x, dy, &rty))
+            }
             MathIntrinsic::Elu => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_elu(x, &rty))
@@ -7245,6 +7277,25 @@ impl FnLowerer<'_> {
         let t2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, t, t));
         let sech2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, t2)); // 1 − t²
         self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, sech2))
+    }
+
+    /// `elu_backward(x, dy) = dy · (x>0 ? 1 : eˣ)` (α=1). Mirrors `elu_bwd8`/`elu_bwd_2` (the same
+    /// `Cmp(Fogt)`+`Select` the forward `emit_elu` uses, so dispatched == composed). The ELU training grad.
+    fn emit_elu_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
+        let mty = mask_ty(rty);
+        let e = self.emit_exp(x, rty);
+        let zero = self.splat_const_f(0.0, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let pos = self.builder.build(mty, Op::Cmp(CmpOp::Fogt, x, zero)); // x > 0
+        let g = self.builder.build(rty.clone(), Op::Select(pos, one, e)); // x>0 ? 1 : eˣ
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, g))
+    }
+
+    /// `softplus_backward(x, dy) = dy · σ(x)` (since `softplus'(x) = σ(x)`). Mirrors
+    /// `softplus_bwd8`/`softplus_bwd_2`. The softplus (VAE/flow/Mish) training gradient.
+    fn emit_softplus_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
+        let s = self.emit_sigmoid(x, rty);
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, s))
     }
 
     /// `elu(x) = x>0 ? x : e^x − 1` (α=1), the exponential linear unit. Mirrors the fused AVX2 `elu8`
@@ -11254,6 +11305,8 @@ enum MathIntrinsic {
     GeluBackward,
     SigmoidBackward,
     TanhBackward,
+    EluBackward,
+    SoftplusBackward,
     Elu,
     LeakyRelu,
     Softplus,
@@ -11321,6 +11374,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "gelu_backward" => MathIntrinsic::GeluBackward,
         "sigmoid_backward" => MathIntrinsic::SigmoidBackward,
         "tanh_backward" => MathIntrinsic::TanhBackward,
+        "elu_backward" => MathIntrinsic::EluBackward,
+        "softplus_backward" => MathIntrinsic::SoftplusBackward,
         "elu" => MathIntrinsic::Elu,
         "leaky_relu" => MathIntrinsic::LeakyRelu,
         "softplus" => MathIntrinsic::Softplus,
