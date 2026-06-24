@@ -19,7 +19,12 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`,
   `bench_linear`, `bench_linear_bf16`, `bench_matmul_tn`, `bench_conv`, `bench_norm`,
   `bench_norm_batched`, `bench_i8gemm`, `bench_bf16`, `bench_streaming_large`, `bench_transpose`,
-  `bench_colsum`, `bench_colmax`, `bench_softmax_bwd`, and `bench_act_backward`.
+  `bench_colsum`, `bench_colmax`, `bench_softmax_bwd`, `bench_act_backward`, `bench_row_losses`
+  (KL-div/entropy/soft-label-xent), `bench_rowarg`, and `bench_colarg`. Each `bench_*` is gated by a
+  `want("<name>")` CLI filter (no arg = run all). The newer benches reuse the 3-pointer `KernelFn`
+  harness; `bench_rowarg`/`bench_colarg` write an **i32 index** into the f32 output slots and cross-check
+  by reinterpreting the bits as i32 (exact), since a per-row/column arg-selection is a deterministic
+  permutation, not a reassociated float reduction.
 - `bench_softmax_bwd` (+ `mer_softmax_bwd`/`c_softmax_bwd`/`rust_softmax_bwd`) — the attention/classifier
   training gradient `dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` over a `[R,C]` batch, at
   1024×1024 / 4096×512. Uses **all three** harness pointers (`y, dy, dx` — no unused middle). Mercury
