@@ -1663,12 +1663,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
-            // `mercury_cumsum_f32[_parallel](x, out, rows, cols)` — the per-row inclusive prefix sum a
-            // recognized cumsum nest lowers to. Marshal `rows*cols` f32 from x, call the *serial* kernel
-            // (bit-identical to the parallel one — rows independent), write the `rows*cols` out (reading
-            // all of x first, so in-place `x==out` is safe). The in-lane scan reassociates, but both
-            // backends run this identical kernel, so interp == native holds.
-            "mercury_cumsum_f32" | "mercury_cumsum_f32_parallel" => {
+            // `mercury_cumsum_f32[_parallel]` / `mercury_cum{max,min}_f32[_parallel](x, out, rows, cols)`
+            // — the per-row inclusive prefix scan a recognized cumsum / cummax / cummin nest lowers to.
+            // Marshal `rows*cols` f32 from x, call the *serial* kernel (bit-identical to the parallel one
+            // — rows independent), write the `rows*cols` out (reading all of x first, so in-place
+            // `x==out` is safe). cumsum's in-lane scan reassociates (both backends run the identical
+            // kernel, so interp == native holds); cummax/cummin select a value, so they are bit-exact.
+            // The kernel fn is chosen by name.
+            "mercury_cumsum_f32"
+            | "mercury_cumsum_f32_parallel"
+            | "mercury_cummax_f32"
+            | "mercury_cummax_f32_parallel"
+            | "mercury_cummin_f32"
+            | "mercury_cummin_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = args[2].as_int() as usize;
@@ -1679,25 +1686,27 @@ impl<'a, 'k> Interp<'a, 'k> {
                     xbuf.push(
                         self.memory
                             .get(x + t)
-                            .ok_or("cumsum operand out of bounds")?
+                            .ok_or("cumscan operand out of bounds")?
                             .as_float() as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
+                let kernel = if name.starts_with("mercury_cummax") {
+                    mercury_runtime::mercury_cummax_f32
+                } else if name.starts_with("mercury_cummin") {
+                    mercury_runtime::mercury_cummin_f32
+                } else {
+                    mercury_runtime::mercury_cumsum_f32
+                };
                 // SAFETY: xbuf and obuf are both rows*cols f32 — the kernel's contract.
                 unsafe {
-                    mercury_runtime::mercury_cumsum_f32(
-                        xbuf.as_ptr(),
-                        obuf.as_mut_ptr(),
-                        rows as i64,
-                        cols as i64,
-                    );
+                    kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
                 }
                 for (t, &val) in obuf.iter().enumerate() {
                     *self
                         .memory
                         .get_mut(out + t)
-                        .ok_or("cumsum output out of bounds")? = Value::Float(val as f64);
+                        .ok_or("cumscan output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }

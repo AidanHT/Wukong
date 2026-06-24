@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+module tests.run.cummax
+
+// Batched per-row cumulative max / min (running-extreme scan): out[r,i] = max/min_{k<=i} x[r,k]. The
+// recognizer folds each [R=2,C=4] nest to one mercury_cum{max,min}_f32 call — gcc/rustc keep the
+// loop-carried fmax/fmin recurrence scalar, while the SIMD in-lane scan vectorizes it. max/min select an
+// input value (no float arithmetic), so the kernel is BIT-EXACT vs the scalar scan — interp == native
+// trivially, with no reassociation exception (unlike cumsum).
+fn main() -> i32 {
+    let x: [f32; 8] = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+    let mut cmax: [f32; 8] = [0.0; 8];
+    let mut cmin: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 { m = fmax(m, x[r * 4 + i]); cmax[r * 4 + i] = m; }
+    }
+    for r in 0..2 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 { m = fmin(m, x[r * 4 + i]); cmin[r * 4 + i] = m; }
+    }
+    // cmax row0: 3,3,4,4   row1: 5,9,9,9    cmin row0: 3,1,1,1   row1: 5,5,2,2
+    for k in 0..8 { print((cmax[k]) as i32); }
+    for k in 0..8 { print((cmin[k]) as i32); }
+    return 0;
+}

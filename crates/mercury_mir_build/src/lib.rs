@@ -132,6 +132,10 @@ pub fn lower_program(
         colargmin_par: interner.intern("mercury_colargmin_i32_parallel"),
         cumsum: interner.intern("mercury_cumsum_f32"),
         cumsum_par: interner.intern("mercury_cumsum_f32_parallel"),
+        cummax: interner.intern("mercury_cummax_f32"),
+        cummax_par: interner.intern("mercury_cummax_f32_parallel"),
+        cummin: interner.intern("mercury_cummin_f32"),
+        cummin_par: interner.intern("mercury_cummin_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -283,6 +287,16 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_cumsum(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row cumulative max/min: same interceptor pattern.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_cumminmax(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -885,6 +899,12 @@ struct GemmSyms {
     /// Hillis-Steele scan + carry vectorizes it. The in-lane tree reassociates → the kernel is the oracle.
     cumsum: Symbol,
     cumsum_par: Symbol,
+    /// Per-row cumulative max / min (`mercury_cum{max,min}_f32[_parallel]`): `out[r,i] = max/min_{k<=i}
+    /// x[r,k]`. Same SIMD-scan lever as cumsum, but max/min select a value (no reassociation) → bit-exact.
+    cummax: Symbol,
+    cummax_par: Symbol,
+    cummin: Symbol,
+    cummin_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2430,6 +2450,152 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Recognize a batched per-row **cumulative max / min** (running max/min scan):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut m: f32 = x[r*C];      // seed = the row's first element (or a <= -1e30 / >= 1e30 sentinel)
+    ///     for i in 0..C {
+    ///         m = fmax(m, x[r*C + i]);   // or fmin  — `cummin`
+    ///         out[r*C + i] = m;
+    ///     }
+    /// }
+    /// ```
+    /// `out[r,i] = max/min_{k<=i} x[r,k]` → `mercury_cummax_f32[_parallel]` / `mercury_cummin_f32[_…]`.
+    /// gcc/rustc keep the loop-carried `out[i]=fmax(out[i-1],x[i])` scalar; the SIMD in-lane max/min scan
+    /// vectorizes it. **No reassociation** — max/min select an input value, so the kernel is *bit-exact*
+    /// vs the scalar scan (unlike cumsum). `out` is f32, distinct from `x`. Pure (`&self`).
+    fn match_cumminmax(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<CumMinMaxNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] let m = <seed>;
+        let (m, seed) = Self::let_init(&body.stmts[0])?;
+        // [1] for i in 0..C { m = fmax/fmin(m, x[r*C+i]); out[r*C+i] = m; }
+        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        let cols = as_dim(ce, self.interner)?;
+        let batch = Some((r, ce));
+        let (x, out, is_max) = self.match_cumminmax_inner(ibody, i, m, batch)?;
+        // The seed must be `<= max(x)` (max) / `>= min(x)` (min) so `fXX(seed, x[0])` == `x[0]` (the
+        // kernel's out[0]): the row's first element `x[r*C]`, or an extreme sentinel.
+        if !self.is_cum_seed(seed, x, batch, is_max) || out == x {
+            return None;
+        }
+        Some(CumMinMaxNest {
+            x,
+            out,
+            rows,
+            cols,
+            is_max,
+        })
+    }
+
+    /// The cumulative max/min inner body `m = fmax(m, x[r*C+i]); out[r*C+i] = m;` (or `fmin`), returning
+    /// `(x, out, is_max)`. Pure.
+    fn match_cumminmax_inner(
+        &self,
+        body: &Block,
+        i: Symbol,
+        m: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, Symbol, bool)> {
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] m = fmax/fmin(m, x[r*C+i])
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        if single_path(target) != Some(m) {
+            return None;
+        }
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let is_max = match self.vectorizable_intrinsic(callee) {
+            Some(MathIntrinsic::Fmax) => true,
+            Some(MathIntrinsic::Fmin) => false,
+            _ => return None,
+        };
+        let xside = if single_path(&args[0]) == Some(m) {
+            1
+        } else if single_path(&args[1]) == Some(m) {
+            0
+        } else {
+            return None;
+        };
+        let x = self.index_off(&args[xside], i, batch)?;
+        // [1] out[r*C+i] = m
+        let StmtKind::Assign {
+            target: ot,
+            op: ast::AssignOp::Assign,
+            value: ov,
+        } = &body.stmts[1].kind
+        else {
+            return None;
+        };
+        let out = self.index_off(ot, i, batch)?;
+        if single_path(ov) != Some(m) || scalar_of(ot, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        Some((x, out, is_max))
+    }
+
+    /// The cumulative-max/min seed is valid iff `fXX(seed, x[r*C])` equals `x[r*C]` for any data: the
+    /// row's first element `x[r*C]`, or an extreme sentinel (`<= -1e30` for max, `>= 1e30` for min). The
+    /// max/`x[r*C]` cases match [`is_max_seed`]; this generalizes it to min. Pure.
+    fn is_cum_seed(
+        &self,
+        init: &Expr,
+        x: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+        is_max: bool,
+    ) -> bool {
+        if let ExprKind::Index { base, indices } = &init.kind {
+            if single_path(base) != Some(x) || indices.len() != 1 {
+                return false;
+            }
+            return match batch {
+                None => {
+                    matches!(&indices[0].kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 0)
+                }
+                Some((row, cols)) => self.is_mul_of(&indices[0], row, cols),
+            };
+        }
+        let v = match &init.kind {
+            ExprKind::Float(t) => parse_float(self.interner.resolve(*t)),
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => match &expr.kind {
+                ExprKind::Float(t) => -parse_float(self.interner.resolve(*t)),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if is_max {
+            v <= -1e30
+        } else {
+            v >= 1e30
+        }
+    }
+
     /// Match `log(arr[r*C+v])` → the indexed array `arr` (a single-arg `log` call over a row-major read).
     fn match_log_index(&self, e: &Expr, v: Symbol, batch: Option<(Symbol, &Expr)>) -> Option<Symbol> {
         let ExprKind::Call { callee, args, .. } = &e.kind else {
@@ -3755,6 +3921,27 @@ impl FnLowerer<'_> {
             self.gemm.cumsum_par
         } else {
             self.gemm.cumsum
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_cum{max,min}_f32[_parallel](x, out, rows, cols)` for a recognized cumulative max/min.
+    fn emit_cumminmax(&mut self, nest: &CumMinMaxNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = match (nest.is_max, parallel) {
+            (true, false) => self.gemm.cummax,
+            (true, true) => self.gemm.cummax_par,
+            (false, false) => self.gemm.cummin,
+            (false, true) => self.gemm.cummin_par,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -5174,6 +5361,13 @@ impl FnLowerer<'_> {
         // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
         if let Some(nest) = self.match_cumsum(pat, iter, body) {
             if self.emit_cumsum(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched per-row cumulative max / min (running extreme scan) → mercury_cum{max,min}_f32. Same
+        // loop-carried scan gcc/rustc keep scalar; bit-exact (max/min select a value, no reassociation).
+        if let Some(nest) = self.match_cumminmax(pat, iter, body) {
+            if self.emit_cumminmax(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -13029,6 +13223,16 @@ struct CumsumNest {
     out: Symbol,
     rows: Dim,
     cols: Dim,
+}
+
+/// A recognized batched per-row cumulative max/min nest (see [`FnLowerer::match_cumminmax`]). `is_max`
+/// selects cummax (`true`) vs cummin (`false`).
+struct CumMinMaxNest {
+    x: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+    is_max: bool,
 }
 
 /// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner
