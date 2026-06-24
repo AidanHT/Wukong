@@ -16,12 +16,54 @@
 /// seed the **first row** (`x[0,j]`, or `|x[0,j]|` for `MaxAbs`) and fold rows `[1, rows)` (idempotent,
 /// so equivalent to folding from 0). `MaxAbs` is the per-channel symmetric-quantization scale
 /// `max_i |x[i,j]|`.
+///
+/// `Mean`/`SumSq`/`L2`/`Rms` are the per-channel **statistics** family — the BatchNorm running mean,
+/// the per-channel energy and L2/RMS column norms. They fold like `Sum` (over `x` for `Mean`, over
+/// `x²` for `SumSq`/`L2`/`Rms`, both additive from `0`), then apply a per-column **finalize** after all
+/// rows are folded: `Mean` divides by `rows`, `L2` takes `sqrt`, `Rms` takes `sqrt(_/rows)`. The
+/// finalize touches each output column exactly once (after its full i-ascending fold), and the parallel
+/// stripes are column-disjoint, so serial == parallel bit-for-bit just like the base folds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColKind {
     Sum,
     Max,
     Min,
     MaxAbs,
+    Mean,
+    SumSq,
+    L2,
+    Rms,
+}
+
+/// Apply the per-column finalize for the statistics kinds over `out[j0..j1]` (after all rows folded):
+/// `Mean` → `/rows`, `L2` → `sqrt`, `Rms` → `sqrt(_/rows)`. `Sum`/`SumSq`/`Max`/`Min`/`MaxAbs` are
+/// no-ops. Scalar arithmetic only (a divide and/or a `sqrt`), identical in the AVX2 and scalar paths
+/// and independent of the column split, so it does not perturb the serial == parallel bit-equality.
+///
+/// # Safety
+/// `out` valid for `[j0, j1)` f32; `rows >= 1`.
+#[inline]
+unsafe fn colreduce_finalize(out: *mut f32, j0: usize, j1: usize, rows: usize, kind: ColKind) {
+    match kind {
+        ColKind::Mean => {
+            let inv = rows as f32;
+            for j in j0..j1 {
+                *out.add(j) /= inv;
+            }
+        }
+        ColKind::L2 => {
+            for j in j0..j1 {
+                *out.add(j) = (*out.add(j)).sqrt();
+            }
+        }
+        ColKind::Rms => {
+            let inv = rows as f32;
+            for j in j0..j1 {
+                *out.add(j) = (*out.add(j) / inv).sqrt();
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Fold rows `[0, rows)` of `x` into the column range `[j0, j1)` of `out` (`out[j] = ⊕_i x[i*cols+j]`),
@@ -43,9 +85,10 @@ unsafe fn colreduce_avx2(
     kind: ColKind,
 ) {
     use std::arch::x86_64::*;
-    // Seed: Sum -> 0; Max/Min -> first row x[0, j]; MaxAbs -> |x[0, j]| (so the fold starts at row 1).
+    // Seed: the additive folds (Sum/Mean and the square folds SumSq/L2/Rms) -> 0; Max/Min -> first row
+    // x[0, j]; MaxAbs -> |x[0, j]| (so the max/min fold starts at row 1).
     let i0 = match kind {
-        ColKind::Sum => {
+        ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
             for j in j0..j1 {
                 *out.add(j) = 0.0;
             }
@@ -67,7 +110,8 @@ unsafe fn colreduce_avx2(
     let sign = _mm256_set1_ps(-0.0); // for MaxAbs: clear the sign bit with andnot
     // The fold loop, monomorphic per kind (the match is hoisted out of the row loop).
     match kind {
-        ColKind::Sum => {
+        // Σ x[i,j] (Mean reuses the Sum fold, then divides in the finalize).
+        ColKind::Sum | ColKind::Mean => {
             for i in i0..rows {
                 let xr = x.add(i * cols);
                 let mut j = j0;
@@ -79,6 +123,26 @@ unsafe fn colreduce_avx2(
                 }
                 while j < j1 {
                     *out.add(j) += *xr.add(j);
+                    j += 1;
+                }
+            }
+        }
+        // Σ x[i,j]² (L2/Rms reuse this, then sqrt[/rows] in the finalize). The square is a separate
+        // `mul` then `add` (NOT an FMA) so the scalar twin `a + v*v` matches it bit-for-bit (no `fma`
+        // target feature assumed here, and one rounding model shared by both paths).
+        ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
+            for i in i0..rows {
+                let xr = x.add(i * cols);
+                let mut j = j0;
+                while j + 8 <= j1 {
+                    let acc = _mm256_loadu_ps(out.add(j));
+                    let v = _mm256_loadu_ps(xr.add(j));
+                    _mm256_storeu_ps(out.add(j), _mm256_add_ps(acc, _mm256_mul_ps(v, v)));
+                    j += 8;
+                }
+                while j < j1 {
+                    let v = *xr.add(j);
+                    *out.add(j) += v * v;
                     j += 1;
                 }
             }
@@ -140,6 +204,9 @@ unsafe fn colreduce_avx2(
             }
         }
     }
+    // Per-column finalize for the statistics kinds (Mean -> /rows, L2 -> sqrt, Rms -> sqrt(/rows));
+    // a no-op for Sum/SumSq/Max/Min/MaxAbs. Identical scalar arithmetic in both paths.
+    colreduce_finalize(out, j0, j1, rows, kind);
 }
 
 /// Scalar twin of [`colreduce_avx2`] (the no-AVX2 fallback and the bit-exact reference). Same
@@ -159,7 +226,7 @@ unsafe fn colreduce_scalar(
     kind: ColKind,
 ) {
     let i0 = match kind {
-        ColKind::Sum => {
+        ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
             for j in j0..j1 {
                 *out.add(j) = 0.0;
             }
@@ -184,7 +251,9 @@ unsafe fn colreduce_scalar(
             let a = *out.add(j);
             let v = *xr.add(j);
             *out.add(j) = match kind {
-                ColKind::Sum => a + v,
+                // `a + v*v` (a separate mul then add) matches the AVX2 `add(acc, mul(v,v))` exactly.
+                ColKind::SumSq | ColKind::L2 | ColKind::Rms => a + v * v,
+                ColKind::Sum | ColKind::Mean => a + v,
                 ColKind::Max => {
                     if a > v {
                         a
@@ -210,6 +279,7 @@ unsafe fn colreduce_scalar(
             };
         }
     }
+    colreduce_finalize(out, j0, j1, rows, kind);
 }
 
 /// Dispatch AVX2 vs scalar for the column range `[j0, j1)`.
@@ -381,6 +451,118 @@ pub unsafe extern "C" fn mercury_colmaxabs_f32_parallel(
     colreduce_parallel(x, out, rows, cols, ColKind::MaxAbs);
 }
 
+/// `out[j] = (Σ_i x[i, j]) / rows` over a `[rows, cols]` row-major matrix, single-threaded — the
+/// per-channel **mean** (the BatchNorm running mean / per-feature batch mean). Same strided-`Σ` gap as
+/// `colsum`, with a `/rows` per-column finalize.
+///
+/// # Safety
+/// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colmean_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Mean);
+}
+
+/// Multi-threaded `out[j] = (Σ_i x[i, j]) / rows` (bit-identical to [`mercury_colmean_f32`]).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_colmean_f32`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colmean_f32_parallel(
+    x: *const f32,
+    out: *mut f32,
+    rows: i64,
+    cols: i64,
+) {
+    colreduce_parallel(x, out, rows, cols, ColKind::Mean);
+}
+
+/// `out[j] = sqrt(Σ_i x[i, j]²)` over a `[rows, cols]` row-major matrix, single-threaded — the
+/// per-channel **L2 norm** (the column vector norm: weight-column norms, per-feature energy). The
+/// strided `Σ x²` gcc/rustc leave scalar, with a `sqrt` per-column finalize.
+///
+/// # Safety
+/// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_coll2_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::L2);
+}
+
+/// Multi-threaded `out[j] = sqrt(Σ_i x[i, j]²)` (bit-identical to [`mercury_coll2_f32`]).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_coll2_f32`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_coll2_f32_parallel(
+    x: *const f32,
+    out: *mut f32,
+    rows: i64,
+    cols: i64,
+) {
+    colreduce_parallel(x, out, rows, cols, ColKind::L2);
+}
+
+/// `out[j] = sqrt((Σ_i x[i, j]²) / rows)` over a `[rows, cols]` row-major matrix, single-threaded —
+/// the per-channel **RMS** (root-mean-square: per-feature magnitude, the RMSNorm-style scale). The
+/// strided `Σ x²` gcc/rustc leave scalar, with a `sqrt(_/rows)` per-column finalize.
+///
+/// # Safety
+/// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colrms_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::Rms);
+}
+
+/// Multi-threaded `out[j] = sqrt((Σ_i x[i, j]²) / rows)` (bit-identical to [`mercury_colrms_f32`]).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_colrms_f32`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colrms_f32_parallel(
+    x: *const f32,
+    out: *mut f32,
+    rows: i64,
+    cols: i64,
+) {
+    colreduce_parallel(x, out, rows, cols, ColKind::Rms);
+}
+
+/// `out[j] = Σ_i x[i, j]²` over a `[rows, cols]` row-major matrix, single-threaded — the per-channel
+/// **sum of squares** (the second moment / per-channel energy; the un-rooted, un-divided `coll2`/
+/// `colrms`). Same strided `Σ x²` gcc/rustc leave scalar, no finalize.
+///
+/// # Safety
+/// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colsumsq_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    colreduce_range(x, out, rows as usize, cols as usize, 0, cols as usize, ColKind::SumSq);
+}
+
+/// Multi-threaded `out[j] = Σ_i x[i, j]²` (bit-identical to [`mercury_colsumsq_f32`]).
+///
+/// # Safety
+/// Operand-size contract of [`mercury_colsumsq_f32`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_colsumsq_f32_parallel(
+    x: *const f32,
+    out: *mut f32,
+    rows: i64,
+    cols: i64,
+) {
+    colreduce_parallel(x, out, rows, cols, ColKind::SumSq);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,15 +571,19 @@ mod tests {
         let mut out = vec![0.0f32; cols];
         for (j, o) in out.iter_mut().enumerate() {
             let mut s = match kind {
-                ColKind::Sum => 0.0f32,
+                ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => 0.0f32,
                 ColKind::MaxAbs => x[j].abs(), // |first row|
                 _ => x[j],                     // first row
             };
-            let i0 = if kind == ColKind::Sum { 0 } else { 1 };
+            let i0 = match kind {
+                ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => 0,
+                _ => 1,
+            };
             for i in i0..rows {
                 let v = x[i * cols + j];
                 s = match kind {
-                    ColKind::Sum => s + v,
+                    ColKind::SumSq | ColKind::L2 | ColKind::Rms => s + v * v,
+                    ColKind::Sum | ColKind::Mean => s + v,
                     ColKind::Max => {
                         if s > v {
                             s
@@ -422,7 +608,13 @@ mod tests {
                     }
                 };
             }
-            *o = s;
+            // Per-column finalize, mirroring `colreduce_finalize`.
+            *o = match kind {
+                ColKind::Mean => s / rows as f32,
+                ColKind::L2 => s.sqrt(),
+                ColKind::Rms => (s / rows as f32).sqrt(),
+                _ => s,
+            };
         }
         out
     }
@@ -444,7 +636,16 @@ mod tests {
             // Distinct values per cell so max/min have a unique answer; an exact integer range so a
             // reordering (if any path had one) would show as a bit mismatch.
             let x: Vec<f32> = (0..rows * cols).map(|t| ((t * 7 + 3) % 101) as f32 - 50.0).collect();
-            for kind in [ColKind::Sum, ColKind::Max, ColKind::Min, ColKind::MaxAbs] {
+            for kind in [
+                ColKind::Sum,
+                ColKind::Max,
+                ColKind::Min,
+                ColKind::MaxAbs,
+                ColKind::Mean,
+                ColKind::L2,
+                ColKind::Rms,
+                ColKind::SumSq,
+            ] {
                 let want = naive(&x, rows, cols, kind);
                 let mut got = vec![0.0f32; cols];
                 let mut got_par = vec![0.0f32; cols];
@@ -456,6 +657,10 @@ mod tests {
                     ColKind::Max => (mercury_colmax_f32, mercury_colmax_f32_parallel),
                     ColKind::Min => (mercury_colmin_f32, mercury_colmin_f32_parallel),
                     ColKind::MaxAbs => (mercury_colmaxabs_f32, mercury_colmaxabs_f32_parallel),
+                    ColKind::Mean => (mercury_colmean_f32, mercury_colmean_f32_parallel),
+                    ColKind::L2 => (mercury_coll2_f32, mercury_coll2_f32_parallel),
+                    ColKind::Rms => (mercury_colrms_f32, mercury_colrms_f32_parallel),
+                    ColKind::SumSq => (mercury_colsumsq_f32, mercury_colsumsq_f32_parallel),
                 };
                 unsafe {
                     f(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);

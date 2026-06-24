@@ -59,9 +59,11 @@ pub use transpose::{
 
 mod colreduce;
 pub use colreduce::{
-    mercury_colmax_f32, mercury_colmax_f32_parallel, mercury_colmaxabs_f32,
-    mercury_colmaxabs_f32_parallel, mercury_colmin_f32, mercury_colmin_f32_parallel,
-    mercury_colsum_f32, mercury_colsum_f32_parallel,
+    mercury_coll2_f32, mercury_coll2_f32_parallel, mercury_colmax_f32, mercury_colmax_f32_parallel,
+    mercury_colmaxabs_f32, mercury_colmaxabs_f32_parallel, mercury_colmean_f32,
+    mercury_colmean_f32_parallel, mercury_colmin_f32, mercury_colmin_f32_parallel,
+    mercury_colrms_f32, mercury_colrms_f32_parallel, mercury_colsum_f32, mercury_colsum_f32_parallel,
+    mercury_colsumsq_f32, mercury_colsumsq_f32_parallel,
 };
 
 mod softmax_bwd;
