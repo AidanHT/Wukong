@@ -99,6 +99,15 @@ pub use xent_bwd::{mercury_xent_bwd_f32, mercury_xent_bwd_f32_parallel};
 mod rope_bwd;
 pub use rope_bwd::{mercury_rope_bwd_f32, mercury_rope_bwd_f32_parallel};
 
+mod kldiv;
+pub use kldiv::{mercury_kldiv_f32, mercury_kldiv_f32_parallel};
+
+mod entropy;
+pub use entropy::{mercury_entropy_f32, mercury_entropy_f32_parallel};
+
+mod kd_loss;
+pub use kd_loss::{mercury_kd_loss_f32, mercury_kd_loss_f32_parallel};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
