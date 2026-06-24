@@ -105,6 +105,8 @@ const RT_XENT: &str = "mercury_xent_fwd_f32";
 const RT_XENT_PAR: &str = "mercury_xent_fwd_f32_parallel";
 const RT_ROPE: &str = "mercury_rope_f32";
 const RT_ROPE_PAR: &str = "mercury_rope_f32_parallel";
+const RT_LOGSUMEXP: &str = "mercury_logsumexp_f32";
+const RT_LOGSUMEXP_PAR: &str = "mercury_logsumexp_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -881,6 +883,17 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, out, n, op]);
             return None;
         }
+        // Batched log-sum-exp: mercury_logsumexp_f32[_parallel](x, out, rows, cols) — two pointers +
+        // two i64, the same vmath shape; route by name. Void.
+        if matches!(name, RT_LOGSUMEXP | RT_LOGSUMEXP_PAR) && args.len() == 4 {
+            let x = self.val(args[0]);
+            let out = self.val(args[1]);
+            let rows = self.coerce_to_i64(args[2]);
+            let cols = self.coerce_to_i64(args[3]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[x, out, rows, cols]);
+            return None;
+        }
         // The cache-blocked transpose: mercury_transpose_f32[_parallel](src, dst, rows, cols) — two
         // pointers and two i64. Same (ptr, ptr, i64, i64) signature as vmath; route by name.
         if matches!(
@@ -1286,6 +1299,8 @@ struct RtFuncs {
     xent_par: FuncId,
     rope: FuncId,
     rope_par: FuncId,
+    logsumexp: FuncId,
+    logsumexp_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     transpose: FuncId,
@@ -1646,6 +1661,12 @@ fn populate_module<M: Module>(
         rope_par: module
             .declare_function(RT_ROPE_PAR, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
+        logsumexp: module
+            .declare_function(RT_LOGSUMEXP, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        logsumexp_par: module
+            .declare_function(RT_LOGSUMEXP_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -1945,6 +1966,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_ROPE_PAR,
                 module.declare_func_in_func(rt.rope_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_LOGSUMEXP,
+                module.declare_func_in_func(rt.logsumexp, builder.func),
+            );
+            rt_refs.insert(
+                RT_LOGSUMEXP_PAR,
+                module.declare_func_in_func(rt.logsumexp_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2338,6 +2367,14 @@ pub fn jit_compile(
         mercury_runtime::mercury_rope_f32_parallel as *const u8,
     );
     builder.symbol(
+        RT_LOGSUMEXP,
+        mercury_runtime::mercury_logsumexp_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_LOGSUMEXP_PAR,
+        mercury_runtime::mercury_logsumexp_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
@@ -2649,6 +2686,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_ROPE_PAR,
         mercury_runtime::mercury_rope_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_LOGSUMEXP,
+        mercury_runtime::mercury_logsumexp_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_LOGSUMEXP_PAR,
+        mercury_runtime::mercury_logsumexp_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,

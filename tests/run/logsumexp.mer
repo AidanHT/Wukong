@@ -1,0 +1,28 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4440
+// EXPECT-OUT: 2626
+module tests.run.logsumexp
+
+// Batched log-sum-exp: out[r] = m + log(Σ exp(x[r,·] − m)) — the stable log-partition (softmax
+// denominator in log space; CRF / structured prediction / mixture-model normalizers). The recognizer
+// folds the [R=2,C=4] nest to one mercury_logsumexp_f32 call: softmax's row-max + Σexp reduction
+// (which gcc/rustc keep scalar) then a per-row scalar store. The reductions reassociate (the documented
+// exception — both backends run the same kernel), so the differential gate (interp == native) holds.
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 0.0, 1.0];
+    let mut out: [f32; 2] = [0.0; 2];
+
+    for r in 0..2 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 { m = fmax(m, x[r * 4 + i]); }
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + exp(x[r * 4 + i] - m); }
+        out[r] = m + log(s);
+    }
+    // Row 0: lse ≈ 4.4402  Row 1: lse ≈ 2.6266
+    for k in 0..2 {
+        print((out[k] * 1000.0) as i32);
+    }
+    return 0;
+}
