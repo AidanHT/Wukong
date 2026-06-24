@@ -110,6 +110,8 @@ pub fn lower_program(
         xent_bwd_par: interner.intern("mercury_xent_bwd_f32_parallel"),
         rope: interner.intern("mercury_rope_f32"),
         rope_par: interner.intern("mercury_rope_f32_parallel"),
+        rope_bwd: interner.intern("mercury_rope_bwd_f32"),
+        rope_bwd_par: interner.intern("mercury_rope_bwd_f32_parallel"),
         logsumexp: interner.intern("mercury_logsumexp_f32"),
         logsumexp_par: interner.intern("mercury_logsumexp_f32_parallel"),
     };
@@ -770,6 +772,9 @@ struct GemmSyms {
     /// embedding nest dispatches here. C/Rust keep sinf/cosf scalar; rows independent → serial==parallel.
     rope: Symbol,
     rope_par: Symbol,
+    /// RoPE backward (`mercury_rope_bwd_f32[_parallel]`): the transpose/inverse rotation (the gradient).
+    rope_bwd: Symbol,
+    rope_bwd_par: Symbol,
     /// Batched log-sum-exp (`mercury_logsumexp_f32[_parallel](x, out, rows, cols)`): the
     /// `out[r] = m + log(Σexp(x[r,·]−m))` log-partition nest dispatches here. Same vmath shape as the
     /// transcendental kernels. C/Rust keep the expf reduction scalar; rows independent → serial==parallel.
@@ -2974,10 +2979,11 @@ impl FnLowerer<'_> {
         let (Some(rows), Some(half)) = (self.dim_value(nest.rows), self.dim_value(nest.half)) else {
             return false;
         };
-        let func = if parallel {
-            self.gemm.rope_par
-        } else {
-            self.gemm.rope
+        let func = match (nest.backward, parallel) {
+            (false, false) => self.gemm.rope,
+            (false, true) => self.gemm.rope_par,
+            (true, false) => self.gemm.rope_bwd,
+            (true, true) => self.gemm.rope_bwd_par,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -4292,7 +4298,9 @@ impl FnLowerer<'_> {
         // A RoPE nest `for r { for j { rotate x[r,j]/x[r,j+H] by inline cos/sin(r·inv_freq[j]) } }`
         // → `mercury_rope_f32` (the `_parallel` one in a `@parallel` function). The inline sinf/cosf
         // gcc keeps scalar; the kernel computes them 8-wide. Bit-identical (a rotation, no reassoc).
-        if let Some(nest) = match_rope(pat, iter, body, self.sema, self.interner) {
+        if let Some(nest) = match_rope(pat, iter, body, false, self.sema, self.interner)
+            .or_else(|| match_rope(pat, iter, body, true, self.sema, self.interner))
+        {
             if self.emit_rope(&nest, self.parallel_fn) {
                 return;
             }
@@ -12301,13 +12309,15 @@ fn rmsnorm_bwd_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Optio
     match_rmsnorm_bwd(pat, iter, lb, sema, interner)
 }
 
-/// A recognized RoPE (rotary position embedding) nest (see [`match_rope`]).
+/// A recognized RoPE (rotary position embedding) nest (see [`match_rope`]). `backward` selects the
+/// transpose/inverse rotation (the gradient) and thus the `mercury_rope_bwd_f32` kernel.
 struct RopeNest {
     x: Symbol,
     inv_freq: Symbol,
     out: Symbol,
     rows: Dim,
     half: Dim,
+    backward: bool,
 }
 
 /// `base[row*stride + col (+ extra…)]` — return `(base, stride, extra_offset_terms)`. The generic twin
@@ -12401,6 +12411,7 @@ fn match_rope(
     pat: &Pattern,
     iter: &ForIter,
     body: &Block,
+    backward: bool,
     sema: &SemaResult,
     interner: &Interner,
 ) -> Option<RopeNest> {
@@ -12463,38 +12474,56 @@ fn match_rope(
     if !stride_is_twice_half(&stride, &half) {
         return None;
     }
-    // [5] out[r*D + j] = a*c - b*s
+    // [5] forward: out[r*D+j] = a*c - b*s   |   backward: dx[r*D+j] = a*c + b*s
     let (out, v5, stride5, off5) = assign_strided(&inner.stmts[5], rvar, jvar, interner)?;
     if stride5 != stride || !off5.is_empty() {
         return None;
     }
     let ExprKind::Binary {
-        op: ast::BinOp::Sub,
+        op: op5,
         lhs: s5l,
         rhs: s5r,
     } = &v5.kind
     else {
         return None;
     };
-    if !(is_prod_of(s5l, a, c) && is_prod_of(s5r, bb, s)) {
+    let ok5 = match (backward, op5) {
+        // forward `a*c - b*s` — a Sub with the order fixed (a·c minuend, b·s subtrahend).
+        (false, ast::BinOp::Sub) => is_prod_of(s5l, a, c) && is_prod_of(s5r, bb, s),
+        // backward `a*c + b*s` — an Add, either operand order.
+        (true, ast::BinOp::Add) => {
+            (is_prod_of(s5l, a, c) && is_prod_of(s5r, bb, s))
+                || (is_prod_of(s5l, bb, s) && is_prod_of(s5r, a, c))
+        }
+        _ => false,
+    };
+    if !ok5 {
         return None;
     }
-    // [6] out[r*D + j + H] = b*c + a*s
+    // [6] forward: out[r*D+j+H] = b*c + a*s   |   backward: dx[r*D+j+H] = b*c - a*s
     let (out6, v6, stride6, off6) = assign_strided(&inner.stmts[6], rvar, jvar, interner)?;
     if out6 != out || stride6 != stride || !offset_is_half(&off6, he) {
         return None;
     }
     let ExprKind::Binary {
-        op: ast::BinOp::Add,
+        op: op6,
         lhs: s6l,
         rhs: s6r,
     } = &v6.kind
     else {
         return None;
     };
-    let bc_as = (is_prod_of(s6l, bb, c) && is_prod_of(s6r, a, s))
-        || (is_prod_of(s6l, a, s) && is_prod_of(s6r, bb, c));
-    if !bc_as {
+    let ok6 = match (backward, op6) {
+        // forward `b*c + a*s` — an Add, either operand order.
+        (false, ast::BinOp::Add) => {
+            (is_prod_of(s6l, bb, c) && is_prod_of(s6r, a, s))
+                || (is_prod_of(s6l, a, s) && is_prod_of(s6r, bb, c))
+        }
+        // backward `b*c - a*s` — a Sub with the order fixed (b·c minuend, a·s subtrahend).
+        (true, ast::BinOp::Sub) => is_prod_of(s6l, bb, c) && is_prod_of(s6r, a, s),
+        _ => false,
+    };
+    if !ok6 {
         return None;
     }
     // inv_freq must be a distinct array (not x/out); x and out may alias (in-place RoPE is sound).
@@ -12507,10 +12536,12 @@ fn match_rope(
         out,
         rows,
         half,
+        backward,
     })
 }
 
-/// Is the whole function body a single RoPE nest? Intercepts a `@parallel` RoPE before the outliner.
+/// Is the whole function body a single RoPE (forward or backward) nest? Intercepts a `@parallel` RoPE
+/// before the outliner.
 fn rope_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<RopeNest> {
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
@@ -12524,7 +12555,8 @@ fn rope_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<RopeN
     else {
         return None;
     };
-    match_rope(pat, iter, lb, sema, interner)
+    match_rope(pat, iter, lb, false, sema, interner)
+        .or_else(|| match_rope(pat, iter, lb, true, sema, interner))
 }
 
 /// Is the whole function body a single fused residual projection (`x = x + act(x·Wᵀ + bias)`)? Used to
