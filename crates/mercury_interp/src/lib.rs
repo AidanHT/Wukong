@@ -1612,6 +1612,47 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_rowarg{max,min}_i32[_parallel](x, out, rows, cols)` — the per-row argmax/argmin a
+            // recognized classification-head nest lowers to. Marshal `rows*cols` f32 from x, call the
+            // *serial* kernel (bit-identical to the parallel one — rows independent), write the `rows`-long
+            // **i32 index** vector back as `Value::Int` (the only output-buffer kernel that writes integers,
+            // not floats). The argmax vs argmin kernel is chosen by name.
+            "mercury_rowargmax_i32"
+            | "mercury_rowargmax_i32_parallel"
+            | "mercury_rowargmin_i32"
+            | "mercury_rowargmin_i32_parallel" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("rowarg operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0i32; rows];
+                let kernel = if name.starts_with("mercury_rowargmin") {
+                    mercury_runtime::mercury_rowargmin_i32
+                } else {
+                    mercury_runtime::mercury_rowargmax_i32
+                };
+                // SAFETY: xbuf is rows*cols f32; obuf is rows i32 — the kernel's contract.
+                unsafe {
+                    kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("rowarg output out of bounds")? = Value::Int(val as i128);
+                }
+                Ok(Value::Unit)
+            }
             // KL divergence and soft-label cross-entropy share the (a, b, out, rows, cols) shape — two
             // `rows*cols` f32 inputs, a `rows`-long scalar out; the kernel fn is chosen by name.
             "mercury_kldiv_f32"

@@ -282,7 +282,7 @@ pub unsafe extern "C" fn mercury_sreduce_f32_parallel(
 /// + explicit lower-index tie = a total order on the (unique-index) pairs, so the fold is associative
 /// and serial == parallel == interp.
 #[inline(always)]
-fn arg_fold(a: (f32, usize), b: (f32, usize), is_max: bool) -> (f32, usize) {
+pub(crate) fn arg_fold(a: (f32, usize), b: (f32, usize), is_max: bool) -> (f32, usize) {
     let b_better = if is_max { b.0 > a.0 } else { b.0 < a.0 };
     if b_better {
         b

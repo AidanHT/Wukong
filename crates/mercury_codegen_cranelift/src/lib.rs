@@ -119,6 +119,10 @@ const RT_ENTROPY: &str = "mercury_entropy_f32";
 const RT_ENTROPY_PAR: &str = "mercury_entropy_f32_parallel";
 const RT_KD_LOSS: &str = "mercury_kd_loss_f32";
 const RT_KD_LOSS_PAR: &str = "mercury_kd_loss_f32_parallel";
+const RT_ROWARGMAX: &str = "mercury_rowargmax_i32";
+const RT_ROWARGMAX_PAR: &str = "mercury_rowargmax_i32_parallel";
+const RT_ROWARGMIN: &str = "mercury_rowargmin_i32";
+const RT_ROWARGMIN_PAR: &str = "mercury_rowargmin_i32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -896,10 +900,19 @@ impl<'a> FnTranslator<'a> {
             return None;
         }
         // Batched log-sum-exp: mercury_logsumexp_f32[_parallel](x, out, rows, cols) — two pointers +
-        // two i64, the same vmath shape; route by name. Void. Row-entropy shares the exact shape.
+        // two i64, the same vmath shape; route by name. Void. Row-entropy and the per-row arg-reductions
+        // (`mercury_rowarg{max,min}_i32`, whose `out` is an i32 buffer — a pointer rides the slot either
+        // way) share the exact `(ptr, ptr, i64, i64)` shape.
         if matches!(
             name,
-            RT_LOGSUMEXP | RT_LOGSUMEXP_PAR | RT_ENTROPY | RT_ENTROPY_PAR
+            RT_LOGSUMEXP
+                | RT_LOGSUMEXP_PAR
+                | RT_ENTROPY
+                | RT_ENTROPY_PAR
+                | RT_ROWARGMAX
+                | RT_ROWARGMAX_PAR
+                | RT_ROWARGMIN
+                | RT_ROWARGMIN_PAR
         ) && args.len() == 4
         {
             let x = self.val(args[0]);
@@ -1355,6 +1368,10 @@ struct RtFuncs {
     kldiv_par: FuncId,
     entropy: FuncId,
     entropy_par: FuncId,
+    rowargmax: FuncId,
+    rowargmax_par: FuncId,
+    rowargmin: FuncId,
+    rowargmin_par: FuncId,
     kd_loss: FuncId,
     kd_loss_par: FuncId,
     vmath_bf16: FuncId,
@@ -1759,6 +1776,18 @@ fn populate_module<M: Module>(
         kd_loss_par: module
             .declare_function(RT_KD_LOSS_PAR, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
+        rowargmax: module
+            .declare_function(RT_ROWARGMAX, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        rowargmax_par: module
+            .declare_function(RT_ROWARGMAX_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        rowargmin: module
+            .declare_function(RT_ROWARGMIN, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        rowargmin_par: module
+            .declare_function(RT_ROWARGMIN_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -2111,6 +2140,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_KD_LOSS_PAR,
                 module.declare_func_in_func(rt.kd_loss_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_ROWARGMAX,
+                module.declare_func_in_func(rt.rowargmax, builder.func),
+            );
+            rt_refs.insert(
+                RT_ROWARGMAX_PAR,
+                module.declare_func_in_func(rt.rowargmax_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_ROWARGMIN,
+                module.declare_func_in_func(rt.rowargmin, builder.func),
+            );
+            rt_refs.insert(
+                RT_ROWARGMIN_PAR,
+                module.declare_func_in_func(rt.rowargmin_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2557,6 +2602,22 @@ pub fn jit_compile(
         mercury_runtime::mercury_kd_loss_f32_parallel as *const u8,
     );
     builder.symbol(
+        RT_ROWARGMAX,
+        mercury_runtime::mercury_rowargmax_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMAX_PAR,
+        mercury_runtime::mercury_rowargmax_i32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMIN,
+        mercury_runtime::mercury_rowargmin_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMIN_PAR,
+        mercury_runtime::mercury_rowargmin_i32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
@@ -2921,6 +2982,22 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_KD_LOSS_PAR,
         mercury_runtime::mercury_kd_loss_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMAX,
+        mercury_runtime::mercury_rowargmax_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMAX_PAR,
+        mercury_runtime::mercury_rowargmax_i32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMIN,
+        mercury_runtime::mercury_rowargmin_i32 as *const u8,
+    );
+    builder.symbol(
+        RT_ROWARGMIN_PAR,
+        mercury_runtime::mercury_rowargmin_i32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,
