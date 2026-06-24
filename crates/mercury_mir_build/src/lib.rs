@@ -102,6 +102,8 @@ pub fn lower_program(
         colrms_par: interner.intern("mercury_colrms_f32_parallel"),
         softmax_bwd: interner.intern("mercury_softmax_bwd_f32"),
         softmax_bwd_par: interner.intern("mercury_softmax_bwd_f32_parallel"),
+        rmsnorm_bwd: interner.intern("mercury_rmsnorm_bwd_f32"),
+        rmsnorm_bwd_par: interner.intern("mercury_rmsnorm_bwd_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -162,6 +164,16 @@ pub fn lower_program(
                 // The embedded `match_softmax_bwd` then emits the multicore `mercury_softmax_bwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && softmax_bwd_fn(body, sema, interner).is_some() {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function batched RMSNorm-backward: intercept before the outliner
+                // (which would split the rows into scalar loops and lose the fused two-reduction+apply
+                // kernel). The embedded `match_rmsnorm_bwd` then emits the multicore
+                // `mercury_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
+                // independent, each row reduces over its own `C` columns).
+                if has_parallel_attr(item, interner) && rmsnorm_bwd_fn(body, sema, interner).is_some() {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -703,6 +715,11 @@ struct GemmSyms {
     /// kernel reuses the bit-exact `sreduce` dot + an 8-wide apply. Rows independent → serial == parallel.
     softmax_bwd: Symbol,
     softmax_bwd_par: Symbol,
+    /// The fused RMSNorm backward (`mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols,
+    /// eps_bits)`): the `dx = r·(g − x·r²·(Σ g·x)/C)` input-gradient nest dispatches here. The two
+    /// per-row reductions gcc/rustc keep scalar; rows independent → serial == parallel.
+    rmsnorm_bwd: Symbol,
+    rmsnorm_bwd_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2444,6 +2461,38 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` call for a
+    /// recognized batched RMSNorm backward. Bails (false) if an operand/dim is unbound. `parallel`
+    /// selects the multicore kernel (rows across cores → bit-identical to the serial one; rows
+    /// independent, no cross-row combine).
+    fn emit_rmsnorm_bwd(&mut self, nest: &RmsNormBwdNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((dy, _)), Some((gamma, _)), Some((dx, _))) = (
+            self.lookup(nest.x),
+            self.lookup(nest.dy),
+            self.lookup(nest.gamma),
+            self.lookup(nest.dx),
+        ) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let eps = self.builder.build(
+            MirType::I64,
+            Op::ConstInt(nest.eps_bits as i128, MirType::I64),
+        );
+        let func = if parallel {
+            self.gemm.rmsnorm_bwd_par
+        } else {
+            self.gemm.rmsnorm_bwd
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, dy, gamma, dx, rows, cols, eps],
+        });
+        true
+    }
+
     /// Emit the fused `mercury_sgemm_{bf16,f16}_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)`
     /// call for a recognized bf16/f16 `nn.Linear`+epilogue (`C = act(A·Bᵀ + bias)`, half inputs / f32
     /// output). Bails (false) if any operand/dim is unbound at the call site, so the caller lowers the
@@ -3700,6 +3749,14 @@ impl FnLowerer<'_> {
         // per-row dot gcc keeps scalar; the kernel reuses the bit-exact sreduce dot + an 8-wide apply.
         if let Some(nest) = match_softmax_bwd(pat, iter, body, self.sema, self.interner) {
             if self.emit_softmax_bwd(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // A batched RMSNorm backward `for r { <dx = r·(g − x·r²·Σg·x/C) over x/dy/gamma[r*C+i]> }` →
+        // `mercury_rmsnorm_bwd_f32` (the `_parallel` one in a `@parallel` function). The two per-row
+        // reductions gcc keeps scalar; the kernel folds them 8-wide then applies the gradient.
+        if let Some(nest) = match_rmsnorm_bwd(pat, iter, body, self.sema, self.interner) {
+            if self.emit_rmsnorm_bwd(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -11104,6 +11161,427 @@ fn softmax_bwd_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Optio
         return None;
     };
     match_softmax_bwd(pat, iter, lb, sema, interner)
+}
+
+struct RmsNormBwdNest {
+    x: Symbol,
+    dy: Symbol,
+    gamma: Symbol,
+    dx: Symbol,
+    rows: Dim,
+    cols: Dim,
+    eps_bits: i64,
+}
+
+/// The `f32` bit pattern of a non-negative float literal (the `eps` ABI slot), or `None`. Free twin of
+/// `FnLowerer::float_lit_bits` (positive case only — `eps` is positive).
+fn float_lit_bits_free(e: &Expr, interner: &Interner) -> Option<i64> {
+    let ExprKind::Float(t) = &e.kind else {
+        return None;
+    };
+    Some((parse_float(interner.resolve(*t)) as f32).to_bits() as i64)
+}
+
+/// Match a single-statement reduction body `acc = acc + <addend>` (or `acc += <addend>`), returning the
+/// addend expr. Free, shared by the norm-backward matchers.
+fn match_add_accum<'a>(body: &'a Block, acc: Symbol) -> Option<&'a Expr> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &body.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(acc) {
+        return None;
+    }
+    match op {
+        ast::AssignOp::Add => Some(value),
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(acc) {
+                return None;
+            }
+            Some(rhs)
+        }
+        _ => None,
+    }
+}
+
+/// Recognize the **batched RMSNorm backward** (input-gradient) nest and dispatch it to
+/// `mercury_rmsnorm_bwd_f32`. The canonical per-row form (over `x`/`dy`/`gamma` `[R, C]`, the learned
+/// per-column scale `gamma` required):
+///
+/// ```text
+/// for r in 0..R {
+///     let mut ms: f32 = 0.0;
+///     for i in 0..C { ms = ms + x[r*C + i] * x[r*C + i]; }      // mean-square sum
+///     let rinv: f32 = 1.0 / sqrt(ms / C + eps);                 // the rms_inv scale
+///     let mut sg: f32 = 0.0;
+///     for i in 0..C { sg = sg + dy[r*C + i] * gamma[i] * x[r*C + i]; }  // the grad dot
+///     let coef: f32 = rinv * rinv * sg / C;                     // loop-invariant
+///     for i in 0..C { dx[r*C + i] = rinv * (dy[r*C + i] * gamma[i] - x[r*C + i] * coef); }
+/// }
+/// ```
+///
+/// — the gradient `dx = r·(g − x·r²·(Σ g·x)/C)`, `g = dy·γ`, that flows through every RMSNorm in a
+/// transformer's backward pass (Llama/Mistral/Qwen). The two per-row reductions (`Σx²`, `Σ g·x`)
+/// gcc/rustc keep **scalar** (no `vaddps` accumulator at `-O3`); the kernel folds them 8-wide then
+/// applies the gradient. The intermediates `ms`/`rinv`/`sg`/`coef` are loop-local to the `for r` body,
+/// so they cannot leak. The reductions reassociate (the documented exception — both backends run this
+/// same kernel), so the differential gate holds.
+fn match_rmsnorm_bwd(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<RmsNormBwdNest> {
+    // for r in 0..R { <7 stmts> }
+    let ast::PatKind::Ident(rvar) = &pat.kind else {
+        return None;
+    };
+    let rvar = *rvar;
+    let (rs, re) = range_bounds(iter)?;
+    if as_int_lit(rs, interner)? != 0 {
+        return None;
+    }
+    let rows = as_dim(re, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 7 {
+        return None;
+    }
+    // [0] let mut ms = 0.0;
+    let (ms, ms0) = stmt_let_init(&body.stmts[0])?;
+    if !is_float_zero(ms0, interner) {
+        return None;
+    }
+    // [1] for i in 0..C { ms = ms + x[r*C+i] * x[r*C+i]; }
+    let (iv1, ce1, b1) = stmt_range0_for(&body.stmts[1], interner)?;
+    let cols = as_dim(ce1, interner)?;
+    let sq = match_add_accum(b1, ms)?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: sqa,
+        rhs: sqb,
+    } = &sq.kind
+    else {
+        return None;
+    };
+    let x = index_rowmaj(sqa, rvar, iv1, &cols, interner)?;
+    if index_rowmaj(sqb, rvar, iv1, &cols, interner)? != x {
+        return None;
+    }
+    if scalar_of(sqa, sema) != Some(mercury_types::Scalar::F32) {
+        return None;
+    }
+    // [2] let rinv = 1.0 / sqrt(ms / C + eps);
+    let (rinv, rinv0) = stmt_let_init(&body.stmts[2])?;
+    let eps_bits = match_rsqrt_meansq(rinv0, ms, ce1, sema, interner)?;
+    // [3] let mut sg = 0.0;
+    let (sg, sg0) = stmt_let_init(&body.stmts[3])?;
+    if !is_float_zero(sg0, interner) {
+        return None;
+    }
+    // [4] for i in 0..C { sg = sg + dy[r*C+i] * gamma[i] * x[r*C+i]; }  ( ((dy*gamma)*x) )
+    let (iv4, ce4, b4) = stmt_range0_for(&body.stmts[4], interner)?;
+    if !exprs_struct_eq(ce4, ce1) {
+        return None;
+    }
+    let dot = match_add_accum(b4, sg)?;
+    let (dy, gamma) = match_dygx(dot, x, rvar, iv4, &cols, interner)?;
+    // [5] let coef = rinv * rinv * sg / C;  ( ((rinv*rinv)*sg) / C )
+    let (coef, coef0) = stmt_let_init(&body.stmts[5])?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Div,
+        lhs: cnum,
+        rhs: cden,
+    } = &coef0.kind
+    else {
+        return None;
+    };
+    if !col_divisor_matches(cden, ce1, interner) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: rr,
+        rhs: sgf,
+    } = &cnum.kind
+    else {
+        return None;
+    };
+    if single_path(sgf) != Some(sg) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: r1,
+        rhs: r2,
+    } = &rr.kind
+    else {
+        return None;
+    };
+    if single_path(r1) != Some(rinv) || single_path(r2) != Some(rinv) {
+        return None;
+    }
+    // [6] for i in 0..C { dx[r*C+i] = rinv * (dy[r*C+i]*gamma[i] - x[r*C+i]*coef); }
+    let (iv6, ce6, b6) = stmt_range0_for(&body.stmts[6], interner)?;
+    if !exprs_struct_eq(ce6, ce1) {
+        return None;
+    }
+    if b6.tail.is_some() || b6.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign {
+        target: dxt,
+        op: ast::AssignOp::Assign,
+        value: av,
+    } = &b6.stmts[0].kind
+    else {
+        return None;
+    };
+    let dx = index_rowmaj(dxt, rvar, iv6, &cols, interner)?;
+    // av = rinv * (g - x*coef): a Mul of `rinv` and a Sub (either operand order).
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: al,
+        rhs: ar,
+    } = &av.kind
+    else {
+        return None;
+    };
+    let sub = if single_path(al) == Some(rinv) {
+        ar.as_ref()
+    } else if single_path(ar) == Some(rinv) {
+        al.as_ref()
+    } else {
+        return None;
+    };
+    let ExprKind::Binary {
+        op: ast::BinOp::Sub,
+        lhs: gterm,
+        rhs: xterm,
+    } = &sub.kind
+    else {
+        return None;
+    };
+    // gterm = dy[r*C+i]*gamma[i] (same dy, gamma as the dot); xterm = x[r*C+i]*coef.
+    let (dy2, gamma2) = match_dygamma(gterm, rvar, iv6, &cols, interner)?;
+    if dy2 != dy || gamma2 != gamma {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs: xl,
+        rhs: xr,
+    } = &xterm.kind
+    else {
+        return None;
+    };
+    let (xf, cf) = if single_path(xr) == Some(coef) {
+        (xl.as_ref(), xr.as_ref())
+    } else if single_path(xl) == Some(coef) {
+        (xr.as_ref(), xl.as_ref())
+    } else {
+        return None;
+    };
+    let _ = cf;
+    if index_rowmaj(xf, rvar, iv6, &cols, interner)? != x {
+        return None;
+    }
+    if dx == x || dx == dy || dx == gamma {
+        return None;
+    }
+    Some(RmsNormBwdNest {
+        x,
+        dy,
+        gamma,
+        dx,
+        rows,
+        cols,
+        eps_bits,
+    })
+}
+
+/// Match `let name = init` returning `(name, init)`. Free twin of `FnLowerer::let_init`.
+fn stmt_let_init(stmt: &Stmt) -> Option<(Symbol, &Expr)> {
+    let StmtKind::Let {
+        pat,
+        init: Some(init),
+        ..
+    } = &stmt.kind
+    else {
+        return None;
+    };
+    let ast::PatKind::Ident(s) = &pat.kind else {
+        return None;
+    };
+    Some((*s, init))
+}
+
+/// Match `for v in 0..N { body }` returning `(v, N, body)`. Free twin of `FnLowerer::as_range0_for`.
+fn stmt_range0_for<'a>(stmt: &'a Stmt, interner: &Interner) -> Option<(Symbol, &'a Expr, &'a Block)> {
+    let StmtKind::For {
+        pat, iter, body, ..
+    } = &stmt.kind
+    else {
+        return None;
+    };
+    let ast::PatKind::Ident(v) = &pat.kind else {
+        return None;
+    };
+    let (s, e) = range_bounds(iter)?;
+    if as_int_lit(s, interner)? != 0 {
+        return None;
+    }
+    Some((*v, e, body))
+}
+
+/// The argument of a reciprocal-square-root, written either as `rsqrt(arg)` or `1.0 / sqrt(arg)` (the
+/// two spellings the forward norm's `as_rsqrt_arg` accepts), or `None`. Free twin of that method.
+fn recip_sqrt_arg<'a>(e: &'a Expr, sema: &SemaResult, interner: &Interner) -> Option<&'a Expr> {
+    // rsqrt(arg)
+    if let ExprKind::Call { callee, args, .. } = &e.kind {
+        if args.len() == 1
+            && matches!(
+                intrinsic_callee(callee, sema, interner),
+                Some(MathIntrinsic::Rsqrt)
+            )
+        {
+            return Some(&args[0]);
+        }
+    }
+    // 1.0 / sqrt(arg)
+    let ExprKind::Binary {
+        op: ast::BinOp::Div,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    if !matches!(&lhs.kind, ExprKind::Float(t) if parse_float(interner.resolve(*t)) == 1.0) {
+        return None;
+    }
+    col_sqrt_arg(rhs, sema, interner)
+}
+
+/// Match `rsqrt(ms / C + eps)` (or `1.0 / sqrt(ms / C + eps)`) — the rms_inv binding → the `eps` bits;
+/// pins the divisor to `C` (`ce`) and the dividend to `ms`.
+fn match_rsqrt_meansq(
+    e: &Expr,
+    ms: Symbol,
+    ce: &Expr,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<i64> {
+    let arg = recip_sqrt_arg(e, sema, interner)?;
+    let ExprKind::Binary {
+        op: ast::BinOp::Add,
+        lhs: msdiv,
+        rhs: eps,
+    } = &arg.kind
+    else {
+        return None;
+    };
+    let ExprKind::Binary {
+        op: ast::BinOp::Div,
+        lhs: msl,
+        rhs: msr,
+    } = &msdiv.kind
+    else {
+        return None;
+    };
+    if single_path(msl) != Some(ms) || !col_divisor_matches(msr, ce, interner) {
+        return None;
+    }
+    float_lit_bits_free(eps, interner)
+}
+
+/// Match `dy[r*C+i] * gamma[i] * x[r*C+i]` (left-assoc `((dy*gamma)*x)`) → `(dy, gamma)`, pinning the
+/// `x` factor to `x` and `gamma` to a column-indexed (by `i`) array.
+fn match_dygx(
+    e: &Expr,
+    x: Symbol,
+    rvar: Symbol,
+    iv: Symbol,
+    cols: &Dim,
+    interner: &Interner,
+) -> Option<(Symbol, Symbol)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    // One factor is x[r*C+i]; the other is the (dy*gamma) product.
+    let (dyg, xf) = if index_rowmaj(rhs, rvar, iv, cols, interner) == Some(x) {
+        (lhs.as_ref(), rhs.as_ref())
+    } else if index_rowmaj(lhs, rvar, iv, cols, interner) == Some(x) {
+        (rhs.as_ref(), lhs.as_ref())
+    } else {
+        return None;
+    };
+    let _ = xf;
+    match_dygamma(dyg, rvar, iv, cols, interner)
+}
+
+/// Match `dy[r*C+i] * gamma[i]` → `(dy, gamma)`: one factor a row-major `[r*C+i]` read (`dy`), the other
+/// a column `[i]` read (`gamma`).
+fn match_dygamma(
+    e: &Expr,
+    rvar: Symbol,
+    iv: Symbol,
+    cols: &Dim,
+    interner: &Interner,
+) -> Option<(Symbol, Symbol)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    if let (Some(dy), Some(g)) = (
+        index_rowmaj(lhs, rvar, iv, cols, interner),
+        index_by_var(rhs, iv),
+    ) {
+        return Some((dy, g));
+    }
+    if let (Some(dy), Some(g)) = (
+        index_rowmaj(rhs, rvar, iv, cols, interner),
+        index_by_var(lhs, iv),
+    ) {
+        return Some((dy, g));
+    }
+    None
+}
+
+/// Is the whole function body a single batched RMSNorm-backward nest? Intercepts a `@parallel` RMSNorm
+/// backward *before* the elementwise outliner, mirroring the softmax-backward interception.
+fn rmsnorm_bwd_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<RmsNormBwdNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_rmsnorm_bwd(pat, iter, lb, sema, interner)
 }
 
 /// Is the whole function body a single fused residual projection (`x = x + act(x·Wᵀ + bias)`)? Used to

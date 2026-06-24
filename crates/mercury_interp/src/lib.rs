@@ -1296,6 +1296,79 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` — the fused
+            // RMSNorm input-gradient (`dx = r·(g − x·r²·Σg·x/C)`, `g = dy·γ`) a recognized batched nest
+            // lowers to. Marshal `rows*cols` f32 from x AND dy plus the `cols`-long gamma, call the
+            // *serial* runtime kernel (bit-identical to the parallel one — rows are independent), write
+            // `dx`. Read all inputs first (so the in-place `dx==dy` aliasing the kernel allows is safe).
+            // The recognizer always binds a real gamma, but a null (`Value::Int(0)`) is still handled by
+            // variant, mirroring the affine-norm convention.
+            "mercury_rmsnorm_bwd_f32" | "mercury_rmsnorm_bwd_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let dy = ptr(args[1])?;
+                let gamma_idx = match args[2] {
+                    Value::Ptr(p) => Some(p),
+                    _ => None,
+                };
+                let dx = ptr(args[3])?;
+                let rows = args[4].as_int() as usize;
+                let cols = args[5].as_int() as usize;
+                let eps_bits = args[6].as_int() as i64;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                let mut dybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("rmsnorm_bwd operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    dybuf.push(
+                        self.memory
+                            .get(dy + t)
+                            .ok_or("rmsnorm_bwd operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut gbuf = Vec::new();
+                if let Some(g) = gamma_idx {
+                    for t in 0..cols {
+                        gbuf.push(
+                            self.memory
+                                .get(g + t)
+                                .ok_or("rmsnorm_bwd gamma out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                }
+                let gptr = if gamma_idx.is_some() {
+                    gbuf.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let mut dxbuf = vec![0.0f32; n];
+                // SAFETY: xbuf/dybuf/dxbuf are exactly rows*cols f32; gamma (when present) is cols —
+                // the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_rmsnorm_bwd_f32(
+                        xbuf.as_ptr(),
+                        dybuf.as_ptr(),
+                        gptr,
+                        dxbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        eps_bits,
+                    );
+                }
+                for (t, &val) in dxbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(dx + t)
+                        .ok_or("rmsnorm_bwd output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath_bf16(x, out, n, op)` — the bf16-input twin of `mercury_vmath_f32` an
             // `out[i] = f((x[i] as f32))` loop over a `[bf16]` array lowers to. Reconstruct the exact
             // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-

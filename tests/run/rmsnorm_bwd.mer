@@ -1,0 +1,48 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -150
+// EXPECT-OUT: 0
+// EXPECT-OUT: -50
+// EXPECT-OUT: 200
+// EXPECT-OUT: -150
+// EXPECT-OUT: -150
+// EXPECT-OUT: 50
+// EXPECT-OUT: 250
+module tests.run.rmsnorm_bwd
+
+// Batched RMSNorm backward (input gradient) dx = r·(g − x·r²·(Σ g·x)/C), g = dy·γ, r = 1/√(Σx²/C+eps)
+// — the gradient that flows through every RMSNorm in a transformer's backward pass (Llama/Mistral/Qwen).
+// Each row needs TWO reductions (Σx², Σ g·x) that gcc/rustc keep scalar at -O3 (they won't reassociate
+// the float sums), then a fused elementwise apply. The recognizer folds the [R=2,C=4] nest to one
+// mercury_rmsnorm_bwd_f32 call (the kernel folds both reductions 8-wide, then applies). The reductions
+// reassociate (the documented exception), but both backends run the same kernel, so the differential
+// gate (interp == native, -O0 == -O3) holds. Values chosen so every f32 is exact (r ∈ {0.5, 1}).
+fn main() -> i32 {
+    // x, dy are [2,4] row-major; gamma is the shared [4] per-column scale.
+    let x: [f32; 8] = [2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0];
+    let dy: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 4.0, 3.0];
+    let gamma: [f32; 4] = [1.0, 2.0, 1.0, 2.0];
+    let mut dx: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        let mut ms: f32 = 0.0;
+        for i in 0..4 {
+            ms = ms + x[r * 4 + i] * x[r * 4 + i];
+        }
+        let rinv: f32 = 1.0 / sqrt(ms / 4.0 + 0.0);
+        let mut sg: f32 = 0.0;
+        for i in 0..4 {
+            sg = sg + dy[r * 4 + i] * gamma[i] * x[r * 4 + i];
+        }
+        let coef: f32 = rinv * rinv * sg / 4.0;
+        for i in 0..4 {
+            dx[r * 4 + i] = rinv * (dy[r * 4 + i] * gamma[i] - x[r * 4 + i] * coef);
+        }
+    }
+    // Row 0: ms=16, r=0.5; g=[1,4,3,8], Σg·x=32, coef=0.25·32/4=2; dx=0.5·(g−2·2)=[-1.5,0,-0.5,2] ×100
+    // Row 1: ms=4,  r=1;   g=[2,2,4,6], Σg·x=14, coef=1·14/4=3.5; dx=(g−1·3.5)=[-1.5,-1.5,0.5,2.5]  ×100
+    for k in 0..8 {
+        print((dx[k] * 100.0) as i32);
+    }
+    return 0;
+}

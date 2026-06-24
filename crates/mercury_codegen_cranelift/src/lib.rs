@@ -99,6 +99,8 @@ const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_VMATH2: &str = "mercury_vmath2_f32";
 const RT_SOFTMAX_BWD: &str = "mercury_softmax_bwd_f32";
 const RT_SOFTMAX_BWD_PAR: &str = "mercury_softmax_bwd_f32_parallel";
+const RT_RMSNORM_BWD: &str = "mercury_rmsnorm_bwd_f32";
+const RT_RMSNORM_BWD_PAR: &str = "mercury_rmsnorm_bwd_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -945,6 +947,22 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[y, dy, dx, rows, cols]);
             return None;
         }
+        // Fused RMSNorm-backward: mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols,
+        // eps_bits) — four pointers, three i64. The two per-row reductions fold 8-wide. Void.
+        if matches!(name, RT_RMSNORM_BWD | RT_RMSNORM_BWD_PAR) && args.len() == 7 {
+            let x = self.val(args[0]);
+            let dy = self.val(args[1]);
+            let gamma = self.val(args[2]);
+            let dx = self.val(args[3]);
+            let rows = self.coerce_to_i64(args[4]);
+            let cols = self.coerce_to_i64(args[5]);
+            let eps = self.coerce_to_i64(args[6]);
+            let fref = self.rt_refs[name];
+            self.builder
+                .ins()
+                .call(fref, &[x, dy, gamma, dx, rows, cols, eps]);
+            return None;
+        }
         // The streaming affine+activation kernel: mercury_velem_f32(x, y, out, n, a, b, c, op) — three
         // pointers, one i64 count, three f32 coefficients, one i64 op (256-bit AVX2 + non-temporal
         // stores, the saxpy/scale/add/bias/ReLU map a recognized streaming loop lowers to). Void.
@@ -1232,6 +1250,8 @@ struct RtFuncs {
     vmath2: FuncId,
     softmax_bwd: FuncId,
     softmax_bwd_par: FuncId,
+    rmsnorm_bwd: FuncId,
+    rmsnorm_bwd_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     transpose: FuncId,
@@ -1418,6 +1438,15 @@ fn populate_module<M: Module>(
     for _ in 0..4 {
         sig_norm_affine.params.push(AbiParam::new(types::I64));
     }
+    // mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx: ptr, rows, cols, eps_bits: i64) — fused
+    // batched RMSNorm input-gradient (4 ptr + 3 i64, void).
+    let mut sig_rmsnorm_bwd = Signature::new(call_conv);
+    for _ in 0..4 {
+        sig_rmsnorm_bwd.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..3 {
+        sig_rmsnorm_bwd.params.push(AbiParam::new(types::I64));
+    }
     // mercury_i8gemm_nt[_parallel](a, b, c: ptr, m, k, n: i64) — int8 quantized nn.Linear (void).
     let mut sig_i8gemm = Signature::new(call_conv);
     for _ in 0..3 {
@@ -1564,6 +1593,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         softmax_bwd_par: module
             .declare_function(RT_SOFTMAX_BWD_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        rmsnorm_bwd: module
+            .declare_function(RT_RMSNORM_BWD, Linkage::Import, &sig_rmsnorm_bwd)
+            .map_err(|e| e.to_string())?,
+        rmsnorm_bwd_par: module
+            .declare_function(RT_RMSNORM_BWD_PAR, Linkage::Import, &sig_rmsnorm_bwd)
             .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
@@ -1846,6 +1881,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SOFTMAX_BWD_PAR,
                 module.declare_func_in_func(rt.softmax_bwd_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_RMSNORM_BWD,
+                module.declare_func_in_func(rt.rmsnorm_bwd, builder.func),
+            );
+            rt_refs.insert(
+                RT_RMSNORM_BWD_PAR,
+                module.declare_func_in_func(rt.rmsnorm_bwd_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2221,6 +2264,14 @@ pub fn jit_compile(
         mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
     );
     builder.symbol(
+        RT_RMSNORM_BWD,
+        mercury_runtime::mercury_rmsnorm_bwd_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_RMSNORM_BWD_PAR,
+        mercury_runtime::mercury_rmsnorm_bwd_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
@@ -2514,6 +2565,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SOFTMAX_BWD_PAR,
         mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_RMSNORM_BWD,
+        mercury_runtime::mercury_rmsnorm_bwd_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_RMSNORM_BWD_PAR,
+        mercury_runtime::mercury_rmsnorm_bwd_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,
