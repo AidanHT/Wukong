@@ -229,6 +229,9 @@ fn main() {
     if want("rmsnorm_bwd") {
         bench_rmsnorm_bwd(&cc, &dir);
     }
+    if want("layernorm_bwd") {
+        bench_layernorm_bwd(&cc, &dir);
+    }
     if want("xent") {
         bench_xent(&cc, &dir);
     }
@@ -1513,6 +1516,89 @@ fn rust_rmsnorm_bwd(rows: usize, cols: usize) -> String {
          \x20   let mut sg=0.0f32; for i in 0..C {{ sg += *dy.add(r*C+i) * *gamma.add(i) * *x.add(r*C+i); }}\n\
          \x20   let coef = rinv*rinv*sg/(C as f32);\n\
          \x20   for i in 0..C {{ *dx.add(r*C+i) = rinv*(*dy.add(r*C+i) * *gamma.add(i) - *x.add(r*C+i) * coef); }} }}\n}}\n"
+    )
+}
+
+/// Batched **LayerNorm backward** (input gradient) `dx = rstd·(g − mean(g) − xhat·mean(g·xhat))`,
+/// `g = dy·γ`, `xhat = (x−mean)·rstd` over `[rows, cols]` — the gradient through every LayerNorm
+/// (GPT-2/BERT/ViT). Four per-row reductions (Σx, Σ(x−mean)², Σg, Σg·xhat) gcc/rustc keep **scalar**;
+/// Mercury folds them 8-wide → `mercury_layernorm_bwd_f32[_parallel]`. Four buffers → the 4-pointer
+/// harness; the reassociated reductions → magnitude-normalized cross-check (like rmsnorm_bwd).
+fn bench_layernorm_bwd(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
+        let n = r * c;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 - 9.0) * 0.1 + 0.3).collect();
+        let dy: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
+        let gamma: Vec<f32> = (0..c).map(|i| (i % 11) as f32 * 0.05 + 0.7).collect();
+        let mut dx = vec![0.0f32; n];
+        let (xp, dyp, gp, dxp) = (x.as_ptr(), dy.as_ptr(), gamma.as_ptr(), dx.as_mut_ptr());
+        let bytes = (3.0 * n as f64 + c as f64) * 4.0;
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== layernorm_bwd (dx = rstd·(g − mean(g) − xhat·mean(g·xhat))) {r}x{c} ===");
+        let mer = bench_mercury4(&mer_layernorm_bwd(r, c, false), &mut dx, xp, dyp, gp, dxp);
+        let mer_par = bench_mercury4(&mer_layernorm_bwd(r, c, true), &mut dx, xp, dyp, gp, dxp);
+        let cm = bench_external4(
+            "c", &c_layernorm_bwd(r, c), dir, "layernorm_bwd", cc,
+            &["-O3", "-march=native", "-shared"], &mut dx, xp, dyp, gp, dxp,
+        );
+        let rm = bench_external4(
+            "rs", &rust_layernorm_bwd(r, c), dir, "layernorm_bwd", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
+        );
+        report_ratio("layernorm_bwd", &mer, &mer_par, &cm, &rm, &gbps);
+    }
+}
+
+fn mer_layernorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], gamma: [f32; {cols}], dx: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut sm: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ sm = sm + x[r * {cols} + i]; }}\n\
+         \x20       let mean: f32 = sm / {cols}.0;\n\
+         \x20       let mut vv: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ vv = vv + (x[r * {cols} + i] - mean) * (x[r * {cols} + i] - mean); }}\n\
+         \x20       let rstd: f32 = 1.0 / sqrt(vv / {cols}.0 + 0.00001);\n\
+         \x20       let mut s1: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ s1 = s1 + dy[r * {cols} + i] * gamma[i]; }}\n\
+         \x20       let mut s2: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ s2 = s2 + dy[r * {cols} + i] * gamma[i] * ((x[r * {cols} + i] - mean) * rstd); }}\n\
+         \x20       let m1: f32 = s1 / {cols}.0;\n\
+         \x20       let m2: f32 = s2 / {cols}.0;\n\
+         \x20       for i in 0..{cols} {{ dx[r * {cols} + i] = rstd * (dy[r * {cols} + i] * gamma[i] - m1 - ((x[r * {cols} + i] - mean) * rstd) * m2); }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_layernorm_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* dy, const float* gamma, float* dx){{\n\
+         \x20 for (long r=0;r<R;r++){{\n\
+         \x20   float sm=0.0f; for(long i=0;i<C;i++) sm+=x[r*C+i]; float mean=sm/(float)C;\n\
+         \x20   float vv=0.0f; for(long i=0;i<C;i++){{ float d=x[r*C+i]-mean; vv+=d*d; }} float rstd=1.0f/sqrtf(vv/(float)C+0.00001f);\n\
+         \x20   float s1=0.0f,s2=0.0f; for(long i=0;i<C;i++){{ float g=dy[r*C+i]*gamma[i]; float xh=(x[r*C+i]-mean)*rstd; s1+=g; s2+=g*xh; }}\n\
+         \x20   float m1=s1/(float)C, m2=s2/(float)C;\n\
+         \x20   for(long i=0;i<C;i++){{ float g=dy[r*C+i]*gamma[i]; float xh=(x[r*C+i]-mean)*rstd; dx[r*C+i]=rstd*(g-m1-xh*m2); }} }}\n}}\n"
+    )
+}
+
+fn rust_layernorm_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, dy:*const f32, gamma:*const f32, dx:*mut f32) {{\n\
+         \x20 for r in 0..R {{\n\
+         \x20   let mut sm=0.0f32; for i in 0..C {{ sm+=*x.add(r*C+i); }} let mean=sm/(C as f32);\n\
+         \x20   let mut vv=0.0f32; for i in 0..C {{ let d=*x.add(r*C+i)-mean; vv+=d*d; }} let rstd=1.0f32/(vv/(C as f32)+0.00001f32).sqrt();\n\
+         \x20   let mut s1=0.0f32; let mut s2=0.0f32; for i in 0..C {{ let g=*dy.add(r*C+i)* *gamma.add(i); let xh=(*x.add(r*C+i)-mean)*rstd; s1+=g; s2+=g*xh; }}\n\
+         \x20   let m1=s1/(C as f32); let m2=s2/(C as f32);\n\
+         \x20   for i in 0..C {{ let g=*dy.add(r*C+i)* *gamma.add(i); let xh=(*x.add(r*C+i)-mean)*rstd; *dx.add(r*C+i)=rstd*(g-m1-xh*m2); }} }} }}\n"
     )
 }
 
