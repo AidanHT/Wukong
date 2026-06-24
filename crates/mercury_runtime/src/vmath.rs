@@ -729,6 +729,9 @@ pub const VM2_GELU_BWD: i64 = 4;
 // The foundational gate gradients (every LSTM/GRU/attention gate): σ'(x)=σ(1−σ), tanh'(x)=1−tanh².
 pub const VM2_SIGMOID_BWD: i64 = 5;
 pub const VM2_TANH_BWD: i64 = 6;
+// ELU / softplus gradients (CNN / VAE-flow nets): elu'(x)=x>0?1:eˣ, softplus'(x)=σ(x).
+pub const VM2_ELU_BWD: i64 = 7;
+pub const VM2_SOFTPLUS_BWD: i64 = 8;
 
 /// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
 #[inline]
@@ -830,6 +833,24 @@ fn tanh_bwd_2(x: f32, dy: f32) -> f32 {
     dy * sech2
 }
 
+/// `elu_backward(x, dy) = dy · elu'(x)`, `elu'(x) = x>0 ? 1 : eˣ` (α=1) — the ELU training gradient. The
+/// branchless `if x>0 {1} else {eˣ}` mirrors the forward [`elu1`]'s blend and the AVX2 [`elu_bwd8`], so
+/// the negative branch reuses the shared [`exp1`] and all paths agree bit-for-bit.
+#[inline]
+fn elu_bwd_2(x: f32, dy: f32) -> f32 {
+    let e = exp1(x);
+    let g = if x > 0.0 { 1.0 } else { e };
+    dy * g
+}
+
+/// `softplus_backward(x, dy) = dy · softplus'(x) = dy · σ(x)` (since `d/dx ln(1+eˣ) = σ(x)`) — the
+/// softplus training gradient (VAEs / normalizing flows / the Mish base). Reuses the shared [`sigmoid1`],
+/// so it agrees with the forward `sigmoid`/`softplus` family; bit-identical across twin / AVX2 / inlined.
+#[inline]
+fn softplus_bwd_2(x: f32, dy: f32) -> f32 {
+    dy * sigmoid1(x)
+}
+
 /// Scalar dispatch for one element pair (the AVX2 tail and the no-AVX2 fallback). The two inputs are
 /// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot, `(x, dy)` for the
 /// activation backwards.
@@ -843,6 +864,8 @@ fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
         VM2_GELU_BWD => gelu_bwd_2(x, y),
         VM2_SIGMOID_BWD => sigmoid_bwd_2(x, y),
         VM2_TANH_BWD => tanh_bwd_2(x, y),
+        VM2_ELU_BWD => elu_bwd_2(x, y),
+        VM2_SOFTPLUS_BWD => softplus_bwd_2(x, y),
         _ => x,
     }
 }
@@ -967,6 +990,31 @@ unsafe fn tanh_bwd8(
     _mm256_mul_ps(dy, sech2)
 }
 
+/// `dy · elu'(x)` over 8 lanes — mirrors [`elu_bwd_2`] (`blendv(eˣ, 1, x>0)`, same compare as `elu8`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn elu_bwd8(
+    x: std::arch::x86_64::__m256,
+    dy: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let e = exp8(x);
+    let pos = _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps());
+    let g = _mm256_blendv_ps(e, _mm256_set1_ps(1.0), pos); // x>0 ? 1 : eˣ
+    _mm256_mul_ps(dy, g)
+}
+
+/// `dy · σ(x)` over 8 lanes (softplus') — mirrors [`softplus_bwd_2`]; reuses `sigmoid8`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softplus_bwd8(
+    x: std::arch::x86_64::__m256,
+    dy: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    _mm256_mul_ps(dy, sigmoid8(x))
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn vmath2_8_for(
@@ -982,6 +1030,8 @@ fn vmath2_8_for(
         VM2_GELU_BWD => gelu_bwd8,
         VM2_SIGMOID_BWD => sigmoid_bwd8,
         VM2_TANH_BWD => tanh_bwd8,
+        VM2_ELU_BWD => elu_bwd8,
+        VM2_SOFTPLUS_BWD => softplus_bwd8,
         _ => return None,
     })
 }
@@ -2001,6 +2051,16 @@ mod tests {
             let t = x.tanh();
             1.0 - t * t
         }
+        fn elu_grad_f64(x: f64) -> f64 {
+            if x > 0.0 {
+                1.0
+            } else {
+                x.exp()
+            }
+        }
+        fn softplus_grad_f64(x: f64) -> f64 {
+            1.0 / (1.0 + (-x).exp())
+        }
         let n = 1003usize; // not a multiple of 8 → exercises the lane body and the scalar tail
         let xs: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.011).collect();
         let dys: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
@@ -2009,6 +2069,8 @@ mod tests {
             (VM2_GELU_BWD, gelu_grad_f64 as fn(f64) -> f64),
             (VM2_SIGMOID_BWD, sigmoid_grad_f64 as fn(f64) -> f64),
             (VM2_TANH_BWD, tanh_grad_f64 as fn(f64) -> f64),
+            (VM2_ELU_BWD, elu_grad_f64 as fn(f64) -> f64),
+            (VM2_SOFTPLUS_BWD, softplus_grad_f64 as fn(f64) -> f64),
         ] {
             let mut got = vec![0.0f32; n];
             // SAFETY: xs/dys/got are exactly n f32 long — the kernel's contract.
