@@ -101,6 +101,8 @@ const RT_SOFTMAX_BWD: &str = "mercury_softmax_bwd_f32";
 const RT_SOFTMAX_BWD_PAR: &str = "mercury_softmax_bwd_f32_parallel";
 const RT_RMSNORM_BWD: &str = "mercury_rmsnorm_bwd_f32";
 const RT_RMSNORM_BWD_PAR: &str = "mercury_rmsnorm_bwd_f32_parallel";
+const RT_XENT: &str = "mercury_xent_fwd_f32";
+const RT_XENT_PAR: &str = "mercury_xent_fwd_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -947,6 +949,18 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[y, dy, dx, rows, cols]);
             return None;
         }
+        // Fused cross-entropy loss: mercury_xent_fwd_f32[_parallel](x, target, loss, rows, cols) — three
+        // pointers (x f32, target i32, loss f32 — a ptr is a ptr) + two i64, the same vmath2 shape. Void.
+        if matches!(name, RT_XENT | RT_XENT_PAR) && args.len() == 5 {
+            let x = self.val(args[0]);
+            let target = self.val(args[1]);
+            let loss = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[x, target, loss, rows, cols]);
+            return None;
+        }
         // Fused RMSNorm-backward: mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols,
         // eps_bits) — four pointers, three i64. The two per-row reductions fold 8-wide. Void.
         if matches!(name, RT_RMSNORM_BWD | RT_RMSNORM_BWD_PAR) && args.len() == 7 {
@@ -1252,6 +1266,8 @@ struct RtFuncs {
     softmax_bwd_par: FuncId,
     rmsnorm_bwd: FuncId,
     rmsnorm_bwd_par: FuncId,
+    xent: FuncId,
+    xent_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     transpose: FuncId,
@@ -1600,6 +1616,12 @@ fn populate_module<M: Module>(
         rmsnorm_bwd_par: module
             .declare_function(RT_RMSNORM_BWD_PAR, Linkage::Import, &sig_rmsnorm_bwd)
             .map_err(|e| e.to_string())?,
+        xent: module
+            .declare_function(RT_XENT, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        xent_par: module
+            .declare_function(RT_XENT_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -1889,6 +1911,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_RMSNORM_BWD_PAR,
                 module.declare_func_in_func(rt.rmsnorm_bwd_par, builder.func),
+            );
+            rt_refs.insert(RT_XENT, module.declare_func_in_func(rt.xent, builder.func));
+            rt_refs.insert(
+                RT_XENT_PAR,
+                module.declare_func_in_func(rt.xent_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2271,6 +2298,11 @@ pub fn jit_compile(
         RT_RMSNORM_BWD_PAR,
         mercury_runtime::mercury_rmsnorm_bwd_f32_parallel as *const u8,
     );
+    builder.symbol(RT_XENT, mercury_runtime::mercury_xent_fwd_f32 as *const u8);
+    builder.symbol(
+        RT_XENT_PAR,
+        mercury_runtime::mercury_xent_fwd_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
@@ -2573,6 +2605,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_RMSNORM_BWD_PAR,
         mercury_runtime::mercury_rmsnorm_bwd_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_XENT, mercury_runtime::mercury_xent_fwd_f32 as *const u8);
+    builder.symbol(
+        RT_XENT_PAR,
+        mercury_runtime::mercury_xent_fwd_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,

@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3440
+// EXPECT-OUT: 2626
+module tests.run.xent
+
+// Batched softmax cross-entropy forward loss: loss[r] = m + log(Σ exp(x[r,·]−m)) − x[r, target[r]]
+// (the stable −log softmax of the true class) — the training loss of every classifier / language model.
+// The recognizer folds the [R=2,C=4] nest to one mercury_xent_fwd_f32 call: softmax's stabilizing
+// row-max + Σexp reduction (which gcc/rustc keep scalar — expf/logf won't vectorize) capped with the
+// data-dependent gather x[r*C + target[r]]. The reductions reassociate (the documented exception —
+// both backends run the same kernel), so the differential gate (interp == native, -O0 == -O3) holds.
+fn main() -> i32 {
+    // x is [2,4] row-major logits; target is the per-row true class index.
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 0.0, 1.0];
+    let target: [i32; 2] = [0, 2];
+    let mut loss: [f32; 2] = [0.0; 2];
+
+    for r in 0..2 {
+        let mut m: f32 = x[r * 4];
+        for i in 0..4 { m = fmax(m, x[r * 4 + i]); }
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + exp(x[r * 4 + i] - m); }
+        loss[r] = m + log(s) - x[r * 4 + target[r]];
+    }
+    // Row 0: lse ≈ 4.4402, target=0 (x=1) → loss ≈ 3.4402
+    // Row 1: lse ≈ 2.6266, target=2 (x=0) → loss ≈ 2.6266
+    for k in 0..2 {
+        print((loss[k] * 1000.0) as i32);
+    }
+    return 0;
+}
