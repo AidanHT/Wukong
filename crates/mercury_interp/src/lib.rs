@@ -1148,7 +1148,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "mercury_colmax_f32"
             | "mercury_colmax_f32_parallel"
             | "mercury_colmin_f32"
-            | "mercury_colmin_f32_parallel" => {
+            | "mercury_colmin_f32_parallel"
+            | "mercury_colmaxabs_f32"
+            | "mercury_colmaxabs_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = args[2].as_int() as usize;
@@ -1165,15 +1167,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 let mut obuf = vec![0.0f32; cols];
                 // The serial kernel matching the name (bit-identical to its `_parallel` twin).
-                let kernel: unsafe extern "C" fn(*const f32, *mut f32, i64, i64) = if name
-                    .starts_with("mercury_colmax")
-                {
-                    mercury_runtime::mercury_colmax_f32
-                } else if name.starts_with("mercury_colmin") {
-                    mercury_runtime::mercury_colmin_f32
-                } else {
-                    mercury_runtime::mercury_colsum_f32
-                };
+                let kernel: unsafe extern "C" fn(*const f32, *mut f32, i64, i64) =
+                    if name.starts_with("mercury_colmaxabs") {
+                        mercury_runtime::mercury_colmaxabs_f32
+                    } else if name.starts_with("mercury_colmax") {
+                        mercury_runtime::mercury_colmax_f32
+                    } else if name.starts_with("mercury_colmin") {
+                        mercury_runtime::mercury_colmin_f32
+                    } else {
+                        mercury_runtime::mercury_colsum_f32
+                    };
                 // SAFETY: xbuf is rows*cols, obuf is cols f32 — the kernel's contract.
                 unsafe {
                     kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);

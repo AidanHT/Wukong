@@ -90,6 +90,8 @@ pub fn lower_program(
         colmax_par: interner.intern("mercury_colmax_f32_parallel"),
         colmin: interner.intern("mercury_colmin_f32"),
         colmin_par: interner.intern("mercury_colmin_f32_parallel"),
+        colmaxabs: interner.intern("mercury_colmaxabs_f32"),
+        colmaxabs_par: interner.intern("mercury_colmaxabs_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -660,6 +662,11 @@ struct GemmSyms {
     colmax_par: Symbol,
     colmin: Symbol,
     colmin_par: Symbol,
+    /// The SIMD column **abs-max** (`mercury_colmaxabs_f32[_parallel]`): `out[j] = max_i |x[i*cols+j]|`,
+    /// the per-channel symmetric int8-quantization scale (`amax_j`). Same strided gap and i-ascending
+    /// fold as colmax, with each element abs'd first (sign-mask `andnot`).
+    colmaxabs: Symbol,
+    colmaxabs_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2349,6 +2356,8 @@ impl FnLowerer<'_> {
             (COL_MAX, true) => self.gemm.colmax_par,
             (COL_MIN, false) => self.gemm.colmin,
             (COL_MIN, true) => self.gemm.colmin_par,
+            (COL_MAXABS, false) => self.gemm.colmaxabs,
+            (COL_MAXABS, true) => self.gemm.colmaxabs_par,
             (_, false) => self.gemm.colsum,
             (_, true) => self.gemm.colsum_par,
         };
@@ -10249,6 +10258,7 @@ fn transpose_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<
 const COL_SUM: i64 = 0;
 const COL_MAX: i64 = 1;
 const COL_MIN: i64 = 2;
+const COL_MAXABS: i64 = 3;
 
 struct ColSumNest {
     x: Symbol,
@@ -10337,8 +10347,9 @@ fn match_colsum(
     if scalar_of(data, sema) != Some(mercury_types::Scalar::F32) {
         return None;
     }
-    // Seed + inner-start must match the fold: SUM seeds `0.0` and folds `0..M`; MAX/MIN seed the first
-    // row `x[j]` and fold `1..M` (or `0..M` — the redundant first fold is idempotent).
+    // Seed + inner-start must match the fold: SUM seeds `0.0` and folds `0..M`; MAX/MIN/MAXABS seed the
+    // first row (`x[j]`, or `abs(x[j])` for MAXABS) and fold `1..M` (or `0..M` — the redundant first fold
+    // is idempotent).
     match colop {
         COL_SUM => {
             if !is_float_zero(s0, interner) || istart != 0 {
@@ -10349,8 +10360,25 @@ fn match_colsum(
             if istart != 0 && istart != 1 {
                 return None;
             }
-            if index_by_var(s0, jvar) != Some(xbase) {
-                return None; // seed must be x[0, j] = x[j]
+            // The seed is the first row's element; for MAXABS it is wrapped in `abs(...)`.
+            let seed_inner = if colop == COL_MAXABS {
+                match &s0.kind {
+                    ExprKind::Call { callee, args, .. }
+                        if args.len() == 1
+                            && matches!(
+                                intrinsic_callee(callee, sema, interner),
+                                Some(MathIntrinsic::Abs)
+                            ) =>
+                    {
+                        &args[0]
+                    }
+                    _ => return None,
+                }
+            } else {
+                s0
+            };
+            if index_by_var(seed_inner, jvar) != Some(xbase) {
+                return None; // seed must be x[0, j] = x[j] (abs'd for MAXABS)
             }
         }
     }
@@ -10406,6 +10434,25 @@ fn classify_colreduce_body<'a>(
                     } else {
                         return None;
                     };
+                    // `fmax(s, abs(x[..]))` is the running **absmax** (the symmetric-quant scale): peel
+                    // the abs and tag COL_MAXABS (the kernel abs's each element before the max fold).
+                    if colop == COL_MAX {
+                        if let ExprKind::Call {
+                            callee: ac,
+                            args: aargs,
+                            ..
+                        } = &data.kind
+                        {
+                            if aargs.len() == 1
+                                && matches!(
+                                    intrinsic_callee(ac, sema, interner),
+                                    Some(MathIntrinsic::Abs)
+                                )
+                            {
+                                return Some((COL_MAXABS, &aargs[0]));
+                            }
+                        }
+                    }
                     return Some((colop, data));
                 }
             }
