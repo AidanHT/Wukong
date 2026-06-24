@@ -122,6 +122,10 @@ pub fn lower_program(
         entropy_par: interner.intern("mercury_entropy_f32_parallel"),
         kd_loss: interner.intern("mercury_kd_loss_f32"),
         kd_loss_par: interner.intern("mercury_kd_loss_f32_parallel"),
+        rowargmax: interner.intern("mercury_rowargmax_i32"),
+        rowargmax_par: interner.intern("mercury_rowargmax_i32_parallel"),
+        rowargmin: interner.intern("mercury_rowargmin_i32"),
+        rowargmin_par: interner.intern("mercury_rowargmin_i32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -243,6 +247,18 @@ pub fn lower_program(
                     }) || probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_kd_loss(pat, it, lb).is_some()
                     }))
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row argmax/argmin: intercept before the outliner (which
+                // would split the rows into per-row scalar loops and lose the kernel). Rows independent →
+                // serial == parallel, so the multicore `mercury_rowarg*_i32_parallel` stays deterministic.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_rowarg(pat, it, lb).is_some()
+                    })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
@@ -823,6 +839,15 @@ struct GemmSyms {
     entropy_par: Symbol,
     kd_loss: Symbol,
     kd_loss_par: Symbol,
+    /// Per-row arg-reductions returning an **i32** index (`mercury_rowarg{max,min}_i32[_parallel](x,
+    /// out, rows, cols)`): `out[r] = {argmax,argmin}_j x[r,j]` — the classification-head / greedy-decode
+    /// top-1 (lowest index wins on a value tie). The index bookkeeping keeps gcc/rustc scalar; AVX2
+    /// tracks 8 (value,index) lanes via blend. `(ptr,ptr,i64,i64)` = the `sig_vmath` shape, but `out` is
+    /// an i32 buffer (the interp writes `Value::Int`). Rows independent → serial == parallel.
+    rowargmax: Symbol,
+    rowargmax_par: Symbol,
+    rowargmin: Symbol,
+    rowargmin_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2077,6 +2102,189 @@ impl FnLowerer<'_> {
             rows,
             cols,
         })
+    }
+
+    /// Recognize a batched per-row argmax/argmin returning an **index** (the classification-head / greedy-
+    /// decode top-1):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut bv: f32 = x[r*C];               // seed value = the row's element 0
+    ///     let mut bi = 0;                          // seed index = 0
+    ///     for j in <0|1>..C { if x[r*C+j] CMP bv { bv = x[r*C+j]; bi = j; } }
+    ///     out[r] = bi;                             // out is an i32 array
+    /// }
+    /// ```
+    /// `CMP` is `>` (argmax) or `<` (argmin) — a **strict** compare, so the lowest index wins on a value
+    /// tie, exactly the `mercury_rowarg{max,min}_i32` semantics. The seed pins index 0 (`bv = x[r*C]`,
+    /// `bi = 0`); the inner loop may start at 0 or 1 (index 0 is the seed either way — a strict compare
+    /// never displaces it) and covers the rest of the row, so the source scans the whole row `[0,C)`,
+    /// equal to the kernel. `out` must be an **i32** array (the kernel writes 4-byte indices; a wider
+    /// slot would stride-mismatch in native), and must differ from `x`. Pure (`&self`).
+    fn match_rowarg(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<RowArgNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 4 {
+            return None;
+        }
+        // [0] let bv: f32 = x[r*C]   (the running-best value, seeded to the row's element 0)
+        let (bv, bv_init) = Self::let_init(&body.stmts[0])?;
+        // [1] let bi = 0             (the running-best index, seeded to 0)
+        let (bi, bi_init) = Self::let_init(&body.stmts[1])?;
+        if !is_int_zero(bi_init, self.interner) {
+            return None;
+        }
+        // [2] for j in <0|1>..C { if x[r*C+j] CMP bv { bv = x[r*C+j]; bi = j } }
+        let StmtKind::For {
+            pat: jp,
+            iter: jit,
+            body: jb,
+            ..
+        } = &body.stmts[2].kind
+        else {
+            return None;
+        };
+        let ast::PatKind::Ident(j) = &jp.kind else {
+            return None;
+        };
+        let j = *j;
+        let ForIter::Range {
+            start: js,
+            end: Some(je),
+            inclusive: false,
+            step: None,
+        } = jit
+        else {
+            return None;
+        };
+        let je: &Expr = je;
+        let jstart = as_int_lit(js, self.interner)?;
+        if jstart != 0 && jstart != 1 {
+            return None;
+        }
+        let batch = Some((r, je));
+        let (x, is_max) = self.match_rowarg_inner(jb, j, bv, bi, batch)?;
+        // The seed value must be exactly `x[r*C]` (the row's element 0): `Index { base == x, idx == r*C }`.
+        let ExprKind::Index { base, indices } = &bv_init.kind else {
+            return None;
+        };
+        if indices.len() != 1
+            || !self.is_mul_of(&indices[0], r, je)
+            || single_path(base) != Some(x)
+        {
+            return None;
+        }
+        // [3] out[r] = bi  — `out` an i32 array distinct from `x`.
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[3].kind
+        else {
+            return None;
+        };
+        let out = index_by_var(target, r)?;
+        if single_path(value) != Some(bi) || out == x {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::I32) {
+            return None;
+        }
+        let cols = as_dim(je, self.interner)?;
+        Some(RowArgNest {
+            x,
+            out,
+            rows,
+            cols,
+            is_max,
+        })
+    }
+
+    /// The argmax/argmin inner body `if x[r*C+j] CMP bv { bv = x[r*C+j]; bi = j; }` (strict `>` → argmax /
+    /// `<` → argmin; `bi = j` may be `j as <int>`), returning `(x_array, is_max)`. The lone `if` may be
+    /// the body's single statement or its tail. Mirrors [`match_argreduce_kernel`] with a row-major batch
+    /// offset (`index_off` with `batch`). Pure.
+    fn match_rowarg_inner(
+        &self,
+        body: &Block,
+        j: Symbol,
+        bv: Symbol,
+        bi: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, bool)> {
+        let if_expr = match (body.stmts.as_slice(), &body.tail) {
+            ([only], None) => match &only.kind {
+                StmtKind::Expr(e) => e,
+                _ => return None,
+            },
+            ([], Some(e)) => e.as_ref(),
+            _ => return None,
+        };
+        let ExprKind::If {
+            cond,
+            then_branch,
+            else_branch: None,
+        } = &if_expr.kind
+        else {
+            return None;
+        };
+        let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+            return None;
+        };
+        // Canonical `x[r*C+j] CMP bv`: row-major data read on the left, running-best scalar on the right.
+        let is_max = match op {
+            ast::BinOp::Gt => true,
+            ast::BinOp::Lt => false,
+            _ => return None,
+        };
+        let x = self.index_off(lhs, j, batch)?;
+        if single_path(rhs) != Some(bv) {
+            return None;
+        }
+        // then-branch: exactly `bv = x[r*C+j]; bi = j;` (order-flexible), no tail value.
+        if then_branch.tail.is_some() || then_branch.stmts.len() != 2 {
+            return None;
+        }
+        let (mut saw_val, mut saw_idx) = (false, false);
+        for s in &then_branch.stmts {
+            let StmtKind::Assign {
+                target,
+                op: ast::AssignOp::Assign,
+                value,
+            } = &s.kind
+            else {
+                return None;
+            };
+            let t = single_path(target)?;
+            if t == bv {
+                // bv = x[r*C+j]
+                if self.index_off(value, j, batch) != Some(x) {
+                    return None;
+                }
+                saw_val = true;
+            } else if t == bi {
+                // bi = j  (or `bi = j as <int>`)
+                let is_j = single_path(value) == Some(j)
+                    || matches!(&value.kind, ExprKind::Cast { expr, .. } if single_path(expr) == Some(j));
+                if !is_j {
+                    return None;
+                }
+                saw_idx = true;
+            } else {
+                return None;
+            }
+        }
+        if saw_val && saw_idx {
+            Some((x, is_max))
+        } else {
+            None
+        }
     }
 
     /// Match `log(arr[r*C+v])` → the indexed array `arr` (a single-arg `log` call over a row-major read).
@@ -3339,6 +3547,28 @@ impl FnLowerer<'_> {
             self.gemm.logsumexp_par
         } else {
             self.gemm.logsumexp
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_rowarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-row arg nest.
+    /// Same `(ptr,ptr,i64,i64)` shape as `mercury_logsumexp_f32`, but `out` is an i32 index buffer.
+    fn emit_rowarg(&mut self, nest: &RowArgNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = match (nest.is_max, parallel) {
+            (true, false) => self.gemm.rowargmax,
+            (true, true) => self.gemm.rowargmax_par,
+            (false, false) => self.gemm.rowargmin,
+            (false, true) => self.gemm.rowargmin_par,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -4733,6 +4963,14 @@ impl FnLowerer<'_> {
         }
         if let Some(nest) = self.match_kd_loss(pat, iter, body) {
             if self.emit_kd_loss(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched per-row argmax/argmin (classification top-1 / greedy decode) → the index-returning
+        // `mercury_rowarg{max,min}_i32` (`_parallel` in a `@parallel` fn). The (value,index) bookkeeping
+        // keeps gcc/rustc scalar; the AVX2 kernel tracks 8 lanes of (value,index) via blend.
+        if let Some(nest) = self.match_rowarg(pat, iter, body) {
+            if self.emit_rowarg(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -12346,6 +12584,16 @@ struct KdLossNest {
     out: Symbol,
     rows: Dim,
     cols: Dim,
+}
+
+/// A recognized batched per-row arg-reduction nest (see [`FnLowerer::match_rowarg`]). `out` is an i32
+/// index buffer; `is_max` selects argmax (`true`) vs argmin (`false`).
+struct RowArgNest {
+    x: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+    is_max: bool,
 }
 
 /// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner
