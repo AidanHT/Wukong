@@ -103,6 +103,8 @@ const RT_RMSNORM_BWD: &str = "mercury_rmsnorm_bwd_f32";
 const RT_RMSNORM_BWD_PAR: &str = "mercury_rmsnorm_bwd_f32_parallel";
 const RT_XENT: &str = "mercury_xent_fwd_f32";
 const RT_XENT_PAR: &str = "mercury_xent_fwd_f32_parallel";
+const RT_ROPE: &str = "mercury_rope_f32";
+const RT_ROPE_PAR: &str = "mercury_rope_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -961,6 +963,20 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, target, loss, rows, cols]);
             return None;
         }
+        // RoPE: mercury_rope_f32[_parallel](x, inv_freq, out, rows, half) — three f32 pointers + two
+        // i64, the same vmath2 shape. Void.
+        if matches!(name, RT_ROPE | RT_ROPE_PAR) && args.len() == 5 {
+            let x = self.val(args[0]);
+            let inv_freq = self.val(args[1]);
+            let out = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let half = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder
+                .ins()
+                .call(fref, &[x, inv_freq, out, rows, half]);
+            return None;
+        }
         // Fused RMSNorm-backward: mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols,
         // eps_bits) — four pointers, three i64. The two per-row reductions fold 8-wide. Void.
         if matches!(name, RT_RMSNORM_BWD | RT_RMSNORM_BWD_PAR) && args.len() == 7 {
@@ -1268,6 +1284,8 @@ struct RtFuncs {
     rmsnorm_bwd_par: FuncId,
     xent: FuncId,
     xent_par: FuncId,
+    rope: FuncId,
+    rope_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     transpose: FuncId,
@@ -1622,6 +1640,12 @@ fn populate_module<M: Module>(
         xent_par: module
             .declare_function(RT_XENT_PAR, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
+        rope: module
+            .declare_function(RT_ROPE, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        rope_par: module
+            .declare_function(RT_ROPE_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -1916,6 +1940,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_XENT_PAR,
                 module.declare_func_in_func(rt.xent_par, builder.func),
+            );
+            rt_refs.insert(RT_ROPE, module.declare_func_in_func(rt.rope, builder.func));
+            rt_refs.insert(
+                RT_ROPE_PAR,
+                module.declare_func_in_func(rt.rope_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2303,6 +2332,11 @@ pub fn jit_compile(
         RT_XENT_PAR,
         mercury_runtime::mercury_xent_fwd_f32_parallel as *const u8,
     );
+    builder.symbol(RT_ROPE, mercury_runtime::mercury_rope_f32 as *const u8);
+    builder.symbol(
+        RT_ROPE_PAR,
+        mercury_runtime::mercury_rope_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
@@ -2610,6 +2644,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_XENT_PAR,
         mercury_runtime::mercury_xent_fwd_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_ROPE, mercury_runtime::mercury_rope_f32 as *const u8);
+    builder.symbol(
+        RT_ROPE_PAR,
+        mercury_runtime::mercury_rope_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,
