@@ -220,6 +220,9 @@ fn main() {
     if want("colmax") {
         bench_colmax(&cc, &dir);
     }
+    if want("colstat") {
+        bench_colstat(&cc, &dir);
+    }
     if want("softmax_bwd") {
         bench_softmax_bwd(&cc, &dir);
     }
@@ -1109,6 +1112,152 @@ fn rust_colmax(m: usize, n: usize, op: u8) -> String {
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
          \x20 for j in 0..N {{ let mut s={lo}*x.add(j){hi}; for i in 1..M {{ let v={lo}*x.add(i*N+j){hi}; s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
+    )
+}
+
+/// Column **statistics** `out[j] = mean/sumsq/L2/RMS_i x[i,j]` — the per-channel BatchNorm mean, 2nd
+/// moment / energy, column L2 norm, and per-feature RMS. Same strided `Σ`/`Σx²` column-outer fold as
+/// `colsum` that gcc/rustc leave **scalar** (verified: no packed `vaddps` for the stride-N reduction);
+/// Mercury folds each nest to `mercury_col{mean,sumsq,l2,rms}_f32[_parallel]` (row-major streaming + a
+/// per-column finalize). Reported as GB/s (`M·N·4`, the matrix read once), reusing the `(x, _, out)`
+/// 3-pointer harness via the unused middle. Each folds its column i-ascending — exactly the naive C
+/// order — and `/M`/`sqrt` are correctly-rounded, so the full-buffer cross-check is **bit-exact**.
+fn bench_colstat(cc: &str, dir: &Path) {
+    // 0 = mean, 1 = sumsq (energy), 2 = L2, 3 = RMS.
+    for (opc, label, sym) in [
+        (0u8, "colmean", "mean"),
+        (1, "colsumsq", "Σ"),
+        (2, "coll2", "L2"),
+        (3, "colrms", "rms"),
+    ] {
+        for (m, n) in [(1024usize, 1024usize), (4096, 1024)] {
+            let mn = m * n;
+            let x: Vec<f32> = (0..mn).map(|i| (i % 17) as f32 * 0.25 - 2.0).collect();
+            let dummy = vec![0.0f32; n];
+            let mut out = vec![0.0f32; n];
+            let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+            let bytes = mn as f64 * 4.0; // the matrix is read once
+            let gbps = |v: &Option<Measure>| {
+                v.as_ref()
+                    .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let desc = if opc == 0 {
+                "x[i,j]"
+            } else {
+                "x[i,j]²"
+            };
+            println!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
+            let mer = bench_mercury(&mer_colstat(m, n, false, opc), &mut out, xp, yp, op);
+            let mer_par = bench_mercury(&mer_colstat(m, n, true, opc), &mut out, xp, yp, op);
+            let cm = bench_external(
+                "c",
+                &c_colstat(m, n, opc),
+                dir,
+                label,
+                cc,
+                &["-O3", "-march=native", "-shared"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            let rm = bench_external(
+                "rs",
+                &rust_colstat(m, n, opc),
+                dir,
+                label,
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "GB/s",
+                gbps(&mer),
+                gbps(&mer_par),
+                gbps(&cm),
+                gbps(&rm)
+            );
+            // Both fold each column i-ascending and finalize with correctly-rounded /M and sqrt, so the
+            // full-buffer cross-check is bit equality.
+            if let (Some(a), Some(c2)) = (&mer, &cm) {
+                if a.out != c2.out {
+                    println!("  ! {label} output mismatch vs C");
+                }
+            }
+            if let (Some(ms), Some(c2)) = (&mer, &cm) {
+                let r = c2.ns_per_call / ms.ns_per_call;
+                println!(
+                    "  -> Mercury single-core is {:.2}x {} than naive C",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                );
+            }
+            if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+                let r = c2.ns_per_call / mp.ns_per_call;
+                println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+            }
+            println!();
+        }
+    }
+}
+
+/// Mercury column-statistics kernel: `for j { let s=0; for i in 0..M { s = s + ⟨x[i*N+j]⟩ }; out[j]=fin(s) }`
+/// the recognizer folds to one `mercury_col{mean,sumsq,l2,rms}_f32[_parallel]` call. op: 0=mean
+/// (`s/M`), 1=sumsq (`s` over `x²`), 2=L2 (`sqrt(s)` over `x²`), 3=RMS (`sqrt(s/M)` over `x²`).
+fn mer_colstat(m: usize, n: usize, parallel: bool, op: u8) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let mn = m * n;
+    let prod = format!("x[i * {n} + j]");
+    let (fold, fin) = match op {
+        0 => (format!("s = s + {prod};"), format!("s / {m}.0")),
+        1 => (format!("s = s + {prod} * {prod};"), "s".to_string()),
+        2 => (format!("s = s + {prod} * {prod};"), "sqrt(s)".to_string()),
+        _ => (format!("s = s + {prod} * {prod};"), format!("sqrt(s / {m}.0)")),
+    };
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for j in 0..{n} {{\n\
+         \x20       let mut s: f32 = 0.0;\n\
+         \x20       for i in 0..{m} {{ {fold} }}\n\
+         \x20       out[j] = {fin};\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_colstat(m: usize, n: usize, op: u8) -> String {
+    let (fold, fin) = match op {
+        0 => ("s += x[i*N+j];", "s / (float)M"),
+        1 => ("s += x[i*N+j]*x[i*N+j];", "s"),
+        2 => ("s += x[i*N+j]*x[i*N+j];", "sqrtf(s)"),
+        _ => ("s += x[i*N+j]*x[i*N+j];", "sqrtf(s / (float)M)"),
+    };
+    format!(
+        "#include <math.h>\n#define M {m}\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++){{ {fold} }} out[j]={fin}; }}\n}}\n"
+    )
+}
+
+fn rust_colstat(m: usize, n: usize, op: u8) -> String {
+    let (fold, fin) = match op {
+        0 => ("s += *x.add(i*N+j);", "s / M as f32"),
+        1 => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "s"),
+        2 => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "s.sqrt()"),
+        _ => ("s += *x.add(i*N+j) * *x.add(i*N+j);", "(s / M as f32).sqrt()"),
+    };
+    format!(
+        "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ {fold} }} *out.add(j)={fin}; }}\n}}\n"
     )
 }
 
