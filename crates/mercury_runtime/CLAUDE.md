@@ -22,9 +22,10 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   softplus=max(x,0)+ln(1+e^−|x|), mish=x·tanh(softplus), selu=scaled elu, hardsigmoid/hardswish=min/max clamp), so one ≈1-ULP `exp` keeps the family exact;
   `gelu1`/`silu1` are `pub(crate)` for the GEMM fused epilogue. The **two-input** twin
   `mercury_vmath2_f32(x, y, out, n, op)` (`VM2_*` codes) covers `pow`/`atan2`/`hypot` **and the
-  activation backwards** `dx = dy·act'(x)` for silu/gelu/sigmoid/tanh (`VM2_{SILU,GELU,SIGMOID,TANH}_BWD`,
-  inputs `(x, dy)`): the derivative folds a sigmoid/tanh (an `expf`) C/Rust keep scalar, so the fused
-  256-bit gradient wins like the forward dispatch (~5–11× single-core vs scalar C, `tanh'` the largest).
+  activation backwards** `dx = dy·act'(x)` for silu/gelu/sigmoid/tanh/elu/softplus
+  (`VM2_{SILU,GELU,SIGMOID,TANH,ELU,SOFTPLUS}_BWD`, inputs `(x, dy)`): the derivative folds a
+  sigmoid/tanh/exp (an `expf`) C/Rust keep scalar, so the fused 256-bit gradient wins like the forward
+  dispatch (~3–12.5× single-core vs scalar C — `tanh'` the largest, `elu'` the most modest).
   The backward derivatives reuse `sigmoid8`/`tanh8`, so they agree with the forward family; scalar twin
   (`silu_bwd_2`…), AVX2 (`silu_bwd8`…), and the inlined MIR share one op sequence (bit-for-bit). Pure
   elementwise — no reduction — so the kernel is bit-identical lane-for-lane (no reassociation exception).
