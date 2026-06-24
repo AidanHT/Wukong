@@ -58,7 +58,10 @@ pub use transpose::{
 };
 
 mod colreduce;
-pub use colreduce::{mercury_colsum_f32, mercury_colsum_f32_parallel};
+pub use colreduce::{
+    mercury_colmax_f32, mercury_colmax_f32_parallel, mercury_colmin_f32, mercury_colmin_f32_parallel,
+    mercury_colsum_f32, mercury_colsum_f32_parallel,
+};
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
