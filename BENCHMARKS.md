@@ -46,6 +46,7 @@ tolerance for the reassociated-float ones).
 | **Fused norms** (softmax/LN/RMS) | ~1.9–6.6× | memory-bound | single-pass fusion + 256-bit `exp`; their float reductions stay sequential |
 | **Reductions** (dot / ssd) | ~2.6–2.9× | ~8–26× | lane accumulators; their reduction is a serial `vaddss` chain |
 | **Activations** (35-op `vmath`) | ~2–13× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
+| **Activation backward** (silu/gelu/sigmoid/tanh grad) | **~5–11×** | **~10–25×** | the derivative folds a sigmoid/tanh (`expf`) C/Rust keep scalar — the forward lever, applied to training |
 | **Softmax backward** (`y·(dy−Σy·dy)`) | ~1.0–2.0× | ~4.5–6.1× | vectorizes the per-row dot's accumulation (modest — they vectorize the apply) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu | ≈tie | — | already bandwidth-bound; no headroom |
@@ -597,6 +598,32 @@ The dot reassociates (lane accumulators vs the C baseline's serial chain — the
 reassociated-reduction exception), so the cross-language check is a magnitude-normalized tolerance, not
 bit-exact; the differential gate (interp == native, both running this kernel) *is* bit-exact, and the
 runtime test pins the kernel to its delegated-dot reference and serial == parallel. `tests/run/softmax_bwd.mer`.
+
+### Activation backward — the 256-bit transcendental gradient
+
+`dx[i] = dy[i]·act'(x[i])` is the elementwise gradient through an activation — the backward of every
+FFN/attention nonlinearity in training. The derivative is itself a **transcendental**: `silu'` and
+`sigmoid'` fold a sigmoid, `gelu'` and `tanh'` fold a tanh — each an `expf` that C/Rust call as scalar
+`libm` inside the loop, so the loop **cannot vectorize** (exactly the wall the forward activation
+dispatch clears). Mercury recognizes `dx[i] = act_backward(x[i], dy[i])` and folds it to one **256-bit**
+`mercury_vmath2_f32` call (`act_backward` ∈ {`silu`,`gelu`,`sigmoid`,`tanh`}, new two-input op codes on
+the same kernel as `pow`/`atan2`/`hypot`), fusing the upstream `dy·` multiply into the derivative — one pass.
+
+| backward | 1-core vs scalar C | `@parallel` vs C | derivative |
+|----------|--------------------|------------------|------------|
+| `silu_backward`    | **~5.1–5.5×** | ~10–11×   | `s + x·s·(1−s)`, `s=σ(x)` |
+| `gelu_backward`    | **~7.3–8.1×** | ~15.6–20× | tanh-approx `g'`; more transcendental work → wider gap |
+| `sigmoid_backward` | **~5.4×**     | ~12×      | `σ(x)·(1−σ(x))` — the logistic gate |
+| `tanh_backward`    | **~11×**      | ~24×      | `1−tanh²(x)` — the largest; `tanhf` is costly scalar, trivial vectorized |
+
+(N = 2²⁰, the `(x, dy, dx)` three-pointer harness; absolute GB/s swings with the laptop clock, so the
+clock-invariant **ratio** is reported.) The derivative is **pure elementwise — no reduction** — so the
+kernel is bit-identical lane-for-lane and the differential gate (interp == native, −O0 == −O3) is trivial
+(not even the reassociation exception softmax-backward needs); the cross-language check is a
+magnitude-normalized tolerance only because the poly sigmoid/tanh differs from C's `libm` by ~1 ULP. The
+scalar twin, the AVX2 lanes, and the inlined-MIR fallback share one op sequence, so a dispatched loop, a
+`while`-loop fallback, and a standalone call all agree bit-for-bit.
+`tests/run/{silu,gelu,gate}_backward.mer`.
 
 ### Single-threaded elementwise & reductions
 
