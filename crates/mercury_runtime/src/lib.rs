@@ -93,6 +93,15 @@ pub use logsoftmax::{
     mercury_logsumexp_f32_parallel,
 };
 
+mod xent_bwd;
+pub use xent_bwd::{mercury_xent_bwd_f32, mercury_xent_bwd_f32_parallel};
+
+mod rope_bwd;
+pub use rope_bwd::{mercury_rope_bwd_f32, mercury_rope_bwd_f32_parallel};
+
+mod gate;
+pub use gate::{mercury_gate_f32, mercury_gate_f32_parallel};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
