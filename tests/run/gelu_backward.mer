@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -11
+// EXPECT-OUT: -82
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1082
+// EXPECT-OUT: 1086
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1734
+// EXPECT-OUT: 530
+module tests.run.gelu_backward
+
+// GELU backward dx[i] = dy[i] * gelu'(x[i]) (tanh approximation, paired with the forward `gelu`) — the
+// training gradient through the BERT/GPT-2/ViT activation. gelu' folds a tanh (an expf) C/Rust keep
+// scalar, so the recognizer folds the elementwise `dx[i] = gelu_backward(x[i], dy[i])` loop to one
+// 256-bit mercury_vmath2_f32 call. Pure elementwise (no reduction) → bit-identical lane-for-lane, so
+// the differential gate (interp == native, -O0 == -O3) is trivial. Frozen deterministic kernel output
+// (×1000, truncated), the same convention as activations.mer.
+fn main() -> i32 {
+    let x: [f32; 8] = [-3.0, -1.0, 0.0, 1.0, 2.0, 3.0, 0.5, -0.5];
+    let dy: [f32; 8] = [1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 2.0, 4.0];
+    let mut dx: [f32; 8] = [0.0; 8];
+
+    // Recognized → mercury_vmath2_f32(x, dy, dx, 8, VM2_GELU_BWD).
+    for i in 0..8 {
+        dx[i] = gelu_backward(x[i], dy[i]);
+    }
+
+    for k in 0..8 {
+        print((dx[k] * 1000.0) as i32);
+    }
+    return 0;
+}

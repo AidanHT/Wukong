@@ -726,6 +726,9 @@ const VMATH_CBRT: u32 = 35;
 const VMATH2_POW: u32 = 0;
 const VMATH2_ATAN2: u32 = 1;
 const VMATH2_HYPOT: u32 = 2;
+// Activation backward `dx = dy·act'(x)` (two inputs `(x, dy)`) — must match `vmath`'s `VM2_*`.
+const VMATH2_SILU_BWD: u32 = 3;
+const VMATH2_GELU_BWD: u32 = 4;
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -4107,6 +4110,11 @@ impl FnLowerer<'_> {
             Some(MathIntrinsic::Pow) => VMATH2_POW,
             Some(MathIntrinsic::Atan2) => VMATH2_ATAN2,
             Some(MathIntrinsic::Hypot) => VMATH2_HYPOT,
+            // Activation backward `dx[j] = act_backward(x[j], dy[j])` = `dy·act'(x)`: the training
+            // gradient through SiLU/GELU. The derivative folds a sigmoid/tanh (an `expf`) C/Rust keep
+            // scalar, so the 256-bit fused kernel wins like the forward activation dispatch.
+            Some(MathIntrinsic::SiluBackward) => VMATH2_SILU_BWD,
+            Some(MathIntrinsic::GeluBackward) => VMATH2_GELU_BWD,
             _ => return None,
         };
         // The kernel computes (and writes) f32; both operands must be unit-stride f32 array reads.
@@ -5104,9 +5112,16 @@ impl FnLowerer<'_> {
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && *lane == Some(MirType::F32)
                 }
-                Some(MathIntrinsic::Pow | MathIntrinsic::Atan2 | MathIntrinsic::Hypot) => {
-                    // Two-arg transcendentals (pow = exp(y·log(x)); atan2; hypot); f32 lane only, same
-                    // reason as exp/log — the IEEE surgery in the composed polys is f32-specific.
+                Some(
+                    MathIntrinsic::Pow
+                    | MathIntrinsic::Atan2
+                    | MathIntrinsic::Hypot
+                    | MathIntrinsic::SiluBackward
+                    | MathIntrinsic::GeluBackward,
+                ) => {
+                    // Two-arg transcendentals (pow = exp(y·log(x)); atan2; hypot; the activation
+                    // backwards `dy·act'(x)`); f32 lane only, same reason as exp/log — the IEEE surgery
+                    // in the composed polys (sigmoid/tanh) is f32-specific.
                     args.len() == 2
                         && self.vec_check_value(&args[0], j, locals, lane, acc)
                         && self.vec_check_value(&args[1], j, locals, lane, acc)
@@ -5948,6 +5963,16 @@ impl FnLowerer<'_> {
                     let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let b = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
                     self.emit_hypot(a, b, vty)
+                }
+                Some(MathIntrinsic::SiluBackward) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let dy = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    self.emit_silu_backward(x, dy, vty)
+                }
+                Some(MathIntrinsic::GeluBackward) => {
+                    let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
+                    let dy = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
+                    self.emit_gelu_backward(x, dy, vty)
                 }
                 Some(MathIntrinsic::Erf) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -6933,6 +6958,25 @@ impl FnLowerer<'_> {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_gelu(x, &rty))
             }
+            // Activation backward `act_backward(x, dy) = dy · act'(x)` — two args. The non-dispatched
+            // path (a `while` loop / standalone call); the elementwise `for` form goes 256-bit via
+            // `match_vmath2_stmt`. Inlined form is bit-identical to the kernel (mirrors `*_bwd8`).
+            MathIntrinsic::SiluBackward => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let x = self.lower_expr(&args[0]);
+                let dy = self.lower_expr(&args[1]);
+                Some(self.emit_silu_backward(x, dy, &rty))
+            }
+            MathIntrinsic::GeluBackward => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let x = self.lower_expr(&args[0]);
+                let dy = self.lower_expr(&args[1]);
+                Some(self.emit_gelu_backward(x, dy, &rty))
+            }
             MathIntrinsic::Elu => {
                 let x = self.lower_expr(args.first()?);
                 Some(self.emit_elu(x, &rty))
@@ -7106,6 +7150,49 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FMul, half, x));
         self.builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, hx, onep))
+    }
+
+    /// `silu_backward(x, dy) = dy · silu'(x)`, `silu'(x) = fma(x·s, 1−s, s)` with `s = sigmoid(x)`.
+    /// Mirrors the runtime `silu_bwd8`/`silu_bwd_2` op-for-op (single-rounded FMA), so the inlined
+    /// fallback (a `while` loop / standalone call) equals the 256-bit `mercury_vmath2_f32` dispatch.
+    /// The training gradient through a SiLU/swish gate; bit-identical across backends.
+    fn emit_silu_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
+        let s = self.emit_sigmoid(x, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let oms = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, s));
+        let xs = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, s));
+        let g = self.builder.build(rty.clone(), Op::Fma(xs, oms, s)); // x·s·(1−s) + s
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, g))
+    }
+
+    /// `gelu_backward(x, dy) = dy · gelu'(x)` (tanh approximation, paired with [`emit_gelu`]). With
+    /// `I = c0·(x + c1·x³)`, `u = tanh(I)`: `gelu'(x) = ½(1+u) + ½·x·(1−u²)·c0·(1 + 3·c1·x²)`. Mirrors
+    /// the runtime `gelu_bwd8`/`gelu_bwd_2` op-for-op (the inner `I`/`u` identical to `emit_gelu`, the
+    /// `3·c1·x²` written as `fma(c1, 3x², 1)` so no new constant), so the inlined fallback equals the
+    /// 256-bit dispatch. The BERT/GPT-2/ViT training gradient; bit-identical across backends.
+    fn emit_gelu_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
+        let c0 = self.splat_const_f(0.7978845608, rty);
+        let c1 = self.splat_const_f(0.044715, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let half = self.splat_const_f(0.5, rty);
+        let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
+        let x3 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x2, x));
+        let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // c1·x³ + x
+        let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
+        let u = self.emit_tanh(inner, rty);
+        let onep = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, one, u));
+        let half_onep = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, half, onep)); // ½(1+u)
+        let u2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, u, u));
+        let sech2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, one, u2)); // 1 − u²
+        let three = self.splat_const_f(3.0, rty);
+        let three_x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, three, x2));
+        let di = self.builder.build(rty.clone(), Op::Fma(c1, three_x2, one)); // c1·3x² + 1
+        let dinner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, di)); // I'(x)
+        let hx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, half, x));
+        let a = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, hx, sech2));
+        let term2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, a, dinner)); // ½x(1−u²)I'
+        let gp = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, half_onep, term2));
+        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, dy, gp))
     }
 
     /// `elu(x) = x>0 ? x : e^x − 1` (α=1), the exponential linear unit. Mirrors the fused AVX2 `elu8`
@@ -11108,6 +11195,11 @@ enum MathIntrinsic {
     Sigmoid,
     Silu,
     Gelu,
+    /// Activation backward (training gradient `dy · act'(x)`), two args `(x, dy)`. The 256-bit
+    /// `mercury_vmath2_f32` dispatch; the derivative folds a transcendental (sigmoid/tanh) C/Rust
+    /// keep scalar.
+    SiluBackward,
+    GeluBackward,
     Elu,
     LeakyRelu,
     Softplus,
@@ -11171,6 +11263,8 @@ fn math_intrinsic(name: &str) -> Option<MathIntrinsic> {
         "sigmoid" => MathIntrinsic::Sigmoid,
         "silu" => MathIntrinsic::Silu,
         "gelu" => MathIntrinsic::Gelu,
+        "silu_backward" => MathIntrinsic::SiluBackward,
+        "gelu_backward" => MathIntrinsic::GeluBackward,
         "elu" => MathIntrinsic::Elu,
         "leaky_relu" => MathIntrinsic::LeakyRelu,
         "softplus" => MathIntrinsic::Softplus,
