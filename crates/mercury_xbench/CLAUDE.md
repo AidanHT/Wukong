@@ -26,12 +26,14 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   naive strided column-outer sum, which gcc/rustc leave **scalar** (verified: no packed `vaddps`). Reuses
   the `(x, _, out)` 3-pointer harness via an unused middle pointer. Bit-exact cross-check (both sum each
   column i-ascending).
-- `bench_colmax` (+ `mer_colmax`/`c_colmax`/`rust_colmax`) — the column **max** and **min**
-  `out[j] = max/min_i x[i,j]` (per-channel quant stats / axis-0 max-min pool) at 1024×1024 / 4096×1024,
-  same GB/s basis and 3-pointer harness as `bench_colsum`. Mercury folds to `mercury_col{max,min}
-  _f32[_parallel]`; C/Rust are the naive strided column-outer max/min, which gcc/rustc also leave
-  **scalar** (verified: no packed `vmaxps`/`vminps` — `fmax`/`fmin` are non-associative). Bit-exact on
-  finite data (both fold each column i-ascending; the C/Rust `s⊕v` mirrors `_mm256_{max,min}_ps`).
+- `bench_colmax` (+ `mer_colmax`/`c_colmax`/`rust_colmax`) — the column **max**, **min**, and
+  **abs-max** `out[j] = max/min_i x[i,j]` / `max_i |x[i,j]|` (per-channel quant stats / axis-0 pooling;
+  abs-max is the symmetric-quant scale) at 1024×1024 / 4096×1024, same GB/s basis and 3-pointer harness
+  as `bench_colsum`. The three are selected by an op code (0/1/2). Mercury folds to
+  `mercury_col{max,min,maxabs}_f32[_parallel]`; C/Rust are the naive strided column-outer reductions,
+  which gcc/rustc also leave **scalar** (verified: no packed `vmaxps`/`vminps` — `fmax`/`fmin` are
+  non-associative). Bit-exact on finite data (both fold each column i-ascending; the C/Rust `s⊕v` mirrors
+  `_mm256_{max,min}_ps`, and abs via sign-mask `andnot` == `fabsf`).
 - `bench_transpose` (+ `mer_transpose`/`c_transpose`/`rust_transpose`) — `dst = srcᵀ` at 1024²/2048²,
   reported as GB/s (`2·N²·4` bytes/call). Mercury folds the nest to the cache-blocked
   `mercury_transpose_f32[_parallel]`; C/Rust are the naive transpose at `-O3 -march=native` (which do
