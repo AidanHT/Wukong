@@ -346,7 +346,7 @@ fn hardswish1(x: f32) -> f32 {
 /// dispatched `sin(x)` loop agrees with a composed/scalar one. Accurate to ≈1 ULP for the |x| where the
 /// 3-part π/2 split holds (RoPE angles, ≲ a few thousand); large |x| loses the reduction, as with libm.
 #[inline]
-fn sincos1(x: f32, is_cos: bool) -> f32 {
+pub(crate) fn sincos1(x: f32, is_cos: bool) -> f32 {
     let tt = x.mul_add(TWO_OVER_PI, EXP_MAGIC);
     let qf = tt - EXP_MAGIC;
     let r = qf.mul_add(-PIO2_1, x);
@@ -1218,7 +1218,7 @@ pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let bits = _mm256_castps_si256(x);
     let epart = _mm256_and_si256(bits, _mm256_set1_epi32(0x7F80_0000));
@@ -1405,7 +1405,7 @@ unsafe fn hardswish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 
 /// `blendv`, matching the scalar `if quad == k` chain.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn sincos8(x: std::arch::x86_64::__m256, is_cos: bool) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn sincos8(x: std::arch::x86_64::__m256, is_cos: bool) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let magic = _mm256_set1_ps(EXP_MAGIC);
     let tt = _mm256_fmadd_ps(x, _mm256_set1_ps(TWO_OVER_PI), magic);
@@ -1450,13 +1450,13 @@ unsafe fn sincos8(x: std::arch::x86_64::__m256, is_cos: bool) -> std::arch::x86_
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn sin8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn sin8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     sincos8(x, false)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn cos8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn cos8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     sincos8(x, true)
 }
 
