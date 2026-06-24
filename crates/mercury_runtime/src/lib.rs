@@ -69,6 +69,18 @@ pub use colreduce::{
 mod softmax_bwd;
 pub use softmax_bwd::{mercury_softmax_bwd_f32, mercury_softmax_bwd_f32_parallel};
 
+mod rmsnorm_bwd;
+pub use rmsnorm_bwd::{mercury_rmsnorm_bwd_f32, mercury_rmsnorm_bwd_f32_parallel};
+
+mod layernorm_bwd;
+pub use layernorm_bwd::{mercury_layernorm_bwd_f32, mercury_layernorm_bwd_f32_parallel};
+
+mod pool2d;
+pub use pool2d::{
+    mercury_avgpool2d_f32, mercury_avgpool2d_f32_parallel, mercury_maxpool2d_f32,
+    mercury_maxpool2d_f32_parallel,
+};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
