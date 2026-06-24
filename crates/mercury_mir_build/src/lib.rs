@@ -108,6 +108,8 @@ pub fn lower_program(
         xent_par: interner.intern("mercury_xent_fwd_f32_parallel"),
         rope: interner.intern("mercury_rope_f32"),
         rope_par: interner.intern("mercury_rope_f32_parallel"),
+        logsumexp: interner.intern("mercury_logsumexp_f32"),
+        logsumexp_par: interner.intern("mercury_logsumexp_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -195,6 +197,12 @@ pub fn lower_program(
                 // the rows into scalar loops and lose the inline-sincos kernel). The embedded
                 // `match_rope` then emits the multicore `mercury_rope_f32_parallel` (rows independent).
                 if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
+                if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm) {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -750,6 +758,11 @@ struct GemmSyms {
     /// embedding nest dispatches here. C/Rust keep sinf/cosf scalar; rows independent → serial==parallel.
     rope: Symbol,
     rope_par: Symbol,
+    /// Batched log-sum-exp (`mercury_logsumexp_f32[_parallel](x, out, rows, cols)`): the
+    /// `out[r] = m + log(Σexp(x[r,·]−m))` log-partition nest dispatches here. Same vmath shape as the
+    /// transcendental kernels. C/Rust keep the expf reduction scalar; rows independent → serial==parallel.
+    logsumexp: Symbol,
+    logsumexp_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -1790,6 +1803,65 @@ impl FnLowerer<'_> {
         None
     }
 
+    /// Recognize the **batched log-sum-exp** (the stable log-partition `out[r] = m + log(Σexp(x[r,·]−m))`,
+    /// the softmax denominator in log space — CRF/structured prediction, mixture models, log-prob
+    /// normalizers) and dispatch it to `mercury_logsumexp_f32`. It is `match_xent` minus the gather: the
+    /// same softmax max + Σexp prefix (shared matchers), then a per-row scalar store `out[r] = m + log(s)`.
+    /// C/Rust keep the expf reduction scalar; the fused 256-bit kernel wins. Reductions reassociate (the
+    /// documented exception — both backends run the kernel), so the gate holds.
+    fn match_logsumexp(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<LogsumexpNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 5 {
+            return None;
+        }
+        let (m, seed) = Self::let_init(&body.stmts[0])?;
+        let (v1, n_expr, body1) = self.as_range0_for(&body.stmts[1])?;
+        let data_batch = Some((r, n_expr));
+        let x = self.match_max_reduce_body(body1, v1, m, data_batch)?;
+        if !self.is_max_seed(seed, x, data_batch) {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&body.stmts[2])?;
+        if !matches!(&s_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
+            return None;
+        }
+        let (v3, n3, body3) = self.as_range0_for(&body.stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        self.match_sumexp_sub_body(body3, v3, x, m, s, data_batch)?;
+        // [4] out[r] = m + log(s)
+        let StmtKind::Assign {
+            target: outt,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[4].kind
+        else {
+            return None;
+        };
+        let out = index_by_var(outt, r)?;
+        self.match_m_plus_log(value, m, s)?;
+        let cols = as_dim(n_expr, self.interner)?;
+        if out == x {
+            return None;
+        }
+        Some(LogsumexpNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
     /// Body `x[v] = (x[v] - m) - ls` (center, then subtract the log-sum-exp, in place). The outermost
     /// `Sub` is by `ls`; the inner is the centered `x[v] - m` (`is_centered`). Pure.
     fn match_logsoftmax_norm_body(
@@ -2716,6 +2788,27 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![x, inv_freq, out, rows, half],
+        });
+        true
+    }
+
+    /// Emit one `mercury_logsumexp_f32[_parallel](x, out, rows, cols)` call for a recognized log-sum-exp
+    /// nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore kernel.
+    fn emit_logsumexp(&mut self, nest: &LogsumexpNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.logsumexp_par
+        } else {
+            self.gemm.logsumexp
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
         });
         true
     }
@@ -4000,6 +4093,13 @@ impl FnLowerer<'_> {
         // gcc keeps scalar; the kernel computes them 8-wide. Bit-identical (a rotation, no reassoc).
         if let Some(nest) = match_rope(pat, iter, body, self.sema, self.interner) {
             if self.emit_rope(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // A batched log-sum-exp `for r { max; Σexp; out[r] = m + log(s) }` → `mercury_logsumexp_f32`
+        // (the `_parallel` one in a `@parallel` function). The expf reduction gcc keeps scalar.
+        if let Some(nest) = self.match_logsumexp(pat, iter, body) {
+            if self.emit_logsumexp(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -11460,6 +11560,51 @@ fn xent_fn(
         vec_loads: HashMap::new(),
     };
     probe.match_xent(pat, iter, lb).is_some()
+}
+
+/// A recognized batched log-sum-exp nest (see [`FnLowerer::match_logsumexp`]).
+struct LogsumexpNest {
+    x: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// Is the whole function body a single batched log-sum-exp nest? Intercepts a `@parallel` logsumexp
+/// before the elementwise outliner (a throwaway `FnLowerer` probe, like [`xent_fn`]).
+fn logsumexp_fn(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    let mut diags = Vec::new();
+    let probe = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::I64),
+        sema,
+        interner,
+        diags: &mut diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+    };
+    probe.match_logsumexp(pat, iter, lb).is_some()
 }
 
 /// The `f32` bit pattern of a non-negative float literal (the `eps` ABI slot), or `None`. Free twin of
