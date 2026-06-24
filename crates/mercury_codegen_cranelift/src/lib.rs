@@ -105,6 +105,10 @@ const RT_TRANSPOSE_U16: &str = "mercury_transpose_u16";
 const RT_TRANSPOSE_U16_PAR: &str = "mercury_transpose_u16_parallel";
 const RT_COLSUM: &str = "mercury_colsum_f32";
 const RT_COLSUM_PAR: &str = "mercury_colsum_f32_parallel";
+const RT_COLMAX: &str = "mercury_colmax_f32";
+const RT_COLMAX_PAR: &str = "mercury_colmax_f32_parallel";
+const RT_COLMIN: &str = "mercury_colmin_f32";
+const RT_COLMIN_PAR: &str = "mercury_colmin_f32_parallel";
 const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
@@ -874,9 +878,13 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[src, dst, rows, cols]);
             return None;
         }
-        // The SIMD column reduction: mercury_colsum_f32[_parallel](x, out, rows, cols) — two pointers
-        // and two i64. Same (ptr, ptr, i64, i64) signature; route by name.
-        if (name == RT_COLSUM || name == RT_COLSUM_PAR) && args.len() == 4 {
+        // The SIMD column reductions: mercury_col{sum,max,min}_f32[_parallel](x, out, rows, cols) — two
+        // pointers and two i64. Same (ptr, ptr, i64, i64) signature; route by name.
+        if matches!(
+            name,
+            RT_COLSUM | RT_COLSUM_PAR | RT_COLMAX | RT_COLMAX_PAR | RT_COLMIN | RT_COLMIN_PAR
+        ) && args.len() == 4
+        {
             let x = self.val(args[0]);
             let out = self.val(args[1]);
             let rows = self.coerce_to_i64(args[2]);
@@ -1191,6 +1199,10 @@ struct RtFuncs {
     transpose_u16_par: FuncId,
     colsum: FuncId,
     colsum_par: FuncId,
+    colmax: FuncId,
+    colmax_par: FuncId,
+    colmin: FuncId,
+    colmin_par: FuncId,
     velem: FuncId,
     vhorner: FuncId,
     sred: FuncId,
@@ -1521,6 +1533,18 @@ fn populate_module<M: Module>(
         colsum_par: module
             .declare_function(RT_COLSUM_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        colmax: module
+            .declare_function(RT_COLMAX, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colmax_par: module
+            .declare_function(RT_COLMAX_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colmin: module
+            .declare_function(RT_COLMIN, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colmin_par: module
+            .declare_function(RT_COLMIN_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         velem: module
             .declare_function(RT_VELEM, Linkage::Import, &sig_velem)
             .map_err(|e| e.to_string())?,
@@ -1759,6 +1783,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_COLSUM_PAR,
                 module.declare_func_in_func(rt.colsum_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLMAX,
+                module.declare_func_in_func(rt.colmax, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLMAX_PAR,
+                module.declare_func_in_func(rt.colmax_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLMIN,
+                module.declare_func_in_func(rt.colmin, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLMIN_PAR,
+                module.declare_func_in_func(rt.colmin_par, builder.func),
             );
             rt_refs.insert(
                 RT_VELEM,
@@ -2066,6 +2106,16 @@ pub fn jit_compile(
         RT_COLSUM_PAR,
         mercury_runtime::mercury_colsum_f32_parallel as *const u8,
     );
+    builder.symbol(RT_COLMAX, mercury_runtime::mercury_colmax_f32 as *const u8);
+    builder.symbol(
+        RT_COLMAX_PAR,
+        mercury_runtime::mercury_colmax_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLMIN, mercury_runtime::mercury_colmin_f32 as *const u8);
+    builder.symbol(
+        RT_COLMIN_PAR,
+        mercury_runtime::mercury_colmin_f32_parallel as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
@@ -2311,6 +2361,16 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_COLSUM_PAR,
         mercury_runtime::mercury_colsum_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLMAX, mercury_runtime::mercury_colmax_f32 as *const u8);
+    builder.symbol(
+        RT_COLMAX_PAR,
+        mercury_runtime::mercury_colmax_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLMIN, mercury_runtime::mercury_colmin_f32 as *const u8);
+    builder.symbol(
+        RT_COLMIN_PAR,
+        mercury_runtime::mercury_colmin_f32_parallel as *const u8,
     );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
