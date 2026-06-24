@@ -732,6 +732,12 @@ pub const VM2_TANH_BWD: i64 = 6;
 // ELU / softplus gradients (CNN / VAE-flow nets): elu'(x)=x>0?1:eˣ, softplus'(x)=σ(x).
 pub const VM2_ELU_BWD: i64 = 7;
 pub const VM2_SOFTPLUS_BWD: i64 = 8;
+// Gated-FFN activation (SwiGLU / GeGLU — the Llama/PaLM/Gemma feed-forward gate): `out = act(a)·b`,
+// the gate branch `a` (activated) weighting the linear branch `b`. The activation folds an `exp` C/Rust
+// keep scalar, so the fused 256-bit gate wins like the forward dispatch; reuses `silu8`/`gelu8`, so it
+// is bit-identical with the forward activation family. Inputs are positional `(a, b)`.
+pub const VM2_SILU_GATE: i64 = 9;
+pub const VM2_GELU_GATE: i64 = 10;
 
 /// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
 #[inline]
@@ -851,6 +857,19 @@ fn softplus_bwd_2(x: f32, dy: f32) -> f32 {
     dy * sigmoid1(x)
 }
 
+/// `silu_gate(a, b) = silu(a) · b` — the SwiGLU FFN gate. Reuses the shared [`silu1`] so it matches the
+/// AVX2 [`silu_gate8`] and the forward activation dispatch bit-for-bit.
+#[inline]
+fn silu_gate_2(a: f32, b: f32) -> f32 {
+    silu1(a) * b
+}
+
+/// `gelu_gate(a, b) = gelu(a) · b` — the GeGLU FFN gate (tanh-approx gelu, matching [`gelu1`]).
+#[inline]
+fn gelu_gate_2(a: f32, b: f32) -> f32 {
+    gelu1(a) * b
+}
+
 /// Scalar dispatch for one element pair (the AVX2 tail and the no-AVX2 fallback). The two inputs are
 /// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot, `(x, dy)` for the
 /// activation backwards.
@@ -866,6 +885,8 @@ fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
         VM2_TANH_BWD => tanh_bwd_2(x, y),
         VM2_ELU_BWD => elu_bwd_2(x, y),
         VM2_SOFTPLUS_BWD => softplus_bwd_2(x, y),
+        VM2_SILU_GATE => silu_gate_2(x, y),
+        VM2_GELU_GATE => gelu_gate_2(x, y),
         _ => x,
     }
 }
@@ -918,6 +939,27 @@ unsafe fn hypot8_2(
     let scaled = _mm256_mul_ps(m, _mm256_sqrt_ps(sum));
     let mzero = _mm256_cmp_ps::<_CMP_EQ_OQ>(m, _mm256_setzero_ps());
     _mm256_blendv_ps(scaled, _mm256_setzero_ps(), mzero) // mzero ? 0 : scaled
+}
+
+/// `silu(a) · b` over 8 lanes — mirrors [`silu_gate_2`] (reuses the forward [`silu8`]), so the lanes,
+/// the scalar tail, and the forward activation dispatch all agree bit-for-bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu_gate8(
+    a: std::arch::x86_64::__m256,
+    b: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    std::arch::x86_64::_mm256_mul_ps(silu8(a), b)
+}
+
+/// `gelu(a) · b` over 8 lanes — mirrors [`gelu_gate_2`] (reuses the forward [`gelu8`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu_gate8(
+    a: std::arch::x86_64::__m256,
+    b: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    std::arch::x86_64::_mm256_mul_ps(gelu8(a), b)
 }
 
 /// `dy · silu'(x)` over 8 lanes — mirrors [`silu_bwd_2`] op-for-op (`silu'(x) = fma(x·s, 1−s, s)`,
@@ -1032,6 +1074,8 @@ fn vmath2_8_for(
         VM2_TANH_BWD => tanh_bwd8,
         VM2_ELU_BWD => elu_bwd8,
         VM2_SOFTPLUS_BWD => softplus_bwd8,
+        VM2_SILU_GATE => silu_gate8,
+        VM2_GELU_GATE => gelu_gate8,
         _ => return None,
     })
 }
@@ -2092,6 +2136,51 @@ mod tests {
                     "op {op} backward({}, {}): got {} want {want}",
                     xs[i],
                     dys[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    /// The gated-FFN activations `out = act(a)·b` (SwiGLU/GeGLU): (1) the kernel output equals the
+    /// scalar twin `apply2_1` bit-for-bit over a non-multiple-of-8 length (AVX2 lanes == scalar tail,
+    /// what lets the interpreter marshal through this kernel); and (2) the scalar twin agrees with an
+    /// independent f64 forward `act(a)·b` to f32 grade, proving it's the real gate.
+    #[test]
+    fn vmath2_gate() {
+        fn silu_f64(x: f64) -> f64 {
+            x / (1.0 + (-x).exp())
+        }
+        fn gelu_f64(x: f64) -> f64 {
+            let c0 = (2.0 / std::f64::consts::PI).sqrt();
+            let c1 = 0.044715f64;
+            0.5 * x * (1.0 + (c0 * (x + c1 * x * x * x)).tanh())
+        }
+        let n = 1003usize; // not a multiple of 8 → exercises the lane body and the scalar tail
+        let a: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.011).collect();
+        let b: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+        for (op, fref) in [
+            (VM2_SILU_GATE, silu_f64 as fn(f64) -> f64),
+            (VM2_GELU_GATE, gelu_f64 as fn(f64) -> f64),
+        ] {
+            let mut got = vec![0.0f32; n];
+            // SAFETY: a/b/got are exactly n f32 long — the kernel's contract.
+            unsafe {
+                mercury_vmath2_f32(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), n as i64, op);
+            }
+            for i in 0..n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    apply2_1(op, a[i], b[i]).to_bits(),
+                    "op {op} i {i} a {}",
+                    a[i]
+                );
+                let want = b[i] as f64 * fref(a[i] as f64);
+                assert!(
+                    (got[i] as f64 - want).abs() <= 1e-4 + 1e-4 * want.abs(),
+                    "op {op} gate({}, {}): got {} want {want}",
+                    a[i],
+                    b[i],
                     got[i]
                 );
             }
