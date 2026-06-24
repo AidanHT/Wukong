@@ -130,6 +130,8 @@ pub fn lower_program(
         colargmax_par: interner.intern("mercury_colargmax_i32_parallel"),
         colargmin: interner.intern("mercury_colargmin_i32"),
         colargmin_par: interner.intern("mercury_colargmin_i32_parallel"),
+        cumsum: interner.intern("mercury_cumsum_f32"),
+        cumsum_par: interner.intern("mercury_cumsum_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -270,6 +272,17 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_rowarg(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row cumsum: intercept before the outliner (rows
+                // independent → the multicore `mercury_cumsum_f32_parallel` is bit-equal to serial).
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_cumsum(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -867,6 +880,11 @@ struct GemmSyms {
     colargmax_par: Symbol,
     colargmin: Symbol,
     colargmin_par: Symbol,
+    /// Per-row inclusive prefix sum (`mercury_cumsum_f32[_parallel](x, out, rows, cols)`): `out[r,i] =
+    /// Σ_{k<=i} x[r,k]`. gcc/rustc keep the loop-carried `out[i]=out[i-1]+x[i]` scalar; the SIMD
+    /// Hillis-Steele scan + carry vectorizes it. The in-lane tree reassociates → the kernel is the oracle.
+    cumsum: Symbol,
+    cumsum_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2306,6 +2324,112 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Recognize a batched per-row **inclusive prefix sum** (cumsum / scan):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut acc: f32 = 0.0;
+    ///     for i in 0..C {
+    ///         acc = acc + x[r*C + i];     // or  acc += x[r*C + i]
+    ///         out[r*C + i] = acc;
+    ///     }
+    /// }
+    /// ```
+    /// `out[r,i] = Σ_{k<=i} x[r,k]` → `mercury_cumsum_f32[_parallel]`. The loop-carried `acc` recurrence
+    /// is exactly what gcc/rustc keep **scalar** (they cannot auto-vectorize a prefix sum); the SIMD
+    /// Hillis-Steele scan + per-row carry vectorizes it. `out` is f32, distinct from `x`. The in-lane tree
+    /// scan reassociates the float sum (the documented reduction exception — both backends run the
+    /// identical kernel, so interp == native holds). Pure (`&self`).
+    fn match_cumsum(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<CumsumNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] let acc: f32 = 0.0;
+        let (acc, acc0) = Self::let_init(&body.stmts[0])?;
+        if !is_float_zero(acc0, self.interner) {
+            return None;
+        }
+        // [1] for i in 0..C { acc = acc + x[r*C+i]; out[r*C+i] = acc; }
+        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        let cols = as_dim(ce, self.interner)?;
+        let batch = Some((r, ce));
+        if ibody.tail.is_some() || ibody.stmts.len() != 2 {
+            return None;
+        }
+        // inner [0] acc = acc + x[r*C+i]  (or  acc += x[r*C+i])
+        let x = self.match_acc_add(&ibody.stmts[0], acc, i, batch)?;
+        // inner [1] out[r*C+i] = acc
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &ibody.stmts[1].kind
+        else {
+            return None;
+        };
+        let out = self.index_off(target, i, batch)?;
+        if single_path(value) != Some(acc) || out == x {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The prefix-sum accumulate `acc = acc + x[r*C+i]` (or the compound `acc += x[r*C+i]`), target
+    /// already `acc`. Returns the data array `x` (the read indexed `r*C + i`). Pure.
+    fn match_acc_add(
+        &self,
+        stmt: &Stmt,
+        acc: Symbol,
+        i: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(acc) {
+            return None;
+        }
+        match op {
+            // `acc += x[r*C+i]`
+            ast::AssignOp::Add => self.index_off(value, i, batch),
+            // `acc = acc + x[r*C+i]` (either operand order)
+            ast::AssignOp::Assign => {
+                let ExprKind::Binary {
+                    op: ast::BinOp::Add,
+                    lhs,
+                    rhs,
+                } = &value.kind
+                else {
+                    return None;
+                };
+                if single_path(lhs) == Some(acc) {
+                    self.index_off(rhs, i, batch)
+                } else if single_path(rhs) == Some(acc) {
+                    self.index_off(lhs, i, batch)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Match `log(arr[r*C+v])` → the indexed array `arr` (a single-arg `log` call over a row-major read).
     fn match_log_index(&self, e: &Expr, v: Symbol, batch: Option<(Symbol, &Expr)>) -> Option<Symbol> {
         let ExprKind::Call { callee, args, .. } = &e.kind else {
@@ -3610,6 +3734,27 @@ impl FnLowerer<'_> {
             (true, true) => self.gemm.rowargmax_par,
             (false, false) => self.gemm.rowargmin,
             (false, true) => self.gemm.rowargmin_par,
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_cumsum_f32[_parallel](x, out, rows, cols)` for a recognized per-row prefix sum.
+    /// Same `(ptr,ptr,i64,i64)` `sig_vmath` shape; the `_parallel` one maps rows across cores.
+    fn emit_cumsum(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.cumsum_par
+        } else {
+            self.gemm.cumsum
         };
         self.builder.build_void(Op::Call {
             func,
@@ -5021,6 +5166,14 @@ impl FnLowerer<'_> {
         // keeps gcc/rustc scalar; the AVX2 kernel tracks 8 lanes of (value,index) via blend.
         if let Some(nest) = self.match_rowarg(pat, iter, body) {
             if self.emit_rowarg(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched per-row inclusive prefix sum (cumsum) → `mercury_cumsum_f32` (the `_parallel` one in a
+        // `@parallel` fn). gcc/rustc keep the loop-carried scan scalar; the SIMD Hillis-Steele + carry
+        // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
+        if let Some(nest) = self.match_cumsum(pat, iter, body) {
+            if self.emit_cumsum(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -12868,6 +13021,14 @@ struct RowArgNest {
     rows: Dim,
     cols: Dim,
     is_max: bool,
+}
+
+/// A recognized batched per-row prefix-sum (cumsum) nest (see [`FnLowerer::match_cumsum`]).
+struct CumsumNest {
+    x: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
 }
 
 /// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner

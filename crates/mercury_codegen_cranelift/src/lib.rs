@@ -127,6 +127,8 @@ const RT_COLARGMAX: &str = "mercury_colargmax_i32";
 const RT_COLARGMAX_PAR: &str = "mercury_colargmax_i32_parallel";
 const RT_COLARGMIN: &str = "mercury_colargmin_i32";
 const RT_COLARGMIN_PAR: &str = "mercury_colargmin_i32_parallel";
+const RT_CUMSUM: &str = "mercury_cumsum_f32";
+const RT_CUMSUM_PAR: &str = "mercury_cumsum_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -921,6 +923,8 @@ impl<'a> FnTranslator<'a> {
                 | RT_COLARGMAX_PAR
                 | RT_COLARGMIN
                 | RT_COLARGMIN_PAR
+                | RT_CUMSUM
+                | RT_CUMSUM_PAR
         ) && args.len() == 4
         {
             let x = self.val(args[0]);
@@ -1384,6 +1388,8 @@ struct RtFuncs {
     colargmax_par: FuncId,
     colargmin: FuncId,
     colargmin_par: FuncId,
+    cumsum: FuncId,
+    cumsum_par: FuncId,
     kd_loss: FuncId,
     kd_loss_par: FuncId,
     vmath_bf16: FuncId,
@@ -1812,6 +1818,12 @@ fn populate_module<M: Module>(
         colargmin_par: module
             .declare_function(RT_COLARGMIN_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        cumsum: module
+            .declare_function(RT_CUMSUM, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        cumsum_par: module
+            .declare_function(RT_CUMSUM_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -2196,6 +2208,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_COLARGMIN_PAR,
                 module.declare_func_in_func(rt.colargmin_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_CUMSUM,
+                module.declare_func_in_func(rt.cumsum, builder.func),
+            );
+            rt_refs.insert(
+                RT_CUMSUM_PAR,
+                module.declare_func_in_func(rt.cumsum_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2673,6 +2693,11 @@ pub fn jit_compile(
         RT_COLARGMIN_PAR,
         mercury_runtime::mercury_colargmin_i32_parallel as *const u8,
     );
+    builder.symbol(RT_CUMSUM, mercury_runtime::mercury_cumsum_f32 as *const u8);
+    builder.symbol(
+        RT_CUMSUM_PAR,
+        mercury_runtime::mercury_cumsum_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
@@ -3070,6 +3095,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_COLARGMIN_PAR,
         mercury_runtime::mercury_colargmin_i32_parallel as *const u8,
+    );
+    builder.symbol(RT_CUMSUM, mercury_runtime::mercury_cumsum_f32 as *const u8);
+    builder.symbol(
+        RT_CUMSUM_PAR,
+        mercury_runtime::mercury_cumsum_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,

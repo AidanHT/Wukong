@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 18
+// EXPECT-OUT: 26
+module tests.run.cumsum
+
+// Batched per-row inclusive prefix sum (cumsum / scan): out[r,i] = Σ_{k<=i} x[r,k]. The recognizer
+// folds the [R=2,C=4] nest to one mercury_cumsum_f32 call — gcc/rustc keep the loop-carried
+// out[i]=out[i-1]+x[i] recurrence scalar (a prefix sum does not auto-vectorize), while the SIMD
+// Hillis-Steele scan + per-row carry vectorizes it. The in-lane tree reassociates the float sum (the
+// documented reduction exception — both backends run the identical kernel, so interp == native holds);
+// integer inputs here make tree == sequential exactly.
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut out: [f32; 8] = [0.0; 8];
+
+    for r in 0..2 {
+        let mut acc: f32 = 0.0;
+        for i in 0..4 {
+            acc = acc + x[r * 4 + i];
+            out[r * 4 + i] = acc;
+        }
+    }
+    // row 0: 1,3,6,10   row 1: 5,11,18,26
+    for k in 0..8 { print((out[k]) as i32); }
+    return 0;
+}
