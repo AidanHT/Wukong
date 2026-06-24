@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 8
+module tests.run.colmax
+
+// Column max out[j] = max_i x[i,j] — the max over the outer (batch/row) axis of a [M=3, N=4] matrix
+// into a per-column [N=4] result (per-channel max for quantization, axis-0 max-pool). Like colsum the
+// data index x[i*N+j] strides by N over the inner loop, so gcc/rustc leave it scalar (verified: no
+// packed vmaxps at -O3 — fmax is non-associative, so they will not reassociate it); the recognizer
+// dispatches to the SIMD mercury_colmax_f32, which streams x row-major + 8 columns at a time, seeded by
+// the first row. The fold is i-ascending per column (the kernel is its own oracle), so the differential
+// gate (interp == native, -O0 == -O3) holds by construction.
+fn main() -> i32 {
+    // x is [3,4] row-major; max/min land in different rows per column (a real reduction, not a corner).
+    let x: [f32; 12] = [9.0, 2.0, 7.0, 4.0, 1.0, 6.0, 3.0, 8.0, 5.0, 10.0, 11.0, 0.0];
+    let mut out: [f32; 4] = [0.0; 4];
+
+    for j in 0..4 {
+        let mut s: f32 = x[j]; // seed = row 0, column j
+        for i in 1..3 {
+            s = fmax(s, x[i * 4 + j]);
+        }
+        out[j] = s;
+    }
+    print(out[0] as i32); // max(9, 1, 5)  = 9
+    print(out[1] as i32); // max(2, 6, 10) = 10
+    print(out[2] as i32); // max(7, 3, 11) = 11
+    print(out[3] as i32); // max(4, 8, 0)  = 8
+    return 0;
+}

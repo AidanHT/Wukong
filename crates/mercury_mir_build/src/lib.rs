@@ -86,6 +86,10 @@ pub fn lower_program(
         transpose_u16_par: interner.intern("mercury_transpose_u16_parallel"),
         colsum: interner.intern("mercury_colsum_f32"),
         colsum_par: interner.intern("mercury_colsum_f32_parallel"),
+        colmax: interner.intern("mercury_colmax_f32"),
+        colmax_par: interner.intern("mercury_colmax_f32_parallel"),
+        colmin: interner.intern("mercury_colmin_f32"),
+        colmin_par: interner.intern("mercury_colmin_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -647,6 +651,15 @@ struct GemmSyms {
     /// (i-ascending per column, same order), so both backends marshal the identical kernel.
     colsum: Symbol,
     colsum_par: Symbol,
+    /// The SIMD column **max**/**min** (`mercury_col{max,min}_f32[_parallel](x, out, rows, cols)`):
+    /// `out[j] = max_i x[i*cols+j]` / `min` (per-channel statistics for quantization, axis-0 max/min
+    /// pooling), the max/min siblings of `colsum`. Same strided gap (gcc/rustc stay scalar — verified)
+    /// and the same i-ascending fold (`_mm256_max_ps`/`_mm256_min_ps`), so both backends marshal the
+    /// identical kernel and it is bit-exact.
+    colmax: Symbol,
+    colmax_par: Symbol,
+    colmin: Symbol,
+    colmin_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -2331,10 +2344,13 @@ impl FnLowerer<'_> {
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
             return false;
         };
-        let func = if parallel {
-            self.gemm.colsum_par
-        } else {
-            self.gemm.colsum
+        let func = match (nest.op, parallel) {
+            (COL_MAX, false) => self.gemm.colmax,
+            (COL_MAX, true) => self.gemm.colmax_par,
+            (COL_MIN, false) => self.gemm.colmin,
+            (COL_MIN, true) => self.gemm.colmin_par,
+            (_, false) => self.gemm.colsum,
+            (_, true) => self.gemm.colsum_par,
         };
         self.builder.build_void(Op::Call {
             func,
@@ -10228,25 +10244,36 @@ fn transpose_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<
 }
 
 /// A recognized column reduction `out[j] = Σ_i x[i, j]` (`x` is `[rows, cols]`, `out` is `[cols]`).
+// Column-reduction op tags (which fold the recognized nest dispatches to). Internal to `mir_build` —
+// each maps to a distinct runtime symbol pair (sum / max / min), not a kernel op argument.
+const COL_SUM: i64 = 0;
+const COL_MAX: i64 = 1;
+const COL_MIN: i64 = 2;
+
 struct ColSumNest {
     x: Symbol,
     out: Symbol,
     rows: Dim,
     cols: Dim,
+    op: i64,
 }
 
-/// Recognize the column-reduction nest and dispatch it to the SIMD `mercury_colsum_f32`:
+/// Recognize a column-reduction nest and dispatch it to the SIMD `mercury_col{sum,max,min}_f32`:
 ///
 /// ```text
-/// for j in 0..N { let mut s: f32 = 0.0; for i in 0..M { s = s + x[i*N + j]; } out[j] = s; }
+/// for j in 0..N { let mut s: f32 = 0.0;  for i in 0..M { s = s + x[i*N + j]; }       out[j] = s; }  // SUM
+/// for j in 0..N { let mut s: f32 = x[j]; for i in 1..M { s = fmax(s, x[i*N + j]); }  out[j] = s; }  // MAX
+/// for j in 0..N { let mut s: f32 = x[j]; for i in 1..M { s = fmin(s, x[i*N + j]); }  out[j] = s; }  // MIN
 /// ```
 ///
-/// — sum each column of `x` (`[M, N]`) over the outer/batch axis into `out` (`[N]`): the bias gradient
-/// `db = Σ_batch dY`, batch sum, reduce-along-axis-0. The data index `i*N + j` strides by `N` over the
-/// inner loop, which gcc/rustc leave scalar; the kernel streams `x` row-major + 8-wide. The
-/// accumulation order is i-ascending per column — exactly the scalar nest's — so the kernel is
-/// bit-identical to it (no reassociation; the differential gate is by-construction exact). `x` and
-/// `out` must be distinct f32 arrays. The strides pin `N`/`M` to the loop bounds, so it never misfires.
+/// — reduce each column of `x` (`[M, N]`) over the outer/batch axis into `out` (`[N]`): the **sum** is
+/// the bias gradient `db = Σ_batch dY` / batch sum; **max**/**min** are per-channel statistics (the
+/// quantization range, axis-0 max/min pooling). The data index `i*N + j` strides by `N` over the inner
+/// loop, which gcc/rustc leave scalar (verified) for *all three* folds; the kernel streams `x` row-major
+/// + 8-wide. The fold order is i-ascending per column — exactly the scalar nest's — so the kernel is its
+/// own bit-exact oracle (no reassociation; both backends marshal the identical kernel). `x` and `out`
+/// must be distinct f32 arrays. The strides pin `N`/`M` to the loop bounds, so it never misfires. The
+/// max/min seed is the first row `x[0,j] = x[j]` (so the inner loop folds `1..M`, idempotent from 0).
 fn match_colsum(
     pat: &Pattern,
     iter: &ForIter,
@@ -10267,7 +10294,7 @@ fn match_colsum(
     if body.tail.is_some() || body.stmts.len() != 3 {
         return None;
     }
-    // [0] let mut s: f32 = 0.0;
+    // [0] let mut s: f32 = <seed>;  (seed value is checked against the fold op below)
     let StmtKind::Let {
         pat: sp,
         init: Some(s0),
@@ -10280,19 +10307,14 @@ fn match_colsum(
         ast::PatKind::Ident(s) => *s,
         _ => return None,
     };
-    if !is_float_zero(s0, interner) {
-        return None;
-    }
-    // [1] for i in 0..M { s = s + x[i*N + j]; }
+    // [1] for i in <i0>..M { s = s ⊕ x[i*N + j]; }
     let (ipat, iiter, ibody) = fusable_for(&body.stmts[1])?;
     let ivar = match &ipat.kind {
         ast::PatKind::Ident(s) => *s,
         _ => return None,
     };
     let (is_, ie) = range_bounds(iiter)?;
-    if as_int_lit(is_, interner)? != 0 {
-        return None;
-    }
+    let istart = as_int_lit(is_, interner)?;
     let rows = as_dim(ie, interner)?;
     if ibody.tail.is_some() || ibody.stmts.len() != 1 {
         return None;
@@ -10303,32 +10325,34 @@ fn match_colsum(
     if single_path(target) != Some(s_sym) {
         return None;
     }
-    let addend = match op {
-        ast::AssignOp::Add => value,
-        ast::AssignOp::Assign => {
-            let ExprKind::Binary {
-                op: ast::BinOp::Add,
-                lhs,
-                rhs,
-            } = &value.kind
-            else {
-                return None;
-            };
-            if single_path(lhs) != Some(s_sym) {
-                return None;
-            }
-            rhs
-        }
-        _ => return None,
-    };
-    // The addend is `x[i*N + j]` (data index `i*cols + j`, stride `cols = N`, offset-free), f32.
-    let (xbase, xidx) = as_index1(addend)?;
+    // Classify the fold + extract the reduced data expr: `s + d` / `s += d` (SUM), or `fmax(s, d)` /
+    // `fmin(s, d)` (MAX / MIN, either operand order).
+    let (colop, data) = classify_colreduce_body(op, value, s_sym, sema, interner)?;
+    // The data is `x[i*N + j]` (index `i*cols + j`, stride `cols = N`, offset-free), f32.
+    let (xbase, xidx) = as_index1(data)?;
     let (stride, off) = match_row_col_off(xidx, ivar, jvar, interner)?;
     if !off.is_empty() || stride != cols {
         return None;
     }
-    if scalar_of(addend, sema) != Some(mercury_types::Scalar::F32) {
+    if scalar_of(data, sema) != Some(mercury_types::Scalar::F32) {
         return None;
+    }
+    // Seed + inner-start must match the fold: SUM seeds `0.0` and folds `0..M`; MAX/MIN seed the first
+    // row `x[j]` and fold `1..M` (or `0..M` — the redundant first fold is idempotent).
+    match colop {
+        COL_SUM => {
+            if !is_float_zero(s0, interner) || istart != 0 {
+                return None;
+            }
+        }
+        _ => {
+            if istart != 0 && istart != 1 {
+                return None;
+            }
+            if index_by_var(s0, jvar) != Some(xbase) {
+                return None; // seed must be x[0, j] = x[j]
+            }
+        }
     }
     // [2] out[j] = s;
     let StmtKind::Assign {
@@ -10351,12 +10375,88 @@ fn match_colsum(
         out: obase,
         rows,
         cols,
+        op: colop,
     })
 }
 
+/// Classify a column-reduction fold body `s = s ⊕ x[..]` (target already checked `== s`): returns the
+/// op tag and the reduced data expr. `s + d` / `s += d` → SUM; `fmax(s, d)` / `fmin(s, d)` (either
+/// operand order) → MAX / MIN. The `data` operand is returned for the caller to pin to `x[i*N+j]`.
+fn classify_colreduce_body<'a>(
+    op: &ast::AssignOp,
+    value: &'a Expr,
+    s_sym: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(i64, &'a Expr)> {
+    // `fmax(s, d)` / `fmin(s, d)` — an `=` assign of a 2-arg intrinsic call.
+    if let ast::AssignOp::Assign = op {
+        if let ExprKind::Call { callee, args, .. } = &value.kind {
+            if args.len() == 2 {
+                let colop = match intrinsic_callee(callee, sema, interner) {
+                    Some(MathIntrinsic::Fmax) => Some(COL_MAX),
+                    Some(MathIntrinsic::Fmin) => Some(COL_MIN),
+                    _ => None,
+                };
+                if let Some(colop) = colop {
+                    let data = if single_path(&args[0]) == Some(s_sym) {
+                        &args[1]
+                    } else if single_path(&args[1]) == Some(s_sym) {
+                        &args[0]
+                    } else {
+                        return None;
+                    };
+                    return Some((colop, data));
+                }
+            }
+        }
+    }
+    // `s += d`, or `s = s + d` (the additive accumulator must be on the left, matching the kernel fold).
+    let addend = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    Some((COL_SUM, addend))
+}
+
+/// Resolve a call's callee to a vectorizable math intrinsic — the free-function twin of
+/// `FnLowerer::vectorizable_intrinsic` (a user `fn` of the same name shadows the intrinsic). Used by the
+/// free column-reduction matcher, which has no `FnLowerer` in hand.
+fn intrinsic_callee(
+    callee: &Expr,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MathIntrinsic> {
+    let ExprKind::Path(p) = &callee.kind else {
+        return None;
+    };
+    if !p.is_single() {
+        return None;
+    }
+    let name = p.first().sym;
+    if matches!(sema.defs.lookup(name).map(|d| &d.kind), Some(DefKind::Fn(_))) {
+        return None;
+    }
+    math_intrinsic(interner.resolve(name))
+}
+
 /// Is the whole function body a single column-reduction nest? Used to intercept a `@parallel` column
-/// sum *before* the elementwise outliner (which would split it into per-column-chunk scalar loops and
-/// lose the SIMD kernel), mirroring the sgemm/norm/transpose interceptions.
+/// reduction *before* the elementwise outliner (which would split it into per-column-chunk scalar loops
+/// and lose the SIMD kernel), mirroring the sgemm/norm/transpose interceptions.
 fn colsum_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<ColSumNest> {
     if body.tail.is_some() || body.stmts.len() != 1 {
         return None;
