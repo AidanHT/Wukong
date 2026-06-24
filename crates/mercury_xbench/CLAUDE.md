@@ -19,7 +19,14 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   relu6), prints per-kernel compile/runtime/GB-per-s and a geomean, then `bench_matmul`,
   `bench_linear`, `bench_linear_bf16`, `bench_matmul_tn`, `bench_conv`, `bench_norm`,
   `bench_norm_batched`, `bench_i8gemm`, `bench_bf16`, `bench_streaming_large`, `bench_transpose`,
-  `bench_colsum`, and `bench_colmax`.
+  `bench_colsum`, `bench_colmax`, and `bench_softmax_bwd`.
+- `bench_softmax_bwd` (+ `mer_softmax_bwd`/`c_softmax_bwd`/`rust_softmax_bwd`) — the attention/classifier
+  training gradient `dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` over a `[R,C]` batch, at
+  1024×1024 / 4096×512. Uses **all three** harness pointers (`y, dy, dx` — no unused middle). Mercury
+  folds it to `mercury_softmax_bwd_f32[_parallel]` (the bit-exact `sreduce` dot's 8 lane accumulators
+  beat gcc/rustc's serial `vaddss` chain on the per-row dot — verified scalar — then an 8-wide apply).
+  GB/s = `3·R·C·4` (two reads + one write). The dot reassociates, so the cross-check is a tight relative
+  tolerance (`< 1e-3`) via `max_rel_err`, like the norm benches.
 - `bench_colsum` (+ `mer_colsum`/`c_colsum`/`rust_colsum`) — the column reduction `out[j] = Σ_i x[i,j]`
   (bias gradient / batch sum) at 1024×1024 / 4096×1024, reported as GB/s (`M·N·4`, the matrix read once).
   Mercury folds the nest to `mercury_colsum_f32[_parallel]` (SIMD + row-major streaming); C/Rust are the

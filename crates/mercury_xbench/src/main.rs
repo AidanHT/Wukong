@@ -220,6 +220,9 @@ fn main() {
     if want("colmax") {
         bench_colmax(&cc, &dir);
     }
+    if want("softmax_bwd") {
+        bench_softmax_bwd(&cc, &dir);
+    }
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -1103,6 +1106,132 @@ fn rust_colmax(m: usize, n: usize, op: u8) -> String {
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
          \x20 for j in 0..N {{ let mut s={lo}*x.add(j){hi}; for i in 1..M {{ let v={lo}*x.add(i*N+j){hi}; s = if s{cmp}v {{s}} else {{v}}; }} *out.add(j)=s; }}\n}}\n"
+    )
+}
+
+/// Softmax backward `dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` — the attention/classification
+/// training gradient. Each row's dot `Σ y·dy` is a reduction gcc/rustc keep **scalar** (verified: they
+/// load/multiply `y·dy` wide but the accumulation is a serial `vaddss` chain — no `ymm` accumulator,
+/// the float sum is not reassociated), then a (vectorized) elementwise `y·(dy − s)`. Mercury folds the
+/// `[R,C]` nest to one `mercury_softmax_bwd_f32[_parallel]` call: the dot uses 8 independent lane
+/// accumulators (no dependency chain), then the apply runs 8-wide. Uses **all three** harness pointers
+/// (`y, dy, dx`). Reported as GB/s (`3·R·C·4`, the two reads + one write). The dot reassociates, so the
+/// cross-check is a **tight relative tolerance** (`< 1e-3`), like the norm benches.
+fn bench_softmax_bwd(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
+        let n = r * c;
+        // A plausible softmax output (positive, rows ~normalized) and a small grad — well-conditioned so
+        // the reassociated dot stays close to the sequential one.
+        let y: Vec<f32> = (0..n).map(|i| ((i % 19) as f32 + 1.0) / 200.0).collect();
+        let dy: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
+        let mut dx = vec![0.0f32; n];
+        let (yp, dyp, dxp) = (y.as_ptr(), dy.as_ptr(), dx.as_mut_ptr());
+        let bytes = 3.0 * n as f64 * 4.0; // y read + dy read + dx write
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== softmax_bwd (dx = y·(dy − Σ y·dy)) {r}x{c} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_softmax_bwd(r, c, false), &mut dx, yp, dyp, dxp);
+        let mer_par = bench_mercury(&mer_softmax_bwd(r, c, true), &mut dx, yp, dyp, dxp);
+        let cm = bench_external(
+            "c",
+            &c_softmax_bwd(r, c),
+            dir,
+            "softmax_bwd",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut dx,
+            yp,
+            dyp,
+            dxp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_softmax_bwd(r, c),
+            dir,
+            "softmax_bwd",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut dx,
+            yp,
+            dyp,
+            dxp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        // The dot reassociates (lane accumulators vs C's serial chain), so check a tolerance. Softmax
+        // backward sums to ~0 per row, so individual dx are catastrophic-cancellation zeros where a
+        // *per-element* relative error is meaningless — normalize the max abs error by the max output
+        // magnitude instead (the honest "is the whole vector close" metric).
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+            let maxerr = m
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! softmax_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r2 = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r2 >= 1.0 { r2 } else { 1.0 / r2 },
+                if r2 >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r2 = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury softmax-backward: the batched nest the recognizer folds to one `mercury_softmax_bwd_f32
+/// [_parallel]` call. The harness's `(x, y, out)` pointers carry `(y, dy, dx)`.
+fn mer_softmax_bwd(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(y: [f32; {n}], dy: [f32; {n}], dx: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut s: f32 = 0.0;\n\
+         \x20       for j in 0..{cols} {{ s = s + y[r * {cols} + j] * dy[r * {cols} + j]; }}\n\
+         \x20       for i in 0..{cols} {{ dx[r * {cols} + i] = y[r * {cols} + i] * (dy[r * {cols} + i] - s); }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_softmax_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* y, const float* dy, float* dx){{\n\
+         \x20 for (long r=0;r<R;r++){{ float s=0.0f; for (long j=0;j<C;j++) s += y[r*C+j]*dy[r*C+j];\n\
+         \x20   for (long i=0;i<C;i++) dx[r*C+i] = y[r*C+i]*(dy[r*C+i]-s); }}\n}}\n"
+    )
+}
+
+fn rust_softmax_bwd(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(y:*const f32, dy:*const f32, dx:*mut f32) {{\n\
+         \x20 for r in 0..R {{ let mut s=0.0f32; for j in 0..C {{ s += *y.add(r*C+j) * *dy.add(r*C+j); }}\n\
+         \x20   for i in 0..C {{ *dx.add(r*C+i) = *y.add(r*C+i) * (*dy.add(r*C+i) - s); }} }}\n}}\n"
     )
 }
 
