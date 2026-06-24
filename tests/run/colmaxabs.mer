@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 8
+module tests.run.colmaxabs
+
+// Column abs-max out[j] = max_i |x[i,j]| — the per-channel symmetric int8-quantization scale (amax_j,
+// from which the scale s_j = amax_j / 127). The abs-max sibling of colmax: like colsum/colmax the
+// strided data index gcc/rustc leave scalar (verified: no packed vmaxps at -O3), dispatched to the SIMD
+// mercury_colmaxabs_f32, which abs's each element (sign-mask andnot) then folds by max, seeded by the
+// first row's |x[0,j]|. Its own oracle (i-ascending |·|-then-max fold), so interp == native, -O0 ==
+// -O3 by construction. The data has negatives so abs matters — without it col0 would be max(-9,1,5)=5.
+fn main() -> i32 {
+    let x: [f32; 12] = [-9.0, 2.0, -7.0, 4.0, 1.0, -6.0, 3.0, -8.0, 5.0, 10.0, -11.0, 0.0];
+    let mut out: [f32; 4] = [0.0; 4];
+
+    for j in 0..4 {
+        let mut s: f32 = abs(x[j]); // seed = |row 0, column j|
+        for i in 1..3 {
+            s = fmax(s, abs(x[i * 4 + j]));
+        }
+        out[j] = s;
+    }
+    print(out[0] as i32); // max(|-9|, |1|, |5|)   = 9
+    print(out[1] as i32); // max(|2|, |-6|, |10|)  = 10
+    print(out[2] as i32); // max(|-7|, |3|, |-11|) = 11
+    print(out[3] as i32); // max(|4|, |-8|, |0|)   = 8
+    return 0;
+}
