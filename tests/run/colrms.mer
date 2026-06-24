@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+module tests.run.colrms
+
+// Column RMS out[j] = sqrt((Σ_i x[i,j]²) / rows) — the per-channel root-mean-square (per-feature
+// magnitude, the RMSNorm-style scale) over the outer axis of a [M=2, N=4] matrix. The strided square
+// fold gcc/rustc leave scalar; the recognizer folds the nest to the SIMD mercury_colrms_f32 (the colsum
+// machinery with a square fold + a `sqrt(_/rows)` per-column finalize, divisor pinned to the row count).
+// Both backends marshal the identical kernel, so the differential gate (interp == native, -O0 == -O3) holds.
+fn main() -> i32 {
+    let x: [f32; 8] = [3.0, 1.0, 4.0, 0.0, 3.0, 7.0, 4.0, 0.0];
+    let mut out: [f32; 4] = [0.0; 4];
+
+    for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for i in 0..2 {
+            s = s + x[i * 4 + j] * x[i * 4 + j];
+        }
+        out[j] = sqrt(s / 2.0);
+    }
+    print(out[0] as i32); // sqrt((3²+3²)/2)  = 3
+    print(out[1] as i32); // sqrt((1²+7²)/2)  = 5
+    print(out[2] as i32); // sqrt((4²+4²)/2)  = 4
+    print(out[3] as i32); // sqrt((0+0)/2)    = 0
+    return 0;
+}

@@ -1150,7 +1150,15 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "mercury_colmin_f32"
             | "mercury_colmin_f32_parallel"
             | "mercury_colmaxabs_f32"
-            | "mercury_colmaxabs_f32_parallel" => {
+            | "mercury_colmaxabs_f32_parallel"
+            | "mercury_colmean_f32"
+            | "mercury_colmean_f32_parallel"
+            | "mercury_colsumsq_f32"
+            | "mercury_colsumsq_f32_parallel"
+            | "mercury_coll2_f32"
+            | "mercury_coll2_f32_parallel"
+            | "mercury_colrms_f32"
+            | "mercury_colrms_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = args[2].as_int() as usize;
@@ -1174,6 +1182,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                         mercury_runtime::mercury_colmax_f32
                     } else if name.starts_with("mercury_colmin") {
                         mercury_runtime::mercury_colmin_f32
+                    } else if name.starts_with("mercury_colmean") {
+                        mercury_runtime::mercury_colmean_f32
+                    } else if name.starts_with("mercury_colsumsq") {
+                        mercury_runtime::mercury_colsumsq_f32
+                    } else if name.starts_with("mercury_coll2") {
+                        mercury_runtime::mercury_coll2_f32
+                    } else if name.starts_with("mercury_colrms") {
+                        mercury_runtime::mercury_colrms_f32
                     } else {
                         mercury_runtime::mercury_colsum_f32
                     };

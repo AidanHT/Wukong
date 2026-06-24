@@ -92,6 +92,14 @@ pub fn lower_program(
         colmin_par: interner.intern("mercury_colmin_f32_parallel"),
         colmaxabs: interner.intern("mercury_colmaxabs_f32"),
         colmaxabs_par: interner.intern("mercury_colmaxabs_f32_parallel"),
+        colmean: interner.intern("mercury_colmean_f32"),
+        colmean_par: interner.intern("mercury_colmean_f32_parallel"),
+        colsumsq: interner.intern("mercury_colsumsq_f32"),
+        colsumsq_par: interner.intern("mercury_colsumsq_f32_parallel"),
+        coll2: interner.intern("mercury_coll2_f32"),
+        coll2_par: interner.intern("mercury_coll2_f32_parallel"),
+        colrms: interner.intern("mercury_colrms_f32"),
+        colrms_par: interner.intern("mercury_colrms_f32_parallel"),
         softmax_bwd: interner.intern("mercury_softmax_bwd_f32"),
         softmax_bwd_par: interner.intern("mercury_softmax_bwd_f32_parallel"),
     };
@@ -678,6 +686,18 @@ struct GemmSyms {
     /// fold as colmax, with each element abs'd first (sign-mask `andnot`).
     colmaxabs: Symbol,
     colmaxabs_par: Symbol,
+    /// The SIMD per-channel **statistics** family (`mercury_col{mean,sumsq,l2,rms}_f32[_parallel]`,
+    /// same `(x, out, rows, cols)` ABI as colsum): `out[j] = mean_i x[i,j]` (BatchNorm mean),
+    /// `Σ_i x[i,j]²` (energy), `sqrt(Σ x²)` (column L2), `sqrt(mean x²)` (per-channel RMS). Same strided
+    /// fold as colsum + a per-column finalize; both backends marshal the identical kernel.
+    colmean: Symbol,
+    colmean_par: Symbol,
+    colsumsq: Symbol,
+    colsumsq_par: Symbol,
+    coll2: Symbol,
+    coll2_par: Symbol,
+    colrms: Symbol,
+    colrms_par: Symbol,
     /// The fused softmax-backward (`mercury_softmax_bwd_f32[_parallel](y, dy, dx, rows, cols)`): a
     /// `dx = y·(dy − Σ y·dy)` batched nest dispatches here. The per-row dot gcc/rustc keep scalar; the
     /// kernel reuses the bit-exact `sreduce` dot + an 8-wide apply. Rows independent → serial == parallel.
@@ -2381,6 +2401,14 @@ impl FnLowerer<'_> {
             (COL_MIN, true) => self.gemm.colmin_par,
             (COL_MAXABS, false) => self.gemm.colmaxabs,
             (COL_MAXABS, true) => self.gemm.colmaxabs_par,
+            (COL_MEAN, false) => self.gemm.colmean,
+            (COL_MEAN, true) => self.gemm.colmean_par,
+            (COL_SUMSQ, false) => self.gemm.colsumsq,
+            (COL_SUMSQ, true) => self.gemm.colsumsq_par,
+            (COL_L2, false) => self.gemm.coll2,
+            (COL_L2, true) => self.gemm.coll2_par,
+            (COL_RMS, false) => self.gemm.colrms,
+            (COL_RMS, true) => self.gemm.colrms_par,
             (_, false) => self.gemm.colsum,
             (_, true) => self.gemm.colsum_par,
         };
@@ -10498,6 +10526,13 @@ const COL_SUM: i64 = 0;
 const COL_MAX: i64 = 1;
 const COL_MIN: i64 = 2;
 const COL_MAXABS: i64 = 3;
+// The per-channel statistics family (same strided fold + a per-column finalize): MEAN = SUM/rows,
+// SUMSQ = Σx², L2 = sqrt(SUMSQ), RMS = sqrt(SUMSQ/rows). MEAN derives from a SUM fold + a `/M` store;
+// SUMSQ/L2/RMS derive from a square fold (`s += x[..]*x[..]`) + a (sqrt[/M]) store.
+const COL_MEAN: i64 = 4;
+const COL_SUMSQ: i64 = 5;
+const COL_L2: i64 = 6;
+const COL_RMS: i64 = 7;
 
 struct ColSumNest {
     x: Symbol,
@@ -10590,7 +10625,8 @@ fn match_colsum(
     // first row (`x[j]`, or `abs(x[j])` for MAXABS) and fold `1..M` (or `0..M` — the redundant first fold
     // is idempotent).
     match colop {
-        COL_SUM => {
+        COL_SUM | COL_SUMSQ => {
+            // The additive folds (Σx and Σx²) seed `0.0` and fold `0..M`.
             if !is_float_zero(s0, interner) || istart != 0 {
                 return None;
             }
@@ -10621,7 +10657,8 @@ fn match_colsum(
             }
         }
     }
-    // [2] out[j] = s;
+    // [2] out[j] = <finalize>(s) — `s` (SUM/SUMSQ/MAX/MIN/MAXABS), `s/M` (MEAN), `sqrt(s)` (L2), or
+    // `sqrt(s/M)` (RMS). The finalize divisor is pinned to the row count `ie` (= M).
     let StmtKind::Assign {
         target: ot,
         op: ast::AssignOp::Assign,
@@ -10630,9 +10667,7 @@ fn match_colsum(
     else {
         return None;
     };
-    if single_path(ov) != Some(s_sym) {
-        return None;
-    }
+    let final_op = colreduce_final_op(ov, s_sym, colop, ie, sema, interner)?;
     let obase = index_by_var(ot, jvar)?; // out[j]
     if scalar_of(ot, sema) != Some(mercury_types::Scalar::F32) || xbase == obase {
         return None;
@@ -10642,7 +10677,7 @@ fn match_colsum(
         out: obase,
         rows,
         cols,
-        op: colop,
+        op: final_op,
     })
 }
 
@@ -10716,7 +10751,103 @@ fn classify_colreduce_body<'a>(
         }
         _ => return None,
     };
+    // `s += d*d` (a square of structurally-equal factors) is the **sum-of-squares** fold (the energy /
+    // L2 / RMS family); the inner factor is returned as the `data` so the stride/offset check pins
+    // `x[i*N+j]`. Otherwise it is a plain `Σ` (the data is the addend).
+    if let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &addend.kind
+    {
+        if exprs_struct_eq(lhs, rhs) {
+            return Some((COL_SUMSQ, lhs));
+        }
+    }
     Some((COL_SUM, addend))
+}
+
+/// Is `e` a `sqrt(arg)` intrinsic call? Returns `arg`. The free twin of the column-finalize sqrt check
+/// (no `FnLowerer` in hand), gated like `intrinsic_callee` so a user `fn sqrt` shadows it.
+fn col_sqrt_arg<'a>(e: &'a Expr, sema: &SemaResult, interner: &Interner) -> Option<&'a Expr> {
+    let ExprKind::Call { callee, args, .. } = &e.kind else {
+        return None;
+    };
+    if args.len() == 1 && matches!(intrinsic_callee(callee, sema, interner), Some(MathIntrinsic::Sqrt)) {
+        Some(&args[0])
+    } else {
+        None
+    }
+}
+
+/// Does the divisor `d` equal the trip count `count` (the row count `M`) as an f32 — `M` itself, a
+/// `(M as f32)` cast, or the literal `M.0`? Pins a `/M` column-mean/RMS divisor to the fold's row
+/// count so it never misfires. The free twin of `FnLowerer::count_as_f32`.
+fn col_divisor_matches(d: &Expr, count: &Expr, interner: &Interner) -> bool {
+    if let (ExprKind::Float(f), ExprKind::Int(k)) = (&d.kind, &count.kind) {
+        return parse_float(interner.resolve(*f)) == parse_int(interner.resolve(*k)) as f64;
+    }
+    if let ExprKind::Cast { expr, .. } = &d.kind {
+        return exprs_struct_eq(expr, count);
+    }
+    exprs_struct_eq(d, count)
+}
+
+/// Classify the column-reduction **store** `out[j] = <finalize>(s)` into the final op code, given the
+/// fold's base op (`COL_SUM`/`COL_SUMSQ`/max/min/maxabs) and the row count `count` (`= M`):
+/// - `out[j] = s`              → the base op unchanged (SUM/SUMSQ/MAX/MIN/MAXABS).
+/// - `out[j] = s / M`          → COL_MEAN   (only from a SUM fold).
+/// - `out[j] = sqrt(s)`        → COL_L2     (only from a SUMSQ fold).
+/// - `out[j] = sqrt(s / M)`    → COL_RMS    (only from a SUMSQ fold).
+/// Returns `None` for any other store, and rejects a finalize on a non-additive base (max/min/maxabs).
+fn colreduce_final_op(
+    ov: &Expr,
+    s_sym: Symbol,
+    base_op: i64,
+    count: &Expr,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<i64> {
+    // out[j] = s — the un-finalized store.
+    if single_path(ov) == Some(s_sym) {
+        return Some(base_op);
+    }
+    // out[j] = sqrt(...) — L2 / RMS (SUMSQ only).
+    if let Some(arg) = col_sqrt_arg(ov, sema, interner) {
+        if base_op != COL_SUMSQ {
+            return None;
+        }
+        if single_path(arg) == Some(s_sym) {
+            return Some(COL_L2); // sqrt(s)
+        }
+        // sqrt(s / M)
+        if let ExprKind::Binary {
+            op: ast::BinOp::Div,
+            lhs,
+            rhs,
+        } = &arg.kind
+        {
+            if single_path(lhs) == Some(s_sym) && col_divisor_matches(rhs, count, interner) {
+                return Some(COL_RMS);
+            }
+        }
+        return None;
+    }
+    // out[j] = s / M — MEAN (SUM only).
+    if let ExprKind::Binary {
+        op: ast::BinOp::Div,
+        lhs,
+        rhs,
+    } = &ov.kind
+    {
+        if base_op == COL_SUM
+            && single_path(lhs) == Some(s_sym)
+            && col_divisor_matches(rhs, count, interner)
+        {
+            return Some(COL_MEAN);
+        }
+    }
+    None
 }
 
 /// Resolve a call's callee to a vectorizable math intrinsic — the free-function twin of
