@@ -113,6 +113,12 @@ const RT_ROPE_BWD: &str = "mercury_rope_bwd_f32";
 const RT_ROPE_BWD_PAR: &str = "mercury_rope_bwd_f32_parallel";
 const RT_LOGSUMEXP: &str = "mercury_logsumexp_f32";
 const RT_LOGSUMEXP_PAR: &str = "mercury_logsumexp_f32_parallel";
+const RT_KLDIV: &str = "mercury_kldiv_f32";
+const RT_KLDIV_PAR: &str = "mercury_kldiv_f32_parallel";
+const RT_ENTROPY: &str = "mercury_entropy_f32";
+const RT_ENTROPY_PAR: &str = "mercury_entropy_f32_parallel";
+const RT_KD_LOSS: &str = "mercury_kd_loss_f32";
+const RT_KD_LOSS_PAR: &str = "mercury_kd_loss_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -890,14 +896,30 @@ impl<'a> FnTranslator<'a> {
             return None;
         }
         // Batched log-sum-exp: mercury_logsumexp_f32[_parallel](x, out, rows, cols) — two pointers +
-        // two i64, the same vmath shape; route by name. Void.
-        if matches!(name, RT_LOGSUMEXP | RT_LOGSUMEXP_PAR) && args.len() == 4 {
+        // two i64, the same vmath shape; route by name. Void. Row-entropy shares the exact shape.
+        if matches!(
+            name,
+            RT_LOGSUMEXP | RT_LOGSUMEXP_PAR | RT_ENTROPY | RT_ENTROPY_PAR
+        ) && args.len() == 4
+        {
             let x = self.val(args[0]);
             let out = self.val(args[1]);
             let rows = self.coerce_to_i64(args[2]);
             let cols = self.coerce_to_i64(args[3]);
             let fref = self.rt_refs[name];
             self.builder.ins().call(fref, &[x, out, rows, cols]);
+            return None;
+        }
+        // KL divergence / soft-label cross-entropy: (p|x, q, out, rows, cols) — three pointers + two
+        // i64, the same vmath2 shape; route by name. Void.
+        if matches!(name, RT_KLDIV | RT_KLDIV_PAR | RT_KD_LOSS | RT_KD_LOSS_PAR) && args.len() == 5 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let out = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, b, out, rows, cols]);
             return None;
         }
         // The cache-blocked transpose: mercury_transpose_f32[_parallel](src, dst, rows, cols) — two
@@ -1329,6 +1351,12 @@ struct RtFuncs {
     rope_bwd_par: FuncId,
     logsumexp: FuncId,
     logsumexp_par: FuncId,
+    kldiv: FuncId,
+    kldiv_par: FuncId,
+    entropy: FuncId,
+    entropy_par: FuncId,
+    kd_loss: FuncId,
+    kd_loss_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
     transpose: FuncId,
@@ -1713,6 +1741,24 @@ fn populate_module<M: Module>(
         logsumexp_par: module
             .declare_function(RT_LOGSUMEXP_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        kldiv: module
+            .declare_function(RT_KLDIV, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        kldiv_par: module
+            .declare_function(RT_KLDIV_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        entropy: module
+            .declare_function(RT_ENTROPY, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        entropy_par: module
+            .declare_function(RT_ENTROPY_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        kd_loss: module
+            .declare_function(RT_KD_LOSS, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        kd_loss_par: module
+            .declare_function(RT_KD_LOSS_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
             .declare_function(RT_VMATH_BF16, Linkage::Import, &sig_vmath)
@@ -2044,6 +2090,27 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_LOGSUMEXP_PAR,
                 module.declare_func_in_func(rt.logsumexp_par, builder.func),
+            );
+            rt_refs.insert(RT_KLDIV, module.declare_func_in_func(rt.kldiv, builder.func));
+            rt_refs.insert(
+                RT_KLDIV_PAR,
+                module.declare_func_in_func(rt.kldiv_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_ENTROPY,
+                module.declare_func_in_func(rt.entropy, builder.func),
+            );
+            rt_refs.insert(
+                RT_ENTROPY_PAR,
+                module.declare_func_in_func(rt.entropy_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_KD_LOSS,
+                module.declare_func_in_func(rt.kd_loss, builder.func),
+            );
+            rt_refs.insert(
+                RT_KD_LOSS_PAR,
+                module.declare_func_in_func(rt.kd_loss_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2468,6 +2535,27 @@ pub fn jit_compile(
         RT_LOGSUMEXP_PAR,
         mercury_runtime::mercury_logsumexp_f32_parallel as *const u8,
     );
+    builder.symbol(RT_KLDIV, mercury_runtime::mercury_kldiv_f32 as *const u8);
+    builder.symbol(
+        RT_KLDIV_PAR,
+        mercury_runtime::mercury_kldiv_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ENTROPY,
+        mercury_runtime::mercury_entropy_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_ENTROPY_PAR,
+        mercury_runtime::mercury_entropy_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_KD_LOSS,
+        mercury_runtime::mercury_kd_loss_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_KD_LOSS_PAR,
+        mercury_runtime::mercury_kd_loss_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
@@ -2812,6 +2900,27 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_LOGSUMEXP_PAR,
         mercury_runtime::mercury_logsumexp_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_KLDIV, mercury_runtime::mercury_kldiv_f32 as *const u8);
+    builder.symbol(
+        RT_KLDIV_PAR,
+        mercury_runtime::mercury_kldiv_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ENTROPY,
+        mercury_runtime::mercury_entropy_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_ENTROPY_PAR,
+        mercury_runtime::mercury_entropy_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_KD_LOSS,
+        mercury_runtime::mercury_kd_loss_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_KD_LOSS_PAR,
+        mercury_runtime::mercury_kd_loss_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,

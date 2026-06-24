@@ -1,0 +1,23 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1064
+// EXPECT-OUT: 4564
+module tests.run.kldiv
+
+// Batched KL divergence out[r] = Σ_i p[r,i]·(log p[r,i] − log q[r,i]) — the knowledge-distillation /
+// VAE loss. The recognizer folds the [R=2,C=4] nest to one mercury_kldiv_f32 call (the logf reduction
+// gcc/rustc keep scalar). The reduction reassociates (the documented exception — both backends run the
+// same kernel), so the differential gate (interp == native) holds.
+fn main() -> i32 {
+    let p: [f32; 8] = [0.1, 0.2, 0.3, 0.4, 0.4, 0.3, 0.2, 0.1];
+    let q: [f32; 8] = [0.25, 0.25, 0.25, 0.25, 0.1, 0.2, 0.3, 0.4];
+    let mut out: [f32; 2] = [0.0; 2];
+
+    for r in 0..2 {
+        let mut s: f32 = 0.0;
+        for i in 0..4 { s = s + p[r * 4 + i] * (log(p[r * 4 + i]) - log(q[r * 4 + i])); }
+        out[r] = s;
+    }
+    for k in 0..2 { print((out[k] * 10000.0) as i32); }
+    return 0;
+}

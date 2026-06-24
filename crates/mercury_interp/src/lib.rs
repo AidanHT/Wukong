@@ -1574,7 +1574,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // recognized `out[r] = m + log(Σexp(x[r,·]−m))` nest lowers to. Marshal `rows*cols` f32 from
             // x, call the *serial* kernel (bit-identical to the parallel one — rows independent), write
             // the `rows`-long out vector.
-            "mercury_logsumexp_f32" | "mercury_logsumexp_f32_parallel" => {
+            // Log-sum-exp and row-entropy share the (x, out, rows, cols) shape — `rows*cols` f32 in,
+            // a `rows`-long scalar out; the kernel fn is chosen by name.
+            "mercury_logsumexp_f32"
+            | "mercury_logsumexp_f32_parallel"
+            | "mercury_entropy_f32"
+            | "mercury_entropy_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = args[2].as_int() as usize;
@@ -1590,10 +1595,62 @@ impl<'a, 'k> Interp<'a, 'k> {
                     );
                 }
                 let mut obuf = vec![0.0f32; rows];
+                let kernel = if name.starts_with("mercury_entropy") {
+                    mercury_runtime::mercury_entropy_f32
+                } else {
+                    mercury_runtime::mercury_logsumexp_f32
+                };
                 // SAFETY: xbuf is rows*cols f32; obuf is rows — the kernel's contract.
                 unsafe {
-                    mercury_runtime::mercury_logsumexp_f32(
-                        xbuf.as_ptr(),
+                    kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("logsumexp output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
+            // KL divergence and soft-label cross-entropy share the (a, b, out, rows, cols) shape — two
+            // `rows*cols` f32 inputs, a `rows`-long scalar out; the kernel fn is chosen by name.
+            "mercury_kldiv_f32"
+            | "mercury_kldiv_f32_parallel"
+            | "mercury_kd_loss_f32"
+            | "mercury_kd_loss_f32_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let n = rows * cols;
+                let mut abuf = Vec::with_capacity(n);
+                let mut bbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    abuf.push(
+                        self.memory
+                            .get(a + t)
+                            .ok_or("kldiv operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("kldiv operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; rows];
+                let kernel = if name.starts_with("mercury_kd_loss") {
+                    mercury_runtime::mercury_kd_loss_f32
+                } else {
+                    mercury_runtime::mercury_kldiv_f32
+                };
+                // SAFETY: abuf/bbuf are rows*cols f32; obuf is rows — the kernel's contract.
+                unsafe {
+                    kernel(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
                         obuf.as_mut_ptr(),
                         rows as i64,
                         cols as i64,
@@ -1603,7 +1660,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     *self
                         .memory
                         .get_mut(out + t)
-                        .ok_or("logsumexp output out of bounds")? = Value::Float(val as f64);
+                        .ok_or("kldiv output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }
