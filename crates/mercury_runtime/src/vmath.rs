@@ -726,6 +726,9 @@ pub const VM2_HYPOT: i64 = 2;
 // vectorize — so this wins for the same reason the *forward* activation dispatch does.
 pub const VM2_SILU_BWD: i64 = 3;
 pub const VM2_GELU_BWD: i64 = 4;
+// The foundational gate gradients (every LSTM/GRU/attention gate): σ'(x)=σ(1−σ), tanh'(x)=1−tanh².
+pub const VM2_SIGMOID_BWD: i64 = 5;
+pub const VM2_TANH_BWD: i64 = 6;
 
 /// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
 #[inline]
@@ -807,6 +810,26 @@ fn gelu_bwd_2(x: f32, dy: f32) -> f32 {
     dy * (half_onep + term2)
 }
 
+/// `sigmoid_backward(x, dy) = dy · σ'(x) = dy · σ(x)·(1 − σ(x))`, the logistic-gate training gradient.
+/// Reuses the shared [`sigmoid1`] (an `expf`), so it agrees with the forward `sigmoid` dispatch and is
+/// bit-identical across the scalar twin / AVX2 [`sigmoid_bwd8`] / inlined MIR.
+#[inline]
+fn sigmoid_bwd_2(x: f32, dy: f32) -> f32 {
+    let s = sigmoid1(x);
+    let oms = 1.0 - s;
+    dy * (s * oms)
+}
+
+/// `tanh_backward(x, dy) = dy · tanh'(x) = dy · (1 − tanh²(x))`, the tanh-gate training gradient (RNN /
+/// LSTM cell). Reuses the shared [`tanh1`] (an `expf`), so it agrees with the forward `tanh` dispatch
+/// and is bit-identical across the scalar twin / AVX2 [`tanh_bwd8`] / inlined MIR.
+#[inline]
+fn tanh_bwd_2(x: f32, dy: f32) -> f32 {
+    let t = tanh1(x);
+    let sech2 = 1.0 - t * t;
+    dy * sech2
+}
+
 /// Scalar dispatch for one element pair (the AVX2 tail and the no-AVX2 fallback). The two inputs are
 /// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot, `(x, dy)` for the
 /// activation backwards.
@@ -818,6 +841,8 @@ fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
         VM2_HYPOT => hypot_1(x, y),
         VM2_SILU_BWD => silu_bwd_2(x, y),
         VM2_GELU_BWD => gelu_bwd_2(x, y),
+        VM2_SIGMOID_BWD => sigmoid_bwd_2(x, y),
+        VM2_TANH_BWD => tanh_bwd_2(x, y),
         _ => x,
     }
 }
@@ -916,6 +941,32 @@ unsafe fn gelu_bwd8(
     _mm256_mul_ps(dy, _mm256_add_ps(half_onep, term2))
 }
 
+/// `dy · σ'(x)` over 8 lanes — mirrors [`sigmoid_bwd_2`] op-for-op (`σ'(x) = s·(1−s)`, `s = sigmoid8`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sigmoid_bwd8(
+    x: std::arch::x86_64::__m256,
+    dy: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let s = sigmoid8(x);
+    let oms = _mm256_sub_ps(_mm256_set1_ps(1.0), s); // 1 − s
+    _mm256_mul_ps(dy, _mm256_mul_ps(s, oms)) // dy · s·(1−s)
+}
+
+/// `dy · tanh'(x)` over 8 lanes — mirrors [`tanh_bwd_2`] op-for-op (`tanh'(x) = 1 − t²`, `t = tanh8`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh_bwd8(
+    x: std::arch::x86_64::__m256,
+    dy: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let t = tanh8(x);
+    let sech2 = _mm256_sub_ps(_mm256_set1_ps(1.0), _mm256_mul_ps(t, t)); // 1 − t²
+    _mm256_mul_ps(dy, sech2)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn vmath2_8_for(
@@ -929,6 +980,8 @@ fn vmath2_8_for(
         VM2_HYPOT => hypot8_2,
         VM2_SILU_BWD => silu_bwd8,
         VM2_GELU_BWD => gelu_bwd8,
+        VM2_SIGMOID_BWD => sigmoid_bwd8,
+        VM2_TANH_BWD => tanh_bwd8,
         _ => return None,
     })
 }
@@ -1940,12 +1993,22 @@ mod tests {
             let u = (c0 * (x + c1 * x * x * x)).tanh();
             0.5 * (1.0 + u) + 0.5 * x * (1.0 - u * u) * c0 * (1.0 + 3.0 * c1 * x * x)
         }
+        fn sigmoid_grad_f64(x: f64) -> f64 {
+            let s = 1.0 / (1.0 + (-x).exp());
+            s * (1.0 - s)
+        }
+        fn tanh_grad_f64(x: f64) -> f64 {
+            let t = x.tanh();
+            1.0 - t * t
+        }
         let n = 1003usize; // not a multiple of 8 → exercises the lane body and the scalar tail
         let xs: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.011).collect();
         let dys: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
         for (op, gref) in [
             (VM2_SILU_BWD, silu_grad_f64 as fn(f64) -> f64),
             (VM2_GELU_BWD, gelu_grad_f64 as fn(f64) -> f64),
+            (VM2_SIGMOID_BWD, sigmoid_grad_f64 as fn(f64) -> f64),
+            (VM2_TANH_BWD, tanh_grad_f64 as fn(f64) -> f64),
         ] {
             let mut got = vec![0.0f32; n];
             // SAFETY: xs/dys/got are exactly n f32 long — the kernel's contract.
