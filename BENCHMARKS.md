@@ -48,6 +48,12 @@ tolerance for the reassociated-float ones).
 | **Activations** (35-op `vmath`) | ~2–13× | ~28× | hand-AVX2 256-bit transcendentals vs scalar libm |
 | **Activation backward** (6: silu/gelu/sigmoid/tanh/elu/softplus grad) | **~3–12×** | **~5.5–25×** | the derivative folds a sigmoid/tanh/exp (`expf`) C/Rust keep scalar — the forward lever, applied to training |
 | **Softmax backward** (`y·(dy−Σy·dy)`) | ~1.0–2.0× | ~4.5–6.1× | vectorizes the per-row dot's accumulation (modest — they vectorize the apply) |
+| **Norm backward** (RMSNorm / LayerNorm grad) | ~2.6–4.0× | ~11–20× | the per-row coupling-term reductions (`Σdy·x̂` etc.) gcc keeps scalar |
+| **Cross-entropy** (softmax xent fwd / bwd) | ~7.8× / ~13.5× | ~32–64× | the fused `expf` log-partition + gather; C's reduction stays scalar |
+| **Row losses** (KL-div / entropy / soft-label xent) | ~3.6–7.5× | ~15–39× | the per-row `logf`/`expf` reduction gcc/rustc keep scalar |
+| **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Mercury one 256-bit `sincos` |
+| **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar |
+| **Row argmax/argmin** (classification top-1) | ~2.6–3.4× | ~11.5–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu | ≈tie | — | already bandwidth-bound; no headroom |
 
