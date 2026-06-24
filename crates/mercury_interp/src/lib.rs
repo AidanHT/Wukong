@@ -1663,6 +1663,44 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_cumsum_f32[_parallel](x, out, rows, cols)` — the per-row inclusive prefix sum a
+            // recognized cumsum nest lowers to. Marshal `rows*cols` f32 from x, call the *serial* kernel
+            // (bit-identical to the parallel one — rows independent), write the `rows*cols` out (reading
+            // all of x first, so in-place `x==out` is safe). The in-lane scan reassociates, but both
+            // backends run this identical kernel, so interp == native holds.
+            "mercury_cumsum_f32" | "mercury_cumsum_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let n = rows * cols;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("cumsum operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf and obuf are both rows*cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_cumsum_f32(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("cumsum output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // KL divergence and soft-label cross-entropy share the (a, b, out, rows, cols) shape — two
             // `rows*cols` f32 inputs, a `rows`-long scalar out; the kernel fn is chosen by name.
             "mercury_kldiv_f32"
