@@ -253,6 +253,9 @@ fn main() {
     if want("rowarg") {
         bench_rowarg(&cc, &dir);
     }
+    if want("colarg") {
+        bench_colarg(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1247,6 +1250,130 @@ fn bench_rowarg(cc: &str, dir: &Path) {
             );
             // Output is an i32 index buffer — reinterpret the f32 harness slots as i32 and compare exactly
             // (no tolerance: a per-row arg-selection is deterministic, lowest index winning on a tie).
+            let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
+            if let (Some(a), Some(c2)) = (&mer, &cm) {
+                if as_i32(&a.out) != as_i32(&c2.out) {
+                    println!("  ! {label} index mismatch vs C");
+                }
+            }
+            if let (Some(ms), Some(c2)) = (&mer, &cm) {
+                let r = c2.ns_per_call / ms.ns_per_call;
+                println!(
+                    "  -> Mercury single-core is {:.2}x {} than naive C",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" }
+                );
+            }
+            if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+                let r = c2.ns_per_call / mp.ns_per_call;
+                println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+            }
+            println!();
+        }
+    }
+}
+
+/// Mercury per-COLUMN argmax/argmin returning an i32 ROW index: `for j { let bv=x[j]; let bi=0; for i in
+/// 1..R { if x[i*C+j] >|< bv { bv=x[i*C+j]; bi=i } }; out[j]=bi }` — folds to one
+/// `mercury_colarg{max,min}_i32[_parallel]`. The STRIDED column-outer (value,index) scan is what gcc
+/// leaves scalar. `out` is a `cols`-long i32 buffer; `y` is the unused middle of the 3-pointer harness.
+fn mer_colarg(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [i32; {cols}]) {{\n\
+         \x20   for j in 0..{cols} {{\n\
+         \x20       let mut bv: f32 = x[j];\n\
+         \x20       let mut bi: i32 = 0;\n\
+         \x20       for i in 1..{rows} {{ if x[i * {cols} + j] {cmp} bv {{ bv = x[i * {cols} + j]; bi = i; }} }}\n\
+         \x20       out[j] = bi;\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_colarg(rows: usize, cols: usize, is_max: bool) -> String {
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, int* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long j=0;j<C;j++){{ float bv=x[j]; int bi=0;\n\
+         \x20   for (long i=1;i<R;i++){{ float v=x[i*C+j]; if (v {cmp} bv){{ bv=v; bi=i; }} }}\n\
+         \x20   out[j]=bi; }} }}\n"
+    )
+}
+
+fn rust_colarg(rows: usize, cols: usize, is_max: bool) -> String {
+    let cmp = if is_max { ">" } else { "<" };
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut i32) {{\n\
+         \x20 for j in 0..C {{ let mut bv=*x.add(j); let mut bi=0i32;\n\
+         \x20   for i in 1..R {{ let v=*x.add(i*C+j); if v {cmp} bv {{ bv=v; bi=i as i32; }} }}\n\
+         \x20   *out.add(j)=bi; }} }}\n"
+    )
+}
+
+/// Per-column argmax/argmin (axis-0 top-1) returning the ROW index. The STRIDED column-outer
+/// (value,index) scan defeats gcc/rustc auto-vectorization (the column-reduction lever — verified
+/// scalar), while Mercury streams row-major tracking 8 column lanes via blend. Output is a `cols`-long
+/// i32 buffer; the cross-check reinterprets the f32 harness slots as i32 and compares EXACTLY. GB/s =
+/// `R·C·4` (matrix read once); the ratio vs naive C is the figure.
+fn bench_colarg(cc: &str, dir: &Path) {
+    for (is_max, label) in [(true, "colargmax"), (false, "colargmin")] {
+        for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
+            let n = rows * cols;
+            let x: Vec<f32> = (0..n).map(|i| ((i * 37 + 11) % 103) as f32 * 0.5 - 25.0).collect();
+            let dummy = vec![0.0f32; n];
+            let mut out = vec![0.0f32; cols];
+            let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+            let bytes = n as f64 * 4.0; // the matrix is read once
+            let gbps = |v: &Option<Measure>| {
+                v.as_ref()
+                    .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                    .unwrap_or_else(|| "n/a".into())
+            };
+            let sym = if is_max { "argmax" } else { "argmin" };
+            println!("=== {label} (out[j] = {sym}_i x[i,j]) {rows}x{cols} (GB/s, higher is better) ===");
+            let mer = bench_mercury(&mer_colarg(rows, cols, is_max, false), &mut out, xp, yp, op);
+            let mer_par = bench_mercury(&mer_colarg(rows, cols, is_max, true), &mut out, xp, yp, op);
+            let cm = bench_external(
+                "c",
+                &c_colarg(rows, cols, is_max),
+                dir,
+                label,
+                cc,
+                &["-O3", "-march=native", "-shared"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            let rm = bench_external(
+                "rs",
+                &rust_colarg(rows, cols, is_max),
+                dir,
+                label,
+                "rustc",
+                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &mut out,
+                xp,
+                yp,
+                op,
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            );
+            println!(
+                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "GB/s",
+                gbps(&mer),
+                gbps(&mer_par),
+                gbps(&cm),
+                gbps(&rm)
+            );
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
             if let (Some(a), Some(c2)) = (&mer, &cm) {
                 if as_i32(&a.out) != as_i32(&c2.out) {
