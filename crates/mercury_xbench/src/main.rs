@@ -232,6 +232,9 @@ fn main() {
     if want("xent") {
         bench_xent(&cc, &dir);
     }
+    if want("rope") {
+        bench_rope(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1607,6 +1610,117 @@ fn rust_xent(rows: usize, cols: usize) -> String {
          \x20   let mut m=*x.add(r*C); for i in 0..C {{ let v=*x.add(r*C+i); if v>m {{ m=v; }} }}\n\
          \x20   let mut s=0.0f32; for i in 0..C {{ s += (*x.add(r*C+i) - m).exp(); }}\n\
          \x20   *loss.add(r) = m + s.ln() - *x.add(r*C + *target.add(r) as usize); }} }}\n"
+    )
+}
+
+/// **RoPE** (rotary position embedding) `out = rotate(x[r,·]) by theta = r·inv_freq[j]` over `[rows, D]`
+/// (`D = 2·half`) — the per-attention-layer positional rotation of every modern LLM (Llama/Qwen/…). The
+/// angles' cos/sin are computed **inline** per element, so C/Rust keep `sinf`/`cosf` scalar; Mercury
+/// folds the nest to one `mercury_rope_f32[_parallel]` (the 8-wide sin8/cos8). All three buffers are
+/// f32, so the plain 3-pointer harness `(x, inv_freq, out)` serves. The kernel is a bit-exact rotation;
+/// only the poly-vs-libm ~1-ULP gap remains, so the cross-check is a tight magnitude-normalized tol.
+fn bench_rope(cc: &str, dir: &Path) {
+    for (rows, half) in [(8192usize, 64usize), (16384, 32)] {
+        let d = 2 * half;
+        let n = rows * d;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
+        // The standard RoPE schedule inv_freq[k] = base^(−k/half), base = 10000.
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|k| 10000f32.powf(-(k as f32) / half as f32))
+            .collect();
+        let mut out = vec![0.0f32; n];
+        let (xp, fp, op_) = (x.as_ptr(), inv_freq.as_ptr(), out.as_mut_ptr());
+        let bytes = (2.0 * n as f64 + half as f64) * 4.0; // x read + out write + inv_freq
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== rope (rotate by r·inv_freq[j]) {rows}x{d} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_rope(rows, half, false), &mut out, xp, fp, op_);
+        let mer_par = bench_mercury(&mer_rope(rows, half, true), &mut out, xp, fp, op_);
+        let cm = bench_external(
+            "c", &c_rope(rows, half), dir, "rope", cc,
+            &["-O3", "-march=native", "-shared"], &mut out, xp, fp, op_,
+        );
+        let rm = bench_external(
+            "rs", &rust_rope(rows, half), dir, "rope", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, xp, fp, op_,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&rm)
+        );
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+            let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! rope mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r2 = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r2 >= 1.0 { r2 } else { 1.0 / r2 },
+                if r2 >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r2 = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury RoPE: the nest the recognizer folds to one `mercury_rope_f32[_parallel]` call. `D = 2·half`.
+fn mer_rope(rows: usize, half: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let d = 2 * half;
+    let n = rows * d;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], inv_freq: [f32; {half}], out: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       for j in 0..{half} {{\n\
+         \x20           let theta: f32 = (r as f32) * inv_freq[j];\n\
+         \x20           let c: f32 = cos(theta);\n\
+         \x20           let s: f32 = sin(theta);\n\
+         \x20           let a: f32 = x[r * {d} + j];\n\
+         \x20           let b: f32 = x[r * {d} + j + {half}];\n\
+         \x20           out[r * {d} + j] = a * c - b * s;\n\
+         \x20           out[r * {d} + j + {half}] = b * c + a * s;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_rope(rows: usize, half: usize) -> String {
+    let d = 2 * half;
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define H {half}\n#define D {d}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* inv_freq, float* out){{\n\
+         \x20 for (long r=0;r<R;r++) for (long j=0;j<H;j++){{\n\
+         \x20   float theta=(float)r*inv_freq[j]; float c=cosf(theta), s=sinf(theta);\n\
+         \x20   float a=x[r*D+j], b=x[r*D+j+H];\n\
+         \x20   out[r*D+j]=a*c-b*s; out[r*D+j+H]=b*c+a*s; }}\n}}\n"
+    )
+}
+
+fn rust_rope(rows: usize, half: usize) -> String {
+    let d = 2 * half;
+    format!(
+        "const R: usize = {rows};\nconst H: usize = {half};\nconst D: usize = {d};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, inv_freq:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ for j in 0..H {{\n\
+         \x20   let theta=(r as f32)* *inv_freq.add(j); let c=theta.cos(); let s=theta.sin();\n\
+         \x20   let a=*x.add(r*D+j); let b=*x.add(r*D+j+H);\n\
+         \x20   *out.add(r*D+j)=a*c-b*s; *out.add(r*D+j+H)=b*c+a*s; }} }} }}\n"
     )
 }
 
