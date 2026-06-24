@@ -229,6 +229,9 @@ fn main() {
     if want("rmsnorm_bwd") {
         bench_rmsnorm_bwd(&cc, &dir);
     }
+    if want("xent") {
+        bench_xent(&cc, &dir);
+    }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
     }
@@ -1498,6 +1501,112 @@ fn rust_rmsnorm_bwd(rows: usize, cols: usize) -> String {
          \x20   let mut sg=0.0f32; for i in 0..C {{ sg += *dy.add(r*C+i) * *gamma.add(i) * *x.add(r*C+i); }}\n\
          \x20   let coef = rinv*rinv*sg/(C as f32);\n\
          \x20   for i in 0..C {{ *dx.add(r*C+i) = rinv*(*dy.add(r*C+i) * *gamma.add(i) - *x.add(r*C+i) * coef); }} }}\n}}\n"
+    )
+}
+
+/// Batched **softmax cross-entropy forward loss** `loss[r] = m + log(Σexp(x[r,·]−m)) − x[r,target[r]]`
+/// over `[rows, classes]` logits — the training loss of every classifier / language model. The
+/// stabilizing row-max + Σexp(x−m) reduction gcc/rustc keep **scalar** (`expf`/`logf` won't vectorize),
+/// so Mercury's fused 256-bit `mercury_xent_fwd_f32[_parallel]` wins. The `target` labels are `i32`, so
+/// the harness's middle `*const f32` pointer carries the `i32` buffer's address (a ptr is a ptr; the
+/// kernel / C baseline cast it back to `int`). GB/s counts the logits read once + the small label/loss
+/// vectors. The lse reductions reassociate → magnitude-normalized cross-check, like softmax_bwd.
+fn bench_xent(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 512)] {
+        let n = r * c;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.3).collect();
+        let target: Vec<i32> = (0..r).map(|i| ((i * 7 + 3) % c) as i32).collect();
+        let mut loss = vec![0.0f32; r];
+        let xp = x.as_ptr();
+        let tp = target.as_ptr() as *const f32; // i32 labels carried through the f32 ptr slot
+        let lossp = loss.as_mut_ptr();
+        let bytes = (n as f64 + 2.0 * r as f64) * 4.0; // logits read once + labels + loss
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== xent (loss = lse(x) − x[target]) {r}x{c} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_xent(r, c, false), &mut loss, xp, tp, lossp);
+        let mer_par = bench_mercury(&mer_xent(r, c, true), &mut loss, xp, tp, lossp);
+        let cm = bench_external(
+            "c", &c_xent(r, c), dir, "xent", cc,
+            &["-O3", "-march=native", "-shared"], &mut loss, xp, tp, lossp,
+        );
+        let rm = bench_external(
+            "rs", &rust_xent(r, c), dir, "xent", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut loss, xp, tp, lossp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&rm)
+        );
+        if let (Some(m), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+            let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! xent mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r2 = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C",
+                if r2 >= 1.0 { r2 } else { 1.0 / r2 },
+                if r2 >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r2 = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+/// Mercury cross-entropy loss: the batched nest the recognizer folds to one
+/// `mercury_xent_fwd_f32[_parallel]` call. The 3-pointer harness carries `(x, target-as-f32, loss)`.
+fn mer_xent(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], target: [i32; {rows}], loss: [f32; {rows}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut m: f32 = x[r * {cols}];\n\
+         \x20       for i in 0..{cols} {{ m = fmax(m, x[r * {cols} + i]); }}\n\
+         \x20       let mut s: f32 = 0.0;\n\
+         \x20       for i in 0..{cols} {{ s = s + exp(x[r * {cols} + i] - m); }}\n\
+         \x20       loss[r] = m + log(s) - x[r * {cols} + target[r]];\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_xent(rows: usize, cols: usize) -> String {
+    format!(
+        "#include <math.h>\n#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* target_f, float* loss){{\n\
+         \x20 const int* target = (const int*)target_f;\n\
+         \x20 for (long r=0;r<R;r++){{\n\
+         \x20   float m=x[r*C]; for(long i=0;i<C;i++) if(x[r*C+i]>m) m=x[r*C+i];\n\
+         \x20   float s=0.0f; for(long i=0;i<C;i++) s+=expf(x[r*C+i]-m);\n\
+         \x20   loss[r] = m + logf(s) - x[r*C + target[r]]; }}\n}}\n"
+    )
+}
+
+fn rust_xent(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, target_f:*const f32, loss:*mut f32) {{\n\
+         \x20 let target = target_f as *const i32;\n\
+         \x20 for r in 0..R {{\n\
+         \x20   let mut m=*x.add(r*C); for i in 0..C {{ let v=*x.add(r*C+i); if v>m {{ m=v; }} }}\n\
+         \x20   let mut s=0.0f32; for i in 0..C {{ s += (*x.add(r*C+i) - m).exp(); }}\n\
+         \x20   *loss.add(r) = m + s.ln() - *x.add(r*C + *target.add(r) as usize); }} }}\n"
     )
 }
 
