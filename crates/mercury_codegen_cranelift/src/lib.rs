@@ -113,6 +113,14 @@ const RT_COLMIN: &str = "mercury_colmin_f32";
 const RT_COLMIN_PAR: &str = "mercury_colmin_f32_parallel";
 const RT_COLMAXABS: &str = "mercury_colmaxabs_f32";
 const RT_COLMAXABS_PAR: &str = "mercury_colmaxabs_f32_parallel";
+const RT_COLMEAN: &str = "mercury_colmean_f32";
+const RT_COLMEAN_PAR: &str = "mercury_colmean_f32_parallel";
+const RT_COLSUMSQ: &str = "mercury_colsumsq_f32";
+const RT_COLSUMSQ_PAR: &str = "mercury_colsumsq_f32_parallel";
+const RT_COLL2: &str = "mercury_coll2_f32";
+const RT_COLL2_PAR: &str = "mercury_coll2_f32_parallel";
+const RT_COLRMS: &str = "mercury_colrms_f32";
+const RT_COLRMS_PAR: &str = "mercury_colrms_f32_parallel";
 const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
@@ -882,8 +890,8 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[src, dst, rows, cols]);
             return None;
         }
-        // The SIMD column reductions: mercury_col{sum,max,min}_f32[_parallel](x, out, rows, cols) — two
-        // pointers and two i64. Same (ptr, ptr, i64, i64) signature; route by name.
+        // The SIMD column reductions: mercury_col{sum,max,min,maxabs,mean,sumsq,l2,rms}_f32[_parallel]
+        // (x, out, rows, cols) — two pointers and two i64. Same (ptr, ptr, i64, i64) signature; by name.
         if matches!(
             name,
             RT_COLSUM
@@ -894,6 +902,14 @@ impl<'a> FnTranslator<'a> {
                 | RT_COLMIN_PAR
                 | RT_COLMAXABS
                 | RT_COLMAXABS_PAR
+                | RT_COLMEAN
+                | RT_COLMEAN_PAR
+                | RT_COLSUMSQ
+                | RT_COLSUMSQ_PAR
+                | RT_COLL2
+                | RT_COLL2_PAR
+                | RT_COLRMS
+                | RT_COLRMS_PAR
         ) && args.len() == 4
         {
             let x = self.val(args[0]);
@@ -1230,6 +1246,14 @@ struct RtFuncs {
     colmin_par: FuncId,
     colmaxabs: FuncId,
     colmaxabs_par: FuncId,
+    colmean: FuncId,
+    colmean_par: FuncId,
+    colsumsq: FuncId,
+    colsumsq_par: FuncId,
+    coll2: FuncId,
+    coll2_par: FuncId,
+    colrms: FuncId,
+    colrms_par: FuncId,
     velem: FuncId,
     vhorner: FuncId,
     sred: FuncId,
@@ -1584,6 +1608,30 @@ fn populate_module<M: Module>(
         colmaxabs_par: module
             .declare_function(RT_COLMAXABS_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        colmean: module
+            .declare_function(RT_COLMEAN, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colmean_par: module
+            .declare_function(RT_COLMEAN_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colsumsq: module
+            .declare_function(RT_COLSUMSQ, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colsumsq_par: module
+            .declare_function(RT_COLSUMSQ_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        coll2: module
+            .declare_function(RT_COLL2, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        coll2_par: module
+            .declare_function(RT_COLL2_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colrms: module
+            .declare_function(RT_COLRMS, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        colrms_par: module
+            .declare_function(RT_COLRMS_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         velem: module
             .declare_function(RT_VELEM, Linkage::Import, &sig_velem)
             .map_err(|e| e.to_string())?,
@@ -1854,6 +1902,38 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_COLMAXABS_PAR,
                 module.declare_func_in_func(rt.colmaxabs_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLMEAN,
+                module.declare_func_in_func(rt.colmean, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLMEAN_PAR,
+                module.declare_func_in_func(rt.colmean_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLSUMSQ,
+                module.declare_func_in_func(rt.colsumsq, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLSUMSQ_PAR,
+                module.declare_func_in_func(rt.colsumsq_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLL2,
+                module.declare_func_in_func(rt.coll2, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLL2_PAR,
+                module.declare_func_in_func(rt.coll2_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLRMS,
+                module.declare_func_in_func(rt.colrms, builder.func),
+            );
+            rt_refs.insert(
+                RT_COLRMS_PAR,
+                module.declare_func_in_func(rt.colrms_par, builder.func),
             );
             rt_refs.insert(
                 RT_VELEM,
@@ -2187,6 +2267,29 @@ pub fn jit_compile(
         RT_COLMAXABS_PAR,
         mercury_runtime::mercury_colmaxabs_f32_parallel as *const u8,
     );
+    builder.symbol(RT_COLMEAN, mercury_runtime::mercury_colmean_f32 as *const u8);
+    builder.symbol(
+        RT_COLMEAN_PAR,
+        mercury_runtime::mercury_colmean_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_COLSUMSQ,
+        mercury_runtime::mercury_colsumsq_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_COLSUMSQ_PAR,
+        mercury_runtime::mercury_colsumsq_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLL2, mercury_runtime::mercury_coll2_f32 as *const u8);
+    builder.symbol(
+        RT_COLL2_PAR,
+        mercury_runtime::mercury_coll2_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLRMS, mercury_runtime::mercury_colrms_f32 as *const u8);
+    builder.symbol(
+        RT_COLRMS_PAR,
+        mercury_runtime::mercury_colrms_f32_parallel as *const u8,
+    );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
         RT_VHORNER,
@@ -2458,6 +2561,29 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_COLMAXABS_PAR,
         mercury_runtime::mercury_colmaxabs_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLMEAN, mercury_runtime::mercury_colmean_f32 as *const u8);
+    builder.symbol(
+        RT_COLMEAN_PAR,
+        mercury_runtime::mercury_colmean_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_COLSUMSQ,
+        mercury_runtime::mercury_colsumsq_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_COLSUMSQ_PAR,
+        mercury_runtime::mercury_colsumsq_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLL2, mercury_runtime::mercury_coll2_f32 as *const u8);
+    builder.symbol(
+        RT_COLL2_PAR,
+        mercury_runtime::mercury_coll2_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_COLRMS, mercury_runtime::mercury_colrms_f32 as *const u8);
+    builder.symbol(
+        RT_COLRMS_PAR,
+        mercury_runtime::mercury_colrms_f32_parallel as *const u8,
     );
     builder.symbol(RT_VELEM, mercury_runtime::mercury_velem_f32 as *const u8);
     builder.symbol(
