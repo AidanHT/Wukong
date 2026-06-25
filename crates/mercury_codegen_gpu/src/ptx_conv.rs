@@ -495,6 +495,70 @@ pub fn conv_wmma_pad_ptx(
     conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, stride, pad)
 }
 
+/// **Explicit zero-pad scatter** (entry `pad_nchw_copy`): copy `X[C,H,W]` (fp16) into the interior of a
+/// pre-zeroed `Xpad[C, H+2·pad, W+2·pad]` (fp16), i.e. `Xpad[c, i+pad, j+pad] = X[c, i, j]`. Lets a padded
+/// conv run as the **dense valid kernel** ([`conv_wmma_strided_ptx`] on the padded dims) — no per-tap
+/// bounds checks, no extra hoisted registers in the GEMM. (Measured ~equal to the single-kernel
+/// bounds-checked gather; see [`super::gpu::conv2d_wmma_padded_explicit`].) The scatter is one streamed
+/// copy of `C·H·W` halfwords (<1% of the conv). Launch with grid `ceil(C·H·W / 256)`, block 256.
+/// `Xpad` must be zeroed (e.g. `alloc_zeros`) so the border stays 0.
+pub fn pad_nchw_copy_ptx(c: usize, h: usize, w: usize, pad: usize) -> String {
+    use std::fmt::Write as _;
+    let hw = h * w;
+    let total = c * hw;
+    let hp = h + 2 * pad;
+    let wp = w + 2 * pad;
+    let mut b = String::new();
+    let _ = writeln!(b, ".version 7.8");
+    let _ = writeln!(b, ".target sm_89");
+    let _ = writeln!(b, ".address_size 64");
+    let _ = writeln!(b);
+    let _ = writeln!(b, "// zero-pad scatter: X[C{c} H{h} W{w}] -> Xpad[C {hp} {wp}] interior (fp16)");
+    let _ = writeln!(b, ".visible .entry pad_nchw_copy(");
+    let _ = writeln!(b, "    .param .u64 pXin,");
+    let _ = writeln!(b, "    .param .u64 pXpad");
+    let _ = writeln!(b, ")");
+    let _ = writeln!(b, "{{");
+    let _ = writeln!(b, "    .reg .pred %p0;");
+    let _ = writeln!(b, "    .reg .b16 %hv;");
+    let _ = writeln!(b, "    .reg .b32 %gid,%cc,%rem,%ii,%jj,%dst,%ntx;");
+    let _ = writeln!(b, "    .reg .b64 %X,%Xp,%off,%ptr;");
+    let _ = writeln!(b);
+    let _ = writeln!(b, "    ld.param.u64 %X,[pXin];");
+    let _ = writeln!(b, "    ld.param.u64 %Xp,[pXpad];");
+    let _ = writeln!(b, "    cvta.to.global.u64 %X,%X;");
+    let _ = writeln!(b, "    cvta.to.global.u64 %Xp,%Xp;");
+    // global thread id = ctaid.x*ntid.x + tid.x  (avoid naming a reg %tid -- collides with %tid.x)
+    let _ = writeln!(b, "    mov.u32 %gid,%ctaid.x;");
+    let _ = writeln!(b, "    mov.u32 %ntx,%ntid.x;");
+    let _ = writeln!(b, "    mul.lo.s32 %gid,%gid,%ntx;");
+    let _ = writeln!(b, "    mov.u32 %rem,%tid.x;");
+    let _ = writeln!(b, "    add.u32 %gid,%gid,%rem;            // global thread id");
+    let _ = writeln!(b, "    setp.ge.u32 %p0,%gid,{total};");
+    let _ = writeln!(b, "    @%p0 bra DONE;");
+    // decode gid -> (c, i, j)
+    let _ = writeln!(b, "    div.u32 %cc,%gid,{hw};            // c = gid/(H*W)");
+    let _ = writeln!(b, "    rem.u32 %rem,%gid,{hw};           // rem = gid%(H*W)");
+    let _ = writeln!(b, "    div.u32 %ii,%rem,{w};             // i = rem/W");
+    let _ = writeln!(b, "    rem.u32 %jj,%rem,{w};             // j = rem%W");
+    // dst = c*(Hp*Wp) + (i+pad)*Wp + (j+pad)
+    let _ = writeln!(b, "    add.u32 %ii,%ii,{pad};            // i+pad");
+    let _ = writeln!(b, "    add.u32 %jj,%jj,{pad};            // j+pad");
+    let _ = writeln!(b, "    mad.lo.s32 %dst,%ii,{wp},%jj;     // (i+pad)*Wp + (j+pad)");
+    let _ = writeln!(b, "    mad.lo.s32 %dst,%cc,{},%dst;      // + c*Hp*Wp", hp * wp);
+    // load X[gid], store Xpad[dst]
+    let _ = writeln!(b, "    mul.wide.u32 %off,%gid,2;");
+    let _ = writeln!(b, "    add.s64 %ptr,%X,%off;");
+    let _ = writeln!(b, "    ld.global.u16 %hv,[%ptr];");
+    let _ = writeln!(b, "    mul.wide.u32 %off,%dst,2;");
+    let _ = writeln!(b, "    add.s64 %ptr,%Xp,%off;");
+    let _ = writeln!(b, "    st.global.u16 [%ptr],%hv;");
+    let _ = writeln!(b, "DONE:");
+    let _ = writeln!(b, "    ret;");
+    let _ = writeln!(b, "}}");
+    b
+}
+
 #[allow(clippy::too_many_arguments)]
 fn conv_wmma_ptx_impl(
     c: usize,
@@ -735,15 +799,13 @@ fn conv_wmma_ptx_impl(
             let _ = writeln!(b, "    add.u32 %xidx,%xidx,%ss;     // + s");
         } else {
             // padded: ih=ph+r, iw=pw+s (signed); AND in-bounds [0,H)x[0,W) into %pv (OOB -> hv=0 zero-pad).
+            // Single UNSIGNED compare per axis: 0<=ih<H  <=>  (u32)ih < H (a negative ih wraps to a huge
+            // u32 >= H, so it fails) -- halves the bounds chain (2 setp+2 and.pred, not 4).
             let _ = writeln!(b, "    add.s32 %ih,%bph{li},%rr;    // ih = ph + r");
             let _ = writeln!(b, "    add.s32 %iw,%bpw{li},%ss;    // iw = pw + s");
-            let _ = writeln!(b, "    setp.ge.s32 %p0,%ih,0;       // ih>=0");
+            let _ = writeln!(b, "    setp.lt.u32 %p0,%ih,{h};     // 0<=ih<H (unsigned wrap)");
             let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
-            let _ = writeln!(b, "    setp.lt.s32 %p0,%ih,{h};     // ih<H");
-            let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
-            let _ = writeln!(b, "    setp.ge.s32 %p0,%iw,0;       // iw>=0");
-            let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
-            let _ = writeln!(b, "    setp.lt.s32 %p0,%iw,{w};     // iw<W");
+            let _ = writeln!(b, "    setp.lt.u32 %p0,%iw,{w};     // 0<=iw<W (unsigned wrap)");
             let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
             let _ = writeln!(b, "    mad.lo.s32 %xidx,%ih,{w},%iw;    // ih*W + iw");
             let _ = writeln!(b, "    mad.lo.s32 %xidx,%cc,{hw},%xidx; // + c*H*W");
