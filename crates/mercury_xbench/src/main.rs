@@ -156,6 +156,33 @@ fn main() {
 
         println!("=== {} ({}) ===", k.name, k.note);
         report(k, &mercury, &c, &rust);
+        // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
+        // of the GEMM-vs-cblas comparison. Mercury's hand-AVX2 vmath vs Intel's hand-tuned VML, both
+        // single-thread, same buffer. Cross-checked against Mercury's output (a large rel error would
+        // expose a VML ABI mismatch — then the column is dishonest, so it is dropped with a note).
+        let vml_fn = match k.name {
+            "exp" => mkl().and_then(|a| a.vs_exp),
+            "log" => mkl().and_then(|a| a.vs_ln),
+            "tanh" => mkl().and_then(|a| a.vs_tanh),
+            _ => None,
+        };
+        if let (Some(f), Some(m)) = (vml_fn, &mercury) {
+            let v = bench_vml(f, xp, &mut out);
+            let (rel, at) = max_rel_err(&m.out, &v.out);
+            if rel > 1e-3 {
+                println!(
+                    "  -> oneMKL VML disagrees with Mercury at [{at}] (rel {rel:.1e}) — likely an ABI \
+                     mismatch on this MKL build; VML column dropped"
+                );
+            } else {
+                let r = v.ns_per_call / m.ns_per_call; // >1 ⇒ Mercury faster
+                println!(
+                    "  -> Mercury vmath is {:.2}x {} than oneMKL VML (hand-tuned vector math), 1 thread",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" },
+                );
+            }
+        }
         if let (Some(m), Some(c)) = (&mercury, &c) {
             runtime_ratios_c.push(c.ns_per_call / m.ns_per_call); // >1 => Mercury faster
             compile_ratios_c.push(c.compile.as_secs_f64() / m.compile.as_secs_f64());
@@ -4713,13 +4740,24 @@ type CblasSgemmFn = unsafe extern "C" fn(
 );
 type MklSetNumThreadsFn = unsafe extern "C" fn(i32);
 type MklGetMaxThreadsFn = unsafe extern "C" fn() -> i32;
+// oneMKL VML (Vector Math Library) single-precision unary op: `vsExp(n, a, y)` ⇒ `y[i] = exp(a[i])`.
+// The `n` width follows the same interface layer as CBLAS — ILP64 here (so `i64`, matching the
+// `cblas_sgemm_64` we resolve). The default HA (high-accuracy, ~0.5 ULP) mode is left in force; the
+// per-kernel cross-check vs Mercury's ~1-ULP poly tolerates the ≤2-ULP difference and would flag an
+// ABI mismatch (garbage output) by reporting a large rel error, in which case the column is dropped.
+type VmlUnaryFn = unsafe extern "C" fn(i64, *const f32, *mut f32);
 
 /// Resolved oneMKL entry points. Function pointers are `Copy + Send + Sync`; the backing library is
-/// leaked (`mem::forget`) so the pointers stay valid for the whole process.
+/// leaked (`mem::forget`) so the pointers stay valid for the whole process. The VML ops are optional
+/// (`None` if the symbol is absent) — they peer Mercury's vectorized transcendentals against Intel's
+/// hand-tuned vector math, the elementwise analogue of the GEMM-vs-cblas comparison.
 struct MklApi {
     sgemm: CblasSgemmFn,
     set_threads: MklSetNumThreadsFn,
     max_threads: i32,
+    vs_exp: Option<VmlUnaryFn>,
+    vs_ln: Option<VmlUnaryFn>,
+    vs_tanh: Option<VmlUnaryFn>,
     path: PathBuf,
 }
 
@@ -4771,10 +4809,18 @@ fn mkl() -> Option<&'static MklApi> {
             let sgemm = *lib.get::<CblasSgemmFn>(b"cblas_sgemm_64\0").ok()?;
             let set_threads = *lib.get::<MklSetNumThreadsFn>(b"MKL_Set_Num_Threads\0").ok()?;
             let get_max = *lib.get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0").ok()?;
+            // VML transcendentals are optional (older MKL builds, or a stripped redist, may omit them).
+            let vml = |sym: &[u8]| lib.get::<VmlUnaryFn>(sym).ok().map(|s| *s);
+            let vs_exp = vml(b"vsExp\0");
+            let vs_ln = vml(b"vsLn\0");
+            let vs_tanh = vml(b"vsTanh\0");
             MklApi {
                 sgemm,
                 set_threads,
                 max_threads: get_max(),
+                vs_exp,
+                vs_ln,
+                vs_tanh,
                 path,
             }
         };
@@ -4830,6 +4876,23 @@ fn bench_mm_mkl(
         ns_per_call,
         out: c.to_vec(),
     })
+}
+
+/// Time a oneMKL VML unary op (`vsExp`/`vsLn`/`vsTanh`) over the buffer: `out = f(x)`, single-threaded
+/// (VML respects `MKL_Set_Num_Threads`; we leave it at 1 to peer Mercury's single-core vmath kernel).
+/// Snapshots the output for the correctness cross-check against Mercury's vectorized transcendental.
+fn bench_vml(f: VmlUnaryFn, x: *const f32, out: &mut [f32]) -> Measure {
+    if let Some(api) = mkl() {
+        unsafe { (api.set_threads)(1) };
+    }
+    let nn = out.len() as i64;
+    let op = out.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe { f(nn, x, op) });
+    Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: out.to_vec(),
+    }
 }
 
 /// Print Mercury's GEMM standing against the oneMKL peer: single-core vs MKL(1 thread) and
