@@ -189,6 +189,9 @@ fn main() {
     if want("linear") {
         bench_linear(&cc, &dir, roof);
     }
+    if want("ffn") {
+        bench_ffn(&cc, &dir, roof);
+    }
     if want("linear_bf16") {
         bench_linear_bf16(&cc, &dir);
     }
@@ -652,6 +655,152 @@ fn rust_linear(ns: usize) -> String {
          \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
          \x20     for k in 0..NS {{ s+=*a.add(i*NS+k)* *b.add(j*NS+k); }}\n\
          \x20     *c.add(i*NS+j)=s; }} }}\n}}\n"
+    )
+}
+
+/// Fused FFN projection `C = silu(A·Bᵀ)` — the real transformer Dense / SwiGLU layer (a `nn.Linear`
+/// immediately followed by an activation). Mercury's epilogue-fusion look-ahead folds the matmul and
+/// the silu pass into ONE `mercury_sgemm_nt_epi` call (SILU act, null bias): the activation is computed
+/// in-register on the GEMM's C-tile writeback, so C is written exactly once. The idiomatic C/Rust do
+/// the GEMM, then a SECOND full pass that reads C back and applies silu with scalar libm `expf` (which
+/// they cannot vectorize) — paying both an extra n² memory round-trip AND a scalar transcendental pass
+/// on top of the GEMM. So Mercury wins the GEMM tiling, the fused (vectorized) silu, and the saved
+/// re-stream all at once.
+///
+/// HONEST DISCLOSURE (same basis as `bench_linear`/`dot`): the GEMM is the idiomatic dot-product
+/// `C=A·Bᵀ` form, whose inner float reduction gcc/rustc keep SERIAL without `-ffast-math` (~5 GFLOP/s).
+/// So the BULK of the headline ratio is the tiled-vs-serial-reduction GEMM gap (≈ the ~22× `bench_linear`
+/// single-core shows on the very same form), and the fused silu is the *incremental* win over C's
+/// separate scalar-`expf` pass (it widens the lead a little and proves the activation does not erode it).
+/// Square M=K=N for the shared-buffer ABI; GFLOP/s on the 2·n³ GEMM-flop basis (the n² silu is fused in).
+/// silu(GEMM): the GEMM reassociates and silu is poly-vs-libm ~1 ULP, so the full-buffer check is a tight
+/// tolerance (`max_rel_err`'s near-zero floor covers silu's zero crossing), exactly like `bench_matmul`.
+fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
+    let _ = roof;
+    for ns in [512usize, 1024] {
+        let n2 = ns * ns;
+        let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+        let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
+        let mut c = vec![0.0f32; n2];
+        let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+        let flops = 2.0 * (ns as f64).powi(3);
+        let gflops = |m: &Option<Measure>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", flops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "=== ffn (fused C=silu(A·Bᵀ): matmul+act folded into one C-write) {ns}x{ns} (GFLOP/s, higher is better) ==="
+        );
+        let mer = bench_mercury(&mer_ffn(ns, false), &mut c, ap, bp, cp);
+        let mer_par = bench_mercury(&mer_ffn(ns, true), &mut c, ap, bp, cp);
+        let cm = bench_external(
+            "c",
+            &c_ffn(ns),
+            dir,
+            "ffn",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_ffn(ns),
+            dir,
+            "ffn",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GFLOP/s",
+            gflops(&mer),
+            gflops(&mer_par),
+            gflops(&cm),
+            gflops(&rm)
+        );
+        // Cross-language correctness over the whole buffer (silu(GEMM) — tight tolerance, see doc).
+        if let (Some(m), Some(c)) = (&mer_par, &cm) {
+            let (rel, at) = max_rel_err(&m.out, &c.out);
+            if rel > 1e-3 {
+                println!(
+                    "  ! full-buffer mismatch vs C at [{at}]: Mercury={} C={} (rel {:.2e})",
+                    m.out[at], c.out[at], rel
+                );
+            }
+        }
+        if let (Some(ms), Some(c)) = (&mer, &cm) {
+            let r = flops / ms.ns_per_call / (flops / c.ns_per_call);
+            println!(
+                "  -> Mercury single-core (fused GEMM+silu) is {:.2}x {} than C (un-tiled GEMM + scalar-expf silu pass)",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c)) = (&mer_par, &cm) {
+            let r = flops / mp.ns_per_call / (flops / c.ns_per_call);
+            println!(
+                "  -> Mercury @parallel is {:.2}x {} than idiomatic single-threaded C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        println!();
+    }
+}
+
+/// `C = silu(A·Bᵀ)` written as the matmul nest + a silu epilogue nest (two consecutive statements).
+/// Mercury's `lower_block` look-ahead fuses them into one `mercury_sgemm_nt_epi` (SILU, null bias).
+fn mer_ffn(ns: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n2 = ns * ns;
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{\n\
+         \x20           let mut s: f32 = 0.0;\n\
+         \x20           for k in 0..{ns} {{ s = s + a[i * {ns} + k] * b[j * {ns} + k]; }}\n\
+         \x20           c[i * {ns} + j] = s;\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   for i in 0..{ns} {{\n\
+         \x20       for j in 0..{ns} {{ c[i * {ns} + j] = silu(c[i * {ns} + j]); }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_ffn(ns: usize) -> String {
+    format!(
+        "#include <math.h>\n#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
+         \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
+         \x20     c[i*NS+j]=s; }}\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++){{ float v=c[i*NS+j]; c[i*NS+j]=v/(1.0f+expf(-v)); }}\n}}\n"
+    )
+}
+
+fn rust_ffn(ns: usize) -> String {
+    format!(
+        "const NS: usize = {ns};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, c:*mut f32) {{\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{ let mut s=0.0f32;\n\
+         \x20     for k in 0..NS {{ s+=*a.add(i*NS+k)* *b.add(j*NS+k); }}\n\
+         \x20     *c.add(i*NS+j)=s; }} }}\n\
+         \x20 for i in 0..NS {{\n\
+         \x20   for j in 0..NS {{ let v=*c.add(i*NS+j); *c.add(i*NS+j)=v/(1.0f32+(-v).exp()); }} }}\n}}\n"
     )
 }
 
@@ -5021,6 +5170,31 @@ fn kernels() -> Vec<Kernel> {
             ),
             rust: rust_kernel(
                 "let mut m=0.0f32; for i in 0..N { let a=(*x.add(i)).abs(); if a>m { m=a; } } *out.add(0)=m;",
+            ),
+        },
+        // Argmax across cores — the greedy-decode top-1 (`next_token = argmax(logits)`) parallelized.
+        // A `@parallel` argmax loop dispatches to the multicore `mercury_argreduce_f32_parallel`: the
+        // FIXED RCHUNK decomposition folded in ascending order, so the returned index is bit-identical
+        // to the serial kernel and to the interpreter, independent of thread count. C/Rust are the
+        // idiomatic single-threaded branchy scalar argmax (the honest bar); the win is one core's
+        // branchless 8-lane (value,index) fold × all cores. Writes only out[0] (the index, exact in f32
+        // since N < 2^24), like `argmax`/`dot`, so the full-buffer cross-check agrees in all three.
+        Kernel {
+            name: "argmax@parallel",
+            bytes_per_call: N * 4,
+            note: "argmax(x) across cores (multicore argreduce kernel) vs single-threaded C/Rust",
+            mer: mer_par_kernel(&format!(
+                "let mut bv: f32 = x[0]; let mut bi: i64 = 0; \
+                 for k in 0..{N} {{ if x[k] > bv {{ bv = x[k]; bi = k as i64; }} }} \
+                 out[0] = bi as f32;"
+            )),
+            c: c_kernel(
+                "float bv=x[0]; long bi=0; \
+                 for(long k=0;k<N;k++){ if(x[k]>bv){ bv=x[k]; bi=k; } } out[0]=(float)bi;",
+            ),
+            rust: rust_kernel(
+                "let mut bv= *x.add(0); let mut bi=0i64; \
+                 for k in 0..N { let v= *x.add(k); if v>bv { bv=v; bi=k as i64; } } *out.add(0)=bi as f32;",
             ),
         },
     ]
