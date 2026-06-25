@@ -1335,4 +1335,89 @@ mod tests {
             });
         });
     }
+
+    // ===================== P7: tensor-parallel partition simulation (single GPU) ====================
+
+    /// Run the tuned WMMA f16 GEMM `C[m,n] = A[m,k]·B[n,k]ᵀ` (the projection kernel TP would split),
+    /// f16 inputs / f32 output. Calls — does not modify — `wmma_nt_f16_sm_db`.
+    fn wmma_gemm_nt(g: &mut Gpu, a16: &[f16], b16: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let a_d = g.stream.memcpy_stod(a16).unwrap();
+        let b_d = g.stream.memcpy_stod(b16).unwrap();
+        let mut c_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
+        let func = g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm_db").unwrap();
+        let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+        let mut b = g.stream.launch_builder(&func);
+        b.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        unsafe { b.launch(wmma_sm_cfg(m, n)).unwrap() };
+        g.stream.synchronize().unwrap();
+        g.stream.memcpy_dtov(&c_d).unwrap()
+    }
+
+    /// **TP column-parallel partition is bit-exact (validates the Megatron partition math on one GPU).**
+    /// QKV / FFN-up projections are *column-parallel*: split the output dim `N` across GPUs, each computing
+    /// its `N/T` shard from the full input with **no communication**, then concat. Simulated here by
+    /// splitting `N` into two halves and reassembling — the result is **bit-for-bit identical** to the
+    /// unsplit GEMM, because each output column is the *same* reduction (splitting `N` never changes the
+    /// `K`-accumulation). The 2-GPU number is unmeasured; the partition math is proven exact.
+    #[test]
+    fn tp_column_parallel_gemm_split_is_bit_exact() {
+        with_gpu("tp_column_parallel_gemm_split_is_bit_exact", |g| {
+            let (m, n, k) = (64usize, 256usize, 256usize); // N%128==0 ⇒ N/2 a multiple of the 64 tile
+            let mut rng = crate::diff::Rng::new(0x701);
+            let a: Vec<f16> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
+            let b: Vec<f16> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
+            let full = wmma_gemm_nt(g, &a, &b, m, n, k);
+            // Two "GPUs", each owning N/2 output columns (B rows): C_g = A · B_g^T, no comm.
+            let nh = n / 2;
+            let c0 = wmma_gemm_nt(g, &a, &b[0..nh * k], m, nh, k);
+            let c1 = wmma_gemm_nt(g, &a, &b[nh * k..n * k], m, nh, k);
+            let mut part = vec![0f32; m * n];
+            for mm in 0..m {
+                for j in 0..nh {
+                    part[mm * n + j] = c0[mm * nh + j];
+                    part[mm * n + nh + j] = c1[mm * nh + j];
+                }
+            }
+            for i in 0..m * n {
+                assert_eq!(part[i].to_bits(), full[i].to_bits(), "column-parallel split != unsplit at {i}");
+            }
+            eprintln!("TP column-parallel ({m}×{n}×{k}, split N {n}→2×{nh}): concat == unsplit BIT-IDENTICAL (no all-reduce needed)");
+        });
+    }
+
+    /// **TP row-parallel all-reduce matches (validates the partition math; the sum is the only comm).**
+    /// Attention-out / FFN-down projections are *row-parallel*: split the contraction dim `K` across GPUs,
+    /// each computing a partial `[M,N]`, then **all-reduce (sum)** the partials. Simulated by splitting `K`
+    /// into two halves and summing. The sum reassociates the `K` reduction (float, not associative), so it
+    /// matches the unsplit GEMM within tolerance — *exactly* the numerical behavior of a real ring
+    /// all-reduce. (The repo's reassociation-exception class; the all-reduce itself is the unmeasured seam.)
+    #[test]
+    fn tp_row_parallel_gemm_allreduce_matches() {
+        with_gpu("tp_row_parallel_gemm_allreduce_matches", |g| {
+            let (m, n, k) = (64usize, 256usize, 256usize); // K/2 a multiple of the 16-wide K tile
+            let mut rng = crate::diff::Rng::new(0x702);
+            let a: Vec<f16> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
+            let b: Vec<f16> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f16::from_f32(x)).collect();
+            let full = wmma_gemm_nt(g, &a, &b, m, n, k);
+            // Each "GPU" owns a K-shard of both operands and computes a full-[M,N] partial.
+            let kh = k / 2;
+            let slice_k = |src: &[f16], rows: usize, lo: usize, hi: usize| -> Vec<f16> {
+                let mut out = Vec::with_capacity(rows * (hi - lo));
+                for r in 0..rows {
+                    out.extend_from_slice(&src[r * k + lo..r * k + hi]);
+                }
+                out
+            };
+            let c0 = wmma_gemm_nt(g, &slice_k(&a, m, 0, kh), &slice_k(&b, n, 0, kh), m, n, kh);
+            let c1 = wmma_gemm_nt(g, &slice_k(&a, m, kh, k), &slice_k(&b, n, kh, k), m, n, kh);
+            // All-reduce (sum) the two partials — the one inter-GPU collective in row-parallel TP.
+            let summed: Vec<f32> = c0.iter().zip(&c1).map(|(&x, &y)| x + y).collect();
+            let s = crate::diff::assert_close("tp_row_parallel", &summed, &full, 1e-2, 1e-2);
+            eprintln!(
+                "TP row-parallel ({m}×{n}×{k}, split K {k}→2×{kh}): summed partials vs unsplit max_abs={:.2e} max_rel={:.2e} \
+                 (all-reduce reassociates the K reduction — float, not bit-exact, as a real ring all-reduce)",
+                s.max_abs, s.max_rel
+            );
+        });
+    }
 }
