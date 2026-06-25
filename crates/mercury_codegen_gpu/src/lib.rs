@@ -82,6 +82,19 @@ pub mod pool;
 pub mod graph;
 
 #[cfg(feature = "gpu")]
+pub mod ptx_int8;
+
+// fp8 *training* kernels (Phase 6): E5M2 backward GEMM + amax + delayed scaling. Single-owner file;
+// reuses the proven E4M3 m16n8k32 fragment layout without touching the forward path.
+#[cfg(feature = "gpu")]
+pub mod ptx_fp8_train;
+
+// Phase 10: per-(op, shape, dtype) autotuning + on-disk config cache + regression mode. Picks the
+// fastest of the int8 GEMM kernel variants (swz / hand-placed × tiles × split-K) per shape, same-run.
+#[cfg(feature = "gpu")]
+pub mod autotune;
+
+#[cfg(feature = "gpu")]
 pub use gpu::{available, gpu, Gpu};
 
 #[cfg(feature = "gpu")]

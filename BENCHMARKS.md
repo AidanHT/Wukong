@@ -786,6 +786,44 @@ fp8 fragment layout on `sm_89` — is bit-exact (`max_abs=0` vs an asymmetric e4
 the multi-tile correctness gate covers it at 64³ and 128×256×64. SMEM K/V staging for fp8's true peak
 remains documented future work.
 
+**int8 (W8A8) tensor-core GEMM — the quantized-inference path (M3).** `u8` activations × `i8` weights
+→ `i32`, `C = A·Bᵀ` (Mercury's CPU `vpdpbusd` contract, on the GPU). int8 shares fp8's `m16n8k32`
+8-bit fragment geometry (no WMMA int8 on `sm_89` either), so the kernels mirror the fp8 stack retyped
+`mma.sync.m16n8k32.s32.u8.s8.s32` with `i32` accumulators: a hand-placed single tile, a fragment-reuse
+`_mt` (2×4 16×8 tiles/warp), and a **SMEM-staged + `cp.async` double-buffered** kernel (64×64 / 128×128
+tiles, fragments loaded from shared via `ld.shared`). Integer accumulate is exact mod 2³², so the gate
+is **bit-exact** — the GPU output must *equal* a wrapping-`i32` CPU reference over the full output (`==`,
+not a tolerance), a stronger correctness bar than the float kernels. Gated green across single-tile,
+`_mt`, and SMEM-staged paths.
+
+Honest same-run scoreboard (`int8_gemm_vs_peers`, RTX 4050, `2·M·N·K` MAC-FLOP, checksum-cross-checked;
+peers: **naive** int8 CUDA-C, a strong **`dp4a.u32.s32`** hand-written CUDA-C, and **cuBLAS int8 IMMA**
+`cublasGemmEx`; all four first gated to *equal* the `i32` oracle — classic GemmEx int8 is `s8×s8`, so
+the peer cross-check uses `[0,127]` activations where `u8≡s8`, the full-range `[0,255]` gate is separate):
+
+| size | Mercury `_smdb` (best) | % of cuBLAS int8 | × vs naive CUDA-C | × vs dp4a CUDA-C |
+|------|------------------------|------------------|-------------------|------------------|
+| 1024³ | 22.8 TFLOP/s (64-tile) | ~44% | ~182× | ~34× |
+| 2048³ | 39.8 TFLOP/s (64-tile) | ~53% | ~237× | ~58× |
+| 4096³ | 39.0 TFLOP/s (128-tile) | ~52% | ~228× | ~57× |
+
+**M6 is a decisive, sustained win — ~180–237× the naive hand-written int8 CUDA-C and ~34–58× the dp4a
+SIMD-int8 kernel** across re-runs (the literal "beat C on the GPU" for the quantized path). The SMEM
+pipeline is **1.6–2.1× the `_mt` fragment-reuse path**, and the dispatch is regime-aware (64×64 tile —
+2× occupancy — wins small/medium; the 128×128 tile — more reuse — wins at 4096³), the same split the
+fp16 GEMM uses. Against cuBLAS the honest standing is **~44–53% of its int8 IMMA** — a real gap; the
+remaining levers are the same ones open on fp16 (multi-stage `cp.async`, `ldmatrix`, swizzled SMEM).
+
+**Beating cuBLAS by fusion (int8 dequant).** cuBLAS int8 outputs raw `i32`; a real quantized pipeline
+then dequantizes, which cuBLAS **cannot fuse** — it needs a *second* kernel that re-reads the whole
+`M×N` `i32` matrix from HBM and writes `M×N` f32. Mercury folds the **per-channel dequant**
+`out[i,j] = f32(Σ u8·i8)·scale[j]` into the C store (`int8_gemm_nt_smdb_deq`): the `i32→f32` cvt and the
+per-column scale happen in registers before the write. It is **exact** vs the CPU reference (`max_abs=0`,
+the shared single f32 rounding), and measured same-run (`int8_dequant_fusion`) the f32-output dequant
+kernel costs **~0 over the plain `i32` kernel** (−5%, within noise) — i.e. Mercury gets the dequant free,
+exactly the HBM round-trip + launch cuBLAS structurally must pay. Reproduce: `int8_gemm_vs_peers` /
+`int8_dequant_fusion` in `mercury_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH.
+
 **Honest peer scoreboard — vs cuBLAS and naive CUDA-C.** A GPU kernel's only meaningful rivals run on
 the *same GPU*. Both are now measured here (Phase 0 of the GPU plan): the redistributable **NVRTC** +
 **cuBLAS** DLLs `dlopen` like the driver itself, so `cargo test` stays toolkit-free and the peer bench
