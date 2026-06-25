@@ -278,6 +278,58 @@ fn run_kernel_f32_inner(
     Ok(())
 }
 
+/// Run an f64-buffer kernel over caller-provided buffers — the double-precision twin of
+/// [`run_kernel_f32`]. The autodiff finite-difference gradient gate evaluates its reference forward
+/// pass through this: an f32 central difference's eps-noise (`~f32_eps/eps`) would swamp the
+/// gradient, whereas f64 keeps it orders of magnitude below the tolerance. Identical to
+/// `run_kernel_f32` except buffers marshal as `Value::Float(v)` directly (no `as f32` rounding), so
+/// a kernel built with `F64` ops computes in full double precision.
+pub fn run_kernel_f64(
+    program: &Program,
+    entry: Symbol,
+    bufs: &mut [&mut [f64]],
+    interner: &Interner,
+) -> Result<(), String> {
+    let func = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    if func.params.len() != bufs.len() {
+        return Err(format!(
+            "kernel `{}` takes {} parameter(s) but {} buffer(s) were provided",
+            interner.resolve(entry),
+            func.params.len(),
+            bufs.len()
+        ));
+    }
+    let mut interp = Interp {
+        program,
+        interner,
+        memory: Vec::new(),
+        stdout: Vec::new(),
+        frames: Vec::new(),
+        scratch: Vec::with_capacity(8),
+        vecs: Vec::new(),
+        accel: None,
+    };
+    let mut bases = Vec::with_capacity(bufs.len());
+    for buf in bufs.iter() {
+        bases.push(interp.memory.len());
+        interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
+    }
+    let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
+    interp.run_function(func, args)?;
+    for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = match interp.memory[base + i] {
+                Value::Float(f) => f,
+                Value::Int(n) => n as f64,
+                _ => 0.0,
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Run an int8 quantized GEMM kernel `fn k(a: [u8; _], b: [i8; _], c: [i32; _])` over caller
 /// buffers — the integer twin of [`run_kernel_f32`], for the full-buffer int8 differential fuzzer.
 ///

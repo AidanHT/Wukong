@@ -426,6 +426,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury_autodiff"
+version = "0.1.0"
+dependencies = [
+ "mercury_interp",
+ "mercury_mir",
+ "mercury_span",
+]
+
+[[package]]
 name = "mercury_backend"
 version = "0.1.0"
 dependencies = [
@@ -474,6 +483,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "half",
+ "mercury_autodiff",
  "mercury_backend",
  "mercury_interp",
  "mercury_lexer",

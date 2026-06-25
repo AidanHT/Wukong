@@ -14,6 +14,7 @@ This is the `mercury_` crate workspace; dependencies flow strictly downward (no 
 - [`mercury_mir`](mercury_mir/CLAUDE.md) — Typed block-structured SSA IR: types, builder, printer, verifier.
 - [`mercury_mir_build`](mercury_mir_build/CLAUDE.md) — Lowers type-checked Mercury AST into MIR (alloca-per-local).
 - [`mercury_opt`](mercury_opt/CLAUDE.md) — Pass manager, CFG/dominator analyses, and SSA MIR transforms.
+- [`mercury_autodiff`](mercury_autodiff/CLAUDE.md) — Reverse-mode AD as a MIR→MIR transform (the backward path for training): VJP rules + a fused AdamW kernel, finite-difference-gated.
 - [`mercury_backend`](mercury_backend/CLAUDE.md) — Backend trait + Artifact enum: the MIR-to-execution/emission seam.
 - [`mercury_interp`](mercury_interp/CLAUDE.md) — Zero-dep tree-walking MIR interpreter; default backend and differential oracle.
 - [`mercury_codegen_cranelift`](mercury_codegen_cranelift/CLAUDE.md) — Native backend via Cranelift (no LLVM): JIT + object/exe.
@@ -37,6 +38,7 @@ This is the `mercury_` crate workspace; dependencies flow strictly downward (no 
 - `mercury_mir` -> `mercury_span`, `mercury_types`.
 - `mercury_mir_build` -> `mercury_span`, `mercury_diag`, `mercury_ast`, `mercury_types`, `mercury_mir`, `mercury_sema`.
 - `mercury_opt` -> `mercury_mir`, `mercury_span`.
+- `mercury_autodiff` -> `mercury_mir`, `mercury_span` (dev: `mercury_interp` for the gradient gate).
 - `mercury_backend` -> `mercury_mir`, `mercury_span`.
 - `mercury_interp` -> `mercury_mir`, `mercury_span`, `mercury_backend`.
 - `mercury_codegen_llvm` -> `mercury_span`, `mercury_mir`, `mercury_backend`.

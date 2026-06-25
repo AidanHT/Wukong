@@ -56,9 +56,13 @@ gpu = [
     "dep:mercury_span",
 ]
 
-# The MIR->PTX lowering gate (`src/lower.rs` tests) builds programs from `.mer` source, so it needs
-# the front-end + the interpreter oracle. These are dev-only and pure-Rust (no toolchain), and the
-# test module is `#[cfg(all(test, feature = "gpu"))]`, so a plain `cargo test` ignores them.
+# Dev-deps for the GPU gates. All toolchain-free, so a plain `cargo test` builds them; the gpu-gated
+# tests that use them are cfg'd out without `--features gpu` (and mercury_mir/span are reached through
+# the feature-gated optional deps above, so they need no dev-dep entry):
+#  - lexer/parser/sema/mir_build/opt: the MIR->PTX lowering gate (`src/lower.rs`) builds `.mer` source.
+#  - mercury_interp: the interpreter oracle the GPU kernels are diffed against.
+#  - mercury_autodiff: the CPU autodiff reference for the GPU training kernels (Session I / M8) — the
+#    fused AdamW MIR kernel + the backward the resident step is differentiated against.
 [dev-dependencies]
 mercury_lexer = { workspace = true }
 mercury_parser = { workspace = true }
@@ -66,3 +70,4 @@ mercury_sema = { workspace = true }
 mercury_mir_build = { workspace = true }
 mercury_opt = { workspace = true }
 mercury_interp = { workspace = true }
+mercury_autodiff = { path = "../mercury_autodiff" }
