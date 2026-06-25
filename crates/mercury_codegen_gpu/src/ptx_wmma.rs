@@ -1526,8 +1526,9 @@ fn entry_mma_pipe(
 /// pipeline, padded conflict-free SMEM fragment loads, threadblock raster — and the D-fragment column map
 /// is identical for both, so the per-column bias add and the SFU activation reuse [`Act::epilogue`]
 /// verbatim. Same shape constraints as [`entry_mma_pipe`]; `bias` adds per-column `bg[N]`,`bu[N]` params.
-/// `swz` selects the no-pad `ldmatrix`+XOR-swizzle staging (the [`entry_mma_pipe`] GEMM-cliff win carried
-/// to both gated GEMMs — A is shared, the two B tiles reuse one swizzle derivation; bit-identical output).
+/// `swz` selects the no-pad `ldmatrix`+XOR-swizzle staging (the [`entry_mma_pipe`] technique ported to both
+/// gated GEMMs — A is shared, the two B tiles reuse one swizzle derivation; bit-identical output). NOTE:
+/// measured a wash-to-loss for this dual-B tile (the single-B win does not transfer); production uses padded.
 fn entry_mma_gate(
     name: &str,
     ty: &str,
@@ -1561,14 +1562,18 @@ fn entry_mma_gate(
     let wnc = bn / warps_n;
     let nc = bk / 8; // 16-byte (8×f16) chunks per SMEM row — the swz XOR-swizzle modulus
     let nc_mask = nc - 1;
-    // The **`swz`** path (ldmatrix + XOR-swizzle + no-pad) carries the single-B workhorse's GEMM-cliff win
-    // (hardware `ldmatrix` fragment loads + a conflict-free no-pad swizzle, 1.13–1.23× the padded base at
-    // equal occupancy) to BOTH gated GEMMs at once: Wg and Wu share x's `[M,K]` A tile and have *identical*
-    // `[N,K]` layout, so the A/B swizzle derivation (see [`entry_mma_pipe`], derived for bk=32/nc=4) ports
-    // verbatim — one A path feeds both `mma` chains, and the B path runs once per B tile sharing the same
-    // `%browb`/`%phaseB`/`%lb8` (only the smem base + ring cursor differ). The register-level epilogue is
-    // untouched, so the output is **bit-identical** to the padded gate. No-pad also *shrinks* SMEM (the
-    // 128×64/s2 footprint drops 40 KiB → 32 KiB), so occupancy can only rise.
+    // The **`swz`** path (ldmatrix + XOR-swizzle + no-pad) ports the single-B workhorse's technique to BOTH
+    // gated GEMMs at once: Wg and Wu share x's `[M,K]` A tile and have *identical* `[N,K]` layout, so the
+    // A/B swizzle derivation (see [`entry_mma_pipe`], derived for bk=32/nc=4) ports verbatim — one A path
+    // feeds both `mma` chains, and the B path runs once per B tile sharing the same `%browb`/`%phaseB`/`%lb8`
+    // (only the smem base + ring cursor differ). The register-level epilogue is untouched, so the output is
+    // **bit-identical** to the padded gate, and no-pad *shrinks* SMEM (128×64/s2: 40 KiB → 32 KiB).
+    // **MEASURED: the single-B 128×128 swz win does NOT transfer to this dual-B 128×64 tile** — same-run vs
+    // the padded gate it is a wash-to-loss (geomean ≈1.00×, ~0.89× @2048³; see `fused_swiglu_gate_vs_chain`),
+    // because the gate already amortizes A across both GEMMs (load-x-once) so it is far less SMEM-fragment-
+    // load-bound (the path `ldmatrix` accelerates), and tn=2 (vs the single-B tn=4) leaves too little mma-ILP
+    // to hide the no-pad swizzle's per-ks address arithmetic. Emitted + correctness-gated as a verified
+    // alternative; **production routes to the padded base** (see `gemm_nt_f16_swiglu`).
     if swz {
         assert!(bk == 32, "{name}: the swz swizzle phase is derived for bk=32 (nc=4)");
         assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs warp row/col bases ≡ 0 (mod 8)");
@@ -2108,10 +2113,10 @@ pub fn wmma_f16_ptx() -> &'static str {
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
             m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, false);
-            // The no-pad `ldmatrix`+XOR-swizzle twin (`..._swz`) — the dual-B gate carried onto the faster
-            // swz base (hardware fragment loads, 1.13–1.23× the padded base at equal/higher occupancy). The
-            // gate's register-level act⊙product epilogue is untouched ⇒ **bit-identical** to the padded gate;
-            // `gemm_nt_f16_swiglu`/`_geglu` route here at the large (≥16 MB A+Wg+Wu) FFN working set.
+            // The no-pad `ldmatrix`+XOR-swizzle twin (`..._swz`), bit-identical to the padded gate. Emitted +
+            // correctness-gated as a verified alternative, but **measured a wash-to-loss for this dual-B tile**
+            // (the single-B GEMM-cliff swz win does NOT transfer — see `entry_mma_gate` / the same-run
+            // `fused_swiglu_gate_vs_chain`), so `gemm_nt_f16_swiglu`/`_geglu` route to the PADDED base, not here.
             m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}_swz"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, true);
         }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
@@ -2257,8 +2262,8 @@ pub fn wmma_bf16_ptx() -> &'static str {
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
             m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, false);
-            // bf16 no-pad swizzle twin (`..._swz`) — the training-dtype gate on the faster swz base
-            // (bit-identical register-level epilogue). `gemm_nt_bf16_swiglu`/`_geglu` route here at ≥16 MB.
+            // bf16 no-pad swizzle twin (`..._swz`), bit-identical; correctness-gated alternative. Like fp16,
+            // measured a wash-to-loss for this dual-B tile, so `gemm_nt_bf16_swiglu`/`_geglu` use the padded base.
             m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}_swz"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, true);
         }
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
