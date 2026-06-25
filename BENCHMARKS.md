@@ -182,6 +182,14 @@ Cranelift JIT compiling in-process vs spawning a full C/Rust+LLVM toolchain is a
 magnitude win, every build. For an ML compiler — where edit/recompile/run iteration dominates
 developer time — this is the most robust result of all.
 
+The pipeline's own hot stage is the **optimizer** (~80–85% of front-to-`-O2` time; the recognizer
+sweep and sema are negligible). Two output-preserving changes cut it **~31%** (in-process, 400-function
+`-O2`: **18.0 ms → 12.5 ms**): the CSE value-numbering key became a packed allocation-free `enum`
+instead of a `format!` string built per pure instruction (CSE is the costliest pass), and the fixpoint
+loop now skips passes already at fixpoint — dropping the final all-passes no-op *confirmation* sweep
+without changing the sequence of mutations. The resulting MIR is bit-identical (the differential and
+`-O0`≡`-O{1,2,3}` gates both still pass), so the speedup is free of any correctness cost.
+
 ### Matmul `C = A·B` — single-core wins, parallel dominates, and the lead grows with size
 
 GFLOP/s (higher is better), naive `ikj` nest in each language:
@@ -224,6 +232,23 @@ C-tile writeback, so it gets the *same* ~19–26× single-core / ~52–104× par
 plain `nn.Linear` above, **plus** the residual-add and bias/activation folded in for free (the
 fused-epilogue kernel — no new symbol, no separate pass). This reuses the existing `nt_epi` kernel
 end-to-end, so it stays bit-exact across backends (`tests/run/linear_residual{,_relu}.mer`).
+
+**Fused FFN `C = silu(A·Bᵀ)` — the complete Dense / SwiGLU layer** (xbench `ffn`). The matmul nest
+followed by a `silu` epilogue nest fuses to one `mercury_sgemm_nt_epi` (SILU act, null bias): the
+activation is computed in-register on the GEMM's C-tile writeback, so C is written once. The idiomatic
+C/Rust do the GEMM, then a *second* full pass that reads C back and applies silu with scalar libm
+`expf` (which they cannot vectorize).
+
+| size  | Mer 1-core | Mer @parallel | C (gcc) | 1-core vs C | parallel vs C |
+|-------|-----------|---------------|---------|-------------|---------------|
+| 512²  | ~115 | ~227 | ~4.8 | **~24×** | **~48×** |
+| 1024² | ~107 | ~389 | ~4.1 | **~26×** | **~95×** |
+
+Honest accounting: the **bulk** of this ratio is the same serial-reduction-vs-tiled GEMM gap as the
+`nn.Linear` row above (~22–26×); the fused vectorized silu is the *incremental* win over C's separate
+scalar-`expf` pass — it widens the lead slightly and proves the activation does not erode it (C's `ffn`
+GFLOP/s ≈ its plain-`linear` GFLOP/s, so the silu pass is not a strawman). silu(GEMM) is checked over the
+whole buffer to a tight tolerance (the GEMM reassociates, silu is poly-vs-libm ~1 ULP).
 
 ### Weight-gradient `C = Aᵀ·B` — the training backward GEMM Mercury dispatches, gcc cannot
 
@@ -683,7 +708,11 @@ shapes and folds each to one i32-output kernel that tracks 8 `(value, index)` la
   now folds 32 elements/iteration across **4 AVX2 accumulators** (8 `f32` value + 8 `i32` index lanes
   each, `_mm256_cmp_ps` strict-compare + `blendv`), collapsing the 32 candidates through the same scalar
   tie-break — so it is bit-identical to the scalar form and **~5–9× faster than gcc** (the `(value,index)`
-  bookkeeping gcc/rustc won't auto-vectorize), up from a 1.30× loss.
+  bookkeeping gcc/rustc won't auto-vectorize), up from a 1.30× loss. Under `@parallel` it now dispatches
+  to `mercury_argreduce_f32_parallel` (previously it fell through to the *serial* kernel — the parallel
+  reduction recognizer handles only `+`/`fmax`/`fmin`, not the argmax bookkeeping), folding the same
+  fixed `RCHUNK` chunks in ascending order so the index stays bit-identical: **~17× vs single-threaded C**
+  (memory-bound, so ~2× over the single-core fold rather than linear in cores).
 
 These are the **first recognized kernels with an i32 output buffer** (the interpreter marshals the result
 back as an integer, not a float). A per-row/column arg-selection is a deterministic permutation — no
