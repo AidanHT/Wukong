@@ -317,15 +317,12 @@ pub const CLIFF_VARIANTS: &[CliffCfg] = &[
     // baselines (== production dispatch): w24 = 8 warps, 16 mma/warp
     CliffCfg { name: "cliff_base_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, swz: false, pad: 8, min_ctas: 0 },
     CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, swz: true, pad: 0, min_ctas: 0 },
-    // WARP-tile sweep on the 128×128 swizzle tile — fewer warps ⇒ bigger warp tile ⇒ more mma/warp (ILP)
-    // AND fewer threads/CTA ⇒ more CTAs/SM. w22 (4 warps, 64×64 warp, 32 mma/warp, 3 CTAs/SM) was the win.
+    // Decision sweep: w22 (4 warps, 64×64 warp, 32 mma/warp, 3 CTAs/SM) vs w24, for BOTH the padded
+    // (16–48 MB regime) and swizzle (≥48 MB regime) paths — to confirm w22 is safe to make the workhorse
+    // geometry (it changes both production paths) at 2048³ and 4096³.
+    CliffCfg { name: "cliff_base_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, swz: false, pad: 8, min_ctas: 0 },
     CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, swz: true, pad: 0, min_ctas: 0 },
-    CliffCfg { name: "cliff_swz_w14", bm: 128, bn: 128, bk: 32, wm: 1, wn: 4, stages: 2, swz: true, pad: 0, min_ctas: 0 }, // 4 warps, 128×32 warp
-    CliffCfg { name: "cliff_swz_w41", bm: 128, bn: 128, bk: 32, wm: 4, wn: 1, stages: 2, swz: true, pad: 0, min_ctas: 0 }, // 4 warps, 32×128 warp
-    CliffCfg { name: "cliff_swz_w42", bm: 128, bn: 128, bk: 32, wm: 4, wn: 2, stages: 2, swz: true, pad: 0, min_ctas: 0 }, // 8 warps, 32×64 warp
-    // combine the warp-tile winner with deeper pipeline / forced occupancy
-    CliffCfg { name: "cliff_swz_w22_s3", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 3, swz: true, pad: 0, min_ctas: 0 },
-    CliffCfg { name: "cliff_swz_w22_lb4", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, swz: true, pad: 0, min_ctas: 4 },
+    CliffCfg { name: "cliff_swz_w14", bm: 128, bn: 128, bk: 32, wm: 1, wn: 4, stages: 2, swz: true, pad: 0, min_ctas: 0 },
 ];
 
 /// Emit the cliff candidate PTX module (separate from `wmma_f16_ptx` so experiments never perturb the
@@ -1918,6 +1915,18 @@ pub fn wmma_f16_ptx() -> &'static str {
                 Act::None, false, false, true,
                 0,
             );
+            // **w22 swizzle workhorse** — the GEMM-cliff win. The 2×2 warp grid (vs the w24 base's 2×4)
+            // gives each warp a 64×64 tile = 32 mma/warp (2× the ILP to hide tensor-core + ldmatrix latency)
+            // AND 128 threads/CTA ⇒ 3 CTAs/SM (vs 2). Measured ~81%→84% of cuBLAS @4096³ (1.04–1.07× the w24
+            // swz, reproduced same-run, bit-gated). `gemm_nt_f16` dispatches it for A+B ≥ 48 MB; the padded
+            // 16–48 MB regime keeps w24 (padded w22 regresses 2048³ ~86%→70%).
+            m += &entry_mma_pipe(
+                &format!("{}_w22swz", wh.name),
+                "f16",
+                wh.bm, wh.bn, wh.bk, 2, 2, wh.stages, wh.raster, wh.pad,
+                Act::None, false, false, true,
+                0,
+            );
         }
         // Fused epilogues on the **deep WMMA pipe `pipe_64_s6`** — the ≤1024³ GEMM champion. The `mma.sync`
         // workhorse the *other* fused epilogues ride is beaten there (`pipe_64_s6` ~90% of cuBLAS vs the
@@ -2078,6 +2087,9 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 ldmatrix+XOR-swizzle+no-pad twin (`_swz`) — the HBM-bound-4096³ win carried to the training
         // dtype (the swz path is dtype-agnostic; `gemm_nt_bf16` regime-dispatches it for A+B ≳ 2×L2).
         m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true, 0);
+        // bf16 w22 swizzle workhorse (the GEMM-cliff win carried to the training dtype): 2×2 warp grid =
+        // 32 mma/warp + 3 CTAs/SM; `gemm_nt_bf16` dispatches it for A+B ≥ 48 MB.
+        m += &entry_mma_pipe(&format!("{}_w22swz", v.name), "bf16", v.bm, v.bn, v.bk, 2, 2, v.stages, v.raster, v.pad, Act::None, false, false, true, 0);
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
         // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
