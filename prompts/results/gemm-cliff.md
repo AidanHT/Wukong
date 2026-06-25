@@ -93,7 +93,47 @@ mma/warp** (2× the ILP) AND 128 threads/CTA ⇒ **3 CTAs/SM** (vs 2). Measured 
   are **pre-existing partial-coverage corpus tests in sibling `--backend=gpu-native` code I never touched**
   (verified identical to main HEAD; independent code path from the GEMM recognizer).
 
-### Next levers (toward parity)
-- register-fragment prefetch (④): tension — raises reg pressure, would cost w22 its 3rd CTA. Measure.
-- 2048³ is at 86% (padded w24) — under its 90% floor; needs a separate lever (the swz/w22 path loses there).
+### Lever 6 — rasterization width on w22: **NULL (r16 is optimal).** Swept r4/r8/r12/r16/r24/r32 same-run.
+At 4096³ (clock-cancelling ratio-to-base; this run's cuBLAS was throttled — self-noise 0.877 — so the
+%-of-cuBLAS reads inflated, trust the ratio): w22@r16 = 1.014× base, every other width 0.85–0.99× base
+(r24/r32 worst). At 2048³ (trustworthy, self-noise 1.020): base swz_s2 86.7%, w22@r16 80.6%, all other
+widths 78–80%. **r16 wins or ties at both sizes** → the "12 MB L2 ⇒ retune narrower" hypothesis is
+falsified; the column-band is already well-tuned. r16 stays. (Confirms 4096³ w22 win holds; 2048³ w22
+regression reconfirmed.)
+
+### Lever 7 — tile-shape load-balance for 2048³: **NULL (128×128 is optimal).** Hypothesis was that a
+128×128 tile = only 16×16 = 256 macro-tiles on 20 SMs (tail/quantization waste) so *smaller* tiles balance
+better. Swept t128x64 / t64x128 / t128x64_w24 / t64x64 same-run. Every smaller tile **LOSES at both sizes
+despite more CTAs/SM**: @2048³ t128x64 79.7% (4 CTAs), t64x64 71.0% (5 CTAs) vs 128×128 base 90.5% (2
+CTAs); @4096³ all 69–74% vs base 77%. The kernel is **compute/reuse-bound at high arithmetic intensity,
+not occupancy-bound** — smaller tiles trade away data reuse (more HBM traffic) that L2 does *not* absorb
+here. Combined with launch-bounds-LOSE + pipeline-depth-FLAT, occupancy is conclusively *not* the lever.
+
+### THE 2048³ WIN — swz w24 vs padded (decisive, 3 trustworthy same-run A/Bs)
+Probed `cliff_pad_w24` (byte-identical to the production padded `mma_nt_f16_128_bk32_s2_r16`) vs the no-pad
+swizzle `cliff_swz_s2` (w24) head-to-head. **The no-pad w24 swizzle robustly dominates the padded base:**
+- **2048³: swz w24 87.4% vs padded 70.9% of cuBLAS — 1.23× same-run** (self-noise 1.024; reproduced 90.5%
+  on a faster-clock run). The padding's bank-conflict-free guarantee *costs a CTA* (40 KiB→2 CTAs/SM); the
+  XOR swizzle makes the `ldmatrix` gathers conflict-free at 32 KiB / 3 CTAs/SM anyway → strictly better.
+- **4096³: swz w24 83.0% vs padded 73.7% — 1.13× same-run.**
+- **w22 re-evaluated:** the prior "+6% @4096³" did **not** survive the round-robin/self-noise instrument —
+  w22/w24 = 0.97–1.02× across 3 runs (a *noise tie*), and w22 *loses* @2048³ (0.93×). So w22 is not a
+  robust win; **the whole ≥16 MB regime uses w24 swizzle**, not w22, not the padded base.
+
+**WIRED TO PRODUCTION (this commit):** `gemm_nt_f16` / `gemm_nt_bf16` route the entire A+B ≥ 16 MB regime
+to the no-pad **w24** swizzle workhorse `mma_nt_{f16,bf16}_128_bk32_s2_r16_swz` (already emitted & bit-gated
+by `mma_swizzle_matches_reference_within_tol`). This **fixes the 2048³ production path: 70.9% → 87.4% of
+cuBLAS (1.23×)** and is neutral-to-better @4096³ (~83%). Removed the noise-level w22 ≥48 MB special-case.
+Full non-ignored GPU gate: 102 pass; the 2 fails are the pre-existing `gpu-native` corpus tests (untouched).
+
+**Floors: 4096³ ≥75% MET (~83%); 2048³ ≥90% — at 87–90% (met on faster-clock runs, ~3% under on dipped).**
+
+### Next levers (toward parity / beyond)
+- **Fused epilogue (the beat-cuBLAS lever):** `act(A·Bᵀ+bias[+residual])` is fused into the swz workhorse
+  store — cuBLAS structurally can't (needs a 2nd kernel round-tripping C through HBM). Measure the *fused op*
+  vs cuBLAS-GEMM + separate-epilogue end-to-end: the saved C round-trip should beat cuBLAS even at ~83% raw.
+- register-fragment prefetch (④): tension — raises reg pressure, would cost the 3rd CTA. Measure.
+- offline ptxas `-O3 --allow-expensive-optimizations` (reserve): the JIT runs ptxas at opt-4 already, but
+  `--allow-expensive-optimizations` isn't exposed via JIT — could close the ~9% SASS residual on BOTH
+  sizes. Needs `pip install nvidia-cuda-nvcc-cu12` + cubin file-load route (cudarc can't load in-mem cubin).
 - SASS scheduling (~9% per CuAsmRL) is the likely residual; not reachable without offline ptxas/hand-SASS.
