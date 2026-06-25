@@ -126,7 +126,11 @@ All notable changes to Mercury are documented here. The format is loosely based 
   `mercury_{max,avg}pool2d_f32[_parallel]` (the CNN spatial downsampler; `@parallel` across channels;
   bit-exact — max is idempotent, the avg `(dy,dx)` sum order is fixed). Honest sharp edge: gcc
   auto-vectorizes regular-stride (e.g. 2×2/s2) pooling, so single-core is a tie there, not a win.
-- **xbench**: a broadcast bias-add (`out[r,c] = x[r,c] + bias[c]`) cross-language row.
+- **xbench**: a broadcast bias-add (`out[r,c] = x[r,c] + bias[c]`) cross-language row, plus a
+  **fused FFN** row (`C = silu(A·Bᵀ)` — the real Dense/SwiGLU layer, matmul + activation folded into
+  one `mercury_sgemm_nt_epi` C-write; **~24–26× single-core, ~48–95× `@parallel`** vs C, where C pays
+  an un-tiled serial-reduction GEMM + a separate scalar-`expf` silu pass) and an **`argmax@parallel`**
+  row (**~17× vs single-threaded C** — the multicore global argmax).
 
 ### Changed
 - A construct lowering cannot yet handle (tensors, SIMD methods, generics, parallel loops) is now a
@@ -142,6 +146,21 @@ All notable changes to Mercury are documented here. The format is loosely based 
 - **Fused elementwise chains**: the vectorizer now forwards a just-stored intermediate's register value
   to its consumer in the same fused body, dropping the per-element store+reload round-trip (one fewer
   memory stream per chained op; the intermediate need not touch memory between producer and consumer).
+- **`@parallel` global argmax/argmin** now dispatches to the multicore `mercury_argreduce_f32_parallel`.
+  It previously fell through to the *serial* kernel (the parallel reduction recognizer handles only
+  plain `+`/`fmax`/`fmin` reductions, not the argmax `(value, index)` bookkeeping), so global argmax
+  never scaled across cores. The parallel kernel folds the same fixed `RCHUNK` decomposition in
+  ascending order, so the index is bit-identical to the serial kernel the interpreter calls — **~17×
+  vs single-threaded C** (the bandwidth-limited ~2× scaling over the 8.9× single-core fold).
+- **Optimizer compile time ~31% faster** (in-process, 400-function `-O2`: 18.0 ms → 12.5 ms), from two
+  output-preserving changes — the MIR is bit-identical to before, verified by `optimization_preserves_
+  results`, the native-vs-interpreter differential gate, and the `-O0`-vs-`-O{1,2,3}` invariance gate:
+  - **CSE value-numbering key** is now a packed, allocation-free `enum` instead of a `format!` string
+    built per pure instruction on every pass (CSE is the costliest pass; the key induces the identical
+    equality relation, so value numbering is unchanged).
+  - **Fixpoint loop** skips passes already at fixpoint: a pass that ran with no change is not re-run
+    until another pass mutates the function, which drops the optimizer's final all-passes no-op
+    *confirmation* sweep without changing the sequence of mutations.
 
 ### Notes
 - Tensors, SIMD vectors, and the parallel/GPU surface parse and type/shape-check today; full
