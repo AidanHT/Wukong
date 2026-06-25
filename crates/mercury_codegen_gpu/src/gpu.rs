@@ -2225,6 +2225,49 @@ pub fn conv2d_wmma_epi(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Strided** fp16 tensor-core implicit-GEMM conv2d (downsampling, `stride>1`). Same contract as
+/// [`conv2d_wmma`] but output `P=⌊(H-R)/stride⌋+1`, `Q=⌊(W-S)/stride⌋+1`; output pixel `(p,q)` reads
+/// input `(p·stride+r, q·stride+s)` ([`crate::ptx_conv::conv_wmma_strided_ptx`]). Tolerance-gated at fp16.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_strided(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let (p, q) = ((h - r) / stride + 1, (width - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let ptx = crate::ptx_conv::conv_wmma_strided_ptx(c, h, width, k, r, s, stride);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -7151,6 +7194,70 @@ mod tests {
                         st.max_abs, st.max_rel
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_strided_matches_reference_within_tol() {
+        // Strided conv f64 reference (output (p,q) reads input (p·st+r, q·st+s)).
+        fn ref_strided(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize, st: usize,
+        ) -> Vec<f32> {
+            let p = (h - r) / st + 1;
+            let q = (wd - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = op * st + rr;
+                                    let iw = oq * st + ss;
+                                    acc += x[cc * h * wd + ih * wd + iw] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_strided", |g| {
+            let mut rng = crate::diff::Rng::new(0x57121D);
+            // (C,H,W,K,R,S,stride): stride 2 + 3; 3×3, 5×5, 1×1; a non-divisible spatial.
+            let cases = [
+                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 2usize),
+                (32, 28, 28, 64, 3, 3, 2),
+                (8, 32, 32, 48, 5, 5, 2),
+                (64, 56, 56, 64, 1, 1, 2),
+                (16, 31, 31, 32, 3, 3, 3),
+            ];
+            for (c, h, width, k, r, s, st) in cases {
+                let (p, q) = ((h - r) / st + 1, (width - s) / st + 1);
+                if c < 1 || k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_strided(g, &x, &w, c, h, width, k, r, s, st).unwrap();
+                let oracle = ref_strided(&x, &w, c, h, width, k, r, s, st);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_strided C{c} {h}x{width} K{k} {r}x{s} s{st}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_strided C{c} {h}x{width} K{k} {r}x{s} stride{st}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
             }
         });
     }
