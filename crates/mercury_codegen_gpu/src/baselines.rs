@@ -1831,3 +1831,225 @@ pub fn cublaslt_available() -> bool {
     })
     .unwrap_or(false)
 }
+
+// ===================================================================================================
+// Tier B — cuDNN conv2d (the gold-standard convolution peer). fp16 NHWC tensor-core fast path.
+// ===================================================================================================
+//
+// cuDNN is the industry-standard convolution library: implicit-precomp-GEMM / Winograd / FFT engines
+// with per-shape autotuning, the bar Mercury's conv must close on. We drive the **legacy** forward API
+// through cudarc's safe `cudnn` module (`ConvForward` over `cudnnConvolutionForward`), letting
+// `cudnnGetConvolutionForwardAlgorithm_v7` (the autotuner heuristic) pick the algorithm — exactly the
+// "cuDNN chooses its best engine" comparison. To engage the tensor cores on Ada (sm_89) we feed cuDNN
+// its fast path: **NHWC fp16** inputs, f32 accumulate, `CUDNN_TENSOR_OP_MATH`. Mercury stores NCHW, so
+// X/W are transposed to NHWC/KRSC **once** at setup (outside the timed loop) and cuDNN's NHWC output is
+// transposed back to `[K,P,Q]` for the same f64 cross-check Mercury's own conv faces. The chosen algo
+// is disclosed in the bench so the % is honest about which engine cuDNN ran.
+
+/// `[C,H,W]` (NCHW, N=1) f32 → `[H,W,C]` (NHWC) f16 — the layout cuDNN's fp16 tensor-core path wants.
+fn nchw_to_nhwc_f16(x: &[f32], c: usize, h: usize, w: usize) -> Vec<f16> {
+    let mut o = vec![f16::from_f32(0.0); c * h * w];
+    for cc in 0..c {
+        for hh in 0..h {
+            for ww in 0..w {
+                o[(hh * w + ww) * c + cc] = f16::from_f32(x[(cc * h + hh) * w + ww]);
+            }
+        }
+    }
+    o
+}
+
+/// `[K,C,R,S]` (KCRS) f32 → `[K,R,S,C]` (KRSC, the NHWC filter layout) f16.
+fn kcrs_to_krsc_f16(wt: &[f32], k: usize, c: usize, r: usize, s: usize) -> Vec<f16> {
+    let mut o = vec![f16::from_f32(0.0); k * c * r * s];
+    for kk in 0..k {
+        for cc in 0..c {
+            for rr in 0..r {
+                for ss in 0..s {
+                    o[((kk * r + rr) * s + ss) * c + cc] =
+                        f16::from_f32(wt[((kk * c + cc) * r + rr) * s + ss]);
+                }
+            }
+        }
+    }
+    o
+}
+
+/// `[P,Q,K]` (NHWC output, N=1) f32 → `[K,P,Q]` (NCHW) f32 — back to Mercury's layout for the cross-check.
+fn nhwc_out_to_kpq(y: &[f32], k: usize, p: usize, q: usize) -> Vec<f32> {
+    let mut o = vec![0f32; k * p * q];
+    for pp in 0..p {
+        for qq in 0..q {
+            for kk in 0..k {
+                o[(kk * p + pp) * q + qq] = y[(pp * q + qq) * k + kk];
+            }
+        }
+    }
+    o
+}
+
+/// Short name of a cuDNN forward-conv algorithm, for honest disclosure of which engine the v7
+/// heuristic chose (e.g. `IMPLICIT_PRECOMP_GEMM`, `WINOGRAD_NONFUSED`).
+pub fn cudnn_fwd_algo_name(algo: cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t) -> &'static str {
+    use cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t as A;
+    match algo {
+        A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM => "IMPLICIT_GEMM",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM => "IMPLICIT_PRECOMP_GEMM",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM => "GEMM",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_DIRECT => "DIRECT",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_FFT => "FFT",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING => "FFT_TILING",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD => "WINOGRAD",
+        A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED => "WINOGRAD_NONFUSED",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Probe whether cuDNN (the Tier-B conv peer) is loadable in this process **without** aborting the run:
+/// `Cudnn::new` dlopens `cudnn64_9.dll` + the cuDNN-9 sublibraries; a missing DLL panics inside cudarc's
+/// loader, so drive it under `catch_unwind` and report `false` (→ the conv bench skips the cuDNN column)
+/// on any failure. Cheap; cached for the whole process.
+pub fn cudnn_available(g: &mut Gpu) -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        let stream = g.stream.clone();
+        std::panic::catch_unwind(|| cudarc::cudnn::Cudnn::new(stream).is_ok()).unwrap_or(false)
+    })
+}
+
+/// Build the cuDNN handle + descriptors for a single-batch `[C,H,W] ⊛ [K,C,R,S]` conv (NHWC fp16,
+/// f32 accumulate, `CROSS_CORRELATION` == Mercury's valid conv, dilation 1) and let the v7 heuristic
+/// pick the algorithm. Returns the handle, the four descriptors, the chosen algo, and `(P,Q)`. Kept
+/// private so the run/time entries share one setup path (the descriptors borrow the handle, so the
+/// caller owns the whole tuple for the launch's lifetime).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn cudnn_conv_setup(
+    g: &Gpu,
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    pad: usize,
+    stride: usize,
+) -> Result<
+    (
+        std::sync::Arc<cudarc::cudnn::Cudnn>,
+        cudarc::cudnn::ConvDescriptor<f32>,
+        cudarc::cudnn::TensorDescriptor<f16>,
+        cudarc::cudnn::FilterDescriptor<f16>,
+        cudarc::cudnn::TensorDescriptor<f16>,
+        cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t,
+        (usize, usize),
+    ),
+    PeerError,
+> {
+    use cudarc::cudnn::sys::{cudnnConvolutionMode_t, cudnnMathType_t, cudnnTensorFormat_t};
+    use cudarc::cudnn::{ConvForward, Cudnn};
+    let p = (h + 2 * pad - r) / stride + 1;
+    let q = (width + 2 * pad - s) / stride + 1;
+    let cudnn = Cudnn::new(g.stream.clone())?;
+    let nhwc = cudnnTensorFormat_t::CUDNN_TENSOR_NHWC;
+    let x_desc = cudnn.create_4d_tensor::<f16>(nhwc, [1, c as i32, h as i32, width as i32])?;
+    let w_desc = cudnn.create_4d_filter::<f16>(nhwc, [k as i32, c as i32, r as i32, s as i32])?;
+    let mut conv_desc = cudnn.create_conv2d::<f32>(
+        [pad as i32, pad as i32],
+        [stride as i32, stride as i32],
+        [1, 1],
+        cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+    )?;
+    // Allow tensor cores (mixed fp16-in / f32-accumulate) — without this the v7 heuristic only offers
+    // the slow CUDNN_DEFAULT_MATH engines.
+    conv_desc.set_math_type(cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
+    // All-f16 I/O with f32 accumulate is cuDNN's standard tensor-core conv config (the precision-fair
+    // match to Mercury's fp16 path); f16-in/f32-out is CUDNN_STATUS_NOT_SUPPORTED for the TC algos.
+    let y_desc = cudnn.create_4d_tensor::<f16>(nhwc, [1, k as i32, p as i32, q as i32])?;
+    let algo = {
+        let fwd = ConvForward { conv: &conv_desc, x: &x_desc, w: &w_desc, y: &y_desc };
+        fwd.pick_algorithm()?
+    };
+    Ok((cudnn, conv_desc, x_desc, w_desc, y_desc, algo, (p, q)))
+}
+
+/// Run cuDNN's convolution forward once and return `(O[K,P,Q] NCHW f32, chosen algo)` — the
+/// correctness-gate + checksum entry. fp16 NHWC tensor-core fast path; the f32 NHWC output is
+/// transposed back to Mercury's `[K,P,Q]` so it faces the identical f64 reference.
+#[allow(clippy::too_many_arguments)]
+pub fn cudnn_conv2d_run(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    pad: usize,
+    stride: usize,
+) -> Result<(Vec<f32>, cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t), PeerError> {
+    use cudarc::cudnn::ConvForward;
+    assert_eq!(x.len(), c * h * width);
+    assert_eq!(w.len(), k * c * r * s);
+    let (cudnn, conv_desc, x_desc, w_desc, y_desc, algo, (p, q)) =
+        cudnn_conv_setup(g, c, h, width, k, r, s, pad, stride)?;
+    let _ = &cudnn; // keep the handle alive for the launch
+    let fwd = ConvForward { conv: &conv_desc, x: &x_desc, w: &w_desc, y: &y_desc };
+    let ws_size = fwd.get_workspace_size(algo)?;
+    let x_d = g.stream.memcpy_stod(&nchw_to_nhwc_f16(x, c, h, width))?;
+    let w_d = g.stream.memcpy_stod(&kcrs_to_krsc_f16(w, k, c, r, s))?;
+    let mut y_d = g.stream.alloc_zeros::<f16>(k * p * q)?;
+    let mut ws: Option<CudaSlice<u8>> =
+        if ws_size > 0 { Some(g.stream.alloc_zeros::<u8>(ws_size)?) } else { None };
+    let (one, zero) = (f16::from_f32(1.0), f16::from_f32(0.0));
+    unsafe {
+        fwd.launch(algo, ws.as_mut(), (one, zero), &x_d, &w_d, &mut y_d)?;
+    }
+    g.stream.synchronize()?;
+    let y_nhwc: Vec<f32> = g.stream.memcpy_dtov(&y_d)?.iter().map(|v| v.to_f32()).collect();
+    Ok((nhwc_out_to_kpq(&y_nhwc, k, p, q), algo))
+}
+
+/// Time cuDNN's convolution forward: `iters` resident launches bracketed by one sync, after a warm-up —
+/// the identical timing shape Mercury's conv bench uses, so the ratio is apples-to-apples. Returns
+/// `(seconds/launch, chosen algo)`.
+#[allow(clippy::too_many_arguments)]
+pub fn time_cudnn_conv2d(
+    g: &mut Gpu,
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    pad: usize,
+    stride: usize,
+    iters: u32,
+) -> Result<(f64, cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t), PeerError> {
+    use cudarc::cudnn::ConvForward;
+    let (cudnn, conv_desc, x_desc, w_desc, y_desc, algo, (p, q)) =
+        cudnn_conv_setup(g, c, h, width, k, r, s, pad, stride)?;
+    let _ = &cudnn;
+    let fwd = ConvForward { conv: &conv_desc, x: &x_desc, w: &w_desc, y: &y_desc };
+    let ws_size = fwd.get_workspace_size(algo)?;
+    let x_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); c * h * width])?;
+    let w_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); k * c * r * s])?;
+    let mut y_d = g.stream.alloc_zeros::<f16>(k * p * q)?;
+    let mut ws: Option<CudaSlice<u8>> =
+        if ws_size > 0 { Some(g.stream.alloc_zeros::<u8>(ws_size)?) } else { None };
+    let (one, zero) = (f16::from_f32(1.0), f16::from_f32(0.0));
+    let do_launch = |ws: &mut Option<CudaSlice<u8>>, y: &mut CudaSlice<f16>| -> Result<(), PeerError> {
+        unsafe { fwd.launch(algo, ws.as_mut(), (one, zero), &x_d, &w_d, y)? };
+        Ok(())
+    };
+    do_launch(&mut ws, &mut y_d)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        do_launch(&mut ws, &mut y_d)?;
+    }
+    g.stream.synchronize()?;
+    Ok((t0.elapsed().as_secs_f64() / iters as f64, algo))
+}
