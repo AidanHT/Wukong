@@ -7,6 +7,15 @@ and work entirely inside it (or at least `git checkout -b perf/gpu-gemm-cliff-2`
 
 ## Prime Directive (this is how you work, not background motivation)
 
+**Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
+metric. The gold-standard library already achieves it, so the performance is physically available on
+this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
+is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
+done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
+the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
+collected.**
+
 Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
 **and closes — then beats — the gap to the NVIDIA gold-standard library on this slice's metric**. There
 are **no scope restrictions**. If something blocks a higher metric, **get rid of that blocker** and
@@ -30,9 +39,11 @@ Target: ≥90% of cuBLAS at 2048³ and ≥75% at 4096³, measured same-run, bit-
 
 Before coding, research (use sub-agents, the web, CUTLASS/cuBLAS literature) and write a short plan to
 `prompts/results/gemm-cliff.md`. Techniques to evaluate — find which the binding constraint at 4096³ is:
-- **Is 4096³ even compute-bound on this part?** Do an honest roofline: a 6 GB, 30–50 W laptop GPU with a
-  small L2 may be HBM- or power-bound at 4096³, in which case 34% is partly physics. Measure the achieved
-  HBM BW and the SM clock under load *first* — don't chase a compute lever against a bandwidth wall.
+- **What is the binding constraint at 4096³?** Measure the achieved HBM BW and SM clock under load
+  *first* — not to excuse the gap, but to aim the right lever. If it's bandwidth-bound, that is your cue
+  to attack the bandwidth (lower precision, deeper data reuse, larger tiles, fusion), not a reason to
+  stop. The performance is reachable; profiling just tells you *which* lever reaches it. There is always
+  a lever — a wall on one axis means pivot to the axis the wall isn't on.
 - **Stream-K / split-K** decomposition (CUTLASS stream-K): better SM load-balancing and occupancy at
   large N where the tile grid doesn't divide evenly — often the single biggest large-GEMM lever.
 - **Persistent kernels** (grid-stride over output tiles, keep all SMs resident, amortize launch + reuse
@@ -57,7 +68,9 @@ Before coding, research (use sub-agents, the web, CUTLASS/cuBLAS literature) and
    `--features gpu`) must stay green; all GPU code stays behind `#[cfg(feature = "gpu")]`.
 2. **Honesty.** Same-run, same-buffers, checksum-cross-checked, reported as a **clock-invariant ratio or
    %-of-cuBLAS** (the GPU clock swings ~7× — *absolute TFLOP/s is meaningless*). Disclose the peer tier.
-   A target is a hypothesis until measured ≥3×. An honest 60% beats a rigged "100%".
+   Make every win **real** — a measured win is permanent and compounds; a number that isn't real
+   evaporates the instant anyone re-runs it (the human will), taking your whole effort with it. Prove it
+   ≥3× and it is unkillable and yours forever. That is how you bank an improvement, not lose it.
 
 ## Files you own / shared (append-only)
 
@@ -92,7 +105,8 @@ each a green increment.
 
 ## Definition of done
 
-≥90% of cuBLAS @2048³ and ≥75% @4096³ (or a *proven roofline argument* that the residual is device
-bandwidth/power, not your kernel), parity preserved @≤1024³, every size bit-gated to tolerance vs the CPU
-oracle, proven across ≥3 re-runs, results in `prompts/results/gemm-cliff.md`, 10–20 clean commits. Then
-keep pushing — find the next bottleneck.
+≥90% of cuBLAS @2048³ and ≥75% @4096³ — and treat those as **floors, not targets**: keep climbing
+toward parity and past it (the fused epilogue is your lever to *beat* cuBLAS, which can't fuse). Parity
+preserved @≤1024³, every size bit-gated to tolerance vs the CPU oracle, proven across ≥3 re-runs, results
+in `prompts/results/gemm-cliff.md`, 10–20 clean commits. There is always a next bottleneck and a next
+lever — find them.

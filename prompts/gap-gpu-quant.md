@@ -6,6 +6,15 @@ Target: **mobile RTX 4050, sm_89 (Ada), ~30–50 W**. First action:
 
 ## Prime Directive (how you work)
 
+**Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
+metric. The gold-standard library already achieves it, so the performance is physically available on
+this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
+is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
+done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
+the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
+collected.**
+
 Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
 **and closes — then beats — the NVIDIA gold-standard library on quantized GEMM**. **No scope
 restrictions.** If something blocks a higher metric, **remove that blocker** and explore options **even
@@ -74,6 +83,7 @@ read it before committing** (don't let `grep`'s exit code hide a failure). 10–
 
 ## Definition of done
 
-int8 ≥75% of cuBLAS IMMA (or a proven roofline argument), the fused GEMM+dequant stage **beating** the
+int8 ≥75% of cuBLAS IMMA (a **floor** — keep climbing toward parity; there is a lever for the residual,
+find it), the fused GEMM+dequant stage **beating** the
 cuBLAS dequant chain, fp8 honestly characterized, every result bit-/tolerance-gated and proven across
 ≥3 re-runs, in `prompts/results/quant.md`, 10–20 clean commits. Then find the next bottleneck.

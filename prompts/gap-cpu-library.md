@@ -8,6 +8,15 @@ action: `git worktree add ../Mercury-cpu -b perf/cpu-library-grade main` and wor
 
 ## Prime Directive (how you work)
 
+**Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
+metric. The gold-standard library already achieves it, so the performance is physically available on
+this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
+is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
+done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
+the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
+collected.**
+
 Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
 across the most important ML/DL-compiler metrics **and closes — then beats — the CPU industry-standard
 libraries (oneDNN / oneMKL / OpenBLAS)**. **No scope restrictions.** Remove any blocker; explore options
@@ -82,7 +91,7 @@ green commits.
 
 ## Definition of done
 
-A reproducible oneDNN/MKL peer in xbench, the true GEMM gap measured at 512³–4096³ and closed where
-possible (or a proven roofline argument), AVX-512 microkernels gated + correctness-proven + documented
+A reproducible oneDNN/MKL peer in xbench, the true GEMM gap measured at 512³–4096³ and **closed** (keep
+attacking any residual — there is a lever, find it), AVX-512 microkernels gated + correctness-proven + documented
 as a projected win, the differential gate green throughout, proven ≥3×, results in
 `prompts/results/cpu-library.md`, 10–20 clean commits. Then find the next bottleneck.

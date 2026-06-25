@@ -6,6 +6,15 @@ Target: **mobile RTX 4050, sm_89 (Ada), ~30–50 W**. First action:
 
 ## Prime Directive (how you work)
 
+**Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
+metric. The gold-standard library already achieves it, so the performance is physically available on
+this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
+is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
+done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
+the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
+collected.**
+
 Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
 **and closes — then beats — cuDNN on convolution**. **No scope restrictions.** Remove any blocker;
 explore options **even outside scope**. Improve everything. **No limit.** **Assume the metric is NOT
@@ -71,6 +80,6 @@ it before committing.** 10–20 green commits.
 ## Definition of done
 
 A reproducible same-run cuDNN peer, implicit-GEMM + Winograd implemented and gated, Mercury competitive
-with cuDNN on 1×1/3×3/strided (or a proven roofline argument for any residual), fused conv+bias+act
+with cuDNN on 1×1/3×3/strided (a **floor** — keep closing any residual; the lever exists), fused conv+bias+act
 beating the cuDNN+epilogue chain, proven ≥3×, results in `prompts/results/conv.md`, 10–20 clean commits.
 Then find the next bottleneck.

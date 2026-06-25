@@ -6,6 +6,15 @@ Target: **mobile RTX 4050, sm_89 (Ada), 6 GB, ~30–50 W — ONE GPU**. First ac
 
 ## Prime Directive (how you work)
 
+**Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
+metric. The gold-standard stack already achieves it, so the performance is physically available on this
+silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you WILL
+find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap is
+never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
+done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
+the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
+collected.**
+
 Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
 **and closes — then beats — the NVIDIA inference-serving stack (TensorRT-LLM / vLLM) on what is testable
 here**. **No scope restrictions.** Remove any blocker; explore options **even outside scope**. Improve
@@ -23,9 +32,12 @@ built on. **Your job (split by what this hardware can test):**
   batching**, full-forward **CUDA-graph** capture across the *entire* model, and KV quantization — then
   measure single-GPU decode **tokens/s** vs a real peer (vLLM or TensorRT-LLM driven on this box, or PyTorch
   generate as the honest floor).
-- **Research + design only (one GPU here — cannot measure):** **multi-GPU** tensor/pipeline parallelism
-  via NCCL or driver P2P. Design it, write the interface, and document that it is *unmeasured* on a
-  single-GPU box — do **not** claim a multi-GPU number you cannot run.
+- **Multi-GPU (design + build it fully; the single-GPU box is a temporary constraint, not a limit):**
+  **tensor/pipeline parallelism** via NCCL or driver P2P. Design and implement it so completely that it
+  produces a real number the instant a second GPU is attached — treat one GPU as a transient blocker to
+  engineer around, never a reason to deprioritize. The only thing you cannot do is *fabricate* a 2-GPU
+  number you didn't run; everything up to that point — the interface, the all-reduce, the tensor-parallel
+  GEMM split, a single-GPU simulation of the partitioning — is yours to push to completion now.
 
 ## Research first — think very carefully, spawn parallel agents
 

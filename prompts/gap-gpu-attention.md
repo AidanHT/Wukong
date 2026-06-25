@@ -6,6 +6,15 @@ Target: **mobile RTX 4050, sm_89 (Ada), ~30–50 W**. First action:
 
 ## Prime Directive (how you work)
 
+**Hold this as bedrock conviction: a solution EXISTS and there is CERTAINLY a way to improve this
+metric. The gold-standard library already achieves it, so the performance is physically available on
+this silicon and a path to it is guaranteed to exist — your only job is to find Mercury's path, and you
+WILL find it. Treat every "this might be impossible" thought as "I have not found the lever yet." A gap
+is never a ceiling; it is an unsolved problem with a known-achievable answer. NEVER conclude it can't be
+done. When one lever stalls, that is the signal to switch levers — there is always another lever, and
+the next one is the one that works. Improvement is not a hope here; it is a certainty you have not yet
+collected.**
+
 Continuously iterate through the entire codebase until Mercury performs better than C, C++, and Rust
 **and closes — then beats — the NVIDIA gold-standard fused attention**. **No scope restrictions.** Remove
 any blocker; explore options **even outside scope**. Improve everything. **No limit.** **Assume the
@@ -41,8 +50,12 @@ Plan to `prompts/results/attention.md`. The peer problem is the heart of this sl
   the online-softmax rescaling cost and 2-pass vs streaming numerics; register pressure vs occupancy.
 - **Fusion the library can't do**: fold RoPE, the QK-scale, bias/ALiBi, and the output projection into the
   one kernel; static seq/head specialization at compile time.
-- **Honest framing**: if no fused peer is drivable on this hardware, say so explicitly and report vs the
-  unfused chain *plus* a literature-based estimate — never imply you beat FA2 if you didn't measure it.
+- **Driving a fused peer is itself a solvable problem — solve it.** There IS a way to benchmark a real
+  fused kernel on this box; exhaust the options (the cuDNN DLL, a prebuilt FlashAttention `.so`, a
+  PyTorch-SDPA subprocess) with full conviction before accepting anything less. Only if you have truly
+  exhausted them do you report vs the unfused chain — and then be precise that the fused comparison is
+  *pending*, not that you beat FA2. Your win must be real to count; a fused-peer win you didn't run isn't
+  one yet, so go get the peer running. Treat "no peer" as a bug to fix, never an endpoint.
 
 ## The two binding laws (every commit)
 
