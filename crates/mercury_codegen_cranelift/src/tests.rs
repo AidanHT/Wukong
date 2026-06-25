@@ -433,6 +433,74 @@ fn i8_linear_nest_lowers_to_i8gemm() {
     );
 }
 
+/// The embedding lookup `out[t,:] = weight[ids[t],:]` (the first layer of every LLM) dispatches to
+/// `mercury_embedding_f32`. The native run gathers via the AVX2 kernel; the interpreter marshals the
+/// identical serial kernel — pure data movement (a row copy), so they are bit-identical by
+/// construction. Covers the serial form and a large-T `@parallel` form (T past the kernel's multicore
+/// threshold so the rayon row-split actually runs, still bit-equal to serial).
+#[test]
+fn differential_embedding() {
+    // Small serial gather: T=4, V=4, H=3, ids hitting row 0, the last row, and a repeat.
+    let serial = "fn embed(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) { \
+         for t in 0..4 { for d in 0..3 { out[t * 3 + d] = weight[ids[t] * 3 + d]; } } } \
+         fn main() -> i32 { let weight: [f32; 12] = [0.0,1.0,2.0,10.0,11.0,12.0,\
+         20.0,21.0,22.0,30.0,31.0,32.0]; let ids: [i32; 4] = [2,0,3,0]; \
+         let mut out: [f32; 12] = [0.0; 12]; embed(ids, weight, out); \
+         let mut acc: f32 = 0.0; for i in 0..12 { acc = acc + out[i]; } \
+         print(acc); print(out[0]); print(out[11]); return 0; }"
+        .to_string();
+    // Large @parallel gather: T=80 (> EMBEDDING_PAR_MIN=64, so the multicore split runs), V=8, H=4.
+    let parallel = "@parallel\nfn embed(ids: [i32; 80], weight: [f32; 32], out: [f32; 320]) { \
+         for t in 0..80 { for d in 0..4 { out[t * 4 + d] = weight[ids[t] * 4 + d]; } } } \
+         fn main() -> i32 { let mut weight: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { weight[i] = (i as f32) * 0.5 - 3.0; } \
+         let mut ids: [i32; 80] = [0; 80]; for i in 0..80 { ids[i] = ((i * 3 + 1) % 8) as i32; } \
+         let mut out: [f32; 320] = [0.0; 320]; embed(ids, weight, out); \
+         let mut acc: f32 = 0.0; for i in 0..320 { acc = acc + out[i]; } \
+         print(acc); print(out[0]); print(out[319]); return 0; }"
+        .to_string();
+    for src in [serial, parallel] {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(&src, opt).expect("jit");
+            let i = interp(&src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "embedding native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
+/// The embedding nest must lower to `mercury_embedding_f32` (the `@parallel` whole-function form to
+/// `_parallel`, intercepted before the outliner so it reaches the multicore kernel). A nest whose
+/// load is NOT a data-dependent gather — `weight[t * H + d]` with the *outer var* as the row, i.e. a
+/// plain elementwise copy — must NOT pick the embedding kernel (no `ids[t]` indirection).
+#[test]
+fn embedding_nest_lowers_to_kernel() {
+    let embed = |attr: &str| {
+        format!(
+            "module m\n{attr}fn embed(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) {{ \
+             for t in 0..4 {{ for d in 0..3 {{ out[t * 3 + d] = weight[ids[t] * 3 + d]; }} }} }}"
+        )
+    };
+    assert!(
+        lowered_calls(&embed(""), "mercury_embedding_f32"),
+        "embedding nest -> mercury_embedding_f32"
+    );
+    assert!(
+        lowered_calls(&embed("@parallel\n"), "mercury_embedding_f32_parallel"),
+        "@parallel embedding nest -> mercury_embedding_f32_parallel"
+    );
+    // A direct copy `out[t*3+d] = weight[t*3+d]` (the row index is the loop var, not a gathered id) is
+    // not an embedding lookup — the recognizer must bail (no `ids[t]` indirection to fold).
+    let copy = "module m\nfn cp(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) { \
+        for t in 0..4 { for d in 0..3 { out[t * 3 + d] = weight[t * 3 + d]; } } }";
+    assert!(
+        !lowered_calls(copy, "mercury_embedding_f32"),
+        "a plain elementwise copy must not pick the embedding kernel"
+    );
+}
+
 /// A `@parallel` reduction (`s += f(x[k], y[k])`, `m = fmax(m, x[k])`) dispatches to the multicore
 /// reduction kernel (`mercury_sreduce_f32_parallel`). The native run folds across cores; the
 /// interpreter calls the *serial* kernel — both are bit-identical by construction (fixed chunking,

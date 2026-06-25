@@ -168,6 +168,8 @@ const RT_I8GEMM_NT: &str = "mercury_i8gemm_nt";
 const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
 const RT_I8GEMM_NT_DEQ: &str = "mercury_i8gemm_nt_deq";
 const RT_I8GEMM_NT_DEQ_PARALLEL: &str = "mercury_i8gemm_nt_deq_parallel";
+const RT_EMBEDDING: &str = "mercury_embedding_f32";
+const RT_EMBEDDING_PAR: &str = "mercury_embedding_f32_parallel";
 const RT_DOT_BF16: &str = "mercury_dot_bf16";
 const RT_SUM_BF16: &str = "mercury_sum_bf16";
 const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
@@ -1224,6 +1226,20 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[a, b, c, m, k, n]);
             return None;
         }
+        // Embedding lookup: mercury_embedding_f32[_parallel](out, weight, ids, t, h, v) — three pointers
+        // (out/weight f32*, ids i32*) and three i64 dims (the table height `v` rides in as a large
+        // sentinel from the recognizer, so the kernel's out-of-range clamp never fires). Void.
+        if matches!(name, RT_EMBEDDING | RT_EMBEDDING_PAR) && args.len() == 6 {
+            let out = self.val(args[0]);
+            let weight = self.val(args[1]);
+            let ids = self.val(args[2]);
+            let t = self.coerce_to_i64(args[3]);
+            let h = self.coerce_to_i64(args[4]);
+            let v = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[out, weight, ids, t, h, v]);
+            return None;
+        }
         // The int8 quantized nn.Linear with fused dequant epilogue:
         // mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n, scale_a, scale_b, bias, act) — three
         // pointers, three i64, one f32 scalar (scale_a), two pointers (scale_b, bias; bias may be
@@ -1439,6 +1455,10 @@ struct RtFuncs {
     i8nt_par: FuncId,
     i8nt_deq: FuncId,
     i8nt_deq_par: FuncId,
+    /// Embedding lookup `mercury_embedding_f32[_parallel](out, weight, ids, t, h, v)` — token-id row
+    /// gather (the first layer of every LLM). Reuses the 3-ptr + 3-i64 void `sig_i8gemm` signature.
+    embedding: FuncId,
+    embedding_par: FuncId,
     dot_bf16: FuncId,
     sum_bf16: FuncId,
     reduce_bf16: FuncId,
@@ -1954,6 +1974,14 @@ fn populate_module<M: Module>(
         i8nt_deq_par: module
             .declare_function(RT_I8GEMM_NT_DEQ_PARALLEL, Linkage::Import, &sig_i8gemm_deq)
             .map_err(|e| e.to_string())?,
+        // Embedding lookup reuses the 3-ptr + 3-i64 void signature (the pointer element type is
+        // irrelevant to the ABI — out/weight are f32*, ids is i32*).
+        embedding: module
+            .declare_function(RT_EMBEDDING, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        embedding_par: module
+            .declare_function(RT_EMBEDDING_PAR, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
             .unwrap(),
@@ -2393,6 +2421,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_I8GEMM_NT_DEQ_PARALLEL,
                 module.declare_func_in_func(rt.i8nt_deq_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_EMBEDDING,
+                module.declare_func_in_func(rt.embedding, builder.func),
+            );
+            rt_refs.insert(
+                RT_EMBEDDING_PAR,
+                module.declare_func_in_func(rt.embedding_par, builder.func),
             );
             rt_refs.insert(
                 RT_AXPBY_BF16,
@@ -2864,6 +2900,14 @@ pub fn jit_compile(
         RT_I8GEMM_NT_DEQ_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_deq_parallel as *const u8,
     );
+    builder.symbol(
+        RT_EMBEDDING,
+        mercury_runtime::mercury_embedding_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_EMBEDDING_PAR,
+        mercury_runtime::mercury_embedding_f32_parallel as *const u8,
+    );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
     builder.symbol(
@@ -3276,6 +3320,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_I8GEMM_NT_DEQ_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_deq_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_EMBEDDING,
+        mercury_runtime::mercury_embedding_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_EMBEDDING_PAR,
+        mercury_runtime::mercury_embedding_f32_parallel as *const u8,
     );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);

@@ -136,6 +136,8 @@ pub fn lower_program(
         cummax_par: interner.intern("mercury_cummax_f32_parallel"),
         cummin: interner.intern("mercury_cummin_f32"),
         cummin_par: interner.intern("mercury_cummin_f32_parallel"),
+        embedding: interner.intern("mercury_embedding_f32"),
+        embedding_par: interner.intern("mercury_embedding_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -297,6 +299,19 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_cumminmax(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function embedding lookup: intercept before the outliner (which would
+                // split the token rows into per-row scalar loops and lose the gather kernel). The embedded
+                // `match_embedding` then emits the multicore `mercury_embedding_f32_parallel` (output rows
+                // independent → bit-equal to serial).
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_embedding(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -905,6 +920,13 @@ struct GemmSyms {
     cummax_par: Symbol,
     cummin: Symbol,
     cummin_par: Symbol,
+    /// Embedding lookup (`mercury_embedding_f32[_parallel](out, weight, ids, t, h, v)`): `out[t,:] =
+    /// weight[ids[t],:]` — the first layer of every LLM (token-id row gather). `ids` is an `i32` index
+    /// array; pure data movement (a row copy), so the kernel is bit-identical to the scalar gather on
+    /// both backends — no reassociation, the differential gate is trivial. Rows independent → `_parallel`
+    /// maps the `T` output rows across cores, bit-equal to serial.
+    embedding: Symbol,
+    embedding_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -1947,6 +1969,192 @@ impl FnLowerer<'_> {
             return index_by_var(peel(lhs), r);
         }
         None
+    }
+
+    /// Recognize the embedding-lookup nest (the first layer of every LLM — token ids select rows of the
+    /// embedding table) and dispatch it to `mercury_embedding_f32`:
+    ///
+    /// ```text
+    /// for t in 0..T { for d in 0..H { out[t*H + d] = weight[ids[t]*H + d]; } }
+    /// ```
+    ///
+    /// `out` (`[T, H]`) is the gather of `weight` (`[V, H]`) rows by the length-`T` `i32` index array
+    /// `ids`. The store index is `t*H + d` (`is_mul_of`/`index_off` pin the stride `H` to the inner loop
+    /// bound) and the load is `ids[t]*H + d` — the **data-dependent gather** `weight[ids[t], :]`, the row
+    /// chosen at runtime by `ids[t]` (`match_embed_load`). `out`/`weight` are f32 arrays, `ids` an `i32`
+    /// array; `out` must differ from `weight` and `ids`. Pure data movement (a row copy), so the kernel is
+    /// **bit-identical** to this scalar nest on both backends — no float reassociation, the differential
+    /// gate is trivial (like the transpose). The naive source has no bounds check, so the emitter passes a
+    /// large `V` sentinel and the kernel's out-of-range→zero clamp never fires for in-range ids. Pure
+    /// (`&self`).
+    fn match_embedding(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<EmbeddingNest> {
+        // for t in 0..T { <single inner for> }
+        let ast::PatKind::Ident(t) = &pat.kind else {
+            return None;
+        };
+        let t = *t;
+        let (ts, te) = range_bounds(iter)?;
+        if as_int_lit(ts, self.interner)? != 0 {
+            return None;
+        }
+        let t_rows = as_dim(te, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        // for d in 0..H { <single assignment> }
+        let (dpat, diter, dbody) = fusable_for(&body.stmts[0])?;
+        let ast::PatKind::Ident(d) = &dpat.kind else {
+            return None;
+        };
+        let d = *d;
+        let (ds, de) = range_bounds(diter)?;
+        if as_int_lit(ds, self.interner)? != 0 {
+            return None;
+        }
+        let h = as_dim(de, self.interner)?;
+        if dbody.tail.is_some() || dbody.stmts.len() != 1 {
+            return None;
+        }
+        // out[t*H + d] = weight[ids[t]*H + d];
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &dbody.stmts[0].kind
+        else {
+            return None;
+        };
+        // Store: `out[t*H + d]` (row-major, stride H = the inner bound `de`).
+        let out = self.index_off(target, d, Some((t, de)))?;
+        // Load: `weight[ids[t]*H + d]` — the data-dependent row gather with the same stride.
+        let (weight, ids) = self.match_embed_load(value, t, d, de)?;
+        // f32 data, i32 indices; `out` distinct from the inputs (a gather never writes its sources).
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32)
+            || scalar_of(value, self.sema) != Some(mercury_types::Scalar::F32)
+        {
+            return None;
+        }
+        if out == weight || out == ids {
+            return None;
+        }
+        Some(EmbeddingNest {
+            out,
+            weight,
+            ids,
+            t_rows,
+            h,
+        })
+    }
+
+    /// Match the embedding load `weight[ids[t]*H + d]` → `(weight, ids)`: a single-index read of an array
+    /// `weight` whose flat index is `ids[t]*H + d` (either addend order), where `ids[t]` is itself a
+    /// single-index read of an `i32` array `ids` at exactly the outer var `t`. The `*H` stride is pinned
+    /// to the inner loop bound `cols` (matching the store's stride) so it never misfires on a non-gather.
+    /// Pure.
+    fn match_embed_load(
+        &self,
+        e: &Expr,
+        t: Symbol,
+        d: Symbol,
+        cols: &Expr,
+    ) -> Option<(Symbol, Symbol)> {
+        let ExprKind::Index { base, indices } = &e.kind else {
+            return None;
+        };
+        if indices.len() != 1 {
+            return None;
+        }
+        let weight = single_path(base)?;
+        // index = `ids[t]*H + d` / `d + ids[t]*H`.
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &indices[0].kind
+        else {
+            return None;
+        };
+        // `ids[t] * H` (either factor order), with `H` structurally equal to the inner bound, and the
+        // other addend exactly the inner var `d`.
+        let row_mul = |me: &Self, e: &Expr| -> Option<Symbol> {
+            let ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } = &e.kind
+            else {
+                return None;
+            };
+            if exprs_struct_eq(rhs, cols) {
+                me.match_id_gather(lhs, t)
+            } else if exprs_struct_eq(lhs, cols) {
+                me.match_id_gather(rhs, t)
+            } else {
+                None
+            }
+        };
+        let ids = if single_path(rhs) == Some(d) {
+            row_mul(self, lhs)?
+        } else if single_path(lhs) == Some(d) {
+            row_mul(self, rhs)?
+        } else {
+            return None;
+        };
+        Some(ids)
+            .map(|i| (weight, i))
+            .filter(|(w, i)| w != i)
+    }
+
+    /// Match `ids[t]` — a single-index read of an `i32` array `ids` at exactly the outer var `t` (an
+    /// optional `as` cast to the index type is peeled) → `ids`. The token-id row selector of the
+    /// embedding gather. Pure.
+    fn match_id_gather(&self, e: &Expr, t: Symbol) -> Option<Symbol> {
+        let inner = match &e.kind {
+            ExprKind::Cast { expr, .. } => expr.as_ref(),
+            _ => e,
+        };
+        let ids = index_by_var(inner, t)?;
+        // `ids` must be an i32 array (the token-id buffer the kernel reads as i32).
+        if scalar_of(inner, self.sema) != Some(mercury_types::Scalar::I32) {
+            return None;
+        }
+        Some(ids)
+    }
+
+    /// Emit one `mercury_embedding_f32[_parallel](out, weight, ids, T, H, V)` call for a recognized
+    /// embedding-lookup nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore
+    /// kernel (rows independent → bit-identical to serial). `V` is a large `i64` sentinel: the naive
+    /// source omits the bounds check, so passing a huge table height keeps the kernel's out-of-range→zero
+    /// clamp from ever firing on the in-range ids a well-typed program produces (both backends call the
+    /// identical kernel, so the differential gate holds regardless of the sentinel value).
+    fn emit_embedding(&mut self, nest: &EmbeddingNest, parallel: bool) -> bool {
+        let (Some((out, _)), Some((weight, _)), Some((ids, _))) = (
+            self.lookup(nest.out),
+            self.lookup(nest.weight),
+            self.lookup(nest.ids),
+        ) else {
+            return false;
+        };
+        let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
+            return false;
+        };
+        // `V` sentinel — larger than any realistic vocabulary, so `0 <= id < V` always holds for valid
+        // ids (the only case a well-typed gather produces) and the clamp is a no-op, matching the naive
+        // unchecked read. `i64::MAX` would risk an `id as usize * h` overflow in the kernel's bounds math
+        // for pathological inputs; a still-astronomical 2^48 leaves ample headroom.
+        let v = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(1i128 << 48, MirType::I64));
+        let func = if parallel {
+            self.gemm.embedding_par
+        } else {
+            self.gemm.embedding
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![out, weight, ids, t_rows, h, v],
+        });
+        true
     }
 
     /// Match `exp(x[r*C+v] - m)` (the recomputed centered exponential) — `true` if `e` is a single-arg
@@ -5368,6 +5576,15 @@ impl FnLowerer<'_> {
         // loop-carried scan gcc/rustc keep scalar; bit-exact (max/min select a value, no reassociation).
         if let Some(nest) = self.match_cumminmax(pat, iter, body) {
             if self.emit_cumminmax(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Embedding lookup `for t { for d { out[t*H+d] = weight[ids[t]*H+d] } }` (the first layer of every
+        // LLM — token ids gather rows of the embedding table) → `mercury_embedding_f32` (the `_parallel`
+        // one in a `@parallel` fn). The data-dependent row gather is pure data movement, bit-identical to
+        // the scalar nest (no reassociation, like the transpose); rows independent → parallel == serial.
+        if let Some(nest) = self.match_embedding(pat, iter, body) {
+            if self.emit_embedding(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -13246,6 +13463,18 @@ struct CumMinMaxNest {
     rows: Dim,
     cols: Dim,
     is_max: bool,
+}
+
+/// A recognized embedding-lookup nest (see [`FnLowerer::match_embedding`]): `out[t,:] = weight[ids[t],:]`.
+/// `t_rows` is the token count (outer loop bound), `h` the hidden width (inner bound = the row stride).
+/// There is no compile-time table-height (`V`) in the naive source — the emitter passes a large sentinel
+/// so the kernel's out-of-range→zero clamp never fires for the in-range ids a well-typed program uses.
+struct EmbeddingNest {
+    out: Symbol,
+    weight: Symbol,
+    ids: Symbol,
+    t_rows: Dim,
+    h: Dim,
 }
 
 /// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner

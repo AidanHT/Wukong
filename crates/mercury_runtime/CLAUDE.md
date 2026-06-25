@@ -89,8 +89,11 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   `rope.rs` + `rope_bwd.rs` (rotary embedding — reuse `vmath`'s `sincos`), `logsoftmax.rs` (per-row
   log-sum-exp), `kldiv.rs` + `entropy.rs` + `kd_loss.rs` (the per-row `logf`/`expf` losses), `rowarg.rs`
   + `colarg.rs` (per-row/column argmax/argmin → an **i32 index** buffer; AVX2 tracks 8 `(value,index)`
-  lanes via blend), and `pool2d.rs` (2D max/avg pooling). The win on every one is the same lever: a
-  strided access or a transcendental that gcc/rustc leave scalar, folded into one 256-bit pass.
+  lanes via blend), `pool2d.rs` (2D max/avg pooling), and `embedding.rs` (the LLM embedding lookup
+  `out[t,:] = weight[ids[t],:]` — a token-id row gather; AVX2 256-bit row copy, out-of-range id → zero
+  row; pure data movement so it's bit-exact, the data-dependent gather is what gcc/rustc keep scalar).
+  The win on every one is the same lever: a strided access or a transcendental that gcc/rustc leave
+  scalar, folded into one 256-bit pass.
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
