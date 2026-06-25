@@ -19,13 +19,15 @@
 // accumulators live (of 16 ymm regs) — the proven Haswell/Zen sweet spot.
 const MR: usize = 6;
 const NR: usize = 16;
-// Cache-block sizes: A panel (MC×KC) targets L2, B panel (KC×NC) targets L3. Multiples of MR/NR.
-// MC=144 (a 144×256 f32 A-block ≈ 144 KB) measured the sweet spot on this Meteor Lake P-core: large
-// enough that each A-block sweeps the B-panel fewer times (so B is re-streamed from L3 less — the
-// large-matrix bottleneck), small enough that the A-block + the live B micro-panel still sit in the
-// 2 MB L2 alongside the streaming B-block. 216/288 both regressed single-core (B-block contention).
+// Cache-block sizes (multiples of MR/NR). The A panel (MC×KC) targets L2, the B panel (KC×NC) the L3.
+// MC=144 (≈144 KB A-block) measured the single-core sweet spot here: small enough to stay L2-resident
+// while B streams. A bigger MC regressed — the larger A-block gets evicted by the streaming B and its
+// micropanels then miss to L3 (1008 ≈ -16% at 2048³; 216/288 lost too). KC=384 is the *cap* for the
+// size-adaptive K-block `select_kc`: the largest KC×NR B-micropanel (24 KB) + MR×KC A-micropanel
+// (9 KB) that stays L1-resident on this 48 KB L1 — KC=512 (44 KB) thrashes L1 and is ~30% slower,
+// while the old KC=256 left ~10% on the table at ≥1024³. NC=4080 keeps a KC×NC B-panel (≤6 MB) in L3.
 const MC: usize = 144;
-const KC: usize = 256;
+const KC: usize = 384;
 const NC: usize = 4080;
 
 // Minimum multiply-accumulate count (`m·n·k`) before the parallel kernel is worth its threading
@@ -36,6 +38,20 @@ const PAR_MIN_MACS: u64 = 1 << 26;
 #[inline]
 fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
+}
+
+/// Size-adaptive K-block height (`kc`). KC=384 is the largest K-block whose `KC×NR` B-micropanel
+/// (24 KB) + `MR×KC` A-micropanel (9 KB) stays L1-resident on this 48 KB-L1 P-core; KC=512 (44 KB)
+/// thrashes L1 (~30% slower) and KC=256 under-amortizes the B-micropanel loads (and doubles the C
+/// re-stream passes), leaving ~10% on the table at ≥1024³. K is split into the fewest equal-ish blocks
+/// ≤ the cap, so k=512 → 2×256 (even) instead of 384+128 (a thin tail costing ~4%), while large K gets
+/// the full ~384. `kc` only changes how the K reduction is *grouped*: both kernels call this so serial
+/// stays bit-identical to parallel, and the grouping differs from KC=256 only in low f32 bits (within
+/// the √k·ε tolerance the gemm tests assert vs a naive reference). Result ∈ [4, KC].
+#[inline]
+fn select_kc(k: usize) -> usize {
+    let nblocks = k.div_ceil(KC).max(1);
+    round_up(k.div_ceil(nblocks), 4) // multiple of the ×4 K-unroll; ≤ KC since k/nblocks ≤ KC
 }
 
 // Reusable per-thread pack scratch for the serial kernel. The A/B panels are fully overwritten by
@@ -733,7 +749,7 @@ unsafe fn sgemm_avx2_parallel(
         let nc = (n - jc).min(NC);
         let mut pc = 0;
         while pc < k {
-            let kc = (k - pc).min(KC);
+            let kc = (k - pc).min(select_kc(k));
             let beta_eff = if pc == 0 { beta } else { 1.0 };
             // The epilogue (bias + activation) is folded into the C writeback on the FINAL K-block
             // only — exactly as the serial path does. Captured as Send-safe primitives (a raw `bias`
@@ -790,7 +806,7 @@ unsafe fn sgemm_avx2_parallel(
                     }
                 }
             });
-            pc += KC;
+            pc += kc;
         }
         jc += NC;
     }
@@ -882,7 +898,7 @@ unsafe fn sgemm_avx2(
         let nc = (n - jc).min(NC);
         let mut pc = 0;
         while pc < k {
-            let kc = (k - pc).min(KC);
+            let kc = (k - pc).min(select_kc(k));
             // First K-block honors the caller's beta; later blocks must accumulate the partial sums.
             let beta_eff = if pc == 0 { beta } else { 1.0 };
             // The fused epilogue applies only once the K reduction is complete — i.e. on the final
@@ -911,7 +927,7 @@ unsafe fn sgemm_avx2(
                 );
                 ic += MC;
             }
-            pc += KC;
+            pc += kc;
         }
         jc += NC;
     }

@@ -104,4 +104,40 @@ fix (peers adjacent + skip the naive pollution at ≥2048) before its gap is tru
 - **Multicore (Phase 2):** ~69% of MKL at 1024³ (294 vs 424) — a real parallel-efficiency gap, but
   thermally confounded; fix the harness first.
 
-### P1 — close the single-core large-size gap — _in progress_
+### P1 — close the single-core large-size gap — _shipped: size-adaptive `select_kc`_
+
+**Lever: size-adaptive K-block.** Baseline KC=256 left ~10% on the table at ≥1024³ (B-micropanel
+loads under-amortized; C re-streamed ⌈k/256⌉× — 8 passes at 2048³). KC=512 *thrashes* the 48 KB L1
+(a 512×16 f32 B-micropanel is 32 KB + a 6×512 A-micropanel 12 KB = 44 KB) → ~30% slower at every size.
+`select_kc(k)` splits K into the **fewest equal-ish blocks ≤ a 384 cap** (the largest KB whose 24 KB
+B + 9 KB A micropanels stay L1-resident): k=512 → 2×256 (even, no thin tail), large K → the full ~384.
+Both kernels call it, so **serial stays bit-identical to parallel**; the grouping differs from KC=256
+only in low f32 bits (within the √k·ε tolerance the gemm tests assert). 18/18 gemm + 134/134 runtime tests green.
+
+`mercury-xbench matmul` (XBENCH_HUGE=1), roofline ~102 GFLOP/s this run. **Mer(1c) is measured first
+in each block, before any heating → the trustworthy single-core series:**
+
+| size | Mer(1c) KC=256 | Mer(1c) `select_kc` | Δ | roofline% | MKL(1c) | Mer/MKL 1c |
+|------|--------:|--------:|--------:|--------:|--------:|-----------:|
+| 256³ | 93.2 | 89.3 | −4%* | 87% | 87.6 | **102%** |
+| 512³ | 82.2 | **88.0** | **+7%** | 86% | 85.6 | **103%** |
+| 1024³| 82.9 | 84.0 | +1% | 82% | 98.6 | 85% |
+| 2048³| 76.8 | **83.8** | **+9%** | 82% | 97.2 | 86% |
+| 4096³| *(n/a)*| **79.2** | — | 77% | 32.5‡ | n/a‡ |
+
+\*256³ has k<384 ⇒ a single K-block either way; the −4% is run-to-run thermal noise (roofline was 106
+vs 102 between runs), not a regression — the computation is byte-identical. ‡**4096³ MKL is thermally
+invalid**: MKL(1c) runs *after* `Mer(par)` (a multi-second all-core 307 GFLOP/s burst) which throttles
+the chip — MKL cannot truly be 32 GFLOP/s at 4096³ when it holds 97 at 2048³. The honest 4096³ datum is
+**Mer(1c)=79 (77% roofline)**; the MKL ratio there awaits the Phase-2 harness fix.
+
+**Result:** the eroding curve `93→82→83→77` flattened to `89→88→84→84→79` — the kernel now holds
+**77–87% of roofline from L2-resident (256³) out to a 512 MB working set (4096³)**, beats MKL single-core
+at 256³/512³, and is 85–86% of it at 1024³/2048³. The 512³ L2-spill dip (the old worst point) is gone.
+Mer(1c) still beats tuned `matrixmultiply` 1.11–1.85× and naive C 2.4–12.5× at every size.
+
+**Measurement-ordering confound found (→ Phase 2):** within a size block the column order is
+Mer(1c), **Mer(par)**, MKL(1c), MKL(all), tuned, C, Rust. The all-core `Mer(par)` burst heats the chip
+*before* MKL(1c)/MKL(all), and the multi-second naive C/Rust nests heat it before the *next* size — so
+every peer after the first all-core run at ≥2048³ is throttled. Phase 2 must measure all single-core
+variants adjacent (and re-warm / skip naive ≥2048) before any large-size MKL ratio is trustworthy.
