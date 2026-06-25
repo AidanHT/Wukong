@@ -54,6 +54,70 @@ fn select_kc(k: usize) -> usize {
     round_up(k.div_ceil(nblocks), 4) // multiple of the ×4 K-unroll; ≤ KC since k/nblocks ≤ KC
 }
 
+/// A private rayon pool for the parallel GEMM, sized to the machine's **physical** core count instead
+/// of rayon's default (one worker per *logical* core). A compute-bound AVX2-FMA GEMM already saturates
+/// a core's two FMA pipes with a single thread, so the HyperThread sibling adds only scheduling
+/// contention: measured at the mid sizes where scaling lags hardest, 16 physical threads scale ~30-40%
+/// better than 22 logical (512³ 2.2×→3.1×, 1024³ 3.2×→3.9× over single core). A *private* pool (not a
+/// global resize) leaves the default pool — and the thread-count-derived striping of the reduction
+/// kernels that run on it — untouched. The GEMM result is independent of how panels are distributed
+/// (the per-(i,j) K-order is fixed), so this changes throughput only, never the bits: serial stays
+/// bit-identical to parallel. `None` (⇒ caller uses the default pool) when physical ≥ logical (no HT
+/// to avoid) or the pool can't be built.
+fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let physical = num_cpus::get_physical().max(1);
+        if physical >= rayon::current_num_threads() {
+            return None; // no HyperThreads to shed (or single pool already this small)
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(physical)
+            .thread_name(|i| format!("mercury-gemm-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
+/// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
+/// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
+/// own internal rayon closures, which already smuggle these pointers across as `usize`.
+#[cfg(target_arch = "x86_64")]
+struct GemmArgs {
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+    bt: bool,
+    epi: Option<Epilogue>,
+}
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for GemmArgs {}
+
+#[cfg(target_arch = "x86_64")]
+impl GemmArgs {
+    /// Run the parallel kernel from this bundle. Taking `self` by value forces a closure that calls it
+    /// to capture the whole (`Send`) `GemmArgs`, not the individual `!Send` raw-pointer fields that
+    /// edition-2021 disjoint capture would otherwise grab.
+    ///
+    /// # Safety
+    /// Same operand-size contract as [`sgemm_avx2_parallel`]; AVX2/FMA must be available.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn run(self) {
+        unsafe {
+            sgemm_avx2_parallel(
+                self.a, self.b, self.c, self.m, self.k, self.n, self.beta, self.bt, self.epi,
+            )
+        }
+    }
+}
+
 // Reusable per-thread pack scratch for the serial kernel. The A/B panels are fully overwritten by
 // the packers (real data + edge-padding zeros) on every block, so reusing the buffers across calls
 // needs no re-zeroing — and removes a per-call malloc+zero of several hundred KB that was a
@@ -220,10 +284,19 @@ unsafe fn gemm_dispatch(
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
-                if par {
-                    sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi);
-                } else {
-                    sgemm_avx2(a, b, c, m, k, n, beta, bt, epi);
+                match (par, gemm_pool()) {
+                    // Parallel, with a private physical-core pool: run the whole kernel inside it so
+                    // its nested `into_par_iter`s (pack + compute) use physical-core workers, not the
+                    // default logical-core pool. The args cross the `install` boundary via `GemmArgs`
+                    // (Send-wrapped); the closure runs to completion before `install` returns.
+                    (true, Some(pool)) => {
+                        let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
+                        // `args.run()` moves the whole bundle, so the closure captures the `Send`
+                        // `GemmArgs` rather than its `!Send` fields (edition-2021 disjoint capture).
+                        pool.install(move || unsafe { args.run() });
+                    }
+                    (true, None) => sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi),
+                    (false, _) => sgemm_avx2(a, b, c, m, k, n, beta, bt, epi),
                 }
             }
             return;
@@ -1573,6 +1646,60 @@ mod tests {
             bench("sgemm_nt (parallel)", &|| unsafe {
                 mercury_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
+        }
+    }
+
+    /// Adjacent A/B: the SAME parallel GEMM run in the default (logical-core) rayon pool vs a private
+    /// physical-core pool, measured back-to-back best-of-N so the laptop's thermal drift cancels in the
+    /// ratio. Cross-RUN comparison of the two pools is hopeless (the power state swings ~3×, and the
+    /// 1c-vs-par self-scaling ratio is dominated by *where* in the thermal cycle each leg is sampled);
+    /// only this interleaved same-run ratio reliably answers whether shedding the HyperThread siblings
+    /// lifts throughput on this compute-bound kernel. Run: `cargo test -p mercury_runtime --release
+    /// sgemm_pool_ab -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sgemm_pool_ab() {
+        use std::time::Instant;
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            println!("no avx2/fma — skipping");
+            return;
+        }
+        let logical = rayon::current_num_threads();
+        let physical = num_cpus::get_physical().max(1);
+        let ppool = rayon::ThreadPoolBuilder::new()
+            .num_threads(physical)
+            .build()
+            .unwrap();
+        println!("pools: logical={logical} physical={physical}");
+        for &n in &[512usize, 1024, 2048, 4096] {
+            let a = fill(1, n * n);
+            let b = fill(2, n * n);
+            let mut c = vec![0.0f32; n * n];
+            let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+            let flops = 2.0 * (n as f64).powi(3);
+            let logical_run = || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, None) };
+            let physical_run = || {
+                let args = GemmArgs { a: ap, b: bp, c: cp, m: n, k: n, n, beta: 0.0, bt: false, epi: None };
+                ppool.install(move || unsafe { args.run() });
+            };
+            for _ in 0..3 {
+                logical_run();
+                physical_run();
+            }
+            let (mut bl, mut bphys) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..12 {
+                let t = Instant::now();
+                logical_run();
+                bl = bl.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                physical_run();
+                bphys = bphys.min(t.elapsed().as_secs_f64());
+            }
+            let (lg, pg) = (flops / bl / 1e9, flops / bphys / 1e9);
+            println!(
+                "n={n:<4} logical(×{logical})={lg:6.1}  physical(×{physical})={pg:6.1} GFLOP/s  →  physical/logical = {:.2}×",
+                pg / lg
+            );
         }
     }
 
