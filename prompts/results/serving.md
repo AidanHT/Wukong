@@ -208,6 +208,31 @@ fill=1 at a throttled clock and fill=64 boosted (the documented ~7× laptop cloc
 round times every fill back-to-back so they share the clock; per-fill best-of-N), so the ratio reflects
 batching alone, not the clock.
 
+### P6 — int8 KV quantization (the 6 GB footprint lever, tolerance-gated)
+The KV cache is the dominant footprint at serving time. Storing it **int8** with a per-(token, head)
+symmetric scale (`scale = max|x|/127`) instead of f16 halves it again — a *quarter* of f32 — the lever
+that fits a long-context batch on a 6 GB device.
+
+**Footprint** (`int8_kv_footprint_shrink`, pure geometry, no device; a Llama-7B-ish 32-layer, 8-KV-head
+× 128, 4096×16-token-block cache): **f32 16.00 GiB | f16 8.00 GiB | int8 4.12 GiB** — **3.88× vs f32,
+1.94× vs f16**. The per-(token, head) f32 scale slab is `head_dim×` smaller than the value slab, so it
+costs only ~3% (1 + 4/`head_dim` bytes/value). A 16 GiB f32 cache that **cannot** fit the device fits at
+int8.
+
+**Correctness (tolerance — the first law for a lossy path):**
+- **int8 decode-attention vs f64 reference** (`paged_int8_attention_matches_reference`, ragged ctx
+  `[37,0,16,100,5,64]`, heads=4, hd=64): **max_abs = 3.00e-3** (gate 1e-2) — the only error is the
+  per-(token, head) int8 quantization of K/V (Q stays f32). The kernel factors the scale out of the dot:
+  `q·K = scaleK·Σ q[d]·int8K[d]`, `acc += (p·scaleV)·int8V[d]`.
+- **Paging still invisible on the quantized path** (`paged_int8_attention_invariant_to_block_layout`):
+  int8 values + scales under two different physical block layouts give **bit-for-bit identical** output
+  (the dequant multiply order is fixed per token — as for f16).
+
+**Kernel** (`paged_attn_decode_int8_ptx`): the warp-cooperative decode-attention kernel with the f16
+cache replaced by `ld.global.s8` + a per-token scale; same online softmax. New `KvConfig::{scale_slab_elems,
+scale_offset, kv_bytes, kv_bytes_int8}` + a host `quantize_kv_int8`. (Storage + read path; on-device
+quantize-on-append is the documented next step — the read path + footprint are the win here.)
+
 ## Multi-GPU design detail (unmeasured)
 
 _see P7._
