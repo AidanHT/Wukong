@@ -2014,6 +2014,20 @@ pub fn wmma_f16_ptx() -> &'static str {
             false,
             0,
         );
+        // The no-pad swizzle twin — the bias-add + residual-add apply register-level to the `mma.sync`
+        // D-fragments (orthogonal to SMEM staging ⇒ bit-identical output) on the faster swz base, so the
+        // down-proj / attention output-proj `out = x·Wᵀ + bias + residual` inherits the swz GEMM's
+        // 1.13–1.23× same-run speed. `gemm_nt_f16_mma_bias_residual` routes here.
+        m += &entry_mma_pipe(
+            &format!("{}_swz_bias_residual", wh.name),
+            "f16",
+            wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, 0,
+            Act::None,
+            true,
+            true,
+            true,
+            0,
+        );
         // Fused **gated-FFN (GLU-family)** kernels `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the SwiGLU/GeGLU gate
         // every modern LLM FFN runs, the fusion cuBLAS needs THREE kernels + two HBM round-trips for. The
         // 128×64 dual-B tile holds two accumulator sets at the SAME 64 D-regs/thread and the SAME 40 KiB
@@ -2147,6 +2161,18 @@ pub fn wmma_bf16_ptx() -> &'static str {
             true,
             true,
             false,
+            0,
+        );
+        // The no-pad swizzle twin (bit-identical register-level epilogue, faster swz base) — the training
+        // down-proj / output-proj inherits the swz GEMM speed. `gemm_nt_bf16_mma_bias_residual` routes here.
+        m += &entry_mma_pipe(
+            &format!("{}_swz_bias_residual", v.name),
+            "bf16",
+            v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, 0,
+            Act::None,
+            true,
+            true,
+            true,
             0,
         );
         // bf16 gated-FFN (GLU-family) gate `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — SwiGLU/GeGLU carried to the
