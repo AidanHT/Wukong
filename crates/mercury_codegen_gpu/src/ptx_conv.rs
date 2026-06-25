@@ -763,6 +763,358 @@ pub fn conv_splitk_factor(c: usize, h: usize, w: usize, k: usize, r: usize, s: u
     best
 }
 
+/// **Register double-buffered** implicit-GEMM conv (same entry names as [`conv_wmma_ptx`] /
+/// [`conv_wmma_splitk_ptx`], so the launcher swaps generators with no launch-config change). The
+/// single-buffer kernel exposes the full global→shared staging latency: it stages A+B, `bar.sync`, then
+/// MMAs, with the tensor cores idle while the loads land — exactly the standalone-GEMM cliff. This
+/// **software-pipelines** the K-loop: it prefetches the *next* K-slice's weights + im2col-gather into
+/// **registers** (the `ld.global`s are issued *before* the MMAs of the current slice, so their latency
+/// flies under the tensor cores), then publishes them to the alternate of **two** SMEM buffers
+/// *after* the MMAs — **one `bar.sync` per K-step** instead of two. Unlike a `cp.async` port this needs
+/// no 16-byte-contiguous global runs, so it is correct for **any** `R,S` (the conv im2col gather is not
+/// 8-f16-contiguous for small filters); the trade-off is a single prefetch depth + a register round-trip
+/// (vs `cp.async`'s deeper DMA pipeline), which is the right lever for these **L2-resident** convs where
+/// the staging stall is L2- not HBM-latency. `a_per+b_per` extra f16 regs/thread (here 16) hold the
+/// in-flight slice. Split-K (`sk`) is orthogonal and threaded through identically to the single-buffer
+/// kernel. Requires the per-buffer tile bytes to be powers of two (the buffer toggle is an XOR).
+pub fn conv_wmma_db_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
+    conv_wmma_db_ptx_impl(c, h, w, k, r, s, 1)
+}
+
+/// Split-K variant of [`conv_wmma_db_ptx`] (entry `conv2d_wmma_splitk`) — the double-buffered pipeline
+/// applied to each `GK/sk` z-slice. Pairs with the same [`conv_splitk_reduce_ptx`].
+pub fn conv_wmma_db_splitk_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sk: usize) -> String {
+    conv_wmma_db_ptx_impl(c, h, w, k, r, s, sk)
+}
+
+fn conv_wmma_db_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sk: usize) -> String {
+    use std::fmt::Write as _;
+    let p = h - r + 1;
+    let q = w - s + 1;
+    let m = k; // GEMM M
+    let n = p * q; // GEMM N
+    let gk = c * r * s; // GEMM K (reduction)
+    assert!(sk >= 1 && gk % sk == 0, "split-K factor {sk} must divide GK={gk}");
+    let gk_per = gk / sk;
+    assert!(sk == 1 || gk_per % 16 == 0, "split-K slice GK/sk={gk_per} must be a multiple of 16");
+    let mn = m * n;
+    let entry = if sk > 1 { "conv2d_wmma_splitk" } else { "conv2d_wmma" };
+    let rs = r * s;
+    let hw = h * w;
+    let (bm, bn) = (WMMA_BM, WMMA_BN);
+    let (warps_m, warps_n) = (WMMA_WM, WMMA_WN);
+    let threads = WMMA_THREADS;
+    let wm = bm / warps_m;
+    let wn = bn / warps_n;
+    let tm = wm / 16;
+    let tn = wn / 16;
+    let wn_shift = warps_n.trailing_zeros();
+    let bn_shift = bn.trailing_zeros();
+    let a_per = bm * 16 / threads; // A elements staged per thread
+    let b_per = 16 * bn / threads; // B elements staged per thread
+    let c_per = bm * bn / threads;
+    let tile_a = bm * 16 * 2; // one A buffer, f16 bytes
+    let tile_b = 16 * bn * 2; // one B buffer
+    assert!(tile_a.is_power_of_two() && tile_b.is_power_of_two(), "buffer toggle is an XOR");
+    let smem_a = 2 * tile_a; // double-buffered
+    let smem_b = 2 * tile_b;
+    let smem_c = bm * bn * 4; // f32 store scratch (single, epilogue-only)
+
+    let veclist = |pre: &str| -> String {
+        let regs: Vec<String> = (0..8).map(|i| format!("%{pre}{i}")).collect();
+        format!("{{{}}}", regs.join(","))
+    };
+
+    // ---- staging emitters (load global -> reg ; store reg -> shared), reused by prologue + K-loop ----
+    // A-load: weights W[M,GK]; slot e=tix+li*T -> (m=e/16, gkk=e%16), gc=<ktreg>+gkk. OOB -> 0.
+    let a_load = |kt: &str, s: &mut String| {
+        for li in 0..a_per {
+            let off = li * threads;
+            let _ = writeln!(s, "    add.u32 %e,%tix,{off};");
+            let _ = writeln!(s, "    shr.u32 %mm,%e,4;");
+            let _ = writeln!(s, "    and.b32 %gkk,%e,15;");
+            let _ = writeln!(s, "    add.u32 %tmp,%m0,%mm;       // gm");
+            let _ = writeln!(s, "    add.u32 %tmp2,{kt},%gkk;    // gc");
+            let _ = writeln!(s, "    setp.lt.u32 %pv,%tmp,{m};");
+            let _ = writeln!(s, "    setp.lt.u32 %p0,%tmp2,{gk};");
+            let _ = writeln!(s, "    and.pred %pv,%pv,%p0;");
+            let _ = writeln!(s, "    mad.lo.s32 %widx,%tmp,{gk},%tmp2;");
+            let _ = writeln!(s, "    mul.wide.u32 %off,%widx,2;");
+            let _ = writeln!(s, "    add.s64 %ptr,%W,%off;");
+            let _ = writeln!(s, "    mov.u16 %na{li},0;");
+            let _ = writeln!(s, "    @%pv ld.global.u16 %na{li},[%ptr];");
+        }
+    };
+    // A-store: publish %na{li} into smemA at byte offset <buf> + e*2.
+    let a_store = |buf: &str, s: &mut String| {
+        for li in 0..a_per {
+            let off = li * threads;
+            let _ = writeln!(s, "    add.u32 %e,%tix,{off};");
+            let _ = writeln!(s, "    mov.u32 %saddr,smemA;");
+            let _ = writeln!(s, "    add.u32 %saddr,%saddr,{buf};");
+            let _ = writeln!(s, "    shl.b32 %tmp,%e,1;");
+            let _ = writeln!(s, "    add.u32 %saddr,%saddr,%tmp;");
+            let _ = writeln!(s, "    st.shared.u16 [%saddr],%na{li};");
+        }
+    };
+    // B-load: im2col of X; slot e -> gkk=e/BN, gkv=<ktreg>+gkk; (nn,xpart) are hoisted (K-independent).
+    let b_load = |kt: &str, out: &mut String| {
+        for li in 0..b_per {
+            let off = li * threads;
+            let _ = writeln!(out, "    add.u32 %e,%tix,{off};");
+            let _ = writeln!(out, "    shr.u32 %gkk,%e,{bn_shift};");
+            let _ = writeln!(out, "    add.u32 %gkv,{kt},%gkk;");
+            let _ = writeln!(out, "    setp.lt.u32 %pv,%gkv,{gk};");
+            let _ = writeln!(out, "    setp.lt.u32 %p0,%bnv{li},{n};");
+            let _ = writeln!(out, "    and.pred %pv,%pv,%p0;");
+            let _ = writeln!(out, "    div.u32 %cc,%gkv,{rs};");
+            let _ = writeln!(out, "    rem.u32 %rem,%gkv,{rs};");
+            let _ = writeln!(out, "    div.u32 %rr,%rem,{s};");
+            let _ = writeln!(out, "    rem.u32 %ss,%rem,{s};");
+            let _ = writeln!(out, "    mad.lo.s32 %xidx,%cc,{hw},%bxp{li};");
+            let _ = writeln!(out, "    mad.lo.s32 %xidx,%rr,{w},%xidx;");
+            let _ = writeln!(out, "    add.u32 %xidx,%xidx,%ss;");
+            let _ = writeln!(out, "    mul.wide.u32 %off,%xidx,2;");
+            let _ = writeln!(out, "    add.s64 %ptr,%X,%off;");
+            let _ = writeln!(out, "    mov.u16 %nb{li},0;");
+            let _ = writeln!(out, "    @%pv ld.global.u16 %nb{li},[%ptr];");
+        }
+    };
+    let b_store = |buf: &str, out: &mut String| {
+        for li in 0..b_per {
+            let off = li * threads;
+            let _ = writeln!(out, "    add.u32 %e,%tix,{off};");
+            let _ = writeln!(out, "    mov.u32 %saddr,smemB;");
+            let _ = writeln!(out, "    add.u32 %saddr,%saddr,{buf};");
+            let _ = writeln!(out, "    shl.b32 %tmp,%e,1;");
+            let _ = writeln!(out, "    add.u32 %saddr,%saddr,%tmp;");
+            let _ = writeln!(out, "    st.shared.u16 [%saddr],%nb{li};");
+        }
+    };
+
+    let mut b = String::new();
+    let _ = writeln!(b, ".version 7.8");
+    let _ = writeln!(b, ".target sm_89");
+    let _ = writeln!(b, ".address_size 64");
+    let _ = writeln!(b);
+    let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv (register double-buffered): C{c} H{h} W{w} K{k} R{r} S{s}");
+    let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}; 2 SMEM buffers");
+    if sk > 1 {
+        let _ = writeln!(b, "// split-K: gridDim.z={sk} z-slices of GK/{sk}={gk_per}, disjoint M*N partial planes");
+    }
+    let _ = writeln!(b, ".visible .entry {entry}(");
+    let _ = writeln!(b, "    .param .u64 pXin,");
+    let _ = writeln!(b, "    .param .u64 pWt,");
+    let _ = writeln!(b, "    .param .u64 pOut");
+    let _ = writeln!(b, ")");
+    let _ = writeln!(b, "{{");
+    let _ = writeln!(b, "    .shared .align 16 .b8 smemA[{smem_a}];");
+    let _ = writeln!(b, "    .shared .align 16 .b8 smemB[{smem_b}];");
+    let _ = writeln!(b, "    .shared .align 16 .b8 smemC[{smem_c}];");
+    let _ = writeln!(b, "    .reg .pred %p0,%pv;");
+    // prefetch value registers (hold the next K-slice in flight across the MMAs)
+    let mut hv = String::from("%hv,");
+    for li in 0..a_per {
+        hv += &format!("%na{li},");
+    }
+    for li in 0..b_per {
+        hv += &format!("%nb{li},");
+    }
+    let _ = writeln!(b, "    .reg .b16 {};", hv.trim_end_matches(','));
+    let _ = writeln!(
+        b,
+        "    .reg .b32 %tix,%m0,%n0,%kt,%ktn,%e,%mm,%gkk,%ncol,%gkv,%nn,%cc,%rem,%rr,%ss,%pp,%qq,%xidx,%widx,%tmp,%tmp2,%saddr,%warpId,%wrb,%wcb,%bufA,%bufB,%bufWA,%bufWB;"
+    );
+    if sk > 1 {
+        let _ = writeln!(b, "    .reg .b32 %zsl,%ktend;");
+    }
+    let mut decl = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for rr in 0..8 {
+                decl += &format!("%c{ti}_{tj}_{rr},");
+            }
+        }
+    }
+    for ti in 0..tm {
+        for rr in 0..8 {
+            decl += &format!("%a{ti}_{rr},");
+        }
+    }
+    for tj in 0..tn {
+        for rr in 0..8 {
+            decl += &format!("%b{tj}_{rr},");
+        }
+    }
+    for li in 0..b_per {
+        decl += &format!("%bnv{li},%bxp{li},");
+    }
+    let _ = writeln!(b, "    .reg .f32 %cf;");
+    let _ = writeln!(b, "    .reg .b32 {};", decl.trim_end_matches(','));
+    let _ = writeln!(b, "    .reg .b64 %X,%W,%O,%off,%gp,%ptr;");
+    let _ = writeln!(b);
+    let _ = writeln!(b, "    ld.param.u64 %X,[pXin];");
+    let _ = writeln!(b, "    ld.param.u64 %W,[pWt];");
+    let _ = writeln!(b, "    ld.param.u64 %O,[pOut];");
+    let _ = writeln!(b, "    cvta.to.global.u64 %X,%X;");
+    let _ = writeln!(b, "    cvta.to.global.u64 %W,%W;");
+    let _ = writeln!(b, "    cvta.to.global.u64 %O,%O;");
+    let _ = writeln!(b, "    mov.u32 %tix,%tid.x;");
+    let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.y;");
+    let _ = writeln!(b, "    mul.lo.s32 %m0,%tmp,{bm};");
+    let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.x;");
+    let _ = writeln!(b, "    mul.lo.s32 %n0,%tmp,{bn};");
+    let _ = writeln!(b, "    shr.u32 %warpId,%tix,5;");
+    let _ = writeln!(b, "    shr.u32 %tmp,%warpId,{wn_shift};");
+    let _ = writeln!(b, "    mul.lo.s32 %wrb,%tmp,{wm};");
+    let _ = writeln!(b, "    and.b32 %tmp,%warpId,{};", warps_n - 1);
+    let _ = writeln!(b, "    mul.lo.s32 %wcb,%tmp,{wn};");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for rr in 0..8 {
+                let _ = writeln!(b, "    mov.f32 %c{ti}_{tj}_{rr},0f00000000;");
+            }
+        }
+    }
+    // Hoist K-independent im2col decode: per B-staging slot, nn=n0+ncol and xpart=p*W+q (used by every kt).
+    let _ = writeln!(b, "    // ---- hoist K-independent im2col decode (n -> p,q -> xpart) ----");
+    for li in 0..b_per {
+        let off = li * threads;
+        let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
+        let _ = writeln!(b, "    and.b32 %ncol,%e,{};", bn - 1);
+        let _ = writeln!(b, "    add.u32 %bnv{li},%n0,%ncol;");
+        let _ = writeln!(b, "    div.u32 %pp,%bnv{li},{q};");
+        let _ = writeln!(b, "    rem.u32 %qq,%bnv{li},{q};");
+        let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{w},%qq;");
+    }
+    // K-slice bounds (sk>1 carves a z-slice; the store adds z*M*N for the disjoint partial plane).
+    if sk > 1 {
+        let _ = writeln!(b, "    mov.u32 %zsl,%ctaid.z;");
+        let _ = writeln!(b, "    mul.lo.s32 %kt,%zsl,{gk_per};");
+        let _ = writeln!(b, "    add.u32 %ktend,%kt,{gk_per};");
+    } else {
+        let _ = writeln!(b, "    mov.u32 %kt,0;");
+    }
+    // ---- prologue: stage the first slice into buffer 0 ----
+    let _ = writeln!(b, "    mov.u32 %bufA,0;");
+    let _ = writeln!(b, "    mov.u32 %bufB,0;");
+    let _ = writeln!(b, "    // ---- prologue: load+publish slice gk0 into buffer 0 ----");
+    a_load("%kt", &mut b);
+    b_load("%kt", &mut b);
+    a_store("%bufA", &mut b);
+    b_store("%bufB", &mut b);
+    let _ = writeln!(b, "    bar.sync 0;");
+    let _ = writeln!(b);
+    let _ = writeln!(b, "KLOOP:");
+    if sk > 1 {
+        let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,%ktend;");
+    } else {
+        let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,{gk};");
+    }
+    let _ = writeln!(b, "    @%p0 bra KEND;");
+    let _ = writeln!(b, "    add.u32 %ktn,%kt,16;          // next K-slice base");
+    let _ = writeln!(b);
+    // Prefetch the next slice into registers FIRST (program order before the MMAs) so the global loads
+    // are in flight while the tensor cores consume the current buffer. OOB lanes load 0 (gc/gkv>=GK).
+    let _ = writeln!(b, "    // ---- prefetch next slice (gk0+16) into registers ----");
+    a_load("%ktn", &mut b);
+    b_load("%ktn", &mut b);
+    let _ = writeln!(b);
+    // Load A/B fragments from the current READ buffer (%bufA/%bufB).
+    let _ = writeln!(b, "    // ---- consume current buffer: load fragments + MMA ----");
+    let _ = writeln!(b, "    mov.u32 %tmp,16;");
+    for ti in 0..tm {
+        let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};", ti * 16);
+        let _ = writeln!(b, "    mul.lo.s32 %tmp2,%tmp2,32;");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemA;");
+        let _ = writeln!(b, "    add.u32 %saddr,%saddr,%bufA;");
+        let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
+        let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
+        let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
+        let ra = veclist(&format!("a{ti}_"));
+        let _ = writeln!(b, "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;");
+    }
+    let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
+    for tj in 0..tn {
+        let _ = writeln!(b, "    add.u32 %tmp2,%wcb,{};", tj * 16);
+        let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,1;");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemB;");
+        let _ = writeln!(b, "    add.u32 %saddr,%saddr,%bufB;");
+        let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
+        let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
+        let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
+        let rb = veclist(&format!("b{tj}_"));
+        let _ = writeln!(b, "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;");
+    }
+    for ti in 0..tm {
+        let ra = veclist(&format!("a{ti}_"));
+        for tj in 0..tn {
+            let rb = veclist(&format!("b{tj}_"));
+            let cc = veclist(&format!("c{ti}_{tj}_"));
+            let _ = writeln!(
+                b,
+                "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};"
+            );
+        }
+    }
+    let _ = writeln!(b);
+    // Publish the prefetched slice into the WRITE buffer (the alternate of the two), then one barrier.
+    let _ = writeln!(b, "    // ---- publish prefetched slice into the alternate buffer ----");
+    let _ = writeln!(b, "    xor.b32 %bufWA,%bufA,{tile_a};");
+    let _ = writeln!(b, "    xor.b32 %bufWB,%bufB,{tile_b};");
+    a_store("%bufWA", &mut b);
+    b_store("%bufWB", &mut b);
+    let _ = writeln!(b, "    bar.sync 0;");
+    let _ = writeln!(b, "    mov.u32 %bufA,%bufWA;");
+    let _ = writeln!(b, "    mov.u32 %bufB,%bufWB;");
+    let _ = writeln!(b, "    add.u32 %kt,%kt,16;");
+    let _ = writeln!(b, "    bra KLOOP;");
+    let _ = writeln!(b, "KEND:");
+    // Epilogue: drain warp tiles to smemC, then cooperative guarded global store (identical to single-buf).
+    let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};", ti * 16);
+            let _ = writeln!(b, "    mul.lo.s32 %tmp2,%tmp2,{bn};");
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%wcb;");
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,{};", tj * 16);
+            let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,2;");
+            let _ = writeln!(b, "    mov.u32 %saddr,smemC;");
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%saddr;");
+            let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;");
+            let _ = writeln!(b, "    cvta.shared.u64 %gp,%gp;");
+            let cc = veclist(&format!("c{ti}_{tj}_"));
+            let _ = writeln!(b, "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;");
+        }
+    }
+    let _ = writeln!(b, "    bar.sync 0;");
+    for li in 0..c_per {
+        let off = li * threads;
+        let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
+        let _ = writeln!(b, "    shr.u32 %mm,%e,{bn_shift};");
+        let _ = writeln!(b, "    and.b32 %ncol,%e,{};", bn - 1);
+        let _ = writeln!(b, "    add.u32 %tmp,%m0,%mm;");
+        let _ = writeln!(b, "    add.u32 %nn,%n0,%ncol;");
+        let _ = writeln!(b, "    setp.lt.u32 %pv,%tmp,{m};");
+        let _ = writeln!(b, "    setp.lt.u32 %p0,%nn,{n};");
+        let _ = writeln!(b, "    and.pred %pv,%pv,%p0;");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemC;");
+        let _ = writeln!(b, "    shl.b32 %tmp2,%e,2;");
+        let _ = writeln!(b, "    add.u32 %saddr,%saddr,%tmp2;");
+        let _ = writeln!(b, "    ld.shared.f32 %cf,[%saddr];");
+        let _ = writeln!(b, "    mad.lo.s32 %xidx,%tmp,{n},%nn;");
+        if sk > 1 {
+            let _ = writeln!(b, "    mad.lo.s32 %xidx,%zsl,{mn},%xidx;");
+        }
+        let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,4;");
+        let _ = writeln!(b, "    add.s64 %ptr,%O,%off;");
+        let _ = writeln!(b, "    @%pv st.global.f32 [%ptr],%cf;");
+    }
+    let _ = writeln!(b, "    ret;");
+    let _ = writeln!(b, "}}");
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
