@@ -2448,6 +2448,47 @@ pub fn conv2d_wmma_padded_auto(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Best-path conv2d dispatch** — routes a conv to Mercury's fastest *correct* kernel for the shape:
+/// - **Winograd F(4×4,3×3)** ([`winograd_conv2d`]) for **valid** (stride 1, no pad) 3×3, deep-channel
+///   (`C≥64`), large-spatial (`H,W≥28` ⇒ batched-GEMM tile count `T≥16`): measured **1.2–2.2× the
+///   implicit-GEMM**, itself cuDNN-parity — so this turns the bread-and-butter 3×3 from parity into a win.
+///   Excludes low channel count (C32 measured 0.77×: the transform-domain reduction `GK=C` is too thin)
+///   and small maps (`T<16`, where the batched GEMM under-fills).
+/// - the affine **split-K auto** path ([`conv2d_wmma_padded_auto`]) when strided or padded;
+/// - the valid **split-K auto** implicit-GEMM ([`conv2d_wmma_auto`]) otherwise.
+///
+/// Winograd carries a looser (rel-Frobenius) accuracy than the GEMM paths (the transform amplifies fp16
+/// quantization) — fine for inference, which is why it is only *auto*-selected here; a caller wanting the
+/// tighter `c·√K·ε` bound calls [`conv2d_wmma_auto`] / [`conv2d_wmma_padded_auto`] directly.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_best(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    // Winograd lane: valid 3×3, ≥64 channels, large enough spatial that the α² batched GEMM (N=tiles) is
+    // a real tensor-core problem. wino_ntiles gives the F(4,3) tile count T.
+    if r == 3 && s == 3 && stride == 1 && pad == 0 && c >= 64 && h >= 28 && width >= 28 {
+        let (_, _, nt) = crate::ptx_winograd::wino_ntiles(h, width, 4);
+        if nt >= 16 {
+            return winograd_conv2d(g, x, w, c, h, width, k, 4);
+        }
+    }
+    if stride > 1 || pad > 0 {
+        conv2d_wmma_padded_auto(g, x, w, c, h, width, k, r, s, stride, pad)
+    } else {
+        conv2d_wmma_auto(g, x, w, c, h, width, k, r, s)
+    }
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -7650,6 +7691,80 @@ mod tests {
                     "conv_padded_auto C{c} {h}x{width} K{k} {r}x{s} stride{st} pad{pad} sk{sk}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
                     stx.max_abs, stx.max_rel
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_best_matches_reference_within_tol() {
+        // The best-path dispatch must be CORRECT whichever lane it routes to (Winograd / valid-auto /
+        // affine-auto). Gated by rel-Frobenius ‖got−ref‖_F/‖ref‖_F ≤ 8e-3 — the looser Winograd bound
+        // (the transform amplifies fp16 quant), which the GEMM lanes pass comfortably. Cases span every
+        // lane; the printed routing confirms the dispatch picked what we expect.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_affine(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_best", |g| {
+            let mut rng = crate::diff::Rng::new(0xBE57FE);
+            // (C,H,W,K,R,S,stride,pad, expected lane): every lane exercised.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd"),
+                (128, 28, 28, 128, 3, 3, 1, 0, "winograd"),
+                (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto (C<64)"),
+                (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto (1x1)"),
+                (64, 56, 56, 64, 3, 3, 2, 1, "affine-auto (s2p1)"),
+                (128, 28, 28, 128, 3, 3, 1, 1, "affine-auto (same)"),
+            ];
+            for (c, h, width, k, r, s, st, pad, lane) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_best(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_affine(&x, &w, c, h, width, k, r, s, st, pad);
+                let err_f = got
+                    .iter()
+                    .zip(&oracle)
+                    .map(|(a, b)| {
+                        let d = *a as f64 - *b as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                let fro_rel = err_f / ref_f.max(1e-9);
+                eprintln!("conv2d_best C{c} {h}x{width} K{k} {r}x{s} s{st}p{pad} -> {lane}: fro_rel={fro_rel:.2e}");
+                assert!(fro_rel < 8e-3, "conv2d_best C{c} {r}x{s} s{st}p{pad} ({lane}): rel-Frobenius {fro_rel:.3e} >= 8e-3");
             }
         });
     }
