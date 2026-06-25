@@ -376,7 +376,7 @@ pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) 
 /// all warps), then every warp computes its `tm×tn` grid of `m16n16k16` tiles out of SMEM. Launch with
 /// block `(WMMA_THREADS,1,1)` and grid `(ceil(N/WMMA_BN), ceil(M/WMMA_BM), 1)` where `M=K`, `N=P*Q`.
 pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1)
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false)
 }
 
 /// **Split-K** variant of [`conv_wmma_ptx`] (entry `conv2d_wmma_splitk`): the `GK=C*R*S` reduction is
@@ -395,10 +395,40 @@ pub fn conv_wmma_splitk_ptx(
     s: usize,
     sk: usize,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, sk)
+    conv_wmma_ptx_impl(c, h, w, k, r, s, sk, crate::ptx_wmma::Act::None, false)
 }
 
-fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sk: usize) -> String {
+/// **Fused conv + bias + activation** implicit-GEMM (entry `conv2d_wmma`): the same tensor-core conv as
+/// [`conv_wmma_ptx`], but the f32-accumulate store epilogue folds in a per-output-channel bias
+/// (`out += bias[k]`, when `bias`) and an activation (`out = act(out)`) — `act(x·Wᵀ + bias)` in one
+/// kernel, racing cuDNN's `cudnnConvolutionBiasActivationForward`. **Free**: the epilogue runs on the
+/// f32 accumulators already in the smemC store-back, so an unfused conv + a separate bias/act pass (an
+/// extra full HBM round-trip of the `K·P·Q` output) collapses to a few instructions. Only `sk=1`
+/// (fusion must apply *after* a split-K reduce, not per-slice — the recognizer keeps split-K unfused).
+pub fn conv_wmma_epi_ptx(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    act: crate::ptx_wmma::Act,
+    bias: bool,
+) -> String {
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, act, bias)
+}
+
+fn conv_wmma_ptx_impl(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+    act: crate::ptx_wmma::Act,
+    bias: bool,
+) -> String {
     use std::fmt::Write as _;
     let p = h - r + 1;
     let q = w - s + 1;
@@ -406,6 +436,9 @@ fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
     assert!(sk >= 1 && gk % sk == 0, "split-K factor {sk} must divide GK={gk}");
+    // Fusion composes only with the single-pass kernel: a split-K conv writes partial M×N planes that
+    // are summed later, so a per-slice bias/activation would be applied sk× (and act before the sum).
+    assert!(sk == 1 || (matches!(act, crate::ptx_wmma::Act::None) && !bias), "split-K conv cannot fuse bias/act");
     let gk_per = gk / sk; // reduction length per z-slice
     // The K-loop advances in 16-wide WMMA tiles, so each slice must be a whole number of them — else a
     // slice over-reads into the next slice's range (the staging guards against the full GK, not ktend).
@@ -448,7 +481,12 @@ fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize
     let _ = writeln!(b, ".visible .entry {entry}(");
     let _ = writeln!(b, "    .param .u64 pXin,");
     let _ = writeln!(b, "    .param .u64 pWt,");
-    let _ = writeln!(b, "    .param .u64 pOut");
+    if bias {
+        let _ = writeln!(b, "    .param .u64 pOut,");
+        let _ = writeln!(b, "    .param .u64 pBias");
+    } else {
+        let _ = writeln!(b, "    .param .u64 pOut");
+    }
     let _ = writeln!(b, ")");
     let _ = writeln!(b, "{{");
     let _ = writeln!(b, "    .shared .align 16 .b8 smemA[{smem_a}];");
@@ -460,6 +498,11 @@ fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize
         b,
         "    .reg .b32 %tix,%m0,%n0,%kt,%e,%mm,%gkk,%ncol,%gkv,%nn,%cc,%rem,%rr,%ss,%pp,%qq,%ih,%iw,%xidx,%widx,%tmp,%tmp2,%saddr,%warpId,%wrb,%wcb;"
     );
+    // Fused-epilogue scratch: bias value + activation temporaries (dropped by ptxas when unused).
+    let _ = writeln!(b, "    .reg .f32 %bv,%act0,%act1;");
+    if bias {
+        let _ = writeln!(b, "    .reg .b64 %Bias;");
+    }
     if sk > 1 {
         let _ = writeln!(b, "    .reg .b32 %zsl,%ktend;");
     }
@@ -650,6 +693,10 @@ fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize
         }
     }
     let _ = writeln!(b, "    bar.sync 0;");
+    if bias {
+        let _ = writeln!(b, "    ld.param.u64 %Bias,[pBias];");
+        let _ = writeln!(b, "    cvta.to.global.u64 %Bias,%Bias;");
+    }
     for li in 0..c_per {
         let off = li * threads;
         let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
@@ -664,6 +711,15 @@ fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize
         let _ = writeln!(b, "    shl.b32 %tmp2,%e,2;");
         let _ = writeln!(b, "    add.u32 %saddr,%saddr,%tmp2;");
         let _ = writeln!(b, "    ld.shared.f32 %cf,[%saddr];");
+        if bias {
+            // out += bias[gm] (gm = %tmp = the output channel). Guarded so padded gm>=K never faults.
+            let _ = writeln!(b, "    mul.wide.u32 %off,%tmp,4;");
+            let _ = writeln!(b, "    add.s64 %ptr,%Bias,%off;");
+            let _ = writeln!(b, "    mov.f32 %bv,0f00000000;");
+            let _ = writeln!(b, "    @%pv ld.global.f32 %bv,[%ptr];");
+            let _ = writeln!(b, "    add.f32 %cf,%cf,%bv;");
+        }
+        b.push_str(&act.epilogue("%cf")); // out = act(out)  (Act::None -> nothing)
         let _ = writeln!(b, "    mad.lo.s32 %xidx,%tmp,{n},%nn;   // gm*N + gn");
         if sk > 1 {
             let _ = writeln!(b, "    mad.lo.s32 %xidx,%zsl,{mn},%xidx;   // + z*M*N (disjoint plane)");

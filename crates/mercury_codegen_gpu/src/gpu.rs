@@ -2175,6 +2175,56 @@ pub fn winograd_conv2d(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Fused conv + bias + activation** (`act(conv2d(X,W) + bias)`) in ONE implicit-GEMM kernel — the GPU
+/// twin of cuDNN's `cudnnConvolutionBiasActivationForward`. `bias` is an optional per-output-channel
+/// `[K]` vector; `act` ∈ {None, Relu, Silu, Gelu}. Same contract/precision as [`conv2d_wmma`]; the bias
+/// add + activation run on the f32 accumulators in the store epilogue ([`crate::ptx_conv::conv_wmma_epi_ptx`]),
+/// so vs an unfused conv + a separate pointwise pass they cost ~nothing (no extra `K·P·Q` HBM round-trip).
+/// Single-pass only (no split-K — fusion must follow a reduce, not precede it).
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_epi(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    bias: Option<&[f32]>,
+    act: crate::ptx_wmma::Act,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    if let Some(bs) = bias {
+        assert_eq!(bs.len(), k, "bias must be length K (one per output channel)");
+    }
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let (p, q) = (h - r + 1, width - s + 1);
+    let ptx = crate::ptx_conv::conv_wmma_epi_ptx(c, h, width, k, r, s, act, bias.is_some());
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = conv_wmma_cfg(h, width, k, r, s);
+    if let Some(bs) = bias {
+        let bias_d = g.stream.memcpy_stod(bs)?;
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d).arg(&bias_d);
+        unsafe { bld.launch(cfg)? };
+    } else {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg)? };
+    }
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -7030,6 +7080,75 @@ mod tests {
                     assert!(
                         max_abs < abs_backstop,
                         "winograd F({m},3) C{c} {h}x{width} K{k}: max_abs {max_abs:.3e} >= {abs_backstop:.0e} (a lane blew up)"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn conv_wmma_epi_matches_reference_within_tol() {
+        use crate::ptx_wmma::Act;
+        // Host activations matching the kernel's epilogue (sigmoid/tanh approx; smooth, within fp16 tol).
+        let apply = |act: Act, v: f64| -> f64 {
+            match act {
+                Act::None => v,
+                Act::Relu => v.max(0.0),
+                Act::Silu => v / (1.0 + (-v).exp()),
+                Act::Gelu => {
+                    let c0 = (2.0f64 / std::f64::consts::PI).sqrt();
+                    0.5 * v * (1.0 + (c0 * (v + 0.044715 * v * v * v)).tanh())
+                }
+            }
+        };
+        with_gpu("conv_wmma_epi", |g| {
+            let mut rng = crate::diff::Rng::new(0xE91C0);
+            let cases = [
+                (16usize, 28usize, 28usize, 32usize, 3usize, 3usize),
+                (32, 14, 14, 64, 3, 3),
+                (8, 16, 16, 48, 5, 5),
+                (32, 14, 14, 64, 1, 1),
+            ];
+            for (c, h, width, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let conv = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                let (p, q) = (h - r + 1, width - s + 1);
+                let bias_v = rng.vec(k, -0.5, 0.5);
+                for (use_bias, act) in
+                    [(true, Act::None), (true, Act::Relu), (false, Act::Relu), (true, Act::Silu), (true, Act::Gelu)]
+                {
+                    let bias = if use_bias { Some(bias_v.as_slice()) } else { None };
+                    let act_name = match act {
+                        Act::None => "none",
+                        Act::Relu => "relu",
+                        Act::Silu => "silu",
+                        Act::Gelu => "gelu",
+                    };
+                    let got = conv2d_wmma_epi(g, &x, &w, c, h, width, k, r, s, bias, act).unwrap();
+                    // Oracle: act(conv + bias) per output channel, on the f32-cast conv.
+                    let mut oracle = vec![0f32; k * p * q];
+                    for kk in 0..k {
+                        let b = if use_bias { bias_v[kk] as f64 } else { 0.0 };
+                        for idx in 0..(p * q) {
+                            let v = conv[kk * p * q + idx] as f64 + b;
+                            oracle[kk * p * q + idx] = apply(act, v) as f32;
+                        }
+                    }
+                    let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                    let st = crate::diff::assert_close(
+                        &format!("conv_epi C{c} {h}x{width} K{k} {r}x{s} bias={use_bias} {act_name}"),
+                        &got,
+                        &oracle,
+                        5e-2,
+                        rel,
+                    );
+                    eprintln!(
+                        "conv_epi C{c} {h}x{width} K{k} {r}x{s} bias={use_bias} {act_name}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
                     );
                 }
             }
