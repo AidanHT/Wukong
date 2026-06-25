@@ -1831,3 +1831,110 @@ pub fn cublaslt_available() -> bool {
     })
     .unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------------------------------
+// int8 GEMM+dequant **chain** peer — the round-trip a cuBLAS int8 inference output stage must pay
+// because cuBLAS emits raw i32. Mercury folds `out = f32(Σ u8·i8)·scale[j]` into the GEMM store for ~0
+// cost (`int8_gemm_nt_*_deq`), a fusion a closed-source library kernel structurally can't do — so the
+// honest end-to-end comparison for the quantized output stage is Mercury's **single fused kernel** vs
+// the cuBLAS **GEMM + separate dequant kernel** chain. This is the int8 "beat cuBLAS outright" lever.
+// ---------------------------------------------------------------------------------------------------
+
+/// Per-channel int8→f32 dequant `out[r,c] = f32(in[r,c])·scale[c]` — one element/thread on a 2-D grid
+/// (`gridDim.x = ⌈N/256⌉`, `gridDim.y = M`; block 256×1), so the output column `c = ctaid.x·256 + tid.x`
+/// needs no per-element integer remainder and `scale[c]` / the i32 row stream coalesce. A fair, fast
+/// dequant — the second kernel a cuBLAS int8 pipeline launches, re-reading the whole M×N i32 from HBM and
+/// writing M×N f32 (the HBM round-trip + launch Mercury's fused epilogue removes).
+const INT8_DEQUANT_CHAIN_PTX: &str = r#".version 8.4
+.target sm_89
+.address_size 64
+.visible .entry int8_dequant_chain(
+    .param .u64 pIn,
+    .param .u64 pScale,
+    .param .u64 pOut,
+    .param .u32 pM,
+    .param .u32 pN
+)
+{
+    .reg .pred %pc,%pr;
+    .reg .b32 %col,%row,%m,%n,%idx,%vi,%bx,%bdx;
+    .reg .f32 %f,%sc;
+    .reg .b64 %In,%Scale,%Out,%off,%pp;
+    ld.param.u64 %In,[pIn];
+    ld.param.u64 %Scale,[pScale];
+    ld.param.u64 %Out,[pOut];
+    ld.param.u32 %m,[pM];
+    ld.param.u32 %n,[pN];
+    cvta.to.global.u64 %In,%In;
+    cvta.to.global.u64 %Scale,%Scale;
+    cvta.to.global.u64 %Out,%Out;
+    mov.u32 %bx,%ctaid.x;
+    mov.u32 %bdx,%ntid.x;
+    mov.u32 %col,%tid.x;
+    mad.lo.s32 %col,%bx,%bdx,%col;
+    mov.u32 %row,%ctaid.y;
+    setp.ge.u32 %pc,%col,%n;
+    @%pc bra END;
+    setp.ge.u32 %pr,%row,%m;
+    @%pr bra END;
+    mad.lo.s32 %idx,%row,%n,%col;
+    mul.wide.u32 %off,%idx,4;
+    add.s64 %pp,%In,%off;
+    ld.global.b32 %vi,[%pp];
+    cvt.rn.f32.s32 %f,%vi;
+    mul.wide.u32 %off,%col,4;
+    add.s64 %pp,%Scale,%off;
+    ld.global.f32 %sc,[%pp];
+    mul.f32 %f,%f,%sc;
+    mul.wide.u32 %off,%idx,4;
+    add.s64 %pp,%Out,%off;
+    st.global.f32 [%pp],%f;
+END:
+    ret;
+}
+"#;
+
+/// Time the **cuBLAS int8 GEMM + dequant chain**: `iters` resident pairs of (`cublasGemmEx` i32 →
+/// `int8_dequant_chain` i32→f32), one warm-up, one trailing sync. Returns **seconds per pair** — the
+/// honest peer for Mercury's single fused `int8_gemm_nt_*_deq`. A/B/scale are dummy (timing is
+/// data-independent); the dequant kernel is JITed once. Needs cuBLAS (skips via `peers_available`).
+pub fn time_cublas_int8_gemm_dequant_chain(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(&vec![1i8; m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![1i8; n * k])?;
+    let mut ci_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let scale_d = g.stream.memcpy_stod(&vec![1.0f32 / 127.0; n])?;
+    let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let module = g.ctx.load_module(INT8_DEQUANT_CHAIN_PTX.into())?;
+    let deq = module.load_function("int8_dequant_chain")?;
+    let stream = g.stream.clone();
+    let (mm, nn) = (m as u32, n as u32);
+    let dcfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), m as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // warm up: one GEMM (i32) then one dequant (i32→f32).
+    unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut ci_d, m, k, n)? };
+    {
+        let mut bld = stream.launch_builder(&deq);
+        bld.arg(&ci_d).arg(&scale_d).arg(&mut cf_d).arg(&mm).arg(&nn);
+        unsafe { bld.launch(dcfg)? };
+    }
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut ci_d, m, k, n)? };
+        let mut bld = stream.launch_builder(&deq);
+        bld.arg(&ci_d).arg(&scale_d).arg(&mut cf_d).arg(&mm).arg(&nn);
+        unsafe { bld.launch(dcfg)? };
+    }
+    stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
