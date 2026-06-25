@@ -1977,6 +1977,10 @@ pub fn conv2d_wmma(
     assert!(h >= r && width >= s, "kernel larger than input");
     let p = h - r + 1;
     let q = width - s + 1;
+    // Single-buffer implicit-GEMM is the production path: the register double-buffered pipeline
+    // ([`crate::ptx_conv::conv_wmma_db_ptx`]) was measured **neutral-to-negative** on these L2-resident
+    // convs (its prefetch registers cut occupancy on the split-K deep-channel shapes), so it is kept only
+    // as a documented A/B in `conv_vs_cudnn`, not shipped.
     let ptx = crate::ptx_conv::conv_wmma_ptx(c, h, width, k, r, s);
     let module = g.load_module_cached(&ptx)?;
     let f = module.load_function("conv2d_wmma")?;
@@ -1990,6 +1994,499 @@ pub fn conv2d_wmma(
     bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&o_d)
+}
+
+/// Launch grid for the **split-K** implicit-GEMM conv: same `M×N` tiling as [`conv_wmma_cfg`] but
+/// `gridDim.z = sk`, so each z-slice computes its `GK/sk` reduction into its own `M×N` partial plane.
+pub(crate) fn conv_wmma_splitk_cfg(
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> LaunchConfig {
+    let mut cfg = conv_wmma_cfg(h, width, k, r, s);
+    cfg.grid_dim.2 = sk as u32;
+    cfg
+}
+
+/// **Split-K fp16 tensor-core implicit-GEMM** conv2d (single batch, stride 1, no padding). Same contract
+/// as [`conv2d_wmma`], but the `GK=C*R*S` reduction is split across `sk` z-slices into `sk` disjoint
+/// `M*N` partial planes ([`crate::ptx_conv::conv_wmma_splitk_ptx`]) then summed in fixed ascending-z
+/// order ([`crate::ptx_conv::conv_splitk_reduce_ptx`]) — the occupancy lever for deep-channel,
+/// small-spatial convs whose base grid under-fills the SMs. `sk` must divide `C*R*S`. Deterministic.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_splitk(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let p = h - r + 1;
+    let q = width - s + 1;
+    let (m, n) = (k, p * q);
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n)?;
+    // Conv: sk z-slices each write their own M*N partial plane (single-buffer is the production path; see
+    // the note in `conv2d_wmma` — the double-buffered pipeline measured neutral here).
+    let ptx = crate::ptx_conv::conv_wmma_splitk_ptx(c, h, width, k, r, s, sk);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma_splitk")?;
+    let cfg = conv_wmma_splitk_cfg(h, width, k, r, s, sk);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut partial_d);
+    unsafe { bld.launch(cfg)? };
+    // Deterministic fixed-order reduction of the sk planes -> O[M,N].
+    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+    let rmod = g.load_module_cached(&rptx)?;
+    let rf = rmod.load_function("conv_splitk_reduce")?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(m * n)?;
+    let rcfg = LaunchConfig {
+        grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut rbld = g.stream.launch_builder(&rf);
+    rbld.arg(&partial_d).arg(&mut o_d);
+    unsafe { rbld.launch(rcfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Auto-dispatched** fp16 tensor-core implicit-GEMM conv2d — Mercury's best implicit-GEMM conv path
+/// for the shape. Picks a split-K factor via [`crate::ptx_conv::conv_splitk_factor`] (using the device
+/// SM count) and runs the base [`conv2d_wmma`] or the [`conv2d_wmma_splitk`] occupancy path accordingly.
+/// Same contract/precision as [`conv2d_wmma`].
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_auto(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, DriverError> {
+    let sk = crate::ptx_conv::conv_splitk_factor(c, h, width, k, r, s, g.sm_count() as usize);
+    if sk > 1 {
+        conv2d_wmma_splitk(g, x, w, c, h, width, k, r, s, sk)
+    } else {
+        conv2d_wmma(g, x, w, c, h, width, k, r, s)
+    }
+}
+
+/// **Winograd F(m×m,3×3) conv2d** (single batch, stride 1, no padding, `R=S=3`; `m∈{2,4}`) — cuDNN's
+/// `WINOGRAD_NONFUSED` strategy, the 2.25–4× multiply-reduction lever for 3×3. Four resident phases on
+/// device buffers (see [`crate::ptx_winograd`]): (1) filter transform `U[α²,K,C]`, (2) input transform
+/// `V[α²,C,T]`, (3) the α² batched channel-reduction GEMMs `M[ξν]=U[ξν]·V[ξν]` — each reusing the
+/// **proven `conv2d_wmma` tensor-core kernel** with `R=S=1` (`O[K,T]=W[K,C]·X[C,T]`) on a sub-slice — and
+/// (4) output transform → `O[K,P,Q]` (f32). fp16 storage, f32 transform arithmetic. Tolerance-gated
+/// against the f64 oracle (fp16 quantization dominates; Winograd's amplification sits under it). Correct
+/// for any tile count `T`; perf only sensible once `T≥16` (a non-trivial batched-GEMM N) — large feature
+/// maps / early layers. `m=4` is F(4×4,3×3) (what cuDNN uses); `m=2` is the lower-amplification F(2,3).
+#[allow(clippy::too_many_arguments)]
+pub fn winograd_conv2d(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    m: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert!(m == 2 || m == 4, "Winograd output tile m must be 2 or 4");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * 9, "W must be K×C×3×3");
+    assert!(h >= 3 && width >= 3, "kernel larger than input");
+    let (p, q) = (h - 2, width - 2);
+    let alpha = m + 2;
+    let aa = alpha * alpha;
+    let (_nti, _ntj, nt) = crate::ptx_winograd::wino_ntiles(h, width, m);
+
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    // Transform-domain intermediates: U[α²,K,C] (f16) and V[α²,C,T] (f16) feed the tensor-core GEMM;
+    // M[α²,K,T] is **f32** (conv2d_wmma's f32 output); O[K,P,Q] is f32.
+    let mut u_d = g.stream.alloc_zeros::<f16>(aa * k * c)?;
+    let mut v_d = g.stream.alloc_zeros::<f16>(aa * c * nt)?;
+    let mut m_d = g.stream.alloc_zeros::<f32>(aa * k * nt)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+
+    // Phase 1 — filter transform (one thread per (k,c)).
+    let fptx = crate::ptx_winograd::wino_filter_xform_ptx(c, k, m);
+    let fmod = g.load_module_cached(&fptx)?;
+    let ff = fmod.load_function("wino_filter_xform")?;
+    let kc = k * c;
+    let cfg1 = LaunchConfig { grid_dim: ((kc as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let mut b1 = g.stream.launch_builder(&ff);
+    b1.arg(&w_d).arg(&mut u_d);
+    unsafe { b1.launch(cfg1)? };
+
+    // Phase 2 — input transform (one thread per (c, tile)).
+    let iptx = crate::ptx_winograd::wino_input_xform_ptx(c, h, width, m);
+    let imod = g.load_module_cached(&iptx)?;
+    let inf = imod.load_function("wino_input_xform")?;
+    let cnt = c * nt;
+    let cfg2 = LaunchConfig { grid_dim: ((cnt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let mut b2 = g.stream.launch_builder(&inf);
+    b2.arg(&x_d).arg(&mut v_d);
+    unsafe { b2.launch(cfg2)? };
+
+    // Phase 3 — the α² channel-reduction GEMMs M[ξν]=U[ξν]·V[ξν] in ONE batched launch (gridDim.z=α²):
+    // 36 separate launches each fill only ~4 CTAs and run serially (≈idle on a 20-SM GPU); batching puts
+    // α²·that CTAs in flight. NN GEMM (no im2col), so a dedicated tensor-core kernel, not conv2d_wmma.
+    let gptx = crate::ptx_winograd::wino_bgemm_ptx(c, nt, k);
+    let gmod = g.load_module_cached(&gptx)?;
+    let gf = gmod.load_function("wino_bgemm")?;
+    let mut cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
+    cfg3.grid_dim.2 = aa as u32;
+    let mut b3 = g.stream.launch_builder(&gf);
+    b3.arg(&v_d).arg(&u_d).arg(&mut m_d); // wino_bgemm(pV, pU, pM)
+    unsafe { b3.launch(cfg3)? };
+
+    // Phase 4 — output transform (one thread per (k, tile)) → O[K,P,Q].
+    let optx = crate::ptx_winograd::wino_output_xform_ptx(k, h, width, m);
+    let omod = g.load_module_cached(&optx)?;
+    let of = omod.load_function("wino_output_xform")?;
+    let cfg4 = LaunchConfig { grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let mut b4 = g.stream.launch_builder(&of);
+    b4.arg(&m_d).arg(&mut o_d);
+    unsafe { b4.launch(cfg4)? };
+
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Fused conv + bias + activation** (`act(conv2d(X,W) + bias)`) in ONE implicit-GEMM kernel — the GPU
+/// twin of cuDNN's `cudnnConvolutionBiasActivationForward`. `bias` is an optional per-output-channel
+/// `[K]` vector; `act` ∈ {None, Relu, Silu, Gelu}. Same contract/precision as [`conv2d_wmma`]; the bias
+/// add + activation run on the f32 accumulators in the store epilogue ([`crate::ptx_conv::conv_wmma_epi_ptx`]),
+/// so vs an unfused conv + a separate pointwise pass they cost ~nothing (no extra `K·P·Q` HBM round-trip).
+/// Single-pass only (no split-K — fusion must follow a reduce, not precede it).
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_epi(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    bias: Option<&[f32]>,
+    act: crate::ptx_wmma::Act,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    if let Some(bs) = bias {
+        assert_eq!(bs.len(), k, "bias must be length K (one per output channel)");
+    }
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let (p, q) = (h - r + 1, width - s + 1);
+    let ptx = crate::ptx_conv::conv_wmma_epi_ptx(c, h, width, k, r, s, act, bias.is_some());
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = conv_wmma_cfg(h, width, k, r, s);
+    if let Some(bs) = bias {
+        let bias_d = g.stream.memcpy_stod(bs)?;
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d).arg(&bias_d);
+        unsafe { bld.launch(cfg)? };
+    } else {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg)? };
+    }
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Strided** fp16 tensor-core implicit-GEMM conv2d (downsampling, `stride>1`). Same contract as
+/// [`conv2d_wmma`] but output `P=⌊(H-R)/stride⌋+1`, `Q=⌊(W-S)/stride⌋+1`; output pixel `(p,q)` reads
+/// input `(p·stride+r, q·stride+s)` ([`crate::ptx_conv::conv_wmma_strided_ptx`]). Tolerance-gated at fp16.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_strided(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let (p, q) = ((h - r) / stride + 1, (width - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let ptx = crate::ptx_conv::conv_wmma_strided_ptx(c, h, width, k, r, s, stride);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Strided + zero-padded** fp16 tensor-core implicit-GEMM conv2d — the general affine conv. Output
+/// `P=⌊(H+2·pad-R)/stride⌋+1`, `Q=⌊(W+2·pad-S)/stride⌋+1`; output pixel `(p,q)` reads input
+/// `(p·stride+r-pad, q·stride+s-pad)`, OOB coords contributing 0
+/// ([`crate::ptx_conv::conv_wmma_pad_ptx`]). The canonical "same" conv (3×3 pad-1) and ResNet stride-2
+/// pad-1 downsample. `pad=0` matches [`conv2d_wmma_strided`]. Tolerance-gated at fp16.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_padded(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
+    let (p, q) = ((h + 2 * pad - r) / stride + 1, (width + 2 * pad - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let ptx = crate::ptx_conv::conv_wmma_pad_ptx(c, h, width, k, r, s, stride, pad);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Explicit-pad** padded conv2d — an alternative to [`conv2d_wmma_padded`]'s in-kernel bounds-checked
+/// gather. Scatters `X` into the interior of a zeroed `(H+2·pad)×(W+2·pad)` buffer
+/// ([`crate::ptx_conv::pad_nchw_copy_ptx`]), then runs the **dense valid strided kernel** on it — no
+/// per-tap bounds checks in the GEMM staging loop. **Measured (same-run A/B in `conv_affine_vs_cudnn`):
+/// this is ~equal to, and typically ~1.0–1.12× *slower* than, the single-kernel bounds-checked path** —
+/// the scatter (one streamed copy of `C·H·W` halfwords, <1% of the conv) costs slightly more than the
+/// per-tap predication it removes, since these convs are L2-resident and the bounds chain is cheap. Kept
+/// as a gated alternative (and the natural seam for split-K on padded inputs, which reuses the valid
+/// split-K kernel verbatim). Same output as [`conv2d_wmma_padded`]; tolerance-gated at fp16.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_padded_explicit(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
+    if pad == 0 {
+        // No padding -> the dense strided path directly (no scatter needed).
+        return conv2d_wmma_strided(g, x, w, c, h, width, k, r, s, stride);
+    }
+    let (hp, wp) = (h + 2 * pad, width + 2 * pad);
+    let (p, q) = ((hp - r) / stride + 1, (wp - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    // Zeroed padded input; scatter X into its interior.
+    let mut xpad_d = g.stream.alloc_zeros::<f16>(c * hp * wp)?;
+    let pad_ptx = crate::ptx_conv::pad_nchw_copy_ptx(c, h, width, pad);
+    let pad_mod = g.load_module_cached(&pad_ptx)?;
+    let pad_f = pad_mod.load_function("pad_nchw_copy")?;
+    let pad_cfg = LaunchConfig {
+        grid_dim: (((c * h * width) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut pb = g.stream.launch_builder(&pad_f);
+    pb.arg(&x_d).arg(&mut xpad_d);
+    unsafe { pb.launch(pad_cfg)? };
+    // Dense valid strided kernel on the padded buffer.
+    let ptx = crate::ptx_conv::conv_wmma_strided_ptx(c, hp, wp, k, r, s, stride);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&xpad_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Auto-dispatched** padded/affine conv2d — Mercury's best single-kernel affine-conv path for the
+/// shape. Picks a split-K factor via [`crate::ptx_conv::conv_splitk_factor_affine`] (device SM count)
+/// and runs the base bounds-checked [`conv2d_wmma_padded`] or, when the downsampled grid starves the SMs
+/// (deep-channel small-spatial, e.g. C128 28²→14²), the split-K path
+/// ([`crate::ptx_conv::conv_wmma_pad_splitk_ptx`] + the deterministic
+/// [`crate::ptx_conv::conv_splitk_reduce_ptx`]). Split-K composes with padding directly — the per-tap
+/// bounds check is independent of the K-slice. Same contract/precision as [`conv2d_wmma_padded`].
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_padded_auto(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
+    let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, stride, pad, g.sm_count() as usize);
+    if sk == 1 {
+        return conv2d_wmma_padded(g, x, w, c, h, width, k, r, s, stride, pad);
+    }
+    let (p, q) = ((h + 2 * pad - r) / stride + 1, (width + 2 * pad - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n)?;
+    let ptx = crate::ptx_conv::conv_wmma_pad_splitk_ptx(c, h, width, k, r, s, stride, pad, sk);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma_splitk")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), sk as u32),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut partial_d);
+    unsafe { bld.launch(cfg)? };
+    // Deterministic fixed-order reduction of the sk planes -> O[M,N].
+    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+    let rmod = g.load_module_cached(&rptx)?;
+    let rf = rmod.load_function("conv_splitk_reduce")?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(m * n)?;
+    let rcfg = LaunchConfig {
+        grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut rbld = g.stream.launch_builder(&rf);
+    rbld.arg(&partial_d).arg(&mut o_d);
+    unsafe { rbld.launch(rcfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// **Best-path conv2d dispatch** — routes a conv to Mercury's fastest *correct* kernel for the shape:
+/// - **Winograd F(4×4,3×3)** ([`winograd_conv2d`]) for **valid** (stride 1, no pad) 3×3, deep-channel
+///   (`C≥64`), large-spatial (`H,W≥28` ⇒ batched-GEMM tile count `T≥16`): measured **1.2–2.2× the
+///   implicit-GEMM**, itself cuDNN-parity — so this turns the bread-and-butter 3×3 from parity into a win.
+///   Excludes low channel count (C32 measured 0.77×: the transform-domain reduction `GK=C` is too thin)
+///   and small maps (`T<16`, where the batched GEMM under-fills).
+/// - the affine **split-K auto** path ([`conv2d_wmma_padded_auto`]) when strided or padded;
+/// - the valid **split-K auto** implicit-GEMM ([`conv2d_wmma_auto`]) otherwise.
+///
+/// Winograd carries a looser (rel-Frobenius) accuracy than the GEMM paths (the transform amplifies fp16
+/// quantization) — fine for inference, which is why it is only *auto*-selected here; a caller wanting the
+/// tighter `c·√K·ε` bound calls [`conv2d_wmma_auto`] / [`conv2d_wmma_padded_auto`] directly.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_best(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    // Winograd lane: valid 3×3, ≥64 channels, large enough spatial that the α² batched GEMM (N=tiles) is
+    // a real tensor-core problem. wino_ntiles gives the F(4,3) tile count T.
+    if r == 3 && s == 3 && stride == 1 && pad == 0 && c >= 64 && h >= 28 && width >= 28 {
+        let (_, _, nt) = crate::ptx_winograd::wino_ntiles(h, width, 4);
+        if nt >= 16 {
+            return winograd_conv2d(g, x, w, c, h, width, k, 4);
+        }
+    }
+    if stride > 1 || pad > 0 {
+        conv2d_wmma_padded_auto(g, x, w, c, h, width, k, r, s, stride, pad)
+    } else {
+        conv2d_wmma_auto(g, x, w, c, h, width, k, r, s)
+    }
 }
 
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
@@ -6796,6 +7293,785 @@ mod tests {
         });
     }
 
+    #[test]
+    fn conv_winograd_matches_reference_within_tol() {
+        with_gpu("winograd", |g| {
+            let mut rng = crate::diff::Rng::new(0x717023);
+            // (C,H,W,K) for R=S=3. Mix of tile-divisible and non-divisible spatials, small + larger;
+            // both F(2,3) (m=2) and F(4,3) (m=4) are gated. P=H-2, Q=W-2.
+            let cases = [
+                (3usize, 10usize, 10usize, 8usize), // P=Q=8
+                (16, 16, 16, 32),                   // P=Q=14 (not %4)
+                (8, 18, 18, 16),                    // P=Q=16
+                (32, 14, 14, 32),                   // P=Q=12 (%4) — small tile count
+                (4, 9, 9, 6),                       // P=Q=7 — divisible by neither 2 nor 4
+            ];
+            for (c, h, width, k) in cases {
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let wt = rng.vec(k * c * 9, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &wt, c, h, width, k, 3, 3);
+                for m in [2usize, 4] {
+                    let got = winograd_conv2d(g, &x, &wt, c, h, width, k, m).unwrap();
+                    // Winograd's correct gate is the **relative-Frobenius** norm ‖got−ref‖_F/‖ref‖_F, NOT
+                    // a per-element rel: the inverse transform produces many near-zero (cancellation)
+                    // outputs, on which a per-element rel explodes (~1e1) even at fp16's true accuracy,
+                    // while the aggregate norm stays ~the fp16 floor. fp16-in dominates (~2^-10·√(9C)),
+                    // F(4,3)'s ~4–7× amplification rides on top. A real bug blows the Frobenius ratio to
+                    // ~1e-1…1e0. A coarse per-element abs backstop catches a single catastrophic lane.
+                    let err_f = got
+                        .iter()
+                        .zip(&oracle)
+                        .map(|(a, b)| {
+                            let d = *a as f64 - *b as f64;
+                            d * d
+                        })
+                        .sum::<f64>()
+                        .sqrt();
+                    let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                    let fro_rel = err_f / ref_f.max(1e-9);
+                    let max_abs =
+                        got.iter().zip(&oracle).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0.0, f64::max);
+                    // fp16 + amplification + the small-output shapes here; ≫ a real-bug threshold (1e-1).
+                    let fro_tol = if m == 4 { 8e-3 } else { 4e-3 };
+                    let abs_backstop = if m == 4 { 3e-1 } else { 1.5e-1 };
+                    eprintln!(
+                        "winograd F({m},3) C{c} {h}x{width} K{k}: fro_rel={fro_rel:.2e} (tol {fro_tol:.0e})  max_abs={max_abs:.2e}"
+                    );
+                    assert!(
+                        fro_rel < fro_tol,
+                        "winograd F({m},3) C{c} {h}x{width} K{k}: rel-Frobenius {fro_rel:.3e} >= {fro_tol:.0e}"
+                    );
+                    assert!(
+                        max_abs < abs_backstop,
+                        "winograd F({m},3) C{c} {h}x{width} K{k}: max_abs {max_abs:.3e} >= {abs_backstop:.0e} (a lane blew up)"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn conv_wmma_epi_matches_reference_within_tol() {
+        use crate::ptx_wmma::Act;
+        // Host activations matching the kernel's epilogue (sigmoid/tanh approx; smooth, within fp16 tol).
+        let apply = |act: Act, v: f64| -> f64 {
+            match act {
+                Act::None => v,
+                Act::Relu => v.max(0.0),
+                Act::Silu => v / (1.0 + (-v).exp()),
+                Act::Gelu => {
+                    let c0 = (2.0f64 / std::f64::consts::PI).sqrt();
+                    0.5 * v * (1.0 + (c0 * (v + 0.044715 * v * v * v)).tanh())
+                }
+            }
+        };
+        with_gpu("conv_wmma_epi", |g| {
+            let mut rng = crate::diff::Rng::new(0xE91C0);
+            let cases = [
+                (16usize, 28usize, 28usize, 32usize, 3usize, 3usize),
+                (32, 14, 14, 64, 3, 3),
+                (8, 16, 16, 48, 5, 5),
+                (32, 14, 14, 64, 1, 1),
+            ];
+            for (c, h, width, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let conv = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                let (p, q) = (h - r + 1, width - s + 1);
+                let bias_v = rng.vec(k, -0.5, 0.5);
+                for (use_bias, act) in
+                    [(true, Act::None), (true, Act::Relu), (false, Act::Relu), (true, Act::Silu), (true, Act::Gelu)]
+                {
+                    let bias = if use_bias { Some(bias_v.as_slice()) } else { None };
+                    let act_name = match act {
+                        Act::None => "none",
+                        Act::Relu => "relu",
+                        Act::Silu => "silu",
+                        Act::Gelu => "gelu",
+                    };
+                    let got = conv2d_wmma_epi(g, &x, &w, c, h, width, k, r, s, bias, act).unwrap();
+                    // Oracle: act(conv + bias) per output channel, on the f32-cast conv.
+                    let mut oracle = vec![0f32; k * p * q];
+                    for kk in 0..k {
+                        let b = if use_bias { bias_v[kk] as f64 } else { 0.0 };
+                        for idx in 0..(p * q) {
+                            let v = conv[kk * p * q + idx] as f64 + b;
+                            oracle[kk * p * q + idx] = apply(act, v) as f32;
+                        }
+                    }
+                    let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                    let st = crate::diff::assert_close(
+                        &format!("conv_epi C{c} {h}x{width} K{k} {r}x{s} bias={use_bias} {act_name}"),
+                        &got,
+                        &oracle,
+                        5e-2,
+                        rel,
+                    );
+                    eprintln!(
+                        "conv_epi C{c} {h}x{width} K{k} {r}x{s} bias={use_bias} {act_name}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_strided_matches_reference_within_tol() {
+        // Strided conv f64 reference (output (p,q) reads input (p·st+r, q·st+s)).
+        fn ref_strided(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize, st: usize,
+        ) -> Vec<f32> {
+            let p = (h - r) / st + 1;
+            let q = (wd - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = op * st + rr;
+                                    let iw = oq * st + ss;
+                                    acc += x[cc * h * wd + ih * wd + iw] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_strided", |g| {
+            let mut rng = crate::diff::Rng::new(0x57121D);
+            // (C,H,W,K,R,S,stride): stride 2 + 3; 3×3, 5×5, 1×1; a non-divisible spatial.
+            let cases = [
+                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 2usize),
+                (32, 28, 28, 64, 3, 3, 2),
+                (8, 32, 32, 48, 5, 5, 2),
+                (64, 56, 56, 64, 1, 1, 2),
+                (16, 31, 31, 32, 3, 3, 3),
+            ];
+            for (c, h, width, k, r, s, st) in cases {
+                let (p, q) = ((h - r) / st + 1, (width - s) / st + 1);
+                if c < 1 || k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_strided(g, &x, &w, c, h, width, k, r, s, st).unwrap();
+                let oracle = ref_strided(&x, &w, c, h, width, k, r, s, st);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_strided C{c} {h}x{width} K{k} {r}x{s} s{st}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_strided C{c} {h}x{width} K{k} {r}x{s} stride{st}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_padded_matches_reference_within_tol() {
+        // General affine-conv f64 reference: output (p,q) reads input (p*st+r-pad, q*st+s-pad), with any
+        // coordinate outside [0,H)×[0,W) contributing 0 (zero-padding). Signed math avoids usize underflow.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_padded(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_padded", |g| {
+            let mut rng = crate::diff::Rng::new(0x9AD12C);
+            // (C,H,W,K,R,S,stride,pad): canonical "same" 3×3 p1; ResNet 3×3 s2 p1 + 7×7 s2 p3 stem; 5×5 p2.
+            let cases = [
+                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize),
+                (32, 28, 28, 64, 3, 3, 1, 1),
+                (16, 56, 56, 32, 3, 3, 2, 1),
+                (3, 64, 64, 64, 7, 7, 2, 3),
+                (8, 32, 32, 48, 5, 5, 1, 2),
+            ];
+            for (c, h, width, k, r, s, st, pad) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_padded(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_padded C{c} {h}x{width} K{k} {r}x{s} s{st} p{pad}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_padded C{c} {h}x{width} K{k} {r}x{s} stride{st} pad{pad}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_padded_explicit_matches_reference_within_tol() {
+        // The explicit-pad path (scatter into a zeroed buffer + dense valid kernel) must produce the
+        // same padded conv as the f64 oracle. Same cases/tolerance as the bounds-checked padded gate.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_padded(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_padded_explicit", |g| {
+            let mut rng = crate::diff::Rng::new(0xE7912D);
+            let cases = [
+                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize),
+                (32, 28, 28, 64, 3, 3, 1, 1),
+                (16, 56, 56, 32, 3, 3, 2, 1),
+                (3, 64, 64, 64, 7, 7, 2, 3),
+                (8, 32, 32, 48, 5, 5, 1, 2),
+            ];
+            for (c, h, width, k, r, s, st, pad) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_padded_explicit(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_padded_explicit C{c} {h}x{width} K{k} {r}x{s} s{st} p{pad}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_padded_explicit C{c} {h}x{width} K{k} {r}x{s} stride{st} pad{pad}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_padded_auto_matches_reference_within_tol() {
+        // The auto-dispatched padded path (split-K when the downsampled grid starves the SMs) must match
+        // the f64 oracle. Cases chosen so several trigger sk>1 (deep-channel small-spatial downsamples);
+        // the printed sk confirms the split-K reduce path is actually exercised.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_padded(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_padded_auto", |g| {
+            let mut rng = crate::diff::Rng::new(0x5C0FFE);
+            let sm = g.sm_count() as usize;
+            // (C,H,W,K,R,S,stride,pad): deep-channel small-spatial downsamples (sk>1) + one sk==1 control.
+            let cases = [
+                (128usize, 28usize, 28usize, 128usize, 3usize, 3usize, 2usize, 1usize),
+                (256, 14, 14, 256, 3, 3, 1, 1),
+                (64, 56, 56, 64, 3, 3, 2, 1),
+                (128, 28, 28, 128, 3, 3, 1, 1),
+                (64, 56, 56, 64, 3, 3, 1, 1), // base grid ~49 CTAs -> sk==1 control
+            ];
+            for (c, h, width, k, r, s, st, pad) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, st, pad, sm);
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_padded_auto(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_padded_auto C{c} {h}x{width} K{k} {r}x{s} s{st} p{pad} sk{sk}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_padded_auto C{c} {h}x{width} K{k} {r}x{s} stride{st} pad{pad} sk{sk}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_best_matches_reference_within_tol() {
+        // The best-path dispatch must be CORRECT whichever lane it routes to (Winograd / valid-auto /
+        // affine-auto). Gated by rel-Frobenius ‖got−ref‖_F/‖ref‖_F ≤ 8e-3 — the looser Winograd bound
+        // (the transform amplifies fp16 quant), which the GEMM lanes pass comfortably. Cases span every
+        // lane; the printed routing confirms the dispatch picked what we expect.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_affine(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_best", |g| {
+            let mut rng = crate::diff::Rng::new(0xBE57FE);
+            // (C,H,W,K,R,S,stride,pad, expected lane): every lane exercised.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 0usize, "winograd"),
+                (128, 28, 28, 128, 3, 3, 1, 0, "winograd"),
+                (32, 64, 64, 64, 3, 3, 1, 0, "valid-auto (C<64)"),
+                (64, 56, 56, 64, 1, 1, 1, 0, "valid-auto (1x1)"),
+                (64, 56, 56, 64, 3, 3, 2, 1, "affine-auto (s2p1)"),
+                (128, 28, 28, 128, 3, 3, 1, 1, "affine-auto (same)"),
+            ];
+            for (c, h, width, k, r, s, st, pad, lane) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_best(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_affine(&x, &w, c, h, width, k, r, s, st, pad);
+                let err_f = got
+                    .iter()
+                    .zip(&oracle)
+                    .map(|(a, b)| {
+                        let d = *a as f64 - *b as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                let fro_rel = err_f / ref_f.max(1e-9);
+                eprintln!("conv2d_best C{c} {h}x{width} K{k} {r}x{s} s{st}p{pad} -> {lane}: fro_rel={fro_rel:.2e}");
+                assert!(fro_rel < 8e-3, "conv2d_best C{c} {r}x{s} s{st}p{pad} ({lane}): rel-Frobenius {fro_rel:.3e} >= 8e-3");
+            }
+        });
+    }
+
+    /// **Fused conv+bias+ReLU vs the unfused chain** — the fused epilogue ([`conv2d_wmma_epi`]) in one
+    /// kernel vs a plain conv + a separate `bias_relu` pointwise pass (the extra HBM round-trip + launch
+    /// that fusion elides). Also times the plain conv alone, to show the epilogue itself is ~free. All
+    /// resident + same-run. The win is largest on memory-bound shapes (1×1), where the separate pass is a
+    /// bigger fraction of the conv.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA; run explicitly"]
+    fn conv_fused_epi_vs_unfused() {
+        use crate::baselines::conv_flop;
+        use crate::ptx_wmma::Act;
+        use half::f16;
+        with_gpu("conv_fused_epi_vs_unfused", |g| {
+            let mut rng = crate::diff::Rng::new(0x4ED10);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize),
+                (256, 14, 14, 256, 3, 3),
+                (64, 56, 56, 64, 1, 1),
+                (128, 28, 28, 128, 1, 1),
+            ];
+            for (c, h, wd, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, wd, k, r, s) {
+                    continue;
+                }
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let pq = p * q;
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let bias = rng.vec(k, -0.5, 0.5);
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let bias_d = g.stream.memcpy_stod(&bias).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(k * pq).unwrap();
+                let cfg = conv_wmma_cfg(h, wd, k, r, s);
+                let ef = g
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_epi_ptx(c, h, wd, k, r, s, Act::Relu, true))
+                    .unwrap()
+                    .load_function("conv2d_wmma")
+                    .unwrap();
+                let pf = g
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s))
+                    .unwrap()
+                    .load_function("conv2d_wmma")
+                    .unwrap();
+                let brf = g
+                    .load_module_cached(&crate::ptx_conv::bias_relu_ptx(k, pq))
+                    .unwrap()
+                    .load_function("bias_relu")
+                    .unwrap();
+                let cfg_br = LaunchConfig { grid_dim: (((k * pq) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let fused = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&ef);
+                    b.arg(&x_d).arg(&w_d).arg(&mut *o).arg(&bias_d);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                let plain = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&pf);
+                    b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                let unfused = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    plain(g, o);
+                    let mut b = g.stream.launch_builder(&brf);
+                    b.arg(&mut *o).arg(&bias_d);
+                    unsafe { b.launch(cfg_br).unwrap() };
+                };
+                fused(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let fo = g.stream.memcpy_dtov(&o_d).unwrap();
+                unfused(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let uo = g.stream.memcpy_dtov(&o_d).unwrap();
+                let maxd = fo.iter().zip(&uo).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(maxd < 1e-4, "fused vs unfused mismatch: {maxd:.2e}");
+
+                let iters = 50usize;
+                let t_fused = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { fused(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let t_plain = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { plain(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let t_unf = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { unfused(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let flop = conv_flop(c, h, wd, k, r, s);
+                eprintln!(
+                    "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: fused {:>6.0} GF | unfused(conv+pass) {:>6.0} GF | fusion {:>4.2}x faster | epilogue {:>+4.1}% vs plain ({:>6.0} GF)",
+                    flop / t_fused / 1e9,
+                    flop / t_unf / 1e9,
+                    t_unf / t_fused,
+                    100.0 * (t_fused - t_plain) / t_plain,
+                    flop / t_plain / 1e9,
+                );
+            }
+        });
+    }
+
+    /// **Winograd F(4×4,3×3) vs cuDNN vs the implicit-GEMM** — does Winograd's 2.25–4× multiply
+    /// reduction actually beat Mercury's (already cuDNN-parity) implicit-GEMM on **large feature maps**
+    /// (where the tile count `T` makes a fat batched-GEMM `N`)? All same-run, fp16 tensor cores, each
+    /// cross-checked (Winograd by rel-Frobenius) before timing; cuDNN best_of, algo disclosed. Winograd
+    /// times the full 4-phase pipeline resident; the implicit-GEMM is the resident `conv2d_wmma`.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_winograd_vs_cudnn() {
+        use crate::baselines::{
+            conv_flop, cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, nvrtc_naive_conv,
+            peers_available, time_cudnn_conv2d, time_nvrtc_naive_conv,
+        };
+        use half::f16;
+        with_gpu("conv_winograd_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] NVRTC not loadable.");
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x317E6D);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let m = 4usize; // F(4×4,3×3) — the cuDNN-grade tile
+            // Large feature maps (3×3, stride 1): T=tiles is a fat GEMM N → Winograd's regime.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize),
+                (32, 64, 64, 64),
+                (64, 112, 112, 64),
+                (128, 28, 28, 128),
+            ];
+            for (c, h, wd, k) in cases {
+                let (p, q) = (h - 2, wd - 2);
+                let alpha = m + 2;
+                let aa = alpha * alpha;
+                let (_, _, nt) = crate::ptx_winograd::wino_ntiles(h, wd, m);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * 9, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, 3, 3);
+
+                // Resident Winograd buffers + kernels (loaded once).
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut u_d = g.stream.alloc_zeros::<f16>(aa * k * c).unwrap();
+                let mut v_d = g.stream.alloc_zeros::<f16>(aa * c * nt).unwrap();
+                let mut m_d = g.stream.alloc_zeros::<f32>(aa * k * nt).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let ff = g
+                    .load_module_cached(&crate::ptx_winograd::wino_filter_xform_ptx(c, k, m))
+                    .unwrap()
+                    .load_function("wino_filter_xform")
+                    .unwrap();
+                let inf = g
+                    .load_module_cached(&crate::ptx_winograd::wino_input_xform_ptx(c, h, wd, m))
+                    .unwrap()
+                    .load_function("wino_input_xform")
+                    .unwrap();
+                let gf = g
+                    .load_module_cached(&crate::ptx_winograd::wino_bgemm_ptx(c, nt, k))
+                    .unwrap()
+                    .load_function("wino_bgemm")
+                    .unwrap();
+                let of = g
+                    .load_module_cached(&crate::ptx_winograd::wino_output_xform_ptx(k, h, wd, m))
+                    .unwrap()
+                    .load_function("wino_output_xform")
+                    .unwrap();
+                let (kc, cnt) = (k * c, c * nt);
+                let cfg1 = LaunchConfig { grid_dim: ((kc as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let cfg2 = LaunchConfig { grid_dim: ((cnt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let mut cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
+                cfg3.grid_dim.2 = aa as u32;
+                let cfg4 = LaunchConfig { grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let wino = |g: &Gpu,
+                            u: &mut cudarc::driver::CudaSlice<f16>,
+                            v: &mut cudarc::driver::CudaSlice<f16>,
+                            mm: &mut cudarc::driver::CudaSlice<f32>,
+                            o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&ff);
+                    b.arg(&w_d).arg(&mut *u);
+                    unsafe { b.launch(cfg1).unwrap() };
+                    let mut b = g.stream.launch_builder(&inf);
+                    b.arg(&x_d).arg(&mut *v);
+                    unsafe { b.launch(cfg2).unwrap() };
+                    let mut b = g.stream.launch_builder(&gf);
+                    b.arg(&*v).arg(&*u).arg(&mut *mm); // wino_bgemm(pV, pU, pM), gridDim.z=α²
+                    unsafe { b.launch(cfg3).unwrap() };
+                    let mut b = g.stream.launch_builder(&of);
+                    b.arg(&*mm).arg(&mut *o);
+                    unsafe { b.launch(cfg4).unwrap() };
+                };
+                wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let err_f = got.iter().zip(&oracle).map(|(a, b)| { let d = *a as f64 - *b as f64; d * d }).sum::<f64>().sqrt();
+                let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                let fro_rel = err_f / ref_f.max(1e-9);
+                assert!(fro_rel < 8e-3, "winograd C{c} {h}x{wd}: rel-Frobenius {fro_rel:.3e}");
+
+                // Implicit-GEMM resident (Mercury's other conv path, R=S=3).
+                let xi_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let wi_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut oi_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let igf = g
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, 3, 3))
+                    .unwrap()
+                    .load_function("conv2d_wmma")
+                    .unwrap();
+                let igcfg = conv_wmma_cfg(h, wd, k, 3, 3);
+                let ig = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&igf);
+                    b.arg(&xi_d).arg(&wi_d).arg(&mut *o);
+                    unsafe { b.launch(igcfg).unwrap() };
+                };
+
+                // naive Tier-A (cross-check only).
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, 3, 3).unwrap();
+                crate::diff::assert_close(&format!("naive C{c}"), &naive, &oracle, 5e-2, 5e-2);
+
+                let (cudnn_algo, g_c) = if have_cudnn {
+                    let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, 3, 3, 0, 1).unwrap();
+                    crate::diff::assert_close(&format!("cudnn C{c}"), &yc, &oracle, 5e-2, 5e-2);
+                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, 3, 3, 0, 1, 100).unwrap().0);
+                    (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, 3, 3) / t_c)
+                } else {
+                    ("n/a", 0.0)
+                };
+
+                let iters = 50usize;
+                let t_wino = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_ig = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { ig(g, &mut oi_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, 3, 3, 10).unwrap();
+                let flop = conv_flop(c, h, wd, k, 3, 3);
+                let (g_w, g_ig, g_n) = (flop / t_wino, flop / t_ig, flop / t_n);
+                eprintln!(
+                    "C{c:>3} {h}x{wd} K{k:>3} 3x3 T={nt:>4}: Winograd {:>6.0} GF ({:>4.1}× naive, {:>3.0}% cuDNN, {:>4.2}× implicit) | implicit {:>6.0} GF | cuDNN {:>6.0} GF [{}] | naive {:>5.0}",
+                    g_w / 1e9,
+                    g_w / g_n,
+                    if g_c > 0.0 { 100.0 * g_w / g_c } else { 0.0 },
+                    g_w / g_ig,
+                    g_ig / 1e9,
+                    g_c / 1e9,
+                    cudnn_algo,
+                    g_n / 1e9,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_splitk_matches_reference_within_tol() {
+        with_gpu("conv2d_wmma_splitk", |g| {
+            let mut rng = crate::diff::Rng::new(0x5719C0);
+            // (C,H,W,K,R,S, sk) — sk must divide GK=C*R*S. Deep-channel/small-spatial shapes are the
+            // split-K target, plus a 1×1 and an sk that does not divide BM-tiles evenly.
+            let cases = [
+                (64usize, 28usize, 28usize, 64usize, 3usize, 3usize, 4usize), // GK=576
+                (128, 14, 14, 128, 3, 3, 8),                                  // GK=1152
+                (32, 16, 16, 32, 3, 3, 2),                                    // GK=288 (gk_per=144)
+                (64, 16, 16, 32, 1, 1, 4),                                    // 1×1, GK=64 (gk_per=16)
+                (48, 18, 18, 16, 3, 3, 3),                                    // GK=432 (gk_per=144)
+            ];
+            for (c, h, width, k, r, s, sk) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
+                    continue;
+                }
+                assert_eq!((c * r * s) % sk, 0, "sk must divide GK");
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_splitk(g, &x, &w, c, h, width, k, r, s, sk).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let st = crate::diff::assert_close(
+                    &format!("conv2d_wmma_splitk C{c} {h}x{width} K{k} {r}x{s} sk{sk}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                // M12 determinism: disjoint planes + fixed ascending-z reduction ⇒ bit-reproducible.
+                let again = conv2d_wmma_splitk(g, &x, &w, c, h, width, k, r, s, sk).unwrap();
+                assert_eq!(got, again, "split-K conv must be deterministic (C{c} {r}x{s} sk{sk})");
+                eprintln!(
+                    "conv2d_wmma_splitk C{c} {h}x{width} K{k} {r}x{s} sk{sk}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
     /// **M6 for conv2d** — Mercury's fp16 tensor-core implicit-GEMM conv (and the f32 SMEM-tiled conv)
     /// vs the **naive CUDA-C conv** a programmer writes first (one thread per output, the whole `c,r,s`
     /// window streamed from global), all JIT-loaded through the same driver and timed **same-run** over
@@ -6927,6 +8203,590 @@ mod tests {
                     t_n * 1e3,
                     g_n / 1e9,
                 );
+            }
+        });
+    }
+
+    /// **The true conv gap (M6, Tier B):** Mercury's fp16 tensor-core implicit-GEMM conv2d vs **cuDNN**
+    /// — the industry-standard convolution library (implicit-precomp-GEMM / Winograd / FFT engines with
+    /// per-shape autotuning) — and vs **naive CUDA-C** (Tier A), all JIT-loaded through the same driver
+    /// and timed **same-run** over identical buffers. cuDNN runs its fp16 **NHWC** tensor-core fast path
+    /// (`CUDNN_TENSOR_OP_MATH`); the engine its v7 heuristic chose is **disclosed** per shape so the % is
+    /// honest about which cuDNN algorithm we're racing. Correctness gates speed: naive, Mercury, and
+    /// cuDNN are each cross-checked against the f64 oracle (fp16 tolerance) and checksum-cross-checked
+    /// before any ratio counts. Reports Mercury as **× vs naive** and **% of cuDNN**.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_vs_cudnn() {
+        use crate::baselines::{
+            conv_flop, cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, nvrtc_naive_conv,
+            peer_env_hint, peers_available, time_cudnn_conv2d, time_nvrtc_naive_conv,
+        };
+        use half::f16;
+        with_gpu("conv_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            if !have_cudnn {
+                eprintln!(
+                    "[warn] cuDNN not loadable — install nvidia-cudnn-cu12 into tools/cuda-redist and \
+                     put nvidia/cudnn/bin on PATH; reporting × vs naive only."
+                );
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0xC0DA77);
+
+            // Clock warmup (peak-vs-peak, same-run): hammer a GEMM until the mobile clock settles.
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+
+            // DL conv shapes (C,H,W,K,R,S): a ResNet-ish 3x3 stack + a 1x1 (pointwise) + a 5x5 + first layer.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize),
+                (128, 28, 28, 128, 3, 3),
+                (256, 14, 14, 256, 3, 3),
+                (64, 56, 56, 64, 1, 1), // pointwise = GEMM
+                (32, 32, 32, 32, 5, 5),
+                (3, 64, 64, 64, 3, 3), // first layer (C=3)
+            ];
+            for (c, h, wd, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, wd, k, r, s) {
+                    continue;
+                }
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+
+                // naive CUDA-C (Tier A): cross-check + checksum.
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
+                crate::diff::assert_close(&format!("naive C{c} {r}x{s}"), &naive, &oracle, 5e-2, rel);
+                let cs_n = csum(&naive);
+
+                // Mercury fp16 implicit-GEMM conv, AUTO-DISPATCHED (split-K when the base grid starves
+                // the SMs); resident, f16 X/W, conv (+ reduce) on persistent buffers so timing is pure.
+                let sk = crate::ptx_conv::conv_splitk_factor(c, h, wd, k, r, s, g.sm_count() as usize);
+                // Production path: the single-buffer implicit-GEMM (auto split-K). We ALSO build the
+                // register double-buffered pipeline below and time it same-run, so the pipeline delta is an
+                // honest in-run A/B — it lands neutral here (these convs are L2-resident, not HBM-latency
+                // bound, and the prefetch registers cut occupancy on the split-K shapes).
+                let (conv_ptx, conv_fn) = if sk == 1 {
+                    (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                } else {
+                    (crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                };
+                let cmod = g.load_module_cached(&conv_ptx).unwrap();
+                let cf = cmod.load_function(conv_fn).unwrap();
+                // Double-buffered A/B (same entry name, distinct module since the PTX differs).
+                let (sb_ptx, _) = if sk == 1 {
+                    (crate::ptx_conv::conv_wmma_db_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                } else {
+                    (crate::ptx_conv::conv_wmma_db_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                };
+                let sbmod = g.load_module_cached(&sb_ptx).unwrap();
+                let sbf = sbmod.load_function(conv_fn).unwrap();
+                let cfg_w = if sk == 1 {
+                    conv_wmma_cfg(h, wd, k, r, s)
+                } else {
+                    conv_wmma_splitk_cfg(h, wd, k, r, s, sk)
+                };
+                let xw_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let ww_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut part_d = g.stream.alloc_zeros::<f32>(sk * k * p * q).unwrap();
+                let mut ow_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let red = if sk > 1 {
+                    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(k * p * q, sk);
+                    let rmod = g.load_module_cached(&rptx).unwrap();
+                    let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                    Some((rmod, rf))
+                } else {
+                    None
+                };
+                let rcfg = LaunchConfig {
+                    grid_dim: (((k * p * q) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_w = |g: &Gpu,
+                                part: &mut cudarc::driver::CudaSlice<f32>,
+                                o: &mut cudarc::driver::CudaSlice<f32>| {
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&cf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&cf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&*part).arg(&mut *o);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                };
+                let launch_sb = |g: &Gpu,
+                                 part: &mut cudarc::driver::CudaSlice<f32>,
+                                 o: &mut cudarc::driver::CudaSlice<f32>| {
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&sbf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&sbf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&*part).arg(&mut *o);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                };
+                launch_w(g, &mut part_d, &mut ow_d);
+                g.stream.synchronize().unwrap();
+                let merc = g.stream.memcpy_dtov(&ow_d).unwrap();
+                crate::diff::assert_close(&format!("mercury C{c} {r}x{s} sk{sk}"), &merc, &oracle, 5e-2, rel);
+                // The single-buffer kernel must produce the **same** result (identical reduction order).
+                launch_sb(g, &mut part_d, &mut ow_d);
+                g.stream.synchronize().unwrap();
+                let merc_sb = g.stream.memcpy_dtov(&ow_d).unwrap();
+                assert_eq!(merc, merc_sb, "db vs single-buffer conv must be bit-identical (same MMA order)");
+
+                // cuDNN (Tier B): cross-check + checksum + disclosed algo. Timed **best_of(ROUNDS)** — the
+                // SAME robustness Mercury gets below — so a single thermal dip in cuDNN's window can't tank
+                // the ratio (a single-shot cuDNN timing vs Mercury's best-of swung the gap ~7× run-to-run).
+                let (cudnn_algo, g_c) = if have_cudnn {
+                    let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
+                    crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
+                    let cs_c = csum(&yc);
+                    assert!(
+                        (cs_c - cs_n).abs() / cs_n.max(1.0) < 6e-2,
+                        "cudnn checksum: c={cs_c:.3e} n={cs_n:.3e}"
+                    );
+                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap().0);
+                    (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, r, s) / t_c)
+                } else {
+                    ("n/a", 0.0)
+                };
+
+                // Speed, same-run.
+                let iters = 50usize;
+                let t_w = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch_w(g, &mut part_d, &mut ow_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_sb = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch_sb(g, &mut part_d, &mut ow_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let naive_iters = if c >= 128 { 10 } else { 30 };
+                let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, r, s, naive_iters).unwrap();
+                let flop = conv_flop(c, h, wd, k, r, s);
+                let (g_w, g_sb, g_n) = (flop / t_w, flop / t_sb, flop / t_n);
+                if have_cudnn {
+                    eprintln!(
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive, {:>3.0}% cuDNN) | db-pipe {:>4.2}× ({:>6.0} GF) | cuDNN {:>6.0} GF [{}] | naive {:>5.0} GF",
+                        g_w / 1e9,
+                        g_w / g_n,
+                        100.0 * g_w / g_c,
+                        g_sb / g_w,
+                        g_sb / 1e9,
+                        g_c / 1e9,
+                        cudnn_algo,
+                        g_n / 1e9,
+                    );
+                } else {
+                    eprintln!(
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive) | db-pipe {:>4.2}× ({:>6.0} GF) | naive {:>5.0} GF",
+                        g_w / 1e9,
+                        g_w / g_n,
+                        g_sb / g_w,
+                        g_sb / 1e9,
+                        g_n / 1e9,
+                    );
+                }
+            }
+        });
+    }
+
+    /// **Affine conv (strided + padded) vs cuDNN** — the general downsampling/"same" convolutions a real
+    /// CNN runs: 3×3 pad-1 "same", the ResNet 3×3 stride-2 pad-1 downsample, the 7×7 stride-2 pad-3 stem,
+    /// and a 1×1 pointwise. Mercury's [`conv2d_wmma_padded`] vs **cuDNN given the identical pad/stride**
+    /// (`cudnnConvolutionForward`, fp16 NHWC tensor-op fast path; chosen engine disclosed), same-run,
+    /// `best_of(ROUNDS)` on both contenders so the ~7× mobile-clock swing can't bias the ratio. Both are
+    /// cross-checked against an f64 affine-conv oracle (fp16 tolerance) and checksum-cross-checked before
+    /// the ratio counts. (The Tier-A naive CUDA-C peer is valid-conv-only, so affine reports % of cuDNN.)
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_affine_vs_cudnn() {
+        use crate::baselines::{
+            cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, peer_env_hint, peers_available,
+            time_cudnn_conv2d,
+        };
+        use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+        use cudarc::driver::CudaSlice;
+        use half::f16;
+        // f64 affine-conv oracle: out(p,q) = sum over (c,r,s) of X[c, p*st+r-pad, q*st+s-pad]·W, OOB=0.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_affine(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv_affine_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_affine_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            if !have_cudnn {
+                eprintln!("[warn] cuDNN not loadable — reporting Mercury GFLOP/s only.");
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0xAFF12E);
+            // Clock warmup (peak-vs-peak, same-run): hammer a GEMM until the mobile clock settles.
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+
+            // (C,H,W,K,R,S,stride,pad): 3×3 "same"; 3×3 s2 p1 + 7×7 s2 p3 downsamples; 1×1 pointwise.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, 1usize, 1usize),
+                (128, 28, 28, 128, 3, 3, 1, 1),
+                (64, 56, 56, 64, 3, 3, 2, 1),
+                (128, 28, 28, 128, 3, 3, 2, 1),
+                (3, 224, 224, 64, 7, 7, 2, 3),
+                (64, 56, 56, 64, 1, 1, 1, 0),
+            ];
+            for (c, h, wd, k, r, s, st, pad) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (wd + 2 * pad - s) / st + 1);
+                let (m, n) = (k, p * q);
+                if k < 16 || c * r * s < 16 || n < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let oracle = ref_affine(&x, &w, c, h, wd, k, r, s, st, pad);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+
+                // Mercury fp16 AUTO padded implicit-GEMM (conv2d_wmma_padded_auto), resident (x/w uploaded
+                // once → pure-compute timing): single bounds-checked kernel, or split-K + deterministic
+                // reduce when the downsampled grid starves the SMs (deep-channel small-spatial).
+                let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, wd, k, r, s, st, pad, g.sm_count() as usize);
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let mut part_d = g.stream.alloc_zeros::<f32>(sk * m * n).unwrap();
+                let (cptx, centry) = if sk == 1 {
+                    (crate::ptx_conv::conv_wmma_pad_ptx(c, h, wd, k, r, s, st, pad), "conv2d_wmma")
+                } else {
+                    (crate::ptx_conv::conv_wmma_pad_splitk_ptx(c, h, wd, k, r, s, st, pad, sk), "conv2d_wmma_splitk")
+                };
+                let cmod = g.load_module_cached(&cptx).unwrap();
+                let f = cmod.load_function(centry).unwrap();
+                let cfg = LaunchConfig {
+                    grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), sk as u32),
+                    block_dim: (WMMA_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let red = if sk > 1 {
+                    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+                    let rmod = g.load_module_cached(&rptx).unwrap();
+                    let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                    Some((rmod, rf))
+                } else {
+                    None
+                };
+                let rcfg = LaunchConfig {
+                    grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch = |g: &Gpu, part: &mut CudaSlice<f32>, o: &mut CudaSlice<f32>| {
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut *part);
+                        unsafe { b.launch(cfg).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&*part).arg(&mut *o);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                };
+                launch(g, &mut part_d, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let merc = g.stream.memcpy_dtov(&o_d).unwrap();
+                crate::diff::assert_close(&format!("mercury affine C{c} {r}x{s} s{st}p{pad} sk{sk}"), &merc, &oracle, 5e-2, rel);
+                let cs_m = csum(&merc);
+
+                // Mercury EXPLICIT-PAD path (same-run A/B): scatter X into a zeroed (H+2p)×(W+2p) buffer,
+                // then the dense VALID strided kernel — trades the in-kernel bounds checks for one streamed
+                // copy. Resident (x/w uploaded once); the scatter re-runs each iter (its honest cost).
+                let (hp, wp) = (h + 2 * pad, wd + 2 * pad);
+                let vptx = crate::ptx_conv::conv_wmma_strided_ptx(c, hp, wp, k, r, s, st);
+                let vmod = g.load_module_cached(&vptx).unwrap();
+                let vf = vmod.load_function("conv2d_wmma").unwrap();
+                let mut xpad_d = g.stream.alloc_zeros::<f16>(c * hp * wp).unwrap();
+                let pad_built = if pad > 0 {
+                    let pptx = crate::ptx_conv::pad_nchw_copy_ptx(c, h, wd, pad);
+                    let pmod = g.load_module_cached(&pptx).unwrap();
+                    let pf = pmod.load_function("pad_nchw_copy").unwrap();
+                    Some((pmod, pf))
+                } else {
+                    None
+                };
+                let pad_cfg = LaunchConfig {
+                    grid_dim: (((c * h * wd) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let vcfg = LaunchConfig {
+                    grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+                    block_dim: (WMMA_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_e = |g: &Gpu, xpad: &mut CudaSlice<f16>, o: &mut CudaSlice<f32>| {
+                    if let Some((_, pf)) = pad_built.as_ref() {
+                        let mut pb = g.stream.launch_builder(pf);
+                        pb.arg(&x_d).arg(&mut *xpad);
+                        unsafe { pb.launch(pad_cfg).unwrap() };
+                        let mut b = g.stream.launch_builder(&vf);
+                        b.arg(&*xpad).arg(&w_d).arg(&mut *o);
+                        unsafe { b.launch(vcfg).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&vf);
+                        b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                        unsafe { b.launch(vcfg).unwrap() };
+                    }
+                };
+                launch_e(g, &mut xpad_d, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let merc_e = g.stream.memcpy_dtov(&o_d).unwrap();
+                crate::diff::assert_close(&format!("mercury affine-explicit C{c} {r}x{s} s{st}p{pad}"), &merc_e, &oracle, 5e-2, rel);
+
+                // cuDNN with the SAME pad/stride: cross-check + checksum + disclosed algo, best_of(ROUNDS).
+                let (cudnn_algo, g_c) = if have_cudnn {
+                    let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, pad, st).unwrap();
+                    crate::diff::assert_close(&format!("cudnn affine C{c} {r}x{s} s{st}p{pad}"), &yc, &oracle, 5e-2, rel);
+                    let cs_c = csum(&yc);
+                    assert!((cs_c - cs_m).abs() / cs_m.max(1.0) < 6e-2, "cudnn checksum: c={cs_c:.3e} m={cs_m:.3e}");
+                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, r, s, pad, st, 100).unwrap().0);
+                    let flop = 2.0 * (k * p * q * c * r * s) as f64;
+                    (cudnn_fwd_algo_name(algo), flop / t_c)
+                } else {
+                    ("n/a", 0.0)
+                };
+
+                // Speed, same-run: auto (single-or-splitK) and explicit-pad (ex) both best_of(ROUNDS).
+                let iters = 50usize;
+                let t_w = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch(g, &mut part_d, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_e = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch_e(g, &mut xpad_d, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let flop = 2.0 * (k * p * q * c * r * s) as f64;
+                let (g_w, g_e) = (flop / t_w, flop / t_e);
+                let g_best = g_w.max(g_e);
+                if have_cudnn {
+                    eprintln!(
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} s{st}p{pad}: Mercury best {:>3.0}% cuDNN [auto(sk{sk}) {:>5.0} GF / ex {:>5.0} GF] | cuDNN {:>5.0} GF [{}]  (out {p}x{q})",
+                        100.0 * g_best / g_c,
+                        g_w / 1e9,
+                        g_e / 1e9,
+                        g_c / 1e9,
+                        cudnn_algo,
+                    );
+                } else {
+                    eprintln!(
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} s{st}p{pad}: Mercury auto(sk{sk}) {:>5.0} GF / ex {:>5.0} GF  (out {p}x{q})",
+                        g_w / 1e9,
+                        g_e / 1e9,
+                    );
+                }
+            }
+        });
+    }
+
+    /// **Split-K sweep** — for the deep-channel / small-spatial 3×3 convs where the base implicit-GEMM
+    /// under-fills the SMs (≈12–22 CTAs), sweep `sk ∈ {1,2,4,8}` of [`conv2d_wmma_splitk`] vs cuDNN,
+    /// same-run, to find the occupancy sweet spot. Each `sk` is cross-checked against the f64 oracle
+    /// before timing; cuDNN's chosen engine is disclosed. Reports each `sk` as GFLOP/s and % of cuDNN.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_splitk_vs_cudnn() {
+        use crate::baselines::{
+            conv_flop, cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, peer_env_hint,
+            peers_available, time_cudnn_conv2d,
+        };
+        use cudarc::driver::CudaSlice;
+        use half::f16;
+        with_gpu("conv_splitk_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_splitk_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x5717C0);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+
+            // (C,H,W,K,R,S, sk candidates) — sk must divide GK and GK/sk be a multiple of 16.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, vec![1usize, 2, 4]),
+                (128, 28, 28, 128, 3, 3, vec![1usize, 2, 4, 8]),
+                (256, 14, 14, 256, 3, 3, vec![1usize, 2, 4, 8]),
+                (256, 28, 28, 256, 3, 3, vec![1usize, 2, 4]),
+            ];
+            for (c, h, wd, k, r, s, sks) in cases {
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let (m, n) = (k, p * q);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let flop = conv_flop(c, h, wd, k, r, s);
+
+                let (g_c, algo) = if have_cudnn {
+                    let (yc, a) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
+                    crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
+                    let (t_c, _) = time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap();
+                    (flop / t_c, cudnn_fwd_algo_name(a))
+                } else {
+                    (0.0, "n/a")
+                };
+
+                let mut line = format!("C{c:>3} {h}x{wd} K{k:>3} {r}x{s}:");
+                let base_ctas = m.div_ceil(crate::ptx_conv::WMMA_BM) * n.div_ceil(crate::ptx_conv::WMMA_BN);
+                for sk in sks {
+                    let (conv_ptx, conv_fn) = if sk == 1 {
+                        (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                    } else {
+                        (crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                    };
+                    let cmod = g.load_module_cached(&conv_ptx).unwrap();
+                    let cf = cmod.load_function(conv_fn).unwrap();
+                    let cfg = if sk == 1 {
+                        conv_wmma_cfg(h, wd, k, r, s)
+                    } else {
+                        conv_wmma_splitk_cfg(h, wd, k, r, s, sk)
+                    };
+                    let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                    let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                    let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
+                    let red = if sk > 1 {
+                        let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+                        let rmod = g.load_module_cached(&rptx).unwrap();
+                        let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                        Some((rmod, rf))
+                    } else {
+                        None
+                    };
+                    let rcfg = LaunchConfig {
+                        grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let launch = |g: &Gpu, part: &mut CudaSlice<f32>, o: &mut CudaSlice<f32>| {
+                        if sk == 1 {
+                            let mut b = g.stream.launch_builder(&cf);
+                            b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        } else {
+                            let mut b = g.stream.launch_builder(&cf);
+                            b.arg(&x_d).arg(&w_d).arg(&mut *part);
+                            unsafe { b.launch(cfg).unwrap() };
+                            let (_, rf) = red.as_ref().unwrap();
+                            let mut rb = g.stream.launch_builder(rf);
+                            rb.arg(&*part).arg(&mut *o);
+                            unsafe { rb.launch(rcfg).unwrap() };
+                        }
+                    };
+                    launch(g, &mut partial_d, &mut o_d);
+                    g.stream.synchronize().unwrap();
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    crate::diff::assert_close(&format!("sk{sk} C{c} {r}x{s}"), &got, &oracle, 5e-2, rel);
+                    let iters = 50usize;
+                    let t = best_of(ROUNDS, || {
+                        let t0 = Instant::now();
+                        for _ in 0..iters {
+                            launch(g, &mut partial_d, &mut o_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / iters as f64
+                    });
+                    let gf = flop / t;
+                    let pct = if g_c > 0.0 { 100.0 * gf / g_c } else { 0.0 };
+                    line += &format!("  sk{sk} {:>5.0}GF({:>3.0}%)", gf / 1e9, pct);
+                }
+                eprintln!("{line}  | {base_ctas} base CTAs | cuDNN {:>5.0}GF [{}]", g_c / 1e9, algo);
             }
         });
     }

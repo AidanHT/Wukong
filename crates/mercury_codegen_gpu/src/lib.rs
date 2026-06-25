@@ -43,6 +43,11 @@ pub mod ptx_flash;
 #[cfg(feature = "gpu")]
 pub mod ptx_conv;
 
+// Winograd convolution F(2×2,3×3) / F(4×4,3×3): the f64 CPU reference (gate oracle) plus the GPU
+// transform + batched-GEMM PTX generators. The 2.25–4× multiply-reduction lever for 3×3 stride-1.
+#[cfg(feature = "gpu")]
+pub mod ptx_winograd;
+
 #[cfg(feature = "gpu")]
 pub mod ptx_fp8;
 
