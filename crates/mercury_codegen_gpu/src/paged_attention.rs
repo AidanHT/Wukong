@@ -36,22 +36,39 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DriverError, LaunchCon
 
 use crate::paged_kv::KvConfig;
 
-/// Threads per CTA for the decode-attention launch. Each thread owns one `(slot, head)`; threads are
-/// independent (no cooperation), so this is just an occupancy knob.
-pub const PAGED_ATTN_BLOCK: u32 = 128;
+/// `(slot, head)` pairs per CTA — one **warp** each (block_dim = `32 * PAGED_ATTN_WARPS`). The warp's
+/// 32 lanes cooperatively stream the context, so the launch fills the GPU (`num_slots*heads` warps)
+/// instead of the one-thread-per-pair version's `num_slots*heads` *threads* (which left 39/40 SMs idle).
+pub const PAGED_ATTN_WARPS: u32 = 4;
 
 /// PTX entry name for the paged decode-attention kernel.
 pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 
-/// Generate the paged decode-attention PTX, **specialized to `head_dim`** (the per-head dimension is
-/// baked so the query vector and the V accumulator unroll into named registers `%q0..` / `%acc0..`).
-/// One thread computes `out[slot,head,:] = softmax(scale · q · Kᵀ) · V` over the sequence's context,
-/// gathering K/V via the block table. Layout matches [`KvConfig::elem_offset`]:
-/// `[layers, num_blocks, block_size, heads, head_dim]`, f16 cache, f32 query/out.
+/// Generate the paged decode-attention PTX, **specialized to `head_dim`** (baked so the V accumulator
+/// unrolls into named registers `%acc0..` and the per-position dot unrolls). **Warp-cooperative**: one
+/// warp computes `out[slot,head,:] = softmax(scale · q · Kᵀ) · V` over the sequence's context — the 32
+/// lanes split the context positions (`lane, lane+32, …`), each keeping a partial online-softmax state,
+/// then a fixed shfl-butterfly merge combines them (`m`→max, rescale, `l`/`acc`→sum). The query vector
+/// lives in shared memory (one copy per warp, read by every lane). `PAGED_ATTN_WARPS` `(slot,head)`
+/// pairs per CTA. Layout matches [`KvConfig::elem_offset`]: `[layers, num_blocks, block_size, heads,
+/// head_dim]`, f16 cache, f32 query/out. **Bit-exact across block layouts** (the lane partition + merge
+/// order are layout-independent; the block table only changes the load address).
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     assert!(head_dim > 0 && head_dim % 2 == 0, "head_dim must be a positive even number");
     let hd = head_dim;
+    let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    // Finite negative sentinel for the online-softmax max init (avoids the -inf − -inf = NaN that the
+    // cross-lane merge would hit when an entire warp's context is empty).
+    let neg_big = format!("0f{:08X}", (-1.0e30f32).to_bits());
+    // Warp butterfly all-reduce of one f32 register under `op` (every lane ends with the full result).
+    let bfly = |reg: &str, op: &str| -> String {
+        let mut t = String::new();
+        for off in [16, 8, 4, 2, 1] {
+            t += &format!("    shfl.sync.bfly.b32 %rt,{reg},{off},0x1f,0xffffffff;\n    {op}.f32 {reg},{reg},%rt;\n");
+        }
+        t
+    };
     let mut s = String::new();
     s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
     s += &format!(
@@ -70,15 +87,13 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         \x20   .param .u32 pMbps,\n\
         \x20   .param .u32 pLayer\n)\n{{\n"
     );
-    // Registers. %q<hd>/%acc<hd> are the unrolled query cache + V accumulator.
-    s += &format!("    .reg .f32 %q<{hd}>;\n");
+    s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
-    s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%invl,%scale,%t0;\n";
+    s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
     s += "    .reg .b16 %h;\n";
-    s += "    .reg .b32 %gid,%slot,%head,%ctx,%t,%logical,%rem,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e;\n";
-    s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%off;\n";
-    s += "    .reg .pred %p0,%p1,%p2,%p3;\n";
-    // Load params.
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%dd;\n";
+    s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
+    s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];   cvta.to.global.u64 %Q,%Q;\n";
     s += "    ld.param.u64 %K,[pK];   cvta.to.global.u64 %K,%K;\n";
     s += "    ld.param.u64 %V,[pV];   cvta.to.global.u64 %V,%V;\n";
@@ -86,72 +101,68 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += "    ld.param.u64 %BT,[pBT]; cvta.to.global.u64 %BT,%BT;\n";
     s += "    ld.param.u64 %CL,[pCL]; cvta.to.global.u64 %CL,%CL;\n";
     s += "    ld.param.f32 %scale,[pScale];\n";
-    s += "    ld.param.u32 %bcap,[pBcap];\n";
-    s += "    ld.param.u32 %heads,[pHeads];\n";
-    s += "    ld.param.u32 %bsz,[pBsz];\n";
-    s += "    ld.param.u32 %nblk,[pNblk];\n";
-    s += "    ld.param.u32 %mbps,[pMbps];\n";
-    s += "    ld.param.u32 %layer,[pLayer];\n";
-    // gid = ctaid.x*ntid.x + tid.x ; bail if gid >= bcap*heads.
-    s += "    mov.u32 %tmp,%ctaid.x;\n    mov.u32 %gid,%ntid.x;\n    mov.u32 %slot,%tid.x;\n";
-    s += "    mad.lo.s32 %gid,%tmp,%gid,%slot;\n";
-    s += "    mul.lo.s32 %nq,%bcap,%heads;\n";
-    s += "    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
-    // slot = gid / heads ; head = gid - slot*heads.
-    s += "    div.u32 %slot,%gid,%heads;\n";
-    s += "    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
-    // ctx = CL[slot].
-    s += "    mul.wide.u32 %off,%slot,4;\n    add.s64 %addr,%CL,%off;\n    ld.global.u32 %ctx,[%addr];\n";
-    // D = heads*hd ; qidx = slot*D + head*hd ; qrow = Q + qidx*4 ; obase = O + qidx*4.
-    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n");
-    s += "    mul.lo.s32 %qidx,%slot,%D;\n";
-    s += &format!("    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
-    s += "    mul.wide.u32 %off,%qidx,4;\n    add.s64 %qrow,%Q,%off;\n    add.s64 %obase,%O,%off;\n";
-    // Cache the query vector in registers (read once, reused every context position).
-    for d in 0..hd {
-        s += &format!("    ld.global.f32 %q{d},[%qrow+{}];\n", d * 4);
-    }
-    // Init online-softmax state: acc=0, m=-inf, l=0.
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
+    s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    // tid = tid.x ; warp = tid/32 ; lane = tid%32 ; gid = ctaid.x*WARPS + warp.
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
+    s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
+    // slot = gid/heads ; head = gid - slot*heads ; ctx = CL[slot].
+    s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
+    // qidx = slot*D + head*hd ; qrow = Q + qidx*4 ; obase = O + qidx*4.
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
+    // qshw = &qsh[warp*hd] (this warp's query staging in shared).
+    s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
+    // Cooperatively stage q into shared: lane stores d = lane, lane+32, … ; warp-sync before the dot.
+    s += &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
+    s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%qrow,%offb;\n    ld.global.f32 %qv,[%addr];\n";
+    s += "    add.s64 %addr,%qshw,%offb;\n    st.shared.f32 [%addr],%qv;\n    add.u32 %dd,%dd,32;\n    bra QL;\nQLE:\n";
+    s += "    bar.warp.sync 0xffffffff;\n";
+    // Per-lane online softmax over positions {t : t%32 == lane}.
+    s += &format!("    mov.f32 %m,{neg_big};\n    mov.f32 %l,0f00000000;\n");
     for d in 0..hd {
         s += &format!("    mov.f32 %acc{d},0f00000000;\n");
     }
-    s += "    mov.f32 %m,0fFF800000;\n    mov.f32 %l,0f00000000;\n";
-    // Context loop with incremental block-table walk (no per-position divide).
-    s += "    mov.u32 %t,0;\n    mov.u32 %logical,0;\n    mov.u32 %rem,0;\n";
-    s += "LOOP:\n    setp.ge.u32 %p1,%t,%ctx;\n    @%p1 bra ENDLOOP;\n";
-    // (Re)load phys = BT[slot*mbps + logical] only at a block boundary (rem==0).
-    s += "    setp.ne.u32 %p3,%rem,0;\n    @%p3 bra HAVEPHYS;\n";
-    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %addr,%BT,%off;\n    ld.global.u32 %phys,[%addr];\n";
-    s += "HAVEPHYS:\n";
-    // e = ((((layer*nblk)+phys)*bsz + rem)*heads + head)*hd  (element index of this token's head, d=0).
-    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n";
-    s += "    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%rem;\n";
-    s += "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n";
-    s += &format!("    mul.lo.s32 %e,%e,{hd};\n");
-    s += "    mul.wide.u32 %off,%e,2;\n    add.s64 %kbase,%K,%off;\n    add.s64 %vbase,%V,%off;\n";
-    // score = scale * dot(q, K[t]).
+    s += "    mov.u32 %t,%lane;\nLOOP:\n    setp.ge.u32 %p1,%t,%ctx;\n    @%p1 bra ENDLOOP;\n";
+    // logical = t/bsz ; off = t - logical*bsz ; phys = BT[slot*mbps + logical].
+    s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    // e = ((((layer*nblk)+phys)*bsz + off)*heads + head)*hd ; kbase/vbase = slab + e*2.
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += &format!("    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n    mul.lo.s32 %e,%e,{hd};\n");
+    s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
+    // score = scale * dot(q, K[t])  (q from shared, K widened from f16).
     s += "    mov.f32 %score,0f00000000;\n";
     for d in 0..hd {
-        s += &format!("    ld.global.u16 %h,[%kbase+{}];\n    cvt.f32.f16 %kf,%h;\n    fma.rn.f32 %score,%q{d},%kf,%score;\n", d * 2);
+        s += &format!("    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.u16 %h,[%kbase+{}];\n    cvt.f32.f16 %kf,%h;\n    fma.rn.f32 %score,%qv,%kf,%score;\n", d * 4, d * 2);
     }
     s += "    mul.f32 %score,%score,%scale;\n";
-    // Online-softmax recurrence: newm=max(m,score); corr=exp(m-newm); p=exp(score-newm); l=l*corr+p.
     s += "    max.f32 %newm,%m,%score;\n";
     s += &format!("    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n");
     s += &format!("    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n");
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
-    // acc[d] = acc[d]*corr + p*V[t][d].
     for d in 0..hd {
         s += &format!("    ld.global.u16 %h,[%vbase+{}];\n    cvt.f32.f16 %vf,%h;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%p,%vf,%acc{d};\n", d * 2);
     }
-    s += "    mov.f32 %m,%newm;\n";
-    // Advance position; cross to the next block when the current one fills.
-    s += "    add.u32 %t,%t,1;\n    add.u32 %rem,%rem,1;\n";
-    s += "    setp.lt.u32 %p3,%rem,%bsz;\n    @%p3 bra LOOP;\n";
-    s += "    mov.u32 %rem,0;\n    add.u32 %logical,%logical,1;\n    bra LOOP;\n";
-    s += "ENDLOOP:\n";
-    // out[d] = acc[d] / l (0 if l==0, i.e. empty/inactive sequence). rcp.rn + select avoids NaN.
-    s += "    rcp.rn.f32 %invl,%l;\n    setp.gt.f32 %p2,%l,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
+    s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
+    // Cross-lane merge (fixed butterfly order): M = max(m) ; rescale by exp(m−M) ; L = Σl ; ACC = Σacc.
+    s += "    mov.f32 %M,%m;\n";
+    s += &bfly("%M", "max");
+    s += &format!("    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n");
+    s += "    mul.f32 %l,%l,%factor;\n";
+    for d in 0..hd {
+        s += &format!("    mul.f32 %acc{d},%acc{d},%factor;\n");
+    }
+    s += "    mov.f32 %L,%l;\n";
+    s += &bfly("%L", "add");
+    for d in 0..hd {
+        s += &bfly(&format!("%acc{d}"), "add");
+    }
+    // invL = (L>0) ? 1/L : 0  (the empty/inactive-sequence guard) ; lane 0 writes out[d] = ACC[d]·invL.
+    s += "    rcp.rn.f32 %invl,%L;\n    setp.gt.f32 %p2,%L,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
+    s += "    setp.ne.u32 %p0,%lane,0;\n    @%p0 bra DONE;\n";
     for d in 0..hd {
         s += &format!("    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n", d * 4);
     }
@@ -190,8 +201,8 @@ pub fn launch_paged_attn_decode(
     debug_assert_eq!(out_d.len(), bcap * cfg.heads * cfg.head_dim, "out must be [bcap, heads*head_dim]");
     let nq = (bcap * cfg.heads) as u32;
     let cfg_launch = LaunchConfig {
-        grid_dim: (nq.div_ceil(PAGED_ATTN_BLOCK), 1, 1),
-        block_dim: (PAGED_ATTN_BLOCK, 1, 1),
+        grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
+        block_dim: (32 * PAGED_ATTN_WARPS, 1, 1),
         shared_mem_bytes: 0,
     };
     let (heads, bsz, nblk, mbps, layer_u) =
@@ -379,8 +390,12 @@ mod tests {
         let ptx = paged_attn_decode_ptx(64);
         assert!(ptx.contains(".visible .entry paged_attn_decode("));
         assert!(ptx.contains(".target sm_89"));
-        assert!(ptx.contains("%q63") && ptx.contains("%acc63"), "head dim must unroll to 64 regs");
-        assert!(!ptx.contains("%q64"), "must not over-unroll past head_dim");
+        assert!(ptx.contains("%acc63"), "head dim must unroll the V accumulator to 64 regs");
+        assert!(!ptx.contains("%acc64"), "must not over-unroll past head_dim");
+        assert!(ptx.contains("qsh[256]"), "per-warp query staging in shared (WARPS*head_dim)");
+        assert!(ptx.contains("ld.shared.f32"), "query read from shared in the dot");
+        assert!(ptx.contains("shfl.sync.bfly.b32"), "cross-lane online-softmax merge");
+        assert!(ptx.contains("bar.warp.sync"), "warp sync after staging q");
         assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
         assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
         // The output uses rcp + select (the empty-sequence NaN guard).
@@ -423,6 +438,33 @@ mod tests {
             Some(g) => body(g),
             None => eprintln!("[skip] {name}: no CUDA device reachable"),
         }
+    }
+
+    /// Diagnostic: print the driver JIT error log for the paged-attn PTX (the `ptxas` line behind a bare
+    /// `CUDA_ERROR_INVALID_PTX`). Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu paged_attn_jit_log -- --ignored --nocapture`.
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "diagnostic; prints the driver JIT log for the paged-attn PTX module"]
+    fn paged_attn_jit_log() {
+        with_gpu("paged_attn_jit_log", |g| {
+            use cudarc::driver::sys;
+            g.ctx.bind_to_thread().unwrap();
+            let ptx = paged_attn_decode_ptx(64);
+            let ptx_c = std::ffi::CString::new(ptx).unwrap();
+            let mut log = vec![0u8; 32768];
+            let mut opts = [
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            ];
+            let mut vals: [*mut std::ffi::c_void; 2] = [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            let res = unsafe {
+                sys::cuModuleLoadDataEx(&mut module, ptx_c.as_ptr() as *const _, 2, opts.as_mut_ptr(), vals.as_mut_ptr())
+            };
+            let s = String::from_utf8_lossy(&log);
+            eprintln!("=== paged-attn JIT result {:?} ===\n{}", res, s.trim_end_matches('\0'));
+        });
     }
 
     /// Round a per-slot f32 K/V set to f16-and-back — the *effective* inputs the f16 cache stores, so the
