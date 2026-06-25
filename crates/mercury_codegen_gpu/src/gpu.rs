@@ -474,26 +474,16 @@ pub fn gemm_nt_f16(
     let ws_bytes = (m * k + n * k) * 2; // fp16 A+B working set (bytes)
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
-        // **Deeply HBM-bound (A+B ≳ 2×L2, e.g. ≥4096³):** the no-pad `ldmatrix`+XOR-swizzle workhorse
-        // wins (weakly dominant ~1.02–1.07× same-run, occasionally to 1.14×) — dropping the padding gives
-        // 3 CTAs/SM (vs the padded 2) to hide the HBM latency, and the swizzle keeps the gathers
-        // conflict-free at that occupancy. The L2-resident 2048³ (≈16 MB) keeps the padded hand-placed base
-        // (there the extra occupancy thrashes L2 and swz loses ~0.86×). Threshold validated at 4096³.
-        if ws_bytes >= 48 * 1024 * 1024 {
-            // GEMM-cliff win: the **w22** swizzle workhorse (2×2 warp grid = 32 mma/warp, 3 CTAs/SM) beats
-            // the w24 swz ~1.04–1.07× same-run at 4096³ (~81%→84% of cuBLAS, bit-gated). wm/wn=2,2 sets the
-            // 128-thread launch (`pipe_cfg` derives threads from wm·wn). Only the ≥48 MB arm — the padded
-            // 16–48 MB regime keeps w24 (padded w22 regresses 2048³).
-            let swz = crate::ptx_wmma::PipeCfg {
-                name: "mma_nt_f16_128_bk32_s2_r16_w22swz",
-                wm: 2,
-                wn: 2,
-                pad: 0,
-                ..*wh
-            };
-            return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz);
-        }
-        return gemm_nt_f16_pipe(g, a, b, m, k, n, wh);
+        // **Large regime (A+B ≥ 16 MB, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
+        // robust same-run winner — it beats the padded hand-placed base **1.23× @2048³ (87.4% vs 70.9% of
+        // cuBLAS) and 1.13× @4096³**. Dropping the padding buys a 3rd CTA/SM to hide HBM latency, and the
+        // swizzle keeps the `ldmatrix` gathers conflict-free without it. A clean re-measure on the
+        // round-robin best-of-N / self-noise-sentinel instrument (`gemm_cliff_ab`) showed the w22 2×2 warp
+        // grid is only a *noise-level* tie with w24 at 4096³ (0.97–1.02× across runs) and *loses* at 2048³,
+        // so the whole regime uses w24 (not w22, not the padded base). Bit-gated by
+        // `mma_swizzle_matches_reference_within_tol`.
+        let swz_w24 = crate::ptx_wmma::PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..*wh };
+        return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz_w24);
     }
     if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));
@@ -1437,13 +1427,11 @@ pub fn gemm_nt_bf16(
     // fix for the training precision, which otherwise fell through to the un-staged `_mt` path below.
     let ws_bytes = (m * k + n * k) * 2;
     if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
-        // Deeply HBM-bound (≥4096³): the no-pad ldmatrix+swizzle twin (3 CTAs/SM) — the fp16 4096³ win
-        // carried to the training dtype. L2-resident 2048³ keeps the padded hand-placed base.
-        if ws_bytes >= 48 * 1024 * 1024 {
-            // GEMM-cliff win carried to bf16: the w22 swizzle workhorse (2×2 warp grid, 3 CTAs/SM).
-            return gemm_nt_bf16_pipe_entry(g, a, b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_w22swz");
-        }
-        return gemm_nt_bf16_pipe(g, a, b, m, k, n);
+        // Large regime (A+B ≥ 16 MB, ≥2048³): the no-pad ldmatrix+XOR-swizzle **w24** twin is the robust
+        // same-run winner over the padded base (1.23× @2048³, 1.13× @4096³ — measured on fp16; bf16 shares
+        // the byte-identical `mma.sync` geometry). The w22 2×2 grid was only a noise-tie at 4096³ and lost
+        // at 2048³, so the whole regime uses w24. Bit-gated by `mma_swizzle_matches_reference_within_tol`.
+        return gemm_nt_bf16_pipe_entry(g, a, b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz");
     }
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
     let b16: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();

@@ -290,6 +290,7 @@ pub struct CliffCfg {
     pub wm: usize,
     pub wn: usize,
     pub stages: usize,
+    pub raster: usize,
     pub swz: bool,
     pub pad: usize,
     pub min_ctas: usize,
@@ -309,20 +310,22 @@ impl CliffCfg {
     }
 }
 
-/// The cliff sweep. `cliff_base_s2`/`cliff_swz_s2` are byte-identical to the dispatched padded/swizzle
-/// workhorses (the A/B baselines). The rest probe the research's **#1 lever — warp/threadblock tile
-/// shape** (more `mma`/warp = more ILP to hide tensor-core + ldmatrix latency, the climb-to-100% lever
-/// on sm_89) plus deeper pipeline depth. All BK=32 (the swizzle phase is derived for it), r16 raster.
+/// The cliff sweep. `cliff_swz_s2` is byte-identical to the dispatched swizzle workhorse (the A/B base).
+/// The rest probe the research's **#1 lever — warp/threadblock tile shape**. The 4096³ win was the warp
+/// grid (w22, 3 CTAs/SM). The 2048³ regime is the open floor: a 128×128 tile gives only 16×16 = **256
+/// macro-tiles on 20 SMs** (~4 waves at 3 CTAs/SM → tail/quantization waste), and the 16.8 MB working set
+/// sits right at the 12 MB L2 edge. *Smaller* tiles double/quadruple the tile count → better SM load
+/// balance (the classic small-GEMM lever), trading arithmetic intensity that L2 can absorb at this size.
+/// All BK=32 (the swizzle phase is derived for it), r16 raster (swept — optimal at both sizes).
 pub const CLIFF_VARIANTS: &[CliffCfg] = &[
-    // baselines (== production dispatch): w24 = 8 warps, 16 mma/warp
-    CliffCfg { name: "cliff_base_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, swz: false, pad: 8, min_ctas: 0 },
-    CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, swz: true, pad: 0, min_ctas: 0 },
-    // Decision sweep: w22 (4 warps, 64×64 warp, 32 mma/warp, 3 CTAs/SM) vs w24, for BOTH the padded
-    // (16–48 MB regime) and swizzle (≥48 MB regime) paths — to confirm w22 is safe to make the workhorse
-    // geometry (it changes both production paths) at 2048³ and 4096³.
-    CliffCfg { name: "cliff_base_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, swz: false, pad: 8, min_ctas: 0 },
-    CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, swz: true, pad: 0, min_ctas: 0 },
-    CliffCfg { name: "cliff_swz_w14", bm: 128, bn: 128, bk: 32, wm: 1, wn: 4, stages: 2, swz: true, pad: 0, min_ctas: 0 },
+    // Three production-shape anchors (all 128×128, BK=32, r16 — the swept-optimal macro-tile/raster).
+    //  - `cliff_swz_s2`  : no-pad swizzle, w24 (2×4) — the dispatched ≥48 MB base, the A/B reference.
+    //  - `cliff_swz_w22` : no-pad swizzle, w22 (2×2) — the 4096³ warp-tile winner (3 CTAs/SM, +ILP).
+    //  - `cliff_pad_w24` : padded (pad=8), w24 — byte-identical to the production `mma_nt_f16_128_bk32_s2_r16`
+    //    that the 16–48 MB arm dispatches; here to settle **swz-vs-padded @2048³ same-run** (the open floor).
+    CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0 },
+    CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0 },
+    CliffCfg { name: "cliff_pad_w24", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: false, pad: 8, min_ctas: 0 },
 ];
 
 /// Emit the cliff candidate PTX module (separate from `wmma_f16_ptx` so experiments never perturb the
@@ -333,8 +336,8 @@ pub fn gemm_cliff_ptx() -> &'static str {
         let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
         for v in CLIFF_VARIANTS {
             m += &entry_mma_pipe(
-                v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, 16, v.pad, Act::None, false, false,
-                v.swz, v.min_ctas,
+                v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false,
+                false, v.swz, v.min_ctas,
             );
         }
         m
