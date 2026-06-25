@@ -54,7 +54,7 @@ tolerance for the reassociated-float ones).
 | **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Mercury one 256-bit `sincos` |
 | **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar |
 | **Row argmax/argmin** (classification top-1) | ~2.6–3.4× | ~11.5–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize |
-| **Prefix sum** (per-row cumsum / scan) | ~1.4–1.7× | ~6.4–7.3× | the loop-carried `out[i]=out[i-1]+x[i]` won't auto-vectorize; SIMD Hillis-Steele scan |
+| **Scans** (cumsum / cummax / cummin) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan (cummax/cummin bit-exact) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu | ≈tie | — | already bandwidth-bound; no headroom |
 
