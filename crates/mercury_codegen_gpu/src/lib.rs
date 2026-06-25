@@ -108,3 +108,10 @@ pub use gpu::{available, gpu, Gpu};
 
 #[cfg(feature = "gpu")]
 pub use lower::{jit_run as lower_jit_run, GpuLowerBackend};
+
+// --- End-to-end serving (perf/gpu-serving): paged KV-cache + continuous batching + decode graph ---
+// Owned, append-only. The host block allocator (`paged_kv::BlockManager`) is pure policy with no device
+// dependency, so this module is declared *un-gated*: it compiles and unit-tests in a plain (no-`gpu`)
+// `cargo test`. Only the device cache (`PagedKvCache`) and the decode kernels are `#[cfg(feature =
+// "gpu")]` within. `paged_attention` and `serving` (GPU launchers/loops) are declared as they land.
+pub mod paged_kv;
