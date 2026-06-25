@@ -298,6 +298,279 @@ pub fn winograd_f43(x: &[f64], w: &[f64], c: usize, h: usize, wd: usize, k: usiz
 // Differential test: Winograd must match the naive direct conv to < 1e-9 in f64.
 // ---------------------------------------------------------------------------------------------
 
+// ===================================================================================================
+// GPU Winograd — the **non-fused, tensor-core** path (cuDNN's `WINOGRAD_NONFUSED` strategy).
+// ===================================================================================================
+//
+// Four phases over global buffers (fp16 storage, f32 transform arithmetic), tolerance-gated against the
+// f64 `winograd_f43`/`winograd_f23` reference above:
+//
+//   1. **filter transform**  U[ξν,k,c] = (G g_kc Gᵀ)[ξν]      — one thread per (k,c); one-time (weights).
+//   2. **input transform**   V[ξν,c,t] = (Bᵀ d_{c,t} B)[ξν]   — one thread per (c, output-tile t).
+//   3. **batched GEMM**      M[ξν,k,t] = Σ_c U[ξν,k,c]·V[ξν,c,t] — α² independent [K×C]·[C×T] GEMMs,
+//      each reusing the **proven `conv_wmma` tensor-core kernel** with R=S=1 (it computes exactly
+//      `O[K,N] = W[K,C]·X[C,N]`); the (ξν) batch is the launcher loop. This is where the FLOPs are, and
+//      where Winograd's 2.25–4× multiply reduction pays — the transforms are cheap elementwise maps.
+//   4. **output transform**  O[k,p,q] = (Aᵀ M_{k,t} A)[..]    — one thread per (k, tile), scatter.
+//
+// Each transform `out = Mat · in` is a constant linear map (the B/G/A matrices are sparse integers /
+// dyadic fractions), so the kernels are a load → unrolled FMA chain (nonzero coefficients only) → store,
+// computed in f32 to keep fp16's ~1e-3 quantization the only error. The buffer layouts are chosen so
+// phase 3 is a plain row-major `W[K,C]·X[C,T]`: U is [ξν][K][C], V is [ξν][C][T], M is [ξν][K][T]
+// (M is f32 — it is conv2d_wmma's f32 accumulator output, read directly by the output transform).
+
+/// f32 hex-bits literal for a PTX immediate (`0fXXXXXXXX`).
+fn f32_hex(v: f64) -> String {
+    format!("0f{:08X}", (v as f32).to_bits())
+}
+
+/// The (Bᵀ, G, Aᵀ, α) constant set for output-tile size `m` (2 → F(2,3), 4 → F(4,3)).
+fn wino_consts(m: usize) -> (&'static [f64], &'static [f64], &'static [f64], usize) {
+    match m {
+        2 => (&F23_BT, &F23_G, &F23_AT, 4),
+        4 => (&F43_BT, &F43_G, &F43_AT, 6),
+        _ => panic!("Winograd output tile m={m} unsupported (use 2 or 4)"),
+    }
+}
+
+/// Filter-transform map `U_flat[α²] = Mf · g_flat[9]`, where `Mf[(ξ,ν)][(i,j)] = G[ξ,i]·G[ν,j]`
+/// (so `U[ξ,ν] = Σ_ij G[ξ,i] g[i,j] G[ν,j] = (G g Gᵀ)[ξ,ν]`). Row-major `α²×9`.
+fn filter_map(g: &[f64], alpha: usize) -> Vec<f64> {
+    let mut mf = vec![0.0f64; alpha * alpha * 9];
+    for xi in 0..alpha {
+        for nu in 0..alpha {
+            for i in 0..3 {
+                for j in 0..3 {
+                    mf[(xi * alpha + nu) * 9 + (i * 3 + j)] = g[xi * 3 + i] * g[nu * 3 + j];
+                }
+            }
+        }
+    }
+    mf
+}
+
+/// Input-transform map `V_flat[α²] = Mi · d_flat[α²]`, `Mi[(ξ,ν)][(a,b)] = Bᵀ[ξ,a]·Bᵀ[ν,b]`
+/// (so `V[ξ,ν] = Σ_ab Bᵀ[ξ,a] d[a,b] Bᵀ[ν,b] = (Bᵀ d B)[ξ,ν]`). Row-major `α²×α²`.
+fn input_map(bt: &[f64], alpha: usize) -> Vec<f64> {
+    let aa = alpha * alpha;
+    let mut mi = vec![0.0f64; aa * aa];
+    for xi in 0..alpha {
+        for nu in 0..alpha {
+            for a in 0..alpha {
+                for b in 0..alpha {
+                    mi[(xi * alpha + nu) * aa + (a * alpha + b)] = bt[xi * alpha + a] * bt[nu * alpha + b];
+                }
+            }
+        }
+    }
+    mi
+}
+
+/// Output-transform map `Y_flat[m²] = Mo · M_flat[α²]`, `Mo[(yi,yj)][(ξ,ν)] = Aᵀ[yi,ξ]·Aᵀ[yj,ν]`
+/// (so `Y[yi,yj] = Σ_ξν Aᵀ[yi,ξ] M[ξ,ν] Aᵀ[yj,ν] = (Aᵀ M A)[yi,yj]`). Row-major `m²×α²`.
+fn output_map(at: &[f64], m: usize, alpha: usize) -> Vec<f64> {
+    let aa = alpha * alpha;
+    let mut mo = vec![0.0f64; m * m * aa];
+    for yi in 0..m {
+        for yj in 0..m {
+            for xi in 0..alpha {
+                for nu in 0..alpha {
+                    mo[(yi * m + yj) * aa + (xi * alpha + nu)] = at[yi * alpha + xi] * at[yj * alpha + nu];
+                }
+            }
+        }
+    }
+    mo
+}
+
+/// Emit the FMA chain `%{acc} = Σ_j row[j]·%{pre}{j}` over the nonzero coefficients of `row` (a `mul`
+/// seeds the first term so no separate zero-init; an all-zero row yields a `mov 0`).
+fn emit_lincomb(s: &mut String, acc: &str, row: &[f64], pre: &str) {
+    use std::fmt::Write as _;
+    let mut first = true;
+    for (j, &co) in row.iter().enumerate() {
+        if co.abs() < 1e-12 {
+            continue;
+        }
+        if first {
+            let _ = writeln!(s, "    mul.f32 {acc},%{pre}{j},{};", f32_hex(co));
+            first = false;
+        } else {
+            let _ = writeln!(s, "    fma.rn.f32 {acc},%{pre}{j},{},{acc};", f32_hex(co));
+        }
+    }
+    if first {
+        let _ = writeln!(s, "    mov.f32 {acc},0f00000000;");
+    }
+}
+
+/// Number of Winograd output tiles for `[H,W]`, output-tile size `m`: `ceil((H-2)/m)·ceil((W-2)/m)`.
+pub fn wino_ntiles(h: usize, w: usize, m: usize) -> (usize, usize, usize) {
+    let (p, q) = (h - 2, w - 2);
+    let (nti, ntj) = (p.div_ceil(m), q.div_ceil(m));
+    (nti, ntj, nti * ntj)
+}
+
+/// **Phase 1 — filter transform.** `wino_filter_xform(pW, pU)`: `W[K,C,3,3]` (f16) → `U[α²,K,C]` (f16),
+/// `U[ξν,k,c] = (G g_kc Gᵀ)[ξν]`. One thread per `(k,c)` (1-D grid over `K·C`); loads the 9 filter taps,
+/// widens to f32, runs the `α²×9` constant map, stores `α²` outputs `U[ξν·KC + tid]`.
+pub fn wino_filter_xform_ptx(c: usize, k: usize, m: usize) -> String {
+    use std::fmt::Write as _;
+    let (_, g, _, alpha) = wino_consts(m);
+    let aa = alpha * alpha;
+    let mf = filter_map(g, alpha);
+    let kc = k * c;
+    let mut s = String::new();
+    let _ = writeln!(s, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(s, "// Winograd F({m},3) filter transform: W[K{k},C{c},3,3] -> U[{aa},K,C]");
+    let _ = writeln!(s, ".visible .entry wino_filter_xform(\n    .param .u64 pW,\n    .param .u64 pU\n)\n{{");
+    let _ = writeln!(s, "    .reg .pred %p0;");
+    let _ = writeln!(s, "    .reg .b16 %h;");
+    let _ = writeln!(s, "    .reg .b32 %gid,%t,%n,%i;");
+    let _ = writeln!(s, "    .reg .f32 {};", {
+        let mut d = String::from("%acc");
+        for j in 0..9 {
+            d += &format!(",%in{j}");
+        }
+        d
+    });
+    let _ = writeln!(s, "    .reg .b64 %W,%U,%off,%base,%ptr;");
+    let _ = writeln!(s, "    ld.param.u64 %W,[pW];\n    ld.param.u64 %U,[pU];");
+    let _ = writeln!(s, "    cvta.to.global.u64 %W,%W;\n    cvta.to.global.u64 %U,%U;");
+    let _ = writeln!(s, "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;");
+    let _ = writeln!(s, "    mad.lo.s32 %gid,%t,%n,%i;");
+    let _ = writeln!(s, "    setp.ge.u32 %p0,%gid,{kc};\n    @%p0 bra RET;");
+    // load 9 taps: W[tid*9 + j]
+    let _ = writeln!(s, "    mul.lo.s32 %t,%gid,9;");
+    let _ = writeln!(s, "    mul.wide.u32 %off,%t,2;\n    add.s64 %base,%W,%off;");
+    for j in 0..9 {
+        let _ = writeln!(s, "    ld.global.u16 %h,[%base+{}];\n    cvt.f32.f16 %in{j},%h;", j * 2);
+    }
+    // U base for this thread: pU + tid*2 ; per-xi store adds xi*KC*2 (constant)
+    let _ = writeln!(s, "    mul.wide.u32 %off,%gid,2;\n    add.s64 %base,%U,%off;");
+    for e in 0..aa {
+        emit_lincomb(&mut s, "%acc", &mf[e * 9..e * 9 + 9], "in");
+        let _ = writeln!(s, "    cvt.rn.f16.f32 %h,%acc;\n    st.global.u16 [%base+{}],%h;", e * kc * 2);
+    }
+    let _ = writeln!(s, "RET:\n    ret;\n}}");
+    s
+}
+
+/// **Phase 2 — input transform.** `wino_input_xform(pX, pV)`: `X[C,H,W]` (f16) → `V[α²,C,T]` (f16),
+/// `V[ξν,c,t] = (Bᵀ d_{c,t} B)[ξν]` with `T` = number of output tiles. One thread per `(c, tile)`
+/// (1-D grid over `C·T`); gathers the `α×α` input tile (zero-padding out-of-range edge reads), widens to
+/// f32, runs the `α²×α²` constant map, stores `V[ξν·CT + tid]`.
+pub fn wino_input_xform_ptx(c: usize, h: usize, w: usize, m: usize) -> String {
+    use std::fmt::Write as _;
+    let (bt, _, _, alpha) = wino_consts(m);
+    let aa = alpha * alpha;
+    let mi = input_map(bt, alpha);
+    let (_nti, ntj, nt) = wino_ntiles(h, w, m);
+    let ct = c * nt;
+    let hw = h * w;
+    let mut s = String::new();
+    let _ = writeln!(s, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(s, "// Winograd F({m},3) input transform: X[C{c},H{h},W{w}] -> V[{aa},C,T{nt}]");
+    let _ = writeln!(s, ".visible .entry wino_input_xform(\n    .param .u64 pX,\n    .param .u64 pV\n)\n{{");
+    let _ = writeln!(s, "    .reg .pred %p0,%pi,%pj;");
+    let _ = writeln!(s, "    .reg .b16 %h;");
+    let _ = writeln!(s, "    .reg .b32 %gid,%t,%n,%i,%cc,%tile,%ti,%tj,%i0,%j0,%gi,%gj,%xb,%idx;");
+    let _ = writeln!(s, "    .reg .f32 {};", {
+        let mut d = String::from("%acc");
+        for e in 0..aa {
+            d += &format!(",%in{e}");
+        }
+        d
+    });
+    let _ = writeln!(s, "    .reg .b64 %X,%V,%off,%base,%ptr;");
+    let _ = writeln!(s, "    ld.param.u64 %X,[pX];\n    ld.param.u64 %V,[pV];");
+    let _ = writeln!(s, "    cvta.to.global.u64 %X,%X;\n    cvta.to.global.u64 %V,%V;");
+    let _ = writeln!(s, "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;");
+    let _ = writeln!(s, "    mad.lo.s32 %gid,%t,%n,%i;");
+    let _ = writeln!(s, "    setp.ge.u32 %p0,%gid,{ct};\n    @%p0 bra RET;");
+    // c = tid/nt ; tile = tid%nt ; ti = tile/ntj ; tj = tile%ntj
+    let _ = writeln!(s, "    div.u32 %cc,%gid,{nt};\n    rem.u32 %tile,%gid,{nt};");
+    let _ = writeln!(s, "    div.u32 %ti,%tile,{ntj};\n    rem.u32 %tj,%tile,{ntj};");
+    let _ = writeln!(s, "    mul.lo.s32 %i0,%ti,{m};\n    mul.lo.s32 %j0,%tj,{m};");
+    let _ = writeln!(s, "    mul.lo.s32 %xb,%cc,{hw};        // c*H*W");
+    // gather d[a][b] -> %in{a*alpha+b}, zero-pad OOB
+    for a in 0..alpha {
+        let _ = writeln!(s, "    add.s32 %gi,%i0,{a};\n    setp.lt.u32 %pi,%gi,{h};");
+        for b in 0..alpha {
+            let e = a * alpha + b;
+            let _ = writeln!(s, "    add.s32 %gj,%j0,{b};\n    setp.lt.u32 %pj,%gj,{w};\n    and.pred %pj,%pj,%pi;");
+            let _ = writeln!(s, "    mad.lo.s32 %idx,%gi,{w},%xb;\n    add.s32 %idx,%idx,%gj;");
+            let _ = writeln!(s, "    mul.wide.u32 %off,%idx,2;\n    add.s64 %ptr,%X,%off;");
+            let _ = writeln!(s, "    mov.u16 %h,0;\n    @%pj ld.global.u16 %h,[%ptr];\n    cvt.f32.f16 %in{e},%h;");
+        }
+    }
+    // V base: pV + tid*2 ; per-xi store adds xi*CT*2
+    let _ = writeln!(s, "    mul.wide.u32 %off,%gid,2;\n    add.s64 %base,%V,%off;");
+    for e in 0..aa {
+        emit_lincomb(&mut s, "%acc", &mi[e * aa..e * aa + aa], "in");
+        let _ = writeln!(s, "    cvt.rn.f16.f32 %h,%acc;\n    st.global.u16 [%base+{}],%h;", e * ct * 2);
+    }
+    let _ = writeln!(s, "RET:\n    ret;\n}}");
+    s
+}
+
+/// **Phase 4 — output transform.** `wino_output_xform(pM, pO)`: `M[α²,K,T]` (f32) → `O[K,P,Q]` (f32),
+/// `O[k,·] = (Aᵀ M_{k,t} A)`. One thread per `(k, tile)` (1-D grid over `K·T`); gathers the `α²`
+/// transform-domain values `M[ξν·KT + tid]`, widens to f32, runs the `m²×α²` constant map, scatters the
+/// `m×m` outputs into `O` (clipping the right/bottom edge tiles).
+pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
+    use std::fmt::Write as _;
+    let (_, _, at, alpha) = wino_consts(m);
+    let aa = alpha * alpha;
+    let mo = output_map(at, m, alpha);
+    let (p, q) = (h - 2, w - 2);
+    let (_nti, ntj, nt) = wino_ntiles(h, w, m);
+    let kt = k * nt;
+    let mut s = String::new();
+    let _ = writeln!(s, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(s, "// Winograd F({m},3) output transform: M[{aa},K{k},T{nt}] -> O[K,P{p},Q{q}]");
+    let _ = writeln!(s, ".visible .entry wino_output_xform(\n    .param .u64 pM,\n    .param .u64 pO\n)\n{{");
+    let _ = writeln!(s, "    .reg .pred %p0,%pi,%pj;");
+    let _ = writeln!(s, "    .reg .b16 %h;");
+    let _ = writeln!(s, "    .reg .b32 %gid,%t,%n,%i,%kk,%tile,%ti,%tj,%i0,%j0,%oi,%oj,%idx;");
+    let _ = writeln!(s, "    .reg .f32 {};", {
+        let mut d = String::from("%acc");
+        for e in 0..aa {
+            d += &format!(",%in{e}");
+        }
+        d
+    });
+    let _ = writeln!(s, "    .reg .b64 %M,%O,%off,%base,%ptr;");
+    let _ = writeln!(s, "    ld.param.u64 %M,[pM];\n    ld.param.u64 %O,[pO];");
+    let _ = writeln!(s, "    cvta.to.global.u64 %M,%M;\n    cvta.to.global.u64 %O,%O;");
+    let _ = writeln!(s, "    mov.u32 %t,%ctaid.x;\n    mov.u32 %n,%ntid.x;\n    mov.u32 %i,%tid.x;");
+    let _ = writeln!(s, "    mad.lo.s32 %gid,%t,%n,%i;");
+    let _ = writeln!(s, "    setp.ge.u32 %p0,%gid,{kt};\n    @%p0 bra RET;");
+    let _ = writeln!(s, "    div.u32 %kk,%gid,{nt};\n    rem.u32 %tile,%gid,{nt};");
+    let _ = writeln!(s, "    div.u32 %ti,%tile,{ntj};\n    rem.u32 %tj,%tile,{ntj};");
+    let _ = writeln!(s, "    mul.lo.s32 %i0,%ti,{m};\n    mul.lo.s32 %j0,%tj,{m};");
+    // gather M_flat[xi] = pM[xi*KT + tid]. M is **f32** (it is conv2d_wmma's f32 output), so a 4-byte
+    // stride and a direct f32 load — no f16 widening.
+    let _ = writeln!(s, "    mul.wide.u32 %off,%gid,4;\n    add.s64 %base,%M,%off;");
+    for e in 0..aa {
+        let _ = writeln!(s, "    ld.global.f32 %in{e},[%base+{}];", e * kt * 4);
+    }
+    // Y = Mo · M_flat ; scatter Y[yi*m+yj] -> O[(kk*P + oi)*Q + oj], oi=i0+yi, oj=j0+yj, clip edges
+    for yi in 0..m {
+        let _ = writeln!(s, "    add.s32 %oi,%i0,{yi};\n    setp.lt.u32 %pi,%oi,{p};");
+        for yj in 0..m {
+            let e = yi * m + yj;
+            emit_lincomb(&mut s, "%acc", &mo[e * aa..e * aa + aa], "in");
+            let _ = writeln!(s, "    add.s32 %oj,%j0,{yj};\n    setp.lt.u32 %pj,%oj,{q};\n    and.pred %pj,%pj,%pi;");
+            let _ = writeln!(s, "    mad.lo.s32 %idx,%kk,{p},%oi;\n    mul.lo.s32 %idx,%idx,{q};\n    add.s32 %idx,%idx,%oj;");
+            let _ = writeln!(s, "    mul.wide.u32 %off,%idx,4;\n    add.s64 %ptr,%O,%off;");
+            let _ = writeln!(s, "    @%pj st.global.f32 [%ptr],%acc;");
+        }
+    }
+    let _ = writeln!(s, "RET:\n    ret;\n}}");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
