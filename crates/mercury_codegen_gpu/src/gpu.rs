@@ -2268,6 +2268,52 @@ pub fn conv2d_wmma_strided(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Strided + zero-padded** fp16 tensor-core implicit-GEMM conv2d — the general affine conv. Output
+/// `P=⌊(H+2·pad-R)/stride⌋+1`, `Q=⌊(W+2·pad-S)/stride⌋+1`; output pixel `(p,q)` reads input
+/// `(p·stride+r-pad, q·stride+s-pad)`, OOB coords contributing 0
+/// ([`crate::ptx_conv::conv_wmma_pad_ptx`]). The canonical "same" conv (3×3 pad-1) and ResNet stride-2
+/// pad-1 downsample. `pad=0` matches [`conv2d_wmma_strided`]. Tolerance-gated at fp16.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_padded(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
+    let (p, q) = ((h + 2 * pad - r) / stride + 1, (width + 2 * pad - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let ptx = crate::ptx_conv::conv_wmma_pad_ptx(c, h, width, k, r, s, stride, pad);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(cfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -7256,6 +7302,76 @@ mod tests {
                 );
                 eprintln!(
                     "conv_strided C{c} {h}x{width} K{k} {r}x{s} stride{st}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_padded_matches_reference_within_tol() {
+        // General affine-conv f64 reference: output (p,q) reads input (p*st+r-pad, q*st+s-pad), with any
+        // coordinate outside [0,H)×[0,W) contributing 0 (zero-padding). Signed math avoids usize underflow.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_padded(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_padded", |g| {
+            let mut rng = crate::diff::Rng::new(0x9AD12C);
+            // (C,H,W,K,R,S,stride,pad): canonical "same" 3×3 p1; ResNet 3×3 s2 p1 + 7×7 s2 p3 stem; 5×5 p2.
+            let cases = [
+                (16usize, 56usize, 56usize, 32usize, 3usize, 3usize, 1usize, 1usize),
+                (32, 28, 28, 64, 3, 3, 1, 1),
+                (16, 56, 56, 32, 3, 3, 2, 1),
+                (3, 64, 64, 64, 7, 7, 2, 3),
+                (8, 32, 32, 48, 5, 5, 1, 2),
+            ];
+            for (c, h, width, k, r, s, st, pad) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_padded(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_padded C{c} {h}x{width} K{k} {r}x{s} s{st} p{pad}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_padded C{c} {h}x{width} K{k} {r}x{s} stride{st} pad{pad}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
                     stx.max_abs, stx.max_rel
                 );
             }
