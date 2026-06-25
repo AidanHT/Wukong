@@ -425,7 +425,7 @@ pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) 
 /// all warps), then every warp computes its `tm×tn` grid of `m16n16k16` tiles out of SMEM. Launch with
 /// block `(WMMA_THREADS,1,1)` and grid `(ceil(N/WMMA_BN), ceil(M/WMMA_BM), 1)` where `M=K`, `N=P*Q`.
 pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false)
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, 1)
 }
 
 /// **Split-K** variant of [`conv_wmma_ptx`] (entry `conv2d_wmma_splitk`): the `GK=C*R*S` reduction is
@@ -444,7 +444,7 @@ pub fn conv_wmma_splitk_ptx(
     s: usize,
     sk: usize,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, sk, crate::ptx_wmma::Act::None, false)
+    conv_wmma_ptx_impl(c, h, w, k, r, s, sk, crate::ptx_wmma::Act::None, false, 1)
 }
 
 /// **Fused conv + bias + activation** implicit-GEMM (entry `conv2d_wmma`): the same tensor-core conv as
@@ -464,9 +464,19 @@ pub fn conv_wmma_epi_ptx(
     act: crate::ptx_wmma::Act,
     bias: bool,
 ) -> String {
-    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, act, bias)
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, act, bias, 1)
 }
 
+/// **Strided** implicit-GEMM conv (entry `conv2d_wmma`): downsampling conv with `stride>1`, output
+/// `P=⌊(H-R)/stride⌋+1`, `Q=⌊(W-S)/stride⌋+1`. Same tensor-core kernel as [`conv_wmma_ptx`]; only the
+/// im2col gather changes — output pixel `(p,q)` reads input `(p·stride+r, q·stride+s)` (the hoisted
+/// `xpart` scales by `stride`). Single-pass (no split-K / fusion threaded here — orthogonal). `stride=1`
+/// reproduces the dense kernel byte-for-byte.
+pub fn conv_wmma_strided_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, stride: usize) -> String {
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, stride)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn conv_wmma_ptx_impl(
     c: usize,
     h: usize,
@@ -477,10 +487,14 @@ fn conv_wmma_ptx_impl(
     sk: usize,
     act: crate::ptx_wmma::Act,
     bias: bool,
+    stride: usize,
 ) -> String {
     use std::fmt::Write as _;
-    let p = h - r + 1;
-    let q = w - s + 1;
+    assert!(stride >= 1, "stride must be >= 1");
+    // Strided conv downsamples: output P=floor((H-R)/stride)+1, and the im2col gather reads
+    // X[c, p*stride+r, q*stride+s] (the hoisted xpart scales p,q by stride; stride=1 is the dense conv).
+    let p = (h - r) / stride + 1;
+    let q = (w - s) / stride + 1;
     let m = k; // GEMM M
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
@@ -617,7 +631,13 @@ fn conv_wmma_ptx_impl(
         let _ = writeln!(b, "    add.u32 %bnv{li},%n0,%ncol;   // nn = n0+ncol");
         let _ = writeln!(b, "    div.u32 %pp,%bnv{li},{q};     // p = nn/Q");
         let _ = writeln!(b, "    rem.u32 %qq,%bnv{li},{q};     // q = nn%Q");
-        let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{w},%qq;   // xpart = p*W + q");
+        if stride == 1 {
+            let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{w},%qq;   // xpart = p*W + q");
+        } else {
+            // strided: input pixel (p*stride+r, q*stride+s) -> xpart = (p*stride)*W + q*stride
+            let _ = writeln!(b, "    mul.lo.s32 %qq,%qq,{stride};   // q*stride");
+            let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{},%qq;   // (p*stride)*W + q*stride", stride * w);
+        }
     }
     if sk > 1 {
         let _ = writeln!(b, "    mov.u32 %zsl,%ctaid.z;");
