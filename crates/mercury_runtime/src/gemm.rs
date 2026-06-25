@@ -19,13 +19,15 @@
 // accumulators live (of 16 ymm regs) — the proven Haswell/Zen sweet spot.
 const MR: usize = 6;
 const NR: usize = 16;
-// Cache-block sizes: A panel (MC×KC) targets L2, B panel (KC×NC) targets L3. Multiples of MR/NR.
-// MC=144 (a 144×256 f32 A-block ≈ 144 KB) measured the sweet spot on this Meteor Lake P-core: large
-// enough that each A-block sweeps the B-panel fewer times (so B is re-streamed from L3 less — the
-// large-matrix bottleneck), small enough that the A-block + the live B micro-panel still sit in the
-// 2 MB L2 alongside the streaming B-block. 216/288 both regressed single-core (B-block contention).
+// Cache-block sizes (multiples of MR/NR). The A panel (MC×KC) targets L2, the B panel (KC×NC) the L3.
+// MC=144 (≈144 KB A-block) measured the single-core sweet spot here: small enough to stay L2-resident
+// while B streams. A bigger MC regressed — the larger A-block gets evicted by the streaming B and its
+// micropanels then miss to L3 (1008 ≈ -16% at 2048³; 216/288 lost too). KC=384 is the *cap* for the
+// size-adaptive K-block `select_kc`: the largest KC×NR B-micropanel (24 KB) + MR×KC A-micropanel
+// (9 KB) that stays L1-resident on this 48 KB L1 — KC=512 (44 KB) thrashes L1 and is ~30% slower,
+// while the old KC=256 left ~10% on the table at ≥1024³. NC=4080 keeps a KC×NC B-panel (≤6 MB) in L3.
 const MC: usize = 144;
-const KC: usize = 256;
+const KC: usize = 384;
 const NC: usize = 4080;
 
 // Minimum multiply-accumulate count (`m·n·k`) before the parallel kernel is worth its threading
@@ -36,6 +38,84 @@ const PAR_MIN_MACS: u64 = 1 << 26;
 #[inline]
 fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
+}
+
+/// Size-adaptive K-block height (`kc`). KC=384 is the largest K-block whose `KC×NR` B-micropanel
+/// (24 KB) + `MR×KC` A-micropanel (9 KB) stays L1-resident on this 48 KB-L1 P-core; KC=512 (44 KB)
+/// thrashes L1 (~30% slower) and KC=256 under-amortizes the B-micropanel loads (and doubles the C
+/// re-stream passes), leaving ~10% on the table at ≥1024³. K is split into the fewest equal-ish blocks
+/// ≤ the cap, so k=512 → 2×256 (even) instead of 384+128 (a thin tail costing ~4%), while large K gets
+/// the full ~384. `kc` only changes how the K reduction is *grouped*: both kernels call this so serial
+/// stays bit-identical to parallel, and the grouping differs from KC=256 only in low f32 bits (within
+/// the √k·ε tolerance the gemm tests assert vs a naive reference). Result ∈ [4, KC].
+#[inline]
+fn select_kc(k: usize) -> usize {
+    let nblocks = k.div_ceil(KC).max(1);
+    round_up(k.div_ceil(nblocks), 4) // multiple of the ×4 K-unroll; ≤ KC since k/nblocks ≤ KC
+}
+
+/// A private rayon pool for the parallel GEMM, sized to the machine's **physical** core count instead
+/// of rayon's default (one worker per *logical* core). A compute-bound AVX2-FMA GEMM already saturates
+/// a core's two FMA pipes with a single thread, so the HyperThread sibling adds only scheduling
+/// contention: measured at the mid sizes where scaling lags hardest, 16 physical threads scale ~30-40%
+/// better than 22 logical (512³ 2.2×→3.1×, 1024³ 3.2×→3.9× over single core). A *private* pool (not a
+/// global resize) leaves the default pool — and the thread-count-derived striping of the reduction
+/// kernels that run on it — untouched. The GEMM result is independent of how panels are distributed
+/// (the per-(i,j) K-order is fixed), so this changes throughput only, never the bits: serial stays
+/// bit-identical to parallel. `None` (⇒ caller uses the default pool) when physical ≥ logical (no HT
+/// to avoid) or the pool can't be built.
+fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let physical = num_cpus::get_physical().max(1);
+        if physical >= rayon::current_num_threads() {
+            return None; // no HyperThreads to shed (or single pool already this small)
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(physical)
+            .thread_name(|i| format!("mercury-gemm-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
+/// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
+/// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
+/// own internal rayon closures, which already smuggle these pointers across as `usize`.
+#[cfg(target_arch = "x86_64")]
+struct GemmArgs {
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+    bt: bool,
+    epi: Option<Epilogue>,
+}
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for GemmArgs {}
+
+#[cfg(target_arch = "x86_64")]
+impl GemmArgs {
+    /// Run the parallel kernel from this bundle. Taking `self` by value forces a closure that calls it
+    /// to capture the whole (`Send`) `GemmArgs`, not the individual `!Send` raw-pointer fields that
+    /// edition-2021 disjoint capture would otherwise grab.
+    ///
+    /// # Safety
+    /// Same operand-size contract as [`sgemm_avx2_parallel`]; AVX2/FMA must be available.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn run(self) {
+        unsafe {
+            sgemm_avx2_parallel(
+                self.a, self.b, self.c, self.m, self.k, self.n, self.beta, self.bt, self.epi,
+            )
+        }
+    }
 }
 
 // Reusable per-thread pack scratch for the serial kernel. The A/B panels are fully overwritten by
@@ -204,10 +284,19 @@ unsafe fn gemm_dispatch(
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
-                if par {
-                    sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi);
-                } else {
-                    sgemm_avx2(a, b, c, m, k, n, beta, bt, epi);
+                match (par, gemm_pool()) {
+                    // Parallel, with a private physical-core pool: run the whole kernel inside it so
+                    // its nested `into_par_iter`s (pack + compute) use physical-core workers, not the
+                    // default logical-core pool. The args cross the `install` boundary via `GemmArgs`
+                    // (Send-wrapped); the closure runs to completion before `install` returns.
+                    (true, Some(pool)) => {
+                        let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
+                        // `args.run()` moves the whole bundle, so the closure captures the `Send`
+                        // `GemmArgs` rather than its `!Send` fields (edition-2021 disjoint capture).
+                        pool.install(move || args.run());
+                    }
+                    (true, None) => sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi),
+                    (false, _) => sgemm_avx2(a, b, c, m, k, n, beta, bt, epi),
                 }
             }
             return;
@@ -733,7 +822,7 @@ unsafe fn sgemm_avx2_parallel(
         let nc = (n - jc).min(NC);
         let mut pc = 0;
         while pc < k {
-            let kc = (k - pc).min(KC);
+            let kc = (k - pc).min(select_kc(k));
             let beta_eff = if pc == 0 { beta } else { 1.0 };
             // The epilogue (bias + activation) is folded into the C writeback on the FINAL K-block
             // only — exactly as the serial path does. Captured as Send-safe primitives (a raw `bias`
@@ -790,7 +879,7 @@ unsafe fn sgemm_avx2_parallel(
                     }
                 }
             });
-            pc += KC;
+            pc += kc;
         }
         jc += NC;
     }
@@ -882,7 +971,7 @@ unsafe fn sgemm_avx2(
         let nc = (n - jc).min(NC);
         let mut pc = 0;
         while pc < k {
-            let kc = (k - pc).min(KC);
+            let kc = (k - pc).min(select_kc(k));
             // First K-block honors the caller's beta; later blocks must accumulate the partial sums.
             let beta_eff = if pc == 0 { beta } else { 1.0 };
             // The fused epilogue applies only once the K reduction is complete — i.e. on the final
@@ -911,7 +1000,7 @@ unsafe fn sgemm_avx2(
                 );
                 ic += MC;
             }
-            pc += KC;
+            pc += kc;
         }
         jc += NC;
     }
@@ -1197,6 +1286,16 @@ unsafe fn micro_6x16(
     epi: Option<Epilogue>,
 ) {
     use std::arch::x86_64::*;
+    // AVX-512 fast path: the full-tile, no-epilogue case (the bulk of a large GEMM's tiles). Wider
+    // 512-bit lanes, half the FMA instructions, and BIT-IDENTICAL accumulation order to the AVX2 body
+    // below (see `micro_6x16_avx512`). Gated on `avx512f` — FALSE on this development box, so the
+    // branch is dead code here (and the `&&` short-circuits to a single predicted-not-taken compare on
+    // the AVX2 path, after the full-tile checks the AVX2 fast path already makes). On AVX-512 silicon
+    // it takes over the hot tiles; the width win is a labelled projection, never measured here.
+    if epi.is_none() && mr == MR && nr == NR && is_x86_feature_detected!("avx512f") {
+        micro_6x16_avx512(kc, ap, bp, c, ldc, beta);
+        return;
+    }
     let (mut c0, mut c1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     let (mut c2, mut c3) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     let (mut c4, mut c5) = (_mm256_setzero_ps(), _mm256_setzero_ps());
@@ -1362,6 +1461,96 @@ unsafe fn micro_6x16(
             };
         }
     }
+}
+
+/// The **AVX-512 twin** of [`micro_6x16`]'s K-accumulation + plain (no-epilogue) full-tile writeback.
+/// Each of the 6 A-rows gets ONE 512-bit accumulator holding all `NR=16` of that row's C-columns —
+/// versus the AVX2 kernel's two 256-bit halves (`c{2r}`, `c{2r+1}`). Per K-step: one 16-wide B load,
+/// 6 A-broadcasts, 6 FMAs — **half** the AVX2 kernel's 12 FMAs for the same flops.
+///
+/// **Correctness is by construction, not measurement.** Lane `j` of accumulator `r` sums `a[r,p]·b[p,j]`
+/// over `p` ascending — exactly the sequence `micro_6x16` accumulates into `c{2r}[j]` (`j<8`) /
+/// `c{2r+1}[j−8]` (`j≥8`). Widening 2×ymm → 1×zmm changes only the register width, never which products
+/// reach `C[i,j]` nor their order, so this is **bit-identical** to the AVX2 kernel — the very argument
+/// the differential gate already makes for SIMD lane width (a wider vector holds *different output
+/// elements*, not partial sums of one). `avx512f` is **false on this development box**, so this is DEAD
+/// CODE here: it can touch no gate and no measured number. On AVX-512 silicon `micro_6x16_avx512_twin`
+/// (a `#[test]`) asserts the bit-equality directly; the width win is reported only as a labelled
+/// PROJECTION (see `prompts/results/cpu-library.md`), never measured on hardware that cannot run it.
+///
+/// Scope is deliberately the full-tile, no-epilogue case — the bulk of a large GEMM's tiles and the
+/// part whose AVX-512 form is a trivial lane-width swap. Partial edge tiles and the fused bias+act
+/// epilogue (which would need AVX-512 `gelu16`/`silu16` vmath that does not exist yet) fall back to the
+/// proven AVX2 [`micro_6x16`], bounding the untestable surface to this small, structurally-trivial core.
+///
+/// # Safety
+/// `avx512f` must be available (caller runtime-checks). Packed-panel/`ldc` contract of [`micro_6x16`],
+/// restricted to a full `MR×NR` tile.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn micro_6x16_avx512(
+    kc: usize,
+    ap: *const f32,
+    bp: *const f32,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+) {
+    use std::arch::x86_64::*;
+    let (mut c0, mut c1, mut c2) =
+        (_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
+    let (mut c3, mut c4, mut c5) =
+        (_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
+    let mut ap = ap;
+    let mut bp = bp;
+    // One K-step: load the 16-wide B row into a single zmm, then for each of the 6 A rows broadcast its
+    // packed value and FMA into that row's accumulator. Identical (a, b) values and ascending-`p` order
+    // as `micro_6x16::kstep`, so the bits match.
+    macro_rules! kstep {
+        () => {{
+            let b = _mm512_loadu_ps(bp);
+            c0 = _mm512_fmadd_ps(_mm512_set1_ps(*ap), b, c0);
+            c1 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(1)), b, c1);
+            c2 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(2)), b, c2);
+            c3 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(3)), b, c3);
+            c4 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(4)), b, c4);
+            c5 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(5)), b, c5);
+            ap = ap.add(MR);
+            bp = bp.add(NR);
+        }};
+    }
+    // Same ×4 K-unroll + one prefetch per 4 steps as the AVX2 kernel.
+    let mut p = 0;
+    while p + 4 <= kc {
+        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
+        kstep!();
+        kstep!();
+        kstep!();
+        kstep!();
+        p += 4;
+    }
+    while p < kc {
+        kstep!();
+        p += 1;
+    }
+    // Plain full-tile writeback, one 512-bit store per row, with the beta rule — the zmm analogue of
+    // the AVX2 fast-path `wb!` (which stored each row as `[c{2r} | c{2r+1}]`).
+    macro_rules! wb {
+        ($acc:expr, $r:expr) => {{
+            let row = c.add($r * ldc);
+            if beta == 0.0 {
+                _mm512_storeu_ps(row, $acc);
+            } else {
+                _mm512_storeu_ps(row, _mm512_add_ps(_mm512_loadu_ps(row), $acc));
+            }
+        }};
+    }
+    wb!(c0, 0);
+    wb!(c1, 1);
+    wb!(c2, 2);
+    wb!(c3, 3);
+    wb!(c4, 4);
+    wb!(c5, 5);
 }
 
 #[cfg(test)]
@@ -1557,6 +1746,104 @@ mod tests {
             bench("sgemm_nt (parallel)", &|| unsafe {
                 mercury_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
+        }
+    }
+
+    /// Adjacent A/B: the SAME parallel GEMM run in the default (logical-core) rayon pool vs a private
+    /// physical-core pool, measured back-to-back best-of-N so the laptop's thermal drift cancels in the
+    /// ratio. Cross-RUN comparison of the two pools is hopeless (the power state swings ~3×, and the
+    /// 1c-vs-par self-scaling ratio is dominated by *where* in the thermal cycle each leg is sampled);
+    /// only this interleaved same-run ratio reliably answers whether shedding the HyperThread siblings
+    /// lifts throughput on this compute-bound kernel. Run: `cargo test -p mercury_runtime --release
+    /// sgemm_pool_ab -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sgemm_pool_ab() {
+        use std::time::Instant;
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            println!("no avx2/fma — skipping");
+            return;
+        }
+        let logical = rayon::current_num_threads();
+        let physical = num_cpus::get_physical().max(1);
+        let ppool = rayon::ThreadPoolBuilder::new()
+            .num_threads(physical)
+            .build()
+            .unwrap();
+        println!("pools: logical={logical} physical={physical}");
+        for &n in &[512usize, 1024, 2048, 4096] {
+            let a = fill(1, n * n);
+            let b = fill(2, n * n);
+            let mut c = vec![0.0f32; n * n];
+            let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+            let flops = 2.0 * (n as f64).powi(3);
+            let logical_run = || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, None) };
+            let physical_run = || {
+                let args = GemmArgs { a: ap, b: bp, c: cp, m: n, k: n, n, beta: 0.0, bt: false, epi: None };
+                ppool.install(move || unsafe { args.run() });
+            };
+            for _ in 0..3 {
+                logical_run();
+                physical_run();
+            }
+            let (mut bl, mut bphys) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..12 {
+                let t = Instant::now();
+                logical_run();
+                bl = bl.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                physical_run();
+                bphys = bphys.min(t.elapsed().as_secs_f64());
+            }
+            let (lg, pg) = (flops / bl / 1e9, flops / bphys / 1e9);
+            println!(
+                "n={n:<4} logical(×{logical})={lg:6.1}  physical(×{physical})={pg:6.1} GFLOP/s  →  physical/logical = {:.2}×",
+                pg / lg
+            );
+        }
+    }
+
+    /// Twin check for the AVX-512 microkernel: it must produce **bit-identical** output to the proven
+    /// AVX2 [`micro_6x16`] on the same packed panels (full 6×16 tile, no epilogue, both beta rules).
+    /// On AVX-512 silicon this asserts the equality directly; on this development box (no `avx512f`) it
+    /// is skipped — but the body still **compiles**, exercising the kernel's form, and its correctness
+    /// rests on the structural-twin argument documented on `micro_6x16_avx512`. This is the honest
+    /// shape of an "AVX-512 twin test" on hardware that cannot execute AVX-512.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn micro_6x16_avx512_twin() {
+        let have = is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma");
+        if !have {
+            println!("micro_6x16_avx512_twin: host lacks avx512f — compile-checked, run skipped");
+            return;
+        }
+        for &kc in &[1usize, 4, 7, 64] {
+            let ap = fill(1, kc * MR);
+            let bp = fill(2, kc * NR);
+            for &beta in &[0.0f32, 1.0] {
+                let cinit = fill(3, MR * NR);
+                let mut c_avx2 = cinit.clone();
+                let mut c_512 = cinit.clone();
+                // SAFETY: features just checked; full MR×NR tile, ldc=NR, no epilogue — the AVX-512
+                // path's supported case.
+                unsafe {
+                    micro_6x16(
+                        kc, ap.as_ptr(), bp.as_ptr(), c_avx2.as_mut_ptr(), NR, beta, MR, NR, None,
+                    );
+                    micro_6x16_avx512(kc, ap.as_ptr(), bp.as_ptr(), c_512.as_mut_ptr(), NR, beta);
+                }
+                for i in 0..MR * NR {
+                    assert_eq!(
+                        c_avx2[i].to_bits(),
+                        c_512[i].to_bits(),
+                        "kc={kc} beta={beta} idx={i}: avx2={} avx512={}",
+                        c_avx2[i],
+                        c_512[i]
+                    );
+                }
+            }
         }
     }
 
