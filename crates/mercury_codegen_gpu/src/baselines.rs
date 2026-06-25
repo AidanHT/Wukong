@@ -1284,3 +1284,550 @@ pub fn conv_flop(c: usize, h: usize, width: usize, k: usize, r: usize, s: usize)
     let (p, q) = (h - r + 1, width - s + 1);
     2.0 * k as f64 * p as f64 * q as f64 * c as f64 * r as f64 * s as f64
 }
+
+// Tier A — int8 (W8A8) CUDA-C peers, compiled by NVRTC (the "beat the hand-written C int8" baselines).
+//
+// Two peers of escalating quality, both `C = A·Bᵀ` with `u8` activations × `i8` weights → `i32`
+// (Mercury's quantized-nn.Linear contract, exact mod 2³²), so all three implementations compute the
+// *identical* integer matrix and cross-check bit-for-bit:
+//   * `naive_gemm_nt_int8` — one thread per output, scalar `(int)A·(int)B` chain. The idiomatic kernel
+//     a programmer writes first; the M6 wide-win floor.
+//   * `dp4a_gemm_nt_int8`  — one thread per output, but the K-loop uses the **`dp4a.u32.s32`** 4-way
+//     byte dot-product (the SIMD int8 instruction a programmer reaches for next; mixed u8×s8 via inline
+//     PTX, which the `__dp4a` C intrinsic doesn't expose). A much stronger hand-written baseline than
+//     naive — the honest "beat the optimized C int8" bar short of a tensor-core library.
+// Both NVRTC-compile to PTX and the driver JITs them to SASS exactly like Mercury's PTX, so the gap is
+// pure kernel quality (tensor cores + fragment reuse vs none).
+// ---------------------------------------------------------------------------------------------------
+
+const NAIVE_GEMM_NT_INT8_CUDA: &str = r#"
+extern "C" __global__ void naive_gemm_nt_int8(int M, int N, int K,
+        const unsigned char* A, const signed char* B, int* C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // n index
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // m index
+    if (row < M && col < N) {
+        int acc = 0;
+        for (int k = 0; k < K; ++k)
+            acc += (int)A[row * K + k] * (int)B[col * K + k];
+        C[row * N + col] = acc;
+    }
+}
+"#;
+
+/// `dp4a.u32.s32` 4-way dot product: each step consumes 4 `u8` of A and 4 `s8` of B (packed as one
+/// `int` each) and accumulates the four products into the `s32` accumulator in a single instruction —
+/// the SIMD int8 primitive on Ada short of the tensor core. Mixed `u8×s8` is expressed via inline PTX
+/// because the `__dp4a` C intrinsic only exposes the same-signedness forms. K must be a multiple of 4.
+const DP4A_GEMM_NT_INT8_CUDA: &str = r#"
+extern "C" __global__ void dp4a_gemm_nt_int8(int M, int N, int K,
+        const int* A, const int* B, int* C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // n index
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // m index
+    if (row < M && col < N) {
+        int acc = 0;
+        int K4 = K >> 2;
+        const int* a = A + row * K4;   // A reinterpreted as packed 4×u8 per int
+        const int* b = B + col * K4;   // B reinterpreted as packed 4×s8 per int
+        for (int k = 0; k < K4; ++k) {
+            int av = a[k], bv = b[k];
+            asm("dp4a.u32.s32 %0, %1, %2, %0;" : "+r"(acc) : "r"(av), "r"(bv));
+        }
+        C[row * N + col] = acc;
+    }
+}
+"#;
+
+fn nvrtc_int8_module(g: &Gpu, src: &str) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions {
+        arch: Some("compute_89"),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(src, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+/// Run the naive int8 CUDA-C GEMM once and copy the `i32` result back — the correctness-gate entry.
+pub fn nvrtc_naive_gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let module = nvrtc_int8_module(g, NAIVE_GEMM_NT_INT8_CUDA)?;
+    let f = module.load_function("naive_gemm_nt_int8")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(naive_cfg(m, n))? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Run the `dp4a` int8 CUDA-C GEMM once and copy the `i32` result back — the stronger-peer gate entry.
+pub fn nvrtc_dp4a_gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(k % 4, 0, "dp4a peer needs K%4==0");
+    let module = nvrtc_int8_module(g, DP4A_GEMM_NT_INT8_CUDA)?;
+    let f = module.load_function("dp4a_gemm_nt_int8")?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+    unsafe { bld.launch(naive_cfg(m, n))? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time the naive int8 CUDA-C GEMM: `iters` resident launches bracketed by one sync, after a warm-up —
+/// the identical timing shape Mercury's GEMM benches use, so the ratio is apples-to-apples. Sec/launch.
+pub fn time_nvrtc_naive_gemm_nt_int8(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    time_int8_peer(g, NAIVE_GEMM_NT_INT8_CUDA, "naive_gemm_nt_int8", m, k, n, iters)
+}
+
+/// Time the `dp4a` int8 CUDA-C GEMM (same timing shape as the naive peer). Seconds per launch.
+pub fn time_nvrtc_dp4a_gemm_nt_int8(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    time_int8_peer(g, DP4A_GEMM_NT_INT8_CUDA, "dp4a_gemm_nt_int8", m, k, n, iters)
+}
+
+/// Shared timing harness for the int8 CUDA-C peers: upload once (dummy bytes), `iters` resident
+/// launches after a warm-up, one trailing sync. Both peers take the same `(M,N,K,A,B,C)` signature.
+fn time_int8_peer(
+    g: &mut Gpu,
+    src: &str,
+    entry: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let module = nvrtc_int8_module(g, src)?;
+    let f = module.load_function(entry)?;
+    let a_d = g.stream.memcpy_stod(&vec![1u8; m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![1i8; n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let cfg = naive_cfg(m, n);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Tier B — cuBLAS **int8 IMMA** GEMM via `cublasGemmEx` (the gold-standard int8 peer; Mercury reports
+// as a % of this). `CUDA_R_8I` data, `CUDA_R_32I` output, `CUBLAS_COMPUTE_32I` (the Ada int8 tensor
+// cores). cuBLASLt's *safe* cudarc wrapper only impls `Matmul` for f32/f16/bf16 (no int8), and the raw
+// IMMA path needs fiddly COL32/COL4 memory ordering — so `cublasGemmEx` is the robust binding here.
+//
+// **Signedness caveat (honesty law):** classic `cublasGemmEx` int8 is **s8×s8→s32**; there is no mixed
+// `u8×s8` form (that lives only in cuBLASLt's specially-ordered IMMA). Mercury's contract is `u8×s8`.
+// To make all three implementations compute the *identical* matrix for the bit-exact cross-check, the
+// int8 peer comparison restricts **activations to `[0,127]`** (where the `u8` and `s8` reinterpretations
+// coincide); weights keep the full `[-128,127]`. The tensor-core *work* is identical regardless of
+// signedness, so the **timing** is a faithful int8-IMMA measurement; only the test data is range-bound.
+// ---------------------------------------------------------------------------------------------------
+
+/// Column-major transpose mapping for Mercury's row-major `C[M×N] = A[M×K]·B[N×K]ᵀ` on cuBLAS — the
+/// int8 twin of [`cublas_nt_cfg`]/[`gemm_ex_nt_f16_f32out`]: `Cᵀ = B̌ᵀ·Ǎ`, so B is the first operand
+/// transposed and A the second untransposed, with `m,n` swapped, `lda=ldb=K`, `ldc=N`. K (=lda=ldb) is
+/// a multiple of 32 and N (=ldc) a multiple of 8 — both satisfy IMMA's multiple-of-4 leading-dim rule.
+///
+/// # Safety
+/// `a_d`/`b_d` (i8) and `c_d` (i32) must be valid device buffers of length `m*k`, `n*k`, `m*n`; the
+/// cuBLAS handle and stream must be live. The device-pointer guards are held across the call.
+unsafe fn gemm_ex_nt_int8(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    a_d: &CudaSlice<i8>,
+    b_d: &CudaSlice<i8>,
+    c_d: &mut CudaSlice<i32>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), PeerError> {
+    let alpha: i32 = 1;
+    let beta: i32 = 0;
+    let (ap, _ra) = a_d.device_ptr(stream);
+    let (bp, _rb) = b_d.device_ptr(stream);
+    let (cp, _rc) = c_d.device_ptr_mut(stream);
+    cublas_result::gemm_ex(
+        *blas.handle(),
+        cublasOperation_t::CUBLAS_OP_T, // B̌ transposed (Mercury's B, first operand)
+        cublasOperation_t::CUBLAS_OP_N, // Ǎ untransposed (Mercury's A, second operand)
+        n as i32,                       // rows of Cᵀ
+        m as i32,                       // cols of Cᵀ
+        k as i32,
+        (&alpha) as *const i32 as *const _,
+        bp as *const _,
+        cudaDataType_t::CUDA_R_8I,
+        k as i32, // lda: B̌ is K×N col-major
+        ap as *const _,
+        cudaDataType_t::CUDA_R_8I,
+        k as i32, // ldb: Ǎ is K×M col-major
+        (&beta) as *const i32 as *const _,
+        cp as *mut _,
+        cudaDataType_t::CUDA_R_32I,
+        n as i32, // ldc: Cᵀ is N×M col-major
+        cublasComputeType_t::CUBLAS_COMPUTE_32I,
+        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+    )?;
+    Ok(())
+}
+
+/// Run cuBLAS int8 (`cublasGemmEx`, IMMA tensor cores) once and return the `i32` result — the
+/// correctness-gate entry. `a` activations must be in `[0,127]` (see the signedness caveat above) so
+/// the `s8×s8` cuBLAS computes the same matrix as Mercury's `u8×s8`; passed here as `i8`.
+pub fn cublas_gemm_nt_int8(
+    g: &mut Gpu,
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<i32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(a)?;
+    let b_d = g.stream.memcpy_stod(b)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time cuBLAS int8 GEMM: `iters` resident `cublasGemmEx` calls, one warm-up, one trailing sync —
+/// matching the Mercury/NVRTC timing shape. Returns seconds per call.
+pub fn time_cublas_gemm_nt_int8(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let blas = CudaBlas::new(g.stream.clone())?;
+    let a_d = g.stream.memcpy_stod(&vec![1i8; m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![1i8; n * k])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n])?;
+    let stream = g.stream.clone();
+    unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? }; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { gemm_ex_nt_int8(&blas, &stream, &a_d, &b_d, &mut c_d, m, k, n)? };
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Tier B — cuBLASLt **fp8 (E4M3) GEMM** — the gold-standard fp8 peer (M2). cuBLASLt is the *only*
+// cuBLAS surface with an fp8 matmul; classic `cublasGemmEx` has none, and cudarc's *safe* `Matmul<T>`
+// wrapper is f32/f16/bf16-only — so this peer drives the raw `cublaslt::{sys,result}` layer directly
+// (the "raw-sys cuBLASLt E4M3" binding the GPU plan calls for). It dlopens `cublasLt64_12.dll` exactly
+// like the cublas/nvrtc peers, so building still needs no toolkit and the benches skip cleanly when the
+// redist DLLs are absent.
+//
+// **Layout mapping — identical to the f16 [`gemm_ex_nt_f16_f32out`].** Mercury computes row-major
+// `C[M×N] = A[M×K]·B[N×K]ᵀ`. cuBLAS(Lt) is column-major, so we compute `Cᵀ[N×M] = B̌ᵀ·Ǎ`: the first
+// operand is Mercury's **B** transposed (`OP_T`), the second is Mercury's **A** untransposed (`OP_N`),
+// output dims swapped. Crucially `transa=T, transb=N` ("TN") is **also the only transpose combo
+// cuBLASLt's fp8 kernels accept** — the fair NT mapping and the fp8 hardware constraint coincide. A and
+// B are E4M3 (the byte-identical operands Mercury's kernel consumes, via the same `f32_to_e4m3`); C/D
+// are f32 — Mercury also accumulates in f32 and stores f32, the identical dtype boundary (the fairness
+// keystone of [`gemm_ex_nt_f16_f32out`]). A/B scale factors are device `1.0` (Mercury's fp8 is
+// unscaled); `FAST_ACCUM` is left default (the higher-precision split accumulation, matching Mercury's
+// full f32 accumulate — so the peer lands inside the same `c·√K·ε` tolerance gate).
+// ---------------------------------------------------------------------------------------------------
+
+use core::ffi::c_void;
+use cudarc::cublaslt::result as cublaslt_result;
+use cudarc::cublaslt::sys as cublaslt_sys;
+
+/// cuBLASLt fp8 workspace — 32 MiB sits comfortably above any Ada fp8 algo's requirement.
+const FP8_LT_WORKSPACE: usize = 32 * 1024 * 1024;
+
+/// A built, reusable cuBLASLt fp8 (E4M3·E4M3 → f32) matmul plan: handle + descriptor + the three
+/// matrix layouts + the heuristic-chosen algorithm + workspace + the (1.0) A/B scale buffers. Built
+/// once — the heuristic search is host-only work we keep *out* of any timing loop — and re-run per call
+/// on fresh device buffers. `Drop` tears down the sys objects so an early `?` cannot leak them.
+struct Fp8LtPlan {
+    handle: cublaslt_sys::cublasLtHandle_t,
+    desc: cublaslt_sys::cublasLtMatmulDesc_t,
+    a_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    b_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    cd_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    pref: cublaslt_sys::cublasLtMatmulPreference_t,
+    algo: cublaslt_sys::cublasLtMatmulAlgo_t,
+    workspace: CudaSlice<u8>,
+    // The 1.0 scales are kept alive for the plan's life: their device addresses are baked into `desc`.
+    _scale_a: CudaSlice<f32>,
+    _scale_b: CudaSlice<f32>,
+}
+
+impl Drop for Fp8LtPlan {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cublaslt_result::destroy_matmul_pref(self.pref);
+            let _ = cublaslt_result::destroy_matrix_layout(self.cd_layout);
+            let _ = cublaslt_result::destroy_matrix_layout(self.b_layout);
+            let _ = cublaslt_result::destroy_matrix_layout(self.a_layout);
+            let _ = cublaslt_result::destroy_matmul_desc(self.desc);
+            let _ = cublaslt_result::destroy_handle(self.handle);
+        }
+    }
+}
+
+impl Fp8LtPlan {
+    /// Build the plan for a row-major `C[M×N] = A[M×K]·B[N×K]ᵀ` E4M3 GEMM. Errors propagate as
+    /// `PeerError` — e.g. the heuristic finding no fp8 algo for this shape/device returns
+    /// `CUBLAS_STATUS_NOT_SUPPORTED`, and the bench then *honestly* reports "no cuBLASLt fp8 peer"
+    /// rather than a fabricated ratio.
+    fn new(g: &mut Gpu, m: usize, k: usize, n: usize) -> Result<Self, PeerError> {
+        // E4M3 leading dims are 1 byte; cuBLASLt wants 16-byte-aligned lda/ldb ⇒ K%16, and the f32 C
+        // ld=N must be 4-element (16-byte) aligned ⇒ N%4. Mercury's m16n8k32 tiles satisfy both.
+        assert!(k % 16 == 0, "cuBLASLt fp8 needs K%16==0 (got K={k})");
+        assert!(n % 4 == 0, "cuBLASLt fp8 needs N%4==0 (got N={n})");
+        let stream = g.stream.clone();
+
+        let handle = cublaslt_result::create_handle()?;
+        let scale_a = stream.memcpy_stod(&[1.0f32])?;
+        let scale_b = stream.memcpy_stod(&[1.0f32])?;
+        let workspace = stream.alloc_zeros::<u8>(FP8_LT_WORKSPACE)?;
+
+        // Descriptor: f32 compute, f32 scale.
+        let desc = cublaslt_result::create_matmul_desc(
+            cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublaslt_sys::cudaDataType_t::CUDA_R_32F,
+        )?;
+        unsafe {
+            // transa = T (Mercury's B, first operand), transb = N (Mercury's A). 1==T, 0==N as i32.
+            let op_t: i32 = 1;
+            let op_n: i32 = 0;
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&op_t) as *const i32 as *const c_void,
+                core::mem::size_of::<i32>(),
+            )?;
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&op_n) as *const i32 as *const c_void,
+                core::mem::size_of::<i32>(),
+            )?;
+            // A/B scale device pointers (both = 1.0). The address is stable across the move into Self.
+            let (sa, _ga) = scale_a.device_ptr(&stream);
+            let (sb, _gb) = scale_b.device_ptr(&stream);
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                (&sa) as *const _ as *const c_void,
+                core::mem::size_of_val(&sa),
+            )?;
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                (&sb) as *const _ as *const c_void,
+                core::mem::size_of_val(&sb),
+            )?;
+        }
+
+        // Layouts (column-major, matrices as stored). cuBLAS A = Mercury B stored [K,N] ld=K E4M3;
+        // cuBLAS B = Mercury A stored [K,M] ld=K E4M3; C/D = Mercury C stored [N,M] ld=N f32.
+        let a_layout = cublaslt_result::create_matrix_layout(
+            cublaslt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
+            k as u64,
+            n as u64,
+            k as i64,
+        )?;
+        let b_layout = cublaslt_result::create_matrix_layout(
+            cublaslt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
+            k as u64,
+            m as u64,
+            k as i64,
+        )?;
+        let cd_layout = cublaslt_result::create_matrix_layout(
+            cublaslt_sys::cudaDataType_t::CUDA_R_32F,
+            n as u64,
+            m as u64,
+            n as i64,
+        )?;
+
+        let pref = cublaslt_result::create_matmul_pref()?;
+        unsafe {
+            let ws = FP8_LT_WORKSPACE;
+            cublaslt_result::set_matmul_pref_attribute(
+                pref,
+                cublaslt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws) as *const usize as *const c_void,
+                core::mem::size_of::<usize>(),
+            )?;
+        }
+
+        // Heuristic: the single fastest algo for this fp8 config (A,B,C,D layouts).
+        let heuristic = unsafe {
+            cublaslt_result::get_matmul_algo_heuristic(
+                handle, desc, a_layout, b_layout, cd_layout, cd_layout, pref,
+            )?
+        };
+
+        Ok(Self {
+            handle,
+            desc,
+            a_layout,
+            b_layout,
+            cd_layout,
+            pref,
+            algo: heuristic.algo,
+            workspace,
+            _scale_a: scale_a,
+            _scale_b: scale_b,
+        })
+    }
+
+    /// One `cublasLtMatmul` on resident device buffers. `b_d` is Mercury's **B** (cuBLAS operand A,
+    /// `OP_T`), `a_d` is Mercury's **A** (cuBLAS operand B, `OP_N`), `c_d` is Mercury's f32 C. Nothing
+    /// is synced here — the caller owns the warm-up/sync discipline.
+    ///
+    /// # Safety
+    /// Buffers must be the documented E4M3/E4M3/f32 sizes; the plan's sys objects must be live.
+    unsafe fn run(
+        &self,
+        stream: &Arc<CudaStream>,
+        b_d: &CudaSlice<u8>,
+        a_d: &CudaSlice<u8>,
+        c_d: &mut CudaSlice<f32>,
+    ) -> Result<(), PeerError> {
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let (bp, _rb) = b_d.device_ptr(stream); // cuBLAS operand A
+        let (ap, _ra) = a_d.device_ptr(stream); // cuBLAS operand B
+        let (cp, _rc) = c_d.device_ptr_mut(stream);
+        let (wp, _rw) = self.workspace.device_ptr(stream);
+        cublaslt_result::matmul(
+            self.handle,
+            self.desc,
+            (&alpha) as *const f32 as *const c_void,
+            (&beta) as *const f32 as *const c_void,
+            bp as *const c_void,
+            self.a_layout,
+            ap as *const c_void,
+            self.b_layout,
+            cp as *const c_void,
+            self.cd_layout,
+            cp as *mut c_void,
+            self.cd_layout,
+            (&self.algo) as *const _,
+            wp as *mut c_void,
+            FP8_LT_WORKSPACE,
+            stream.cu_stream() as *mut _,
+        )?;
+        Ok(())
+    }
+}
+
+/// Run cuBLASLt fp8 (E4M3·E4M3 → f32, tensor cores) once and return the f32 result — the
+/// correctness-gate entry. Host f32 in, **rounded to E4M3 on the host with Mercury's own
+/// `f32_to_e4m3`** so the peer multiplies the byte-identical operands Mercury's kernel does; cross-
+/// checked against the same E4M3-rounded f64 reference, so a transpose slip shows as a gross miss.
+pub fn cublaslt_gemm_nt_fp8_e4m3(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
+    let a8_d = g.stream.memcpy_stod(&a8)?;
+    let b8_d = g.stream.memcpy_stod(&b8)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let plan = Fp8LtPlan::new(g, m, k, n)?;
+    let stream = g.stream.clone();
+    unsafe { plan.run(&stream, &b8_d, &a8_d, &mut c_d)? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time cuBLASLt fp8 GEMM: build the plan once (the heuristic search is host-only), then `iters`
+/// resident `cublasLtMatmul` calls, one warm-up, one trailing sync — the same timing shape as
+/// [`time_cublas_gemm_nt_f16`]. Returns **seconds per call**. The caller passes its already-resident
+/// E4M3 A/B (so the bench feeds the *identical* bytes it gave Mercury) and an f32 C of length `m*n`.
+pub fn time_cublaslt_gemm_nt_fp8_e4m3(
+    g: &mut Gpu,
+    a8_d: &CudaSlice<u8>,
+    b8_d: &CudaSlice<u8>,
+    c_d: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let plan = Fp8LtPlan::new(g, m, k, n)?;
+    let stream = g.stream.clone();
+    unsafe { plan.run(&stream, b8_d, a8_d, c_d)? }; // warm up
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { plan.run(&stream, b8_d, a8_d, c_d)? };
+    }
+    stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// Probe whether `cublasLt64_12.dll` is loadable (it lives beside `cublas64_12.dll` in the redist, so
+/// in practice it tracks [`peers_available`], but [`peers_available`] only checks cublas/nvrtc). The fp8
+/// peer benches gate on this to **skip, not fail**, when the DLL is absent — the same "green without the
+/// hardware" discipline as the other peers. Loading `cublasLt` panics if the DLL is missing, so the
+/// probe is wrapped in `catch_unwind`.
+pub fn cublaslt_available() -> bool {
+    std::panic::catch_unwind(|| match cublaslt_result::create_handle() {
+        Ok(h) => {
+            unsafe {
+                let _ = cublaslt_result::destroy_handle(h);
+            }
+            true
+        }
+        Err(_) => false,
+    })
+    .unwrap_or(false)
+}
