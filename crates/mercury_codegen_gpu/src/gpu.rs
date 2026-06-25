@@ -9613,6 +9613,139 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Offline-`ptxas` A/B (reserve lever).** The production path compiles PTX→SASS with the driver's
+    /// *embedded* ptxas (via `cuLink`, see `load_module_cached`). This asks: does the standalone CUDA-12.9
+    /// `ptxas` (newer than the driver's, + aggressive flags `--allow-expensive-optimizations`) schedule the
+    /// swz workhorse better? Same PTX, same launch ⇒ the round-robin best-of-N **ptxas/jit ratio** isolates
+    /// the COMPILER effect (clock-cancelling); cuBLAS is the same-run yardstick + self-noise sentinel. Each
+    /// offline cubin is checksum-gated vs the driver build (same algorithm ⇒ bit-identical) before timing.
+    /// Needs standalone `ptxas` (`pip install nvidia-cuda-nvcc-cu12`): set `MERCURY_PTXAS`, else the nvcc
+    /// default path. `cargo test ... --features gpu -- --ignored --nocapture gemm_cliff_ptxas_ab`.
+    #[test]
+    #[ignore]
+    fn gemm_cliff_ptxas_ab() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16};
+        use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
+        use cudarc::nvrtc::Ptx;
+        use half::f16;
+        let ptxas = match std::env::var("MERCURY_PTXAS") {
+            Ok(p) if std::path::Path::new(&p).exists() => p,
+            _ => {
+                eprintln!("[skip] set MERCURY_PTXAS to a standalone ptxas (`pip install nvidia-cuda-nvcc-cu12` → nvidia/cuda_nvcc/bin/ptxas.exe).");
+                return;
+            }
+        };
+        with_gpu("gemm_cliff_ptxas", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {} | ptxas: {ptxas}", g.device_name());
+            let v = CLIFF_VARIANTS.iter().find(|v| v.name == "cliff_swz_s2").unwrap();
+            let ptx = gemm_cliff_ptx();
+            // Offline-compile the module with a few ptxas flag sets → cubin → driver-load.
+            let dir = std::env::temp_dir();
+            let pid = std::process::id();
+            let ptx_path = dir.join(format!("mercury_cliff_{pid}.ptx"));
+            std::fs::write(&ptx_path, ptx).unwrap();
+            let _ = g.ctx.bind_to_thread();
+            let flagsets: &[(&str, &[&str])] = &[
+                ("ptxas12.9_O3", &["-O3"]),
+                ("ptxas12.9_O3_xpa", &["-O3", "--allow-expensive-optimizations=true"]),
+            ];
+            let mut cands: Vec<(String, cudarc::driver::CudaFunction)> = Vec::new();
+            for (tag, flags) in flagsets {
+                let cubin_path = dir.join(format!("mercury_cliff_{pid}_{tag}.cubin"));
+                let out = std::process::Command::new(&ptxas)
+                    .arg("-arch=sm_89")
+                    .args(*flags)
+                    .arg("-o")
+                    .arg(&cubin_path)
+                    .arg(&ptx_path)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => match g.ctx.load_module(Ptx::from_file(&cubin_path)) {
+                        Ok(m) => match m.load_function(v.name) {
+                            Ok(f) => cands.push((tag.to_string(), f)),
+                            Err(e) => eprintln!("[skip] {tag}: load_function {e}"),
+                        },
+                        Err(e) => eprintln!("[skip] {tag}: driver rejected cubin (driver < 12.9?) {e}"),
+                    },
+                    Ok(o) => eprintln!("[skip] {tag}: ptxas exit {:?}: {}", o.status.code(), String::from_utf8_lossy(&o.stderr)),
+                    Err(e) => eprintln!("[skip] {tag}: spawn ptxas: {e}"),
+                }
+            }
+            if cands.is_empty() {
+                eprintln!("[skip] no offline cubin loaded — lever blocked (likely driver older than the ptxas toolkit).");
+                return;
+            }
+            // The driver's own build (production path), via the in-process module cache.
+            let jit = g.function("gemm_cliff", ptx, v.name).unwrap();
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            let mut rng = crate::diff::Rng::new(0xC11FF_A5);
+            for sz in [2048usize, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let iters = if sz >= 4096 { 20 } else { 40 };
+                let rounds = 10usize;
+                let cfg = cliff_cfg_for(v, m, n);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                // checksum: every build must produce the identical result (same PTX/algorithm).
+                let checksum = |g: &Gpu, f: &cudarc::driver::CudaFunction, c_d: &mut cudarc::driver::CudaSlice<f32>| -> f64 {
+                    let (mm, nn, kk) = dims;
+                    {
+                        let mut bld = g.stream.launch_builder(f);
+                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut *c_d);
+                        unsafe { bld.launch(cfg).unwrap() };
+                    }
+                    g.stream.memcpy_dtov(&*c_d).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>()
+                };
+                let cs_jit = checksum(g, &jit, &mut c_d);
+                let mut fns: Vec<(&str, &cudarc::driver::CudaFunction)> = vec![("driver_jit", &jit)];
+                for (t, f) in &cands {
+                    let cs = checksum(g, f, &mut c_d);
+                    assert!(
+                        (cs - cs_jit).abs() / cs_jit.max(1.0) < 1e-4,
+                        "{sz}³ {t} checksum {cs:.5e} != driver {cs_jit:.5e}"
+                    );
+                    fns.push((t.as_str(), f));
+                }
+                let mut best = vec![f64::INFINITY; fns.len()];
+                let (mut bc, mut bc2) = (f64::INFINITY, f64::INFINITY);
+                for _ in 0..rounds {
+                    for (i, (_, f)) in fns.iter().enumerate() {
+                        best[i] = best[i].min(time_wmma(g, f, cfg, dims, &a_d, &b_d, &mut c_d, iters));
+                    }
+                    bc = bc.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                    bc2 = bc2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                }
+                let jit_t = best[0];
+                eprintln!(
+                    "\n{sz}³ fp16 swz offline-ptxas vs driver-JIT (best-of-{rounds}; cuBLAS self-noise {:.3}×):",
+                    bc2 / bc
+                );
+                for (i, (name, _)) in fns.iter().enumerate() {
+                    eprintln!(
+                        "  {:<20}: {:>7.0} GFLOP/s | {:>5.1}% cuBLAS | {:>6.3}× driver-jit",
+                        name,
+                        flop / best[i] / 1e9,
+                        100.0 * bc / best[i],
+                        jit_t / best[i],
+                    );
+                }
+            }
+        });
+    }
+
     /// **M5/M6: register-resident flash vs two peers — Tier-A naive CUDA-C *and* the Tier-B cuBLAS
     /// unfused attention chain**, same-run, single head, D=64. Mercury's `flash_d64_mp` (tensor-core
     /// `mma.sync`, O/m/l in registers, `cp.async`-staged double-buffered K/V, online softmax) vs:

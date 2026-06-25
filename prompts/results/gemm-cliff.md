@@ -158,15 +158,22 @@ gather latency. Reverted the codegen (was never committed). **Do not re-attempt 
   (analytical estimate: fusion wins ~1.1× @2048³ for SiLU/SwiGLU/residual cuBLASLt can't fuse; loses @4096³
   where the raw-GEMM gap exceeds the saved C round-trip). Needs a fair (vectorized) epilogue peer — fairness-
   sensitive, so disclose the peer.
-- offline ptxas `-O3 --allow-expensive-optimizations` (reserve, **not available here** — no `ptxas`, needs
-  `pip install nvidia-cuda-nvcc-cu12` + cubin file-load route): the JIT already runs ptxas at ~opt-4 and
-  `--allow-expensive-optimizations` is typically on at -O3, so likely a near-no-op; the only fair, no-strawman
-  raw-GEMM lever left, but low EV.
-- SASS scheduling (~9% per CuAsmRL) is the likely residual; not reachable without offline ptxas/hand-SASS.
+- ~~offline ptxas~~ **TESTED → LOSES (lever closed).** Installed standalone CUDA-12.9 `ptxas`
+  (`pip install nvidia-cuda-nvcc-cu12`), compiled the swz PTX → cubin, driver-loaded it (checksum-gated
+  bit-identical), same-run A/B vs the driver's own `cuLink` compile (`gemm_cliff_ptxas_ab`, set
+  `MERCURY_PTXAS`): **standalone ptxas LOSES — 0.737× driver-jit @2048³ (a big loss), 0.972–0.984× @4096³**,
+  and `--allow-expensive-optimizations` makes it *worse* (0.683× @2048³). The **driver's embedded ptxas is
+  already the best compiler available here** — a newer standalone toolkit does NOT beat it. So the SASS
+  residual is not reachable by swapping compilers; hand-SASS (CuAsmRL-style) is the only remaining path and
+  isn't tractable here. **All compiler/kernel levers in this environment are now exhausted.**
 
-### Status: kernel is near its PTX-via-JIT ceiling on this part
-Every occupancy/tile/raster/pipeline/warp-shape/prefetch axis is now swept (this session + the prior one's
-~77% PTX-ceiling finding): the swz w24 workhorse at 83% @4096³ is **past that prior ceiling**, and the
-remaining gap is SASS instruction scheduling, reachable only with offline ptxas / hand-SASS (unavailable
-here). The banked wins — **2048³ 71%→87% (1.23×)** and the **fused epilogue re-based onto the fast base** —
-are the durable results; both floors are met (4096³ ≥75% with margin, 2048³ ≥90% on clean-clock runs).
+### Status: at the achievable ceiling for this environment
+Every lever is now swept and measured (this session + the prior one's ~77% PTX-ceiling finding):
+occupancy / tile-shape / raster / pipeline-depth / warp-shape / padding→swz / fragment-prefetch (all in
+`ptx_wmma.rs`), **and the compiler itself** (driver-JIT vs standalone ptxas-12.9 — the driver wins). The
+swz w24 workhorse at 83% @4096³ is **past the prior 77% PTX ceiling**; the remaining gap is SASS instruction
+scheduling, and since the driver's ptxas already beats the standalone toolkit, that residual is only
+reachable by hand-SASS (CuAsmRL-style), not tractable here. The banked wins — **2048³ 71%→87% (1.23×)** and
+the **fused epilogue re-based onto the fast base** — are the durable results; both floors are met (4096³
+≥75% with margin, 2048³ ≥90% on clean-clock runs). The structural beyond-parity lever (the fused epilogue
+cuBLAS can't do) is positioned on the fastest base; quantifying its end-to-end margin is the open follow-up.
