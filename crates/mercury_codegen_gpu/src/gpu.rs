@@ -2061,6 +2061,30 @@ pub fn conv2d_wmma_splitk(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Auto-dispatched** fp16 tensor-core implicit-GEMM conv2d — Mercury's best implicit-GEMM conv path
+/// for the shape. Picks a split-K factor via [`crate::ptx_conv::conv_splitk_factor`] (using the device
+/// SM count) and runs the base [`conv2d_wmma`] or the [`conv2d_wmma_splitk`] occupancy path accordingly.
+/// Same contract/precision as [`conv2d_wmma`].
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_auto(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, DriverError> {
+    let sk = crate::ptx_conv::conv_splitk_factor(c, h, width, k, r, s, g.sm_count() as usize);
+    if sk > 1 {
+        conv2d_wmma_splitk(g, x, w, c, h, width, k, r, s, sk)
+    } else {
+        conv2d_wmma(g, x, w, c, h, width, k, r, s)
+    }
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -7106,23 +7130,59 @@ mod tests {
                 crate::diff::assert_close(&format!("naive C{c} {r}x{s}"), &naive, &oracle, 5e-2, rel);
                 let cs_n = csum(&naive);
 
-                // Mercury fp16 implicit-GEMM conv (resident; f16 X/W).
-                let ptx_w = crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s);
-                let mod_w = g.load_module_cached(&ptx_w).unwrap();
-                let f_w = mod_w.load_function("conv2d_wmma").unwrap();
-                let cfg_w = conv_wmma_cfg(h, wd, k, r, s);
+                // Mercury fp16 implicit-GEMM conv, AUTO-DISPATCHED (split-K when the base grid starves
+                // the SMs); resident, f16 X/W, conv (+ reduce) on persistent buffers so timing is pure.
+                let sk = crate::ptx_conv::conv_splitk_factor(c, h, wd, k, r, s, g.sm_count() as usize);
+                let (conv_ptx, conv_fn) = if sk == 1 {
+                    (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                } else {
+                    (crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                };
+                let cmod = g.load_module_cached(&conv_ptx).unwrap();
+                let cf = cmod.load_function(conv_fn).unwrap();
+                let cfg_w = if sk == 1 {
+                    conv_wmma_cfg(h, wd, k, r, s)
+                } else {
+                    conv_wmma_splitk_cfg(h, wd, k, r, s, sk)
+                };
                 let xw_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
                 let ww_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut part_d = g.stream.alloc_zeros::<f32>(sk * k * p * q).unwrap();
                 let mut ow_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
-                let launch_w = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
-                    let mut b = g.stream.launch_builder(&f_w);
-                    b.arg(&xw_d).arg(&ww_d).arg(o);
-                    unsafe { b.launch(cfg_w).unwrap() };
+                let red = if sk > 1 {
+                    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(k * p * q, sk);
+                    let rmod = g.load_module_cached(&rptx).unwrap();
+                    let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                    Some((rmod, rf))
+                } else {
+                    None
                 };
-                launch_w(g, &mut ow_d);
+                let rcfg = LaunchConfig {
+                    grid_dim: (((k * p * q) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_w = |g: &Gpu,
+                                part: &mut cudarc::driver::CudaSlice<f32>,
+                                o: &mut cudarc::driver::CudaSlice<f32>| {
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&cf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&cf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&*part).arg(&mut *o);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                };
+                launch_w(g, &mut part_d, &mut ow_d);
                 g.stream.synchronize().unwrap();
                 let merc = g.stream.memcpy_dtov(&ow_d).unwrap();
-                crate::diff::assert_close(&format!("mercury C{c} {r}x{s}"), &merc, &oracle, 5e-2, rel);
+                crate::diff::assert_close(&format!("mercury C{c} {r}x{s} sk{sk}"), &merc, &oracle, 5e-2, rel);
 
                 // cuDNN (Tier B): cross-check + checksum + disclosed algo.
                 let (cudnn_algo, g_c) = if have_cudnn {
@@ -7144,7 +7204,7 @@ mod tests {
                 let t_w = best_of(ROUNDS, || {
                     let t0 = Instant::now();
                     for _ in 0..iters {
-                        launch_w(g, &mut ow_d);
+                        launch_w(g, &mut part_d, &mut ow_d);
                     }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
@@ -7155,7 +7215,7 @@ mod tests {
                 let (g_w, g_n) = (flop / t_w, flop / t_n);
                 if have_cudnn {
                     eprintln!(
-                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury {:>6.0} GF ({:>5.1}× naive, {:>3.0}% cuDNN) | cuDNN {:>6.0} GF [{}] | naive {:>5.0} GF",
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive, {:>3.0}% cuDNN) | cuDNN {:>6.0} GF [{}] | naive {:>5.0} GF",
                         g_w / 1e9,
                         g_w / g_n,
                         100.0 * g_w / g_c,
@@ -7165,7 +7225,7 @@ mod tests {
                     );
                 } else {
                     eprintln!(
-                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury {:>6.0} GF ({:>5.1}× naive) | naive {:>5.0} GF",
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive) | naive {:>5.0} GF",
                         g_w / 1e9,
                         g_w / g_n,
                         g_n / 1e9,

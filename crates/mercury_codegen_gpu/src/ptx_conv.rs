@@ -728,3 +728,70 @@ pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
     let _ = writeln!(b, "}}");
     b
 }
+
+/// Choose a split-K factor for the implicit-GEMM conv: enough z-slices to raise the (often tiny,
+/// single-batch `N=1`) `M×N` base grid to ~one full wave of resident CTAs on the device, but no more —
+/// over-splitting adds reduce overhead and shrinks each slice's arithmetic intensity. Returns `1` when
+/// the base grid already fills the SMs, or the shape can't be split cleanly (`GK` not a multiple of the
+/// 16-wide WMMA K-tile, e.g. a 3-channel first layer). Pure (takes the SM count) so it is unit-testable
+/// without a device. Every returned `sk>1` satisfies the [`conv_wmma_splitk_ptx`] contract: `sk | GK`
+/// and `GK/sk` a multiple of 16.
+pub fn conv_splitk_factor(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sm_count: usize) -> usize {
+    let gk = c * r * s;
+    if gk % 16 != 0 {
+        return 1; // can't carve whole 16-wide K-tiles (e.g. C3 R3 S3 -> GK=27)
+    }
+    let n = (h - r + 1) * (w - s + 1);
+    let base = k.div_ceil(WMMA_BM) * n.div_ceil(WMMA_BN);
+    let units16 = gk / 16; // whole 16-wide K-tiles available to slice across z
+    // Only split when the base grid is starved AND a clean split actually reaches a useful occupancy:
+    // `lo` is the "worth bothering" floor, `hi` ~one full wave (conv tile ~20 KB SMEM ⇒ ~5 CTAs/SM). A
+    // shape whose largest valid split can't even reach `lo` (e.g. a 5×5 with a tiny base) keeps sk=1 —
+    // over-splitting a near-full grid only adds the reduce pass and loses (measured).
+    let lo = (sm_count * 2).max(40);
+    let hi = (sm_count * 5).max(96);
+    if base >= lo {
+        return 1; // base grid already feeds the SMs
+    }
+    let mut best = 1;
+    for &sk in &[2usize, 3, 4, 6, 8] {
+        let ctas = base * sk;
+        if units16 % sk == 0 && gk / sk >= 64 && (lo..=hi).contains(&ctas) {
+            best = sk; // ascending ⇒ keeps the largest sk that still lands within one wave
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitk_factor_picks_reasonable() {
+        // ~20-SM device (RTX 4050). Heavily-starved deep-channel shapes split; full grids don't.
+        let sm = 20;
+        // C256 14x14 K256 (base = 4*3 = 12) is badly starved -> a large split.
+        assert!(conv_splitk_factor(256, 14, 14, 256, 3, 3, sm) >= 4);
+        // C128 28x28 K128 (base = 2*11 = 22) -> a moderate split.
+        assert!(conv_splitk_factor(128, 28, 28, 128, 3, 3, sm) >= 2);
+        // C64 56x56 K64 (base = 1*46 = 46 ≥ 2·SM) already feeds the SMs -> no split.
+        assert_eq!(conv_splitk_factor(64, 56, 56, 64, 3, 3, sm), 1);
+        // C32 32x32 5x5 (base = 13) — its only clean split (sk2 -> 26 CTAs) can't reach 2 waves, and
+        // over-splitting a near-half-wave grid measured *slower* (reduce overhead) -> keep sk=1.
+        assert_eq!(conv_splitk_factor(32, 32, 32, 32, 5, 5, sm), 1);
+        // First layer C3 R3 S3 -> GK=27, not a multiple of 16 -> cannot split.
+        assert_eq!(conv_splitk_factor(3, 64, 64, 64, 3, 3, sm), 1);
+        // Every split it returns must satisfy the kernel contract (sk|GK, GK/sk % 16 == 0).
+        for (c, h, w, k, r, s) in
+            [(256usize, 14, 14, 256, 3, 3), (128, 28, 28, 128, 3, 3), (256, 14, 14, 256, 1, 1)]
+        {
+            let sk = conv_splitk_factor(c, h, w, k, r, s, sm);
+            let gk = c * r * s;
+            assert_eq!(gk % sk, 0);
+            if sk > 1 {
+                assert_eq!((gk / sk) % 16, 0, "GK/sk must be a multiple of the WMMA K-tile");
+            }
+        }
+    }
+}
