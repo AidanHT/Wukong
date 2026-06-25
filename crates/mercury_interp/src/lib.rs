@@ -2562,6 +2562,70 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_embedding_f32[_parallel](out, weight, ids, t, h, v)` — embedding lookup (the first
+            // layer of every LLM): `out[r,:] = weight[ids[r],:]`. NOTE the output pointer is the FIRST
+            // arg. Marshal the `t` i32 token ids and the f32 weight table out of abstract memory, call the
+            // *serial* kernel (bit-identical to the parallel one — output rows independent), write the
+            // `t*h` f32 result. The recognizer passes a huge `v` sentinel (so its clamp never fires); the
+            // interpreter can't marshal a 2^48-row table, so it derives the *real* table extent from the
+            // ids — `v_eff = max(ids)+1` — and passes that, which marshals exactly the live weight memory
+            // and still leaves every valid id in range (no clamp), matching the native call's gather.
+            "mercury_embedding_f32" | "mercury_embedding_f32_parallel" => {
+                let out = ptr(args[0])?;
+                let weight = ptr(args[1])?;
+                let ids = ptr(args[2])?;
+                let t = args[3].as_int() as usize;
+                let h = args[4].as_int() as usize;
+                // Read the `t` token ids (each a `Value::Int`).
+                let mut idbuf = Vec::with_capacity(t);
+                for r in 0..t {
+                    idbuf.push(
+                        self.memory
+                            .get(ids + r)
+                            .ok_or("embedding ids out of bounds")?
+                            .as_int() as i32,
+                    );
+                }
+                // Effective table height = the largest in-range id + 1 (out-of-range ids zero their row
+                // regardless of `v`, so they don't extend the live extent). This bounds the weight
+                // marshalling to memory that actually exists and keeps every valid id in `[0, v_eff)`.
+                let v_eff = idbuf
+                    .iter()
+                    .filter(|&&id| id >= 0)
+                    .map(|&id| id as usize + 1)
+                    .max()
+                    .unwrap_or(0);
+                let wn = v_eff * h;
+                let mut wbuf = Vec::with_capacity(wn);
+                for i in 0..wn {
+                    wbuf.push(
+                        self.memory
+                            .get(weight + i)
+                            .ok_or("embedding weight out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; t * h];
+                // SAFETY: obuf is t*h f32, wbuf is v_eff*h f32, idbuf is t i32 — the kernel's contract,
+                // with every id < v_eff so no out-of-range path reads past wbuf.
+                unsafe {
+                    mercury_runtime::mercury_embedding_f32(
+                        obuf.as_mut_ptr(),
+                        wbuf.as_ptr(),
+                        idbuf.as_ptr(),
+                        t,
+                        h,
+                        v_eff,
+                    );
+                }
+                for (i, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + i)
+                        .ok_or("embedding output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }
