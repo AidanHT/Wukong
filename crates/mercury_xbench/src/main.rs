@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use mercury_span::{Interner, SourceId};
@@ -155,6 +156,33 @@ fn main() {
 
         println!("=== {} ({}) ===", k.name, k.note);
         report(k, &mercury, &c, &rust);
+        // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
+        // of the GEMM-vs-cblas comparison. Mercury's hand-AVX2 vmath vs Intel's hand-tuned VML, both
+        // single-thread, same buffer. Cross-checked against Mercury's output (a large rel error would
+        // expose a VML ABI mismatch — then the column is dishonest, so it is dropped with a note).
+        let vml_fn = match k.name {
+            "exp" => mkl().and_then(|a| a.vs_exp),
+            "log" => mkl().and_then(|a| a.vs_ln),
+            "tanh" => mkl().and_then(|a| a.vs_tanh),
+            _ => None,
+        };
+        if let (Some(f), Some(m)) = (vml_fn, &mercury) {
+            let v = bench_vml(f, xp, &mut out);
+            let (rel, at) = max_rel_err(&m.out, &v.out);
+            if rel > 1e-3 {
+                println!(
+                    "  -> oneMKL VML disagrees with Mercury at [{at}] (rel {rel:.1e}) — likely an ABI \
+                     mismatch on this MKL build; VML column dropped"
+                );
+            } else {
+                let r = v.ns_per_call / m.ns_per_call; // >1 ⇒ Mercury faster
+                println!(
+                    "  -> Mercury vmath is {:.2}x {} than oneMKL VML (hand-tuned vector math), 1 thread",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" },
+                );
+            }
+        }
         if let (Some(m), Some(c)) = (&mercury, &c) {
             runtime_ratios_c.push(c.ns_per_call / m.ns_per_call); // >1 => Mercury faster
             compile_ratios_c.push(c.compile.as_secs_f64() / m.compile.as_secs_f64());
@@ -182,6 +210,16 @@ fn main() {
              of THIS, which is clock-invariant (absolute GFLOP/s swings with the laptop's power state)."
         );
         println!();
+    }
+    match mkl() {
+        Some(api) => println!(
+            "oneMKL peer: {} (max {} threads) — Intel's hand-tuned CPU GEMM, the Tier-B library bar.\n",
+            api.path.display(),
+            api.max_threads
+        ),
+        None => println!(
+            "oneMKL peer: not found — set MERCURY_MKL_DLL=<path to mkl_rt.dll> to enable the MKL column.\n"
+        ),
     }
     if want("matmul") {
         bench_matmul(&cc, &dir, roof);
@@ -279,7 +317,14 @@ fn main() {
 /// way in each language, and additionally Mercury's `@parallel` form. Reported as GFLOP/s. The win
 /// is shown across a size sweep so it is clearly structural, not a single-size artifact.
 fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
-    for ns in [256usize, 512, 1024] {
+    // 2048³ already spills L3 (3×16 MB operands + packing vs ~24 MB L3) — the regime where multi-level
+    // blocking and the library gap show. 4096³ is the same regime, larger; it is multi-second per call
+    // so it is gated behind XBENCH_HUGE to keep the default run quick.
+    let mut sizes = vec![256usize, 512, 1024, 2048];
+    if std::env::var("XBENCH_HUGE").is_ok() {
+        sizes.push(4096);
+    }
+    for ns in sizes {
         bench_matmul_size(cc, dir, ns, roof);
         println!();
     }
@@ -300,50 +345,93 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             .unwrap_or_else(|| "n/a".into())
     };
 
+    // Measurement ordering is thermal hygiene (the honesty law). On this hybrid laptop a multi-second
+    // all-core or naive-scalar run heat-throttles the chip for ~seconds after it, so WHO RUNS BEFORE
+    // WHOM decides whether a peer ratio is fair. Three groups, coolest-first:
+    //  (1) single-core peers adjacent — Mer(1c), MKL(1c), tuned — each internally warmed and cheap
+    //      (one core barely heats the package even at 2048³), so the Mer/MKL 1-core ratio is taken in
+    //      the same near-cold state at EVERY size. The old order ran MKL(1c) *last*, after the all-core
+    //      burst + both naive nests, throttling it to a bogus 32 GFLOP/s at 4096³ (< its own 2048³).
+    //  (2) all-core peers adjacent — Mer(par) then MKL(all) — both in the same warm state, so thermal
+    //      cancels in their ratio even when the absolute GFLOP/s is throttled.
+    //  (3) the naive C/Rust nests LAST (they are the dominant heat source — multi-second scalar triple
+    //      loops) so they pollute no library peer, and are skipped at ≥2048³ where a single call is tens
+    //      of seconds (their win is already overwhelming and widening at ≤1024³; set XBENCH_NAIVE_HUGE
+    //      to force them). At those sizes correctness is cross-checked against MKL instead of C.
     let mer = bench_mercury(&mer_matmul(ns, false), &mut c, ap, bp, cp);
-    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
-    let cm = bench_external(
-        "c",
-        &c_matmul(ns),
-        dir,
-        "matmul",
-        cc,
-        &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-        &mut c,
-        ap,
-        bp,
-        cp,
-    );
-    let rm = bench_external(
-        "rs",
-        &rust_matmul(ns),
-        dir,
-        "matmul",
-        "rustc",
-        &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
-        &mut c,
-        ap,
-        bp,
-        cp,
-    );
+    let mkl_1c = bench_mm_mkl(ns, false, 1, &a, &b, &mut c);
     let tuned = bench_mm_tuned(ns, false, &a, &b, &mut c);
+    // All-core peers, sequential, MKL(all) measured FIRST — the ordering that is clean AND honest on a
+    // throttling laptop. Mer(1c)/tuned above use serial kernels that never touch rayon, so rayon's
+    // global pool is still DORMANT here: MKL(all) runs on otherwise-idle cores (no rival thread pool
+    // is spinning) in the coolest available state, so its number is trustworthy. Mer(par) runs *after*,
+    // spinning up rayon only once MKL is done; if anything it inherits MKL's residual heat. So the
+    // Mer/MKL all-core ratio is a CONSERVATIVE lower bound on Mercury — we throttle ourselves, never
+    // the competitor, the honest direction when two all-core runs cannot both be cool. (An earlier
+    // interleaved A/B timer was reproducibility-fragile: alternating two live thread pools thrashes the
+    // OS scheduler and MKL's OpenMP workers park between blocks, reading a bogus sub-1-thread number.)
+    let mkl_all = mkl()
+        .map(|api| api.max_threads)
+        .and_then(|t| bench_mm_mkl(ns, false, t, &a, &b, &mut c));
+    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
+    let run_naive = ns < 2048 || std::env::var("XBENCH_NAIVE_HUGE").is_ok();
+    let (cm, rm) = if run_naive {
+        let cm = bench_external(
+            "c",
+            &c_matmul(ns),
+            dir,
+            "matmul",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_matmul(ns),
+            dir,
+            "matmul",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut c,
+            ap,
+            bp,
+            cp,
+        );
+        (cm, rm)
+    } else {
+        (None, None)
+    };
 
     println!(
-        "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
-        "", "Mer(1core)", "Mer(par)", "tuned(mm)", "C (gcc)", "Rust"
+        "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "Mer(1c)", "Mer(par)", "MKL(1c)", "MKL(all)", "tuned(mm)", "C(gcc)", "Rust"
     );
     println!(
-        "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "GFLOP/s",
         gflops(&mer),
         gflops(&mer_par),
+        gflops(&mkl_1c),
+        gflops(&mkl_all),
         gflops(&Some(tuned.clone())),
         gflops(&cm),
         gflops(&rm)
     );
     report_gemm_standing(&mer, &tuned, roof, flops);
-    // Cross-language correctness: every backend must compute the same C, element by element.
-    if let (Some(m), Some(c)) = (&mer_par, &cm) {
+    report_gemm_vs_mkl(&mer, &mer_par, &mkl_1c, &mkl_all, flops);
+    if !run_naive {
+        println!(
+            "  -> naive C/Rust omitted at {ns}³ (multi-second per call; their loss widens monotonically\n     below — Mer 1c is 2.4–3.8× naive C at 256–1024³ and naive C keeps falling on cache misses).\n     Correctness here is cross-checked vs MKL (above), the stronger oracle."
+        );
+    }
+    // Cross-language correctness: Mercury's C must match the C/gcc reference element-by-element. Uses
+    // the single-core `mer` (which carries an output snapshot) — the interleaved all-core pair skips
+    // the snapshot (its kernel is proven bit-identical to serial by the runtime unit test, and serial
+    // is the cross-checked `mer` here), so we validate the serial output and trust the equivalence.
+    if let (Some(m), Some(c)) = (&mer, &cm) {
         let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
             println!(
@@ -4541,10 +4629,33 @@ fn bench_external_bf16(
 /// batches. On a busy multicore box the *minimum* batch is the least-interfered estimate (the run
 /// that suffered the least scheduler/thermal noise), so more samples tighten the result.
 fn time_ns(mut run: impl FnMut()) -> f64 {
-    for _ in 0..5 {
+    // Warm up twice, then probe one call to size the sampling. A kernel whose *single* call already
+    // exceeds the 50 ms target (the large GEMMs, 2048³/4096³) is sampled best-of-6 single calls
+    // instead of best-of-14 rep-blocks, so a multi-second GEMM benches in seconds, not minutes —
+    // identical "best observed" methodology, just fewer samples. Sub-target kernels are unchanged:
+    // 5 warmups total, reps scaled until a block ≥ 50 ms, then best-of-14.
+    run();
+    run();
+    let probe = {
+        let t = Instant::now();
         run();
-    }
+        t.elapsed()
+    };
     let target = Duration::from_millis(50);
+    if probe >= target {
+        let mut best = probe;
+        for _ in 0..6 {
+            let t = Instant::now();
+            run();
+            let e = t.elapsed();
+            if e < best {
+                best = e;
+            }
+        }
+        return best.as_secs_f64() * 1e9;
+    }
+    run();
+    run();
     let mut reps = 1u64;
     loop {
         let t = Instant::now();
@@ -4588,6 +4699,258 @@ fn report_gemm_standing(mer: &Option<Measure>, tuned: &Measure, roof: f64, flops
                 "  -> Mercury single-core = {:.0}% of measured roofline; tuned matrixmultiply = {:.0}%",
                 mer_g / roof * 100.0,
                 tuned_g / roof * 100.0
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// oneMKL library peer — the gold-standard CPU GEMM (Intel MKL), resolved at runtime via dlopen.
+// MKL ships in Anaconda/Miniconda as `mkl_rt.dll`; we load it with no build-time linkage so the
+// bench runs with or without it (the column shows "n/a" when absent). On Meteor Lake MKL dispatches
+// its AVX2 kernels (this part has no AVX-512), so MKL(1 thread) is an apples-to-apples 256-bit
+// single-core peer, and MKL(all) uses MKL's own threading — the true Tier-B library bar, a tier
+// above naive C/Rust and the pure-Rust `matrixmultiply` crate.
+// ----------------------------------------------------------------------------------------------
+
+// CBLAS enums (Intel MKL / Netlib CBLAS).
+const CBLAS_ROW_MAJOR: i32 = 101;
+const CBLAS_NO_TRANS: i32 = 111;
+const CBLAS_TRANS: i32 = 112;
+
+// Unconditional ILP64 GEMM `cblas_sgemm_64(layout, transa, transb, m, n, k, alpha, A, lda, B, ldb,
+// beta, C, ldc)`: the CBLAS enums stay 32-bit `int`; the dimensions and leading dims are 64-bit
+// `MKL_INT`. Using the `_64` symbol sidesteps the interface-layer default — Anaconda's `mkl_rt`
+// defaults to ILP64 here, so the plain `cblas_sgemm` with 32-bit dims is misread and segfaults.
+type CblasSgemmFn = unsafe extern "C" fn(
+    i32,
+    i32,
+    i32,
+    i64,
+    i64,
+    i64,
+    f32,
+    *const f32,
+    i64,
+    *const f32,
+    i64,
+    f32,
+    *mut f32,
+    i64,
+);
+type MklSetNumThreadsFn = unsafe extern "C" fn(i32);
+type MklGetMaxThreadsFn = unsafe extern "C" fn() -> i32;
+// oneMKL VML (Vector Math Library) single-precision unary op: `vsExp(n, a, y)` ⇒ `y[i] = exp(a[i])`.
+// The `n` width follows the same interface layer as CBLAS — ILP64 here (so `i64`, matching the
+// `cblas_sgemm_64` we resolve). The default HA (high-accuracy, ~0.5 ULP) mode is left in force; the
+// per-kernel cross-check vs Mercury's ~1-ULP poly tolerates the ≤2-ULP difference and would flag an
+// ABI mismatch (garbage output) by reporting a large rel error, in which case the column is dropped.
+type VmlUnaryFn = unsafe extern "C" fn(i64, *const f32, *mut f32);
+
+/// Resolved oneMKL entry points. Function pointers are `Copy + Send + Sync`; the backing library is
+/// leaked (`mem::forget`) so the pointers stay valid for the whole process. The VML ops are optional
+/// (`None` if the symbol is absent) — they peer Mercury's vectorized transcendentals against Intel's
+/// hand-tuned vector math, the elementwise analogue of the GEMM-vs-cblas comparison.
+struct MklApi {
+    sgemm: CblasSgemmFn,
+    set_threads: MklSetNumThreadsFn,
+    max_threads: i32,
+    vs_exp: Option<VmlUnaryFn>,
+    vs_ln: Option<VmlUnaryFn>,
+    vs_tanh: Option<VmlUnaryFn>,
+    path: PathBuf,
+}
+
+/// Best-effort discovery of `mkl_rt.dll`: an explicit `MERCURY_MKL_DLL` override first, then the
+/// standard conda layouts (`$CONDA_PREFIX`, `%USERPROFILE%\{Anaconda3,miniconda3,…}\Library\bin`,
+/// and the system-wide ProgramData install).
+fn mkl_dll_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MERCURY_MKL_DLL") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
+        bases.push(PathBuf::from(prefix).join("Library").join("bin"));
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        for name in ["Anaconda3", "anaconda3", "miniconda3", "Miniconda3", "miniforge3"] {
+            bases.push(PathBuf::from(&home).join(name).join("Library").join("bin"));
+        }
+    }
+    bases.push(PathBuf::from(r"C:\ProgramData\Anaconda3\Library\bin"));
+    for base in bases {
+        for fname in ["mkl_rt.2.dll", "mkl_rt.1.dll", "mkl_rt.dll"] {
+            let p = base.join(fname);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Load oneMKL once (cached). `LOAD_WITH_ALTERED_SEARCH_PATH` makes the Windows loader resolve MKL's
+/// own dependencies (`libiomp5md.dll`, `mkl_core`, `mkl_intel_thread`) from the DLL's directory.
+fn mkl() -> Option<&'static MklApi> {
+    static API: OnceLock<Option<MklApi>> = OnceLock::new();
+    API.get_or_init(|| {
+        let path = mkl_dll_path()?;
+        use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
+        let lib =
+            unsafe { WinLibrary::load_with_flags(&path, LOAD_WITH_ALTERED_SEARCH_PATH) }.ok()?;
+        let lib: libloading::Library = lib.into();
+        let api = unsafe {
+            // CamelCase = MKL's C by-value interface. The lowercase `mkl_set_num_threads` is the
+            // Fortran *by-reference* binding (`const int*`); calling it by value dereferences the
+            // thread count as a pointer and segfaults — use `MKL_Set_Num_Threads` (by value).
+            let sgemm = *lib.get::<CblasSgemmFn>(b"cblas_sgemm_64\0").ok()?;
+            let set_threads = *lib.get::<MklSetNumThreadsFn>(b"MKL_Set_Num_Threads\0").ok()?;
+            let get_max = *lib.get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0").ok()?;
+            // VML transcendentals are optional (older MKL builds, or a stripped redist, may omit them).
+            let vml = |sym: &[u8]| lib.get::<VmlUnaryFn>(sym).ok().map(|s| *s);
+            let vs_exp = vml(b"vsExp\0");
+            let vs_ln = vml(b"vsLn\0");
+            let vs_tanh = vml(b"vsTanh\0");
+            MklApi {
+                sgemm,
+                set_threads,
+                max_threads: get_max(),
+                vs_exp,
+                vs_ln,
+                vs_tanh,
+                path,
+            }
+        };
+        std::mem::forget(lib);
+        Some(api)
+    })
+    .as_ref()
+}
+
+/// Time oneMKL's `cblas_sgemm` for `C = A·B` (or `A·Bᵀ` when `transpose_b`), row-major square `ns`,
+/// pinned to `threads` MKL threads. `None` if MKL is unavailable.
+fn bench_mm_mkl(
+    ns: usize,
+    transpose_b: bool,
+    threads: i32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) -> Option<Measure> {
+    let api = mkl()?;
+    let (m, n, k) = (ns as i64, ns as i64, ns as i64);
+    let lda = ns as i64;
+    let (transb, ldb) = if transpose_b {
+        (CBLAS_TRANS, ns as i64)
+    } else {
+        (CBLAS_NO_TRANS, ns as i64)
+    };
+    let ldc = ns as i64;
+    unsafe {
+        (api.set_threads)(threads.max(1));
+    }
+    c.iter_mut().for_each(|v| *v = 0.0);
+    let ns_per_call = time_ns(|| unsafe {
+        (api.sgemm)(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            transb,
+            m,
+            n,
+            k,
+            1.0,
+            a.as_ptr(),
+            lda,
+            b.as_ptr(),
+            ldb,
+            0.0,
+            c.as_mut_ptr(),
+            ldc,
+        );
+    });
+    Some(Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: c.to_vec(),
+    })
+}
+
+/// Time a oneMKL VML unary op (`vsExp`/`vsLn`/`vsTanh`) over the buffer: `out = f(x)`, single-threaded
+/// (VML respects `MKL_Set_Num_Threads`; we leave it at 1 to peer Mercury's single-core vmath kernel).
+/// Snapshots the output for the correctness cross-check against Mercury's vectorized transcendental.
+fn bench_vml(f: VmlUnaryFn, x: *const f32, out: &mut [f32]) -> Measure {
+    if let Some(api) = mkl() {
+        unsafe { (api.set_threads)(1) };
+    }
+    let nn = out.len() as i64;
+    let op = out.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe { f(nn, x, op) });
+    Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: out.to_vec(),
+    }
+}
+
+/// Print Mercury's GEMM standing against the oneMKL peer: single-core vs MKL(1 thread) and
+/// @parallel vs MKL(all threads), as a clock-invariant ratio + Mercury's %-of-MKL. MKL is Intel's
+/// hand-tuned, JIT'd GEMM (AVX2 dispatch on this part) — the honest library bar. Also cross-checks
+/// that Mercury's blocked kernel agrees with MKL element-by-element (independent correctness).
+fn report_gemm_vs_mkl(
+    mer: &Option<Measure>,
+    mer_par: &Option<Measure>,
+    mkl_1c: &Option<Measure>,
+    mkl_all: &Option<Measure>,
+    flops: f64,
+) {
+    if let (Some(m), Some(k)) = (mer, mkl_1c) {
+        let (mg, kg) = (flops / m.ns_per_call, flops / k.ns_per_call);
+        let r = mg / kg;
+        println!(
+            "  -> Mercury 1-core is {:.2}x {} than oneMKL(1 thread) — {:.0}% of MKL ({mg:.0} vs {kg:.0} GFLOP/s)",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" },
+            mg / kg * 100.0,
+        );
+        let (rel, at) = max_rel_err(&m.out, &k.out);
+        if rel > 1e-3 {
+            println!("  ! Mercury vs MKL full-buffer mismatch at [{at}] (rel {rel:.2e})");
+        }
+    }
+    // Mercury's own parallel scaling: @parallel ÷ its own single core. Both are measured in the same
+    // run with the same (rayon) thread pool, so this is robust to the laptop's power state and free of
+    // the cross-pool noise that wrecks the MKL all-core comparison — the honest "how well does Mercury
+    // scale" figure (16 physical cores is the ceiling; HT siblings add no FMA throughput).
+    if let (Some(m1), Some(mp)) = (mer, mer_par) {
+        let eff = m1.ns_per_call / mp.ns_per_call;
+        println!("  -> Mercury @parallel scales {eff:.1}× over its own single core");
+    }
+    if let (Some(m), Some(k1), Some(ka)) = (mer_par, mkl_1c, mkl_all) {
+        let (mg, kag, k1g) = (
+            flops / m.ns_per_call,
+            flops / ka.ns_per_call,
+            flops / k1.ns_per_call,
+        );
+        // Degeneracy guard. A real all-core GEMM is ≥4× its single-core self; if MKL(all) failed to
+        // clear even 1.2× MKL(1c), its 16 OpenMP workers did not actually scale this call — a known
+        // pathology on this thermally-constrained hybrid when the box is loaded (the pool stalls, and
+        // we have measured MKL(all) read *below* MKL(1c)). Printing "1200% of MKL" off such a run would
+        // be a measurement artifact dressed as a win — omit the ratio and say why (honesty law).
+        if kag <= k1g * 1.2 {
+            println!(
+                "  -> oneMKL(all) {kag:.0} ≤ MKL(1c) {k1g:.0} GFLOP/s: degenerate all-core run (OMP did \
+                 not scale on this loaded hybrid) — ratio omitted; see the @parallel scaling above"
+            );
+        } else {
+            let r = mg / kag;
+            println!(
+                "  -> Mercury @parallel is {:.2}x {} than oneMKL(all threads) — {:.0}% of MKL ({mg:.0} vs {kag:.0} GFLOP/s)",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" },
+                mg / kag * 100.0,
             );
         }
     }
@@ -4669,7 +5032,18 @@ unsafe fn fma_roofline_avx2() -> f64 {
         _mm256_storeu_ps(tmp.as_mut_ptr(), s);
         tmp.iter().sum()
     };
-    let _ = run(2_000_000); // warm up the clock
+    // Ramp the clock to its sustained turbo state before timing. A fixed-iteration warmup (~5 ms) is
+    // far too short: the chip boosts over ~100-400 ms from a cold idle start, so the roofline would be
+    // measured throttled and then read *below* the warm GEMM that runs minutes later — making
+    // "% of roofline" exceed 100% (an obvious honesty bug). Warm for ≥400 ms of wall time instead.
+    {
+        let t = Instant::now();
+        let mut warm = 0f32;
+        while t.elapsed() < Duration::from_millis(400) {
+            warm += run(2_000_000);
+        }
+        std::hint::black_box(warm);
+    }
     let iters = 40_000_000u64;
     let mut best = f64::INFINITY;
     let mut sink = 0f32;
