@@ -84,6 +84,9 @@ pub use pool2d::{
 mod xent;
 pub use xent::{mercury_xent_fwd_f32, mercury_xent_fwd_f32_parallel};
 
+mod embedding;
+pub use embedding::{mercury_embedding_f32, mercury_embedding_f32_parallel};
+
 mod rope;
 pub use rope::{mercury_rope_f32, mercury_rope_f32_parallel};
 
