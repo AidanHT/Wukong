@@ -122,6 +122,44 @@ number the instant a 2nd GPU is attached.
   layers, Bcap=64): **bit-for-bit identical** across two physical block layouts (ascending vs descending
   slot allocation) — every layer reads/writes the cache correctly; a misread would diverge.
 
+### P4 — whole-model decode CUDA graph (the first law + a same-run latency ratio)
+- **Graphed == eager, bit-for-bit + deterministic** (`serving_decode_graph_matches_eager`, 6 layers,
+  Bcap=64): the entire 6-layer decode step (~84 kernel launches) captured into **one `cuGraphLaunch`**
+  reproduces the eager per-op `run_layers_on` output **bit-for-bit** (`to_bits()` equality, every
+  element) and is **identical across two replays** (deterministic). The graph changes *how* the launches
+  are issued, never *what* they compute. Capture runs on a dedicated non-blocking stream with event
+  tracking disabled (the NULL stream is un-capturable; cross-stream event waits break capture).
+- **Same-run latency, graphed vs eager per-op** (`serving_decode_graph_throughput`, RTX 4050, named peer
+  = Mercury's own eager per-op decode):
+
+  | depth N | eager | graphed | graphed speedup | tokens/s eager → graphed | launches folded |
+  |--------:|------:|--------:|----------------:|--------------------------|-----------------|
+  | 1       | 997 µs  | 744 µs  | **1.34×** | 64 197 → 85 963 | ~14 → 1 |
+  | 6       | 2399 µs | 1777 µs | **1.35×** | 26 678 → 36 023 | ~84 → 1 |
+  | 12      | 4108 µs | 3824 µs | **1.07×** | 15 581 → 16 735 | ~168 → 1 |
+
+- **Honest reading**: the graph win is real but **modest, and shrinks with depth** — the diagnostic that
+  at Bcap=64 the decode step is **compute/execution-bound, not launch-bound** (eager's async launches
+  already pipeline behind GPU compute; the graph only recovers the exposed launch overhead, a roughly
+  fixed ~250–280 µs, which is a large fraction of one shallow layer but a small fraction of twelve). The
+  per-layer wall (~320 µs) is dominated by the six WMMA GEMMs running at M=64 — only 8–32 CTAs on 40 SMs,
+  a single under-occupied wave with a long K-reduction. **This underutilization is precisely the lever
+  P5 (continuous batching) converts into goodput**: the fixed-shape step costs ~the same whether 1 or 64
+  rows are useful, so filling the batch multiplies useful tokens/s without adding latency. The graph's
+  1.07–1.35× then stacks on top of the batching win. (The decode GEMM kernel itself is owned by the
+  kernel branches — not edited here; the serving path calls it as-is.)
+
+### P4 — paged decode-attention kernel: warp-cooperative rewrite (correctness preserved)
+- The v1 decode-attention kernel was **one thread per `(slot, head)`** — correct and trivially bit-exact,
+  but it launched only `num_slots*heads` *threads* (512 here), leaving 39/40 SMs idle. Rewritten
+  **warp-cooperative**: one **warp** per `(slot, head)`, the 32 lanes split the context (`t = lane,
+  lane+32, …`), each lane runs a partial online-softmax (FP32 accumulators), then a fixed
+  `shfl.sync.bfly.b32` butterfly merges them (max → rescale → Σl → Σacc). The query is staged once per
+  warp in shared memory. **Both P2 gates still pass on the new kernel** — tolerance vs the f64 reference
+  (`max_abs = 1.79e-7`) and **bit-for-bit identical across two physical block layouts** — because the
+  lane partition and the butterfly merge order are layout-independent, so paging stays numerically
+  invisible by construction.
+
 ## Multi-GPU design detail (unmeasured)
 
 _see P7._

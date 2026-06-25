@@ -687,4 +687,210 @@ mod tests {
             eprintln!("{depth}-layer decode step BIT-IDENTICAL across 2 physical block layouts (Bcap={bcap}) — paging invisible end-to-end");
         });
     }
+
+    // ============================ P4: whole-model decode CUDA graph ==================================
+    use cudarc::driver::CudaContext;
+
+    /// Disable cudarc's default event tracking for the duration of `f` (it inserts cross-stream waits a
+    /// CUDA-graph capture rejects). Mirrors the gpu.rs harness helper.
+    fn with_event_tracking_disabled(g: &mut Gpu, f: impl FnOnce(&mut Gpu)) {
+        struct Reenable(Arc<CudaContext>);
+        impl Drop for Reenable {
+            fn drop(&mut self) {
+                unsafe { self.0.enable_event_tracking() };
+            }
+        }
+        let _guard = Reenable(g.ctx.clone());
+        unsafe { g.ctx.disable_event_tracking() };
+        f(g);
+    }
+
+    /// Best (lowest) per-iteration wall time of `run` in seconds, syncing `s` to retire the work. Warms
+    /// the boost clock, then takes the fastest of several timed rounds — the least-throttled measurement.
+    fn min_latency(s: &Arc<CudaStream>, mut run: impl FnMut()) -> f64 {
+        use std::time::Instant;
+        const WARMUP: usize = 20;
+        const ROUNDS: usize = 10;
+        const ITERS: usize = 30;
+        for _ in 0..WARMUP {
+            run();
+        }
+        s.synchronize().unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                run();
+            }
+            s.synchronize().unwrap();
+            best = best.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+        }
+        best
+    }
+
+    /// Build an `N`-layer `DecodeModel`, reserve+populate every layer's cache plane with `ctx0[b]`
+    /// f16-rounded past tokens per slot, and advance one token (host append + metadata upload) so the
+    /// model is primed for exactly one decode step.
+    fn primed_model(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        cfg: KvConfig,
+        dff: usize,
+        ctx0: &[usize],
+        pool_bytes: usize,
+        seed: u64,
+    ) -> DecodeModel {
+        let d = cfg.heads * cfg.head_dim;
+        let mut model = DecodeModel::new(g, weights, cfg, dff, pool_bytes).unwrap();
+        for b in 0..cfg.num_slots {
+            if ctx0[b] > 0 {
+                model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
+            }
+        }
+        let mut kh = vec![f16::from_f32(0.0); cfg.slab_elems()];
+        let mut vh = vec![f16::from_f32(0.0); cfg.slab_elems()];
+        for layer in 0..cfg.layers {
+            let mut lrng = crate::diff::Rng::new(seed + layer as u64);
+            for b in 0..cfg.num_slots {
+                let pk: Vec<f32> = lrng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
+                let pv: Vec<f32> = lrng.vec(ctx0[b] * d, -1.0, 1.0).iter().map(|&x| f16r(x)).collect();
+                for t in 0..ctx0[b] {
+                    let (phys, off) = model.cache_mut().manager_ref().locate(b, t);
+                    for h in 0..cfg.heads {
+                        for dh in 0..cfg.head_dim {
+                            let idx = cfg.elem_offset(layer, phys, off, h, dh);
+                            kh[idx] = f16::from_f32(pk[(t * cfg.heads + h) * cfg.head_dim + dh]);
+                            vh[idx] = f16::from_f32(pv[(t * cfg.heads + h) * cfg.head_dim + dh]);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let (ks, vs) = model.cache_mut().slabs_mut();
+            g.stream.memcpy_htod(&kh, ks).unwrap();
+            g.stream.memcpy_htod(&vh, vs).unwrap();
+        }
+        model.advance_and_upload(&g.stream.clone()).unwrap();
+        g.stream.synchronize().unwrap();
+        model
+    }
+
+    fn graph_cfg(depth: usize) -> (KvConfig, usize, Vec<usize>, usize, usize) {
+        let (heads, hd, dff, bsz, bcap) = (8usize, 64usize, 2048usize, 16usize, 64usize);
+        let ctx0: Vec<usize> = (0..bcap).map(|b| 32 + (b * 7) % 64).collect();
+        let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+        let num_blocks = bcap * max_bps + 8;
+        let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+        (cfg, dff, ctx0, heads * hd, bcap)
+    }
+
+    /// **Whole-model decode CUDA-graph gate (the first law).** The entire `N`-layer decode step captured
+    /// into one `cuGraphLaunch` must produce output **bit-for-bit identical** to the eager per-op
+    /// `run_layers_on`, and be deterministic across two replays — the graph changes *how* the launches
+    /// are issued, not *what* they compute. Capture runs on a dedicated non-blocking stream with event
+    /// tracking disabled (the NULL stream is un-capturable; events break capture).
+    #[test]
+    fn serving_decode_graph_matches_eager() {
+        with_gpu("serving_decode_graph_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let depth = 6usize;
+                let (cfg, dff, ctx0, d, bcap) = graph_cfg(depth);
+                let mut rng = crate::diff::Rng::new(0xC0F0);
+                let wdata = layer_weights(&mut rng, depth, d, dff);
+                let weights = weights_view(&wdata);
+                let mut model = primed_model(g, &weights, cfg, dff, &ctx0, 64 * 1024 * 1024, 0xC0DE);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                // Eager reference on the default stream.
+                let mut out_e = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                model.run_layers_on(&g.stream.clone(), &x_d, &mut out_e).unwrap();
+                g.stream.synchronize().unwrap();
+                let ref_host = g.stream.memcpy_dtov(&out_e).unwrap();
+
+                // Capture the whole decode step on a dedicated capturable stream.
+                let cap = g.ctx.new_stream().unwrap();
+                let mut out_c = cap.alloc_zeros::<f32>(bcap * d).unwrap();
+                model.run_layers_on(&cap, &x_d, &mut out_c).unwrap(); // warmup (stable pool pointers)
+                cap.synchronize().unwrap();
+                let graph = crate::graph::Graph::capture(cap.clone(), || {
+                    model.run_layers_on(&cap, &x_d, &mut out_c)
+                })
+                .unwrap();
+                graph.launch().unwrap();
+                cap.synchronize().unwrap();
+                let g1 = cap.memcpy_dtov(&out_c).unwrap();
+                graph.launch().unwrap();
+                cap.synchronize().unwrap();
+                let g2 = cap.memcpy_dtov(&out_c).unwrap();
+
+                assert_eq!(g1.len(), ref_host.len());
+                for i in 0..ref_host.len() {
+                    assert_eq!(g1[i].to_bits(), ref_host[i].to_bits(), "graphed != eager at {i}");
+                    assert_eq!(g1[i].to_bits(), g2[i].to_bits(), "graph replay non-deterministic at {i}");
+                }
+                eprintln!(
+                    "{depth}-layer decode step graphed==eager bit-identical & deterministic (Bcap={bcap} D={d} Dff={dff}); \
+                     whole decode step = one cuGraphLaunch (~{} launches folded)",
+                    depth * 14
+                );
+            });
+        });
+    }
+
+    /// **P4 throughput — whole-model decode: eager per-op vs one graph replay.** At decode shape every
+    /// kernel runs for microseconds, so the per-launch driver overhead (`cuLaunchKernel` × ~14 × depth)
+    /// dominates; folding the whole step into one `cuGraphLaunch` collapses it. Same-run ratio (the
+    /// honesty law — clocks swing ~7×; named peer = **Mercury's own eager per-op decode**, the project's
+    /// standing GPU baseline). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn serving_decode_graph_throughput() {
+        with_gpu("serving_decode_graph_throughput", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                for &depth in &[1usize, 6, 12] {
+                    let (cfg, dff, ctx0, d, bcap) = graph_cfg(depth);
+                    let mut rng = crate::diff::Rng::new(0x7000 + depth as u64);
+                    let wdata = layer_weights(&mut rng, depth, d, dff);
+                    let weights = weights_view(&wdata);
+                    let mut model = primed_model(g, &weights, cfg, dff, &ctx0, 128 * 1024 * 1024, 0xBEE5);
+                    let x = rng.vec(bcap * d, -1.0, 1.0);
+                    let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                    // Eager: per-op launches on the default stream (named peer = Mercury's own eager decode).
+                    let mut out_e = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                    let gs = g.stream.clone();
+                    let eager = min_latency(&gs, || {
+                        model.run_layers_on(&gs, &x_d, &mut out_e).unwrap();
+                    });
+
+                    // Graphed: the whole decode step as one cuGraphLaunch.
+                    let cap = g.ctx.new_stream().unwrap();
+                    let mut out_c = cap.alloc_zeros::<f32>(bcap * d).unwrap();
+                    model.run_layers_on(&cap, &x_d, &mut out_c).unwrap();
+                    cap.synchronize().unwrap();
+                    let graph = crate::graph::Graph::capture(cap.clone(), || {
+                        model.run_layers_on(&cap, &x_d, &mut out_c)
+                    })
+                    .unwrap();
+                    let graphed = min_latency(&cap, || {
+                        graph.launch().unwrap();
+                    });
+
+                    eprintln!(
+                        "depth N={depth:2} (Bcap={bcap} D={d} Dff={dff}): eager {:8.1} us | graphed {:7.1} us → \
+                         graphed {:.2}x  | tokens/s eager {:.0} graphed {:.0}  (~{} launches → 1 cuGraphLaunch)",
+                        eager * 1e6,
+                        graphed * 1e6,
+                        eager / graphed,
+                        bcap as f64 / eager,
+                        bcap as f64 / graphed,
+                        depth * 14
+                    );
+                }
+            });
+        });
+    }
 }
