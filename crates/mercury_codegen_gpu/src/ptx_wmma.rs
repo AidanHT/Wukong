@@ -273,6 +273,78 @@ pub fn pipe_variant(name: &str) -> &'static PipeCfg {
         .unwrap_or_else(|| panic!("unknown pipe variant {name:?}"))
 }
 
+/// **GEMM-cliff experiment candidates** (branch `perf/gpu-gemm-cliff-2`). A self-contained family of
+/// large-GEMM workhorse variants — all 128×128 / BK=32 / r16 raster `mma.sync.m16n8k16`, varying only the
+/// SMEM layout (8-padded vs no-pad XOR-swizzle), the cp.async pipeline **depth** (`stages`), and the
+/// **launch-bounds** (`min_ctas` ⇒ `.minnctapersm`). The research existence-proof (sm_89, 4096³ → 100% of
+/// cuBLAS) attributes the climb past ~74% to warp-tile ILP + swizzle + a **3-stage** pipeline (CUTLASS's
+/// SM80 floor is 3; the production workhorse is at 2). The no-pad swizzle is what frees the SMEM for s3
+/// (s2 padded = 40 KiB, s3 padded = 60 KiB > the 48 KiB static cap; s3 no-pad = 48 KiB exactly). All are
+/// numerically identical `C = A·Bᵀ`; gated by `gemm_cliff_matches_reference`, A/B-timed by `gemm_cliff_ab`.
+#[derive(Clone, Copy)]
+pub struct CliffCfg {
+    pub name: &'static str,
+    pub bm: usize,
+    pub bn: usize,
+    pub bk: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub stages: usize,
+    pub raster: usize,
+    pub swz: bool,
+    pub pad: usize,
+    pub min_ctas: usize,
+}
+
+impl CliffCfg {
+    /// Static SMEM bytes (`stages·(bm+bn)·(bk+pad)·2`); `pad==0` on the swizzle path.
+    pub const fn smem_bytes(&self) -> usize {
+        self.stages * (self.bm + self.bn) * (self.bk + self.pad) * 2
+    }
+    pub const fn threads(&self) -> usize {
+        self.wm * self.wn * 32
+    }
+    /// `mma` sub-tiles per warp (the warp-tile ILP knob: `mma`/iteration = `tm·tn·(bk/16)`).
+    pub const fn mma_per_warp(&self) -> usize {
+        (self.bm / (16 * self.wm)) * (self.bn / (8 * self.wn))
+    }
+}
+
+/// The cliff sweep. `cliff_swz_s2` is byte-identical to the dispatched swizzle workhorse (the A/B base).
+/// The rest probe the research's **#1 lever — warp/threadblock tile shape**. The 4096³ win was the warp
+/// grid (w22, 3 CTAs/SM). The 2048³ regime is the open floor: a 128×128 tile gives only 16×16 = **256
+/// macro-tiles on 20 SMs** (~4 waves at 3 CTAs/SM → tail/quantization waste), and the 16.8 MB working set
+/// sits right at the 12 MB L2 edge. *Smaller* tiles double/quadruple the tile count → better SM load
+/// balance (the classic small-GEMM lever), trading arithmetic intensity that L2 can absorb at this size.
+/// All BK=32 (the swizzle phase is derived for it), r16 raster (swept — optimal at both sizes).
+pub const CLIFF_VARIANTS: &[CliffCfg] = &[
+    // Three production-shape anchors (all 128×128, BK=32, r16 — the swept-optimal macro-tile/raster).
+    //  - `cliff_swz_s2`  : no-pad swizzle, w24 (2×4) — the dispatched ≥48 MB base, the A/B reference.
+    //  - `cliff_swz_w22` : no-pad swizzle, w22 (2×2) — the 4096³ warp-tile winner (3 CTAs/SM, +ILP).
+    //  - `cliff_pad_w24` : padded (pad=8), w24 — byte-identical to the production `mma_nt_f16_128_bk32_s2_r16`
+    //    that the 16–48 MB arm dispatches; here to settle **swz-vs-padded @2048³ same-run** (the open floor).
+    CliffCfg { name: "cliff_swz_s2", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0 },
+    CliffCfg { name: "cliff_swz_w22", bm: 128, bn: 128, bk: 32, wm: 2, wn: 2, stages: 2, raster: 16, swz: true, pad: 0, min_ctas: 0 },
+    CliffCfg { name: "cliff_pad_w24", bm: 128, bn: 128, bk: 32, wm: 2, wn: 4, stages: 2, raster: 16, swz: false, pad: 8, min_ctas: 0 },
+];
+
+/// Emit the cliff candidate PTX module (separate from `wmma_f16_ptx` so experiments never perturb the
+/// dispatched module / its cubin cache). Each [`CliffCfg`] becomes one `mma.sync` entry.
+pub fn gemm_cliff_ptx() -> &'static str {
+    static PTX: OnceLock<String> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let mut m = String::from(".version 7.8\n.target sm_89\n.address_size 64\n");
+        for v in CLIFF_VARIANTS {
+            m += &entry_mma_pipe(
+                v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false,
+                false, v.swz, v.min_ctas,
+            );
+        }
+        m
+    })
+    .as_str()
+}
+
 /// Generate a shared-memory-staged WMMA GEMM entry computing `C = A·Bᵀ`. `ty` is "f16" or "bf16"; the
 /// CTA stages a `bm×SM_BK` tile of A and a `bn×SM_BK` tile of B, with a `warps_m×warps_n` warp grid
 /// each owning a `(bm/warps_m)×(bn/warps_n)` sub-tile. `bm`,`bn` must be 16-multiples and the staging
@@ -1124,6 +1196,12 @@ fn entry_mma_pipe(
     bias: bool,
     residual: bool,
     swz: bool,
+    // min_ctas: `0` ⇒ emit no launch-bounds directive (the driver JIT picks registers/occupancy blind,
+    // the historical behavior). `>0` ⇒ emit `.maxntid {threads},1,1` + `.minnctapersm {min_ctas}` so
+    // ptxas caps the per-thread register count to fit at least `min_ctas` CTAs/SM. The 128×128 tile
+    // carries 64 f32 accumulators/thread, so the JIT defaults to ~2 CTAs/SM (register-limited) even
+    // when SMEM would allow 3 — forcing the occupancy is the HBM-latency-hiding lever for ≥4096³.
+    min_ctas: usize,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1182,8 +1260,16 @@ fn entry_mma_pipe(
     let resid_param = if residual { ",\n    .param .u64 pResid" } else { "" };
     let mut s = String::new();
     s += &format!(
-        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n{{\n"
+        ".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{bias_param}{resid_param}\n)\n"
     );
+    // Launch-bounds: `.maxntid` declares the exact block size so ptxas sizes occupancy, and
+    // `.minnctapersm` forces it to allocate ≤ 64K/(min_ctas·threads) registers/thread so `min_ctas`
+    // CTAs co-reside per SM. Without these the JIT under- or over-occupies the register-heavy mma tile.
+    // CUTLASS emits the same pair via `__launch_bounds__`. `min_ctas == 0` keeps byte-identical legacy PTX.
+    if min_ctas > 0 {
+        s += &format!(".maxntid {threads}, 1, 1\n.minnctapersm {min_ctas}\n");
+    }
+    s += "{\n";
     s += &format!("    .shared .align 16 .b8 smemA_{name}[{smem_a}];\n");
     s += &format!("    .shared .align 16 .b8 smemB_{name}[{smem_b}];\n");
     s += "    .reg .pred %p0,%pmore;\n";
@@ -1440,6 +1526,9 @@ fn entry_mma_pipe(
 /// pipeline, padded conflict-free SMEM fragment loads, threadblock raster — and the D-fragment column map
 /// is identical for both, so the per-column bias add and the SFU activation reuse [`Act::epilogue`]
 /// verbatim. Same shape constraints as [`entry_mma_pipe`]; `bias` adds per-column `bg[N]`,`bu[N]` params.
+/// `swz` selects the no-pad `ldmatrix`+XOR-swizzle staging (the [`entry_mma_pipe`] technique ported to both
+/// gated GEMMs — A is shared, the two B tiles reuse one swizzle derivation; bit-identical output). NOTE:
+/// measured a wash-to-loss for this dual-B tile (the single-B win does not transfer); production uses padded.
 fn entry_mma_gate(
     name: &str,
     ty: &str,
@@ -1453,6 +1542,7 @@ fn entry_mma_gate(
     pad: usize,
     gate_act: Act,
     bias: bool,
+    swz: bool,
 ) -> String {
     assert!(stages >= 2, "the pipeline needs at least 2 stages");
     assert!(bk % 16 == 0 && (bk / 8).is_power_of_two(), "bk must be a 16-multiple with bk/8 a power of two");
@@ -1470,7 +1560,25 @@ fn entry_mma_gate(
     let nks = bk / 16;
     let wmr = bm / warps_m;
     let wnc = bn / warps_n;
-    let ldp = bk + pad;
+    let nc = bk / 8; // 16-byte (8×f16) chunks per SMEM row — the swz XOR-swizzle modulus
+    let nc_mask = nc - 1;
+    // The **`swz`** path (ldmatrix + XOR-swizzle + no-pad) ports the single-B workhorse's technique to BOTH
+    // gated GEMMs at once: Wg and Wu share x's `[M,K]` A tile and have *identical* `[N,K]` layout, so the
+    // A/B swizzle derivation (see [`entry_mma_pipe`], derived for bk=32/nc=4) ports verbatim — one A path
+    // feeds both `mma` chains, and the B path runs once per B tile sharing the same `%browb`/`%phaseB`/`%lb8`
+    // (only the smem base + ring cursor differ). The register-level epilogue is untouched, so the output is
+    // **bit-identical** to the padded gate, and no-pad *shrinks* SMEM (128×64/s2: 40 KiB → 32 KiB).
+    // **MEASURED: the single-B 128×128 swz win does NOT transfer to this dual-B 128×64 tile** — same-run vs
+    // the padded gate it is a wash-to-loss (geomean ≈1.00×, ~0.89× @2048³; see `fused_swiglu_gate_vs_chain`),
+    // because the gate already amortizes A across both GEMMs (load-x-once) so it is far less SMEM-fragment-
+    // load-bound (the path `ldmatrix` accelerates), and tn=2 (vs the single-B tn=4) leaves too little mma-ILP
+    // to hide the no-pad swizzle's per-ks address arithmetic. Emitted + correctness-gated as a verified
+    // alternative; **production routes to the padded base** (see `gemm_nt_f16_swiglu`).
+    if swz {
+        assert!(bk == 32, "{name}: the swz swizzle phase is derived for bk=32 (nc=4)");
+        assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs warp row/col bases ≡ 0 (mod 8)");
+    }
+    let ldp = if swz { bk } else { bk + pad }; // swz: no pad (the swizzle, not padding, gives conflict-free)
     let tile_a = bm * ldp * 2;
     let tile_b = bn * ldp * 2; // one Wg (== one Wu) tile
     let smem_a = stages * tile_a;
@@ -1502,6 +1610,12 @@ fn entry_mma_gate(
     }
     if bias {
         s += "    .reg .f32 %biasg0,%biasg1,%biasu0,%biasu1;\n    .reg .b64 %BiasG,%BiasU;\n";
+    }
+    if swz {
+        // swz scratch (shared by A and BOTH B tiles): %phaseA/%phaseB per-lane swizzle phases; %arowb/%browb
+        // this lane's A/B row byte-base; %la16=lane>>4 (A x4 chunk selector), %lb8=(lane>>3)&1 (B x2 selector);
+        // %swztmp: chunk-offset scratch; %tmp3: staging dest scratch.
+        s += "    .reg .b32 %phaseA,%phaseB,%arowb,%browb,%la16,%lb8,%swztmp,%tmp3;\n";
     }
     if raster > 0 {
         s += "    .reg .b32 %lin,%tn,%tm,%gsz,%grpr,%rem,%col0,%gw,%trow,%tcol;\n";
@@ -1554,6 +1668,18 @@ fn entry_mma_gate(
     s += &format!("    shr.u32 %warpRow,%warpId,{wn_shift};\n    and.b32 %warpCol,%warpId,{};\n", warps_n - 1);
     s += &format!("    mul.lo.s32 %warpMrow,%warpRow,{wmr};\n    mul.lo.s32 %warpNcol,%warpCol,{wnc};\n");
     s += &format!("    mul.lo.s32 %laneoff,%grp,{ldp};\n    add.u32 %laneoff,%laneoff,%tg2;\n    shl.b32 %laneoff,%laneoff,1;\n");
+    if swz {
+        // A ldmatrix.x4: row R = warpMrow + mi·16 + (lane&15); arowb = (warpMrow + (lane&15))·bk·2 (mi·16
+        // added per sub-tile). phaseA = ((lane&15)>>1)&(nc-1). la16 = lane>>4 (x4 chunk selector). Shared by
+        // the gate and up chains (both read the SAME staged x). B (Wg AND Wu) ldmatrix.x2: row R = warpNcol +
+        // ni·8 + (lane&7); browb = (warpNcol + (lane&7))·bk·2; phaseB = ((lane&7)>>1)&(nc-1); lb8 = (lane>>3)&1.
+        s += &format!("    and.b32 %tmp,%lane,15;\n    add.u32 %tmp2,%tmp,%warpMrow;\n    mul.lo.s32 %arowb,%tmp2,{};\n", bk * 2);
+        s += &format!("    shr.u32 %tmp2,%tmp,1;\n    and.b32 %phaseA,%tmp2,{nc_mask};\n");
+        s += "    shr.u32 %la16,%lane,4;\n";
+        s += &format!("    and.b32 %tmp,%lane,7;\n    add.u32 %tmp2,%tmp,%warpNcol;\n    mul.lo.s32 %browb,%tmp2,{};\n", bk * 2);
+        s += &format!("    shr.u32 %tmp2,%tmp,1;\n    and.b32 %phaseB,%tmp2,{nc_mask};\n");
+        s += "    shr.u32 %tmp,%lane,3;\n    and.b32 %lb8,%tmp,1;\n";
+    }
     for mi in 0..tm {
         for ni in 0..tn {
             for r in 0..4 {
@@ -1562,7 +1688,10 @@ fn entry_mma_gate(
         }
     }
 
-    // cp.async staging into padded SMEM (row stride `ldp`) — identical to entry_mma_pipe's `stage`.
+    // cp.async staging into the SMEM tile — identical for A, Wg, Wu. Non-swz: **padded** row-major
+    // (`bufoff + row·ldp·2 + col·2`, the layout the hand-placed b32 fragment loads read conflict-free).
+    // swz: **no-pad + XOR-swizzle** (`bufoff + row·bk·2 + (chunk XOR ((row>>1)&nc_mask))·16`, the layout the
+    // `ldmatrix` gathers read conflict-free). Same global read either way.
     let stage = |g_base: &str, gbase_ptr: &str, smem: &str, bufoff: &str, chunks: usize, s: &mut String| {
         for li in 0..chunks {
             if li == 0 {
@@ -1573,8 +1702,15 @@ fn entry_mma_gate(
             *s += &format!("    shr.u32 %r,%e,{row_shift};\n    and.b32 %c,%e,{col_mask};\n    shl.b32 %c,%c,3;\n");
             *s += &format!("    add.u32 %tmp,{g_base},%r;\n    mul.lo.s32 %tmp,%tmp,%K;\n    add.u32 %tmp,%tmp,%kcol;\n    add.u32 %tmp,%tmp,%c;\n");
             *s += &format!("    mul.wide.u32 %off,%tmp,2;\n    add.s64 %gptr,{gbase_ptr},%off;\n");
-            *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
-            *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
+            if swz {
+                // chunk_col = %c>>3; chunk_swz = chunk XOR ((row>>1)&nc_mask); dest = smem + bufoff +
+                // row·bk·2 + chunk_swz·16 — the swizzle the ldmatrix reads invert (write/read agree).
+                *s += &format!("    shr.u32 %swztmp,%c,3;\n    shr.u32 %tmp2,%r,1;\n    and.b32 %tmp2,%tmp2,{nc_mask};\n    xor.b32 %swztmp,%swztmp,%tmp2;\n    shl.b32 %swztmp,%swztmp,4;\n");
+                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n    mul.lo.s32 %tmp3,%r,{};\n    add.u32 %tmp,%tmp,%tmp3;\n    add.u32 %tmp,%tmp,%swztmp;\n", bk * 2);
+            } else {
+                *s += &format!("    mov.u32 %tmp,{smem};\n    add.u32 %tmp,%tmp,{bufoff};\n");
+                *s += &format!("    mul.lo.s32 %tmp2,%r,{};\n    add.u32 %tmp,%tmp,%tmp2;\n    shl.b32 %tmp2,%c,1;\n    add.u32 %tmp,%tmp,%tmp2;\n", ldp * 2);
+            }
             *s += "    cp.async.cg.shared.global [%tmp],[%gptr],16;\n";
         }
     };
@@ -1602,38 +1738,60 @@ fn entry_mma_gate(
 
     // Compute: load A fragments ONCE (smem + buffer + warp + lane + ks·16), then issue the gate `mma`s
     // (A×Wg → %dg) and the up `mma`s (A×Wu → %du, A fragments reused) — the load-x-once arithmetic win.
+    // Both B tiles are loaded before any mma so the 2·tm·tn mma's (disjoint %dg/%du accumulators ⇒ all
+    // mutually independent) form one pipeline-able block. swz: warp-cooperative `ldmatrix` from the
+    // XOR-swizzled no-pad SMEM; non-swz: hand-placed `ld.shared.b32` from the padded SMEM (same fragments).
     for ks in 0..nks {
-        s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
-        s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
-        s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
-        for mi in 0..tm {
-            let base = mi * 16 * ldp * 2;
-            let r8 = 8 * ldp * 2;
-            s += &format!("    ld.shared.b32 %a{mi}_0,[%aptr+{}];\n", base);
-            s += &format!("    ld.shared.b32 %a{mi}_2,[%aptr+{}];\n", base + 16);
-            s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
-            s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
-        }
-        // Preload BOTH B tiles' fragments (Wg into %bg, Wu into %bu) before issuing any mma, so the
-        // 2·tm·tn mma's below — which write disjoint accumulators (%dg vs %du) and so are all mutually
-        // independent — form one pipeline-able block with every operand already in registers (matches the
-        // single-B workhorse's clean N-independent-mma schedule; the serialized load/mma/load/mma form
-        // left the up mma's waiting on the Wu loads).
-        s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n");
-        s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
-        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
-        for ni in 0..tn {
-            let base = ni * 8 * ldp * 2;
-            s += &format!("    ld.shared.b32 %bg{ni}_0,[%bptr+{}];\n", base);
-            s += &format!("    ld.shared.b32 %bg{ni}_1,[%bptr+{}];\n", base + 16);
-        }
-        s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n");
-        s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
-        s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
-        for ni in 0..tn {
-            let base = ni * 8 * ldp * 2;
-            s += &format!("    ld.shared.b32 %bu{ni}_0,[%bptr+{}];\n", base);
-            s += &format!("    ld.shared.b32 %bu{ni}_1,[%bptr+{}];\n", base + 16);
+        if swz {
+            // A (x): one ldmatrix.x4 per m16 sub-tile; chunk_off = ((ks·2 | la16) XOR phaseA)·16, +mi·16·bk·2.
+            s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n    add.u32 %aptr,%aptr,%arowb;\n");
+            s += &format!("    or.b32 %swztmp,%la16,{};\n    xor.b32 %swztmp,%swztmp,%phaseA;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+            for mi in 0..tm {
+                let mibase = mi * 16 * bk * 2;
+                s += &format!("    add.u32 %tmp,%aptr,%swztmp;\n    add.u32 %tmp,%tmp,{mibase};\n    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%a{mi}_0,%a{mi}_1,%a{mi}_2,%a{mi}_3}},[%tmp];\n");
+            }
+            // Wg then Wu: one ldmatrix.x2 per n8 sub-tile; shared %browb/%phaseB/%lb8, only smem base + cursor
+            // differ. chunk_off = ((ks·2 | lb8) XOR phaseB)·16, +ni·8·bk·2.
+            s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n    add.u32 %bptr,%bptr,%browb;\n");
+            s += &format!("    or.b32 %swztmp,%lb8,{};\n    xor.b32 %swztmp,%swztmp,%phaseB;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+            for ni in 0..tn {
+                let nibase = ni * 8 * bk * 2;
+                s += &format!("    add.u32 %tmp,%bptr,%swztmp;\n    add.u32 %tmp,%tmp,{nibase};\n    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{%bg{ni}_0,%bg{ni}_1}},[%tmp];\n");
+            }
+            s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n    add.u32 %bptr,%bptr,%browb;\n");
+            s += &format!("    or.b32 %swztmp,%lb8,{};\n    xor.b32 %swztmp,%swztmp,%phaseB;\n    shl.b32 %swztmp,%swztmp,4;\n", ks * 2);
+            for ni in 0..tn {
+                let nibase = ni * 8 * bk * 2;
+                s += &format!("    add.u32 %tmp,%bptr,%swztmp;\n    add.u32 %tmp,%tmp,{nibase};\n    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{%bu{ni}_0,%bu{ni}_1}},[%tmp];\n");
+            }
+        } else {
+            s += &format!("    mov.u32 %aptr,smemA_{name};\n    add.u32 %aptr,%aptr,%bufcA;\n");
+            s += &format!("    mul.lo.s32 %tmp,%warpMrow,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %aptr,%aptr,%tmp;\n");
+            s += &format!("    add.u32 %aptr,%aptr,%laneoff;\n    add.u32 %aptr,%aptr,{};\n", ks * 32);
+            for mi in 0..tm {
+                let base = mi * 16 * ldp * 2;
+                let r8 = 8 * ldp * 2;
+                s += &format!("    ld.shared.b32 %a{mi}_0,[%aptr+{}];\n", base);
+                s += &format!("    ld.shared.b32 %a{mi}_2,[%aptr+{}];\n", base + 16);
+                s += &format!("    ld.shared.b32 %a{mi}_1,[%aptr+{}];\n", base + r8);
+                s += &format!("    ld.shared.b32 %a{mi}_3,[%aptr+{}];\n", base + r8 + 16);
+            }
+            s += &format!("    mov.u32 %bptr,smemBg_{name};\n    add.u32 %bptr,%bptr,%bufcBg;\n");
+            s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
+            s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+            for ni in 0..tn {
+                let base = ni * 8 * ldp * 2;
+                s += &format!("    ld.shared.b32 %bg{ni}_0,[%bptr+{}];\n", base);
+                s += &format!("    ld.shared.b32 %bg{ni}_1,[%bptr+{}];\n", base + 16);
+            }
+            s += &format!("    mov.u32 %bptr,smemBu_{name};\n    add.u32 %bptr,%bptr,%bufcBu;\n");
+            s += &format!("    mul.lo.s32 %tmp,%warpNcol,{ldp};\n    shl.b32 %tmp,%tmp,1;\n    add.u32 %bptr,%bptr,%tmp;\n");
+            s += &format!("    add.u32 %bptr,%bptr,%laneoff;\n    add.u32 %bptr,%bptr,{};\n", ks * 32);
+            for ni in 0..tn {
+                let base = ni * 8 * ldp * 2;
+                s += &format!("    ld.shared.b32 %bu{ni}_0,[%bptr+{}];\n", base);
+                s += &format!("    ld.shared.b32 %bu{ni}_1,[%bptr+{}];\n", base + 16);
+            }
         }
         // Interleave gate and up mma per (mi,ni): adjacent independent ops (different accumulators) give
         // the issue stage maximal ILP. A fragments are shared (loaded once above) → the load-x-once win.
@@ -1812,7 +1970,7 @@ pub fn wmma_f16_ptx() -> &'static str {
         // dispatched from `gemm_nt_f16`. All share the precision-generic `entry_smem_pipe` generator.
         for v in PIPE_VARIANTS {
             m += &if v.mma {
-                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false)
+                entry_mma_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0)
             } else {
                 entry_smem_pipe(v.name, "f16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, Act::None, false, false)
             };
@@ -1830,6 +1988,19 @@ pub fn wmma_f16_ptx() -> &'static str {
                 "f16",
                 wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, wh.pad,
                 Act::None, false, false, true,
+                0,
+            );
+            // **w22 swizzle workhorse** — the GEMM-cliff win. The 2×2 warp grid (vs the w24 base's 2×4)
+            // gives each warp a 64×64 tile = 32 mma/warp (2× the ILP to hide tensor-core + ldmatrix latency)
+            // AND 128 threads/CTA ⇒ 3 CTAs/SM (vs 2). Measured ~81%→84% of cuBLAS @4096³ (1.04–1.07× the w24
+            // swz, reproduced same-run, bit-gated). `gemm_nt_f16` dispatches it for A+B ≥ 48 MB; the padded
+            // 16–48 MB regime keeps w24 (padded w22 regresses 2048³ ~86%→70%).
+            m += &entry_mma_pipe(
+                &format!("{}_w22swz", wh.name),
+                "f16",
+                wh.bm, wh.bn, wh.bk, 2, 2, wh.stages, wh.raster, wh.pad,
+                Act::None, false, false, true,
+                0,
             );
         }
         // Fused epilogues on the **deep WMMA pipe `pipe_64_s6`** — the ≤1024³ GEMM champion. The `mma.sync`
@@ -1880,6 +2051,24 @@ pub fn wmma_f16_ptx() -> &'static str {
                 true,
                 false,
                 false,
+                0,
+            );
+            // The **no-pad swizzle** twin of each fused-epilogue kernel (`..._swz_bias{,_relu,_silu,_gelu}`).
+            // The bias-add + activation apply register-level to the `mma.sync` D-fragments — independent of
+            // how A/B were staged in SMEM — so the swizzle composes orthogonally and the result is *bit-
+            // identical* to the padded epilogue, but it inherits the swizzle GEMM's 1.13–1.23× same-run speed
+            // (hardware `ldmatrix` fragment loads vs the padded base's manual `ld.shared.b32`, at equal
+            // occupancy). This is the fastest base for the beat-cuBLAS fused Linear/FFN:
+            // `gemm_nt_f16_mma_bias{,_relu,_silu,_gelu}` route here.
+            m += &entry_mma_pipe(
+                &format!("{}_swz_{suffix}", wh.name),
+                "f16",
+                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, 0,
+                act,
+                true,
+                false,
+                true,
+                0,
             );
         }
         // Fused **bias + residual** (no activation) on the same fast mma workhorse — the transformer
@@ -1895,6 +2084,21 @@ pub fn wmma_f16_ptx() -> &'static str {
             true,
             true,
             false,
+            0,
+        );
+        // The no-pad swizzle twin — the bias-add + residual-add apply register-level to the `mma.sync`
+        // D-fragments (orthogonal to SMEM staging ⇒ bit-identical output) on the faster swz base, so the
+        // down-proj / attention output-proj `out = x·Wᵀ + bias + residual` inherits the swz GEMM's
+        // 1.13–1.23× same-run speed. `gemm_nt_f16_mma_bias_residual` routes here.
+        m += &entry_mma_pipe(
+            &format!("{}_swz_bias_residual", wh.name),
+            "f16",
+            wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, 0,
+            Act::None,
+            true,
+            true,
+            true,
+            0,
         );
         // Fused **gated-FFN (GLU-family)** kernels `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the SwiGLU/GeGLU gate
         // every modern LLM FFN runs, the fusion cuBLAS needs THREE kernels + two HBM round-trips for. The
@@ -1908,7 +2112,12 @@ pub fn wmma_f16_ptx() -> &'static str {
             ("gate_silu_bias", Act::Silu, true),
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
-            m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias);
+            m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, false);
+            // The no-pad `ldmatrix`+XOR-swizzle twin (`..._swz`), bit-identical to the padded gate. Emitted +
+            // correctness-gated as a verified alternative, but **measured a wash-to-loss for this dual-B tile**
+            // (the single-B GEMM-cliff swz win does NOT transfer — see `entry_mma_gate` / the same-run
+            // `fused_swiglu_gate_vs_chain`), so `gemm_nt_f16_swiglu`/`_geglu` route to the PADDED base, not here.
+            m += &entry_mma_gate(&format!("mma_nt_f16_128x64_{suffix}_swz"), "f16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, true);
         }
         // Fused activation epilogues — the beat-cuBLAS lever (cuBLAS can't fuse). 64-tile pipeline.
         // relu/silu/gelu cover the activations the FFN and classic CNN/MLP stacks actually use; silu in
@@ -1985,10 +2194,13 @@ pub fn wmma_bf16_ptx() -> &'static str {
         // bf16 large-GEMM workhorse (mma.sync + padded conflict-free SMEM + r16 raster) — the cliff fix
         // carried to the training precision; `gemm_nt_bf16` dispatches A+B ≳ L2 here.
         let v = PIPE_BF16;
-        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false);
+        m += &entry_mma_pipe(v.name, "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, false, 0);
         // bf16 ldmatrix+XOR-swizzle+no-pad twin (`_swz`) — the HBM-bound-4096³ win carried to the training
         // dtype (the swz path is dtype-agnostic; `gemm_nt_bf16` regime-dispatches it for A+B ≳ 2×L2).
-        m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true);
+        m += &entry_mma_pipe(&format!("{}_swz", v.name), "bf16", v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, v.pad, Act::None, false, false, true, 0);
+        // bf16 w22 swizzle workhorse (the GEMM-cliff win carried to the training dtype): 2×2 warp grid =
+        // 32 mma/warp + 3 CTAs/SM; `gemm_nt_bf16` dispatches it for A+B ≥ 48 MB.
+        m += &entry_mma_pipe(&format!("{}_w22swz", v.name), "bf16", v.bm, v.bn, v.bk, 2, 2, v.stages, v.raster, v.pad, Act::None, false, false, true, 0);
         // Fused-epilogue variants on the **fast bf16 mma workhorse** — the register-level `act(x·Wᵀ+bias)`
         // (bias added to the f32 accumulators via the known D-fragment column map, no SMEM scratch) carried
         // to the training dtype. The bf16 twin of the fp16 `mma_nt_f16_128_bk32_s2_r16_bias*` champions.
@@ -2001,6 +2213,20 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 true,
                 false,
                 false,
+                0,
+            );
+            // The no-pad swizzle twin (`..._swz_bias*`) — the register-level epilogue composes orthogonally
+            // with the SMEM swizzle (bit-identical output) and inherits the swizzle GEMM's 1.13–1.23× speed.
+            // `gemm_nt_bf16_mma_bias{,_relu,_silu,_gelu}` route here (the training-dtype fused Linear/FFN base).
+            m += &entry_mma_pipe(
+                &format!("{}_swz_{suffix}", v.name),
+                "bf16",
+                v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, 0,
+                act,
+                true,
+                false,
+                true,
+                0,
             );
         }
         // bf16 fused bias + residual (training down-proj / output-proj): out = x·Wᵀ + bias + residual.
@@ -2012,6 +2238,19 @@ pub fn wmma_bf16_ptx() -> &'static str {
             true,
             true,
             false,
+            0,
+        );
+        // The no-pad swizzle twin (bit-identical register-level epilogue, faster swz base) — the training
+        // down-proj / output-proj inherits the swz GEMM speed. `gemm_nt_bf16_mma_bias_residual` routes here.
+        m += &entry_mma_pipe(
+            &format!("{}_swz_bias_residual", v.name),
+            "bf16",
+            v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, 0,
+            Act::None,
+            true,
+            true,
+            true,
+            0,
         );
         // bf16 gated-FFN (GLU-family) gate `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)` — SwiGLU/GeGLU carried to the
         // training dtype (the dual-B generator is precision-generic, keying the mma type off `ty`).
@@ -2022,7 +2261,10 @@ pub fn wmma_bf16_ptx() -> &'static str {
             ("gate_silu_bias", Act::Silu, true),
             ("gate_gelu_bias", Act::Gelu, true),
         ] {
-            m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias);
+            m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, false);
+            // bf16 no-pad swizzle twin (`..._swz`), bit-identical; correctness-gated alternative. Like fp16,
+            // measured a wash-to-loss for this dual-B tile, so `gemm_nt_bf16_swiglu`/`_geglu` use the padded base.
+            m += &entry_mma_gate(&format!("mma_nt_bf16_128x64_{suffix}_swz"), "bf16", 128, 64, 32, 2, 4, 2, 16, 8, act, gbias, true);
         }
         m += &entry_smem_db("wmma_nt_bf16_sm_db", "bf16", SM_BM, SM_BN, SM_WARPS_M, SM_WARPS_N, Act::None, false, false);
         for (suffix, act) in [("relu", Act::Relu), ("silu", Act::Silu), ("gelu", Act::Gelu)] {
