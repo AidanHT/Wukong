@@ -39,6 +39,9 @@ struct Int8Cand {
     warps: usize,
     sk: usize,
     k_mult: usize,
+    /// Threadblock-rasterization band width (0 = none / 2-D grid). When > 0 the kernel uses a 1-D CTA
+    /// grid (`gridDim.x = tiles_m·tiles_n`) — mutually exclusive with split-K (which uses `gridDim.z`).
+    raster: usize,
 }
 
 /// The full int8 GEMM candidate set (the kernels owned by this crate). Filtered per shape by
@@ -47,16 +50,23 @@ struct Int8Cand {
 fn int8_candidates() -> Vec<Int8Cand> {
     use crate::ptx_int8::{
         int8_gemm_smdb128_ptx, int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_ptx,
-        int8_gemm_smdb_swz_ptx, int8_gemm_smdb_swz_splitk_ptx, INT8_BM, INT8_BM128, INT8_BN,
-        INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128,
+        int8_gemm_smdb_swz_ptx, int8_gemm_smdb_swz_splitk_ptx, int8_gemm_w64_swz_ptx,
+        int8_gemm_w64_swz_r8_ptx, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M,
+        INT8_WARPS_M128, INT8_WARPS_N, INT8_WARPS_N128, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M,
+        INT8_W64_WARPS_N,
     };
     let w64 = INT8_WARPS_M * INT8_WARPS_N;
     let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+    let ww64 = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
     let mut v = vec![
-        Int8Cand { name: "smdb64", ptx: int8_gemm_smdb_ptx, entry: "int8_gemm_nt_smdb", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 32 },
-        Int8Cand { name: "smdb128", ptx: int8_gemm_smdb128_ptx, entry: "int8_gemm_nt_smdb128", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 32 },
-        Int8Cand { name: "swz64", ptx: int8_gemm_smdb_swz_ptx, entry: "int8_gemm_nt_smdb_swz", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 64 },
-        Int8Cand { name: "swz128", ptx: int8_gemm_smdb128_swz_ptx, entry: "int8_gemm_nt_smdb128_swz", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 64 },
+        Int8Cand { name: "smdb64", ptx: int8_gemm_smdb_ptx, entry: "int8_gemm_nt_smdb", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 32, raster: 0 },
+        Int8Cand { name: "smdb128", ptx: int8_gemm_smdb128_ptx, entry: "int8_gemm_nt_smdb128", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 32, raster: 0 },
+        Int8Cand { name: "swz64", ptx: int8_gemm_smdb_swz_ptx, entry: "int8_gemm_nt_smdb_swz", bm: INT8_BM, bn: INT8_BN, warps: w64, sk: 1, k_mult: 64, raster: 0 },
+        Int8Cand { name: "swz128", ptx: int8_gemm_smdb128_swz_ptx, entry: "int8_gemm_nt_smdb128_swz", bm: INT8_BM128, bn: INT8_BN128, warps: w128, sk: 1, k_mult: 64, raster: 0 },
+        // The 64×64-warp-tile workhorse (128×128 CTA, 4 warps) — the perf/gpu-quant-2 winner (~1.2–1.3×
+        // the 8-warp swz128 same-run; 2048³→92%, +raster8→99.6% of cuBLAS) — and its rasterized sibling.
+        Int8Cand { name: "w64", ptx: int8_gemm_w64_swz_ptx, entry: "int8_gemm_nt_w64_swz", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 0 },
+        Int8Cand { name: "w64_r8", ptx: int8_gemm_w64_swz_r8_ptx, entry: "int8_gemm_nt_w64_swz_r8", bm: INT8_W64_BM, bn: INT8_W64_BN, warps: ww64, sk: 1, k_mult: 64, raster: 8 },
     ];
     // split-K variants of the 64×64 swz kernel (one entry, gridDim.z = sk; thin-M / small-N lever).
     for sk in [2usize, 4, 8] {
@@ -69,6 +79,7 @@ fn int8_candidates() -> Vec<Int8Cand> {
             warps: w64,
             sk,
             k_mult: sk * 64,
+            raster: 0,
         });
     }
     v
@@ -79,11 +90,14 @@ fn applicable(c: &Int8Cand, m: usize, n: usize, k: usize) -> bool {
 }
 
 fn launch_cfg(c: &Int8Cand, m: usize, n: usize) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: ((n / c.bn) as u32, (m / c.bm) as u32, c.sk as u32),
-        block_dim: ((c.warps * 32) as u32, 1, 1),
-        shared_mem_bytes: 0,
-    }
+    // Rasterized kernels take a 1-D CTA grid (gridDim.x = tiles_m·tiles_n); all others a 2-D grid with
+    // the K-split factor in gridDim.z (sk==1 for the non-split kernels).
+    let grid_dim = if c.raster > 0 {
+        (((m / c.bm) * (n / c.bn)) as u32, 1, 1)
+    } else {
+        ((n / c.bn) as u32, (m / c.bm) as u32, c.sk as u32)
+    };
+    LaunchConfig { grid_dim, block_dim: ((c.warps * 32) as u32, 1, 1), shared_mem_bytes: 0 }
 }
 
 /// best-of-`rounds` min over `iters` launches each (clock-warmed) — wall-clock seconds per launch. The
