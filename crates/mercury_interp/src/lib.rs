@@ -1161,6 +1161,95 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_{max,avg}pool2d_f32[_parallel](x, out, channels, h, w, kh, kw, sh, sw)` — 2D
+            // max/avg pooling over a [channels, h, w] row-major input (no padding) a recognized pooling
+            // nest lowers to. Marshal `channels*h*w` f32 from x, call the *serial* runtime kernel
+            // (bit-identical to the parallel one — channels independent, max idempotent, avg sum order
+            // fixed), write the `channels*oh*ow` result to out (`oh=(h-kh)/sh+1`, `ow=(w-kw)/sw+1`; a
+            // window that doesn't fit writes nothing, so the output buffer is pre-zeroed). Read all of x
+            // first so any overlap is robust.
+            "mercury_maxpool2d_f32"
+            | "mercury_maxpool2d_f32_parallel"
+            | "mercury_avgpool2d_f32"
+            | "mercury_avgpool2d_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let channels = args[2].as_int() as i64;
+                let h = args[3].as_int() as i64;
+                let w = args[4].as_int() as i64;
+                let kh = args[5].as_int() as i64;
+                let kw = args[6].as_int() as i64;
+                let sh = args[7].as_int() as i64;
+                let sw = args[8].as_int() as i64;
+                let n_in = (channels.max(0) * h.max(0) * w.max(0)) as usize;
+                let mut xbuf = Vec::with_capacity(n_in);
+                for t in 0..n_in {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("pool2d operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                // Output length: channels*oh*ow when the window fits, else 0 (the kernel writes nothing).
+                let out_len = if channels > 0
+                    && h > 0
+                    && w > 0
+                    && kh > 0
+                    && kw > 0
+                    && sh > 0
+                    && sw > 0
+                    && kh <= h
+                    && kw <= w
+                {
+                    let oh = (h - kh) / sh + 1;
+                    let ow = (w - kw) / sw + 1;
+                    if oh > 0 && ow > 0 {
+                        (channels * oh * ow) as usize
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                let mut obuf = vec![0.0f32; out_len];
+                let kernel: unsafe extern "C" fn(
+                    *const f32,
+                    *mut f32,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ) = if name.starts_with("mercury_avgpool2d") {
+                    mercury_runtime::mercury_avgpool2d_f32
+                } else {
+                    mercury_runtime::mercury_maxpool2d_f32
+                };
+                // SAFETY: xbuf is channels*h*w, obuf is channels*oh*ow f32 — the kernel's contract.
+                unsafe {
+                    kernel(
+                        xbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        channels,
+                        h,
+                        w,
+                        kh,
+                        kw,
+                        sh,
+                        sw,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("pool2d output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_transpose_u16[_parallel](src, dst, rows, cols)` — the 16-bit (bf16/f16) transpose.
             // A transpose is a permutation, so the interpreter moves the `Value`s directly (precision-
             // agnostic): the bf16/f16 elements are stored as their rounded `Value::Float`, which the
