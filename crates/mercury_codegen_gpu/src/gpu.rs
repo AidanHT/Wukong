@@ -7155,6 +7155,104 @@ mod tests {
         });
     }
 
+    /// **Fused conv+bias+ReLU vs the unfused chain** — the fused epilogue ([`conv2d_wmma_epi`]) in one
+    /// kernel vs a plain conv + a separate `bias_relu` pointwise pass (the extra HBM round-trip + launch
+    /// that fusion elides). Also times the plain conv alone, to show the epilogue itself is ~free. All
+    /// resident + same-run. The win is largest on memory-bound shapes (1×1), where the separate pass is a
+    /// bigger fraction of the conv.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA; run explicitly"]
+    fn conv_fused_epi_vs_unfused() {
+        use crate::baselines::conv_flop;
+        use crate::ptx_wmma::Act;
+        use half::f16;
+        with_gpu("conv_fused_epi_vs_unfused", |g| {
+            let mut rng = crate::diff::Rng::new(0x4ED10);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize),
+                (256, 14, 14, 256, 3, 3),
+                (64, 56, 56, 64, 1, 1),
+                (128, 28, 28, 128, 1, 1),
+            ];
+            for (c, h, wd, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, wd, k, r, s) {
+                    continue;
+                }
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let pq = p * q;
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let bias = rng.vec(k, -0.5, 0.5);
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let bias_d = g.stream.memcpy_stod(&bias).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(k * pq).unwrap();
+                let cfg = conv_wmma_cfg(h, wd, k, r, s);
+                let ef = g
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_epi_ptx(c, h, wd, k, r, s, Act::Relu, true))
+                    .unwrap()
+                    .load_function("conv2d_wmma")
+                    .unwrap();
+                let pf = g
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s))
+                    .unwrap()
+                    .load_function("conv2d_wmma")
+                    .unwrap();
+                let brf = g
+                    .load_module_cached(&crate::ptx_conv::bias_relu_ptx(k, pq))
+                    .unwrap()
+                    .load_function("bias_relu")
+                    .unwrap();
+                let cfg_br = LaunchConfig { grid_dim: (((k * pq) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let fused = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&ef);
+                    b.arg(&x_d).arg(&w_d).arg(&mut *o).arg(&bias_d);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                let plain = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&pf);
+                    b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                let unfused = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    plain(g, o);
+                    let mut b = g.stream.launch_builder(&brf);
+                    b.arg(&mut *o).arg(&bias_d);
+                    unsafe { b.launch(cfg_br).unwrap() };
+                };
+                fused(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let fo = g.stream.memcpy_dtov(&o_d).unwrap();
+                unfused(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let uo = g.stream.memcpy_dtov(&o_d).unwrap();
+                let maxd = fo.iter().zip(&uo).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(maxd < 1e-4, "fused vs unfused mismatch: {maxd:.2e}");
+
+                let iters = 50usize;
+                let t_fused = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { fused(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let t_plain = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { plain(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let t_unf = best_of(ROUNDS, || { let t0 = Instant::now(); for _ in 0..iters { unfused(g, &mut o_d); } g.stream.synchronize().unwrap(); t0.elapsed().as_secs_f64() / iters as f64 });
+                let flop = conv_flop(c, h, wd, k, r, s);
+                eprintln!(
+                    "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: fused {:>6.0} GF | unfused(conv+pass) {:>6.0} GF | fusion {:>4.2}x faster | epilogue {:>+4.1}% vs plain ({:>6.0} GF)",
+                    flop / t_fused / 1e9,
+                    flop / t_unf / 1e9,
+                    t_unf / t_fused,
+                    100.0 * (t_fused - t_plain) / t_plain,
+                    flop / t_plain / 1e9,
+                );
+            }
+        });
+    }
+
     /// **Winograd F(4×4,3×3) vs cuDNN vs the implicit-GEMM** — does Winograd's 2.25–4× multiply
     /// reduction actually beat Mercury's (already cuDNN-parity) implicit-GEMM on **large feature maps**
     /// (where the tile count `T` makes a fat batched-GEMM `N`)? All same-run, fp16 tensor cores, each
