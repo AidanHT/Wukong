@@ -13479,6 +13479,62 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Correctness gate (law #1) for the `ldmatrix.x2.trans` PV V-load** (`flash_d{64,128}_mp_lm` /
+    /// `_mpc_lm`). The `_lm` kernels swap the hand-packed strided `ld.shared.u16` V-gather for one
+    /// warp-collective `ldmatrix.trans` — a pure feed-path change, so the result must stay tolerance-equal
+    /// to the f64 oracle (hence to the hand-packed `_mp`/`_mpc` siblings gated above). This catches any
+    /// transpose / fragment-addressing slip in the ldmatrix layout at both head dims, non-causal + causal.
+    #[test]
+    fn flash_lm_matches_reference() {
+        use half::f16;
+        with_gpu("flash_lm", |g| {
+            let mut rng = crate::diff::Rng::new(0x1D_AA55);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for &(entry, d, causal) in &[
+                ("flash_d64_mp_lm", 64usize, false),
+                ("flash_d64_mpc_lm", 64usize, true),
+                ("flash_d128_mp_lm", 128usize, false),
+                ("flash_d128_mpc_lm", 128usize, true),
+            ] {
+                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                for &s in &[16usize, 64, 256, 512] {
+                    let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                    let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                    let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                    let s32 = s as u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((s / 16) as u32, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let oracle = if causal {
+                        ref_attn_causal(&back(&q16), &back(&k16), &back(&v16), s, d, scale)
+                    } else {
+                        ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale)
+                    };
+                    let st = crate::diff::assert_close(
+                        &format!("{entry} s={s}"),
+                        &got,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                }
+            }
+        });
+    }
+
     /// **D=128 flash vs cuDNN/cutlass fused SDPA** — the modern head dim, a new regime (the fast `mma`
     /// kernels were D=64 only). Same honesty model as [`attn_vs_fused_peer`]: identical f16 Q/K/V to
     /// Mercury's `flash_d128_mp` and the fused peer, output gated vs the per-head f64 oracle at small S
