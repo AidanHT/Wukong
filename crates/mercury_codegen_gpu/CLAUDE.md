@@ -16,6 +16,21 @@ untouched. Run GPU work with `cargo test -p mercury_codegen_gpu --features gpu`.
 toolkit — only **running** needs the driver + a device.
 
 ## Layout
+- `src/pool.rs` — **device memory pool** (M7): `DevicePool`, a bump arena over one `cuMemAllocAsync`
+  slab. `alloc`/`alloc_zeros` hand out a sub-range by bumping a cursor (no driver call), `reset()`
+  reclaims everything O(1), `high_water_bytes()` tracks the peak. Handouts are real `CudaSlice<T>`
+  (`leak()`→`upgrade_device_ptr()`), so they feed the existing launchers unchanged; `PoolBuf`
+  **leaks-not-frees** on drop (the slab owns the bytes). Kills per-op alloc/free/zeroing in the
+  resident loop **and** is the prerequisite for graph capture (a captured region must contain no
+  synchronizing alloc). `poison(byte)` dirties the slab so a gate can expose any read-of-uninit.
+- `src/graph.rs` — **CUDA graph capture/replay** (M7): `Graph::capture(stream, record)` records a fixed
+  launch sequence (raw `cuStreamBeginCapture`/`EndCapture` + `cuGraphInstantiateWithFlags(flags=0)`,
+  since cudarc's safe wrapper forces AUTO_FREE), `launch()` replays the whole thing with one
+  `cuGraphLaunch`; Drop-correct. Plus `PinnedBuf<T>` (page-locked host staging for async H2D/D2H). Two
+  gotchas it works around: cudarc's `default_stream()` is the **un-capturable NULL stream** (capture on
+  a dedicated `new_stream()`), and cudarc enables **event tracking by default** → once a 2nd stream
+  exists it inserts cross-stream waits capture rejects (build the layer + buffers with event tracking
+  disabled so nothing carries events; see `with_event_tracking_disabled` in `gpu.rs` tests).
 - `src/lib.rs` — crate root; `GPU_ENABLED` const; re-exports behind `#[cfg(feature = "gpu")]`.
 - `src/gpu.rs` — host harness: `Gpu` (context + default stream + PTX-module cache), the process-wide
   `gpu()` accessor (a `Mutex<Option<Gpu>>` — `None` means no device → tests *skip*, not fail), and the
@@ -24,7 +39,14 @@ toolkit — only **running** needs the driver + a device.
   (f32, simple + register-blocked), `gemm_nt_f16`/`_bf16` (WMMA tensor core), `gemm_nt_fp8` + `fp8_tile`
   (fp8 mma.sync), `norm` (softmax/LayerNorm/RMSNorm), `conv2d`, `flash_attn`, and `transformer_layer`
   (a whole pre-norm encoder layer, end-to-end GPU-resident — chains the above on device buffers with no
-  host round-trip; `TransformerWeights` bundles the six projections).
+  host round-trip; `TransformerWeights` bundles the six projections). **M7 additions (append-only):**
+  `ResidentLayerF16::forward_device_pooled{,_on}` (the pooled forward — same kernels/configs/dtypes as
+  `forward_device`, scratch from a `DevicePool`, result into a caller-owned persistent buffer; `_on`
+  takes an explicit capturable stream), and the test-module M7 gates/benches
+  (`resident_layer_{pooled,graphed}_matches_eager`, `resident_stack_graphed_matches_eager`,
+  `pool_graph_vs_unpooled`, `decode_stack_latency`, `overlap_throughput`,
+  `concurrent_forwards_throughput`) + the `forward_stack_pooled_on` / `capture_resident_{layer,stack}`
+  helpers that fold a whole N-layer stack into one `cuGraphLaunch`.
 - `src/cubin.rs` — persistent **cubin cache** (M10): `ptx_to_cubin` runs the driver's `cuLink*` JIT to
   emit SASS; `Gpu::load_module_cached` caches it on disk (keyed by PTX hash + driver version) so warm
   processes load precompiled cubins via `cuModuleLoad` instead of re-JITing. Graceful fallback to a
@@ -48,6 +70,18 @@ toolkit — only **running** needs the driver + a device.
 - `src/ptx_fp8.rs` — fp8 (E4M3) `mma.sync.m16n8k32` tile + tiled GEMM, single-tile and fragment-reuse
   multi-tile (`_mt`, 2×4 16×8 tiles/warp — the fastest tensor-core path; no WMMA fp8 on sm_89, so the
   fragments are hand-placed per the PTX-ISA lane layout) + host-side E4M3 round/widen.
+- `src/ptx_int4.rs` — **W4A16 int4 weight-only decode** (M4 — the LLM-decode workhorse, an *immature*
+  GPU-library field so a documented lead). Host group-wise int4 quant (`quantize_weight_symmetric` /
+  `quantize_weight_asymmetric` — AWQ/GPTQ zero-point, group=128) into the **Marlin/AWQ-interleaved**
+  packed layout (`nibble_pos`), an exact-bit fp16 dequant reference (`dequant_weight`/`reference_w4a16`),
+  and the `gemm_nt_w4a16` PTX: a 64×64 SMEM-staged tensor-core tile that reads **packed int4 from global**
+  (8 weights/`u32` — 4× the fp16 weight-footprint shrink) and **unpacks to fp16 on the fly** with the
+  canonical fast path (one `lop3` extracts a pair into an `f16x2` of `1024+u`, then one `sub.rn.f16x2`
+  zero-offset + one `mul.rn.f16x2` scale dequant two weights/op), then runs the *identical* fp16
+  `wmma.mma.sync.m16n16k16` as the dense path. Symmetric (offset-binary, `Z=8`) and zero-point (`Z=zero`)
+  share one unpack. `w4a16_static_ptx` is the **static-shape** variant (dims baked → ptxas strength-reduces
+  the strides). Launchers `gemm_nt_w4a16` / `gemm_nt_w4a16_static` in `gpu.rs`; peer + scoreboard in
+  `baselines.rs` (`nvrtc_naive_w4a16`) / `gpu.rs` (`int4_gemm_vs_peers`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).

@@ -1072,6 +1072,41 @@ while cuBLAS's reproducibility is incidental — NVIDIA documents none across li
 architecture, or its heuristic algorithm/split-K selection. Reproducible-by-default matters for
 regression gates, debugging, and regulated training.
 
+**W4A16 int4 weight-only decode (M4) — leading an immature field.** The LLM-decode workhorse: 4-bit
+weights (group-wise quantized, per-group fp16 scale + optional AWQ/GPTQ zero-point), fp16 activations.
+`gemm_nt_w4a16` reads the **packed int4 weight from global** (8 weights per `u32` — a **4× smaller
+weight footprint** than fp16, the bandwidth win that makes decode memory-bound-friendly), **unpacks
+int4→fp16 on the fly inside the K-loop** with the canonical Marlin/AWQ fast path (one `lop3` extracts an
+interleaved nibble *pair* straight into an `f16x2` of `1024+u`, then a single `sub.rn.f16x2` zero-offset
+and `mul.rn.f16x2` scale dequant **two weights per op** — no per-element convert), then runs the
+*identical* fp16 `wmma.mma.sync.m16n16k16` tensor-core tile as the dense path. The only deviation from an
+*exact* dequant is the same f32-accumulation tolerance the fp16 GEMM carries (~2e-3): the gate
+reconstructs the weight bit-for-bit on the CPU (`reference_w4a16`) and matmuls in f64; both the symmetric
+(offset-binary, `Z=8`) and asymmetric (`Z=zero[group]`) paths pass, and the kernel is deterministic
+run-to-run (M12).
+
+**No robust library int4-decode GEMM is bindable on this box** (cuBLASLt offers no general W4A16 decode),
+so M4 is a *documented lead*, stated honestly: the Tier-A peer is a **naive CUDA-C W4A16** kernel (NVRTC,
+one thread/output with an on-the-fly unpack). One representative back-to-back run (`int4_gemm_vs_peers`,
+clock-warmed, best-of-4, checksum-cross-checked vs the naive peer):
+
+| shape (M×K×N) | Mercury W4A16 | × vs naive CUDA-C | × vs Mercury fp16 (same tile) | weight HBM/pass |
+|---------------|--------------:|------------------:|------------------------------:|-----------------|
+| 64×4096×4096 (decode) | ~12.6 TFLOP/s | **~180–213×** | **~4.0–4.2×** | int4 8.4 MB vs fp16 33.6 MB (**4×**) |
+| 256×2048×2048 | ~14.9 TFLOP/s | ~165× | **~1.46×** | 2.1 vs 8.4 MB |
+| 64×2048×2048 | ~8.8 TFLOP/s | ~92× | ~1.00× | 2.1 vs 8.4 MB |
+| 512×512×512 | ~9.1 TFLOP/s | ~78× | ~1.00× | 0.13 vs 0.5 MB |
+
+The **4× weight-bandwidth reduction lands in the large-weight decode regime** (64×4096), where decode is
+weight-BW-bound and the fp16 path stalls on weight reads — Mercury is ~4× faster there. After the
+Marlin/AWQ `lop3` unpack made the dequant nearly free, **W4A16 is ≥ the fp16 path in *every* regime** (no
+int4 penalty anywhere; it even *beats* fp16 1.46× at 256×2048 because the 4× smaller weight tile fits L2
+far better). **Static-shape specialization** (Mercury's no-library lever — `w4a16_static_ptx` bakes M/N/K
+as constants so ptxas strength-reduces the strides to shifts) adds a further **1.05–1.30×** over the
+same-loaded dynamic kernel, bit-identical. The remaining headroom is in the thin-M decode shape, which is
+occupancy-bound (M=64 → few CTAs); split-K is the identified next lever (its deterministic reduction caps
+the net gain).
+
 **Other op categories** (all emit+execute, tolerance-gated on the 4050): elementwise (saxpy/vadd),
 deterministic reductions (sum/dot/max — bit-exact for max, tolerance for the f32 sums), activations
 (relu/exp/sigmoid/tanh/silu/gelu via SFU), fused row norms (softmax/LayerNorm/RMSNorm, one warp per
@@ -1092,6 +1127,88 @@ The CPU↔GPU boundary stays a tolerance differential: the `gpu_backend_*` drive
 on the interp oracle and the GPU over identical buffers and require both that the offload *actually
 fired* and that outputs match within `c·√K·ε` (GEMM bit-exact; silu ~5e-7, dot ~7e-7, softmax ~3e-8
 abs on this box). A device error surfaces as an error, never a silent CPU fallback.
+
+### M7 runtime — device memory pool + CUDA graphs + multi-stream (decode/small-batch latency)
+
+A resident transformer layer is ~13–16 individual kernel launches, each touching a few KB at decode
+sizes; per-op `cuMemAllocAsync`/free and per-kernel `cuLaunchKernel` then dominate. The Phase-7 runtime
+removes both — a **device memory pool** (`pool.rs`, a bump arena over one slab: no per-op alloc/free,
+no zeroing memset) and **CUDA-graph capture/replay** (`graph.rs`: capture the whole layer once, replay
+with one `cuGraphLaunch`). Every optimized path is gated **bit-identical** to the per-op-alloc +
+individual-launch baseline (the slab is poisoned `0xFF` first to expose any read-of-uninitialized
+scratch) and deterministic across replays; all numbers are **same-run** ratios (the ~7× laptop clock
+swing makes absolutes meaningless), reported as the best of ≥3 re-runs.
+
+| Workload (RTX 4050) | eager → pooled | eager → **graphed** | note |
+|---|---|---|---|
+| 1 layer, decode (S=64, D=64) | ~1.9–2.0× | **~4.5–6.4×** | graph adds ~2.2–3.3× on top of pooling |
+| 1 layer, S=512 D=128 | ~1.8–2.1× | ~3.2–3.5× | |
+| 1 layer, GPT-2 (S=512 D=768 H=12) | ~1.0× | ~1.1× | compute-bound; little overhead to remove |
+| **12-layer model, decode** | — | **~6.5–6.9×** | ~2.5 ms → ~380 µs; 156 launches → **1 cuGraphLaunch** |
+
+The whole-model win **compounds with depth** (more launches folded) while graphed latency scales
+linearly at ~32 µs/layer (pure compute + one launch), and the pool footprint stays at **one layer's
+232 KiB** for the whole stack (reset between layers). **Multi-stream:** copy/compute overlap with
+pinned host staging (`PinnedBuf`, 2 streams, event-ordered) is gated bit-identical to serial but is
+~1.0× here — the resident layer is strongly compute-bound, so even GPT-2's 1.5 MiB/item transfer is a
+small fraction of compute (the prefill/slow-link lever, not realized on this workload). The lever that
+*does* help the underutilized decode regime is **concurrent forwards** — K=4 independent requests on K
+streams reclaim idle SMs for **~1.3×** decode-serving throughput (and ~1.0× at the GPT-2 shape, which
+already saturates). Reproduce: `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored
+--nocapture pool_graph_vs_unpooled decode_stack_latency overlap_throughput concurrent_forwards_throughput`.
+
+### End-to-end models — GPT-2 & Llama blocks authored in `.mer` (Phase 9)
+
+Two real transformer blocks now exist as Mercury *source*: `examples/gpt2.mer` (a pre-LayerNorm GPT-2
+decoder block — multi-head causal attention + GELU MLP + residuals) and `examples/llama_block.mer` (a
+pre-RMSNorm Llama block — RoPE + multi-head causal attention + SwiGLU FFN + residuals). They are
+written **entirely in the recognized op-forms**, so the *same source* dispatches to the tuned kernels
+on every backend rather than to a naive nest:
+
+| model | recognized dispatch (`--emit=mir`) | oracle gate |
+|---|---|---|
+| `gpt2.mer`        | 2× `mercury_norm_affine_f32` (LayerNorm) + **6× `mercury_sgemm_nt`** (Q/K/V/O + FFN up/down) + streaming residual `velem` | `--run` **-O0 == -O3**, deterministic |
+| `llama_block.mer` | 2× `mercury_norm_affine_f32` (RMSNorm) + **7× `mercury_sgemm_nt`** (Q/K/V/O + SwiGLU gate/up/down) + `silu` vmath + streaming `velem` | `--run` **-O0 == -O3**, deterministic |
+
+(The per-head attention `Q·Kᵀ`/`P·V` matmuls carry a head-column offset, so on the CPU oracle they run
+as general nests; on the GPU they are the hand-coded flash kernel inside the resident layer below.)
+Both run end-to-end on the interpreter oracle at a small-but-structurally-exact config (S=8, D=64,
+H=4, Dff=256 — the 124M / 7B configs are harness-driven, since a `--run` stack cannot hold the
+weights) and are differentially gated **`-O0 == -O3`** (deterministic, byte-for-byte).
+
+**Compile latency on a real model (M10).** Best-of-15, release `mercuryc`, this RTX-4050 box, full
+source → optimized MIR (`mercuryc --emit=mir -O2 <model>`):
+
+| model | source → optimized MIR (wall, best-of-15) | vs the JIT field's cold compile |
+|---|---|---|
+| `gpt2.mer` (200 lines)        | **~12.8 ms** (≈7.5 ms is a fixed process-startup floor → ≈5 ms compile work) | **~2,300–9,400×** faster |
+| `llama_block.mer` (195 lines) | **~14.6 ms** (≈7 ms compile over the same floor)                             | **~2,000–8,200×** faster |
+
+The denominator is the **documented Triton / TorchInductor cold-compile of 30–120 s** for a model (one
+reported Triton kernel alone: 151 s), which includes the runtime autotuning search Mercury skips
+outright — its shapes are compile-time-known (in the type system), so it emits a bespoke kernel with no
+search. Mercury compiles a *whole transformer block's definition* source → runnable IR in **single-digit
+-to-teens of milliseconds**; the per-kernel PTX→SASS step is then the already-measured driver JIT
+(**0.76 ms cold, 0.16 ms warm cubin**, M10 above). This compile-latency gap is the one place an
+orders-of-magnitude **absolute** claim is fair, and these authored models confirm it end-to-end.
+
+**GPU-resident execution = the resident-layer benches above.** The math these `.mer` blocks express is
+exactly the resident `transformer_layer` / `ResidentLayerF16` benched in this section — RMSNorm →
+Q/K/V → flash-attention → O-proj + residual → norm → FFN → residual: M7 reports **1.33 ms/layer @S=256**
+(~160–190 K tokens/s) and M13 reports the fp16 fused layer **beating the cuBLAS call-chain at D=64,
+~par at the real GPT-2 D=768/H=12 shape**, with the Phase-7 pool+graph runtime folding a 12-layer
+decode into **one `cuGraphLaunch` (~6.5–6.9× eager)**.
+
+**Honest status & what is pending (the honesty law).** Authored + oracle-gated + compile-latency-measured
+here; the GPU-resident *inference* numbers are the resident-layer benches above (same computation, same
+device). **Not yet measured, so not claimed:** the full 124M-GPT-2 / 7B-Llama run driven straight from
+these `.mer` files through the general lowerer (recognized-op GPU dispatch is the Phase-4 *perf* tail,
+owned by a sibling session); a **training-step** tokens/s vs PyTorch-eager (the autodiff engine is built
+but its branch is not yet integrated on this trunk); the **whole-model megakernel** path (Phase 8, not
+started); and a **PyTorch-eager / TensorRT-LLM** same-run peer for the full model. This trunk
+(`gpu-integrate`) currently integrates the general MIR→PTX lowerer, the Phase-7 device pool + CUDA
+graphs, and the conv2d slice; the int8 / autodiff / large-GEMM-fusion branches are pending coordinated
+integration.
 
 ## Honest summary
 
