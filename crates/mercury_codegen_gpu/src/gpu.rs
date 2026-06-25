@@ -13366,6 +13366,151 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Correctness gate (law #1) for the head-dim warp-split D=128 flash** (`flash_d128_hs`). Two warps
+    /// share the 16 query rows; each computes the full score but only its **half** of the PV output and
+    /// stores its hdim half. This gates that the split + 64-thread cooperative staging + 2-warp barriers
+    /// reproduce the f64 `ref_attn` — a wrong `hbase` offset or a missed barrier would corrupt exactly one
+    /// hdim half (warp 1's `[64:128)`), which the per-element compare catches. `block_dim=64`.
+    #[test]
+    fn flash_hs_matches_reference() {
+        use half::f16;
+        with_gpu("flash_hs", |g| {
+            let d = 128usize;
+            let mut rng = crate::diff::Rng::new(0x45_0150);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_hs").unwrap();
+            for &s in &[16usize, 64, 256, 512] {
+                let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                let s32 = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
+                let st = crate::diff::assert_close(
+                    &format!("flash_d128_hs s={s}"),
+                    &got,
+                    &oracle,
+                    3e-3,
+                    3e-2,
+                );
+                eprintln!("flash_d128_hs s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+            }
+        });
+    }
+
+    /// **Same-run A/B: head-dim warp-split vs single-warp D=128 flash** (`flash_hs_vs_mp`). `flash_d128_hs`
+    /// (block 64 — 2 warps, 32 O-accs each, ~2× occupancy) vs `flash_d128_mp` (block 32 — 64 O-accs, the
+    /// register-pressure-capped baseline). Both hand-packed loads so the ratio isolates the **occupancy**
+    /// effect, not ldmatrix. Clock-cancelled exactly as `flash_mp4_vs_mp` (warm both, time both orders, min
+    /// per kernel, median of 9; per-kernel launch configs). `hs/mp < 1.0` ⇒ the occupancy bet pays — and
+    /// since D=128's plateau is *half* D=64's at the same per-warp work, the upside is large if it lands.
+    #[test]
+    #[ignore = "same-run flash A/B bench; needs a GPU"]
+    fn flash_hs_vs_mp() {
+        use half::f16;
+        with_gpu("flash_hs_vs_mp", |g| {
+            let d = 128usize;
+            let mut rng = crate::diff::Rng::new(0x45_0AB0);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_mp").unwrap();
+            let f_hs = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_hs").unwrap();
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            let pin = |g: &mut Gpu| {
+                for _ in 0..40 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            };
+            const ROUNDS: usize = 9;
+            let heads = 8usize;
+            for &s in &[512usize, 1024, 2048, 4096] {
+                let n = heads * s * d;
+                let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let cfg_mp = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let cfg_hs = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(f);
+                    b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                run(g, &f_mp, cfg_mp, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                run(g, &f_hs, cfg_hs, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_hs: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                assert!(
+                    (s_hs - s_mp).abs() / s_mp.max(1.0) < 3e-2,
+                    "S={s}: hs vs mp checksum disagree mp={s_mp:.3e} hs={s_hs:.3e}"
+                );
+                let mut ratios = Vec::new();
+                let mut t_mp_best = f64::INFINITY;
+                for _ in 0..ROUNDS {
+                    pin(g);
+                    for _ in 0..30 {
+                        run(g, &f_mp, cfg_mp, &mut o_d);
+                        run(g, &f_hs, cfg_hs, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    };
+                    let a1 = time1(g, &f_mp, cfg_mp, &mut o_d);
+                    let b1 = time1(g, &f_hs, cfg_hs, &mut o_d);
+                    let b2 = time1(g, &f_hs, cfg_hs, &mut o_d);
+                    let a2 = time1(g, &f_mp, cfg_mp, &mut o_d);
+                    let tmp = a1.min(a2);
+                    let ths = b1.min(b2);
+                    ratios.push(ths / tmp);
+                    t_mp_best = t_mp_best.min(tmp);
+                }
+                ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = ratios[ratios.len() / 2];
+                let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
+                eprintln!(
+                    "hs-vs-mp H={heads} S={s:>4} D=128: mp {:>6.0} GF/s | hs/mp {:.3}×  {} (clock-cancelled, median of {ROUNDS})",
+                    flop / t_mp_best / 1e9,
+                    med,
+                    if med < 0.98 { "<- hs wins" } else if med > 1.02 { "(mp wins)" } else { "(tie)" },
+                );
+            }
+        });
+    }
+
     /// **Correctness gate (law #1) for fused-RoPE flash** (`flash_d64_mprope`). The kernel rotates Q and
     /// K *inside* attention; this gates it against an independent CPU oracle that rotates Q,K with the
     /// same interleaved `(2t,2t+1)` convention (`θ_t = base^(−2t/d)`) and then runs the f64 attention
