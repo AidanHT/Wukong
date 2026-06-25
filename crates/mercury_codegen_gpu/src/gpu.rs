@@ -12089,6 +12089,266 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **int8 rasterized-swizzle bit-exact gate (first law).** The rasterized swz kernel
+    /// ([`crate::ptx_int8::int8_gemm_smdb_swz_raster_ptx`]) only permutes which CTA computes which output
+    /// tile (a 1-D column-banded grid); the per-tile `u8`×`i8`→`i32` mod-2³² arithmetic is untouched, so it
+    /// must reproduce the wrapping-`i32` CPU reference EXACTLY for any raster width. Full-range activations
+    /// (`u8` 0..255) + weights (`i8`), several 128-tiling shapes and raster widths — including edge bands
+    /// narrower than `raster` (tiles_n < raster) and tall/wide grids. 1-D grid launch. Skips without a GPU.
+    #[test]
+    fn quant_int8_raster_matches_reference() {
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_raster_entry, int8_gemm_smdb_swz_raster_ptx, INT8_BM128, INT8_BN128,
+            INT8_WARPS_M128, INT8_WARPS_N128,
+        };
+        with_gpu("quant_int8_raster", |g| {
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            let (bm, bn) = (INT8_BM128, INT8_BN128);
+            let mut rng = crate::diff::Rng::new(0x4A58);
+            let entry = int8_gemm_smdb_swz_raster_entry(true);
+            // (m,k,n,raster): square, edge-band (tiles_n<raster), tall, wide, big-raster. M%128==N%128==K%64==0.
+            for (m, k, n, r) in [
+                (128usize, 64usize, 128usize, 8usize),
+                (256, 128, 128, 8),
+                (128, 192, 384, 4),
+                (384, 64, 256, 16),
+                (256, 256, 256, 32),
+            ] {
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let want = ref_nt_int8(&a, &b, m, k, n);
+                let ptx = int8_gemm_smdb_swz_raster_ptx(true, r);
+                let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                let f = module.load_function(entry).unwrap();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let cfg = LaunchConfig {
+                    grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1),
+                    block_dim: ((w128 * 32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&c_d).unwrap();
+                assert_eq!(got, want, "rasterized swz128 r={r} {m}x{k}x{n} must equal the i32 oracle bit-for-bit");
+                eprintln!("int8 raster r={r} {m}x{k}x{n}: bit-exact ✓");
+            }
+        });
+    }
+
+    /// **int8 rasterized-swizzle %-of-cuBLAS sweep — the 4096³ HBM-bound lever (perf/gpu-quant-2).** The
+    /// dispatched swz128 kernel is HBM/L2-bound at 4096³ (~62% of cuBLAS, the one square shape below the
+    /// 75% floor): A+B (32 MiB) overflow L2 and the naive `ctaid.x/y → tile` map streams a scattered
+    /// footprint through HBM. Threadblock rasterization ([`crate::ptx_int8::int8_gemm_smdb_swz_raster_ptx`])
+    /// bands the 1-D CTA grid into `raster`-wide N-tile columns so co-resident CTAs reuse a compact A/B
+    /// slab from L2 — the lever that took the fp16 mma path 56%→72% at 4096³. Sweeps raster ∈ {4,8,16,32}
+    /// for the 128×128 swz kernel vs the un-rasterized swz128 baseline and cuBLAS, same-run interleaved, at
+    /// 2048³ and 4096³. **Bit-exact** checksum cross-check first (raster only permutes tile→CTA ownership;
+    /// the per-tile u8×i8→i32 arithmetic is untouched). Needs the redist DLLs on PATH. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture quant_int8_raster_sweep`
+    #[test]
+    #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn quant_int8_raster_sweep() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::ptx_int8::{
+            int8_gemm_smdb128_swz_ptx, int8_gemm_smdb_swz_raster_entry, int8_gemm_smdb_swz_raster_ptx,
+            INT8_BM128, INT8_BN128, INT8_WARPS_M128, INT8_WARPS_N128,
+        };
+        with_gpu("quant_int8_raster_sweep", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] quant_int8_raster_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let w128 = INT8_WARPS_M128 * INT8_WARPS_N128;
+            let (bm, bn) = (INT8_BM128, INT8_BN128);
+            let mut rng = crate::diff::Rng::new(0x4A57);
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            // checksum of one launch of `f` with cfg — bit-exact cross-check before any timing (first law).
+            let cs_of = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, dims: (u32, u32, u32), a_d: &cudarc::driver::CudaSlice<u8>, b_d: &cudarc::driver::CudaSlice<i8>, mn: usize| -> i64 {
+                let mut cc = g.stream.memcpy_stod(&vec![0i32; mn]).unwrap();
+                let mut bld = g.stream.launch_builder(f);
+                bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(a_d).arg(b_d).arg(&mut cc);
+                unsafe { bld.launch(cfg).unwrap() };
+                g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+            };
+            for sz in [2048usize, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                eprintln!("\n{sz}³ int8 rasterized-swz128 vs cuBLAS (same-run, interleaved):");
+
+                // Baseline: un-rasterized swz128 (2-D grid).
+                let f_base = g
+                    .function("int8_swz128_base", int8_gemm_smdb128_swz_ptx(), "int8_gemm_nt_smdb128_swz")
+                    .unwrap();
+                let cfg_base = int8_smdb_cfg(m, n, bm, bn, w128);
+                assert_eq!(cs_of(g, &f_base, cfg_base, dims, &a_d, &b_d, m * n), cs_ref, "swz128 base {sz}³ checksum");
+                let (mut s_base, mut s_cub) = (f64::INFINITY, f64::INFINITY);
+                for _ in 0..ROUNDS {
+                    s_base = s_base.min(time_gemm_int8(g, &f_base, cfg_base, dims, &a_d, &b_d, &mut c_d, 50));
+                    s_cub = s_cub.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                }
+                let (g_base, g_cub) = (flop / s_base, flop / s_cub);
+                let base_pct = 100.0 * g_base / g_cub;
+                eprintln!("  swz128 no-raster : {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", g_base / 1e9, base_pct, g_cub / 1e9);
+
+                // Rasterized sweep (1-D grid: gridDim.x = tiles_m·tiles_n).
+                let entry = int8_gemm_smdb_swz_raster_entry(true);
+                let grid1d = ((m / bm) * (n / bn)) as u32;
+                let cfg_r = LaunchConfig { grid_dim: (grid1d, 1, 1), block_dim: ((w128 * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                let mut best: Option<(usize, f64)> = None;
+                for r in [4usize, 8, 16, 32] {
+                    let ptx = int8_gemm_smdb_swz_raster_ptx(true, r);
+                    let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                    let f = module.load_function(entry).unwrap();
+                    assert_eq!(cs_of(g, &f, cfg_r, dims, &a_d, &b_d, m * n), cs_ref, "swz128_r{r} {sz}³ checksum");
+                    let (mut s_v, mut s_c) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..ROUNDS {
+                        s_v = s_v.min(time_gemm_int8(g, &f, cfg_r, dims, &a_d, &b_d, &mut c_d, 50));
+                        s_c = s_c.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                    }
+                    let (gf, gc) = (flop / s_v, flop / s_c);
+                    let pct = 100.0 * gf / gc;
+                    eprintln!("  swz128 raster={r:<2} : {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS", gf / 1e9, pct);
+                    if best.map_or(true, |(_, p)| pct > p) {
+                        best = Some((r, pct));
+                    }
+                }
+                if let Some((r, p)) = best {
+                    eprintln!("  → best @{sz}³: raster={r} at {p:.1}% of cuBLAS (vs no-raster {base_pct:.1}% → {:+.1} pts)", p - base_pct);
+                }
+            }
+        });
+    }
+
+    /// **int8 big-tile swizzle bit-exact gate (first law).** The 256×128 / 128×256 swz tiles
+    /// ([`crate::ptx_int8::int8_gemm_swz_tile_ptx`], the #1 int8→cuBLAS lever — a 64×64 warp tile) change
+    /// only the CTA/warp work assignment; the per-tile `u8`×`i8`→`i32` mod-2³² arithmetic is identical, so
+    /// they must equal the wrapping-`i32` CPU reference EXACTLY (±rasterization, which only permutes
+    /// tile→CTA ownership). Full-range inputs. Skips without a GPU.
+    #[test]
+    fn quant_int8_bigtile_matches_reference() {
+        with_gpu("quant_int8_bigtile", |g| {
+            let mut rng = crate::diff::Rng::new(0x4A59);
+            // (bm,bn,wm,wn,raster): 256×128 & 128×256, plain + rasterized (1-D grid). M%bm==N%bn==K%64==0.
+            let cfgs = [(256usize, 128usize, 4usize, 2usize, 0usize), (128, 256, 2, 4, 0), (256, 128, 4, 2, 8), (128, 256, 2, 4, 8)];
+            for (bm, bn, wm, wn, r) in cfgs {
+                for (m, k, n) in [(bm, 128usize, bn), (2 * bm, 64usize, 2 * bn)] {
+                    let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                    let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                    let want = ref_nt_int8(&a, &b, m, k, n);
+                    let (entry, ptx) = crate::ptx_int8::int8_gemm_swz_tile_ptx(bm, bn, wm, wn, r);
+                    let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                    let f = module.load_function(entry.as_str()).unwrap();
+                    let a_d = g.stream.memcpy_stod(&a).unwrap();
+                    let b_d = g.stream.memcpy_stod(&b).unwrap();
+                    let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                    let grid = if r > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
+                    let cfg = LaunchConfig { grid_dim: grid, block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    assert_eq!(g.stream.memcpy_dtov(&c_d).unwrap(), want, "swz {bm}x{bn} w{wm}x{wn} r{r} {m}x{k}x{n}");
+                }
+            }
+            eprintln!("int8 big-tile swz (256×128 / 128×256, ±raster): bit-exact ✓");
+        });
+    }
+
+    /// **int8 big-tile swizzle %-of-cuBLAS sweep — the #1 lever (perf/gpu-quant-2).** Per the Ada int8
+    /// study, the remaining ~2× to cuBLAS is **CTA/warp-tile size**, not pipelining: the shipped swz128
+    /// kernel has a 32×64 per-warp tile, while CUTLASS's winning int8 configs use **256×128 / 128×256 with
+    /// a 64×64 warp tile** (8 warps) for 2× the per-warp A/B reuse. This sweeps those big tiles (±threadblock
+    /// rasterization) vs the 128×128 baseline and cuBLAS, same-run interleaved, at 1024³/2048³/4096³.
+    /// **Bit-exact** checksum cross-check first. Needs the redist DLLs on PATH. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture quant_int8_bigtile_sweep`
+    #[test]
+    #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn quant_int8_bigtile_sweep() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::ptx_int8::int8_gemm_swz_tile_ptx;
+        with_gpu("quant_int8_bigtile_sweep", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] quant_int8_bigtile_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x4A5A);
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            // (label, bm, bn, wm, wn, raster): 128×128 baseline + the 256×128 / 128×256 big tiles (±raster).
+            let variants: [(&str, usize, usize, usize, usize, usize); 6] = [
+                ("128x128 w4x2    ", 128, 128, 4, 2, 0),
+                ("256x128 w4x2    ", 256, 128, 4, 2, 0),
+                ("128x256 w2x4    ", 128, 256, 2, 4, 0),
+                ("256x128 w4x2 r8 ", 256, 128, 4, 2, 8),
+                ("128x256 w2x4 r8 ", 128, 256, 2, 4, 8),
+                ("256x128 w4x2 r16", 256, 128, 4, 2, 16),
+            ];
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                eprintln!("\n{sz}³ int8 big-tile swz vs cuBLAS (same-run, interleaved):");
+                let mut best: Option<(String, f64)> = None;
+                for (label, bm, bn, wm, wn, r) in variants {
+                    if m % bm != 0 || n % bn != 0 {
+                        eprintln!("  {label}: n/a (not {bm}×{bn}-divisible)");
+                        continue;
+                    }
+                    let (entry, ptx) = int8_gemm_swz_tile_ptx(bm, bn, wm, wn, r);
+                    let module = g.ctx.load_module(ptx.as_str().into()).unwrap();
+                    let f = module.load_function(entry.as_str()).unwrap();
+                    let grid = if r > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
+                    let cfg = LaunchConfig { grid_dim: grid, block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    // bit-exact cross-check (first law) before timing.
+                    let cs: i64 = {
+                        let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(cfg).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                    };
+                    assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
+                    let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..ROUNDS {
+                        s_v = s_v.min(time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                        s_cub = s_cub.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                    }
+                    let (gf, gc) = (flop / s_v, flop / s_cub);
+                    let pct = 100.0 * gf / gc;
+                    eprintln!("  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, gc / 1e9);
+                    if best.as_ref().map_or(true, |(_, p)| pct > *p) {
+                        best = Some((label.trim().to_string(), pct));
+                    }
+                }
+                if let Some((label, pct)) = best {
+                    eprintln!("  → best @{sz}³: {label} at {pct:.1}% of cuBLAS");
+                }
+            }
+        });
+    }
+
     /// **int8 `ldmatrix`+swizzle vs hand-placed, same-run internal A/B (M3 lever, contention-robust).**
     /// Times the conflict-free-SMEM `_swz` kernels against the hand-placed `_smdb` baseline back-to-back
     /// under one clock state and reports the **Mercury-internal** swz/handplaced ratio — which stays
