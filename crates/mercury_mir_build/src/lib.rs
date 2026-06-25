@@ -52,6 +52,7 @@ pub fn lower_program(
         vhorner: interner.intern("mercury_vhorner_f32"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         argreduce: interner.intern("mercury_argreduce_f32"),
+        argreduce_par: interner.intern("mercury_argreduce_f32_parallel"),
         norm: interner.intern("mercury_norm_f32"),
         norm_par: interner.intern("mercury_norm_f32_parallel"),
         norm_affine: interner.intern("mercury_norm_affine_f32"),
@@ -737,6 +738,11 @@ struct GemmSyms {
     /// index on ties). Serial form (bit-identical to the parallel one), which the interpreter also
     /// calls — so a recognized argmax loop stays exact across backends.
     argreduce: Symbol,
+    /// The multicore variant (`mercury_argreduce_f32_parallel`): a recognized global argmax/argmin in
+    /// a `@parallel` function lowers to this. It is **bit-identical** to the serial `argreduce` (fixed
+    /// `RCHUNK` decomposition, ascending partial fold — index independent of thread count), which the
+    /// interpreter calls, so native @parallel and interp stay exact.
+    argreduce_par: Symbol,
     /// The fused single-pass row-wise normalization kernel (`mercury_norm_f32(x, out, rows, cols,
     /// eps_bits, op)`): an idiomatic multi-pass softmax / LayerNorm / RMSNorm written in plain loops
     /// lowers to this one call. The interpreter marshals through the identical kernel.
@@ -4864,11 +4870,18 @@ impl FnLowerer<'_> {
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
-        // ki = lowest-index argmax/argmin over x[0..n]; kv = x[ki].
+        // ki = lowest-index argmax/argmin over x[0..n]; kv = x[ki]. In a `@parallel` function the
+        // multicore kernel is selected — it folds the same fixed chunk decomposition in ascending
+        // order, so the returned index is bit-identical to the serial one the interpreter calls.
+        let argreduce_sym = if self.parallel_fn {
+            self.gemm.argreduce_par
+        } else {
+            self.gemm.argreduce
+        };
         let ki = self.builder.build(
             MirType::I64,
             Op::Call {
-                func: self.gemm.argreduce,
+                func: argreduce_sym,
                 args: vec![xv, n, opv],
             },
         );
