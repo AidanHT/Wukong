@@ -204,6 +204,113 @@ pub fn launch_paged_attn_decode(
     Ok(())
 }
 
+/// PTX entry name for the KV-append (scatter) kernel.
+pub const KV_APPEND_ENTRY: &str = "kv_append";
+
+/// Generate the **KV-append** PTX: scatter each slot's just-projected new token K and V (f32 `[bcap,
+/// D]`) into the paged f16 cache at the slot's write position, through its block table. One thread per
+/// `(slot, channel)` element. `head_dim` is a runtime param (no unroll needed — it's a pure scatter).
+/// This is the device twin of [`crate::paged_kv::BlockManager::append`]'s `(phys, off)` address.
+pub fn kv_append_ptx() -> String {
+    let mut s = String::new();
+    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += &format!(
+        ".visible .entry {KV_APPEND_ENTRY}(\n\
+        \x20   .param .u64 pKnew,\n\
+        \x20   .param .u64 pVnew,\n\
+        \x20   .param .u64 pK,\n\
+        \x20   .param .u64 pV,\n\
+        \x20   .param .u64 pBT,\n\
+        \x20   .param .u64 pWPos,\n\
+        \x20   .param .u32 pBcap,\n\
+        \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pHd,\n\
+        \x20   .param .u32 pBsz,\n\
+        \x20   .param .u32 pNblk,\n\
+        \x20   .param .u32 pMbps,\n\
+        \x20   .param .u32 pLayer\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0;\n";
+    s += "    .reg .b16 %hk,%hv;\n";
+    s += "    .reg .f32 %fk,%fv;\n";
+    s += "    .reg .b32 %gid,%b,%d,%hh,%dh,%D,%total,%pos,%logical,%off,%phys,%e,%tmp,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
+    s += "    .reg .b64 %Knew,%Vnew,%K,%V,%BT,%WP,%addr,%o64;\n";
+    s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
+    s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
+    s += "    ld.param.u64 %K,[pK];       cvta.to.global.u64 %K,%K;\n";
+    s += "    ld.param.u64 %V,[pV];       cvta.to.global.u64 %V,%V;\n";
+    s += "    ld.param.u64 %BT,[pBT];     cvta.to.global.u64 %BT,%BT;\n";
+    s += "    ld.param.u64 %WP,[pWPos];   cvta.to.global.u64 %WP,%WP;\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
+    s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    // gid = ctaid.x*ntid.x + tid.x ; D = heads*hd ; total = bcap*D ; bail if gid>=total.
+    s += "    mov.u32 %tmp,%ctaid.x;\n    mov.u32 %gid,%ntid.x;\n    mov.u32 %b,%tid.x;\n    mad.lo.s32 %gid,%tmp,%gid,%b;\n";
+    s += "    mul.lo.s32 %D,%heads,%hd;\n    mul.lo.s32 %total,%bcap,%D;\n";
+    s += "    setp.ge.u32 %p0,%gid,%total;\n    @%p0 bra DONE;\n";
+    // b = gid/D ; d = gid - b*D ; hh = d/hd ; dh = d - hh*hd.
+    s += "    div.u32 %b,%gid,%D;\n    mul.lo.s32 %tmp,%b,%D;\n    sub.u32 %d,%gid,%tmp;\n";
+    s += "    div.u32 %hh,%d,%hd;\n    mul.lo.s32 %tmp,%hh,%hd;\n    sub.u32 %dh,%d,%tmp;\n";
+    // pos = WP[b] ; logical = pos/bsz ; off = pos - logical*bsz.
+    s += "    mul.wide.u32 %o64,%b,4;\n    add.s64 %addr,%WP,%o64;\n    ld.global.u32 %pos,[%addr];\n";
+    s += "    div.u32 %logical,%pos,%bsz;\n    mul.lo.s32 %tmp,%logical,%bsz;\n    sub.u32 %off,%pos,%tmp;\n";
+    // phys = BT[b*mbps + logical].
+    s += "    mul.lo.s32 %tmp,%b,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %o64,%tmp,4;\n    add.s64 %addr,%BT,%o64;\n    ld.global.u32 %phys,[%addr];\n";
+    // e = ((((layer*nblk)+phys)*bsz+off)*heads+hh)*hd + dh.
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%hh;\n    mul.lo.s32 %e,%e,%hd;\n    add.u32 %e,%e,%dh;\n";
+    // load Knew[gid]/Vnew[gid], narrow to f16, store at slab[e].
+    s += "    mul.wide.u32 %o64,%gid,4;\n    add.s64 %addr,%Knew,%o64;\n    ld.global.f32 %fk,[%addr];\n    add.s64 %addr,%Vnew,%o64;\n    ld.global.f32 %fv,[%addr];\n";
+    s += "    cvt.rn.f16.f32 %hk,%fk;\n    cvt.rn.f16.f32 %hv,%fv;\n";
+    s += "    mul.wide.u32 %o64,%e,2;\n    add.s64 %addr,%K,%o64;\n    st.global.b16 [%addr],%hk;\n    add.s64 %addr,%V,%o64;\n    st.global.b16 [%addr],%hv;\n";
+    s += "DONE:\n    ret;\n}\n";
+    s
+}
+
+/// Threads per CTA for the KV-append scatter.
+pub const KV_APPEND_BLOCK: u32 = 256;
+
+/// Launch the KV-append scatter for **one layer**: write the new token K/V (`knew_d`/`vnew_d`, f32
+/// `[bcap, D]`) into the f16 cache slabs at each slot's `wpos_d[slot]` position, via the block table.
+/// `wpos_d[slot]` must be the slot's pre-append position and its block must already be reserved (the
+/// host [`BlockManager::append`](crate::paged_kv::BlockManager::append) does both). Full-overwrite of
+/// one f16 element per channel ⇒ safe on pooled (uninit) `knew/vnew`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    k_d: &mut CudaSlice<half::f16>,
+    v_d: &mut CudaSlice<half::f16>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    let total = (bcap * cfg.heads * cfg.head_dim) as u32;
+    let launch = LaunchConfig {
+        grid_dim: (total.div_ceil(KV_APPEND_BLOCK), 1, 1),
+        block_dim: (KV_APPEND_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (bcap_u, heads, hd, bsz, nblk, mbps, layer_u) = (
+        bcap as u32,
+        cfg.heads as u32,
+        cfg.head_dim as u32,
+        cfg.block_size as u32,
+        cfg.num_blocks as u32,
+        cfg.max_blocks_per_seq as u32,
+        layer as u32,
+    );
+    let mut b = stream.launch_builder(func);
+    b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(bt_d).arg(wpos_d);
+    b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    unsafe { b.launch(launch)? };
+    Ok(())
+}
+
 /// **f64 full-softmax CPU reference** for the decode attention — the tolerance oracle. `q` is
 /// `[bcap, D]`; `k_slots`/`v_slots[b]` are slot `b`'s contiguous context, each `[ctx_b, heads,
 /// head_dim]` row-major (`ctx_b == ctx_lens[b]`). Returns `out` `[bcap, D]` f32. A slot with `ctx_b ==

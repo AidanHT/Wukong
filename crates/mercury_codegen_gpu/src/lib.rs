@@ -121,3 +121,9 @@ pub mod paged_kv;
 /// launcher is `#[cfg(feature = "gpu")]` within.
 #[cfg(feature = "gpu")]
 pub mod paged_attention;
+
+/// Batched autoregressive decode layer/model over the paged KV-cache (`DecodeLayer`/`DecodeModel`) —
+/// the serving forward pass: projections + append-to-cache + paged attention + FFN, whole-stack
+/// GPU-resident, pooled/on-stream so a CUDA graph captures the whole decode step.
+#[cfg(feature = "gpu")]
+pub mod serving;
