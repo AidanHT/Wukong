@@ -115,3 +115,9 @@ pub use lower::{jit_run as lower_jit_run, GpuLowerBackend};
 // `cargo test`. Only the device cache (`PagedKvCache`) and the decode kernels are `#[cfg(feature =
 // "gpu")]` within. `paged_attention` and `serving` (GPU launchers/loops) are declared as they land.
 pub mod paged_kv;
+
+/// Paged decode-attention kernel: single-query attention against the paged KV-cache, gathering K/V
+/// through the per-sequence block table (PagedAttention). PTX generator + reference are pure; the
+/// launcher is `#[cfg(feature = "gpu")]` within.
+#[cfg(feature = "gpu")]
+pub mod paged_attention;
