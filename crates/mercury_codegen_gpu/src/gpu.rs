@@ -13101,6 +13101,146 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Correctness gate (law #1) for the software-pipelined flash** (`flash_d64_msp`). The QKᵀ-ahead
+    /// pipeline reorders the K-loop, runs on separate K/V SMEM pools with `XOR`-toggled double buffers, and
+    /// rotates score registers — this gates that the reordering + buffer rotation + prologue/tail
+    /// boundaries still reproduce the f64 `ref_attn`. Includes S=16 (n=1, the prologue-only single-tile
+    /// path) and S=32 (n=2) to exercise the ragged loop edges, plus larger S.
+    #[test]
+    fn flash_sp_matches_reference() {
+        use half::f16;
+        with_gpu("flash_sp", |g| {
+            let d = 64usize;
+            let mut rng = crate::diff::Rng::new(0x5B_0011);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_msp").unwrap();
+            for &s in &[16usize, 32, 64, 256, 512] {
+                let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                let s32 = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
+                let st = crate::diff::assert_close(
+                    &format!("flash_d64_msp s={s}"),
+                    &got,
+                    &oracle,
+                    3e-3,
+                    3e-2,
+                );
+                eprintln!("flash_d64_msp s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+            }
+        });
+    }
+
+    /// **Same-run A/B: software-pipelined vs base flash** (`flash_sp_vs_mp`). `flash_d64_msp` (QKᵀ(i+1)
+    /// issued ahead to overlap the softmax(i) SFU stall) vs `flash_d64_mp`, identical launch geometry,
+    /// clock-cancelled exactly as `flash_lm_vs_mp` (warm both, time both orders, min per kernel, median of
+    /// 9). `sp/base < 1.0` ⇒ the overlap wins. The softmax stall binds at long S, so a win should grow
+    /// with S. Occupancy is unchanged (separate K/V pools = same 8 KB as the base 2-slab buffer), so unlike
+    /// `mp4`/`mpw` this isolates the overlap, not an occupancy trade.
+    #[test]
+    #[ignore = "same-run flash A/B bench; needs a GPU"]
+    fn flash_sp_vs_mp() {
+        use half::f16;
+        with_gpu("flash_sp_vs_mp", |g| {
+            let d = 64usize;
+            let mut rng = crate::diff::Rng::new(0x5B_0A0B);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let f_base = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
+            let f_sp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_msp").unwrap();
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            let pin = |g: &mut Gpu| {
+                for _ in 0..40 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            };
+            const ROUNDS: usize = 9;
+            let heads = 8usize;
+            for &s in &[512usize, 1024, 2048, 4096] {
+                let n = heads * s * d;
+                let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(f);
+                    b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                run(g, &f_base, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_b: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                run(g, &f_sp, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_l: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                assert!(
+                    (s_l - s_b).abs() / s_b.max(1.0) < 3e-2,
+                    "S={s}: sp vs base checksum disagree base={s_b:.3e} sp={s_l:.3e}"
+                );
+                let mut ratios = Vec::new();
+                let mut t_base_best = f64::INFINITY;
+                for _ in 0..ROUNDS {
+                    pin(g);
+                    for _ in 0..30 {
+                        run(g, &f_base, &mut o_d);
+                        run(g, &f_sp, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    };
+                    let a1 = time1(g, &f_base, &mut o_d);
+                    let b1 = time1(g, &f_sp, &mut o_d);
+                    let b2 = time1(g, &f_sp, &mut o_d);
+                    let a2 = time1(g, &f_base, &mut o_d);
+                    let tb = a1.min(a2);
+                    let tl = b1.min(b2);
+                    ratios.push(tl / tb);
+                    t_base_best = t_base_best.min(tb);
+                }
+                ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = ratios[ratios.len() / 2];
+                let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
+                eprintln!(
+                    "sp-vs-mp H={heads} S={s:>4}: base {:>6.0} GF/s | sp/base {:.3}×  {} (clock-cancelled, median of {ROUNDS})",
+                    flop / t_base_best / 1e9,
+                    med,
+                    if med < 0.98 { "<- sp wins" } else if med > 1.02 { "(base wins)" } else { "(tie)" },
+                );
+            }
+        });
+    }
+
     /// **Correctness gate (law #1) for fused-RoPE flash** (`flash_d64_mprope`). The kernel rotates Q and
     /// K *inside* attention; this gates it against an independent CPU oracle that rotates Q,K with the
     /// same interleaved `(2t,2t+1)` convention (`θ_t = base^(−2t/d)`) and then runs the f64 attention
