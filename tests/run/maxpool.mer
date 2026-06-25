@@ -1,0 +1,51 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 60
+// EXPECT-OUT: 80
+module tests.run.maxpool
+
+// 2D max-pooling over a [C=2, H=4, W=4] row-major input, 2x2 window, stride 2x2, no padding →
+// [C=2, OH=2, OW=2]. The recognizer detects the idiomatic 5-deep nest (channel × out-y × out-x ×
+// window-dy × window-dx, seeding the accumulator with the window's first cell, folding the rest by fmax)
+// and dispatches it to the AVX2 `mercury_maxpool2d_f32`. Max is idempotent/associative, so the
+// kernel is bit-identical to this nest — the differential gate (interp == native, -O0 == -O3) is
+// trivial (no float reassociation).
+//
+// Channel 0 = 1..16 row-major; channel 1 = 10·(1..16). Each 2x2 window's max is its bottom-right:
+//   plane0 = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]
+//   out0   = [[6,8],[14,16]]      (max of each 2x2 block)
+//   out1   = [[60,80],[140,160]]
+fn main() -> i32 {
+    let x: [f32; 32] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0,
+    ];
+    let mut out: [f32; 8] = [0.0; 8];
+    for c in 0..2 {
+        for oy in 0..2 {
+            for ox in 0..2 {
+                let mut m = x[c * 4 * 4 + (oy * 2) * 4 + (ox * 2)];
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let v = x[c * 4 * 4 + (oy * 2 + dy) * 4 + (ox * 2 + dx)];
+                        m = fmax(m, v);
+                    }
+                }
+                out[c * 2 * 2 + oy * 2 + ox] = m;
+            }
+        }
+    }
+    print(out[0] as i32); // plane0 [0,0] = max(1,2,5,6) = 6
+    print(out[1] as i32); // plane0 [0,1] = max(3,4,7,8) = 8
+    print(out[2] as i32); // plane0 [1,0] = max(9,10,13,14) = 14
+    print(out[3] as i32); // plane0 [1,1] = max(11,12,15,16) = 16
+    print(out[4] as i32); // plane1 [0,0] = max(10,20,50,60) = 60
+    print(out[5] as i32); // plane1 [0,1] = max(30,40,70,80) = 80
+    return 0;
+}
