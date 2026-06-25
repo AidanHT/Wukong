@@ -226,12 +226,13 @@ same-run via PyTorch SDPA over identical f16 bytes — objective (a), DONE):
 | Regime | Mercury vs the fused peer | verdict |
 |---|---|---|
 | **Fused RoPE, S≤512** (§3) | 1.8–5.7× the rope+SDPA pipeline | **WIN** (library can't fuse RoPE) |
-| **Causal, S=512** (§4) | 1.03–1.16× — beats **both** cuDNN & efficient | **WIN** |
-| **Causal, S=1024** (§4) | ~1.01× cutlass-efficient / 0.87× cuDNN | **tie vs efficient** |
-| Non-causal, S≤1024 (§2) | 0.55–0.80× cuDNN | competitive |
-| Causal/non-causal, S≥2048 | 0.37–0.65× cuDNN (efficient closer) | trails (cuDNN scaling) |
-| D=128, S≤1024 (§5) | 0.86–0.97× cutlass-efficient | competitive |
-| Multi-warp lever (§2 #1) | wash; +12% only at S≥4096 | honest negative |
+| **Causal D=64, S=512** (§4) | 1.03–1.16× — beats **both** cuDNN & efficient | **WIN** |
+| **Causal D=64, S=1024** (§4) | ~1.01× cutlass-efficient / 0.87× cuDNN | **tie vs efficient** |
+| **D=128 (causal+noncausal), S≤1024** (§7) | **1.11–1.20× cutlass-efficient** | **WIN vs efficient** (after ldmatrix) |
+| Non-causal D=64, S≤1024 (§2) | 0.55–0.80× cuDNN | competitive |
+| D=128, S≥2048 (§7) | 0.79–1.00× cutlass-efficient / 0.47–0.58× cuDNN | competitive w/ efficient |
+| Causal/non-causal, S≥2048 | 0.37–0.66× cuDNN (efficient closer) | trails (cuDNN scaling) |
+| Multi-warp / wide-Bk / software-pipeline levers | wash or loss | honest negatives (§2 #1, §7) |
 
 **Objective (b) is met and exceeded.** Mercury is **competitive-or-ahead of a genuinely fused FA-2-class
 kernel across the entire short/medium-context regime (S≤512–1024)** — outright winning in the two
@@ -242,3 +243,66 @@ occupancy levers swept here (multi-warp, wide-Bk both measured negative), and an
 work (`ldmatrix`, deeper pipeline, head-dim warp-splitting). Every kernel is tolerance-gated against the
 f64 oracle; every headline ratio is same-run, checksum-cross-checked, and reported over ≥3 runs (D=128
 coverage excepted, labeled indicative).
+
+## 7. Round 2 — `ldmatrix` SMEM-feed: D=128 now beats cutlass-efficient ≤1024
+
+The §2/§5 long-S gap and the flat D=128 plateau both pointed at the **SMEM feed**. The PV V-fragment was
+gathered by hand — `nto×(4 ld.shared.u16 + shifts + ors)` with key-strided addresses that **8-way
+bank-conflict** (a grp's lanes read keys 0,2,4,6 at a fixed hdim → same bank) — and the QKᵀ K-fragment was
+a strided `2× ld.shared.b32` that conflicts the same way. The `_lm` kernels replace **both** with one
+warp-collective conflict-free `ldmatrix` per tile: **V via `ldmatrix.x2.trans`** (V is staged row-major
+`[key][hdim]`, the mma wants col-major, `.trans` transposes in hardware) and **K via `ldmatrix.x2`** (no
+trans — K is already col-major B, the gemm-NT B layout; addressing `key=lane&7`, `chunk=((lane>>3)&1)·8`
+ported from the gemm). Bit-exact on the first instantiation (the byte geometry ports verbatim from the
+gemm-cliff `ldmatrix` derivation); gated `flash_lm_matches_reference` (max_abs ~1.0–1.5e-4, matches hand).
+
+### Internal A/B — isolates the feed change (`flash_lm_vs_mp`, clock-cancelled, median of 9)
+
+Identical launch geometry, differing only in the two SMEM fragment loads, so the ratio is pure feed:
+
+| regime | lm / hand-packed (S=512 / 1024 / 2048 / 4096) |
+|---|---|
+| **D=128 non-causal** | **0.769 / 0.789 / 0.815 / 0.813** (18–23% faster) |
+| D=64 non-causal | 0.979 / 0.972 / 0.958 / 0.975 (marginal win) |
+| D=64 causal | 0.987 / 0.985 / 0.986 / 0.986 (marginal; V-only long-S regression gone) |
+
+D=128 PV has nto=16 n-tiles so the V-feed dominates → conflict removal pays most; D=64 (nto=8) is not
+SMEM-feed-bound. Adding the K-load ldmatrix both removed the V-only D=64-causal long-S regression and added
+~5% to D=128, so `_lm` is **≥ the hand path at every regime** — it is the default for the peer comparison.
+
+### vs the fused peers (`attn_lm_vs_fused_peer`, H=8, REPS=3, same-run, gated + checksum)
+
+| kernel | S | Mercury / cuDNN | Mercury / cutlass-efficient | verdict |
+|---|---|---|---|---|
+| **D=128 `mp_lm`** (non-causal) | 512 | 0.80× | **1.17×** | **beats efficient** |
+| | 1024 | 0.49× | **1.11×** | **beats efficient** |
+| | 2048 | 0.47× | 0.79× | competitive |
+| | 4096 | 0.55× | 0.83× | competitive |
+| **D=128 `mpc_lm`** (causal) | 512 | 0.78× | **1.16×** | **beats efficient** |
+| | 1024 | 0.74× | **1.20×** | **beats efficient** |
+| | 2048 | 0.50× | ~1.00× | ties efficient |
+| | 4096 | 0.58× | 0.85× | competitive |
+| D=64 `mpc_lm` (causal) | 512 | ~1.02× | ~1.04× | ≈ base (ldmatrix-neutral at D=64) |
+
+Gates at S=512: Mercury max_abs 3.8e-5 (D=128 noncausal) / 3.3e-4 (causal) vs the f64 oracle ✓.
+
+**Before ldmatrix, D=128 was 0.86–0.97× cutlass-efficient — *just behind*. ldmatrix flipped it to *beating*
+efficient at S≤1024** (1.11–1.20×), causal and non-causal, and improved the cuDNN ratio ~+0.1 (0.37–0.66×
+→ 0.47–0.80×). That is a **third** objective-(b) regime — and the modern Llama/GPT head dim. cuDNN's long-S
+scaling (it reaches ~38 TFLOP/s at S=4096 D=64, near this part's f16 tensor-core peak) remains the wall.
+
+### Measured negative — software-pipelining the softmax stall (`flash_sp_vs_mp`)
+
+The residual long-S gap is the documented **softmax SFU stall** (the tensor cores idle through the
+`ex2.approx`/`shfl` sequence — no independent `mma` to issue). `flash_d64_msp` hoists QKᵀ(i+1) to overlap
+softmax(i), kept **occupancy-neutral** via *separate K and V SMEM pools* (2 buffers each = the same 8 KB as
+the base 2-slab; K staged one tile further ahead than V) — the trick that distinguishes it from the
+occupancy-losing mp4/wide. Clock-cancelled `sp/base` (median of 9) = **1.04 / 1.04 / 1.01 / 1.02** — a
+wash. `ptxas` already extracts what little single-warp mma/SFU overlap exists, and the score-rotation +
+separate-pool address arithmetic offset the rest. It joins multi-warp and wide-Bk as a measured
+occupancy/overlap negative. The long-S ceiling is **not** closable by single-warp software-pipelining; the
+remaining open lever is head-dim warp-splitting for D=128's register-pressure (occupancy) bound.
+
+**Round-2 takeaway:** the `ldmatrix` SMEM-feed win is the concrete close-the-gap result — it makes Mercury
+**beat cutlass mem-efficient fMHA at D=128 for S≤1024** (where it was just behind), the head dim modern
+models use, while staying bit-exact. cuDNN's near-peak long-S throughput is the honest remaining frontier.
