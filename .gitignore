@@ -26,6 +26,7 @@ a.out
 # Created via `python -m venv tools/torch-venv` + `pip install torch --index-url
 # https://download.pytorch.org/whl/cu124` — ~2.5 GB of wheels; never committed.
 /tools/torch-venv
+/tools/torch-cuda-venv
 
 # Python bytecode cache (from the bench/pytorch peer harness).
 __pycache__/
