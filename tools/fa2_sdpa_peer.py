@@ -39,6 +39,13 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--dtype", default="f16", choices=["f16", "bf16"])
+    ap.add_argument("--rope", type=int, default=0,
+                    help="if 1, the peer is the HONEST RoPE path: an optimized interleaved-RoPE kernel "
+                         "over Q,K (what a model must run because the fused-attention library can't "
+                         "absorb RoPE) + SDPA, timed as one pipeline. {backend}_sec then measures "
+                         "rope+sdpa; {backend}_sdpa_sec the sdpa-only reference.")
+    ap.add_argument("--cos", default=None, help="cos table [S, D/2] f32 (required with --rope)")
+    ap.add_argument("--sin", default=None, help="sin table [S, D/2] f32 (required with --rope)")
     args = ap.parse_args()
 
     import numpy as np
@@ -65,12 +72,70 @@ def main():
     causal = bool(args.causal)
     scale = float(args.scale)
 
-    def time_backend(backend):
+    # Optional RoPE: the honest peer for the fused-RoPE comparison. The fused-attention library can't
+    # absorb RoPE, so a model runs it as a separate elementwise pass over Q,K. We use the *fastest*
+    # correct RoPE torch can produce (a contiguous interleaved rotation, plus torch.compile if it works),
+    # so the comparison is fair to the peer — not the naive strided version.
+    rope_enabled = bool(args.rope)
+    rope_variants = []  # list of (label, fn); the timer takes the min over them
+    if rope_enabled:
+        if args.cos is None or args.sin is None:
+            raise SystemExit("--rope needs --cos and --sin")
+        half = D // 2
+        cosv = np.fromfile(args.cos, dtype=np.float32).reshape(S, half)
+        sinv = np.fromfile(args.sin, dtype=np.float32).reshape(S, half)
+        cos_t = torch.from_numpy(cosv.copy()).to("cuda", tdt).view(1, 1, S, half)
+        sin_t = torch.from_numpy(sinv.copy()).to("cuda", tdt).view(1, 1, S, half)
+
+        def rope(x):
+            xr = x.reshape(B, H, S, half, 2)
+            x1 = xr[..., 0]
+            x2 = xr[..., 1]
+            o1 = x1 * cos_t - x2 * sin_t
+            o2 = x1 * sin_t + x2 * cos_t
+            return torch.stack((o1, o2), dim=-1).reshape(B, H, S, D)
+
+        rope_variants.append(("eager", rope))
+
+        # Complex-multiply interleaved RoPE — the *fastest* form torch can produce without triton: it
+        # avoids the eager path's `stack` alloc+scatter, doing one complex elementwise multiply over
+        # zero-copy `view_as_complex`/`view_as_real` views (rotation `cos+i·sin` precomputed once, since
+        # it's position- not data-dependent). Taking the min over variants keeps the peer as strong as
+        # possible — the conservative direction for any Mercury claim. Guarded: view_as_complex needs an
+        # f32 last-dim-2 contiguous tensor, so we pay one f16→f32 cast in-loop (still fewer launches).
+        try:
+            rot = torch.view_as_complex(
+                torch.stack((cos_t.float().view(S, half), sin_t.float().view(S, half)), dim=-1).contiguous()
+            ).view(1, 1, S, half)
+
+            def rope_cplx(x):
+                xc = torch.view_as_complex(x.float().reshape(B, H, S, half, 2).contiguous())
+                return torch.view_as_real(xc * rot).reshape(B, H, S, D).to(tdt)
+
+            for _ in range(3):
+                _ = rope_cplx(q)
+            torch.cuda.synchronize()
+            rope_variants.append(("complex", rope_cplx))
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:  # torch.compile may be unavailable on Windows (no triton/inductor backend); guard it
+            rope_c = torch.compile(rope)
+            for _ in range(3):
+                _ = rope_c(q)
+            torch.cuda.synchronize()
+            rope_variants.append(("compiled", rope_c))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def time_backend(backend, ropef):
         with sdpa_kernel(backend):
             o = None
             for _ in range(args.warmup):
+                qq = ropef(q) if ropef is not None else q
+                kk = ropef(k) if ropef is not None else k
                 o = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=causal, scale=scale)
+                    qq, kk, v, attn_mask=None, dropout_p=0.0, is_causal=causal, scale=scale)
             torch.cuda.synchronize()
             best = float("inf")
             for _ in range(args.runs):
@@ -78,12 +143,29 @@ def main():
                 e_ev = torch.cuda.Event(enable_timing=True)
                 s_ev.record()
                 for _ in range(args.iters):
+                    qq = ropef(q) if ropef is not None else q
+                    kk = ropef(k) if ropef is not None else k
                     o = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=None, dropout_p=0.0, is_causal=causal, scale=scale)
+                        qq, kk, v, attn_mask=None, dropout_p=0.0, is_causal=causal, scale=scale)
                 e_ev.record()
                 torch.cuda.synchronize()
                 best = min(best, s_ev.elapsed_time(e_ev) / 1000.0 / args.iters)
             return best, o
+
+    def measure(backend):
+        """Returns (pipeline_sec, sdpa_only_sec, O, rope_label). With RoPE, pipeline = best rope+sdpa over
+        the rope variants (rope_label names the winner); sdpa_only is the no-rope reference. Without RoPE
+        both secs are the same and rope_label is None."""
+        if not rope_enabled:
+            sec, o = time_backend(backend, None)
+            return sec, sec, o, None
+        sdpa_sec, _ = time_backend(backend, None)
+        best_sec, best_o, best_label = float("inf"), None, None
+        for label, fn in rope_variants:
+            sec, o = time_backend(backend, fn)
+            if sec < best_sec:
+                best_sec, best_o, best_label = sec, o, label
+        return best_sec, sdpa_sec, best_o, best_label
 
     candidates = [
         ("flash", SDPBackend.FLASH_ATTENTION),
@@ -101,12 +183,15 @@ def main():
         "scale": scale,
         "backends": {},
     }
+    report["rope"] = rope_enabled
     best_fused = None  # (name, sec, O tensor)
     for name, be in candidates:
         try:
-            sec, o = time_backend(be)
+            sec, sdpa_sec, o, rope_label = measure(be)
             report["backends"][name] = {
                 "sec": sec,
+                "sdpa_sec": sdpa_sec,
+                "rope_variant": rope_label,
                 "checksum": float(o.float().sum().item()),
                 "gflops": (4.0 * B * H * S * S * D) / sec / 1e9,
             }
@@ -135,10 +220,13 @@ def main():
             b = report["backends"].get(name, {})
             if "sec" in b:
                 lines.append(f"{name}_sec={b['sec']:.9e}")
+                lines.append(f"{name}_sdpa_sec={b.get('sdpa_sec', b['sec']):.9e}")
+                lines.append(f"{name}_rope_variant={b.get('rope_variant') or 'none'}")
                 lines.append(f"{name}_checksum={b['checksum']:.6f}")
                 lines.append(f"{name}_gflops={b['gflops']:.3f}")
             else:
                 lines.append(f"{name}_error={b.get('error', 'missing')}")
+        lines.append(f"rope={1 if report['rope'] else 0}")
         with open(args.report, "w") as fh:
             fh.write("\n".join(lines) + "\n")
 

@@ -1861,6 +1861,15 @@ pub struct Fa2PeerReport {
     pub chosen: String,
     pub chosen_sec: f64,
     pub chosen_gflops: f64,
+    /// The chosen backend's *sdpa-only* time. Without `--rope` this equals `chosen_sec`. With `--rope`,
+    /// `chosen_sec` is the rope+sdpa pipeline (what a model pays because the fused-attention library
+    /// can't absorb RoPE) and `chosen_sdpa_sec` is the no-rope reference — the gap is the RoPE kernel
+    /// overhead Mercury fuses into its one flash launch for free.
+    pub chosen_sdpa_sec: Option<f64>,
+    /// Which RoPE variant the peer's chosen backend used (`eager`/`complex`/`compiled`), or `None`/`"none"`
+    /// without `--rope`. Names the rope the peer pipeline was timed against, so the writeup can't be
+    /// accused of strawmanning a slow rope — the harness times all variants and reports the fastest.
+    pub chosen_rope_variant: Option<String>,
     pub cudnn_sec: Option<f64>,
     pub efficient_sec: Option<f64>,
     pub math_sec: Option<f64>,
@@ -2007,9 +2016,142 @@ pub fn fa2_sdpa_peer(
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 
     Ok(Fa2PeerReport {
-        chosen,
+        chosen: chosen.clone(),
         chosen_sec,
         chosen_gflops,
+        chosen_sdpa_sec: getf(&format!("{chosen}_sdpa_sec")),
+        chosen_rope_variant: map.get(&format!("{chosen}_rope_variant")).cloned(),
+        cudnn_sec: getf("cudnn_sec"),
+        efficient_sec: getf("efficient_sec"),
+        math_sec: getf("math_sec"),
+        o,
+        device: map.get("device").cloned().unwrap_or_default(),
+        torch: map.get("torch").cloned().unwrap_or_default(),
+    })
+}
+
+/// Fused-RoPE variant of [`fa2_sdpa_peer`]: the honest peer for Mercury's `flash_d64_mprope`. A model
+/// using a fused attention library (cuDNN/cutlass) **cannot fold RoPE into the attention kernel** — it
+/// must run an interleaved-RoPE elementwise pass over Q and K *first*, then the fused SDPA. This drives
+/// exactly that pipeline (the optimized eager — and `torch.compile` if available — RoPE Python can
+/// produce, so the peer isn't strawmanned) and times it as one unit. `chosen_sec` is rope+sdpa (what the
+/// model pays); `chosen_sdpa_sec` is sdpa-only (the no-rope reference). Mercury pays neither separately —
+/// its flash rotates Q/K in-register at load, so the rope+sdpa→sdpa gap is the lever the library can't
+/// touch. `cos`/`sin` are the `[s, d/2]` interleaved-RoPE tables (θ_t = base^(−2t/d)).
+#[allow(clippy::too_many_arguments)]
+pub fn fa2_sdpa_peer_rope(
+    b: usize,
+    h: usize,
+    s: usize,
+    d: usize,
+    q16: &[f16],
+    k16: &[f16],
+    v16: &[f16],
+    cos: &[f32],
+    sin: &[f32],
+    scale: f32,
+    causal: bool,
+    warmup: u32,
+    iters: u32,
+    runs: u32,
+) -> Result<Fa2PeerReport, PeerError> {
+    use std::io::Write;
+    let n = b * h * s * d;
+    assert_eq!(q16.len(), n, "Q must be b*h*s*d");
+    assert_eq!(k16.len(), n, "K must be b*h*s*d");
+    assert_eq!(v16.len(), n, "V must be b*h*s*d");
+    assert_eq!(cos.len(), s * (d / 2), "cos must be s*(d/2)");
+    assert_eq!(sin.len(), s * (d / 2), "sin must be s*(d/2)");
+    let (python, peer) = fa2_peer_paths();
+
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uid = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mercury_fa2r_{}_{}", std::process::id(), uid));
+    std::fs::create_dir_all(&dir)?;
+    let dump16 = |name: &str, v: &[f16]| -> Result<std::path::PathBuf, PeerError> {
+        let p = dir.join(name);
+        let mut bytes = Vec::with_capacity(v.len() * 2);
+        for x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::File::create(&p)?.write_all(&bytes)?;
+        Ok(p)
+    };
+    let dump32 = |name: &str, v: &[f32]| -> Result<std::path::PathBuf, PeerError> {
+        let p = dir.join(name);
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::File::create(&p)?.write_all(&bytes)?;
+        Ok(p)
+    };
+    let qp = dump16("q.bin", q16)?;
+    let kp = dump16("k.bin", k16)?;
+    let vp = dump16("v.bin", v16)?;
+    let cp = dump32("cos.bin", cos)?;
+    let sp = dump32("sin.bin", sin)?;
+    let op = dir.join("o.bin");
+    let rp = dir.join("rep.txt");
+
+    let out = std::process::Command::new(&python)
+        .arg(&peer)
+        .arg("--q").arg(&qp).arg("--k").arg(&kp).arg("--v").arg(&vp)
+        .arg("--o").arg(&op).arg("--report").arg(&rp)
+        .arg("--B").arg(b.to_string()).arg("--H").arg(h.to_string())
+        .arg("--S").arg(s.to_string()).arg("--D").arg(d.to_string())
+        .arg("--scale").arg(format!("{scale:.9}"))
+        .arg("--causal").arg(if causal { "1" } else { "0" })
+        .arg("--warmup").arg(warmup.to_string())
+        .arg("--iters").arg(iters.to_string())
+        .arg("--runs").arg(runs.to_string())
+        .arg("--rope").arg("1").arg("--cos").arg(&cp).arg("--sin").arg(&sp)
+        .output()?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "fa2 rope peer subprocess failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+
+    let rep = std::fs::read_to_string(&rp)?;
+    let mut map = std::collections::HashMap::new();
+    for line in rep.lines() {
+        if let Some((k, val)) = line.split_once('=') {
+            map.insert(k.to_string(), val.to_string());
+        }
+    }
+    let getf = |k: &str| -> Option<f64> { map.get(k).and_then(|v| v.parse::<f64>().ok()) };
+    let chosen = map.get("chosen").cloned().unwrap_or_else(|| "none".into());
+    if chosen == "none" || chosen == "None" {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("fa2 rope peer: no fused backend available; report:\n{rep}").into());
+    }
+    let chosen_sec = getf(&format!("{chosen}_sec"))
+        .ok_or_else(|| -> PeerError { format!("fa2 rope peer: missing {chosen}_sec").into() })?;
+    let chosen_gflops = getf(&format!("{chosen}_gflops")).unwrap_or(0.0);
+
+    let obytes = std::fs::read(&op)?;
+    if obytes.len() != n * 4 {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("fa2 rope peer: O is {} bytes != {}", obytes.len(), n * 4).into());
+    }
+    let o: Vec<f32> = obytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    Ok(Fa2PeerReport {
+        chosen: chosen.clone(),
+        chosen_sec,
+        chosen_gflops,
+        chosen_sdpa_sec: getf(&format!("{chosen}_sdpa_sec")),
+        chosen_rope_variant: map.get(&format!("{chosen}_rope_variant")).cloned(),
         cudnn_sec: getf("cudnn_sec"),
         efficient_sec: getf("efficient_sec"),
         math_sec: getf("math_sec"),
