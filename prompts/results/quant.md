@@ -58,6 +58,36 @@ Real swz %-of-cuBLAS (the prompt's "44%/53%" were the *hand-placed* `_smdb`, sta
   fp16 mma path proved raster takes 4096³ 56%→72% (L2 locality). → port raster to int8 swz = lever #1.
 - 2048³ latency-bound: 3-stage swz (128×128 BK=64 = 48 KiB, fits static) = lever #2.
 
+### L3 RESULT — warp-tile lever (the big one). `quant_int8_bigtile_sweep`, same-run interleaved.
+The lever is the **warp tile, NOT the CTA tile**. 128×128 CTA with **w2×2 (4 warps ⇒ 64×64 warp tile)**
+crushes the shipped w4×2 (8 warps, 32×64 warp tile); bigger CTA tiles (256×128/128×256) LOSE (20 SMs
+can't fill them, 1 CTA/SM).
+| config | 1024³ | 2048³ | 4096³ |
+|---|---|---|---|
+| 128×128 w4×2 (shipped, 32×64 warp) | 69.3% | 79.1% | 75.0% |
+| **128×128 w2×2 (64×64 warp)** | **84.3%** | **91.7%** | **84.2%** |
+| 128×128 w2×2 + raster=8 | 84.3% | **99.6%** | 81.7% |
+| 256×128 / 128×256 (bigger CTA) | ~62% | ~67% | ~66% |
+- Internal clock-robust ratio w2×2 / w4×2: **1.21× @1024³, 1.30× @2048³, 1.24× @4096³** (cuBLAS swung
+  66932–75388 @4096³ same run → trust the internal ratio over the %).
+- **Baseline 88/79.6/62% → 84/99.6/84%.** 2048³ near parity; 4096³ +22 pts (floor cleared at all sizes).
+  raster=8 helps ONLY @2048³ (L2-edge regime); neutral @1024³, slightly hurts @4096³ → per-size.
+### L3 CONFIRMED + SHIPPED — `quant_int8_w64_confirm` ×3 (per-size winner stable across 3 runs):
+| size  | winner | run1 | run2 | run3 | vs baseline |
+|-------|--------|------|------|------|-------------|
+| 1024³ | **64×64 swz** (smdb64_swz) | 89.1% | 86.7% | 85.7% | ~88% (unchanged — already good) |
+| 2048³ | **w64** (±raster8) | 127.5%* | 95.2% | 96.5% | **79.6% → ~96% (near parity)** |
+| 4096³ | **w64** (±raster8) | 80.8% | 84.1% | 85.6% | **62.1% → ~84% (+22 pts)** |
+*127.5% = a cuBLAS contention outlier; true ~95-99%. ALL sizes well above the 75% floor; 2048³ ≈ parity.
+- **SHIPPED**: `gemm_nt_int8_smdb` dispatch now: 64×64 swz (<2048²) / **w64** (≥2048², 128-div) / hand-placed
+  fallbacks. Autotuner gained `w64` + `w64_r8` candidates (bit-exact cross-checked, ranks 8/shape; picks
+  smdb64 for small square, swz64_sk8 for thin decode, w64 for large). raster8 is an autotuner-only refinement
+  (regime-narrow ~2048², noisy → not in the static path). bm≠bn double-buffer fix made 256×128/128×256
+  buildable (they lose on 20 SMs, kept only as autotuner/experimental candidates).
+- COMMIT 2: w64 ship + dispatch + autotuner.
+- Next: (a) push 1024³/4096³ toward parity — multistage + dynamic-SMEM (untried across the whole backend);
+  (b) fused dequant headline (now lands — GEMM near parity); (c) fp8 characterization; (d) split-K/Stream-K decode.
+
 ## Research findings (parallel agents, verified)
 **Ada int8 binding constraint (RTX 4050, sm_89):** at 1024³–4096³ a well-tiled int8 GEMM is
 **on-chip-datapath / tensor-core-issue bound, NOT HBM-bound** (int8 roofline knee ~374 OP/byte; square

@@ -3515,7 +3515,7 @@ pub fn gemm_nt_int8_smdb(
 ) -> Result<Vec<i32>, DriverError> {
     use crate::ptx_int8::{
         INT8_BK, INT8_BM, INT8_BM128, INT8_BN, INT8_BN128, INT8_WARPS_M, INT8_WARPS_M128,
-        INT8_WARPS_N, INT8_WARPS_N128,
+        INT8_WARPS_N, INT8_WARPS_N128, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
     };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
@@ -3523,45 +3523,51 @@ pub fn gemm_nt_int8_smdb(
         m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
         "int8 smdb GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
-    // Reuse-bound at large sizes → the bigger 128×128 tile; latency-bound below → the 64×64 tile.
-    // The `ldmatrix` + XOR-swizzle (conflict-free SMEM, BK=64) path is a same-run ~1.2-1.5× internal
-    // win over the hand-placed fragment loads at every measured size/tile (`int8_swz_vs_handplaced`), so
-    // it is the default whenever K%64==0; a K that is only a 32-multiple falls back to the hand-placed
-    // BK=32 kernel. Both are bit-exact vs the same i32 oracle, so the choice is purely throughput. The
-    // 64×64 tile wins while latency-bound (small/medium), the 128×128 once reuse-bound (≥4096²).
-    let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    // The `ldmatrix` + XOR-swizzle (conflict-free SMEM, BK=64) path is the default whenever K%64==0; a K
+    // that is only a 32-multiple falls back to the hand-placed BK=32 kernel. All are bit-exact vs the same
+    // i32 oracle, so the choice is purely throughput. Among the swz tiles the perf/gpu-quant-2 sweep found:
+    //   • the **w64** tile (128×128 CTA, 4 warps ⇒ 64×64 warp tile) wins once M,N ≥ ~2048 — its 2× per-warp
+    //     reuse beats the 64×64 tile there (2048³ ~92%, 4096³ ~84% of cuBLAS, vs the old 8-warp 128 ~79/62%);
+    //   • the **64×64** tile wins below that (1024³ ~88% of cuBLAS — more CTAs hide latency when the grid is
+    //     small). Bigger CTA tiles (256×128) *lose* on the 20-SM 4050 (1 CTA/SM starves latency hiding).
+    // (The fixed heuristic is refined per shape by the Phase-10 autotuner, which also searches w64+raster /
+    // split-K.) Non-swz large shapes keep the hand-placed 128 tile; everything else the hand-placed 64.
     let swz = k % 64 == 0;
-    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) =
-        match (use_128, swz) {
-            (true, true) => (
-                crate::ptx_int8::int8_gemm_smdb128_swz_ptx(),
-                "int8_gemm_nt_smdb128_swz",
-                INT8_BM128,
-                INT8_BN128,
-                INT8_WARPS_M128 * INT8_WARPS_N128,
-            ),
-            (true, false) => (
-                crate::ptx_int8::int8_gemm_smdb128_ptx(),
-                "int8_gemm_nt_smdb128",
-                INT8_BM128,
-                INT8_BN128,
-                INT8_WARPS_M128 * INT8_WARPS_N128,
-            ),
-            (false, true) => (
-                crate::ptx_int8::int8_gemm_smdb_swz_ptx(),
-                "int8_gemm_nt_smdb_swz",
-                INT8_BM,
-                INT8_BN,
-                INT8_WARPS_M * INT8_WARPS_N,
-            ),
-            (false, false) => (
-                crate::ptx_int8::int8_gemm_smdb_ptx(),
-                "int8_gemm_nt_smdb",
-                INT8_BM,
-                INT8_BN,
-                INT8_WARPS_M * INT8_WARPS_N,
-            ),
-        };
+    let use_w64 = swz && m >= 2048 && n >= 2048 && m % INT8_W64_BM == 0 && n % INT8_W64_BN == 0;
+    let use_128_hand = !swz && m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64 {
+        (
+            crate::ptx_int8::int8_gemm_w64_swz_ptx(),
+            "int8_gemm_nt_w64_swz",
+            INT8_W64_BM,
+            INT8_W64_BN,
+            INT8_W64_WARPS_M * INT8_W64_WARPS_N,
+        )
+    } else if swz {
+        (
+            crate::ptx_int8::int8_gemm_smdb_swz_ptx(),
+            "int8_gemm_nt_smdb_swz",
+            INT8_BM,
+            INT8_BN,
+            INT8_WARPS_M * INT8_WARPS_N,
+        )
+    } else if use_128_hand {
+        (
+            crate::ptx_int8::int8_gemm_smdb128_ptx(),
+            "int8_gemm_nt_smdb128",
+            INT8_BM128,
+            INT8_BN128,
+            INT8_WARPS_M128 * INT8_WARPS_N128,
+        )
+    } else {
+        (
+            crate::ptx_int8::int8_gemm_smdb_ptx(),
+            "int8_gemm_nt_smdb",
+            INT8_BM,
+            INT8_BN,
+            INT8_WARPS_M * INT8_WARPS_N,
+        )
+    };
     let f = g.function(entry, ptx, entry)?;
     let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
     let a_d = g.stream.memcpy_stod(a)?;
@@ -12291,14 +12297,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
             }
             const ROUNDS: usize = 6;
-            // (label, bm, bn, wm, wn, raster): 128×128 baseline + the 256×128 / 128×256 big tiles (±raster).
-            let variants: [(&str, usize, usize, usize, usize, usize); 6] = [
-                ("128x128 w4x2    ", 128, 128, 4, 2, 0),
+            // (label, bm, bn, wm, wn, raster). Isolates two levers: (a) WARP tile at constant CTA tile —
+            // 128×128 w4×2 (shipped, 32×64 warp tile) vs w2×2 (64×64 warp tile, half the warps); (b) CTA
+            // tile — 256×128 / 128×256 (64×64 warp tile, 8 warps), ±threadblock rasterization.
+            let variants: [(&str, usize, usize, usize, usize, usize); 8] = [
+                ("128x128 w4x2    ", 128, 128, 4, 2, 0), // shipped baseline (32×64 warp tile)
+                ("128x128 w2x2    ", 128, 128, 2, 2, 0), // 64×64 warp tile, 4 warps — warp-tile lever
                 ("256x128 w4x2    ", 256, 128, 4, 2, 0),
                 ("128x256 w2x4    ", 128, 256, 2, 4, 0),
                 ("256x128 w4x2 r8 ", 256, 128, 4, 2, 8),
                 ("128x256 w2x4 r8 ", 128, 256, 2, 4, 8),
                 ("256x128 w4x2 r16", 256, 128, 4, 2, 16),
+                ("128x128 w2x2 r8 ", 128, 128, 2, 2, 8),
             ];
             for sz in [1024usize, 2048, 4096] {
                 let (m, k, n) = (sz, sz, sz);
@@ -12322,6 +12332,85 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let grid = if r > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
                     let cfg = LaunchConfig { grid_dim: grid, block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
                     // bit-exact cross-check (first law) before timing.
+                    let cs: i64 = {
+                        let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(cfg).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                    };
+                    assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
+                    let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..ROUNDS {
+                        s_v = s_v.min(time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                        s_cub = s_cub.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                    }
+                    let (gf, gc) = (flop / s_v, flop / s_cub);
+                    let pct = 100.0 * gf / gc;
+                    eprintln!("  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, gc / 1e9);
+                    if best.as_ref().map_or(true, |(_, p)| pct > *p) {
+                        best = Some((label.trim().to_string(), pct));
+                    }
+                }
+                if let Some((label, pct)) = best {
+                    eprintln!("  → best @{sz}³: {label} at {pct:.1}% of cuBLAS");
+                }
+            }
+        });
+    }
+
+    /// **int8 w64 (64×64-warp-tile) finalization sweep — settles the default per size (perf/gpu-quant-2).**
+    /// The big-tile sweep found the 64×64 warp tile (128×128 CTA, 4 warps) is the lever; this compares the
+    /// three shipping candidates — the 64×64-CTA swz tile (the prior small-size default), the new w64 (128×128
+    /// CTA / 64×64 warp tile), and w64+raster=8 — vs cuBLAS, same-run interleaved, at 1024³/2048³/4096³. Lean
+    /// (3 variants) so it can be re-run ≥3× for stability (the binding law). **Bit-exact** checksum first. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture quant_int8_w64_confirm`
+    #[test]
+    #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn quant_int8_w64_confirm() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_ptx, int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_r8_ptx, INT8_BM, INT8_BN,
+            INT8_WARPS_M, INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        };
+        with_gpu("quant_int8_w64_confirm", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] quant_int8_w64_confirm: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let w_small = INT8_WARPS_M * INT8_WARPS_N;
+            let w64v = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
+            // (label, ptx, entry, bm, bn, warps, raster)
+            let variants: [(&str, &'static str, &'static str, usize, usize, usize, usize); 3] = [
+                ("smdb64_swz   ", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, w_small, 0),
+                ("w64          ", int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz", INT8_W64_BM, INT8_W64_BN, w64v, 0),
+                ("w64_raster8  ", int8_gemm_w64_swz_r8_ptx(), "int8_gemm_nt_w64_swz_r8", INT8_W64_BM, INT8_W64_BN, w64v, 8),
+            ];
+            let mut rng = crate::diff::Rng::new(0x4A60);
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                eprintln!("\n{sz}³ int8 w64-finalization vs cuBLAS (same-run, interleaved):");
+                let mut best: Option<(String, f64)> = None;
+                for (label, ptx, entry, bm, bn, warps, raster) in variants {
+                    if m % bm != 0 || n % bn != 0 {
+                        eprintln!("  {label}: n/a");
+                        continue;
+                    }
+                    let f = g.function(entry, ptx, entry).unwrap();
+                    let grid = if raster > 0 { (((m / bm) * (n / bn)) as u32, 1, 1) } else { ((n / bn) as u32, (m / bm) as u32, 1) };
+                    let cfg = LaunchConfig { grid_dim: grid, block_dim: ((warps * 32) as u32, 1, 1), shared_mem_bytes: 0 };
                     let cs: i64 = {
                         let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
                         let mut bld = g.stream.launch_builder(&f);
