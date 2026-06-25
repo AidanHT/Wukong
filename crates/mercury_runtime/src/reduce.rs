@@ -295,14 +295,39 @@ pub(crate) fn arg_fold(a: (f32, usize), b: (f32, usize), is_max: bool) -> (f32, 
 
 /// Reduce `x[lo..hi]` to its `(extreme value, index)` under argmax/argmin. Pure function of the chunk
 /// (ascending scan + lowest-index tie-break), so every thread or the serial loop returns the same pair.
-/// Eight lane candidates give ILP without an AVX2 twin: at N=2^20 an argmax is memory-bound (one load
-/// stream), so the scalar fold already saturates load bandwidth and beats C's branchy `if (x>best)`
-/// loop (no mispredicts), and being scalar-only it is trivially bit-exact.
+/// Dispatches to a 256-bit AVX2 path when available (the `(value, index)` bookkeeping gcc/rustc won't
+/// auto-vectorize — but a hand-written `cmp + blendv` sweep can), falling back to the scalar twin below
+/// on non-AVX2 targets. Both return the **same** `(extreme, lowest-index)` pair, so the differential
+/// oracle stays bit-exact (the SIMD candidates collapse through the very same scalar [`arg_fold`]).
 ///
 /// # Safety
 /// `x` valid for reads on `[lo, hi)`.
 #[inline]
 unsafe fn argreduce_chunk(x: *const f32, lo: usize, hi: usize, is_max: bool) -> (f32, usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The kernel tracks indices in i32 SIMD lanes; fall back to the scalar twin if a chunk index
+        // could exceed i32 (it never does for realistic logit/vocab tensors — RCHUNK·nchunks ≤ n).
+        if is_x86_feature_detected!("avx2") && hi <= i32::MAX as usize {
+            use std::arch::x86_64::{_CMP_GT_OQ, _CMP_LT_OQ};
+            // SAFETY: feature detected; range validity is the caller's contract.
+            return if is_max {
+                unsafe { argreduce_chunk_avx2::<_CMP_GT_OQ>(x, lo, hi, f32::NEG_INFINITY, true) }
+            } else {
+                unsafe { argreduce_chunk_avx2::<_CMP_LT_OQ>(x, lo, hi, f32::INFINITY, false) }
+            };
+        }
+    }
+    // SAFETY: range validity is the caller's contract.
+    unsafe { argreduce_chunk_scalar(x, lo, hi, is_max) }
+}
+
+/// Portable reference: 8 scalar lane candidates (ILP) collapsed ascending. The AVX2 path is pinned
+/// bit-identical to this by the unit tests; this also backs non-AVX2 targets.
+///
+/// # Safety
+/// `x` valid for reads on `[lo, hi)`.
+unsafe fn argreduce_chunk_scalar(x: *const f32, lo: usize, hi: usize, is_max: bool) -> (f32, usize) {
     let ident_v = if is_max {
         f32::NEG_INFINITY
     } else {
@@ -328,6 +353,76 @@ unsafe fn argreduce_chunk(x: *const f32, lo: usize, hi: usize, is_max: bool) -> 
     let mut r = acc[0];
     for a in &acc[1..] {
         r = arg_fold(r, *a, is_max);
+    }
+    r
+}
+
+/// AVX2 chunk arg-reduce: **4 independent accumulators** (4×8 = 32 elements/iteration) each tracking 8
+/// `f32` extreme-value lanes + 8 `i32` index lanes. Per element it does one `_mm256_cmp_ps::<PRED>`
+/// (strict `>` for argmax / `<` for argmin — ordered, non-signalling, so NaN never displaces, matching
+/// the scalar twin) and two `blendv` (value + index) — the bookkeeping gcc/rustc leave scalar. The
+/// strict compare gives the lowest-index tie-break **for free** (a tie never fires the update, so each
+/// lane keeps its earlier index). The 32 lane candidates then collapse through the *same* scalar
+/// [`arg_fold`] (a total order on unique indices, so order-independent), and a `< 32` scalar tail folds
+/// in after — so the result is bit-identical to [`argreduce_chunk_scalar`]. Four accumulators hide the
+/// `cmp→blendv` latency while staying inside 16 ymm registers.
+///
+/// # Safety
+/// `x` valid for reads on `[lo, hi)`; AVX2 available; `hi ≤ i32::MAX` (indices ride i32 lanes).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn argreduce_chunk_avx2<const PRED: i32>(
+    x: *const f32,
+    lo: usize,
+    hi: usize,
+    ident_v: f32,
+    is_max: bool,
+) -> (f32, usize) {
+    use std::arch::x86_64::*;
+    let len = hi - lo;
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut vext = [_mm256_set1_ps(ident_v); 4]; // running extreme value per lane
+    let mut vidx = [_mm256_set1_epi32(-1); 4]; // running index per lane (-1 = unconsumed sentinel)
+    // Absolute index of lane 0 of each accumulator at the current step.
+    let mut ibase = [
+        _mm256_add_epi32(_mm256_set1_epi32(lo as i32), lane),
+        _mm256_add_epi32(_mm256_set1_epi32((lo + 8) as i32), lane),
+        _mm256_add_epi32(_mm256_set1_epi32((lo + 16) as i32), lane),
+        _mm256_add_epi32(_mm256_set1_epi32((lo + 24) as i32), lane),
+    ];
+    let bump = _mm256_set1_epi32(32);
+    let nsteps = len / 32;
+    for s in 0..nsteps {
+        let base = lo + s * 32;
+        for a in 0..4 {
+            let xv = _mm256_loadu_ps(x.add(base + a * 8));
+            // mask = all-ones where xv strictly beats the running extreme (NaN -> 0, never updates).
+            let mask = _mm256_cmp_ps::<PRED>(xv, vext[a]);
+            vext[a] = _mm256_blendv_ps(vext[a], xv, mask);
+            // The f32 compare mask is all-ones/all-zeros per 32-bit lane, so a byte-blend selects the
+            // whole index lane exactly.
+            vidx[a] = _mm256_blendv_epi8(vidx[a], ibase[a], _mm256_castps_si256(mask));
+            ibase[a] = _mm256_add_epi32(ibase[a], bump);
+        }
+    }
+    // Collapse the 32 lane candidates through the scalar arg_fold (preserves the lowest-index tie-break
+    // exactly); only lanes that consumed an element (idx >= 0) participate.
+    let mut vals = [0f32; 32];
+    let mut idxs = [0i32; 32];
+    for a in 0..4 {
+        _mm256_storeu_ps(vals.as_mut_ptr().add(a * 8), vext[a]);
+        _mm256_storeu_si256(idxs.as_mut_ptr().add(a * 8) as *mut __m256i, vidx[a]);
+    }
+    let mut r = (ident_v, usize::MAX);
+    for k in 0..32 {
+        if idxs[k] >= 0 {
+            r = arg_fold(r, (vals[k], idxs[k] as usize), is_max);
+        }
+    }
+    // Scalar tail (< 32 elements), ascending — composes with the SIMD candidates under the same fold.
+    let tail = lo + nsteps * 32;
+    for i in tail..hi {
+        r = arg_fold(r, (*x.add(i), i), is_max);
     }
     r
 }
@@ -542,5 +637,51 @@ mod tests {
             0,
             "argmin lowest index"
         );
+    }
+
+    #[test]
+    fn argreduce_avx2_lane_ties_and_tails() {
+        // Pin the AVX2 path's two tricky cases against the naive ascending scan: (a) duplicate maxima
+        // in different SIMD lanes *within one 32-wide span* must collapse to the lower lane index, and
+        // (b) the extreme living in a `< 32` scalar tail of a non-multiple-of-32 length.
+        let naive = |x: &[f32], is_max: bool| {
+            let mut best = (
+                if is_max { f32::NEG_INFINITY } else { f32::INFINITY },
+                usize::MAX,
+            );
+            for (i, &v) in x.iter().enumerate() {
+                best = arg_fold(best, (v, i), is_max);
+            }
+            best.1 as i64
+        };
+        // (a) ties at lanes 5 and 13 of the first span — argmax must return 5.
+        let mut x = vec![0.5f32; 64];
+        x[5] = 7.0;
+        x[13] = 7.0;
+        x[40] = 7.0;
+        assert_eq!(
+            unsafe { mercury_argreduce_f32(x.as_ptr(), 64, RED_ARGMAX) },
+            5
+        );
+        assert_eq!(naive(&x, true), 5);
+        // (b) extreme in the scalar tail of several non-mult-of-32 lengths, both ops.
+        for &n in &[33usize, 47, 63, 65, 95, 1000] {
+            let mut x = vec![0.0f32; n];
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = ((i * 31 % 17) as f32) * 0.25 - 2.0; // varied finite data
+            }
+            x[n - 1] = 100.0; // max in the tail
+            x[n - 2] = -100.0; // min in the tail
+            assert_eq!(
+                unsafe { mercury_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMAX) },
+                naive(&x, true),
+                "argmax tail n={n}"
+            );
+            assert_eq!(
+                unsafe { mercury_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMIN) },
+                naive(&x, false),
+                "argmin tail n={n}"
+            );
+        }
     }
 }
