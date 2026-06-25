@@ -216,6 +216,55 @@ pub fn conv2d_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) ->
     b
 }
 
+/// Standalone **bias + ReLU** pointwise pass `O[i] = max(O[i] + bias[i/(P·Q)], 0)` over `O[K,P,Q]` (f32,
+/// in-place), `bias[K]`. The *unfused* baseline for [`conv_wmma_epi_ptx`]: a plain conv writes `O`, then
+/// this separate kernel re-reads + rewrites the whole `K·P·Q` output — the extra HBM round-trip + launch
+/// that the fused epilogue elides. Entry `bias_relu`, params `(pOut, pBias)`, 1-D launch over `K·P·Q`.
+pub fn bias_relu_ptx(k: usize, pq: usize) -> String {
+    let total = k * pq;
+    format!(
+        r#".version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry bias_relu(
+    .param .u64 pOut,
+    .param .u64 pBias
+)
+{{
+    .reg .pred %p0;
+    .reg .b32 %idx,%t,%n,%kc;
+    .reg .f32 %v,%bv;
+    .reg .b64 %O,%B,%off,%ptr;
+    ld.param.u64 %O,[pOut];
+    ld.param.u64 %B,[pBias];
+    cvta.to.global.u64 %O,%O;
+    cvta.to.global.u64 %B,%B;
+    mov.u32 %t,%ctaid.x;
+    mov.u32 %n,%ntid.x;
+    mov.u32 %idx,%tid.x;
+    mad.lo.s32 %idx,%t,%n,%idx;
+    setp.ge.u32 %p0,%idx,{total};
+    @%p0 bra RET;
+    div.u32 %kc,%idx,{pq};
+    mul.wide.u32 %off,%idx,4;
+    add.s64 %ptr,%O,%off;
+    ld.global.f32 %v,[%ptr];
+    mul.wide.u32 %off,%kc,4;
+    add.s64 %ptr,%B,%off;
+    ld.global.f32 %bv,[%ptr];
+    add.f32 %v,%v,%bv;
+    max.f32 %v,%v,0f00000000;
+    mul.wide.u32 %off,%idx,4;
+    add.s64 %ptr,%O,%off;
+    st.global.f32 [%ptr],%v;
+RET:
+    ret;
+}}
+"#
+    )
+}
+
 /// `conv2d(C,H,W,K,R,S,P,Q, Xin,Wt,Out)` -- the original **naive** one-thread-per-output kernel. Output
 /// index `idx = (k*P+p)*Q+q` is the linear thread id, so the store address is just `Out + idx`. Kept as
 /// the honest worst-case reference and the fallback for shapes the tiled generator rejects.
