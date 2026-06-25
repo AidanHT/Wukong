@@ -12961,4 +12961,204 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         });
     }
+
+    /// **The fused-RoPE win the library can't touch** — Mercury's `flash_d64_mprope` (one kernel that
+    /// rotates Q,K in-register at load *and* does attention) vs the honest peer a model must run with a
+    /// fused-attention library: an **optimized interleaved-RoPE pass over Q,K, then cuDNN/cutlass fused
+    /// SDPA** ([`crate::baselines::fa2_sdpa_peer_rope`]). cuDNN's fused flash cannot absorb RoPE, so the
+    /// model pays a *separate* elementwise kernel (extra HBM round-trip of Q,K) the library can't fuse —
+    /// while Mercury folds the rotation into the b32 mma fragments it already loads, ~free on a kernel
+    /// that's tensor-core-bound. We report Mercury vs **both** the peer's full rope+sdpa pipeline (what a
+    /// model actually pays) and its sdpa-only time (so the RoPE tax the library forces is visible).
+    ///
+    /// Honesty mirrors [`attn_vs_fused_peer`]: same f16 Q/K/V + cos/sin to both; Mercury's fused-rope O is
+    /// checksum-cross-checked against the peer's rope+sdpa O (and at small S both gated vs an f64 oracle
+    /// that rotates then attends); Mercury wall-clock vs the peer's CUDA-event time (peer's launch
+    /// overhead excluded ⇒ Mercury wins are conservative); REPS back-to-back on a warmed clock. Small/
+    /// moderate S, where Mercury's flash is near parity and the RoPE round-trip is the largest fraction.
+    #[test]
+    #[ignore = "fused-RoPE peer bench; needs the torch-CUDA venv (set MERCURY_FA2_PYTHON) + a GPU"]
+    fn attn_rope_vs_fused_peer() {
+        use crate::baselines::{attn_flop, fa2_peer_available, fa2_sdpa_peer_rope};
+        use half::f16;
+        with_gpu("attn_rope_vs_fused_peer", |g| {
+            if !fa2_peer_available() {
+                eprintln!(
+                    "[skip] attn_rope_vs_fused_peer: torch-CUDA peer not runnable. Set MERCURY_FA2_PYTHON \
+                     to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
+                );
+                return;
+            }
+            eprintln!(
+                "device: {} | peer: optimized interleaved-RoPE(Q,K) + PyTorch SDPA fused (cuDNN / cutlass)",
+                g.device_name()
+            );
+            let d = 64usize;
+            let half = d / 2;
+            let heads = 8usize;
+            let mut rng = crate::diff::Rng::new(0x0FA2_2052);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+
+            // Clock warmup — same boost discipline as attn_vs_fused_peer (the ~7× idle→boost ramp would
+            // otherwise corrupt the cross-process ratio; the peer re-warms in its own process too).
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            const REPS: usize = 3;
+
+            let f_m = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mprope")
+                .unwrap();
+
+            for &s in &[256usize, 512, 1024, 2048] {
+                let n = heads * s * d;
+                let qf = rng.vec(n, -1.0, 1.0);
+                let kf = rng.vec(n, -1.0, 1.0);
+                let vf = rng.vec(n, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                // Interleaved-RoPE tables [s, half], θ_t = 10000^(−2t/d) — shared across heads.
+                let (mut cos, mut sin) = (vec![0f32; s * half], vec![0f32; s * half]);
+                for p in 0..s {
+                    for t in 0..half {
+                        let freq = 10000f64.powf(-2.0 * t as f64 / d as f64);
+                        let ang = p as f64 * freq;
+                        cos[p * half + t] = ang.cos() as f32;
+                        sin[p * half + t] = ang.sin() as f32;
+                    }
+                }
+                let (q16h, k16h, v16h) = (to16(&qf), to16(&kf), to16(&vf));
+                let q16 = g.stream.memcpy_stod(&q16h).unwrap();
+                let k16 = g.stream.memcpy_stod(&k16h).unwrap();
+                let v16 = g.stream.memcpy_stod(&v16h).unwrap();
+                let cos_d = g.stream.memcpy_stod(&cos).unwrap();
+                let sin_d = g.stream.memcpy_stod(&sin).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut bld = g.stream.launch_builder(&f_m);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d).arg(&cos_d).arg(&sin_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                };
+
+                // Mercury fused-rope output once for the cross-check.
+                launch_m(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
+
+                // The honest peer: optimized RoPE(Q,K) + fused SDPA over the IDENTICAL f16 bytes + tables.
+                let rep = fa2_sdpa_peer_rope(
+                    1, heads, s, d, &q16h, &k16h, &v16h, &cos, &sin, scale, false, 20, 50, 4,
+                )
+                .unwrap();
+
+                // Correctness: at small S gate BOTH vs an f64 oracle that rotates (interleaved) then attends
+                // per head; at all S checksum-cross-check Mercury vs the peer's rope+sdpa O.
+                if s <= 512 {
+                    let rope_apply = |x: &[f32]| -> Vec<f32> {
+                        let mut o = x.to_vec();
+                        for p in 0..s {
+                            for t in 0..half {
+                                let (c, sn) = (cos[p * half + t], sin[p * half + t]);
+                                let (a, b) = (x[p * d + 2 * t], x[p * d + 2 * t + 1]);
+                                o[p * d + 2 * t] = a * c - b * sn;
+                                o[p * d + 2 * t + 1] = a * sn + b * c;
+                            }
+                        }
+                        o
+                    };
+                    let mut oracle = vec![0f32; n];
+                    for hh in 0..heads {
+                        let lo = hh * s * d;
+                        let hi = lo + s * d;
+                        let qr = rope_apply(&qf[lo..hi]);
+                        let kr = rope_apply(&kf[lo..hi]);
+                        let r = ref_attn(&qr, &kr, &vf[lo..hi], s, d, scale);
+                        oracle[lo..hi].copy_from_slice(&r);
+                    }
+                    let sm = crate::diff::assert_close(
+                        &format!("Mercury rope-flash H={heads} S={s}"),
+                        &out_m,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    let sp = crate::diff::assert_close(
+                        &format!("{} rope+peer H={heads} S={s}", rep.chosen),
+                        &rep.o,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    eprintln!(
+                        "[gate] S={s}: Mercury rope-flash max_abs={:.2e} | {} rope+peer max_abs={:.2e} (both vs f64 oracle) ✓",
+                        sm.max_abs, rep.chosen, sp.max_abs
+                    );
+                }
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let (cs_m, cs_p) = (csum(&out_m), csum(&rep.o));
+                assert!(
+                    (cs_m - cs_p).abs() / cs_p.max(1.0) < 3e-2,
+                    "H={heads} S={s}: Mercury rope-flash vs {} rope+peer checksum disagree: mer={cs_m:.4e} peer={cs_p:.4e}",
+                    rep.chosen
+                );
+
+                // Speed — REPS back-to-back. Mercury's ONE kernel vs the peer's rope+sdpa pipeline; we also
+                // track the peer's sdpa-only time so the RoPE tax (pipeline − sdpa) is explicit.
+                let flop = attn_flop(heads, s, d);
+                let mut best_m = f64::INFINITY;
+                let mut best_pipe = rep.chosen_sec;
+                let mut best_sdpa = rep.chosen_sdpa_sec.unwrap_or(rep.chosen_sec);
+                let mut peer_name = rep.chosen.clone();
+                for _ in 0..REPS {
+                    let tm = best_of(ROUNDS, || {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            launch_m(g, &mut o_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    });
+                    best_m = best_m.min(tm);
+                    let r = fa2_sdpa_peer_rope(
+                        1, heads, s, d, &q16h, &k16h, &v16h, &cos, &sin, scale, false, 20, 50, 4,
+                    )
+                    .unwrap();
+                    if r.chosen_sec < best_pipe {
+                        best_pipe = r.chosen_sec;
+                        peer_name = r.chosen.clone();
+                    }
+                    if let Some(sd) = r.chosen_sdpa_sec {
+                        best_sdpa = best_sdpa.min(sd);
+                    }
+                }
+                let g_m = flop / best_m / 1e9;
+                let g_pipe = flop / best_pipe / 1e9;
+                let g_sdpa = flop / best_sdpa / 1e9;
+                let rope_tax = (best_pipe - best_sdpa).max(0.0);
+                let rope_kind = rep.chosen_rope_variant.as_deref().unwrap_or("?");
+                eprintln!(
+                    "H={heads} S={s:>4} D={d}: Mercury(fused-rope) {:.4} ms ({:>6.0} GF/s) | {} rope({rope_kind})+sdpa {:.4} ms ({:>6.0} GF/s) [sdpa-only {:.4} ms ({:>6.0} GF/s), RoPE tax {:.4} ms = {:>4.0}%] || Mercury {:.2}× the pipeline, {:.2}× sdpa-only",
+                    best_m * 1e3,
+                    g_m,
+                    peer_name,
+                    best_pipe * 1e3,
+                    g_pipe,
+                    best_sdpa * 1e3,
+                    g_sdpa,
+                    rope_tax * 1e3,
+                    100.0 * rope_tax / best_sdpa,
+                    best_pipe / best_m,
+                    best_sdpa / best_m,
+                );
+            }
+        });
+    }
 }
