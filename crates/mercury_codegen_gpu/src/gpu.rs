@@ -13426,4 +13426,162 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         });
     }
+
+    /// **Correctness gate (law #1) for D=128 register-resident flash** (`flash_d128_mp`). D=128 is the
+    /// modern head dim (Llama/GPT); the `mma.sync` flash generator is d-parameterized (ktq=8 QKᵀ tiles,
+    /// nto=16 PV n-tiles), so this gates that the generalized kernel matches the f64 [`ref_attn`] oracle
+    /// at D=128 — catching any d-dependent register/SMEM/loop-bound slip the D=64 path never exercised.
+    /// Single-head `[S,128]`, f16 in. Also gates the causal sibling `flash_d128_mpc` vs `ref_attn_causal`.
+    #[test]
+    fn flash_d128_matches_reference() {
+        use half::f16;
+        with_gpu("flash_d128", |g| {
+            let d = 128usize;
+            let mut rng = crate::diff::Rng::new(0xD128);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for &(entry, causal) in &[("flash_d128_mp", false), ("flash_d128_mpc", true)] {
+                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                for &s in &[16usize, 64, 256, 512] {
+                    let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                    let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                    let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                    let s32 = s as u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((s / 16) as u32, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let oracle = if causal {
+                        ref_attn_causal(&back(&q16), &back(&k16), &back(&v16), s, d, scale)
+                    } else {
+                        ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale)
+                    };
+                    let st = crate::diff::assert_close(
+                        &format!("{entry} s={s}"),
+                        &got,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+                }
+            }
+        });
+    }
+
+    /// **D=128 flash vs cuDNN/cutlass fused SDPA** — the modern head dim, a new regime (the fast `mma`
+    /// kernels were D=64 only). Same honesty model as [`attn_vs_fused_peer`]: identical f16 Q/K/V to
+    /// Mercury's `flash_d128_mp` and the fused peer, output gated vs the per-head f64 oracle at small S
+    /// and checksum-cross-checked, Mercury wall-clock vs the peer's CUDA-event time, REPS on a warmed
+    /// clock. Establishes Mercury's D=128 standing against the genuinely fused FA-class peers.
+    #[test]
+    #[ignore = "fused-peer D=128 bench; needs the torch-CUDA venv (set MERCURY_FA2_PYTHON) + a GPU"]
+    fn attn_d128_vs_fused_peer() {
+        use crate::baselines::{attn_flop, fa2_peer_available, fa2_sdpa_peer};
+        use half::f16;
+        with_gpu("attn_d128_vs_fused_peer", |g| {
+            if !fa2_peer_available() {
+                eprintln!("[skip] attn_d128_vs_fused_peer: set MERCURY_FA2_PYTHON to CUDA torch.");
+                return;
+            }
+            eprintln!("device: {} | peer: PyTorch SDPA fused (cuDNN / cutlass-efficient), D=128", g.device_name());
+            let d = 128usize;
+            let heads = 8usize;
+            let mut rng = crate::diff::Rng::new(0x0FA2_0128);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            const REPS: usize = 3;
+            let f_m = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d128_mp").unwrap();
+            for &s in &[512usize, 1024, 2048, 4096] {
+                let n = heads * s * d;
+                let qf = rng.vec(n, -1.0, 1.0);
+                let kf = rng.vec(n, -1.0, 1.0);
+                let vf = rng.vec(n, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let (q16h, k16h, v16h) = (to16(&qf), to16(&kf), to16(&vf));
+                let q16 = g.stream.memcpy_stod(&q16h).unwrap();
+                let k16 = g.stream.memcpy_stod(&k16h).unwrap();
+                let v16 = g.stream.memcpy_stod(&v16h).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut bld = g.stream.launch_builder(&f_m);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                };
+                launch_m(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
+                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                    .unwrap();
+                if s <= 512 {
+                    let mut oracle = vec![0f32; n];
+                    for hh in 0..heads {
+                        let lo = hh * s * d;
+                        let hi = lo + s * d;
+                        let r = ref_attn(&qf[lo..hi], &kf[lo..hi], &vf[lo..hi], s, d, scale);
+                        oracle[lo..hi].copy_from_slice(&r);
+                    }
+                    let sm = crate::diff::assert_close(&format!("Mercury d128 S={s}"), &out_m, &oracle, 3e-3, 3e-2);
+                    let sp = crate::diff::assert_close(&format!("{} d128 S={s}", rep.chosen), &rep.o, &oracle, 3e-3, 3e-2);
+                    eprintln!("[gate] D=128 S={s}: Mercury max_abs={:.2e} | {} peer max_abs={:.2e} ✓", sm.max_abs, rep.chosen, sp.max_abs);
+                }
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let (cs_m, cs_p) = (csum(&out_m), csum(&rep.o));
+                assert!(
+                    (cs_m - cs_p).abs() / cs_p.max(1.0) < 3e-2,
+                    "D=128 S={s}: Mercury vs {} checksum disagree mer={cs_m:.4e} peer={cs_p:.4e}", rep.chosen
+                );
+                let flop = attn_flop(heads, s, d);
+                let mut best_m = f64::INFINITY;
+                let mut best_peer_sec = rep.chosen_sec;
+                let mut peer_name = rep.chosen.clone();
+                let (mut cud, mut eff) = (rep.cudnn_sec, rep.efficient_sec);
+                let upd = |slot: &mut Option<f64>, v: Option<f64>| {
+                    if let Some(x) = v { *slot = Some(slot.map_or(x, |c: f64| c.min(x))); }
+                };
+                for _ in 0..REPS {
+                    let tm = best_of(ROUNDS, || {
+                        let t0 = Instant::now();
+                        for _ in 0..50 { launch_m(g, &mut o_d); }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    });
+                    best_m = best_m.min(tm);
+                    let r = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                        .unwrap();
+                    if r.chosen_sec < best_peer_sec { best_peer_sec = r.chosen_sec; peer_name = r.chosen.clone(); }
+                    upd(&mut cud, r.cudnn_sec);
+                    upd(&mut eff, r.efficient_sec);
+                }
+                let g_m = flop / best_m;
+                let g_p = flop / best_peer_sec;
+                let gf = |o: Option<f64>| o.map_or(f64::NAN, |sec| flop / sec / 1e9);
+                eprintln!(
+                    "H={heads} S={s:>4} D=128: Mercury {:.4} ms ({:>6.0} GF/s) | {} fused {:.4} ms ({:>6.0} GF/s) || Mercury {:.2}× {} || cuDNN {:>6.0} | efficient {:>6.0} GF/s",
+                    best_m * 1e3, g_m / 1e9, peer_name, best_peer_sec * 1e3, g_p / 1e9, g_m / g_p, peer_name, gf(cud), gf(eff),
+                );
+            }
+        });
+    }
 }
