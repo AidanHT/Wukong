@@ -669,6 +669,29 @@ reassociation — so the differential gate is bit-exact and the cross-language c
 output indices match bit-for-bit, reinterpreting the harness's f32 slots as i32), a stronger bar than the
 float kernels' tolerance. `tests/run/{rowargmax,colargmax}.mer`.
 
+### Scans — the prefix computations gcc/rustc can't auto-vectorize at all
+
+A scan `out[i] = ⊕(out[i-1], x[i])` is a **loop-carried dependency**: each output needs the previous one,
+so gcc `-O3 -march=native` and rustc leave the whole thing scalar (no auto-vectorization is possible from
+the naive recurrence). Mercury recognizes the per-row scan and folds it to a **SIMD Hillis-Steele in-lane
+scan + per-row carry** (`_mm256_permutevar8x32_ps` cross-lane shift, three shift-`⊕` steps per 8-block,
+then a broadcast-carry fold). Measured single-core / `@parallel` vs naive C (C ≡ Rust — both scalar):
+
+| scan | 1024×1024 | 4096×1024 | fold | cross-check |
+|------|-----------|-----------|------|-------------|
+| **cumsum** (prefix sum) | 1.72× / 6.39× | 1.37× / 7.29× | `+` | tolerance (in-lane tree reassociates) |
+| **cummax** (running max) | **2.87× / 11.6×** | **2.28× / 12.1×** | `fmax` | **bit-exact** |
+| **cummin** (running min) | **2.88× / 11.8×** | **2.25× / 12.1×** | `fmin` | **bit-exact** |
+
+`cummax`/`cummin` lead `cumsum` single-core because gcc's scalar `fmax`/`fmin` recurrence pipelines worse
+than its dependent add chain — and because max/min **select** an input value (no float arithmetic), the
+SIMD tree fold gives *exactly* the left-to-right scan, so the cross-language check is bit-for-bit (no
+tolerance). `cumsum`'s in-lane tree reassociates the float add, so it takes the documented reduction
+exception (both backends run the identical kernel → interp == native; the cross-check is magnitude-
+normalized, since a mean-zero prefix sum is a random walk that crosses zero where a pointwise ratio
+divides by ≈0). GB/s = `R·C·4·2` (read x + write out); rows are independent, so `@parallel` is bit-equal
+to serial. `tests/run/{cumsum,cummax}.mer`.
+
 ### Single-threaded elementwise & reductions
 
 A recognized streaming map (`out[i] = act(a·x[i] (+ b·y[i]) + c)`) dispatches to the **256-bit AVX2
