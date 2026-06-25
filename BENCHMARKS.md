@@ -53,15 +53,24 @@ tolerance for the reassociated-float ones).
 | **Row losses** (KL-div / entropy / soft-label xent) | ~3.6–7.5× | ~15–39× | the per-row `logf`/`expf` reduction gcc/rustc keep scalar |
 | **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Mercury one 256-bit `sincos` |
 | **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar |
-| **Row argmax/argmin** (classification top-1) | ~2.6–3.4× | ~11.5–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize |
+| **Argmax/argmin** (global / row / column) | **~2.7–9×** | ~3.4–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize; global + column are AVX2 single-pass |
 | **Scans** (cumsum / cummax / cummin) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan (cummax/cummin bit-exact) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
-| relu / fused linear→relu | ≈tie | — | already bandwidth-bound; no headroom |
+| relu / fused linear→relu / bias-add | ≈tie | — | already bandwidth-bound; no headroom standalone (won when *fused*) |
 
 The pattern: Mercury **heavily** exceeds C/Rust wherever domain knowledge lets a tensor compiler do
 what a scalar C compiler won't (tiling, packing, register-blocking, fusion, 256-bit transcendentals,
 vectorizing strided/reduction folds). On already-bandwidth-bound elementwise work it ties; on the
 recognized kernel surface it wins, often by one to two orders of magnitude.
+
+**Additional recognized coverage** (correctness-gated, interp == native bit-for-bit): the **embedding
+lookup** `out[t,:] = weight[ids[t],:]` (the token-id row gather that is the first layer of every LLM —
+`mercury_embedding_f32`, a bandwidth-bound copy single-core, an `@parallel` win across rows) and **2D
+max/avg pooling** `mercury_{max,avg}pool2d_f32` (the CNN downsampler — an `@parallel` win; note that
+for *regular* strides like 2×2/s2, gcc auto-vectorizes the pooling well, so single-core is a tie/loss
+there, not a win — an honest sharp edge). Broadcast **bias-add** `out[r,c] = x[r,c] + bias[c]` is
+memory-bound and ties gcc standalone, but is **fused for free** into the GEMM epilogue / norm affine
+(where Mercury already wins) — which is how real models use it.
 
 ## How Mercury wins: domain-aware lowering
 
@@ -653,15 +662,28 @@ shapes and folds each to one i32-output kernel that tracks 8 `(value, index)` la
   | 1024×1024  | **3.42×** / 11.5× | **3.23×** / 11.5× |
   | 4096×1024  | **2.61×** / 18.7× | **2.88×** / 17.7× |
 
-- **Per-column** `out[j] = argmax_i x[i,j]` (strided axis-0) → `mercury_colarg{max,min}_i32`. Honest
-  caveat: here gcc *does* vectorize the strided column argmax (it bands 8 output columns the same way
-  Mercury does), so single-core is only a **tie** (~0.9–1.6×). But rustc leaves it scalar (~9× vs Rust),
-  and `@parallel` wins **3.7–10.5×** (Mercury auto-parallelizes; idiomatic C/Rust are single-threaded):
+- **Per-column** `out[j] = argmax_i x[i,j]` (strided axis-0) → `mercury_colarg{max,min}_i32`. The AVX2
+  kernel now streams the matrix in a **single pass** — the column range's running `best_val`/`best_idx`
+  is kept L1-resident and each `x` element is read **once** row-major (8 columns/step) — instead of
+  re-scanning all rows per 8-column band, which re-read the whole matrix `cols/8` times from L3
+  (latency-bound). gcc *does* vectorize the column arg-scan (it bands 8 columns), but Mercury's single
+  DRAM pass beats it outright, and the lead grows with the matrix:
 
   | shape | argmax 1-core / `@parallel` | argmin 1-core / `@parallel` |
   |---|---|---|
-  | 1024×1024  | 1.09× / 4.16× | 0.90× / 3.69× |
-  | 4096×1024  | 1.62× / 10.5× | 1.27× / 7.57× |
+  | 1024×1024  | **2.72×** / 3.6× | **3.23×** / 3.4× |
+  | 4096×1024  | **5.32×** / 10.8× | **3.96×** / 9.0× |
+
+  (Before the single-pass rewrite this was only a single-core *tie/loss* — 0.9–1.6×; the re-read was
+  the bottleneck, not the SIMD width.) The bit-exactness is unchanged: the strict compare keeps the
+  lowest-row tie-break and rows are scanned i-ascending, so the kernel still equals the scalar twin.
+
+- **Global** `out = argmax(x)` over a flat array → `mercury_argreduce_f32`. This was the one memory-bound
+  reduction Mercury *lost* (it had no AVX2 path, so gcc's branch-predicted scalar loop won by 1.30×). It
+  now folds 32 elements/iteration across **4 AVX2 accumulators** (8 `f32` value + 8 `i32` index lanes
+  each, `_mm256_cmp_ps` strict-compare + `blendv`), collapsing the 32 candidates through the same scalar
+  tie-break — so it is bit-identical to the scalar form and **~5–9× faster than gcc** (the `(value,index)`
+  bookkeeping gcc/rustc won't auto-vectorize), up from a 1.30× loss.
 
 These are the **first recognized kernels with an i32 output buffer** (the interpreter marshals the result
 back as an integer, not a float). A per-row/column arg-selection is a deterministic permutation — no
