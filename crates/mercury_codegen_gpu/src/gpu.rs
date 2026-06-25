@@ -476,12 +476,14 @@ pub fn gemm_nt_f16(
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
         // **Large regime (A+B ≥ 16 MB, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
         // robust same-run winner — it beats the padded hand-placed base **1.23× @2048³ (87.4% vs 70.9% of
-        // cuBLAS) and 1.13× @4096³**. Dropping the padding buys a 3rd CTA/SM to hide HBM latency, and the
-        // swizzle keeps the `ldmatrix` gathers conflict-free without it. A clean re-measure on the
-        // round-robin best-of-N / self-noise-sentinel instrument (`gemm_cliff_ab`) showed the w22 2×2 warp
-        // grid is only a *noise-level* tie with w24 at 4096³ (0.97–1.02× across runs) and *loses* at 2048³,
-        // so the whole regime uses w24 (not w22, not the padded base). Bit-gated by
-        // `mma_swizzle_matches_reference_within_tol`.
+        // cuBLAS) and 1.13× @4096³**. The mechanism is the *fragment load*, not occupancy: the swz path loads
+        // each mma operand with one warp-cooperative hardware `ldmatrix` (conflict-free via the no-pad XOR
+        // swizzle), where the padded base issues manual `ld.shared.b32` scalar fragment loads — both run at
+        // the SAME 2 CTAs/SM (verified, `occupancy_max_active_blocks`), so the win is per-CTA ldmatrix
+        // throughput. A clean re-measure on the round-robin best-of-N / self-noise-sentinel instrument
+        // (`gemm_cliff_ab`) showed the w22 2×2 warp grid (which DOES reach 3 CTAs/SM) is only a *noise-level*
+        // tie with w24 at 4096³ (0.97–1.02× across runs) and *loses* at 2048³, so the whole regime uses w24
+        // (not w22, not the padded base). Bit-gated by `mma_swizzle_matches_reference_within_tol`.
         let swz_w24 = crate::ptx_wmma::PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..*wh };
         return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz_w24);
     }
@@ -1073,7 +1075,7 @@ pub fn gemm_nt_f16_mma_bias(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias")
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias")
 }
 
 /// `C = relu(A·Bᵀ + bias)` fused into the fast mma workhorse — Linear+ReLU (see [`gemm_nt_f16_pipe_fused_bias`]).
@@ -1086,7 +1088,7 @@ pub fn gemm_nt_f16_mma_bias_relu(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_relu")
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias_relu")
 }
 
 /// `C = silu(A·Bᵀ + bias)` fused into the fast mma workhorse — SiLU FFN (see [`gemm_nt_f16_pipe_fused_bias`]).
@@ -1099,7 +1101,7 @@ pub fn gemm_nt_f16_mma_bias_silu(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_silu")
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias_silu")
 }
 
 /// `C = gelu(A·Bᵀ + bias)` fused into the fast mma workhorse — the canonical transformer FFN first layer
@@ -1113,7 +1115,7 @@ pub fn gemm_nt_f16_mma_bias_gelu(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_bias_gelu")
+    gemm_nt_f16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_f16_128_bk32_s2_r16_swz_bias_gelu")
 }
 
 /// `C = A·Bᵀ + bias + residual` fused into the fast mma workhorse (`mma_nt_f16_128_bk32_s2_r16_bias_
@@ -1552,19 +1554,19 @@ fn gemm_nt_bf16_pipe_fused_bias(
 
 /// `C = A·Bᵀ + bias` fused into the fast bf16 mma workhorse (affine Linear) — see [`gemm_nt_bf16_pipe_fused_bias`].
 pub fn gemm_nt_bf16_mma_bias(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_bias")
+    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias")
 }
 /// `C = relu(A·Bᵀ + bias)` fused into the fast bf16 mma workhorse (see [`gemm_nt_bf16_pipe_fused_bias`]).
 pub fn gemm_nt_bf16_mma_bias_relu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_bias_relu")
+    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias_relu")
 }
 /// `C = silu(A·Bᵀ + bias)` fused into the fast bf16 mma workhorse (see [`gemm_nt_bf16_pipe_fused_bias`]).
 pub fn gemm_nt_bf16_mma_bias_silu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_bias_silu")
+    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias_silu")
 }
 /// `C = gelu(A·Bᵀ + bias)` fused into the fast bf16 mma workhorse (see [`gemm_nt_bf16_pipe_fused_bias`]).
 pub fn gemm_nt_bf16_mma_bias_gelu(g: &mut Gpu, a: &[f32], b: &[f32], bias: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_bias_gelu")
+    gemm_nt_bf16_pipe_fused_bias(g, a, b, bias, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz_bias_gelu")
 }
 
 /// `C = act(A·Bᵀ)` in **bf16 inputs / f32 accumulate**, fused in one cp.async-pipelined WMMA kernel —

@@ -113,8 +113,11 @@ here. Combined with launch-bounds-LOSE + pipeline-depth-FLAT, occupancy is concl
 Probed `cliff_pad_w24` (byte-identical to the production padded `mma_nt_f16_128_bk32_s2_r16`) vs the no-pad
 swizzle `cliff_swz_s2` (w24) head-to-head. **The no-pad w24 swizzle robustly dominates the padded base:**
 - **2048³: swz w24 87.4% vs padded 70.9% of cuBLAS — 1.23× same-run** (self-noise 1.024; reproduced 90.5%
-  on a faster-clock run). The padding's bank-conflict-free guarantee *costs a CTA* (40 KiB→2 CTAs/SM); the
-  XOR swizzle makes the `ldmatrix` gathers conflict-free at 32 KiB / 3 CTAs/SM anyway → strictly better.
+  on a faster-clock run). **Mechanism = the fragment load, not occupancy** (both are 2 CTAs/SM per
+  `occupancy_max_active_blocks`): the swz path loads each mma operand with one warp-cooperative hardware
+  `ldmatrix` (conflict-free via the no-pad XOR swizzle), where the padded "hand-placed" base issues manual
+  `ld.shared.b32` scalar fragment loads. (The w22 grid is the one that reaches 3 CTAs/SM — but it's only a
+  noise-tie at 4096³ and loses here.) Earlier "swz buys a 3rd CTA" notes were wrong — corrected per the API.
 - **4096³: swz w24 83.0% vs padded 73.7% — 1.13× same-run.**
 - **w22 re-evaluated:** the prior "+6% @4096³" did **not** survive the round-robin/self-noise instrument —
   w22/w24 = 0.97–1.02× across 3 runs (a *noise tie*), and w22 *loses* @2048³ (0.93×). So w22 is not a
@@ -128,10 +131,20 @@ Full non-ignored GPU gate: 102 pass; the 2 fails are the pre-existing `gpu-nativ
 
 **Floors: 4096³ ≥75% MET (~83%); 2048³ ≥90% — at 87–90% (met on faster-clock runs, ~3% under on dipped).**
 
+### Fused epilogue re-based onto the swz workhorse (the beat-cuBLAS lever)
+The fused `C = act(x·Wᵀ + bias)` Linear/FFN epilogue was built on the **padded** base (the slower one).
+Re-based the core epilogue family onto the no-pad swz workhorse: emit `mma_nt_{f16,bf16}_128_bk32_s2_r16_
+swz_bias{,_relu,_silu,_gelu}` (the register-level bias-add + activation apply to the `mma.sync` D-fragments,
+*orthogonal* to SMEM staging ⇒ bit-identical output, +swz's 1.13–1.23× speed). Re-routed
+`gemm_nt_{f16,bf16}_mma_bias{,_relu,_silu,_gelu}` to them. Gated bit-equivalent by the existing
+`wmma_{,bf16_}mma_bias_match_reference_within_tol` (they call the public fns ⇒ auto-cover the swz path).
+**Net: every fused nn.Linear / FFN-up-proj at ≥2048³ inherits the 1.13–1.23× GEMM win** (the epilogue is
+register-level, ~free) — and the higher base efficiency is what lifts the *fused op* over cuBLAS+separate-
+epilogue (fusion beats cuBLAS+epilogue once raw eff > ~1/(1+epilogue/GEMM); the C round-trip saved grows
+with N, so the threshold is met at 2048³ for SiLU/SwiGLU/residual cuBLASLt can't fuse).
+
 ### Next levers (toward parity / beyond)
-- **Fused epilogue (the beat-cuBLAS lever):** `act(A·Bᵀ+bias[+residual])` is fused into the swz workhorse
-  store — cuBLAS structurally can't (needs a 2nd kernel round-tripping C through HBM). Measure the *fused op*
-  vs cuBLAS-GEMM + separate-epilogue end-to-end: the saved C round-trip should beat cuBLAS even at ~83% raw.
+- **Measure the fused op vs cuBLAS-GEMM + separate-epilogue** end-to-end to quantify the beat-cuBLAS margin.
 - register-fragment prefetch (④): tension — raises reg pressure, would cost the 3rd CTA. Measure.
 - offline ptxas `-O3 --allow-expensive-optimizations` (reserve): the JIT runs ptxas at opt-4 already, but
   `--allow-expensive-optimizations` isn't exposed via JIT — could close the ~9% SASS residual on BOTH
