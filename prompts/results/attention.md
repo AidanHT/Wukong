@@ -72,9 +72,20 @@ Correctness gate at S=512: Mercury max_abs **3.6e-5**, cuDNN max_abs **5.3e-5** 
   chain" (cuBLAS chain ≈ 2× MATH). The *fused-peer* comparison is the new, harder, honest bar.
 
 ### Levers to close → beat (in priority order)
-1. **Multi-warp CTA at long S** — `flash_d64_mp4`/`mp8` already exist (4/8 warps share one staged K/V
-   block: 4–8× L2 reuse + higher occupancy) but aren't dispatched. If they win at long S, dispatching
-   them is a near-free recovery of the S≥2048 collapse. *(measuring next)*
+1. **Multi-warp CTA at long S** — `flash_d64_mp4` (4 warps share one staged K/V block: 4× L2 reuse).
+   **MEASURED — RESOLVED: a wash ≤3072, only ~12% at S≥4096; NOT the gap-closer.** Two independent
+   methodologies agree (cross-process `attn_variants_vs_fused_peer`: mp4 0.48× vs mp 0.44× cuDNN at
+   S=4096; clock-cancelled in-process `flash_mp4_vs_mp`: mp4/mp = 0.99×/1.02× at S≤3072, 0.88×/0.88× at
+   S=4096/8192). The single-warp grid already saturates the 20-SM GPU at long S, so packing warps into
+   fewer CTAs trades parallelism for the reuse and only nets out at the very largest S. mp stays the
+   production kernel; mp4 is a noted regime-aware option at S≥4096 but still leaves Mercury at ~0.48×
+   cuDNN there — it does **not** close the gap.
+   - **Measurement cautionary tale (kept in the `flash_mp4_vs_mp` harness):** the *first* in-process A/B
+     reported an incoherent, non-monotonic mp4/mp = **0.25/1.02/0.51/0.70** — a false "4× mp4 win." Cause:
+     it timed `mp` first every round right after the clock-pinning GEMMs, so `mp` ate the clock *ramp*
+     while `mp4` (second) ran already-boosted. Fix: warm BOTH kernels to steady clock before timing, and
+     time each in both orders (mp,mp4,mp4,mp) taking the min — which collapsed the "win" to the true
+     ~1.0×/~0.88×. A clean reminder that same-process ≠ clock-cancelled unless the launch order is too.
 3. **Deeper cp.async pipeline** (3–4 stage) to hide the K-loop latency the 2-stage pipe exposes.
 4. **`ldmatrix`** for Q/K/V fragment loads (the one untried lever per project memory; ~1.2–1.5× on int8).
 5. **D=128 tensor-core flash** — the fast `mma` kernels are instantiated at D=64 only; D=128 is the
