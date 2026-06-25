@@ -103,7 +103,13 @@ number the instant a 2nd GPU is attached.
 
 ## Results (filled as measured, same-run ratios only)
 
-_pending P2+._
+### P2 — paged decode-attention kernel (correctness, the first law)
+- **Absolute correctness** (`paged_attention_matches_reference`, ragged ctx `[37,0,16,100,5,64]`, heads=4,
+  hd=64): paged decode-attention vs f64 full-softmax reference **max_abs = 1.79e-7, max_rel = 3.87e-5** —
+  far under the 1e-2/3e-3 gate (K/V pre-rounded to f16 so only GPU `ex2.approx` + f32 order remains).
+- **Paging is numerically invisible** (`paged_attention_invariant_to_block_layout`): the same logical
+  sequences under **two different physical block layouts** (slot 0: A=`[0,1,2]` vs B=`[10,11,12]`) give
+  **bit-for-bit identical** output. The first-law decode analogue of int8 split-K / transpose bit-exactness.
 
 ## Multi-GPU design detail (unmeasured)
 
