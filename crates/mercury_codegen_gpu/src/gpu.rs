@@ -12885,4 +12885,80 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         });
     }
+
+    /// **Correctness gate (law #1) for fused-RoPE flash** (`flash_d64_mprope`). The kernel rotates Q and
+    /// K *inside* attention; this gates it against an independent CPU oracle that rotates Q,K with the
+    /// same interleaved `(2t,2t+1)` convention (`θ_t = base^(−2t/d)`) and then runs the f64 attention
+    /// [`ref_attn`]. Catches a wrong rotation sign / pair mapping / position index before any speed
+    /// claim. Single-head `[S,D]`, host-precomputed `cos`/`sin` `[S,d/2]` f32 tables.
+    #[test]
+    fn flash_rope_matches_reference() {
+        use half::f16;
+        with_gpu("flash_rope", |g| {
+            let d = 64usize;
+            let half = d / 2;
+            let mut rng = crate::diff::Rng::new(0x0FACE);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            let f = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mprope")
+                .unwrap();
+            for &s in &[64usize, 128, 512, 768] {
+                let (mut cos, mut sin) = (vec![0f32; s * half], vec![0f32; s * half]);
+                for p in 0..s {
+                    for t in 0..half {
+                        let freq = 10000f64.powf(-2.0 * t as f64 / d as f64);
+                        let ang = p as f64 * freq;
+                        cos[p * half + t] = ang.cos() as f32;
+                        sin[p * half + t] = ang.sin() as f32;
+                    }
+                }
+                let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                // oracle: rotate the f16-widened Q,K (interleaved) by position, then f64 attention.
+                let rope_apply = |x: &[f32]| -> Vec<f32> {
+                    let mut o = x.to_vec();
+                    for p in 0..s {
+                        for t in 0..half {
+                            let (c, sn) = (cos[p * half + t], sin[p * half + t]);
+                            let (a, b) = (x[p * d + 2 * t], x[p * d + 2 * t + 1]);
+                            o[p * d + 2 * t] = a * c - b * sn;
+                            o[p * d + 2 * t + 1] = a * sn + b * c;
+                        }
+                    }
+                    o
+                };
+                let qr = rope_apply(&back(&q16));
+                let kr = rope_apply(&back(&k16));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let oracle = ref_attn(&qr, &kr, &back(&v16), s, d, scale);
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let cos_d = g.stream.memcpy_stod(&cos).unwrap();
+                let sin_d = g.stream.memcpy_stod(&sin).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&ss).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d).arg(&cos_d).arg(&sin_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                g.stream.synchronize().unwrap();
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let st = crate::diff::assert_close(
+                    &format!("flash rope s={s}"),
+                    &got,
+                    &oracle,
+                    3e-3,
+                    3e-2,
+                );
+                eprintln!("flash rope s={s}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
+            }
+        });
+    }
 }
