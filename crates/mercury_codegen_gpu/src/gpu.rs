@@ -2151,26 +2151,23 @@ pub fn winograd_conv2d(
     b2.arg(&x_d).arg(&mut v_d);
     unsafe { b2.launch(cfg2)? };
 
-    // Phase 3 — α² batched GEMMs M[ξν]=U[ξν]·V[ξν], each the proven conv2d_wmma kernel with R=S=1.
-    let gptx = crate::ptx_conv::conv_wmma_ptx(c, 1, nt, k, 1, 1);
+    // Phase 3 — the α² channel-reduction GEMMs M[ξν]=U[ξν]·V[ξν] in ONE batched launch (gridDim.z=α²):
+    // 36 separate launches each fill only ~4 CTAs and run serially (≈idle on a 20-SM GPU); batching puts
+    // α²·that CTAs in flight. NN GEMM (no im2col), so a dedicated tensor-core kernel, not conv2d_wmma.
+    let gptx = crate::ptx_winograd::wino_bgemm_ptx(c, nt, k);
     let gmod = g.load_module_cached(&gptx)?;
-    let gf = gmod.load_function("conv2d_wmma")?;
-    let cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
-    let knt = k * nt;
-    for xi in 0..aa {
-        let u_v = u_d.slice(xi * kc..(xi + 1) * kc);
-        let v_v = v_d.slice(xi * cnt..(xi + 1) * cnt);
-        let mut m_v = m_d.slice_mut(xi * knt..(xi + 1) * knt);
-        let mut b3 = g.stream.launch_builder(&gf);
-        b3.arg(&v_v).arg(&u_v).arg(&mut m_v); // conv2d_wmma(pXin=V, pWt=U, pOut=M)
-        unsafe { b3.launch(cfg3)? };
-    }
+    let gf = gmod.load_function("wino_bgemm")?;
+    let mut cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
+    cfg3.grid_dim.2 = aa as u32;
+    let mut b3 = g.stream.launch_builder(&gf);
+    b3.arg(&v_d).arg(&u_d).arg(&mut m_d); // wino_bgemm(pV, pU, pM)
+    unsafe { b3.launch(cfg3)? };
 
     // Phase 4 — output transform (one thread per (k, tile)) → O[K,P,Q].
     let optx = crate::ptx_winograd::wino_output_xform_ptx(k, h, width, m);
     let omod = g.load_module_cached(&optx)?;
     let of = omod.load_function("wino_output_xform")?;
-    let cfg4 = LaunchConfig { grid_dim: ((knt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg4 = LaunchConfig { grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
     let mut b4 = g.stream.launch_builder(&of);
     b4.arg(&m_d).arg(&mut o_d);
     unsafe { b4.launch(cfg4)? };
@@ -7035,6 +7032,170 @@ mod tests {
                         "winograd F({m},3) C{c} {h}x{width} K{k}: max_abs {max_abs:.3e} >= {abs_backstop:.0e} (a lane blew up)"
                     );
                 }
+            }
+        });
+    }
+
+    /// **Winograd F(4×4,3×3) vs cuDNN vs the implicit-GEMM** — does Winograd's 2.25–4× multiply
+    /// reduction actually beat Mercury's (already cuDNN-parity) implicit-GEMM on **large feature maps**
+    /// (where the tile count `T` makes a fat batched-GEMM `N`)? All same-run, fp16 tensor cores, each
+    /// cross-checked (Winograd by rel-Frobenius) before timing; cuDNN best_of, algo disclosed. Winograd
+    /// times the full 4-phase pipeline resident; the implicit-GEMM is the resident `conv2d_wmma`.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_winograd_vs_cudnn() {
+        use crate::baselines::{
+            conv_flop, cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, nvrtc_naive_conv,
+            peers_available, time_cudnn_conv2d, time_nvrtc_naive_conv,
+        };
+        use half::f16;
+        with_gpu("conv_winograd_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] NVRTC not loadable.");
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x317E6D);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let m = 4usize; // F(4×4,3×3) — the cuDNN-grade tile
+            // Large feature maps (3×3, stride 1): T=tiles is a fat GEMM N → Winograd's regime.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize),
+                (32, 64, 64, 64),
+                (64, 112, 112, 64),
+                (128, 28, 28, 128),
+            ];
+            for (c, h, wd, k) in cases {
+                let (p, q) = (h - 2, wd - 2);
+                let alpha = m + 2;
+                let aa = alpha * alpha;
+                let (_, _, nt) = crate::ptx_winograd::wino_ntiles(h, wd, m);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * 9, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, 3, 3);
+
+                // Resident Winograd buffers + kernels (loaded once).
+                let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut u_d = g.stream.alloc_zeros::<f16>(aa * k * c).unwrap();
+                let mut v_d = g.stream.alloc_zeros::<f16>(aa * c * nt).unwrap();
+                let mut m_d = g.stream.alloc_zeros::<f32>(aa * k * nt).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let ff = g
+                    .load_module_cached(&crate::ptx_winograd::wino_filter_xform_ptx(c, k, m))
+                    .unwrap()
+                    .load_function("wino_filter_xform")
+                    .unwrap();
+                let inf = g
+                    .load_module_cached(&crate::ptx_winograd::wino_input_xform_ptx(c, h, wd, m))
+                    .unwrap()
+                    .load_function("wino_input_xform")
+                    .unwrap();
+                let gf = g
+                    .load_module_cached(&crate::ptx_winograd::wino_bgemm_ptx(c, nt, k))
+                    .unwrap()
+                    .load_function("wino_bgemm")
+                    .unwrap();
+                let of = g
+                    .load_module_cached(&crate::ptx_winograd::wino_output_xform_ptx(k, h, wd, m))
+                    .unwrap()
+                    .load_function("wino_output_xform")
+                    .unwrap();
+                let (kc, cnt) = (k * c, c * nt);
+                let cfg1 = LaunchConfig { grid_dim: ((kc as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let cfg2 = LaunchConfig { grid_dim: ((cnt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let mut cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
+                cfg3.grid_dim.2 = aa as u32;
+                let cfg4 = LaunchConfig { grid_dim: (((k * nt) as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+                let wino = |g: &Gpu,
+                            u: &mut cudarc::driver::CudaSlice<f16>,
+                            v: &mut cudarc::driver::CudaSlice<f16>,
+                            mm: &mut cudarc::driver::CudaSlice<f32>,
+                            o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&ff);
+                    b.arg(&w_d).arg(&mut *u);
+                    unsafe { b.launch(cfg1).unwrap() };
+                    let mut b = g.stream.launch_builder(&inf);
+                    b.arg(&x_d).arg(&mut *v);
+                    unsafe { b.launch(cfg2).unwrap() };
+                    let mut b = g.stream.launch_builder(&gf);
+                    b.arg(&*v).arg(&*u).arg(&mut *mm); // wino_bgemm(pV, pU, pM), gridDim.z=α²
+                    unsafe { b.launch(cfg3).unwrap() };
+                    let mut b = g.stream.launch_builder(&of);
+                    b.arg(&*mm).arg(&mut *o);
+                    unsafe { b.launch(cfg4).unwrap() };
+                };
+                wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let err_f = got.iter().zip(&oracle).map(|(a, b)| { let d = *a as f64 - *b as f64; d * d }).sum::<f64>().sqrt();
+                let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                let fro_rel = err_f / ref_f.max(1e-9);
+                assert!(fro_rel < 8e-3, "winograd C{c} {h}x{wd}: rel-Frobenius {fro_rel:.3e}");
+
+                // Implicit-GEMM resident (Mercury's other conv path, R=S=3).
+                let xi_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let wi_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut oi_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let igf = g
+                    .load_module_cached(&crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, 3, 3))
+                    .unwrap()
+                    .load_function("conv2d_wmma")
+                    .unwrap();
+                let igcfg = conv_wmma_cfg(h, wd, k, 3, 3);
+                let ig = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&igf);
+                    b.arg(&xi_d).arg(&wi_d).arg(&mut *o);
+                    unsafe { b.launch(igcfg).unwrap() };
+                };
+
+                // naive Tier-A (cross-check only).
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, 3, 3).unwrap();
+                crate::diff::assert_close(&format!("naive C{c}"), &naive, &oracle, 5e-2, 5e-2);
+
+                let (cudnn_algo, g_c) = if have_cudnn {
+                    let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, 3, 3, 0, 1).unwrap();
+                    crate::diff::assert_close(&format!("cudnn C{c}"), &yc, &oracle, 5e-2, 5e-2);
+                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, 3, 3, 0, 1, 100).unwrap().0);
+                    (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, 3, 3) / t_c)
+                } else {
+                    ("n/a", 0.0)
+                };
+
+                let iters = 50usize;
+                let t_wino = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { wino(g, &mut u_d, &mut v_d, &mut m_d, &mut o_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_ig = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { ig(g, &mut oi_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, 3, 3, 10).unwrap();
+                let flop = conv_flop(c, h, wd, k, 3, 3);
+                let (g_w, g_ig, g_n) = (flop / t_wino, flop / t_ig, flop / t_n);
+                eprintln!(
+                    "C{c:>3} {h}x{wd} K{k:>3} 3x3 T={nt:>4}: Winograd {:>6.0} GF ({:>4.1}× naive, {:>3.0}% cuDNN, {:>4.2}× implicit) | implicit {:>6.0} GF | cuDNN {:>6.0} GF [{}] | naive {:>5.0}",
+                    g_w / 1e9,
+                    g_w / g_n,
+                    if g_c > 0.0 { 100.0 * g_w / g_c } else { 0.0 },
+                    g_w / g_ig,
+                    g_ig / 1e9,
+                    g_c / 1e9,
+                    cudnn_algo,
+                    g_n / 1e9,
+                );
             }
         });
     }
