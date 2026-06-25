@@ -3,6 +3,30 @@
 Branch: `perf/cpu-library-grade` (worktree `../Mercury-cpu`). Owner files: `crates/mercury_runtime/src/*`,
 `crates/mercury_xbench/src/main.rs`, additive recognizer arms in `crates/mercury_mir_build/src/lib.rs`.
 
+## Headline standing (vs the oneMKL gold standard, measured this session)
+
+Peer = **Intel oneMKL** (`mkl_rt`, AVX2-dispatched on this Meteor Lake part — apples-to-apples 256-bit),
+the gold-standard CPU GEMM/VML the mission names. All ratios same-run + thermally-controlled (see the
+measurement law); AVX-512 is a labelled projection (no silicon here). Both binding laws hold — full
+`cargo test` green, and `-O0 ≡ -O1 ≡ -O2 ≡ -O3 ≡ interp ≡ native` bit-for-bit on the GEMM fixtures.
+
+- **Single-core GEMM: parity with MKL.** Was eroding 93→77 GFLOP/s across 256→2048³; size-adaptive
+  `select_kc` flattened it to ~89→84→79 (77–87% of roofline out to a 512 MB working set). **Now beats
+  MKL-1-thread at 256³/512³ (102–104%) and holds 84–95% at 1024–4096³** — up from 82–88%.
+- **Multicore GEMM: competitive-to-winning.** A private **physical-core** pool (shed HyperThread
+  contention) lifts parallel throughput 1.1–1.4× at the compute-bound mid sizes. **@parallel is 60–70%
+  of MKL-all-threads at 512–1024³ and reaches parity-to-winning (86–129%) at ≥2048³** — the large-matrix
+  ML regime.
+- **vs naive C/Rust (the floor): crushed.** GEMM **2.4–12.5×** single-core (and far more `@parallel`);
+  vectorized transcendentals **5–6×**.
+- **vmath vs MKL VML: honest open gap.** Mercury's exp/log are ~1.7–2× under VML — *algorithmic* (VML's
+  cheaper ~0.5-ULP approximation), not an ILP deficiency (a 4× unroll measured 0.97×; the kernel is
+  already OoO-saturated). Characterised and deferred, bounded by the 1-ULP correctness gate.
+- **AVX-512 (projection):** a gated, twin-tested microkernel, bit-identical-by-construction to the AVX2
+  kernel; projected ~1.3–1.8× on dual-FMA server cores, never measured on hardware that can't run it.
+
+Commits: `select_kc` · honest-harness · physical-pool · AVX-512 · VML-peer (+ P2–P4 docs).
+
 ## Environment (measured this session)
 
 - **CPU: Intel Core Ultra 7 155H (Meteor Lake)** — 16 cores / 22 threads: 6 P-cores (HT → 12),
