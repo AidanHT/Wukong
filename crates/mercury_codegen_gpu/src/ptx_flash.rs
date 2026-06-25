@@ -1326,6 +1326,199 @@ fn entry_mma_reg_pipe_sp(d: usize) -> String {
     s
 }
 
+/// **Head-dim warp-split** flash (`flash_d{d}_hs`, non-causal, intended for D=128). D=128's
+/// register-resident kernel plateaus at ~8 TFLOP/s — *half* of D=64's ~16 — because its **64 f32
+/// O-accumulators** (nto=16) plus the 16 KB double-buffer cap it at ~6 warps/SM (~12.5% occupancy): the
+/// tensor cores starve for warps. This kernel runs **2 warps / CTA on the SAME 16 query rows**, each warp
+/// owning **half the output head dim** (warp `w` owns hdim `[w·d/2, w·d/2 + d/2)`). Both warps redundantly
+/// compute the full QKᵀ + softmax (the score is tiny and both read the same staged K), but each does only
+/// **half the PV**, so each holds **32 O-accumulators, not 64** — halving the binding register pressure.
+/// With the 16 KB K/V buffer now shared by the 2 warps (not duplicated), occupancy ≈ doubles toward the
+/// ~12 warps/SM that lifted D=64; that gap *is* the documented D=128 bound. The two warps cooperatively
+/// stage the full K+V slab (64-thread `cp.async`) and `bar.sync` on it before reading, and `bar.sync`
+/// again before the prefetch overwrites the buffer. The redundant QKᵀ is the price; the occupancy is the
+/// bet. Gated vs `ref_attn`; A/B'd same-run vs `flash_d{d}_mp` by `flash_hs_vs_mp` (isolates the occupancy
+/// effect — both hand-packed). Non-causal.
+///
+/// **MEASURED NEGATIVE RESULT (kept as a documented A/B — `flash_hs_vs_mp`).** Clock-cancelled `hs/mp`
+/// (median of 9, H=8, D=128) = **1.110 / 1.108 / 1.199 / 1.193** at S=512/1024/2048/4096 — the split is
+/// **11–20% SLOWER**. Occupancy *did* roughly double (SMEM-bound 6→12 warps/SM, verified by the halved
+/// O-accumulators), but the bet **lost**: the redundant full QKᵀ (both warps recompute the whole score)
+/// plus the two per-tile `bar.sync`s cost more than the extra warps buy. So D=128's plateau is **not**
+/// occupancy-bound the way the register count suggested — doubling warps does not help. It joins
+/// `mp4`/`mpw`/`msp` as a measured occupancy/overlap negative; the contraction-split (no redundant QKᵀ,
+/// but a cross-warp partial-score exchange) is not pursued given this evidence. The banked D=128 win
+/// stays the `ldmatrix` SMEM-feed (`flash_d128_mp_lm`), which beats cutlass-efficient ≤1024.
+fn entry_mma_reg_pipe_hs(d: usize) -> String {
+    assert!(d % 32 == 0, "head-split needs (d/2) % 16 == 0");
+    let ktq = d / 16; // full QKᵀ contraction tiles (both warps compute these, redundantly)
+    let hh = d / 2; // head-dim half each warp owns
+    let nto = hh / 8; // PV n-tiles per warp (half the output)
+    let ksz = 16 * d * 2; // full K slab (== V slab)
+    let bufsz = 2 * ksz; // K+V per pipeline buffer
+    let cpl = 2 * d / 64; // 16-byte cp.async chunks per thread per tensor over 64 threads
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = format!("flash_d{d}_hs");
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0,%pnext;\n";
+    let mut fr = String::from(
+        "%scale,%m0,%m1,%mnew0,%mnew1,%corr0,%corr1,%l0,%l1,%lmax0,%lmax1,%rt,%psum0,%psum1,%pp,%tp0,%tp1,%tp2,%tp3",
+    );
+    for nk in 0..2 {
+        for r in 0..4 {
+            fr += &format!(",%s{nk}_{r}");
+        }
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            fr += &format!(",%o{nt}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    let mut br = String::new();
+    for kt in 0..ktq {
+        for r in 0..4 {
+            br += &format!("%qa{kt}_{r},");
+        }
+    }
+    br += "%a0,%a1,%a2,%a3,%b0,%b1,%hr0,%hr1,";
+    s += &format!(
+        "    .reg .b32 {br}%S,%tix,%lane,%warpid,%grp,%tg,%tg2,%row,%qr0,%qr1,%hbase,%kb,%idx,%tmp,%hoff,%bufc,%bufp,%next,%sbase,%sk,%chunk,%lkey,%bswap;\n"
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
+    s += &format!("    .shared .align 16 .b8 smem_{name}[{}];\n", 2 * bufsz);
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    s += &format!("    mov.u32 %hoff,%ctaid.y;\n    mul.lo.u32 %hoff,%hoff,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+    s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+    s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+    // tid → warpid/lane; lane → grp/tg/tg2. hbase = warpid·(d/2) (this warp's output hdim base).
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpid,%tix,5;\n    and.b32 %lane,%tix,31;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    s += &format!("    mul.lo.u32 %hbase,%warpid,{hh};\n");
+    s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n";
+
+    // FULL Q A-fragments (both warps load all d — needed for the full QKᵀ contraction).
+    for kt in 0..ktq {
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_0,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_2,[%base];\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_1,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_3,[%base];\n");
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %o{nt}_{r},0f00000000;\n");
+        }
+    }
+    s += "    mov.f32 %m0,0fFF800000;\n    mov.f32 %m1,0fFF800000;\n    mov.f32 %l0,0f00000000;\n    mov.f32 %l1,0f00000000;\n";
+
+    // Cooperative stage (64 threads) of the full K+V slab at global tile `kbreg` into buffer `bufreg`.
+    let stage = |kbreg: &str, bufreg: &str| -> String {
+        let mut t = String::new();
+        for ci in 0..cpl {
+            t += &format!("    add.u32 %chunk,%tix,{};\n", ci * 64);
+            t += &format!("    mul.lo.u32 %tmp,{kbreg},{d};\n    shl.b32 %sk,%chunk,3;\n    add.u32 %tmp,%tmp,%sk;\n    mul.wide.u32 %off,%tmp,2;\n");
+            t += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,{bufreg};\n    shl.b32 %sk,%chunk,4;\n    add.u32 %sbase,%sbase,%sk;\n");
+            t += "    add.s64 %base,%K,%off;\n    cp.async.cg.shared.global [%sbase],[%base],16;\n";
+            t += &format!("    add.u32 %sbase,%sbase,{ksz};\n    add.s64 %base,%V,%off;\n    cp.async.cg.shared.global [%sbase],[%base],16;\n");
+        }
+        t
+    };
+
+    s += &format!("    mov.u32 %bufc,0;\n    mov.u32 %bufp,{bufsz};\n    mov.u32 %kb,0;\n");
+    s += &stage("%kb", "%bufc");
+    s += "    cp.async.commit_group;\n";
+
+    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+    s += "    add.u32 %next,%kb,16;\n    setp.ge.u32 %pnext,%next,%S;\n";
+    s += &format!("    @%pnext bra NOPF_{name};\n");
+    s += &stage("%next", "%bufp");
+    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+    s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
+    s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
+
+    // 1. S = Q.Kt (FULL contraction, both warps) — K read from SMEM at bufc.
+    for nk in 0..2 {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
+        }
+        s += &format!("    add.u32 %lkey,%grp,{};\n", nk * 8);
+        for kt in 0..ktq {
+            s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
+            s += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+        }
+    }
+
+    // 2. online softmax (full, both warps identical) — copied from entry_mma_reg_pipe.
+    s += "    max.f32 %lmax0,%s0_0,%s0_1;\n    max.f32 %lmax0,%lmax0,%s1_0;\n    max.f32 %lmax0,%lmax0,%s1_1;\n    mul.f32 %lmax0,%lmax0,%scale;\n";
+    s += "    max.f32 %lmax1,%s0_2,%s0_3;\n    max.f32 %lmax1,%lmax1,%s1_2;\n    max.f32 %lmax1,%lmax1,%s1_3;\n    mul.f32 %lmax1,%lmax1,%scale;\n";
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax0,{off},0x1f,0xffffffff;\n    max.f32 %lmax0,%lmax0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax1,{off},0x1f,0xffffffff;\n    max.f32 %lmax1,%lmax1,%rt;\n");
+    }
+    s += &format!("    max.f32 %mnew0,%m0,%lmax0;\n    sub.f32 %corr0,%m0,%mnew0;\n    mul.f32 %corr0,%corr0,{log2e};\n    ex2.approx.f32 %corr0,%corr0;\n");
+    s += &format!("    max.f32 %mnew1,%m1,%lmax1;\n    sub.f32 %corr1,%m1,%mnew1;\n    mul.f32 %corr1,%corr1,{log2e};\n    ex2.approx.f32 %corr1,%corr1;\n");
+    for nt in 0..nto {
+        s += &format!("    mul.f32 %o{nt}_0,%o{nt}_0,%corr0;\n    mul.f32 %o{nt}_1,%o{nt}_1,%corr0;\n    mul.f32 %o{nt}_2,%o{nt}_2,%corr1;\n    mul.f32 %o{nt}_3,%o{nt}_3,%corr1;\n");
+    }
+    let prob = |dst: &str, sreg: &str, mnew: &str| -> String {
+        format!("    mul.f32 %pp,{sreg},%scale;\n    sub.f32 %pp,%pp,{mnew};\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 {dst},%pp;\n")
+    };
+    let pack = |dst: &str, lo: &str, hi: &str| -> String {
+        format!("    cvt.rn.f16.f32 %hr0,{lo};\n    and.b32 %hr0,%hr0,65535;\n    cvt.rn.f16.f32 %hr1,{hi};\n    shl.b32 %hr1,%hr1,16;\n    or.b32 {dst},%hr0,%hr1;\n")
+    };
+    s += &prob("%tp0", "%s0_0", "%mnew0");
+    s += &prob("%tp1", "%s0_1", "%mnew0");
+    s += &prob("%tp2", "%s1_0", "%mnew0");
+    s += &prob("%tp3", "%s1_1", "%mnew0");
+    s += "    add.f32 %psum0,%tp0,%tp1;\n    add.f32 %psum0,%psum0,%tp2;\n    add.f32 %psum0,%psum0,%tp3;\n";
+    s += &pack("%a0", "%tp0", "%tp1");
+    s += &pack("%a2", "%tp2", "%tp3");
+    s += &prob("%tp0", "%s0_2", "%mnew1");
+    s += &prob("%tp1", "%s0_3", "%mnew1");
+    s += &prob("%tp2", "%s1_2", "%mnew1");
+    s += &prob("%tp3", "%s1_3", "%mnew1");
+    s += "    add.f32 %psum1,%tp0,%tp1;\n    add.f32 %psum1,%psum1,%tp2;\n    add.f32 %psum1,%psum1,%tp3;\n";
+    s += &pack("%a1", "%tp0", "%tp1");
+    s += &pack("%a3", "%tp2", "%tp3");
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum0,{off},0x1f,0xffffffff;\n    add.f32 %psum0,%psum0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum1,{off},0x1f,0xffffffff;\n    add.f32 %psum1,%psum1,%rt;\n");
+    }
+    s += "    fma.rn.f32 %l0,%l0,%corr0,%psum0;\n    fma.rn.f32 %l1,%l1,%corr1,%psum1;\n";
+    s += "    mov.f32 %m0,%mnew0;\n    mov.f32 %m1,%mnew1;\n";
+
+    // 4. O += P.V : HALF the PV — V columns hdim ∈ [hbase, hbase+hh). V read from SMEM at bufc+ksz.
+    for nt in 0..nto {
+        s += &format!("    add.u32 %idx,%grp,{};\n    add.u32 %idx,%idx,%hbase;\n", nt * 8);
+        s += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
+        s += &format!("    ld.shared.u16 %hr0,[%sbase];\n    ld.shared.u16 %hr1,[%sbase+{}];\n    shl.b32 %hr1,%hr1,16;\n    or.b32 %b0,%hr0,%hr1;\n", 2 * d);
+        s += &format!("    ld.shared.u16 %hr0,[%sbase+{}];\n    ld.shared.u16 %hr1,[%sbase+{}];\n    shl.b32 %hr1,%hr1,16;\n    or.b32 %b1,%hr0,%hr1;\n", 16 * d, 18 * d);
+        s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+    }
+
+    // 2-warp barrier before the next iteration's prefetch overwrites bufc.
+    s += "    bar.sync 0;\n";
+    s += "    mov.u32 %bswap,%bufc;\n    mov.u32 %bufc,%bufp;\n    mov.u32 %bufp,%bswap;\n";
+    s += &format!("    mov.u32 %kb,%next;\n    bra KB_{name};\n");
+
+    // store O[query][hbase + nt*8 + ...] = o / l.
+    s += &format!("DONE_{name}:\n");
+    for nt in 0..nto {
+        s += &format!("    div.rn.f32 %o{nt}_0,%o{nt}_0,%l0;\n    div.rn.f32 %o{nt}_1,%o{nt}_1,%l0;\n    div.rn.f32 %o{nt}_2,%o{nt}_2,%l1;\n    div.rn.f32 %o{nt}_3,%o{nt}_3,%l1;\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,%hbase;\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_0;\n    st.global.f32 [%base+4],%o{nt}_1;\n", nt * 8);
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,%hbase;\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_2;\n    st.global.f32 [%base+4],%o{nt}_3;\n", nt * 8);
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
 /// Generate the **multi-warp-CTA** `cp.async`-pipelined flash kernel (`flash_d{d}_mp{warps}`,
 /// non-causal). Identical per-warp math to [`entry_mma_reg_pipe`] — each warp owns a 16-query-row block
 /// and keeps O/m/l in registers — but `warps` warps share **one** CTA and **cooperatively stage a single
@@ -1986,6 +2179,9 @@ pub fn flash_ptx() -> &'static str {
         // Software-pipelined (QKᵀ-ahead overlaps softmax SFU; separate K/V pools keep base occupancy):
         // the lever for the long-S softmax-stall ceiling that no SMEM-feed change touches. Non-causal.
         m += &entry_mma_reg_pipe_sp(64);
+        // Head-dim warp-split for D=128: 2 warps share the 16 query rows, each owns half the output hdim
+        // (32 not 64 O-accumulators) → ~2× occupancy, the documented D=128 register-pressure bound.
+        m += &entry_mma_reg_pipe_hs(128);
         m
     })
     .as_str()
