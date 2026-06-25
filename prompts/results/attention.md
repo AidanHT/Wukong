@@ -300,9 +300,24 @@ the base 2-slab; K staged one tile further ahead than V) — the trick that dist
 occupancy-losing mp4/wide. Clock-cancelled `sp/base` (median of 9) = **1.04 / 1.04 / 1.01 / 1.02** — a
 wash. `ptxas` already extracts what little single-warp mma/SFU overlap exists, and the score-rotation +
 separate-pool address arithmetic offset the rest. It joins multi-warp and wide-Bk as a measured
-occupancy/overlap negative. The long-S ceiling is **not** closable by single-warp software-pipelining; the
-remaining open lever is head-dim warp-splitting for D=128's register-pressure (occupancy) bound.
+occupancy/overlap negative.
+
+### Measured negative — head-dim warp-split for D=128 (`flash_hs_vs_mp`)
+
+The last documented lever: D=128's flat ~8 TFLOP/s (half D=64's) looked register-pressure-bound — 64
+O-accumulators cap the single-warp kernel at ~6 warps/SM. `flash_d128_hs` runs **2 warps on the same 16
+query rows, each owning half the output hdim** (32 O-accs, not 64), so occupancy ~doubles. Gated correct
+(`flash_hs_matches_reference`). But clock-cancelled `hs/mp` (median of 9) = **1.110 / 1.108 / 1.199 /
+1.193** — **11–20% slower**. Occupancy *did* double (verified: SMEM-bound 6→12 warps/SM), yet it lost: the
+redundant full QKᵀ (both warps recompute the whole score) + two per-tile `bar.sync`s cost more than the
+warps buy. **So D=128 is not occupancy-bound the way the register count implied** — doubling warps does not
+help. Four occupancy/overlap levers now agree (mp4, wide-Bk, software-pipeline, warp-split): the long-S
+plateau is **not** movable by them. cuDNN's long-S scaling is sophisticated tile/pipeline design at the
+hardware-peak frontier, not a single missing trick.
 
 **Round-2 takeaway:** the `ldmatrix` SMEM-feed win is the concrete close-the-gap result — it makes Mercury
 **beat cutlass mem-efficient fMHA at D=128 for S≤1024** (where it was just behind), the head dim modern
-models use, while staying bit-exact. cuDNN's near-peak long-S throughput is the honest remaining frontier.
+models use, while staying bit-exact, and improves the cuDNN ratio ~+0.1. The exhaustive negative sweep
+(mp4 / wide-Bk / software-pipeline / head-split — all gated correct, all measured slower-or-tie) is itself
+an honest result: it maps the ceiling. cuDNN's near-peak long-S throughput is the documented frontier that
+this hardware's accessible kernel levers do not close.
