@@ -195,3 +195,34 @@ tapering to parity where the kernel is HBM-bandwidth-bound. Never a regression.
 **Honest multicore standing:** Mercury's @parallel GEMM is competitive with oneMKL's threaded GEMM on
 this hybrid — 60–70% of MKL at 512–1024³, **parity-to-winning (86–129%) at ≥2048³** — the large-matrix
 regime that matters for ML. The residual mid-size gap is threading/packing overhead, not the kernel.
+
+### P3 — AVX-512 microkernel (gated, twin-tested, **projection only**)
+
+This box (Meteor Lake) has **no AVX-512** — `avx512f` detects false, so an AVX-512 path is dead code
+here and **cannot be measured**. The honest deliverable is therefore: implement it, prove correctness by
+construction, gate it so it touches no live gate, and report the width win **only as a labelled
+projection**.
+
+`micro_6x16_avx512` (commit `perf(runtime):`) is the AVX-512 twin of the proven `micro_6x16`'s
+K-accumulation + plain full-tile writeback. Each of the 6 A-rows gets one 512-bit accumulator holding
+all 16 of its C-columns (vs the AVX2 kernel's two 256-bit halves); per K-step one 16-wide B load, 6
+broadcasts, **6 FMAs — half** the AVX2 kernel's 12 for the same flops.
+
+- **Correctness — by construction, not measurement.** Lane `j` of accumulator `r` sums `a[r,p]·b[p,j]`
+  over `p` ascending — the exact sequence `micro_6x16` folds into its `c{2r}[j]` / `c{2r+1}[j−8]`.
+  Widening 2×ymm → 1×zmm changes only register width, never which products reach `C[i,j]` nor their
+  order, so it is **bit-identical** to the AVX2 kernel (the very argument the differential gate already
+  makes for SIMD width). `micro_6x16_avx512_twin` asserts this on AVX-512 silicon; here it compiles and
+  run-skips. The gate stays sacred: dead code can't break it.
+- **Bounded untestable surface.** Only the full-tile, no-epilogue case (the bulk of a large GEMM's
+  tiles, and the part whose AVX-512 form is a trivial lane-width swap) takes the AVX-512 path. Partial
+  edge tiles and the fused bias+act epilogue (which would need AVX-512 `gelu16`/`silu16` vmath that does
+  not exist yet) fall back to the proven AVX2 kernel.
+- **Projected width win (NOT measured — no silicon here).** Same flops in **half** the FMA instructions.
+  On a **dual-512-bit-FMA** server core (Skylake-X / Ice Lake-SP class) that is up to 2× the AVX2 FMA
+  issue rate; the 6 independent accumulators only partly hide the ~4-cycle FMA latency against two
+  units (need ~8 in flight), so realistically **~1.3–1.8×**, and AVX-512 down-clocking on older Xeons
+  shaves some of that. On a **single-512-bit-FMA** client AVX-512 core it is ~**parity** (the 6 zmm
+  FMAs match the AVX2 kernel's 12 ymm FMAs on fused 256-bit units) — never a regression. A production
+  path would widen the tile (e.g. 14×32, 28 accumulators) to fully saturate toward 2×; that is
+  straightforward but deferred precisely because it **cannot be validated on this hardware**.
