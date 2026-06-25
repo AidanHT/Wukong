@@ -217,6 +217,9 @@ fn main() {
     if want("colsum") {
         bench_colsum(&cc, &dir);
     }
+    if want("biasadd") {
+        bench_biasadd(&cc, &dir);
+    }
     if want("colmax") {
         bench_colmax(&cc, &dir);
     }
@@ -1019,6 +1022,110 @@ fn rust_colsum(m: usize, n: usize) -> String {
     format!(
         "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
          \x20 for j in 0..N {{ let mut s=0.0f32; for i in 0..M {{ s += *x.add(i*N+j); }} *out.add(j)=s; }}\n}}\n"
+    )
+}
+
+/// Broadcast bias-add `out[r,c] = x[r,c] + bias[c]` over a `[R, C]` matrix — the post-projection bias
+/// add / the affine after a non-fused norm / FiLM conditioning, one of the most ubiquitous transformer
+/// elementwise ops. The bias is broadcast down the rows (one `[C]` vector reused for every row). It is
+/// memory-bound (read x + write out, bias stays cached). Reported as GB/s (`2·R·C·4`: x read once,
+/// out written once). The full-buffer cross-check is bit-exact (a plain add, no reassociation).
+fn bench_biasadd(cc: &str, dir: &Path) {
+    for (r, c) in [(1024usize, 1024usize), (4096, 1024)] {
+        let rc = r * c;
+        let x: Vec<f32> = (0..rc).map(|i| (i % 17) as f32 * 0.25 - 2.0).collect();
+        let bias: Vec<f32> = (0..c).map(|i| (i % 13) as f32 * 0.5 - 1.0).collect();
+        let mut out = vec![0.0f32; rc];
+        let (xp, bp, op) = (x.as_ptr(), bias.as_ptr(), out.as_mut_ptr());
+        let bytes = 2.0 * rc as f64 * 4.0; // read x once, write out once
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== biasadd (out[r,c] = x[r,c] + bias[c]) {r}x{c} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_biasadd(r, c, false), &mut out, xp, bp, op);
+        let mer_par = bench_mercury(&mer_biasadd(r, c, true), &mut out, xp, bp, op);
+        let cm = bench_external(
+            "c",
+            &c_biasadd(r, c),
+            dir,
+            "biasadd",
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            &mut out,
+            xp,
+            bp,
+            op,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_biasadd(r, c),
+            dir,
+            "biasadd",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            xp,
+            bp,
+            op,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        if let (Some(a), Some(c2)) = (&mer, &cm) {
+            if a.out != c2.out {
+                println!("  ! biasadd output mismatch vs C");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let ratio = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than C",
+                if ratio >= 1.0 { ratio } else { 1.0 / ratio },
+                if ratio >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let ratio = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {ratio:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+fn mer_biasadd(r: usize, c: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let rc = r * c;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {rc}], bias: [f32; {c}], out: [f32; {rc}]) {{\n\
+         \x20   for r in 0..{r} {{\n\
+         \x20       for c in 0..{c} {{ out[r * {c} + c] = x[r * {c} + c] + bias[c]; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_biasadd(r: usize, c: usize) -> String {
+    format!(
+        "#define R {r}\n#define C {c}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* bias, float* out){{\n\
+         \x20 for (long r=0;r<R;r++){{ for (long c=0;c<C;c++){{ out[r*C+c] = x[r*C+c] + bias[c]; }} }}\n}}\n"
+    )
+}
+
+fn rust_biasadd(r: usize, c: usize) -> String {
+    format!(
+        "const R: usize = {r};\nconst C: usize = {c};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, bias:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ for c in 0..C {{ *out.add(r*C+c) = *x.add(r*C+c) + *bias.add(c); }} }}\n}}\n"
     )
 }
 
