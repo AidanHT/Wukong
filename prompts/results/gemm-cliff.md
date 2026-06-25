@@ -161,10 +161,10 @@ live-ranges and constrained the scheduler. The compute is bound by the per-`(mi,
 gather latency. Reverted the codegen (was never committed). **Do not re-attempt fragment prefetch on this tile.**
 
 ### Next levers (toward parity / beyond)
-- **Measure the fused op vs cuBLAS-GEMM + separate-epilogue** end-to-end to quantify the beat-cuBLAS margin
-  (analytical estimate: fusion wins ~1.1× @2048³ for SiLU/SwiGLU/residual cuBLASLt can't fuse; loses @4096³
-  where the raw-GEMM gap exceeds the saved C round-trip). Needs a fair (vectorized) epilogue peer — fairness-
-  sensitive, so disclose the peer.
+- ~~Measure the fused op vs cuBLAS-GEMM + separate-epilogue~~ **DONE — see Lever 9 + Lever 10 below.** The
+  fused gated-FFN vs cuBLAS 3-kernel chain is measured: **wins ~1.05–1.20× @≤2048³, loses @4096³** (matching
+  the analytical estimate). The gated-FFN swz re-base was *also* attempted and **measured a wash-to-loss**
+  (the single-B win does not transfer to the dual-B tile) — production stays on the padded gate.
 - ~~offline ptxas~~ **TESTED → LOSES (lever closed).** Installed standalone CUDA-12.9 `ptxas`
   (`pip install nvidia-cuda-nvcc-cu12`), compiled the swz PTX → cubin, driver-loaded it (checksum-gated
   bit-identical), same-run A/B vs the driver's own `cuLink` compile (`gemm_cliff_ptxas_ab`, set
@@ -183,4 +183,50 @@ scheduling, and since the driver's ptxas already beats the standalone toolkit, t
 reachable by hand-SASS (CuAsmRL-style), not tractable here. The banked wins — **2048³ 71%→87% (1.23×)** and
 the **fused epilogue re-based onto the fast base** — are the durable results; both floors are met (4096³
 ≥75% with margin, 2048³ ≥90% on clean-clock runs). The structural beyond-parity lever (the fused epilogue
-cuBLAS can't do) is positioned on the fastest base; quantifying its end-to-end margin is the open follow-up.
+cuBLAS can't do) is positioned on the fastest base; the end-to-end margin is now quantified (Lever 10).
+
+### Lever 9 — gated-FFN (SwiGLU/GeGLU) swz re-base: **measured WASH-TO-LOSS, production stays padded.**
+Ported the no-pad `ldmatrix`+XOR-swizzle path into the **128×64 dual-B** `entry_mma_gate` generator (the
+SwiGLU/GeGLU FFN gate: `out = act(x·Wgᵀ) ⊙ (x·Wuᵀ)`). The port is faithful — x's `[M,K]` A tile is shared by
+both `mma` chains, Wg/Wu have identical `[N,K]` layout so they reuse one swizzle derivation (shared
+`%browb`/`%phaseB`/`%lb8`, only smem base + ring cursor differ); no-pad even *shrinks* SMEM 40→32 KiB. It is
+**bit-identical** to the padded gate (`swiglu_gate_match_reference_within_tol` covers all 5 variants × {padded,
+swz} × {f16,bf16}; every swz twin's max_abs == its padded base's). **But the single-B 128×128 GEMM-cliff win
+does NOT transfer.** Same-run swz-vs-padded internal A/B (`fused_swiglu_gate_vs_chain`, interleaved best-of-6,
+shared-clock-cancelling), two runs:
+
+| shape | 512³ | 1024³ | 2048³ | 4096³ | 512×4096×4096 |
+|---|---|---|---|---|---|
+| swz × padded (run 1) | 1.04 | 1.08 | **0.89** | 1.03 | 0.97 |
+| swz × padded (run 2) | 1.04 | 1.03 | **1.01** | 1.01 | 1.07 |
+
+geomean ≈ **1.00×** with the 2048³ point swinging 0.89↔1.01 — no reliable win, a real loss on the cleaner run.
+**Mechanism:** the gate already amortizes x across both GEMMs (load-x-once), so it is far less bottlenecked on
+the SMEM fragment-load path `ldmatrix` accelerates; and tn=2 (vs the single-B tn=4) leaves too little mma-ILP
+to hide the no-pad swizzle's per-ks address arithmetic. The swizzle overhead ≈ the ldmatrix benefit → wash.
+**Outcome:** the `..._swz` gate twins are emitted + correctness-gated as a verified alternative, but the
+`gemm_nt_{f16,bf16}_{swiglu,geglu}` wrappers route to the **padded base** (`gate_use_swz` removed). A faithful
+negative result — the swz win is specific to the single-B 128×128 tile, not a universal lever.
+
+### Lever 10 — fused gated-FFN vs cuBLAS 3-kernel chain: **the beat-cuBLAS fusion win (~1.05–1.20× @≤2048³).**
+The structural beyond-parity statistic. cuBLAS has no fused-gate path, so a library must run **three** kernels
+for the SwiGLU gate — GEMM `x·Wgᵀ`, GEMM `x·Wuᵀ`, then an elementwise `silu(gate)⊙up` — round-tripping both
+`[M,N]` intermediates through HBM (a 4·MN extra round-trip) and reading `x` twice. The fused gate reads `x`
+**once** (shared A fragments feed both GEMMs) and never materializes the intermediates. Same-run, interleaved
+best-of-6, the **padded** fused gate vs the chain (2 cuBLAS GEMMs + a `vadd`-proxy elementwise combine):
+
+| shape | 512³ | 1024³ | 2048³ | 4096³ | 512×4096×4096 |
+|---|---|---|---|---|---|
+| fused × chain (run 1, clean clock) | **1.20** | 1.01 | **1.18** | 0.88 | 0.98 |
+| fused × chain (run 2, contended) | **1.07** | 0.98 | **1.03** | 0.88 | 0.97 |
+
+**Fusion wins at 512³ and 2048³ (1.03–1.20×), ties at 1024³/FFN-shape, loses at 4096³ (0.88×).** Mechanism
+(matches the analytical prediction): the win is `saved-4·MN-round-trip + redundant-x-read` *minus*
+`raw-GEMM-gap penalty`. At ≤2048³ (L2-resident) our raw GEMM is near cuBLAS parity, so the saved traffic
+dominates → fusion wins. At 4096³ the raw-GEMM gap (our ~17 TFLOP/s vs cuBLAS's higher large-tile rate) exceeds
+the saved traffic → fusion loses. The win regime (≤2048³) is exactly the inference-relevant FFN tile size
+(decode + short-prefill). Bench is `fused_swiglu_gate_vs_chain` (`#[ignore]`, needs cuBLAS redist on PATH);
+disclosed peer — the elementwise combine is a `vadd` proxy with identical 3·MN HBM traffic, not a strawman.
+**Measurement caveat:** the fused-vs-chain ratio crosses kernel families (ours vs cuBLAS) so it is clock-
+sensitive (run 2 was ~4× slower wall-clock under contention); the *signs* are stable across runs, the
+magnitudes are not. The swz-vs-padded A/B (same-family) is the trustworthy ratio and confirms the wash.
