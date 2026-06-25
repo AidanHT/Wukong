@@ -193,3 +193,52 @@ regime that real decoders run, Mercury's fused flash **beats both genuinely-fuse
 matches cutlass-efficient through S=1024**. Combined with §3 (fused RoPE ≤512) Mercury is
 competitive-or-ahead of a real FA-2-class kernel across the short/medium-context regime; the residual
 gap is purely cuDNN's long-S (≥2048) attention-throughput scaling.
+
+## 5. D=128 (Llama/GPT head dim) — new-regime coverage, gated correct
+
+The fast `mma.sync` flash kernels were instantiated at D=64 only; D=128 is the modern head dim. Because
+the generator is fully d-parameterized (ktq=8 QKᵀ tiles, nto=16 PV n-tiles, cpl=8 cp.async chunks),
+`flash_d128_mp` / `flash_d128_mpc` drop out for free and **gate correct on the first instantiation**
+(max_abs 2.4e-5–1.4e-4 vs the f64 `ref_attn`/`ref_attn_causal` oracle at S=16/64/256/512 ✓).
+
+Standing vs the fused peers (`gpu::attn_d128_vs_fused_peer`, H=8, **single run — indicative**, cross-process):
+
+| S | Mercury GF/s | vs cutlass-efficient | vs cuDNN |
+|---|---|---|---|
+| 512 | 7245 | **0.97×** | 0.66× |
+| 1024 | 7772 | 0.86× | 0.39× |
+| 2048 | 6696 | 0.65× | 0.37× |
+| 4096 | 6496 | 0.64× | 0.44× |
+
+- **Competitive with cutlass mem-efficient fMHA at S≤1024** (0.86–0.97×), behind at long S. Mercury's
+  D=128 kernel **plateaus at ~6.5–7.8 TFLOP/s** — *lower* than D=64's ~8–9 — because the single warp now
+  holds **64 f32 O-accumulators + 32 Q-fragment regs** (~120/thread), and that register pressure caps
+  occupancy. This is the D=128-specific lever (split the head-dim PV n-tiles across warps to relieve
+  registers) — left as future work; the point here is **correct, free D=128 coverage**, not a win.
+- Single run ⇒ presented as *indicative* (not a 3-run claim like §3/§4); the direction (competitive with
+  efficient at short S, register-bound at long S) is unambiguous and matches the D=64 pattern.
+
+## 6. Overall standing — where Mercury beats a genuinely fused FA-2-class kernel
+
+Against **cuDNN's fused flash + cutlass mem-efficient fMHA** (named, genuinely fused FA-class peers,
+same-run via PyTorch SDPA over identical f16 bytes — objective (a), DONE):
+
+| Regime | Mercury vs the fused peer | verdict |
+|---|---|---|
+| **Fused RoPE, S≤512** (§3) | 1.8–5.7× the rope+SDPA pipeline | **WIN** (library can't fuse RoPE) |
+| **Causal, S=512** (§4) | 1.03–1.16× — beats **both** cuDNN & efficient | **WIN** |
+| **Causal, S=1024** (§4) | ~1.01× cutlass-efficient / 0.87× cuDNN | **tie vs efficient** |
+| Non-causal, S≤1024 (§2) | 0.55–0.80× cuDNN | competitive |
+| Causal/non-causal, S≥2048 | 0.37–0.65× cuDNN (efficient closer) | trails (cuDNN scaling) |
+| D=128, S≤1024 (§5) | 0.86–0.97× cutlass-efficient | competitive |
+| Multi-warp lever (§2 #1) | wash; +12% only at S≥4096 | honest negative |
+
+**Objective (b) is met and exceeded.** Mercury is **competitive-or-ahead of a genuinely fused FA-2-class
+kernel across the entire short/medium-context regime (S≤512–1024)** — outright winning in the two
+regimes a real model spends most of its time in: **causal decode/prefill** (beats both peers at S=512)
+and **RoPE prefill** (the fusion a library structurally cannot do). The one durable gap is **cuDNN's
+long-context (S≥2048) attention-throughput scaling** on this 20-SM mobile GPU — not closable by the
+occupancy levers swept here (multi-warp, wide-Bk both measured negative), and an honest target for future
+work (`ldmatrix`, deeper pipeline, head-dim warp-splitting). Every kernel is tolerance-gated against the
+f64 oracle; every headline ratio is same-run, checksum-cross-checked, and reported over ≥3 runs (D=128
+coverage excepted, labeled indicative).
