@@ -12472,6 +12472,138 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **3-stage w64 bit-exact gate (first law, perf/gpu-quant-2).** The multistage int8 swz kernel deepens
+    /// the w64 2-buffer `cp.async` into a 3-buffer SMEM ring. A deeper prefetch ring only changes *when* each
+    /// K-slab is staged — the per-tile `u8×i8→i32` `mma` accumulation is byte-for-byte the 2-stage kernel's —
+    /// so the 3-stage output must equal the 2-stage output **and** the i32 CPU oracle **element-for-element**
+    /// (the strongest possible gate, stronger than a checksum). Shapes exercise the ring at exactly K=128
+    /// (prologue fills the whole ring, no main-loop prefetch), a single wrap (K=256), and multiple wraps
+    /// (K=384), across rectangular CTA grids. Multistage requires K≥(stages-1)·64=128 (the prologue stages 2
+    /// slabs ahead). This validates the `stages`-general ring; the kernel itself is **not** dispatched —
+    /// `quant_int8_w64_s3_sweep` measured 3-stage slower than 2-stage for int8 at every size. Skips without a GPU.
+    #[test]
+    fn quant_int8_w64_s3_matches_reference() {
+        use crate::ptx_int8::{
+            int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_s3_ptx, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M,
+            INT8_W64_WARPS_N,
+        };
+        with_gpu("quant_int8_w64_s3", |g| {
+            let warps = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
+            let f2 = g
+                .function("int8_gemm_nt_w64_swz", int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz")
+                .unwrap();
+            let f3 = g
+                .function("int8_gemm_nt_w64_swz_s3", int8_gemm_w64_swz_s3_ptx(), "int8_gemm_nt_w64_swz_s3")
+                .unwrap();
+            let mut rng = crate::diff::Rng::new(0x5A30);
+            for (m, k, n) in [(128usize, 128usize, 128usize), (256, 256, 256), (128, 384, 256), (384, 256, 128)] {
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let rf = ref_nt_int8(&a_u8, &b, m, k, n);
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let dims = (m as u32, n as u32, k as u32);
+                let cfg = LaunchConfig {
+                    grid_dim: ((n / INT8_W64_BN) as u32, (m / INT8_W64_BM) as u32, 1),
+                    block_dim: ((warps * 32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let run = |g: &mut Gpu, f: &_| -> Vec<i32> {
+                    let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                    let mut bld = g.stream.launch_builder(f);
+                    bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    g.stream.memcpy_dtov(&cc).unwrap()
+                };
+                let c2 = run(g, &f2);
+                let c3 = run(g, &f3);
+                assert_eq!(c3, rf, "w64_s3 {m}x{k}x{n} != i32 oracle (element-wise)");
+                assert_eq!(c3, c2, "w64_s3 {m}x{k}x{n} != w64 2-stage (element-wise)");
+                eprintln!("int8 w64_s3 {m}x{k}x{n}: 3-stage == 2-stage == i32 oracle ✓ ({} elems)", m * n);
+            }
+        });
+    }
+
+    /// **3-stage vs 2-stage w64 %-of-cuBLAS sweep (perf/gpu-quant-2).** The fp8 warp-tile sweep showed the
+    /// 3-stage `cp.async` ring adds +10/+19 pts at 1024³/2048³; this measures the same lever for int8 on the
+    /// 64×64 warp tile — 2-stage `w64` vs 3-stage `w64_s3` vs cuBLAS IMMA, same-run interleaved, at
+    /// 1024³/2048³/4096³. Bit-exact checksum cross-check first. Confirms the routing (s3 for ≤2048², 2-stage
+    /// at 4096³ where the deeper ring's SMEM/occupancy cost loses to HBM bandwidth). Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture quant_int8_w64_s3_sweep`
+    #[test]
+    #[ignore = "throughput sweep; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn quant_int8_w64_s3_sweep() {
+        use crate::baselines::{gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8};
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_ptx, int8_gemm_w64_swz_ptx, int8_gemm_w64_swz_s3_ptx, INT8_BM, INT8_BN,
+            INT8_WARPS_M, INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        };
+        with_gpu("quant_int8_w64_s3_sweep", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] quant_int8_w64_s3_sweep: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            // (label, ptx, entry, bm, bn, warps): the current per-size shipped winner (smdb64_swz @1024,
+            // w64 @2048/4096) vs the new 3-stage w64 ring. s3 only legal at 128-div M,N (skipped otherwise).
+            let variants: [(&str, &'static str, &'static str, usize, usize, usize); 3] = [
+                ("smdb64_swz   ", int8_gemm_smdb_swz_ptx(), "int8_gemm_nt_smdb_swz", INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N),
+                ("w64 (2-stage)", int8_gemm_w64_swz_ptx(), "int8_gemm_nt_w64_swz", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M * INT8_W64_WARPS_N),
+                ("w64_s3       ", int8_gemm_w64_swz_s3_ptx(), "int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M * INT8_W64_WARPS_N),
+            ];
+            let mut rng = crate::diff::Rng::new(0x5A31);
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let (a_u8, _a_i8, b) = int8_inputs_a127(&mut rng, m, k, n);
+                let cs_ref: i64 = ref_nt_int8(&a_u8, &b, m, k, n).iter().map(|&x| x as i64).sum();
+                let a_d = g.stream.memcpy_stod(&a_u8).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                eprintln!("\n{sz}³ int8 3-stage-vs-2-stage w64 vs cuBLAS (same-run, interleaved):");
+                let mut best: Option<(String, f64)> = None;
+                for (label, ptx, entry, bm, bn, warps) in variants {
+                    if m % bm != 0 || n % bn != 0 {
+                        eprintln!("  {label}: n/a");
+                        continue;
+                    }
+                    let f = g.function(entry, ptx, entry).unwrap();
+                    let cfg = LaunchConfig {
+                        grid_dim: ((n / bn) as u32, (m / bm) as u32, 1),
+                        block_dim: ((warps * 32) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let cs: i64 = {
+                        let mut cc = g.stream.memcpy_stod(&vec![0i32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(cfg).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as i64).sum()
+                    };
+                    assert_eq!(cs, cs_ref, "{label} {sz}³ checksum");
+                    let (mut s_v, mut s_cub) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..ROUNDS {
+                        s_v = s_v.min(time_gemm_int8(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                        s_cub = s_cub.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                    }
+                    let (gf, gc) = (flop / s_v, flop / s_cub);
+                    let pct = 100.0 * gf / gc;
+                    eprintln!("  {label}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLAS ({:>6.0})", gf / 1e9, pct, gc / 1e9);
+                    if best.as_ref().map_or(true, |(_, p)| pct > *p) {
+                        best = Some((label.trim().to_string(), pct));
+                    }
+                }
+                if let Some((label, pct)) = best {
+                    eprintln!("  → best @{sz}³: {label} at {pct:.1}% of cuBLAS");
+                }
+            }
+        });
+    }
+
     /// **w64 fused-dequant tolerance gate (first law).** The w64 (64×64-warp-tile) fused-dequant kernel
     /// folds `out = f32(Σ u8·i8)·scale[j]` into the C store on the fast base. The i32 GEMM is bit-exact; the
     /// per-column f32 dequant rounds once (i32→f32 cvt + f32 mul), so the result matches an f64 reference
