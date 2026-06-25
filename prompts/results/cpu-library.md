@@ -226,3 +226,35 @@ broadcasts, **6 FMAs — half** the AVX2 kernel's 12 for the same flops.
   FMAs match the AVX2 kernel's 12 ymm FMAs on fused 256-bit units) — never a regression. A production
   path would widen the tile (e.g. 14×32, 28 accumulators) to fully saturate toward 2×; that is
   straightforward but deferred precisely because it **cannot be validated on this hardware**.
+
+### P4 — vmath vs oneMKL VML: the gap is *algorithmic*, and honestly so
+
+Beyond GEMM, the mission asks to measure the gap to MKL for the elementwise/transcendental kernels.
+Added a **oneMKL VML peer** (commit `bench(xbench):`) — `vsExp`/`vsLn` resolved from the same
+`mkl_rt`, single-thread, same buffer, cross-checked against Mercury's output (rel < 1e-3 confirms the
+ILP64 ABI and would flag a mismatch). The elementwise analogue of the GEMM-vs-cblas comparison.
+
+| op | Mercury | vs scalar C/Rust | vs oneMKL VML |
+|----|--------:|-----------------:|--------------:|
+| exp | 256-bit AVX2 poly | **~6× faster** | ~1.7× slower |
+| log | 256-bit AVX2 poly | **~5.5× faster** | ~2.0× slower |
+
+So Mercury's vectorized transcendentals **crush idiomatic scalar C/Rust** (the mission's floor — gcc/rustc
+can't vectorize a libm call), but trail Intel's VML by ~1.7–2×, *both on AVX2* (MKL dispatches AVX2 on
+Meteor Lake). The natural suspicion was an ILP deficiency — the kernel processed one 8-lane vector
+through a ~15-FMA poly chain at a time. **Tested and refuted:** a 4×-unrolled loop (four independent
+`exp8` chains) measured **0.97×** vs single-vector in an adjacent A/B (`vmath_unroll_ab`) — *no* gain,
+because the out-of-order core's deep reorder buffer already overlaps consecutive independent iterations,
+so the kernel is **already throughput-saturated on the FMA units**, not latency-bound. The unroll was
+reverted (a no-op that only adds code).
+
+The remaining ~1.7–2× is therefore **algorithmic**: VML uses a cheaper approximation (table-assisted
+range reduction / lower-degree poly) and still hits ~0.5 ULP, *better* accuracy than Mercury's ~1 ULP.
+Matching it means rewriting the exp/log cores — real numerical work bounded by the `≈1-ULP` f64-reference
+gate (`vmath_kernels_match_f64_reference`), not a quick tune. **Honestly characterised and deferred**:
+this is a disclosed open gap, distinct from GEMM (where Mercury reaches MKL parity), and Mercury's vmath
+remains decisively ahead of the C/C++/Rust baselines the mission targets.
+
+Memory-bound kernels (saxpy / reduce / streaming elementwise) are DRAM-bandwidth-bound — Mercury already
+streams them with 256-bit + non-temporal stores and sits at ~1.3–1.5× naive C; there a library peer ties
+by physics (both saturate the same bus), the CPU analogue of the GPU HBM-bandwidth result.
