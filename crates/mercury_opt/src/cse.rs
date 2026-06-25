@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mercury_mir::{Function, Op, ValueId};
+use mercury_mir::{Function, MirType, Op, ValueId};
 
 use crate::{cfg, dom, map_op_uses, map_term_uses, Pass};
 
@@ -70,15 +70,43 @@ struct Numbering<'a> {
     children: &'a [Vec<u32>],
     allocas: &'a HashSet<u32>,
     /// pure-op key -> canonical value id, scoped to the current dominator-tree path.
-    vn: HashMap<String, u32>,
+    vn: HashMap<Key, u32>,
     /// value id -> the value it is replaced by (load forwards and CSE rewrites).
     rewrite: HashMap<u32, u32>,
+}
+
+/// A canonical, allocation-free value-numbering key for a pure op. One variant per cacheable
+/// `Op`, carrying exactly the fields the previous `format!`-string key encoded: the op
+/// discriminant (the enum variant itself), every operand `ValueId` (as its inner `u32`, mapped
+/// through prior rewrites), the result/operand `MirType` where the op carried one, immediates,
+/// and op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) as their stable `as u8` discriminant.
+/// `Eq`/`Hash` are derived, so two ops compare equal here iff their old strings were equal —
+/// no more, no less. `MirType` is `Hash + Eq` and a bitwise copy for scalars (only `Vec`/`Array`
+/// operand types touch the heap), so this avoids the per-instruction `String` the old key built.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Key {
+    ConstInt(i128, MirType),
+    /// Float immediate keyed by its raw bits (matches the old `x.to_bits()`), so `-0.0`/`NaN`
+    /// payloads stay distinct exactly as before.
+    ConstFloat(u64, MirType),
+    Bin(u8, u32, u32),
+    Cmp(u8, u32, u32),
+    Neg(u32),
+    Not(u32),
+    Cast(u8, u32, MirType),
+    Select(u32, u32, u32),
+    Gep(u32, u32, MirType),
+    FuncAddr(u32),
+    Splat(u32),
+    Fma(u32, u32, u32),
+    Sqrt(u32),
+    Round(u8, u32),
 }
 
 impl Numbering<'_> {
     fn visit(&mut self, blk: u32) {
         // Keys this block introduced into `vn`, to remove when we leave its subtree.
-        let mut added: Vec<String> = Vec::new();
+        let mut added: Vec<Key> = Vec::new();
         // Load forwarding is intra-block: the current value of each slot, reset per block.
         let mut slot_val: HashMap<u32, u32> = HashMap::new();
 
@@ -153,25 +181,27 @@ fn resolve(rewrite: &HashMap<u32, u32>, mut v: u32) -> u32 {
     v
 }
 
-/// A canonical string key for a pure op, operands mapped through prior rewrites so equal
+/// A canonical [`Key`] for a pure op, operands mapped through prior rewrites so equal
 /// computations hash identically. Returns `None` for impure/uncacheable ops (handled separately).
-fn pure_key(op: &Op, rewrite: &HashMap<u32, u32>) -> Option<String> {
+/// The op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) are fieldless C-like enums; `as u8`
+/// is their stable discriminant, which distinguishes the same variants the old `{:?}` did.
+fn pure_key(op: &Op, rewrite: &HashMap<u32, u32>) -> Option<Key> {
     let m = |v: ValueId| -> u32 { resolve(rewrite, v.0) };
     Some(match op {
-        Op::ConstInt(n, ty) => format!("ci:{n}:{ty:?}"),
-        Op::ConstFloat(x, ty) => format!("cf:{}:{ty:?}", x.to_bits()),
-        Op::Bin(o, a, b) => format!("bin:{o:?}:{}:{}", m(*a), m(*b)),
-        Op::Cmp(o, a, b) => format!("cmp:{o:?}:{}:{}", m(*a), m(*b)),
-        Op::Neg(a) => format!("neg:{}", m(*a)),
-        Op::Not(a) => format!("not:{}", m(*a)),
-        Op::Cast(k, a, ty) => format!("cast:{k:?}:{}:{ty:?}", m(*a)),
-        Op::Select(c, a, b) => format!("sel:{}:{}:{}", m(*c), m(*a), m(*b)),
-        Op::Gep { ptr, index, elem } => format!("gep:{}:{}:{elem:?}", m(*ptr), m(*index)),
-        Op::FuncAddr(s) => format!("faddr:{s:?}"),
-        Op::Splat(a) => format!("splat:{}", m(*a)),
-        Op::Fma(a, b, c) => format!("fma:{}:{}:{}", m(*a), m(*b), m(*c)),
-        Op::Sqrt(a) => format!("sqrt:{}", m(*a)),
-        Op::Round(mode, a) => format!("round:{mode:?}:{}", m(*a)),
+        Op::ConstInt(n, ty) => Key::ConstInt(*n, ty.clone()),
+        Op::ConstFloat(x, ty) => Key::ConstFloat(x.to_bits(), ty.clone()),
+        Op::Bin(o, a, b) => Key::Bin(*o as u8, m(*a), m(*b)),
+        Op::Cmp(o, a, b) => Key::Cmp(*o as u8, m(*a), m(*b)),
+        Op::Neg(a) => Key::Neg(m(*a)),
+        Op::Not(a) => Key::Not(m(*a)),
+        Op::Cast(k, a, ty) => Key::Cast(*k as u8, m(*a), ty.clone()),
+        Op::Select(c, a, b) => Key::Select(m(*c), m(*a), m(*b)),
+        Op::Gep { ptr, index, elem } => Key::Gep(m(*ptr), m(*index), elem.clone()),
+        Op::FuncAddr(s) => Key::FuncAddr(s.0),
+        Op::Splat(a) => Key::Splat(m(*a)),
+        Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
+        Op::Sqrt(a) => Key::Sqrt(m(*a)),
+        Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
         Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::Alloca(..) => return None,
     })
 }
