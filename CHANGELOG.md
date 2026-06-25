@@ -5,6 +5,29 @@ All notable changes to Mercury are documented here. The format is loosely based 
 
 ## [Unreleased]
 
+### Performance — close-the-NVIDIA-gap campaign (vs the vendor libraries)
+- **CPU GEMM to oneMKL parity** (`perf/cpu-library-grade`): size-adaptive `select_kc(k)` + a private
+  physical-core rayon pool put single-core GEMM at 102–104% of MKL-1-thread (256/512³) and 84–95%
+  (1024–4096³); `@parallel` reaches 86–129% of MKL-all-threads at ≥2048³. MKL cblas/VML peers added to
+  `mercury_xbench`. (vmath still loses to MKL VML — algorithmic, documented.)
+- **fp16/bf16 large-GEMM cliff vs cuBLAS** (`perf/gpu-gemm-cliff-2`): the no-pad ldmatrix+XOR-swizzle
+  workhorse takes 2048³ to ~87–90% and 4096³ to ~83% of cuBLAS (past the prior 77% `mma.sync` ceiling).
+- **int8/fp8 GEMM vs cuBLAS IMMA / cuBLASLt** (`perf/gpu-quant-2`): int8 beats IMMA at 2048³
+  (~96–105%); the fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.1–2.2×; fp8 is 82–151%
+  of cuBLASLt. w64 warp-tile + autotuner candidates.
+- **Fused attention vs a genuinely-fused FA2-class peer** (`perf/gpu-attention-2`): vs PyTorch SDPA's
+  cuDNN / cutlass mem-efficient backends, the fused flash wins fused-RoPE 1.8–5.7× and causal D=64
+  1.03–1.16× (beats both) for S≤512; D=128 ldmatrix beats cutlass for S≤1024.
+- **Conv vs cuDNN** (`perf/gpu-conv-2`): a real cuDNN-9 peer plus implicit-GEMM + Winograd
+  F(2×2,3×3)/F(4×4,3×3) + a fused epilogue + `conv2d_best` per-shape dispatch reach cuDNN
+  parity-to-win (1×1 3.5–5.6×, deep-channel 0.93–1.21×).
+- **GPU serving stack** (`perf/gpu-serving`): vLLM-style paged KV-cache + Orca continuous batching +
+  whole-model decode CUDA graph + int8 KV (3.88× footprint) + a TP partition sim — 39.1× batching
+  goodput at fill=64.
+
+All measured same-run (clock-invariant) on a mobile RTX 4050; the documented gaps and measured negative
+results are recorded in `prompts/results/`, and every kernel stays gated against the interpreter oracle.
+
 ### Added
 - **Front-end**: lexer (with `@attributes` and error recovery), recursive-descent + Pratt parser,
   AST with a pretty-printer, and `--emit=tokens|ast`.

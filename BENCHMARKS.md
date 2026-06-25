@@ -55,7 +55,8 @@ where gcc/rustc won't vectorize — disclosed per section, never a rigged baseli
 
 **GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
 [below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
-(~101%) at ≤1024³**, falling to ~74% at 2048³ and **~34% at the 4096³ cliff** (still being closed);
+(~101%) at ≤1024³**, and the ldmatrix+XOR-swizzle workhorse lifts the large regime to **~87–90% at
+2048³, ~83% at 4096³** (past the prior 77% PTX ceiling);
 **95.7% of the 192 GB/s HBM hardware peak** on the saxpy triad; the fused flash-attention is **3.6–5×
 a cuBLAS unfused attention chain** (205–738× naive CUDA-C); int8 tensor-core GEMM is **~180–237× naive
 CUDA-C** (~44–53% of cuBLAS int8 IMMA); the **fused GEMM+activation beats the cuBLAS GEMM+act chain
@@ -64,6 +65,24 @@ Triton's 30–120 s** (~4×10⁴–1.6×10⁵×).
 
 Every number is gated bit-for-bit (CPU) or to a `c·√K·ε` tolerance (GPU) against the interpreter
 oracle — the wins are correct, not miscompiles.
+
+### Close-the-NVIDIA-gap campaign (vs the vendor libraries)
+
+A six-slice campaign (2026-06-25) measured Mercury against the hand-tuned vendor libraries it had not
+yet been compared to — oneMKL, cuBLAS, cuBLAS IMMA / cuBLASLt, cuDNN, and a genuinely *fused*
+FlashAttention-class peer — and closed or beat them where the measurement is honest. Every standing is
+**same-run** (the 4050's ~7× clock swing makes absolute GFLOP/s meaningless; only the ratio and the
+win/lose *direction* are stable across ≥3 re-runs). Full per-slice findings, including the **measured
+negative results**, live in [`prompts/results/`](prompts/results/).
+
+| Slice | Peer | Standing | Honest residual gap |
+|---|---|---|---|
+| CPU GEMM | oneMKL | 1-core **102–104%** @256/512³, **84–95%** @1024–4096³; `@parallel` **86–129%** of all-threads @≥2048³ | vmath loses to MKL VML (exp ~1.7×, log ~2×) — algorithmic; AVX-512 projected only |
+| fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~87–90%** @2048³, **~83%** @4096³ (past the prior 77% `mma.sync` ceiling) | 4096³ residual is SASS-level; occupancy/pipeline/prefetch levers all measured losses |
+| int8/fp8 GEMM | cuBLAS IMMA / cuBLASLt | int8 **96–105%** @2048³ (**beats IMMA**), 86–88% @1024³; **fused GEMM+dequant 1.1–2.2×** the cuBLAS chain; fp8 82–151% of cuBLASLt | int8 ~70% @4096³ (HBM-bound) |
+| Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 | non-causal long-S (≥2048) 0.40–0.80× cuDNN's throughput scaling |
+| Conv | cuDNN-9 | 1×1 **3.5–5.6×**, 3×3/5×5 deep-channel **0.93–1.21×**, Winograd F(4×4,3×3) **1.2–2.2×** over implicit-GEMM | Winograd loses at low channel count; depthwise/dilated not yet covered |
+| Serving | (no vLLM/TRT-LLM installable — vs Mercury's own eager) | **39.1× continuous-batching goodput** @fill=64; decode CUDA graph 1.07–1.35×; int8 KV **3.88×** footprint | multi-GPU collective (NCCL) unmeasured on one device |
 
 ## Scoreboard
 
