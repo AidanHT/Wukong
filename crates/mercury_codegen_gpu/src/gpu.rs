@@ -2383,6 +2383,71 @@ pub fn conv2d_wmma_padded_explicit(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// **Auto-dispatched** padded/affine conv2d — Mercury's best single-kernel affine-conv path for the
+/// shape. Picks a split-K factor via [`crate::ptx_conv::conv_splitk_factor_affine`] (device SM count)
+/// and runs the base bounds-checked [`conv2d_wmma_padded`] or, when the downsampled grid starves the SMs
+/// (deep-channel small-spatial, e.g. C128 28²→14²), the split-K path
+/// ([`crate::ptx_conv::conv_wmma_pad_splitk_ptx`] + the deterministic
+/// [`crate::ptx_conv::conv_splitk_reduce_ptx`]). Split-K composes with padding directly — the per-tap
+/// bounds check is independent of the K-slice. Same contract/precision as [`conv2d_wmma_padded`].
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_padded_auto(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    use half::f16;
+    assert!(stride >= 1, "stride must be >= 1");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h + 2 * pad >= r && width + 2 * pad >= s, "kernel larger than padded input");
+    let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, stride, pad, g.sm_count() as usize);
+    if sk == 1 {
+        return conv2d_wmma_padded(g, x, w, c, h, width, k, r, s, stride, pad);
+    }
+    let (p, q) = ((h + 2 * pad - r) / stride + 1, (width + 2 * pad - s) / stride + 1);
+    let (m, n) = (k, p * q);
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n)?;
+    let ptx = crate::ptx_conv::conv_wmma_pad_splitk_ptx(c, h, width, k, r, s, stride, pad, sk);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma_splitk")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), sk as u32),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut partial_d);
+    unsafe { bld.launch(cfg)? };
+    // Deterministic fixed-order reduction of the sk planes -> O[M,N].
+    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+    let rmod = g.load_module_cached(&rptx)?;
+    let rf = rmod.load_function("conv_splitk_reduce")?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(m * n)?;
+    let rcfg = LaunchConfig {
+        grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut rbld = g.stream.launch_builder(&rf);
+    rbld.arg(&partial_d).arg(&mut o_d);
+    unsafe { rbld.launch(rcfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -7516,6 +7581,79 @@ mod tests {
         });
     }
 
+    #[test]
+    fn conv2d_wmma_padded_auto_matches_reference_within_tol() {
+        // The auto-dispatched padded path (split-K when the downsampled grid starves the SMs) must match
+        // the f64 oracle. Cases chosen so several trigger sk>1 (deep-channel small-spatial downsamples);
+        // the printed sk confirms the split-K reduce path is actually exercised.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_padded(
+            x: &[f32], w: &[f32], c: usize, h: usize, wd: usize, k: usize, r: usize, s: usize,
+            st: usize, pad: usize,
+        ) -> Vec<f32> {
+            let p = (h + 2 * pad - r) / st + 1;
+            let q = (wd + 2 * pad - s) / st + 1;
+            let mut o = vec![0f32; k * p * q];
+            for kk in 0..k {
+                for op in 0..p {
+                    for oq in 0..q {
+                        let mut acc = 0f64;
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                for ss in 0..s {
+                                    let ih = (op * st + rr) as i64 - pad as i64;
+                                    let iw = (oq * st + ss) as i64 - pad as i64;
+                                    if ih < 0 || ih >= h as i64 || iw < 0 || iw >= wd as i64 {
+                                        continue;
+                                    }
+                                    acc += x[cc * h * wd + ih as usize * wd + iw as usize] as f64
+                                        * w[((kk * c + cc) * r + rr) * s + ss] as f64;
+                                }
+                            }
+                        }
+                        o[(kk * p + op) * q + oq] = acc as f32;
+                    }
+                }
+            }
+            o
+        }
+        with_gpu("conv2d_wmma_padded_auto", |g| {
+            let mut rng = crate::diff::Rng::new(0x5C0FFE);
+            let sm = g.sm_count() as usize;
+            // (C,H,W,K,R,S,stride,pad): deep-channel small-spatial downsamples (sk>1) + one sk==1 control.
+            let cases = [
+                (128usize, 28usize, 28usize, 128usize, 3usize, 3usize, 2usize, 1usize),
+                (256, 14, 14, 256, 3, 3, 1, 1),
+                (64, 56, 56, 64, 3, 3, 2, 1),
+                (128, 28, 28, 128, 3, 3, 1, 1),
+                (64, 56, 56, 64, 3, 3, 1, 1), // base grid ~49 CTAs -> sk==1 control
+            ];
+            for (c, h, width, k, r, s, st, pad) in cases {
+                let (p, q) = ((h + 2 * pad - r) / st + 1, (width + 2 * pad - s) / st + 1);
+                if k < 16 || c * r * s < 16 || p * q < 16 {
+                    continue;
+                }
+                let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, width, k, r, s, st, pad, sm);
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_padded_auto(g, &x, &w, c, h, width, k, r, s, st, pad).unwrap();
+                let oracle = ref_padded(&x, &w, c, h, width, k, r, s, st, pad);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let stx = crate::diff::assert_close(
+                    &format!("conv_padded_auto C{c} {h}x{width} K{k} {r}x{s} s{st} p{pad} sk{sk}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv_padded_auto C{c} {h}x{width} K{k} {r}x{s} stride{st} pad{pad} sk{sk}: P{p}xQ{q} max_abs={:.2e} max_rel={:.2e}",
+                    stx.max_abs, stx.max_rel
+                );
+            }
+        });
+    }
+
     /// **Fused conv+bias+ReLU vs the unfused chain** — the fused epilogue ([`conv2d_wmma_epi`]) in one
     /// kernel vs a plain conv + a separate `bias_relu` pointwise pass (the extra HBM round-trip + launch
     /// that fusion elides). Also times the plain conv alone, to show the epilogue itself is ~free. All
@@ -8262,27 +8400,58 @@ mod tests {
                 let oracle = ref_affine(&x, &w, c, h, wd, k, r, s, st, pad);
                 let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
 
-                // Mercury fp16 padded implicit-GEMM, resident (x/w uploaded once → pure-compute timing).
-                let ptx = crate::ptx_conv::conv_wmma_pad_ptx(c, h, wd, k, r, s, st, pad);
-                let module = g.load_module_cached(&ptx).unwrap();
-                let f = module.load_function("conv2d_wmma").unwrap();
+                // Mercury fp16 AUTO padded implicit-GEMM (conv2d_wmma_padded_auto), resident (x/w uploaded
+                // once → pure-compute timing): single bounds-checked kernel, or split-K + deterministic
+                // reduce when the downsampled grid starves the SMs (deep-channel small-spatial).
+                let sk = crate::ptx_conv::conv_splitk_factor_affine(c, h, wd, k, r, s, st, pad, g.sm_count() as usize);
                 let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
                 let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
                 let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let mut part_d = g.stream.alloc_zeros::<f32>(sk * m * n).unwrap();
+                let (cptx, centry) = if sk == 1 {
+                    (crate::ptx_conv::conv_wmma_pad_ptx(c, h, wd, k, r, s, st, pad), "conv2d_wmma")
+                } else {
+                    (crate::ptx_conv::conv_wmma_pad_splitk_ptx(c, h, wd, k, r, s, st, pad, sk), "conv2d_wmma_splitk")
+                };
+                let cmod = g.load_module_cached(&cptx).unwrap();
+                let f = cmod.load_function(centry).unwrap();
                 let cfg = LaunchConfig {
-                    grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), 1),
+                    grid_dim: ((n as u32).div_ceil(WMMA_BN as u32), (m as u32).div_ceil(WMMA_BM as u32), sk as u32),
                     block_dim: (WMMA_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let launch = |g: &Gpu, o: &mut CudaSlice<f32>| {
-                    let mut b = g.stream.launch_builder(&f);
-                    b.arg(&x_d).arg(&w_d).arg(&mut *o);
-                    unsafe { b.launch(cfg).unwrap() };
+                let red = if sk > 1 {
+                    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+                    let rmod = g.load_module_cached(&rptx).unwrap();
+                    let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                    Some((rmod, rf))
+                } else {
+                    None
                 };
-                launch(g, &mut o_d);
+                let rcfg = LaunchConfig {
+                    grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch = |g: &Gpu, part: &mut CudaSlice<f32>, o: &mut CudaSlice<f32>| {
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&f);
+                        b.arg(&x_d).arg(&w_d).arg(&mut *part);
+                        unsafe { b.launch(cfg).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&*part).arg(&mut *o);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                };
+                launch(g, &mut part_d, &mut o_d);
                 g.stream.synchronize().unwrap();
                 let merc = g.stream.memcpy_dtov(&o_d).unwrap();
-                crate::diff::assert_close(&format!("mercury affine C{c} {r}x{s} s{st}p{pad}"), &merc, &oracle, 5e-2, rel);
+                crate::diff::assert_close(&format!("mercury affine C{c} {r}x{s} s{st}p{pad} sk{sk}"), &merc, &oracle, 5e-2, rel);
                 let cs_m = csum(&merc);
 
                 // Mercury EXPLICIT-PAD path (same-run A/B): scatter X into a zeroed (H+2p)×(W+2p) buffer,
@@ -8343,12 +8512,12 @@ mod tests {
                     ("n/a", 0.0)
                 };
 
-                // Speed, same-run: bounds-checked (bc) and explicit-pad (ex) both best_of(ROUNDS).
+                // Speed, same-run: auto (single-or-splitK) and explicit-pad (ex) both best_of(ROUNDS).
                 let iters = 50usize;
                 let t_w = best_of(ROUNDS, || {
                     let t0 = Instant::now();
                     for _ in 0..iters {
-                        launch(g, &mut o_d);
+                        launch(g, &mut part_d, &mut o_d);
                     }
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
@@ -8366,7 +8535,7 @@ mod tests {
                 let g_best = g_w.max(g_e);
                 if have_cudnn {
                     eprintln!(
-                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} s{st}p{pad}: Mercury best {:>3.0}% cuDNN [bc {:>5.0} GF / ex {:>5.0} GF] | cuDNN {:>5.0} GF [{}]  (out {p}x{q})",
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} s{st}p{pad}: Mercury best {:>3.0}% cuDNN [auto(sk{sk}) {:>5.0} GF / ex {:>5.0} GF] | cuDNN {:>5.0} GF [{}]  (out {p}x{q})",
                         100.0 * g_best / g_c,
                         g_w / 1e9,
                         g_e / 1e9,
@@ -8375,7 +8544,7 @@ mod tests {
                     );
                 } else {
                     eprintln!(
-                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} s{st}p{pad}: Mercury bc {:>5.0} GF / ex {:>5.0} GF  (out {p}x{q})",
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s} s{st}p{pad}: Mercury auto(sk{sk}) {:>5.0} GF / ex {:>5.0} GF  (out {p}x{q})",
                         g_w / 1e9,
                         g_e / 1e9,
                     );

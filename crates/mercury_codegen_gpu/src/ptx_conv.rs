@@ -495,6 +495,27 @@ pub fn conv_wmma_pad_ptx(
     conv_wmma_ptx_impl(c, h, w, k, r, s, 1, crate::ptx_wmma::Act::None, false, stride, pad)
 }
 
+/// **Split-K** affine conv (entry `conv2d_wmma_splitk`): the strided+padded [`conv_wmma_pad_ptx`] with
+/// its `GK=C·R·S` reduction sliced across `gridDim.z = sk` (disjoint `M×N` partial planes, summed by
+/// [`conv_splitk_reduce_ptx`] in fixed ascending-`z` order — deterministic). The occupancy lever for the
+/// **deep-channel, small-spatial downsamples** (e.g. C128 28²→14², whose base grid is only ≈8 CTAs).
+/// Split-K and padding compose freely — the per-tap bounds check is independent of the K-slice. Requires
+/// `sk | GK` and `GK/sk` a multiple of 16.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_wmma_pad_splitk_ptx(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    stride: usize,
+    pad: usize,
+    sk: usize,
+) -> String {
+    conv_wmma_ptx_impl(c, h, w, k, r, s, sk, crate::ptx_wmma::Act::None, false, stride, pad)
+}
+
 /// **Explicit zero-pad scatter** (entry `pad_nchw_copy`): copy `X[C,H,W]` (fp16) into the interior of a
 /// pre-zeroed `Xpad[C, H+2·pad, W+2·pad]` (fp16), i.e. `Xpad[c, i+pad, j+pad] = X[c, i, j]`. Lets a padded
 /// conv run as the **dense valid kernel** ([`conv_wmma_strided_ptx`] on the padded dims) — no per-tap
@@ -978,17 +999,36 @@ pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
 /// without a device. Every returned `sk>1` satisfies the [`conv_wmma_splitk_ptx`] contract: `sk | GK`
 /// and `GK/sk` a multiple of 16.
 pub fn conv_splitk_factor(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sm_count: usize) -> usize {
-    let gk = c * r * s;
+    let n = (h - r + 1) * (w - s + 1); // valid-conv output P*Q
+    splitk_factor_for_n(c * r * s, n, k, sm_count)
+}
+
+/// Split-K factor for the **affine** conv (strided + zero-padded): same occupancy heuristic as
+/// [`conv_splitk_factor`] but over the downsampled/padded output `P=⌊(H+2·pad-R)/stride⌋+1`,
+/// `Q=⌊(W+2·pad-S)/stride⌋+1` — the grid the affine kernel actually launches. The deep-channel,
+/// small-spatial downsamples (e.g. C128 28²→14²) are exactly where the base grid starves the SMs and
+/// split-K helps; `stride=1, pad=0` reduces to [`conv_splitk_factor`].
+#[allow(clippy::too_many_arguments)]
+pub fn conv_splitk_factor_affine(
+    c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, stride: usize, pad: usize, sm_count: usize,
+) -> usize {
+    let p = (h + 2 * pad - r) / stride + 1;
+    let q = (w + 2 * pad - s) / stride + 1;
+    splitk_factor_for_n(c * r * s, p * q, k, sm_count)
+}
+
+/// Core split-K occupancy heuristic shared by the valid and affine variants: given the GEMM reduction
+/// length `gk = C·R·S` and output `n = P·Q`, pick the largest clean split that lands the CTA count in a
+/// useful occupancy window. Only splits when the base grid is starved AND a clean split reaches it:
+/// `lo` is the "worth bothering" floor, `hi` ~one full wave (conv tile ~20 KB SMEM ⇒ ~5 CTAs/SM). A
+/// shape whose largest valid split can't even reach `lo` (e.g. a 5×5 with a tiny base) keeps sk=1 —
+/// over-splitting a near-full grid only adds the reduce pass and loses (measured).
+fn splitk_factor_for_n(gk: usize, n: usize, k: usize, sm_count: usize) -> usize {
     if gk % 16 != 0 {
         return 1; // can't carve whole 16-wide K-tiles (e.g. C3 R3 S3 -> GK=27)
     }
-    let n = (h - r + 1) * (w - s + 1);
     let base = k.div_ceil(WMMA_BM) * n.div_ceil(WMMA_BN);
     let units16 = gk / 16; // whole 16-wide K-tiles available to slice across z
-    // Only split when the base grid is starved AND a clean split actually reaches a useful occupancy:
-    // `lo` is the "worth bothering" floor, `hi` ~one full wave (conv tile ~20 KB SMEM ⇒ ~5 CTAs/SM). A
-    // shape whose largest valid split can't even reach `lo` (e.g. a 5×5 with a tiny base) keeps sk=1 —
-    // over-splitting a near-full grid only adds the reduce pass and loses (measured).
     let lo = (sm_count * 2).max(40);
     let hi = (sm_count * 5).max(96);
     if base >= lo {
