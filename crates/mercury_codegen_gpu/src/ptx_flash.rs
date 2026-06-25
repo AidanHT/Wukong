@@ -863,7 +863,7 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
 ///
 /// **Causal** (`flash_d{d}_mpc`): same diagonal mask + upper-block skip as [`entry_mma_reg`]; the prefetch
 /// is guarded so the diagonal block (the last one processed) does not stage an out-of-range successor.
-fn entry_mma_reg_pipe(d: usize, causal: bool) -> String {
+fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
     assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
     let nto = d / 8; // P.V output n-tiles (over hdim)
@@ -871,10 +871,11 @@ fn entry_mma_reg_pipe(d: usize, causal: bool) -> String {
     let bufsz = 2 * ksz; // K+V slab per pipeline buffer
     let cpl = d / 16; // 16-byte cp.async chunks per lane per tensor (16*d*2/16/32 = d/16)
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
-    let name = if causal {
-        format!("flash_d{d}_mpc")
-    } else {
-        format!("flash_d{d}_mp")
+    let name = match (causal, pv_ldmatrix) {
+        (false, false) => format!("flash_d{d}_mp"),
+        (true, false) => format!("flash_d{d}_mpc"),
+        (false, true) => format!("flash_d{d}_mp_lm"),
+        (true, true) => format!("flash_d{d}_mpc_lm"),
     };
 
     let mut s = String::new();
@@ -1045,16 +1046,33 @@ fn entry_mma_reg_pipe(d: usize, causal: bool) -> String {
     s += "    fma.rn.f32 %l0,%l0,%corr0,%psum0;\n    fma.rn.f32 %l1,%l1,%corr1,%psum1;\n";
     s += "    mov.f32 %m0,%mnew0;\n    mov.f32 %m1,%mnew1;\n";
 
-    // 4. O += P.V : V read from SMEM at bufc+ksz (col-of-key strided u16 pairs, now SMEM-resident).
-    for nt in 0..nto {
-        s += &format!("    add.u32 %idx,%grp,{};\n", nt * 8);
-        // base = &smemV[key=tg2][hdim=idx] = smem + bufc + ksz + (tg2*d + idx)*2
-        s += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
-        // b0: keys tg2, tg2+1 (the next key is +d elements = +2d bytes in the staged [key][hdim] slab)
-        s += &format!("    ld.shared.u16 %h0,[%sbase];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n", 2 * d);
-        // b1: keys tg2+8, tg2+9
-        s += &format!("    ld.shared.u16 %h0,[%sbase+{}];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b1,%h0,%h1;\n", 16 * d, 18 * d);
-        s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+    // 4. O += P.V : V read from SMEM at bufc+ksz.
+    if pv_ldmatrix {
+        // `ldmatrix.x2.trans` gathers the PV B=V fragment in ONE warp-collective instruction. V is staged
+        // row-major [key][hdim]; the mma wants it col-major [hdim][key], so `.trans` does the 8×8 transpose
+        // in hardware. This replaces the hand-packed gather below — nto×(4 `ld.shared.u16` + 2 shl + 2 or)
+        // whose key-strided addresses 8-way bank-conflict (lanes of one grp read keys tg2=0,2,4,6 at a fixed
+        // hdim ⇒ same bank) — the documented "strided SMEM V-load" ceiling. Each of lanes 0..15 supplies the
+        // address of one key row (key = lane&15, 8 contiguous hdim at nt*8); lanes 16..31 alias 0..15 (the
+        // x2 form ignores their address but they still participate). Output {%b0,%b1} is exactly the mma B
+        // fragment, so the PV mma is unchanged. Bit-identical to the hand path up to nothing (same values).
+        for nt in 0..nto {
+            s += &format!("    and.b32 %idx,%lane,15;\n    mul.lo.u32 %tmp,%idx,{d};\n    add.u32 %tmp,%tmp,{};\n    shl.b32 %tmp,%tmp,1;\n", nt * 8);
+            s += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
+            s += "    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%b0,%b1},[%sbase];\n";
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+        }
+    } else {
+        for nt in 0..nto {
+            s += &format!("    add.u32 %idx,%grp,{};\n", nt * 8);
+            // base = &smemV[key=tg2][hdim=idx] = smem + bufc + ksz + (tg2*d + idx)*2
+            s += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
+            // b0: keys tg2, tg2+1 (the next key is +d elements = +2d bytes in the staged [key][hdim] slab)
+            s += &format!("    ld.shared.u16 %h0,[%sbase];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n", 2 * d);
+            // b1: keys tg2+8, tg2+9
+            s += &format!("    ld.shared.u16 %h0,[%sbase+{}];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b1,%h0,%h1;\n", 16 * d, 18 * d);
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+        }
     }
 
     // advance: swap buffers, kb = next.
@@ -1706,13 +1724,21 @@ pub fn flash_ptx() -> &'static str {
         m += &entry_wmma_wide(64, WMMA_FLASH_NKB);
         m += &entry_mma_reg(64, false);
         m += &entry_mma_reg(64, true);
-        m += &entry_mma_reg_pipe(64, false);
-        m += &entry_mma_reg_pipe(64, true);
+        m += &entry_mma_reg_pipe(64, false, false);
+        m += &entry_mma_reg_pipe(64, true, false);
+        // `ldmatrix.x2.trans` PV V-load variants (`_lm`): one warp-collective conflict-free transpose-gather
+        // replaces the strided, 8-way-bank-conflicting hand-packed V load — the documented feed ceiling
+        // (the `mp4` wash proved this kernel is tensor-core-feed-bound, not occupancy-bound). Same math,
+        // gated bit-tolerance-equal vs the hand path; A/B'd same-run by `flash_lm_vs_mp`.
+        m += &entry_mma_reg_pipe(64, false, true);
+        m += &entry_mma_reg_pipe(64, true, true);
         // D=128 (Llama/GPT modern head dim): the register-resident mma flash generalizes over d
         // (ktq=d/16=8 QKᵀ tiles, nto=d/8=16 PV n-tiles, cpl=d/16=8 cp.async chunks, 16 KB SMEM,
         // ~120 regs/thread — all within Ada limits). Non-causal + causal, gated vs ref_attn at D=128.
-        m += &entry_mma_reg_pipe(128, false);
-        m += &entry_mma_reg_pipe(128, true);
+        m += &entry_mma_reg_pipe(128, false, false);
+        m += &entry_mma_reg_pipe(128, true, false);
+        m += &entry_mma_reg_pipe(128, false, true);
+        m += &entry_mma_reg_pipe(128, true, true);
         m += &entry_mma_reg_pipe_mw(64, 4);
         m += &entry_mma_reg_pipe_mw(64, 8);
         m += &entry_mma_reg_pipe_wide(64, 2);
