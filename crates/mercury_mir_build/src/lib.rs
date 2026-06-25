@@ -7497,6 +7497,19 @@ impl FnLowerer<'_> {
                         });
                         // A store may invalidate any cached load (conservatively, all of them).
                         self.vec_loads.clear();
+                        // Intermediate-forwarding (the fused-elementwise-chain win): the value just
+                        // stored *is* the current content of `target[index]`. For a unit-stride store,
+                        // re-seed the load cache with it so a later read of the same element in this
+                        // fused body uses the register value instead of reloading from memory. A fused
+                        // `t[i] = f(x[i]); out[i] = g(t[i])` then costs read-x + write-t + write-out and
+                        // drops the read-t reload (4 streams -> 3; longer chains drop one reload each).
+                        // Only the just-written key survives the clear above, so any *aliasing* store
+                        // still invalidates it (the next store clears the cache again before re-seeding).
+                        if affine_stride(&indices[0], j) == Some(1) {
+                            if let Some(k) = load_key(base, &indices[0], self.interner) {
+                                self.vec_loads.insert(k, stored);
+                            }
+                        }
                     }
                     _ => unreachable!("vec_lower_stmt on unvalidated target"),
                 }
