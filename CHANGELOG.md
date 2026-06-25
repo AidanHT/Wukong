@@ -118,11 +118,30 @@ All notable changes to Mercury are documented here. The format is loosely based 
 - **Performance**: the interpreter pools per-call register files and passes block-parameter arguments
   through a reused buffer, roughly halving its wall-clock; large `[v; n]` array initializers lower to
   a fill loop instead of unrolled stores.
+- **Embedding-lookup dispatch**: the LLM token-id row gather `out[t,:] = weight[ids[t],:]` (over an
+  `i32` index array — the first recognized dispatch with an integer *index input*) is recognized and
+  lowered to `mercury_embedding_f32[_parallel]` (a 256-bit row copy; bit-exact data movement, mapped
+  across the independent output rows under `@parallel`).
+- **2D pooling dispatch**: the idiomatic 5-deep max/avg-pool nest lowers to
+  `mercury_{max,avg}pool2d_f32[_parallel]` (the CNN spatial downsampler; `@parallel` across channels;
+  bit-exact — max is idempotent, the avg `(dy,dx)` sum order is fixed). Honest sharp edge: gcc
+  auto-vectorizes regular-stride (e.g. 2×2/s2) pooling, so single-core is a tie there, not a win.
+- **xbench**: a broadcast bias-add (`out[r,c] = x[r,c] + bias[c]`) cross-language row.
 
 ### Changed
 - A construct lowering cannot yet handle (tensors, SIMD methods, generics, parallel loops) is now a
   hard `error[C0001]` instead of a warning, and the driver refuses to optimize, run, or codegen a
   module whose lowering failed — so the compiler never emits or executes invalid MIR.
+- **Global argmax/argmin** (`mercury_argreduce_f32`) gained a 256-bit AVX2 path (4 accumulators × 8
+  `f32` value + `i32` index lanes, strict-compare + `blendv`, collapsed through the scalar tie-break).
+  It was the one memory-bound reduction lacking one, so it had *lost* to gcc's branch-predicted scalar
+  loop by 1.30× — now **~5–9× faster**, bit-identical to the scalar lowest-index result.
+- **Column argmax/argmin** (`mercury_colarg{max,min}_i32`) rewritten to a single row-major pass with
+  the column range's running best kept L1-resident, instead of re-reading the matrix `cols/8` times
+  per 8-column band — a former 0.9–1.6× tie/loss became **2.7–5.3× faster** (bit-exactness unchanged).
+- **Fused elementwise chains**: the vectorizer now forwards a just-stored intermediate's register value
+  to its consumer in the same fused body, dropping the per-element store+reload round-trip (one fewer
+  memory stream per chained op; the intermediate need not touch memory between producer and consumer).
 
 ### Notes
 - Tensors, SIMD vectors, and the parallel/GPU surface parse and type/shape-check today; full
