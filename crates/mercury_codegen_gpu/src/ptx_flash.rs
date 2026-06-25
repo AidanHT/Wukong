@@ -1708,6 +1708,11 @@ pub fn flash_ptx() -> &'static str {
         m += &entry_mma_reg(64, true);
         m += &entry_mma_reg_pipe(64, false);
         m += &entry_mma_reg_pipe(64, true);
+        // D=128 (Llama/GPT modern head dim): the register-resident mma flash generalizes over d
+        // (ktq=d/16=8 QKᵀ tiles, nto=d/8=16 PV n-tiles, cpl=d/16=8 cp.async chunks, 16 KB SMEM,
+        // ~120 regs/thread — all within Ada limits). Non-causal + causal, gated vs ref_attn at D=128.
+        m += &entry_mma_reg_pipe(128, false);
+        m += &entry_mma_reg_pipe(128, true);
         m += &entry_mma_reg_pipe_mw(64, 4);
         m += &entry_mma_reg_pipe_mw(64, 8);
         m += &entry_mma_reg_pipe_wide(64, 2);
