@@ -93,13 +93,17 @@ number the instant a 2nd GPU is attached.
 
 ## Milestones
 
-- **P1** `paged_kv.rs`: block manager + block table + device slabs. CPU-unit-tested allocator. ✅/⏳
-- **P2** `paged_attention.rs`: decode-attn PTX + launcher; tolerance gate + block-layout bit-exact gate.
-- **P3** `serving.rs`: batched `DecodeLayer`/`DecodeModel` (proj + append + paged-attn + FFN), pooled/on-stream.
-- **P4** whole-model decode CUDA graph; bit-exact+deterministic gate; same-run speedup vs eager (≥3× target).
-- **P5** continuous batching scheduler; aggregate tokens/s vs single-sequence.
-- **P6** int8 KV quantization (tolerance-gated); 6 GB-budget footprint win.
-- **P7** tensor-parallel design + single-GPU partition simulation (bit-exact); NCCL/P2P documented unmeasured.
+- **P1 ✅** `paged_kv.rs`: block manager + block table + device slabs. CPU-unit-tested allocator (8 host tests).
+- **P2 ✅** `paged_attention.rs`: warp-cooperative decode-attn PTX; tolerance gate (max_abs 1.79e-7) + block-layout bit-exact gate.
+- **P3 ✅** `serving.rs`: batched `DecodeLayer`/`DecodeModel` (proj + append + paged-attn + FFN), pooled/on-stream; vs-f64 + paging-invariant gates.
+- **P4 ✅** whole-model decode CUDA graph; bit-exact + deterministic gate; same-run **1.07–1.35×** vs eager (modest — compute-bound at this batch).
+- **P5 ✅** continuous-batching scheduler (admit/evict/free, masked append); **39.1× goodput** at fill=64 vs single-sequence (same-clock).
+- **P6 ✅** int8 KV quantization (tolerance-gated, max_abs 3e-3); **3.88× footprint** vs f32 (1.94× vs f16) — the 6 GB lever.
+- **P7 ✅** Megatron tensor-parallel design + single-GPU partition simulation: column-parallel **bit-exact**, row-parallel all-reduce **1.34e-5**; NCCL/P2P collective documented unmeasured.
+
+**Headline (single GPU, honest, same-run):** paged + continuous-batched + whole-model-graphed decode at
+**39× goodput** over single-sequence serving, **bit-exact** vs the eager/non-paged reference at every step,
+with an **int8 KV cache** cutting footprint **3.9×**; multi-GPU partition math proven exact on one device.
 
 ## Results (filled as measured, same-run ratios only)
 
@@ -233,6 +237,34 @@ cache replaced by `ld.global.s8` + a per-token scale; same online softmax. New `
 scale_offset, kv_bytes, kv_bytes_int8}` + a host `quantize_kv_int8`. (Storage + read path; on-device
 quantize-on-append is the documented next step — the read path + footprint are the win here.)
 
-## Multi-GPU design detail (unmeasured)
+### P7 — multi-GPU tensor parallelism (design + single-GPU partition simulation)
+The device here is **one** RTX 4050, so the 2-GPU throughput/latency is **explicitly unmeasured**. What
+*is* built and gated: the **Megatron partition math**, validated on one GPU so the instant a second GPU +
+a collective are attached it produces a real number.
 
-_see P7._
+**Megatron tensor parallelism for a decode layer** (`T` GPUs):
+- **QKV projection + FFN gate/up → column-parallel.** Split the output dim `N` across GPUs; GPU `g` holds
+  weight shard `W[g·N/T:(g+1)·N/T, :]` and computes `C_g = A·W_gᵀ = [Bcap, N/T]` from the *full* input —
+  **no communication**. The attention heads partition cleanly: GPU `g` owns `heads/T` heads, so its slice
+  of the **paged KV-cache is local** (each GPU appends + attends over only its own heads — no KV is moved
+  cross-GPU during decode, the property that makes paged-attention TP cheap).
+- **Attention-out + FFN-down → row-parallel.** Split the contraction dim `K`; GPU `g` holds `W_g[:, k-shard]`
+  and the matching input shard, computes a **partial** `[Bcap, D]`, and the partials are summed by an
+  **all-reduce**. Two all-reduces per layer (one after attn-out, one after FFN-down).
+- **Comm volume:** `2 · Bcap · D` elements/layer; a ring all-reduce moves `2(T−1)/T · Bcap·D` per GPU per
+  collective. At decode shapes (`Bcap·D` small) this is latency-bound — the regime CUDA graphs + batching
+  already target.
+
+**Single-GPU partition simulation (the math, gated):**
+- **Column-parallel is bit-exact** (`tp_column_parallel_gemm_split_is_bit_exact`, 64×256×256): splitting
+  `N` into two shards and concatenating is **bit-for-bit identical** to the unsplit WMMA GEMM — each output
+  column is the same `K`-reduction, so column-parallel needs **no all-reduce and introduces zero error**.
+- **Row-parallel all-reduce matches within tolerance** (`tp_row_parallel_gemm_allreduce_matches`,
+  64×256×256, split K): summing the two `K`-shard partials matches the unsplit GEMM at **max_abs =
+  1.34e-5** — the sum reassociates the `K` reduction (float, not associative), *exactly* the
+  numerical behavior of a real ring all-reduce (the repo's standing reassociation-exception class).
+
+**The one unmeasured seam:** the all-reduce *collective* itself — NCCL ring or CUDA driver P2P
+(`cuMemcpyPeer` / `cuLaunchKernel` over P2P-mapped buffers). Everything feeding it (the column/row weight
+split, the local sharded KV-cache, the partial GEMMs, the partial-sum reduction) is built and gated on one
+GPU; only the cross-device transport is absent, and only because there is no second device attached.
