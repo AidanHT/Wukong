@@ -79,13 +79,17 @@ unsafe fn colarg_scalar(
     }
 }
 
-/// AVX2 per-column argmax/argmin: stream `x` **row-major**, folding **8 columns per step** into a
-/// per-lane running best-value vector + best-index vector. Bit-identical to [`colarg_scalar`]: lane
-/// `l` tracks column `j0 + 8*step + l` independently; a lane updates only where the new value
-/// **strictly** beats its running best (`_mm256_cmp_ps(v, best, GT/LT)` → `_mm256_blendv_ps`), so a
-/// tie keeps the lane's earlier (lower) row index. The best-value vector is seeded from **row 0** and
-/// the best-index vector from 0; rows `1..rows` are scanned. The final `cols % 8` columns are a scalar
-/// tail (the same strict-compare scan), handled by [`colarg_scalar`] over `[j_tail, j1)`.
+/// AVX2 per-column argmax/argmin over the column range `[j0, j1)`, streaming `x` **row-major in a
+/// SINGLE pass** with the full column range's running best held in L1 scratch (8 columns/AVX2 step).
+/// Bit-identical to [`colarg_scalar`]: each column updates only where the new value **strictly** beats
+/// its running best (`_mm256_cmp_ps(v, best, GT/LT)` → `_mm256_blendv_ps`), so a tie keeps the earlier
+/// (lower) row index; rows are scanned ascending (seed row 0, then `1..rows`), the identical order.
+///
+/// The previous form scanned all rows **per 8-column band**, re-reading the whole matrix `cols/8`
+/// times (L3-rebound, latency-bound ~ tied gcc). This form keeps `best_val`/`best_idx` for the whole
+/// range L1-resident and reads each `x` element **once** from DRAM — the same single-pass, cache-
+/// resident-accumulator structure as [`crate::mercury_colsum_f32`]. The `width % 8` trailing columns
+/// fold in a per-row scalar tail (same strict compare), so the range is covered in one pass.
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `cols` `i32`; `j0 <= j1 <= cols`; `rows >= 1`;
@@ -102,41 +106,64 @@ unsafe fn colarg_avx2(
     is_max: bool,
 ) {
     use std::arch::x86_64::*;
-
-    // Walk the 8-column blocks [j, j+8) within [j0, j1); the trailing < 8 columns are the scalar tail.
-    let mut j = j0;
-    while j + 8 <= j1 {
-        // Seed the 8 lanes from row 0: best value = x[0, j..j+8], best row index = 0 (all lanes).
-        let mut best_val = _mm256_loadu_ps(x.add(j)); // x[0*cols + j .. +8]
-        let mut best_idx = _mm256_setzero_ps(); // row index 0 in every lane
-        let mut i = 1usize;
-        while i < rows {
-            // The current row index, broadcast to all 8 lanes (small integer, exact in f32).
-            let row_i = _mm256_set1_ps(i as f32);
-            let v = _mm256_loadu_ps(x.add(i * cols + j)); // 8 columns of row i
-            // STRICT compare so a tie does NOT update (each lane keeps its earlier, lower row index):
-            // argmax updates lanes where v > best_val; argmin where v < best_val.
-            let mask = if is_max {
-                _mm256_cmp_ps(v, best_val, _CMP_GT_OQ)
-            } else {
-                _mm256_cmp_ps(v, best_val, _CMP_LT_OQ)
-            };
-            // blendv(a, b, mask) = mask ? b : a — take the new value/row only in strictly-winning lanes,
-            // keep the running best (and its lower row index) elsewhere.
-            best_val = _mm256_blendv_ps(best_val, v, mask);
-            best_idx = _mm256_blendv_ps(best_idx, row_i, mask);
-            i += 1;
-        }
-        // Store the 8 best row indices as i32. The indices are non-negative integers < rows held exactly
-        // in f32, so truncation (`cvtt`, round-toward-zero) recovers them exactly — same value the
-        // scalar twin writes.
-        let idx_i = _mm256_cvttps_epi32(best_idx);
-        _mm256_storeu_si256(out.add(j) as *mut __m256i, idx_i);
-        j += 8;
+    let width = j1 - j0;
+    // L1-resident running best for every column in the range (row index tracked as f32 — exact for the
+    // `< rows` integers, matching the scalar twin's `cvtt`). Seeded from row 0.
+    let mut best_val = vec![0f32; width];
+    let mut best_idx = vec![0f32; width];
+    let bvp = best_val.as_mut_ptr();
+    let bip = best_idx.as_mut_ptr();
+    for jj in 0..width {
+        *bvp.add(jj) = *x.add(j0 + jj); // x[0, j0+jj]
+        // best_idx already 0.0 (row 0)
     }
-    // Scalar tail for the final `cols % 8` columns in this range — identical strict-compare scan.
-    if j < j1 {
-        colarg_scalar(x, out, rows, cols, j, j1, is_max);
+    // Stream rows 1..rows ONCE, updating the resident accumulators 8 columns at a time.
+    let n8 = width & !7; // floor to multiple of 8
+    let mut i = 1usize;
+    while i < rows {
+        let row_i = _mm256_set1_ps(i as f32);
+        let xrow = x.add(i * cols + j0);
+        let mut jj = 0usize;
+        while jj < n8 {
+            let bv = _mm256_loadu_ps(bvp.add(jj));
+            let bi = _mm256_loadu_ps(bip.add(jj));
+            let v = _mm256_loadu_ps(xrow.add(jj)); // 8 columns of row i
+            // STRICT compare: argmax updates where v > best; argmin where v < best (tie keeps lower row).
+            let mask = if is_max {
+                _mm256_cmp_ps(v, bv, _CMP_GT_OQ)
+            } else {
+                _mm256_cmp_ps(v, bv, _CMP_LT_OQ)
+            };
+            _mm256_storeu_ps(bvp.add(jj), _mm256_blendv_ps(bv, v, mask));
+            _mm256_storeu_ps(bip.add(jj), _mm256_blendv_ps(bi, row_i, mask));
+            jj += 8;
+        }
+        // Per-row scalar tail for the `width % 8` trailing columns (same strict-compare update).
+        while jj < width {
+            let v = *xrow.add(jj);
+            let better = if is_max {
+                v > *bvp.add(jj)
+            } else {
+                v < *bvp.add(jj)
+            };
+            if better {
+                *bvp.add(jj) = v;
+                *bip.add(jj) = i as f32;
+            }
+            jj += 1;
+        }
+        i += 1;
+    }
+    // Write the winning row indices as i32 (round-toward-zero recovers the exact integers).
+    let mut jj = 0usize;
+    while jj < n8 {
+        let idx_i = _mm256_cvttps_epi32(_mm256_loadu_ps(bip.add(jj)));
+        _mm256_storeu_si256(out.add(j0 + jj) as *mut __m256i, idx_i);
+        jj += 8;
+    }
+    while jj < width {
+        *out.add(j0 + jj) = *bip.add(jj) as i32;
+        jj += 1;
     }
 }
 
