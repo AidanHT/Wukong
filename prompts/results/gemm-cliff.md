@@ -143,6 +143,13 @@ register-level, ~free) — and the higher base efficiency is what lifts the *fus
 epilogue (fusion beats cuBLAS+epilogue once raw eff > ~1/(1+epilogue/GEMM); the C round-trip saved grows
 with N, so the threshold is met at 2048³ for SiLU/SwiGLU/residual cuBLASLt can't fuse).
 
+**Extended to the `_bias_residual` family** (down-proj / attention output-proj `out = x·Wᵀ + bias + residual`
+— the OTHER two GEMMs in every transformer block, which `gemm_nt_{f16,bf16}_mma_bias_residual` dispatch):
+emitted `mma_nt_{f16,bf16}_128_bk32_s2_r16_swz_bias_residual` and re-routed to them. The residual-add (to
+the post-bias accumulators) is register-level like the bias/act, orthogonal to staging ⇒ bit-identical,
+gated by `wmma_mma_bias_residual_match_reference_within_tol`. So **all of the transformer-block GEMM fusions
+(up-proj act-bias + down-proj bias-residual) now run on the fast swz base**, not just the core epilogue.
+
 ### Lever 8 — register-fragment prefetch (④): **LOSES (reverted).** The non-prefetch inner loop reuses one
 `%a`/`%b` set per k16-step, so step ks+1's `ldmatrix` has a WAR hazard against step ks's `mma` (ptxas can't
 rename across it). Implemented a double-buffered probe (`cliff_swz_pf`, `_pf` name → `entry_mma_pipe` loads
