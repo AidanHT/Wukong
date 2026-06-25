@@ -78,7 +78,15 @@ can't fill them, 1 CTA/SM).
 | 1024³ | **64×64 swz** (smdb64_swz) | 89.1% | 86.7% | 85.7% | ~88% (unchanged — already good) |
 | 2048³ | **w64** (±raster8) | 127.5%* | 95.2% | 96.5% | **79.6% → ~96% (near parity)** |
 | 4096³ | **w64** (±raster8) | 80.8% | 84.1% | 85.6% | **62.1% → ~84% (+22 pts)** |
-*127.5% = a cuBLAS contention outlier; true ~95-99%. ALL sizes well above the 75% floor; 2048³ ≈ parity.
+*127.5% = a cuBLAS contention outlier; true ~95-99%. 2048³ ≈ parity.
+- **CORRECTION (fresh ×4 re-measure, L8 sweep + re-run `quant_int8_w64_confirm`):** the run1 4096³=84% above was
+  clock-inflated (cuBLAS baseline contention-depressed that run). Honest, stable 4096³ = **~68–73%** of cuBLAS
+  (plain w64; smdb64 ~46%, **w64_raster8 ~57% — raster HURTS, not helps**, reversing the "±raster8" note). So
+  **the floor is met at 1024³ (~86–88%) and 2048³ (~96–105%, beats IMMA) but NOT at 4096³ (~70%)**. 4096³ is
+  HBM-bound on the 20-SM 4050 and every known lever is a measured loss there: multistage (L8, −8 pts), raster8
+  (−11 pts), bigger CTA tiles 256×128 (lose, 1 CTA/SM). w64 (2-stage, no raster) is the static-SMEM ceiling;
+  closing 4096³ would need dynamic-SMEM + a fundamentally better L2 schedule (cuBLAS's edge there). Dispatch is
+  already correct (plain w64 at 4096³; raster8 stays autotuner-only and is never picked since it loses).
 - **SHIPPED**: `gemm_nt_int8_smdb` dispatch now: 64×64 swz (<2048²) / **w64** (≥2048², 128-div) / hand-placed
   fallbacks. Autotuner gained `w64` + `w64_r8` candidates (bit-exact cross-checked, ranks 8/shape; picks
   smdb64 for small square, swz64_sk8 for thin decode, w64 for large). raster8 is an autotuner-only refinement
