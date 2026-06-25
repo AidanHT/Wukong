@@ -1831,3 +1831,190 @@ pub fn cublaslt_available() -> bool {
     })
     .unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Fused FA2-class peer — PyTorch SDPA's *fused* backends (cuDNN fused attention + cutlass mem-efficient
+// fMHA), driven as a subprocess. THE bar the M5 milestone actually requires: a genuinely *fused*
+// FlashAttention-class kernel, NOT the pre-FlashAttention unfused cuBLAS chain ([`cublas_attn_chain`]).
+//
+// Why a subprocess: a real fused FA-class kernel exists for Ada sm_89 but is reachable here only from
+// Python (NVRTC has no headers, so `nvcuda::wmma`/CUTLASS/FlashAttention won't compile as an in-process
+// peer). The peer script `tools/fa2_sdpa_peer.py` forces each fused SDPA backend in turn over the SAME
+// f16 Q/K/V bytes Mercury's flash runs, CUDA-event-times it (so Python's per-call dispatch overhead is
+// excluded — fair to the peer), writes the chosen backend's O (f32) for the same `ref_attn` f64-oracle
+// cross-check Mercury's flash gets, and a flat `key=value` report this driver parses (no serde). On the
+// Windows PyTorch wheel FLASH_ATTENTION is not built, but **CUDNN_ATTENTION (cuDNN's fused flash) and
+// EFFICIENT_ATTENTION (cutlass mem-efficient fMHA) are** — both genuinely fused; the faster is chosen.
+//
+// Honesty: cross-process means the GPU clock can differ between Mercury's timing and the peer's, so the
+// caller must (a) warm the GPU, (b) run the peer and Mercury back-to-back in one window, (c) repeat >=3x
+// and report best-of. The peer's CUDA-event time excludes its launch overhead while Mercury's wall-clock
+// includes its (negligible, Rust) launch overhead, so any Mercury win is the *conservative* direction.
+// The MATH backend (also reported) is the unfused in-process analogue of [`cublas_attn_chain`] — a
+// cross-anchor that should track Mercury's existing chain ratio.
+// ---------------------------------------------------------------------------------------------------
+
+/// Outcome of one fused-peer run. `chosen`/`chosen_sec`/`chosen_gflops` are the *fastest fused* backend
+/// (cuDNN or cutlass-efficient); `math_sec` is the unfused softmax-materialize anchor; `o` is the chosen
+/// backend's `[b*h*s*d]` f32 output, for the same `ref_attn` f64 cross-check Mercury's flash gets.
+pub struct Fa2PeerReport {
+    pub chosen: String,
+    pub chosen_sec: f64,
+    pub chosen_gflops: f64,
+    pub cudnn_sec: Option<f64>,
+    pub efficient_sec: Option<f64>,
+    pub math_sec: Option<f64>,
+    pub o: Vec<f32>,
+    pub device: String,
+    pub torch: String,
+}
+
+/// Resolve `(python, peer_script)`: env `MERCURY_FA2_PYTHON` / `MERCURY_FA2_PEER` override the defaults
+/// (the workspace `tools/torch-cuda-venv` python + `tools/fa2_sdpa_peer.py`, relative to this crate).
+/// In a git worktree the venv usually lives in the main checkout, so set `MERCURY_FA2_PYTHON` there.
+fn fa2_peer_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default(); // crates/mercury_codegen_gpu -> workspace root
+    let python = std::env::var_os("MERCURY_FA2_PYTHON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join("tools/torch-cuda-venv/Scripts/python.exe"));
+    let peer = std::env::var_os("MERCURY_FA2_PEER")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join("tools/fa2_sdpa_peer.py"));
+    (python, peer)
+}
+
+/// True iff the fused-peer Python with CUDA torch is runnable, cached for the process. Lets the bench
+/// **skip, not fail**, when the optional torch-CUDA venv isn't installed — the same "green without the
+/// hardware" discipline as [`peers_available`]. Probes `import torch; torch.cuda.is_available()`.
+pub fn fa2_peer_available() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        let (python, peer) = fa2_peer_paths();
+        if !peer.exists() {
+            return false;
+        }
+        std::process::Command::new(&python)
+            .args([
+                "-c",
+                "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 4)",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Drive the fused FA2-class peer over the SAME f16 Q/K/V Mercury's flash runs (`[b,h,s,d]` head-major,
+/// `b=1` for the single-batch bench). Returns the chosen fused backend's O (f32) and its same-shape
+/// timing. `scale` is folded the way SDPA expects: `softmax(scale * Q*Kᵀ) * V`. The Python harness times
+/// each backend best-of-`runs` over `iters` CUDA-event-bracketed launches after `warmup` launches.
+pub fn fa2_sdpa_peer(
+    b: usize,
+    h: usize,
+    s: usize,
+    d: usize,
+    q16: &[f16],
+    k16: &[f16],
+    v16: &[f16],
+    scale: f32,
+    causal: bool,
+    warmup: u32,
+    iters: u32,
+    runs: u32,
+) -> Result<Fa2PeerReport, PeerError> {
+    use std::io::Write;
+    let n = b * h * s * d;
+    assert_eq!(q16.len(), n, "Q must be b*h*s*d");
+    assert_eq!(k16.len(), n, "K must be b*h*s*d");
+    assert_eq!(v16.len(), n, "V must be b*h*s*d");
+    let (python, peer) = fa2_peer_paths();
+
+    // Per-call temp workspace (the Gpu mutex serializes callers in practice; the counter is belt-and-
+    // suspenders against any concurrent use).
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uid = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mercury_fa2_{}_{}", std::process::id(), uid));
+    std::fs::create_dir_all(&dir)?;
+    let dump = |name: &str, v: &[f16]| -> Result<std::path::PathBuf, PeerError> {
+        let p = dir.join(name);
+        let mut bytes = Vec::with_capacity(v.len() * 2);
+        for x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::File::create(&p)?.write_all(&bytes)?;
+        Ok(p)
+    };
+    let qp = dump("q.bin", q16)?;
+    let kp = dump("k.bin", k16)?;
+    let vp = dump("v.bin", v16)?;
+    let op = dir.join("o.bin");
+    let rp = dir.join("rep.txt");
+
+    let out = std::process::Command::new(&python)
+        .arg(&peer)
+        .arg("--q").arg(&qp).arg("--k").arg(&kp).arg("--v").arg(&vp)
+        .arg("--o").arg(&op).arg("--report").arg(&rp)
+        .arg("--B").arg(b.to_string()).arg("--H").arg(h.to_string())
+        .arg("--S").arg(s.to_string()).arg("--D").arg(d.to_string())
+        .arg("--scale").arg(format!("{scale:.9}"))
+        .arg("--causal").arg(if causal { "1" } else { "0" })
+        .arg("--warmup").arg(warmup.to_string())
+        .arg("--iters").arg(iters.to_string())
+        .arg("--runs").arg(runs.to_string())
+        .output()?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "fa2 peer subprocess failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+
+    let rep = std::fs::read_to_string(&rp)?;
+    let mut map = std::collections::HashMap::new();
+    for line in rep.lines() {
+        if let Some((k, val)) = line.split_once('=') {
+            map.insert(k.to_string(), val.to_string());
+        }
+    }
+    let getf = |k: &str| -> Option<f64> { map.get(k).and_then(|v| v.parse::<f64>().ok()) };
+    let chosen = map.get("chosen").cloned().unwrap_or_else(|| "none".into());
+    if chosen == "none" || chosen == "None" {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("fa2 peer: no fused backend available; report:\n{rep}").into());
+    }
+    let chosen_sec = getf(&format!("{chosen}_sec"))
+        .ok_or_else(|| -> PeerError { format!("fa2 peer: missing {chosen}_sec in report").into() })?;
+    let chosen_gflops = getf(&format!("{chosen}_gflops")).unwrap_or(0.0);
+
+    let obytes = std::fs::read(&op)?;
+    if obytes.len() != n * 4 {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("fa2 peer: O is {} bytes != expected {}", obytes.len(), n * 4).into());
+    }
+    let o: Vec<f32> = obytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+
+    Ok(Fa2PeerReport {
+        chosen,
+        chosen_sec,
+        chosen_gflops,
+        cudnn_sec: getf("cudnn_sec"),
+        efficient_sec: getf("efficient_sec"),
+        math_sec: getf("math_sec"),
+        o,
+        device: map.get("device").cloned().unwrap_or_default(),
+        torch: map.get("torch").cloned().unwrap_or_default(),
+    })
+}
