@@ -376,12 +376,42 @@ pub fn wmma_applies(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) 
 /// all warps), then every warp computes its `tm×tn` grid of `m16n16k16` tiles out of SMEM. Launch with
 /// block `(WMMA_THREADS,1,1)` and grid `(ceil(N/WMMA_BN), ceil(M/WMMA_BM), 1)` where `M=K`, `N=P*Q`.
 pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize) -> String {
+    conv_wmma_ptx_impl(c, h, w, k, r, s, 1)
+}
+
+/// **Split-K** variant of [`conv_wmma_ptx`] (entry `conv2d_wmma_splitk`): the `GK=C*R*S` reduction is
+/// sliced across `gridDim.z = sk`, each CTA accumulating only its `GK/sk` slice into its **own** `M×N`
+/// plane of a `sk·M·N` partial buffer (disjoint planes — no atomics), then summed by
+/// [`conv_splitk_reduce_ptx`] in a fixed ascending-`z` order (deterministic, M12-safe). The lever for
+/// **deep-channel, small-spatial** convs whose base grid under-fills the SMs (e.g. C256 14×14 → only
+/// `ceil(256/64)·ceil(144/64)=12` CTAs; `sk` multiplies the resident-CTA count that hides the deep-GK
+/// latency). Requires `sk` to divide `GK`.
+pub fn conv_wmma_splitk_ptx(
+    c: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> String {
+    conv_wmma_ptx_impl(c, h, w, k, r, s, sk)
+}
+
+fn conv_wmma_ptx_impl(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize, sk: usize) -> String {
     use std::fmt::Write as _;
     let p = h - r + 1;
     let q = w - s + 1;
     let m = k; // GEMM M
     let n = p * q; // GEMM N
     let gk = c * r * s; // GEMM K (reduction)
+    assert!(sk >= 1 && gk % sk == 0, "split-K factor {sk} must divide GK={gk}");
+    let gk_per = gk / sk; // reduction length per z-slice
+    // The K-loop advances in 16-wide WMMA tiles, so each slice must be a whole number of them — else a
+    // slice over-reads into the next slice's range (the staging guards against the full GK, not ktend).
+    assert!(sk == 1 || gk_per % 16 == 0, "split-K slice GK/sk={gk_per} must be a multiple of 16");
+    let mn = m * n; // one output plane (for the z-plane store offset)
+    let entry = if sk > 1 { "conv2d_wmma_splitk" } else { "conv2d_wmma" };
     let rs = r * s;
     let hw = h * w;
     let (bm, bn) = (WMMA_BM, WMMA_BN);
@@ -412,7 +442,10 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
     let _ = writeln!(b);
     let _ = writeln!(b, "// fp16 tensor-core implicit-GEMM conv: C{c} H{h} W{w} K{k} R{r} S{s}");
     let _ = writeln!(b, "// M={m} N={n} GK={gk}; CTA tile {bm}x{bn}, {warps_m}x{warps_n} warps, per-warp {wm}x{wn}");
-    let _ = writeln!(b, ".visible .entry conv2d_wmma(");
+    if sk > 1 {
+        let _ = writeln!(b, "// split-K: gridDim.z={sk} z-slices of GK/{sk}={gk_per}, disjoint M*N partial planes");
+    }
+    let _ = writeln!(b, ".visible .entry {entry}(");
     let _ = writeln!(b, "    .param .u64 pXin,");
     let _ = writeln!(b, "    .param .u64 pWt,");
     let _ = writeln!(b, "    .param .u64 pOut");
@@ -427,6 +460,9 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
         b,
         "    .reg .b32 %tix,%m0,%n0,%kt,%e,%mm,%gkk,%ncol,%gkv,%nn,%cc,%rem,%rr,%ss,%pp,%qq,%ih,%iw,%xidx,%widx,%tmp,%tmp2,%saddr,%warpId,%wrb,%wcb;"
     );
+    if sk > 1 {
+        let _ = writeln!(b, "    .reg .b32 %zsl,%ktend;");
+    }
     // accumulator + a/b fragments
     let mut decl = String::new();
     for ti in 0..tm {
@@ -491,9 +527,19 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
         let _ = writeln!(b, "    rem.u32 %qq,%bnv{li},{q};     // q = nn%Q");
         let _ = writeln!(b, "    mad.lo.s32 %bxp{li},%pp,{w},%qq;   // xpart = p*W + q");
     }
-    let _ = writeln!(b, "    mov.u32 %kt,0;              // gk0");
+    if sk > 1 {
+        let _ = writeln!(b, "    mov.u32 %zsl,%ctaid.z;");
+        let _ = writeln!(b, "    mul.lo.s32 %kt,%zsl,{gk_per};   // gk0 = z*GK/sk");
+        let _ = writeln!(b, "    add.u32 %ktend,%kt,{gk_per};    // gk_end = gk0+GK/sk");
+    } else {
+        let _ = writeln!(b, "    mov.u32 %kt,0;              // gk0");
+    }
     let _ = writeln!(b, "KLOOP:");
-    let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,{gk};");
+    if sk > 1 {
+        let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,%ktend;");
+    } else {
+        let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,{gk};");
+    }
     let _ = writeln!(b, "    @%p0 bra KEND;");
     let _ = writeln!(b);
     let _ = writeln!(b, "    // ---- stage A (weights [M,GK]) into smemA[BM][16] ----");
@@ -619,10 +665,65 @@ pub fn conv_wmma_ptx(c: usize, h: usize, w: usize, k: usize, r: usize, s: usize)
         let _ = writeln!(b, "    add.u32 %saddr,%saddr,%tmp2;");
         let _ = writeln!(b, "    ld.shared.f32 %cf,[%saddr];");
         let _ = writeln!(b, "    mad.lo.s32 %xidx,%tmp,{n},%nn;   // gm*N + gn");
+        if sk > 1 {
+            let _ = writeln!(b, "    mad.lo.s32 %xidx,%zsl,{mn},%xidx;   // + z*M*N (disjoint plane)");
+        }
         let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,4;");
         let _ = writeln!(b, "    add.s64 %ptr,%O,%off;");
         let _ = writeln!(b, "    @%pv st.global.f32 [%ptr],%cf;");
     }
+    let _ = writeln!(b, "    ret;");
+    let _ = writeln!(b, "}}");
+    b
+}
+
+/// Reduce the `sk` disjoint `M×N` partial planes [`conv_wmma_splitk_ptx`] produced into the final
+/// `O[M,N]` (`= [K,P,Q]`), summing in **fixed ascending-`z` order** so the result is bit-reproducible
+/// (M12 determinism — a float `atomicAdd` split-K could not be). One thread per output element; `sk`
+/// and `mn = M*N` are baked in (the per-plane stride is a small constant `add.s64`, never a giant
+/// immediate offset). Entry `conv_splitk_reduce`, params `(pPartial, pOut)`, launch 1-D over `M*N`.
+pub fn conv_splitk_reduce_ptx(mn: usize, sk: usize) -> String {
+    use std::fmt::Write as _;
+    let plane = mn * 4; // bytes between successive z-planes
+    let mut b = String::new();
+    let _ = writeln!(b, ".version 7.8");
+    let _ = writeln!(b, ".target sm_89");
+    let _ = writeln!(b, ".address_size 64");
+    let _ = writeln!(b);
+    let _ = writeln!(b, "// split-K reduce: sum {sk} planes of {mn} f32 -> O, fixed z-order (deterministic)");
+    let _ = writeln!(b, ".visible .entry conv_splitk_reduce(");
+    let _ = writeln!(b, "    .param .u64 pPartial,");
+    let _ = writeln!(b, "    .param .u64 pOut");
+    let _ = writeln!(b, ")");
+    let _ = writeln!(b, "{{");
+    let _ = writeln!(b, "    .reg .pred %p0;");
+    let _ = writeln!(b, "    .reg .b32 %idx,%t,%tmp;");
+    let _ = writeln!(b, "    .reg .f32 %acc,%v;");
+    let _ = writeln!(b, "    .reg .b64 %P,%O,%base,%ptr,%off;");
+    let _ = writeln!(b, "    ld.param.u64 %P,[pPartial];");
+    let _ = writeln!(b, "    ld.param.u64 %O,[pOut];");
+    let _ = writeln!(b, "    cvta.to.global.u64 %P,%P;");
+    let _ = writeln!(b, "    cvta.to.global.u64 %O,%O;");
+    let _ = writeln!(b, "    mov.u32 %tmp,%ntid.x;");
+    let _ = writeln!(b, "    mov.u32 %t,%ctaid.x;");
+    let _ = writeln!(b, "    mul.lo.s32 %idx,%t,%tmp;");
+    let _ = writeln!(b, "    mov.u32 %tmp,%tid.x;");
+    let _ = writeln!(b, "    add.s32 %idx,%idx,%tmp;");
+    let _ = writeln!(b, "    setp.ge.u32 %p0,%idx,{mn};");
+    let _ = writeln!(b, "    @%p0 bra RET;");
+    let _ = writeln!(b, "    mul.wide.u32 %off,%idx,4;");
+    let _ = writeln!(b, "    add.s64 %base,%P,%off;          // &partial[0*MN+idx]");
+    let _ = writeln!(b, "    mov.f32 %acc,0f00000000;");
+    for z in 0..sk {
+        let _ = writeln!(b, "    ld.global.f32 %v,[%base];");
+        let _ = writeln!(b, "    add.f32 %acc,%acc,%v;       // += plane {z}");
+        if z + 1 < sk {
+            let _ = writeln!(b, "    add.s64 %base,%base,{plane};   // -> next z-plane");
+        }
+    }
+    let _ = writeln!(b, "    add.s64 %ptr,%O,%off;");
+    let _ = writeln!(b, "    st.global.f32 [%ptr],%acc;");
+    let _ = writeln!(b, "RET:");
     let _ = writeln!(b, "    ret;");
     let _ = writeln!(b, "}}");
     b

@@ -1992,6 +1992,75 @@ pub fn conv2d_wmma(
     g.stream.memcpy_dtov(&o_d)
 }
 
+/// Launch grid for the **split-K** implicit-GEMM conv: same `M×N` tiling as [`conv_wmma_cfg`] but
+/// `gridDim.z = sk`, so each z-slice computes its `GK/sk` reduction into its own `M×N` partial plane.
+pub(crate) fn conv_wmma_splitk_cfg(
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> LaunchConfig {
+    let mut cfg = conv_wmma_cfg(h, width, k, r, s);
+    cfg.grid_dim.2 = sk as u32;
+    cfg
+}
+
+/// **Split-K fp16 tensor-core implicit-GEMM** conv2d (single batch, stride 1, no padding). Same contract
+/// as [`conv2d_wmma`], but the `GK=C*R*S` reduction is split across `sk` z-slices into `sk` disjoint
+/// `M*N` partial planes ([`crate::ptx_conv::conv_wmma_splitk_ptx`]) then summed in fixed ascending-z
+/// order ([`crate::ptx_conv::conv_splitk_reduce_ptx`]) — the occupancy lever for deep-channel,
+/// small-spatial convs whose base grid under-fills the SMs. `sk` must divide `C*R*S`. Deterministic.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma_splitk(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    sk: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let p = h - r + 1;
+    let q = width - s + 1;
+    let (m, n) = (k, p * q);
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n)?;
+    // Conv: sk z-slices each write their own M*N partial plane.
+    let ptx = crate::ptx_conv::conv_wmma_splitk_ptx(c, h, width, k, r, s, sk);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma_splitk")?;
+    let cfg = conv_wmma_splitk_cfg(h, width, k, r, s, sk);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&x_d).arg(&w_d).arg(&mut partial_d);
+    unsafe { bld.launch(cfg)? };
+    // Deterministic fixed-order reduction of the sk planes -> O[M,N].
+    let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+    let rmod = g.load_module_cached(&rptx)?;
+    let rf = rmod.load_function("conv_splitk_reduce")?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(m * n)?;
+    let rcfg = LaunchConfig {
+        grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut rbld = g.stream.launch_builder(&rf);
+    rbld.arg(&partial_d).arg(&mut o_d);
+    unsafe { rbld.launch(rcfg)? };
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -6796,6 +6865,47 @@ mod tests {
         });
     }
 
+    #[test]
+    fn conv2d_wmma_splitk_matches_reference_within_tol() {
+        with_gpu("conv2d_wmma_splitk", |g| {
+            let mut rng = crate::diff::Rng::new(0x5719C0);
+            // (C,H,W,K,R,S, sk) — sk must divide GK=C*R*S. Deep-channel/small-spatial shapes are the
+            // split-K target, plus a 1×1 and an sk that does not divide BM-tiles evenly.
+            let cases = [
+                (64usize, 28usize, 28usize, 64usize, 3usize, 3usize, 4usize), // GK=576
+                (128, 14, 14, 128, 3, 3, 8),                                  // GK=1152
+                (32, 16, 16, 32, 3, 3, 2),                                    // GK=288 (gk_per=144)
+                (64, 16, 16, 32, 1, 1, 4),                                    // 1×1, GK=64 (gk_per=16)
+                (48, 18, 18, 16, 3, 3, 3),                                    // GK=432 (gk_per=144)
+            ];
+            for (c, h, width, k, r, s, sk) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
+                    continue;
+                }
+                assert_eq!((c * r * s) % sk, 0, "sk must divide GK");
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma_splitk(g, &x, &w, c, h, width, k, r, s, sk).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let st = crate::diff::assert_close(
+                    &format!("conv2d_wmma_splitk C{c} {h}x{width} K{k} {r}x{s} sk{sk}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                // M12 determinism: disjoint planes + fixed ascending-z reduction ⇒ bit-reproducible.
+                let again = conv2d_wmma_splitk(g, &x, &w, c, h, width, k, r, s, sk).unwrap();
+                assert_eq!(got, again, "split-K conv must be deterministic (C{c} {r}x{s} sk{sk})");
+                eprintln!(
+                    "conv2d_wmma_splitk C{c} {h}x{width} K{k} {r}x{s} sk{sk}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
     /// **M6 for conv2d** — Mercury's fp16 tensor-core implicit-GEMM conv (and the f32 SMEM-tiled conv)
     /// vs the **naive CUDA-C conv** a programmer writes first (one thread per output, the whole `c,r,s`
     /// window streamed from global), all JIT-loaded through the same driver and timed **same-run** over
@@ -7061,6 +7171,129 @@ mod tests {
                         g_n / 1e9,
                     );
                 }
+            }
+        });
+    }
+
+    /// **Split-K sweep** — for the deep-channel / small-spatial 3×3 convs where the base implicit-GEMM
+    /// under-fills the SMs (≈12–22 CTAs), sweep `sk ∈ {1,2,4,8}` of [`conv2d_wmma_splitk`] vs cuDNN,
+    /// same-run, to find the occupancy sweet spot. Each `sk` is cross-checked against the f64 oracle
+    /// before timing; cuDNN's chosen engine is disclosed. Reports each `sk` as GFLOP/s and % of cuDNN.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_splitk_vs_cudnn() {
+        use crate::baselines::{
+            conv_flop, cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, peer_env_hint,
+            peers_available, time_cudnn_conv2d,
+        };
+        use cudarc::driver::CudaSlice;
+        use half::f16;
+        with_gpu("conv_splitk_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_splitk_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0x5717C0);
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+
+            // (C,H,W,K,R,S, sk candidates) — sk must divide GK and GK/sk be a multiple of 16.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize, vec![1usize, 2, 4]),
+                (128, 28, 28, 128, 3, 3, vec![1usize, 2, 4, 8]),
+                (256, 14, 14, 256, 3, 3, vec![1usize, 2, 4, 8]),
+                (256, 28, 28, 256, 3, 3, vec![1usize, 2, 4]),
+            ];
+            for (c, h, wd, k, r, s, sks) in cases {
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let (m, n) = (k, p * q);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let flop = conv_flop(c, h, wd, k, r, s);
+
+                let (g_c, algo) = if have_cudnn {
+                    let (yc, a) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
+                    crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
+                    let (t_c, _) = time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap();
+                    (flop / t_c, cudnn_fwd_algo_name(a))
+                } else {
+                    (0.0, "n/a")
+                };
+
+                let mut line = format!("C{c:>3} {h}x{wd} K{k:>3} {r}x{s}:");
+                let base_ctas = m.div_ceil(crate::ptx_conv::WMMA_BM) * n.div_ceil(crate::ptx_conv::WMMA_BN);
+                for sk in sks {
+                    let (conv_ptx, conv_fn) = if sk == 1 {
+                        (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                    } else {
+                        (crate::ptx_conv::conv_wmma_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                    };
+                    let cmod = g.load_module_cached(&conv_ptx).unwrap();
+                    let cf = cmod.load_function(conv_fn).unwrap();
+                    let cfg = if sk == 1 {
+                        conv_wmma_cfg(h, wd, k, r, s)
+                    } else {
+                        conv_wmma_splitk_cfg(h, wd, k, r, s, sk)
+                    };
+                    let x_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                    let w_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                    let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(m * n).unwrap();
+                    let red = if sk > 1 {
+                        let rptx = crate::ptx_conv::conv_splitk_reduce_ptx(m * n, sk);
+                        let rmod = g.load_module_cached(&rptx).unwrap();
+                        let rf = rmod.load_function("conv_splitk_reduce").unwrap();
+                        Some((rmod, rf))
+                    } else {
+                        None
+                    };
+                    let rcfg = LaunchConfig {
+                        grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let launch = |g: &Gpu, part: &mut CudaSlice<f32>, o: &mut CudaSlice<f32>| {
+                        if sk == 1 {
+                            let mut b = g.stream.launch_builder(&cf);
+                            b.arg(&x_d).arg(&w_d).arg(&mut *o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        } else {
+                            let mut b = g.stream.launch_builder(&cf);
+                            b.arg(&x_d).arg(&w_d).arg(&mut *part);
+                            unsafe { b.launch(cfg).unwrap() };
+                            let (_, rf) = red.as_ref().unwrap();
+                            let mut rb = g.stream.launch_builder(rf);
+                            rb.arg(&*part).arg(&mut *o);
+                            unsafe { rb.launch(rcfg).unwrap() };
+                        }
+                    };
+                    launch(g, &mut partial_d, &mut o_d);
+                    g.stream.synchronize().unwrap();
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    crate::diff::assert_close(&format!("sk{sk} C{c} {r}x{s}"), &got, &oracle, 5e-2, rel);
+                    let iters = 50usize;
+                    let t = best_of(ROUNDS, || {
+                        let t0 = Instant::now();
+                        for _ in 0..iters {
+                            launch(g, &mut partial_d, &mut o_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / iters as f64
+                    });
+                    let gf = flop / t;
+                    let pct = if g_c > 0.0 { 100.0 * gf / g_c } else { 0.0 };
+                    line += &format!("  sk{sk} {:>5.0}GF({:>3.0}%)", gf / 1e9, pct);
+                }
+                eprintln!("{line}  | {base_ctas} base CTAs | cuDNN {:>5.0}GF [{}]", g_c / 1e9, algo);
             }
         });
     }
