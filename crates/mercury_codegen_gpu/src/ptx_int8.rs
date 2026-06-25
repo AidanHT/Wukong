@@ -823,6 +823,41 @@ pub fn int8_gemm_swz_tile_ptx(bm: usize, bn: usize, wm: usize, wn: usize, raster
     (name, ptx)
 }
 
+/// **The winning int8 swz config (perf/gpu-quant-2): a 128×128 CTA with a 64×64 warp tile** — 4 warps
+/// (`wm=wn=2`) instead of the shipped 8-warp 32×64. Doubling the per-warp tile (`tm=4` 16-row × `tn=8`
+/// 8-col = 32 subtiles, a 64×64 warp tile) doubles the A/B fragment reuse per `mma.sync` — the lever the
+/// Ada int8 study put at 89.5%→100% of cuBLAS. Measured same-run vs the shipped 8-warp 128×128 (`_smdb128_swz`):
+/// **~1.2–1.3× faster** (1024³ 69%→84%, 2048³ 79%→92%, 4096³ 75%→84% of cuBLAS) — bigger CTA tiles
+/// (256×128) instead *lose* on the 20-SM 4050 (1 CTA/SM starves latency hiding). 4 warps × 128 accumulator
+/// regs keeps ~3 CTAs/SM. Bit-exact (only the warp work split changes). M%128==N%128==0, K%64==0.
+pub const INT8_W64_BM: usize = 128;
+pub const INT8_W64_BN: usize = 128;
+pub const INT8_W64_WARPS_M: usize = 2;
+pub const INT8_W64_WARPS_N: usize = 2;
+
+/// 64×64-warp-tile int8 swz GEMM (entry `int8_gemm_nt_w64_swz`) — the new default workhorse. 2-D grid.
+pub fn int8_gemm_w64_swz_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_w64_swz", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0)).as_str()
+}
+
+/// 64×64-warp-tile int8 swz GEMM **with threadblock rasterization** (`raster=8`, entry
+/// `int8_gemm_nt_w64_swz_r8`) — the 2048²-regime near-parity config (w2×2 91.7%→**99.6%** of cuBLAS with
+/// raster=8). raster is L2-edge-specific (neutral at 1024³, slightly negative at 4096³), so it is
+/// dispatched only in the L2-transition regime. **Launch a 1-D grid** `gridDim.x = (M/128)·(N/128)`.
+pub fn int8_gemm_w64_swz_r8_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_w64_swz_r8", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 8)).as_str()
+}
+
+/// 64×64-warp-tile int8 swz GEMM **with the fused per-channel dequant epilogue** (entry
+/// `int8_gemm_nt_w64_swz_deq`) — the fast `out = f32(Σ u8·i8)·scale[j]` Linear/inference output stage on
+/// the winning warp tile (the cuBLAS-can't-fuse lever, now riding the fastest int8 base). 2-D grid.
+pub fn int8_gemm_w64_swz_deq_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_w64_swz_deq", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, true, false, None, 0)).as_str()
+}
+
 /// Full **int8 (W8A8) tensor-core GEMM** `C = A·Bᵀ` (the quantized nn.Linear form): A is `[M,K]` **u8**
 /// row-major (activations), B is `[N,K]` **i8** row-major (weights) — which *is* the `K×N` column-major
 /// layout the `mma` `.col` operand wants, so `A·Bᵀ` maps straight onto `mma.row.col` with no transpose.
