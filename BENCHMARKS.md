@@ -35,8 +35,9 @@ quality, not just beating textbook code:
   **~104–117 GFLOP/s ≈ 90% of one P-core's AVX2-FMA roofline**, and is **1.1–1.3× faster than the
   tuned `matrixmultiply` Rust crate** — a real hand-optimized peer, not a strawman (`117 vs 89`,
   `115 vs 91`, `104 vs 96` GFLOP/s across 512²–1024²) — with **no LLVM**.
-- **Compile time leads by 1–2 orders of magnitude, every build:** **~100–680× faster than C/Rust**
-  (in-process Cranelift JIT vs spawning a toolchain; ~1–2 ms vs ~125–245 ms).
+- **Compile time leads by 2–3 orders of magnitude, every build:** **~100–680× faster than C/Rust**
+  (latest full-board geomean ~305×; in-process Cranelift JIT vs spawning a toolchain; ~0.3–1.5 ms vs
+  ~125–245 ms).
 - **Geomean across the elementwise/reduction battery: 4.86× faster than C.**
 
 The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
@@ -44,20 +45,22 @@ where gcc/rustc won't vectorize — disclosed per section, never a rigged baseli
 
 | What | 1-core vs C | `@parallel` vs C |
 |---|---|---|
-| Weight-gradient GEMM `dW=Aᵀ·B` | **up to ~167×** | **up to ~422×** |
+| Weight-gradient GEMM `dW=Aᵀ·B` (vs naive C; ~10× vs hand-transposed C) | **up to ~128×** | **up to ~445×** |
 | `nn.Linear` `C=A·Bᵀ` | ~19–26× | up to **~104×** |
-| bf16 `nn.Linear` | ~24–27× | up to ~97× |
+| bf16 `nn.Linear` | ~24–25× | up to ~109× |
 | Fused FFN `silu(A·Bᵀ)` (the Dense layer) | ~24–26× | ~48–95× |
 | Strided column reductions (sum/max/absmax) | **~29–50×** | ~37–107× |
 | RoPE (rotary embedding) | ~29–54× | **~146–156×** |
 | Reductions / transcendentals / argmax | ~2.5–9× | ~9–26× |
 
 **GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
-[below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): within **77–97% of cuBLAS** on GEMM and **95.7%
-of the 192 GB/s HBM hardware peak**; **3.6–5× a cuBLAS unfused attention chain** on fused
-flash-attention (and 205–738× naive CUDA-C); int4/int8 decode **~180–237× naive CUDA-C**; the
-whole-program megakernel **~285×** the per-op offload chain; and GPU compile **0.76 ms cold vs
-Triton's 30–120 s** (~10⁴–10⁵×).
+[below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): fp16 tensor-core GEMM reaches **cuBLAS parity
+(~101%) at ≤1024³**, falling to ~74% at 2048³ and **~34% at the 4096³ cliff** (still being closed);
+**95.7% of the 192 GB/s HBM hardware peak** on the saxpy triad; the fused flash-attention is **3.6–5×
+a cuBLAS unfused attention chain** (205–738× naive CUDA-C); int8 tensor-core GEMM is **~180–237× naive
+CUDA-C** (~44–53% of cuBLAS int8 IMMA); the **fused GEMM+activation beats the cuBLAS GEMM+act chain
+1.18–2.41×** (the fusion cuBLAS structurally can't express); and GPU compile is **0.76 ms cold vs
+Triton's 30–120 s** (~4×10⁴–1.6×10⁵×).
 
 Every number is gated bit-for-bit (CPU) or to a `c·√K·ε` tolerance (GPU) against the interpreter
 oracle — the wins are correct, not miscompiles.
@@ -213,8 +216,11 @@ naively-written source:
 
 | | Mercury | C (gcc) | Rust | Mercury speedup |
 |---|---|---|---|---|
-| any kernel | ~1–2 ms | ~125–245 ms | ~185–210 ms | **~100–260×** (geomean ~135–155×) |
+| any kernel | ~0.3–1.5 ms | ~125–245 ms | ~185–250 ms | **~100–680×** (geomean ~305×) |
 
+The speedup *scales with how long the C/Rust toolchain takes to spawn* (the dominant term — it varies
+run to run), so the geomean drifts between ~150× and ~310× across sessions; the latest full-board run
+measured **306× geomean** (per-kernel **107–680×**). Either way it is a 2–3 order-of-magnitude win.
 Cranelift JIT compiling in-process vs spawning a full C/Rust+LLVM toolchain is a 1–2 order-of-
 magnitude win, every build. For an ML compiler — where edit/recompile/run iteration dominates
 developer time — this is the most robust result of all.
@@ -378,8 +384,9 @@ The full elementwise math suite — `sqrt`/`rsqrt`/`cbrt` (root family), `exp`/`
 `pow` (= `exp(y·log(x))`), `atan2`/`hypot` (two-arg geometry), `tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`selu`/`tanhshrink`/`hardsigmoid`/`hardswish`,
 the trig `sin`/`cos`/`tan`/`atan`/`asin`/`acos`, the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`, and `fmax`/`fmin` — all vectorize. Every kernel passes the cross-language checksum (the ≈1-ULP poly agrees
 with `libm` within tolerance) and
-compiles ~100–490× faster. These are compute-bound, so the win is real SIMD throughput, not
-bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
+compiles ~260–680× faster (the simplest single-op kernels compile fastest, so the transcendental
+rows post the highest compile ratios on the board). These are compute-bound, so the win is real SIMD
+throughput, not bandwidth. An `@parallel` activation dispatches *each thread's chunk* to the kernel, so it runs
 multicore × 256-bit. `softmax`/`LayerNorm`/`RMSNorm` are recognized and dispatched to a fused
 single-pass kernel (`mercury_norm_f32` — see the section above), and **log-softmax / cross-entropy**
 (`exp` + `log`) run as fused vectorized chains (`tests/run/`); a transformer FFN block (two `nn.Linear` matmuls + GELU)
@@ -1341,8 +1348,9 @@ integration.
 
 ## Honest summary
 
-- **Compile time:** ~100–260× faster than gcc/rustc (geomean ~135–155×). Robust every run; the metric
-  that dominates ML iteration.
+- **Compile time:** ~100–680× faster than gcc/rustc (latest full-board geomean **306×**; drifts
+  ~150–310× with the C/Rust toolchain's spawn time). Robust every run; the metric that dominates ML
+  iteration.
 - **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~3–26×) and
   dominates parallel (~9–104×)**, and the lead **grows with matrix size** — the compiler tiles,
   packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds
