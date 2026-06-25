@@ -141,3 +141,57 @@ Mer(1c), **Mer(par)**, MKL(1c), MKL(all), tuned, C, Rust. The all-core `Mer(par)
 *before* MKL(1c)/MKL(all), and the multi-second naive C/Rust nests heat it before the *next* size — so
 every peer after the first all-core run at ≥2048³ is throttled. Phase 2 must measure all single-core
 variants adjacent (and re-warm / skip naive ≥2048) before any large-size MKL ratio is trustworthy.
+
+### P2 — multicore: honest measurement + a physical-core pool
+
+This phase is two parts: first **make the multicore measurement trustworthy** (it was not), then
+**close the scaling gap** with the lever the clean numbers pointed to.
+
+**P2a — measurement (commit `bench(xbench):`).** The harness threw away the multicore signal. The
+all-core MKL peer was measured *after* Mercury's all-core burst + two multi-second naive nests had
+heat-throttled the chip — at 2048³/4096³ it read **below its own single-thread number** (a bogus
+~8–32 GFLOP/s), once even printing "1245% of MKL". Four fixes:
+- **Thermal-grouped ordering, coolest-first:** single-core peers adjacent (Mer 1c, MKL 1c, tuned) →
+  all-core peers → naive C/Rust LAST (the dominant heat source; skipped ≥2048³, `XBENCH_NAIVE_HUGE`
+  to force). The 1-core ratio is now taken near-cold at every size.
+- **MKL(all) measured BEFORE Mer(par):** Mer 1c/tuned use serial kernels that never touch rayon, so
+  rayon's pool is dormant and MKL(all) runs on idle cores in the coolest state. Mer(par) runs after, so
+  the ratio is a *conservative lower bound* on Mercury (throttle ourselves, never the peer). An earlier
+  interleaved A/B timer was abandoned — alternating two live thread pools (rayon + MKL's OpenMP)
+  thrashes the scheduler and parks MKL's workers, reading worse than sequential.
+- **Turbo-ramped roofline:** the ~5 ms fixed-iter warmup measured a cold-clock roofline that warm GEMM
+  later *exceeded* (>100% of roofline — an obvious bug). Now warms ≥400 ms of wall time.
+- **Degeneracy guard:** when MKL(all) ≤ 1.2× MKL(1c) its 16 OpenMP workers did not scale that call (a
+  real pathology on this loaded hybrid); the ratio is omitted with a reason instead of a fake multiple.
+  Also reports Mercury's own @parallel scaling (robust to power state).
+
+With this, clean same-run all-core ratios are reproducible — e.g. (roofline 92) **Mer(par)/MKL(all) =
+25 / 64 / 70 / 129%** at 256/512/1024/2048³ (Mercury *wins* at 2048³), and mm6 measured 55/49/71/86/124%
+at 256→4096³. The gap is concentrated at small sizes (threading overhead) and closes — to a win — by 2048³.
+
+**P2b — physical-core pool (commit `perf(runtime):`).** The clean numbers said mid-size scaling lagged.
+Lever: rayon defaults to one worker per **logical** core (22 on this part — 16 physical cores, 6 of them
+HyperThreaded). A compute-bound AVX2-FMA GEMM saturates a core's two FMA pipes with **one** thread, so
+the HT sibling only contends. The parallel GEMM now runs in a private pool sized to
+`num_cpus::get_physical()` (16) — *private*, not a global resize, so the thread-count-derived striping of
+the reduction kernels is untouched, and since the GEMM result is independent of panel distribution
+(fixed per-(i,j) K-order), it is throughput-only: **serial stays bit-identical to parallel** (18/18 gemm,
+134/134 runtime tests green).
+
+Measured with a new **adjacent-A/B probe** (`sgemm_pool_ab`) — the only reliable instrument here: it runs
+the *same* kernel in each pool back-to-back best-of-N, so the laptop's ~3× thermal swing (and the
+1c-vs-par self-scaling confound that wrecks cross-run comparison) cancels in the ratio. `physical/logical`:
+
+| size | run A | run B | reading |
+|------|------:|------:|---------|
+| 512³ | 1.09× | 1.40× | compute-bound — HT contention bites hardest |
+| 1024³| 1.10× | 1.09× | the stablest point: ~1.10× |
+| 2048³| 1.19× | 1.02× | |
+| 4096³| 1.05× | 1.00× | bandwidth-bound — thread count matters less |
+
+**≥1.0× at every size in every run** — a Pareto improvement, 1.1–1.4× at the compute-bound mid sizes,
+tapering to parity where the kernel is HBM-bandwidth-bound. Never a regression.
+
+**Honest multicore standing:** Mercury's @parallel GEMM is competitive with oneMKL's threaded GEMM on
+this hybrid — 60–70% of MKL at 512–1024³, **parity-to-winning (86–129%) at ≥2048³** — the large-matrix
+regime that matters for ML. The residual mid-size gap is threading/packing overhead, not the kernel.
