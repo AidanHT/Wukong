@@ -1349,24 +1349,38 @@ fn gemm_nt_bf16_gate(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// The fused gate routes to the no-pad `ldmatrix`+XOR-swizzle twin (`..._swz`) once the A+Wg+Wu working
+/// set clears ~16 MB — the SAME large-GEMM threshold the single-B workhorse uses ([`gemm_nt_f16`]): the
+/// swz fragment-load win (1.13–1.23× the padded base) materializes there, while below it the two are a
+/// noise-level tie, so the small/test regime keeps the padded base. The 128×64 gate tile always satisfies
+/// swz's bk=32 / `wmr`,`wnc`%8 constraints, so the choice is purely the working-set size.
+fn gate_use_swz(m: usize, k: usize, n: usize) -> bool {
+    let ws_bytes = (m * k + 2 * n * k) * 2; // x + Wg + Wu working set (fp16/bf16 bytes)
+    ws_bytes >= 16 * 1024 * 1024
+}
+
 /// Fused **SwiGLU** FFN gate (fp16): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)` — the Llama/Mistral/Gemma FFN gate, one kernel.
 pub fn gemm_nt_f16_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_f16_128x64_gate_silu")
+    let entry = if gate_use_swz(m, k, n) { "mma_nt_f16_128x64_gate_silu_swz" } else { "mma_nt_f16_128x64_gate_silu" };
+    gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, entry)
 }
 
 /// Fused **GeGLU** FFN gate (fp16): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)` (the GLU-with-GELU FFN gate).
 pub fn gemm_nt_f16_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_f16_128x64_gate_gelu")
+    let entry = if gate_use_swz(m, k, n) { "mma_nt_f16_128x64_gate_gelu_swz" } else { "mma_nt_f16_128x64_gate_gelu" };
+    gemm_nt_f16_gate(g, x, wg, wu, None, m, k, n, entry)
 }
 
 /// Fused **SwiGLU** FFN gate (bf16, the training dtype): `silu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
 pub fn gemm_nt_bf16_swiglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_bf16_128x64_gate_silu")
+    let entry = if gate_use_swz(m, k, n) { "mma_nt_bf16_128x64_gate_silu_swz" } else { "mma_nt_bf16_128x64_gate_silu" };
+    gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, entry)
 }
 
 /// Fused **GeGLU** FFN gate (bf16): `gelu(x·Wgᵀ) ⊙ (x·Wuᵀ)`.
 pub fn gemm_nt_bf16_geglu(g: &mut Gpu, x: &[f32], wg: &[f32], wu: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, DriverError> {
-    gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, "mma_nt_bf16_128x64_gate_gelu")
+    let entry = if gate_use_swz(m, k, n) { "mma_nt_bf16_128x64_gate_gelu_swz" } else { "mma_nt_bf16_128x64_gate_gelu" };
+    gemm_nt_bf16_gate(g, x, wg, wu, None, m, k, n, entry)
 }
 
 /// `C = A·Bᵀ + bias + residual` fused into the fast **bf16** mma workhorse — the training-dtype twin of
@@ -5199,7 +5213,8 @@ mod tests {
     /// elementwise product fused into the store. The tolerance is looser than a plain GEMM's because the
     /// product of two ~√K-magnitude factors **compounds** their relative errors (and the SFU silu/gelu
     /// approx adds its own ε); the `OR` semantics let large-magnitude lanes pass on relative error and
-    /// near-zero lanes on absolute. Exercised for all five variants (silu/gelu/glu, ± bias) in fp16 + bf16.
+    /// near-zero lanes on absolute. Exercised for all five variants (silu/gelu/glu, ± bias) in fp16 + bf16,
+    /// each on BOTH the padded base and the no-pad `_swz` (ldmatrix+XOR-swizzle) twin (bit-identical math).
     #[test]
     fn swiglu_gate_match_reference_within_tol() {
         use half::{bf16, f16};
@@ -5237,12 +5252,20 @@ mod tests {
                 };
                 // fp16 (inference): all five gate variants.
                 let f16r = |x: f32| f16::from_f32(x).to_f32();
-                let f16_cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 5] = [
+                // Each variant in BOTH the padded base and the no-pad `_swz` (ldmatrix+XOR-swizzle) twin —
+                // the swz kernel is bit-identical by construction (same math, the swizzle only relayouts the
+                // SMEM staging), so it shares the same f64 reference and tolerance.
+                let f16_cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 10] = [
                     ("mma_nt_f16_128x64_gate_silu", &silu, false),
                     ("mma_nt_f16_128x64_gate_gelu", &gelu, false),
                     ("mma_nt_f16_128x64_gate_glu", &id, false),
                     ("mma_nt_f16_128x64_gate_silu_bias", &silu, true),
                     ("mma_nt_f16_128x64_gate_gelu_bias", &gelu, true),
+                    ("mma_nt_f16_128x64_gate_silu_swz", &silu, false),
+                    ("mma_nt_f16_128x64_gate_gelu_swz", &gelu, false),
+                    ("mma_nt_f16_128x64_gate_glu_swz", &id, false),
+                    ("mma_nt_f16_128x64_gate_silu_bias_swz", &silu, true),
+                    ("mma_nt_f16_128x64_gate_gelu_bias_swz", &gelu, true),
                 ];
                 for (entry, act, wb) in f16_cases {
                     let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
@@ -5255,12 +5278,17 @@ mod tests {
                 }
                 // bf16 (training): the precision-generic twin.
                 let bf16r = |x: f32| bf16::from_f32(x).to_f32();
-                let bf16_cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 5] = [
+                let bf16_cases: [(&'static str, &dyn Fn(f32) -> f32, bool); 10] = [
                     ("mma_nt_bf16_128x64_gate_silu", &silu, false),
                     ("mma_nt_bf16_128x64_gate_gelu", &gelu, false),
                     ("mma_nt_bf16_128x64_gate_glu", &id, false),
                     ("mma_nt_bf16_128x64_gate_silu_bias", &silu, true),
                     ("mma_nt_bf16_128x64_gate_gelu_bias", &gelu, true),
+                    ("mma_nt_bf16_128x64_gate_silu_swz", &silu, false),
+                    ("mma_nt_bf16_128x64_gate_gelu_swz", &gelu, false),
+                    ("mma_nt_bf16_128x64_gate_glu_swz", &id, false),
+                    ("mma_nt_bf16_128x64_gate_silu_bias_swz", &silu, true),
+                    ("mma_nt_bf16_128x64_gate_gelu_bias_swz", &gelu, true),
                 ];
                 for (entry, act, wb) in bf16_cases {
                     let bias = if wb { Some((bg.as_slice(), bu.as_slice())) } else { None };
