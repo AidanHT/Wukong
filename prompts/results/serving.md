@@ -160,6 +160,54 @@ number the instant a 2nd GPU is attached.
   lane partition and the butterfly merge order are layout-independent, so paging stays numerically
   invisible by construction.
 
+### P5 — continuous (in-flight) batching (the throughput lever)
+The serving forward is fixed-shape `Bcap=64`, so the decode kernels compute **all 64 rows every step**
+regardless of how many carry a live request. An Orca-style [`Scheduler`] admits waiting requests into
+free slots (prefilling each prompt into the paged cache), advances all *active* slots one token per
+[`step`], and evicts a sequence the iteration it hits its `gen_len` — freeing its blocks for the next
+admission. Inactive/free slots are **masked off in the append kernel** (a free slot pads its block table
+with 0, so an unmasked write would scatter into block 0, a *live* block) and read as empty by attention
+(`context_len == 0` ⇒ zero row), so they are numerically inert.
+
+**Correctness (the first law):**
+- **Append mask** (`serving_kv_append_masked_skips_inactive`): with a ragged active mask, the *entire*
+  cache slab is zero except the active slots' written addresses — every inactive row is skipped, **block
+  0 untouched**. (The mask is a new `pAct` param on the append kernel; bit-exact write set.)
+- **Batch composition is invisible** (`serving_decode_step_invariant_to_batch_composition`): slot 0's
+  decode output is **bit-for-bit identical** whether co-batched with 63 other active sequences carrying
+  unrelated context or run **alone** (all other slots masked). Row-independent GEMMs + per-sequence paged
+  attention + the append mask make co-batched sequences invisible to one another — *the* property that
+  makes continuous batching correct (the serving analogue of the paging-invariance gate).
+- **Scheduler liveness + block conservation** (`serving_scheduler_drains_and_conserves_blocks`): 240
+  ragged requests (prompt 1..40, gen 1..24) driven to completion through admit→step→evict→free: **all 240
+  complete**, useful tokens **= 3000 = Σ gen_len**, **every KV block returned** to the pool (416→416, no
+  leak), peak batch **64/64**, and two identical request streams produce the **identical per-step
+  schedule** (deterministic). 62 steps for 3000 tokens.
+
+**Goodput — same-clock interleaved best-of-N** (`serving_continuous_batching_goodput`, RTX 4050,
+graphed 12-layer decode step, D=512 Dff=2048, Bcap=64; named peer = Mercury's own single-sequence decode):
+
+| batch fill | step latency | goodput (useful tok/s) | vs fill=1 |
+|-----------:|-------------:|-----------------------:|----------:|
+| 1 / 64  | 2008 µs | 498    | 1.0×  |
+| 4 / 64  | 2035 µs | 1 966  | 3.9×  |
+| 16 / 64 | 2444 µs | 6 548  | 13.1× |
+| 32 / 64 | 2384 µs | 13 421 | 27.0× |
+| 64 / 64 | 3287 µs | 19 471 | **39.1×** |
+
+**HEADLINE: 39.1× goodput at fill=64 vs fill=1, at only 1.64× step latency.** The decode step cost is
+dominated by the six WMMA GEMMs, which compute all 64 rows regardless of fill — so per-token cost falls
+almost linearly as the batch fills. Latency grows only 1.64× over a 64× range of active rows (the paged
+attention + masked append are the only fill-dependent work, and they are a small fraction of the step),
+so goodput = fill / latency scales nearly linearly. **≥3× is met from fill=4** and reaches **39×** at full
+batch. This stacks with P4's graph win (each step here is *already* one `cuGraphLaunch`).
+
+**Measurement honesty.** A *first* (naive sequential) sweep reported a spurious **415×** — it timed
+fill=1 at a throttled clock and fill=64 boosted (the documented ~7× laptop clock swing). That number is
+**discarded**. The honest figure above captures all fills up front and times them **interleaved** (each
+round times every fill back-to-back so they share the clock; per-fill best-of-N), so the ratio reflects
+batching alone, not the clock.
+
 ## Multi-GPU design detail (unmeasured)
 
 _see P7._
