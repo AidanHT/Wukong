@@ -986,11 +986,28 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
         for r in 0..4 {
             s += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
         }
-        s += &format!("    add.u32 %lkey,%grp,{};\n", nk * 8);
-        for kt in 0..ktq {
-            s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
-            s += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
-            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+        if pv_ldmatrix {
+            // K via `ldmatrix.x2` (no trans): K is staged [key][hdim] = col-major B for mma.row.col — the
+            // SAME layout as the gemm-NT B operand — so no transpose is needed. Per kt the source row is
+            // key = 8nk + (lane&7); the chunk selector ((lane>>3)&1)·8 picks the k-low / k-high half of the
+            // 16-hdim contraction tile. One conflict-free warp-collective load replaces the 2 strided
+            // `ld.shared.b32` (which 8-way bank-conflict: a grp's lanes read keys 0,2,4,6 at fixed hdim).
+            for kt in 0..ktq {
+                s += &format!("    and.b32 %lkey,%lane,7;\n    add.u32 %lkey,%lkey,{};\n", nk * 8);
+                s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n");
+                s += "    shr.u32 %idx,%lane,3;\n    and.b32 %idx,%idx,1;\n    shl.b32 %idx,%idx,3;\n";
+                s += &format!("    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n", kt * 16);
+                s += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n");
+                s += "    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%b0,%b1},[%sbase];\n";
+                s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+            }
+        } else {
+            s += &format!("    add.u32 %lkey,%grp,{};\n", nk * 8);
+            for kt in 0..ktq {
+                s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
+                s += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
+                s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+            }
         }
     }
 
@@ -1726,10 +1743,13 @@ pub fn flash_ptx() -> &'static str {
         m += &entry_mma_reg(64, true);
         m += &entry_mma_reg_pipe(64, false, false);
         m += &entry_mma_reg_pipe(64, true, false);
-        // `ldmatrix.x2.trans` PV V-load variants (`_lm`): one warp-collective conflict-free transpose-gather
-        // replaces the strided, 8-way-bank-conflicting hand-packed V load — the documented feed ceiling
-        // (the `mp4` wash proved this kernel is tensor-core-feed-bound, not occupancy-bound). Same math,
-        // gated bit-tolerance-equal vs the hand path; A/B'd same-run by `flash_lm_vs_mp`.
+        // `ldmatrix` SMEM-feed variants (`_lm`): both fragment loads become one warp-collective
+        // conflict-free `ldmatrix` — V via `.x2.trans` (transpose-gather), K via `.x2` (no trans; K is
+        // already col-major B). Replaces the strided, 8-way-bank-conflicting hand-packed loads — the
+        // documented feed ceiling (the `mp4` wash proved this kernel is tensor-core-feed-bound, not
+        // occupancy-bound). Same math, gated bit-tolerance-equal vs the hand path; A/B'd by `flash_lm_vs_mp`:
+        // wins D=128 ~18–23% (the SMEM feed dominates there, nto=16) and ~2–4% at D=64 — ≥ the hand path
+        // at every regime, so it is the default for the cuDNN comparison.
         m += &entry_mma_reg_pipe(64, false, true);
         m += &entry_mma_reg_pipe(64, true, true);
         // D=128 (Llama/GPT modern head dim): the register-resident mma flash generalizes over d
