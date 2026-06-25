@@ -9,14 +9,19 @@ implicit-GEMM, Winograd, and fused conv+bias+act.
 
 ## Status / plan
 
-1. [done] cuDNN Tier-B peer bound (`baselines.rs::cudnn_conv2d_run` / `time_cudnn_conv2d`), NHWC fp16
-   tensor-core fast path, v7-heuristic-chosen engine disclosed. Bench `gpu.rs::conv_vs_cudnn`.
-2. [in progress] Measure the true gap: existing `conv_wmma` implicit-GEMM vs cuDNN on 1×1/3×3/strided.
-3. [todo] Improve the implicit-GEMM toward cuDNN (cp.async pipeline, mma.sync, raster, static unroll).
-4. [todo] Winograd F(2×2,3×3) + F(4×4,3×3) for 3×3 stride-1 (`ptx_winograd.rs`), looser gate.
-5. [todo] Fused conv+bias+act epilogue — beat the cuDNN unfused chain (and race cuDNN's *fused*
-   `cudnnConvolutionBiasActivationForward`).
-6. [todo] Coverage: 1×1 (=GEMM), strided, padded; depthwise/grouped/dilated as stretch.
+1. [done] cuDNN Tier-B peer bound (`baselines.rs::cudnn_conv2d_run` / `time_cudnn_conv2d`, takes
+   `pad`/`stride`), NHWC fp16 tensor-core fast path, v7-heuristic-chosen engine disclosed. Benches
+   `gpu.rs::{conv_vs_cudnn, conv_affine_vs_cudnn, conv_splitk_vs_cudnn, conv_winograd_vs_cudnn}`.
+2. [done] Measured the true gap on 1×1/3×3/strided/padded — see tables below. The headline "~50% of
+   cuDNN" from the first cut was a **measurement phantom** (single-shot cuDNN timing); fair `best_of`
+   both → parity-to-win everywhere bar one soft shape.
+3. [done] Implicit-GEMM improved: static-shape specialization + **split-K** (valid *and* affine) for
+   the occupancy-starved deep-channel shapes. (cp.async/db-pipe tried, neutral here — L2-resident.)
+4. [done] Winograd F(2×2,3×3) + F(4×4,3×3), batched α²-plane GEMM (`ptx_winograd.rs`), rel-Frobenius gate.
+5. [done] Fused conv+bias+act epilogue (`conv2d_wmma_epi`) vs the unfused chain — see §Fused.
+6. [done] Coverage: 1×1 (=GEMM), 3×3, **strided** (`conv2d_wmma_strided`), **zero-padded "same"**
+   (`conv2d_wmma_padded` bounds-checked + `conv2d_wmma_padded_explicit` scatter + `conv2d_wmma_padded_auto`
+   split-K). depthwise/grouped/dilated = the documented next bottleneck (§Coverage).
 
 ## The cuDNN peer (reproducible recipe)
 
@@ -132,6 +137,86 @@ whereas the implicit-GEMM reduces over the full `GK=C·9=288`. So the win is cha
 Winograd for ≥64-channel large-spatial 3×3, implicit-GEMM otherwise (a per-shape dispatch is the
 follow-up). Absolute throughput up to **~9.7 TFLOP/s** (C64 112²). F(2,3) (lower amplification) and
 F(4,3) (cuDNN-grade) both gated.
+
+## Affine conv: strided + zero-padded "same" (shipped, gated, vs cuDNN at matching pad/stride)
+
+The real CNN convs aren't valid-only — they downsample (`stride>1`) and pad ("same"). Both are threaded
+through the *one* implicit-GEMM kernel (`conv_wmma_ptx_impl`, a `stride`+`pad` arg each):
+
+* **Strided** (`conv2d_wmma_strided`) — output `P=⌊(H−R)/s⌋+1`; the hoisted im2col `xpart` scales by
+  `stride`. `stride=1` is byte-identical to the dense kernel. Gated stride 2/3 over 3×3/5×5/1×1 + a
+  non-divisible 31² — **bit-close** (max_abs 3.4–5.5e-3 vs f64).
+* **Zero-padded** (`conv2d_wmma_padded`) — output `P=⌊(H+2·pad−R)/s⌋+1`; gather reads `(p·s+r−pad,
+  q·s+s−pad)`, OOB→0. `pad>0` switches the gather from the linear `xpart` fold to a **single unsigned
+  bounds compare per axis** (`0≤i<N ⟺ (u32)i<N`; the fold would row-wrap on OOB). Gated 3×3 pad-1 "same",
+  ResNet 3×3 s2 p1 + 7×7 s2 p3 stem, 5×5 pad-2 — **bit-close** (max_abs 4.0–7.0e-3).
+* Two padded implementations, measured **same-run A/B** (`conv_affine_vs_cudnn`): the single-kernel
+  bounds-checked gather vs **explicit-pad** (`conv2d_wmma_padded_explicit`: scatter X into a zeroed
+  `(H+2p)×(W+2p)` buffer, then the dense valid kernel — no per-tap predication). Reliable Mercury-vs-
+  Mercury, stable across 3 reruns: **the bounds-checked single kernel is ~1.0–1.12× *faster*** — the
+  scatter costs slightly more than the cheap bounds chain it removes (L2-resident convs). So the single
+  kernel is the default; explicit-pad stays gated (and as the natural split-K seam).
+
+### Split-K for affine — closes the deep-channel small-spatial gap (the one real residual)
+
+The downsamples starve the SMs: C128 28²→14² is only **~8 CTAs** over 20 SMs. `conv_wmma_ptx_impl`
+already composes `sk`+`pad` (the per-tap bounds check is K-slice-independent), so `conv2d_wmma_padded_auto`
+exposes it — `conv_splitk_factor_affine` applies the same occupancy heuristic over the *downsampled*
+output `P·Q`, and dispatches the single kernel or split-K + the deterministic reduce. **Reliable same-run
+speedup over the single padded kernel** (auto ÷ explicit-single, stable across reruns):
+
+| shape (C,H,W,K) 3×3, s/pad        | sk | auto ÷ single (same-run) | % of cuDNN (aligned clock) |
+|-----------------------------------|----|--------------------------|----------------------------|
+| C64 56² K64 **s1 p1** ("same")    | 1  | ~1.1× (=single)          | ~parity (51–134 %, noisy)  |
+| C128 28² K128 **s1 p1** ("same")  | 3  | **~1.8×**                | 51–108 % (parity at clock) |
+| C64 56² K64 **s2 p1** (downsample)| 6  | **~1.4–2.2×**            | 119–286 % (**win**)        |
+| C128 28² K128 **s2 p1** (downsmp) | 8  | **~2.3–3.1×**            | 72–263 % (**parity-win**)  |
+| C3 224² K64 **s2 p3** (stem)      | 1  | ~1.0× (=single)          | 96–118 % (**parity**)      |
+| C64 56² K64 **1×1** (pointwise)   | 1  | ~1.0× (=single)          | 120–440 % (**decisive win**)|
+
+**Read:** split-K delivers a clean **1.4–3.1× same-run** lift on the occupancy-starved downsamples and
+moves the C128 s2p1 target from ~60 % to parity-to-win. The auto gate exercises sk 1/3/6/8, all bit-close
+to the f64 oracle (max_abs ≤1.8e-2, the looser split-K-reduce tolerance). **Measurement caveat, reaffirmed
+hard:** the cuDNN cross-family % is *clock-noise-dominated* — C128 s1p1 read **51 % then 108 % on byte-
+identical code** between two back-to-back reruns (one caught cuDNN's window at high boost, Mercury's at
+low). Only the **same-run Mercury-vs-Mercury** ratio (split-K ÷ single, cuDNN ÷ nothing) is trustworthy;
+the % column is a range over reruns, never a point. The single genuinely-soft shape is **3×3 s1 p1 C64
+"same"** at mid-size — cuDNN's IMPLICIT_PRECOMP_GEMM is strong there and the base grid (~49 CTAs) is
+already full so split-K can't help; padded-Winograd (≥64-ch lever, currently valid-only) is the follow-up.
+
+## Fused conv+bias+act epilogue (shipped, gated)
+
+`conv2d_wmma_epi` folds a per-output-channel bias add + activation (ReLU/SiLU/GELU) into the implicit-GEMM
+**store epilogue** — it runs on the f32 accumulators already in the smemC store-back
+(`conv_wmma_epi_ptx`), racing cuDNN's `cudnnConvolutionBiasActivationForward`. Gated host-side (bias+act
+applied to the plain-conv oracle). Same-run vs the **unfused chain** (plain conv + a separate `bias_relu`
+pointwise pass = the extra `K·P·Q` HBM round-trip + launch that fusion elides), `conv_fused_epi_vs_unfused`:
+
+| shape          | fused ÷ unfused | note |
+|----------------|-----------------|------|
+| 3×3 (compute-bound) | **1.0–1.03×** | conv dominates; the epilogue is ~free but the saved pass is a small fraction |
+| 1×1 (memory-bound)  | **1.06–1.22×** | the elided HBM round-trip is a bigger share → the real win |
+
+**Read:** the epilogue itself is **free** (a few instructions on registers already live), so fusion's
+value is exactly the round-trip it removes — largest on the memory-bound 1×1 (where the separate pass is a
+big fraction of the conv), marginal on the compute-bound 3×3. Honest, modest, in the right direction.
+
+## Coverage & the next bottleneck
+
+**Shipped & gated:** 1×1 (=GEMM, decisive win), 3×3 valid (parity-to-win), 5×5, 7×7 stem, **strided 2/3**,
+**zero-padded "same"/downsample** (bounds-checked + explicit-pad + split-K), **fused bias+act**, **Winograd
+F(2,3)+F(4,3)**. Every path bit-/Frobenius-close to the f64 oracle; `cargo test` (no `gpu`) stays green
+(all GPU code behind `#[cfg(feature="gpu")]`).
+
+**Next bottleneck, in priority order:**
+1. **Dilated** — cheapest: the gather just scales the tap by `dilation` (`ih=p·s+r·d−pad`), a one-line
+   change to the same kernel (atrous/segmentation convs).
+2. **Depthwise / grouped** — a different kernel *structure* (per-group GEMM, no cross-channel reduction;
+   depthwise has `GK=R·S` so it's bandwidth-bound, not tensor-core-bound) → a dedicated path, not a flag.
+3. **Padded Winograd** — the lever for the soft 3×3 s1 p1 "same" mid-size shapes (Winograd is currently
+   valid-only; padding it would let the ≥64-ch 3×3 win extend to "same" convs).
+4. **Per-shape Winograd↔implicit dispatch** — auto-pick Winograd for ≥64-ch large-spatial 3×3 (where the
+   measured ratio is 1.2–2.2×), implicit-GEMM otherwise.
 
 ## Winograd reference (Lavin & Gray 2016, wincnn convention — for `ptx_winograd.rs`)
 
