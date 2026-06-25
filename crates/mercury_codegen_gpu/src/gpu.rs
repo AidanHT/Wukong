@@ -12653,9 +12653,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // (label, entry, warps-per-CTA). Each warp owns 16 query rows; W warps share one staged K/V
             // block (W× L2 reuse) and lift occupancy — the long-S levers.
             let variants: &[(&str, &str, u32)] = &[
-                ("mp   1w/16r", "flash_d64_mp", 1),
-                ("mp4  4w/64r", "flash_d64_mp4", 4),
-                ("mp8  8w/128r", "flash_d64_mp8", 8),
+                ("mp    1w/16r", "flash_d64_mp", 1),
+                ("mp4   4w/64r", "flash_d64_mp4", 4),
+                ("mpw2  1w/Bk32", "flash_d64_mpw2", 1),
+                ("mpw4  1w/Bk64", "flash_d64_mpw4", 1),
             ];
             let mut rng = crate::diff::Rng::new(0x0FA2_05EE);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
@@ -12730,6 +12731,155 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         t * 1e3,
                         gfm / 1e9,
                         gfm / g_p
+                    );
+                }
+            }
+        });
+    }
+
+    /// **Correctness gate (law #1) for the wide-key-tile flash** (`flash_d64_mpw2`/`mpw4`). The online
+    /// softmax is associative over any tile width, so a `BK = 16·nkb`-wide step must still match the f64
+    /// oracle [`ref_attn`] to f16 tolerance — this catches a P-fragment / V-load / psum mis-map in the
+    /// wide generator before any speed number is taken. Single-head `[S,D]`, `S % BK == 0`.
+    #[test]
+    fn flash_wide_matches_reference() {
+        use half::f16;
+        with_gpu("flash_wide", |g| {
+            let d = 64usize;
+            let mut rng = crate::diff::Rng::new(0x3FA12);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for &(entry, bk) in &[("flash_d64_mpw2", 32usize), ("flash_d64_mpw4", 64usize)] {
+                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                for &s in &[64usize, 128, 512, 1024] {
+                    if s % bk != 0 {
+                        continue;
+                    }
+                    let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                    let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                    let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                    let ss = s as u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((s / 16) as u32, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&ss).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                    g.stream.synchronize().unwrap();
+                    let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
+                    let st = crate::diff::assert_close(
+                        &format!("flash wide [{entry}] s={s}"),
+                        &got,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    eprintln!(
+                        "flash wide [{entry}] s={s}: max_abs={:.2e} max_rel={:.2e}",
+                        st.max_abs, st.max_rel
+                    );
+                }
+            }
+        });
+    }
+
+    /// **Clock-cancelling internal A/B: wide-key-tile (`mpw2`/`mpw4`) vs the narrow `mp`.** The
+    /// cross-process peer sweep is corrupted by the laptop's ~7× clock swing (the peer subprocess idles
+    /// the GPU between shapes), so this isolates the wide lever with a *same-process, same-round* ratio:
+    /// each round pins the clock, times mp / mpw2 / mpw4 back-to-back, and records the per-round ratios
+    /// `mpwN/mp` — both kernels run at the identical clock within a round, so the ratio is clock-invariant
+    /// (the median over rounds is reported). All three are checksum-cross-checked first.
+    #[test]
+    #[ignore = "tuning A/B; run explicitly"]
+    fn flash_wide_vs_mp() {
+        use half::f16;
+        with_gpu("flash_wide_vs_mp", |g| {
+            let d = 64usize;
+            let mut rng = crate::diff::Rng::new(0x3FA17);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let variants = [
+                ("mp  ", "flash_d64_mp"),
+                ("mpw2", "flash_d64_mpw2"),
+                ("mpw4", "flash_d64_mpw4"),
+            ];
+            let funcs: Vec<_> = variants
+                .iter()
+                .map(|(_, e)| g.function("flash", crate::ptx_flash::flash_ptx(), e).unwrap())
+                .collect();
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            let pin = |g: &mut Gpu| {
+                for _ in 0..40 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            };
+            const ROUNDS: usize = 9;
+            for &heads in &[1usize, 8] {
+                for &s in &[512usize, 1024, 2048, 4096] {
+                    let n = heads * s * d;
+                    let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                    let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                    let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let ss = s as u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((s / 16) as u32, heads as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let mut b = g.stream.launch_builder(f);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    };
+                    // checksum cross-check: all variants agree.
+                    let mut sums = [0f64; 3];
+                    for (i, f) in funcs.iter().enumerate() {
+                        run(g, f, &mut o_d);
+                        g.stream.synchronize().unwrap();
+                        sums[i] = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    }
+                    assert!(
+                        (sums[1] - sums[0]).abs() / sums[0] < 3e-2 && (sums[2] - sums[0]).abs() / sums[0] < 3e-2,
+                        "H={heads} S={s}: wide vs mp checksum disagree {sums:?}"
+                    );
+                    // per-round ratios (clock-invariant).
+                    let mut r2 = Vec::new();
+                    let mut r4 = Vec::new();
+                    let mut t_mp_best = f64::INFINITY;
+                    for _ in 0..ROUNDS {
+                        pin(g);
+                        let mut t = [0f64; 3];
+                        for (i, f) in funcs.iter().enumerate() {
+                            let t0 = Instant::now();
+                            for _ in 0..50 {
+                                run(g, f, &mut o_d);
+                            }
+                            g.stream.synchronize().unwrap();
+                            t[i] = t0.elapsed().as_secs_f64() / 50.0;
+                        }
+                        r2.push(t[1] / t[0]);
+                        r4.push(t[2] / t[0]);
+                        t_mp_best = t_mp_best.min(t[0]);
+                    }
+                    r2.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    r4.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = |v: &[f64]| v[v.len() / 2];
+                    let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
+                    eprintln!(
+                        "H={heads} S={s:>4}: mp {:>6.0} GF/s | mpw2/mp {:.3}× | mpw4/mp {:.3}×  (median of {ROUNDS}, clock-cancelled)",
+                        flop / t_mp_best / 1e9,
+                        med(&r2),
+                        med(&r4),
                     );
                 }
             }

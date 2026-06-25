@@ -1267,6 +1267,219 @@ fn entry_mma_reg_pipe_mw(d: usize, warps: usize) -> String {
     s
 }
 
+/// **Wide-key-tile** `cp.async`-pipelined register-resident flash (`flash_d{d}_mpw{nkb}`, non-causal).
+/// Identical online-softmax math to [`entry_mma_reg_pipe`] but processes **`BK = 16·nkb` keys per
+/// online-softmax step** instead of 16. The narrow kernel pays the softmax *fixed* cost — two warp
+/// `shfl` reductions (running max + denominator), the `ex2.approx` max-correction, and the rescale of
+/// all `nto·4` O accumulators — **once per 16 keys**, and between the QKᵀ and PV `mma`s the tensor
+/// cores idle through that scalar/SFU work (the measured ~9 TFLOP/s plateau vs cuDNN's scaling to 20).
+/// Widening to `BK` keys amortises that fixed cost over `nkb×` more `mma`: one softmax over `2·nkb`
+/// score n-tiles, one O rescale, one P pack of `nkb` k-tiles, then `nto·nkb` PV `mma`. The online
+/// softmax is associative over any tile width, so O equals `flash_d{d}_mp` up to f32 rounding (gated
+/// vs `ref_attn`). The staged K+V slab grows `nkb×` (`2·BK·d·2` bytes / double-buffer = 16 KB at
+/// nkb=2, d=64); **requires `S % BK == 0`** (each block is full — no ragged-tail mask), which the WMMA
+/// layer's `S % 64 == 0` already gives for nkb ≤ 4. Single warp / CTA (one 16-query-row block), so it
+/// composes with the multi-warp lever orthogonally.
+///
+/// **MEASURED NEGATIVE RESULT (kept as a documented A/B — `flash_wide_vs_mp`).** Clock-cancelled
+/// same-round ratios show wide **loses** to the narrow `mp`: `mpw2/mp ≈ 0.65–0.91×` at the realistic
+/// multi-head regime, *worse* at large S (≈0.65× at H=8/S=4096). The softmax fixed cost was NOT the
+/// binding constraint — the wider tile's extra score/P registers and `nkb×` SMEM cut occupancy
+/// (fewer concurrent warps / CTAs-per-SM) by more than the amortisation saves, and the penalty
+/// compounds over the longer K-loop. The real ceiling is occupancy + the strided SMEM V-load, not the
+/// per-step softmax. So the production path stays `mp`/`mp4`; this kernel is retained only to localise
+/// the comparison should a future GPU change the occupancy/softmax balance.
+fn entry_mma_reg_pipe_wide(d: usize, nkb: usize) -> String {
+    assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(nkb >= 1, "nkb must be >= 1");
+    let ktq = d / 16; // Q·Kt contraction tiles (over hdim)
+    let nto = d / 8; // P·V output n-tiles (over hdim)
+    let bk = 16 * nkb; // keys staged + softmaxed per step
+    let ntile = 2 * nkb; // 8-key QKᵀ score n-tiles per step
+    let ksz = bk * d * 2; // bytes of one staged K block (== one V block)
+    let bufsz = 2 * ksz; // K+V slab per pipeline buffer
+    let cpl = bk * d / 256; // 16-byte cp.async chunks per lane per tensor (bk*d*2/16/32)
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = format!("flash_d{d}_mpw{nkb}");
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0,%pnext;\n";
+    let mut fr = String::from(
+        "%scale,%m0,%m1,%mnew0,%mnew1,%corr0,%corr1,%l0,%l1,%lmax0,%lmax1,%rt,%psum0,%psum1,%pp,%tp0,%tp1,%tp2,%tp3",
+    );
+    for nt in 0..ntile {
+        for r in 0..4 {
+            fr += &format!(",%s{nt}_{r}");
+        }
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            fr += &format!(",%o{nt}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    let mut br = String::new();
+    for kt in 0..ktq {
+        for r in 0..4 {
+            br += &format!("%qa{kt}_{r},");
+        }
+    }
+    for kk in 0..nkb {
+        for r in 0..4 {
+            br += &format!("%pa{kk}_{r},");
+        }
+    }
+    br += "%b0,%b1,%h0,%h1,";
+    s += &format!(
+        "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%idx,%tmp,%hoff,%bufc,%bufp,%next,%sbase,%sk,%chunk,%lkey,%bswap;\n"
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
+    s += &format!("    .shared .align 16 .b8 smem_{name}[{}];\n", 2 * bufsz);
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    // multi-head head base offset (ctaid.y), identical to entry_mma_reg_pipe.
+    s += &format!("    mov.u32 %hoff,%ctaid.y;\n    mul.lo.u32 %hoff,%hoff,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+    s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+    s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+    s += "    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n";
+
+    // Load Q A-fragments once (reused across every key block).
+    for kt in 0..ktq {
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_0,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_2,[%base];\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_1,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_3,[%base];\n");
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %o{nt}_{r},0f00000000;\n");
+        }
+    }
+    s += "    mov.f32 %m0,0fFF800000;\n    mov.f32 %m1,0fFF800000;\n    mov.f32 %l0,0f00000000;\n    mov.f32 %l1,0f00000000;\n";
+
+    // cp.async stage of the BK-key K+V slab at global key index `kbreg` into buffer `bufreg`.
+    let stage = |kbreg: &str, bufreg: &str| -> String {
+        let mut t = String::new();
+        for ci in 0..cpl {
+            t += &format!("    add.u32 %chunk,%lane,{};\n", ci * 32);
+            t += &format!("    mul.lo.u32 %tmp,{kbreg},{d};\n    shl.b32 %sk,%chunk,3;\n    add.u32 %tmp,%tmp,%sk;\n    mul.wide.u32 %off,%tmp,2;\n");
+            t += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,{bufreg};\n    shl.b32 %sk,%chunk,4;\n    add.u32 %sbase,%sbase,%sk;\n");
+            t += "    add.s64 %base,%K,%off;\n    cp.async.cg.shared.global [%sbase],[%base],16;\n";
+            t += &format!("    add.u32 %sbase,%sbase,{ksz};\n    add.s64 %base,%V,%off;\n    cp.async.cg.shared.global [%sbase],[%base],16;\n");
+        }
+        t
+    };
+
+    s += &format!("    mov.u32 %bufc,0;\n    mov.u32 %bufp,{bufsz};\n    mov.u32 %kb,0;\n");
+    s += &stage("%kb", "%bufc");
+    s += "    cp.async.commit_group;\n";
+
+    // for kb in 0..S step BK (S % BK == 0 ⇒ every block full).
+    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+    s += &format!("    add.u32 %next,%kb,{bk};\n    setp.ge.u32 %pnext,%next,%S;\n");
+    s += &format!("    @%pnext bra NOPF_{name};\n");
+    s += &stage("%next", "%bufp");
+    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+    s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
+    s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
+
+    // 1. S = Q·Kt : ntile key n-tiles, K read from SMEM at bufc (local key = 8·nt+grp).
+    for nt in 0..ntile {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %s{nt}_{r},0f00000000;\n");
+        }
+        s += &format!("    add.u32 %lkey,%grp,{};\n", nt * 8);
+        for kt in 0..ktq {
+            s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
+            s += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nt}_0,%s{nt}_1,%s{nt}_2,%s{nt}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nt}_0,%s{nt}_1,%s{nt}_2,%s{nt}_3}};\n");
+        }
+    }
+
+    // 2. online softmax over the full BK-wide score row (register-resident).
+    s += "    max.f32 %lmax0,%s0_0,%s0_1;\n";
+    for nt in 1..ntile {
+        s += &format!("    max.f32 %lmax0,%lmax0,%s{nt}_0;\n    max.f32 %lmax0,%lmax0,%s{nt}_1;\n");
+    }
+    s += "    mul.f32 %lmax0,%lmax0,%scale;\n";
+    s += "    max.f32 %lmax1,%s0_2,%s0_3;\n";
+    for nt in 1..ntile {
+        s += &format!("    max.f32 %lmax1,%lmax1,%s{nt}_2;\n    max.f32 %lmax1,%lmax1,%s{nt}_3;\n");
+    }
+    s += "    mul.f32 %lmax1,%lmax1,%scale;\n";
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax0,{off},0x1f,0xffffffff;\n    max.f32 %lmax0,%lmax0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax1,{off},0x1f,0xffffffff;\n    max.f32 %lmax1,%lmax1,%rt;\n");
+    }
+    s += &format!("    max.f32 %mnew0,%m0,%lmax0;\n    sub.f32 %corr0,%m0,%mnew0;\n    mul.f32 %corr0,%corr0,{log2e};\n    ex2.approx.f32 %corr0,%corr0;\n");
+    s += &format!("    max.f32 %mnew1,%m1,%lmax1;\n    sub.f32 %corr1,%m1,%mnew1;\n    mul.f32 %corr1,%corr1,{log2e};\n    ex2.approx.f32 %corr1,%corr1;\n");
+    for nt in 0..nto {
+        s += &format!("    mul.f32 %o{nt}_0,%o{nt}_0,%corr0;\n    mul.f32 %o{nt}_1,%o{nt}_1,%corr0;\n    mul.f32 %o{nt}_2,%o{nt}_2,%corr1;\n    mul.f32 %o{nt}_3,%o{nt}_3,%corr1;\n");
+    }
+    let prob = |dst: &str, sreg: &str, mnew: &str| -> String {
+        format!("    mul.f32 %pp,{sreg},%scale;\n    sub.f32 %pp,%pp,{mnew};\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 {dst},%pp;\n")
+    };
+    let pack = |dst: &str, lo: &str, hi: &str| -> String {
+        format!("    cvt.rn.f16.f32 %h0,{lo};\n    and.b32 %h0,%h0,65535;\n    cvt.rn.f16.f32 %h1,{hi};\n    shl.b32 %h1,%h1,16;\n    or.b32 {dst},%h0,%h1;\n")
+    };
+    // qr0 probabilities → P fragments + psum0 (each n-tile nt → k-tile nt/2, slot 0 if even else 2).
+    s += "    mov.f32 %psum0,0f00000000;\n";
+    for nt in 0..ntile {
+        s += &prob("%tp0", &format!("%s{nt}_0"), "%mnew0");
+        s += &prob("%tp1", &format!("%s{nt}_1"), "%mnew0");
+        s += "    add.f32 %psum0,%psum0,%tp0;\n    add.f32 %psum0,%psum0,%tp1;\n";
+        let (kk, slot) = (nt / 2, if nt % 2 == 0 { 0 } else { 2 });
+        s += &pack(&format!("%pa{kk}_{slot}"), "%tp0", "%tp1");
+    }
+    // qr1 probabilities → P fragments + psum1 (slot 1 if even else 3).
+    s += "    mov.f32 %psum1,0f00000000;\n";
+    for nt in 0..ntile {
+        s += &prob("%tp2", &format!("%s{nt}_2"), "%mnew1");
+        s += &prob("%tp3", &format!("%s{nt}_3"), "%mnew1");
+        s += "    add.f32 %psum1,%psum1,%tp2;\n    add.f32 %psum1,%psum1,%tp3;\n";
+        let (kk, slot) = (nt / 2, if nt % 2 == 0 { 1 } else { 3 });
+        s += &pack(&format!("%pa{kk}_{slot}"), "%tp2", "%tp3");
+    }
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum0,{off},0x1f,0xffffffff;\n    add.f32 %psum0,%psum0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum1,{off},0x1f,0xffffffff;\n    add.f32 %psum1,%psum1,%rt;\n");
+    }
+    s += "    fma.rn.f32 %l0,%l0,%corr0,%psum0;\n    fma.rn.f32 %l1,%l1,%corr1,%psum1;\n";
+    s += "    mov.f32 %m0,%mnew0;\n    mov.f32 %m1,%mnew1;\n";
+
+    // 4. O += P·V : for each output d-tile, accumulate nkb key k-tiles (V from SMEM at bufc+ksz).
+    for nt in 0..nto {
+        s += &format!("    add.u32 %idx,%grp,{};\n", nt * 8);
+        for kk in 0..nkb {
+            // base = &smemV[key = 16·kk + tg2][hdim = idx] = smem + bufc + ksz + ((16kk+tg2)·d + idx)·2
+            s += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    add.u32 %tmp,%tmp,{};\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n", 16 * kk * d);
+            s += &format!("    ld.shared.u16 %h0,[%sbase];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n", 2 * d);
+            s += &format!("    ld.shared.u16 %h0,[%sbase+{}];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b1,%h0,%h1;\n", 16 * d, 18 * d);
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%pa{kk}_0,%pa{kk}_1,%pa{kk}_2,%pa{kk}_3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+        }
+    }
+
+    // advance: swap buffers, kb = next.
+    s += "    mov.u32 %bswap,%bufc;\n    mov.u32 %bufc,%bufp;\n    mov.u32 %bufp,%bswap;\n";
+    s += &format!("    mov.u32 %kb,%next;\n    bra KB_{name};\n");
+
+    // store O[row][c] = o / l_row.
+    s += &format!("DONE_{name}:\n");
+    for nt in 0..nto {
+        s += &format!("    div.rn.f32 %o{nt}_0,%o{nt}_0,%l0;\n    div.rn.f32 %o{nt}_1,%o{nt}_1,%l0;\n    div.rn.f32 %o{nt}_2,%o{nt}_2,%l1;\n    div.rn.f32 %o{nt}_3,%o{nt}_3,%l1;\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_0;\n    st.global.f32 [%base+4],%o{nt}_1;\n", nt * 8);
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_2;\n    st.global.f32 [%base+4],%o{nt}_3;\n", nt * 8);
+    }
+    s += "    ret;\n}\n";
+    s
+}
+
 /// Flash-attention module: untiled `flash_d{D}` + tiled `flash_d{D}_t` per supported head dim, the
 /// tensor-core `flash_d64_w` (16-key tile) and wide-key `flash_d64_w4` (64-key tile), plus the
 /// register-resident `flash_d64_m` (hand-placed `mma.sync`, O/m/l in registers — no SMEM round-trip).
@@ -1286,6 +1499,8 @@ pub fn flash_ptx() -> &'static str {
         m += &entry_mma_reg_pipe(64, true);
         m += &entry_mma_reg_pipe_mw(64, 4);
         m += &entry_mma_reg_pipe_mw(64, 8);
+        m += &entry_mma_reg_pipe_wide(64, 2);
+        m += &entry_mma_reg_pipe_wide(64, 4);
         m
     })
     .as_str()
