@@ -1,0 +1,195 @@
+module examples.llama_block
+
+// =====================================================================================
+// Llama-style transformer block in Mercury's surface — RMSNorm + RoPE + SwiGLU FFN.
+// =====================================================================================
+//
+// The modern decoder block (Llama / Mistral / Qwen). One block, pre-norm:
+//
+//     a   = x + Wo · Attn( RoPE( RMSNorm1(x) ) )                 // attention + residual
+//     out = a + Wd · ( SiLU(Wg · RMSNorm2(a)) ⊙ (Wu · RMSNorm2(a)) )   // SwiGLU FFN + residual
+//
+// Differences from GPT-2 (`examples/gpt2.mer`), all spelled in recognized op-forms:
+//   * RMSNorm (no mean-subtraction, gain only) instead of LayerNorm  -> mercury_norm_affine_f32
+//   * Rotary Position Embedding (RoPE) on Q and K                     -> sin/cos vmath
+//   * SwiGLU gated FFN  down(silu(gate) ⊙ up)  instead of a single GELU MLP
+//                                                                     -> 3 GEMMs + a gated elementwise
+//
+// This is the exact shape the GPU resident `transformer_layer` (RMSNorm + flash attention +
+// SiLU/SwiGLU FFN) is built for, so the same math the interpreter oracle runs here is what the
+// host harness drives GPU-resident at the 7B-scale config.
+//
+// Small runnable config (the production config — D=4096, H=32, Dff=11008 — is harness-driven):
+//     S=8 tokens, D=64 model dim, H=4 heads (hd=16), Dff=256 FFN hidden.
+
+fn llama_block(
+    x:    [f32; 512],     // [S=8, D=64]  input hidden states
+    rg1:  [f32; 64],      // RMSNorm 1 gain (per-channel)
+    wq:   [f32; 4096], wk:  [f32; 4096],  // [D, D]  query / key projections
+    wv:   [f32; 4096], wo:  [f32; 4096],  // [D, D]  value / output projections
+    rg2:  [f32; 64],      // RMSNorm 2 gain
+    wg:   [f32; 16384],   // [Dff=256, D=64]  SwiGLU gate projection
+    wu:   [f32; 16384],   // [Dff=256, D=64]  SwiGLU up   projection
+    wd:   [f32; 16384],   // [D=64, Dff=256]  SwiGLU down projection
+    out:  [f32; 512],     // [S, D]  output hidden states
+) {
+    let mut nrm:   [f32; 512]  = [0.0; 512];   // RMSNorm output [S, D]
+    let mut q:     [f32; 512]  = [0.0; 512];
+    let mut k:     [f32; 512]  = [0.0; 512];
+    let mut v:     [f32; 512]  = [0.0; 512];
+    let mut scores:[f32; 64]   = [0.0; 64];    // per-head scores [S, S]
+    let mut attn:  [f32; 512]  = [0.0; 512];
+    let mut a:     [f32; 512]  = [0.0; 512];   // residual stream after attention
+    let mut gate:  [f32; 2048] = [0.0; 2048];  // SwiGLU gate [S, Dff]
+    let mut up:    [f32; 2048] = [0.0; 2048];  // SwiGLU up   [S, Dff]
+    let mut h:     [f32; 2048] = [0.0; 2048];  // silu(gate) ⊙ up [S, Dff]
+
+    // ---- 1. RMSNorm1(x) -> nrm  (affine, gain only; copy in, normalize in place) ----
+    for i in 0..512 { nrm[i] = x[i]; }
+    for r in 0..8 {
+        let mut s: f32 = 0.0;
+        for i in 0..64 { s = s + nrm[r*64+i] * nrm[r*64+i]; }
+        let inv: f32 = rsqrt(s / 64.0 + 0.00001);
+        for i in 0..64 { nrm[r*64+i] = nrm[r*64+i] * inv * rg1[i]; }
+    }
+
+    // ---- 2. Q, K, V projections (nn.Linear, [S,D]·[D,D]ᵀ) ----
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wq[j*64+p]; }
+        q[i*64+j] = s;
+    } }
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wk[j*64+p]; }
+        k[i*64+j] = s;
+    } }
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wv[j*64+p]; }
+        v[i*64+j] = s;
+    } }
+
+    // ---- 3. RoPE on Q and K (interleaved pairs), per head, per position ----
+    // angle(pos, p) = pos · 10000^(-2p/hd);  rotates the pair (2p, 2p+1) of each head.
+    for i in 0..8 {                 // token position
+        for hh in 0..4 {            // head
+            for p in 0..8 {         // frequency pair index  (hd/2 = 8)
+                let freq: f32 = pow(10000.0, -((2*p) as f32) / 16.0);
+                let theta: f32 = (i as f32) * freq;
+                let c: f32 = cos(theta);
+                let sn: f32 = sin(theta);
+                let i0: i32 = i*64 + hh*16 + 2*p;
+                let i1: i32 = i0 + 1;
+                let q0: f32 = q[i0]; let q1: f32 = q[i1];
+                q[i0] = q0 * c - q1 * sn;
+                q[i1] = q0 * sn + q1 * c;
+                let k0: f32 = k[i0]; let k1: f32 = k[i1];
+                k[i0] = k0 * c - k1 * sn;
+                k[i1] = k0 * sn + k1 * c;
+            }
+        }
+    }
+
+    // ---- 4. Multi-head causal attention.  H=4 heads, hd=16, scale 1/sqrt(16) = 0.25 ----
+    for hh in 0..4 {
+        for i in 0..8 { for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for p in 0..16 { s = s + q[i*64 + hh*16 + p] * k[j*64 + hh*16 + p]; }
+            scores[i*8+j] = s * 0.25;
+        } }
+        for i in 0..8 {
+            for j in 0..8 { if j > i { scores[i*8+j] = -1.0e30; } }
+            let mut m: f32 = scores[i*8+0];
+            for j in 0..8 { m = fmax(m, scores[i*8+j]); }
+            let mut sm: f32 = 0.0;
+            for j in 0..8 { let e: f32 = exp(scores[i*8+j] - m); scores[i*8+j] = e; sm = sm + e; }
+            let inv: f32 = 1.0 / sm;
+            for j in 0..8 { scores[i*8+j] = scores[i*8+j] * inv; }
+        }
+        for i in 0..8 { for j in 0..16 {
+            let mut s: f32 = 0.0;
+            for p in 0..8 { s = s + scores[i*8+p] * v[p*64 + hh*16 + j]; }
+            attn[i*64 + hh*16 + j] = s;
+        } }
+    }
+
+    // ---- 5. Output projection + residual:  a = x + attn·Woᵀ ----
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + attn[i*64+p] * wo[j*64+p]; }
+        a[i*64+j] = s;
+    } }
+    for i in 0..512 { a[i] = x[i] + a[i]; }
+
+    // ---- 6. RMSNorm2(a) -> nrm ----
+    for i in 0..512 { nrm[i] = a[i]; }
+    for r in 0..8 {
+        let mut s: f32 = 0.0;
+        for i in 0..64 { s = s + nrm[r*64+i] * nrm[r*64+i]; }
+        let inv: f32 = rsqrt(s / 64.0 + 0.00001);
+        for i in 0..64 { nrm[r*64+i] = nrm[r*64+i] * inv * rg2[i]; }
+    }
+
+    // ---- 7. SwiGLU FFN:  gate = nrm·Wgᵀ,  up = nrm·Wuᵀ,  h = silu(gate) ⊙ up ----
+    for i in 0..8 { for j in 0..256 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wg[j*64+p]; }
+        gate[i*256+j] = s;
+    } }
+    for i in 0..8 { for j in 0..256 {
+        let mut s: f32 = 0.0;
+        for p in 0..64 { s = s + nrm[i*64+p] * wu[j*64+p]; }
+        up[i*256+j] = s;
+    } }
+    // SiLU(gate) in place, then the gated product  h = silu(gate) ⊙ up.
+    // The activation uses the `silu` intrinsic so the `for i { g[i] = silu(g[i]) }` form is
+    // recognized and dispatched to the tuned 256-bit vmath kernel (mercury_vmath_f32); the gate
+    // is a plain elementwise product.  silu(z) = z·sigmoid(z).
+    for i in 0..2048 { gate[i] = silu(gate[i]); }
+    for i in 0..2048 { h[i] = gate[i] * up[i]; }
+
+    // ---- 8. Down-projection + residual:  out = a + h·Wdᵀ   [S,Dff]·[D,Dff]ᵀ -> [S,D] ----
+    for i in 0..8 { for j in 0..64 {
+        let mut s: f32 = 0.0;
+        for p in 0..256 { s = s + h[i*256+p] * wd[j*256+p]; }
+        out[i*64+j] = s;
+    } }
+    for i in 0..512 { out[i] = a[i] + out[i]; }
+}
+
+fn main() -> i32 {
+    let mut x:   [f32; 512]   = [0.0; 512];
+    let mut rg1: [f32; 64]    = [1.0; 64];
+    let mut wq:  [f32; 4096]  = [0.0; 4096];
+    let mut wk:  [f32; 4096]  = [0.0; 4096];
+    let mut wv:  [f32; 4096]  = [0.0; 4096];
+    let mut wo:  [f32; 4096]  = [0.0; 4096];
+    let mut rg2: [f32; 64]    = [1.0; 64];
+    let mut wg:  [f32; 16384] = [0.0; 16384];
+    let mut wu:  [f32; 16384] = [0.0; 16384];
+    let mut wd:  [f32; 16384] = [0.0; 16384];
+    let mut out: [f32; 512]   = [0.0; 512];
+
+    for i in 0..512 { x[i] = ((i % 13) as f32) * 0.02 - 0.12; }
+    for i in 0..4096 {
+        wq[i] = ((i % 7)  as f32) * 0.01 - 0.03;
+        wk[i] = ((i % 11) as f32) * 0.008 - 0.04;
+        wv[i] = ((i % 5)  as f32) * 0.012 - 0.024;
+        wo[i] = ((i % 9)  as f32) * 0.009 - 0.036;
+    }
+    for i in 0..16384 {
+        wg[i] = ((i % 17) as f32) * 0.004 - 0.032;
+        wu[i] = ((i % 19) as f32) * 0.003 - 0.027;
+        wd[i] = ((i % 23) as f32) * 0.0025 - 0.0275;
+    }
+    for i in 0..64 { rg1[i] = 1.0 + ((i % 3) as f32) * 0.1; rg2[i] = 1.0 - ((i % 4) as f32) * 0.05; }
+
+    llama_block(x, rg1, wq, wk, wv, wo, rg2, wg, wu, wd, out);
+
+    print(round(out[0]   * 10000.0) as i32);
+    print(round(out[64]  * 10000.0) as i32);
+    print(round(out[256] * 10000.0) as i32);
+    print(round(out[511] * 10000.0) as i32);
+    return 0;
+}

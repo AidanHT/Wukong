@@ -1223,10 +1223,29 @@ pub(crate) fn flash_attn_run(
     g.stream.memcpy_dtov(&o_d)
 }
 
-/// Direct 2D **convolution** on the GPU (single batch, stride 1, no padding): input `x` is `[C,H,W]`,
+/// Launch grid/block for the SMEM-tiled conv: one CTA per `TILE_P×TILE_Q` output tile per channel `k`
+/// (`grid = (ceil(Q/TQ), ceil(P/TP), K)`, `block = (TQ, TP, 1)`). Shared mem is the kernel's own static
+/// `.shared` array, so `shared_mem_bytes = 0`. Shared by the launcher and the `conv_vs_peers` bench.
+pub(crate) fn conv_tiled_cfg(h: usize, width: usize, k: usize, r: usize, s: usize) -> LaunchConfig {
+    use crate::ptx_conv::{kblock, TILE_P, TILE_Q};
+    let (p, q) = (h - r + 1, width - s + 1);
+    LaunchConfig {
+        grid_dim: (
+            (q as u32).div_ceil(TILE_Q as u32),
+            (p as u32).div_ceil(TILE_P as u32),
+            (k / kblock(k)) as u32,
+        ),
+        block_dim: (TILE_Q as u32, TILE_P as u32, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// 2D **convolution** on the GPU (single batch, stride 1, no padding): input `x` is `[C,H,W]`,
 /// weights `w` are `[K,C,R,S]`, output is `[K,P,Q]` with `P=H-R+1`, `Q=W-S+1` — the valid
-/// cross-correlation deep-learning calls conv2d. One thread per output element. Tolerance-gated
-/// (the GPU `fma`-accumulates the C·R·S window in a different order than a serial reference).
+/// cross-correlation deep-learning calls conv2d. Dispatches the **SMEM-tiled, static-shape-specialized**
+/// generator ([`crate::ptx_conv::conv2d_ptx`]) when the staged halo fits shared memory, else falls back
+/// to the naive one-thread-per-output kernel. Tolerance-gated (the GPU `fma`-accumulates the C·R·S
+/// window in a different order than a serial reference).
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d(
     g: &mut Gpu,
@@ -1244,21 +1263,90 @@ pub fn conv2d(
     assert!(h >= r && width >= s, "kernel larger than input");
     let p = h - r + 1;
     let q = width - s + 1;
-    let total = (k * p * q) as u32;
-    let f = g.function("conv2d", crate::ptx_conv::CONV2D, "conv2d")?;
     let x_d = g.stream.memcpy_stod(x)?;
     let w_d = g.stream.memcpy_stod(w)?;
     let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
-    let dims = [c, h, width, k, r, s, p, q].map(|v| v as u32);
-    let cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(256), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut bld = g.stream.launch_builder(&f);
-    for d in &dims {
-        bld.arg(d);
+
+    if crate::ptx_conv::tiled_applies(c, h, width, k, r, s) {
+        // Shape-specialized PTX: cache by PTX hash (the in-process module map keys by &'static str,
+        // which would alias different shapes), then launch the tiled grid.
+        let ptx = crate::ptx_conv::conv2d_ptx(c, h, width, k, r, s);
+        let module = g.load_module_cached(&ptx)?;
+        let f = module.load_function("conv2d")?;
+        let cfg = conv_tiled_cfg(h, width, k, r, s);
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg)? };
+    } else {
+        let total = (k * p * q) as u32;
+        let f = g.function("conv2d_naive", crate::ptx_conv::CONV2D, "conv2d")?;
+        let dims = [c, h, width, k, r, s, p, q].map(|v| v as u32);
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bld = g.stream.launch_builder(&f);
+        for d in &dims {
+            bld.arg(d);
+        }
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg)? };
     }
+    g.stream.memcpy_dtov(&o_d)
+}
+
+/// Launch grid/block for the fp16 tensor-core implicit-GEMM conv: one warp per CTA owns a
+/// `WMMA_BM×WMMA_BN` output tile (`grid = (ceil(N/BN), ceil(M/BM), 1)`, `block = (32,1,1)`), with
+/// `M=K`, `N=P*Q`. Shared by the launcher and the `conv_vs_peers` bench.
+pub(crate) fn conv_wmma_cfg(h: usize, width: usize, k: usize, r: usize, s: usize) -> LaunchConfig {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS};
+    let (p, q) = (h - r + 1, width - s + 1);
+    let (m, n) = (k, p * q);
+    LaunchConfig {
+        grid_dim: (
+            (n as u32).div_ceil(WMMA_BN as u32),
+            (m as u32).div_ceil(WMMA_BM as u32),
+            1,
+        ),
+        block_dim: (WMMA_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// **fp16 tensor-core implicit-GEMM** conv2d (single batch, stride 1, no padding). Same contract as
+/// [`conv2d`] but the multiplies run on the tensor cores in fp16 with f32 accumulate (so `X`,`W` are
+/// rounded to f16 on the host — the price the tensor-core path pays), staging the weights and an
+/// on-the-fly im2col of `X` through shared memory ([`crate::ptx_conv::conv_wmma_ptx`]). Tolerance-gated
+/// at fp16 precision against the f64 reference.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_wmma(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * r * s, "W must be K×C×R×S");
+    assert!(h >= r && width >= s, "kernel larger than input");
+    let p = h - r + 1;
+    let q = width - s + 1;
+    let ptx = crate::ptx_conv::conv_wmma_ptx(c, h, width, k, r, s);
+    let module = g.load_module_cached(&ptx)?;
+    let f = module.load_function("conv2d_wmma")?;
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+    let cfg = conv_wmma_cfg(h, width, k, r, s);
+    let mut bld = g.stream.launch_builder(&f);
     bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
     unsafe { bld.launch(cfg)? };
     g.stream.memcpy_dtov(&o_d)
@@ -2125,6 +2213,271 @@ pub fn gemm_nt_fp8(
     g.stream.memcpy_dtov(&c_d)
 }
 
+/// **W4A16 weight-only int4 decode** `C = A·dequant(W)ᵀ` (the LLM-decode workhorse). `A` (`[M,K]`)
+/// arrives f32 and is rounded to f16; `W` is the group-wise int4-quantized weight `[N,K]` ([`QuantWeight`]
+/// from [`crate::ptx_int4`]) — packed 4-bit values, per-group fp16 scales, optional integer zero-points.
+/// The kernel reads the **packed int4 weight (4-bit/weight — 4× the fp16 footprint shrink), unpacks it to
+/// fp16 on the fly, and runs the identical fp16 tensor-core MMA**; `C` is `[M,N]` f32. Requires
+/// `M%64==0`, `N%64==0`, `K%GROUP_SIZE==0`, and `qw.group == GROUP_SIZE` (the kernel bakes the group
+/// size). Dispatches the symmetric (`gemm_nt_w4a16`) or asymmetric/zero-point (`gemm_nt_w4a16_z`) entry.
+pub fn gemm_nt_w4a16(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int4::{GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be M*K");
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
+    assert!(
+        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        "gemm_nt_w4a16 requires M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
+    );
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let scl_d = g.stream.memcpy_stod(&qw.scales)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+        block_dim: (W4_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match &qw.zeros {
+        None => {
+            let f = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16")?;
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+            unsafe { bld.launch(cfg)? };
+        }
+        Some(zeros) => {
+            let z_d = g.stream.memcpy_stod(zeros)?;
+            let f = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16_z")?;
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d).arg(&z_d);
+            unsafe { bld.launch(cfg)? };
+        }
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
+/// **Static-shape-specialized** W4A16 (Mercury's no-library lever, §1A.2): JIT-load a kernel with M/N/K
+/// **baked as compile-time constants** for this exact shape, then launch it. Numerically identical to
+/// [`gemm_nt_w4a16`] (gated against the same f64 reference), but ptxas strength-reduces the baked strides
+/// (`×K`, `×N`, `K/8`, `K/group`) to shifts/immediates — the runtime-multiply overhead a library, which
+/// never sees the shape at compile time, cannot remove. Loads a fresh module per call here (the per-shape
+/// compile is the static-shape tradeoff; the persistent cubin cache (M10) amortizes it across runs).
+pub fn gemm_nt_w4a16_static(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use crate::ptx_int4::{GROUP_SIZE, W4_BM, W4_BN, W4_THREADS};
+    use half::f16;
+    assert_eq!(a.len(), m * k, "A must be M*K");
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
+    assert!(
+        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        "gemm_nt_w4a16_static requires M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
+    );
+    let zero_point = qw.zeros.is_some();
+    let ptx = crate::ptx_int4::w4a16_static_ptx(m, n, k, zero_point);
+    let module = g.ctx.load_module(ptx.as_str().into())?;
+    let f = module.load_function(crate::ptx_int4::w4a16_static_entry(zero_point))?;
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let scl_d = g.stream.memcpy_stod(&qw.scales)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+        block_dim: (W4_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match &qw.zeros {
+        None => {
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d);
+            unsafe { bld.launch(cfg)? };
+        }
+        Some(zeros) => {
+            let z_d = g.stream.memcpy_stod(zeros)?;
+            let mut bld = g.stream.launch_builder(&f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&bq_d).arg(&scl_d).arg(&mut c_d).arg(&z_d);
+            unsafe { bld.launch(cfg)? };
+        }
+    }
+    g.stream.memcpy_dtov(&c_d)
+}
+
+// ===================================================================================================
+// M7 runtime (Phase 7): pooled resident layer. New `impl` block, append-only — it reuses the struct's
+// already-preloaded kernels and uploaded weights and only changes *where* the per-op scratch lives
+// (a `DevicePool` bump arena instead of per-op `alloc_zeros`). The op sequence, kernels, launch
+// configs and dtypes are identical to `forward_device`, so the result is bit-identical (gated) while
+// the steady-state inner loop issues zero device alloc/free. This is also the alloc-free body that
+// CUDA-graph capture records as pure launches (see `crate::graph`).
+// ===================================================================================================
+impl ResidentLayerF16 {
+    /// [`forward_device`](Self::forward_device) with every intermediate sub-allocated from `pool` and
+    /// the `[S,D]` result written into the caller-owned **persistent** `out` (which, like `x_d`, lives
+    /// outside the pool so a per-iteration [`reset`](crate::pool::DevicePool::reset) never clobbers it —
+    /// the ping-pong a decode loop needs). Does **not** reset the pool; the caller owns the arena's
+    /// lifecycle. Every pooled buffer is a full-overwrite output, so the uninitialized
+    /// [`alloc`](crate::pool::DevicePool::alloc) fast path is used throughout — the
+    /// `resident_layer_pooled_matches_eager` gate proves it by poisoning the slab first.
+    pub fn forward_device_pooled(
+        &self,
+        pool: &mut crate::pool::DevicePool,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+        out: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<(), DriverError> {
+        let stream = self.stream.clone();
+        self.forward_device_pooled_on(&stream, pool, x_d, out)
+    }
+
+    /// As [`forward_device_pooled`](Self::forward_device_pooled) but issuing every launch on an
+    /// explicit `stream` (which may differ from the layer's own NULL default stream). The pool's
+    /// uninitialized `alloc` path issues no stream work, so *only* these launches land on `stream` —
+    /// exactly what [`crate::graph::Graph::capture`] needs: a capturable (non-NULL) stream carrying
+    /// nothing but the layer's launches.
+    pub fn forward_device_pooled_on(
+        &self,
+        stream: &Arc<CudaStream>,
+        pool: &mut crate::pool::DevicePool,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+        out: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<(), DriverError> {
+        use crate::pool::{DevicePool, PoolBuf};
+        use cudarc::driver::{CudaSlice, CudaFunction};
+        use half::f16;
+        let (s, d, dff, eps) = (self.s, self.d, self.dff, self.eps);
+        assert_eq!(x_d.len(), s * d, "x_d must be S*D");
+        assert_eq!(out.len(), s * d, "out must be S*D");
+        let norm_cfg = LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+
+        // Pooled equivalents of forward_device's closures. `pool` is threaded as a parameter (not
+        // captured) so several pool buffers can be live at once without aliasing a single `&mut`.
+        let norm = |pool: &mut DevicePool, src: &CudaSlice<f32>, rows: usize| -> Result<PoolBuf<f32>, DriverError> {
+            let mut o = pool.alloc::<f32>(rows * d)?;
+            let (r, c) = (rows as u32, d as u32);
+            let mut b = stream.launch_builder(&self.f_norm);
+            b.arg(&r).arg(&c).arg(&eps).arg(src).arg(&mut *o);
+            unsafe { b.launch(norm_cfg)? };
+            Ok(o)
+        };
+        let cast = |pool: &mut DevicePool, src: &CudaSlice<f32>, n: usize| -> Result<PoolBuf<f16>, DriverError> {
+            let mut dst = pool.alloc::<f16>(n)?;
+            let nn = n as u32;
+            let mut b = stream.launch_builder(&self.f_cast);
+            b.arg(&nn).arg(src).arg(&mut *dst);
+            unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+            Ok(dst)
+        };
+        let gemm16 = |pool: &mut DevicePool, f: &CudaFunction, a: &CudaSlice<f16>, b: &CudaSlice<f16>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+            let mut c = pool.alloc::<f32>(m * n)?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut *c);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+        let resid_gemm = |pool: &mut DevicePool, a: &CudaSlice<f16>, b: &CudaSlice<f16>, residual: &CudaSlice<f32>, m: usize, k: usize, n: usize| -> Result<PoolBuf<f32>, DriverError> {
+            let mut c = pool.alloc::<f32>(m * n)?;
+            let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+            let mut bld = stream.launch_builder(&self.f_resid);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a).arg(b).arg(&mut *c).arg(residual);
+            unsafe { bld.launch(wmma_sm_cfg(m, n))? };
+            Ok(c)
+        };
+
+        // --- attention: fp16 tensor-core Q/K/V/O projections, flash, residual fused into O ---
+        let h1 = norm(pool, x_d, s)?;
+        let h1_16 = cast(pool, &h1, s * d)?;
+        let q = gemm16(pool, &self.f_gemm, &h1_16, &self.wq, s, d, d)?;
+        let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, s, d, d)?;
+        let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, s, d, d)?;
+
+        // Pooled attention seam — mirrors `run_attn` exactly (single-head f32/tensor-core flash, or
+        // multi-head cast-transpose → tensor-core flash with grid.y=heads → transpose back).
+        let attn: PoolBuf<f32> = {
+            let scale = 1.0f32 / (self.dh as f32).sqrt();
+            let ss = s as u32;
+            if self.heads == 1 {
+                let mut attn = pool.alloc::<f32>(s * d)?;
+                if let Some((f_w, cfg_w)) = &self.f_flash_w {
+                    let q16 = cast(pool, &q, s * d)?;
+                    let k16 = cast(pool, &k, s * d)?;
+                    let v16 = cast(pool, &v, s * d)?;
+                    let mut bld = stream.launch_builder(f_w);
+                    bld.arg(&ss).arg(&scale).arg(&*q16).arg(&*k16).arg(&*v16).arg(&mut *attn);
+                    unsafe { bld.launch(*cfg_w)? };
+                } else {
+                    let mut bld = stream.launch_builder(&self.f_flash);
+                    bld.arg(&ss).arg(&scale).arg(&*q).arg(&*k).arg(&*v).arg(&mut *attn);
+                    unsafe { bld.launch(self.flash_cfg)? };
+                }
+                attn
+            } else {
+                let (f_w, _) = self.f_flash_w.as_ref().expect("multi-head requires the tensor-core flash");
+                let cast_transpose = |pool: &mut DevicePool, src: &CudaSlice<f32>| -> Result<PoolBuf<f16>, DriverError> {
+                    let n = s * d;
+                    let mut dst = pool.alloc::<f16>(n)?;
+                    let (nn, dd, dhh, sdh) = (n as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
+                    let mut b = stream.launch_builder(&self.f_qkv_trans);
+                    b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(src).arg(&mut *dst);
+                    unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+                    Ok(dst)
+                };
+                let q_hsd = cast_transpose(pool, &q)?;
+                let k_hsd = cast_transpose(pool, &k)?;
+                let v_hsd = cast_transpose(pool, &v)?;
+                let mut attn_hsd = pool.alloc::<f32>(s * d)?;
+                let cfg = LaunchConfig { grid_dim: ((s / 16) as u32, self.heads as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+                let mut bld = stream.launch_builder(f_w);
+                bld.arg(&ss).arg(&scale).arg(&*q_hsd).arg(&*k_hsd).arg(&*v_hsd).arg(&mut *attn_hsd);
+                unsafe { bld.launch(cfg)? };
+                // transpose the [H,S,dh] flash output back to token-major [S,H·dh].
+                let mut dst = pool.alloc::<f32>(s * d)?;
+                let (nn, dd, dhh, sdh) = ((s * d) as u32, d as u32, self.dh as u32, (s * self.dh) as u32);
+                let mut b = stream.launch_builder(&self.f_attn_trans);
+                b.arg(&nn).arg(&dd).arg(&dhh).arg(&sdh).arg(&*attn_hsd).arg(&mut *dst);
+                unsafe { b.launch(LaunchConfig::for_num_elems(nn))? };
+                dst
+            }
+        };
+
+        let attn_16 = cast(pool, &attn, s * d)?;
+        let x1 = resid_gemm(pool, &attn_16, &self.wo, x_d, s, d, d)?; // x + A·Woᵀ (residual 1, fused)
+
+        // --- FFN: RMSNorm → SiLU up-projection (fused) → down-projection with residual (fused) ---
+        let h2 = norm(pool, &x1, s)?;
+        let h2_16 = cast(pool, &h2, s * d)?;
+        let f1 = gemm16(pool, &self.f_silu, &h2_16, &self.w1, s, d, dff)?; // SiLU(h2·W1ᵀ), act fused
+        let f1_16 = cast(pool, &f1, s * dff)?;
+        // residual 2 into the persistent `out`: out = f1·W2ᵀ + x1 (fused), no pool buffer for the result.
+        {
+            let (mm, nn, kk) = (s as u32, d as u32, dff as u32);
+            let mut bld = stream.launch_builder(&self.f_resid);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(&*f1_16).arg(&self.w2).arg(&mut *out).arg(&*x1);
+            unsafe { bld.launch(wmma_sm_cfg(s, d))? };
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2137,6 +2490,123 @@ mod tests {
             Some(g) => body(g),
             None => eprintln!("[skip] {name}: no CUDA device reachable"),
         }
+    }
+
+    /// **W4A16 correctness gate (the first law).** The int4-decode kernel must reproduce — within the
+    /// fp16-accumulate tolerance — an *exact* f64 dequant reference: dequantize the int4 weights with the
+    /// same group scales/zero-points on the CPU ([`crate::ptx_int4::reference_w4a16`]) and matmul in f64.
+    /// The only legitimate error is the tensor cores' f32 accumulation order (the weight itself is
+    /// reconstructed bit-for-bit), so the bound is the same `1e-2 abs / 2e-3 rel` the dense fp16 GEMM
+    /// carries — *not* a quantization fudge. Both the symmetric (signed) and asymmetric (zero-point)
+    /// paths are gated; a final repeat-run asserts byte-identical output (M12 determinism: fixed grid,
+    /// no atomics). A kernel that dequantizes wrong fails here before any speed number is taken.
+    #[test]
+    fn int4_gemm_matches_reference() {
+        use crate::ptx_int4::{
+            quantize_weight_asymmetric, quantize_weight_symmetric, reference_w4a16, GROUP_SIZE,
+        };
+        with_gpu("int4_w4a16", |g| {
+            let mut rng = crate::diff::Rng::new(0x174A);
+            // (M,N,K): M%64==0, N%64==0, K%128==0. Square-ish + decode-like (small M, big K) + rectangular.
+            let shapes = [
+                (64usize, 64usize, 128usize),
+                (64, 128, 256),
+                (128, 256, 256),
+                (192, 64, 128),
+                (64, 192, 512),
+                (256, 128, 384),
+            ];
+            for (idx, (m, n, k)) in shapes.into_iter().enumerate() {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8); // weight [N,K]
+
+                // Symmetric (signed int4).
+                let qw = quantize_weight_symmetric(&w, n, k, GROUP_SIZE);
+                let c = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
+                let r = reference_w4a16(&a, &qw, m);
+                let s = crate::diff::assert_close(
+                    &format!("w4a16 sym {m}x{k}x{n}"),
+                    &c,
+                    &r,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!("w4a16 sym  {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", s.max_abs, s.max_rel);
+
+                // Asymmetric (per-group zero-point) — the AWQ/GPTQ form.
+                let qwz = quantize_weight_asymmetric(&w, n, k, GROUP_SIZE);
+                let cz = gemm_nt_w4a16(g, &a, &qwz, m, k, n).unwrap();
+                let rz = reference_w4a16(&a, &qwz, m);
+                let sz = crate::diff::assert_close(
+                    &format!("w4a16 asym {m}x{k}x{n}"),
+                    &cz,
+                    &rz,
+                    1e-2,
+                    2e-3,
+                );
+                eprintln!("w4a16 asym {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", sz.max_abs, sz.max_rel);
+
+                // M12 determinism: a second launch is byte-identical (fixed grid, no nondeterministic atomics).
+                let c2 = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
+                assert!(
+                    c.iter().zip(&c2).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "w4a16 {m}x{k}x{n} not deterministic run-to-run"
+                );
+
+                // Static-shape specialization must be bit-identical to the dynamic kernel (same math,
+                // only baked constants). Gated on the first 2 shapes (each JIT-compiles a per-shape
+                // module) for both the symmetric and zero-point paths.
+                if idx < 2 {
+                    let cs = gemm_nt_w4a16_static(g, &a, &qw, m, k, n).unwrap();
+                    assert!(
+                        c.iter().zip(&cs).all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "w4a16 static {m}x{k}x{n} (sym) differs from the dynamic kernel"
+                    );
+                    let csz = gemm_nt_w4a16_static(g, &a, &qwz, m, k, n).unwrap();
+                    assert!(
+                        cz.iter().zip(&csz).all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "w4a16 static {m}x{k}x{n} (asym) differs from the dynamic kernel"
+                    );
+                    eprintln!("w4a16 static {m}x{k}x{n}: bit-identical to dynamic (sym + asym) ✓");
+                }
+            }
+        });
+    }
+
+    /// Diagnostic: print the driver JIT error log for the W4A16 module (`ptx_int4::w4a16_ptx`) — the
+    /// `ptxas` line/error behind a bare `CUDA_ERROR_INVALID_PTX`. Also writes the PTX to a temp file.
+    /// `cargo test -p mercury_codegen_gpu --features gpu int4_jit_log -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic; prints the driver JIT log for the W4A16 PTX module"]
+    fn int4_jit_log() {
+        with_gpu("int4_jitlog", |g| {
+            use cudarc::driver::sys;
+            g.ctx.bind_to_thread().unwrap();
+            let ptx = crate::ptx_int4::w4a16_ptx();
+            let dump = std::env::temp_dir().join("mercury_w4a16.ptx");
+            let _ = std::fs::write(&dump, ptx);
+            eprintln!("wrote PTX to {}", dump.display());
+            let ptx_c = std::ffi::CString::new(ptx).unwrap();
+            let mut log = vec![0u8; 32768];
+            let mut opts = [
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            ];
+            let mut vals: [*mut std::ffi::c_void; 2] =
+                [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            let res = unsafe {
+                sys::cuModuleLoadDataEx(
+                    &mut module,
+                    ptx_c.as_ptr() as *const _,
+                    2,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                )
+            };
+            let s = String::from_utf8_lossy(&log);
+            eprintln!("=== JIT result {:?} ===\n{}", res, s.trim_end_matches('\0'));
+        });
     }
 
     #[test]
@@ -4180,10 +4650,16 @@ mod tests {
     fn conv2d_matches_reference_within_tol() {
         with_gpu("conv2d", |g| {
             let mut rng = crate::diff::Rng::new(0xC0FFEE);
-            // (C, H, W, K, R, S) — a 3×3 over 3 channels, and a 5×5 over 16 channels
+            // (C, H, W, K, R, S) — sweep the tiled generator: partial tiles (P,Q not a tile multiple),
+            // an exact single full tile (P=Q=16), a 1×1 conv (halo == tile), and a larger multi-tile
+            // image so the grid spans many CTAs.
             let cases = [
-                (3usize, 16usize, 16usize, 8usize, 3usize, 3usize),
-                (16, 32, 32, 4, 5, 5),
+                (3usize, 16usize, 16usize, 8usize, 3usize, 3usize), // P=Q=14 (partial tile)
+                (16, 32, 32, 4, 5, 5),                              // P=Q=28 (partial tile)
+                (8, 18, 18, 12, 3, 3),                              // P=Q=16 (one full tile)
+                (32, 28, 28, 16, 1, 1),                             // 1×1 conv (halo == tile)
+                (8, 64, 64, 16, 3, 3),                              // P=Q=62 (16 tiles, multi-CTA)
+                (4, 24, 40, 6, 3, 5),                               // non-square image + kernel
             ];
             for (c, h, width, k, r, s) in cases {
                 let x = rng.vec(c * h * width, -1.0, 1.0);
@@ -4202,6 +4678,179 @@ mod tests {
                 eprintln!(
                     "conv2d C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conv2d_wmma_matches_reference_within_tol() {
+        with_gpu("conv2d_wmma", |g| {
+            let mut rng = crate::diff::Rng::new(0x3CA1B0);
+            // (C,H,W,K,R,S) — exercise M/N/GK that are NOT tile multiples (guards must zero-pad):
+            // K not %32, P*Q not %32, C*R*S not %16, plus a 1×1 and a clean shape.
+            let cases = [
+                (3usize, 32usize, 32usize, 16usize, 3usize, 3usize), // GK=27, N=900 (both non-mult)
+                (16, 28, 28, 32, 3, 3),                              // GK=144, N=676
+                (8, 16, 16, 48, 5, 5),                               // K=48, GK=200, N=144
+                (32, 14, 14, 64, 1, 1),                              // 1×1: GK=32, N=196
+                (4, 24, 24, 24, 3, 3),                               // K=24 (not %32), GK=36
+            ];
+            for (c, h, width, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, width, k, r, s) {
+                    continue;
+                }
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let got = conv2d_wmma(g, &x, &w, c, h, width, k, r, s).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, width, k, r, s);
+                // fp16 inputs: relative error ~ 2^-10 per element, grows with the C·R·S reduction.
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+                let st = crate::diff::assert_close(
+                    &format!("conv2d_wmma C{c} {h}x{width} K{k} {r}x{s}"),
+                    &got,
+                    &oracle,
+                    5e-2,
+                    rel,
+                );
+                eprintln!(
+                    "conv2d_wmma C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
+            }
+        });
+    }
+
+    /// **M6 for conv2d** — Mercury's fp16 tensor-core implicit-GEMM conv (and the f32 SMEM-tiled conv)
+    /// vs the **naive CUDA-C conv** a programmer writes first (one thread per output, the whole `c,r,s`
+    /// window streamed from global), all JIT-loaded through the same driver and timed **same-run** over
+    /// identical buffers. Correctness gates speed: the naive peer is cross-checked against the f64
+    /// oracle, and both Mercury kernels are checksum-cross-checked against the peer at every shape
+    /// before any ratio counts. Needs the CUDA redist DLLs on PATH (see `gemm_vs_peers` /
+    /// `peer_env_hint`).
+    ///
+    /// **cuDNN (Tier-B gold standard) status:** *not bound here.* `cudarc`'s cuDNN module needs the
+    /// cuDNN redist (separate from the NVRTC/cuBLAS wheels these benches already dlopen) and a fragile
+    /// descriptor-graph setup; rather than fake a peer, the honest headline is the **wide Tier-A win
+    /// over naive CUDA-C** (1.3–5.8× same-run across these shapes, ≥3 reruns). Binding cuDNN to report
+    /// a % is the next peer-side TODO.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA NVRTC redist DLLs on PATH; run explicitly"]
+    fn conv_vs_peers() {
+        use crate::baselines::{
+            conv_flop, nvrtc_naive_conv, peer_env_hint, peers_available, time_nvrtc_naive_conv,
+        };
+        with_gpu("conv_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_vs_peers: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0xC04F1E);
+
+            // --- Correctness first: naive CUDA-C conv matches the f64 oracle on small shapes. ---
+            for (c, h, wd, k, r, s) in [(3usize, 16usize, 16usize, 8usize, 3usize, 3usize), (16, 24, 24, 8, 5, 5)] {
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((8.0 * ((c * r * s) as f64).sqrt()) * f32::EPSILON as f64).max(1e-4);
+                crate::diff::assert_close(&format!("naive conv C{c} {r}x{s}"), &naive, &oracle, 1e-4, rel);
+            }
+            eprintln!("[gate] naive CUDA-C conv matches the f64 oracle ✓");
+
+            // --- Clock warmup (peak-vs-peak, same-run): hammer a GEMM until the mobile clock settles. ---
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+
+            // DL-style conv shapes (C, H, W, K, R, S): a ResNet-ish stack of 3x3 layers + a 5x5.
+            let cases = [
+                (3usize, 64usize, 64usize, 64usize, 3usize, 3usize),
+                (64, 56, 56, 64, 3, 3),
+                (128, 28, 28, 128, 3, 3),
+                (256, 14, 14, 256, 3, 3),
+                (32, 32, 32, 32, 5, 5),
+            ];
+            use half::f16;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+            for (c, h, wd, k, r, s) in cases {
+                assert!(crate::ptx_conv::tiled_applies(c, h, wd, k, r, s), "shape not tiled");
+                assert!(crate::ptx_conv::wmma_applies(c, h, wd, k, r, s), "shape not wmma");
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
+                let cs_n = csum(&naive);
+
+                // --- Mercury f32 SMEM-tiled conv (resident; module loaded once) ---
+                let ptx_t = crate::ptx_conv::conv2d_ptx(c, h, wd, k, r, s);
+                let mod_t = g.load_module_cached(&ptx_t).unwrap();
+                let f_t = mod_t.load_function("conv2d").unwrap();
+                let cfg_t = conv_tiled_cfg(h, wd, k, r, s);
+                let xt_d = g.stream.memcpy_stod(&x).unwrap();
+                let wt_d = g.stream.memcpy_stod(&w).unwrap();
+                let mut ot_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let launch_t = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&f_t);
+                    b.arg(&xt_d).arg(&wt_d).arg(o);
+                    unsafe { b.launch(cfg_t).unwrap() };
+                };
+                launch_t(g, &mut ot_d);
+                g.stream.synchronize().unwrap();
+                let cs_t = csum(&g.stream.memcpy_dtov(&ot_d).unwrap());
+                assert!((cs_t - cs_n).abs() / cs_n.max(1.0) < 2e-2, "tiled checksum: t={cs_t:.3e} n={cs_n:.3e}");
+
+                // --- Mercury fp16 tensor-core implicit-GEMM conv (resident; f16 X/W) ---
+                let ptx_w = crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s);
+                let mod_w = g.load_module_cached(&ptx_w).unwrap();
+                let f_w = mod_w.load_function("conv2d_wmma").unwrap();
+                let cfg_w = conv_wmma_cfg(h, wd, k, r, s);
+                let xw_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let ww_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut ow_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let launch_w = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&f_w);
+                    b.arg(&xw_d).arg(&ww_d).arg(o);
+                    unsafe { b.launch(cfg_w).unwrap() };
+                };
+                launch_w(g, &mut ow_d);
+                g.stream.synchronize().unwrap();
+                let cs_w = csum(&g.stream.memcpy_dtov(&ow_d).unwrap());
+                assert!((cs_w - cs_n).abs() / cs_n.max(1.0) < 6e-2, "wmma checksum: w={cs_w:.3e} n={cs_n:.3e}");
+
+                // Speed, same-run.
+                let iters = 50usize;
+                let t_t = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { launch_t(g, &mut ot_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let t_w = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters { launch_w(g, &mut ow_d); }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let naive_iters = if c >= 128 { 10 } else { 30 };
+                let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, r, s, naive_iters).unwrap();
+
+                let flop = conv_flop(c, h, wd, k, r, s);
+                let (g_t, g_w, g_n) = (flop / t_t, flop / t_w, flop / t_n);
+                eprintln!(
+                    "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: tiled {:>6.0} GF ({:>4.1}×) | WMMA {:.4} ms {:>6.0} GF ({:>4.1}×) | naive {:.4} ms {:>5.0} GF",
+                    g_t / 1e9,
+                    g_t / g_n,
+                    t_w * 1e3,
+                    g_w / 1e9,
+                    g_w / g_n,
+                    t_n * 1e3,
+                    g_n / 1e9,
                 );
             }
         });
@@ -4608,6 +5257,12 @@ mod tests {
             let xc = rng.vec(c * h * wd, -1.0, 1.0);
             let wc = rng.vec(kc * c * r * s, -1.0, 1.0);
             twice_eq!("conv2d", conv2d(g, &xc, &wc, c, h, wd, kc, r, s).unwrap());
+
+            // Conv2d (fp16 tensor-core implicit GEMM) — fixed grid, no atomics ⇒ bit-reproducible.
+            let (c2, h2, w2, k2, r2, s2) = (16usize, 16usize, 16usize, 32usize, 3usize, 3usize);
+            let xw = rng.vec(c2 * h2 * w2, -1.0, 1.0);
+            let ww = rng.vec(k2 * c2 * r2 * s2, -1.0, 1.0);
+            twice_eq!("conv2d_wmma", conv2d_wmma(g, &xw, &ww, c2, h2, w2, k2, r2, s2).unwrap());
 
             // Reductions — fixed grid + fixed ascending host combine.
             let xr = rng.vec(1 << 16, 0.0, 1.0);
@@ -6682,5 +7337,992 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         }
         g.stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Per-iter device time of the W4A16 decode kernel (`gemm_nt_w4a16`, symmetric): args
+    /// `(M,N,K, A_f16, Bq_u32, Scales_f16, C_f32)` over resident buffers. Same warmup+loop shape as
+    /// [`time_wmma`], so the ratio vs the fp16 path and the naive peer is same-run apples-to-apples.
+    #[allow(clippy::too_many_arguments)]
+    fn time_w4a16(
+        g: &Gpu,
+        f: &cudarc::driver::CudaFunction,
+        cfg: LaunchConfig,
+        dims: (u32, u32, u32),
+        a_d: &cudarc::driver::CudaSlice<half::f16>,
+        bq_d: &cudarc::driver::CudaSlice<u32>,
+        scl_d: &cudarc::driver::CudaSlice<half::f16>,
+        c_d: &mut cudarc::driver::CudaSlice<f32>,
+        iters: usize,
+    ) -> f64 {
+        let (mm, nn, kk) = dims;
+        let launch = |c_d: &mut cudarc::driver::CudaSlice<f32>| {
+            let mut bld = g.stream.launch_builder(f);
+            bld.arg(&mm).arg(&nn).arg(&kk).arg(a_d).arg(bq_d).arg(scl_d).arg(c_d);
+            unsafe { bld.launch(cfg).unwrap() };
+        };
+        launch(c_d);
+        g.stream.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(c_d);
+        }
+        g.stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// **The honest W4A16 (int4 weight-only decode) scoreboard — M4 / M6.** Mercury's int4-decode GEMM
+    /// measured *same-run, same buffers* against (Tier A) a **naive CUDA-C W4A16** kernel compiled by
+    /// NVRTC — the literal "beat the hand-written int4 decode kernel" — and against Mercury's **own
+    /// fp16 GEMM on the identical 64×64 tile**, which isolates the weight-bandwidth win: the *only*
+    /// difference is the B-load (packed int4 vs full fp16), so the ratio is the value of moving 4× fewer
+    /// weight bytes. **Tier B is honestly empty:** there is no robust general W4A16-decode GEMM bindable
+    /// through `cudarc` (cuBLASLt offers none), so the strongest *measurable* int4 peer is the naive
+    /// kernel and M4 stands as a documented lead — stated in the output, not papered over.
+    ///
+    /// Correctness gates speed (first law): Mercury and the naive peer are first cross-checked against
+    /// the f64 dequant reference, and at each timing shape their checksums must agree. Needs the redist
+    /// DLLs on PATH; skips (never fails) if absent. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture int4_gemm_vs_peers`
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn int4_gemm_vs_peers() {
+        use crate::baselines::{
+            gemm_flop, nvrtc_naive_w4a16, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+            time_nvrtc_naive_w4a16,
+        };
+        use crate::ptx_int4::{
+            quantize_weight_symmetric, reference_w4a16, GROUP_SIZE, W4_BM, W4_BN, W4_THREADS,
+        };
+        use half::f16;
+        with_gpu("int4_gemm_vs_peers", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] int4_gemm_vs_peers: NVRTC/cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            let group = GROUP_SIZE;
+
+            // --- Correctness first: Mercury W4A16 + the naive peer both match the f64 dequant oracle. ---
+            let mut rng = crate::diff::Rng::new(0x4B17);
+            for (m, n, k) in [(64usize, 128usize, 256usize), (128, 128, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8);
+                let qw = quantize_weight_symmetric(&w, n, k, group);
+                let r = reference_w4a16(&a, &qw, m);
+                let merc = gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap();
+                crate::diff::assert_close(&format!("Mercury W4A16 {m}x{k}x{n}"), &merc, &r, 1e-2, 2e-3);
+                let naive = nvrtc_naive_w4a16(g, &a, &qw, m, k, n).unwrap();
+                crate::diff::assert_close(&format!("naive W4A16 {m}x{k}x{n}"), &naive, &r, 5e-2, 2e-2);
+            }
+            eprintln!("[gate] Mercury W4A16 + naive CUDA-C W4A16 both match the f64 dequant oracle ✓");
+            eprintln!(
+                "[peer] No robust library int4-decode GEMM is bindable here (cuBLASLt has no general \
+                 W4A16 decode), so naive CUDA-C is the honest Tier-A peer and M4 is a *documented lead*."
+            );
+
+            // --- Clock warmup (same-run peak-vs-peak; the ~7× boost ramp corrupts a cold first shape). ---
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 4;
+
+            // Shapes: decode-like (small M, big N=K) where weight-BW dominates → the int4 win shows;
+            // plus a squarer, more compute-leaning shape. All M%64==0, N%64==0, K%128==0.
+            for (m, k, n) in [
+                (64usize, 4096usize, 4096usize),
+                (64, 2048, 2048),
+                (256, 2048, 2048),
+                (512, 512, 512),
+            ] {
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let w = rng.vec(n * k, -0.8, 0.8);
+                let qw = quantize_weight_symmetric(&w, n, k, group);
+
+                // Mercury W4A16 — resident packed int4 weights + fp16 activations.
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let bq_d = g.stream.memcpy_stod(&qw.packed).unwrap();
+                let scl_d = g.stream.memcpy_stod(&qw.scales).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let f_w4 = g.function("w4a16", crate::ptx_int4::w4a16_ptx(), "gemm_nt_w4a16").unwrap();
+                let cfg_w4 = LaunchConfig {
+                    grid_dim: ((n / W4_BN) as u32, (m / W4_BM) as u32, 1),
+                    block_dim: (W4_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let s_w4 = best_of(ROUNDS, || {
+                    time_w4a16(g, &f_w4, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                });
+
+                // Static-shape-specialized kernel (M/N/K baked) — Mercury's no-library lever. ptxas
+                // strength-reduces the baked strides (`×K`/`×N` → shifts for the power-of-2 dims here);
+                // the dynamic kernel keeps them as register multiplies. To isolate the *baked-constants*
+                // effect, time the static kernel against a DYNAMIC kernel loaded the SAME raw-JIT way
+                // (the headline s_w4 above uses the cubin cache, a different ptxas opt level — comparing
+                // to it would confound the loading path with the specialization).
+                let ptx_s = crate::ptx_int4::w4a16_static_ptx(m, n, k, false);
+                let mod_s = g.ctx.load_module(ptx_s.as_str().into()).unwrap();
+                let f_s = mod_s.load_function(crate::ptx_int4::w4a16_static_entry(false)).unwrap();
+                let s_static = best_of(ROUNDS, || {
+                    time_w4a16(g, &f_s, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                });
+                let mod_dyn_raw = g.ctx.load_module(crate::ptx_int4::w4a16_ptx().into()).unwrap();
+                let f_dyn_raw = mod_dyn_raw.load_function("gemm_nt_w4a16").unwrap();
+                let s_dyn_raw = best_of(ROUNDS, || {
+                    time_w4a16(g, &f_dyn_raw, cfg_w4, dims, &a_d, &bq_d, &scl_d, &mut c_d, 50)
+                });
+
+                // Mercury fp16 on the SAME 64×64 tile (`wmma_nt_f16_sm`) — full fp16 weights. The only
+                // difference vs W4A16 is the B-load (fp16 vs packed int4), so s_f16/s_w4 IS the
+                // weight-bandwidth win in the decode regime.
+                let b16: Vec<f16> = w.iter().map(|&x| f16::from_f32(x)).collect();
+                let bf16_d = g.stream.memcpy_stod(&b16).unwrap();
+                let f_f16 =
+                    g.function("wmma_f16", crate::ptx_wmma::wmma_f16_ptx(), "wmma_nt_f16_sm").unwrap();
+                let s_f16 = best_of(ROUNDS, || {
+                    time_wmma(g, &f_f16, wmma_sm_cfg(m, n), dims, &a_d, &bf16_d, &mut c_d, 50)
+                });
+
+                // Naive CUDA-C W4A16 (Tier A). Slow (one thread/output, full K-loop) → fewer iters.
+                let naive_iters = if (m * n * k) as u64 >= 500_000_000 { 3 } else { 10 };
+                let s_naive = time_nvrtc_naive_w4a16(g, m, k, n, group, naive_iters).unwrap();
+
+                // Checksum cross-check: Mercury and naive compute the same matrix (within the dequant gap).
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_w4 = csum(&gemm_nt_w4a16(g, &a, &qw, m, k, n).unwrap());
+                let cs_n = csum(&nvrtc_naive_w4a16(g, &a, &qw, m, k, n).unwrap());
+                assert!(
+                    (cs_w4 - cs_n).abs() / cs_n.max(1.0) < 3e-2,
+                    "{m}x{k}x{n} checksum disagreement: w4={cs_w4:.3e} naive={cs_n:.3e}"
+                );
+
+                // Weight bytes moved from HBM per pass: int4 = N·K/2, fp16 = N·K·2 (the structural 4×).
+                let (wb_int4, wb_fp16) = ((n * k / 2) as f64, (n * k * 2) as f64);
+                let (g_w4, g_static, g_dyn_raw, g_f16, g_naive) = (
+                    flop / s_w4,
+                    flop / s_static,
+                    flop / s_dyn_raw,
+                    flop / s_f16,
+                    flop / s_naive,
+                );
+                eprintln!(
+                    "\n{m}x{k}x{n} W4A16 (same-run):\n  \
+                     Mercury W4A16     : {:>8.0} GFLOP/s | {:>6.1}× vs naive CUDA-C | {:>5.2}× vs Mercury fp16 (same tile)\n  \
+                     Mercury W4A16 stat: {:>8.0} GFLOP/s | {:>5.2}× vs dynamic (same raw-JIT load; M/N/K baked)\n  \
+                     Mercury fp16      : {:>8.0} GFLOP/s | full fp16 weights — the HBM traffic int4 avoids\n  \
+                     naive CUDA-C      : {:>8.0} GFLOP/s | Tier-A int4 baseline (no robust library peer exists)\n  \
+                     weight HBM/pass: int4 {:.1} MB vs fp16 {:.1} MB ({:.1}× less weight traffic)",
+                    g_w4 / 1e9,
+                    g_w4 / g_naive,
+                    g_w4 / g_f16,
+                    g_static / 1e9,
+                    g_static / g_dyn_raw,
+                    g_f16 / 1e9,
+                    g_naive / 1e9,
+                    wb_int4 / 1e6,
+                    wb_fp16 / 1e6,
+                    wb_fp16 / wb_int4,
+                );
+            }
+        });
+    }
+
+    // ============================================================================================
+    // M7 runtime (Phase 7): device memory pool + CUDA graphs. Gates assert the pooled / graphed /
+    // multi-stream path is **bit-identical** to the per-op-alloc + individual-launch baseline (the
+    // runtime changes when/where memory lives and how launches issue, not *what* is computed), and
+    // benches report the latency delta **same-run** at decode/small-batch shapes.
+    // ============================================================================================
+
+    /// Build a `ResidentLayerF16` and random `[S,D]` input for a `(s,d,dff,heads)` case — the shared
+    /// setup for the pool/graph gates and benches.
+    fn pool_layer_fixture(
+        g: &mut Gpu,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
+        seed: u64,
+    ) -> (ResidentLayerF16, Vec<f32>) {
+        let mut rng = crate::diff::Rng::new(seed);
+        let wq = rng.vec(d * d, -0.08, 0.08);
+        let wk = rng.vec(d * d, -0.08, 0.08);
+        let wv = rng.vec(d * d, -0.08, 0.08);
+        let wo = rng.vec(d * d, -0.08, 0.08);
+        let w1 = rng.vec(dff * d, -0.05, 0.05);
+        let w2 = rng.vec(d * dff, -0.05, 0.05);
+        let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+        let layer = ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap();
+        let x = rng.vec(s * d, -1.0, 1.0);
+        (layer, x)
+    }
+
+    /// **Identical-numerics gate (the first law).** The pooled forward must produce output
+    /// **bit-for-bit** equal to the per-op-`alloc_zeros` eager forward — same kernels, same launch
+    /// order, only the scratch provenance differs. The slab is **poisoned with 0xFF (NaN-ish)** before
+    /// the pooled run, so any intermediate read before it is fully written would leak a NaN and fail
+    /// the equality — proving the uninitialized `alloc` fast path is only used on full-overwrite
+    /// outputs. Covers the single-head (f32 flash) and multi-head (tensor-core flash + transposes)
+    /// attention paths, plus the real GPT-2 layer shape.
+    #[test]
+    fn resident_layer_pooled_matches_eager() {
+        with_gpu("resident_layer_pooled_matches_eager", |g| {
+            // (S, D, Dff, heads): single-head small (f32 flash); multi-head (tensor-core flash);
+            // GPT-2 layer (D=768/H=12).
+            let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+            for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
+                let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x9001 + ci as u64);
+                let stream = g.stream.clone();
+                let x_d = stream.memcpy_stod(&x).unwrap();
+
+                // eager reference (per-op alloc_zeros + individual launches).
+                let ref_out = layer.forward_device(&x_d).unwrap();
+                let ref_host = stream.memcpy_dtov(&ref_out).unwrap();
+
+                // pooled: hostile (poisoned) slab + persistent out buffer outside the arena.
+                let cap = 256 * 1024 * 1024; // generous; high-water reports the real footprint.
+                let mut pool = crate::pool::DevicePool::new(stream.clone(), cap).unwrap();
+                pool.poison(0xFF).unwrap();
+                let mut out_d = stream.alloc_zeros::<f32>(s * d).unwrap();
+                layer.forward_device_pooled(&mut pool, &x_d, &mut out_d).unwrap();
+                let pooled_host = stream.memcpy_dtov(&out_d).unwrap();
+
+                assert_eq!(pooled_host.len(), ref_host.len());
+                for i in 0..ref_host.len() {
+                    assert_eq!(
+                        pooled_host[i].to_bits(),
+                        ref_host[i].to_bits(),
+                        "pooled != eager at {i} (S={s} D={d} Dff={dff} heads={heads})"
+                    );
+                }
+                assert!(
+                    pool.high_water_bytes() <= cap,
+                    "pool overflowed: high_water {} > cap {}",
+                    pool.high_water_bytes(),
+                    cap
+                );
+                eprintln!(
+                    "pooled==eager bit-identical: S={s} D={d} Dff={dff} heads={heads}; \
+                     pool high-water {} KiB across {} sub-allocs (cap {} MiB)",
+                    pool.high_water_bytes() / 1024,
+                    pool.served(),
+                    cap / (1024 * 1024)
+                );
+            }
+        });
+    }
+
+    /// Run `f` with the shared context's event tracking **disabled**, re-enabling on the way out
+    /// (panic-safe). cudarc records per-buffer read/write events (on by default) and, once a second
+    /// stream exists, inserts a cross-stream `cuStreamWaitEvent` on every buffer use — which
+    /// `cuStreamBeginCapture` rejects as a dependency on uncaptured work. A buffer created while
+    /// tracking is off carries no events, so a multi-stream capture inserts no such waits. The whole
+    /// GPU suite is serialized under one process-wide mutex, so toggling the shared context here races
+    /// with nothing; the layer/buffers built inside `f` must be created here (so they are event-free),
+    /// and the caller is responsible for explicit stream synchronization (done in the helpers below).
+    fn with_event_tracking_disabled(g: &mut Gpu, f: impl FnOnce(&mut Gpu)) {
+        struct Reenable(Arc<CudaContext>);
+        impl Drop for Reenable {
+            fn drop(&mut self) {
+                unsafe { self.0.enable_event_tracking() };
+            }
+        }
+        let _guard = Reenable(g.ctx.clone());
+        unsafe { g.ctx.disable_event_tracking() };
+        f(g);
+    }
+
+    /// Capture `layer.forward_device_pooled_on` into a replayable CUDA graph on a fresh non-blocking
+    /// stream, with the scratch pool and persistent in/out buffers all event-free on that stream.
+    /// **Must run inside [`with_event_tracking_disabled`]** so the capture inserts no cross-stream
+    /// waits. Returns the capture stream, the pool, the persistent input/output device buffers (whose
+    /// pointers are baked into the graph — keep them alive and on this stream for replay), and the
+    /// graph. `x` seeds the input. A warmup forward on the capture stream precedes capture (primes
+    /// state; makes the NULL-stream-uploaded weights visible to the capture stream).
+    #[allow(clippy::type_complexity)]
+    fn capture_resident_layer(
+        g: &Gpu,
+        layer: &ResidentLayerF16,
+        s: usize,
+        d: usize,
+        x: &[f32],
+        cap_bytes: usize,
+    ) -> (
+        Arc<CudaStream>,
+        crate::pool::DevicePool,
+        cudarc::driver::CudaSlice<f32>,
+        cudarc::driver::CudaSlice<f32>,
+        crate::graph::Graph,
+    ) {
+        let cap = g.ctx.new_stream().unwrap();
+        let mut pool = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
+        let x_d = cap.memcpy_stod(x).unwrap();
+        let mut out_d = cap.alloc_zeros::<f32>(s * d).unwrap();
+        // Weights were uploaded on the NULL stream; make them visible to the capture stream.
+        g.stream.synchronize().unwrap();
+        // Warmup once on the capture stream, then capture into a graph.
+        pool.reset();
+        layer.forward_device_pooled_on(&cap, &mut pool, &x_d, &mut out_d).unwrap();
+        cap.synchronize().unwrap();
+        pool.reset();
+        let graph = crate::graph::Graph::capture(cap.clone(), || {
+            layer.forward_device_pooled_on(&cap, &mut pool, &x_d, &mut out_d)
+        })
+        .unwrap();
+        (cap, pool, x_d, out_d, graph)
+    }
+
+    /// **Identical-numerics gate for graph replay (the first law).** Capturing the pooled forward into
+    /// a CUDA graph and replaying it with a single `cuGraphLaunch` must produce output **bit-for-bit**
+    /// equal to the eager per-op forward — the graph changes *how* the same launches are issued, not
+    /// *what* they compute. Capture runs on a dedicated non-blocking stream (the layer's default stream
+    /// is the un-capturable NULL stream); the slab is poisoned 0xFF before replay (hostile dirty), and
+    /// a second replay must match the first **bit-for-bit** (M12 determinism — replay is deterministic
+    /// against stable baked-in pointers). Covers single-head, multi-head, and the GPT-2 layer.
+    #[test]
+    fn resident_layer_graphed_matches_eager() {
+        with_gpu("resident_layer_graphed_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
+                    let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0xA001 + ci as u64);
+
+                    // eager reference on the default stream (same kernels, same weights, same input).
+                    let x_d_ref = g.stream.memcpy_stod(&x).unwrap();
+                    let ref_host =
+                        g.stream.memcpy_dtov(&layer.forward_device(&x_d_ref).unwrap()).unwrap();
+
+                    // capture the pooled forward into a graph on a dedicated stream.
+                    let (cap, mut pool, _x_d, out_d, graph) =
+                        capture_resident_layer(g, &layer, s, d, &x, 256 * 1024 * 1024);
+
+                    // Poison the slab (ordered on `cap` before replay), then replay twice.
+                    pool.poison(0xFF).unwrap();
+                    graph.launch().unwrap();
+                    cap.synchronize().unwrap();
+                    let g1 = cap.memcpy_dtov(&out_d).unwrap();
+                    graph.launch().unwrap();
+                    cap.synchronize().unwrap();
+                    let g2 = cap.memcpy_dtov(&out_d).unwrap();
+
+                    assert_eq!(g1.len(), ref_host.len());
+                    for i in 0..ref_host.len() {
+                        assert_eq!(
+                            g1[i].to_bits(),
+                            ref_host[i].to_bits(),
+                            "graphed != eager at {i} (S={s} D={d} Dff={dff} heads={heads})"
+                        );
+                        assert_eq!(
+                            g1[i].to_bits(),
+                            g2[i].to_bits(),
+                            "graph replay non-deterministic at {i} (S={s} D={d} Dff={dff} heads={heads})"
+                        );
+                    }
+                    eprintln!(
+                        "graphed==eager bit-identical & replay deterministic: S={s} D={d} Dff={dff} \
+                         heads={heads}; one cuGraphLaunch replays the whole resident layer (high-water {} KiB)",
+                        pool.high_water_bytes() / 1024
+                    );
+                }
+            });
+        });
+    }
+
+    /// Best (lowest) per-iteration wall time of `run`, in seconds, synchronizing `sync_stream` to
+    /// retire the work. Warms up to coax the boost clock, then takes the fastest of several timed
+    /// rounds — the least-throttled measurement, mirroring `best_bw`'s reasoning for the ~7× laptop
+    /// clock swing. Only **ratios** of two such numbers measured back-to-back in one process are
+    /// reported (the honesty law).
+    fn min_latency(sync_stream: &Arc<CudaStream>, mut run: impl FnMut()) -> f64 {
+        const WARMUP: usize = 30;
+        const ROUNDS: usize = 12;
+        const ITERS: usize = 40;
+        for _ in 0..WARMUP {
+            run();
+        }
+        sync_stream.synchronize().unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                run();
+            }
+            sync_stream.synchronize().unwrap();
+            best = best.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+        }
+        best
+    }
+
+    /// **M7 same-run latency — eager vs pooled vs graphed.** All three run the *identical* kernel
+    /// sequence; they differ only in runtime overhead:
+    /// - **eager**: a `cuMemAllocAsync`+`cuMemsetD8Async` per intermediate, a `cuMemFreeAsync` on drop,
+    ///   and one `cuLaunchKernel` per kernel.
+    /// - **pooled**: a host cursor bump per intermediate (no driver call, no zeroing) + per-kernel
+    ///   launches — removes the alloc/free/zero traffic.
+    /// - **graphed**: the whole captured layer replayed by a **single `cuGraphLaunch`** — also removes
+    ///   the per-kernel launch overhead.
+    ///
+    /// Reported back-to-back at decode/small-batch + GPT-2 shapes, where this allocate/free/zero/launch
+    /// overhead is the largest fraction of a tiny layer's wall time. eager runs on the default (NULL)
+    /// stream; pooled/graphed on a dedicated capture stream (event tracking off so capture inserts no
+    /// cross-stream waits — see `with_event_tracking_disabled`).
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn pool_graph_vs_unpooled() {
+        with_gpu("pool_graph_vs_unpooled", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let cap_bytes = 256 * 1024 * 1024;
+                for &(s, d, dff, heads) in &cases {
+                    let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x7001);
+
+                    // eager on the default stream: per-op alloc_zeros + free-on-drop + N launches.
+                    let x_d_g = g.stream.memcpy_stod(&x).unwrap();
+                    let eager = min_latency(&g.stream, || {
+                        let _ = layer.forward_device(&x_d_g).unwrap();
+                    });
+
+                    // Capture the layer into a graph on a dedicated stream (keeps its pool + buffers).
+                    let (cap, pool, x_d_cap, _out_cap, graph) =
+                        capture_resident_layer(g, &layer, s, d, &x, cap_bytes);
+
+                    // pooled on the capture stream: bump arena, N individual launches (own pool/out).
+                    let mut pool2 = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
+                    let mut out2 = cap.alloc_zeros::<f32>(s * d).unwrap();
+                    pool2.reset();
+                    layer.forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2).unwrap();
+                    let allocs_per_fwd = pool2.served();
+                    let pooled = min_latency(&cap, || {
+                        pool2.reset();
+                        layer.forward_device_pooled_on(&cap, &mut pool2, &x_d_cap, &mut out2).unwrap();
+                    });
+
+                    // graphed on the capture stream: one cuGraphLaunch replays the whole layer.
+                    let graphed = min_latency(&cap, || {
+                        graph.launch().unwrap();
+                    });
+
+                    eprintln!(
+                        "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: eager {:7.1} | pooled {:7.1} | graphed {:7.1} us \
+                         → graphed {:.2}x vs eager, {:.2}x vs pooled  ({} pooled sub-allocs/fwd; high-water {} KiB)",
+                        eager * 1e6,
+                        pooled * 1e6,
+                        graphed * 1e6,
+                        eager / graphed,
+                        pooled / graphed,
+                        allocs_per_fwd,
+                        pool.high_water_bytes() / 1024,
+                    );
+                }
+            });
+        });
+    }
+
+    // ============================================================================================
+    // M7 runtime (Phase 7): multi-stream copy/compute overlap + pinned host memory.
+    // ============================================================================================
+
+    /// A double-buffered, two-stream pipeline that processes a batch of independent `[S,D]` inputs
+    /// through the resident layer, overlapping **H2D(next) ‖ compute(cur) ‖ D2H(prev)**. Inputs/outputs
+    /// stage through **pinned** host memory (so the copies are truly async on the copy stream while the
+    /// compute stream runs), and ordering across the two streams is enforced by explicit CUDA events.
+    /// Must be built/run inside [`with_event_tracking_disabled`] (so cudarc inserts no implicit
+    /// cross-stream waits — this pipeline owns all the ordering).
+    struct OverlapPipeline<'a> {
+        layer: &'a ResidentLayerF16,
+        cs: Arc<CudaStream>, // compute stream
+        cp: Arc<CudaStream>, // copy stream (H2D + D2H)
+        nb: usize,           // double-buffer slots
+        x_d: Vec<cudarc::driver::CudaSlice<f32>>,
+        out_d: Vec<cudarc::driver::CudaSlice<f32>>,
+        pool: Vec<crate::pool::DevicePool>,
+        h2d_done: Vec<cudarc::driver::CudaEvent>,
+        comp_done: Vec<cudarc::driver::CudaEvent>,
+        d2h_done: Vec<cudarc::driver::CudaEvent>,
+        pin_in: Vec<crate::graph::PinnedBuf<f32>>,
+        pin_out: Vec<crate::graph::PinnedBuf<f32>>,
+        b: usize,
+    }
+
+    impl<'a> OverlapPipeline<'a> {
+        fn new(
+            g: &Gpu,
+            layer: &'a ResidentLayerF16,
+            inputs: &[Vec<f32>],
+            s: usize,
+            d: usize,
+            cap_bytes: usize,
+        ) -> Self {
+            let nb = 2;
+            let cs = g.ctx.new_stream().unwrap();
+            let cp = g.ctx.new_stream().unwrap();
+            let x_d = (0..nb).map(|_| cs.alloc_zeros::<f32>(s * d).unwrap()).collect();
+            let out_d = (0..nb).map(|_| cs.alloc_zeros::<f32>(s * d).unwrap()).collect();
+            let pool = (0..nb)
+                .map(|_| crate::pool::DevicePool::new(cs.clone(), cap_bytes).unwrap())
+                .collect();
+            let ev = || g.ctx.new_event(None).unwrap();
+            let h2d_done = (0..nb).map(|_| ev()).collect();
+            let comp_done = (0..nb).map(|_| ev()).collect();
+            let d2h_done = (0..nb).map(|_| ev()).collect();
+            let mut pin_in = Vec::with_capacity(inputs.len());
+            let mut pin_out = Vec::with_capacity(inputs.len());
+            for inp in inputs {
+                let mut pi = crate::graph::PinnedBuf::<f32>::alloc(&g.ctx, s * d).unwrap();
+                pi.copy_from_slice(inp).unwrap();
+                pin_in.push(pi);
+                pin_out.push(crate::graph::PinnedBuf::<f32>::alloc(&g.ctx, s * d).unwrap());
+            }
+            // Weights uploaded on the NULL stream must be visible to the compute stream.
+            g.stream.synchronize().unwrap();
+            let _ = (s, d); // shapes are captured by the device buffers; not stored.
+            Self {
+                layer, cs, cp, nb, x_d, out_d, pool, h2d_done, comp_done, d2h_done, pin_in, pin_out,
+                b: inputs.len(),
+            }
+        }
+
+        /// **Serial baseline:** one stream, one buffer set — H2D, compute, D2H fully ordered with no
+        /// overlap. Even with pinned memory, a single stream cannot overlap its own copies and compute.
+        fn run_serial(&mut self) {
+            for i in 0..self.b {
+                self.cs.memcpy_htod(&*self.pin_in[i], &mut self.x_d[0]).unwrap();
+                self.pool[0].reset();
+                self.layer
+                    .forward_device_pooled_on(&self.cs, &mut self.pool[0], &self.x_d[0], &mut self.out_d[0])
+                    .unwrap();
+                self.cs.memcpy_dtoh(&self.out_d[0], &mut *self.pin_out[i]).unwrap();
+            }
+            self.cs.synchronize().unwrap();
+        }
+
+        /// **Overlapped:** H2D(next) on the copy stream runs while the compute stream runs the current
+        /// forward and D2H(prev) drains the previous result — double-buffered, with events guarding
+        /// every read-after-write and write-after-read hazard across the two streams.
+        fn run_overlapped(&mut self) {
+            let nb = self.nb;
+            for i in 0..self.b {
+                let b = i % nb;
+                // WAR on x_d[b]: don't overwrite until compute(i-nb), which read it, has finished.
+                if i >= nb {
+                    self.cp.wait(&self.comp_done[b]).unwrap();
+                }
+                self.cp.memcpy_htod(&*self.pin_in[i], &mut self.x_d[b]).unwrap();
+                self.h2d_done[b].record(&self.cp).unwrap();
+                // Compute waits for its input (RAW on x_d[b]); WAR on out_d[b]: don't overwrite until
+                // D2H(i-nb), which read it, has finished.
+                self.cs.wait(&self.h2d_done[b]).unwrap();
+                if i >= nb {
+                    self.cs.wait(&self.d2h_done[b]).unwrap();
+                }
+                self.pool[b].reset();
+                self.layer
+                    .forward_device_pooled_on(&self.cs, &mut self.pool[b], &self.x_d[b], &mut self.out_d[b])
+                    .unwrap();
+                self.comp_done[b].record(&self.cs).unwrap();
+                // D2H waits for compute (RAW on out_d[b]).
+                self.cp.wait(&self.comp_done[b]).unwrap();
+                self.cp.memcpy_dtoh(&self.out_d[b], &mut *self.pin_out[i]).unwrap();
+                self.d2h_done[b].record(&self.cp).unwrap();
+            }
+            self.cs.synchronize().unwrap();
+            self.cp.synchronize().unwrap();
+        }
+
+        /// Collect the `B` pinned output buffers into host `Vec`s.
+        fn collect(&self) -> Vec<Vec<f32>> {
+            self.pin_out.iter().map(|p| p.to_vec().unwrap()).collect()
+        }
+    }
+
+    /// Best (lowest) per-batch wall times of two self-synchronizing batch runs `a` and `b`, measured in
+    /// **interleaved** rounds so both see the same drifting clock/contention state (this laptop GPU
+    /// swings ~7× with memory-clock throttling, and the parallel sessions add contention — timing the
+    /// two paths in separate phases makes the ratio meaningless). Returns `(best_a, best_b)` in seconds.
+    fn best_batch_pair(mut a: impl FnMut(), mut b: impl FnMut()) -> (f64, f64) {
+        const WARMUP: usize = 4;
+        const ROUNDS: usize = 16;
+        for _ in 0..WARMUP {
+            a();
+            b();
+        }
+        let (mut best_a, mut best_b) = (f64::MAX, f64::MAX);
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            a();
+            best_a = best_a.min(t0.elapsed().as_secs_f64());
+            let t1 = Instant::now();
+            b();
+            best_b = best_b.min(t1.elapsed().as_secs_f64());
+        }
+        (best_a, best_b)
+    }
+
+    /// **Identical-numerics gate for multi-stream overlap (the first law).** The overlapped pipeline
+    /// must produce, for every input in the batch, output **bit-for-bit** equal to the serial
+    /// single-stream pipeline — the overlap changes *when* copies/compute run and *on which stream*,
+    /// never the math (M12 determinism holds). Also checks the serial path ties the eager
+    /// `forward_device` reference. Covers single-head, multi-head, and the GPT-2 layer.
+    #[test]
+    fn multistream_overlap_matches_serial() {
+        with_gpu("multistream_overlap_matches_serial", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                for (ci, &(s, d, dff, heads)) in cases.iter().enumerate() {
+                    let (layer, _x) = pool_layer_fixture(g, s, d, dff, heads, 0xB001 + ci as u64);
+                    let mut rng = crate::diff::Rng::new(0x00C0_FFEE + ci as u64);
+                    let bsz = 12usize;
+                    let inputs: Vec<Vec<f32>> = (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
+                    let cap_bytes = 64 * 1024 * 1024;
+
+                    let mut serial = OverlapPipeline::new(g, &layer, &inputs, s, d, cap_bytes);
+                    serial.run_serial();
+                    let serial_out = serial.collect();
+
+                    let mut over = OverlapPipeline::new(g, &layer, &inputs, s, d, cap_bytes);
+                    over.run_overlapped();
+                    let over_out = over.collect();
+
+                    for i in 0..bsz {
+                        for j in 0..s * d {
+                            assert_eq!(
+                                over_out[i][j].to_bits(),
+                                serial_out[i][j].to_bits(),
+                                "overlap != serial at input {i} elem {j} (S={s} D={d} Dff={dff} heads={heads})"
+                            );
+                        }
+                    }
+                    // Sanity: the serial path ties the established eager reference for input 0.
+                    let x_d = g.stream.memcpy_stod(&inputs[0]).unwrap();
+                    let eager = g.stream.memcpy_dtov(&layer.forward_device(&x_d).unwrap()).unwrap();
+                    for j in 0..s * d {
+                        assert_eq!(
+                            serial_out[0][j].to_bits(),
+                            eager[j].to_bits(),
+                            "serial != eager at elem {j} (S={s} D={d})"
+                        );
+                    }
+                    eprintln!(
+                        "overlap==serial==eager bit-identical: S={s} D={d} Dff={dff} heads={heads}, B={bsz} \
+                         ({} KiB I/O per item, pinned, 2-stream)",
+                        s * d * 4 / 1024
+                    );
+                }
+            });
+        });
+    }
+
+    /// **M7 same-run throughput — multi-stream copy/compute overlap vs serial.** Both process `B`
+    /// independent inputs; the overlapped path runs H2D/compute/D2H on two streams with pinned staging
+    /// so copies can hide under compute. Measured with interleaved timing (shared clock state). Honest
+    /// finding on this box: **~1.0× at both shapes** — the resident layer is strongly compute-bound, so
+    /// even the GPT-2 shape's 1.5 MiB/item transfer is a small, largely overhead-bound fraction of the
+    /// ~1.2 ms compute and there is little to hide. The mechanism is correct (gated bit-identical); the
+    /// throughput lever for the *underutilized decode* regime is concurrent forwards, not copy overlap
+    /// (see `concurrent_forwards_throughput`). Pinned + overlap matter most when transfers genuinely
+    /// rival compute (large prompts / a slower link) — not realized here.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn overlap_throughput() {
+        with_gpu("overlap_throughput", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 768, 3072, 12)];
+                let bsz = 16usize;
+                for &(s, d, dff, heads) in &cases {
+                    let (layer, _x) = pool_layer_fixture(g, s, d, dff, heads, 0x7777);
+                    let mut rng = crate::diff::Rng::new(0x5EED);
+                    let inputs: Vec<Vec<f32>> = (0..bsz).map(|_| rng.vec(s * d, -1.0, 1.0)).collect();
+                    // Two pipelines so serial and overlapped can be timed interleaved (shared clock).
+                    let mut pipe_s = OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
+                    let mut pipe_o = OverlapPipeline::new(g, &layer, &inputs, s, d, 64 * 1024 * 1024);
+
+                    let (serial, over) =
+                        best_batch_pair(|| pipe_s.run_serial(), || pipe_o.run_overlapped());
+                    let bf = bsz as f64;
+                    eprintln!(
+                        "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: serial {:7.1} us/item | overlapped {:7.1} us/item \
+                         → overlap {:.2}x  (B={bsz}, {} KiB I/O per item, pinned)",
+                        serial / bf * 1e6,
+                        over / bf * 1e6,
+                        serial / over,
+                        s * d * 4 / 1024
+                    );
+                }
+            });
+        });
+    }
+
+    /// Best (lowest) per-iteration wall time of `run` while synchronizing **all** of `streams` to
+    /// retire the work (the multi-stream analogue of `min_latency`).
+    fn min_latency_multi(streams: &[Arc<CudaStream>], mut run: impl FnMut()) -> f64 {
+        const WARMUP: usize = 20;
+        const ROUNDS: usize = 12;
+        const ITERS: usize = 30;
+        for _ in 0..WARMUP {
+            run();
+        }
+        for st in streams {
+            st.synchronize().unwrap();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..ROUNDS {
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                run();
+            }
+            for st in streams {
+                st.synchronize().unwrap();
+            }
+            best = best.min(t0.elapsed().as_secs_f64() / ITERS as f64);
+        }
+        best
+    }
+
+    /// **M7 same-run throughput — concurrent forwards on K streams vs serial.** A single small (decode)
+    /// layer launches far too few CTAs to fill the GPU, so the SMs sit idle. Running `K` independent
+    /// requests on `K` streams lets the scheduler co-resident them and reclaim that idle capacity — the
+    /// real multi-stream lever for small-batch *serving*. Compared back-to-back: `K` forwards serialized
+    /// on one stream vs one forward on each of `K` streams (each its own event-free pool + buffers, so
+    /// nothing cross-stream serializes them). The win shrinks as the layer grows to fill the GPU on its
+    /// own (the GPT-2 shape already saturates).
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn concurrent_forwards_throughput() {
+        with_gpu("concurrent_forwards_throughput", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let cases = [(64usize, 64usize, 256usize, 1usize), (512, 128, 512, 2), (512, 768, 3072, 12)];
+                let kk = 4usize;
+                for &(s, d, dff, heads) in &cases {
+                    let (layer, x) = pool_layer_fixture(g, s, d, dff, heads, 0x9999);
+                    let streams: Vec<Arc<CudaStream>> = (0..kk).map(|_| g.ctx.new_stream().unwrap()).collect();
+                    let mut pools: Vec<crate::pool::DevicePool> = streams
+                        .iter()
+                        .map(|st| crate::pool::DevicePool::new(st.clone(), 64 * 1024 * 1024).unwrap())
+                        .collect();
+                    let x_ds: Vec<cudarc::driver::CudaSlice<f32>> =
+                        streams.iter().map(|st| st.memcpy_stod(&x).unwrap()).collect();
+                    let mut out_ds: Vec<cudarc::driver::CudaSlice<f32>> =
+                        streams.iter().map(|st| st.alloc_zeros::<f32>(s * d).unwrap()).collect();
+                    g.stream.synchronize().unwrap();
+
+                    // serial: K forwards back-to-back on ONE stream.
+                    let serial = min_latency(&streams[0], || {
+                        for _ in 0..kk {
+                            pools[0].reset();
+                            layer
+                                .forward_device_pooled_on(&streams[0], &mut pools[0], &x_ds[0], &mut out_ds[0])
+                                .unwrap();
+                        }
+                    });
+                    // concurrent: one forward on each of K streams, all retired together.
+                    let sync_streams: Vec<Arc<CudaStream>> = streams.clone();
+                    let concurrent = min_latency_multi(&sync_streams, || {
+                        for k in 0..kk {
+                            pools[k].reset();
+                            layer
+                                .forward_device_pooled_on(&streams[k], &mut pools[k], &x_ds[k], &mut out_ds[k])
+                                .unwrap();
+                        }
+                    });
+
+                    eprintln!(
+                        "S={s:4} D={d:4} Dff={dff:5} h{heads:<2}: {kk} fwds serial {:7.1} us | concurrent {:7.1} us \
+                         → concurrent {:.2}x throughput (K={kk} streams)",
+                        serial * 1e6,
+                        concurrent * 1e6,
+                        serial / concurrent,
+                    );
+                }
+            });
+        });
+    }
+
+    // ============================================================================================
+    // M7 / M13: the whole resident STACK captured into ONE graph — a whole-model forward replayed by
+    // a single cuGraphLaunch. The pool is reset between layers (so its footprint is one layer, not N),
+    // inter-layer activations ping-pong through two persistent buffers, and the N×(~13) launches fold
+    // into one driver call — the decode/small-batch latency lever where launch overhead dominates.
+    // ============================================================================================
+
+    /// Run an `N`-layer resident stack pooled on `stream`: layer 0 reads `x_d`, each later layer reads
+    /// the previous layer's output, every layer's intermediates come from `pool` (**reset between
+    /// layers**, so the slab holds one layer's scratch, not N), and inter-layer activations ping-pong
+    /// through `bufs[0]`/`bufs[1]` (persistent, outside the pool, so a reset never clobbers them). All
+    /// launches land on `stream`. Returns the index in `bufs` holding the final output.
+    fn forward_stack_pooled_on(
+        layers: &[ResidentLayerF16],
+        stream: &Arc<CudaStream>,
+        pool: &mut crate::pool::DevicePool,
+        x_d: &cudarc::driver::CudaSlice<f32>,
+        bufs: &mut [cudarc::driver::CudaSlice<f32>; 2],
+    ) -> Result<usize, DriverError> {
+        let n = layers.len();
+        pool.reset();
+        layers[0].forward_device_pooled_on(stream, pool, x_d, &mut bufs[0])?;
+        for i in 1..n {
+            pool.reset();
+            let (lo, hi) = bufs.split_at_mut(1);
+            if (i - 1) % 2 == 0 {
+                layers[i].forward_device_pooled_on(stream, pool, &lo[0], &mut hi[0])?;
+            } else {
+                layers[i].forward_device_pooled_on(stream, pool, &hi[0], &mut lo[0])?;
+            }
+        }
+        Ok((n - 1) % 2)
+    }
+
+    /// Build `n` independent resident layers (distinct random weights each) + a random `[S,D]` input.
+    fn multi_layer_fixture(
+        g: &mut Gpu,
+        n: usize,
+        s: usize,
+        d: usize,
+        dff: usize,
+        heads: usize,
+        seed: u64,
+    ) -> (Vec<ResidentLayerF16>, Vec<f32>) {
+        let mut rng = crate::diff::Rng::new(seed);
+        let mut layers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let wq = rng.vec(d * d, -0.08, 0.08);
+            let wk = rng.vec(d * d, -0.08, 0.08);
+            let wv = rng.vec(d * d, -0.08, 0.08);
+            let wo = rng.vec(d * d, -0.08, 0.08);
+            let w1 = rng.vec(dff * d, -0.05, 0.05);
+            let w2 = rng.vec(d * dff, -0.05, 0.05);
+            let w = TransformerWeights { wq: &wq, wk: &wk, wv: &wv, wo: &wo, w1: &w1, w2: &w2 };
+            layers.push(ResidentLayerF16::new_mha(g, &w, s, d, dff, heads).unwrap());
+        }
+        let x = rng.vec(s * d, -1.0, 1.0);
+        (layers, x)
+    }
+
+    /// Capture the whole pooled `N`-layer stack into one graph on a dedicated stream. Returns the
+    /// stream, pool, persistent input + ping-pong buffers (all baked into the graph — keep alive), the
+    /// index of the result buffer, and the graph. **Must run inside [`with_event_tracking_disabled`].**
+    #[allow(clippy::type_complexity)]
+    fn capture_resident_stack(
+        g: &Gpu,
+        layers: &[ResidentLayerF16],
+        s: usize,
+        d: usize,
+        x: &[f32],
+        cap_bytes: usize,
+    ) -> (
+        Arc<CudaStream>,
+        crate::pool::DevicePool,
+        cudarc::driver::CudaSlice<f32>,
+        [cudarc::driver::CudaSlice<f32>; 2],
+        usize,
+        crate::graph::Graph,
+    ) {
+        let cap = g.ctx.new_stream().unwrap();
+        let mut pool = crate::pool::DevicePool::new(cap.clone(), cap_bytes).unwrap();
+        let x_d = cap.memcpy_stod(x).unwrap();
+        let mut bufs = [cap.alloc_zeros::<f32>(s * d).unwrap(), cap.alloc_zeros::<f32>(s * d).unwrap()];
+        g.stream.synchronize().unwrap();
+        // Warmup, then capture.
+        let _ = forward_stack_pooled_on(layers, &cap, &mut pool, &x_d, &mut bufs).unwrap();
+        cap.synchronize().unwrap();
+        let mut result_idx = 0usize;
+        let graph = crate::graph::Graph::capture(cap.clone(), || {
+            result_idx = forward_stack_pooled_on(layers, &cap, &mut pool, &x_d, &mut bufs)?;
+            Ok(())
+        })
+        .unwrap();
+        (cap, pool, x_d, bufs, result_idx, graph)
+    }
+
+    /// **Identical-numerics gate for the whole-model graph (the first law).** An `N`-layer resident
+    /// stack captured into one graph and replayed by a single `cuGraphLaunch` must produce output
+    /// **bit-for-bit** equal to the eager layer-by-layer `forward_device` chain, and be deterministic
+    /// across two replays (M12). The slab is poisoned 0xFF first; the pool is reset between layers, so
+    /// this also proves the inter-layer ping-pong + per-layer scratch reuse is correct under capture.
+    #[test]
+    fn resident_stack_graphed_matches_eager() {
+        with_gpu("resident_stack_graphed_matches_eager", |g| {
+            with_event_tracking_disabled(g, |g| {
+                let (n, s, d, dff, heads) = (12usize, 64usize, 64usize, 256usize, 1usize);
+                let (layers, x) = multi_layer_fixture(g, n, s, d, dff, heads, 0xD00D);
+
+                // eager: layer-by-layer forward_device chain.
+                let x_d_ref = g.stream.memcpy_stod(&x).unwrap();
+                let mut cur = layers[0].forward_device(&x_d_ref).unwrap();
+                for l in &layers[1..] {
+                    cur = l.forward_device(&cur).unwrap();
+                }
+                let ref_host = g.stream.memcpy_dtov(&cur).unwrap();
+
+                // graphed whole stack.
+                let (cap, mut pool, _x_d, bufs, ridx, graph) =
+                    capture_resident_stack(g, &layers, s, d, &x, 64 * 1024 * 1024);
+                pool.poison(0xFF).unwrap();
+                graph.launch().unwrap();
+                cap.synchronize().unwrap();
+                let g1 = cap.memcpy_dtov(&bufs[ridx]).unwrap();
+                graph.launch().unwrap();
+                cap.synchronize().unwrap();
+                let g2 = cap.memcpy_dtov(&bufs[ridx]).unwrap();
+
+                assert_eq!(g1.len(), ref_host.len());
+                for i in 0..ref_host.len() {
+                    assert_eq!(g1[i].to_bits(), ref_host[i].to_bits(), "stack graphed != eager at {i}");
+                    assert_eq!(g1[i].to_bits(), g2[i].to_bits(), "stack replay non-deterministic at {i}");
+                }
+                eprintln!(
+                    "{n}-layer stack graphed==eager bit-identical & deterministic (S={s} D={d} Dff={dff}); \
+                     whole model = one cuGraphLaunch (high-water {} KiB, one layer's scratch)",
+                    pool.high_water_bytes() / 1024
+                );
+            });
+        });
+    }
+
+    /// **M7 decode latency — whole-model: eager `N`-layer chain vs one graph replay.** A token's forward
+    /// through an `N`-layer resident stack is `N×(~13)` individual launches eagerly; captured, it is a
+    /// **single `cuGraphLaunch`**. At the decode shape the launch overhead dominates, so folding the
+    /// whole stack collapses per-token latency. Same-run ratio across depths.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn decode_stack_latency() {
+        with_gpu("decode_stack_latency", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                let (s, d, dff, heads) = (64usize, 64usize, 256usize, 1usize);
+                for &n in &[1usize, 6, 12] {
+                    let (layers, x) = multi_layer_fixture(g, n, s, d, dff, heads, 0xBEEF);
+
+                    // eager: per-op alloc + N*(~13) launches, layer by layer.
+                    let x_d = g.stream.memcpy_stod(&x).unwrap();
+                    let eager = min_latency(&g.stream, || {
+                        let mut cur = layers[0].forward_device(&x_d).unwrap();
+                        for l in &layers[1..] {
+                            cur = l.forward_device(&cur).unwrap();
+                        }
+                    });
+
+                    // graphed: the whole stack as one cuGraphLaunch.
+                    let (cap, _pool, _x_d, _bufs, _ridx, graph) =
+                        capture_resident_stack(g, &layers, s, d, &x, 64 * 1024 * 1024);
+                    let graphed = min_latency(&cap, || {
+                        graph.launch().unwrap();
+                    });
+
+                    eprintln!(
+                        "depth N={n:2} (S={s} D={d} Dff={dff}, decode): eager {:8.1} us | graphed {:7.1} us \
+                         → graphed {:.2}x  (~{} launches → 1 cuGraphLaunch)",
+                        eager * 1e6,
+                        graphed * 1e6,
+                        eager / graphed,
+                        n * 13
+                    );
+                }
+            });
+        });
     }
 }

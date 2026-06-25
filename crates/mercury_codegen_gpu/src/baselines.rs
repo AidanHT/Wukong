@@ -1047,3 +1047,240 @@ impl CublasChainModel {
         Ok(self.stream.memcpy_dtov(&out)?)
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Tier A — naive CUDA-C **W4A16** (int4 weight-only decode), compiled by NVRTC. The idiomatic kernel a
+// programmer writes for 4-bit weight decode: one thread per output element, unpack the int4 weight to
+// float on the fly (shift + mask + sign-extend, × the per-group scale), `acc += a·w`. No tiling, no
+// shared memory, no tensor cores, no fused unpack. NVRTC on this toolkit-free box has no fp16 headers
+// (even `#include <cuda_fp16.h>` fails — see the cuBLAS-chain note), so it dequantizes and accumulates
+// in **float**; the result is checksum-cross-checked against Mercury within the fp16-vs-fp32 dequant
+// gap. This is the M6 wide-win floor and — crucially — the honest M4 headline: there is **no robust
+// library int4-decode GEMM** bindable through `cudarc` (cuBLASLt offers no general W4A16 decode), so
+// the strongest *measurable* int4 peer on this box is this naive kernel, and M4 is a documented lead.
+// ---------------------------------------------------------------------------------------------------
+
+/// Naive **symmetric** W4A16: `C[M×N] = A·dequant(W)ᵀ`, `A` `[M,K]` f32, `Bq` packed int4 `[N,K/8]`
+/// (8 nibbles/word, Marlin-**interleaved** `nibble_pos(j)=(j/2)*4+(j%2)*16`, offset-binary `u=q+8`), `S`
+/// per-group f32 scales `[N,K/group]`. One thread per output, full K-loop with an on-the-fly unpack
+/// (`w = (u-8)*scale`) — the "beat the hand-written int4 decode kernel" baseline. Reads the *same*
+/// packed layout Mercury's kernel consumes, so the comparison is pure kernel quality on identical bytes.
+const NAIVE_W4A16_CUDA: &str = r#"
+extern "C" __global__ void naive_w4a16(int M, int N, int K, int group,
+        const float* A, const unsigned* Bq, const float* S, float* C) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // n (weight row)
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // m (activation row)
+    if (row < M && col < N) {
+        int KW = K >> 3;        // u32 words per row (8 nibbles/word)
+        int KG = K / group;     // groups per row
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            unsigned word = Bq[col * KW + (k >> 3)];
+            int j = k & 7;
+            int pos = (j >> 1) * 4 + (j & 1) * 16;          // interleaved nibble position
+            int u = (word >> pos) & 0xF;                    // unsigned nibble (offset-binary)
+            float w = (float)(u - 8) * S[col * KG + k / group]; // dequant: (u-8)*scale
+            acc += A[row * K + k] * w;
+        }
+        C[row * N + col] = acc;
+    }
+}
+"#;
+
+fn nvrtc_naive_w4a16_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions { arch: Some("compute_89"), ..Default::default() };
+    let ptx = compile_ptx_with_opts(NAIVE_W4A16_CUDA, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+/// Run the naive CUDA-C W4A16 once and copy the result back — the peer correctness-gate entry. `qw`
+/// must be the **symmetric** quant (this peer's nibbles are signed); its fp16 scales are widened to f32
+/// for the NVRTC-no-fp16 kernel, so the peer's output differs from Mercury's f16-dequant only by the
+/// ~2⁻¹¹ dequant precision gap (checksum-cross-checked, and gated against the same f64 reference).
+pub fn nvrtc_naive_w4a16(
+    g: &mut Gpu,
+    a: &[f32],
+    qw: &crate::ptx_int4::QuantWeight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(qw.n, n, "weight N mismatch");
+    assert_eq!(qw.k, k, "weight K mismatch");
+    assert!(qw.signed, "naive_w4a16 peer expects the symmetric (signed) quant");
+    let module = nvrtc_naive_w4a16_module(g)?;
+    let f = module.load_function("naive_w4a16")?;
+    let s_f32: Vec<f32> = qw.scales.iter().map(|x| x.to_f32()).collect();
+    let a_d = g.stream.memcpy_stod(a)?;
+    let bq_d = g.stream.memcpy_stod(&qw.packed)?;
+    let s_d = g.stream.memcpy_stod(&s_f32)?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk, gg) = (m as i32, n as i32, k as i32, qw.group as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&mm).arg(&nn).arg(&kk).arg(&gg).arg(&a_d).arg(&bq_d).arg(&s_d).arg(&mut c_d);
+    unsafe { bld.launch(naive_cfg(m, n))? };
+    Ok(g.stream.memcpy_dtov(&c_d)?)
+}
+
+/// Time the naive CUDA-C W4A16: `iters` resident launches bracketed by one sync after a warm-up — the
+/// identical timing shape Mercury's W4A16 bench uses, so the ratio is same-run apples-to-apples. Dummy
+/// buffers of the correct `[M,K]` / `[N,K/8]` / `[N,K/group]` sizes (values don't affect timing).
+/// Returns seconds per launch.
+pub fn time_nvrtc_naive_w4a16(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    group: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let module = nvrtc_naive_w4a16_module(g)?;
+    let f = module.load_function("naive_w4a16")?;
+    let a_d = g.stream.memcpy_stod(&vec![0.01f32; m * k])?;
+    let bq_d = g.stream.memcpy_stod(&vec![0u32; n * (k / 8)])?;
+    let s_d = g.stream.memcpy_stod(&vec![0.01f32; n * (k / group)])?;
+    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+    let (mm, nn, kk, gg) = (m as i32, n as i32, k as i32, group as i32);
+    let cfg = naive_cfg(m, n);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        bld.arg(&mm).arg(&nn).arg(&kk).arg(&gg).arg(&a_d).arg(&bq_d).arg(&s_d).arg(&mut c_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+// Tier A — naive CUDA-C conv2d, compiled by NVRTC (the "beat the hand-written C conv" baseline).
+// ---------------------------------------------------------------------------------------------------
+
+/// The idiomatic conv a programmer writes first: **one thread per output element** `(k,p,q)`, looping
+/// the whole `c,r,s` window with a fused-multiply-add chain, no shared memory, no tiling, no tensor
+/// cores — the GPU twin of Mercury's *old* naive PTX conv. Single batch, stride 1, no padding (valid
+/// cross-correlation): input `X[C,H,W]`, weights `W[K,C,R,S]`, output `O[K,P,Q]` with `P=H-R+1`,
+/// `Q=W-S+1`. NVRTC compiles this CUDA-C to PTX at runtime; the driver JITs it to SASS just like
+/// Mercury's own PTX, so the comparison is pure kernel quality (tiling/SMEM/tensor-cores vs none).
+const NAIVE_CONV_CUDA: &str = r#"
+extern "C" __global__ void naive_conv(int C, int H, int W, int K, int R, int S, int P, int Q,
+                                      const float* X, const float* Wt, float* O) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; // linear (k,p,q)
+    int total = K * P * Q;
+    if (idx >= total) return;
+    int q = idx % Q;
+    int t = idx / Q;
+    int p = t % P;
+    int k = t / P;
+    float acc = 0.0f;
+    for (int c = 0; c < C; ++c)
+        for (int r = 0; r < R; ++r)
+            for (int s = 0; s < S; ++s) {
+                int ih = p + r, iw = q + s;
+                acc += X[(c * H + ih) * W + iw] * Wt[((k * C + c) * R + r) * S + s];
+            }
+    O[idx] = acc;
+}
+"#;
+
+fn nvrtc_naive_conv_module(g: &Gpu) -> Result<Arc<CudaModule>, PeerError> {
+    let opts = CompileOptions {
+        arch: Some("compute_89"),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(NAIVE_CONV_CUDA, opts)?;
+    Ok(g.ctx.load_module(ptx)?)
+}
+
+fn naive_conv_cfg(k: usize, p: usize, q: usize) -> LaunchConfig {
+    let total = (k * p * q) as u32;
+    LaunchConfig {
+        grid_dim: (total.div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Run the naive CUDA-C conv once and copy `O` back — the correctness-gate entry. `X`/`W` are the same
+/// f32 buffers Mercury's conv is cross-checked against (`[C,H,W]` / `[K,C,R,S]`).
+#[allow(clippy::too_many_arguments)]
+pub fn nvrtc_naive_conv(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(x.len(), c * h * width);
+    assert_eq!(w.len(), k * c * r * s);
+    let (p, q) = (h - r + 1, width - s + 1);
+    let module = nvrtc_naive_conv_module(g)?;
+    let f = module.load_function("naive_conv")?;
+    let x_d = g.stream.memcpy_stod(x)?;
+    let w_d = g.stream.memcpy_stod(w)?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
+    let dims = [c, h, width, k, r, s, p, q].map(|v| v as i32);
+    let mut bld = g.stream.launch_builder(&f);
+    for d in &dims {
+        bld.arg(d);
+    }
+    bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+    unsafe { bld.launch(naive_conv_cfg(k, p, q))? };
+    Ok(g.stream.memcpy_dtov(&o_d)?)
+}
+
+/// Time the naive CUDA-C conv: `iters` resident launches bracketed by one sync, after a warm-up — the
+/// identical timing shape Mercury's own conv bench uses, so the ratio is apples-to-apples. Seconds/launch.
+#[allow(clippy::too_many_arguments)]
+pub fn time_nvrtc_naive_conv(
+    g: &mut Gpu,
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    r: usize,
+    s: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let (p, q) = (h - r + 1, width - s + 1);
+    let module = nvrtc_naive_conv_module(g)?;
+    let f = module.load_function("naive_conv")?;
+    let x_d = g.stream.memcpy_stod(&vec![0.01f32; c * h * width])?;
+    let w_d = g.stream.memcpy_stod(&vec![0.01f32; k * c * r * s])?;
+    let mut o_d = g.stream.memcpy_stod(&vec![0f32; k * p * q])?;
+    let dims = [c, h, width, k, r, s, p, q].map(|v| v as i32);
+    let cfg = naive_conv_cfg(k, p, q);
+    let mut launch = |g: &Gpu| -> Result<(), DriverError> {
+        let mut bld = g.stream.launch_builder(&f);
+        for d in &dims {
+            bld.arg(d);
+        }
+        bld.arg(&x_d).arg(&w_d).arg(&mut o_d);
+        unsafe { bld.launch(cfg) }.map(|_| ())
+    };
+    launch(g)?; // warm up
+    g.stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(g)?;
+    }
+    g.stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// `2·K·P·Q·C·R·S` — conv2d FLOPs (each output is a `C·R·S` MAC reduction), for turning
+/// seconds/launch into FLOP/s.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_flop(c: usize, h: usize, width: usize, k: usize, r: usize, s: usize) -> f64 {
+    let (p, q) = (h - r + 1, width - s + 1);
+    2.0 * k as f64 * p as f64 * q as f64 * c as f64 * r as f64 * s as f64
+}
