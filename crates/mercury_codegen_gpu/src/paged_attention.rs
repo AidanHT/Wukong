@@ -215,6 +215,187 @@ pub fn launch_paged_attn_decode(
     Ok(())
 }
 
+/// PTX entry name for the **int8** paged decode-attention kernel.
+pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
+
+/// Generate the **int8-KV** paged decode-attention PTX — the [`paged_attn_decode_ptx`] kernel with the
+/// f16 cache replaced by an **int8** cache plus a **per-(token, head) f32 scale**. K/V are stored
+/// `int8 ≈ value / scale`; the kernel reads the int8 byte (`ld.global.s8`), and because one scale covers
+/// a whole head_dim vector it **factors the scale out of the dot**: `q·K = scaleK · Σ q[d]·int8K[d]` and
+/// `acc += (p·scaleV)·int8V[d]`. Halves the cache footprint vs f16 (a quarter of f32); the tiny scale
+/// slab is `head_dim×` smaller than the K slab. Same warp-cooperative online softmax; **bit-exact across
+/// block layouts** (the dequant multiply order is fixed per token). Tolerance-gated (lossy), not bit-exact.
+pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
+    assert!(head_dim > 0 && head_dim % 2 == 0, "head_dim must be a positive even number");
+    let hd = head_dim;
+    let w = PAGED_ATTN_WARPS as usize;
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let neg_big = format!("0f{:08X}", (-1.0e30f32).to_bits());
+    let bfly = |reg: &str, op: &str| -> String {
+        let mut t = String::new();
+        for off in [16, 8, 4, 2, 1] {
+            t += &format!("    shfl.sync.bfly.b32 %rt,{reg},{off},0x1f,0xffffffff;\n    {op}.f32 {reg},{reg},%rt;\n");
+        }
+        t
+    };
+    let mut s = String::new();
+    s += ".version 7.8\n.target sm_89\n.address_size 64\n\n";
+    s += &format!(
+        ".visible .entry {PAGED_ATTN_INT8_ENTRY}(\n\
+        \x20   .param .u64 pQ,\n\
+        \x20   .param .u64 pK,\n\
+        \x20   .param .u64 pV,\n\
+        \x20   .param .u64 pKsc,\n\
+        \x20   .param .u64 pVsc,\n\
+        \x20   .param .u64 pO,\n\
+        \x20   .param .u64 pBT,\n\
+        \x20   .param .u64 pCL,\n\
+        \x20   .param .f32 pScale,\n\
+        \x20   .param .u32 pBcap,\n\
+        \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pBsz,\n\
+        \x20   .param .u32 pNblk,\n\
+        \x20   .param .u32 pMbps,\n\
+        \x20   .param .u32 pLayer\n)\n{{\n"
+    );
+    s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
+    s += &format!("    .reg .f32 %acc<{hd}>;\n");
+    s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt,%scK,%scV,%pv;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%es,%ki,%dd;\n";
+    s += "    .reg .b64 %Q,%K,%V,%Ksc,%Vsc,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
+    s += "    .reg .pred %p0,%p1,%p2;\n";
+    s += "    ld.param.u64 %Q,[pQ];     cvta.to.global.u64 %Q,%Q;\n";
+    s += "    ld.param.u64 %K,[pK];     cvta.to.global.u64 %K,%K;\n";
+    s += "    ld.param.u64 %V,[pV];     cvta.to.global.u64 %V,%V;\n";
+    s += "    ld.param.u64 %Ksc,[pKsc]; cvta.to.global.u64 %Ksc,%Ksc;\n";
+    s += "    ld.param.u64 %Vsc,[pVsc]; cvta.to.global.u64 %Vsc,%Vsc;\n";
+    s += "    ld.param.u64 %O,[pO];     cvta.to.global.u64 %O,%O;\n";
+    s += "    ld.param.u64 %BT,[pBT];   cvta.to.global.u64 %BT,%BT;\n";
+    s += "    ld.param.u64 %CL,[pCL];   cvta.to.global.u64 %CL,%CL;\n";
+    s += "    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
+    s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
+    s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
+    s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
+    s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
+    s += &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
+    s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%qrow,%offb;\n    ld.global.f32 %qv,[%addr];\n";
+    s += "    add.s64 %addr,%qshw,%offb;\n    st.shared.f32 [%addr],%qv;\n    add.u32 %dd,%dd,32;\n    bra QL;\nQLE:\n";
+    s += "    bar.warp.sync 0xffffffff;\n";
+    s += &format!("    mov.f32 %m,{neg_big};\n    mov.f32 %l,0f00000000;\n");
+    for d in 0..hd {
+        s += &format!("    mov.f32 %acc{d},0f00000000;\n");
+    }
+    s += "    mov.u32 %t,%lane;\nLOOP:\n    setp.ge.u32 %p1,%t,%ctx;\n    @%p1 bra ENDLOOP;\n";
+    s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    // es = token-head linear index (scale slab) ; e = es*hd (int8 element index).
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%head;\n    mov.u32 %es,%e;\n";
+    s += &format!("    mul.lo.s32 %e,%e,{hd};\n");
+    // Per-token-head dequant scales.
+    s += "    mul.wide.u32 %offb,%es,4;\n    add.s64 %addr,%Ksc,%offb;\n    ld.global.f32 %scK,[%addr];\n    add.s64 %addr,%Vsc,%offb;\n    ld.global.f32 %scV,[%addr];\n";
+    // int8 K/V bases (1 byte/elem).
+    s += "    mul.wide.u32 %offb,%e,1;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
+    // raw int dot, then scale by scaleK and the attention scale.
+    s += "    mov.f32 %score,0f00000000;\n";
+    for d in 0..hd {
+        s += &format!("    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.s8 %ki,[%kbase+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n", d * 4, d);
+    }
+    s += "    mul.f32 %score,%score,%scK;\n    mul.f32 %score,%score,%scale;\n";
+    s += "    max.f32 %newm,%m,%score;\n";
+    s += &format!("    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n");
+    s += &format!("    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n");
+    s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
+    s += "    mul.f32 %pv,%p,%scV;\n";
+    for d in 0..hd {
+        s += &format!("    ld.global.s8 %ki,[%vbase+{}];\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n", d);
+    }
+    s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
+    s += "    mov.f32 %M,%m;\n";
+    s += &bfly("%M", "max");
+    s += &format!("    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n");
+    s += "    mul.f32 %l,%l,%factor;\n";
+    for d in 0..hd {
+        s += &format!("    mul.f32 %acc{d},%acc{d},%factor;\n");
+    }
+    s += "    mov.f32 %L,%l;\n";
+    s += &bfly("%L", "add");
+    for d in 0..hd {
+        s += &bfly(&format!("%acc{d}"), "add");
+    }
+    s += "    rcp.rn.f32 %invl,%L;\n    setp.gt.f32 %p2,%L,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
+    s += "    setp.ne.u32 %p0,%lane,0;\n    @%p0 bra DONE;\n";
+    for d in 0..hd {
+        s += &format!("    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n", d * 4);
+    }
+    s += "DONE:\n    ret;\n}\n";
+    s
+}
+
+/// Launch the **int8-KV** paged decode-attention kernel. Like [`launch_paged_attn_decode`] but `k_d`/`v_d`
+/// are `int8` slabs and `ksc_d`/`vsc_d` the per-(token, head) f32 scale slabs (`cfg.scale_slab_elems()`
+/// each). `scale` is `1/sqrt(head_dim)`. Full-overwrite of every active slot's output row.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_int8(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    k_d: &CudaSlice<i8>,
+    v_d: &CudaSlice<i8>,
+    ksc_d: &CudaSlice<f32>,
+    vsc_d: &CudaSlice<f32>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let nq = (bcap * cfg.heads) as u32;
+    let cfg_launch = LaunchConfig {
+        grid_dim: (nq.div_ceil(PAGED_ATTN_WARPS), 1, 1),
+        block_dim: (32 * PAGED_ATTN_WARPS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (heads, bsz, nblk, mbps, layer_u) =
+        (cfg.heads as u32, cfg.block_size as u32, cfg.num_blocks as u32, cfg.max_blocks_per_seq as u32, layer as u32);
+    let bcap_u = bcap as u32;
+    let mut b = stream.launch_builder(func);
+    b.arg(q_d).arg(k_d).arg(v_d).arg(ksc_d).arg(vsc_d).arg(out_d).arg(bt_d).arg(cl_d).arg(&scale);
+    b.arg(&bcap_u).arg(&heads).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
+    unsafe { b.launch(cfg_launch)? };
+    Ok(())
+}
+
+/// **Host reference quantizer**: per-slot f32 K/V (`[ctx, heads, head_dim]` row-major) → int8 values +
+/// per-(token, head) f32 scales (`scale = max_d |x| / 127`, `0 → 1`), `int8 = round(x / scale)` clamped.
+/// The device int8 cache stores exactly this; [`paged_attn_decode_int8_ptx`] dequants `int8 · scale`.
+pub fn quantize_kv_int8(slot: &[f32], ctx: usize, heads: usize, head_dim: usize) -> (Vec<i8>, Vec<f32>) {
+    let mut q = vec![0i8; ctx * heads * head_dim];
+    let mut sc = vec![0f32; ctx * heads];
+    for t in 0..ctx {
+        for h in 0..heads {
+            let base = (t * heads + h) * head_dim;
+            let amax = (0..head_dim).fold(0f32, |m, d| m.max(slot[base + d].abs()));
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            sc[t * heads + h] = scale;
+            for d in 0..head_dim {
+                let q_val = (slot[base + d] / scale).round().clamp(-127.0, 127.0);
+                q[base + d] = q_val as i8;
+            }
+        }
+    }
+    (q, sc)
+}
+
 /// PTX entry name for the KV-append (scatter) kernel.
 pub const KV_APPEND_ENTRY: &str = "kv_append";
 
@@ -646,6 +827,127 @@ mod tests {
                 a.table(first_active),
                 bm.table(first_active)
             );
+        });
+    }
+
+    // ===================== P6: int8-KV quantization (tolerance-gated footprint win) =================
+
+    /// Quantize each slot's f32 K/V to the int8 cache (per-(token, head) scale), lay them + the scales
+    /// into the slabs via the block table, run the int8 decode-attention kernel, return the `[bcap, D]`
+    /// output. The device twin of [`run_paged_attn`] with int8 storage.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_int8(
+        g: &mut crate::Gpu,
+        mgr: &BlockManager,
+        cfg: &KvConfig,
+        layer: usize,
+        q: &[f32],
+        k_slots: &[Vec<f32>],
+        v_slots: &[Vec<f32>],
+        scale: f32,
+    ) -> Vec<f32> {
+        let bcap = cfg.num_slots;
+        let d = cfg.heads * cfg.head_dim;
+        let mut kq = vec![0i8; cfg.slab_elems()];
+        let mut vq = vec![0i8; cfg.slab_elems()];
+        let mut ks = vec![0f32; cfg.scale_slab_elems()];
+        let mut vs = vec![0f32; cfg.scale_slab_elems()];
+        for b in 0..bcap {
+            let ctx = mgr.context_len(b);
+            let (kqi, ksi) = quantize_kv_int8(&k_slots[b], ctx, cfg.heads, cfg.head_dim);
+            let (vqi, vsi) = quantize_kv_int8(&v_slots[b], ctx, cfg.heads, cfg.head_dim);
+            for t in 0..ctx {
+                let (phys, off) = mgr.locate(b, t);
+                for h in 0..cfg.heads {
+                    ks[cfg.scale_offset(layer, phys, off, h)] = ksi[t * cfg.heads + h];
+                    vs[cfg.scale_offset(layer, phys, off, h)] = vsi[t * cfg.heads + h];
+                    for dh in 0..cfg.head_dim {
+                        let idx = cfg.elem_offset(layer, phys, off, h, dh);
+                        let src = (t * cfg.heads + h) * cfg.head_dim + dh;
+                        kq[idx] = kqi[src];
+                        vq[idx] = vqi[src];
+                    }
+                }
+            }
+        }
+        let q_d = g.stream.memcpy_stod(q).unwrap();
+        let k_d = g.stream.memcpy_stod(&kq).unwrap();
+        let v_d = g.stream.memcpy_stod(&vq).unwrap();
+        let ksc_d = g.stream.memcpy_stod(&ks).unwrap();
+        let vsc_d = g.stream.memcpy_stod(&vs).unwrap();
+        let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+        let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
+        let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+        let key: &'static str = match cfg.head_dim {
+            64 => "paged_attn_int8_d64",
+            128 => "paged_attn_int8_d128",
+            _ => "paged_attn_int8_dX",
+        };
+        let func = g.function(key, &paged_attn_decode_int8_ptx(cfg.head_dim), PAGED_ATTN_INT8_ENTRY).unwrap();
+        launch_paged_attn_decode_int8(
+            &g.stream, &func, &q_d, &k_d, &v_d, &ksc_d, &vsc_d, &mut out_d, &bt_d, &cl_d, cfg, layer, bcap, scale,
+        )
+        .unwrap();
+        g.stream.synchronize().unwrap();
+        g.stream.memcpy_dtov(&out_d).unwrap()
+    }
+
+    /// **int8-KV tolerance gate (the first law, lossy path).** The int8-cache decode-attention must match
+    /// the f64 full-precision reference within tolerance — the only error is the per-(token, head) int8
+    /// quantization of K/V (Q stays f32). Ragged contexts exercise the block-table walk + empty guard.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_int8_attention_matches_reference() {
+        with_gpu("paged_int8_attention_matches_reference", |g| {
+            let (heads, hd, block_size) = (4usize, 64usize, 16usize);
+            let (cfg, ctx, q, k, v, scale) =
+                fixture(0x171AB, heads, hd, block_size, vec![37, 0, 16, 100, 5, 64]);
+            let mut mgr = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            for b in 0..cfg.num_slots {
+                if ctx[b] > 0 {
+                    mgr.reserve(b, ctx[b]).unwrap();
+                }
+            }
+            let got = run_paged_attn_int8(g, &mgr, &cfg, 0, &q, &k, &v, scale);
+            let refv = reference_decode_attn(&q, &k, &v, &ctx, heads, hd, scale);
+            // int8-KV achieves max_abs ~3e-3 here; gate at 1e-2 (3× headroom) to catch regressions.
+            let s = crate::diff::assert_close("paged_attn_int8", &got, &refv, 1e-2, 5e-2);
+            eprintln!(
+                "int8-KV decode-attn vs f64 ref: max_abs={:.2e} max_rel={:.2e} (per-(token,head) int8 K/V, f32 Q; \
+                 ragged ctx {:?})",
+                s.max_abs, s.max_rel, ctx
+            );
+        });
+    }
+
+    /// **int8-KV paging invariance.** The int8 values + scales placed under two *different physical block
+    /// layouts* must give **bit-for-bit identical** output — the dequant multiply order is fixed per
+    /// token, so paging stays invisible even on the quantized path (as for f16).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn paged_int8_attention_invariant_to_block_layout() {
+        with_gpu("paged_int8_attention_invariant_to_block_layout", |g| {
+            let (heads, hd, block_size) = (4usize, 64usize, 16usize);
+            let (cfg, ctx, q, k, v, scale) = fixture(0x9C0DE, heads, hd, block_size, vec![40, 7, 0, 96, 33]);
+            let mut a = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            for b in 0..cfg.num_slots {
+                if ctx[b] > 0 {
+                    a.reserve(b, ctx[b]).unwrap();
+                }
+            }
+            let mut bm = BlockManager::new(cfg.num_blocks, block_size, cfg.num_slots, cfg.max_blocks_per_seq);
+            for b in (0..cfg.num_slots).rev() {
+                if ctx[b] > 0 {
+                    bm.reserve(b, ctx[b]).unwrap();
+                }
+            }
+            let out_a = run_paged_attn_int8(g, &a, &cfg, 0, &q, &k, &v, scale);
+            let out_b = run_paged_attn_int8(g, &bm, &cfg, 0, &q, &k, &v, scale);
+            for i in 0..out_a.len() {
+                assert_eq!(out_a[i].to_bits(), out_b[i].to_bits(), "int8 attention changed under a different block layout at {i}");
+            }
+            eprintln!("int8-KV decode-attn BIT-IDENTICAL across 2 physical block layouts — paging invisible on the quantized path");
         });
     }
 }

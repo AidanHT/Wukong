@@ -92,6 +92,34 @@ impl KvConfig {
             * self.head_dim
             + dh
     }
+
+    /// f32 scale entries in one int8 K (or V) **scale slab**: one per `(token, head)` =
+    /// `layers * num_blocks * block_size * heads` — a factor `head_dim` smaller than the value slab.
+    #[inline]
+    pub fn scale_slab_elems(&self) -> usize {
+        self.layers * self.num_blocks * self.block_size * self.heads
+    }
+
+    /// Flat index of `scale[layer][phys_block][tok][head]` — the per-(token, head) dequant scale the
+    /// [int8 attention kernel](crate::paged_attention::paged_attn_decode_int8_ptx) reads. Equals
+    /// `elem_offset(..., dh=0) / head_dim`.
+    #[inline]
+    pub fn scale_offset(&self, layer: usize, phys_block: u32, tok: usize, head: usize) -> usize {
+        ((layer * self.num_blocks + phys_block as usize) * self.block_size + tok) * self.heads + head
+    }
+
+    /// Bytes for the whole K **and** V cache at `elem_size` bytes/element (4 = f32, 2 = f16): the
+    /// dense-storage footprint against the 6 GB budget.
+    #[inline]
+    pub fn kv_bytes(&self, elem_size: usize) -> usize {
+        2 * self.slab_elems() * elem_size
+    }
+
+    /// Bytes for the **int8** K and V cache: 1 byte/value plus the two per-(token, head) f32 scale slabs.
+    #[inline]
+    pub fn kv_bytes_int8(&self) -> usize {
+        2 * self.slab_elems() + 2 * self.scale_slab_elems() * 4
+    }
 }
 
 /// The **host-side** block allocator + per-slot block tables. No device handle — this is pure policy,
@@ -382,6 +410,35 @@ impl PagedKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **int8 KV footprint win (the 6 GB lever).** Pure geometry: int8 storage is ~half of f16 and ~a
+    /// quarter of f32 — the per-(token, head) f32 scale slab is `head_dim×` smaller than the value slab,
+    /// so it barely dents the win. No device needed.
+    #[test]
+    fn int8_kv_footprint_shrink() {
+        // A Llama-7B-ish KV geometry: 32 layers, 8 KV heads × 128, 4096 blocks of 16.
+        let cfg = KvConfig {
+            layers: 32,
+            heads: 8,
+            head_dim: 128,
+            block_size: 16,
+            num_blocks: 4096,
+            num_slots: 64,
+            max_blocks_per_seq: 256,
+        };
+        let (f32b, f16b, i8b) = (cfg.kv_bytes(4), cfg.kv_bytes(2), cfg.kv_bytes_int8());
+        assert!(i8b < f16b && f16b < f32b, "int8 < f16 < f32");
+        let vs_f16 = f16b as f64 / i8b as f64;
+        let vs_f32 = f32b as f64 / i8b as f64;
+        // head_dim=128 ⇒ int8 = 1 + 4/128 bytes/value ⇒ ~1.94× vs f16, ~3.88× vs f32.
+        assert!(vs_f16 > 1.9 && vs_f16 < 2.0, "int8 ~half of f16 (got {vs_f16:.3}x)");
+        assert!(vs_f32 > 3.8 && vs_f32 < 4.0, "int8 ~quarter of f32 (got {vs_f32:.3}x)");
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "KV footprint (32L, 8h×128, 4096×16 blocks): f32 {:.2} GiB | f16 {:.2} GiB | int8 {:.2} GiB → {:.2}x vs f16, {:.2}x vs f32",
+            gib(f32b), gib(f16b), gib(i8b), vs_f16, vs_f32
+        );
+    }
 
     // ---- pure host allocator: runs on a GPU-less box (the policy is device-independent) ----
 
