@@ -12886,6 +12886,115 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Clock-cancelling internal A/B: multi-warp `mp4` (4 warps/CTA share one staged K/V block) vs the
+    /// single-warp `mp`.** The cross-process peer sweep [`attn_variants_vs_fused_peer`] hinted mp4 loses
+    /// at S≤2048 but *wins* ~10% at S=4096 — right at the within-process drift floor. This isolates it
+    /// with a same-process, same-round ratio: each round pins the clock, times mp then mp4 back-to-back
+    /// (each with ITS OWN launch config — mp is 1 warp/grid `S/16`, mp4 is 4 warps/grid `S/64`), and
+    /// records `mp4/mp`. Both run at the identical clock within a round ⇒ the ratio is clock-invariant
+    /// (median over rounds reported; <1 means mp4 is faster). Checksum-cross-checked first. This is the
+    /// definitive same-run evidence for whether to dispatch mp4 at long S in [`wmma_flash_entry`].
+    #[test]
+    #[ignore = "tuning A/B; run explicitly"]
+    fn flash_mp4_vs_mp() {
+        use half::f16;
+        with_gpu("flash_mp4_vs_mp", |g| {
+            let d = 64usize;
+            let mut rng = crate::diff::Rng::new(0x3FA4A);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
+            let f_mp4 = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp4").unwrap();
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            let pin = |g: &mut Gpu| {
+                for _ in 0..40 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            };
+            const ROUNDS: usize = 9;
+            for &heads in &[8usize] {
+                for &s in &[2048usize, 3072, 4096, 8192] {
+                    let n = heads * s * d;
+                    let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                    let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                    let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                    let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let ss = s as u32;
+                    let cfg_mp = LaunchConfig {
+                        grid_dim: ((s / 16) as u32, heads as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let cfg_mp4 = LaunchConfig {
+                        grid_dim: (((s / 16) as u32).div_ceil(4), heads as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let mut b = g.stream.launch_builder(f);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    };
+                    // checksum cross-check: mp4 must agree with mp.
+                    run(g, &f_mp, cfg_mp, &mut o_d);
+                    g.stream.synchronize().unwrap();
+                    let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    run(g, &f_mp4, cfg_mp4, &mut o_d);
+                    g.stream.synchronize().unwrap();
+                    let s_mp4: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                    assert!(
+                        (s_mp4 - s_mp).abs() / s_mp < 3e-2,
+                        "H={heads} S={s}: mp4 vs mp checksum disagree mp={s_mp:.3e} mp4={s_mp4:.3e}"
+                    );
+                    let mut ratios = Vec::new();
+                    let mut t_mp_best = f64::INFINITY;
+                    for _ in 0..ROUNDS {
+                        pin(g);
+                        // Steady-state warmup of BOTH kernels before timing — otherwise the FIRST-timed
+                        // kernel eats the post-pin clock ramp and the second looks artificially faster
+                        // (the bias that produced an incoherent non-monotonic mp4/mp). With both warmed
+                        // the clock is boosted before either is timed.
+                        for _ in 0..30 {
+                            run(g, &f_mp, cfg_mp, &mut o_d);
+                            run(g, &f_mp4, cfg_mp4, &mut o_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        // Time each TWICE in opposite order (mp,mp4,mp4,mp) and take the min per kernel,
+                        // so any residual intra-round drift hits both kernels symmetrically.
+                        let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, cfg: LaunchConfig, o: &mut cudarc::driver::CudaSlice<f32>| {
+                            let t0 = Instant::now();
+                            for _ in 0..50 {
+                                let mut b = g.stream.launch_builder(f);
+                                b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
+                                unsafe { b.launch(cfg).unwrap() };
+                            }
+                            g.stream.synchronize().unwrap();
+                            t0.elapsed().as_secs_f64() / 50.0
+                        };
+                        let a1 = time1(g, &f_mp, cfg_mp, &mut o_d);
+                        let b1 = time1(g, &f_mp4, cfg_mp4, &mut o_d);
+                        let b2 = time1(g, &f_mp4, cfg_mp4, &mut o_d);
+                        let a2 = time1(g, &f_mp, cfg_mp, &mut o_d);
+                        let tmp = a1.min(a2);
+                        let tmp4 = b1.min(b2);
+                        ratios.push(tmp4 / tmp);
+                        t_mp_best = t_mp_best.min(tmp);
+                    }
+                    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = ratios[ratios.len() / 2];
+                    let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
+                    eprintln!(
+                        "H={heads} S={s:>4}: mp {:>6.0} GF/s | mp4/mp {:.3}×  {} (median of {ROUNDS}, clock-cancelled)",
+                        flop / t_mp_best / 1e9,
+                        med,
+                        if med < 0.98 { "<- mp4 wins" } else if med > 1.02 { "(mp wins)" } else { "(tie)" },
+                    );
+                }
+            }
+        });
+    }
+
     /// **Correctness gate (law #1) for fused-RoPE flash** (`flash_d64_mprope`). The kernel rotates Q and
     /// K *inside* attention; this gates it against an independent CPU oracle that rotates Q,K with the
     /// same interleaved `(2t,2t+1)` convention (`θ_t = base^(−2t/d)`) and then runs the f64 attention
