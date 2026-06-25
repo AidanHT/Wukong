@@ -26,6 +26,42 @@ boost, E-core scheduling, thermals). The harness reports the best of many batche
 interfered estimate); the ranges below span several runs. Treat them as representative, not exact —
 but the *ratios* (who wins, by roughly how much) are stable.
 
+## Headline results
+
+The numbers that matter most are the ones where the *baseline is hard* — so the win reflects real
+quality, not just beating textbook code:
+
+- **GEMM is near the silicon limit *and* ahead of a tuned library.** The single-core f32 GEMM holds
+  **~104–117 GFLOP/s ≈ 90% of one P-core's AVX2-FMA roofline**, and is **1.1–1.3× faster than the
+  tuned `matrixmultiply` Rust crate** — a real hand-optimized peer, not a strawman (`117 vs 89`,
+  `115 vs 91`, `104 vs 96` GFLOP/s across 512²–1024²) — with **no LLVM**.
+- **Compile time leads by 1–2 orders of magnitude, every build:** **~100–680× faster than C/Rust**
+  (in-process Cranelift JIT vs spawning a toolchain; ~1–2 ms vs ~125–245 ms).
+- **Geomean across the elementwise/reduction battery: 4.86× faster than C.**
+
+The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
+where gcc/rustc won't vectorize — disclosed per section, never a rigged baseline):
+
+| What | 1-core vs C | `@parallel` vs C |
+|---|---|---|
+| Weight-gradient GEMM `dW=Aᵀ·B` | **up to ~167×** | **up to ~422×** |
+| `nn.Linear` `C=A·Bᵀ` | ~19–26× | up to **~104×** |
+| bf16 `nn.Linear` | ~24–27× | up to ~97× |
+| Fused FFN `silu(A·Bᵀ)` (the Dense layer) | ~24–26× | ~48–95× |
+| Strided column reductions (sum/max/absmax) | **~29–50×** | ~37–107× |
+| RoPE (rotary embedding) | ~29–54× | **~146–156×** |
+| Reductions / transcendentals / argmax | ~2.5–9× | ~9–26× |
+
+**GPU backend** (`--features gpu`, mobile RTX 4050, same-run clock-invariant ratios — full section
+[below](#gpu-backend-nvidia-rtx-4050-laptop-sm_89)): within **77–97% of cuBLAS** on GEMM and **95.7%
+of the 192 GB/s HBM hardware peak**; **3.6–5× a cuBLAS unfused attention chain** on fused
+flash-attention (and 205–738× naive CUDA-C); int4/int8 decode **~180–237× naive CUDA-C**; the
+whole-program megakernel **~285×** the per-op offload chain; and GPU compile **0.76 ms cold vs
+Triton's 30–120 s** (~10⁴–10⁵×).
+
+Every number is gated bit-for-bit (CPU) or to a `c·√K·ε` tolerance (GPU) against the interpreter
+oracle — the wins are correct, not miscompiles.
+
 ## Scoreboard
 
 Headline ratios vs the **idiomatic** C/Rust baseline (`gcc -O3 -march=native` / `rustc -O -C
@@ -39,6 +75,7 @@ tolerance for the reassociated-float ones).
 |---|---|---|---|
 | **f32 GEMM** (matmul / `nn.Linear`) | ~3–3.6× | up to ~100× | register-block + cache-tile + pack; they vectorize the inner loop but never tile |
 | **bf16/f16 GEMM** | ~25× (idiomatic) | large | lossless widen-prepass → the tuned f32 microkernel |
+| **Fused FFN** (`silu(A·Bᵀ)`, the Dense layer) | ~24–26× | ~48–95× | matmul + activation folded into one C-write; C re-streams C through a separate scalar-`expf` pass |
 | **TN weight-gradient** (`dW=dYᵀ·X`) | ~10× (hand-T C) | large | transpose-prepass; the idiomatic nest reads A column-strided (they can't vectorize) |
 | **int8 `nn.Linear`** (`vpdpbusd`) | ~1.5–2.5× | ~4.6–14.7× | 2×4 register tile halves B traffic (vs gcc's own `vpdpbusd`) |
 | **Column reductions** (sum/max/min/absmax) | **~29–50×** | **~37–107×** | the strided column-outer fold gcc/rustc leave *scalar* |
@@ -202,7 +239,10 @@ GFLOP/s (higher is better), naive `ikj` nest in each language:
 
 The single-core kernel now holds **~110–120 GFLOP/s** at 512³–1024³ — ≈90% of one P-core's AVX2-FMA
 peak (pinned to a P-core it reaches a stable ~117–126) — while gcc's naive nest falls from ~40 to ~22
-GFLOP/s as 1024² spills out of cache, so the **single-thread lead widens with size**. The parallel
+GFLOP/s as 1024² spills out of cache, so the **single-thread lead widens with size**. Crucially, that
+single-core kernel also **beats the tuned `matrixmultiply` Rust crate by ~1.1–1.3×** (117 vs 89, 115
+vs 91, 104 vs 96 GFLOP/s at 256²–1024²) — so Mercury is not merely beating naive C; it edges a
+dedicated hand-optimized GEMM library while sitting at ~90% of the AVX2-FMA roofline. The parallel
 kernel reaches **~437–522 GFLOP/s at 1024³** and **~690 at 2048³** (after the `MC=144` cache-block
 widening cut the B-panel's L3 re-streaming, and the pack-scratch is reused across blocks rather than
 re-allocated per K-block).
