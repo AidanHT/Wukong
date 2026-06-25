@@ -1977,6 +1977,10 @@ pub fn conv2d_wmma(
     assert!(h >= r && width >= s, "kernel larger than input");
     let p = h - r + 1;
     let q = width - s + 1;
+    // Single-buffer implicit-GEMM is the production path: the register double-buffered pipeline
+    // ([`crate::ptx_conv::conv_wmma_db_ptx`]) was measured **neutral-to-negative** on these L2-resident
+    // convs (its prefetch registers cut occupancy on the split-K deep-channel shapes), so it is kept only
+    // as a documented A/B in `conv_vs_cudnn`, not shipped.
     let ptx = crate::ptx_conv::conv_wmma_ptx(c, h, width, k, r, s);
     let module = g.load_module_cached(&ptx)?;
     let f = module.load_function("conv2d_wmma")?;
@@ -2037,7 +2041,8 @@ pub fn conv2d_wmma_splitk(
     let x_d = g.stream.memcpy_stod(&x16)?;
     let w_d = g.stream.memcpy_stod(&w16)?;
     let mut partial_d = g.stream.alloc_zeros::<f32>(sk * m * n)?;
-    // Conv: sk z-slices each write their own M*N partial plane.
+    // Conv: sk z-slices each write their own M*N partial plane (single-buffer is the production path; see
+    // the note in `conv2d_wmma` — the double-buffered pipeline measured neutral here).
     let ptx = crate::ptx_conv::conv_wmma_splitk_ptx(c, h, width, k, r, s, sk);
     let module = g.load_module_cached(&ptx)?;
     let f = module.load_function("conv2d_wmma_splitk")?;
@@ -7133,6 +7138,10 @@ mod tests {
                 // Mercury fp16 implicit-GEMM conv, AUTO-DISPATCHED (split-K when the base grid starves
                 // the SMs); resident, f16 X/W, conv (+ reduce) on persistent buffers so timing is pure.
                 let sk = crate::ptx_conv::conv_splitk_factor(c, h, wd, k, r, s, g.sm_count() as usize);
+                // Production path: the single-buffer implicit-GEMM (auto split-K). We ALSO build the
+                // register double-buffered pipeline below and time it same-run, so the pipeline delta is an
+                // honest in-run A/B — it lands neutral here (these convs are L2-resident, not HBM-latency
+                // bound, and the prefetch registers cut occupancy on the split-K shapes).
                 let (conv_ptx, conv_fn) = if sk == 1 {
                     (crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s), "conv2d_wmma")
                 } else {
@@ -7140,6 +7149,14 @@ mod tests {
                 };
                 let cmod = g.load_module_cached(&conv_ptx).unwrap();
                 let cf = cmod.load_function(conv_fn).unwrap();
+                // Double-buffered A/B (same entry name, distinct module since the PTX differs).
+                let (sb_ptx, _) = if sk == 1 {
+                    (crate::ptx_conv::conv_wmma_db_ptx(c, h, wd, k, r, s), "conv2d_wmma")
+                } else {
+                    (crate::ptx_conv::conv_wmma_db_splitk_ptx(c, h, wd, k, r, s, sk), "conv2d_wmma_splitk")
+                };
+                let sbmod = g.load_module_cached(&sb_ptx).unwrap();
+                let sbf = sbmod.load_function(conv_fn).unwrap();
                 let cfg_w = if sk == 1 {
                     conv_wmma_cfg(h, wd, k, r, s)
                 } else {
@@ -7179,12 +7196,36 @@ mod tests {
                         unsafe { rb.launch(rcfg).unwrap() };
                     }
                 };
+                let launch_sb = |g: &Gpu,
+                                 part: &mut cudarc::driver::CudaSlice<f32>,
+                                 o: &mut cudarc::driver::CudaSlice<f32>| {
+                    if sk == 1 {
+                        let mut b = g.stream.launch_builder(&sbf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *o);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                    } else {
+                        let mut b = g.stream.launch_builder(&sbf);
+                        b.arg(&xw_d).arg(&ww_d).arg(&mut *part);
+                        unsafe { b.launch(cfg_w).unwrap() };
+                        let (_, rf) = red.as_ref().unwrap();
+                        let mut rb = g.stream.launch_builder(rf);
+                        rb.arg(&*part).arg(&mut *o);
+                        unsafe { rb.launch(rcfg).unwrap() };
+                    }
+                };
                 launch_w(g, &mut part_d, &mut ow_d);
                 g.stream.synchronize().unwrap();
                 let merc = g.stream.memcpy_dtov(&ow_d).unwrap();
                 crate::diff::assert_close(&format!("mercury C{c} {r}x{s} sk{sk}"), &merc, &oracle, 5e-2, rel);
+                // The single-buffer kernel must produce the **same** result (identical reduction order).
+                launch_sb(g, &mut part_d, &mut ow_d);
+                g.stream.synchronize().unwrap();
+                let merc_sb = g.stream.memcpy_dtov(&ow_d).unwrap();
+                assert_eq!(merc, merc_sb, "db vs single-buffer conv must be bit-identical (same MMA order)");
 
-                // cuDNN (Tier B): cross-check + checksum + disclosed algo.
+                // cuDNN (Tier B): cross-check + checksum + disclosed algo. Timed **best_of(ROUNDS)** — the
+                // SAME robustness Mercury gets below — so a single thermal dip in cuDNN's window can't tank
+                // the ratio (a single-shot cuDNN timing vs Mercury's best-of swung the gap ~7× run-to-run).
                 let (cudnn_algo, g_c) = if have_cudnn {
                     let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
                     crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
@@ -7193,7 +7234,7 @@ mod tests {
                         (cs_c - cs_n).abs() / cs_n.max(1.0) < 6e-2,
                         "cudnn checksum: c={cs_c:.3e} n={cs_n:.3e}"
                     );
-                    let (t_c, _a) = time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap();
+                    let t_c = best_of(ROUNDS, || time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap().0);
                     (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, r, s) / t_c)
                 } else {
                     ("n/a", 0.0)
@@ -7209,25 +7250,37 @@ mod tests {
                     g.stream.synchronize().unwrap();
                     t0.elapsed().as_secs_f64() / iters as f64
                 });
+                let t_sb = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch_sb(g, &mut part_d, &mut ow_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
                 let naive_iters = if c >= 128 { 10 } else { 30 };
                 let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, r, s, naive_iters).unwrap();
                 let flop = conv_flop(c, h, wd, k, r, s);
-                let (g_w, g_n) = (flop / t_w, flop / t_n);
+                let (g_w, g_sb, g_n) = (flop / t_w, flop / t_sb, flop / t_n);
                 if have_cudnn {
                     eprintln!(
-                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive, {:>3.0}% cuDNN) | cuDNN {:>6.0} GF [{}] | naive {:>5.0} GF",
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive, {:>3.0}% cuDNN) | db-pipe {:>4.2}× ({:>6.0} GF) | cuDNN {:>6.0} GF [{}] | naive {:>5.0} GF",
                         g_w / 1e9,
                         g_w / g_n,
                         100.0 * g_w / g_c,
+                        g_sb / g_w,
+                        g_sb / 1e9,
                         g_c / 1e9,
                         cudnn_algo,
                         g_n / 1e9,
                     );
                 } else {
                     eprintln!(
-                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive) | naive {:>5.0} GF",
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury(sk{sk}) {:>6.0} GF ({:>5.1}× naive) | db-pipe {:>4.2}× ({:>6.0} GF) | naive {:>5.0} GF",
                         g_w / 1e9,
                         g_w / g_n,
+                        g_sb / g_w,
+                        g_sb / 1e9,
                         g_n / 1e9,
                     );
                 }
