@@ -571,6 +571,183 @@ pub fn wino_output_xform_ptx(k: usize, h: usize, w: usize, m: usize) -> String {
     s
 }
 
+/// **Phase 3 (batched) — the α² channel-reduction GEMMs in ONE launch.** `wino_bgemm(pV, pU, pM)`
+/// computes every transform-position plane `M[z] = U[z]·V[z]` for `z = ctaid.z ∈ [0,α²)`:
+/// `M[z][K,T] = U[z][K,C] · V[z][C,T]` (row-major **NN**, no im2col — the Winograd GEMM is plain). A
+/// fp16 `m16n16k16` WMMA GEMM (the same tensor-core core as `conv2d_wmma`), but the per-plane loop is
+/// folded into `gridDim.z`: launching the α² planes separately fills only `ceil(T/BN)·ceil(K/BM)` CTAs
+/// each (≈4 on a feature map) and runs them serially — ~idle on a 20-SM GPU — whereas batching puts
+/// `α²·that` CTAs in flight at once. Plane strides (U:`K·C`, V:`C·T`, M:`K·T`) are baked; `M` is **f32**
+/// (read directly by the output transform). Launch: block `(WMMA_THREADS,1,1)`, grid
+/// `(ceil(T/BN), ceil(K/BN), α²)`.
+pub fn wino_bgemm_ptx(c: usize, nt: usize, k: usize) -> String {
+    use crate::ptx_conv::{WMMA_BM, WMMA_BN, WMMA_THREADS, WMMA_WM, WMMA_WN};
+    use std::fmt::Write as _;
+    let m = k; // GEMM M
+    let n = nt; // GEMM N
+    let gk = c; // GEMM K (contraction)
+    let kc = k * c; // U plane stride (f16 elems)
+    let cnt = c * nt; // V plane stride
+    let knt = k * nt; // M plane stride (f32 elems)
+    let (bm, bn) = (WMMA_BM, WMMA_BN);
+    let (warps_m, warps_n) = (WMMA_WM, WMMA_WN);
+    let threads = WMMA_THREADS;
+    let wm = bm / warps_m;
+    let wn = bn / warps_n;
+    let tm = wm / 16;
+    let tn = wn / 16;
+    let wn_shift = warps_n.trailing_zeros();
+    let bn_shift = bn.trailing_zeros();
+    let a_per = bm * 16 / threads;
+    let b_per = 16 * bn / threads;
+    let c_per = bm * bn / threads;
+    let smem_a = bm * 16 * 2;
+    let smem_b = 16 * bn * 2;
+    let smem_c = bm * bn * 4;
+
+    let veclist = |pre: &str| -> String {
+        let regs: Vec<String> = (0..8).map(|i| format!("%{pre}{i}")).collect();
+        format!("{{{}}}", regs.join(","))
+    };
+
+    let mut b = String::new();
+    let _ = writeln!(b, ".version 7.8\n.target sm_89\n.address_size 64\n");
+    let _ = writeln!(b, "// Winograd batched NN GEMM: M[z][K{k},T{nt}] = U[z][K,C{c}] * V[z][C,T], z=gridDim.z");
+    let _ = writeln!(b, ".visible .entry wino_bgemm(\n    .param .u64 pV,\n    .param .u64 pU,\n    .param .u64 pM\n)\n{{");
+    let _ = writeln!(b, "    .shared .align 16 .b8 smemA[{smem_a}];");
+    let _ = writeln!(b, "    .shared .align 16 .b8 smemB[{smem_b}];");
+    let _ = writeln!(b, "    .shared .align 16 .b8 smemC[{smem_c}];");
+    let _ = writeln!(b, "    .reg .pred %p0,%pv;");
+    let _ = writeln!(b, "    .reg .b16 %hv;");
+    let _ = writeln!(
+        b,
+        "    .reg .b32 %tix,%m0,%n0,%kt,%e,%mm,%gkk,%ncol,%gkv,%nn,%xidx,%widx,%tmp,%tmp2,%saddr,%warpId,%wrb,%wcb,%zA,%zB,%zM,%z;"
+    );
+    let mut decl = String::new();
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for rr in 0..8 {
+                decl += &format!("%c{ti}_{tj}_{rr},");
+            }
+        }
+    }
+    for ti in 0..tm {
+        for rr in 0..8 {
+            decl += &format!("%a{ti}_{rr},");
+        }
+    }
+    for tj in 0..tn {
+        for rr in 0..8 {
+            decl += &format!("%b{tj}_{rr},");
+        }
+    }
+    let _ = writeln!(b, "    .reg .f32 %cf;");
+    let _ = writeln!(b, "    .reg .b32 {};", decl.trim_end_matches(','));
+    let _ = writeln!(b, "    .reg .b64 %V,%U,%M,%off,%gp,%ptr;");
+    let _ = writeln!(b, "    ld.param.u64 %V,[pV];\n    ld.param.u64 %U,[pU];\n    ld.param.u64 %M,[pM];");
+    let _ = writeln!(b, "    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %U,%U;\n    cvta.to.global.u64 %M,%M;");
+    let _ = writeln!(b, "    mov.u32 %tix,%tid.x;");
+    let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %m0,%tmp,{bm};");
+    let _ = writeln!(b, "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %n0,%tmp,{bn};");
+    // plane (z) base offsets, in ELEMENTS (folded into each index below)
+    let _ = writeln!(b, "    mov.u32 %z,%ctaid.z;");
+    let _ = writeln!(b, "    mul.lo.s32 %zA,%z,{kc};      // U plane = z*K*C");
+    let _ = writeln!(b, "    mul.lo.s32 %zB,%z,{cnt};     // V plane = z*C*T");
+    let _ = writeln!(b, "    mul.lo.s32 %zM,%z,{knt};     // M plane = z*K*T");
+    let _ = writeln!(b, "    shr.u32 %warpId,%tix,5;");
+    let _ = writeln!(b, "    shr.u32 %tmp,%warpId,{wn_shift};");
+    let _ = writeln!(b, "    mul.lo.s32 %wrb,%tmp,{wm};");
+    let _ = writeln!(b, "    and.b32 %tmp,%warpId,{};", warps_n - 1);
+    let _ = writeln!(b, "    mul.lo.s32 %wcb,%tmp,{wn};");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            for rr in 0..8 {
+                let _ = writeln!(b, "    mov.f32 %c{ti}_{tj}_{rr},0f00000000;");
+            }
+        }
+    }
+    let _ = writeln!(b, "    mov.u32 %kt,0;");
+    let _ = writeln!(b, "KLOOP:");
+    let _ = writeln!(b, "    setp.ge.u32 %p0,%kt,{gk};\n    @%p0 bra KEND;");
+    // stage A (U[K,C]): A[m][gc] = U[zA + gm*C + gc]
+    for li in 0..a_per {
+        let off = li * threads;
+        let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
+        let _ = writeln!(b, "    shr.u32 %mm,%e,4;\n    and.b32 %gkk,%e,15;");
+        let _ = writeln!(b, "    add.u32 %tmp,%m0,%mm;\n    add.u32 %tmp2,%kt,%gkk;");
+        let _ = writeln!(b, "    setp.lt.u32 %pv,%tmp,{m};\n    setp.lt.u32 %p0,%tmp2,{gk};\n    and.pred %pv,%pv,%p0;");
+        let _ = writeln!(b, "    mad.lo.s32 %widx,%tmp,{gk},%tmp2;\n    add.u32 %widx,%widx,%zA;");
+        let _ = writeln!(b, "    mul.wide.u32 %off,%widx,2;\n    add.s64 %ptr,%U,%off;");
+        let _ = writeln!(b, "    mov.u16 %hv,0;\n    @%pv ld.global.u16 %hv,[%ptr];");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemA;\n    shl.b32 %tmp,%e,1;\n    add.u32 %saddr,%saddr,%tmp;\n    st.shared.u16 [%saddr],%hv;");
+    }
+    // stage B (V[C,T]): B[gk][n] = V[zB + gkv*T + nn]  (plain row-major, no im2col)
+    for li in 0..b_per {
+        let off = li * threads;
+        let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
+        let _ = writeln!(b, "    shr.u32 %gkk,%e,{bn_shift};\n    and.b32 %ncol,%e,{};", bn - 1);
+        let _ = writeln!(b, "    add.u32 %gkv,%kt,%gkk;\n    add.u32 %nn,%n0,%ncol;");
+        let _ = writeln!(b, "    setp.lt.u32 %pv,%gkv,{gk};\n    setp.lt.u32 %p0,%nn,{n};\n    and.pred %pv,%pv,%p0;");
+        let _ = writeln!(b, "    mad.lo.s32 %xidx,%gkv,{nt},%nn;\n    add.u32 %xidx,%xidx,%zB;");
+        let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,2;\n    add.s64 %ptr,%V,%off;");
+        let _ = writeln!(b, "    mov.u16 %hv,0;\n    @%pv ld.global.u16 %hv,[%ptr];");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemB;\n    shl.b32 %tmp,%e,1;\n    add.u32 %saddr,%saddr,%tmp;\n    st.shared.u16 [%saddr],%hv;");
+    }
+    let _ = writeln!(b, "    bar.sync 0;");
+    let _ = writeln!(b, "    mov.u32 %tmp,16;");
+    for ti in 0..tm {
+        let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};\n    mul.lo.s32 %tmp2,%tmp2,32;", ti * 16);
+        let _ = writeln!(b, "    mov.u32 %saddr,smemA;\n    add.u32 %tmp2,%tmp2,%saddr;");
+        let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;");
+        let ra = veclist(&format!("a{ti}_"));
+        let _ = writeln!(b, "    wmma.load.a.sync.aligned.m16n16k16.row.f16 {ra}, [%gp], %tmp;");
+    }
+    let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
+    for tj in 0..tn {
+        let _ = writeln!(b, "    add.u32 %tmp2,%wcb,{};\n    shl.b32 %tmp2,%tmp2,1;", tj * 16);
+        let _ = writeln!(b, "    mov.u32 %saddr,smemB;\n    add.u32 %tmp2,%tmp2,%saddr;");
+        let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;");
+        let rb = veclist(&format!("b{tj}_"));
+        let _ = writeln!(b, "    wmma.load.b.sync.aligned.m16n16k16.row.f16 {rb}, [%gp], %tmp;");
+    }
+    for ti in 0..tm {
+        let ra = veclist(&format!("a{ti}_"));
+        for tj in 0..tn {
+            let rb = veclist(&format!("b{tj}_"));
+            let cc = veclist(&format!("c{ti}_{tj}_"));
+            let _ = writeln!(b, "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 {cc}, {ra}, {rb}, {cc};");
+        }
+    }
+    let _ = writeln!(b, "    bar.sync 0;");
+    let _ = writeln!(b, "    add.u32 %kt,%kt,16;\n    bra KLOOP;");
+    let _ = writeln!(b, "KEND:");
+    let _ = writeln!(b, "    mov.u32 %tmp,{bn};");
+    for ti in 0..tm {
+        for tj in 0..tn {
+            let _ = writeln!(b, "    add.u32 %tmp2,%wrb,{};\n    mul.lo.s32 %tmp2,%tmp2,{bn};", ti * 16);
+            let _ = writeln!(b, "    add.u32 %tmp2,%tmp2,%wcb;\n    add.u32 %tmp2,%tmp2,{};", tj * 16);
+            let _ = writeln!(b, "    shl.b32 %tmp2,%tmp2,2;\n    mov.u32 %saddr,smemC;\n    add.u32 %tmp2,%tmp2,%saddr;");
+            let _ = writeln!(b, "    cvt.u64.u32 %gp,%tmp2;\n    cvta.shared.u64 %gp,%gp;");
+            let cc = veclist(&format!("c{ti}_{tj}_"));
+            let _ = writeln!(b, "    wmma.store.d.sync.aligned.m16n16k16.row.f32 [%gp], {cc}, %tmp;");
+        }
+    }
+    let _ = writeln!(b, "    bar.sync 0;");
+    for li in 0..c_per {
+        let off = li * threads;
+        let _ = writeln!(b, "    add.u32 %e,%tix,{off};");
+        let _ = writeln!(b, "    shr.u32 %mm,%e,{bn_shift};\n    and.b32 %ncol,%e,{};", bn - 1);
+        let _ = writeln!(b, "    add.u32 %tmp,%m0,%mm;\n    add.u32 %nn,%n0,%ncol;");
+        let _ = writeln!(b, "    setp.lt.u32 %pv,%tmp,{m};\n    setp.lt.u32 %p0,%nn,{n};\n    and.pred %pv,%pv,%p0;");
+        let _ = writeln!(b, "    mov.u32 %saddr,smemC;\n    shl.b32 %tmp2,%e,2;\n    add.u32 %saddr,%saddr,%tmp2;\n    ld.shared.f32 %cf,[%saddr];");
+        let _ = writeln!(b, "    mad.lo.s32 %xidx,%tmp,{n},%nn;\n    add.u32 %xidx,%xidx,%zM;");
+        let _ = writeln!(b, "    mul.wide.u32 %off,%xidx,4;\n    add.s64 %ptr,%M,%off;");
+        let _ = writeln!(b, "    @%pv st.global.f32 [%ptr],%cf;");
+    }
+    let _ = writeln!(b, "    ret;\n}}");
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
