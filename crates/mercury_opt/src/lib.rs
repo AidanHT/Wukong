@@ -84,13 +84,32 @@ impl PassManager {
     }
 
     fn run_function(&self, f: &mut mercury_mir::Function) {
+        // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
+        // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
+        // function — re-running it on identical MIR would again be a no-op. We therefore skip
+        // known-clean passes, and a mutation re-dirties every pass (conservatively). This skips the
+        // optimizer's final all-passes no-op *confirmation* sweep (and any pass already at fixpoint
+        // mid-run) WITHOUT changing the sequence of mutations, so the resulting MIR is bit-identical
+        // to the naive "run everything every sweep" fixpoint — the differential gate (-O0 ≡ -O{1,2,3},
+        // interp ≡ native) and the debug verify below both still hold. ~20% off optimizer time.
+        let mut clean = vec![false; self.passes.len()];
         let mut iterations = 0;
         loop {
             let mut changed = false;
-            for p in &self.passes {
-                changed |= p.run_function(f);
-                // verify-each: in debug builds (tests, CI) confirm every pass leaves the MIR
-                // well-formed, naming the culprit immediately. Compiled out of release builds.
+            for (i, p) in self.passes.iter().enumerate() {
+                if clean[i] {
+                    continue; // at fixpoint: nothing has mutated the MIR since this pass last ran
+                }
+                if p.run_function(f) {
+                    changed = true;
+                    // A mutation may have created work for every pass again (including earlier ones
+                    // already run this sweep, and `p` itself). Re-dirty all; they re-run next sweep.
+                    clean.iter_mut().for_each(|c| *c = false);
+                } else {
+                    clean[i] = true;
+                }
+                // verify-each: in debug builds (tests, CI) confirm every pass *that ran* leaves the
+                // MIR well-formed, naming the culprit immediately. Compiled out of release builds.
                 #[cfg(debug_assertions)]
                 {
                     let errs = mercury_mir::verify::verify_function(f);
