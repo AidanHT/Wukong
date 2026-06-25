@@ -233,6 +233,7 @@ pub fn kv_append_ptx() -> String {
         \x20   .param .u64 pV,\n\
         \x20   .param .u64 pBT,\n\
         \x20   .param .u64 pWPos,\n\
+        \x20   .param .u64 pAct,\n\
         \x20   .param .u32 pBcap,\n\
         \x20   .param .u32 pHeads,\n\
         \x20   .param .u32 pHd,\n\
@@ -245,13 +246,14 @@ pub fn kv_append_ptx() -> String {
     s += "    .reg .b16 %hk,%hv;\n";
     s += "    .reg .f32 %fk,%fv;\n";
     s += "    .reg .b32 %gid,%b,%d,%hh,%dh,%D,%total,%pos,%logical,%off,%phys,%e,%tmp,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
-    s += "    .reg .b64 %Knew,%Vnew,%K,%V,%BT,%WP,%addr,%o64;\n";
+    s += "    .reg .b64 %Knew,%Vnew,%K,%V,%BT,%WP,%ACT,%addr,%o64;\n";
     s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
     s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
     s += "    ld.param.u64 %K,[pK];       cvta.to.global.u64 %K,%K;\n";
     s += "    ld.param.u64 %V,[pV];       cvta.to.global.u64 %V,%V;\n";
     s += "    ld.param.u64 %BT,[pBT];     cvta.to.global.u64 %BT,%BT;\n";
     s += "    ld.param.u64 %WP,[pWPos];   cvta.to.global.u64 %WP,%WP;\n";
+    s += "    ld.param.u64 %ACT,[pAct];   cvta.to.global.u64 %ACT,%ACT;\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
     s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
     // gid = ctaid.x*ntid.x + tid.x ; D = heads*hd ; total = bcap*D ; bail if gid>=total.
@@ -260,6 +262,9 @@ pub fn kv_append_ptx() -> String {
     s += "    setp.ge.u32 %p0,%gid,%total;\n    @%p0 bra DONE;\n";
     // b = gid/D ; d = gid - b*D ; hh = d/hd ; dh = d - hh*hd.
     s += "    div.u32 %b,%gid,%D;\n    mul.lo.s32 %tmp,%b,%D;\n    sub.u32 %d,%gid,%tmp;\n";
+    // Skip inactive (padding) rows: a free slot pads its block table with 0, so appending it would
+    // scatter into block 0 (a live block). Act[b]==0 ⇒ this row carries no request ⇒ no write.
+    s += "    mul.wide.u32 %o64,%b,4;\n    add.s64 %addr,%ACT,%o64;\n    ld.global.u32 %tmp,[%addr];\n    setp.eq.u32 %p0,%tmp,0;\n    @%p0 bra DONE;\n";
     s += "    div.u32 %hh,%d,%hd;\n    mul.lo.s32 %tmp,%hh,%hd;\n    sub.u32 %dh,%d,%tmp;\n";
     // pos = WP[b] ; logical = pos/bsz ; off = pos - logical*bsz.
     s += "    mul.wide.u32 %o64,%b,4;\n    add.s64 %addr,%WP,%o64;\n    ld.global.u32 %pos,[%addr];\n";
@@ -283,8 +288,10 @@ pub const KV_APPEND_BLOCK: u32 = 256;
 /// Launch the KV-append scatter for **one layer**: write the new token K/V (`knew_d`/`vnew_d`, f32
 /// `[bcap, D]`) into the f16 cache slabs at each slot's `wpos_d[slot]` position, via the block table.
 /// `wpos_d[slot]` must be the slot's pre-append position and its block must already be reserved (the
-/// host [`BlockManager::append`](crate::paged_kv::BlockManager::append) does both). Full-overwrite of
-/// one f16 element per channel ⇒ safe on pooled (uninit) `knew/vnew`.
+/// host [`BlockManager::append`](crate::paged_kv::BlockManager::append) does both). `active_d[slot]`
+/// (u32 0/1) gates the write: a `0` (free/padding) slot is skipped entirely — its block table pads to
+/// block 0, so writing it would corrupt a live block. Full-overwrite of one f16 element per active
+/// channel ⇒ safe on pooled (uninit) `knew/vnew`.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn launch_kv_append(
@@ -296,6 +303,7 @@ pub fn launch_kv_append(
     v_d: &mut CudaSlice<half::f16>,
     bt_d: &CudaSlice<u32>,
     wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
     cfg: &KvConfig,
     layer: usize,
     bcap: usize,
@@ -316,7 +324,7 @@ pub fn launch_kv_append(
         layer as u32,
     );
     let mut b = stream.launch_builder(func);
-    b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(bt_d).arg(wpos_d);
+    b.arg(knew_d).arg(vnew_d).arg(k_d).arg(v_d).arg(bt_d).arg(wpos_d).arg(active_d);
     b.arg(&bcap_u).arg(&heads).arg(&hd).arg(&bsz).arg(&nblk).arg(&mbps).arg(&layer_u);
     unsafe { b.launch(launch)? };
     Ok(())

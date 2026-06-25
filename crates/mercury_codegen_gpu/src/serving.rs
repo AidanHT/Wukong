@@ -159,6 +159,7 @@ impl DecodeLayer {
         bt_d: &CudaSlice<u32>,
         cl_d: &CudaSlice<u32>,
         wpos_d: &CudaSlice<u32>,
+        active_d: &CudaSlice<u32>,
         layer: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
@@ -207,7 +208,7 @@ impl DecodeLayer {
         let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, bcap, d, d)?;
         let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, bcap, d, d)?;
         // Append the new token's K/V into this layer's cache plane at each slot's write position.
-        launch_kv_append(stream, &self.f_append, &k, &v, k_cache, v_cache, bt_d, wpos_d, &self.cfg, layer, bcap)?;
+        launch_kv_append(stream, &self.f_append, &k, &v, k_cache, v_cache, bt_d, wpos_d, active_d, &self.cfg, layer, bcap)?;
         // Paged decode attention over the (now-updated) cache.
         let mut attn = pool.alloc::<f32>(bcap * d)?;
         launch_paged_attn_decode(stream, &self.f_attn, &q, k_cache, v_cache, &mut attn, bt_d, cl_d, &self.cfg, layer, bcap, self.scale)?;
@@ -238,6 +239,10 @@ pub struct DecodeModel {
     bt_d: CudaSlice<u32>,
     cl_d: CudaSlice<u32>,
     wpos_d: CudaSlice<u32>,
+    /// Per-slot active mask (u32 0/1) the append kernel reads — a free/padding slot is skipped so it
+    /// can't scatter into a live block. All-1 for the all-slots-active [`step_on`]; the P5 scheduler
+    /// uploads a ragged mask via [`advance_and_upload_masked`](Self::advance_and_upload_masked).
+    active_d: CudaSlice<u32>,
     /// `[Bcap,D]` ping-pong activations between layers (persistent — outside the pool).
     bufs: [CudaSlice<f32>; 2],
     cfg: KvConfig,
@@ -264,6 +269,11 @@ impl DecodeModel {
         &mut self.cache
     }
 
+    /// Read access to the paged cache (footprint + block accounting for the scheduler / gates).
+    pub fn cache(&self) -> &PagedKvCache {
+        &self.cache
+    }
+
     /// Build the `N` decode layers (one weight set each), the paged cache (`cfg`), a `pool_bytes`
     /// scratch arena, and the per-step metadata + ping-pong buffers. All share `g`'s stream.
     pub fn new(
@@ -285,8 +295,9 @@ impl DecodeModel {
         let bt_d = g.stream.alloc_zeros::<u32>(cfg.num_slots * cfg.max_blocks_per_seq)?;
         let cl_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
         let wpos_d = g.stream.alloc_zeros::<u32>(cfg.num_slots)?;
+        let active_d = g.stream.memcpy_stod(&vec![1u32; cfg.num_slots])?;
         let bufs = [g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?, g.stream.alloc_zeros::<f32>(cfg.num_slots * d)?];
-        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, bufs, cfg })
+        Ok(Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, cfg })
     }
 
     /// Advance **every** slot by one token: append a cache position per slot (host), upload the block
@@ -300,22 +311,8 @@ impl DecodeModel {
         x_d: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
-        let bcap = self.cfg.num_slots;
-        // Host: append a token to every slot, recording each slot's pre-append write position.
-        let mut wpos = vec![0u32; bcap];
-        for (b, w) in wpos.iter_mut().enumerate() {
-            *w = self.cache.manager().context_len(b) as u32;
-            self.cache
-                .manager()
-                .append(b)
-                .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
-        }
-        // Upload the shared per-step metadata once (block table may have grown during append).
-        let table = self.cache.manager_ref().flat_block_table();
-        let lens = self.cache.manager_ref().ctx_lens();
-        stream.memcpy_htod(&table, &mut self.bt_d)?;
-        stream.memcpy_htod(&lens, &mut self.cl_d)?;
-        stream.memcpy_htod(&wpos, &mut self.wpos_d)?;
+        let active = vec![true; self.cfg.num_slots];
+        self.advance_and_upload_masked(stream, &active)?;
         self.run_layers_on(stream, x_d, out)
     }
 
@@ -328,27 +325,27 @@ impl DecodeModel {
         out: &mut CudaSlice<f32>,
     ) -> Result<(), DriverError> {
         // Disjoint field borrows (the launchers need &mut cache slabs + &mut pool + & metadata at once).
-        let Self { layers, cache, pool, bt_d, cl_d, wpos_d, bufs, .. } = self;
+        let Self { layers, cache, pool, bt_d, cl_d, wpos_d, active_d, bufs, .. } = self;
         let n = layers.len();
         let (ks, vs) = cache.slabs_mut();
         if n == 1 {
             pool.reset();
-            return layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, 0, out);
+            return layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, active_d, 0, out);
         }
         pool.reset();
-        layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, 0, &mut bufs[0])?;
+        layers[0].forward_step_on(stream, pool, ks, vs, x_d, bt_d, cl_d, wpos_d, active_d, 0, &mut bufs[0])?;
         let mut cur = 0usize; // layer i-1's output lives in bufs[cur]
         for (i, layer) in layers.iter().enumerate().take(n - 1).skip(1) {
             pool.reset();
             let (a, b) = bufs.split_at_mut(1);
             let (src, dst) = if cur == 0 { (&a[0], &mut b[0]) } else { (&b[0], &mut a[0]) };
-            layer.forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, i, dst)?;
+            layer.forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, active_d, i, dst)?;
             cur = 1 - cur;
         }
         pool.reset();
         // Last layer reads the current buffer, writes the caller's `out`.
         let src = &bufs[cur];
-        layers[n - 1].forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, n - 1, out)
+        layers[n - 1].forward_step_on(stream, pool, ks, vs, src, bt_d, cl_d, wpos_d, active_d, n - 1, out)
     }
 
     /// Upload the current host block table / context lengths / write positions to the device metadata
@@ -356,26 +353,207 @@ impl DecodeModel {
     /// a graph can capture only the launch half ([`run_layers_on`](Self::run_layers_on)). Returns the
     /// per-slot write positions it appended.
     pub fn advance_and_upload(&mut self, stream: &Arc<CudaStream>) -> Result<Vec<u32>, DriverError> {
+        let active = vec![true; self.cfg.num_slots];
+        self.advance_and_upload_masked(stream, &active)
+    }
+
+    /// Like [`advance_and_upload`](Self::advance_and_upload) but only the `active[slot]` slots advance
+    /// (append a token + grow context); inactive slots are frozen and **masked off** in the device
+    /// `active_d` buffer so the append kernel skips them (it cannot write a free slot's padding-0 block
+    /// table without corrupting block 0). This is the host half of one continuous-batching step — the
+    /// [`Scheduler`] calls it, then [`run_layers_on`](Self::run_layers_on) (the graph-capturable launch
+    /// half). Returns the per-slot pre-append write positions.
+    pub fn advance_and_upload_masked(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        active: &[bool],
+    ) -> Result<Vec<u32>, DriverError> {
         let bcap = self.cfg.num_slots;
+        assert_eq!(active.len(), bcap, "active mask must be one bool per slot");
         let mut wpos = vec![0u32; bcap];
-        for (b, w) in wpos.iter_mut().enumerate() {
-            *w = self.cache.manager().context_len(b) as u32;
-            self.cache
-                .manager()
-                .append(b)
-                .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+        let mut mask = vec![0u32; bcap];
+        for b in 0..bcap {
+            wpos[b] = self.cache.manager().context_len(b) as u32;
+            if active[b] {
+                mask[b] = 1;
+                self.cache
+                    .manager()
+                    .append(b)
+                    .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+            }
         }
         let table = self.cache.manager_ref().flat_block_table();
         let lens = self.cache.manager_ref().ctx_lens();
         stream.memcpy_htod(&table, &mut self.bt_d)?;
         stream.memcpy_htod(&lens, &mut self.cl_d)?;
         stream.memcpy_htod(&wpos, &mut self.wpos_d)?;
+        stream.memcpy_htod(&mask, &mut self.active_d)?;
         Ok(wpos)
     }
 
     /// The two ping-pong activation buffers (a graph bakes their pointers — keep alive).
     pub fn buffers(&self) -> &[CudaSlice<f32>; 2] {
         &self.bufs
+    }
+}
+
+/// A serving request: a `prompt_len`-token prefill followed by `gen_len` decode tokens.
+#[derive(Clone, Copy, Debug)]
+pub struct Request {
+    pub prompt_len: usize,
+    pub gen_len: usize,
+}
+
+/// Per-slot in-flight sequence state.
+#[derive(Clone, Copy)]
+struct Inflight {
+    /// Decode tokens still to emit before this sequence finishes and frees its slot.
+    remaining: usize,
+}
+
+/// **Continuous-batching (in-flight) scheduler** over a fixed-`Bcap` [`DecodeModel`] — Orca-style
+/// iteration-level scheduling with selective batching. A waiting [`Request`] is admitted into any free
+/// slot (prefilling its prompt into the paged cache); every [`step`](Self::step) advances all *active*
+/// slots by one decode token; a sequence that reaches its `gen_len` is **evicted the same iteration**,
+/// its blocks freed back to the pool and a waiting request admitted into the freed slot.
+///
+/// The throughput lever: the fixed-shape decode kernel computes all `Bcap` rows *regardless* of how many
+/// carry a live request, so the per-step latency is **independent of the active count**. A server that
+/// runs one sequence at a time wastes `Bcap-1` rows of compute every step; continuous batching fills
+/// them, so **goodput (useful tokens/s) scales with batch fill** at ~constant latency. Inactive slots
+/// are masked off in the append kernel (they hold no blocks — a write would corrupt block 0) and read as
+/// empty by attention (`context_len == 0` ⇒ zero row), so they are numerically inert.
+pub struct Scheduler {
+    model: DecodeModel,
+    /// Per-slot occupancy (`None` = free); length `Bcap`.
+    slots: Vec<Option<Inflight>>,
+    /// FIFO of requests not yet admitted (no free slot, or insufficient blocks).
+    waiting: std::collections::VecDeque<Request>,
+    /// Cumulative useful decode tokens emitted (one per active slot per step).
+    emitted: usize,
+    /// Cumulative requests admitted / completed (for accounting gates).
+    admitted: usize,
+    completed: usize,
+}
+
+impl Scheduler {
+    /// Wrap a built [`DecodeModel`]; all `Bcap` slots start free.
+    pub fn new(model: DecodeModel) -> Self {
+        let bcap = model.bcap();
+        Self {
+            model,
+            slots: vec![None; bcap],
+            waiting: std::collections::VecDeque::new(),
+            emitted: 0,
+            admitted: 0,
+            completed: 0,
+        }
+    }
+
+    /// Queue a request for admission.
+    pub fn enqueue(&mut self, req: Request) {
+        self.waiting.push_back(req);
+    }
+
+    /// The underlying model (cache footprint, geometry).
+    pub fn model(&self) -> &DecodeModel {
+        &self.model
+    }
+
+    /// Active (occupied) slot count this instant.
+    pub fn num_active(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Requests still waiting for a slot.
+    pub fn pending(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Cumulative useful tokens emitted; admitted / completed request counts.
+    pub fn emitted(&self) -> usize {
+        self.emitted
+    }
+    pub fn admitted(&self) -> usize {
+        self.admitted
+    }
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
+    /// Physical KV blocks currently free in the pool (block-conservation gates).
+    pub fn free_blocks(&self) -> usize {
+        self.model.cache().manager_ref().free_blocks()
+    }
+
+    /// No active sequences and nothing waiting — the drain loop's stop condition.
+    pub fn is_idle(&self) -> bool {
+        self.waiting.is_empty() && self.num_active() == 0
+    }
+
+    /// Admit waiting requests into free slots, prefilling each prompt into the paged cache (FIFO; stops
+    /// at the first request that doesn't fit — head-of-line, the standard simple policy). Returns the
+    /// number admitted this call.
+    pub fn admit(&mut self) -> Result<usize, DriverError> {
+        let bcap = self.model.bcap();
+        let mut n = 0;
+        for slot in 0..bcap {
+            if self.slots[slot].is_some() {
+                continue;
+            }
+            let Some(req) = self.waiting.front().copied() else { break };
+            let mgr = self.model.cache_mut().manager();
+            if !mgr.can_grow(slot, req.prompt_len.max(1)) {
+                break; // out of blocks → leave the request queued
+            }
+            // Prefill: bulk-reserve the prompt's cache positions (≥1 so the slot owns a block; the
+            // attention/append kernels then see a non-empty, non-padding row).
+            mgr.reserve(slot, req.prompt_len.max(1))
+                .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+            self.slots[slot] = Some(Inflight { remaining: req.gen_len });
+            self.waiting.pop_front();
+            self.admitted += 1;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// One continuous-batching iteration on `stream`: admit waiting requests, advance every active slot
+    /// by one decode token (masked append + one metadata upload, then the `N`-layer launch over the
+    /// already-uploaded metadata), then retire any sequence that has emitted its `gen_len` tokens
+    /// (freeing its blocks). `x_d`/`out` are `[Bcap,D]`. Returns the useful tokens emitted this step
+    /// (= the active slot count). When idle, runs nothing and returns 0.
+    pub fn step(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x_d: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<usize, DriverError> {
+        self.admit()?;
+        let active: Vec<bool> = self.slots.iter().map(|s| s.is_some()).collect();
+        let n_active = active.iter().filter(|&&a| a).count();
+        if n_active == 0 {
+            return Ok(0);
+        }
+        self.model.advance_and_upload_masked(stream, &active)?;
+        self.model.run_layers_on(stream, x_d, out)?;
+        // Retire finished sequences (decrement, then free without holding a borrow of the slot).
+        for slot in 0..self.model.bcap() {
+            let remaining = match &mut self.slots[slot] {
+                Some(inf) => {
+                    inf.remaining -= 1;
+                    inf.remaining
+                }
+                None => continue,
+            };
+            self.emitted += 1;
+            if remaining == 0 {
+                self.model.cache_mut().manager().free(slot);
+                self.slots[slot] = None;
+                self.completed += 1;
+            }
+        }
+        Ok(n_active)
     }
 }
 
@@ -497,8 +675,9 @@ mod tests {
             let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
             let wpos_u: Vec<u32> = wpos.iter().map(|&p| p as u32).collect();
             let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
+            let active_d = g.stream.memcpy_stod(&vec![1u32; bcap]).unwrap(); // all slots active
             let func = g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY).unwrap();
-            launch_kv_append(&g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &cfg, 0, bcap).unwrap();
+            launch_kv_append(&g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &active_d, &cfg, 0, bcap).unwrap();
             g.stream.synchronize().unwrap();
             let kh = g.stream.memcpy_dtov(&k_d).unwrap();
             let vh = g.stream.memcpy_dtov(&v_d).unwrap();
@@ -890,6 +1069,269 @@ mod tests {
                         depth * 14
                     );
                 }
+            });
+        });
+    }
+
+    // ============================ P5: continuous batching ==========================================
+
+    /// **Append-mask gate.** A slot with `active==0` must be skipped entirely — its padding block-table
+    /// entry (0) would otherwise scatter K/V into block 0 (a live block). Mark a subset inactive and
+    /// assert the *whole* cache slab is zero except the active slots' written addresses (so no inactive
+    /// row touched anything, block 0 included).
+    #[test]
+    fn serving_kv_append_masked_skips_inactive() {
+        with_gpu("serving_kv_append_masked_skips_inactive", |g| {
+            let (heads, hd, bsz, bcap) = (4usize, 64usize, 16usize, 8usize);
+            let d = heads * hd;
+            let active = [true, false, true, true, false, false, true, false];
+            let wpos = [3usize, 0, 7, 16, 0, 0, 20, 0];
+            let max_bps = wpos.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 4;
+            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut mgr = BlockManager::new(num_blocks, bsz, bcap, max_bps);
+            for b in 0..bcap {
+                if active[b] {
+                    mgr.reserve(b, wpos[b] + 1).unwrap();
+                }
+            }
+            let mut rng = crate::diff::Rng::new(0x5A1D);
+            let knew = rng.vec(bcap * d, -1.0, 1.0);
+            let vnew = rng.vec(bcap * d, -1.0, 1.0);
+            let knew_d = g.stream.memcpy_stod(&knew).unwrap();
+            let vnew_d = g.stream.memcpy_stod(&vnew).unwrap();
+            let mut k_d = g.stream.alloc_zeros::<f16>(cfg.slab_elems()).unwrap();
+            let mut v_d = g.stream.alloc_zeros::<f16>(cfg.slab_elems()).unwrap();
+            let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+            let wpos_u: Vec<u32> = wpos.iter().map(|&p| p as u32).collect();
+            let wpos_d = g.stream.memcpy_stod(&wpos_u).unwrap();
+            let act_u: Vec<u32> = active.iter().map(|&a| a as u32).collect();
+            let act_d = g.stream.memcpy_stod(&act_u).unwrap();
+            let func = g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY).unwrap();
+            launch_kv_append(&g.stream, &func, &knew_d, &vnew_d, &mut k_d, &mut v_d, &bt_d, &wpos_d, &act_d, &cfg, 0, bcap).unwrap();
+            g.stream.synchronize().unwrap();
+            let kh = g.stream.memcpy_dtov(&k_d).unwrap();
+            // Exact slab expectation: zeros everywhere except each active slot's written channels.
+            let mut expect = vec![0f32; cfg.slab_elems()];
+            for b in 0..bcap {
+                if !active[b] {
+                    continue;
+                }
+                let (phys, off) = mgr.locate(b, wpos[b]);
+                for h in 0..heads {
+                    for dh in 0..hd {
+                        expect[cfg.elem_offset(0, phys, off, h, dh)] = f16r(knew[(h * hd + dh) + b * d]);
+                    }
+                }
+            }
+            for i in 0..cfg.slab_elems() {
+                assert_eq!(kh[i].to_f32(), expect[i], "slab elem {i} (inactive-row leak?)");
+            }
+            let written = active.iter().filter(|&&a| a).count();
+            eprintln!("kv_append mask: {written}/{bcap} active slots written; every inactive row skipped (block 0 intact)");
+        });
+    }
+
+    /// **Batch-composition invariance (the first law for serving).** A sequence's decode output must be
+    /// bit-for-bit independent of which *other* sequences share its batch — the property that makes
+    /// continuous batching correct. Run slot 0's sequence (a) co-batched with 63 other active sequences
+    /// carrying unrelated context, and (b) alone (all other slots masked inactive); slot 0's output row
+    /// must be identical to the bit (row-independent GEMMs + per-sequence paged attention + append mask).
+    #[test]
+    fn serving_decode_step_invariant_to_batch_composition() {
+        with_gpu("serving_decode_step_invariant_to_batch_composition", |g| {
+            let (heads, hd, dff, bsz, bcap) = (4usize, 64usize, 256usize, 16usize, 64usize);
+            let d = heads * hd;
+            let l0 = 37usize; // slot 0's prefilled context length
+            let max_bps = (l0 + 80).div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 8;
+            let cfg = KvConfig { layers: 1, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut rng = crate::diff::Rng::new(0x4242);
+            let wdata = layer_weights(&mut rng, 1, d, dff);
+            let weights = weights_view(&wdata);
+            let x = rng.vec(bcap * d, -1.0, 1.0); // same input both runs; row 0 = the sequence under test
+            let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+            let run = |g: &mut Gpu, ctx0: &[usize], active: &[bool]| -> Vec<f32> {
+                let mut model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
+                let _ = populate_one_layer(g, &mut model, ctx0, heads, hd, 0xABCD);
+                let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                model.advance_and_upload_masked(&g.stream.clone(), active).unwrap();
+                model.run_layers_on(&g.stream.clone(), &x_d, &mut out).unwrap();
+                g.stream.synchronize().unwrap();
+                g.stream.memcpy_dtov(&out).unwrap()
+            };
+
+            // (a) co-batched: every slot active with its own (slot-0-shared) context.
+            let ctx_co: Vec<usize> = (0..bcap).map(|b| if b == 0 { l0 } else { 8 + (b * 5) % 72 }).collect();
+            let out_co = run(g, &ctx_co, &vec![true; bcap]);
+            // (b) alone: only slot 0 active; others free + masked.
+            let mut ctx_alone = vec![0usize; bcap];
+            ctx_alone[0] = l0;
+            let mut act_alone = vec![false; bcap];
+            act_alone[0] = true;
+            let out_alone = run(g, &ctx_alone, &act_alone);
+
+            for i in 0..d {
+                assert_eq!(out_co[i].to_bits(), out_alone[i].to_bits(), "slot 0 dim {i}: co-batched != alone");
+            }
+            eprintln!("slot-0 decode output bit-identical: co-batched (64 active) == alone (1 active) — batch composition is invisible");
+        });
+    }
+
+    /// **Scheduler liveness + block conservation.** Drive >Bcap requests of ragged prompt/gen lengths to
+    /// completion: every request finishes, useful tokens == Σ gen_len, every KV block returns to the pool
+    /// (no leak), and two identical request streams produce the identical per-step active-count schedule
+    /// (deterministic). Exercises admit → masked step → evict → free over thousands of iterations.
+    #[test]
+    fn serving_scheduler_drains_and_conserves_blocks() {
+        with_gpu("serving_scheduler_drains_and_conserves_blocks", |g| {
+            let (heads, hd, dff, bsz, bcap, depth) = (4usize, 64usize, 256usize, 16usize, 64usize, 2usize);
+            let d = heads * hd;
+            let max_bps = (40usize + 24).div_ceil(bsz) + 2;
+            let num_blocks = bcap * max_bps + 32;
+            let cfg = KvConfig { layers: depth, heads, head_dim: hd, block_size: bsz, num_blocks, num_slots: bcap, max_blocks_per_seq: max_bps };
+            let mut rng = crate::diff::Rng::new(0x77AA);
+            let wdata = layer_weights(&mut rng, depth, d, dff);
+            let weights = weights_view(&wdata);
+            let x = rng.vec(bcap * d, -1.0, 1.0);
+
+            const NREQ: usize = 240;
+            let reqs: Vec<Request> =
+                (0..NREQ).map(|i| Request { prompt_len: 1 + (i * 7) % 40, gen_len: 1 + (i * 5) % 24 }).collect();
+            let total_gen: usize = reqs.iter().map(|r| r.gen_len).sum();
+
+            let drive = |g: &mut Gpu| -> (usize, usize, usize, usize, Vec<usize>) {
+                let model = DecodeModel::new(g, &weights, cfg, dff, 64 * 1024 * 1024).unwrap();
+                let init_free = model.cache().manager_ref().free_blocks();
+                let mut sched = Scheduler::new(model);
+                for &r in &reqs {
+                    sched.enqueue(r);
+                }
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+                let mut out = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                let mut trace = Vec::new();
+                let mut steps = 0;
+                while !sched.is_idle() {
+                    let n = sched.step(&g.stream.clone(), &x_d, &mut out).unwrap();
+                    trace.push(n);
+                    steps += 1;
+                    assert!(steps < 100_000, "scheduler failed to drain (liveness)");
+                }
+                g.stream.synchronize().unwrap();
+                (sched.completed(), sched.emitted(), sched.free_blocks(), init_free, trace)
+            };
+
+            let (completed, emitted, free_end, init_free, trace1) = drive(g);
+            assert_eq!(completed, NREQ, "every request completes");
+            assert_eq!(emitted, total_gen, "useful tokens == Σ gen_len");
+            assert_eq!(free_end, init_free, "all KV blocks returned to the pool (no leak)");
+            let peak = trace1.iter().copied().max().unwrap();
+            let (_, _, _, _, trace2) = drive(g);
+            assert_eq!(trace1, trace2, "scheduler schedule is deterministic");
+            eprintln!(
+                "scheduler drained {NREQ} reqs in {} steps: {emitted} tokens (=Σgen_len), peak batch {peak}/{bcap}, blocks conserved {init_free}→{free_end}",
+                trace1.len()
+            );
+        });
+    }
+
+    /// **P5 throughput — continuous-batching goodput vs batch fill.** The fixed-shape decode step computes
+    /// all `Bcap` rows regardless of how many carry a live request, so per-step latency is ~independent of
+    /// the active count: a server running one sequence at a time wastes `Bcap-1` rows of compute every
+    /// step, while continuous batching fills them, turning otherwise-idle rows into goodput.
+    ///
+    /// **Measurement honesty (the laptop clock swings ~7×).** All fills' graphs are captured up front and
+    /// kept alive, then timed **interleaved, best-of-N**: each round times every fill back-to-back so they
+    /// share the same clock state, and the per-fill minimum picks its boosted time. A naive sequential
+    /// sweep (measure fill=1 fully, then fill=64) is *invalid* here — it catches fill=1 at a cold clock and
+    /// fill=64 boosted, inflating the ratio. The interleaved ratio is the honest continuous-batching win.
+    /// Named peer = Mercury's own single-sequence (fill=1) decode. --ignored.
+    #[test]
+    #[ignore = "perf bench; needs a GPU. Run with --ignored --nocapture"]
+    fn serving_continuous_batching_goodput() {
+        with_gpu("serving_continuous_batching_goodput", |g| {
+            eprintln!("device: {}", g.device_name());
+            with_event_tracking_disabled(g, |g| {
+                use std::time::Instant;
+                let depth = 12usize;
+                let (cfg, dff, ctx0, d, bcap) = graph_cfg(depth);
+                let mut rng = crate::diff::Rng::new(0x9100);
+                let wdata = layer_weights(&mut rng, depth, d, dff);
+                let weights = weights_view(&wdata);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+
+                // A captured decode-step graph at a given fill, with everything it references kept alive.
+                struct Held {
+                    fill: usize,
+                    cap: Arc<CudaStream>,
+                    graph: crate::graph::Graph,
+                    _model: DecodeModel,
+                    _x: CudaSlice<f32>,
+                    _out: CudaSlice<f32>,
+                }
+                let fills = [1usize, 4, 16, 32, 64];
+                let mut held: Vec<Held> = Vec::new();
+                for &fill in &fills {
+                    let mut model = DecodeModel::new(g, &weights, cfg, dff, 48 * 1024 * 1024).unwrap();
+                    for b in 0..fill {
+                        model.cache_mut().manager().reserve(b, ctx0[b]).unwrap();
+                    }
+                    let active: Vec<bool> = (0..bcap).map(|b| b < fill).collect();
+                    model.advance_and_upload_masked(&g.stream.clone(), &active).unwrap();
+                    let cap = g.ctx.new_stream().unwrap();
+                    let x_d = g.stream.memcpy_stod(&x).unwrap();
+                    let mut out_c = cap.alloc_zeros::<f32>(bcap * d).unwrap();
+                    model.run_layers_on(&cap, &x_d, &mut out_c).unwrap(); // warmup (stable pool pointers)
+                    cap.synchronize().unwrap();
+                    let graph = crate::graph::Graph::capture(cap.clone(), || model.run_layers_on(&cap, &x_d, &mut out_c)).unwrap();
+                    held.push(Held { fill, cap, graph, _model: model, _x: x_d, _out: out_c });
+                }
+
+                // Global warmup on the largest fill to lock the boost clock high before any timing.
+                let big = held.len() - 1;
+                for _ in 0..200 {
+                    held[big].graph.launch().unwrap();
+                }
+                held[big].cap.synchronize().unwrap();
+
+                // Interleaved best-of-N: every round times all fills adjacently (shared clock), min per fill.
+                const ROUNDS: usize = 15;
+                const ITERS: usize = 20;
+                let mut best = vec![f64::MAX; held.len()];
+                for _ in 0..ROUNDS {
+                    for (i, h) in held.iter().enumerate() {
+                        let t = Instant::now();
+                        for _ in 0..ITERS {
+                            h.graph.launch().unwrap();
+                        }
+                        h.cap.synchronize().unwrap();
+                        best[i] = best[i].min(t.elapsed().as_secs_f64() / ITERS as f64);
+                    }
+                }
+
+                let l1 = best[0];
+                let g1 = 1.0 / l1; // fill=1 goodput: one useful token per step
+                eprintln!("continuous-batching goodput (graphed {depth}-layer decode step, D={d} Dff={dff}, Bcap={bcap}; interleaved best-of-N):");
+                for (i, h) in held.iter().enumerate() {
+                    let l = best[i];
+                    let gp = h.fill as f64 / l;
+                    eprintln!(
+                        "  fill {:2}/{bcap}: step {:7.1} us | goodput {:8.0} tok/s | {:5.1}x vs fill=1 (step latency {:.2}x)",
+                        h.fill,
+                        l * 1e6,
+                        gp,
+                        gp / g1,
+                        l / l1
+                    );
+                }
+                let lf = best[big];
+                eprintln!(
+                    "HEADLINE: fill={} vs fill=1 → {:.1}x goodput at {:.2}x step latency (same-clock interleaved; constant-cost step ⇒ batching is ~free goodput)",
+                    held[big].fill,
+                    (held[big].fill as f64 / lf) / g1,
+                    lf / l1
+                );
             });
         });
     }
