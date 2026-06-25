@@ -9403,6 +9403,157 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// Launch config for an experimental cliff variant: r16-rasterized ⇒ a 1-D grid of `(M/bm)·(N/bn)`
+    /// blocks of `wm·wn·32` threads, all SMEM static (`shared_mem_bytes = 0`).
+    #[cfg(feature = "gpu")]
+    fn cliff_cfg_for(v: &crate::ptx_wmma::CliffCfg, m: usize, n: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (((m / v.bm) * (n / v.bn)) as u32, 1, 1),
+            block_dim: (v.threads() as u32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// **Correctness gate for the GEMM-cliff candidates** (binding law #1: every kernel matches an
+    /// independent f64 reference over the full output before any speed number counts). Each
+    /// [`CLIFF_VARIANTS`] entry — padded/swizzle × pipeline depth × launch-bounds — computes `C = A·Bᵀ`
+    /// and must match the f16-rounded f64 oracle within the fp16 GEMM tolerance (abs 1e-2, rel 2e-3).
+    /// Runs under plain `cargo test --features gpu` (skips without a GPU); no cuBLAS/redist needed.
+    #[test]
+    fn gemm_cliff_matches_reference() {
+        use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
+        use half::f16;
+        with_gpu("gemm_cliff_gate", |g| {
+            let mut rng = crate::diff::Rng::new(0xC11F_6A7E);
+            for &(m, k, n) in &[(256usize, 256usize, 256usize), (256, 160, 512), (512, 128, 384)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let r = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                for v in CLIFF_VARIANTS {
+                    if m % v.bm != 0 || n % v.bn != 0 || k % v.bk != 0 {
+                        continue; // this shape doesn't tile this variant's macro-tile
+                    }
+                    let f = g.function("gemm_cliff", gemm_cliff_ptx(), v.name).unwrap();
+                    let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                    let mut bld = g.stream.launch_builder(&f);
+                    bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                    unsafe { bld.launch(cliff_cfg_for(v, m, n)).unwrap() };
+                    let c = g.stream.memcpy_dtov(&c_d).unwrap();
+                    let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
+                    eprintln!("{:<20} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", v.name, s.max_abs, s.max_rel);
+                }
+            }
+        });
+    }
+
+    /// **GEMM-cliff A/B instrument** — the iteration loop for closing the large fp16 GEMM gap to cuBLAS.
+    /// Clock-locking is denied on this mobile part, so absolute GFLOP/s is meaningless; the trustworthy
+    /// signal is **ratio-of-best round-robin**: every kernel (each [`CLIFF_VARIANTS`] candidate + cuBLAS)
+    /// is timed once per round so all sample the same clock evolution, and `best_of` converges each to its
+    /// peak-clock time — ratio-of-best is *unbiased* for identical kernels (→1.0), unlike min-of-ratio
+    /// which picks anti-correlated-noise extremes. A two-slot cuBLAS self-noise sentinel (~1.00 = trust)
+    /// flags clock drift. Reports candidate %-of-cuBLAS, ×-vs-`cliff_swz_s2` (the production swizzle base),
+    /// and **achieved CTAs/SM** (`occupancy_max_active_blocks_per_multiprocessor`). Checksum-cross-checked
+    /// vs cuBLAS at each size; the f64-tolerance gate is `gemm_cliff_matches_reference`. 2048³ + 4096³, fp16.
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture gemm_cliff_ab`.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn gemm_cliff_ab() {
+        use crate::baselines::{
+            cublas_gemm_nt_f16, gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_f16,
+        };
+        use crate::ptx_wmma::{gemm_cliff_ptx, CLIFF_VARIANTS};
+        use half::f16;
+        with_gpu("gemm_cliff_ab", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] gemm_cliff_ab: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            // Clock warmup — pin the boost clock high before measuring (cf. gemm_pipe_sweep).
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
+            }
+            let mut rng = crate::diff::Rng::new(0xC11FF_AB);
+            for sz in [2048usize, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let dims = (m as u32, n as u32, k as u32);
+                let iters = if sz >= 4096 { 20 } else { 40 };
+                let rounds = 10usize;
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a16).unwrap();
+                let b_d = g.stream.memcpy_stod(&b16).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let cs_ref = cublas_gemm_nt_f16(g, &a, &b, m, k, n).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                // Preload every variant function, gate its checksum vs cuBLAS, record achieved occupancy.
+                let mut variants: Vec<(&str, cudarc::driver::CudaFunction, u32, usize, LaunchConfig)> = Vec::new();
+                for v in CLIFF_VARIANTS {
+                    if m % v.bm != 0 || n % v.bn != 0 || k % v.bk != 0 {
+                        continue;
+                    }
+                    let vcfg = cliff_cfg_for(v, m, n);
+                    let f = g.function("gemm_cliff", gemm_cliff_ptx(), v.name).unwrap();
+                    let occ = f
+                        .occupancy_max_active_blocks_per_multiprocessor(v.threads() as u32, 0, None)
+                        .unwrap_or(0);
+                    let (mm, nn, kk) = dims;
+                    {
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                        unsafe { bld.launch(vcfg).unwrap() };
+                    }
+                    let cs = g.stream.memcpy_dtov(&c_d).unwrap().iter().map(|x| x.abs() as f64).sum::<f64>();
+                    assert!(
+                        (cs - cs_ref).abs() / cs_ref.max(1.0) < 3e-2,
+                        "{sz}³ {} checksum {cs:.3e} vs cuBLAS {cs_ref:.3e}",
+                        v.name
+                    );
+                    variants.push((v.name, f, occ, v.smem_bytes(), vcfg));
+                }
+                // Round-robin best-of-N. **Ratio-of-best is unbiased** for identical kernels (→ 1.0),
+                // unlike min-of-ratio which picks anti-correlated-noise extremes. Every kernel is timed
+                // once per round so all sample the same clock evolution; the min over rounds converges to
+                // each kernel's peak-clock time. cuBLAS is timed in two slots as a noise sentinel — its
+                // self-ratio should be ~1.00; a larger value means the clock was still drifting (distrust).
+                let mut best: Vec<f64> = vec![f64::INFINITY; variants.len()];
+                let (mut best_cub, mut best_cub2) = (f64::INFINITY, f64::INFINITY);
+                for _ in 0..rounds {
+                    for (i, (_, f, _, _, vcfg)) in variants.iter().enumerate() {
+                        best[i] = best[i].min(time_wmma(g, f, *vcfg, dims, &a_d, &b_d, &mut c_d, iters));
+                    }
+                    best_cub = best_cub.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                    best_cub2 = best_cub2.min(time_cublas_gemm_nt_f16(g, m, k, n, iters as u32).unwrap());
+                }
+                let base_i = variants.iter().position(|v| v.0 == "cliff_swz_s2").unwrap();
+                let base_t = best[base_i];
+                eprintln!(
+                    "\n{sz}³ fp16 GEMM-cliff A/B (best-of-{rounds} round-robin; base=cliff_swz_s2; cuBLAS self-noise {:.3}×):",
+                    best_cub2 / best_cub
+                );
+                for (i, (name, _, occ, smem, _)) in variants.iter().enumerate() {
+                    eprintln!(
+                        "  {:<24}: {:>7.0} GFLOP/s | {:>5.1}% cuBLAS | {:>6.3}× base | {} CTAs/SM, {}KiB",
+                        name,
+                        flop / best[i] / 1e9,
+                        100.0 * best_cub / best[i],
+                        base_t / best[i],
+                        occ,
+                        smem / 1024,
+                    );
+                }
+            }
+        });
+    }
+
     /// **M5/M6: register-resident flash vs two peers — Tier-A naive CUDA-C *and* the Tier-B cuBLAS
     /// unfused attention chain**, same-run, single head, D=64. Mercury's `flash_d64_mp` (tensor-core
     /// `mma.sync`, O/m/l in registers, `cp.async`-staged double-buffered K/V, online softmax) vs:
