@@ -111,6 +111,17 @@ number the instant a 2nd GPU is attached.
   sequences under **two different physical block layouts** (slot 0: A=`[0,1,2]` vs B=`[10,11,12]`) give
   **bit-for-bit identical** output. The first-law decode analogue of int8 split-K / transpose bit-exactness.
 
+### P3 — batched decode layer/model (the serving forward, the first law)
+- **KV-append scatter** (`serving_kv_append_round_trip`): appending the new token's K/V through the block
+  table, read back, is **bit-exact vs f16(input)** at every address.
+- **Whole decode step vs f64 reference** (`serving_decode_step_matches_reference`, Bcap=64, ragged ctx
+  0..80): RMSNorm→proj→append→paged-attn→O-proj+res→RMSNorm→SiLU-FFN→res matches the f64 oracle at
+  **max_abs = 4.55e-4** (every element within the 5e-2 abs gate; the high max_rel is the near-zero-element
+  artifact). The integration of every reused WMMA/norm kernel + the new append/paged-attention.
+- **Whole-model decode step is paging-invariant** (`serving_decode_step_invariant_to_block_layout`, 4
+  layers, Bcap=64): **bit-for-bit identical** across two physical block layouts (ascending vs descending
+  slot allocation) — every layer reads/writes the cache correctly; a misread would diverge.
+
 ## Multi-GPU design detail (unmeasured)
 
 _see P7._

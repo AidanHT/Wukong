@@ -351,6 +351,13 @@ impl PagedKvCache {
         &mut self.v
     }
 
+    /// Both slabs mutably at once (`&mut K`, `&mut V`) via a split borrow — the decode step needs to
+    /// pass both to the append kernel in one launch, which two separate `k_mut`/`v_mut` calls (each a
+    /// full `&mut self`) cannot express.
+    pub fn slabs_mut(&mut self) -> (&mut CudaSlice<half::f16>, &mut CudaSlice<half::f16>) {
+        (&mut self.k, &mut self.v)
+    }
+
     /// Push the current host block table + context lengths to the device buffers the attention kernel
     /// reads, returning `(&block_table_d, &ctx_len_d)`. Call after any `append`/`reserve`/`free` that
     /// changed the layout, before launching paged attention.
