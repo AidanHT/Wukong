@@ -293,7 +293,7 @@ unsafe fn gemm_dispatch(
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
                         // `args.run()` moves the whole bundle, so the closure captures the `Send`
                         // `GemmArgs` rather than its `!Send` fields (edition-2021 disjoint capture).
-                        pool.install(move || unsafe { args.run() });
+                        pool.install(move || args.run());
                     }
                     (true, None) => sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi),
                     (false, _) => sgemm_avx2(a, b, c, m, k, n, beta, bt, epi),
@@ -1286,6 +1286,16 @@ unsafe fn micro_6x16(
     epi: Option<Epilogue>,
 ) {
     use std::arch::x86_64::*;
+    // AVX-512 fast path: the full-tile, no-epilogue case (the bulk of a large GEMM's tiles). Wider
+    // 512-bit lanes, half the FMA instructions, and BIT-IDENTICAL accumulation order to the AVX2 body
+    // below (see `micro_6x16_avx512`). Gated on `avx512f` — FALSE on this development box, so the
+    // branch is dead code here (and the `&&` short-circuits to a single predicted-not-taken compare on
+    // the AVX2 path, after the full-tile checks the AVX2 fast path already makes). On AVX-512 silicon
+    // it takes over the hot tiles; the width win is a labelled projection, never measured here.
+    if epi.is_none() && mr == MR && nr == NR && is_x86_feature_detected!("avx512f") {
+        micro_6x16_avx512(kc, ap, bp, c, ldc, beta);
+        return;
+    }
     let (mut c0, mut c1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     let (mut c2, mut c3) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     let (mut c4, mut c5) = (_mm256_setzero_ps(), _mm256_setzero_ps());
@@ -1451,6 +1461,96 @@ unsafe fn micro_6x16(
             };
         }
     }
+}
+
+/// The **AVX-512 twin** of [`micro_6x16`]'s K-accumulation + plain (no-epilogue) full-tile writeback.
+/// Each of the 6 A-rows gets ONE 512-bit accumulator holding all `NR=16` of that row's C-columns —
+/// versus the AVX2 kernel's two 256-bit halves (`c{2r}`, `c{2r+1}`). Per K-step: one 16-wide B load,
+/// 6 A-broadcasts, 6 FMAs — **half** the AVX2 kernel's 12 FMAs for the same flops.
+///
+/// **Correctness is by construction, not measurement.** Lane `j` of accumulator `r` sums `a[r,p]·b[p,j]`
+/// over `p` ascending — exactly the sequence `micro_6x16` accumulates into `c{2r}[j]` (`j<8`) /
+/// `c{2r+1}[j−8]` (`j≥8`). Widening 2×ymm → 1×zmm changes only the register width, never which products
+/// reach `C[i,j]` nor their order, so this is **bit-identical** to the AVX2 kernel — the very argument
+/// the differential gate already makes for SIMD lane width (a wider vector holds *different output
+/// elements*, not partial sums of one). `avx512f` is **false on this development box**, so this is DEAD
+/// CODE here: it can touch no gate and no measured number. On AVX-512 silicon `micro_6x16_avx512_twin`
+/// (a `#[test]`) asserts the bit-equality directly; the width win is reported only as a labelled
+/// PROJECTION (see `prompts/results/cpu-library.md`), never measured on hardware that cannot run it.
+///
+/// Scope is deliberately the full-tile, no-epilogue case — the bulk of a large GEMM's tiles and the
+/// part whose AVX-512 form is a trivial lane-width swap. Partial edge tiles and the fused bias+act
+/// epilogue (which would need AVX-512 `gelu16`/`silu16` vmath that does not exist yet) fall back to the
+/// proven AVX2 [`micro_6x16`], bounding the untestable surface to this small, structurally-trivial core.
+///
+/// # Safety
+/// `avx512f` must be available (caller runtime-checks). Packed-panel/`ldc` contract of [`micro_6x16`],
+/// restricted to a full `MR×NR` tile.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn micro_6x16_avx512(
+    kc: usize,
+    ap: *const f32,
+    bp: *const f32,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+) {
+    use std::arch::x86_64::*;
+    let (mut c0, mut c1, mut c2) =
+        (_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
+    let (mut c3, mut c4, mut c5) =
+        (_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
+    let mut ap = ap;
+    let mut bp = bp;
+    // One K-step: load the 16-wide B row into a single zmm, then for each of the 6 A rows broadcast its
+    // packed value and FMA into that row's accumulator. Identical (a, b) values and ascending-`p` order
+    // as `micro_6x16::kstep`, so the bits match.
+    macro_rules! kstep {
+        () => {{
+            let b = _mm512_loadu_ps(bp);
+            c0 = _mm512_fmadd_ps(_mm512_set1_ps(*ap), b, c0);
+            c1 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(1)), b, c1);
+            c2 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(2)), b, c2);
+            c3 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(3)), b, c3);
+            c4 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(4)), b, c4);
+            c5 = _mm512_fmadd_ps(_mm512_set1_ps(*ap.add(5)), b, c5);
+            ap = ap.add(MR);
+            bp = bp.add(NR);
+        }};
+    }
+    // Same ×4 K-unroll + one prefetch per 4 steps as the AVX2 kernel.
+    let mut p = 0;
+    while p + 4 <= kc {
+        _mm_prefetch::<_MM_HINT_T0>(bp.add(NR * 8) as *const i8);
+        kstep!();
+        kstep!();
+        kstep!();
+        kstep!();
+        p += 4;
+    }
+    while p < kc {
+        kstep!();
+        p += 1;
+    }
+    // Plain full-tile writeback, one 512-bit store per row, with the beta rule — the zmm analogue of
+    // the AVX2 fast-path `wb!` (which stored each row as `[c{2r} | c{2r+1}]`).
+    macro_rules! wb {
+        ($acc:expr, $r:expr) => {{
+            let row = c.add($r * ldc);
+            if beta == 0.0 {
+                _mm512_storeu_ps(row, $acc);
+            } else {
+                _mm512_storeu_ps(row, _mm512_add_ps(_mm512_loadu_ps(row), $acc));
+            }
+        }};
+    }
+    wb!(c0, 0);
+    wb!(c1, 1);
+    wb!(c2, 2);
+    wb!(c3, 3);
+    wb!(c4, 4);
+    wb!(c5, 5);
 }
 
 #[cfg(test)]
@@ -1700,6 +1800,50 @@ mod tests {
                 "n={n:<4} logical(×{logical})={lg:6.1}  physical(×{physical})={pg:6.1} GFLOP/s  →  physical/logical = {:.2}×",
                 pg / lg
             );
+        }
+    }
+
+    /// Twin check for the AVX-512 microkernel: it must produce **bit-identical** output to the proven
+    /// AVX2 [`micro_6x16`] on the same packed panels (full 6×16 tile, no epilogue, both beta rules).
+    /// On AVX-512 silicon this asserts the equality directly; on this development box (no `avx512f`) it
+    /// is skipped — but the body still **compiles**, exercising the kernel's form, and its correctness
+    /// rests on the structural-twin argument documented on `micro_6x16_avx512`. This is the honest
+    /// shape of an "AVX-512 twin test" on hardware that cannot execute AVX-512.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn micro_6x16_avx512_twin() {
+        let have = is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma");
+        if !have {
+            println!("micro_6x16_avx512_twin: host lacks avx512f — compile-checked, run skipped");
+            return;
+        }
+        for &kc in &[1usize, 4, 7, 64] {
+            let ap = fill(1, kc * MR);
+            let bp = fill(2, kc * NR);
+            for &beta in &[0.0f32, 1.0] {
+                let cinit = fill(3, MR * NR);
+                let mut c_avx2 = cinit.clone();
+                let mut c_512 = cinit.clone();
+                // SAFETY: features just checked; full MR×NR tile, ldc=NR, no epilogue — the AVX-512
+                // path's supported case.
+                unsafe {
+                    micro_6x16(
+                        kc, ap.as_ptr(), bp.as_ptr(), c_avx2.as_mut_ptr(), NR, beta, MR, NR, None,
+                    );
+                    micro_6x16_avx512(kc, ap.as_ptr(), bp.as_ptr(), c_512.as_mut_ptr(), NR, beta);
+                }
+                for i in 0..MR * NR {
+                    assert_eq!(
+                        c_avx2[i].to_bits(),
+                        c_512[i].to_bits(),
+                        "kc={kc} beta={beta} idx={i}: avx2={} avx512={}",
+                        c_avx2[i],
+                        c_512[i]
+                    );
+                }
+            }
         }
     }
 
