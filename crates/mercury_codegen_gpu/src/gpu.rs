@@ -13270,4 +13270,160 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         });
     }
+
+    /// **Causal flash vs cuDNN/cutlass causal SDPA** (`is_causal=true`). Mercury's `flash_d64_mpc` skips
+    /// every all-masked K-block (the K-loop stops at the diagonal `kb==row`) and masks only the diagonal
+    /// block — so it does ~half the `mma` work at long S. This times it against the SAME fused peer from
+    /// [`attn_vs_fused_peer`] but with `is_causal=true` (cuDNN/cutlass also skip the upper triangle), over
+    /// identical f16 Q/K/V. The honest question: does the clean triangular skip let Mercury's causal
+    /// ratio *beat* its non-causal ~0.4–0.8× (i.e. is Mercury's skip more efficient than cuDNN's)? Output
+    /// is gated vs the per-head f64 [`ref_attn_causal`] oracle at small S and checksum-cross-checked at
+    /// all S. Same honesty model as the non-causal bench (Mercury wall-clock vs peer CUDA-event time;
+    /// REPS back-to-back on a warmed clock). GF/s uses the full `4·H·S²·D` convention on BOTH sides (so
+    /// the ratio is exact; the absolute number is ~2× the useful causal FLOP — a shared, disclosed
+    /// convention, not a per-side advantage).
+    #[test]
+    #[ignore = "fused-peer causal bench; needs the torch-CUDA venv (set MERCURY_FA2_PYTHON) + a GPU"]
+    fn attn_causal_vs_fused_peer() {
+        use crate::baselines::{attn_flop, fa2_peer_available, fa2_sdpa_peer};
+        use half::f16;
+        with_gpu("attn_causal_vs_fused_peer", |g| {
+            if !fa2_peer_available() {
+                eprintln!(
+                    "[skip] attn_causal_vs_fused_peer: torch-CUDA peer not runnable. Set MERCURY_FA2_PYTHON \
+                     to a python.exe with CUDA `torch` + numpy (see tools/fa2_sdpa_peer.py)."
+                );
+                return;
+            }
+            eprintln!("device: {} | peer: PyTorch SDPA fused causal (cuDNN / cutlass-efficient)", g.device_name());
+            let d = 64usize;
+            let heads = 8usize;
+            let mut rng = crate::diff::Rng::new(0x0FA2_CA05);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            const REPS: usize = 3;
+
+            let f_mc = g
+                .function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mpc")
+                .unwrap();
+
+            for &s in &[512usize, 1024, 2048, 4096] {
+                let n = heads * s * d;
+                let qf = rng.vec(n, -1.0, 1.0);
+                let kf = rng.vec(n, -1.0, 1.0);
+                let vf = rng.vec(n, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let (q16h, k16h, v16h) = (to16(&qf), to16(&kf), to16(&vf));
+                let q16 = g.stream.memcpy_stod(&q16h).unwrap();
+                let k16 = g.stream.memcpy_stod(&k16h).unwrap();
+                let v16 = g.stream.memcpy_stod(&v16h).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_m = |g: &Gpu, o_d: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut bld = g.stream.launch_builder(&f_mc);
+                    bld.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o_d);
+                    unsafe { bld.launch(cfg).unwrap() };
+                };
+
+                launch_m(g, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let out_m = g.stream.memcpy_dtov(&o_d).unwrap();
+
+                // The fused peer with is_causal=true over the IDENTICAL f16 bytes.
+                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, true, 20, 50, 4)
+                    .unwrap();
+
+                if s <= 512 {
+                    let mut oracle = vec![0f32; n];
+                    for hh in 0..heads {
+                        let lo = hh * s * d;
+                        let hi = lo + s * d;
+                        let r = ref_attn_causal(&qf[lo..hi], &kf[lo..hi], &vf[lo..hi], s, d, scale);
+                        oracle[lo..hi].copy_from_slice(&r);
+                    }
+                    let sm = crate::diff::assert_close(
+                        &format!("Mercury causal flash H={heads} S={s}"),
+                        &out_m,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    let sp = crate::diff::assert_close(
+                        &format!("{} causal peer H={heads} S={s}", rep.chosen),
+                        &rep.o,
+                        &oracle,
+                        3e-3,
+                        3e-2,
+                    );
+                    eprintln!(
+                        "[gate] S={s}: Mercury causal max_abs={:.2e} | {} causal peer max_abs={:.2e} (both vs f64 oracle) ✓",
+                        sm.max_abs, rep.chosen, sp.max_abs
+                    );
+                }
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let (cs_m, cs_p) = (csum(&out_m), csum(&rep.o));
+                assert!(
+                    (cs_m - cs_p).abs() / cs_p.max(1.0) < 3e-2,
+                    "H={heads} S={s}: Mercury causal vs {} causal peer checksum disagree: mer={cs_m:.4e} peer={cs_p:.4e}",
+                    rep.chosen
+                );
+
+                let flop = attn_flop(heads, s, d); // full-S² convention on both sides (ratio-exact)
+                let mut best_m = f64::INFINITY;
+                let mut best_peer_sec = rep.chosen_sec;
+                let mut peer_name = rep.chosen.clone();
+                let (mut cud, mut eff) = (rep.cudnn_sec, rep.efficient_sec);
+                let upd = |slot: &mut Option<f64>, v: Option<f64>| {
+                    if let Some(x) = v {
+                        *slot = Some(slot.map_or(x, |c: f64| c.min(x)));
+                    }
+                };
+                for _ in 0..REPS {
+                    let tm = best_of(ROUNDS, || {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            launch_m(g, &mut o_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    });
+                    best_m = best_m.min(tm);
+                    let r = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, true, 20, 50, 4)
+                        .unwrap();
+                    if r.chosen_sec < best_peer_sec {
+                        best_peer_sec = r.chosen_sec;
+                        peer_name = r.chosen.clone();
+                    }
+                    upd(&mut cud, r.cudnn_sec);
+                    upd(&mut eff, r.efficient_sec);
+                }
+                let g_m = flop / best_m;
+                let g_p = flop / best_peer_sec;
+                let gf = |o: Option<f64>| o.map_or(f64::NAN, |sec| flop / sec / 1e9);
+                eprintln!(
+                    "H={heads} S={s:>4} D={d} CAUSAL: Mercury {:.4} ms ({:>6.0} GF/s) | {} fused {:.4} ms ({:>6.0} GF/s) || Mercury {:.2}× {} || cuDNN {:>6.0} | efficient {:>6.0} GF/s  [GF/s = full-S² conv.]",
+                    best_m * 1e3,
+                    g_m / 1e9,
+                    peer_name,
+                    best_peer_sec * 1e3,
+                    g_p / 1e9,
+                    g_m / g_p,
+                    peer_name,
+                    gf(cud),
+                    gf(eff),
+                );
+            }
+        });
+    }
 }
