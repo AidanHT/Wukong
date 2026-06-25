@@ -1981,6 +1981,23 @@ pub fn wmma_f16_ptx() -> &'static str {
                 false,
                 0,
             );
+            // The **no-pad swizzle** twin of each fused-epilogue kernel (`..._swz_bias{,_relu,_silu,_gelu}`).
+            // The bias-add + activation apply register-level to the `mma.sync` D-fragments — independent of
+            // how A/B were staged in SMEM — so the swizzle composes orthogonally and the result is *bit-
+            // identical* to the padded epilogue, but it inherits the swizzle GEMM's 1.13–1.23× same-run speed
+            // (hardware `ldmatrix` fragment loads vs the padded base's manual `ld.shared.b32`, at equal
+            // occupancy). This is the fastest base for the beat-cuBLAS fused Linear/FFN:
+            // `gemm_nt_f16_mma_bias{,_relu,_silu,_gelu}` route here.
+            m += &entry_mma_pipe(
+                &format!("{}_swz_{suffix}", wh.name),
+                "f16",
+                wh.bm, wh.bn, wh.bk, wh.wm, wh.wn, wh.stages, wh.raster, 0,
+                act,
+                true,
+                false,
+                true,
+                0,
+            );
         }
         // Fused **bias + residual** (no activation) on the same fast mma workhorse — the transformer
         // down-proj / attention output-proj sublayer output `out = x·Wᵀ + bias + residual` (the residual
@@ -2105,6 +2122,19 @@ pub fn wmma_bf16_ptx() -> &'static str {
                 true,
                 false,
                 false,
+                0,
+            );
+            // The no-pad swizzle twin (`..._swz_bias*`) — the register-level epilogue composes orthogonally
+            // with the SMEM swizzle (bit-identical output) and inherits the swizzle GEMM's 1.13–1.23× speed.
+            // `gemm_nt_bf16_mma_bias{,_relu,_silu,_gelu}` route here (the training-dtype fused Linear/FFN base).
+            m += &entry_mma_pipe(
+                &format!("{}_swz_{suffix}", v.name),
+                "bf16",
+                v.bm, v.bn, v.bk, v.wm, v.wn, v.stages, v.raster, 0,
+                act,
+                true,
+                false,
+                true,
                 0,
             );
         }
