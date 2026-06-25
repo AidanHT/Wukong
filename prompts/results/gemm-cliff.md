@@ -75,5 +75,25 @@ mma/warp** (2× the ILP) AND 128 threads/CTA ⇒ **3 CTAs/SM** (vs 2). Measured 
 - **w22: 76.6%→81.7–84.3%** (1.067–1.093× base) · **w14: →82.2%** (1.073×) — both 3 CTAs/SM.
 - w41 (4×1) / w42 (4×2) do NOT win (warp shape matters — wn≥2 with bigger tm wins).
 - Bigger *threadblock* tiles (256×128, 128×256) LOSE (1 CTA/SM). w22+s3 loses (back to 2 CTAs).
-**Net: ~+6% @4096³ → ~82% of cuBLAS, bit-gated, reproduced.** Next: register-fragment prefetch (lever ④)
-stacked on w22/w14, then wire the winner into the ≥48 MB dispatch.
+**Net: ~+6% @4096³ → ~82% of cuBLAS, bit-gated, reproduced.**
+
+### Decision sweep (w22 vs w24 × padded vs swizzle, both sizes)
+- 4096³: **swz_w22 84.0%** > swz_w14 82.0% > swz_w24 81.0% > padded 78% → **swz_w22 wins.**
+- 2048³: padded_w24 86.3% (best) ; **padded_w22 REGRESSES to 70.3%** ; swz ~77–79%.
+- ⇒ the win is **swizzle-path-only**: the padded 16–48 MB regime must stay w24.
+
+### WIRED TO PRODUCTION (commit 2)
+- ptx_wmma.rs emits `mma_nt_{f16,bf16}_128_bk32_s2_r16_w22swz` (2×2 warp grid swizzle workhorse).
+- `gemm_nt_f16` / `gemm_nt_bf16` route **A+B ≥ 48 MB → w22swz** (128-thread launch via `pipe_cfg`); the
+  16–48 MB padded arm is untouched (regression-safe — w22 only ever fires ≥48 MB). bf16 `…_pipe_entry`
+  derives the 128-thread grid from the `w22swz` entry suffix.
+- Gated by `gemm_cliff_w22swz_matches_reference` (f16+bf16 production kernels vs f64 oracle, default suite).
+- **+4096³ fp16/bf16 dispatch now ~84% of cuBLAS (was ~76–81%).** Full non-ignored GPU gate suite: 102
+  pass; the 2 failures (`lower::run_corpus_matches_interp_oracle`, `megakernel::mega_corpus_matches_oracle`)
+  are **pre-existing partial-coverage corpus tests in sibling `--backend=gpu-native` code I never touched**
+  (verified identical to main HEAD; independent code path from the GEMM recognizer).
+
+### Next levers (toward parity)
+- register-fragment prefetch (④): tension — raises reg pressure, would cost w22 its 3rd CTA. Measure.
+- 2048³ is at 86% (padded w24) — under its 90% floor; needs a separate lever (the swz/w22 path loses there).
+- SASS scheduling (~9% per CuAsmRL) is the likely residual; not reachable without offline ptxas/hand-SASS.

@@ -480,7 +480,17 @@ pub fn gemm_nt_f16(
         // conflict-free at that occupancy. The L2-resident 2048³ (≈16 MB) keeps the padded hand-placed base
         // (there the extra occupancy thrashes L2 and swz loses ~0.86×). Threshold validated at 4096³.
         if ws_bytes >= 48 * 1024 * 1024 {
-            let swz = crate::ptx_wmma::PipeCfg { name: "mma_nt_f16_128_bk32_s2_r16_swz", pad: 0, ..*wh };
+            // GEMM-cliff win: the **w22** swizzle workhorse (2×2 warp grid = 32 mma/warp, 3 CTAs/SM) beats
+            // the w24 swz ~1.04–1.07× same-run at 4096³ (~81%→84% of cuBLAS, bit-gated). wm/wn=2,2 sets the
+            // 128-thread launch (`pipe_cfg` derives threads from wm·wn). Only the ≥48 MB arm — the padded
+            // 16–48 MB regime keeps w24 (padded w22 regresses 2048³).
+            let swz = crate::ptx_wmma::PipeCfg {
+                name: "mma_nt_f16_128_bk32_s2_r16_w22swz",
+                wm: 2,
+                wn: 2,
+                pad: 0,
+                ..*wh
+            };
             return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz);
         }
         return gemm_nt_f16_pipe(g, a, b, m, k, n, wh);
@@ -1430,7 +1440,8 @@ pub fn gemm_nt_bf16(
         // Deeply HBM-bound (≥4096³): the no-pad ldmatrix+swizzle twin (3 CTAs/SM) — the fp16 4096³ win
         // carried to the training dtype. L2-resident 2048³ keeps the padded hand-placed base.
         if ws_bytes >= 48 * 1024 * 1024 {
-            return gemm_nt_bf16_pipe_entry(g, a, b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_swz");
+            // GEMM-cliff win carried to bf16: the w22 swizzle workhorse (2×2 warp grid, 3 CTAs/SM).
+            return gemm_nt_bf16_pipe_entry(g, a, b, m, k, n, "mma_nt_bf16_128_bk32_s2_r16_w22swz");
         }
         return gemm_nt_bf16_pipe(g, a, b, m, k, n);
     }
@@ -1499,7 +1510,14 @@ fn gemm_nt_bf16_pipe_entry(
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let mut bld = g.stream.launch_builder(&f);
     bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d);
-    unsafe { bld.launch(pipe_cfg(v, m, n))? };
+    // The w22 swizzle workhorse is a 2×2 warp grid (128 threads); every other entry is the PIPE_BF16 w24
+    // geometry (256 threads). Derive the launch from the entry so the w22 cliff kernel gets the right grid.
+    let launch_v = if entry.ends_with("w22swz") {
+        crate::ptx_wmma::PipeCfg { wm: 2, wn: 2, ..*v }
+    } else {
+        *v
+    };
+    unsafe { bld.launch(pipe_cfg(&launch_v, m, n))? };
     g.stream.memcpy_dtov(&c_d)
 }
 
@@ -9447,6 +9465,57 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     let s = crate::diff::assert_close(&format!("{} {m}x{k}x{n}", v.name), &c, &r, 1e-2, 2e-3);
                     eprintln!("{:<20} {m}x{k}x{n}: max_abs={:.2e} max_rel={:.2e}", v.name, s.max_abs, s.max_rel);
                 }
+            }
+        });
+    }
+
+    /// **Correctness gate for the dispatched w22 swizzle workhorses** (`mma_nt_{f16,bf16}_128_bk32_s2_r16_
+    /// w22swz`, the GEMM-cliff win `gemm_nt_{f16,bf16}` route ≥48 MB to). Small shapes never reach the ≥48 MB
+    /// arm, so this loads the production kernels by name and checks `C = A·Bᵀ` vs the {f16,bf16}-rounded f64
+    /// oracle (128-thread w22 launch). Runs under plain `cargo test --features gpu`; no cuBLAS needed.
+    #[test]
+    fn gemm_cliff_w22swz_matches_reference() {
+        use crate::ptx_wmma::{wmma_bf16_ptx, wmma_f16_ptx};
+        use half::{bf16, f16};
+        with_gpu("gemm_cliff_w22swz_gate", |g| {
+            let mut rng = crate::diff::Rng::new(0x7722_5217);
+            for &(m, k, n) in &[(256usize, 256usize, 256usize), (384, 160, 256)] {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(n * k, -1.0, 1.0);
+                let cfg = LaunchConfig {
+                    grid_dim: (((m / 128) * (n / 128)) as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                // f16
+                let rf = ref_nt_rounded(&a, &b, m, k, n, |x| f16::from_f32(x).to_f32());
+                let af: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+                let bf: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+                let ad = g.stream.memcpy_stod(&af).unwrap();
+                let bd = g.stream.memcpy_stod(&bf).unwrap();
+                let mut cd = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let f = g.function("wmma_f16", wmma_f16_ptx(), "mma_nt_f16_128_bk32_s2_r16_w22swz").unwrap();
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&ad).arg(&bd).arg(&mut cd);
+                unsafe { bld.launch(cfg).unwrap() };
+                let cf = g.stream.memcpy_dtov(&cd).unwrap();
+                let s = crate::diff::assert_close(&format!("f16 w22swz {m}x{k}x{n}"), &cf, &rf, 1e-2, 2e-3);
+                eprintln!("f16  w22swz {m}x{k}x{n}: max_abs={:.2e}", s.max_abs);
+                // bf16
+                let rb = ref_nt_rounded(&a, &b, m, k, n, |x| bf16::from_f32(x).to_f32());
+                let ab: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
+                let bb: Vec<bf16> = b.iter().map(|&x| bf16::from_f32(x)).collect();
+                let ad = g.stream.memcpy_stod(&ab).unwrap();
+                let bd = g.stream.memcpy_stod(&bb).unwrap();
+                let mut cd = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let f = g.function("wmma_bf16", wmma_bf16_ptx(), "mma_nt_bf16_128_bk32_s2_r16_w22swz").unwrap();
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&ad).arg(&bd).arg(&mut cd);
+                unsafe { bld.launch(cfg).unwrap() };
+                let cb = g.stream.memcpy_dtov(&cd).unwrap();
+                let s = crate::diff::assert_close(&format!("bf16 w22swz {m}x{k}x{n}"), &cb, &rb, 5e-2, 2e-2);
+                eprintln!("bf16 w22swz {m}x{k}x{n}: max_abs={:.2e}", s.max_abs);
             }
         });
     }
