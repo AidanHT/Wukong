@@ -1122,9 +1122,14 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
 /// `K(i+1)` (in `%kahead`), PV reads `V(i)` (in `%vcur`), and the `K(i+2)`/`V(i+1)` prefetch is in flight —
 /// the `cp.async.wait_group 1` "1 group in flight at step start" invariant is exactly the base kernel's.
 /// Buffer offsets toggle by `XOR ksz` (ksz is a power of two; the V pool base `2·ksz` has the ksz bit
-/// clear, so the toggle stays within each pool). Score registers rotate `%sn`→`%s`. Gated vs `ref_attn`,
-/// A/B'd same-run vs `flash_d{d}_mp` by `flash_sp_vs_mp`. Non-causal (a causal QKᵀ-ahead would have to
-/// stop the ahead-tile at the diagonal independently of the consume-tile; deferred to a sibling).
+/// clear, so the toggle stays within each pool). Score registers rotate `%sn`→`%s`. Gated vs `ref_attn`.
+///
+/// **MEASURED NEGATIVE RESULT (kept as a documented A/B — `flash_sp_vs_mp`).** Clock-cancelled `sp/base`
+/// (median of 9, H=8) is a **wash-to-slight-loss**: `1.043 / 1.044 / 1.010 / 1.019` at S=512/1024/2048/
+/// 4096. The manual QKᵀ-ahead did not beat the softmax stall — either `ptxas` already extracts what little
+/// mma/SFU overlap one warp affords, or the rotation `mov`s + separate-pool address arithmetic cost as much
+/// as the overlap saves. So the long-S ceiling is not closable by software-pipelining a single warp's QKᵀ;
+/// it joins `mp4`/`mpw` as a measured occupancy/overlap negative. Non-causal; not extended, given the wash.
 fn entry_mma_reg_pipe_sp(d: usize) -> String {
     assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
     let ktq = d / 16;
