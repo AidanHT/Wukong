@@ -750,6 +750,30 @@ pub fn fp8_pipe_cfg_ptx(
     m
 }
 
+/// **fp8 64×64-warp-tile pipe — the transferred int8 lever (M2, perf/gpu-quant-2).** A 128×128 CTA with
+/// `wm=wn=2` ⇒ a **64×64 warp tile** on 4 warps (128 threads), `BK=64`, 2-stage `cp.async`. The int8
+/// sweep found that on this 20-SM Ada part the win is the *warp* tile, not the CTA tile: doubling the
+/// per-warp A/B fragment reuse (64×64 vs the shipped 64×32 default) lifts throughput at every size. fp8
+/// shares the identical `mma.sync.m16n8k32` 8-bit geometry, and the warp-tile sweep
+/// ([`crate::gpu::tests`] `quant_fp8_warp_tile_sweep`) confirmed it same-run: 1024/2048/4096³ at
+/// 72/132/91% of cuBLASLt vs the 64×32 default's 66/102/86%. Repartitioning *which* warp owns an output
+/// element leaves the per-element k=0,32,64,… accumulation order unchanged ⇒ **bit-identical** to the
+/// default entry ⇒ rides the same E4M3 tolerance gate. Entry `fp8_gemm_pipe` (launch with 128 threads).
+/// Best at 4096³; for M,N≤2048 the 3-stage [`fp8_pipe_w64_s3_ptx`] adds ~10–19 pts.
+pub fn fp8_pipe_w64_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 64, 2, 2, 2, FP8_PIPE_RASTER)).as_str()
+}
+
+/// 3-stage (`BK=32`) sibling of [`fp8_pipe_w64_ptx`] — the deeper `cp.async` pipeline that wins at the
+/// small/mid square sizes (1024³ 82%, 2048³ 151% of cuBLASLt; ~+10/+19 pts over the 2-stage) but loses
+/// the register/SMEM-pressure trade at 4096³ (81% vs 91%), so [`crate::gpu::gemm_nt_fp8_pipe`] routes it
+/// only for M,N≤2048. Same `fp8_gemm_pipe` entry / 128-thread launch; same bit-identical K-accumulation.
+pub fn fp8_pipe_w64_s3_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| fp8_pipe_cfg_ptx(FP8_PIPE_BM, FP8_PIPE_BN, 32, 2, 2, 3, FP8_PIPE_RASTER)).as_str()
+}
+
 /// Multi-tile per warp for fp8: `M` direction tiles (each 16 rows) and `N` direction tiles (each 8
 /// cols). 2×4 → a 32×32 C block per warp, 8 `mma`s per K-step. Each warp tile size = 16·TM × 8·TN.
 pub const FP8_TM: usize = 2;

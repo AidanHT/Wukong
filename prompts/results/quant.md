@@ -100,6 +100,22 @@ Mercury's fused kernel (GEMM **+** dequant) runs at ~90–95% of cuBLAS's GEMM-*
 is genuinely free. **Decisive end-to-end win, the lever a closed library can't use.** COMMIT 3. Peer =
 `time_cublas_int8_gemm_dequant_chain` (fair no-rem 2-D dequant kernel). Dequant dispatch upgraded to w64_deq.
 
+### L6 fp8 — warp-tile lever transfers (BIGGER than int8). `quant_fp8_warp_tile_sweep` vs cuBLASLt E4M3.
+| size  | default w2×4 (64×32 warp) | **w2×2 (64×64 warp)** | w2×2 + 3-stage (BK=32) | best |
+|-------|---------------------------|-----------------------|------------------------|------|
+| 1024³ | 66.2%                     | 72.1%                 | **82.2%**              | w22_s3 |
+| 2048³ | 102.3%                    | 132.4%                | **151.1%**             | w22_s3 |
+| 4096³ | 86.1%                     | **90.9%**             | 80.9%                  | w22 |
+- Internal clock-robust w22/default ratio: 1.09×/1.29×/1.06×; w22_s3/default 1.24×/1.48× @1024/2048.
+- **Multistage (3-stage BK=32) gave fp8 +19 pts @2048³** — a real lever (the research's "+3%" undersells it;
+  it RE-VALIDATES trying multistage for int8). But it HURTS @4096³ (HBM-bound) — same pattern as int8 raster.
+- Ship: fp8 64×64 warp tile (w2×2), 3-stage ≤2048², 2-stage @4096². (cuBLASLt fp8 on a consumer 4050 is likely
+  under-tuned → the >100% are real internal wins but the absolute % is generous; trust the internal ratio.)
+- **SHIPPED (COMMIT 4)**: `fp8_pipe_w64_ptx`/`fp8_pipe_w64_s3_ptx` (ptx_fp8.rs); `gemm_nt_fp8_pipe` dispatch →
+  w64_s3 (3-stage) for 128∣M∧128∣N∧M,N≤2048∧K≥96, w64 (2-stage) for larger, m64 fallback for 128∤M. Bit-
+  identical k-accum ⇒ same E4M3 tol gate: `fp8_pipe_matches_reference_within_tol`, `fp8_pipe_regime_matches_
+  reference` (exercises all 3 entries), `quant_fp8_warp_tile_matches` (w22==w24 checksum) all GREEN.
+
 ## Research findings (parallel agents, verified)
 **Ada int8 binding constraint (RTX 4050, sm_89):** at 1024³–4096³ a well-tiled int8 GEMM is
 **on-chip-datapath / tensor-core-issue bound, NOT HBM-bound** (int8 roofline knee ~374 OP/byte; square

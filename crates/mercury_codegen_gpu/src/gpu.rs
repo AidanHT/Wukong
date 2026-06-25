@@ -3201,29 +3201,36 @@ pub fn gemm_nt_fp8_pipe(
     };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
-    // Regime-aware tile (see `fp8_pipe_config_sweep_vs_cublaslt`): the 64×128 `_m64` entry's higher
-    // occupancy wins for M≤2048 by a wide same-run margin and is the only legal entry when 128∤M but
-    // 64∣M; the 128×128 entry ties/wins for the larger M. Both share N%128==0, K%64==0; the chosen tile
-    // additionally needs M%BM==0. Same codegen, only BM differs ⇒ bit-identical accumulation.
-    let use_m64 = m % FP8_PIPE_BM != 0 || m <= 2048;
-    let (bm, entry) = if use_m64 {
-        (FP8_PIPE_M64_BM, "fp8_gemm_pipe_m64")
-    } else {
-        (FP8_PIPE_BM, "fp8_gemm_pipe")
-    };
+    // Warp-tile dispatch (the transferred int8 lever; `quant_fp8_warp_tile_sweep`, perf/gpu-quant-2).
+    // The win on this 20-SM Ada part is the **64×64 warp tile** (128×128 CTA, wm=wn=2, 128 threads), not
+    // the CTA tile — it doubles per-warp A/B fragment reuse and beats the old 64×32 default same-run at
+    // every size. The 3-stage (BK=32) variant adds ~10–19 pts at the small/mid square sizes (M,N≤2048)
+    // but loses the SMEM/register trade at 4096³, so route it only there; the 2-stage (BK=64) is best at
+    // 4096³. When 128∤M (but 64∣M) the 128-row tile is illegal, so fall back to the 64×128 `_m64` entry.
+    // All three share N%128==0, K%64==0 and an identical k=0,32,… accumulation order ⇒ bit-identical ⇒
+    // the same E4M3 tolerance gate. (k≥96 keeps the 3-stage pipeline full; below that use the 2-stage.)
+    let w64ok = m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0;
+    let (bm, threads, key, ptx, entry): (usize, usize, &str, &str, &str) =
+        if w64ok && m <= 2048 && n <= 2048 && k >= 96 {
+            (FP8_PIPE_BM, 128, "fp8_pipe_w64_s3", crate::ptx_fp8::fp8_pipe_w64_s3_ptx(), "fp8_gemm_pipe")
+        } else if w64ok {
+            (FP8_PIPE_BM, 128, "fp8_pipe_w64", crate::ptx_fp8::fp8_pipe_w64_ptx(), "fp8_gemm_pipe")
+        } else {
+            (FP8_PIPE_M64_BM, FP8_PIPE_THREADS, "fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), "fp8_gemm_pipe_m64")
+        };
     assert!(
         m % bm == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
         "fp8_gemm_pipe requires M%{bm}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
     );
     let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
     let b8: Vec<u8> = b.iter().map(|&x| f32_to_e4m3(x)).collect();
-    let f = g.function("fp8_pipe", crate::ptx_fp8::fp8_pipe_ptx(), entry)?;
+    let f = g.function(key, ptx, entry)?;
     let a_d = g.stream.memcpy_stod(&a8)?;
     let b_d = g.stream.memcpy_stod(&b8)?;
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     let cfg = LaunchConfig {
         grid_dim: (((m / bm) * (n / FP8_PIPE_BN)) as u32, 1, 1), // 1-D rasterized grid
-        block_dim: (FP8_PIPE_THREADS as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: 0,
     };
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
@@ -8292,19 +8299,20 @@ mod tests {
         });
     }
 
-    /// Gate for the **regime-aware fp8 pipe dispatch** (M2 lever): `gemm_nt_fp8_pipe` now routes M≤2048
-    /// (and any M where 128∤M but 64∣M) to the 64×128 `fp8_gemm_pipe_m64` entry, and larger M to the
-    /// 128×128 entry — the higher-occupancy small-tile won the cuBLASLt-fp8 sweep at M≤2048. Both entries
-    /// must match the same E4M3-rounded f64 reference; the shapes straddle the M=2048 threshold and
-    /// include a 128∤M case, so each entry (and the dispatch boundary) is exercised. Same codegen, only
-    /// BM differs ⇒ bit-identical accumulation ⇒ the same fp8 `c·√K·ε` tolerance.
+    /// Gate for the **warp-tile fp8 pipe dispatch** (M2 lever, perf/gpu-quant-2): `gemm_nt_fp8_pipe` now
+    /// routes 128∣M∧128∣N to the **64×64 warp tile** (128×128 CTA, `bm=128`) — 3-stage `_w64_s3` for
+    /// M,N≤2048, 2-stage `_w64` for larger — and falls back to the 64×128 `fp8_gemm_pipe_m64` entry
+    /// (`bm=64`) only when 128∤M (but 64∣M). All three entries must match the same E4M3-rounded f64
+    /// reference; the shapes straddle the M=2048 (w64_s3↔w64) threshold and include two 128∤M cases, so
+    /// each entry and both dispatch boundaries are exercised. Repartitioning the warp tile leaves the
+    /// k=0,32,… accumulation order unchanged ⇒ bit-identical ⇒ the same fp8 `c·√K·ε` tolerance.
     #[test]
     fn fp8_pipe_regime_matches_reference() {
         use crate::ptx_fp8::{e4m3_to_f32, f32_to_e4m3};
         with_gpu("fp8_pipe_regime", |g| {
             let mut rng = crate::diff::Rng::new(0xF8D3);
             let round = |x: f32| e4m3_to_f32(f32_to_e4m3(x));
-            // (m, k, n): three M≤2048 (incl. 128∤M=192) → m64 entry; two M>2048 → 128×128 entry.
+            // (m, k, n): two 128∤M → m64 (bm=64); 1024 → w64_s3 (bm=128, M≤2048); 2304/2560 → w64 (bm=128).
             for (m, k, n) in [
                 (64usize, 128usize, 128usize),
                 (192, 128, 256),
@@ -8317,7 +8325,7 @@ mod tests {
                 let c = gemm_nt_fp8_pipe(g, &a, &b, m, k, n).unwrap();
                 let r = ref_nt_rounded(&a, &b, m, k, n, round);
                 let rel = ((8.0 * (k as f64).sqrt()) * f32::EPSILON as f64).max(2e-3);
-                let bm = if m % 128 != 0 || m <= 2048 { 64 } else { 128 };
+                let bm = if m % 128 != 0 || n % 128 != 0 { 64 } else { 128 };
                 let st = crate::diff::assert_close(
                     &format!("fp8_pipe_regime {m}x{k}x{n} bm={bm}"),
                     &c,
