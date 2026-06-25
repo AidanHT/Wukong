@@ -12633,4 +12633,106 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
         });
     }
+
+    /// Sweep Mercury flash **kernel variants** against the same cuDNN fused peer, same-run — the
+    /// iteration harness for closing the [`attn_vs_fused_peer`] gap. Every variant is checksum-cross-
+    /// checked against the peer's O before its time counts; the peer is the per-S denominator.
+    #[test]
+    #[ignore = "fused-peer variant sweep; needs MERCURY_FA2_PYTHON + a GPU"]
+    fn attn_variants_vs_fused_peer() {
+        use crate::baselines::{attn_flop, fa2_peer_available, fa2_sdpa_peer};
+        use half::f16;
+        with_gpu("attn_variants_vs_fused_peer", |g| {
+            if !fa2_peer_available() {
+                eprintln!("[skip] attn_variants_vs_fused_peer: set MERCURY_FA2_PYTHON to CUDA torch.");
+                return;
+            }
+            eprintln!("device: {} | peer: cuDNN/cutlass fused SDPA", g.device_name());
+            let d = 64usize;
+            let heads = 8usize;
+            // (label, entry, warps-per-CTA). Each warp owns 16 query rows; W warps share one staged K/V
+            // block (W× L2 reuse) and lift occupancy — the long-S levers.
+            let variants: &[(&str, &str, u32)] = &[
+                ("mp   1w/16r", "flash_d64_mp", 1),
+                ("mp4  4w/64r", "flash_d64_mp4", 4),
+                ("mp8  8w/128r", "flash_d64_mp8", 8),
+            ];
+            let mut rng = crate::diff::Rng::new(0x0FA2_05EE);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 6;
+            let funcs: Vec<_> = variants
+                .iter()
+                .map(|(_, e, w)| {
+                    (g.function("flash", crate::ptx_flash::flash_ptx(), e).unwrap(), *w)
+                })
+                .collect();
+            for &s in &[512usize, 1024, 2048, 4096] {
+                let n = heads * s * d;
+                let qf = rng.vec(n, -1.0, 1.0);
+                let kf = rng.vec(n, -1.0, 1.0);
+                let vf = rng.vec(n, -1.0, 1.0);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let (q16h, k16h, v16h) = (to16(&qf), to16(&kf), to16(&vf));
+                let q16 = g.stream.memcpy_stod(&q16h).unwrap();
+                let k16 = g.stream.memcpy_stod(&k16h).unwrap();
+                let v16 = g.stream.memcpy_stod(&v16h).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let ss = s as u32;
+                let rep = fa2_sdpa_peer(1, heads, s, d, &q16h, &k16h, &v16h, scale, false, 20, 50, 4)
+                    .unwrap();
+                let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+                let cs_p = csum(&rep.o);
+                let flop = attn_flop(heads, s, d);
+                let g_p = flop / rep.chosen_sec;
+                eprintln!(
+                    "--- H={heads} S={s:>4} D={d}: {} fused {:.4} ms ({:>6.0} GF/s) [cuDNN {:.0} | eff {:.0}] ---",
+                    rep.chosen,
+                    rep.chosen_sec * 1e3,
+                    g_p / 1e9,
+                    rep.cudnn_sec.map_or(f64::NAN, |x| flop / x / 1e9),
+                    rep.efficient_sec.map_or(f64::NAN, |x| flop / x / 1e9),
+                );
+                for ((f, w), (label, _, _)) in funcs.iter().zip(variants.iter()) {
+                    let cfg = LaunchConfig {
+                        grid_dim: (((s / 16) as u32).div_ceil(*w), heads as u32, 1),
+                        block_dim: (32 * w, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let launch = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let mut b = g.stream.launch_builder(f);
+                        b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                        unsafe { b.launch(cfg).unwrap() };
+                    };
+                    launch(g, &mut o_d);
+                    g.stream.synchronize().unwrap();
+                    let out = g.stream.memcpy_dtov(&o_d).unwrap();
+                    let cs = csum(&out);
+                    assert!(
+                        (cs - cs_p).abs() / cs_p.max(1.0) < 3e-2,
+                        "S={s} {label}: checksum vs peer mer={cs:.3e} peer={cs_p:.3e}"
+                    );
+                    let t = best_of(ROUNDS, || {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            launch(g, &mut o_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    });
+                    let gfm = flop / t;
+                    eprintln!(
+                        "  {label:14}: {:.4} ms ({:>6.0} GF/s)  {:.2}× cuDNN",
+                        t * 1e3,
+                        gfm / 1e9,
+                        gfm / g_p
+                    );
+                }
+            }
+        });
+    }
 }
