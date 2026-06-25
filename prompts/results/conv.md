@@ -205,8 +205,10 @@ big fraction of the conv), marginal on the compute-bound 3×3. Honest, modest, i
 
 **Shipped & gated:** 1×1 (=GEMM, decisive win), 3×3 valid (parity-to-win), 5×5, 7×7 stem, **strided 2/3**,
 **zero-padded "same"/downsample** (bounds-checked + explicit-pad + split-K), **fused bias+act**, **Winograd
-F(2,3)+F(4,3)**. Every path bit-/Frobenius-close to the f64 oracle; `cargo test` (no `gpu`) stays green
-(all GPU code behind `#[cfg(feature="gpu")]`).
+F(2,3)+F(4,3)**, and a **`conv2d_best` per-shape dispatch** that auto-routes Winograd↔implicit↔split-K↔
+affine (Winograd for valid 3×3 ≥64-ch large-spatial — the 1.2–2.2× lane — GEMM elsewhere; gate routes
+through every lane, rel-Frobenius ≤8e-3). Every path bit-/Frobenius-close to the f64 oracle; `cargo test`
+(no `gpu`) stays green (all GPU code behind `#[cfg(feature="gpu")]`).
 
 **Next bottleneck, in priority order:**
 1. **Dilated** — cheapest: the gather just scales the tap by `dilation` (`ih=p·s+r·d−pad`), a one-line
@@ -214,9 +216,9 @@ F(2,3)+F(4,3)**. Every path bit-/Frobenius-close to the f64 oracle; `cargo test`
 2. **Depthwise / grouped** — a different kernel *structure* (per-group GEMM, no cross-channel reduction;
    depthwise has `GK=R·S` so it's bandwidth-bound, not tensor-core-bound) → a dedicated path, not a flag.
 3. **Padded Winograd** — the lever for the soft 3×3 s1 p1 "same" mid-size shapes (Winograd is currently
-   valid-only; padding it would let the ≥64-ch 3×3 win extend to "same" convs).
-4. **Per-shape Winograd↔implicit dispatch** — auto-pick Winograd for ≥64-ch large-spatial 3×3 (where the
-   measured ratio is 1.2–2.2×), implicit-GEMM otherwise.
+   valid-only; padding it would let the ≥64-ch 3×3 win extend to "same" convs, and let `conv2d_best`
+   route "same" 3×3 to Winograd too).
+4. ~~Per-shape Winograd↔implicit dispatch~~ — **done** (`conv2d_best`).
 
 ## Winograd reference (Lavin & Gray 2016, wincnn convention — for `ptx_winograd.rs`)
 
