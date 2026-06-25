@@ -2090,6 +2090,94 @@ pub fn conv2d_wmma_auto(
     }
 }
 
+/// **Winograd F(m×m,3×3) conv2d** (single batch, stride 1, no padding, `R=S=3`; `m∈{2,4}`) — cuDNN's
+/// `WINOGRAD_NONFUSED` strategy, the 2.25–4× multiply-reduction lever for 3×3. Four resident phases on
+/// device buffers (see [`crate::ptx_winograd`]): (1) filter transform `U[α²,K,C]`, (2) input transform
+/// `V[α²,C,T]`, (3) the α² batched channel-reduction GEMMs `M[ξν]=U[ξν]·V[ξν]` — each reusing the
+/// **proven `conv2d_wmma` tensor-core kernel** with `R=S=1` (`O[K,T]=W[K,C]·X[C,T]`) on a sub-slice — and
+/// (4) output transform → `O[K,P,Q]` (f32). fp16 storage, f32 transform arithmetic. Tolerance-gated
+/// against the f64 oracle (fp16 quantization dominates; Winograd's amplification sits under it). Correct
+/// for any tile count `T`; perf only sensible once `T≥16` (a non-trivial batched-GEMM N) — large feature
+/// maps / early layers. `m=4` is F(4×4,3×3) (what cuDNN uses); `m=2` is the lower-amplification F(2,3).
+#[allow(clippy::too_many_arguments)]
+pub fn winograd_conv2d(
+    g: &mut Gpu,
+    x: &[f32],
+    w: &[f32],
+    c: usize,
+    h: usize,
+    width: usize,
+    k: usize,
+    m: usize,
+) -> Result<Vec<f32>, DriverError> {
+    use half::f16;
+    assert!(m == 2 || m == 4, "Winograd output tile m must be 2 or 4");
+    assert_eq!(x.len(), c * h * width, "X must be C×H×W");
+    assert_eq!(w.len(), k * c * 9, "W must be K×C×3×3");
+    assert!(h >= 3 && width >= 3, "kernel larger than input");
+    let (p, q) = (h - 2, width - 2);
+    let alpha = m + 2;
+    let aa = alpha * alpha;
+    let (_nti, _ntj, nt) = crate::ptx_winograd::wino_ntiles(h, width, m);
+
+    let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+    let w16: Vec<f16> = w.iter().map(|&v| f16::from_f32(v)).collect();
+    let x_d = g.stream.memcpy_stod(&x16)?;
+    let w_d = g.stream.memcpy_stod(&w16)?;
+    // Transform-domain intermediates: U[α²,K,C] (f16) and V[α²,C,T] (f16) feed the tensor-core GEMM;
+    // M[α²,K,T] is **f32** (conv2d_wmma's f32 output); O[K,P,Q] is f32.
+    let mut u_d = g.stream.alloc_zeros::<f16>(aa * k * c)?;
+    let mut v_d = g.stream.alloc_zeros::<f16>(aa * c * nt)?;
+    let mut m_d = g.stream.alloc_zeros::<f32>(aa * k * nt)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(k * p * q)?;
+
+    // Phase 1 — filter transform (one thread per (k,c)).
+    let fptx = crate::ptx_winograd::wino_filter_xform_ptx(c, k, m);
+    let fmod = g.load_module_cached(&fptx)?;
+    let ff = fmod.load_function("wino_filter_xform")?;
+    let kc = k * c;
+    let cfg1 = LaunchConfig { grid_dim: ((kc as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let mut b1 = g.stream.launch_builder(&ff);
+    b1.arg(&w_d).arg(&mut u_d);
+    unsafe { b1.launch(cfg1)? };
+
+    // Phase 2 — input transform (one thread per (c, tile)).
+    let iptx = crate::ptx_winograd::wino_input_xform_ptx(c, h, width, m);
+    let imod = g.load_module_cached(&iptx)?;
+    let inf = imod.load_function("wino_input_xform")?;
+    let cnt = c * nt;
+    let cfg2 = LaunchConfig { grid_dim: ((cnt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let mut b2 = g.stream.launch_builder(&inf);
+    b2.arg(&x_d).arg(&mut v_d);
+    unsafe { b2.launch(cfg2)? };
+
+    // Phase 3 — α² batched GEMMs M[ξν]=U[ξν]·V[ξν], each the proven conv2d_wmma kernel with R=S=1.
+    let gptx = crate::ptx_conv::conv_wmma_ptx(c, 1, nt, k, 1, 1);
+    let gmod = g.load_module_cached(&gptx)?;
+    let gf = gmod.load_function("conv2d_wmma")?;
+    let cfg3 = conv_wmma_cfg(1, nt, k, 1, 1);
+    let knt = k * nt;
+    for xi in 0..aa {
+        let u_v = u_d.slice(xi * kc..(xi + 1) * kc);
+        let v_v = v_d.slice(xi * cnt..(xi + 1) * cnt);
+        let mut m_v = m_d.slice_mut(xi * knt..(xi + 1) * knt);
+        let mut b3 = g.stream.launch_builder(&gf);
+        b3.arg(&v_v).arg(&u_v).arg(&mut m_v); // conv2d_wmma(pXin=V, pWt=U, pOut=M)
+        unsafe { b3.launch(cfg3)? };
+    }
+
+    // Phase 4 — output transform (one thread per (k, tile)) → O[K,P,Q].
+    let optx = crate::ptx_winograd::wino_output_xform_ptx(k, h, width, m);
+    let omod = g.load_module_cached(&optx)?;
+    let of = omod.load_function("wino_output_xform")?;
+    let cfg4 = LaunchConfig { grid_dim: ((knt as u32).div_ceil(128), 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let mut b4 = g.stream.launch_builder(&of);
+    b4.arg(&m_d).arg(&mut o_d);
+    unsafe { b4.launch(cfg4)? };
+
+    g.stream.memcpy_dtov(&o_d)
+}
+
 /// **Fused FFN block** `out = x + SiLU(RMSNorm(x)·W1ᵀ)·W2ᵀ` (the SiLU MLP), GPU-**resident**: `x` and
 /// the weights upload once, every op runs on device buffers, only the `[S,D]` output copies back. The
 /// two epilogues a GEMM library cannot fuse are folded into the projections — the SiLU into the
@@ -6890,6 +6978,63 @@ mod tests {
                     "conv2d_wmma C{c} {h}x{width} K{k} {r}x{s}: max_abs={:.2e} max_rel={:.2e}",
                     st.max_abs, st.max_rel
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn conv_winograd_matches_reference_within_tol() {
+        with_gpu("winograd", |g| {
+            let mut rng = crate::diff::Rng::new(0x717023);
+            // (C,H,W,K) for R=S=3. Mix of tile-divisible and non-divisible spatials, small + larger;
+            // both F(2,3) (m=2) and F(4,3) (m=4) are gated. P=H-2, Q=W-2.
+            let cases = [
+                (3usize, 10usize, 10usize, 8usize), // P=Q=8
+                (16, 16, 16, 32),                   // P=Q=14 (not %4)
+                (8, 18, 18, 16),                    // P=Q=16
+                (32, 14, 14, 32),                   // P=Q=12 (%4) — small tile count
+                (4, 9, 9, 6),                       // P=Q=7 — divisible by neither 2 nor 4
+            ];
+            for (c, h, width, k) in cases {
+                let x = rng.vec(c * h * width, -1.0, 1.0);
+                let wt = rng.vec(k * c * 9, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &wt, c, h, width, k, 3, 3);
+                for m in [2usize, 4] {
+                    let got = winograd_conv2d(g, &x, &wt, c, h, width, k, m).unwrap();
+                    // Winograd's correct gate is the **relative-Frobenius** norm ‖got−ref‖_F/‖ref‖_F, NOT
+                    // a per-element rel: the inverse transform produces many near-zero (cancellation)
+                    // outputs, on which a per-element rel explodes (~1e1) even at fp16's true accuracy,
+                    // while the aggregate norm stays ~the fp16 floor. fp16-in dominates (~2^-10·√(9C)),
+                    // F(4,3)'s ~4–7× amplification rides on top. A real bug blows the Frobenius ratio to
+                    // ~1e-1…1e0. A coarse per-element abs backstop catches a single catastrophic lane.
+                    let err_f = got
+                        .iter()
+                        .zip(&oracle)
+                        .map(|(a, b)| {
+                            let d = *a as f64 - *b as f64;
+                            d * d
+                        })
+                        .sum::<f64>()
+                        .sqrt();
+                    let ref_f = oracle.iter().map(|b| (*b as f64) * (*b as f64)).sum::<f64>().sqrt();
+                    let fro_rel = err_f / ref_f.max(1e-9);
+                    let max_abs =
+                        got.iter().zip(&oracle).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0.0, f64::max);
+                    // fp16 + amplification + the small-output shapes here; ≫ a real-bug threshold (1e-1).
+                    let fro_tol = if m == 4 { 8e-3 } else { 4e-3 };
+                    let abs_backstop = if m == 4 { 3e-1 } else { 1.5e-1 };
+                    eprintln!(
+                        "winograd F({m},3) C{c} {h}x{width} K{k}: fro_rel={fro_rel:.2e} (tol {fro_tol:.0e})  max_abs={max_abs:.2e}"
+                    );
+                    assert!(
+                        fro_rel < fro_tol,
+                        "winograd F({m},3) C{c} {h}x{width} K{k}: rel-Frobenius {fro_rel:.3e} >= {fro_tol:.0e}"
+                    );
+                    assert!(
+                        max_abs < abs_backstop,
+                        "winograd F({m},3) C{c} {h}x{width} K{k}: max_abs {max_abs:.3e} >= {abs_backstop:.0e} (a lane blew up)"
+                    );
+                }
             }
         });
     }
