@@ -88,6 +88,18 @@ can't fill them, 1 CTA/SM).
 - Next: (a) push 1024³/4096³ toward parity — multistage + dynamic-SMEM (untried across the whole backend);
   (b) fused dequant headline (now lands — GEMM near parity); (c) fp8 characterization; (d) split-K/Stream-K decode.
 
+### L7 HEADLINE — fused GEMM+dequant BEATS the cuBLAS GEMM+dequant chain. `quant_int8_fused_dequant_vs_chain` ×3.
+cuBLAS int8 emits raw i32 → needs a 2nd kernel re-reading M×N i32 from HBM + writing M×N f32; Mercury folds
+`out=f32(Σu8·i8)·scale[j]` into the GEMM store for ~0 cost. Now that the GEMM is near parity, the fusion wins:
+| size  | Mercury fused vs cuBLAS chain (run1/2/3) | dequant tax cuBLAS pays | fused vs cuBLAS GEMM-only |
+|-------|------------------------------------------|-------------------------|---------------------------|
+| 1024³ | 1.17× / 1.09× / 1.18×                     | +28–35%                 | ~90% |
+| 2048³ | **1.71× / 2.01× / 2.22×**                 | +80–118%                | **~95%** |
+| 4096³ | 1.51× / 1.46× / 1.53×                     | +53–59%                 | ~95% |
+Mercury's fused kernel (GEMM **+** dequant) runs at ~90–95% of cuBLAS's GEMM-*alone* throughput — the dequant
+is genuinely free. **Decisive end-to-end win, the lever a closed library can't use.** COMMIT 3. Peer =
+`time_cublas_int8_gemm_dequant_chain` (fair no-rem 2-D dequant kernel). Dequant dispatch upgraded to w64_deq.
+
 ## Research findings (parallel agents, verified)
 **Ada int8 binding constraint (RTX 4050, sm_89):** at 1024³–4096³ a well-tiled int8 GEMM is
 **on-chip-datapath / tensor-core-issue bound, NOT HBM-bound** (int8 roofline knee ~374 OP/byte; square

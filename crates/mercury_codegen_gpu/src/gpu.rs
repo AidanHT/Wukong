@@ -3686,7 +3686,10 @@ pub fn gemm_nt_int8_smdb_dequant(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, DriverError> {
-    use crate::ptx_int8::{INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N};
+    use crate::ptx_int8::{
+        INT8_BK, INT8_BM, INT8_BN, INT8_WARPS_M, INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN,
+        INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+    };
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert_eq!(scale.len(), n, "per-channel scale must be length N");
@@ -3694,16 +3697,39 @@ pub fn gemm_nt_int8_smdb_dequant(
         m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
         "int8 smdb-dequant GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
-    // Same ldmatrix+swizzle win as the plain int8 GEMM, carried to the fused-dequant epilogue: prefer
-    // the conflict-free `_swz_deq` kernel when K%64==0, fall back to the hand-placed BK=32 deq otherwise.
-    // Both fold the identical `f32(acc)·scale[j]` store, so the result is unchanged — purely throughput.
-    let (ptx, entry) = if k % 64 == 0 {
-        (crate::ptx_int8::int8_gemm_smdb_swz_deq_ptx(), "int8_gemm_nt_smdb_swz_deq")
+    // Mirror the plain-GEMM dispatch (`gemm_nt_int8_smdb`), carrying the fused `f32(acc)·scale[j]` store
+    // onto each tile: the **w64** tile (64×64 warp tile) for large M,N, the 64×64 swz tile below, the
+    // hand-placed BK=32 deq when K isn't a 64-multiple. All fold the identical dequant ⇒ result unchanged,
+    // purely throughput — so the fused inference output stage rides the fastest int8 base it can.
+    let swz = k % 64 == 0;
+    let use_w64 = swz && m >= 2048 && n >= 2048 && m % INT8_W64_BM == 0 && n % INT8_W64_BN == 0;
+    let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64 {
+        (
+            crate::ptx_int8::int8_gemm_w64_swz_deq_ptx(),
+            "int8_gemm_nt_w64_swz_deq",
+            INT8_W64_BM,
+            INT8_W64_BN,
+            INT8_W64_WARPS_M * INT8_W64_WARPS_N,
+        )
+    } else if swz {
+        (
+            crate::ptx_int8::int8_gemm_smdb_swz_deq_ptx(),
+            "int8_gemm_nt_smdb_swz_deq",
+            INT8_BM,
+            INT8_BN,
+            INT8_WARPS_M * INT8_WARPS_N,
+        )
     } else {
-        (crate::ptx_int8::int8_gemm_smdb_deq_ptx(), "int8_gemm_nt_smdb_deq")
+        (
+            crate::ptx_int8::int8_gemm_smdb_deq_ptx(),
+            "int8_gemm_nt_smdb_deq",
+            INT8_BM,
+            INT8_BN,
+            INT8_WARPS_M * INT8_WARPS_N,
+        )
     };
     let f = g.function(entry, ptx, entry)?;
-    let cfg = int8_smdb_cfg(m, n, INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N);
+    let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
     let a_d = g.stream.memcpy_stod(a)?;
     let b_d = g.stream.memcpy_stod(b)?;
     let scale_d = g.stream.memcpy_stod(scale)?;
@@ -12433,6 +12459,251 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
                 if let Some((label, pct)) = best {
                     eprintln!("  → best @{sz}³: {label} at {pct:.1}% of cuBLAS");
+                }
+            }
+        });
+    }
+
+    /// **w64 fused-dequant tolerance gate (first law).** The w64 (64×64-warp-tile) fused-dequant kernel
+    /// folds `out = f32(Σ u8·i8)·scale[j]` into the C store on the fast base. The i32 GEMM is bit-exact; the
+    /// per-column f32 dequant rounds once (i32→f32 cvt + f32 mul), so the result matches an f64 reference
+    /// within a tight tolerance. Several 128-tiling shapes. Skips without a GPU.
+    #[test]
+    fn quant_int8_w64_dequant_matches_reference() {
+        use crate::ptx_int8::{
+            int8_gemm_w64_swz_deq_ptx, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        };
+        with_gpu("quant_int8_w64_deq", |g| {
+            let warps = INT8_W64_WARPS_M * INT8_W64_WARPS_N;
+            let mut rng = crate::diff::Rng::new(0x4DEA);
+            let f = g
+                .function("int8_gemm_nt_w64_swz_deq", int8_gemm_w64_swz_deq_ptx(), "int8_gemm_nt_w64_swz_deq")
+                .unwrap();
+            for (m, k, n) in [(128usize, 64usize, 128usize), (256, 128, 256), (128, 256, 384)] {
+                let a: Vec<u8> = (0..m * k).map(|_| (rng.f32_range(0.0, 256.0) as u32 & 0xff) as u8).collect();
+                let b: Vec<i8> = (0..n * k).map(|_| ((rng.f32_range(0.0, 256.0) as i32) - 128) as i8).collect();
+                let scale: Vec<f32> = (0..n).map(|_| rng.f32_range(1e-3, 5e-2)).collect();
+                let acc = ref_nt_int8(&a, &b, m, k, n);
+                let want: Vec<f32> = (0..m * n).map(|t| acc[t] as f32 * scale[t % n]).collect();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let scale_d = g.stream.memcpy_stod(&scale).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                let cfg = int8_smdb_cfg(m, n, INT8_W64_BM, INT8_W64_BN, warps);
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(&mut c_d).arg(&scale_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&c_d).unwrap();
+                let st = crate::diff::assert_close(&format!("w64_dequant {m}x{k}x{n}"), &got, &want, 1e-3, 1e-6);
+                eprintln!("int8 w64_dequant {m}x{k}x{n}: ✓ max_abs={:.2e}", st.max_abs);
+            }
+        });
+    }
+
+    /// **int8 fused GEMM+dequant vs the cuBLAS GEMM+dequant chain — the cuBLAS-can't-fuse headline
+    /// (perf/gpu-quant-2).** A quantized-inference output stage is `out = f32(Σ u8·i8)·scale[j]`. cuBLAS
+    /// int8 emits raw `i32`, so it needs a **second** kernel that re-reads the whole M×N i32 from HBM and
+    /// writes M×N f32 — Mercury folds that dequant into the GEMM store for ~0 cost (`int8_gemm_nt_*_deq`).
+    /// Now that the int8 GEMM is near cuBLAS parity (w64), the fusion makes Mercury's single kernel **beat
+    /// the cuBLAS GEMM+dequant chain outright** — the lever a closed library can't use. Times Mercury's
+    /// dispatched fused kernel vs the cuBLAS (GEMM + dequant) chain and cuBLAS GEMM-only, same-run
+    /// interleaved, at 1024³/2048³/4096³. Needs the redist DLLs on PATH. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture quant_int8_fused_dequant_vs_chain`
+    #[test]
+    #[ignore = "throughput bench; needs CUDA redist DLLs on PATH; run explicitly"]
+    fn quant_int8_fused_dequant_vs_chain() {
+        use crate::baselines::{
+            gemm_flop, peer_env_hint, peers_available, time_cublas_gemm_nt_int8,
+            time_cublas_int8_gemm_dequant_chain,
+        };
+        use crate::ptx_int8::{
+            int8_gemm_smdb_swz_deq_ptx, int8_gemm_w64_swz_deq_ptx, INT8_BM, INT8_BN, INT8_WARPS_M,
+            INT8_WARPS_N, INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N,
+        };
+        with_gpu("quant_int8_fused_dequant_vs_chain", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] quant_int8_fused_dequant_vs_chain: cuBLAS not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            for _ in 0..40 {
+                let _ = time_cublas_gemm_nt_int8(g, 2048, 2048, 2048, 20);
+            }
+            const ROUNDS: usize = 6;
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = gemm_flop(m, n, k);
+                let (mm, nn, kk) = (m as u32, n as u32, k as u32);
+                // Mercury's dispatched fused-dequant kernel for this size (mirrors gemm_nt_int8_smdb_dequant).
+                let use_w64 = m >= 2048 && n >= 2048;
+                let (ptx, entry, bm, bn, warps) = if use_w64 {
+                    (int8_gemm_w64_swz_deq_ptx(), "int8_gemm_nt_w64_swz_deq", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M * INT8_W64_WARPS_N)
+                } else {
+                    (int8_gemm_smdb_swz_deq_ptx(), "int8_gemm_nt_smdb_swz_deq", INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N)
+                };
+                let f = g.function(entry, ptx, entry).unwrap();
+                let cfg = int8_smdb_cfg(m, n, bm, bn, warps);
+                let a_d = g.stream.memcpy_stod(&vec![1u8; m * k]).unwrap();
+                let b_d = g.stream.memcpy_stod(&vec![1i8; n * k]).unwrap();
+                let scale_d = g.stream.memcpy_stod(&vec![1.0f32 / 127.0; n]).unwrap();
+                let mut cf_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let (mut s_fused, mut s_chain, mut s_gemm) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                for _ in 0..ROUNDS {
+                    // Mercury single fused kernel (GEMM+dequant), resident, best-of this round.
+                    let s_f = {
+                        let launch = |c: &mut cudarc::driver::CudaSlice<f32>| {
+                            let mut bld = g.stream.launch_builder(&f);
+                            bld.arg(&mm).arg(&nn).arg(&kk).arg(&a_d).arg(&b_d).arg(c).arg(&scale_d);
+                            unsafe { bld.launch(cfg).unwrap() };
+                        };
+                        launch(&mut cf_d);
+                        g.stream.synchronize().unwrap();
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            launch(&mut cf_d);
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    };
+                    s_fused = s_fused.min(s_f);
+                    s_chain = s_chain.min(time_cublas_int8_gemm_dequant_chain(g, m, k, n, 50).unwrap());
+                    s_gemm = s_gemm.min(time_cublas_gemm_nt_int8(g, m, k, n, 50).unwrap());
+                }
+                eprintln!(
+                    "\n{sz}³ int8 output stage = act-free Linear out (same-run):\n  \
+                     Mercury FUSED gemm+dequant : {:>8.0} GFLOP/s\n  \
+                     cuBLAS GEMM + dequant chain: {:>8.0} GFLOP/s\n  \
+                     cuBLAS GEMM only (no dequant): {:>8.0} GFLOP/s\n  \
+                     → Mercury fused BEATS the cuBLAS chain {:>5.2}× (the chain pays {:+.1}% over its own GEMM for the\n    \
+                       separate i32→f32 HBM round-trip; Mercury folds it into the GEMM store for ~0)",
+                    flop / s_fused / 1e9,
+                    flop / s_chain / 1e9,
+                    flop / s_gemm / 1e9,
+                    s_chain / s_fused,
+                    100.0 * (s_chain - s_gemm) / s_gemm,
+                );
+            }
+        });
+    }
+
+    /// **fp8 warp-tile cross-check gate (first law).** The int8 win was the 64×64 **warp** tile (4 warps);
+    /// fp8 shares the same `mma.sync.m16n8k32` 8-bit geometry, so a 128×128 CTA with wm=wn=2 (a 64×64 warp
+    /// tile) is the transferable lever. A change of warp tiling only repartitions which warp computes which
+    /// output element — the per-element f32 K-accumulation order (k=0,32,64,…) is unchanged — so the wm=2,wn=2
+    /// config must produce the **same** fp8 result as the shipped wm=2,wn=4 default. Checks checksum equality
+    /// at a small shape. Skips without a GPU.
+    #[test]
+    fn quant_fp8_warp_tile_matches() {
+        use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
+        with_gpu("quant_fp8_warp_tile", |g| {
+            let mut rng = crate::diff::Rng::new(0xF8E1);
+            let (m, k, n) = (256usize, 128usize, 256usize);
+            let a: Vec<u8> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
+            let b: Vec<u8> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
+            let a_d = g.stream.memcpy_stod(&a).unwrap();
+            let b_d = g.stream.memcpy_stod(&b).unwrap();
+            let dims = (m as u32, n as u32, k as u32);
+            // (key, bm,bn,bk,wm,wn,stages,raster): default 64×32 warp tile vs the 64×64 warp tile (the lever).
+            let cfgs = [("fp8w24", 128usize, 128usize, 64usize, 2usize, 4usize, 2usize, 16usize), ("fp8w22", 128, 128, 64, 2, 2, 2, 16)];
+            let mut ref_sum: Option<f64> = None;
+            for (key, bm, bn, bk, wm, wn, stg, ras) in cfgs {
+                let ptx = fp8_pipe_cfg_ptx(bm, bn, bk, wm, wn, stg, ras);
+                let f = g.function(key, &ptx, "fp8_gemm_pipe").unwrap();
+                let cfg = LaunchConfig { grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1), block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut c_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let sum: f64 = g.stream.memcpy_dtov(&c_d).unwrap().iter().map(|&x| x as f64).sum();
+                match ref_sum {
+                    None => ref_sum = Some(sum),
+                    Some(r) => assert!((sum - r).abs() <= 1e-4 * r.abs().max(1.0), "fp8 {key} checksum {sum} != default {r}"),
+                }
+            }
+            eprintln!("fp8 warp-tile w2×2 (64×64) == w2×4 default: checksum match ✓");
+        });
+    }
+
+    /// **fp8 warp-tile %-of-cuBLASLt sweep — the transferable int8 lever (perf/gpu-quant-2).** The shipped
+    /// fp8 pipe runs a 128×128 CTA with wm=2,wn=4 (a 64×32 warp tile); the int8 sweep found the **64×64**
+    /// warp tile (wm=wn=2, 4 warps) wins by doubling per-warp reuse. fp8 is the same `mma.sync.m16n8k32`
+    /// 8-bit geometry, so this sweeps the warp tiling (64×32 default, **64×64**, 32×64, +a 3-stage 64×64) vs
+    /// cuBLASLt fp8 E4M3, same-run, at 1024³/2048³/4096³. Cross-checks each config's checksum == the default
+    /// (same K-accumulation order) before timing. Needs the redist DLLs on PATH. Run:
+    /// `cargo test -p mercury_codegen_gpu --features gpu --release -- --ignored --nocapture quant_fp8_warp_tile_sweep`
+    #[test]
+    #[ignore = "throughput sweep; needs cublasLt64_12.dll on PATH; run explicitly"]
+    fn quant_fp8_warp_tile_sweep() {
+        use crate::baselines::{cublaslt_available, peer_env_hint, peers_available, time_cublaslt_gemm_nt_fp8_e4m3};
+        use crate::ptx_fp8::{f32_to_e4m3, fp8_pipe_cfg_ptx};
+        with_gpu("quant_fp8_warp_tile_sweep", |g| {
+            if !peers_available(g) || !cublaslt_available() {
+                eprintln!("[skip] quant_fp8_warp_tile_sweep: cuBLASLt not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            eprintln!("device: {}", g.device_name());
+            // (key, bm,bn,bk,wm,wn,stages,raster). All ≤48 KiB padded SMEM.
+            let configs: [(&'static str, usize, usize, usize, usize, usize, usize, usize); 4] = [
+                ("fp8_w24_64x32def", 128, 128, 64, 2, 4, 2, 16),
+                ("fp8_w22_64x64   ", 128, 128, 64, 2, 2, 2, 16),
+                ("fp8_w42_32x64   ", 128, 128, 64, 4, 2, 2, 16),
+                ("fp8_w22_64x64_s3", 128, 128, 32, 2, 2, 3, 16),
+            ];
+            let mut rng = crate::diff::Rng::new(0xF8E0);
+            let wa = rng.vec(2048 * 2048, -1.0, 1.0);
+            let wb = rng.vec(2048 * 2048, -1.0, 1.0);
+            for _ in 0..15 {
+                let _ = gemm_nt_fp8_pipe(g, &wa, &wb, 2048, 2048, 2048).unwrap();
+            }
+            const ROUNDS: usize = 6;
+            for sz in [1024usize, 2048, 4096] {
+                let (m, k, n) = (sz, sz, sz);
+                let flop = 2.0 * m as f64 * k as f64 * n as f64;
+                let dims = (m as u32, n as u32, k as u32);
+                let a: Vec<u8> = rng.vec(m * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
+                let b: Vec<u8> = rng.vec(n * k, -1.0, 1.0).iter().map(|&x| f32_to_e4m3(x)).collect();
+                let a_d = g.stream.memcpy_stod(&a).unwrap();
+                let b_d = g.stream.memcpy_stod(&b).unwrap();
+                let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                let s_lt = match time_cublaslt_gemm_nt_fp8_e4m3(g, &a_d, &b_d, &mut c_d, m, k, n, 50) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{sz}³ [skip] cuBLASLt fp8: {e}");
+                        continue;
+                    }
+                };
+                eprintln!("\n{sz}³ fp8 warp-tile sweep vs cuBLASLt {:>6.0} GFLOP/s (same-run):", flop / s_lt / 1e9);
+                let mut ref_sum: Option<f64> = None;
+                let mut best: Option<(&str, f64)> = None;
+                for (key, bm, bn, bk, wm, wn, stg, ras) in configs {
+                    if m % bm != 0 || n % bn != 0 || k % bk != 0 {
+                        eprintln!("  {key}: n/a");
+                        continue;
+                    }
+                    let ptx = fp8_pipe_cfg_ptx(bm, bn, bk, wm, wn, stg, ras);
+                    let f = g.function(key, &ptx, "fp8_gemm_pipe").unwrap();
+                    let cfg = LaunchConfig { grid_dim: (((m / bm) * (n / bn)) as u32, 1, 1), block_dim: ((wm * wn * 32) as u32, 1, 1), shared_mem_bytes: 0 };
+                    let sum: f64 = {
+                        let mut cc = g.stream.memcpy_stod(&vec![0f32; m * n]).unwrap();
+                        let mut bld = g.stream.launch_builder(&f);
+                        bld.arg(&dims.0).arg(&dims.1).arg(&dims.2).arg(&a_d).arg(&b_d).arg(&mut cc);
+                        unsafe { bld.launch(cfg).unwrap() };
+                        g.stream.memcpy_dtov(&cc).unwrap().iter().map(|&x| x as f64).sum()
+                    };
+                    match ref_sum {
+                        None => ref_sum = Some(sum),
+                        Some(r) => assert!((sum - r).abs() <= 1e-3 * r.abs().max(1.0), "{key} {sz}³ fp8 checksum {sum} vs default {r}"),
+                    }
+                    let s = best_of(ROUNDS, || time_wmma(g, &f, cfg, dims, &a_d, &b_d, &mut c_d, 50));
+                    let pct = 100.0 * s_lt / s;
+                    eprintln!("  {key}: {:>8.0} GFLOP/s | {:>5.1}% of cuBLASLt", flop / s / 1e9, pct);
+                    if best.map_or(true, |(_, p)| pct > p) {
+                        best = Some((key.trim(), pct));
+                    }
+                }
+                if let Some((key, pct)) = best {
+                    eprintln!("  → best @{sz}³: {key} at {pct:.1}% of cuBLASLt", );
                 }
             }
         });
