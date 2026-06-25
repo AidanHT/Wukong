@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 13
+// EXPECT-OUT: 35
+// EXPECT-OUT: 55
+module tests.run.avgpool
+
+// 2D average-pooling over a [C=2, H=4, W=4] row-major input, 2x2 window, stride 2x2, no padding →
+// [C=2, OH=2, OW=2]. The recognizer detects the idiomatic 5-deep nest (channel × out-y × out-x ×
+// window-dy × window-dx, seeding `s` with 0, folding the window by `+` in (dy,dx) order, then
+// dividing by the window count KH*KW=4) and dispatches it to the AVX2 `mercury_avgpool2d_f32`. The
+// sum order is fixed (the kernel folds (dy,dx) ascending then one divide), so the kernel is
+// bit-identical to this nest — the differential gate is trivial.
+//
+//   plane0 = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]
+//   out0   = [[avg(1,2,5,6), avg(3,4,7,8)], ...] = [[3.5,5.5],[11.5,13.5]]   (printed truncated to i32)
+//   out1   = 10·plane0 averages = [[35,55],[115,135]]
+fn main() -> i32 {
+    let x: [f32; 32] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0,
+    ];
+    let mut out: [f32; 8] = [0.0; 8];
+    for c in 0..2 {
+        for oy in 0..2 {
+            for ox in 0..2 {
+                let mut s = 0.0;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let v = x[c * 4 * 4 + (oy * 2 + dy) * 4 + (ox * 2 + dx)];
+                        s = s + v;
+                    }
+                }
+                out[c * 2 * 2 + oy * 2 + ox] = s / 4.0;
+            }
+        }
+    }
+    print(out[0] as i32); // avg(1,2,5,6)=3.5 -> 3
+    print(out[1] as i32); // avg(3,4,7,8)=5.5 -> 5
+    print(out[2] as i32); // avg(9,10,13,14)=11.5 -> 11
+    print(out[3] as i32); // avg(11,12,15,16)=13.5 -> 13
+    print(out[4] as i32); // avg(10,20,50,60)=35 -> 35
+    print(out[5] as i32); // avg(30,40,70,80)=55 -> 55
+    return 0;
+}

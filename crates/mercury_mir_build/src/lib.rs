@@ -136,6 +136,10 @@ pub fn lower_program(
         cummax_par: interner.intern("mercury_cummax_f32_parallel"),
         cummin: interner.intern("mercury_cummin_f32"),
         cummin_par: interner.intern("mercury_cummin_f32_parallel"),
+        maxpool2d: interner.intern("mercury_maxpool2d_f32"),
+        maxpool2d_par: interner.intern("mercury_maxpool2d_f32_parallel"),
+        avgpool2d: interner.intern("mercury_avgpool2d_f32"),
+        avgpool2d_par: interner.intern("mercury_avgpool2d_f32_parallel"),
     };
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -178,6 +182,16 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_transpose_f32_parallel`. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function 2D pooling nest: intercept before the elementwise outliner
+                // (which would split the channel loop into per-chunk scalar loops and lose the AVX2
+                // kernel). Lower it normally with `parallel = true`; the embedded `match_pool2d` in
+                // `lower_for` then emits the multicore `mercury_{max,avg}pool2d_f32_parallel` (channels
+                // across cores, bit-equal to serial — channels independent, no cross-channel combine).
+                if has_parallel_attr(item, interner) && pool2d_fn(body, sema, interner).is_some() {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
@@ -905,6 +919,17 @@ struct GemmSyms {
     cummax_par: Symbol,
     cummin: Symbol,
     cummin_par: Symbol,
+    /// 2D max/avg pooling (`mercury_{max,avg}pool2d_f32[_parallel](x, out, channels, h, w, kh, kw,
+    /// sh, sw)`): `out[c,oy,ox] = ⊕ over the kh×kw window of x[c, oy*sh+dy, ox*sw+dx]` over a
+    /// `[channels, h, w]` row-major input, no padding (`⊕` = max / sum÷(kh·kw)). The idiomatic 5-deep
+    /// CNN downsampling nest dispatches here; the AVX2 kernel folds 8 output columns at once (the
+    /// strided window gcc/rustc leave scalar). Channels independent → `_parallel` is bit-equal to
+    /// serial; max idempotent and the avg sum order is fixed, so both backends marshal the identical
+    /// kernel (no reassociation exception).
+    maxpool2d: Symbol,
+    maxpool2d_par: Symbol,
+    avgpool2d: Symbol,
+    avgpool2d_par: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -3618,6 +3643,44 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_{max,avg}pool2d_f32[_parallel](x, out, channels, h, w, kh, kw, sh, sw)` call
+    /// for a recognized 2D pooling nest. Bails (false) if an operand/dim is unbound (the caller then
+    /// lowers the scalar nest). `parallel` selects the multicore kernel (channels across cores →
+    /// bit-identical to the serial one, which the interpreter marshals; channels are independent, no
+    /// cross-channel combine). Max is idempotent and the avg sum order is fixed, so the kernel equals
+    /// the scalar nest bit-for-bit (no reassociation exception).
+    fn emit_pool2d(&mut self, nest: &Pool2dNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(channels), Some(h), Some(w)) = (
+            self.dim_value(nest.channels),
+            self.dim_value(nest.h),
+            self.dim_value(nest.w),
+        ) else {
+            return false;
+        };
+        let (Some(kh), Some(kw), Some(sh), Some(sw)) = (
+            self.dim_value(nest.kh),
+            self.dim_value(nest.kw),
+            self.dim_value(nest.sh),
+            self.dim_value(nest.sw),
+        ) else {
+            return false;
+        };
+        let func = match (nest.op, parallel) {
+            (POOL_MAX, false) => self.gemm.maxpool2d,
+            (POOL_MAX, true) => self.gemm.maxpool2d_par,
+            (_, false) => self.gemm.avgpool2d,
+            (_, true) => self.gemm.avgpool2d_par,
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, channels, h, w, kh, kw, sh, sw],
+        });
+        true
+    }
+
     /// Emit one `mercury_transpose_f32[_parallel](src, dst, rows, cols)` call for a recognized matrix
     /// transpose. Bails (false) if an operand/dim is unbound at the call site (the caller then lowers
     /// the scalar nest). `parallel` selects the multicore kernel (the row blocks write disjoint `dst`
@@ -5253,6 +5316,15 @@ impl FnLowerer<'_> {
         // bit-identical to the scalar nest; the block tiling is the win `-O3` won't do for a transpose.
         if let Some(nest) = match_transpose(pat, iter, body, self.sema, self.interner) {
             if self.emit_transpose(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // 2D max/avg pooling `for c { for oy { for ox { seed; for dy { for dx { fold window } }; store } } }`
+        // → the AVX2 `mercury_{max,avg}pool2d_f32` (the `_parallel` one in a `@parallel` function). The
+        // strided window gcc/rustc leave scalar; the kernel folds 8 output columns at once. Max is
+        // idempotent and the avg sum order is fixed → bit-identical to the scalar nest.
+        if let Some(nest) = match_pool2d(pat, iter, body, self.sema, self.interner) {
+            if self.emit_pool2d(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -12234,6 +12306,554 @@ fn transpose_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<
         return None;
     };
     match_transpose(pat, iter, lb, sema, interner)
+}
+
+// ============================ 2D pooling (max / avg) ============================
+//
+// Pool op tags: which fold the recognized pooling nest dispatches to (each maps to a distinct runtime
+// symbol pair). Internal to `mir_build`.
+const POOL_MAX: i64 = 0;
+const POOL_AVG: i64 = 1;
+
+/// A recognized 2D max/avg pooling nest over a `[channels, h, w]` row-major input (no padding), `kh×kw`
+/// window, stride `sh×sw`. `out` is `[channels, oh, ow]`. `op` is `POOL_MAX` / `POOL_AVG`.
+struct Pool2dNest {
+    x: Symbol,
+    out: Symbol,
+    channels: Dim,
+    h: Dim,
+    w: Dim,
+    kh: Dim,
+    kw: Dim,
+    sh: Dim,
+    sw: Dim,
+    op: i64,
+}
+
+/// `e == a * b` (left-associated `(a*b)`) where `single_path(a) == var`; returns `b` as a `Dim` (the
+/// stride factor). The shape `oy*2`, `ox*2`, `c*4`, etc. Used to peel an index term.
+fn mul_var_dim(e: &Expr, var: Symbol, interner: &Interner) -> Option<Dim> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    if single_path(lhs) == Some(var) {
+        return as_dim(rhs, interner);
+    }
+    if single_path(rhs) == Some(var) {
+        return as_dim(lhs, interner);
+    }
+    None
+}
+
+/// Recognize the idiomatic 2D pooling nest and dispatch it to `mercury_{max,avg}pool2d_f32`:
+///
+/// ```text
+/// for c in 0..C { for oy in 0..OH { for ox in 0..OW {
+///   // MAX: seed the window's first cell, fold the rest by fmax.
+///   var m = x[c*H*W + (oy*SH)*W + (ox*SW)];
+///   for dy in 0..KH { for dx in 0..KW {
+///     let v = x[c*H*W + (oy*SH+dy)*W + (ox*SW+dx)];
+///     m = fmax(m, v);
+///   } }
+///   out[c*OH*OW + oy*OW + ox] = m;
+///   // AVG: seed 0, fold by +, divide by KH*KW.
+/// } } }
+/// ```
+///
+/// The match is strict — every stride is pinned to the dims, the window data index must be exactly
+/// `c*(H*W) + (oy*SH + dy)*W + (ox*SW + dx)`, the output index `c*(OH*OW) + oy*OW + ox` with
+/// `OH=(H-KH)/SH+1`, `OW=(W-KW)/SW+1` (so it never misfires), and `x`/`out` are distinct f32 arrays.
+/// Max is idempotent/associative and the avg sum order is fixed (the kernel folds (dy,dx) ascending
+/// then one divide), so the kernel is bit-identical to this nest — the differential gate is trivial.
+/// The strided window gcc/rustc leave scalar; the AVX2 kernel folds 8 output columns at once.
+fn match_pool2d(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<Pool2dNest> {
+    // for c in 0..C { <single inner for> }
+    let cvar = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (cs, ce) = range_bounds(iter)?;
+    if as_int_lit(cs, interner)? != 0 {
+        return None;
+    }
+    let channels = as_dim(ce, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    // for oy in 0..OH { <single inner for> }
+    let (oypat, oyiter, oybody) = fusable_for(&body.stmts[0])?;
+    let oyvar = match &oypat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (oys, oye) = range_bounds(oyiter)?;
+    if as_int_lit(oys, interner)? != 0 {
+        return None;
+    }
+    let oh = as_dim(oye, interner)?;
+    if oybody.tail.is_some() || oybody.stmts.len() != 1 {
+        return None;
+    }
+    // for ox in 0..OW { <3 stmts: seed; window-fold for-nest; store> }
+    let (oxpat, oxiter, oxbody) = fusable_for(&oybody.stmts[0])?;
+    let oxvar = match &oxpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (oxs, oxe) = range_bounds(oxiter)?;
+    if as_int_lit(oxs, interner)? != 0 {
+        return None;
+    }
+    let ow = as_dim(oxe, interner)?;
+    if oxbody.tail.is_some() || oxbody.stmts.len() != 3 {
+        return None;
+    }
+    // [0] var acc = <seed>;  (an accumulator local; the seed/op classified below.)
+    let StmtKind::Let {
+        pat: ap,
+        init: Some(seed),
+        ..
+    } = &oxbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let acc = match &ap.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    // [1] for dy in 0..KH { for dx in 0..KW { let v = x[..]; acc = fold(acc, v); } }
+    let (dypat, dyiter, dybody) = fusable_for(&oxbody.stmts[1])?;
+    let dyvar = match &dypat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (dys, dye) = range_bounds(dyiter)?;
+    if as_int_lit(dys, interner)? != 0 {
+        return None;
+    }
+    let kh = as_dim(dye, interner)?;
+    if dybody.tail.is_some() || dybody.stmts.len() != 1 {
+        return None;
+    }
+    let (dxpat, dxiter, dxbody) = fusable_for(&dybody.stmts[0])?;
+    let dxvar = match &dxpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (dxs, dxe) = range_bounds(dxiter)?;
+    if as_int_lit(dxs, interner)? != 0 {
+        return None;
+    }
+    let kw = as_dim(dxe, interner)?;
+    // The window body is two statements: `let v = x[..];` then `acc = fold(acc, v);`.
+    if dxbody.tail.is_some() || dxbody.stmts.len() != 2 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: vp,
+        init: Some(vinit),
+        ..
+    } = &dxbody.stmts[0].kind
+    else {
+        return None;
+    };
+    let vvar = match &vp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    // The window data load `x[c*(H*W) + (oy*SH + dy)*W + (ox*SW + dx)]` — pin every stride to a dim.
+    let (xbase, w, sh, sw) = match_pool_window_index(vinit, cvar, oyvar, oxvar, dyvar, dxvar, interner)?;
+    if scalar_of(vinit, sema) != Some(mercury_types::Scalar::F32) {
+        return None;
+    }
+    // The channel stride is `H*W`; we know `W = w` (the row stride), so `H = channel_stride / W`. But to
+    // keep dims symbolic we instead re-derive `H` from the channel base term and require it consistent.
+    let h = match_pool_channel_h(vinit, cvar, w, interner)?;
+    // [1.2] acc = fold(acc, v): `fmax(acc, v)` (MAX) or `acc = acc + v` / `acc += v` (AVG sum).
+    let op = classify_pool_fold(&dxbody.stmts[1], acc, vvar, sema, interner)?;
+    // The seed must match the fold: MAX seeds the window's first cell `x[c*(H*W) + (oy*SH)*W + ox*SW]`
+    // (dy=dx=0), AVG seeds the float literal `0.0`.
+    match op {
+        POOL_MAX => {
+            let (sbase, sw_w, ssh, ssw) =
+                match_pool_seed_index(seed, cvar, oyvar, oxvar, interner)?;
+            if sbase != xbase || sw_w != w || ssh != sh || ssw != sw {
+                return None;
+            }
+            // The seed's channel stride must also be H*W with the same H.
+            if match_pool_channel_h(seed, cvar, w, interner)? != h {
+                return None;
+            }
+        }
+        _ => {
+            if !is_float_zero(seed, interner) {
+                return None;
+            }
+        }
+    }
+    // [2] out[c*(OH*OW) + oy*OW + ox] = <finalize>(acc): `acc` (MAX) or `acc / (KH*KW)` (AVG).
+    let StmtKind::Assign {
+        target: ot,
+        op: ast::AssignOp::Assign,
+        value: ov,
+    } = &oxbody.stmts[2].kind
+    else {
+        return None;
+    };
+    // The store value: MAX writes `acc`; AVG writes `acc / count` where count == KH*KW.
+    match op {
+        POOL_MAX => {
+            if single_path(ov) != Some(acc) {
+                return None;
+            }
+        }
+        _ => {
+            if !pool_avg_divide_matches(ov, acc, kh, kw, interner) {
+                return None;
+            }
+        }
+    }
+    // The output index `c*(OH*OW) + oy*OW + ox` — channel-major over the output plane, row stride OW.
+    // `match_row_col_off` pins the `oy*OW` term + bare `ox`, leaving the channel base as the offset.
+    let (obase, oidx) = as_index1(ot)?;
+    let (out_ow, oy_off) = match_row_col_off(oidx, oyvar, oxvar, interner)?;
+    if out_ow != ow || oy_off.len() != 1 {
+        return None;
+    }
+    // The leftover offset term is the channel base `c*(OH*OW)` (= `(c*OH)*OW`): verify OH == oh.
+    if match_pool_channel_h(oy_off[0], cvar, ow, interner) != Some(oh) {
+        return None;
+    }
+    if scalar_of(ot, sema) != Some(mercury_types::Scalar::F32) || obase == xbase {
+        return None;
+    }
+    Some(Pool2dNest {
+        x: xbase,
+        out: obase,
+        channels,
+        h,
+        w,
+        kh,
+        kw,
+        sh,
+        sw,
+        op,
+    })
+}
+
+/// Match the pooling window data index `x[c*(H*W) + (oy*SH + dy)*W + (ox*SW + dx)]`, returning
+/// `(x, W, SH, SW)` (the row stride and the two strides). The channel term `c*(H*W)` is left for
+/// [`match_pool_channel_h`] (it derives `H`). Flattens the additive terms and classifies each by which
+/// loop var it carries, so it never misfires on a non-pooling index.
+fn match_pool_window_index(
+    e: &Expr,
+    cvar: Symbol,
+    oyvar: Symbol,
+    oxvar: Symbol,
+    dyvar: Symbol,
+    dxvar: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Dim, Dim)> {
+    let (xbase, idx) = as_index1(e)?;
+    let mut terms = Vec::new();
+    flatten_add_terms(idx, &mut terms);
+    // The bare `dx` term (offset within the window's x).
+    let dx_pos = terms.iter().position(|t| single_path(t) == Some(dxvar))?;
+    terms.remove(dx_pos);
+    // The `ox * SW` term (the window's left input column).
+    let ox_pos = terms
+        .iter()
+        .position(|t| mul_var_dim(t, oxvar, interner).is_some())?;
+    let sw = mul_var_dim(terms[ox_pos], oxvar, interner)?;
+    terms.remove(ox_pos);
+    // The `(oy*SH + dy) * W` term (the window's top input row, scaled by the row width W). It is a
+    // product of an `Add(oy*SH, dy)` and `W`; identify the row factor by it containing `oy`.
+    let row_pos = terms.iter().position(|t| {
+        matches!(&t.kind, ExprKind::Binary { op: ast::BinOp::Mul, .. })
+            && pool_row_factor(t, oyvar, dyvar, interner).is_some()
+    })?;
+    let (sh, w) = pool_row_factor(terms[row_pos], oyvar, dyvar, interner)?;
+    terms.remove(row_pos);
+    // The remaining term is the channel base `c*(H*W)` — verify it carries `c` (H derived elsewhere).
+    if terms.len() != 1 || !pool_term_has_var(terms[0], cvar) {
+        return None;
+    }
+    Some((xbase, w, sh, sw))
+}
+
+/// For a `(oy*SH + dy) * W` term (either `*` operand order, either `+` operand order), return
+/// `(SH, W)`. The row factor is the `Add` side that contains both `oy` and `dy`; `W` is the other.
+fn pool_row_factor(e: &Expr, oyvar: Symbol, dyvar: Symbol, interner: &Interner) -> Option<(Dim, Dim)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    for (inner, wfac) in [(lhs, rhs), (rhs, lhs)] {
+        // `inner == oy*SH + dy` (either addend order).
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs: a,
+            rhs: b,
+        } = &inner.kind
+        else {
+            continue;
+        };
+        let sh = if single_path(b) == Some(dyvar) {
+            mul_var_dim(a, oyvar, interner)
+        } else if single_path(a) == Some(dyvar) {
+            mul_var_dim(b, oyvar, interner)
+        } else {
+            None
+        };
+        if let (Some(sh), Some(w)) = (sh, as_dim(wfac, interner)) {
+            return Some((sh, w));
+        }
+    }
+    None
+}
+
+/// Match the MAX-pool seed index `x[c*(H*W) + (oy*SH)*W + (ox*SW)]` (the window's first cell, dy=dx=0):
+/// returns `(x, W, SH, SW)`. Same flatten-and-classify approach as the window index, but with no `dy`/
+/// `dx` terms (the row term is `(oy*SH)*W` = `((oy*SH))*W`).
+fn match_pool_seed_index(
+    e: &Expr,
+    cvar: Symbol,
+    oyvar: Symbol,
+    oxvar: Symbol,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Dim, Dim)> {
+    let (xbase, idx) = as_index1(e)?;
+    let mut terms = Vec::new();
+    flatten_add_terms(idx, &mut terms);
+    // `ox * SW` (the window's left column; dx=0).
+    let ox_pos = terms
+        .iter()
+        .position(|t| mul_var_dim(t, oxvar, interner).is_some())?;
+    let sw = mul_var_dim(terms[ox_pos], oxvar, interner)?;
+    terms.remove(ox_pos);
+    // `(oy*SH) * W` — a product whose one factor is `oy*SH` (contains oy) and the other is W.
+    let row_pos = terms.iter().position(|t| {
+        matches!(&t.kind, ExprKind::Binary { op: ast::BinOp::Mul, .. })
+            && pool_seed_row_factor(t, oyvar, interner).is_some()
+    })?;
+    let (sh, w) = pool_seed_row_factor(terms[row_pos], oyvar, interner)?;
+    terms.remove(row_pos);
+    // The channel base `c*(H*W)`.
+    if terms.len() != 1 || !pool_term_has_var(terms[0], cvar) {
+        return None;
+    }
+    Some((xbase, w, sh, sw))
+}
+
+/// For a `(oy*SH) * W` term, return `(SH, W)`: the factor containing `oy` (itself `oy*SH`) yields SH,
+/// the other is W. Handles both `*` operand orders.
+fn pool_seed_row_factor(e: &Expr, oyvar: Symbol, interner: &Interner) -> Option<(Dim, Dim)> {
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+    for (inner, wfac) in [(lhs, rhs), (rhs, lhs)] {
+        if let (Some(sh), Some(w)) = (mul_var_dim(inner, oyvar, interner), as_dim(wfac, interner)) {
+            return Some((sh, w));
+        }
+    }
+    None
+}
+
+/// Given a flat index expression that contains a channel base term `c*(stride*last)` (= `(c*stride)*last`
+/// — i.e. `H*W` for an input index or `OH*OW` for an output index), where `last` is the already-known
+/// trailing stride (`W` or `OW`), derive and return the leading dim (`H` or `OH`). Flattens the additive
+/// terms, finds the unique term carrying `c`, and matches `(c * lead) * last`.
+fn match_pool_channel_h(e: &Expr, cvar: Symbol, last: Dim, interner: &Interner) -> Option<Dim> {
+    let idx = match &e.kind {
+        ExprKind::Index { indices, .. } if indices.len() == 1 => &indices[0],
+        _ => e,
+    };
+    let mut terms = Vec::new();
+    flatten_add_terms(idx, &mut terms);
+    let cterm = terms.into_iter().find(|t| pool_term_has_var(t, cvar))?;
+    // `cterm == (c * lead) * last` (left-associated). The outer `* last` peels first.
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &cterm.kind
+    else {
+        return None;
+    };
+    // Outer factor `last`; inner is `c * lead`.
+    for (inner, lastfac) in [(lhs, rhs), (rhs, lhs)] {
+        if as_dim(lastfac, interner) == Some(last) {
+            if let Some(lead) = mul_var_dim(inner, cvar, interner) {
+                return Some(lead);
+            }
+        }
+    }
+    None
+}
+
+/// Does `e`'s expression subtree mention the variable `v` as a bare path anywhere? A conservative scan
+/// (used only to confirm the channel base term is the one carrying `c`).
+fn pool_term_has_var(e: &Expr, v: Symbol) -> bool {
+    if single_path(e) == Some(v) {
+        return true;
+    }
+    match &e.kind {
+        ExprKind::Binary { lhs, rhs, .. } => pool_term_has_var(lhs, v) || pool_term_has_var(rhs, v),
+        ExprKind::Unary { expr, .. } => pool_term_has_var(expr, v),
+        _ => false,
+    }
+}
+
+/// Classify the pooling fold statement `acc = fold(acc, v)`: `acc = fmax(acc, v)` (either operand order)
+/// → POOL_MAX; `acc = acc + v` / `acc += v` → POOL_AVG (the running window sum). `acc`/`v` are f32.
+fn classify_pool_fold(
+    stmt: &Stmt,
+    acc: Symbol,
+    vvar: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<i64> {
+    let StmtKind::Assign { target, op, value } = &stmt.kind else {
+        return None;
+    };
+    if single_path(target) != Some(acc) {
+        return None;
+    }
+    // `acc = fmax(acc, v)` — the MAX fold.
+    if let ast::AssignOp::Assign = op {
+        if let ExprKind::Call { callee, args, .. } = &value.kind {
+            if args.len() == 2
+                && matches!(intrinsic_callee(callee, sema, interner), Some(MathIntrinsic::Fmax))
+            {
+                let (a0, a1) = (single_path(&args[0]), single_path(&args[1]));
+                if (a0 == Some(acc) && a1 == Some(vvar)) || (a1 == Some(acc) && a0 == Some(vvar)) {
+                    return Some(POOL_MAX);
+                }
+            }
+            return None;
+        }
+    }
+    // `acc = acc + v` or `acc += v` — the AVG sum (accumulator on the left, matching the kernel fold).
+    let addend = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(acc) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if single_path(addend) == Some(vvar) {
+        Some(POOL_AVG)
+    } else {
+        None
+    }
+}
+
+/// Does the avg-pool store value `acc / (KH*KW)` divide the accumulator by the window count? Accepts
+/// `acc / d` where `d` equals the product `KH*KW` (matched against the loop bounds, either factor
+/// order; literal product or `(KH as f32)*(KW as f32)` etc.) — pins the divisor to the true window
+/// size so it never misfires.
+fn pool_avg_divide_matches(ov: &Expr, acc: Symbol, kh: Dim, kw: Dim, interner: &Interner) -> bool {
+    let ExprKind::Binary {
+        op: ast::BinOp::Div,
+        lhs,
+        rhs,
+    } = &ov.kind
+    else {
+        return false;
+    };
+    if single_path(lhs) != Some(acc) {
+        return false;
+    }
+    pool_count_matches(rhs, kh, kw, interner)
+}
+
+/// Is `d` the window count `KH*KW`? Accepts the float literal equal to `KH*KW` (when both are literal
+/// dims), or `a * b` with `{a,b}` == `{KH, KW}` as dims (each a literal or a `(K as f32)` cast).
+fn pool_count_matches(d: &Expr, kh: Dim, kw: Dim, interner: &Interner) -> bool {
+    // A bare float/int literal equal to KH*KW (only when both dims are literals).
+    if let (Dim::Lit(a), Dim::Lit(b)) = (kh, kw) {
+        let prod = (a * b) as f64;
+        if let ExprKind::Float(f) = &d.kind {
+            return parse_float(interner.resolve(*f)) == prod;
+        }
+        if let ExprKind::Int(i) = &d.kind {
+            return parse_int(interner.resolve(*i)) as f64 == prod;
+        }
+    }
+    // A product `KH * KW` (each factor a dim, possibly `as f32`-cast).
+    if let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &d.kind
+    {
+        let ld = pool_factor_dim(lhs, interner);
+        let rd = pool_factor_dim(rhs, interner);
+        if let (Some(ld), Some(rd)) = (ld, rd) {
+            return (ld == kh && rd == kw) || (ld == kw && rd == kh);
+        }
+    }
+    false
+}
+
+/// A window-count factor as a `Dim`: a bare literal/path, or a `(expr as <ty>)` cast around one.
+fn pool_factor_dim(e: &Expr, interner: &Interner) -> Option<Dim> {
+    if let ExprKind::Cast { expr, .. } = &e.kind {
+        return as_dim(expr, interner);
+    }
+    as_dim(e, interner)
+}
+
+/// Is the whole function body a single pooling nest? Intercepts a `@parallel` pooling function *before*
+/// the elementwise outliner (which would split the channel loop into per-chunk scalar loops and lose
+/// the AVX2 kernel). Detection only — the function is then lowered normally (`lower_fn`, `parallel =
+/// true`) and the embedded `match_pool2d` in `lower_for` emits the multicore kernel. Mirrors the
+/// sgemm/transpose/colsum whole-function interceptions.
+fn pool2d_fn(body: &Block, sema: &SemaResult, interner: &Interner) -> Option<Pool2dNest> {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    match_pool2d(pat, iter, lb, sema, interner)
 }
 
 /// A recognized column reduction `out[j] = Σ_i x[i, j]` (`x` is `[rows, cols]`, `out` is `[cols]`).

@@ -133,6 +133,10 @@ const RT_CUMMAX: &str = "mercury_cummax_f32";
 const RT_CUMMAX_PAR: &str = "mercury_cummax_f32_parallel";
 const RT_CUMMIN: &str = "mercury_cummin_f32";
 const RT_CUMMIN_PAR: &str = "mercury_cummin_f32_parallel";
+const RT_MAXPOOL2D: &str = "mercury_maxpool2d_f32";
+const RT_MAXPOOL2D_PAR: &str = "mercury_maxpool2d_f32_parallel";
+const RT_AVGPOOL2D: &str = "mercury_avgpool2d_f32";
+const RT_AVGPOOL2D_PAR: &str = "mercury_avgpool2d_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
@@ -970,6 +974,23 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[src, dst, rows, cols]);
             return None;
         }
+        // 2D pooling: mercury_{max,avg}pool2d_f32[_parallel](x, out, channels, h, w, kh, kw, sh, sw) —
+        // two pointers and seven i64. Route by name to the declared import.
+        if matches!(
+            name,
+            RT_MAXPOOL2D | RT_MAXPOOL2D_PAR | RT_AVGPOOL2D | RT_AVGPOOL2D_PAR
+        ) && args.len() == 9
+        {
+            let x = self.val(args[0]);
+            let out = self.val(args[1]);
+            let mut call_args = vec![x, out];
+            for a in &args[2..] {
+                call_args.push(self.coerce_to_i64(*a));
+            }
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &call_args);
+            return None;
+        }
         // The SIMD column reductions: mercury_col{sum,max,min,maxabs,mean,sumsq,l2,rms}_f32[_parallel]
         // (x, out, rows, cols) — two pointers and two i64. Same (ptr, ptr, i64, i64) signature; by name.
         if matches!(
@@ -1402,6 +1423,10 @@ struct RtFuncs {
     cummax_par: FuncId,
     cummin: FuncId,
     cummin_par: FuncId,
+    maxpool2d: FuncId,
+    maxpool2d_par: FuncId,
+    avgpool2d: FuncId,
+    avgpool2d_par: FuncId,
     kd_loss: FuncId,
     kd_loss_par: FuncId,
     vmath_bf16: FuncId,
@@ -1589,6 +1614,14 @@ fn populate_module<M: Module>(
     }
     for _ in 0..4 {
         sig_norm_affine.params.push(AbiParam::new(types::I64));
+    }
+    // mercury_{max,avg}pool2d_f32[_parallel](x, out: ptr, channels, h, w, kh, kw, sh, sw: i64) — 2D
+    // pooling (2 ptr + 7 i64, void).
+    let mut sig_pool2d = Signature::new(call_conv);
+    sig_pool2d.params.push(AbiParam::new(ptr_ty));
+    sig_pool2d.params.push(AbiParam::new(ptr_ty));
+    for _ in 0..7 {
+        sig_pool2d.params.push(AbiParam::new(types::I64));
     }
     // mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx: ptr, rows, cols, eps_bits: i64) — fused
     // batched RMSNorm input-gradient (4 ptr + 3 i64, void).
@@ -1847,6 +1880,18 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         cummin_par: module
             .declare_function(RT_CUMMIN_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        maxpool2d: module
+            .declare_function(RT_MAXPOOL2D, Linkage::Import, &sig_pool2d)
+            .map_err(|e| e.to_string())?,
+        maxpool2d_par: module
+            .declare_function(RT_MAXPOOL2D_PAR, Linkage::Import, &sig_pool2d)
+            .map_err(|e| e.to_string())?,
+        avgpool2d: module
+            .declare_function(RT_AVGPOOL2D, Linkage::Import, &sig_pool2d)
+            .map_err(|e| e.to_string())?,
+        avgpool2d_par: module
+            .declare_function(RT_AVGPOOL2D_PAR, Linkage::Import, &sig_pool2d)
             .map_err(|e| e.to_string())?,
         // bf16/f16-input twins: identical (ptr, ptr, i64, i64) signature.
         vmath_bf16: module
@@ -2256,6 +2301,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_CUMMIN_PAR,
                 module.declare_func_in_func(rt.cummin_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_MAXPOOL2D,
+                module.declare_func_in_func(rt.maxpool2d, builder.func),
+            );
+            rt_refs.insert(
+                RT_MAXPOOL2D_PAR,
+                module.declare_func_in_func(rt.maxpool2d_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_AVGPOOL2D,
+                module.declare_func_in_func(rt.avgpool2d, builder.func),
+            );
+            rt_refs.insert(
+                RT_AVGPOOL2D_PAR,
+                module.declare_func_in_func(rt.avgpool2d_par, builder.func),
             );
             rt_refs.insert(
                 RT_VMATH_BF16,
@@ -2749,6 +2810,22 @@ pub fn jit_compile(
         mercury_runtime::mercury_cummin_f32_parallel as *const u8,
     );
     builder.symbol(
+        RT_MAXPOOL2D,
+        mercury_runtime::mercury_maxpool2d_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_MAXPOOL2D_PAR,
+        mercury_runtime::mercury_maxpool2d_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_AVGPOOL2D,
+        mercury_runtime::mercury_avgpool2d_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_AVGPOOL2D_PAR,
+        mercury_runtime::mercury_avgpool2d_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_VMATH_BF16,
         mercury_runtime::mercury_vmath_bf16 as *const u8,
     );
@@ -3160,6 +3237,22 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_CUMMIN_PAR,
         mercury_runtime::mercury_cummin_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_MAXPOOL2D,
+        mercury_runtime::mercury_maxpool2d_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_MAXPOOL2D_PAR,
+        mercury_runtime::mercury_maxpool2d_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_AVGPOOL2D,
+        mercury_runtime::mercury_avgpool2d_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_AVGPOOL2D_PAR,
+        mercury_runtime::mercury_avgpool2d_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_VMATH_BF16,
