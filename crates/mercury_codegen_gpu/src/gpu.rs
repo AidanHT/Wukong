@@ -6931,6 +6931,140 @@ mod tests {
         });
     }
 
+    /// **The true conv gap (M6, Tier B):** Mercury's fp16 tensor-core implicit-GEMM conv2d vs **cuDNN**
+    /// — the industry-standard convolution library (implicit-precomp-GEMM / Winograd / FFT engines with
+    /// per-shape autotuning) — and vs **naive CUDA-C** (Tier A), all JIT-loaded through the same driver
+    /// and timed **same-run** over identical buffers. cuDNN runs its fp16 **NHWC** tensor-core fast path
+    /// (`CUDNN_TENSOR_OP_MATH`); the engine its v7 heuristic chose is **disclosed** per shape so the % is
+    /// honest about which cuDNN algorithm we're racing. Correctness gates speed: naive, Mercury, and
+    /// cuDNN are each cross-checked against the f64 oracle (fp16 tolerance) and checksum-cross-checked
+    /// before any ratio counts. Reports Mercury as **× vs naive** and **% of cuDNN**.
+    #[test]
+    #[ignore = "throughput bench; needs CUDA + cuDNN redist DLLs on PATH; run explicitly"]
+    fn conv_vs_cudnn() {
+        use crate::baselines::{
+            conv_flop, cudnn_available, cudnn_conv2d_run, cudnn_fwd_algo_name, nvrtc_naive_conv,
+            peer_env_hint, peers_available, time_cudnn_conv2d, time_nvrtc_naive_conv,
+        };
+        use half::f16;
+        with_gpu("conv_vs_cudnn", |g| {
+            if !peers_available(g) {
+                eprintln!("[skip] conv_vs_cudnn: NVRTC not loadable.\n{}", peer_env_hint());
+                return;
+            }
+            let have_cudnn = cudnn_available(g);
+            if !have_cudnn {
+                eprintln!(
+                    "[warn] cuDNN not loadable — install nvidia-cudnn-cu12 into tools/cuda-redist and \
+                     put nvidia/cudnn/bin on PATH; reporting × vs naive only."
+                );
+            }
+            eprintln!("device: {}", g.device_name());
+            let mut rng = crate::diff::Rng::new(0xC0DA77);
+
+            // Clock warmup (peak-vs-peak, same-run): hammer a GEMM until the mobile clock settles.
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            for _ in 0..40 {
+                gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+            }
+            const ROUNDS: usize = 5;
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let csum = |v: &[f32]| v.iter().map(|x| x.abs() as f64).sum::<f64>();
+
+            // DL conv shapes (C,H,W,K,R,S): a ResNet-ish 3x3 stack + a 1x1 (pointwise) + a 5x5 + first layer.
+            let cases = [
+                (64usize, 56usize, 56usize, 64usize, 3usize, 3usize),
+                (128, 28, 28, 128, 3, 3),
+                (256, 14, 14, 256, 3, 3),
+                (64, 56, 56, 64, 1, 1), // pointwise = GEMM
+                (32, 32, 32, 32, 5, 5),
+                (3, 64, 64, 64, 3, 3), // first layer (C=3)
+            ];
+            for (c, h, wd, k, r, s) in cases {
+                if !crate::ptx_conv::wmma_applies(c, h, wd, k, r, s) {
+                    continue;
+                }
+                let (p, q) = (h - r + 1, wd - s + 1);
+                let x = rng.vec(c * h * wd, -1.0, 1.0);
+                let w = rng.vec(k * c * r * s, -1.0, 1.0);
+                let oracle = ref_conv2d(&x, &w, c, h, wd, k, r, s);
+                let rel = ((4.0 * ((c * r * s) as f64).sqrt()) * (2f64).powi(-10)).max(2e-2);
+
+                // naive CUDA-C (Tier A): cross-check + checksum.
+                let naive = nvrtc_naive_conv(g, &x, &w, c, h, wd, k, r, s).unwrap();
+                crate::diff::assert_close(&format!("naive C{c} {r}x{s}"), &naive, &oracle, 5e-2, rel);
+                let cs_n = csum(&naive);
+
+                // Mercury fp16 implicit-GEMM conv (resident; f16 X/W).
+                let ptx_w = crate::ptx_conv::conv_wmma_ptx(c, h, wd, k, r, s);
+                let mod_w = g.load_module_cached(&ptx_w).unwrap();
+                let f_w = mod_w.load_function("conv2d_wmma").unwrap();
+                let cfg_w = conv_wmma_cfg(h, wd, k, r, s);
+                let xw_d = g.stream.memcpy_stod(&to16(&x)).unwrap();
+                let ww_d = g.stream.memcpy_stod(&to16(&w)).unwrap();
+                let mut ow_d = g.stream.alloc_zeros::<f32>(k * p * q).unwrap();
+                let launch_w = |g: &Gpu, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(&f_w);
+                    b.arg(&xw_d).arg(&ww_d).arg(o);
+                    unsafe { b.launch(cfg_w).unwrap() };
+                };
+                launch_w(g, &mut ow_d);
+                g.stream.synchronize().unwrap();
+                let merc = g.stream.memcpy_dtov(&ow_d).unwrap();
+                crate::diff::assert_close(&format!("mercury C{c} {r}x{s}"), &merc, &oracle, 5e-2, rel);
+
+                // cuDNN (Tier B): cross-check + checksum + disclosed algo.
+                let (cudnn_algo, g_c) = if have_cudnn {
+                    let (yc, algo) = cudnn_conv2d_run(g, &x, &w, c, h, wd, k, r, s, 0, 1).unwrap();
+                    crate::diff::assert_close(&format!("cudnn C{c} {r}x{s}"), &yc, &oracle, 5e-2, rel);
+                    let cs_c = csum(&yc);
+                    assert!(
+                        (cs_c - cs_n).abs() / cs_n.max(1.0) < 6e-2,
+                        "cudnn checksum: c={cs_c:.3e} n={cs_n:.3e}"
+                    );
+                    let (t_c, _a) = time_cudnn_conv2d(g, c, h, wd, k, r, s, 0, 1, 100).unwrap();
+                    (cudnn_fwd_algo_name(algo), conv_flop(c, h, wd, k, r, s) / t_c)
+                } else {
+                    ("n/a", 0.0)
+                };
+
+                // Speed, same-run.
+                let iters = 50usize;
+                let t_w = best_of(ROUNDS, || {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        launch_w(g, &mut ow_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                });
+                let naive_iters = if c >= 128 { 10 } else { 30 };
+                let t_n = time_nvrtc_naive_conv(g, c, h, wd, k, r, s, naive_iters).unwrap();
+                let flop = conv_flop(c, h, wd, k, r, s);
+                let (g_w, g_n) = (flop / t_w, flop / t_n);
+                if have_cudnn {
+                    eprintln!(
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury {:>6.0} GF ({:>5.1}× naive, {:>3.0}% cuDNN) | cuDNN {:>6.0} GF [{}] | naive {:>5.0} GF",
+                        g_w / 1e9,
+                        g_w / g_n,
+                        100.0 * g_w / g_c,
+                        g_c / 1e9,
+                        cudnn_algo,
+                        g_n / 1e9,
+                    );
+                } else {
+                    eprintln!(
+                        "C{c:>3} {h}x{wd} K{k:>3} {r}x{s}: Mercury {:>6.0} GF ({:>5.1}× naive) | naive {:>5.0} GF",
+                        g_w / 1e9,
+                        g_w / g_n,
+                        g_n / 1e9,
+                    );
+                }
+            }
+        });
+    }
+
     /// f64 RMSNorm reference over `[rows, cols]`: `out = x / sqrt(mean(x²) + eps)` per row — the
     /// non-affine form the GPU `rmsnorm` kernel computes.
     fn ref_rmsnorm(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
