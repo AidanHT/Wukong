@@ -143,10 +143,30 @@ register-level, ~free) — and the higher base efficiency is what lifts the *fus
 epilogue (fusion beats cuBLAS+epilogue once raw eff > ~1/(1+epilogue/GEMM); the C round-trip saved grows
 with N, so the threshold is met at 2048³ for SiLU/SwiGLU/residual cuBLASLt can't fuse).
 
+### Lever 8 — register-fragment prefetch (④): **LOSES (reverted).** The non-prefetch inner loop reuses one
+`%a`/`%b` set per k16-step, so step ks+1's `ldmatrix` has a WAR hazard against step ks's `mma` (ptxas can't
+rename across it). Implemented a double-buffered probe (`cliff_swz_pf`, `_pf` name → `entry_mma_pipe` loads
+both k-steps into separate `%a/%b`+`%an/%bn` buffers, bit-identical accumulation, gated). It **kept 2 CTAs/SM**
+(register pressure was NOT the killer) but still **lost: 0.774× base @2048³, 0.919× @4096³.** Mechanism: the
+inner loop already issues **16 independent `mma` per k-step** (tm·tn = 4×4) — that ILP already hides the
+`ldmatrix` latency, so the ks→ks WAR was never the bottleneck; double-buffering just widened the fragment
+live-ranges and constrained the scheduler. The compute is bound by the per-`(mi,ni)` D-accumulator chain, not
+gather latency. Reverted the codegen (was never committed). **Do not re-attempt fragment prefetch on this tile.**
+
 ### Next levers (toward parity / beyond)
-- **Measure the fused op vs cuBLAS-GEMM + separate-epilogue** end-to-end to quantify the beat-cuBLAS margin.
-- register-fragment prefetch (④): tension — raises reg pressure, would cost the 3rd CTA. Measure.
-- offline ptxas `-O3 --allow-expensive-optimizations` (reserve): the JIT runs ptxas at opt-4 already, but
-  `--allow-expensive-optimizations` isn't exposed via JIT — could close the ~9% SASS residual on BOTH
-  sizes. Needs `pip install nvidia-cuda-nvcc-cu12` + cubin file-load route (cudarc can't load in-mem cubin).
+- **Measure the fused op vs cuBLAS-GEMM + separate-epilogue** end-to-end to quantify the beat-cuBLAS margin
+  (analytical estimate: fusion wins ~1.1× @2048³ for SiLU/SwiGLU/residual cuBLASLt can't fuse; loses @4096³
+  where the raw-GEMM gap exceeds the saved C round-trip). Needs a fair (vectorized) epilogue peer — fairness-
+  sensitive, so disclose the peer.
+- offline ptxas `-O3 --allow-expensive-optimizations` (reserve, **not available here** — no `ptxas`, needs
+  `pip install nvidia-cuda-nvcc-cu12` + cubin file-load route): the JIT already runs ptxas at ~opt-4 and
+  `--allow-expensive-optimizations` is typically on at -O3, so likely a near-no-op; the only fair, no-strawman
+  raw-GEMM lever left, but low EV.
 - SASS scheduling (~9% per CuAsmRL) is the likely residual; not reachable without offline ptxas/hand-SASS.
+
+### Status: kernel is near its PTX-via-JIT ceiling on this part
+Every occupancy/tile/raster/pipeline/warp-shape/prefetch axis is now swept (this session + the prior one's
+~77% PTX-ceiling finding): the swz w24 workhorse at 83% @4096³ is **past that prior ceiling**, and the
+remaining gap is SASS instruction scheduling, reachable only with offline ptxas / hand-SASS (unavailable
+here). The banked wins — **2048³ 71%→87% (1.23×)** and the **fused epilogue re-based onto the fast base** —
+are the durable results; both floors are met (4096³ ≥75% with margin, 2048³ ≥90% on clean-clock runs).
