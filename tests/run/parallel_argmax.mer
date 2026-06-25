@@ -1,0 +1,48 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 12345
+// EXPECT-OUT: 5000
+module tests.run.parallel_argmax
+
+// `@parallel` global argmax / argmin -> mercury_argreduce_f32_parallel (the multicore variant of the
+// greedy-decode top-1). The kernel folds a FIXED chunk decomposition (RCHUNK=8192) in ascending order,
+// so the returned index is bit-identical to the serial mercury_argreduce_f32 the interpreter calls —
+// serial == parallel == interp regardless of thread count. N=20000 spans 3 chunks, and the argmax tie
+// (9.0 at index 12345 in chunk 1 AND 17000 in chunk 2) verifies the cross-chunk fold keeps the LOWEST
+// index. gcc/rustc run a branchy serial scalar loop; this dispatches the whole array across cores.
+
+@parallel
+fn argextrema(x: [f32; 20000], o: [i32; 2]) {
+    let mut bv: f32 = x[0];
+    let mut bi: i64 = 0;
+    for k in 0..20000 {
+        if x[k] > bv {
+            bv = x[k];
+            bi = k as i64;
+        }
+    }
+    o[0] = bi as i32;
+
+    let mut cv: f32 = x[0];
+    let mut ci: i64 = 0;
+    for k in 0..20000 {
+        if x[k] < cv {
+            cv = x[k];
+            ci = k as i64;
+        }
+    }
+    o[1] = ci as i32;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 20000] = [0.0; 20000];
+    x[12345] = 9.0; // max in chunk 1 (8192..16384)
+    x[17000] = 9.0; // a tying max in chunk 2 — the lower index (12345) must win the cross-chunk fold
+    x[5000] = -7.0; // unique min in chunk 0
+
+    let mut o: [i32; 2] = [0; 2];
+    argextrema(x, o);
+    print(o[0]); // 12345 (argmax, lowest index on the cross-chunk tie)
+    print(o[1]); // 5000  (argmin)
+    return 0;
+}

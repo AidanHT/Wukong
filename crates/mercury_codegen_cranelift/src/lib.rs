@@ -164,6 +164,7 @@ const RT_VHORNER: &str = "mercury_vhorner_f32";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
 const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
 const RT_ARGREDUCE: &str = "mercury_argreduce_f32";
+const RT_ARGREDUCE_PARALLEL: &str = "mercury_argreduce_f32_parallel";
 const RT_NORM: &str = "mercury_norm_f32";
 const RT_NORM_PARALLEL: &str = "mercury_norm_f32_parallel";
 const RT_NORM_AFFINE: &str = "mercury_norm_affine_f32";
@@ -1149,7 +1150,7 @@ impl<'a> FnTranslator<'a> {
         // The deterministic arg-reduction: mercury_argreduce_f32(x, n, op) -> i64 (the argmax/argmin a
         // recognized `if x[k] CMP bv {...}` loop reconciles against). One pointer, two i64, an i64
         // index result — bind the result like the sreduce kernel above.
-        if name == RT_ARGREDUCE && args.len() == 3 {
+        if (name == RT_ARGREDUCE || name == RT_ARGREDUCE_PARALLEL) && args.len() == 3 {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let op = self.coerce_to_i64(args[2]);
@@ -1472,6 +1473,7 @@ struct RtFuncs {
     sred: FuncId,
     sred_par: FuncId,
     argreduce: FuncId,
+    argreduce_par: FuncId,
     norm: FuncId,
     norm_par: FuncId,
     norm_affine: FuncId,
@@ -1995,6 +1997,9 @@ fn populate_module<M: Module>(
         argreduce: module
             .declare_function(RT_ARGREDUCE, Linkage::Import, &sig_argreduce)
             .map_err(|e| e.to_string())?,
+        argreduce_par: module
+            .declare_function(RT_ARGREDUCE_PARALLEL, Linkage::Import, &sig_argreduce)
+            .map_err(|e| e.to_string())?,
         norm: module
             .declare_function(RT_NORM, Linkage::Import, &sig_norm)
             .map_err(|e| e.to_string())?,
@@ -2453,6 +2458,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_ARGREDUCE,
                 module.declare_func_in_func(rt.argreduce, builder.func),
+            );
+            rt_refs.insert(
+                RT_ARGREDUCE_PARALLEL,
+                module.declare_func_in_func(rt.argreduce_par, builder.func),
             );
             rt_refs.insert(RT_NORM, module.declare_func_in_func(rt.norm, builder.func));
             rt_refs.insert(
@@ -2948,6 +2957,10 @@ pub fn jit_compile(
         RT_ARGREDUCE,
         mercury_runtime::mercury_argreduce_f32 as *const u8,
     );
+    builder.symbol(
+        RT_ARGREDUCE_PARALLEL,
+        mercury_runtime::mercury_argreduce_f32_parallel as *const u8,
+    );
     builder.symbol(RT_NORM, mercury_runtime::mercury_norm_f32 as *const u8);
     builder.symbol(
         RT_NORM_PARALLEL,
@@ -3384,6 +3397,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_ARGREDUCE,
         mercury_runtime::mercury_argreduce_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_ARGREDUCE_PARALLEL,
+        mercury_runtime::mercury_argreduce_f32_parallel as *const u8,
     );
     builder.symbol(RT_NORM, mercury_runtime::mercury_norm_f32 as *const u8);
     builder.symbol(
