@@ -476,6 +476,31 @@ fn gen_int8_smdb_swz(
     static_dims: Option<(usize, usize, usize)>,
     raster: usize,
 ) -> String {
+    // The shipped 2-stage double-buffer — every existing caller routes here, byte-identical to before the
+    // `stages` generalization (the `_impl` `stages==2` branch contains the verbatim XOR-toggle path).
+    gen_int8_smdb_swz_impl(name, bm, bn, wm, wn, dequant, splitk, static_dims, raster, 2)
+}
+
+/// `stages`-deep generalization of [`gen_int8_smdb_swz`]: `stages==2` is the original XOR double-buffer
+/// (bit-identical PTX); `stages>=3` deepens it into a `stages`-buffer `cp.async` SMEM ring that prefetches
+/// `stages-1` K-slabs ahead (the fp16/fp8-proven multistage lever, ported onto the swizzled-`ldmatrix`
+/// 64×64-warp tile). Same 2-barrier overwrite discipline at any depth; the deeper ring only reorders when
+/// each slab is staged, so it stays **bit-exact mod 2³²** vs the i32 oracle. `stages>=3` is supported only
+/// on the plain dynamic path (no split-K / static-dims / raster — those each reuse `ctaid`/baked constants
+/// the ring prologue does not thread). 3-stage 128×128 BK=64 = exactly 48 KiB static SMEM (the no-carveout max).
+#[allow(clippy::too_many_arguments)]
+fn gen_int8_smdb_swz_impl(
+    name: &str,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    dequant: bool,
+    splitk: bool,
+    static_dims: Option<(usize, usize, usize)>,
+    raster: usize,
+    stages: usize,
+) -> String {
     let bk = 64usize; // u8 K-slab: nc = bk/16 = 4 chunks/row (reuses the fp16 nc=4 swizzle phase), 2 k32 steps
     let threads = wm * wn * 32;
     let tm = bm / (16 * wm); // 16-row A subtiles per warp
@@ -497,7 +522,15 @@ fn gen_int8_smdb_swz(
     assert!(bm % (16 * wm) == 0 && bn % (8 * wn) == 0, "{name}: bm/bn must tile by 16*wm / 8*wn");
     assert!(wmr % 8 == 0 && wnc % 8 == 0, "{name}: swz needs per-warp row/col bases = 0 (mod 8)");
     assert!(a_tile.is_power_of_two() && b_tile.is_power_of_two(), "{name}: A/B tile bytes must be powers of two (XOR double-buffer)");
-    assert!(2 * (bm * bk) + 2 * (bn * bk) <= 48 * 1024, "{name}: static SMEM exceeds 48 KiB");
+    assert!(stages >= 2, "{name}: needs >=2 pipeline stages");
+    // stages>=3 deepens the ring; it is only wired for the plain dynamic path (the prologue stages absolute
+    // K columns 0,bk,…,(stages-2)·bk and the ring advance uses add+wrap, neither of which threads the
+    // split-K K-range, the static baked dims, or the rasterized 1-D tile map).
+    assert!(
+        stages == 2 || (!splitk && static_dims.is_none() && raster == 0),
+        "{name}: multistage (stages>=3) only supports the plain dynamic non-raster path"
+    );
+    assert!(stages * (bm * bk) + stages * (bn * bk) <= 48 * 1024, "{name}: static SMEM exceeds 48 KiB");
     assert!((bm * bk) % (threads * 16) == 0 && (bn * bk) % (threads * 16) == 0, "{name}: threads*16 must divide the tile bytes");
     // split-K folds each CTA's partial product into C by `red.global.add.u32` (deterministic for i32 —
     // integer add commutes, so the result is order-independent and bit-exact, unlike a float reduction).
@@ -524,8 +557,8 @@ fn gen_int8_smdb_swz(
     let scale_param = if dequant { ",\n    .param .u64 pScale" } else { "" };
     let mut s = String::from(".version 8.4\n.target sm_89\n.address_size 64\n\n");
     s += &format!(".visible .entry {name}(\n    .param .u32 pM,\n    .param .u32 pN,\n    .param .u32 pK,\n    .param .u64 pA,\n    .param .u64 pB,\n    .param .u64 pC{scale_param}\n)\n{{\n");
-    s += &format!("    .shared .align 16 .b8 smemA[{}];\n", 2 * bm * bk);
-    s += &format!("    .shared .align 16 .b8 smemB[{}];\n", 2 * bn * bk);
+    s += &format!("    .shared .align 16 .b8 smemA[{}];\n", stages * bm * bk);
+    s += &format!("    .shared .align 16 .b8 smemB[{}];\n", stages * bn * bk);
     s += "    .reg .pred %p0,%pmore;\n";
     s += "    .reg .b32 %M,%N,%K,%baseRow,%baseCol,%kt,%ktn,%kcol,%tmp,%tmp2,%tmp3,%tix,%warpId,%warpRow,%warpCol,%e,%r,%c,%bufcA,%bufpA,%bufcB,%bufpB,%lane,%grp,%tg2,%warpMrow,%warpNcol,%aptr,%bptr,%phaseA,%phaseB,%arowb,%browb,%la16,%lb8,%swztmp;\n";
     if splitk {
@@ -619,10 +652,12 @@ fn gen_int8_smdb_swz(
             }
         }
     }
+    // Read pointer = oldest buffer (0); write pointer = newest slot ((stages-1)·tile). For stages==2 the
+    // write slot is `tile` — byte-identical to the original double-buffer init.
     s += "    mov.u32 %bufcA,0;\n";
-    s += &format!("    mov.u32 %bufpA,{a_tile};\n");
+    s += &format!("    mov.u32 %bufpA,{};\n", (stages - 1) * a_tile);
     s += "    mov.u32 %bufcB,0;\n";
-    s += &format!("    mov.u32 %bufpB,{b_tile};\n");
+    s += &format!("    mov.u32 %bufpB,{};\n", (stages - 1) * b_tile);
 
     // cp.async staging into the **swizzled** SMEM tile (16-byte chunks). chunk e: r=e>>row_shift,
     // chunk=e&col_mask, byte col c=chunk·16; src is 16 contiguous u8 of global row (g_base+r) at kcol+c;
@@ -647,21 +682,46 @@ fn gen_int8_smdb_swz(
     // Prologue: prefetch this CTA's first slab (kbeg, or 0 without split-K) into buffer 0.
     let kstart = if splitk { "%kbeg" } else { "0" };
     let kstop = if splitk { "%kend" } else { "%K" };
-    s += &format!("    mov.u32 %kcol,{kstart};\n");
-    stage("%baseRow", "%A", "smemA", "%bufcA", a_chunks, &mut s);
-    stage("%baseCol", "%B", "smemB", "%bufcB", b_chunks, &mut s);
-    s += "    cp.async.commit_group;\n";
+    if stages == 2 {
+        s += &format!("    mov.u32 %kcol,{kstart};\n");
+        stage("%baseRow", "%A", "smemA", "%bufcA", a_chunks, &mut s);
+        stage("%baseCol", "%B", "smemB", "%bufcB", b_chunks, &mut s);
+        s += "    cp.async.commit_group;\n";
+    } else {
+        // Multistage prologue: prefetch slabs 0..stages-2 into buffers 0..stages-2 (stages-1 committed
+        // groups). kstart is 0 here (multistage forbids split-K), so kcol = j·bk are absolute K columns.
+        for j in 0..(stages - 1) {
+            s += &format!("    mov.u32 %kcol,{};\n", j * bk);
+            let (offa, offb) = (format!("{}", j * a_tile), format!("{}", j * b_tile));
+            stage("%baseRow", "%A", "smemA", &offa, a_chunks, &mut s);
+            stage("%baseCol", "%B", "smemB", &offb, b_chunks, &mut s);
+            s += "    cp.async.commit_group;\n";
+        }
+    }
 
     s += &format!("    mov.u32 %kt,{kstart};\n");
     s += &format!("KLOOP_{name}:\n    setp.ge.u32 %p0,%kt,{kstop};\n    @%p0 bra KEND_{name};\n");
-    s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,{kstop};\n");
-    s += &format!("    @!%pmore bra LAST_{name};\n");
-    s += "    mov.u32 %kcol,%ktn;\n";
-    stage("%baseRow", "%A", "smemA", "%bufpA", a_chunks, &mut s);
-    stage("%baseCol", "%B", "smemB", "%bufpB", b_chunks, &mut s);
-    s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n";
-    s += &format!("    bra SYNC_{name};\nLAST_{name}:\n    cp.async.wait_group 0;\nSYNC_{name}:\n");
-    s += "    bar.sync 0;\n";
+    if stages == 2 {
+        s += &format!("    add.u32 %ktn,%kt,{bk};\n    setp.lt.u32 %pmore,%ktn,{kstop};\n");
+        s += &format!("    @!%pmore bra LAST_{name};\n");
+        s += "    mov.u32 %kcol,%ktn;\n";
+        stage("%baseRow", "%A", "smemA", "%bufpA", a_chunks, &mut s);
+        stage("%baseCol", "%B", "smemB", "%bufpB", b_chunks, &mut s);
+        s += "    cp.async.commit_group;\n    cp.async.wait_group 1;\n";
+        s += &format!("    bra SYNC_{name};\nLAST_{name}:\n    cp.async.wait_group 0;\nSYNC_{name}:\n");
+        s += "    bar.sync 0;\n";
+    } else {
+        // Prefetch slab (kt + (stages-1)·bk) into the write buffer (bufp), if it exists; then keep
+        // stages-1 groups in flight so the oldest (bufc) is guaranteed arrived before the compute reads it.
+        s += &format!("    add.u32 %ktn,%kt,{};\n    setp.lt.u32 %pmore,%ktn,{kstop};\n", (stages - 1) * bk);
+        s += &format!("    @!%pmore bra NOSTAGE_{name};\n");
+        s += "    mov.u32 %kcol,%ktn;\n";
+        stage("%baseRow", "%A", "smemA", "%bufpA", a_chunks, &mut s);
+        stage("%baseCol", "%B", "smemB", "%bufpB", b_chunks, &mut s);
+        s += &format!("NOSTAGE_{name}:\n");
+        s += &format!("    cp.async.commit_group;\n    cp.async.wait_group {};\n", stages - 1);
+        s += "    bar.sync 0;\n";
+    }
 
     // Compute: per k32 step, one warp-cooperative `ldmatrix.x4` (A) / `.x2` (B) per subtile from the
     // XOR-swizzled (conflict-free, no-pad) SMEM, then `tm·tn` `mma.sync.m16n8k32` (A frag reused across N,
@@ -686,8 +746,17 @@ fn gen_int8_smdb_swz(
         }
     }
     s += "    bar.sync 0;\n"; // all warps done reading bufcA/bufcB before a later step overwrites them
-    s += &format!("    xor.b32 %bufcA,%bufcA,{a_tile};\n    xor.b32 %bufpA,%bufpA,{a_tile};\n");
-    s += &format!("    xor.b32 %bufcB,%bufcB,{b_tile};\n    xor.b32 %bufpB,%bufpB,{b_tile};\n");
+    if stages == 2 {
+        s += &format!("    xor.b32 %bufcA,%bufcA,{a_tile};\n    xor.b32 %bufpA,%bufpA,{a_tile};\n");
+        s += &format!("    xor.b32 %bufcB,%bufcB,{b_tile};\n    xor.b32 %bufpB,%bufpB,{b_tile};\n");
+    } else {
+        // Ring advance: bump each pointer one tile, wrapping at stages·tile (the XOR trick only cycles 2).
+        let (a_ring, b_ring) = (stages * a_tile, stages * b_tile);
+        s += &format!("    add.u32 %bufcA,%bufcA,{a_tile};\n    setp.ge.u32 %pmore,%bufcA,{a_ring};\n    @%pmore sub.u32 %bufcA,%bufcA,{a_ring};\n");
+        s += &format!("    add.u32 %bufpA,%bufpA,{a_tile};\n    setp.ge.u32 %pmore,%bufpA,{a_ring};\n    @%pmore sub.u32 %bufpA,%bufpA,{a_ring};\n");
+        s += &format!("    add.u32 %bufcB,%bufcB,{b_tile};\n    setp.ge.u32 %pmore,%bufcB,{b_ring};\n    @%pmore sub.u32 %bufcB,%bufcB,{b_ring};\n");
+        s += &format!("    add.u32 %bufpB,%bufpB,{b_tile};\n    setp.ge.u32 %pmore,%bufpB,{b_ring};\n    @%pmore sub.u32 %bufpB,%bufpB,{b_ring};\n");
+    }
     s += &format!("    add.u32 %kt,%kt,{bk};\n    bra KLOOP_{name};\n");
 
     // Epilogue: store each subtile's 16×8 i32 result (D-fragment layout is fixed by the `mma`, identical
@@ -839,6 +908,25 @@ pub const INT8_W64_WARPS_N: usize = 2;
 pub fn int8_gemm_w64_swz_ptx() -> &'static str {
     static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PTX.get_or_init(|| gen_int8_smdb_swz("int8_gemm_nt_w64_swz", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0)).as_str()
+}
+
+/// **3-stage** 64×64-warp-tile int8 swz GEMM (entry `int8_gemm_nt_w64_swz_s3`) — deepens
+/// [`int8_gemm_w64_swz_ptx`]'s 2-buffer `cp.async` into a 3-buffer SMEM ring (prefetch 2 K-slabs ahead).
+/// At 128×128 BK=64 the ring is 3·(8 KiB+8 KiB) = **exactly 48 KiB** static SMEM — the no-carveout max.
+///
+/// **MEASURED NEGATIVE for int8 — NOT shipped** (`quant_int8_w64_s3_sweep`, ≥3 same-run passes). The
+/// fp8 warp-tile sweep found this same 3-stage pipeline *won* (+10/+19 pts at 1024³/2048³), so it was
+/// the obvious int8 lever to try — but for int8 it **loses at every size** (1024³ ~67%, 2048³ ~69–80%,
+/// 4096³ ~65% of cuBLAS, vs the 2-stage's ~84/100/72%). int8 runs `mma` at 2× the fp16/fp8 rate, so the
+/// 2-stage BK=64 already hides the `cp.async` latency; deepening to 48 KiB SMEM only *cuts occupancy*
+/// (fewer CTAs/SM) with no compute-bound payoff — confirming the earlier hand-placed "+3%" / Ada-study
+/// read that multistage depth is not the int8 lever (the warp tile was). Retained as the bit-exact
+/// validation of the `stages`-general ring (`quant_int8_w64_s3_matches_reference`) and the reproducible
+/// record of the dead-end; the dispatch stays on the 2-stage [`int8_gemm_w64_swz_ptx`].
+/// **Bit-exact** mod 2³² (a deeper prefetch ring only reorders staging; the i32 mma arithmetic is identical).
+pub fn int8_gemm_w64_swz_s3_ptx() -> &'static str {
+    static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PTX.get_or_init(|| gen_int8_smdb_swz_impl("int8_gemm_nt_w64_swz_s3", INT8_W64_BM, INT8_W64_BN, INT8_W64_WARPS_M, INT8_W64_WARPS_N, false, false, None, 0, 3)).as_str()
 }
 
 /// 64×64-warp-tile int8 swz GEMM **with threadblock rasterization** (`raster=8`, entry

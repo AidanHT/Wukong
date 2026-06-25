@@ -116,6 +116,23 @@ is genuinely free. **Decisive end-to-end win, the lever a closed library can't u
   identical k-accum ⇒ same E4M3 tol gate: `fp8_pipe_matches_reference_within_tol`, `fp8_pipe_regime_matches_
   reference` (exercises all 3 entries), `quant_fp8_warp_tile_matches` (w22==w24 checksum) all GREEN.
 
+### L8 int8 multistage — the fp8 lever does NOT transfer (measured NEGATIVE, ×3). `quant_int8_w64_s3_sweep`.
+fp8's 3-stage ring won big (+10/+19 pts), so 3-stage on the int8 64×64 warp tile was the obvious next lever.
+Generalized `gen_int8_smdb_swz` to a `stages`-deep `cp.async` ring (2-stage byte-identical; 3-stage 128×128
+BK=64 = **exactly 48 KiB** static SMEM) and measured it same-run vs the 2-stage w64 + smdb64 + cuBLAS:
+| size  | smdb64_swz | **w64 (2-stage, shipped)** | w64_s3 (3-stage) |
+|-------|-----------|----------------------------|------------------|
+| 1024³ | 80–85%    | **81–86%**                 | 65–68% (−16)     |
+| 2048³ | 75–100%   | **95–105%** (beats IMMA)   | 69–80% (−17)     |
+| 4096³ | 45–48%    | **72–73%**                 | 64–65% (−8)      |
+- **3-stage LOSES at every size, stable across 3 passes.** int8 runs `mma` at 2× the fp16/fp8 rate ⇒ the
+  2-stage BK=64 already hides the cp.async latency; deepening to 48 KiB only cuts occupancy (fewer CTAs/SM)
+  with no compute-bound payoff. **Confirms the Ada-study "+3%" / "multistage is not the int8 lever" read** —
+  and explains why fp8 differs (lower TC rate ⇒ latency-bound ⇒ deeper pipeline helps). 2-stage w64 stays.
+- Retained: the `stages`-general ring (reusable infra) + `quant_int8_w64_s3_matches_reference` (3-stage ==
+  2-stage == i32 oracle, element-wise, bit-exact). Kernel NOT dispatched. Honest dead-end, recorded.
+- COMMIT 5: int8 multistage ring + bit-exact gate + measured-negative finding (2-stage stays shipped).
+
 ## Research findings (parallel agents, verified)
 **Ada int8 binding constraint (RTX 4050, sm_89):** at 1024³–4096³ a well-tiled int8 GEMM is
 **on-chip-datapath / tensor-core-issue bound, NOT HBM-bound** (int8 roofline knee ~374 OP/byte; square
