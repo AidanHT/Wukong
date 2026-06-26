@@ -1862,7 +1862,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "mercury_cummax_f32"
             | "mercury_cummax_f32_parallel"
             | "mercury_cummin_f32"
-            | "mercury_cummin_f32_parallel" => {
+            | "mercury_cummin_f32_parallel"
+            | "mercury_cumprod_f32"
+            | "mercury_cumprod_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = args[2].as_int() as usize;
@@ -1882,6 +1884,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     mercury_runtime::mercury_cummax_f32
                 } else if name.starts_with("mercury_cummin") {
                     mercury_runtime::mercury_cummin_f32
+                } else if name.starts_with("mercury_cumprod") {
+                    mercury_runtime::mercury_cumprod_f32
                 } else {
                     mercury_runtime::mercury_cumsum_f32
                 };

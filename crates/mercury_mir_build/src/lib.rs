@@ -133,6 +133,8 @@ pub fn lower_program(
         colargmin_par: interner.intern("mercury_colargmin_i32_parallel"),
         cumsum: interner.intern("mercury_cumsum_f32"),
         cumsum_par: interner.intern("mercury_cumsum_f32_parallel"),
+        cumprod: interner.intern("mercury_cumprod_f32"),
+        cumprod_par: interner.intern("mercury_cumprod_f32_parallel"),
         lrscan: interner.intern("mercury_lrscan_f32"),
         lrscan_par: interner.intern("mercury_lrscan_f32_parallel"),
         cummax: interner.intern("mercury_cummax_f32"),
@@ -308,6 +310,17 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_cumsum(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row prefix product (cumprod): same interceptor — rows
+                // independent → the multicore kernel is bit-equal to serial.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_cumprod(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -961,6 +974,12 @@ struct GemmSyms {
     /// Hillis-Steele scan + carry vectorizes it. The in-lane tree reassociates → the kernel is the oracle.
     cumsum: Symbol,
     cumsum_par: Symbol,
+    /// Inclusive per-row prefix product `out[r,i] = Π_{k<=i} x[r,k]` (cumulative product / scan),
+    /// `mercury_cumprod_f32[_parallel](x, out, rows, cols)`. Loop-carried like cumsum → gcc/rustc keep it
+    /// scalar; the kernel's lever is 4-row-interleaved ILP. Bit-exact (a product is not fused — no
+    /// reassociation, unlike the prefix sum).
+    cumprod: Symbol,
+    cumprod_par: Symbol,
     /// Linear-recurrence / selective scan `out[r,t] = a[r,t]·h_{t-1} + b[r,t]` (SSM/Mamba/S4/EMA), each
     /// row an independent first-order recurrence (`mercury_lrscan_f32[_parallel](a, b, out, rows, cols)`).
     /// Loop-carried within a row like cumsum → gcc/rustc keep the carry scalar; the lever is the
@@ -2814,6 +2833,108 @@ impl FnLowerer<'_> {
         })
     }
 
+    /// Recognize a batched per-row **inclusive prefix product** (cumulative product / scan):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut p: f32 = 1.0;            // multiplicative identity, resets every row
+    ///     for i in 0..C { p = p * x[r*C+i]; out[r*C+i] = p; }
+    /// }
+    /// ```
+    /// `out[r,i] = Π_{k<=i} x[r,k]` → `mercury_cumprod_f32[_parallel]`. Mirrors [`Self::match_cumsum`]
+    /// exactly but with the multiplicative seed `1.0` and a `*` accumulate. The loop-carried product is
+    /// what gcc/rustc keep scalar; the kernel's 4-row-interleaved ILP wins. **Bit-exact** — a bare product
+    /// is not fused, so it folds strictly left-to-right == the scalar nest (no reassociation, unlike the
+    /// prefix sum). `out` is f32, distinct from `x`. Pure (`&self`).
+    fn match_cumprod(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<CumsumNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] let p: f32 = 1.0;  (multiplicative identity)
+        let (p, p_init) = Self::let_init(&body.stmts[0])?;
+        if !matches!(&p_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) {
+            return None;
+        }
+        // [1] for i in 0..C { p = p * x[r*C+i]; out[r*C+i] = p; }
+        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        let cols = as_dim(ce, self.interner)?;
+        let batch = Some((r, ce));
+        if ibody.tail.is_some() || ibody.stmts.len() != 2 {
+            return None;
+        }
+        let x = self.match_prod_body(&ibody.stmts[0], p, i, batch)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &ibody.stmts[1].kind
+        else {
+            return None;
+        };
+        let out = self.index_off(target, i, batch)?;
+        if single_path(value) != Some(p) || out == x {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The prefix-product accumulate `p = p * x[r*C+i]` (or the compound `p *= x[r*C+i]`), target already
+    /// `p`. Returns the data array `x` (the read indexed `r*C + i`). The multiplicative twin of
+    /// [`Self::match_acc_add`]. Pure.
+    fn match_prod_body(
+        &self,
+        stmt: &Stmt,
+        acc: Symbol,
+        i: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(acc) {
+            return None;
+        }
+        match op {
+            // `p *= x[r*C+i]`
+            ast::AssignOp::Mul => self.index_off(value, i, batch),
+            // `p = p * x[r*C+i]` (either operand order)
+            ast::AssignOp::Assign => {
+                let ExprKind::Binary {
+                    op: ast::BinOp::Mul,
+                    lhs,
+                    rhs,
+                } = &value.kind
+                else {
+                    return None;
+                };
+                if single_path(lhs) == Some(acc) {
+                    self.index_off(rhs, i, batch)
+                } else if single_path(rhs) == Some(acc) {
+                    self.index_off(lhs, i, batch)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The prefix-sum accumulate `acc = acc + x[r*C+i]` (or the compound `acc += x[r*C+i]`), target
     /// already `acc`. Returns the data array `x` (the read indexed `r*C + i`). Pure.
     fn match_acc_add(
@@ -4593,6 +4714,27 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit `mercury_cumprod_f32[_parallel](x, out, rows, cols)` for a recognized prefix product. Same
+    /// 2-ptr + 2-i64 `sig_vmath` ABI as cumsum; the `_parallel` one maps independent rows across cores.
+    fn emit_cumprod(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.cumprod_par
+        } else {
+            self.gemm.cumprod
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
     /// Emit `mercury_lrscan_f32[_parallel](a, b, out, rows, cols)` for a recognized linear-recurrence scan.
     /// 3 pointers + 2 i64 (the `softmax_bwd` ABI); the `_parallel` one maps the independent rows across
     /// cores (bit-identical to serial — no cross-row combine).
@@ -6070,6 +6212,14 @@ impl FnLowerer<'_> {
         // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
         if let Some(nest) = self.match_cumsum(pat, iter, body) {
             if self.emit_cumsum(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched per-row inclusive prefix product (cumprod) → `mercury_cumprod_f32` (the `_parallel` one
+        // in a `@parallel` fn). Loop-carried like cumsum; the kernel's lever is 4-row-interleaved ILP.
+        // Bit-exact (a bare product is not fused → strict left-to-right, no reassociation).
+        if let Some(nest) = self.match_cumprod(pat, iter, body) {
+            if self.emit_cumprod(&nest, self.parallel_fn) {
                 return;
             }
         }
