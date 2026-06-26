@@ -1,0 +1,39 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+module tests.run.cumprod
+
+// Inclusive per-row prefix product `out[r,i] = Π_{k<=i} x[r,k]` (cumulative product). The loop-carried
+// `out[i] = out[i-1] * x[i]` recurrence won't auto-vectorize (gcc/rustc keep it scalar, like the prefix
+// sum); Mercury folds the nest to one `mercury_cumprod_f32` call (4-row-interleaved ILP). A bare product
+// is not fused, so each row folds strictly left-to-right == the scalar nest — bit-exact, no reassociation,
+// so the differential gate (interp == native) and `-O0 == -O3` are trivial.
+fn main() -> i32 {
+    // [2, 4] matrix. Row 0: [2, 0.5, 4, 0.25] -> prefixes [2, 1, 4, 1].
+    //                Row 1: [3, 0,   5, 7]    -> prefixes [3, 0, 0, 0] (the 0 zeroes every later prefix).
+    let mut x: [f32; 8] = [0.0; 8];
+    x[0] = 2.0; x[1] = 0.5; x[2] = 4.0; x[3] = 0.25;
+    x[4] = 3.0; x[5] = 0.0; x[6] = 5.0; x[7] = 7.0;
+
+    let mut out: [f32; 8] = [0.0; 8];
+    for r in 0..2 {
+        let mut p: f32 = 1.0;
+        for i in 0..4 {
+            p = p * x[r * 4 + i];
+            out[r * 4 + i] = p;
+        }
+    }
+
+    print(out[0] as i32); // 2
+    print(out[1] as i32); // 1  (2 * 0.5)
+    print(out[2] as i32); // 4  (1 * 4)
+    print(out[3] as i32); // 1  (4 * 0.25)
+    print(out[4] as i32); // 3
+    print(out[5] as i32); // 0  (3 * 0 — carry erased)
+    return 0;
+}

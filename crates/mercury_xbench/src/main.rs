@@ -329,6 +329,9 @@ fn main() {
     if want("cumsum") {
         bench_cumsum(&cc, &dir);
     }
+    if want("cumprod") {
+        bench_cumprod(&cc, &dir);
+    }
     if want("lrscan") {
         bench_lrscan(&cc, &dir);
     }
@@ -1917,6 +1920,126 @@ fn bench_lrscan(cc: &str, dir: &Path) {
             let r = c2.ns_per_call / ms.ns_per_call;
             println!(
                 "  -> Mercury single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's single serial chain)",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+        }
+        println!();
+    }
+}
+
+fn mer_cumprod(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut p: f32 = 1.0;\n\
+         \x20       for i in 0..{cols} {{ p = p * x[r * {cols} + i]; out[r * {cols} + i] = p; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_cumprod(rows: usize, cols: usize) -> String {
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         \x20 (void)y;\n\
+         \x20 for (long r=0;r<R;r++){{ float p=1.0f; for (long i=0;i<C;i++){{ p*=x[r*C+i]; out[r*C+i]=p; }} }} }}\n"
+    )
+}
+
+fn rust_cumprod(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ let mut p=1.0f32; for i in 0..C {{ p *= *x.add(r*C+i); *out.add(r*C+i)=p; }} }} }}\n"
+    )
+}
+
+/// Per-row inclusive prefix **product** (cumprod / scan). Loop-carried `out[i]=out[i-1]*x[i]`, so gcc
+/// `-O3 -march=native` / rustc keep it SCALAR (one serial `mulss` chain per row, latency-bound). Mercury's
+/// `mercury_cumprod_f32` interleaves **4 independent rows** for ILP (the same lever as `lrscan`). A bare
+/// product is *not* fused, so each row folds strictly left-to-right — **bit-exact** vs the scalar C/Rust
+/// nest (no reassociation, unlike the prefix sum), though the cross-check stays magnitude-normalized since
+/// a running product spans a wide dynamic range. GB/s = `R·C·4·2` (read x + write out); `@parallel` maps
+/// independent rows across cores, bit-equal to serial. Inputs oscillate around 1.0 so the product stays
+/// finite and `O(1)`.
+fn bench_cumprod(cc: &str, dir: &Path) {
+    for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
+        let n = rows * cols;
+        // Oscillate around 1.0 ({0.96,0.98,1.0,1.02,1.04}) so the running product is a bounded random walk.
+        let x: Vec<f32> = (0..n)
+            .map(|i| 0.96 + 0.02 * ((i * 7 + 3) % 5) as f32)
+            .collect();
+        let dummy = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        let (xp, yp, op) = (x.as_ptr(), dummy.as_ptr(), out.as_mut_ptr());
+        let bytes = n as f64 * 4.0 * 2.0; // read x + write out
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== cumprod (out[r,i] = Prod_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_cumprod(rows, cols, false), &mut out, xp, yp, op);
+        let mer_par = bench_mercury(&mer_cumprod(rows, cols, true), &mut out, xp, yp, op);
+        let cm = bench_external(
+            "c",
+            &c_cumprod(rows, cols),
+            dir,
+            "cumprod",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_cumprod(rows, cols),
+            dir,
+            "cumprod",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            xp,
+            yp,
+            op,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        if let (Some(a), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+            let maxerr = a
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! cumprod mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
