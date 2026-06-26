@@ -91,9 +91,16 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   + `colarg.rs` (per-row/column argmax/argmin → an **i32 index** buffer; AVX2 tracks 8 `(value,index)`
   lanes via blend), `pool2d.rs` (2D max/avg pooling), and `embedding.rs` (the LLM embedding lookup
   `out[t,:] = weight[ids[t],:]` — a token-id row gather; AVX2 256-bit row copy, out-of-range id → zero
-  row; pure data movement so it's bit-exact, the data-dependent gather is what gcc/rustc keep scalar).
-  The win on every one is the same lever: a strided access or a transcendental that gcc/rustc leave
-  scalar, folded into one 256-bit pass.
+  row; pure data movement so it's bit-exact, the data-dependent gather is what gcc/rustc keep scalar),
+  `lrscan.rs` (the SSM/Mamba first-order linear-recurrence / selective scan `out[r,t] = a[r,t]·h_{t-1} +
+  b[r,t]` — a loop-carried recurrence gcc/rustc run as one serial chain per row; the lever here is *not*
+  SIMD but **4 independent rows interleaved** for ILP, with plain `mul`+`add` — **not** `f32::mul_add`,
+  which on a non-`fma`-target build lowers to a libm `fmaf` *call* that re-serializes the chain), and
+  `scatter.rs` (the embedding-gradient backward `grad_w[ids[t],:] += grad_out[t,:]` — the gather's dual;
+  the `_parallel` one splits the **output rows** across cores so writes never collide → lock-free and
+  **bit-identical to serial**, the structural win over a C author's non-deterministic atomic scatter).
+  The win on every one is the same lever: a strided access, a transcendental, or a loop-carried recurrence
+  that gcc/rustc leave scalar/serial, folded into one 256-bit pass — or, for the scans, row-parallel ILP.
 
 ## Key types & entry points
 - `Arena` (`src/lib.rs`) — bump allocator over an owned `Vec<u8>`. API: `with_capacity`, `alloc(size, align)`, `slice_mut(offset, len)`, `reset`, `used`, `capacity`.
