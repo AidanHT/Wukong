@@ -141,6 +141,8 @@ pub fn lower_program(
         cummin_par: interner.intern("mercury_cummin_f32_parallel"),
         embedding: interner.intern("mercury_embedding_f32"),
         embedding_par: interner.intern("mercury_embedding_f32_parallel"),
+        scatter_add: interner.intern("mercury_scatter_add_f32"),
+        scatter_add_par: interner.intern("mercury_scatter_add_f32_parallel"),
         maxpool2d: interner.intern("mercury_maxpool2d_f32"),
         maxpool2d_par: interner.intern("mercury_maxpool2d_f32_parallel"),
         avgpool2d: interner.intern("mercury_avgpool2d_f32"),
@@ -340,6 +342,18 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_embedding(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function scatter-add (embedding-gradient backward): intercept before
+                // the outliner; `match_scatter` then emits `mercury_scatter_add_f32_parallel`, which splits
+                // the V output rows across cores (disjoint writes → race-free, deterministic == serial).
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_scatter(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -966,6 +980,11 @@ struct GemmSyms {
     /// maps the `T` output rows across cores, bit-equal to serial.
     embedding: Symbol,
     embedding_par: Symbol,
+    /// Scatter-add / embedding-gradient backward `grad_w[ids[t], :] += grad_out[t, :]`
+    /// (`mercury_scatter_add_f32[_parallel](grad_w, grad_out, ids, T, H, V)`). The dual of the embedding
+    /// gather; the `_parallel` one splits the V output rows across cores (collision-free, deterministic).
+    scatter_add: Symbol,
+    scatter_add_par: Symbol,
     /// 2D max/avg pooling (`mercury_{max,avg}pool2d_f32[_parallel](x, out, channels, h, w, kh, kw,
     /// sh, sw)`): `out[c,oy,ox] = ⊕ over the kh×kw window of x[c, oy*sh+dy, ox*sw+dx]` over a
     /// `[channels, h, w]` row-major input, no padding (`⊕` = max / sum÷(kh·kw)). The idiomatic 5-deep
@@ -2213,6 +2232,123 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![out, weight, ids, t_rows, h, v],
+        });
+        true
+    }
+
+    /// Recognize the **scatter-add / embedding-gradient backward** — the dual of the embedding gather:
+    /// ```text
+    /// for t in 0..T { for d in 0..H { grad_w[ids[t]*H + d] += grad_out[t*H + d]; } }
+    /// ```
+    /// `grad_w[ids[t], :] += grad_out[t, :]` → `mercury_scatter_add_f32[_parallel]`. The data-dependent
+    /// row index `ids[t]` is on the **write** side (where the gather has it on the read side), and the
+    /// op is `+=` (colliding tokens — a word occurring twice — sum into one weight row). The kernel folds
+    /// each row's collisions in ascending token order, the *same* order this nest runs, so it is
+    /// **bit-identical** to the scalar loop — no reassociation. The `@parallel` kernel splits the output
+    /// rows (not the tokens) across cores so writes never collide: lock-free, race-free, and
+    /// deterministic == serial (a structural win — a C author would need non-deterministic atomic adds).
+    /// `grad_w` must be the zeroed accumulator the program is filling (`+=` into its current contents).
+    /// Pure (`&self`).
+    fn match_scatter(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<ScatterNest> {
+        // for t in 0..T { <single inner for> }
+        let ast::PatKind::Ident(t) = &pat.kind else {
+            return None;
+        };
+        let t = *t;
+        let (ts, te) = range_bounds(iter)?;
+        if as_int_lit(ts, self.interner)? != 0 {
+            return None;
+        }
+        let t_rows = as_dim(te, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        // for d in 0..H { <single assignment> }
+        let (dpat, diter, dbody) = fusable_for(&body.stmts[0])?;
+        let ast::PatKind::Ident(d) = &dpat.kind else {
+            return None;
+        };
+        let d = *d;
+        let (ds, de) = range_bounds(diter)?;
+        if as_int_lit(ds, self.interner)? != 0 {
+            return None;
+        }
+        let h = as_dim(de, self.interner)?;
+        if dbody.tail.is_some() || dbody.stmts.len() != 1 {
+            return None;
+        }
+        // grad_w[ids[t]*H + d] += grad_out[t*H + d];  (`+=` — the embedding gradient sums collisions)
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Add,
+            value,
+        } = &dbody.stmts[0].kind
+        else {
+            return None;
+        };
+        // Store: the data-dependent indirect row `grad_w[ids[t]*H + d]` — the SAME shape as the embedding
+        // gather LOAD (`match_embed_load`), but here on the WRITE side (scatter is the gather's dual).
+        let (grad_w, ids) = self.match_embed_load(target, t, d, de)?;
+        // Read: the plain row-major upstream gradient `grad_out[t*H + d]`.
+        let grad_out = self.index_off(value, d, Some((t, de)))?;
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32)
+            || scalar_of(value, self.sema) != Some(mercury_types::Scalar::F32)
+        {
+            return None;
+        }
+        // The accumulator, the upstream gradient, and the id buffer are three distinct arrays.
+        if grad_w == grad_out || grad_w == ids || grad_out == ids {
+            return None;
+        }
+        // V (grad_w's table height) must be REAL for the parallel kernel's output-row partition (a
+        // sentinel would pile all work in chunk 0). Recover the total length `V*H` from grad_w's sema
+        // array type — present even for an array PARAMETER (MIR lowers it to a bare pointer, but sema
+        // keeps the declared `[f32; V*H]`); decline if grad_w is not a statically-sized array.
+        let ExprKind::Index { base: gw_base, .. } = &target.kind else {
+            return None;
+        };
+        let total = match self.expr_ty(gw_base) {
+            Ty::Array { len, .. } => len,
+            _ => return None,
+        };
+        Some(ScatterNest {
+            grad_w,
+            grad_out,
+            ids,
+            t_rows,
+            h,
+            total,
+        })
+    }
+
+    /// Emit one `mercury_scatter_add_f32[_parallel](grad_w, grad_out, ids, T, H, V)` call for a recognized
+    /// scatter-add. `V = total / H` is the **real** table height (not a sentinel like the embedding's),
+    /// derived from grad_w's array length, because the parallel kernel partitions the `V` output rows
+    /// across cores. `parallel` selects the multicore kernel (output-row split → bit-identical to serial).
+    fn emit_scatter(&mut self, nest: &ScatterNest, parallel: bool) -> bool {
+        let (Some((grad_w, _)), Some((grad_out, _)), Some((ids, _))) = (
+            self.lookup(nest.grad_w),
+            self.lookup(nest.grad_out),
+            self.lookup(nest.ids),
+        ) else {
+            return false;
+        };
+        let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
+            return false;
+        };
+        // V = grad_w length / H (integer div; `total = V*H` exactly for a well-formed `[f32; V*H]`).
+        let total = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
+        let v = self.builder.build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
+        let func = if parallel {
+            self.gemm.scatter_add_par
+        } else {
+            self.gemm.scatter_add
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![grad_w, grad_out, ids, t_rows, h, v],
         });
         true
     }
@@ -5959,6 +6095,16 @@ impl FnLowerer<'_> {
         // the scalar nest (no reassociation, like the transpose); rows independent → parallel == serial.
         if let Some(nest) = self.match_embedding(pat, iter, body) {
             if self.emit_embedding(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Scatter-add / embedding-gradient backward `for t { for d { grad_w[ids[t]*H+d] += grad_out[t*H+d] } }`
+        // → `mercury_scatter_add_f32` (the `_parallel` one in a `@parallel` fn). The dual of the embedding
+        // gather; bit-identical to the scalar nest (collisions sum in token order, no reassociation). It is
+        // probed AFTER embedding — disjoint store ops (`+=` indirect-write vs `=` indirect-read), so neither
+        // steals the other's nest.
+        if let Some(nest) = self.match_scatter(pat, iter, body) {
+            if self.emit_scatter(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -14508,6 +14654,19 @@ struct EmbeddingNest {
     ids: Symbol,
     t_rows: Dim,
     h: Dim,
+}
+
+/// A recognized scatter-add / embedding-gradient-backward nest (see [`FnLowerer::match_scatter`]):
+/// `grad_w[ids[t], :] += grad_out[t, :]`. `t_rows` is the token count, `h` the hidden width (row stride),
+/// and `total` is grad_w's full array length `V*H` (from its sema type) — the emitter divides it by `H`
+/// to recover the real table height `V` the parallel kernel partitions across cores.
+struct ScatterNest {
+    grad_w: Symbol,
+    grad_out: Symbol,
+    ids: Symbol,
+    t_rows: Dim,
+    h: Dim,
+    total: u64,
 }
 
 /// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner

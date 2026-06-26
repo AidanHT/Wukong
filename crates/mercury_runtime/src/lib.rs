@@ -134,6 +134,9 @@ pub use cumminmax::{
 mod lrscan;
 pub use lrscan::{mercury_lrscan_f32, mercury_lrscan_f32_parallel};
 
+mod scatter;
+pub use scatter::{mercury_scatter_add_f32, mercury_scatter_add_f32_parallel};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
