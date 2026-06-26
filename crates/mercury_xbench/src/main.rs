@@ -5270,6 +5270,33 @@ fn kernels() -> Vec<Kernel> {
                  *out.add(i)=0.5*v*(1.0+t); }",
             ),
         },
+        // Batched GELU `out[r*C+j] = gelu(x[r*C+j])` over a flat [R, C] = 1024x1024 matrix (= N) — the
+        // real [tokens, hidden] FFN/attention activation shape (the bare `gelu` above is one flat row).
+        // Mercury's batched recognizer folds the nest to ONE flat 256-bit `mercury_vmath_f32` over the
+        // whole [0, R*C) buffer; before that generalization the offset-indexed inner loop fell to the
+        // 128-bit generic vectorizer (half the kernel width). C/Rust write the inner loop with scalar
+        // libm `expf` (the tanh-approx gelu won't vectorize), so the structural win that the flat `gelu`
+        // gets is now *also* captured for the nested transformer shape — at the full 256-bit width.
+        Kernel {
+            name: "gelu_batched",
+            bytes_per_call: 2 * N * 4,
+            note: "out[r*C+j]=gelu(x[r*C+j]) [R,C]=1024x1024: batched 256-bit dispatch vs scalar C/Rust",
+            mer: mer_kernel(
+                "for r in 0..1024 { for j in 0..1024 { out[r * 1024 + j] = gelu(x[r * 1024 + j]); } }",
+            ),
+            c: c_kernel(
+                "for(long r=0;r<1024;r++) for(long j=0;j<1024;j++){ long ix=r*1024+j; float v=x[ix]; \
+                 float u=0.7978845608f*(v+0.044715f*v*v*v); \
+                 float t=1.0f-2.0f/(expf(2.0f*u)+1.0f); \
+                 out[ix]=0.5f*v*(1.0f+t); }",
+            ),
+            rust: rust_kernel(
+                "for r in 0..1024 { for j in 0..1024 { let ix=r*1024+j; let v= *x.add(ix); \
+                 let u=0.7978845608f32*(v+0.044715*v*v*v); \
+                 let t=1.0f32-2.0/((2.0*u).exp()+1.0); \
+                 *out.add(ix)=0.5*v*(1.0+t); } }",
+            ),
+        },
         // SiLU / swish: x * sigmoid(x), the activation in Llama/modern transformers. sigmoid is one
         // intrinsic that vectorizes; C/Rust spell it 1/(1+exp(-x)) with a scalar libm expf.
         Kernel {
@@ -5751,7 +5778,7 @@ fn c_kernel(body: &str) -> String {
 fn rust_kernel(body: &str) -> String {
     // `#[allow(unused_variables)]`: some kernels (relu, poly) don't read `y`; the fixed `(x,y,out)`
     // ABI keeps the param, so silence the warning rather than clutter the benchmark output.
-    format!("const N: usize = {N};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
+    format!("#[allow(dead_code)]\nconst N: usize = {N};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(x:*const f32, y:*const f32, out:*mut f32) {{\n  {body}\n}}\n")
 }
 
 /// Render a C kernel source as **C++** for the g++ peer column. C is a subset of C++, so the numeric
