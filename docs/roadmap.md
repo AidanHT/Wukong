@@ -5,7 +5,7 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
-Two execution backends now run the full language and agree bit-for-bit (a differential gate proves
+Two CPU execution backends now run the full language and agree bit-for-bit (a differential gate proves
 it across opt levels): the zero-dependency tree-walking interpreter (the reference oracle) and a
 from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, object/exe via
 `--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
@@ -43,7 +43,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
   the way XLA/TVM/oneDNN lower a matmul op. Serial and `@parallel`. Beats gcc/rustc's naive nest
-  ~2.4–3.5× single-thread and up to ~13× parallel on `C = A·B` (~19–70× on `nn.Linear`), the lead
+  ~3–3.6× single-thread (~110–120 GFLOP/s ≈ 90% of one P-core's roofline) and up to ~18× parallel on `C = A·B` (~19–26× single-core / up to ~104× parallel on `nn.Linear`), the lead
   growing with size. Dimensions may be compile-time literals **or runtime values** (function
   params/locals): the recognizer checks strides symbolically, so a general matmul function dispatches
   to the kernel, not just fixed-size benchmark kernels. The two factors may even be the **same array**
@@ -89,7 +89,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   for i { dx = y·(dy−s) } }` (the gradient through a row softmax — attention + classifier training) folds to
   `mercury_softmax_bwd_f32[_parallel]`, which delegates the per-row dot to the bit-exact `sreduce` (8 lane
   accumulators) then applies `y·(dy−s)` 8-wide. gcc/rustc keep the dot's *accumulation* scalar (a serial
-  `vaddss` chain), so Mercury wins ~1.0–1.85× single-core (the apply is already vectorized in both) and
+  `vaddss` chain), so Mercury wins ~1.0–2.0× single-core (the apply is already vectorized in both) and
   ~5–6× `@parallel` (rows across cores). The dot reassociates (the reduction exception), so the differential
   gate is bit-exact while the cross-language check is a tolerance (`tests/run/softmax_bwd.mer`).
 - **Activation backward → 256-bit transcendental gradient**: a `for i { dx[i] = act_backward(x[i],
@@ -143,7 +143,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit)
   vectorizer can't reach; a *composed* use auto-vectorizes the inlined poly at 128-bit. So softmax, layernorm,
   GELU (tanh and exact erf), SiLU/swish, ELU, softplus, mish, tanh, RoPE, and **log-softmax /
-  cross-entropy** run on SIMD instead of scalar `libm` — **~4–11.5× faster** than gcc/rustc's scalar
+  cross-entropy** run on SIMD instead of scalar `libm` — **~2–13× faster** than gcc/rustc's scalar
   `libm` call (which can't vectorize a loop containing it; ~28× across cores under `@parallel`). See `tests/run/{transcendental,softmax,
   layernorm,gelu,elu,leaky_relu,softplus,mish,activations,log,erf,trig,ihyp,atan,log_softmax,ffn_block}.mer`.
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
@@ -183,7 +183,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
 
-A third backend, `mercury_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
+A GPU backend, `mercury_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
 toolkit** is needed to build or run, only the driver). Every transformer op category is a device
 kernel, each gated against a CPU reference by a **tolerance** differential (`c·√K·ε`, deterministic
@@ -196,7 +196,8 @@ mobile 4050 (see `BENCHMARKS.md`):
   16×8 tiles per warp) is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and
   ~1.3–2.3× fp16/bf16 in the same run (single-tile retained as the fallback for non-divisible shapes).
 - **Fused flash-attention** (online softmax, never materializes the `S×S` scores — the kernel that
-  *loses* on CPU): warp-per-query-row, 183→372 GFLOP/s as context grows to 4 K.
+  *loses* on CPU): warp-per-query-row + `cp.async` double-buffering, **3.6–5.0× a cuBLAS unfused
+  attention chain** (205–738× naive CUDA-C), and faster than PyTorch eager at every sequence length.
 - **Fused row norms** (softmax/LayerNorm/RMSNorm, one warp per row), **activations** (SFU), **reductions**
   (deterministic; max bit-exact), **conv2d**, and elementwise.
 - **A whole pre-norm transformer layer runs end-to-end GPU-resident** — RMSNorm → QKV → flash-attn →
@@ -215,8 +216,21 @@ the interp oracle and the GPU over identical buffers and matches within toleranc
 silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
 
 Run the kernel suite with `cargo test -p mercury_codegen_gpu --features gpu` (skips cleanly with no
-GPU). A full MIR→PTX scalar compiler (so arbitrary, non-recognized kernels run GPU-side too) is the
-remaining stretch; today unrecognized ops execute on the CPU within the same offloading run.
+GPU).
+
+**General MIR→PTX — `--backend=gpu-native`.** Beyond the recognizer-offload path above, a fourth
+backend (`GpuLower`) lowers the *whole* program's MIR to PTX, so arbitrary non-recognized kernels run
+GPU-side too; an eligible program is fused into a single-block cooperative **megakernel** (one launch,
+no host round-trips). It is tolerance-gated against the interpreter oracle and optimization-invariant
+(`-O0` ≡ `-O3`), the same contract as the offload path.
+
+## Automatic differentiation (`mercury_autodiff`)
+
+Reverse-mode autodiff runs as a **MIR→MIR transform**: given a forward function computing a scalar
+loss, it emits a new function that also accumulates the gradient w.r.t. designated input buffers (the
+vector-Jacobian product). Matmul adjoints ride the same tuned GEMM kernels, and a fused AdamW step is
+emitted as one kernel. Every VJP rule is **finite-difference-gated** (forward + backward run in f64)
+against a closed-form reference. It is a library transform today, not yet a CLI surface.
 
 ## Checked but not yet executed
 
@@ -232,15 +246,14 @@ remaining stretch; today unrecognized ops execute on the CPU within the same off
 - Fusing chains *under* `@parallel`; a **parallel** fused-epilogue GEMM kernel (the serial one already
   folds bias + ReLU/GELU/SiLU, bias optional, into the microkernel write-back — a multicore
   `mercury_sgemm_nt_epi_parallel` is the remaining step).
-- A **GPU backend** (the next major frontier — where flash-attention and large-batch throughput
-  actually win). Scoped in `next-steps.md` at the repo root.
 - 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
   value (verified — pinned as a tripwire test), so the elementwise vectorizer is 128-bit + unrolling;
   the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
   needs a raw-AVX emitter or a future Cranelift.
 - Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
 - Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
-- GPU device codegen (PTX/AMDGPU), autodiff — designed-for, explicitly deferred.
+- AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
+  reverse-mode autodiff already ships as the `mercury_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
 

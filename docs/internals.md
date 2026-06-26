@@ -42,7 +42,11 @@ mercury_backend   `Backend` trait + `Artifact`
 mercury_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
 mercury_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
 mercury_codegen_llvm  textual LLVM IR backend
-mercury_runtime   C-ABI arena allocator + rayon-backed parallel_for
+mercury_codegen_gpu   GPU backend (--features gpu): PTX emit + cudarc driver-JIT — recognizer
+                  offload (--backend=gpu) + general MIR→PTX (--backend=gpu-native), no CUDA toolkit
+mercury_runtime   C-ABI arena + rayon parallel_for + the AVX2/FMA microkernels (GEMM, vmath,
+                  reductions, norms, int8 — the symbols the recognizers dispatch to)
+mercury_autodiff  reverse-mode autodiff as a MIR→MIR transform (the training backward pass)
 mercury_driver    Session + compile() pipeline + --emit / --backend handling
 mercuryc          thin CLI binary
 mercury_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
@@ -62,6 +66,7 @@ source
   → mir_build    (mercury_mir_build::lower_program)     -> MIR (High)
   → opt          (mercury_opt::optimize)                fixpoint passes
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
+                 | GPU (--features gpu: --backend=gpu offload, --backend=gpu-native MIR→PTX)
                  | textual LLVM IR (--emit=llvm-ir)
 ```
 
@@ -109,6 +114,9 @@ list of function-level `Pass`es to a per-function fixpoint. Two shared analyses 
 | `Cse`         | -O2   | local value numbering with alloca-aware load forwarding |
 | `Dse`         | -O2   | dead-store elimination (overwritten stores to a slot with no intervening read) |
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader |
+
+`-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
+(`PassManager::standard` adds passes at `-O1` and `-O2` only).
 
 `Mem2Reg` is the keystone: the front-end's memory traffic hides constants, common subexpressions,
 and induction variables, so promoting slots to SSA is what lets the rest of the pipeline fire. It
@@ -191,6 +199,19 @@ Crucially this stays inside the differential oracle: the interpreter, on a `merc
 **marshals its abstract `Value` memory into real f32 buffers and calls the identical kernel**, then
 marshals the result back — so native and interpreter agree bit-for-bit despite the reassociated
 accumulation (the parallel kernel is bit-identical to the serial one by construction).
+
+## GPU backend
+
+`mercury_codegen_gpu` (behind `--features gpu`) is a third execution path: being a compiler, it
+**emits PTX text** and **driver-JIT-loads it via `cudarc`** (`cuModuleLoadData`), so no `nvcc`/CUDA
+toolkit is needed — only the NVIDIA driver. It offers two modes. `--backend=gpu` runs the program on
+an **offloading interpreter** (the CPU tree-walks every op as the oracle does, but recognized
+GEMM/activation/reduction/norm calls execute on the device). `--backend=gpu-native` (the `GpuLower`
+backend) instead lowers the **whole** MIR to PTX, so arbitrary non-recognized kernels run GPU-side
+too; an eligible program can be fused into a single-block cooperative *megakernel* (one launch, no
+host round-trips). The CPU↔GPU boundary is **tolerance-gated** (`c·√K·ε`) rather than bit-exact — the
+GPU analogue of the CPU differential oracle — and the path stays optimization-invariant (`-O0` ≡
+`-O3`). It builds but is inert without the feature, so plain `cargo test` is unaffected.
 
 ## Testing strategy
 

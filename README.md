@@ -16,36 +16,48 @@ Mercury compiles to native code through a **from-scratch [Cranelift](https://cra
 no LLVM, no external toolchain**. In a head-to-head cross-language benchmark (same kernel in each
 language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 
-- **compiles ~100–260× faster** than gcc/rustc (Cranelift JIT in-process vs spawning a full
-  C/Rust+LLVM toolchain) — the metric that dominates real ML edit-run iteration;
+- **compiles ~100–680× faster** than gcc/rustc (full-board geomean **~305×**; Cranelift JIT in-process
+  vs spawning a full C/Rust+LLVM toolchain) — the metric that dominates real ML edit-run iteration;
 - **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
   `nn.Linear` `A·Bᵀ` form) and dispatches it to a tuned register-blocked, cache-tiled, packed
-  **AVX2/FMA** microkernel — **~2.8–3.5× faster single-thread** (and **~1.3–1.7× over the tuned
-  `matrixmultiply` Rust crate**) **and up to ~20× parallel** on plain `C = A·B`, **~80–156× on
-  `nn.Linear`** (where naive C leaves the reduction latency-bound), the lead *growing with matrix
-  size* as their version falls out of cache;
-- **wins the transcendental/activation family ~4–11.5×** — the cleanest compute-bound win. Mercury
-  dispatches a pure `out[i]=f(x[i])` loop for **35** functions (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/
-  `silu`/`softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`
-  — the transformer activations plus **RoPE**'s `sin`/`cos`, the inverse trig `atan`/`asin`/`acos`, the
-  exact-GELU `erf`, the stable `expm1`/`log1p`/`logsigmoid`, and the hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where
-  gcc/rustc call scalar `libm` and **cannot vectorize a loop containing the call**;
-- **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form) **~1.7–6.7×**
-  and **convolution** (im2col + GEMM) **~5–7×**;
-- **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~8× parallel**, and runs a full
-  **bf16 *and* f16 mixed-precision CPU suite** — `dot`/`sum` (**~3–8×**), `max`/`min`/`absmax`
-  (the symmetric-quant scale), streaming `axpby`, and the 36-op activation set — all half-in/f32-out,
-  where C/Rust can vectorize neither `libm` nor the half→f32 widen (f16 via the F16C `vcvtph2ps`);
-- **wins reductions ~2.6–3.6×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
-  which gcc/rustc leave serial;
-- is **~1.8–26× faster** than idiomatic single-threaded C once `@parallel` auto-parallelizes and
-  vectorizes the loop (bounded by aggregate memory bandwidth on the memory-bound kernels).
+  **AVX2/FMA** microkernel — **~3–3.6× faster single-thread** at **~110–120 GFLOP/s ≈ 90% of one
+  P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
+  **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
+  (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*;
+- **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
+  over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
+  column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
+  **RoPE** rotary embedding **~29–54×** (up to **~156× parallel**), **strided column reductions**
+  (bias-grad / per-channel quant stats) **~29–50×**, and the training-backward kernels
+  (activation/softmax/LayerNorm-RMSNorm backward, cross-entropy) **~3–13×**;
+- **wins the transcendental/activation family ~2–13×** (**~28× under `@parallel`**) — the cleanest
+  compute-bound win. Mercury dispatches a pure `out[i]=f(x[i])` loop for **35** functions
+  (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/
+  `softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the
+  hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh` — the transformer activations plus **RoPE**'s
+  `sin`/`cos`, the inverse trig, the exact-GELU `erf`, the stable `expm1`/`log1p`/`logsigmoid`, and the
+  hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where gcc/rustc
+  call scalar `libm` and **cannot vectorize a loop containing the call**;
+- **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form)
+  **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
+- **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~4.6–14.7× parallel**, and runs a full
+  **bf16 *and* f16 mixed-precision CPU suite** — `dot` (**~3×**) / `sum` (**~6–8×**), `max`/`min`/`absmax`
+  (the symmetric-quant scale), streaming `axpby`, the `nn.Linear` GEMM (**~24–25×**), and the 36-op
+  activation set — all half-in/f32-out, where C/Rust can vectorize neither `libm` nor the half→f32
+  widen (f16 via the F16C `vcvtph2ps`);
+- **wins reductions ~2.6–2.9×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
+  which gcc/rustc leave serial — and **~7.9–8.6× under `@parallel`** (up to ~25× for `max`/`absmax`);
+- and ships a **GPU backend** (`--features gpu`, NVIDIA RTX 4050; PTX + cudarc driver-JIT, no CUDA
+  toolkit): fp16 tensor-core GEMM at **cuBLAS parity (~101%) ≤1024³**, a fused **flash-attention**
+  **3.6–5× a cuBLAS unfused attention chain** (and faster than PyTorch eager at every sequence length),
+  int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
+  compile vs Triton's 30–120 s**.
 
 The domain-aware paths (GEMM, the `vmath` transcendentals, the `velem` streaming elementwise, the
 fused norms) all emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — the width
 Cranelift's *general* vectorizer can't legalize (it caps at 128-bit `f32x4`). So even the
-memory-bandwidth-bound elementwise kernels are now small **wins** (saxpy ~1.3×, poly ~1.2×, widening
-to ~1.3–1.6× at realistic >L3 tensor sizes via non-temporal stores); the one honest **tie** left is
+memory-bandwidth-bound elementwise kernels are now small **wins** (saxpy ~1.25–1.45×, poly ~1.1–1.2×,
+widening to ~1.3–1.6× at realistic >L3 tensor sizes via non-temporal stores); the one honest **tie** left is
 `relu` at an L3-resident size, where both languages are pinned to the same cache bandwidth.
 
 Where Mercury is built to win for the ML/DL niche:
@@ -115,20 +127,25 @@ Mercury IR (MIR)         one SSA IR that lowers progressively from "High" to "Lo
 MIR (Low)
    ├──────────────► interpreter      (always available, zero deps; the reference oracle)
    ├──────────────► Cranelift backend (native JIT + object/exe; NO LLVM — the fast path)
+   ├──────────────► GPU backend      (PTX + cudarc driver-JIT; offload + MIR→PTX)   [feature = "gpu"]
    └──────────────► LLVM backend     (textual IR for external clang/llc)            [feature = "llvm"]
 ```
 
 The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cranelift native
 backend** build and test with plain `cargo test` on any machine — no LLVM, no toolchain. The native
 backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
-interpreter bit-for-bit. LLVM is an optional *textual-IR* emitter behind `--features llvm`.
+interpreter bit-for-bit. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
+behind `--features gpu`, and LLVM is an optional *textual-IR* emitter behind `--features llvm`.
 
 ## Status
 
 Early development — built incrementally and openly. The full front-end, optimizer, interpreter, and
 **native Cranelift backend** work today, including **matmul → tuned AVX2/FMA GEMM dispatch** (serial
 and `@parallel`, incl. `nn.Linear` `A·Bᵀ`), SIMD auto-vectorization (elementwise + reductions), FMA
-contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels.
+contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels. A
+**GPU backend** (`--features gpu`; NVIDIA, PTX via cudarc driver-JIT) adds tensor-core GEMM, fused
+flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode autodiff**
+(`mercury_autodiff`) emits the training backward pass — both gated against the interpreter oracle.
 Shape-typed *tensor* operations type-check today but do not yet lower/run. See the docs:
 
 - [Benchmarks](BENCHMARKS.md) — honest cross-language results vs C and Rust, with methodology.

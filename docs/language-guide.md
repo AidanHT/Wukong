@@ -172,7 +172,7 @@ When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **an
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
 are **dispatched to a tuned 256-bit
 AVX2/FMA kernel** (`mercury_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
-activation family runs ~5–7.5× faster than C's scalar `libm`, and ~28× across cores under
+activation family runs ~2–13× faster than C's scalar `libm`, and ~28× across cores under
 `@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`) auto-vectorize the inlined poly at 128-bit.
 Every form is bit-identical across the interpreter and native backends.
 
@@ -190,9 +190,11 @@ stay differentially equal. Allocator selection and `defer` are still being wired
 ```
 mercuryc [OPTIONS] <input.mer>
 
---run                 compile and execute via the built-in interpreter
+--run                 compile and execute (via --backend; default the interpreter)
+--backend=<b>         interp | native | gpu | gpu-native  (execution backend for --run;
+                      gpu / gpu-native require a --features gpu build)
 --emit=<stage>        tokens | ast | mir-high | mir | llvm-ir | obj | exe
--O0|-O1|-O2|-O3       optimization level
+-O0|-O1|-O2|-O3       optimization level (-O3 currently runs the -O2 pipeline)
 -o <path>             output path
 --error-format=<f>    human | json
 --explain <CODE>      print an extended explanation for an error code
