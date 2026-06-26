@@ -5697,6 +5697,13 @@ impl FnLowerer<'_> {
         if self.try_emit_batched_norm(pat, iter, body) {
             return;
         }
+        // A `for r in 0..R { for j in 0..C { out[r*C + j] = f(x[r*C + j]) } }` batched activation nest
+        // (the `[tokens, hidden]` FFN/attention shape) dispatches to one flat 256-bit `mercury_vmath_f32`
+        // over the whole `[0, R*C)` buffer — restoring the full kernel width the offset-indexed inner
+        // loop would otherwise lose to the 128-bit generic vectorizer.
+        if self.try_emit_batched_vmath(pat, iter, body) {
+            return;
+        }
         let (start, end, inclusive, step) = match iter {
             ForIter::Range {
                 start,
@@ -5860,7 +5867,12 @@ impl FnLowerer<'_> {
 
     /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
     /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
-    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32, MirType)> {
+    fn match_vmath_stmt(
+        &self,
+        stmt: &Stmt,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, Symbol, u32, MirType)> {
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -5869,7 +5881,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let out_sym = self.index_by_loopvar(target, j)?;
+        let out_sym = self.index_off(target, j, batch)?;
         // Gated SiLU / swish written as a product — `out[j] = x[j] * sigmoid(x[j])` — the textbook
         // definition a programmer writes before reaching for the `silu()` intrinsic (and the value==gate
         // case of a SwiGLU gate). Dispatch to the existing 256-bit `VMATH_SILU` kernel, which *is*
@@ -5883,8 +5895,8 @@ impl FnLowerer<'_> {
         {
             if self.expr_mir(value) == MirType::F32 {
                 if let Some(x_sym) = self
-                    .match_gated_silu(lhs, rhs, j)
-                    .or_else(|| self.match_gated_silu(rhs, lhs, j))
+                    .match_gated_silu(lhs, rhs, j, batch)
+                    .or_else(|| self.match_gated_silu(rhs, lhs, j, batch))
                 {
                     return Some((out_sym, x_sym, VMATH_SILU, MirType::F32));
                 }
@@ -5969,7 +5981,7 @@ impl FnLowerer<'_> {
             if self.expr_mir(target) == MirType::F32
                 && scalar_of(arg, self.sema) == Some(mercury_types::Scalar::F32)
             {
-                let x_sym = self.index_by_loopvar(inner, j)?;
+                let x_sym = self.index_off(inner, j, batch)?;
                 return Some((out_sym, x_sym, opcode, in_elem));
             }
             return None;
@@ -5978,7 +5990,7 @@ impl FnLowerer<'_> {
         if self.expr_mir(arg) != MirType::F32 {
             return None;
         }
-        let x_sym = self.index_by_loopvar(arg, j)?;
+        let x_sym = self.index_off(arg, j, batch)?;
         Some((out_sym, x_sym, opcode, MirType::F32))
     }
 
@@ -5986,8 +5998,14 @@ impl FnLowerer<'_> {
     /// unit-stride f32 read `x[j]` and `gate` the call `sigmoid(x[j])` over the *same* array. Returns
     /// that array's symbol, or `None`. Pure — used by [`match_vmath_stmt`] to fold the product form
     /// into the `VMATH_SILU` dispatch (`silu(x) == x·sigmoid(x)`, bit-identical to the inlined form).
-    fn match_gated_silu(&self, val: &Expr, gate: &Expr, j: Symbol) -> Option<Symbol> {
-        let xs = self.index_by_loopvar(val, j)?;
+    fn match_gated_silu(
+        &self,
+        val: &Expr,
+        gate: &Expr,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let xs = self.index_off(val, j, batch)?;
         if self.expr_mir(val) != MirType::F32 {
             return None;
         }
@@ -5998,7 +6016,7 @@ impl FnLowerer<'_> {
         {
             return None;
         }
-        let xs2 = self.index_by_loopvar(&args[0], j)?;
+        let xs2 = self.index_off(&args[0], j, batch)?;
         (xs == xs2).then_some(xs)
     }
 
@@ -6010,13 +6028,14 @@ impl FnLowerer<'_> {
         &self,
         j: Symbol,
         body: &Block,
+        batch: Option<(Symbol, &Expr)>,
     ) -> Option<Vec<(ValueId, ValueId, u32, MirType)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
-            let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j)?;
+            let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j, batch)?;
             let (out_base, _) = self.lookup(out_sym)?;
             let (x_base, _) = self.lookup(x_sym)?;
             calls.push((out_base, x_base, opcode, in_elem));
@@ -6075,7 +6094,7 @@ impl FnLowerer<'_> {
     /// interpreter marshals through the identical kernel, so the differential oracle stays exact.
     /// Returns false (fall back to the generic vectorizer) unless every statement matches.
     fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
-        let Some(calls) = self.match_vmath_body(j, body) else {
+        let Some(calls) = self.match_vmath_body(j, body, None) else {
             return false;
         };
         // Bounds GEP each base by the start index, so a loop from `lo` begins at element `lo`.
@@ -6086,6 +6105,88 @@ impl FnLowerer<'_> {
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
         self.emit_vmath_calls(s, e, calls);
+        true
+    }
+
+    /// Recognize a **batched** transcendental-activation nest `for r in 0..R { for j in 0..C { out[r*C
+    /// + j] = f(x[r*C + j]) } }` — the real `[tokens, hidden]` FFN/attention activation shape — and
+    /// lower it to a single flat 256-bit `mercury_vmath_f32` call over the whole `[0, R*C)` buffer. A
+    /// per-element activation over a contiguous `[R, C]` matrix *is* one flat activation of `R*C`
+    /// elements, so the row structure is irrelevant to the kernel — one call covers it, at true 256-bit
+    /// width (the generic vectorizer that would otherwise lower the offset-indexed inner loop is capped
+    /// at 128-bit SSE, so the batched shape ran at half the width of the flat `for i in 0..N` form). The
+    /// kernel mirrors the inlined poly, so dispatched == the generic-vectorized form bit-for-bit, and
+    /// the interpreter marshals the same kernel — the differential gate stays exact. Returns false (fall
+    /// through) unless the nest matches exactly; a partial match leaves the generic vectorizer to lower
+    /// the loops correctly. Both `r` and `j` must start at 0 so the touched indices are exactly the
+    /// contiguous `[0, R*C)` (a non-zero inner start would leave per-row gaps the flat call can't model).
+    fn try_emit_batched_vmath(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start: r_start,
+            end: Some(r_end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(r_start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(r),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        // The outer body must be exactly one inner `for j in 0..C { <vmath stmts over x[r*C + j]> }`.
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return false;
+        }
+        let StmtKind::For {
+            pat: jpat,
+            iter: jiter,
+            body: inner,
+            ..
+        } = &body.stmts[0].kind
+        else {
+            return false;
+        };
+        let ForIter::Range {
+            start: j_start,
+            end: Some(cols),
+            inclusive: false,
+            step: None,
+        } = jiter
+        else {
+            return false;
+        };
+        if const_usize_expr(j_start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(jvar),
+            ..
+        } = jpat
+        else {
+            return false;
+        };
+        let Some(calls) = self.match_vmath_body(*jvar, inner, Some((*r, cols))) else {
+            return false;
+        };
+        // Flat range `[0, R*C)`: each base GEPs from element 0, length `R*C`.
+        let rty = self.expr_mir(r_end);
+        let rv = self.lower_expr(r_end);
+        let rv = self.coerce_to(rv, &rty, &MirType::I64, true);
+        let cty = self.expr_mir(cols);
+        let cv = self.lower_expr(cols);
+        let cv = self.coerce_to(cv, &cty, &MirType::I64, true);
+        let total = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, rv, cv));
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        self.emit_vmath_calls(zero, total, calls);
         true
     }
 
@@ -6842,7 +6943,7 @@ impl FnLowerer<'_> {
         // A transcendental-activation chunk dispatches to the 256-bit AVX2 kernel here too, so an
         // `@parallel` activation runs multicore × 256-bit (each thread's chunk is one kernel call).
         // Elementwise, so the interpreter's whole-range pass and the native per-chunk passes agree.
-        if let Some(calls) = self.match_vmath_body(j, body) {
+        if let Some(calls) = self.match_vmath_body(j, body, None) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
             self.emit_vmath_calls(s, e, calls);
