@@ -2761,6 +2761,66 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_scatter_add_f32[_parallel](grad_w, grad_out, ids, t, h, v)` — the embedding-gradient
+            // backward `grad_w[ids[t], :] += grad_out[t, :]` (the gather's dual). Marshal the `t` i32 ids,
+            // the `t*h` upstream gradient, AND grad_w's CURRENT `v*h` contents (the kernel accumulates in
+            // place, so we start from the program's zeroed accumulator, not zeros), call the *serial* kernel
+            // (bit-identical to the parallel one — output-row split, ascending-`ti` fold), write grad_w back.
+            "mercury_scatter_add_f32" | "mercury_scatter_add_f32_parallel" => {
+                let grad_w = ptr(args[0])?;
+                let grad_out = ptr(args[1])?;
+                let ids = ptr(args[2])?;
+                let t = args[3].as_int() as usize;
+                let h = args[4].as_int() as usize;
+                let v = args[5].as_int() as usize;
+                let mut idbuf = Vec::with_capacity(t);
+                for r in 0..t {
+                    idbuf.push(
+                        self.memory
+                            .get(ids + r)
+                            .ok_or("scatter_add ids out of bounds")?
+                            .as_int() as i32,
+                    );
+                }
+                let gon = t * h;
+                let mut gobuf = Vec::with_capacity(gon);
+                for i in 0..gon {
+                    gobuf.push(
+                        self.memory
+                            .get(grad_out + i)
+                            .ok_or("scatter_add grad_out out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let gwn = v * h;
+                let mut gwbuf = Vec::with_capacity(gwn);
+                for i in 0..gwn {
+                    gwbuf.push(
+                        self.memory
+                            .get(grad_w + i)
+                            .ok_or("scatter_add grad_w out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                // SAFETY: gwbuf is v*h f32, gobuf is t*h f32, idbuf is t i32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_scatter_add_f32(
+                        gwbuf.as_mut_ptr(),
+                        gobuf.as_ptr(),
+                        idbuf.as_ptr(),
+                        t,
+                        h,
+                        v,
+                    );
+                }
+                for (i, &val) in gwbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(grad_w + i)
+                        .ok_or("scatter_add grad_w output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }

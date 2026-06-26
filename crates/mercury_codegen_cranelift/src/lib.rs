@@ -177,6 +177,8 @@ const RT_I8GEMM_NT_DEQ: &str = "mercury_i8gemm_nt_deq";
 const RT_I8GEMM_NT_DEQ_PARALLEL: &str = "mercury_i8gemm_nt_deq_parallel";
 const RT_EMBEDDING: &str = "mercury_embedding_f32";
 const RT_EMBEDDING_PAR: &str = "mercury_embedding_f32_parallel";
+const RT_SCATTER_ADD: &str = "mercury_scatter_add_f32";
+const RT_SCATTER_ADD_PAR: &str = "mercury_scatter_add_f32_parallel";
 const RT_DOT_BF16: &str = "mercury_dot_bf16";
 const RT_SUM_BF16: &str = "mercury_sum_bf16";
 const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
@@ -1277,6 +1279,21 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[out, weight, ids, t, h, v]);
             return None;
         }
+
+        // Scatter-add / embedding-gradient backward: mercury_scatter_add_f32[_parallel](grad_w, grad_out,
+        // ids, t, h, v) — same 3-ptr + 3-i64 ABI as the embedding gather (grad_w/grad_out f32*, ids i32*),
+        // but `v` is the real table height (the parallel kernel partitions its output rows). Void.
+        if matches!(name, RT_SCATTER_ADD | RT_SCATTER_ADD_PAR) && args.len() == 6 {
+            let grad_w = self.val(args[0]);
+            let grad_out = self.val(args[1]);
+            let ids = self.val(args[2]);
+            let t = self.coerce_to_i64(args[3]);
+            let h = self.coerce_to_i64(args[4]);
+            let v = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[grad_w, grad_out, ids, t, h, v]);
+            return None;
+        }
         // The int8 quantized nn.Linear with fused dequant epilogue:
         // mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n, scale_a, scale_b, bias, act) — three
         // pointers, three i64, one f32 scalar (scale_a), two pointers (scale_b, bias; bias may be
@@ -1503,6 +1520,8 @@ struct RtFuncs {
     /// gather (the first layer of every LLM). Reuses the 3-ptr + 3-i64 void `sig_i8gemm` signature.
     embedding: FuncId,
     embedding_par: FuncId,
+    scatter_add: FuncId,
+    scatter_add_par: FuncId,
     dot_bf16: FuncId,
     sum_bf16: FuncId,
     reduce_bf16: FuncId,
@@ -2055,6 +2074,12 @@ fn populate_module<M: Module>(
         embedding_par: module
             .declare_function(RT_EMBEDDING_PAR, Linkage::Import, &sig_i8gemm)
             .map_err(|e| e.to_string())?,
+        scatter_add: module
+            .declare_function(RT_SCATTER_ADD, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        scatter_add_par: module
+            .declare_function(RT_SCATTER_ADD_PAR, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
             .unwrap(),
@@ -2527,6 +2552,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_EMBEDDING_PAR,
                 module.declare_func_in_func(rt.embedding_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SCATTER_ADD,
+                module.declare_func_in_func(rt.scatter_add, builder.func),
+            );
+            rt_refs.insert(
+                RT_SCATTER_ADD_PAR,
+                module.declare_func_in_func(rt.scatter_add_par, builder.func),
             );
             rt_refs.insert(
                 RT_AXPBY_BF16,
@@ -3031,6 +3064,14 @@ pub fn jit_compile(
         RT_EMBEDDING_PAR,
         mercury_runtime::mercury_embedding_f32_parallel as *const u8,
     );
+    builder.symbol(
+        RT_SCATTER_ADD,
+        mercury_runtime::mercury_scatter_add_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD_PAR,
+        mercury_runtime::mercury_scatter_add_f32_parallel as *const u8,
+    );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
     builder.symbol(
@@ -3476,6 +3517,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_EMBEDDING_PAR,
         mercury_runtime::mercury_embedding_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD,
+        mercury_runtime::mercury_scatter_add_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD_PAR,
+        mercury_runtime::mercury_scatter_add_f32_parallel as *const u8,
     );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
