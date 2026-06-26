@@ -20,7 +20,7 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   `bench_linear`, `bench_linear_bf16`, `bench_matmul_tn`, `bench_conv`, `bench_norm`,
   `bench_norm_batched`, `bench_i8gemm`, `bench_bf16`, `bench_streaming_large`, `bench_transpose`,
   `bench_colsum`, `bench_colmax`, `bench_softmax_bwd`, `bench_act_backward`, `bench_row_losses`
-  (KL-div/entropy/soft-label-xent), `bench_rowarg`, and `bench_colarg`. Each `bench_*` is gated by a
+  (KL-div/entropy/soft-label-xent), `bench_rowarg`, `bench_colarg`, the **scan** family `bench_cumsum`/`bench_cumminmax`/`bench_cumprod` (loop-carried prefix sum/max/min/product → Hillis-Steele in-lane scan, or 4-row-interleaved ILP for `cumprod`), and `bench_lrscan` (the SSM/Mamba first-order linear-recurrence scan `h_t = a_t·h_{t-1} + b_t` — 4-row-interleaved ILP; **plain `mul`+`add`, not `f32::mul_add`** which on a non-`fma`-target build is a libm `fmaf` call that serializes the chain). Each `bench_*` is gated by a
   `want("<name>")` CLI filter (no arg = run all). The newer benches reuse the 3-pointer `KernelFn`
   harness; `bench_rowarg`/`bench_colarg` write an **i32 index** into the f32 output slots and cross-check
   by reinterpreting the bits as i32 (exact), since a per-row/column arg-selection is a deterministic
