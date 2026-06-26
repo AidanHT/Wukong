@@ -19,12 +19,14 @@ cargo build --features llvm                  # native codegen path (requires LLV
 
 CLI flags (`crates/mercuryc/src/main.rs` → `mercury_driver::Options`):
 - `--run` — compile and execute via the interpreter (the default execution path here).
-- `--backend=interp|native|gpu` — execution backend for `--run` (default `interp`). `native` is the
-  Cranelift JIT. `gpu` requires a build with `--features gpu` + a CUDA device: it runs recognized
-  GEMM/activation/reduction/norm calls on the device via an offloading interpreter (see GPU backend below).
+- `--backend=interp|native|gpu|gpu-native` — execution backend for `--run` (default `interp`).
+  `native` is the Cranelift JIT. `gpu` and `gpu-native` require a build with `--features gpu` + a CUDA
+  device: `gpu` runs recognized GEMM/activation/reduction/norm calls on the device via an offloading
+  interpreter, while `gpu-native` lowers the *whole* program's MIR to PTX (general MIR→PTX, optionally
+  fused into one cooperative megakernel). See the GPU backend section below.
 - `--emit=<stage>` — emit one artifact and stop: `tokens`, `ast`, `mir-high`, `mir` (alias `mir-low`),
   `llvm-ir`, `obj`, `exe` (default `exe`). Artifacts go to stdout; diagnostics to stderr.
-- `-O0|-O1|-O2|-O3` — optimization level (default `-O0`).
+- `-O0|-O1|-O2|-O3` — optimization level (default `-O0`; `-O3` currently runs the `-O2` pipeline).
 - `-o <path>`, `--color=auto|always|never`, `--error-format=human|json`, `--explain <CODE>`,
   `-h/--help`, `-V/--version`.
 - `--emit=obj|exe` shells out to `clang` on the textual IR; with no LLVM installed it returns
@@ -40,7 +42,7 @@ source.mer
   → mir_build   mercury_mir_build::lower_program     -> MIR (High, alloca-per-local)
   → opt         mercury_opt::optimize                fixpoint SSA passes -> MIR (Low)
   → backend     mercury_interp (--run) | mercury_codegen_cranelift (--backend=native)
-                | mercury_codegen_gpu (--backend=gpu, offloading interp) | mercury_codegen_llvm (--emit=llvm-ir|obj|exe)
+                | mercury_codegen_gpu (--backend=gpu offload | --backend=gpu-native MIR→PTX) | mercury_codegen_llvm (--emit=llvm-ir|obj|exe)
 ```
 
 `mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early.
@@ -57,6 +59,8 @@ source.mer
 - `mercury_mir` — typed block-structured SSA IR: types, builder, printer, verifier.
 - `mercury_mir_build` — lowers type-checked Mercury AST into MIR (alloca-per-local).
 - `mercury_opt` — pass manager, CFG/dominator analyses, and SSA MIR transforms.
+- `mercury_autodiff` — reverse-mode autodiff as a MIR→MIR transform (the training backward path):
+  VJP rules + a fused AdamW kernel, finite-difference-gated.
 - `mercury_backend` — `Backend` trait + `Artifact` enum: the MIR-to-execution/emission seam.
 - `mercury_interp` — zero-dep tree-walking MIR interpreter; default backend and differential oracle.
 - `mercury_codegen_cranelift` — native backend via Cranelift (no LLVM): JIT + object/exe; the fast path.

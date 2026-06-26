@@ -26,8 +26,11 @@ See [`docs/internals.md`](docs/internals.md) for the crate layering and pipeline
 - Front-end: `mercury_lexer`, `mercury_parser`, `mercury_ast`.
 - Types & checking: `mercury_types`, `mercury_sema` (including shape checking).
 - Middle-end: `mercury_mir`, `mercury_mir_build`, `mercury_opt`.
-- Back-ends: `mercury_interp` (default), `mercury_codegen_llvm` (textual IR).
-- Driver/CLI: `mercury_driver`, `mercuryc`. Harness: `mercury_bench`.
+- Back-ends: `mercury_interp` (default oracle), `mercury_codegen_cranelift` (Cranelift JIT — the
+  native fast path), `mercury_codegen_llvm` (textual LLVM IR), `mercury_codegen_gpu` (PTX GPU backend,
+  `--features gpu`). Runtime microkernels: `mercury_runtime`.
+- Training: `mercury_autodiff` (reverse-mode autodiff, a MIR→MIR transform).
+- Driver/CLI: `mercury_driver`, `mercuryc`. Harness: `mercury_bench`, `mercury_xbench`.
 
 ## Adding a diagnostic
 

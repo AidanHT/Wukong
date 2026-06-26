@@ -1,10 +1,16 @@
-# Next steps — scoping a GPU backend for Mercury
+# Next steps — scoping a GPU backend for Mercury (HISTORICAL / SUPERSEDED)
 
-> Status: scoping note, not a commitment. Written after the CPU work reached diminishing returns
-> (the GEMM microkernel already beats C/C++/Rust and dominates runtime; remaining single-thread CPU
-> wins are marginal). This documents *why* a GPU backend is the next real frontier, the realistic
-> options given Mercury's constraints, and a phased plan. See `BENCHMARKS.md` for the current CPU
-> standing and `docs/internals.md` for the pipeline this would extend.
+> **Status: superseded — the GPU backend scoped here has since been built.** This is the original
+> pre-build scoping note, kept as a design record; the plan below is no longer current. What actually
+> shipped: `mercury_codegen_gpu` (behind `--features gpu`) emits **PTX directly** — the "very high
+> effort" option in the table below, *not* the recommended CUDA-C→`nvcc` route — and driver-JIT-loads
+> it via `cudarc` (`cuModuleLoadData`), so no `nvcc`/CUDA toolkit is needed, only the NVIDIA driver.
+> Phases 0–5 all shipped and were exceeded: tensor-core fp16/bf16/fp8/int8/int4 GEMM, fused
+> flash-attention, fused norms, conv, a GPU-resident transformer layer, a device-memory pool + CUDA
+> graphs, per-shape autotuning, a serving stack, and GPU-resident training — plus a general MIR→PTX
+> backend (`--backend=gpu-native`) and a whole-program cooperative megakernel. For the **current**
+> state see `docs/roadmap.md` ("GPU backend"), `docs/internals.md`, and the GPU section of
+> `BENCHMARKS.md`. The original scoping note follows unchanged, for historical context.
 
 ## Why GPU is the next frontier
 

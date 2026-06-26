@@ -61,17 +61,16 @@ toolkit — only **running** needs the driver + a device.
   route past the ~72% WMMA ceiling). The `PipeCfg`/`PIPE_VARIANTS` table drives the generator, gate
   (`wmma_pipe_matches_reference`), sweep (`gemm_pipe_sweep`), and dispatch from one source. Same-run vs
   cuBLAS on the RTX 4050 (clock-/contention-sensitive — only %-of-peer is reportable): **≤1024³ ~90%**
-  (deep BK=16 WMMA pipe `pipe_64_s6`), **2048³ ~90–97%** and **4096³ ~77%** (`mma_*_r16`, padded + r16
-  raster; up from a pre-pipeline 79%/66%/32%). 4096³ is HBM-bound — bigger dynamic-SMEM tiles, 2-D raster,
-  and *naive* non-padded occupancy were all swept and *lost*; ~77% is near the PTX-`mma.sync` ceiling
-  (cuBLAS's remaining edge is SASS-level). **One lever did reclaim a bit at 4096³: `ldmatrix` + XOR-swizzle
-  + no-pad** (`entry_mma_pipe`'s `swz` flag → `mma_nt_f16_128_bk32_s2_r16_swz`). Dropping the pad (40→32 KiB
-  ⇒ 3 CTAs/SM vs the padded 2) + an XOR swizzle (`chunk ↦ chunk XOR ((row>>1)&3)`) keeps *both* the
-  cp.async stores and the `ldmatrix.x4/.x2` gathers conflict-free at that higher occupancy — the extra
-  CTAs/SM hide the HBM latency the padded 2-CTA tile can't. Weakly dominant same-run (`mma_swizzle_vs_
-  handplaced`, 7 runs @4096³ mean ~1.04×, never < parity, ~72%→~74% of cuBLAS) — so it's **regime-dispatched
-  for A+B ≳ 2×L2 only** (the L2-resident 2048³ loses ~0.86× to the occupancy thrash, keeps the padded base).
-  NB the *un-swizzled* padded ldmatrix LOSES ~20% (a trap — the swizzle, not ldmatrix alone, is the lever).
+  (deep BK=16 WMMA pipe `pipe_64_s6`), and at **≥2048³ (A+B ≳ 16 MB)** the no-pad `ldmatrix` + XOR-swizzle
+  **w24** workhorse (`entry_mma_pipe`'s `swz` flag → `mma_nt_f16_128_bk32_s2_r16_swz`) is the robust
+  same-run winner — **2048³ ~87%** (1.23× over the padded hand-placed base, 87.4% vs 70.9% of cuBLAS) and
+  **4096³ ~83%** (1.13× over padded, past the prior ~77% `mma.sync` ceiling). The mechanism is the
+  *fragment load*, not occupancy: dropping the pad (40→32 KiB ⇒ 3 CTAs/SM vs the padded 2) + an XOR swizzle
+  (`chunk ↦ chunk XOR ((row>>1)&3)`) keeps *both* the cp.async stores and the `ldmatrix.x4/.x2` gathers
+  conflict-free at that higher occupancy, and the `ldmatrix` fragment gather beats hand-placed
+  `ld.shared.b32` at equal occupancy. The padded `mma_*_r16` (r16 raster) and the `_sm_db`/`_sm128_db`
+  cp.async kernels are retained as fallbacks. NB the *un-swizzled* padded ldmatrix LOSES ~20% (a trap —
+  the swizzle, not ldmatrix alone, is the lever).
   Gated `mma_swizzle_matches_reference` (max_abs ≤ 1.3e-5). Also: single-tile/`_mt`, `_sm`, **`cp.async` double-buffered** `_sm_db`/
   `_sm128_db` (the older 64×64/128×128 staged kernels, now fallbacks), and a **fused
   activation epilogue** (`Act` enum — relu/silu/gelu applied to the f32 accumulators before the C store;
