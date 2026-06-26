@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1875
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 8
+module tests.run.lrscan
+
+// First-order linear recurrence / selective scan `out[r,t] = a[r,t]*h_{t-1} + b[r,t]` (h resets to 0
+// each row) — the state-space sequence-model step (Mamba / S4 / RWKV / EMA). The carried `h` makes the
+// inner time loop a true loop-carried dependency gcc/rustc keep scalar; Mercury folds the nest to one
+// `mercury_lrscan_f32` call (the `_parallel` one maps independent rows across cores). The recurrence is
+// inherently sequential within a row, so there is no reassociation — the dispatched kernel is bit-
+// identical to the scalar nest, and the interp == native differential gate holds by construction.
+
+fn main() -> i32 {
+    // A [2, 4] batch of two independent sequences. Row 0: a = 0.5, b = 1 (an EMA: h = 1, 1.5, 1.75,
+    // 1.875 — geometric partial sums). Row 1: a = 0, b = [2,3,4,5] (the zero gate erases all history,
+    // so out == b exactly). All values are exact binary fractions, so the result is rounding-free.
+    let mut a: [f32; 8] = [0.0; 8];
+    let mut b: [f32; 8] = [0.0; 8];
+    for t in 0..4 { a[t] = 0.5; }                  // row 0 gate 0.5; row 1 gate stays 0
+    for t in 0..4 { b[t] = 1.0; }                  // row 0 input 1
+    for t in 0..4 { b[4 + t] = (t as f32) + 2.0; } // row 1 input 2,3,4,5
+
+    let mut out: [f32; 8] = [0.0; 8];
+    for r in 0..2 {
+        let mut h: f32 = 0.0;
+        for t in 0..4 {
+            h = a[r * 4 + t] * h + b[r * 4 + t];
+            out[r * 4 + t] = h;
+        }
+    }
+
+    print(round(out[3] * 1000.0) as i32); // 1875 — row 0 EMA accumulation (0.5·1.75 + 1)
+    print(round(out[7] * 1000.0) as i32); // 5000 — row 1 (a=0): out == b
+
+    // Verify every element against the closed form.
+    let mut ok: i32 = 0;
+    if out[0] == 1.0 { ok = ok + 1; }
+    if out[1] == 1.5 { ok = ok + 1; }
+    if out[2] == 1.75 { ok = ok + 1; }
+    if out[3] == 1.875 { ok = ok + 1; }
+    if out[4] == 2.0 { ok = ok + 1; }
+    if out[5] == 3.0 { ok = ok + 1; }
+    if out[6] == 4.0 { ok = ok + 1; }
+    if out[7] == 5.0 { ok = ok + 1; }
+    print(ok); // 8
+    return 0;
+}

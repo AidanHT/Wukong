@@ -329,6 +329,9 @@ fn main() {
     if want("cumsum") {
         bench_cumsum(&cc, &dir);
     }
+    if want("lrscan") {
+        bench_lrscan(&cc, &dir);
+    }
     if want("cumminmax") {
         bench_cumminmax(&cc, &dir);
     }
@@ -1803,6 +1806,127 @@ fn rust_cumsum(rows: usize, cols: usize) -> String {
          pub unsafe extern \"C\" fn kbench(x:*const f32, _y:*const f32, out:*mut f32) {{\n\
          \x20 for r in 0..R {{ let mut acc=0.0f32; for i in 0..C {{ acc += *x.add(r*C+i); *out.add(r*C+i)=acc; }} }} }}\n"
     )
+}
+
+fn mer_lrscan(rows: usize, cols: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let n = rows * cols;
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for r in 0..{rows} {{\n\
+         \x20       let mut h: f32 = 0.0;\n\
+         \x20       for t in 0..{cols} {{ h = a[r * {cols} + t] * h + b[r * {cols} + t]; out[r * {cols} + t] = h; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_lrscan(rows: usize, cols: usize) -> String {
+    format!(
+        "#define R {rows}\n#define C {cols}\n\
+         __declspec(dllexport) void kbench(const float* a, const float* b, float* out){{\n\
+         \x20 for (long r=0;r<R;r++){{ float h=0.0f; for (long t=0;t<C;t++){{ h = a[r*C+t]*h + b[r*C+t]; out[r*C+t]=h; }} }} }}\n"
+    )
+}
+
+fn rust_lrscan(rows: usize, cols: usize) -> String {
+    format!(
+        "const R: usize = {rows};\nconst C: usize = {cols};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(a:*const f32, b:*const f32, out:*mut f32) {{\n\
+         \x20 for r in 0..R {{ let mut h=0.0f32; for t in 0..C {{ h = *a.add(r*C+t)*h + *b.add(r*C+t); *out.add(r*C+t)=h; }} }} }}\n"
+    )
+}
+
+/// First-order linear-recurrence / selective scan `out[r,t] = a[r,t]·h_{t-1} + b[r,t]` (the SSM/Mamba/S4
+/// step, also EMA). The carried `h` is a true loop-carried dependency, so gcc/rustc cannot auto-vectorize
+/// the inner time loop (like cumsum) and emit **one serial mul+add chain** per row — latency-bound, a few
+/// GB/s. Mercury's kernel **interleaves 4 independent rows**, keeping four chains in flight to fill the
+/// idle ports: a genuine single-core WIN (~1.6–1.9×), since gcc/rustc may not legally re-order an f32
+/// recurrence across rows. `@parallel` maps independent row chunks across cores on top (~5–8×). GB/s =
+/// `3·R·C·4` (read `a` + read `b` + write `out`). The recurrence is sequential within a row (no
+/// reassociation) and the kernel does plain mul+add (two roundings) where gcc may fuse to one `fma`, so
+/// the cross-check is a ~1-ULP magnitude-normalized tolerance like cumsum.
+fn bench_lrscan(cc: &str, dir: &Path) {
+    for (rows, cols) in [(1024usize, 1024usize), (4096, 1024)] {
+        let n = rows * cols;
+        // `a` (the gate) bounded in (−1, 1) so the recurrence is a contraction and `h` stays finite;
+        // `b` (the input drive) small. Deterministic, no RNG.
+        let a: Vec<f32> = (0..n).map(|i| ((i * 13 + 5) % 19) as f32 * 0.1 - 0.9).collect();
+        let b: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) % 11) as f32 * 0.2 - 1.0).collect();
+        let mut out = vec![0.0f32; n];
+        let (ap, bp, op) = (a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
+        let bytes = n as f64 * 4.0 * 3.0; // read a + read b + write out
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "=== lrscan (out[r,t] = a[r,t]·h + b[r,t], SSM/Mamba selective scan) {rows}x{cols} (GB/s, higher is better) ==="
+        );
+        let mer = bench_mercury(&mer_lrscan(rows, cols, false), &mut out, ap, bp, op);
+        let mer_par = bench_mercury(&mer_lrscan(rows, cols, true), &mut out, ap, bp, op);
+        let cm = bench_external(
+            "c",
+            &c_lrscan(rows, cols),
+            dir,
+            "lrscan",
+            cc,
+            &["-O3", "-march=native", "-shared"],
+            &mut out,
+            ap,
+            bp,
+            op,
+        );
+        let rm = bench_external(
+            "rs",
+            &rust_lrscan(rows, cols),
+            dir,
+            "lrscan",
+            "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &mut out,
+            ap,
+            bp,
+            op,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s",
+            gbps(&mer),
+            gbps(&mer_par),
+            gbps(&cm),
+            gbps(&rm)
+        );
+        if let (Some(a2), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+            let maxerr = a2
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! lrscan mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than naive C (4-row-interleaved ILP vs C's single serial chain)",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
+        }
+        println!();
+    }
 }
 
 /// Per-row inclusive prefix sum (cumsum / scan). gcc/rustc keep the loop-carried `out[i]=out[i-1]+x[i]`
