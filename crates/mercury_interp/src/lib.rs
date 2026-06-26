@@ -1437,6 +1437,52 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_lrscan_f32[_parallel](a, b, out, rows, cols)` — the first-order linear-recurrence
+            // / selective scan (SSM/Mamba/EMA) `out[r,t] = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1}=0` per row.
+            // Marshal the `rows*cols` f32 gate `a` and input `b`, call the *serial* kernel (bit-identical
+            // to the parallel one — rows independent, no cross-row combine), write the `rows*cols` result.
+            "mercury_lrscan_f32" | "mercury_lrscan_f32_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let n = rows * cols;
+                let mut abuf = Vec::with_capacity(n);
+                let mut bbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    abuf.push(
+                        self.memory
+                            .get(a + t)
+                            .ok_or("lrscan operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("lrscan operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut outbuf = vec![0.0f32; n];
+                // SAFETY: abuf/bbuf/outbuf are exactly rows*cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_lrscan_f32(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        outbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in outbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("lrscan output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` — the fused
             // RMSNorm input-gradient (`dx = r·(g − x·r²·Σg·x/C)`, `g = dy·γ`) a recognized batched nest
             // lowers to. Marshal `rows*cols` f32 from x AND dy plus the `cols`-long gamma, call the
@@ -1816,7 +1862,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "mercury_cummax_f32"
             | "mercury_cummax_f32_parallel"
             | "mercury_cummin_f32"
-            | "mercury_cummin_f32_parallel" => {
+            | "mercury_cummin_f32_parallel"
+            | "mercury_cumprod_f32"
+            | "mercury_cumprod_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = args[2].as_int() as usize;
@@ -1836,6 +1884,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     mercury_runtime::mercury_cummax_f32
                 } else if name.starts_with("mercury_cummin") {
                     mercury_runtime::mercury_cummin_f32
+                } else if name.starts_with("mercury_cumprod") {
+                    mercury_runtime::mercury_cumprod_f32
                 } else {
                     mercury_runtime::mercury_cumsum_f32
                 };
@@ -2712,6 +2762,66 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get_mut(out + i)
                         .ok_or("embedding output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
+            // `mercury_scatter_add_f32[_parallel](grad_w, grad_out, ids, t, h, v)` — the embedding-gradient
+            // backward `grad_w[ids[t], :] += grad_out[t, :]` (the gather's dual). Marshal the `t` i32 ids,
+            // the `t*h` upstream gradient, AND grad_w's CURRENT `v*h` contents (the kernel accumulates in
+            // place, so we start from the program's zeroed accumulator, not zeros), call the *serial* kernel
+            // (bit-identical to the parallel one — output-row split, ascending-`ti` fold), write grad_w back.
+            "mercury_scatter_add_f32" | "mercury_scatter_add_f32_parallel" => {
+                let grad_w = ptr(args[0])?;
+                let grad_out = ptr(args[1])?;
+                let ids = ptr(args[2])?;
+                let t = args[3].as_int() as usize;
+                let h = args[4].as_int() as usize;
+                let v = args[5].as_int() as usize;
+                let mut idbuf = Vec::with_capacity(t);
+                for r in 0..t {
+                    idbuf.push(
+                        self.memory
+                            .get(ids + r)
+                            .ok_or("scatter_add ids out of bounds")?
+                            .as_int() as i32,
+                    );
+                }
+                let gon = t * h;
+                let mut gobuf = Vec::with_capacity(gon);
+                for i in 0..gon {
+                    gobuf.push(
+                        self.memory
+                            .get(grad_out + i)
+                            .ok_or("scatter_add grad_out out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let gwn = v * h;
+                let mut gwbuf = Vec::with_capacity(gwn);
+                for i in 0..gwn {
+                    gwbuf.push(
+                        self.memory
+                            .get(grad_w + i)
+                            .ok_or("scatter_add grad_w out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                // SAFETY: gwbuf is v*h f32, gobuf is t*h f32, idbuf is t i32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_scatter_add_f32(
+                        gwbuf.as_mut_ptr(),
+                        gobuf.as_ptr(),
+                        idbuf.as_ptr(),
+                        t,
+                        h,
+                        v,
+                    );
+                }
+                for (i, &val) in gwbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(grad_w + i)
+                        .ok_or("scatter_add grad_w output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }

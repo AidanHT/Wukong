@@ -28,6 +28,7 @@ pub const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row (numerically s
 pub const NORM_LAYERNORM: i64 = 1; // out = (x - mean) / sqrt(var + eps)
 pub const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
 pub const NORM_LOGSOFTMAX: i64 = 3; // out = (x - m) - log(sum(exp(x - m))) — stable log-softmax
+pub const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit-norm (no mean divisor)
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -192,6 +193,35 @@ unsafe fn rmsnorm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
         *ssj = v.mul_add(v, *ssj);
     }
     let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    for i in 0..n {
+        *out.add(i) = *x.add(i) * inv;
+    }
+}
+
+/// L2-normalize one row, scalar reference: `out[i] = x[i] / sqrt(Σ x[i]² + eps)` — the unit-norm
+/// projection (cosine similarity, normalized embeddings, retrieval keys). Identical to
+/// [`rmsnorm_row_scalar`] **without** the `1/n` mean factor on the sum of squares: RMSNorm divides by
+/// the root-*mean*-square, L2 by the root-*sum*-square. The sum-of-squares reduction is byte-for-byte
+/// the same as RMSNorm's, so the AVX2 twin agrees the same way. `x`/`out` may alias (in-place).
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+unsafe fn l2norm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
+    let nb = n / 8;
+    let t = nb * 8;
+    let mut ss = [0.0f32; 8];
+    for s in 0..nb {
+        let b = s * 8;
+        for (j, ssj) in ss.iter_mut().enumerate() {
+            let v = *x.add(b + j);
+            *ssj = v.mul_add(v, *ssj);
+        }
+    }
+    for (j, ssj) in ss.iter_mut().enumerate().take(n - t) {
+        let v = *x.add(t + j);
+        *ssj = v.mul_add(v, *ssj);
+    }
+    let inv = 1.0 / (hsum8(ss) + eps).sqrt();
     for i in 0..n {
         *out.add(i) = *x.add(i) * inv;
     }
@@ -364,6 +394,42 @@ unsafe fn rmsnorm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
         *ssj = v.mul_add(v, *ssj);
     }
     let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    let ivb = _mm256_set1_ps(inv);
+    i = 0;
+    while i + 8 <= n {
+        _mm256_storeu_ps(out.add(i), _mm256_mul_ps(_mm256_loadu_ps(x.add(i)), ivb));
+        i += 8;
+    }
+    while i < n {
+        *out.add(i) = *x.add(i) * inv;
+        i += 1;
+    }
+}
+
+/// L2-normalize one row, AVX2 twin of [`l2norm_row_scalar`]. Identical to [`rmsnorm_row_avx2`] minus
+/// the `1/n` mean factor — the `fmadd` sum-of-squares accumulator and horizontal `hsum8` are the same,
+/// so it agrees with the scalar twin bit-for-bit (pinned by `scalar_matches_avx2_bit_for_bit`).
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn l2norm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
+    use std::arch::x86_64::*;
+    let mut ssv = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.add(i));
+        ssv = _mm256_fmadd_ps(v, v, ssv);
+        i += 8;
+    }
+    let mut ss = [0.0f32; 8];
+    _mm256_storeu_ps(ss.as_mut_ptr(), ssv);
+    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
+        let v = *x.add(i + j);
+        *ssj = v.mul_add(v, *ssj);
+    }
+    let inv = 1.0 / (hsum8(ss) + eps).sqrt();
     let ivb = _mm256_set1_ps(inv);
     i = 0;
     while i + 8 <= n {
@@ -641,6 +707,7 @@ unsafe fn norm_row(x: *const f32, out: *mut f32, n: usize, eps: f32, op: i64) {
                 NORM_LOGSOFTMAX => return logsoftmax_row_avx2(x, out, n),
                 NORM_LAYERNORM => return layernorm_row_avx2(x, out, n, eps),
                 NORM_RMSNORM => return rmsnorm_row_avx2(x, out, n, eps),
+                NORM_L2NORM => return l2norm_row_avx2(x, out, n, eps),
                 _ => return,
             }
         }
@@ -650,6 +717,7 @@ unsafe fn norm_row(x: *const f32, out: *mut f32, n: usize, eps: f32, op: i64) {
         NORM_LOGSOFTMAX => logsoftmax_row_scalar(x, out, n),
         NORM_LAYERNORM => layernorm_row_scalar(x, out, n, eps),
         NORM_RMSNORM => rmsnorm_row_scalar(x, out, n, eps),
+        NORM_L2NORM => l2norm_row_scalar(x, out, n, eps),
         _ => {}
     }
 }
@@ -802,11 +870,12 @@ pub unsafe extern "C" fn mercury_norm_affine_f32_parallel(
 mod tests {
     use super::*;
 
-    const OPS: [i64; 4] = [
+    const OPS: [i64; 5] = [
         NORM_SOFTMAX,
         NORM_LOGSOFTMAX,
         NORM_LAYERNORM,
         NORM_RMSNORM,
+        NORM_L2NORM,
     ];
     const EPS: f32 = 1e-5;
 
@@ -835,9 +904,17 @@ mod tests {
                             softmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
                             softmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
                         }
+                        NORM_LOGSOFTMAX => {
+                            logsoftmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                            logsoftmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                        }
                         NORM_LAYERNORM => {
                             layernorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
                             layernorm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                        }
+                        NORM_L2NORM => {
+                            l2norm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                            l2norm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
                         }
                         _ => {
                             rmsnorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
@@ -1012,6 +1089,29 @@ mod tests {
                 (rn[i] as f64 - want).abs() < 1e-3,
                 "rmsnorm i={i}: {} vs {want}",
                 rn[i]
+            );
+        }
+
+        // l2norm — `out[i] = x[i] / sqrt(Σ x[i]² + eps)` (RMSNorm without the mean divisor).
+        let mut l2 = vec![0.0f32; n];
+        unsafe {
+            mercury_norm_f32(
+                x.as_ptr(),
+                l2.as_mut_ptr(),
+                1,
+                n as i64,
+                EPS.to_bits() as i64,
+                NORM_L2NORM,
+            );
+        }
+        let ssq = xd.iter().map(|&v| v * v).sum::<f64>();
+        let invl = 1.0 / (ssq + EPS as f64).sqrt();
+        for i in 0..n {
+            let want = xd[i] * invl;
+            assert!(
+                (l2[i] as f64 - want).abs() < 1e-4,
+                "l2norm i={i}: {} vs {want}",
+                l2[i]
             );
         }
     }

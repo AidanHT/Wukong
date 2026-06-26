@@ -1,11 +1,14 @@
-# Mercury benchmarks — Mercury vs C vs Rust
+# Mercury benchmarks — Mercury vs C, C++, and Rust
 
-An **honest** cross-language benchmark. For each kernel the *same* computation is written three ways
+An **honest** cross-language benchmark. For each kernel the *same* computation is written several ways
 — Mercury (compiled to native code by the from-scratch backend, **no LLVM**), C (`gcc -O3
--march=native`), and Rust (`rustc -O -C target-cpu=native`) — and all three are timed through one
-identical Rust harness over the same buffers. C and Rust are built to shared libraries and called via
-their C ABI; Mercury is JIT-compiled in-process. The harness cross-checks a result checksum across
-all three languages, so a miscompiled kernel is caught, not silently mis-measured.
+-march=native`), and Rust (`rustc -O -C target-cpu=native`) — and all are timed through one identical
+Rust harness over the same buffers. C and Rust are built to shared libraries and called via their C
+ABI; Mercury is JIT-compiled in-process. The harness cross-checks a result checksum across every
+language, so a miscompiled kernel is caught, not silently mis-measured. The elementwise/reduction
+battery additionally times **C++ (`g++ -O3 -march=native -ffp-contract=fast`)**; g++ and gcc share a
+backend, so on identical kernel code C++ tracks C to within a few percent — the C ratios below stand
+for C++ too (each is cross-checked against C++ as well, and "vs C++" is printed alongside "vs C").
 
 Reproduce:
 
@@ -113,7 +116,7 @@ tolerance for the reassociated-float ones).
 | **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Mercury one 256-bit `sincos` |
 | **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar |
 | **Argmax/argmin** (global / row / column) | **~2.7–9×** | ~3.4–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize; global + column are AVX2 single-pass |
-| **Scans** (cumsum / cummax / cummin) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan (cummax/cummin bit-exact) |
+| **Scans** (cumsum / cummax / cummin / cumprod) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu / bias-add | ≈tie | — | already bandwidth-bound; no headroom standalone (won when *fused*) |
 
@@ -440,6 +443,7 @@ across runs:
 | RMSNorm   | **~1.9–2.5× faster** | one reduction (mean-square); the copy/scale elementwise passes, which gcc vectorizes too, dilute it |
 | LayerNorm (affine γ, β) | **~2.8–3.7× faster** | the real transformer form `(x-μ)·inv·γ + β` → `mercury_norm_affine_f32`; same reduction win, γ/β fused into the writeback |
 | RMSNorm (affine γ) | **~1.7–3.2× faster** | the real transformer form `x·inv·γ` → same affine kernel |
+| L2 / unit-normalize | **~1.8–2.1× faster** | `x / √(Σx² + eps)` (cosine similarity, normalized embeddings, retrieval keys) — RMSNorm without the mean divisor, the same fused single-pass reduction → `mercury_norm_f32` |
 
 Softmax wins most — the vectorized `exp` dominates, the same effect as the standalone `exp` kernel.
 LayerNorm and RMSNorm win on their reassociated reductions (gcc keeps float reductions strictly
@@ -799,6 +803,13 @@ then a broadcast-carry fold). Measured single-core / `@parallel` vs naive C (C �
 | **cumsum** (prefix sum) | 1.72× / 6.39× | 1.37× / 7.29× | `+` | tolerance (in-lane tree reassociates) |
 | **cummax** (running max) | **2.87× / 11.6×** | **2.28× / 12.1×** | `fmax` | **bit-exact** |
 | **cummin** (running min) | **2.88× / 11.8×** | **2.25× / 12.1×** | `fmin` | **bit-exact** |
+| **cumprod** (prefix product) | **1.77–1.89× / 6.0×** | **1.77× / 7.0–7.8×** | `*` | **bit-exact** |
+
+`cumprod` (prefix product) uses a *different* lever than the three above: a bare product is not amenable
+to the same in-lane reassociation trade-off, so instead of Hillis-Steele it scans **4 independent rows
+interleaved** (the `lrscan` lever — four `mul` chains in flight to fill the ports the single serial chain
+leaves idle). Because a product is never fused (no `fma` contraction), each row folds strictly
+left-to-right == the scalar C/Rust nest, so the cross-language check is **bit-exact**, not toleranced.
 
 `cummax`/`cummin` lead `cumsum` single-core because gcc's scalar `fmax`/`fmin` recurrence pipelines worse
 than its dependent add chain — and because max/min **select** an input value (no float arithmetic), the
@@ -808,6 +819,36 @@ exception (both backends run the identical kernel → interp == native; the cros
 normalized, since a mean-zero prefix sum is a random walk that crosses zero where a pointwise ratio
 divides by ≈0). GB/s = `R·C·4·2` (read x + write out); rows are independent, so `@parallel` is bit-equal
 to serial. `tests/run/{cumsum,cummax}.mer`.
+
+**Linear-recurrence / selective scan (SSM / Mamba).** A first-order recurrence `h_t = a_t·h_{t-1} + b_t`
+— the state-space step at the heart of Mamba / S4 / RWKV linear attention, and the EMA — is also
+loop-carried, so gcc `-O3 -march=native` and rustc emit **one serial `mul`+`add` chain per row**:
+*latency-bound* at a few GB/s, far below DRAM. But the **rows are independent**, so Mercury's
+`mercury_lrscan_f32` scans **4 rows interleaved**, keeping four chains in flight to fill the ports the
+single chain leaves idle (plain `mul`+`add`, deliberately *not* `f32::mul_add` — on a build without the
+`fma` target feature the latter lowers to a libm `fmaf` **call** that re-serializes the chain and erases
+the ILP: measured `mul_add` 0.8× vs C, plain `mul`+`add` 1.8×). gcc/rustc may not legally re-order an f32
+recurrence across rows without `-ffast-math`, so this 4-way ILP is a genuine **single-core win**:
+
+| scan | 1024×1024 | 4096×1024 | cross-check |
+|------|-----------|-----------|-------------|
+| **lrscan** `h_t = a_t·h_{t-1} + b_t` | **1.75–1.92× / 5.3–7.6×** | **1.56–1.84× / 7.2–7.7×** | tolerance (gcc may fuse to one `fma`; ~1 ULP) |
+
+Single-core (4-row ILP) beats gcc's serial chain; `@parallel` maps independent row *chunks* across cores
+on top. Bit-exact across backends — each row stays its own in-order recurrence, so the 4-row interleave
+changes only *issue order*, never a row's arithmetic (no reassociation). GB/s = `3·R·C·4` (read a + read b
++ write out). `tests/run/lrscan.mer`.
+
+**Scatter-add / embedding-gradient backward** (`grad_w[ids[t], :] += grad_out[t, :]`, the dual of the
+embedding gather, run every LLM training step) is the one place the headline is **correctness, not a
+speed ratio**. Single-core is an honest memory-bound tie (both vectorize the contiguous row read-
+modify-write). The structural win is **deterministic parallelism**: a C author splits the *tokens* across
+threads and lets colliding ids race into shared `grad_w` rows → **atomic** float adds, slow *and*
+non-deterministic in float order (low bits wobble run to run). Mercury's `mercury_scatter_add_f32_parallel`
+splits the **output rows** instead — each core owns a disjoint `grad_w` range, scans all tokens, accumulates
+only its rows → lock-free, race-free, and **bit-identical to serial** regardless of thread count. The
+recognizer recovers the real table height `V` from `grad_w`'s sema array length, and folds collisions in
+ascending token order (== the scalar nest), so the differential gate is exact. `tests/run/scatter_add.mer`.
 
 ### Single-threaded elementwise & reductions
 

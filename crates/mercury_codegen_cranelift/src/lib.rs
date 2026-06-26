@@ -99,6 +99,8 @@ const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_VMATH2: &str = "mercury_vmath2_f32";
 const RT_SOFTMAX_BWD: &str = "mercury_softmax_bwd_f32";
 const RT_SOFTMAX_BWD_PAR: &str = "mercury_softmax_bwd_f32_parallel";
+const RT_LRSCAN: &str = "mercury_lrscan_f32";
+const RT_LRSCAN_PAR: &str = "mercury_lrscan_f32_parallel";
 const RT_RMSNORM_BWD: &str = "mercury_rmsnorm_bwd_f32";
 const RT_RMSNORM_BWD_PAR: &str = "mercury_rmsnorm_bwd_f32_parallel";
 const RT_LAYERNORM_BWD: &str = "mercury_layernorm_bwd_f32";
@@ -129,6 +131,8 @@ const RT_COLARGMIN: &str = "mercury_colargmin_i32";
 const RT_COLARGMIN_PAR: &str = "mercury_colargmin_i32_parallel";
 const RT_CUMSUM: &str = "mercury_cumsum_f32";
 const RT_CUMSUM_PAR: &str = "mercury_cumsum_f32_parallel";
+const RT_CUMPROD: &str = "mercury_cumprod_f32";
+const RT_CUMPROD_PAR: &str = "mercury_cumprod_f32_parallel";
 const RT_CUMMAX: &str = "mercury_cummax_f32";
 const RT_CUMMAX_PAR: &str = "mercury_cummax_f32_parallel";
 const RT_CUMMIN: &str = "mercury_cummin_f32";
@@ -175,6 +179,8 @@ const RT_I8GEMM_NT_DEQ: &str = "mercury_i8gemm_nt_deq";
 const RT_I8GEMM_NT_DEQ_PARALLEL: &str = "mercury_i8gemm_nt_deq_parallel";
 const RT_EMBEDDING: &str = "mercury_embedding_f32";
 const RT_EMBEDDING_PAR: &str = "mercury_embedding_f32_parallel";
+const RT_SCATTER_ADD: &str = "mercury_scatter_add_f32";
+const RT_SCATTER_ADD_PAR: &str = "mercury_scatter_add_f32_parallel";
 const RT_DOT_BF16: &str = "mercury_dot_bf16";
 const RT_SUM_BF16: &str = "mercury_sum_bf16";
 const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
@@ -940,6 +946,8 @@ impl<'a> FnTranslator<'a> {
                 | RT_CUMMAX_PAR
                 | RT_CUMMIN
                 | RT_CUMMIN_PAR
+                | RT_CUMPROD
+                | RT_CUMPROD_PAR
         ) && args.len() == 4
         {
             let x = self.val(args[0]);
@@ -1047,6 +1055,19 @@ impl<'a> FnTranslator<'a> {
             let cols = self.coerce_to_i64(args[4]);
             let fref = self.rt_refs[name];
             self.builder.ins().call(fref, &[y, dy, dx, rows, cols]);
+            return None;
+        }
+
+        // Linear-recurrence scan: mercury_lrscan_f32[_parallel](a, b, out, rows, cols) — three pointers,
+        // two i64 (same (ptr,ptr,ptr,i64,i64) shape as softmax_bwd); route by name. Void.
+        if matches!(name, RT_LRSCAN | RT_LRSCAN_PAR) && args.len() == 5 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let out = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, b, out, rows, cols]);
             return None;
         }
         // Fused cross-entropy loss: mercury_xent_fwd_f32[_parallel](x, target, loss, rows, cols) — three
@@ -1262,6 +1283,21 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[out, weight, ids, t, h, v]);
             return None;
         }
+
+        // Scatter-add / embedding-gradient backward: mercury_scatter_add_f32[_parallel](grad_w, grad_out,
+        // ids, t, h, v) — same 3-ptr + 3-i64 ABI as the embedding gather (grad_w/grad_out f32*, ids i32*),
+        // but `v` is the real table height (the parallel kernel partitions its output rows). Void.
+        if matches!(name, RT_SCATTER_ADD | RT_SCATTER_ADD_PAR) && args.len() == 6 {
+            let grad_w = self.val(args[0]);
+            let grad_out = self.val(args[1]);
+            let ids = self.val(args[2]);
+            let t = self.coerce_to_i64(args[3]);
+            let h = self.coerce_to_i64(args[4]);
+            let v = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[grad_w, grad_out, ids, t, h, v]);
+            return None;
+        }
         // The int8 quantized nn.Linear with fused dequant epilogue:
         // mercury_i8gemm_nt_deq[_parallel](a, b, out, m, k, n, scale_a, scale_b, bias, act) — three
         // pointers, three i64, one f32 scalar (scale_a), two pointers (scale_b, bias; bias may be
@@ -1408,6 +1444,8 @@ struct RtFuncs {
     vmath2: FuncId,
     softmax_bwd: FuncId,
     softmax_bwd_par: FuncId,
+    lrscan: FuncId,
+    lrscan_par: FuncId,
     rmsnorm_bwd: FuncId,
     rmsnorm_bwd_par: FuncId,
     layernorm_bwd: FuncId,
@@ -1436,6 +1474,8 @@ struct RtFuncs {
     colargmin_par: FuncId,
     cumsum: FuncId,
     cumsum_par: FuncId,
+    cumprod: FuncId,
+    cumprod_par: FuncId,
     cummax: FuncId,
     cummax_par: FuncId,
     cummin: FuncId,
@@ -1486,6 +1526,8 @@ struct RtFuncs {
     /// gather (the first layer of every LLM). Reuses the 3-ptr + 3-i64 void `sig_i8gemm` signature.
     embedding: FuncId,
     embedding_par: FuncId,
+    scatter_add: FuncId,
+    scatter_add_par: FuncId,
     dot_bf16: FuncId,
     sum_bf16: FuncId,
     reduce_bf16: FuncId,
@@ -1801,6 +1843,12 @@ fn populate_module<M: Module>(
         softmax_bwd_par: module
             .declare_function(RT_SOFTMAX_BWD_PAR, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
+        lrscan: module
+            .declare_function(RT_LRSCAN, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        lrscan_par: module
+            .declare_function(RT_LRSCAN_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
         rmsnorm_bwd: module
             .declare_function(RT_RMSNORM_BWD, Linkage::Import, &sig_rmsnorm_bwd)
             .map_err(|e| e.to_string())?,
@@ -1890,6 +1938,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         cumsum_par: module
             .declare_function(RT_CUMSUM_PAR, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        cumprod: module
+            .declare_function(RT_CUMPROD, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        cumprod_par: module
+            .declare_function(RT_CUMPROD_PAR, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
         cummax: module
             .declare_function(RT_CUMMAX, Linkage::Import, &sig_vmath)
@@ -2031,6 +2085,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         embedding_par: module
             .declare_function(RT_EMBEDDING_PAR, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        scatter_add: module
+            .declare_function(RT_SCATTER_ADD, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        scatter_add_par: module
+            .declare_function(RT_SCATTER_ADD_PAR, Linkage::Import, &sig_i8gemm)
             .map_err(|e| e.to_string())?,
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
@@ -2208,6 +2268,11 @@ fn populate_module<M: Module>(
                 RT_SOFTMAX_BWD_PAR,
                 module.declare_func_in_func(rt.softmax_bwd_par, builder.func),
             );
+            rt_refs.insert(RT_LRSCAN, module.declare_func_in_func(rt.lrscan, builder.func));
+            rt_refs.insert(
+                RT_LRSCAN_PAR,
+                module.declare_func_in_func(rt.lrscan_par, builder.func),
+            );
             rt_refs.insert(
                 RT_RMSNORM_BWD,
                 module.declare_func_in_func(rt.rmsnorm_bwd, builder.func),
@@ -2318,6 +2383,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_CUMSUM_PAR,
                 module.declare_func_in_func(rt.cumsum_par, builder.func),
+            );
+            rt_refs.insert(RT_CUMPROD, module.declare_func_in_func(rt.cumprod, builder.func));
+            rt_refs.insert(
+                RT_CUMPROD_PAR,
+                module.declare_func_in_func(rt.cumprod_par, builder.func),
             );
             rt_refs.insert(
                 RT_CUMMAX,
@@ -2499,6 +2569,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_EMBEDDING_PAR,
                 module.declare_func_in_func(rt.embedding_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SCATTER_ADD,
+                module.declare_func_in_func(rt.scatter_add, builder.func),
+            );
+            rt_refs.insert(
+                RT_SCATTER_ADD_PAR,
+                module.declare_func_in_func(rt.scatter_add_par, builder.func),
             );
             rt_refs.insert(
                 RT_AXPBY_BF16,
@@ -2736,6 +2814,11 @@ pub fn jit_compile(
         RT_SOFTMAX_BWD_PAR,
         mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
     );
+    builder.symbol(RT_LRSCAN, mercury_runtime::mercury_lrscan_f32 as *const u8);
+    builder.symbol(
+        RT_LRSCAN_PAR,
+        mercury_runtime::mercury_lrscan_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_RMSNORM_BWD,
         mercury_runtime::mercury_rmsnorm_bwd_f32 as *const u8,
@@ -2843,6 +2926,11 @@ pub fn jit_compile(
     builder.symbol(
         RT_CUMSUM_PAR,
         mercury_runtime::mercury_cumsum_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_CUMPROD, mercury_runtime::mercury_cumprod_f32 as *const u8);
+    builder.symbol(
+        RT_CUMPROD_PAR,
+        mercury_runtime::mercury_cumprod_f32_parallel as *const u8,
     );
     builder.symbol(RT_CUMMAX, mercury_runtime::mercury_cummax_f32 as *const u8);
     builder.symbol(
@@ -2997,6 +3085,14 @@ pub fn jit_compile(
     builder.symbol(
         RT_EMBEDDING_PAR,
         mercury_runtime::mercury_embedding_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD,
+        mercury_runtime::mercury_scatter_add_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD_PAR,
+        mercury_runtime::mercury_scatter_add_f32_parallel as *const u8,
     );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
@@ -3177,6 +3273,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         RT_SOFTMAX_BWD_PAR,
         mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
     );
+    builder.symbol(RT_LRSCAN, mercury_runtime::mercury_lrscan_f32 as *const u8);
+    builder.symbol(
+        RT_LRSCAN_PAR,
+        mercury_runtime::mercury_lrscan_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_RMSNORM_BWD,
         mercury_runtime::mercury_rmsnorm_bwd_f32 as *const u8,
@@ -3284,6 +3385,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_CUMSUM_PAR,
         mercury_runtime::mercury_cumsum_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_CUMPROD, mercury_runtime::mercury_cumprod_f32 as *const u8);
+    builder.symbol(
+        RT_CUMPROD_PAR,
+        mercury_runtime::mercury_cumprod_f32_parallel as *const u8,
     );
     builder.symbol(RT_CUMMAX, mercury_runtime::mercury_cummax_f32 as *const u8);
     builder.symbol(
@@ -3438,6 +3544,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_EMBEDDING_PAR,
         mercury_runtime::mercury_embedding_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD,
+        mercury_runtime::mercury_scatter_add_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_SCATTER_ADD_PAR,
+        mercury_runtime::mercury_scatter_add_f32_parallel as *const u8,
     );
     builder.symbol(RT_DOT_BF16, mercury_runtime::mercury_dot_bf16 as *const u8);
     builder.symbol(RT_SUM_BF16, mercury_runtime::mercury_sum_bf16 as *const u8);
