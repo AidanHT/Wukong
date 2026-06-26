@@ -99,6 +99,8 @@ const RT_VMATH: &str = "mercury_vmath_f32";
 const RT_VMATH2: &str = "mercury_vmath2_f32";
 const RT_SOFTMAX_BWD: &str = "mercury_softmax_bwd_f32";
 const RT_SOFTMAX_BWD_PAR: &str = "mercury_softmax_bwd_f32_parallel";
+const RT_LRSCAN: &str = "mercury_lrscan_f32";
+const RT_LRSCAN_PAR: &str = "mercury_lrscan_f32_parallel";
 const RT_RMSNORM_BWD: &str = "mercury_rmsnorm_bwd_f32";
 const RT_RMSNORM_BWD_PAR: &str = "mercury_rmsnorm_bwd_f32_parallel";
 const RT_LAYERNORM_BWD: &str = "mercury_layernorm_bwd_f32";
@@ -1049,6 +1051,19 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[y, dy, dx, rows, cols]);
             return None;
         }
+
+        // Linear-recurrence scan: mercury_lrscan_f32[_parallel](a, b, out, rows, cols) — three pointers,
+        // two i64 (same (ptr,ptr,ptr,i64,i64) shape as softmax_bwd); route by name. Void.
+        if matches!(name, RT_LRSCAN | RT_LRSCAN_PAR) && args.len() == 5 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let out = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, b, out, rows, cols]);
+            return None;
+        }
         // Fused cross-entropy loss: mercury_xent_fwd_f32[_parallel](x, target, loss, rows, cols) — three
         // pointers (x f32, target i32, loss f32 — a ptr is a ptr) + two i64, the same vmath2 shape. Void.
         if matches!(name, RT_XENT | RT_XENT_PAR) && args.len() == 5 {
@@ -1408,6 +1423,8 @@ struct RtFuncs {
     vmath2: FuncId,
     softmax_bwd: FuncId,
     softmax_bwd_par: FuncId,
+    lrscan: FuncId,
+    lrscan_par: FuncId,
     rmsnorm_bwd: FuncId,
     rmsnorm_bwd_par: FuncId,
     layernorm_bwd: FuncId,
@@ -1800,6 +1817,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         softmax_bwd_par: module
             .declare_function(RT_SOFTMAX_BWD_PAR, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        lrscan: module
+            .declare_function(RT_LRSCAN, Linkage::Import, &sig_vmath2)
+            .map_err(|e| e.to_string())?,
+        lrscan_par: module
+            .declare_function(RT_LRSCAN_PAR, Linkage::Import, &sig_vmath2)
             .map_err(|e| e.to_string())?,
         rmsnorm_bwd: module
             .declare_function(RT_RMSNORM_BWD, Linkage::Import, &sig_rmsnorm_bwd)
@@ -2207,6 +2230,11 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SOFTMAX_BWD_PAR,
                 module.declare_func_in_func(rt.softmax_bwd_par, builder.func),
+            );
+            rt_refs.insert(RT_LRSCAN, module.declare_func_in_func(rt.lrscan, builder.func));
+            rt_refs.insert(
+                RT_LRSCAN_PAR,
+                module.declare_func_in_func(rt.lrscan_par, builder.func),
             );
             rt_refs.insert(
                 RT_RMSNORM_BWD,
@@ -2736,6 +2764,11 @@ pub fn jit_compile(
         RT_SOFTMAX_BWD_PAR,
         mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
     );
+    builder.symbol(RT_LRSCAN, mercury_runtime::mercury_lrscan_f32 as *const u8);
+    builder.symbol(
+        RT_LRSCAN_PAR,
+        mercury_runtime::mercury_lrscan_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_RMSNORM_BWD,
         mercury_runtime::mercury_rmsnorm_bwd_f32 as *const u8,
@@ -3176,6 +3209,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SOFTMAX_BWD_PAR,
         mercury_runtime::mercury_softmax_bwd_f32_parallel as *const u8,
+    );
+    builder.symbol(RT_LRSCAN, mercury_runtime::mercury_lrscan_f32 as *const u8);
+    builder.symbol(
+        RT_LRSCAN_PAR,
+        mercury_runtime::mercury_lrscan_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_RMSNORM_BWD,

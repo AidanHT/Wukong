@@ -133,6 +133,8 @@ pub fn lower_program(
         colargmin_par: interner.intern("mercury_colargmin_i32_parallel"),
         cumsum: interner.intern("mercury_cumsum_f32"),
         cumsum_par: interner.intern("mercury_cumsum_f32_parallel"),
+        lrscan: interner.intern("mercury_lrscan_f32"),
+        lrscan_par: interner.intern("mercury_lrscan_f32_parallel"),
         cummax: interner.intern("mercury_cummax_f32"),
         cummax_par: interner.intern("mercury_cummax_f32_parallel"),
         cummin: interner.intern("mercury_cummin_f32"),
@@ -304,6 +306,17 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_cumsum(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row linear-recurrence scan (SSM/Mamba): same
+                // interceptor — the independent rows map across cores (bit-equal to serial).
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_lrscan(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -934,6 +947,12 @@ struct GemmSyms {
     /// Hillis-Steele scan + carry vectorizes it. The in-lane tree reassociates → the kernel is the oracle.
     cumsum: Symbol,
     cumsum_par: Symbol,
+    /// Linear-recurrence / selective scan `out[r,t] = a[r,t]·h_{t-1} + b[r,t]` (SSM/Mamba/S4/EMA), each
+    /// row an independent first-order recurrence (`mercury_lrscan_f32[_parallel](a, b, out, rows, cols)`).
+    /// Loop-carried within a row like cumsum → gcc/rustc keep the carry scalar; the lever is the
+    /// `_parallel` map of the independent rows across cores (memory-bound single-core tie otherwise).
+    lrscan: Symbol,
+    lrscan_par: Symbol,
     /// Per-row cumulative max / min (`mercury_cum{max,min}_f32[_parallel]`): `out[r,i] = max/min_{k<=i}
     /// x[r,k]`. Same SIMD-scan lever as cumsum, but max/min select a value (no reassociation) → bit-exact.
     cummax: Symbol,
@@ -2699,6 +2718,140 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Recognize a batched per-row **first-order linear recurrence / selective scan** (SSM/Mamba/EMA):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut h: f32 = 0.0;              // zero initial state, resets every row
+    ///     for t in 0..C {
+    ///         h = a[r*C + t] * h + b[r*C + t];  // h_t = gate·h_{t-1} + input
+    ///         out[r*C + t] = h;
+    ///     }
+    /// }
+    /// ```
+    /// `out[r,t] = a[r,t]·h_{t-1} + b[r,t]` → `mercury_lrscan_f32[_parallel]`. The carry `h` makes the
+    /// inner loop a true loop-carried dependency that gcc/rustc keep **scalar** (like cumsum); rows are
+    /// independent so the `_parallel` map across rows is the lever. **No reassociation** is possible (the
+    /// recurrence is inherently sequential within a row), so the kernel is bit-identical to the scalar
+    /// nest — the interpreter marshals the *same* kernel. `out` is f32, distinct from `a`/`b`. Pure.
+    fn match_lrscan(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<LrscanNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] let h: f32 = 0.0;  (zero initial hidden state)
+        let (h, h0) = Self::let_init(&body.stmts[0])?;
+        if !is_float_zero(h0, self.interner) {
+            return None;
+        }
+        // [1] for t in 0..C { h = a[r*C+t]*h + b[r*C+t]; out[r*C+t] = h; }
+        let (t, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        let cols = as_dim(ce, self.interner)?;
+        let batch = Some((r, ce));
+        if ibody.tail.is_some() || ibody.stmts.len() != 2 {
+            return None;
+        }
+        // inner [0] the recurrence step h = a[r*C+t]*h + b[r*C+t]  →  (a, b)
+        let (a, b) = self.match_lrscan_step(&ibody.stmts[0], h, t, batch)?;
+        // inner [1] out[r*C+t] = h
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &ibody.stmts[1].kind
+        else {
+            return None;
+        };
+        let out = self.index_off(target, t, batch)?;
+        if single_path(value) != Some(h) || out == a || out == b {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        Some(LrscanNest {
+            a,
+            b,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The recurrence step `h = a[r*C+t]·h + b[r*C+t]` (target already the carried scalar `h`): returns
+    /// `(a, b)` — `a` the per-step gate (multiplied by the carry), `b` the per-step input (added). The
+    /// top-level op is an `Add` whose one operand is the gated carry `a[..]·h` and whose other is the
+    /// plain data read `b[..]` (either addend order). Pure.
+    fn match_lrscan_step(
+        &self,
+        stmt: &Stmt,
+        h: Symbol,
+        t: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, Symbol)> {
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if single_path(target) != Some(h) {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        if let Some(a) = self.match_gated_carry(lhs, h, t, batch) {
+            let b = self.index_off(rhs, t, batch)?;
+            Some((a, b))
+        } else if let Some(a) = self.match_gated_carry(rhs, h, t, batch) {
+            let b = self.index_off(lhs, t, batch)?;
+            Some((a, b))
+        } else {
+            None
+        }
+    }
+
+    /// `a[r*C+t] · h` (either factor order, `h` the carried scalar) → the gate array `a` (the factor
+    /// indexed `r*C + t`). Pure.
+    fn match_gated_carry(
+        &self,
+        e: &Expr,
+        h: Symbol,
+        t: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &e.kind
+        else {
+            return None;
+        };
+        if single_path(rhs) == Some(h) {
+            self.index_off(lhs, t, batch)
+        } else if single_path(lhs) == Some(h) {
+            self.index_off(rhs, t, batch)
+        } else {
+            None
+        }
+    }
+
     /// Recognize a batched per-row **cumulative max / min** (running max/min scan):
     /// ```text
     /// for r in 0..R {
@@ -4304,6 +4457,30 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit `mercury_lrscan_f32[_parallel](a, b, out, rows, cols)` for a recognized linear-recurrence scan.
+    /// 3 pointers + 2 i64 (the `softmax_bwd` ABI); the `_parallel` one maps the independent rows across
+    /// cores (bit-identical to serial — no cross-row combine).
+    fn emit_lrscan(&mut self, nest: &LrscanNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((out, _))) =
+            (self.lookup(nest.a), self.lookup(nest.b), self.lookup(nest.out))
+        else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.lrscan_par
+        } else {
+            self.gemm.lrscan
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, out, rows, cols],
+        });
+        true
+    }
+
     /// Emit `mercury_cum{max,min}_f32[_parallel](x, out, rows, cols)` for a recognized cumulative max/min.
     fn emit_cumminmax(&mut self, nest: &CumMinMaxNest, parallel: bool) -> bool {
         let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
@@ -5757,6 +5934,15 @@ impl FnLowerer<'_> {
         // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
         if let Some(nest) = self.match_cumsum(pat, iter, body) {
             if self.emit_cumsum(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched per-row first-order linear recurrence (SSM/Mamba/EMA selective scan) →
+        // `mercury_lrscan_f32` (the `_parallel` one in a `@parallel` fn). The carry defeats gcc/rustc
+        // auto-vectorization (scalar, like cumsum); rows independent → multicore over rows. Bit-exact
+        // (the recurrence is inherently sequential within a row — no reassociation).
+        if let Some(nest) = self.match_lrscan(pat, iter, body) {
+            if self.emit_lrscan(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -14287,6 +14473,16 @@ struct RowArgNest {
 /// A recognized batched per-row prefix-sum (cumsum) nest (see [`FnLowerer::match_cumsum`]).
 struct CumsumNest {
     x: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
+/// A recognized batched per-row first-order linear-recurrence scan (see [`FnLowerer::match_lrscan`]):
+/// `out[r,t] = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1} = 0` per row. `a` is the gate, `b` the input.
+struct LrscanNest {
+    a: Symbol,
+    b: Symbol,
     out: Symbol,
     rows: Dim,
     cols: Dim,

@@ -1437,6 +1437,52 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_lrscan_f32[_parallel](a, b, out, rows, cols)` — the first-order linear-recurrence
+            // / selective scan (SSM/Mamba/EMA) `out[r,t] = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1}=0` per row.
+            // Marshal the `rows*cols` f32 gate `a` and input `b`, call the *serial* kernel (bit-identical
+            // to the parallel one — rows independent, no cross-row combine), write the `rows*cols` result.
+            "mercury_lrscan_f32" | "mercury_lrscan_f32_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let n = rows * cols;
+                let mut abuf = Vec::with_capacity(n);
+                let mut bbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    abuf.push(
+                        self.memory
+                            .get(a + t)
+                            .ok_or("lrscan operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("lrscan operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut outbuf = vec![0.0f32; n];
+                // SAFETY: abuf/bbuf/outbuf are exactly rows*cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_lrscan_f32(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        outbuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                    );
+                }
+                for (t, &val) in outbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("lrscan output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_rmsnorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` — the fused
             // RMSNorm input-gradient (`dx = r·(g − x·r²·Σg·x/C)`, `g = dy·γ`) a recognized batched nest
             // lowers to. Marshal `rows*cols` f32 from x AND dy plus the `cols`-long gamma, call the
