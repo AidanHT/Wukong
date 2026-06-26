@@ -116,7 +116,7 @@ tolerance for the reassociated-float ones).
 | **RoPE** (rotary embedding fwd / bwd) | **~29–54×** | **~146–156×** | the per-pair sin/cos — C calls scalar `sincosf`; Mercury one 256-bit `sincos` |
 | **Gate** (SwiGLU / GeGLU `act(a)·b`) | ~5–13× | ~13–27× | the gate's silu/gelu folds an `expf` C/Rust keep scalar |
 | **Argmax/argmin** (global / row / column) | **~2.7–9×** | ~3.4–18.7× | the `(value,index)` bookkeeping gcc/rustc won't auto-vectorize; global + column are AVX2 single-pass |
-| **Scans** (cumsum / cummax / cummin) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan (cummax/cummin bit-exact) |
+| **Scans** (cumsum / cummax / cummin / cumprod) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu / bias-add | ≈tie | — | already bandwidth-bound; no headroom standalone (won when *fused*) |
 
@@ -803,6 +803,13 @@ then a broadcast-carry fold). Measured single-core / `@parallel` vs naive C (C �
 | **cumsum** (prefix sum) | 1.72× / 6.39× | 1.37× / 7.29× | `+` | tolerance (in-lane tree reassociates) |
 | **cummax** (running max) | **2.87× / 11.6×** | **2.28× / 12.1×** | `fmax` | **bit-exact** |
 | **cummin** (running min) | **2.88× / 11.8×** | **2.25× / 12.1×** | `fmin` | **bit-exact** |
+| **cumprod** (prefix product) | **1.77–1.89× / 6.0×** | **1.77× / 7.0–7.8×** | `*` | **bit-exact** |
+
+`cumprod` (prefix product) uses a *different* lever than the three above: a bare product is not amenable
+to the same in-lane reassociation trade-off, so instead of Hillis-Steele it scans **4 independent rows
+interleaved** (the `lrscan` lever — four `mul` chains in flight to fill the ports the single serial chain
+leaves idle). Because a product is never fused (no `fma` contraction), each row folds strictly
+left-to-right == the scalar C/Rust nest, so the cross-language check is **bit-exact**, not toleranced.
 
 `cummax`/`cummin` lead `cumsum` single-core because gcc's scalar `fmax`/`fmin` recurrence pipelines worse
 than its dependent add chain — and because max/min **select** an input value (no float arithmetic), the
