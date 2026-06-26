@@ -133,12 +133,18 @@ pub fn lower_program(
         colargmin_par: interner.intern("mercury_colargmin_i32_parallel"),
         cumsum: interner.intern("mercury_cumsum_f32"),
         cumsum_par: interner.intern("mercury_cumsum_f32_parallel"),
+        cumprod: interner.intern("mercury_cumprod_f32"),
+        cumprod_par: interner.intern("mercury_cumprod_f32_parallel"),
+        lrscan: interner.intern("mercury_lrscan_f32"),
+        lrscan_par: interner.intern("mercury_lrscan_f32_parallel"),
         cummax: interner.intern("mercury_cummax_f32"),
         cummax_par: interner.intern("mercury_cummax_f32_parallel"),
         cummin: interner.intern("mercury_cummin_f32"),
         cummin_par: interner.intern("mercury_cummin_f32_parallel"),
         embedding: interner.intern("mercury_embedding_f32"),
         embedding_par: interner.intern("mercury_embedding_f32_parallel"),
+        scatter_add: interner.intern("mercury_scatter_add_f32"),
+        scatter_add_par: interner.intern("mercury_scatter_add_f32_parallel"),
         maxpool2d: interner.intern("mercury_maxpool2d_f32"),
         maxpool2d_par: interner.intern("mercury_maxpool2d_f32_parallel"),
         avgpool2d: interner.intern("mercury_avgpool2d_f32"),
@@ -310,6 +316,28 @@ pub fn lower_program(
                     program.funcs.push(func);
                     continue;
                 }
+                // `@parallel` whole-function per-row prefix product (cumprod): same interceptor — rows
+                // independent → the multicore kernel is bit-equal to serial.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_cumprod(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-row linear-recurrence scan (SSM/Mamba): same
+                // interceptor — the independent rows map across cores (bit-equal to serial).
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_lrscan(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
                 // `@parallel` whole-function per-row cumulative max/min: same interceptor pattern.
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
@@ -327,6 +355,18 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
                         p.match_embedding(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function scatter-add (embedding-gradient backward): intercept before
+                // the outliner; `match_scatter` then emits `mercury_scatter_add_f32_parallel`, which splits
+                // the V output rows across cores (disjoint writes → race-free, deterministic == serial).
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_scatter(pat, it, lb).is_some()
                     })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
@@ -934,6 +974,18 @@ struct GemmSyms {
     /// Hillis-Steele scan + carry vectorizes it. The in-lane tree reassociates → the kernel is the oracle.
     cumsum: Symbol,
     cumsum_par: Symbol,
+    /// Inclusive per-row prefix product `out[r,i] = Π_{k<=i} x[r,k]` (cumulative product / scan),
+    /// `mercury_cumprod_f32[_parallel](x, out, rows, cols)`. Loop-carried like cumsum → gcc/rustc keep it
+    /// scalar; the kernel's lever is 4-row-interleaved ILP. Bit-exact (a product is not fused — no
+    /// reassociation, unlike the prefix sum).
+    cumprod: Symbol,
+    cumprod_par: Symbol,
+    /// Linear-recurrence / selective scan `out[r,t] = a[r,t]·h_{t-1} + b[r,t]` (SSM/Mamba/S4/EMA), each
+    /// row an independent first-order recurrence (`mercury_lrscan_f32[_parallel](a, b, out, rows, cols)`).
+    /// Loop-carried within a row like cumsum → gcc/rustc keep the carry scalar; the lever is the
+    /// `_parallel` map of the independent rows across cores (memory-bound single-core tie otherwise).
+    lrscan: Symbol,
+    lrscan_par: Symbol,
     /// Per-row cumulative max / min (`mercury_cum{max,min}_f32[_parallel]`): `out[r,i] = max/min_{k<=i}
     /// x[r,k]`. Same SIMD-scan lever as cumsum, but max/min select a value (no reassociation) → bit-exact.
     cummax: Symbol,
@@ -947,6 +999,11 @@ struct GemmSyms {
     /// maps the `T` output rows across cores, bit-equal to serial.
     embedding: Symbol,
     embedding_par: Symbol,
+    /// Scatter-add / embedding-gradient backward `grad_w[ids[t], :] += grad_out[t, :]`
+    /// (`mercury_scatter_add_f32[_parallel](grad_w, grad_out, ids, T, H, V)`). The dual of the embedding
+    /// gather; the `_parallel` one splits the V output rows across cores (collision-free, deterministic).
+    scatter_add: Symbol,
+    scatter_add_par: Symbol,
     /// 2D max/avg pooling (`mercury_{max,avg}pool2d_f32[_parallel](x, out, channels, h, w, kh, kw,
     /// sh, sw)`): `out[c,oy,ox] = ⊕ over the kh×kw window of x[c, oy*sh+dy, ox*sw+dx]` over a
     /// `[channels, h, w]` row-major input, no padding (`⊕` = max / sum÷(kh·kw)). The idiomatic 5-deep
@@ -1061,6 +1118,7 @@ const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
 const NORM_LAYERNORM: i64 = 1; // out = (x - mean) / sqrt(var + eps)
 const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
 const NORM_LOGSOFTMAX: i64 = 3; // out = (x - m) - log(sum(exp(x - m))) — stable log-softmax
+const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit normalize (no mean divisor)
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -1202,6 +1260,15 @@ impl FnLowerer<'_> {
             }
             if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
                 if self.emit_norm(arr, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+                    i += n;
+                    continue;
+                }
+            }
+            // L2-normalize (4 stmts, same shape as RMSNorm but `1/sqrt(Σx² + eps)` — no mean divisor).
+            // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
+            // so neither steals the other's window.
+            if let Some((n, arr, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
+                if self.emit_norm(arr, None, &n_expr, eps, NORM_L2NORM, None, None) {
                     i += n;
                     continue;
                 }
@@ -2188,6 +2255,123 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Recognize the **scatter-add / embedding-gradient backward** — the dual of the embedding gather:
+    /// ```text
+    /// for t in 0..T { for d in 0..H { grad_w[ids[t]*H + d] += grad_out[t*H + d]; } }
+    /// ```
+    /// `grad_w[ids[t], :] += grad_out[t, :]` → `mercury_scatter_add_f32[_parallel]`. The data-dependent
+    /// row index `ids[t]` is on the **write** side (where the gather has it on the read side), and the
+    /// op is `+=` (colliding tokens — a word occurring twice — sum into one weight row). The kernel folds
+    /// each row's collisions in ascending token order, the *same* order this nest runs, so it is
+    /// **bit-identical** to the scalar loop — no reassociation. The `@parallel` kernel splits the output
+    /// rows (not the tokens) across cores so writes never collide: lock-free, race-free, and
+    /// deterministic == serial (a structural win — a C author would need non-deterministic atomic adds).
+    /// `grad_w` must be the zeroed accumulator the program is filling (`+=` into its current contents).
+    /// Pure (`&self`).
+    fn match_scatter(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<ScatterNest> {
+        // for t in 0..T { <single inner for> }
+        let ast::PatKind::Ident(t) = &pat.kind else {
+            return None;
+        };
+        let t = *t;
+        let (ts, te) = range_bounds(iter)?;
+        if as_int_lit(ts, self.interner)? != 0 {
+            return None;
+        }
+        let t_rows = as_dim(te, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        // for d in 0..H { <single assignment> }
+        let (dpat, diter, dbody) = fusable_for(&body.stmts[0])?;
+        let ast::PatKind::Ident(d) = &dpat.kind else {
+            return None;
+        };
+        let d = *d;
+        let (ds, de) = range_bounds(diter)?;
+        if as_int_lit(ds, self.interner)? != 0 {
+            return None;
+        }
+        let h = as_dim(de, self.interner)?;
+        if dbody.tail.is_some() || dbody.stmts.len() != 1 {
+            return None;
+        }
+        // grad_w[ids[t]*H + d] += grad_out[t*H + d];  (`+=` — the embedding gradient sums collisions)
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Add,
+            value,
+        } = &dbody.stmts[0].kind
+        else {
+            return None;
+        };
+        // Store: the data-dependent indirect row `grad_w[ids[t]*H + d]` — the SAME shape as the embedding
+        // gather LOAD (`match_embed_load`), but here on the WRITE side (scatter is the gather's dual).
+        let (grad_w, ids) = self.match_embed_load(target, t, d, de)?;
+        // Read: the plain row-major upstream gradient `grad_out[t*H + d]`.
+        let grad_out = self.index_off(value, d, Some((t, de)))?;
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32)
+            || scalar_of(value, self.sema) != Some(mercury_types::Scalar::F32)
+        {
+            return None;
+        }
+        // The accumulator, the upstream gradient, and the id buffer are three distinct arrays.
+        if grad_w == grad_out || grad_w == ids || grad_out == ids {
+            return None;
+        }
+        // V (grad_w's table height) must be REAL for the parallel kernel's output-row partition (a
+        // sentinel would pile all work in chunk 0). Recover the total length `V*H` from grad_w's sema
+        // array type — present even for an array PARAMETER (MIR lowers it to a bare pointer, but sema
+        // keeps the declared `[f32; V*H]`); decline if grad_w is not a statically-sized array.
+        let ExprKind::Index { base: gw_base, .. } = &target.kind else {
+            return None;
+        };
+        let total = match self.expr_ty(gw_base) {
+            Ty::Array { len, .. } => len,
+            _ => return None,
+        };
+        Some(ScatterNest {
+            grad_w,
+            grad_out,
+            ids,
+            t_rows,
+            h,
+            total,
+        })
+    }
+
+    /// Emit one `mercury_scatter_add_f32[_parallel](grad_w, grad_out, ids, T, H, V)` call for a recognized
+    /// scatter-add. `V = total / H` is the **real** table height (not a sentinel like the embedding's),
+    /// derived from grad_w's array length, because the parallel kernel partitions the `V` output rows
+    /// across cores. `parallel` selects the multicore kernel (output-row split → bit-identical to serial).
+    fn emit_scatter(&mut self, nest: &ScatterNest, parallel: bool) -> bool {
+        let (Some((grad_w, _)), Some((grad_out, _)), Some((ids, _))) = (
+            self.lookup(nest.grad_w),
+            self.lookup(nest.grad_out),
+            self.lookup(nest.ids),
+        ) else {
+            return false;
+        };
+        let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
+            return false;
+        };
+        // V = grad_w length / H (integer div; `total = V*H` exactly for a well-formed `[f32; V*H]`).
+        let total = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
+        let v = self.builder.build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
+        let func = if parallel {
+            self.gemm.scatter_add_par
+        } else {
+            self.gemm.scatter_add
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![grad_w, grad_out, ids, t_rows, h, v],
+        });
+        true
+    }
+
     /// Match `exp(x[r*C+v] - m)` (the recomputed centered exponential) — `true` if `e` is a single-arg
     /// `exp` call whose argument is `x[r*C+v] - m`. Mirrors [`match_exp_sub_body`]'s inner shape.
     fn is_exp_centered(
@@ -2649,6 +2833,108 @@ impl FnLowerer<'_> {
         })
     }
 
+    /// Recognize a batched per-row **inclusive prefix product** (cumulative product / scan):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut p: f32 = 1.0;            // multiplicative identity, resets every row
+    ///     for i in 0..C { p = p * x[r*C+i]; out[r*C+i] = p; }
+    /// }
+    /// ```
+    /// `out[r,i] = Π_{k<=i} x[r,k]` → `mercury_cumprod_f32[_parallel]`. Mirrors [`Self::match_cumsum`]
+    /// exactly but with the multiplicative seed `1.0` and a `*` accumulate. The loop-carried product is
+    /// what gcc/rustc keep scalar; the kernel's 4-row-interleaved ILP wins. **Bit-exact** — a bare product
+    /// is not fused, so it folds strictly left-to-right == the scalar nest (no reassociation, unlike the
+    /// prefix sum). `out` is f32, distinct from `x`. Pure (`&self`).
+    fn match_cumprod(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<CumsumNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] let p: f32 = 1.0;  (multiplicative identity)
+        let (p, p_init) = Self::let_init(&body.stmts[0])?;
+        if !matches!(&p_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) {
+            return None;
+        }
+        // [1] for i in 0..C { p = p * x[r*C+i]; out[r*C+i] = p; }
+        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        let cols = as_dim(ce, self.interner)?;
+        let batch = Some((r, ce));
+        if ibody.tail.is_some() || ibody.stmts.len() != 2 {
+            return None;
+        }
+        let x = self.match_prod_body(&ibody.stmts[0], p, i, batch)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &ibody.stmts[1].kind
+        else {
+            return None;
+        };
+        let out = self.index_off(target, i, batch)?;
+        if single_path(value) != Some(p) || out == x {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The prefix-product accumulate `p = p * x[r*C+i]` (or the compound `p *= x[r*C+i]`), target already
+    /// `p`. Returns the data array `x` (the read indexed `r*C + i`). The multiplicative twin of
+    /// [`Self::match_acc_add`]. Pure.
+    fn match_prod_body(
+        &self,
+        stmt: &Stmt,
+        acc: Symbol,
+        i: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return None;
+        };
+        if single_path(target) != Some(acc) {
+            return None;
+        }
+        match op {
+            // `p *= x[r*C+i]`
+            ast::AssignOp::Mul => self.index_off(value, i, batch),
+            // `p = p * x[r*C+i]` (either operand order)
+            ast::AssignOp::Assign => {
+                let ExprKind::Binary {
+                    op: ast::BinOp::Mul,
+                    lhs,
+                    rhs,
+                } = &value.kind
+                else {
+                    return None;
+                };
+                if single_path(lhs) == Some(acc) {
+                    self.index_off(rhs, i, batch)
+                } else if single_path(rhs) == Some(acc) {
+                    self.index_off(lhs, i, batch)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The prefix-sum accumulate `acc = acc + x[r*C+i]` (or the compound `acc += x[r*C+i]`), target
     /// already `acc`. Returns the data array `x` (the read indexed `r*C + i`). Pure.
     fn match_acc_add(
@@ -2686,6 +2972,140 @@ impl FnLowerer<'_> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Recognize a batched per-row **first-order linear recurrence / selective scan** (SSM/Mamba/EMA):
+    /// ```text
+    /// for r in 0..R {
+    ///     let mut h: f32 = 0.0;              // zero initial state, resets every row
+    ///     for t in 0..C {
+    ///         h = a[r*C + t] * h + b[r*C + t];  // h_t = gate·h_{t-1} + input
+    ///         out[r*C + t] = h;
+    ///     }
+    /// }
+    /// ```
+    /// `out[r,t] = a[r,t]·h_{t-1} + b[r,t]` → `mercury_lrscan_f32[_parallel]`. The carry `h` makes the
+    /// inner loop a true loop-carried dependency that gcc/rustc keep **scalar** (like cumsum); rows are
+    /// independent so the `_parallel` map across rows is the lever. **No reassociation** is possible (the
+    /// recurrence is inherently sequential within a row), so the kernel is bit-identical to the scalar
+    /// nest — the interpreter marshals the *same* kernel. `out` is f32, distinct from `a`/`b`. Pure.
+    fn match_lrscan(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> Option<LrscanNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        let (rs, re) = range_bounds(iter)?;
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        if body.tail.is_some() || body.stmts.len() != 2 {
+            return None;
+        }
+        // [0] let h: f32 = 0.0;  (zero initial hidden state)
+        let (h, h0) = Self::let_init(&body.stmts[0])?;
+        if !is_float_zero(h0, self.interner) {
+            return None;
+        }
+        // [1] for t in 0..C { h = a[r*C+t]*h + b[r*C+t]; out[r*C+t] = h; }
+        let (t, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        let cols = as_dim(ce, self.interner)?;
+        let batch = Some((r, ce));
+        if ibody.tail.is_some() || ibody.stmts.len() != 2 {
+            return None;
+        }
+        // inner [0] the recurrence step h = a[r*C+t]*h + b[r*C+t]  →  (a, b)
+        let (a, b) = self.match_lrscan_step(&ibody.stmts[0], h, t, batch)?;
+        // inner [1] out[r*C+t] = h
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &ibody.stmts[1].kind
+        else {
+            return None;
+        };
+        let out = self.index_off(target, t, batch)?;
+        if single_path(value) != Some(h) || out == a || out == b {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        Some(LrscanNest {
+            a,
+            b,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The recurrence step `h = a[r*C+t]·h + b[r*C+t]` (target already the carried scalar `h`): returns
+    /// `(a, b)` — `a` the per-step gate (multiplied by the carry), `b` the per-step input (added). The
+    /// top-level op is an `Add` whose one operand is the gated carry `a[..]·h` and whose other is the
+    /// plain data read `b[..]` (either addend order). Pure.
+    fn match_lrscan_step(
+        &self,
+        stmt: &Stmt,
+        h: Symbol,
+        t: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, Symbol)> {
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if single_path(target) != Some(h) {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &value.kind
+        else {
+            return None;
+        };
+        if let Some(a) = self.match_gated_carry(lhs, h, t, batch) {
+            let b = self.index_off(rhs, t, batch)?;
+            Some((a, b))
+        } else if let Some(a) = self.match_gated_carry(rhs, h, t, batch) {
+            let b = self.index_off(lhs, t, batch)?;
+            Some((a, b))
+        } else {
+            None
+        }
+    }
+
+    /// `a[r*C+t] · h` (either factor order, `h` the carried scalar) → the gate array `a` (the factor
+    /// indexed `r*C + t`). Pure.
+    fn match_gated_carry(
+        &self,
+        e: &Expr,
+        h: Symbol,
+        t: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &e.kind
+        else {
+            return None;
+        };
+        if single_path(rhs) == Some(h) {
+            self.index_off(lhs, t, batch)
+        } else if single_path(lhs) == Some(h) {
+            self.index_off(rhs, t, batch)
+        } else {
+            None
         }
     }
 
@@ -3576,6 +3996,94 @@ impl FnLowerer<'_> {
         Some((4, x, n_expr.clone(), eps_bits, gamma, beta))
     }
 
+    /// `let inv = 1.0 / sqrt(sum + eps)` (or `rsqrt(...)`, `eps` either side, or the bare
+    /// `1.0/sqrt(sum)` with implicit `eps = 0`) → `(inv, eps_bits)`. The L2-normalization
+    /// reciprocal-norm binding: like [`Self::match_inv_rstd`] but the sqrt argument is the **raw**
+    /// sum-of-squares — no `/N` mean divisor (the feature that distinguishes RMSNorm). The two are
+    /// structurally disjoint (a `/N` node is present xor absent), so a window matches at most one. Pure.
+    fn match_inv_l2norm(&self, stmt: &Stmt, sum: Symbol) -> Option<(Symbol, i64)> {
+        let (name, init) = Self::let_init(stmt)?;
+        let arg = self.as_rsqrt_arg(init)?;
+        // Bare `sqrt(sum)` — no eps term: eps defaults to 0.0.
+        if single_path(arg) == Some(sum) {
+            return Some((name, 0.0f32.to_bits() as i64));
+        }
+        // `sqrt(sum + eps)` — eps is one operand; the other must be the bare sum-of-squares symbol.
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        let (base, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+            (lhs.as_ref(), b)
+        } else if let Some(b) = self.float_lit_bits(lhs) {
+            (rhs.as_ref(), b)
+        } else {
+            return None;
+        };
+        if single_path(base) == Some(sum) {
+            Some((name, eps_bits))
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the in-place flat **L2-normalization** window (`out = x / ‖x‖₂`, the cosine-similarity
+    /// / normalized-embedding / retrieval-key projection) at `b.stmts[at..]` — structurally RMSNorm
+    /// minus the mean divisor:
+    ///
+    /// ```text
+    /// let mut s = 0.0;
+    /// for i in 0..N { s += x[i]*x[i]; }      // sum of squares = ‖x‖₂²
+    /// let inv = 1.0 / sqrt(s + eps);         // 1/‖x‖₂   (no `/N` — that is RMSNorm)
+    /// for i in 0..N { x[i] = x[i] * inv; }   // unit-normalize
+    /// ```
+    ///
+    /// Returns `(consumed, x, n_expr, eps_bits, None, None)`. Reuses every RMSNorm helper
+    /// (`match_sumsq_body`, `match_scale_body`); only the reciprocal binding differs
+    /// (`match_inv_l2norm` vs `match_inv_rstd`) and the op code is [`NORM_L2NORM`]. An affine wrapper
+    /// is **declined** (L2-normalize has no learned scale/shift — there is no affine L2 kernel), so a
+    /// trailing `* gamma[i]` falls to the generic vectorizer rather than being silently dropped. Pure.
+    fn match_l2norm(
+        &self,
+        b: &Block,
+        at: usize,
+        batch: Option<Symbol>,
+    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 4 {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&stmts[0])?;
+        if !self.is_zero_lit(s_init) {
+            return None;
+        }
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
+        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s)?;
+        let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        // L2-normalize is non-affine; a `* gamma[i]` (or `+ beta[i]`) window is not an L2 norm.
+        if gamma.is_some() || beta.is_some() {
+            return None;
+        }
+        let rest = &b.stmts[at + 4..];
+        let tail = b.tail.as_deref();
+        for sc in [s, inv] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((4, x, n_expr.clone(), eps_bits, None, None))
+    }
+
     /// Is `e` the float literal `0.0`? Pure.
     fn is_zero_lit(&self, e: &Expr) -> bool {
         matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
@@ -4202,6 +4710,51 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_cumprod_f32[_parallel](x, out, rows, cols)` for a recognized prefix product. Same
+    /// 2-ptr + 2-i64 `sig_vmath` ABI as cumsum; the `_parallel` one maps independent rows across cores.
+    fn emit_cumprod(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
+        let (Some((x, _)), Some((out, _))) = (self.lookup(nest.x), self.lookup(nest.out)) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.cumprod_par
+        } else {
+            self.gemm.cumprod
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![x, out, rows, cols],
+        });
+        true
+    }
+
+    /// Emit `mercury_lrscan_f32[_parallel](a, b, out, rows, cols)` for a recognized linear-recurrence scan.
+    /// 3 pointers + 2 i64 (the `softmax_bwd` ABI); the `_parallel` one maps the independent rows across
+    /// cores (bit-identical to serial — no cross-row combine).
+    fn emit_lrscan(&mut self, nest: &LrscanNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((b, _)), Some((out, _))) =
+            (self.lookup(nest.a), self.lookup(nest.b), self.lookup(nest.out))
+        else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.lrscan_par
+        } else {
+            self.gemm.lrscan
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, b, out, rows, cols],
         });
         true
     }
@@ -5478,6 +6031,11 @@ impl FnLowerer<'_> {
                 return Some((x, cols, eps, NORM_RMSNORM, gamma, beta));
             }
         }
+        if let Some((consumed, x, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
+            if consumed == body.stmts.len() {
+                return Some((x, cols, eps, NORM_L2NORM, None, None));
+            }
+        }
         None
     }
 
@@ -5657,6 +6215,23 @@ impl FnLowerer<'_> {
                 return;
             }
         }
+        // Batched per-row inclusive prefix product (cumprod) → `mercury_cumprod_f32` (the `_parallel` one
+        // in a `@parallel` fn). Loop-carried like cumsum; the kernel's lever is 4-row-interleaved ILP.
+        // Bit-exact (a bare product is not fused → strict left-to-right, no reassociation).
+        if let Some(nest) = self.match_cumprod(pat, iter, body) {
+            if self.emit_cumprod(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Batched per-row first-order linear recurrence (SSM/Mamba/EMA selective scan) →
+        // `mercury_lrscan_f32` (the `_parallel` one in a `@parallel` fn). The carry defeats gcc/rustc
+        // auto-vectorization (scalar, like cumsum); rows independent → multicore over rows. Bit-exact
+        // (the recurrence is inherently sequential within a row — no reassociation).
+        if let Some(nest) = self.match_lrscan(pat, iter, body) {
+            if self.emit_lrscan(&nest, self.parallel_fn) {
+                return;
+            }
+        }
         // Batched per-row cumulative max / min (running extreme scan) → mercury_cum{max,min}_f32. Same
         // loop-carried scan gcc/rustc keep scalar; bit-exact (max/min select a value, no reassociation).
         if let Some(nest) = self.match_cumminmax(pat, iter, body) {
@@ -5670,6 +6245,16 @@ impl FnLowerer<'_> {
         // the scalar nest (no reassociation, like the transpose); rows independent → parallel == serial.
         if let Some(nest) = self.match_embedding(pat, iter, body) {
             if self.emit_embedding(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // Scatter-add / embedding-gradient backward `for t { for d { grad_w[ids[t]*H+d] += grad_out[t*H+d] } }`
+        // → `mercury_scatter_add_f32` (the `_parallel` one in a `@parallel` fn). The dual of the embedding
+        // gather; bit-identical to the scalar nest (collisions sum in token order, no reassociation). It is
+        // probed AFTER embedding — disjoint store ops (`+=` indirect-write vs `=` indirect-read), so neither
+        // steals the other's nest.
+        if let Some(nest) = self.match_scatter(pat, iter, body) {
+            if self.emit_scatter(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -5695,6 +6280,13 @@ impl FnLowerer<'_> {
         // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
         // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
         if self.try_emit_batched_norm(pat, iter, body) {
+            return;
+        }
+        // A `for r in 0..R { for j in 0..C { out[r*C + j] = f(x[r*C + j]) } }` batched activation nest
+        // (the `[tokens, hidden]` FFN/attention shape) dispatches to one flat 256-bit `mercury_vmath_f32`
+        // over the whole `[0, R*C)` buffer — restoring the full kernel width the offset-indexed inner
+        // loop would otherwise lose to the 128-bit generic vectorizer.
+        if self.try_emit_batched_vmath(pat, iter, body) {
             return;
         }
         let (start, end, inclusive, step) = match iter {
@@ -5860,7 +6452,12 @@ impl FnLowerer<'_> {
 
     /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
     /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
-    fn match_vmath_stmt(&self, stmt: &Stmt, j: Symbol) -> Option<(Symbol, Symbol, u32, MirType)> {
+    fn match_vmath_stmt(
+        &self,
+        stmt: &Stmt,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, Symbol, u32, MirType)> {
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -5869,7 +6466,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let out_sym = self.index_by_loopvar(target, j)?;
+        let out_sym = self.index_off(target, j, batch)?;
         // Gated SiLU / swish written as a product — `out[j] = x[j] * sigmoid(x[j])` — the textbook
         // definition a programmer writes before reaching for the `silu()` intrinsic (and the value==gate
         // case of a SwiGLU gate). Dispatch to the existing 256-bit `VMATH_SILU` kernel, which *is*
@@ -5883,8 +6480,8 @@ impl FnLowerer<'_> {
         {
             if self.expr_mir(value) == MirType::F32 {
                 if let Some(x_sym) = self
-                    .match_gated_silu(lhs, rhs, j)
-                    .or_else(|| self.match_gated_silu(rhs, lhs, j))
+                    .match_gated_silu(lhs, rhs, j, batch)
+                    .or_else(|| self.match_gated_silu(rhs, lhs, j, batch))
                 {
                     return Some((out_sym, x_sym, VMATH_SILU, MirType::F32));
                 }
@@ -5969,7 +6566,7 @@ impl FnLowerer<'_> {
             if self.expr_mir(target) == MirType::F32
                 && scalar_of(arg, self.sema) == Some(mercury_types::Scalar::F32)
             {
-                let x_sym = self.index_by_loopvar(inner, j)?;
+                let x_sym = self.index_off(inner, j, batch)?;
                 return Some((out_sym, x_sym, opcode, in_elem));
             }
             return None;
@@ -5978,7 +6575,7 @@ impl FnLowerer<'_> {
         if self.expr_mir(arg) != MirType::F32 {
             return None;
         }
-        let x_sym = self.index_by_loopvar(arg, j)?;
+        let x_sym = self.index_off(arg, j, batch)?;
         Some((out_sym, x_sym, opcode, MirType::F32))
     }
 
@@ -5986,8 +6583,14 @@ impl FnLowerer<'_> {
     /// unit-stride f32 read `x[j]` and `gate` the call `sigmoid(x[j])` over the *same* array. Returns
     /// that array's symbol, or `None`. Pure — used by [`match_vmath_stmt`] to fold the product form
     /// into the `VMATH_SILU` dispatch (`silu(x) == x·sigmoid(x)`, bit-identical to the inlined form).
-    fn match_gated_silu(&self, val: &Expr, gate: &Expr, j: Symbol) -> Option<Symbol> {
-        let xs = self.index_by_loopvar(val, j)?;
+    fn match_gated_silu(
+        &self,
+        val: &Expr,
+        gate: &Expr,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<Symbol> {
+        let xs = self.index_off(val, j, batch)?;
         if self.expr_mir(val) != MirType::F32 {
             return None;
         }
@@ -5998,7 +6601,7 @@ impl FnLowerer<'_> {
         {
             return None;
         }
-        let xs2 = self.index_by_loopvar(&args[0], j)?;
+        let xs2 = self.index_off(&args[0], j, batch)?;
         (xs == xs2).then_some(xs)
     }
 
@@ -6010,13 +6613,14 @@ impl FnLowerer<'_> {
         &self,
         j: Symbol,
         body: &Block,
+        batch: Option<(Symbol, &Expr)>,
     ) -> Option<Vec<(ValueId, ValueId, u32, MirType)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
-            let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j)?;
+            let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j, batch)?;
             let (out_base, _) = self.lookup(out_sym)?;
             let (x_base, _) = self.lookup(x_sym)?;
             calls.push((out_base, x_base, opcode, in_elem));
@@ -6075,7 +6679,7 @@ impl FnLowerer<'_> {
     /// interpreter marshals through the identical kernel, so the differential oracle stays exact.
     /// Returns false (fall back to the generic vectorizer) unless every statement matches.
     fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
-        let Some(calls) = self.match_vmath_body(j, body) else {
+        let Some(calls) = self.match_vmath_body(j, body, None) else {
             return false;
         };
         // Bounds GEP each base by the start index, so a loop from `lo` begins at element `lo`.
@@ -6086,6 +6690,88 @@ impl FnLowerer<'_> {
         let e = self.lower_expr(end);
         let e = self.coerce_to(e, &ety, &MirType::I64, true);
         self.emit_vmath_calls(s, e, calls);
+        true
+    }
+
+    /// Recognize a **batched** transcendental-activation nest `for r in 0..R { for j in 0..C { out[r*C
+    /// + j] = f(x[r*C + j]) } }` — the real `[tokens, hidden]` FFN/attention activation shape — and
+    /// lower it to a single flat 256-bit `mercury_vmath_f32` call over the whole `[0, R*C)` buffer. A
+    /// per-element activation over a contiguous `[R, C]` matrix *is* one flat activation of `R*C`
+    /// elements, so the row structure is irrelevant to the kernel — one call covers it, at true 256-bit
+    /// width (the generic vectorizer that would otherwise lower the offset-indexed inner loop is capped
+    /// at 128-bit SSE, so the batched shape ran at half the width of the flat `for i in 0..N` form). The
+    /// kernel mirrors the inlined poly, so dispatched == the generic-vectorized form bit-for-bit, and
+    /// the interpreter marshals the same kernel — the differential gate stays exact. Returns false (fall
+    /// through) unless the nest matches exactly; a partial match leaves the generic vectorizer to lower
+    /// the loops correctly. Both `r` and `j` must start at 0 so the touched indices are exactly the
+    /// contiguous `[0, R*C)` (a non-zero inner start would leave per-row gaps the flat call can't model).
+    fn try_emit_batched_vmath(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start: r_start,
+            end: Some(r_end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(r_start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(r),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        // The outer body must be exactly one inner `for j in 0..C { <vmath stmts over x[r*C + j]> }`.
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return false;
+        }
+        let StmtKind::For {
+            pat: jpat,
+            iter: jiter,
+            body: inner,
+            ..
+        } = &body.stmts[0].kind
+        else {
+            return false;
+        };
+        let ForIter::Range {
+            start: j_start,
+            end: Some(cols),
+            inclusive: false,
+            step: None,
+        } = jiter
+        else {
+            return false;
+        };
+        if const_usize_expr(j_start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(jvar),
+            ..
+        } = jpat
+        else {
+            return false;
+        };
+        let Some(calls) = self.match_vmath_body(*jvar, inner, Some((*r, cols))) else {
+            return false;
+        };
+        // Flat range `[0, R*C)`: each base GEPs from element 0, length `R*C`.
+        let rty = self.expr_mir(r_end);
+        let rv = self.lower_expr(r_end);
+        let rv = self.coerce_to(rv, &rty, &MirType::I64, true);
+        let cty = self.expr_mir(cols);
+        let cv = self.lower_expr(cols);
+        let cv = self.coerce_to(cv, &cty, &MirType::I64, true);
+        let total = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, rv, cv));
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        self.emit_vmath_calls(zero, total, calls);
         true
     }
 
@@ -6842,7 +7528,7 @@ impl FnLowerer<'_> {
         // A transcendental-activation chunk dispatches to the 256-bit AVX2 kernel here too, so an
         // `@parallel` activation runs multicore × 256-bit (each thread's chunk is one kernel call).
         // Elementwise, so the interpreter's whole-range pass and the native per-chunk passes agree.
-        if let Some(calls) = self.match_vmath_body(j, body) {
+        if let Some(calls) = self.match_vmath_body(j, body, None) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
             self.emit_vmath_calls(s, e, calls);
@@ -14088,6 +14774,16 @@ struct CumsumNest {
     cols: Dim,
 }
 
+/// A recognized batched per-row first-order linear-recurrence scan (see [`FnLowerer::match_lrscan`]):
+/// `out[r,t] = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1} = 0` per row. `a` is the gate, `b` the input.
+struct LrscanNest {
+    a: Symbol,
+    b: Symbol,
+    out: Symbol,
+    rows: Dim,
+    cols: Dim,
+}
+
 /// A recognized batched per-row cumulative max/min nest (see [`FnLowerer::match_cumminmax`]). `is_max`
 /// selects cummax (`true`) vs cummin (`false`).
 struct CumMinMaxNest {
@@ -14108,6 +14804,19 @@ struct EmbeddingNest {
     ids: Symbol,
     t_rows: Dim,
     h: Dim,
+}
+
+/// A recognized scatter-add / embedding-gradient-backward nest (see [`FnLowerer::match_scatter`]):
+/// `grad_w[ids[t], :] += grad_out[t, :]`. `t_rows` is the token count, `h` the hidden width (row stride),
+/// and `total` is grad_w's full array length `V*H` (from its sema type) — the emitter divides it by `H`
+/// to recover the real table height `V` the parallel kernel partitions across cores.
+struct ScatterNest {
+    grad_w: Symbol,
+    grad_out: Symbol,
+    ids: Symbol,
+    t_rows: Dim,
+    h: Dim,
+    total: u64,
 }
 
 /// Build a throwaway `FnLowerer` probe over a single-`for`-statement body and run `check` on the inner
