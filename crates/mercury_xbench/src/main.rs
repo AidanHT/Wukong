@@ -3695,6 +3695,7 @@ fn bench_norm(cc: &str, dir: &Path) {
             "logsoftmax",
             "layernorm",
             "rmsnorm",
+            "l2norm",
             "layernorm_affine",
             "rmsnorm_affine",
         ] {
@@ -3810,6 +3811,13 @@ fn mer_norm(cols: usize, op: &str) -> String {
              let inv: f32 = rsqrt(s / {cols}.0 + 0.00001); \
              for i in 0..{cols} {{ out[i] = out[i] * inv * y[i]; }}"
         ),
+        // L2 / unit normalize: RMSNorm's `rsqrt(s / cols + eps)` without the `/ cols` mean divisor.
+        "l2norm" => format!(
+            "let mut s: f32 = 0.0; \
+             for i in 0..{cols} {{ s = s + out[i] * out[i]; }} \
+             let inv: f32 = rsqrt(s + 0.00001); \
+             for i in 0..{cols} {{ out[i] = out[i] * inv; }}"
+        ),
         _ => format!(
             "let mut s: f32 = 0.0; \
              for i in 0..{cols} {{ s = s + out[i] * out[i]; }} \
@@ -3854,6 +3862,11 @@ fn c_norm(cols: usize, op: &str) -> String {
              float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
              for(long i=0;i<C;i++) out[i]=out[i]*inv*y[i];"
         }
+        "l2norm" => {
+            "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]*out[i]; \
+             float inv=1.0f/sqrtf(s+1e-5f); \
+             for(long i=0;i<C;i++) out[i]*=inv;"
+        }
         _ => {
             "float s=0.0f; for(long i=0;i<C;i++) s+=out[i]*out[i]; \
              float inv=1.0f/sqrtf(s/(float)C+1e-5f); \
@@ -3896,6 +3909,11 @@ fn rust_norm(cols: usize, op: &str) -> String {
             "let mut s=0.0f32; for i in 0..C { let v=*out.add(i); s+=v*v; } \
              let inv=1.0f32/(s/(C as f32)+1e-5f32).sqrt(); \
              for i in 0..C { *out.add(i)=*out.add(i)*inv * *y.add(i); }"
+        }
+        "l2norm" => {
+            "let mut s=0.0f32; for i in 0..C { let v=*out.add(i); s+=v*v; } \
+             let inv=1.0f32/(s+1e-5f32).sqrt(); \
+             for i in 0..C { *out.add(i)*=inv; }"
         }
         _ => {
             "let mut s=0.0f32; for i in 0..C { let v=*out.add(i); s+=v*v; } \

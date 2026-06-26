@@ -1061,6 +1061,7 @@ const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
 const NORM_LAYERNORM: i64 = 1; // out = (x - mean) / sqrt(var + eps)
 const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
 const NORM_LOGSOFTMAX: i64 = 3; // out = (x - m) - log(sum(exp(x - m))) — stable log-softmax
+const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit normalize (no mean divisor)
 
 struct FnLowerer<'a> {
     builder: Builder,
@@ -1202,6 +1203,15 @@ impl FnLowerer<'_> {
             }
             if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
                 if self.emit_norm(arr, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+                    i += n;
+                    continue;
+                }
+            }
+            // L2-normalize (4 stmts, same shape as RMSNorm but `1/sqrt(Σx² + eps)` — no mean divisor).
+            // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
+            // so neither steals the other's window.
+            if let Some((n, arr, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
+                if self.emit_norm(arr, None, &n_expr, eps, NORM_L2NORM, None, None) {
                     i += n;
                     continue;
                 }
@@ -3576,6 +3586,94 @@ impl FnLowerer<'_> {
         Some((4, x, n_expr.clone(), eps_bits, gamma, beta))
     }
 
+    /// `let inv = 1.0 / sqrt(sum + eps)` (or `rsqrt(...)`, `eps` either side, or the bare
+    /// `1.0/sqrt(sum)` with implicit `eps = 0`) → `(inv, eps_bits)`. The L2-normalization
+    /// reciprocal-norm binding: like [`Self::match_inv_rstd`] but the sqrt argument is the **raw**
+    /// sum-of-squares — no `/N` mean divisor (the feature that distinguishes RMSNorm). The two are
+    /// structurally disjoint (a `/N` node is present xor absent), so a window matches at most one. Pure.
+    fn match_inv_l2norm(&self, stmt: &Stmt, sum: Symbol) -> Option<(Symbol, i64)> {
+        let (name, init) = Self::let_init(stmt)?;
+        let arg = self.as_rsqrt_arg(init)?;
+        // Bare `sqrt(sum)` — no eps term: eps defaults to 0.0.
+        if single_path(arg) == Some(sum) {
+            return Some((name, 0.0f32.to_bits() as i64));
+        }
+        // `sqrt(sum + eps)` — eps is one operand; the other must be the bare sum-of-squares symbol.
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        let (base, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+            (lhs.as_ref(), b)
+        } else if let Some(b) = self.float_lit_bits(lhs) {
+            (rhs.as_ref(), b)
+        } else {
+            return None;
+        };
+        if single_path(base) == Some(sum) {
+            Some((name, eps_bits))
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the in-place flat **L2-normalization** window (`out = x / ‖x‖₂`, the cosine-similarity
+    /// / normalized-embedding / retrieval-key projection) at `b.stmts[at..]` — structurally RMSNorm
+    /// minus the mean divisor:
+    ///
+    /// ```text
+    /// let mut s = 0.0;
+    /// for i in 0..N { s += x[i]*x[i]; }      // sum of squares = ‖x‖₂²
+    /// let inv = 1.0 / sqrt(s + eps);         // 1/‖x‖₂   (no `/N` — that is RMSNorm)
+    /// for i in 0..N { x[i] = x[i] * inv; }   // unit-normalize
+    /// ```
+    ///
+    /// Returns `(consumed, x, n_expr, eps_bits, None, None)`. Reuses every RMSNorm helper
+    /// (`match_sumsq_body`, `match_scale_body`); only the reciprocal binding differs
+    /// (`match_inv_l2norm` vs `match_inv_rstd`) and the op code is [`NORM_L2NORM`]. An affine wrapper
+    /// is **declined** (L2-normalize has no learned scale/shift — there is no affine L2 kernel), so a
+    /// trailing `* gamma[i]` falls to the generic vectorizer rather than being silently dropped. Pure.
+    fn match_l2norm(
+        &self,
+        b: &Block,
+        at: usize,
+        batch: Option<Symbol>,
+    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 4 {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&stmts[0])?;
+        if !self.is_zero_lit(s_init) {
+            return None;
+        }
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
+        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s)?;
+        let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        // L2-normalize is non-affine; a `* gamma[i]` (or `+ beta[i]`) window is not an L2 norm.
+        if gamma.is_some() || beta.is_some() {
+            return None;
+        }
+        let rest = &b.stmts[at + 4..];
+        let tail = b.tail.as_deref();
+        for sc in [s, inv] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((4, x, n_expr.clone(), eps_bits, None, None))
+    }
+
     /// Is `e` the float literal `0.0`? Pure.
     fn is_zero_lit(&self, e: &Expr) -> bool {
         matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
@@ -5476,6 +5574,11 @@ impl FnLowerer<'_> {
         if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_rmsnorm(body, 0, Some(*r)) {
             if consumed == body.stmts.len() {
                 return Some((x, cols, eps, NORM_RMSNORM, gamma, beta));
+            }
+        }
+        if let Some((consumed, x, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
+            if consumed == body.stmts.len() {
+                return Some((x, cols, eps, NORM_L2NORM, None, None));
             }
         }
         None
