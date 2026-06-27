@@ -1,0 +1,27 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+module tests.run.enum_cstyle
+
+// C-style enums: a variant `E::Name` lowers to its integer discriminant. Discriminants
+// auto-increment from 0 (or from the last explicit `= <int>`). An enum value is its discriminant, so
+// it can be cast to an integer, bound to a `let`, and compared. The interpreter and native backend
+// agree (the value is a compile-time constant).
+enum Code { Ok = 10, Err = 20 }
+enum Color { Red, Green, Blue }       // 0, 1, 2
+enum Step { A = 5, B, C }             // 5, 6, 7
+
+fn main() -> i32 {
+    print(Code::Ok as i32);           // 10  (explicit discriminant)
+    print(Code::Err as i32);          // 20
+    print(Color::Blue as i32);        // 2   (auto-increment from 0)
+    print(Step::C as i32);            // 7   (continues after the explicit 5)
+
+    let s: Code = Code::Err;
+    if s == Code::Err { print(1); } else { print(0); }   // 1  (comparison)
+    return 0;
+}

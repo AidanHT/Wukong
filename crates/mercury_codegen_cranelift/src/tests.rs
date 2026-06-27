@@ -612,6 +612,33 @@ fn differential_nested_tuple_field() {
     }
 }
 
+/// C-style enums: a variant `E::B` lowers to its integer discriminant (auto-incremented from 0, or
+/// set by an explicit `= <int>` and continuing from there). Covers an explicit discriminant, plain
+/// auto-increment, continuation after an explicit value, a `let x: E = E::A` binding, an equality
+/// comparison, and arithmetic via `as i32`. The value is a compile-time constant, so both backends
+/// agree.
+#[test]
+fn differential_enum() {
+    let cases = [
+        ("enum E { A = 10, B = 20 } fn main() -> i32 { return E::B as i32; }", 20),
+        ("enum Color { Red, Green, Blue } fn main() -> i32 { return Color::Blue as i32; }", 2),
+        ("enum E { A = 5, B, C } fn main() -> i32 { return E::C as i32; }", 7),
+        ("enum E { A = 10, B = 20 } fn main() -> i32 { let x: E = E::A; return x as i32; }", 10),
+        ("enum E { A = 10, B = 20 } \
+          fn main() -> i32 { let x: E = E::B; if x == E::B { return 1; } return 0; }", 1),
+        ("enum E { A = 10, B = 20 } \
+          fn main() -> i32 { return (E::A as i32) + (E::B as i32); }", 30),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "enum native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "enum wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
