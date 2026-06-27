@@ -540,9 +540,16 @@ impl Sema<'_> {
                     }
                 }
             }
+            // An or-pattern's alternatives are typically binding-free literals/variants; bind each
+            // against the same scrutinee type so any shared identifier resolves.
+            PatKind::Or(alts) => {
+                for a in alts {
+                    self.bind_pattern(a, ty);
+                }
+            }
             PatKind::Wildcard | PatKind::Unit => {}
-            // Literal patterns bind nothing — they test the scrutinee's value.
-            PatKind::Int { .. } | PatKind::Bool(_) => {}
+            // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
+            PatKind::Int { .. } | PatKind::Bool(_) | PatKind::Path(_) | PatKind::Range { .. } => {}
         }
     }
 

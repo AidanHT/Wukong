@@ -10132,7 +10132,31 @@ impl FnLowerer<'_> {
         scrut_ty: &Ty,
         guard: Option<&Expr>,
     ) -> ValueId {
-        let pat_cond = match &pat.kind {
+        let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
+        match (pat_cond, guard) {
+            (Some(pc), Some(g)) => {
+                let gv = self.lower_expr(g);
+                self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
+            }
+            (Some(pc), None) => pc,
+            (None, Some(g)) => self.lower_expr(g),
+            (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
+        }
+    }
+
+    /// The i1 condition under which `pat` matches the scrutinee. For a scalar pattern `scrut` is the
+    /// loaded scrutinee value; for a tuple pattern it is the tuple buffer's base pointer. `None` means
+    /// the pattern is unconditional (a wildcard / identifier binding). Literal int/bool/enum-variant/
+    /// range patterns compare the value; a tuple ANDs its fields; an or-pattern ORs its alternatives.
+    fn pattern_cond(
+        &mut self,
+        pat: &Pattern,
+        scrut: ValueId,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        match &pat.kind {
             ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit => None,
             ast::PatKind::Int { sym, neg } => {
                 let mut v = parse_int(self.interner.resolve(*sym));
@@ -10142,33 +10166,113 @@ impl FnLowerer<'_> {
                 let c = self
                     .builder
                     .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
-                Some(
-                    self.builder
-                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
-                )
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
             ast::PatKind::Bool(b) => {
                 let c = self
                     .builder
                     .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
-                Some(
-                    self.builder
-                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
-                )
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
-            // A tuple pattern matches when every field's sub-pattern matches: `scrut` is the tuple
-            // buffer's base pointer, so AND each field's test (literals compare, nested tuples
-            // recurse, wildcards/idents are unconditional). See `tuple_pattern_cond`.
-            ast::PatKind::Tuple(subs) => self.tuple_pattern_cond(subs, scrut, scrut_ty, pat.span),
+            // `Enum::Variant` — compare the scrutinee (an enum value is its discriminant) to the
+            // variant's discriminant. An unresolved path is rejected (a hard error, never a no-op).
+            ast::PatKind::Path(path) => {
+                let Some(disc) = self.enum_path_value(path) else {
+                    self.unsupported(span, "match pattern");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
+                let c = self.builder.build(
+                    scrut_mir.clone(),
+                    Op::ConstInt(disc as i128, scrut_mir.clone()),
+                );
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+            }
+            // A range pattern `lo..hi` / `lo..=hi`: `lo <= scrut` AND `scrut < hi` (or `<= hi`),
+            // with the comparison signedness taken from the scrutinee's type.
+            ast::PatKind::Range {
+                lo,
+                hi,
+                inclusive,
+            } => {
+                let signed = !matches!(scrut_ty, Ty::Scalar(s) if !s.is_signed());
+                let lo_v = self.pattern_int_value(lo);
+                let hi_v = self.pattern_int_value(hi);
+                let lo_c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(lo_v, scrut_mir.clone()));
+                let hi_c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(hi_v, scrut_mir.clone()));
+                let ge = self.builder.build(
+                    MirType::I1,
+                    Op::Cmp(if signed { CmpOp::Sge } else { CmpOp::Uge }, scrut, lo_c),
+                );
+                let hi_op = match (*inclusive, signed) {
+                    (true, true) => CmpOp::Sle,
+                    (false, true) => CmpOp::Slt,
+                    (true, false) => CmpOp::Ule,
+                    (false, false) => CmpOp::Ult,
+                };
+                let lt = self.builder.build(MirType::I1, Op::Cmp(hi_op, scrut, hi_c));
+                Some(self.builder.build(MirType::I1, Op::Bin(BinOp::And, ge, lt)))
+            }
+            // `scrut` is the tuple buffer's base pointer; AND each field's sub-pattern test.
+            ast::PatKind::Tuple(subs) => self.tuple_pattern_cond(subs, scrut, scrut_ty, span),
+            // An or-pattern matches if any alternative does: OR each alternative's condition. An
+            // unconditional alternative (a wildcard/ident) makes the whole or-pattern unconditional.
+            ast::PatKind::Or(alts) => {
+                let mut acc: Option<ValueId> = None;
+                for alt in alts {
+                    match self.pattern_cond(alt, scrut, scrut_mir, scrut_ty, alt.span) {
+                        None => return None,
+                        Some(c) => {
+                            acc = Some(match acc {
+                                Some(a) => {
+                                    self.builder.build(MirType::I1, Op::Bin(BinOp::Or, a, c))
+                                }
+                                None => c,
+                            });
+                        }
+                    }
+                }
+                acc
+            }
+        }
+    }
+
+    /// The integer value of an int-literal range bound (`lo`/`hi`). A non-int bound yields 0.
+    fn pattern_int_value(&self, pat: &Pattern) -> i128 {
+        if let ast::PatKind::Int { sym, neg } = &pat.kind {
+            let v = parse_int(self.interner.resolve(*sym));
+            if *neg {
+                -v
+            } else {
+                v
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Resolve an enum-variant path pattern (`Enum::Variant`) to its integer discriminant.
+    fn enum_path_value(&self, path: &ast::Path) -> Option<i64> {
+        if path.segments.len() != 2 {
+            return None;
+        }
+        let DefKind::Enum(variants) = &self.sema.defs.lookup(path.segments[0].sym)?.kind else {
+            return None;
         };
-        match (pat_cond, guard) {
-            (Some(pc), Some(g)) => {
-                let gv = self.lower_expr(g);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
-            }
-            (Some(pc), None) => pc,
-            (None, Some(g)) => self.lower_expr(g),
-            (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
+        let var = path.segments[1].sym;
+        variants.iter().find(|(v, _)| *v == var).map(|(_, d)| *d)
+    }
+
+    /// Whether a pattern must be tested against the scrutinee's *address* (a tuple field that is
+    /// itself an aggregate) rather than its loaded value.
+    fn pattern_needs_ptr(pat: &Pattern) -> bool {
+        match &pat.kind {
+            ast::PatKind::Tuple(_) => true,
+            ast::PatKind::Or(alts) => alts.iter().any(Self::pattern_needs_ptr),
+            _ => false,
         }
     }
 
@@ -10201,7 +10305,14 @@ impl FnLowerer<'_> {
             };
             let fmty = self.mir_ty_of(fty);
             let fptr = self.field_ptr(base, off);
-            if let Some(c) = self.field_pattern_cond(sub, fptr, &fmty, fty, span) {
+            // A nested aggregate sub-pattern tests against the field address; a scalar sub-pattern
+            // tests against the loaded field value.
+            let field_scrut = if Self::pattern_needs_ptr(sub) {
+                fptr
+            } else {
+                self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+            };
+            if let Some(c) = self.pattern_cond(sub, field_scrut, &fmty, fty, span) {
                 acc = Some(match acc {
                     Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
                     None => c,
@@ -10209,39 +10320,6 @@ impl FnLowerer<'_> {
             }
         }
         acc
-    }
-
-    /// The i1 condition under which sub-pattern `pat` matches the field at place `fptr` (MIR type
-    /// `fmty`, sema type `fty`). `None` = unconditional (wildcard/ident/unit). A literal loads the
-    /// field and compares for equality; a nested tuple recurses through `tuple_pattern_cond`.
-    fn field_pattern_cond(
-        &mut self,
-        pat: &Pattern,
-        fptr: ValueId,
-        fmty: &MirType,
-        fty: &Ty,
-        span: Span,
-    ) -> Option<ValueId> {
-        match &pat.kind {
-            ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit => None,
-            ast::PatKind::Int { sym, neg } => {
-                let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
-                let mut v = parse_int(self.interner.resolve(*sym));
-                if *neg {
-                    v = -v;
-                }
-                let c = self.builder.build(fmty.clone(), Op::ConstInt(v, fmty.clone()));
-                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, val, c)))
-            }
-            ast::PatKind::Bool(b) => {
-                let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
-                let c = self
-                    .builder
-                    .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
-                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, val, c)))
-            }
-            ast::PatKind::Tuple(inner) => self.tuple_pattern_cond(inner, fptr, fty, span),
-        }
     }
 
     /// Lower a match arm body and, unless it diverged, branch to `merge` passing the body value when
