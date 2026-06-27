@@ -530,6 +530,38 @@ fn differential_radix_literals() {
     }
 }
 
+/// Float → narrow integer (`i8`/`i16`/`u8`/`u16`) casts. Cranelift's `fcvt_to_{sint,uint}_sat`
+/// cannot target a sub-32-bit result on x64 and used to panic the backend (an ICE on a perfectly
+/// valid program). The fix converts to `i32` saturating, clamps to the narrow type's range, and
+/// `ireduce`s — reproducing Rust `as` / the interpreter's saturating semantics, so in-range,
+/// out-of-range, negative-to-unsigned, and truncating inputs all agree with the oracle.
+#[test]
+fn differential_float_narrow_int_cast() {
+    let cases = [
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as u8) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as i8) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as u16) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as i16) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 300.0;        return (a as u8) as i32; }", 255),
+        ("fn main() -> i32 { let a: f32 = 300.0;        return (a as i8) as i32; }", 127),
+        ("fn main() -> i32 { let a: f32 = 0.0 - 1.0;    return (a as u8) as i32; }", 0),
+        ("fn main() -> i32 { let a: f32 = 0.0 - 300.0;  return (a as i8) as i32; }", -128),
+        ("fn main() -> i32 { let a: f32 = 70000.0;      return (a as u16) as i32; }", 65535),
+        ("fn main() -> i32 { let a: f32 = 0.0 - 70000.0; return (a as i16) as i32; }", -32768),
+        ("fn main() -> i32 { let a: f64 = 3.9;          return (a as u8) as i32; }", 3),
+        // a >= 32-bit target still uses the direct path.
+        ("fn main() -> i32 { let a: f32 = 1000000.0;    return (a as i32); }", 1_000_000),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "float->narrow-int native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "float->narrow-int wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
