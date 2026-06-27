@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 66
+// EXPECT-OUT: 77
+module tests.run.tensor_add
+
+// A constant-shape tensor runs end-to-end: `Tensor[f32, 2, 3]` parameters pass by base pointer (like
+// an array out-param), and the multi-dimensional index `a[i, j]` flattens to a row-major GEP
+// (`i*3 + j`). This is the shape-typed surface executing — not just shape-checking. Arrays are passed
+// into the tensor params (sema's lenient array↔tensor unify), and both decay to a base pointer.
+fn add(a: Tensor[f32, 2, 3], b: Tensor[f32, 2, 3], out: Tensor[f32, 2, 3]) {
+    for i in 0..2 {
+        for j in 0..3 {
+            out[i, j] = a[i, j] + b[i, j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: [f32; 6] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let mut c: [f32; 6] = [0.0; 6];
+    add(a, b, c);
+    print(c[0] as i32);          // 1 + 10 = 11
+    print(c[5] as i32);          // 6 + 60 = 66
+    print((c[0] + c[5]) as i32); // 77
+    return 0;
+}

@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 99
+// EXPECT-OUT: 42
+module tests.run.pointer
+
+// Pointers/references run end-to-end: `&mut x` takes an address, `*p` stores/loads through it, and a
+// pointer threads through a call. Address-taken locals correctly stay in memory under the optimizer
+// (mem2reg refuses to promote a slot whose address escapes via a store), so -O0 == -O3 and interp ==
+// native. Also exercises the cast-precedence fix: `*p as i32` is `(*p) as i32` (not `*(p as i32)`).
+fn setit(p: *mut i32, v: i32) {
+    *p = v;
+}
+
+fn main() -> i32 {
+    let mut x: f32 = 3.0;
+    let pf: *mut f32 = &mut x;
+    *pf = 7.0;
+    print(*pf as i32);       // 7
+
+    let mut n: i32 = 0;
+    setit(&mut n, 99);       // pointer through a function call
+    print(n);                // 99
+
+    let mut y: i32 = 42;
+    let py: *mut i32 = &mut y;
+    print(*py as i32);       // 42 — (*py) as i32, not *(py as i32)
+    return 0;
+}
