@@ -4101,7 +4101,13 @@ impl FnLowerer<'_> {
                 };
                 let slot = self.builder.alloca(mty.clone());
                 if let Some(e) = init {
-                    if let MirType::Array(elem, n) = &mty {
+                    // A tuple initializer fills the byte buffer field-by-field (the slot *is* the
+                    // buffer, like an array). Detected by the literal shape so non-aggregate inits
+                    // are unaffected.
+                    if let ExprKind::TupleLit(items) = &e.kind {
+                        let tty = self.expr_ty(e);
+                        self.lower_tuple_init(slot, &tty, items);
+                    } else if let MirType::Array(elem, n) = &mty {
                         self.lower_array_init(slot, elem, *n, e);
                     } else {
                         let v = self.lower_expr(e);
@@ -9164,6 +9170,62 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Store { ptr: p, value });
     }
 
+    /// Pointer to byte offset `off` within an aggregate buffer `base`. Using `elem = I8` makes the
+    /// GEP index raw bytes (Cranelift scales by `size_of(I8) = 1`; the interpreter, which indexes
+    /// slots, uses the byte offset directly — distinct field offsets never alias, so both backends
+    /// observe the same field values). This is the one primitive tuple/struct field access needs.
+    fn field_ptr(&mut self, base: ValueId, off: u64) -> ValueId {
+        let idx = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(off as i128, MirType::I64));
+        self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: MirType::I8,
+            },
+        )
+    }
+
+    /// Lower a tuple literal `(a, b, …)` into the byte buffer at `base`: one typed store per field
+    /// at its padded byte offset (`tuple_offsets` is the layout authority). Each value is coerced
+    /// to its field type first, so a narrowing field (e.g. a `bf16`) rounds on store. Reuses the
+    /// array machinery (`field_ptr` + `Store`) — no backend change, bit-identical interp == native.
+    fn lower_tuple_init(&mut self, base: ValueId, tuple_ty: &Ty, items: &[Expr]) {
+        let Some(offsets) = tuple_ty.tuple_offsets() else {
+            if let Some(first) = items.first() {
+                self.unsupported(first.span, "tuple with an unsized field");
+            }
+            return;
+        };
+        for (item, (off, fty)) in items.iter().zip(offsets.iter()) {
+            let v0 = self.lower_expr(item);
+            let vty = self.expr_mir(item);
+            let fmty = mir_ty(fty);
+            let v = self.coerce_to(v0, &vty, &fmty, self.signed(item));
+            let p = self.field_ptr(base, *off);
+            self.builder.build_void(Op::Store { ptr: p, value: v });
+        }
+    }
+
+    /// Address + MIR type of tuple field `index` of the tuple expression `base`. The tuple local's
+    /// value *is* its buffer pointer (an `Array`-typed slot returns the slot directly), so this just
+    /// GEPs to the field's padded byte offset. Drives both reads (`t.0`) and writes (`t.0 = …`).
+    fn tuple_field_place(&mut self, base: &Expr, index: usize) -> (ValueId, MirType) {
+        let tuple_ty = self.expr_ty(base);
+        if let Some(offsets) = tuple_ty.tuple_offsets() {
+            if let Some((off, fty)) = offsets.get(index) {
+                let base_ptr = self.lower_expr(base);
+                let p = self.field_ptr(base_ptr, *off);
+                return (p, mir_ty(fty));
+            }
+        }
+        self.unsupported(base.span, "tuple field access");
+        let ty = MirType::I32;
+        (self.builder.alloca(ty.clone()), ty)
+    }
+
     /// Row-major element strides for a tensor `base`, if computable. `stride_k` = product of the
     /// dims *after* position `k`; computable when every dim after the first is a compile-time
     /// `Const` (the leading dim may be `Var`/`Dynamic` — it never contributes to a stride). Returns
@@ -9290,6 +9352,8 @@ impl FnLowerer<'_> {
                 );
                 (p, elem)
             }
+            // `t.0 = …` — assign to a tuple field at its byte offset.
+            ExprKind::TupleField { base, index } => self.tuple_field_place(base, *index as usize),
             // Multi-dimensional tensor indexing `t[i, j, …]` — the shape-typed surface. Flatten to a
             // row-major offset using the tensor's static strides.
             ExprKind::Index { base, indices } if indices.len() >= 2 => {
@@ -9352,6 +9416,23 @@ impl FnLowerer<'_> {
                 let (ptr, elem) = self.lower_place(e);
                 let _ = (base, indices);
                 self.builder.build(elem.clone(), Op::Load(ptr, elem))
+            }
+            // `t.0` — read tuple field 0 by GEP to its byte offset + a typed load.
+            ExprKind::TupleField { base, index } => {
+                let (ptr, fmty) = self.tuple_field_place(base, *index as usize);
+                self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+            }
+            // A tuple literal in value position (a call argument, a nested field) materializes a
+            // fresh byte buffer and yields its base pointer — the same by-pointer convention an
+            // array value follows.
+            ExprKind::TupleLit(items) => {
+                let tty = self.expr_ty(e);
+                let size = tty.size_of().unwrap_or(0) as u32;
+                let buf = self
+                    .builder
+                    .alloca(MirType::Array(Box::new(MirType::I8), size));
+                self.lower_tuple_init(buf, &tty, items);
+                buf
             }
             ExprKind::Cast { expr, .. } => self.lower_cast(expr, e),
             ExprKind::Block(b) => match self.lower_block(b) {
@@ -10957,6 +11038,13 @@ fn mir_ty(ty: &Ty) -> MirType {
         Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) => MirType::Ptr,
         Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
         Ty::Unit => MirType::Void,
+        // A tuple (and any other aggregate) is a flat byte buffer; its local *value* is the base
+        // pointer (like an array), and field access GEPs to a padded byte offset. `tuple_offsets`
+        // is the layout authority. Falls back to a 0-byte buffer for an unsized field (never read).
+        Ty::Tuple(_) => MirType::Array(
+            Box::new(MirType::I8),
+            ty.size_of().unwrap_or(0) as u32,
+        ),
         _ => MirType::I32,
     }
 }
