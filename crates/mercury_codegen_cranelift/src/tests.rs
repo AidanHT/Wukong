@@ -502,6 +502,34 @@ fn differential_match() {
     }
 }
 
+/// Radix integer literals — hex `0xFF`, octal `0o17`, binary `0b1010`, with `_` separators and type
+/// suffixes — must evaluate to their real value, not `0`. The literal value is a compile-time MIR
+/// constant, so both backends agree by construction; these assertions pin the *value* (the bug was
+/// that `parse_int` kept only the leading decimal-digit run, so every non-decimal literal was `0`).
+#[test]
+fn differential_radix_literals() {
+    // (program, expected exit code) — `main` returns the literal-derived value directly.
+    let cases = [
+        ("fn main() -> i32 { return 0xFF; }", 255),
+        ("fn main() -> i32 { return 0o17; }", 15),
+        ("fn main() -> i32 { return 0b1010; }", 10),
+        ("fn main() -> i32 { return 0xFF & 0x0F; }", 15),
+        ("fn main() -> i32 { return 0xFF_FF; }", 65535),
+        ("fn main() -> i32 { return 1_000 + 0x10; }", 1016),
+        // hex array index and a decimal literal sanity check.
+        ("fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[0x2]; }", 30),
+        ("fn main() -> i32 { return 1_000_000; }", 1_000_000),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "radix native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "radix literal wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the

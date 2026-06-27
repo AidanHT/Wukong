@@ -17174,12 +17174,43 @@ pub fn is_intrinsic(name: &str) -> bool {
     matches!(name, "print" | "println" | "assert")
 }
 
+/// Parse an integer literal's source text to its value. Handles the radix prefixes `0x`/`0o`/`0b`
+/// (case-insensitive), digit separators `_`, an explicit integer type suffix (`10i64`, `250u8`,
+/// `5usize`), and an optional leading sign. The previous version kept only the leading run of
+/// decimal digits, so every non-decimal literal (`0xFF`, `0b1010`, `0o17`) silently parsed to `0`.
 fn parse_int(text: &str) -> i128 {
-    let digits: String = text
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '_')
-        .collect();
-    digits.replace('_', "").parse().unwrap_or(0)
+    let mut s = text.trim();
+    let neg = s.starts_with('-');
+    if neg || s.starts_with('+') {
+        s = &s[1..];
+    }
+    // Strip an integer type suffix (longest-first so `usize`/`isize` win over a shorter prefix). A
+    // suffix uses letters `i`/`u`/`s`/`z`/`n` that are never hex digits, so this can't truncate a
+    // hex literal's digits.
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(stripped) = s.strip_suffix(suf) {
+            s = stripped;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    let val = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16)
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        i128::from_str_radix(o, 8)
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        i128::from_str_radix(b, 2)
+    } else {
+        body.parse::<i128>()
+    }
+    .unwrap_or(0);
+    if neg {
+        -val
+    } else {
+        val
+    }
 }
 
 fn parse_float(text: &str) -> f64 {

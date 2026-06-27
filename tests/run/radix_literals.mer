@@ -1,0 +1,25 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 255
+// EXPECT-OUT: 15
+// EXPECT-OUT: 10
+// EXPECT-OUT: 15
+// EXPECT-OUT: 65535
+// EXPECT-OUT: 30
+module tests.run.radix_literals
+
+// Hex (`0xFF`), octal (`0o17`), and binary (`0b1010`) integer literals — with `_` digit separators
+// and an optional type suffix — parse to their real value. (They previously all evaluated to `0`
+// because the literal parser kept only the leading run of decimal digits.) The value is a
+// compile-time constant, so the interpreter and the native backend agree by construction.
+fn main() -> i32 {
+    print(0xFF);          // 255
+    print(0o17);          // 15
+    print(0b1010);        // 10
+    print(0xFF & 0x0F);   // 15  (bitwise on hex literals)
+    print(0xFF_FF);       // 65535 (digit separators)
+
+    let a: [i32; 4] = [10, 20, 30, 40];
+    print(a[0x2]);        // 30  (hex index)
+    return 0;
+}
