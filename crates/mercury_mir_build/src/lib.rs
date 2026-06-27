@@ -9990,6 +9990,7 @@ impl FnLowerer<'_> {
         let result_ty = self.expr_mir(e);
         let produces_value = result_ty != MirType::Void;
         let scrut_mir = self.expr_mir(scrutinee);
+        let scrut_ty = self.expr_ty(scrutinee);
         let scrut = self.lower_expr(scrutinee);
 
         let merge = self.builder.new_block();
@@ -10010,7 +10011,7 @@ impl FnLowerer<'_> {
             if unconditional {
                 // Always matches: lower the body directly, then the remaining arms are unreachable.
                 self.push_scope();
-                self.bind_match_ident(&arm.pat, scrut, &scrut_mir);
+                self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
                 self.emit_match_arm_body(&arm.body, merge, merge_param, &result_ty);
                 self.pop_scope();
                 handled_default = true;
@@ -10022,8 +10023,9 @@ impl FnLowerer<'_> {
             // Bind first so an `Ident` pattern's guard can reference the binding; the binding is
             // scoped to this arm (popped after the body).
             self.push_scope();
-            self.bind_match_ident(&arm.pat, scrut, &scrut_mir);
-            let cond = self.match_arm_cond(&arm.pat, scrut, &scrut_mir, arm.guard.as_ref());
+            self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
+            let cond =
+                self.match_arm_cond(&arm.pat, scrut, &scrut_mir, &scrut_ty, arm.guard.as_ref());
             self.builder
                 .cond_br(cond, body_bb, vec![], next_bb, vec![]);
 
@@ -10057,20 +10059,64 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Bind an `Ident` match pattern to the scrutinee value for the arm's scope: a scalar is stored
-    /// into a fresh slot (so a `Path` read loads it, like a param); an aggregate scrutinee binds its
-    /// base pointer directly. Literal / wildcard / unit patterns bind nothing.
-    fn bind_match_ident(&mut self, pat: &Pattern, scrut: ValueId, scrut_mir: &MirType) {
-        if let ast::PatKind::Ident(name) = &pat.kind {
-            if matches!(scrut_mir, MirType::Array(..)) {
-                self.bind(*name, scrut, scrut_mir.clone());
-            } else {
-                let slot = self.builder.alloca(scrut_mir.clone());
-                self.builder.build_void(Op::Store {
-                    ptr: slot,
-                    value: scrut,
-                });
-                self.bind(*name, slot, scrut_mir.clone());
+    /// Bind a match pattern's identifiers to the scrutinee for the arm's scope: a scalar `Ident` is
+    /// stored into a fresh slot (so a `Path` read loads it, like a param); an aggregate `Ident` binds
+    /// its base pointer directly. A `Tuple` pattern recurses into each field's place (so
+    /// `(x, y) => x + y` binds `x`/`y` to the tuple's fields). Literal / wildcard / unit bind nothing.
+    fn bind_match_ident(
+        &mut self,
+        pat: &Pattern,
+        scrut: ValueId,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+    ) {
+        match &pat.kind {
+            ast::PatKind::Ident(name) => {
+                if matches!(scrut_mir, MirType::Array(..)) {
+                    self.bind(*name, scrut, scrut_mir.clone());
+                } else {
+                    let slot = self.builder.alloca(scrut_mir.clone());
+                    self.builder.build_void(Op::Store {
+                        ptr: slot,
+                        value: scrut,
+                    });
+                    self.bind(*name, slot, scrut_mir.clone());
+                }
+            }
+            ast::PatKind::Tuple(subs) => self.bind_tuple_match(subs, scrut, scrut_ty),
+            _ => {}
+        }
+    }
+
+    /// Bind the identifiers of a tuple pattern to their field places within the tuple buffer at base
+    /// pointer `base` (sema type `ty`). A scalar field `Ident` is copied into a fresh slot (so reads
+    /// load it and a mutated binding doesn't write back into the scrutinee); an aggregate field
+    /// `Ident` binds the field address (the array/by-pointer convention); a nested tuple pattern
+    /// recurses; a literal/wildcard sub-pattern binds nothing.
+    fn bind_tuple_match(&mut self, subs: &[Pattern], base: ValueId, ty: &Ty) {
+        let Ty::Tuple(ftys) = ty else { return };
+        let Some((offsets, _, _)) = self.aggregate_layout(ftys) else {
+            return;
+        };
+        for (i, sub) in subs.iter().enumerate() {
+            let (Some(&off), Some(fty)) = (offsets.get(i), ftys.get(i)) else {
+                continue;
+            };
+            let fmty = self.mir_ty_of(fty);
+            let fptr = self.field_ptr(base, off);
+            match &sub.kind {
+                ast::PatKind::Ident(name) => {
+                    if matches!(fmty, MirType::Array(..)) {
+                        self.bind(*name, fptr, fmty);
+                    } else {
+                        let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                        let slot = self.builder.alloca(fmty.clone());
+                        self.builder.build_void(Op::Store { ptr: slot, value: val });
+                        self.bind(*name, slot, fmty);
+                    }
+                }
+                ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, fty),
+                _ => {}
             }
         }
     }
@@ -10083,6 +10129,7 @@ impl FnLowerer<'_> {
         pat: &Pattern,
         scrut: ValueId,
         scrut_mir: &MirType,
+        scrut_ty: &Ty,
         guard: Option<&Expr>,
     ) -> ValueId {
         let pat_cond = match &pat.kind {
@@ -10109,10 +10156,10 @@ impl FnLowerer<'_> {
                         .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
                 )
             }
-            // A tuple pattern in a match is not lowered yet; treat as always-matching so the arm
-            // still binds nothing and runs (a conservative over-match, flagged by the front end if
-            // it ever type-checks a real tuple scrutinee).
-            ast::PatKind::Tuple(_) => None,
+            // A tuple pattern matches when every field's sub-pattern matches: `scrut` is the tuple
+            // buffer's base pointer, so AND each field's test (literals compare, nested tuples
+            // recurse, wildcards/idents are unconditional). See `tuple_pattern_cond`.
+            ast::PatKind::Tuple(subs) => self.tuple_pattern_cond(subs, scrut, scrut_ty, pat.span),
         };
         match (pat_cond, guard) {
             (Some(pc), Some(g)) => {
@@ -10122,6 +10169,78 @@ impl FnLowerer<'_> {
             (Some(pc), None) => pc,
             (None, Some(g)) => self.lower_expr(g),
             (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
+        }
+    }
+
+    /// The i1 condition under which a tuple pattern matches the tuple at base pointer `base` (sema
+    /// type `ty`): the AND of each field sub-pattern's condition. `None` (every field unconditional)
+    /// means the whole tuple matches unconditionally. If the tuple can't be laid out (a non-tuple type
+    /// or an unsizeable field) the arm is rejected with `unsupported` and a `false` condition — never
+    /// a silent over-match, which would violate the differential-correctness invariant.
+    fn tuple_pattern_cond(
+        &mut self,
+        subs: &[Pattern],
+        base: ValueId,
+        ty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        let layout = match ty {
+            Ty::Tuple(ftys) => self
+                .aggregate_layout(ftys)
+                .map(|(offs, _, _)| (ftys.clone(), offs)),
+            _ => None,
+        };
+        let Some((ftys, offsets)) = layout else {
+            self.unsupported(span, "tuple pattern");
+            return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+        };
+        let mut acc: Option<ValueId> = None;
+        for (i, sub) in subs.iter().enumerate() {
+            let (Some(&off), Some(fty)) = (offsets.get(i), ftys.get(i)) else {
+                continue;
+            };
+            let fmty = self.mir_ty_of(fty);
+            let fptr = self.field_ptr(base, off);
+            if let Some(c) = self.field_pattern_cond(sub, fptr, &fmty, fty, span) {
+                acc = Some(match acc {
+                    Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
+                    None => c,
+                });
+            }
+        }
+        acc
+    }
+
+    /// The i1 condition under which sub-pattern `pat` matches the field at place `fptr` (MIR type
+    /// `fmty`, sema type `fty`). `None` = unconditional (wildcard/ident/unit). A literal loads the
+    /// field and compares for equality; a nested tuple recurses through `tuple_pattern_cond`.
+    fn field_pattern_cond(
+        &mut self,
+        pat: &Pattern,
+        fptr: ValueId,
+        fmty: &MirType,
+        fty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        match &pat.kind {
+            ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit => None,
+            ast::PatKind::Int { sym, neg } => {
+                let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                let mut v = parse_int(self.interner.resolve(*sym));
+                if *neg {
+                    v = -v;
+                }
+                let c = self.builder.build(fmty.clone(), Op::ConstInt(v, fmty.clone()));
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, val, c)))
+            }
+            ast::PatKind::Bool(b) => {
+                let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                let c = self
+                    .builder
+                    .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, val, c)))
+            }
+            ast::PatKind::Tuple(inner) => self.tuple_pattern_cond(inner, fptr, fty, span),
         }
     }
 
