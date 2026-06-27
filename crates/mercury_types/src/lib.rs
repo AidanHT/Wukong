@@ -229,6 +229,24 @@ impl Ty {
         }
     }
 
+    /// The padded byte offset and type of each field of a `Tuple`, in declaration order — the
+    /// single source of truth for aggregate layout (the same `round_up` accumulation as
+    /// [`size_of`](Ty::size_of)). `None` for a non-tuple or a tuple with an unsized field. The MIR
+    /// builder uses this to lower tuple construction/field-access as byte-offset GEPs.
+    pub fn tuple_offsets(&self) -> Option<Vec<(u64, Ty)>> {
+        let Ty::Tuple(fields) = self else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(fields.len());
+        let mut off = 0u64;
+        for f in fields {
+            off = round_up(off, f.align_of()?);
+            out.push((off, f.clone()));
+            off += f.size_of()?;
+        }
+        Some(out)
+    }
+
     /// A human-readable rendering for diagnostics (resolves interned symbols).
     pub fn display(&self, interner: &Interner) -> String {
         match self {

@@ -195,6 +195,30 @@ fn differential_against_interpreter() {
     }
 }
 
+/// Tuples lower to a padded byte buffer with byte-offset field GEPs (no aggregate MIR type). The
+/// native backend writes the real packed layout; the interpreter indexes the byte offset as a slot.
+/// Distinct field offsets never alias, so both must agree on the observed field values — including a
+/// heterogeneous `(f32, i32)` whose `i32` field sits at a padded offset, and a field assignment.
+#[test]
+fn differential_tuple() {
+    let programs = [
+        "fn main() -> i32 { let t = (3, 4); return t.0 + t.1; }",
+        "fn main() -> i32 { let mut u = (1.5, 2); u.0 = u.0 + 0.5; \
+         print(u.0); print(t_dummy(u.1)); return 0; } fn t_dummy(x: i32) -> i32 { return x * 3; }",
+        "fn main() -> i32 { let v = (10, 20, 30); let w = (v.0 + v.1, v.2); \
+         return w.0 + w.1; }",
+        "fn main() -> i32 { let p = (1, 2.5, 7); print(p.0); print(p.2); \
+         let q: f32 = p.1 * 2.0; print(q as i32); return p.0 + p.2; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "tuple native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Float kernels must agree too: the interpreter computes `f32` ops in `f32`, so its printed
 /// results are bit-identical to native (including division, which would otherwise double-round).
 #[test]
