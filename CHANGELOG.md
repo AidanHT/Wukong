@@ -147,7 +147,8 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   Fixtures `tests/run/{tuple,struct,struct_nested,pointer,loop,tensor_add,tensor_matmul}.mer`; the
   aggregate path is differentially gated by `differential_{tuple,struct,nested_struct}` and pointers by
   `differential_pointer` (native vs interpreter, bit-for-bit). By-value aggregate parameters/returns
-  (an sret ABI) and symbolic-generic tensor dimensions remain pending.
+  (an sret ABI) now lower too (see the language-surface additions below); symbolic-generic tensor
+  dimensions remain pending.
 - **Intrinsics**: `print`/`println` (captured stdout) and `assert` (traps on false).
 - **Runtime**: a bump `Arena` allocator and a deterministic `parallel_for`.
 - **Diagnostics**: rustc-style renderer, a stable error-code catalog with `--explain <CODE>`, and
@@ -173,6 +174,71 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   one `mercury_sgemm_nt_epi` C-write; **~24–26× single-core, ~48–95× `@parallel`** vs C, where C pays
   an un-tiled serial-reduction GEMM + a separate scalar-`expf` silu pass) and an **`argmax@parallel`**
   row (**~17× vs single-threaded C** — the multicore global argmax).
+- **`match` expressions** (`tests/run/{match_expr,match_patterns,match_tuple}.mer`): integer/bool
+  literal, identifier-binding, and wildcard `_` patterns, **or-patterns** `1 | 2 | 3`, half-open
+  `0..10` / inclusive `0..=10` **range** patterns, **enum-variant** patterns `Color::Red` (matched by
+  discriminant), and **tuple** patterns `(0, _)` (per-field tests + bindings, nesting, and composition
+  like `(0 | 1, y)`), each with an optional `if` guard. The scrutinee is evaluated once and the whole
+  `match` lowers to an if-else chain; it works in value and statement position. Gated by
+  `differential_match`/`differential_match_patterns`/`differential_tuple_match` (native==interp, -O0..3).
+- **C-style enums** (`tests/run/enum_cstyle.mer`): `enum Code { Ok = 10, Err = 20 }`, auto-incrementing
+  `enum Color { Red, Green, Blue }` (0,1,2), and continue-after-explicit `enum Step { A = 5, B, C }`
+  (5,6,7). A variant *is* its integer discriminant — usable in `let`, `==`, `as i32`, and as a `match`
+  pattern. Unit variants only; tuple/struct-payload (tagged-union) variants and enum-payload matching
+  remain unimplemented. Gated by `differential_enum`.
+- **Top-level `const` usable as a value** (`tests/run/top_level_const.mer`): sema type-checks each
+  initializer against its annotation (an unsuffixed literal adapts) and records it; mir_build inlines
+  it at every use site — a bare value, in arithmetic, as an array index, as a loop bound, and when one
+  `const` references another (recursive inlining). Gated by `differential_top_level_const`.
+- **Tuple destructuring in `let`** (`tests/run/let_destructure.mer`): `let (a, b) = …`, nested
+  `let ((m, n), o) = …`, a wildcard `let (keep, _) = …`, and destructuring a tuple-returning call
+  result — each sub-pattern binds a view into the initialized tuple buffer (value semantics). Gated by
+  `differential_let_destructure`.
+- **Nested tuple-field access** (`tests/run/nested_tuple_field.mer`): `t.0.1`, `t.0.0.0`, as reads and
+  as assignment targets — the parser splits a lexer-glued `N.M` float in field position into two
+  consecutive tuple-field accesses. Gated by `differential_nested_tuple_field`.
+- **By-value aggregate parameters and returns** (`tests/run/{struct_fn,struct_return}.mer`): a
+  tuple/struct passed by value and a `fn … -> Struct` return are modeled with a MIR-level **sret** ABI
+  (a hidden leading pointer, a deep-copy into it, a void return; the call site allocates the
+  destination and passes it as the hidden first argument), so no aggregate ever rides in a register and
+  both backends agree. A struct param resolves to its registry-aware byte-buffer type (passed by base
+  pointer), and `p.x` through a `&`/`*mut` reference auto-derefs. Whole-aggregate **assignment**
+  (`s = other;`, `*p = Struct{..}`) now deep-copies leaf by leaf (`tests/run/struct_assign.mer`). Gated
+  by `differential_struct_across_fns`/`differential_struct_return`/`differential_struct_assign`.
+- **Radix integer literals** (`tests/run/radix_literals.mer`): hex `0xFF`, octal `0o17`, binary
+  `0b1010` — with `_` digit separators and an optional type suffix — parse to their real value (they
+  previously all evaluated to `0`, since `parse_int` kept only the leading run of decimal digits). Gated
+  by `differential_radix_literals`.
+- **Char literals** (`tests/run/char_literals.mer`): `'A'` lowers to its `u32` Unicode scalar value,
+  with the one-character escapes (`\n` `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes
+  (the lexer's escape scanner now consumes the multi-byte forms). Gated by `differential_char_literals`.
+- **Correctness fixes** (interpreter↔native divergences and ICEs removed; each gated bit-for-bit):
+  - **`break`/`continue` outside any loop** is now a clean **`E0303`** instead of a backend divergence
+    — the lowerer left a fallback `unreachable` the interpreter trapped (exit 1) but the native backend
+    turned into a SIGILL (exit 132). Registered in the diagnostic catalog (`--explain E0303`);
+    `tests/fail/break_outside_loop.mer`.
+  - **`&&` / `||` now short-circuit** — they lowered to a bitwise `And`/`Or` of both eagerly-evaluated
+    operands (so a side-effecting or guarded RHS always ran, e.g. `n != 0 && 100/n > 0` divided by
+    zero); now lowered to control flow. Gated by `differential_short_circuit`.
+  - **`continue` in a range `for`** now runs the loop step (it had branched straight back to the header
+    without advancing the index — an infinite loop); a dedicated latch block holds the step, on both the
+    sequential and `@parallel` per-thread paths. `tests/run/for_continue.mer` (`differential_for_continue`).
+  - **float → narrow-int casts** (`1e30 as i8`) no longer ICE the native backend and now **saturate**:
+    Cranelift's `fcvt_to_*_sat` can't target a sub-32-bit result, so the backend converts to `i32`
+    saturating then clamps/reduces to the narrow range — Rust `as` semantics, matching the oracle.
+    `tests/run/float_cast_narrow.mer`.
+  - **Deep recursion** in the interpreter no longer aborts the process: `run_with_output` runs on a
+    scoped 512 MiB-stack worker thread, so a deeply recursive program returns instead of overflowing the
+    ~8 MiB main stack (which had taken the whole differential gate down). Gated by
+    `deep_recursion_does_not_overflow_oracle`.
+  - **int → f32 casts above 2⁵³** round in one step in the interpreter oracle — it had double-rounded
+    `int → f64 → f32`, disagreeing with native's single `fcvt_from_*` by a full ULP. Gated by
+    `differential_int_to_f32_rounding`.
+  - **Math intrinsics on integer operands** no longer emit float-op-on-int MIR: `abs`/`round`/`floor`/
+    `ceil`/`trunc` are now type-preserving (integer `abs` = `select(x<0, −x, x)`, rounding an integer is
+    the identity) and `sqrt`/the transcendentals promote an integer operand to `f32` — native had
+    rejected the old MIR while the interpreter ran it lossily. `tests/run/int_math.mer`
+    (`differential_int_math_intrinsics`).
 
 ### Changed
 - **Cast precedence fixed**: `*p as T` now parses as `(*p) as T`, not `*(p as T)` (which had
@@ -208,6 +274,7 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
     *confirmation* sweep without changing the sequence of mutations.
 
 ### Notes
-- **Constant-shape** tensors now execute end-to-end (above); **symbolic-generic** tensor dimensions,
-  SIMD vector *values*, `enum`s/slices, and by-value aggregate parameters/returns parse and
-  type/shape-check today but do not yet lower/run, and native LLVM linking is in progress.
+- **Constant-shape** tensors, **C-style `enum`s**, and **by-value aggregate parameters/returns** now
+  execute end-to-end (above); **symbolic-generic** tensor dimensions, SIMD vector *values*, and slices
+  `[]T` parse and type/shape-check today but do not yet lower/run, and native LLVM linking is in
+  progress.

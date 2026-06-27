@@ -1,7 +1,15 @@
 # Rust build artifacts
 /target
 **/target
+# Alternate Cargo target dirs (e.g. CARGO_TARGET_DIR=target-gpucheck for feature-gated builds)
+/target-*
 **/*.rs.bk
+
+# Claude Code local working dir (agent git worktrees, etc.)
+.claude/
+
+# Session/prompt notes (kept local, not committed)
+prompts/*.md
 
 # Mercury / native build outputs
 *.exe

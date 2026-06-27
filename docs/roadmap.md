@@ -10,8 +10,12 @@ it across opt levels): the zero-dependency tree-walking interpreter (the referen
 from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, object/exe via
 `--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
-- Modules, functions (including recursion and mutual recursion), and direct calls.
-- `let`/`let mut`/`const`, shadowing, block-as-expression values.
+- Modules, functions (including recursion and mutual recursion — the interpreter oracle runs on a
+  512 MiB worker thread, so deep recursion no longer overflows the stack), and direct calls.
+- `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
+  (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.mer`), and a **top-level
+  `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
+  loop bound, const-referencing-const; `tests/run/top_level_const.mer`).
 - Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
   rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
@@ -35,9 +39,27 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   and the interpreter marshals through the identical kernel, so native == interp bit-for-bit. C/Rust
   can vectorize neither a `libm` call nor the half→f32 widen, so the gap is structural. A half-precision
   *output* (→ ~2× on the streaming ops) needs a narrowing store and is future work.
-- All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
+- All arithmetic/comparison/bitwise/boolean operators (`&&`/`||` **short-circuit**), compound
+  assignment, casts — including a float → narrow-int cast (`1e30 as i8`) that **saturates** identically
+  on both backends (`tests/run/float_cast_narrow.mer`).
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`, `loop { … }` with
-  `break`/`continue` (innermost loop; labeled forms are still 🟡).
+  `break`/`continue` (innermost loop; labeled forms are still 🟡). `continue` in a range `for` runs the
+  loop step (`tests/run/for_continue.mer`), and a `break`/`continue` outside any loop is rejected with
+  `E0303` (`tests/fail/break_outside_loop.mer`).
+- **`match`** in value and statement position: integer/bool literal, identifier-binding, and wildcard
+  `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
+  **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
+  (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), each with an optional `if`
+  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain
+  (`tests/run/{match_expr,match_patterns,match_tuple}.mer`).
+- **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
+  variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
+  (`tests/run/enum_cstyle.mer`). Data-carrying (tagged-union) variants and enum-payload matching are
+  still unsupported.
+- **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
+  digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
+  one-character / `\xHH` / `\u{…}` escapes) lowering to their `u32` Unicode scalar value
+  (`tests/run/char_literals.mer`).
 - **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
   pointer parameter threads through calls — address-taken locals correctly stay in memory under the
   optimizer (`tests/run/pointer.mer`). `as` casts bind looser than `*`/unary, tighter than binary
@@ -49,8 +71,12 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   to any depth, arrays of structs, an aggregate field deep-copied from a variable). Lowered as a flat
   byte buffer with byte-offset field GEPs (the local's value is its base pointer, like an array; nested
   fields recurse), so the interpreter and native backend agree bit-for-bit with no backend-specific
-  aggregate handling (`tests/run/{tuple,struct,struct_nested}.mer`). By-value aggregate
-  parameters/returns are not yet wired.
+  aggregate handling (`tests/run/{tuple,struct,struct_nested}.mer`), and nested tuple-field access
+  `t.0.1` / `t.0.0.0` plus whole-aggregate assignment `s = other;` both run
+  (`tests/run/{nested_tuple_field,struct_assign}.mer`). A tuple/struct also crosses function
+  boundaries **by value** — a by-value parameter and a `fn … -> Struct` return via a hidden-pointer
+  (sret) ABI modeled in mir_build, so no aggregate ever rides in a register and both backends agree
+  (`tests/run/{struct_fn,struct_return}.mer`).
 - **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
   row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
   on both backends (`tests/run/tensor_*.mer`) — and a matmul written in tensor notation dispatches to
@@ -162,6 +188,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   cross-entropy** run on SIMD instead of scalar `libm` — **~2–13× faster** than gcc/rustc's scalar
   `libm` call (which can't vectorize a loop containing it; ~28× across cores under `@parallel`). See `tests/run/{transcendental,softmax,
   layernorm,gelu,elu,leaky_relu,softplus,mish,activations,log,erf,trig,ihyp,atan,log_softmax,ffn_block}.mer`.
+- **Math intrinsics on integer operands**: `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving on
+  an integer (integer `abs` = `select(x<0, −x, x)`; rounding an integer is the identity), and `sqrt` /
+  the transcendentals promote an integer operand to `f32` — so they no longer emit the float-op-on-int
+  MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.mer`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
   runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
@@ -264,9 +294,8 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   the recognized kernels get true 256-bit AVX2 via the runtime microkernels.)
 - **Attributes** `@simd`/`@tile`/`@align`/`@extern`/`@export`: parse and validate; consumers in
   progress. (`@parallel` now executes — see above.)
-- **`enum`s, slices `[]T`, and aggregate by-value parameters/returns**: `enum`/`[]T` parse and
-  type-check but do not yet run; **tuples and structs run** (see below) but only as locals/values, not
-  passed by value into or out of a function (pass by `*`/`&` or array out-param).
+- **Slices `[]T`**: parse and type-check but do not yet run. (C-style `enum`s and by-value aggregate
+  parameters/returns now **run** — see "Works end to end" above.)
 
 ## Planned
 
@@ -278,7 +307,8 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
   needs a raw-AVX emitter or a future Cranelift.
 - Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
-- Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
+- Slices and a minimal stdlib (structs, enums, and multi-dimensional indexing `a[i, j]` now run — see
+  "Works end to end" above).
 - AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
   reverse-mode autodiff already ships as the `mercury_autodiff` crate — both above).
 

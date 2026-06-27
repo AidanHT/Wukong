@@ -146,8 +146,12 @@ contraction, loop fusion, and `@parallel` multicore execution over fixed-size-ar
 **GPU backend** (`--features gpu`; NVIDIA, PTX via cudarc driver-JIT) adds tensor-core GEMM, fused
 flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode autodiff**
 (`mercury_autodiff`) emits the training backward pass — both gated against the interpreter oracle.
-Tuples, structs (including nested struct-in-struct), pointers/references (`&mut`/`*p`), and
-`loop`/`break`/`continue` execute end-to-end on both backends, and **constant-shape tensors run** —
+Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
+an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
+(`&mut`/`*p`), and `loop`/`break`/`continue` execute end-to-end on both backends — as do **`match`**
+(literal / range / or / enum-variant / tuple patterns, with guards), **C-style enums**, top-level
+**`const`** values, **`let` tuple destructuring**, and **radix `0xFF`/`0o17`/`0b1010` and char `'A'`
+literals**. And **constant-shape tensors run** —
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
 flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a
 matmul written in tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot and accumulate spellings)
