@@ -665,6 +665,43 @@ fn differential_let_destructure() {
     }
 }
 
+/// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
+/// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
+/// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*
+/// miscompile both backends shared (so the differential gate couldn't catch it). Pins the real
+/// per-field semantics, including a binding arm, a tuple-pattern guard, a nested pattern, and bools.
+#[test]
+fn differential_tuple_match() {
+    const F: &str = "fn f(a: i32, b: i32) -> i32 { return match (a, b) \
+        { (0, 0) => 1, (0, _) => 2, (x, y) => x + y }; } fn main() -> i32 { return f";
+    const N: &str = "fn f(a: i32, b: i32, c: i32) -> i32 { return match ((a, b), c) \
+        { ((0, 0), 0) => 1, ((0, y), _) => y, ((x, _), z) => x + z }; } fn main() -> i32 { return f";
+    let cases = [
+        (format!("{F}(0, 0); }}"), 1),
+        (format!("{F}(0, 5); }}"), 2),
+        (format!("{F}(7, 3); }}"), 10),
+        (format!("{F}(4, 0); }}"), 4),
+        (format!("{N}(0, 9, 1); }}"), 9),
+        (format!("{N}(3, 4, 5); }}"), 8),
+        // a tuple-pattern guard (the binding precedes the guard, so the guard reads it).
+        ("fn f(a: i32, b: i32) -> i32 { return match (a, b) { (x, y) if x > y => 1, _ => 0 }; } \
+          fn main() -> i32 { return f(5, 2); }".to_string(), 1),
+        ("fn f(a: i32, b: i32) -> i32 { return match (a, b) { (x, y) if x > y => 1, _ => 0 }; } \
+          fn main() -> i32 { return f(2, 5); }".to_string(), 0),
+        // bool fields.
+        ("fn f(a: bool, b: bool) -> i32 { return match (a, b) { (true, _) => 1, (_, true) => 2, _ => 3 }; } \
+          fn main() -> i32 { return f(false, true); }".to_string(), 2),
+    ];
+    for (src, want) in &cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "tuple-match native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, *want, "tuple-match wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Char literals lower to their Unicode scalar value (sema types a char as `u32`, which MIR carries
 /// as `i32`). Covers ASCII, the one-character escapes, `\xHH` hex, `\u{…}` Unicode, ordering, and
 /// arithmetic. The value is a compile-time constant, so native == interp at every `-O`.
