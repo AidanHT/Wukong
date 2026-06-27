@@ -1457,6 +1457,80 @@ fn matmul_is_correct() {
     }
 }
 
+/// The idiomatic shape-typed matmul — `c[i,j] = Σ a[i,k]·b[k,j]` written with multi-index tensor
+/// accesses on `Tensor[f32,N,N]` params — must dispatch to the SAME tuned `mercury_sgemm` kernel as
+/// the flat `a[i*N+k]` spelling (the 2-index access supplies the row stride from the tensor's inner
+/// dim), agree native==interp, and compute the right result. The transposed `b[j,k]` spelling is the
+/// `nn.Linear` `A·Bᵀ` form and must reach `mercury_sgemm_nt`. Arrays are passed into the tensor
+/// params (sema's lenient array↔tensor unify) and both decay to a base pointer.
+#[test]
+fn tensor_matmul_is_correct() {
+    fn reference(ns: usize, transposed_b: bool) -> i64 {
+        let a: Vec<f32> = (0..ns * ns).map(|i| (i % 3) as f32).collect();
+        let b: Vec<f32> = (0..ns * ns).map(|i| (i % 2) as f32).collect();
+        let mut sum = 0.0f32;
+        for i in 0..ns {
+            for j in 0..ns {
+                let mut acc = 0.0f32;
+                for k in 0..ns {
+                    let bkj = if transposed_b { b[j * ns + k] } else { b[k * ns + j] };
+                    acc += a[i * ns + k] * bkj;
+                }
+                sum += acc;
+            }
+        }
+        sum as i64
+    }
+
+    // `ijk` dot form in shape-typed tensor notation; `b_idx` is `k,j` (normal) or `j,k` (nn.Linear).
+    let kernel = |ns: usize, transposed_b: bool, parallel: bool| {
+        let attr = if parallel { "@parallel\n" } else { "" };
+        let n2 = ns * ns;
+        let b_idx = if transposed_b { "j, k" } else { "k, j" };
+        format!(
+            "module m\n{attr}fn mm(a: Tensor[f32, {ns}, {ns}], b: Tensor[f32, {ns}, {ns}], \
+             c: Tensor[f32, {ns}, {ns}]) {{\n\
+             for i in 0..{ns} {{ for j in 0..{ns} {{ let mut s: f32 = 0.0; \
+             for k in 0..{ns} {{ s = s + a[i, k] * b[{b_idx}]; }} c[i, j] = s; }} }} }}\n\
+             fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; \
+             let mut b: [f32; {n2}] = [0.0; {n2}]; let mut c: [f32; {n2}] = [0.0; {n2}]; \
+             let mut i: i32 = 0; \
+             while i < {n2} {{ a[i] = ((i % 3) as f32); b[i] = ((i % 2) as f32); i += 1; }} \
+             mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+             while j < {n2} {{ s = s + c[j]; j += 1; }} return s as i32; }}"
+        )
+    };
+
+    // The 2-index tensor spelling must reach the kernel, not fall to a scalar nest.
+    assert!(
+        lowered_calls(&kernel(8, false, false), "mercury_sgemm"),
+        "tensor a[i,k]*b[k,j] -> mercury_sgemm"
+    );
+    assert!(
+        lowered_calls(&kernel(8, true, false), "mercury_sgemm_nt"),
+        "tensor a[i,k]*b[j,k] -> mercury_sgemm_nt"
+    );
+
+    for ns in [6usize, 7, 16, 17, 32] {
+        for transposed_b in [false, true] {
+            for parallel in [false, true] {
+                let src = kernel(ns, transposed_b, parallel);
+                let native = jit(&src, 3).expect("jit");
+                let interp = interp(&src, 3).expect("interp");
+                assert_eq!(
+                    native, interp,
+                    "tensor matmul native vs interp (ns={ns}, tb={transposed_b}, par={parallel})"
+                );
+                assert_eq!(
+                    native.0,
+                    reference(ns, transposed_b),
+                    "tensor matmul wrong result (ns={ns}, tb={transposed_b}, par={parallel})"
+                );
+            }
+        }
+    }
+}
+
 /// Lower `src` and report whether any function calls the named runtime symbol — used to prove the
 /// matmul recognizer fired (and picked the serial vs parallel variant), not merely that a scalar
 /// fallback happened to compute the right answer.

@@ -4526,11 +4526,25 @@ impl FnLowerer<'_> {
 
     /// Emit a call to the GEMM microkernel for a recognized nest. Returns `false` (and emits
     /// nothing) if any operand array is not a pointer in scope, so the caller lowers it normally.
+    /// The base pointer of a kernel operand `sym`. An array operand binds *directly* to its base
+    /// pointer (a `MirType::Array` slot value), so it is used as-is; a tensor (or pointer) operand has
+    /// MIR type `Ptr` and binds to a *slot* holding the pointer, so it must be loaded first. A no-op
+    /// for every array operand (so existing matmuls are byte-identical) — it only adds the load that
+    /// makes a shape-typed `Tensor[..]` operand reach the kernel as its actual base pointer.
+    fn kernel_base_ptr(&mut self, sym: Symbol) -> Option<ValueId> {
+        let (val, ty) = self.lookup(sym)?;
+        Some(if matches!(ty, MirType::Ptr) {
+            self.builder.build(MirType::Ptr, Op::Load(val, MirType::Ptr))
+        } else {
+            val
+        })
+    }
+
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
+        let (Some(a), Some(b), Some(c)) = (
+            self.kernel_base_ptr(nest.a),
+            self.kernel_base_ptr(nest.b),
+            self.kernel_base_ptr(nest.c),
         ) else {
             return false;
         };
@@ -11981,38 +11995,93 @@ fn match_product_ab(
     pair(f1, f2).or_else(|| pair(f2, f1))
 }
 
-/// An A factor of the inline `ijk` product: `A[row*sa + k (+ off)]` (normal) or `A[k*sa + row (+ off)]`
-/// (transposed — the `dW = Aᵀ·B` weight-gradient spelling, where the contraction `k` is the outer
-/// index of A's storage). Returns `(base, sa, offset, transposed_a)`.
+/// The row-major inner-dimension stride of a **rank-2 contiguous tensor** operand, as a recognizer
+/// `Dim` — for `A: Tensor[f32, M, N]` accessed `A[i, j]`, the axis-0 stride is the inner dim `N`
+/// (a `Const` → `Dim::Lit`, a bound symbolic `Var` → `Dim::Var`). This lets the shape-typed 2-index
+/// spelling `a[i, k]` supply the *same* stride the flat `a[i*K + k]` form derives from its index
+/// arithmetic — so the idiomatic tensor matmul dispatches to the GEMM kernel. `None` for a
+/// non-tensor, a non-contiguous layout, a non-rank-2 tensor, or a `Dynamic` (`?`) inner dim.
+fn tensor_inner_stride(base: &Expr, sema: &SemaResult) -> Option<Dim> {
+    let Some(Ty::Tensor { shape, layout, .. }) = sema.types.get(&base.id) else {
+        return None;
+    };
+    if !matches!(layout, mercury_types::Layout::Contiguous) || shape.0.len() != 2 {
+        return None;
+    }
+    match &shape.0[1] {
+        mercury_types::Dim::Const(v) => Some(Dim::Lit(*v as i64)),
+        mercury_types::Dim::Var(s) => Some(Dim::Var(*s)),
+        mercury_types::Dim::Dynamic => None,
+    }
+}
+
+/// Decompose a matmul operand access into `(base, row_stride, offset_terms)` for a known `row` index
+/// and an expected `col` index. Accepts BOTH spellings:
+///   * the flat form `base[row*stride + col (+ offset…)]` — stride read from the index arithmetic
+///     (delegates to [`match_row_col_off`], so the flat path is byte-identical to before), and
+///   * the shape-typed 2-index form `base[row, col]` — stride = the tensor's inner dim, no offset.
+/// The 2-index branch is what makes `c[i,j] += a[i,k]*b[k,j]` dispatch to the tuned GEMM kernel
+/// instead of running as a scalar nest. Both indices must be exactly the expected `row`/`col` vars
+/// (a strided or offset 2-index access is not a plain matmul operand). `None` if neither shape matches.
+fn match_operand_row_col_off<'a>(
+    f: &'a Expr,
+    row: Symbol,
+    col: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Vec<&'a Expr>)> {
+    match &f.kind {
+        ExprKind::Index { base, indices } if indices.len() == 1 => {
+            let abase = single_path(base)?;
+            let (stride, off) = match_row_col_off(&indices[0], row, col, interner)?;
+            Some((abase, stride, off))
+        }
+        ExprKind::Index { base, indices } if indices.len() == 2 => {
+            if single_path(&indices[0])? != row || single_path(&indices[1])? != col {
+                return None;
+            }
+            let abase = single_path(base)?;
+            let stride = tensor_inner_stride(base, sema)?;
+            Some((abase, stride, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
+/// An A factor of the inline `ijk` product: `A[row*sa + k (+ off)]` / `A[row, k]` (normal) or
+/// `A[k*sa + row (+ off)]` / `A[k, row]` (transposed — the `dW = Aᵀ·B` weight-gradient spelling, the
+/// contraction `k` being the outer index of A's storage). Returns `(base, sa, offset, transposed_a)`.
+/// Both the flat and shape-typed 2-index spellings dispatch (via [`match_operand_row_col_off`]).
 fn match_a_factor<'a>(
     f: &'a Expr,
     row: Symbol,
     kvar: Symbol,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>, bool)> {
-    let (abase, aidx) = as_index1(f)?;
-    if let Some((sa, off)) = match_row_col_off(aidx, row, kvar, interner) {
+    if let Some((abase, sa, off)) = match_operand_row_col_off(f, row, kvar, sema, interner) {
         return Some((abase, sa, off, false));
     }
-    if let Some((sa, off)) = match_row_col_off(aidx, kvar, row, interner) {
+    if let Some((abase, sa, off)) = match_operand_row_col_off(f, kvar, row, sema, interner) {
         return Some((abase, sa, off, true));
     }
     None
 }
 
-/// A B factor of the inline `ijk` product: `B[k*sb + j (+ off)]` (normal) or `B[j*sb + k (+ off)]`
-/// (transposed — the `A·Bᵀ` spelling). Returns `(base, sb, offset, transposed)`.
+/// A B factor of the inline `ijk` product: `B[k*sb + j (+ off)]` / `B[k, j]` (normal) or
+/// `B[j*sb + k (+ off)]` / `B[j, k]` (transposed — the `A·Bᵀ` `nn.Linear` spelling). Returns
+/// `(base, sb, offset, transposed)`. Both flat and 2-index spellings dispatch.
 fn match_b_factor<'a>(
     f: &'a Expr,
     kvar: Symbol,
     jvar: Symbol,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>, bool)> {
-    let (bbase, bidx) = as_index1(f)?;
-    if let Some((sb, off)) = match_row_col_off(bidx, kvar, jvar, interner) {
+    if let Some((bbase, sb, off)) = match_operand_row_col_off(f, kvar, jvar, sema, interner) {
         return Some((bbase, sb, off, false));
     }
-    if let Some((sb, off)) = match_row_col_off(bidx, jvar, kvar, interner) {
+    if let Some((bbase, sb, off)) = match_operand_row_col_off(f, jvar, kvar, sema, interner) {
         return Some((bbase, sb, off, true));
     }
     None
@@ -12027,6 +12096,7 @@ fn match_product_ab_off<'a>(
     row: Symbol,
     kvar: Symbol,
     jvar: Symbol,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>, Symbol, Dim, Vec<&'a Expr>, bool, bool)> {
     let ExprKind::Binary {
@@ -12040,8 +12110,8 @@ fn match_product_ab_off<'a>(
     // Either factor order: `A*B` or `B*A`.
     for (fa, fb) in [(f1, f2), (f2, f1)] {
         if let (Some((a, sa, aoff, ta)), Some((b, sb, boff, t))) = (
-            match_a_factor(fa, row, kvar, interner),
-            match_b_factor(fb, kvar, jvar, interner),
+            match_a_factor(fa, row, kvar, sema, interner),
+            match_b_factor(fb, kvar, jvar, sema, interner),
         ) {
             return Some((a, sa, aoff, b, sb, boff, t, ta));
         }
@@ -12596,10 +12666,12 @@ fn match_matmul_i8_nt(
         let mut found = None;
         for (fa, fb) in [(f1, f2), (f2, f1)] {
             let (ai, bi) = (peel_cast(fa), peel_cast(fb));
-            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, interner) else {
+            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, sema, interner)
+            else {
                 continue;
             };
-            let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
+            let Some((b_sym, sb, b_off, transposed)) =
+                match_b_factor(bi, kvar, jvar, sema, interner)
             else {
                 continue;
             };
@@ -12809,10 +12881,12 @@ fn match_matmul_lowp(
                 continue;
             }
             let (ai, bi) = (peel_cast(fa), peel_cast(fb));
-            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, interner) else {
+            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, sema, interner)
+            else {
                 continue;
             };
-            let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
+            let Some((b_sym, sb, b_off, transposed)) =
+                match_b_factor(bi, kvar, jvar, sema, interner)
             else {
                 continue;
             };
@@ -12980,7 +13054,7 @@ fn match_matmul_ijk<'a>(
     // each be indexed `… + h*S*D`, the hallmark of a batched matmul (multi-head attention is one
     // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
     let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
-        match_product_ab_off(prod, row, kvar, jvar, interner)?;
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
     // Final store: c[i*N + j (+ off)] = s.
     let StmtKind::Assign {
         target: ct,
@@ -12993,8 +13067,8 @@ fn match_matmul_ijk<'a>(
     if single_path(cv) != Some(s_sym) {
         return None;
     }
-    let (cbase, cidx) = as_index1(ct)?;
-    let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
+    // The output store `c[i*N + j (+ off)] = s` or the shape-typed `c[i, j] = s`.
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
     // (`A[k*M+i]`). Normal B's is N; transposed B's is K.
     let sa_ok = if transposed_a { sa == m } else { sa == kdim };
@@ -13191,7 +13265,7 @@ fn match_matmul_residual<'a>(
         return None;
     }
     let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
-        match_product_ab_off(prod, row, kvar, jvar, interner)?;
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
     // The fused-epilogue kernel is the plain 2-D `A·Bᵀ`: require transposed B, normal A, no batch
     // offsets (a TN / batched residual has no epilogue kernel — fall back to the scalar nest).
     if !transposed || transposed_a || !a_off.is_empty() || !b_off.is_empty() {
