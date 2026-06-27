@@ -11909,9 +11909,14 @@ fn is_f32_expr(e: &Expr, sema: &SemaResult) -> bool {
     matches!(sema.types.get(&e.id), Some(t) if mir_ty(t) == MirType::F32)
 }
 
-/// `for col in 0..n { c[row*stride + col] = 0.0; }` — the per-row zero-init of a beta-0 matmul.
-/// Returns `(c, stride, n)` with the outer row variable `row`.
-fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol, Dim, Dim)> {
+/// `for col in 0..n { c[row*stride + col] = 0.0; }` (or the 2-index `c[row, col] = 0.0`) — the per-row
+/// zero-init of a beta-0 matmul. Returns `(c, stride, n)` with the outer row variable `row`.
+fn match_zero_init(
+    s: &Stmt,
+    row: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Dim)> {
     let (pat, iter, body) = fusable_for(s)?;
     let col = match &pat.kind {
         ast::PatKind::Ident(c) => *c,
@@ -11936,8 +11941,7 @@ fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol
     if !is_float_zero(value, interner) {
         return None;
     }
-    let (cbase, cidx) = as_index1(target)?;
-    let (stride, cc) = match_row_col(cidx, row, interner)?;
+    let (cbase, stride, cc) = match_operand_row_then_col(target, row, sema, interner)?;
     if cc != col {
         return None;
     }
@@ -11953,6 +11957,7 @@ fn match_product_ab(
     kvar: Symbol,
     jvar: Symbol,
     aik: Option<(Symbol, Symbol, Dim)>,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Symbol, Dim, bool)> {
     let ExprKind::Binary {
@@ -11969,19 +11974,17 @@ fn match_product_ab(
                 return Some((asym, sa));
             }
         }
-        let (abase, aidx) = as_index1(f)?;
-        let (asa, ak) = match_row_col(aidx, row, interner)?;
+        let (abase, asa, ak) = match_operand_row_then_col(f, row, sema, interner)?;
         (ak == kvar).then_some((abase, asa))
     };
     let is_b = |f: &Expr| -> Option<(Symbol, Dim, bool)> {
-        let (bbase, bidx) = as_index1(f)?;
-        // normal `B[k*N+j]`: row is k, col is j; transposed `B[j*K+k]`: row is j, col is k.
-        if let Some((sb, bc)) = match_row_col(bidx, kvar, interner) {
+        // normal `B[k*N+j]` / `B[k,j]`: row is k, col is j; transposed `B[j*K+k]` / `B[j,k]`: row j, col k.
+        if let Some((bbase, sb, bc)) = match_operand_row_then_col(f, kvar, sema, interner) {
             if bc == jvar {
                 return Some((bbase, sb, false));
             }
         }
-        if let Some((sb, bc)) = match_row_col(bidx, jvar, interner) {
+        if let Some((bbase, sb, bc)) = match_operand_row_then_col(f, jvar, sema, interner) {
             if bc == kvar {
                 return Some((bbase, sb, true));
             }
@@ -12043,6 +12046,35 @@ fn match_operand_row_col_off<'a>(
             let abase = single_path(base)?;
             let stride = tensor_inner_stride(base, sema)?;
             Some((abase, stride, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
+/// Like [`match_operand_row_col_off`] but for the offset-free `ikj` accumulate matmul, whose helpers
+/// *discover* the column rather than knowing it in advance: `base[row*stride + col]` (flat) or
+/// `base[row, col]` (2-index tensor, stride = inner dim) for a known `row`. Returns `(base, stride,
+/// col)`. The 2-index branch is what dispatches `c[i,j] += a[i,k]*b[k,j]` written in tensor notation.
+fn match_operand_row_then_col(
+    f: &Expr,
+    row: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Symbol)> {
+    match &f.kind {
+        ExprKind::Index { base, indices } if indices.len() == 1 => {
+            let abase = single_path(base)?;
+            let (stride, col) = match_row_col(&indices[0], row, interner)?;
+            Some((abase, stride, col))
+        }
+        ExprKind::Index { base, indices } if indices.len() == 2 => {
+            if single_path(&indices[0])? != row {
+                return None;
+            }
+            let col = single_path(&indices[1])?;
+            let abase = single_path(base)?;
+            let stride = tensor_inner_stride(base, sema)?;
+            Some((abase, stride, col))
         }
         _ => None,
     }
@@ -13363,8 +13395,7 @@ fn match_matmul<'a>(
                 ast::PatKind::Ident(s) => *s,
                 _ => return None,
             };
-            let (abase, aidx) = as_index1(init)?;
-            let (asa, ak) = match_row_col(aidx, row, interner)?;
+            let (abase, asa, ak) = match_operand_row_then_col(init, row, sema, interner)?;
             if ak != kvar {
                 return None;
             }
@@ -13390,8 +13421,7 @@ fn match_matmul<'a>(
     let StmtKind::Assign { target, op, value } = &jbody.stmts[0].kind else {
         return None;
     };
-    let (cbase, cidx) = as_index1(target)?;
-    let (sc, cj) = match_row_col(cidx, row, interner)?;
+    let (cbase, sc, cj) = match_operand_row_then_col(target, row, sema, interner)?;
     if cj != jvar {
         return None;
     }
@@ -13409,8 +13439,7 @@ fn match_matmul<'a>(
             else {
                 return None;
             };
-            let (clhs, clidx) = as_index1(lhs)?;
-            let (clsc, clj) = match_row_col(clidx, row, interner)?;
+            let (clhs, clsc, clj) = match_operand_row_then_col(lhs, row, sema, interner)?;
             if clhs != cbase || clsc != sc || clj != jvar {
                 return None;
             }
@@ -13426,7 +13455,7 @@ fn match_matmul<'a>(
         _ => None,
     };
     let (a_sym, sa, b_sym, sb, transposed) =
-        match_product_ab(prod, row, kvar, jvar, aik_info, interner)?;
+        match_product_ab(prod, row, kvar, jvar, aik_info, sema, interner)?;
 
     // Strides must describe contiguous row-major A[m,k] and C[m,n], and B[k,n] (normal) or B[n,k]
     // (transposed) — i.e. B's contraction stride is N normally, K when transposed.
@@ -13435,7 +13464,7 @@ fn match_matmul<'a>(
         return None;
     }
     if beta == 0 {
-        let (cz, scz, nz) = match_zero_init(czero?, row, interner)?;
+        let (cz, scz, nz) = match_zero_init(czero?, row, sema, interner)?;
         if cz != cbase || scz != n || nz != n {
             return None;
         }
