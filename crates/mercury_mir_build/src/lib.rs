@@ -1189,38 +1189,115 @@ impl FnLowerer<'_> {
     /// `mir_ty`, but resolves a named struct (`Ty::Named`) to its byte-buffer storage type using the
     /// struct's field layout from sema (the free `mir_ty` has no def access and would fall back to
     /// `I32`). A struct value, like a tuple, is a flat padded byte buffer addressed by field offset.
+    /// Recurses through arrays and tuples so a *nested* struct (a struct field, or an element of an
+    /// array of structs) also resolves — `mir_ty` stops at the first `Named` and mis-sizes the rest.
     fn mir_ty_of(&self, ty: &Ty) -> MirType {
-        if let Ty::Named(sym) = ty {
-            if let Some(size) = self.struct_size(*sym) {
-                return MirType::Array(Box::new(MirType::I8), size as u32);
+        match ty {
+            Ty::Named(sym) => match self.struct_size(*sym) {
+                Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
+                None => mir_ty(ty),
+            },
+            Ty::Array { elem, len } => {
+                MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32)
             }
+            Ty::Tuple(_) => {
+                MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
+            }
+            _ => mir_ty(ty),
         }
-        mir_ty(ty)
+    }
+
+    /// Size in bytes of `ty`, resolving named structs through the sema registry — the registry-aware
+    /// companion to `Ty::size_of` (which returns `None` for `Ty::Named`, since the leaf type crate
+    /// has no def access). Recurses through arrays/tuples so nested structs lay out correctly.
+    fn ty_size(&self, ty: &Ty) -> Option<u64> {
+        match ty {
+            Ty::Named(sym) => self.struct_size(*sym),
+            Ty::Array { elem, len } => Some(self.ty_size(elem)? * len),
+            Ty::Tuple(fields) => self.aggregate_layout(fields).map(|(_, size, _)| size),
+            _ => ty.size_of(),
+        }
+    }
+
+    /// Alignment of `ty`, resolving named structs through the sema registry (see [`ty_size`]).
+    fn ty_align(&self, ty: &Ty) -> Option<u64> {
+        match ty {
+            Ty::Named(sym) => self.struct_align(*sym),
+            Ty::Array { elem, .. } => self.ty_align(elem),
+            Ty::Tuple(fields) => fields
+                .iter()
+                .try_fold(1u64, |a, f| Some(a.max(self.ty_align(f)?))),
+            _ => ty.align_of(),
+        }
+    }
+
+    /// Padded field offsets + total size + alignment for a sequence of field types — the single
+    /// layout authority shared by structs and tuples (the same `round_up` accumulation as
+    /// `Ty::size_of`, but registry-aware so a named-struct field is sized recursively). `None` if any
+    /// field is genuinely unsized (a slice/tensor/unresolved name).
+    fn aggregate_layout(&self, fields: &[Ty]) -> Option<(Vec<u64>, u64, u64)> {
+        let mut offsets = Vec::with_capacity(fields.len());
+        let mut size = 0u64;
+        let mut align = 1u64;
+        for f in fields {
+            let fa = self.ty_align(f)?;
+            let fs = self.ty_size(f)?;
+            size = round_up(size, fa);
+            offsets.push(size);
+            size += fs;
+            align = align.max(fa);
+        }
+        Some((offsets, round_up(size, align), align))
     }
 
     /// The field layout of a declared struct: `(field name, byte offset, field MIR type)` in
-    /// declaration order. Reuses `Ty::tuple_offsets` by viewing the struct as a tuple of its field
-    /// types (identical padded layout). `None` if `name` is not a struct or has an unsized field.
+    /// declaration order. Uses the registry-aware `aggregate_layout` (so a field that is itself a
+    /// struct lays out correctly) and `mir_ty_of` for each field type (so a nested-struct field gets
+    /// its byte-buffer type, not the `I32` fallback). `None` if `name` is not a struct or is unsized.
     fn struct_layout(&self, name: Symbol) -> Option<Vec<(Symbol, u64, MirType)>> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let offsets = Ty::Tuple(fields.iter().map(|(_, t)| t.clone()).collect()).tuple_offsets()?;
+        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+        let (offsets, _, _) = self.aggregate_layout(&tys)?;
         Some(
             fields
                 .iter()
                 .zip(offsets)
-                .map(|((fname, _), (off, fty))| (*fname, off, mir_ty(&fty)))
+                .map(|((fname, fty), off)| (*fname, off, self.mir_ty_of(fty)))
                 .collect(),
         )
     }
 
-    /// Total padded byte size of a declared struct (its alloca size).
+    /// `(byte offset, field type)` for each field of struct `name`, in declaration order — the
+    /// semantic-type companion to `struct_layout` (which gives MIR types). Drives nested aggregate
+    /// initialization and copies, which need the `Ty` to recurse.
+    fn struct_field_tys(&self, name: Symbol) -> Option<Vec<(u64, Ty)>> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+        let (offsets, _, _) = self.aggregate_layout(&tys)?;
+        Some(tys.into_iter().zip(offsets).map(|(t, o)| (o, t)).collect())
+    }
+
+    /// Total padded byte size of a declared struct (its alloca size), registry-aware.
     fn struct_size(&self, name: Symbol) -> Option<u64> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        Ty::Tuple(fields.iter().map(|(_, t)| t.clone()).collect()).size_of()
+        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+        self.aggregate_layout(&tys).map(|(_, size, _)| size)
+    }
+
+    /// Alignment of a declared struct (the max field alignment), registry-aware.
+    fn struct_align(&self, name: Symbol) -> Option<u64> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        fields
+            .iter()
+            .try_fold(1u64, |a, (_, f)| Some(a.max(self.ty_align(f)?)))
     }
 
     /// Address + MIR type of struct field `fname` of the struct expression `base` (the local's value
@@ -1242,27 +1319,143 @@ impl FnLowerer<'_> {
         (self.builder.alloca(ty.clone()), ty)
     }
 
-    /// Lower a struct literal `Name { f: v, … }` into the byte buffer at `base`: one typed store per
-    /// field at its declared offset (field order in the literal may differ from declaration order —
-    /// each value goes to its named field's offset). Reuses the tuple/array byte-GEP machinery.
+    /// Lower a struct literal `Name { f: v, … }` into the byte buffer at `base`: each field value is
+    /// initialized at its declared byte offset (literal field order may differ from declaration order
+    /// — each value goes to its named field's offset). A field that is itself a struct/tuple/array
+    /// recurses (or byte-copies) via `init_field`, so nested aggregates work.
     fn lower_struct_init(&mut self, base: ValueId, sym: Symbol, fields: &[ast::FieldInit], span: Span) {
-        let Some(layout) = self.struct_layout(sym) else {
+        let Some(field_tys) = self.struct_field_tys(sym) else {
             self.unsupported(span, "struct with an unsized field");
             return;
         };
+        let by_name: HashMap<Symbol, (u64, Ty)> = self
+            .sema
+            .defs
+            .lookup(sym)
+            .and_then(|d| match &d.kind {
+                DefKind::Struct(decl) => Some(
+                    decl.iter()
+                        .map(|(n, _)| *n)
+                        .zip(field_tys.iter().cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
         for fi in fields {
-            let Some((_, off, fmty)) = layout.iter().find(|(n, _, _)| *n == fi.name.sym) else {
+            let Some((off, fty)) = by_name.get(&fi.name.sym).cloned() else {
                 self.unsupported(fi.name.span, "unknown struct field");
                 continue;
             };
-            let off = *off;
-            let fmty = fmty.clone();
-            let v0 = self.lower_expr(&fi.value);
-            let vty = self.expr_mir(&fi.value);
-            let v = self.coerce_to(v0, &vty, &fmty, self.signed(&fi.value));
             let p = self.field_ptr(base, off);
-            self.builder.build_void(Op::Store { ptr: p, value: v });
+            self.init_field(p, &fty, &fi.value);
         }
+    }
+
+    /// Initialize the location `dst` (a pointer into an aggregate buffer) of semantic type `fty` from
+    /// initializer `value`. A nested struct/tuple/array literal recurses *directly* into `dst` (no
+    /// temporary buffer + copy); a non-literal aggregate value is deep-copied from its buffer; a
+    /// scalar is coerced to the field type and stored. The one initializer primitive shared by struct,
+    /// tuple, and (aggregate-element) array lowering.
+    fn init_field(&mut self, dst: ValueId, fty: &Ty, value: &Expr) {
+        match (&value.kind, fty) {
+            (ExprKind::StructLit { fields, .. }, Ty::Named(sym)) => {
+                self.lower_struct_init(dst, *sym, fields, value.span);
+            }
+            (ExprKind::TupleLit(items), Ty::Tuple(_)) => {
+                self.lower_tuple_init(dst, fty, items);
+            }
+            (ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }, Ty::Array { elem, len }) => {
+                let emir = self.mir_ty_of(elem);
+                self.lower_array_init(dst, &emir, *len as u32, value);
+            }
+            _ => {
+                let fmty = self.mir_ty_of(fty);
+                if matches!(fmty, MirType::Array(..)) {
+                    // An aggregate value from a non-literal expression (a variable, a call result, a
+                    // field): the expression yields a base pointer; deep-copy its leaves into `dst`.
+                    let src = self.lower_expr(value);
+                    self.emit_copy(dst, src, fty);
+                } else {
+                    let v0 = self.lower_expr(value);
+                    let vty = self.expr_mir(value);
+                    let v = self.coerce_to(v0, &vty, &fmty, self.signed(value));
+                    self.builder.build_void(Op::Store { ptr: dst, value: v });
+                }
+            }
+        }
+    }
+
+    /// Deep-copy a value of type `ty` from buffer `src` to buffer `dst` (both base pointers), using
+    /// the *same* GEP discipline as field/element access so it is correct under both the interpreter's
+    /// slot-indexed memory and native's byte-indexed memory: struct/tuple fields recurse through the
+    /// byte-offset `field_ptr`, array elements through an element-typed GEP, and scalar leaves are a
+    /// single load+store. A flat byte `memcpy` would be wrong for the interpreter (a non-leading
+    /// scalar field lives at its byte-offset slot, which an 8-byte chunked copy would skip).
+    fn emit_copy(&mut self, dst: ValueId, src: ValueId, ty: &Ty) {
+        match ty {
+            Ty::Named(sym) => {
+                if let Some(layout) = self.struct_field_tys(*sym) {
+                    for (off, fty) in layout {
+                        let s = self.field_ptr(src, off);
+                        let d = self.field_ptr(dst, off);
+                        self.emit_copy(d, s, &fty);
+                    }
+                }
+            }
+            Ty::Tuple(fields) => {
+                if let Some((offsets, _, _)) = self.aggregate_layout(fields) {
+                    let pairs: Vec<(u64, Ty)> =
+                        offsets.into_iter().zip(fields.iter().cloned()).collect();
+                    for (off, fty) in pairs {
+                        let s = self.field_ptr(src, off);
+                        let d = self.field_ptr(dst, off);
+                        self.emit_copy(d, s, &fty);
+                    }
+                }
+            }
+            Ty::Array { elem, len } => {
+                let emir = self.mir_ty_of(elem);
+                for i in 0..*len as i128 {
+                    let s = self.gep_elem(src, &emir, i);
+                    let d = self.gep_elem(dst, &emir, i);
+                    self.emit_copy(d, s, elem);
+                }
+            }
+            _ => {
+                let mir = self.mir_ty_of(ty);
+                let v = self.builder.build(mir.clone(), Op::Load(src, mir.clone()));
+                self.builder.build_void(Op::Store { ptr: dst, value: v });
+            }
+        }
+    }
+
+    /// Read a field/element at `ptr` of MIR type `fmty`: a scalar/pointer field is loaded; an
+    /// aggregate field (`MirType::Array`, i.e. a nested struct/tuple/inline array) yields `ptr`
+    /// itself — the by-pointer convention arrays follow, so a further field/index access GEPs off it
+    /// rather than trying to load (and copy) the whole buffer through a register.
+    fn load_or_addr(&mut self, ptr: ValueId, fmty: MirType) -> ValueId {
+        if matches!(fmty, MirType::Array(..)) {
+            ptr
+        } else {
+            self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+        }
+    }
+
+    /// Pointer to element `index` of `base` for an element of MIR type `elem` (the element-typed GEP
+    /// the array machinery uses: native scales by `size_of(elem)`, the interpreter indexes slots).
+    fn gep_elem(&mut self, base: ValueId, elem: &MirType, index: i128) -> ValueId {
+        let idx = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(index, MirType::I64));
+        self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: elem.clone(),
+            },
+        )
     }
 
     fn signed(&self, e: &Expr) -> bool {
@@ -9279,24 +9472,24 @@ impl FnLowerer<'_> {
         )
     }
 
-    /// Lower a tuple literal `(a, b, …)` into the byte buffer at `base`: one typed store per field
-    /// at its padded byte offset (`tuple_offsets` is the layout authority). Each value is coerced
-    /// to its field type first, so a narrowing field (e.g. a `bf16`) rounds on store. Reuses the
-    /// array machinery (`field_ptr` + `Store`) — no backend change, bit-identical interp == native.
+    /// Lower a tuple literal `(a, b, …)` into the byte buffer at `base`: each field is initialized at
+    /// its padded byte offset (`aggregate_layout` is the registry-aware layout authority). A field
+    /// that is itself a struct/tuple/array recurses via `init_field`; a scalar field is coerced to
+    /// its type and stored (so a narrowing field, e.g. a `bf16`, rounds on store).
     fn lower_tuple_init(&mut self, base: ValueId, tuple_ty: &Ty, items: &[Expr]) {
-        let Some(offsets) = tuple_ty.tuple_offsets() else {
+        let Ty::Tuple(field_tys) = tuple_ty else {
+            return;
+        };
+        let Some((offsets, _, _)) = self.aggregate_layout(field_tys) else {
             if let Some(first) = items.first() {
                 self.unsupported(first.span, "tuple with an unsized field");
             }
             return;
         };
-        for (item, (off, fty)) in items.iter().zip(offsets.iter()) {
-            let v0 = self.lower_expr(item);
-            let vty = self.expr_mir(item);
-            let fmty = mir_ty(fty);
-            let v = self.coerce_to(v0, &vty, &fmty, self.signed(item));
-            let p = self.field_ptr(base, *off);
-            self.builder.build_void(Op::Store { ptr: p, value: v });
+        let plan: Vec<(u64, Ty)> = offsets.into_iter().zip(field_tys.iter().cloned()).collect();
+        for (item, (off, fty)) in items.iter().zip(plan) {
+            let p = self.field_ptr(base, off);
+            self.init_field(p, &fty, item);
         }
     }
 
@@ -9304,12 +9497,14 @@ impl FnLowerer<'_> {
     /// value *is* its buffer pointer (an `Array`-typed slot returns the slot directly), so this just
     /// GEPs to the field's padded byte offset. Drives both reads (`t.0`) and writes (`t.0 = …`).
     fn tuple_field_place(&mut self, base: &Expr, index: usize) -> (ValueId, MirType) {
-        let tuple_ty = self.expr_ty(base);
-        if let Some(offsets) = tuple_ty.tuple_offsets() {
-            if let Some((off, fty)) = offsets.get(index) {
-                let base_ptr = self.lower_expr(base);
-                let p = self.field_ptr(base_ptr, *off);
-                return (p, mir_ty(fty));
+        if let Ty::Tuple(fields) = self.expr_ty(base) {
+            if let Some((offsets, _, _)) = self.aggregate_layout(&fields) {
+                if let (Some(&off), Some(fty)) = (offsets.get(index), fields.get(index)) {
+                    let fmty = self.mir_ty_of(fty);
+                    let base_ptr = self.lower_expr(base);
+                    let p = self.field_ptr(base_ptr, off);
+                    return (p, fmty);
+                }
             }
         }
         self.unsupported(base.span, "tuple field access");
@@ -9510,15 +9705,18 @@ impl FnLowerer<'_> {
                 let _ = (base, indices);
                 self.builder.build(elem.clone(), Op::Load(ptr, elem))
             }
-            // `t.0` — read tuple field 0 by GEP to its byte offset + a typed load.
+            // `t.0` — read tuple field 0 by GEP to its byte offset. A scalar field loads; an
+            // aggregate field (a nested struct/tuple/array) yields its address, the by-pointer
+            // convention arrays follow, so a further `.field`/`[i]` GEPs off it.
             ExprKind::TupleField { base, index } => {
                 let (ptr, fmty) = self.tuple_field_place(base, *index as usize);
-                self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+                self.load_or_addr(ptr, fmty)
             }
-            // `s.field` — read a struct field by GEP to its declared byte offset + a typed load.
+            // `s.field` — read a struct field by GEP to its declared byte offset (scalar loads,
+            // aggregate yields its address — see `TupleField`).
             ExprKind::Field { base, name } => {
                 let (ptr, fmty) = self.struct_field_place(base, name.sym);
-                self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+                self.load_or_addr(ptr, fmty)
             }
             // A struct literal in value position materializes a fresh byte buffer, yielding its base
             // pointer (the same by-pointer convention as arrays/tuples).
@@ -9536,7 +9734,7 @@ impl FnLowerer<'_> {
             // array value follows.
             ExprKind::TupleLit(items) => {
                 let tty = self.expr_ty(e);
-                let size = tty.size_of().unwrap_or(0) as u32;
+                let size = self.ty_size(&tty).unwrap_or(0) as u32;
                 let buf = self
                     .builder
                     .alloca(MirType::Array(Box::new(MirType::I8), size));
@@ -11137,6 +11335,17 @@ fn param_abi_ty(ty: &Ty) -> MirType {
     match mir_ty(ty) {
         MirType::Array(..) => MirType::Ptr,
         t => t,
+    }
+}
+
+/// Round `x` up to the next multiple of `align` (a power of two) — field-offset padding, mirroring
+/// the private `round_up` in `mercury_types` (the registry-aware aggregate layout reimplements the
+/// same accumulation here because it must resolve named-struct field sizes the leaf crate can't).
+fn round_up(x: u64, align: u64) -> u64 {
+    if align <= 1 {
+        x
+    } else {
+        (x + align - 1) & !(align - 1)
     }
 }
 

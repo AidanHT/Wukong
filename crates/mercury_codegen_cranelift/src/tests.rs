@@ -244,6 +244,44 @@ fn differential_struct() {
     }
 }
 
+/// Nested aggregates: a struct field that is itself a struct (and a tuple field that is a struct)
+/// lays out recursively, reads as a *pointer* (the by-pointer convention, so `o.inner.a` GEPs twice
+/// rather than loading a whole buffer through a register), and initializes either by recursing into
+/// a nested literal or by a leaf-precise deep copy of a non-literal aggregate value. Native and
+/// interp must agree across all four `-O` levels, including a 3-deep chain and an out-of-order
+/// initializer.
+#[test]
+fn differential_nested_struct() {
+    let programs = [
+        // struct-in-struct, nested literal.
+        "struct Inner { a: i32, b: i32 } struct Outer { inner: Inner, c: i32 } \
+         fn main() -> i32 { let o = Outer { inner: Inner { a: 10, b: 20 }, c: 5 }; \
+         print(o.inner.a); print(o.inner.b); return o.inner.a + o.inner.b + o.c; }",
+        // aggregate field initialized from a *variable* (exercises the leaf-precise deep copy).
+        "struct Inner { a: i32, b: i32 } struct Outer { inner: Inner, c: i32 } \
+         fn main() -> i32 { let src = Inner { a: 10, b: 20 }; \
+         let o = Outer { inner: src, c: 5 }; return o.inner.a + o.inner.b + o.c; }",
+        // 3-deep nesting + a mixed-precision inner field at a padded offset.
+        "struct A { v: f32 } struct B { a: A, w: i32 } struct C { b: B, x: i32 } \
+         fn main() -> i32 { let c = C { b: B { a: A { v: 2.5 }, w: 2 }, x: 4 }; \
+         print(c.b.a.v); return (c.b.a.v as i32) + c.b.w + c.x; }",
+        // tuple whose first field is a struct.
+        "struct A { v: i32, w: i32 } \
+         fn main() -> i32 { let t = (A { v: 100, w: 1 }, 8); return t.0.v + t.0.w + t.1; }",
+        // write through a nested field path.
+        "struct Inner { a: i32 } struct Outer { inner: Inner, c: i32 } \
+         fn main() -> i32 { let mut o = Outer { inner: Inner { a: 1 }, c: 2 }; \
+         o.inner.a = o.inner.a + 40; return o.inner.a + o.c; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "nested-struct native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Float kernels must agree too: the interpreter computes `f32` ops in `f32`, so its printed
 /// results are bit-identical to native (including division, which would otherwise double-round).
 #[test]
