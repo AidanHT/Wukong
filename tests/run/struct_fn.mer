@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 17
+// EXPECT-OUT: 3
+// EXPECT-OUT: 42
+// EXPECT-OUT: 115
+module tests.run.struct_fn
+
+// Structs cross function boundaries. A struct passed by value (`f(p: Pt)`) is passed by base pointer
+// (its registry-aware ABI is a buffer pointer, not the scalar `i32` the free `mir_ty` returned for a
+// named type — which made the native backend reject the field GEP and the optimizer panic). Field
+// access through a pointer/reference (`p.x` on `&Pt` / `*mut Pt`) auto-derefs in both sema and
+// mir_build, including a nested field through a reference (`o.inner.a`).
+struct Pt { x: i32, y: i32 }
+struct Inner { a: i32 }
+struct Outer { inner: Inner, b: i32 }
+
+fn byval(p: Pt) -> i32 { return p.x + p.y; }
+fn rd(p: &Pt) -> i32 { return p.x + p.y; }
+fn setx(p: *mut Pt, v: i32) { p.x = v; }
+fn nested(o: &Outer, k: i32) -> i32 { return o.inner.a + o.b + k; }
+
+fn main() -> i32 {
+    let p: Pt = Pt { x: 8, y: 9 };
+    print(byval(p));                 // 17
+
+    let mut s: Pt = Pt { x: 1, y: 2 };
+    print(rd(&s));                   // 3
+    setx(&mut s, 40);
+    print(s.x + s.y);                // 40 + 2 = 42
+
+    let o: Outer = Outer { inner: Inner { a: 10 }, b: 5 };
+    print(nested(&o, 100));          // 10 + 5 + 100 = 115
+    return 0;
+}

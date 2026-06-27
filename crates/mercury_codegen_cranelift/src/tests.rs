@@ -346,6 +346,37 @@ fn differential_for_continue() {
     }
 }
 
+/// Structs cross function boundaries: a struct passed **by value** (`fn f(p: Pt)`) is passed by base
+/// pointer (its registry-aware ABI is a buffer pointer, not the `I32` the free `mir_ty` gave — which
+/// is what made the native verifier reject the field GEP and `mem2reg` panic at -O2), and field
+/// access **through a pointer/reference** (`p.x` on a `&Pt` / `*mut Pt`) auto-derefs. Native == interp
+/// across -O0..-O3, including a mutation written through a `*mut Pt` that the caller observes.
+#[test]
+fn differential_struct_across_fns() {
+    let programs = [
+        // struct by value: param passed by pointer, fields read in the callee.
+        "struct Pt { x: i32, y: i32 } fn f(p: Pt) -> i32 { return p.x + p.y; } \
+         fn main() -> i32 { let p = Pt { x: 8, y: 9 }; return f(p); }",
+        // field through &Pt (read) and *mut Pt (write the caller observes).
+        "struct Pt { x: i32, y: i32 } \
+         fn rd(p: &Pt) -> i32 { return p.x + p.y; } \
+         fn setx(p: *mut Pt, v: i32) { p.x = v; } \
+         fn main() -> i32 { let mut s = Pt { x: 1, y: 2 }; let a = rd(&s); \
+         setx(&mut s, 40); return a + s.x + s.y; }",
+        // a struct param alongside scalar params (ABI ordering) + a nested struct field through a ref.
+        "struct Inner { a: i32 } struct Outer { inner: Inner, b: i32 } \
+         fn sum(o: &Outer, k: i32) -> i32 { return o.inner.a + o.b + k; } \
+         fn main() -> i32 { let o = Outer { inner: Inner { a: 10 }, b: 5 }; return sum(&o, 100); }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct-across-fns native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
