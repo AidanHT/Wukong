@@ -373,6 +373,23 @@ impl Sema<'_> {
         }
     }
 
+    /// An elementwise binary operator requires its operand *shapes* to agree: adding two tensors of
+    /// different shape (`Tensor[f32,2,3] + Tensor[f32,3,2]`) is meaningless, yet the result-type
+    /// `join` picks one operand and lets it through. This applies the headline shape check to
+    /// operators — the call-site unifier already covers function arguments, so this closes the last
+    /// of the three shape-bearing contexts. Only fires when *both* sides are tensors, or both are
+    /// vectors: a tensor/scalar pairing stays lenient (scalar broadcast), and two scalars promote via
+    /// `join` (mixed precision like `(i as f64) + 1.0` must not error).
+    fn check_binop_shapes(&mut self, l: &Ty, r: &Ty, span: Span) {
+        if matches!(
+            (l, r),
+            (Ty::Tensor { .. }, Ty::Tensor { .. }) | (Ty::Vector { .. }, Ty::Vector { .. })
+        ) {
+            let mut dims = HashMap::new();
+            self.unify(l, r, &mut dims, span);
+        }
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -675,6 +692,9 @@ impl Sema<'_> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.type_expr(lhs);
                 let r = self.type_expr(rhs);
+                // Operand shapes must agree (tensor-tensor / vector-vector); a mismatch is a real
+                // error regardless of whether the operator yields a value or a bool.
+                self.check_binop_shapes(&l, &r, e.span);
                 use BinOp::*;
                 match op {
                     Eq | Ne | Lt | Le | Gt | Ge | And | Or => Ty::Scalar(Scalar::Bool),

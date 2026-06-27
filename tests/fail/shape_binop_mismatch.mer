@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0502
+module tests.fail.shape_binop_mismatch
+
+// An elementwise binary operator requires its operands to have the same shape. `a + b` here adds a
+// `Tensor[f32, 2, 3]` to a `Tensor[f32, 3, 2]` — the result-type join would silently pick one operand
+// and let it through, so the shape engine now unifies the two operand shapes and rejects the mismatch.
+fn bad_add(a: Tensor[f32, 2, 3], b: Tensor[f32, 3, 2]) -> f32 {
+    let c = a + b;
+    return 0.0;
+}
+
+fn main() -> i32 {
+    return 0;
+}
