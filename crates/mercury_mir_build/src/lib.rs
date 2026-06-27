@@ -1364,6 +1364,32 @@ impl FnLowerer<'_> {
     /// pointer, like a tuple/array), and **a pointer/reference to a struct** — `p.f` on a `&Pt` /
     /// `*mut Pt` param auto-derefs (the bound `Ptr` slot loads the pointer, then this GEPs the field).
     /// So a struct passed by `&`/`*` works the same as a local. Drives `s.f` reads and `s.f = …` writes.
+    /// Bind a tuple destructuring pattern `(a, b, …)` against an aggregate `base` of tuple type
+    /// `tty`: each sub-pattern is bound to its field's place (byte offset within `base`). A scalar
+    /// field binds a pointer that reads via `Load` (like a `let` slot); an aggregate field binds its
+    /// pointer directly (the by-pointer convention); a nested tuple pattern recurses; a wildcard
+    /// binds nothing. Used by `let (a, b) = …`.
+    fn bind_tuple_pattern(&mut self, base: ValueId, tty: &Ty, subs: &[Pattern]) {
+        let Ty::Tuple(fields) = tty else {
+            return;
+        };
+        let Some((offsets, _, _)) = self.aggregate_layout(fields) else {
+            return;
+        };
+        for (i, sub) in subs.iter().enumerate() {
+            let (Some(off), Some(fty)) = (offsets.get(i), fields.get(i)) else {
+                continue;
+            };
+            let fmir = self.mir_ty_of(fty);
+            let fptr = self.field_ptr(base, *off);
+            match &sub.kind {
+                ast::PatKind::Ident(name) => self.bind(*name, fptr, fmir),
+                ast::PatKind::Tuple(inner) => self.bind_tuple_pattern(fptr, fty, inner),
+                _ => {}
+            }
+        }
+    }
+
     /// If `base.name` is a C-style enum-variant access `E::B` (a `Field` whose base is a single
     /// segment path naming a declared enum, and `name` is one of its variants), return the variant's
     /// integer discriminant. Lowered to that constant (the enum value's runtime representation).
@@ -4503,12 +4529,19 @@ impl FnLowerer<'_> {
                         });
                     }
                 }
-                if let Pattern {
-                    kind: ast::PatKind::Ident(name),
-                    ..
-                } = pat
-                {
-                    self.bind(*name, slot, mty);
+                match &pat.kind {
+                    ast::PatKind::Ident(name) => self.bind(*name, slot, mty),
+                    // Destructuring `let (a, b) = …`: bind each sub-pattern to its tuple field's
+                    // place within the slot (a scalar field reads via a `Load`, an aggregate field
+                    // binds its pointer). Recurses for a nested tuple pattern.
+                    ast::PatKind::Tuple(subs) => {
+                        let tty = init
+                            .as_ref()
+                            .map(|e| self.expr_ty(e))
+                            .unwrap_or(Ty::Unknown);
+                        self.bind_tuple_pattern(slot, &tty, subs);
+                    }
+                    _ => {}
                 }
             }
             StmtKind::Assign { target, op, value } => {

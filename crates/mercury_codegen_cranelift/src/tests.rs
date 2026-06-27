@@ -639,6 +639,32 @@ fn differential_enum() {
     }
 }
 
+/// Tuple-destructuring `let (a, b) = …`. The `let` lowering binds each sub-pattern to its field's
+/// place within the initialized tuple buffer (a scalar reads via a `Load`, an aggregate field by
+/// pointer; a nested tuple pattern recurses; `_` skips). Covers a literal tuple, a triple, a
+/// struct-returning… (here a tuple-returning) call, a nested pattern, a wildcard, and mutating a
+/// destructured binding. Both backends agree.
+#[test]
+fn differential_let_destructure() {
+    let cases = [
+        ("fn main() -> i32 { let (a, b) = (3, 4); return a + b; }", 7),
+        ("fn main() -> i32 { let (a, b, c) = (1, 2, 3); return a + b + c; }", 6),
+        ("fn mk() -> (i32, i32) { return (10, 20); } \
+          fn main() -> i32 { let (x, y) = mk(); return x + y; }", 30),
+        ("fn main() -> i32 { let ((a, b), c) = ((1, 2), 3); return a + b + c; }", 6),
+        ("fn main() -> i32 { let (a, _) = (5, 99); return a; }", 5),
+        ("fn main() -> i32 { let (a, b) = (10, 20); a = 30; return a + b; }", 50),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "let-destructure native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "let-destructure wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
