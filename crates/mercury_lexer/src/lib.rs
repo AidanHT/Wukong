@@ -95,6 +95,10 @@ impl<'a> Lexer<'a> {
             return Token::new(kind, self.span(start));
         }
         if c == b'\'' {
+            // A `'name` not closed by a `'` is a loop label, not a char literal (`'a'`).
+            if let Some(kind) = self.try_lex_label() {
+                return Token::new(kind, self.span(start));
+            }
             let kind = self.lex_char(start);
             return Token::new(kind, self.span(start));
         }
@@ -305,6 +309,33 @@ impl<'a> Lexer<'a> {
             }
             None => {}
         }
+    }
+
+    /// Try to lex a loop label `'ident` at the cursor (which is on the opening `'`). A label is a
+    /// `'` followed by an identifier that is *not* immediately closed by a `'` — `'a'` is a char
+    /// literal, but `'outer:`, `'a ` etc. are labels (the exact disambiguation Rust uses). Returns
+    /// `Some(Label)` having consumed `'ident`, or `None` with the cursor unmoved (a char literal).
+    fn try_lex_label(&mut self) -> Option<TokenKind> {
+        let first = self.peek_at(1)?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None; // `'5'`, `'\n'`, `'!'`, … → char literal
+        }
+        // Length of the identifier following the quote (ASCII identifier chars).
+        let mut len = 1;
+        while self
+            .peek_at(len)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            len += 1;
+        }
+        // A closing quote right after the identifier means it was a char literal (`'a'`), not a label.
+        if self.peek_at(len) == Some(b'\'') {
+            return None;
+        }
+        for _ in 0..len {
+            self.bump();
+        }
+        Some(TokenKind::Label)
     }
 
     fn lex_char(&mut self, start: usize) -> TokenKind {

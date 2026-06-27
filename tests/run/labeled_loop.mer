@@ -1,0 +1,30 @@
+// EXPECT-EXIT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+module tests.run.labeled_loop
+
+// A labeled loop lets `break`/`continue` target an *outer* loop by name. `continue 'outer` from the
+// inner loop resumes the outer `for`; `break 'outer` / `break 'w` exits the whole nest. Both backends
+// must agree (the lowering routes the branch to the labeled loop's continue/break block).
+fn main() -> i32 {
+    let mut count: i32 = 0;
+    'outer: for i in 0..5 {
+        for j in 0..5 {
+            if j == 2 { continue 'outer; }
+            if i == 3 { break 'outer; }
+            count = count + 1;
+        }
+    }
+    print(count);
+
+    let mut k: i32 = 0;
+    'w: while k < 100 {
+        for m in 0..10 {
+            if m == 4 { break 'w; }
+            k = k + 1;
+        }
+    }
+    print(k);
+
+    return count;
+}

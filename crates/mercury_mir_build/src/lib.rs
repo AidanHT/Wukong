@@ -1176,8 +1176,10 @@ struct FnLowerer<'a> {
     diags: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<Symbol, (ValueId, MirType)>>,
     terminated: bool,
-    /// (continue target, break target) for the innermost loops.
-    loops: Vec<(mercury_mir::BlockId, mercury_mir::BlockId)>,
+    /// (optional label, continue target, break target) for the enclosing loops, innermost last. A
+    /// labeled `break`/`continue` `'l` searches this stack for the matching label; an unlabeled one
+    /// targets the innermost (the top).
+    loops: Vec<(Option<Symbol>, mercury_mir::BlockId, mercury_mir::BlockId)>,
     /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
     gemm: GemmSyms,
     /// True while lowering the body of a `@parallel` function: a recognized reduction loop dispatches
@@ -1727,7 +1729,7 @@ impl FnLowerer<'_> {
         for m in (2..=run).rev() {
             let fused = fuse_for_bodies(&stmts[..m]);
             if self.vectorizable(&fused, var).is_some() {
-                self.lower_for(pat0, iter0, &fused);
+                self.lower_for(None, pat0, iter0, &fused);
                 return Some(m);
             }
         }
@@ -4617,19 +4619,25 @@ impl FnLowerer<'_> {
                 }
                 self.terminated = true;
             }
-            StmtKind::While { cond, body, .. } => self.lower_while(cond, body),
+            StmtKind::While {
+                cond, body, label, ..
+            } => self.lower_while(label.map(|l| l.sym), cond, body),
             StmtKind::For {
-                pat, iter, body, ..
-            } => self.lower_for(pat, iter, body),
-            StmtKind::Loop { body, .. } => self.lower_loop(body),
-            StmtKind::Break(_) => {
-                if let Some((_, brk)) = self.loops.last().copied() {
+                pat,
+                iter,
+                body,
+                label,
+                ..
+            } => self.lower_for(label.map(|l| l.sym), pat, iter, body),
+            StmtKind::Loop { body, label, .. } => self.lower_loop(label.map(|l| l.sym), body),
+            StmtKind::Break(label) => {
+                if let Some((_, _, brk)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     self.builder.br(brk, vec![]);
                 }
                 self.terminated = true;
             }
-            StmtKind::Continue(_) => {
-                if let Some((cont, _)) = self.loops.last().copied() {
+            StmtKind::Continue(label) => {
+                if let Some((_, cont, _)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     self.builder.br(cont, vec![]);
                 }
                 self.terminated = true;
@@ -4661,7 +4669,26 @@ impl FnLowerer<'_> {
         }
     }
 
-    fn lower_while(&mut self, cond: &Expr, body: &Block) {
+    /// Resolve a `break`/`continue` target. A labeled `'l` finds the nearest enclosing loop with
+    /// that label; an unlabeled one is the innermost loop (the top of the stack). `None` if there is
+    /// no such loop (sema rejects out-of-loop and unknown-label cases with `E0303` first, so this is
+    /// only reachable in a malformed module — the branch is simply omitted).
+    fn find_loop(
+        &self,
+        label: Option<Symbol>,
+    ) -> Option<(Option<Symbol>, mercury_mir::BlockId, mercury_mir::BlockId)> {
+        match label {
+            Some(l) => self
+                .loops
+                .iter()
+                .rev()
+                .find(|(lbl, ..)| *lbl == Some(l))
+                .copied(),
+            None => self.loops.last().copied(),
+        }
+    }
+
+    fn lower_while(&mut self, label: Option<Symbol>, cond: &Expr, body: &Block) {
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
         let exit = self.builder.new_block();
@@ -4674,7 +4701,7 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((label, header, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -4685,13 +4712,13 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
-    fn lower_loop(&mut self, body: &Block) {
+    fn lower_loop(&mut self, label: Option<Symbol>, body: &Block) {
         let header = self.builder.new_block();
         let exit = self.builder.new_block();
         self.builder.br(header, vec![]);
         self.builder.switch_to(header);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((label, header, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -6533,7 +6560,7 @@ impl FnLowerer<'_> {
         false
     }
 
-    fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
+    fn lower_for(&mut self, label: Option<Symbol>, pat: &Pattern, iter: &ForIter, body: &Block) {
         // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
         // whole-function `@parallel` form is handled earlier in `lower_program`).
         if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
@@ -6843,7 +6870,7 @@ impl FnLowerer<'_> {
         // the body's tail, unlike a `while`, whose header re-evaluates the user's own condition).
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((latch, exit));
+        self.loops.push((label, latch, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -8506,7 +8533,9 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(bb);
         self.terminated = false;
-        self.loops.push((hdr, exit));
+        // A vectorized loop body has no break/continue (vectorizability rejects them), so it never
+        // needs a label.
+        self.loops.push((None, hdr, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -9422,7 +9451,9 @@ impl FnLowerer<'_> {
         // `continue` targets the latch (the increment), not the header — see `lower_for`.
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((latch, exit));
+        // The `@parallel` per-thread ranged loop carries no user label (a labeled break across the
+        // parallel boundary is not modeled); an unlabeled break/continue still targets it.
+        self.loops.push((None, latch, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {

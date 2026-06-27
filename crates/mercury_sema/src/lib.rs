@@ -78,7 +78,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         scopes: Vec::new(),
         generics: HashSet::new(),
         ret_ty: Ty::Unit,
-        loop_depth: 0,
+        loop_labels: Vec::new(),
         consts: HashMap::new(),
     };
     s.collect(module);
@@ -99,10 +99,13 @@ struct Sema<'a> {
     scopes: Vec<HashMap<Symbol, Ty>>,
     generics: HashSet<Symbol>,
     ret_ty: Ty,
-    /// Number of enclosing loops at the current point. A `break`/`continue` with `loop_depth == 0`
-    /// is a hard error (E0303) — without it the lowerer emits an `unreachable` terminator, which the
-    /// interpreter traps but the native backend turns into a SIGILL, a differential-gate divergence.
-    loop_depth: u32,
+    /// The labels of the enclosing loops at the current point (innermost last; `None` for an
+    /// unlabeled loop). A `break`/`continue` with an empty stack is a hard error (E0303) — without it
+    /// the lowerer emits an `unreachable` terminator, which the interpreter traps but the native
+    /// backend turns into a SIGILL, a differential-gate divergence. A labeled `break`/`continue` `'l`
+    /// whose label is not on the stack is likewise E0303 (an undeclared label would otherwise leave
+    /// mir_build with a terminator-less block).
+    loop_labels: Vec<Option<Symbol>>,
     /// Top-level `const` initializer expressions (by name), accumulated as their bodies are checked.
     consts: HashMap<Symbol, Expr>,
 }
@@ -500,41 +503,52 @@ impl Sema<'_> {
             StmtKind::Defer(e) => {
                 self.type_expr(e);
             }
-            StmtKind::Break(_) | StmtKind::Continue(_) => {
-                if self.loop_depth == 0 {
-                    let kw = if matches!(s.kind, StmtKind::Break(_)) {
-                        "break"
-                    } else {
-                        "continue"
-                    };
-                    self.error(
-                        s.span,
-                        "E0303",
-                        format!("`{kw}` outside of a loop"),
-                    );
+            StmtKind::Break(lbl) | StmtKind::Continue(lbl) => {
+                let kw = if matches!(s.kind, StmtKind::Break(_)) {
+                    "break"
+                } else {
+                    "continue"
+                };
+                if self.loop_labels.is_empty() {
+                    self.error(s.span, "E0303", format!("`{kw}` outside of a loop"));
+                } else if let Some(l) = lbl {
+                    // A labeled `break`/`continue` must name an enclosing loop's label.
+                    if !self.loop_labels.iter().any(|x| *x == Some(l.sym)) {
+                        self.error(
+                            l.span,
+                            "E0303",
+                            format!("use of undeclared loop label `'{}`", self.sym_str(l.sym)),
+                        );
+                    }
                 }
             }
-            StmtKind::While { cond, body, .. } => {
+            StmtKind::While {
+                cond, body, label, ..
+            } => {
                 self.type_expr(cond);
-                self.loop_depth += 1;
+                self.loop_labels.push(label.as_ref().map(|l| l.sym));
                 self.type_block(body);
-                self.loop_depth -= 1;
+                self.loop_labels.pop();
             }
             StmtKind::For {
-                pat, iter, body, ..
+                pat,
+                iter,
+                body,
+                label,
+                ..
             } => {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
-                self.loop_depth += 1;
+                self.loop_labels.push(label.as_ref().map(|l| l.sym));
                 self.type_block(body);
-                self.loop_depth -= 1;
+                self.loop_labels.pop();
                 self.pop_scope();
             }
-            StmtKind::Loop { body, .. } => {
-                self.loop_depth += 1;
+            StmtKind::Loop { body, label, .. } => {
+                self.loop_labels.push(label.as_ref().map(|l| l.sym));
                 self.type_block(body);
-                self.loop_depth -= 1;
+                self.loop_labels.pop();
             }
         }
     }
