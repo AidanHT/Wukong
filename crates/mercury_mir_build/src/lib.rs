@@ -9876,6 +9876,14 @@ impl FnLowerer<'_> {
             ExprKind::Bool(b) => self
                 .builder
                 .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1)),
+            // A char literal is its Unicode scalar value — sema types it `u32`, so it lowers like an
+            // integer constant of that value (escapes/`\x`/`\u{…}` decoded by `decode_char_literal`).
+            ExprKind::Char(s) => {
+                let v = decode_char_literal(self.interner.resolve(*s));
+                let ty = self.expr_mir(e);
+                let ty = if ty.is_int() { ty } else { MirType::I32 };
+                self.builder.build(ty.clone(), Op::ConstInt(v as i128, ty))
+            }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
                     // An array variable *is* its storage: its value is the base pointer, so reads
@@ -17285,6 +17293,49 @@ fn parse_float(text: &str) -> f64 {
         }
     }
     core.parse().unwrap_or(0.0)
+}
+
+/// Decode a char literal's raw source text (including the surrounding single quotes) into its
+/// Unicode scalar value. Handles the one-character escapes (`\n` `\r` `\t` `\\` `\'` `\"` `\0`),
+/// `\xHH`, and `\u{…}`. Returns 0 for an empty/malformed literal (the lexer already reported any
+/// lexical error). This is the value a `'c'` literal lowers to (sema types it `u32`).
+fn decode_char_literal(text: &str) -> u32 {
+    let inner = text
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .unwrap_or(text);
+    let mut chars = inner.chars();
+    match chars.next() {
+        Some('\\') => decode_escape(&mut chars),
+        Some(c) => c as u32,
+        None => 0,
+    }
+}
+
+/// Decode the body of a backslash escape (the `\` already consumed) to a code point.
+fn decode_escape(chars: &mut std::str::Chars) -> u32 {
+    match chars.next() {
+        Some('n') => '\n' as u32,
+        Some('r') => '\r' as u32,
+        Some('t') => '\t' as u32,
+        Some('\\') => '\\' as u32,
+        Some('\'') => '\'' as u32,
+        Some('"') => '"' as u32,
+        Some('0') => 0,
+        // `\xHH` — up to two hex digits (the lexer consumed at most two).
+        Some('x') => chars.by_ref().take(2).fold(0u32, |v, c| {
+            c.to_digit(16).map_or(v, |d| v * 16 + d)
+        }),
+        // `\u{HHHH}` — the hex digits between the braces.
+        Some('u') => chars
+            .by_ref()
+            .skip_while(|&c| c != '{')
+            .skip(1)
+            .take_while(|&c| c != '}')
+            .fold(0u32, |v, c| c.to_digit(16).map_or(v, |d| v * 16 + d)),
+        Some(c) => c as u32,
+        None => 0,
+    }
 }
 
 #[cfg(test)]
