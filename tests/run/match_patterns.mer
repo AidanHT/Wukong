@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 200
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+module tests.run.match_patterns
+
+// Richer `match` patterns: or-patterns `A | B | C`, half-open `lo..hi` and inclusive `lo..=hi`
+// ranges, and enum-variant patterns `Color::Red` (matched by discriminant). Each lowers to a pure
+// value test, so the interpreter and native backend agree.
+enum Color { Red, Green, Blue }
+
+fn bucket(n: i32) -> i32 {
+    return match n {
+        0 | 1 | 2 => 100,    // or-pattern
+        3..10 => 200,        // half-open range (3..=9)
+        10..=20 => 300,      // inclusive range
+        _ => 400,
+    };
+}
+
+fn name(c: Color) -> i32 {
+    return match c {
+        Color::Red => 1,     // enum-variant pattern
+        Color::Green => 2,
+        Color::Blue => 3,
+    };
+}
+
+fn main() -> i32 {
+    print(bucket(1));    // 100
+    print(bucket(2));    // 100
+    print(bucket(5));    // 200
+    print(bucket(9));    // 200
+    print(bucket(10));   // 300
+    print(bucket(20));   // 300
+    print(bucket(21));   // 400
+
+    print(name(Color::Red));     // 1
+    print(name(Color::Blue));    // 3
+
+    let t = match (1, 7) { (0 | 1, y) => y, _ => 0 };   // or-pattern in a tuple field
+    print(t);            // 7
+    return 0;
+}

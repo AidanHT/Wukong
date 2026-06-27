@@ -417,6 +417,26 @@ impl AstPrinter<'_> {
                 self.line(format!("pat {}{}", if *neg { "-" } else { "" }, s));
             }
             PatKind::Bool(b) => self.line(format!("pat {b}")),
+            PatKind::Or(alts) => {
+                self.line("pat or");
+                self.indented(|p| {
+                    for a in alts {
+                        p.pattern(a);
+                    }
+                });
+            }
+            PatKind::Path(path) => self.line(format!("pat {}", self.path_str(path, "::"))),
+            PatKind::Range {
+                lo,
+                hi,
+                inclusive,
+            } => {
+                self.line(format!("pat range{}", if *inclusive { "=" } else { "" }));
+                self.indented(|p| {
+                    p.pattern(lo);
+                    p.pattern(hi);
+                });
+            }
         }
     }
 

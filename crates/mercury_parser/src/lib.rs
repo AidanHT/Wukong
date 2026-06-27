@@ -1076,7 +1076,62 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a pattern, including an or-pattern `A | B | C` at the top level (each alternative may
+    /// itself be a range or path pattern).
     fn parse_pattern(&mut self) -> Pattern {
+        let start = self.span();
+        let first = self.parse_pattern_range();
+        if !self.at(T::Pipe) {
+            return first;
+        }
+        let mut alts = vec![first];
+        while self.eat(T::Pipe) {
+            alts.push(self.parse_pattern_range());
+        }
+        Pattern {
+            id: self.nid(),
+            kind: PatKind::Or(alts),
+            span: start.to(self.prev_span()),
+        }
+    }
+
+    /// A primary pattern optionally followed by a range tail `..hi` / `..=hi`. A range is recognized
+    /// only after an integer-literal lower bound, so it never shadows `_`/identifier/tuple patterns.
+    fn parse_pattern_range(&mut self) -> Pattern {
+        let start = self.span();
+        let lo = self.parse_pattern_primary();
+        if matches!(lo.kind, PatKind::Int { .. }) && (self.at(T::DotDot) || self.at(T::DotDotEq)) {
+            let inclusive = self.at(T::DotDotEq);
+            self.bump();
+            let hi = self.parse_pattern_primary();
+            return Pattern {
+                id: self.nid(),
+                kind: PatKind::Range {
+                    lo: Box::new(lo),
+                    hi: Box::new(hi),
+                    inclusive,
+                },
+                span: start.to(self.prev_span()),
+            };
+        }
+        lo
+    }
+
+    /// Parse a `::`-separated path (`Enum::Variant`), used by enum-variant patterns.
+    fn parse_colon_path(&mut self) -> Path {
+        let start = self.span();
+        let mut segments = vec![self.ident()];
+        while self.at(T::ColonColon) && self.nth(1) == T::Ident {
+            self.bump(); // ::
+            segments.push(self.ident());
+        }
+        Path {
+            segments,
+            span: start.to(self.prev_span()),
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> Pattern {
         let start = self.span();
         let kind = match self.kind() {
             T::Ident => {
@@ -1084,6 +1139,9 @@ impl<'a> Parser<'a> {
                 if text == "_" {
                     self.bump();
                     PatKind::Wildcard
+                } else if self.nth(1) == T::ColonColon {
+                    // `Enum::Variant` — an enum-variant pattern (resolved to its discriminant).
+                    PatKind::Path(self.parse_colon_path())
                 } else {
                     let sym = self.intern_span(start);
                     self.bump();

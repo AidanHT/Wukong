@@ -1,6 +1,6 @@
 //! Statements, blocks, and patterns.
 
-use crate::{AssignOp, Attr, Expr, Ident, NodeId, TypeExpr};
+use crate::{AssignOp, Attr, Expr, Ident, NodeId, Path, TypeExpr};
 use mercury_span::{Span, Symbol};
 
 /// A braced block: zero or more statements and an optional trailing expression (its value).
@@ -89,4 +89,16 @@ pub enum PatKind {
     Int { sym: Symbol, neg: bool },
     /// A boolean literal pattern (`true` / `false`).
     Bool(bool),
+    /// An or-pattern `A | B | C` — matches if any alternative matches. Alternatives are typically
+    /// literals / enum variants (binding-free); a binding inside one is not recommended.
+    Or(Vec<Pattern>),
+    /// A path pattern — an enum variant such as `Color::Red`, matched by its integer discriminant.
+    Path(Path),
+    /// A range pattern `lo..hi` (half-open) or `lo..=hi` (inclusive). The bounds are integer-literal
+    /// patterns (`PatKind::Int`); the scrutinee matches when it falls within the range.
+    Range {
+        lo: Box<Pattern>,
+        hi: Box<Pattern>,
+        inclusive: bool,
+    },
 }

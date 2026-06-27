@@ -665,6 +665,48 @@ fn differential_let_destructure() {
     }
 }
 
+/// Richer `match` patterns: or-patterns `1 | 2 | 3`, half-open `lo..hi` and inclusive `lo..=hi`
+/// ranges, and enum-variant patterns `Color::Red` (compared by discriminant). Each lowers to a
+/// pure value test (an OR of equalities / a range conjunction / a discriminant equality), so native
+/// and interp agree at every `-O`. Also covers an or-pattern nested in a tuple field and a negative
+/// range bound.
+#[test]
+fn differential_match_patterns() {
+    const FIZZ: &str = "fn fizz(n: i32) -> i32 { return match n \
+        { 0 | 1 | 2 => 100, 3..10 => 200, 10..=20 => 300, _ => 400 }; } \
+        fn main() -> i32 { return fizz";
+    const NAME: &str = "enum Color { Red, Green, Blue } \
+        fn name(c: Color) -> i32 { return match c \
+        { Color::Red => 1, Color::Green => 2, Color::Blue => 3 }; } \
+        fn main() -> i32 { return name";
+    let cases = [
+        (format!("{FIZZ}(0); }}"), 100),
+        (format!("{FIZZ}(2); }}"), 100),
+        (format!("{FIZZ}(3); }}"), 200),
+        (format!("{FIZZ}(9); }}"), 200),
+        (format!("{FIZZ}(10); }}"), 300),
+        (format!("{FIZZ}(20); }}"), 300),
+        (format!("{FIZZ}(21); }}"), 400),
+        (format!("{FIZZ}(-5); }}"), 400),
+        (format!("{NAME}(Color::Red); }}"), 1),
+        (format!("{NAME}(Color::Green); }}"), 2),
+        (format!("{NAME}(Color::Blue); }}"), 3),
+        // an or-pattern nested in a tuple field.
+        ("fn main() -> i32 { return match (1, 7) { (0 | 1, y) => y, _ => 0 }; }".to_string(), 7),
+        // a negative range bound, signed comparison.
+        ("fn f(n: i32) -> i32 { return match n { -5..0 => 1, 0..=5 => 2, _ => 3 }; } \
+          fn main() -> i32 { return f(-3); }".to_string(), 1),
+    ];
+    for (src, want) in &cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "match-patterns native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, *want, "match-patterns wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
 /// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
 /// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*
