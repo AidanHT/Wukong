@@ -43,9 +43,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   assignment, casts — including a float → narrow-int cast (`1e30 as i8`) that **saturates** identically
   on both backends (`tests/run/float_cast_narrow.mer`).
 - `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`, `loop { … }` with
-  `break`/`continue` (innermost loop; labeled forms are still 🟡). `continue` in a range `for` runs the
-  loop step (`tests/run/for_continue.mer`), and a `break`/`continue` outside any loop is rejected with
-  `E0303` (`tests/fail/break_outside_loop.mer`).
+  `break`/`continue`, including **labeled loops** `'outer: for … { … break 'outer; continue 'outer; }`
+  — a labeled `break`/`continue` targets the named enclosing loop, not just the innermost (the lexer
+  tells a label `'outer` from a char literal `'a'` the way Rust does; `tests/run/labeled_loop.mer`).
+  `continue` in a range `for` runs the loop step (`tests/run/for_continue.mer`); a `break`/`continue`
+  outside any loop, or one naming an undeclared label, is rejected with `E0303`
+  (`tests/fail/{break_outside_loop,break_unknown_label}.mer`). Loop-as-expression / break-with-value
+  (`let x = loop { break 5; };`) is still pending — loops are statement-only and `break` carries no value (🟡).
 - **`match`** in value and statement position: integer/bool literal, identifier-binding, and wildcard
   `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
   **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
@@ -60,6 +64,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) lowering to their `u32` Unicode scalar value
   (`tests/run/char_literals.mer`).
+- **String literals**: `"hello"` materializes its UTF-8 bytes (plus a NUL) into a stack byte buffer,
+  typed `*u8`; the escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode. `print`/`println`
+  of a `*u8` (a literal, a `let`-bound string, or one returned from a function) renders the bytes, not
+  the pointer value (`tests/run/string_literal.mer`). No string *type* beyond `*u8` yet — no
+  concatenation/indexing/length and no general static-data section (🟡).
 - **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
   pointer parameter threads through calls — address-taken locals correctly stay in memory under the
   optimizer (`tests/run/pointer.mer`). `as` casts bind looser than `*`/unary, tighter than binary

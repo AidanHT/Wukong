@@ -212,6 +212,22 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **Char literals** (`tests/run/char_literals.mer`): `'A'` lowers to its `u32` Unicode scalar value,
   with the one-character escapes (`\n` `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes
   (the lexer's escape scanner now consumes the multi-byte forms). Gated by `differential_char_literals`.
+- **String literals** (`tests/run/string_literal.mer`): `"hello"` materializes its UTF-8 bytes plus a
+  NUL terminator into a stack byte buffer (the same by-pointer convention as arrays), typed `*u8`; the
+  escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode, each code point re-encoded as UTF-8.
+  `print`/`println` of a `*u8` (a literal, a `let`-bound string, or one returned from a function) is
+  routed (type-directed) to a `print_str`/`println_str` path that renders the bytes — the interpreter
+  walks its slot memory, native reads the buffer via `rt_print_str` — while numeric `print` still
+  prints numbers. No string *type* beyond `*u8` yet (no concatenation/indexing/length, no general
+  static-data section). Gated by `differential_string_literals`.
+- **Labeled loops** (`tests/run/labeled_loop.mer`): `'label: loop/while/for { … break 'label;
+  continue 'label; }` — a labeled `break`/`continue` targets the named enclosing loop, not just the
+  innermost. The lexer has a `Label` token disambiguated from a char literal exactly as Rust (`'a'`
+  closed by a `'` is a char; `'outer:` is a label); sema tracks an enclosing-label stack, so a
+  `break`/`continue` outside any loop **or** one naming an undeclared label is `E0303`
+  (`tests/fail/break_unknown_label.mer`); mir_build's loop stack carries each loop's label and resolves
+  the branch target. Loop-as-expression / break-with-value (`let x = loop { break 5; };`) is still
+  pending — `break` carries a label but no value. Gated by `differential_labeled_loops`.
 - **Correctness fixes** (interpreter↔native divergences and ICEs removed; each gated bit-for-bit):
   - **`break`/`continue` outside any loop** is now a clean **`E0303`** instead of a backend divergence
     — the lowerer left a fallback `unreachable` the interpreter trapped (exit 1) but the native backend

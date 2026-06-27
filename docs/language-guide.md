@@ -77,6 +77,14 @@ separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix
 `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes — so it can be cast, compared, and used
 in arithmetic (`tests/run/char_literals.mer`).
 
+A **string literal** `"hello"` materializes its UTF-8 bytes (plus a trailing NUL) into a stack byte
+buffer and is typed `*u8` — the same by-pointer convention as an array. The escapes `\n` `\r` `\t`
+`\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode (each code point re-encoded as UTF-8). `print`/`println` of
+a `*u8` — a literal, a `let s = "hi";` binding, or a `*u8` returned from a function — renders the
+bytes, while numeric `print` still prints numbers (`tests/run/string_literal.mer`). There is **no
+string type beyond `*u8`** yet: no concatenation/indexing/length operators and no general
+static-data section — a string is just a NUL-terminated `*u8` buffer suitable for `print` (🟡).
+
 ## Types
 
 | Category    | Examples                                            | Status |
@@ -107,12 +115,22 @@ while cond { ... }
 for i in 0..n { ... }
 for i in 0..n step 2 { ... }   // strided range; empty if lo >= hi
 loop { ... }                    // ✅ infinite loop; exit with `break`
-break; continue;                // ✅ innermost loop (labeled `break 'l` is 🟡)
+break; continue;                // ✅ innermost loop
+'outer: for i in 0..n {         // ✅ a loop label
+    for j in 0..n { break 'outer; continue 'outer; }  // target an outer loop by name
+}
 return expr;
 ```
 
 Blocks are expressions: the trailing expression of a block (no semicolon) is its value. A
 `break`/`continue` with no enclosing loop is a compile error (`E0303`).
+
+A **loop label** `'name:` on a `loop`/`while`/`for` lets a nested `break 'name` / `continue 'name`
+target that named outer loop instead of the innermost one — the lexer tells a label `'outer` from a
+char literal `'a'` exactly as Rust does (`tests/run/labeled_loop.mer`). A labeled `break`/`continue`
+naming an **undeclared** label is rejected with `E0303` (`tests/fail/break_unknown_label.mer`). A
+loop is still **statement-only**: loop-as-expression / break-with-value (`let x = loop { break 5; };`)
+is not yet supported — `break` carries an optional label but no value (🟡).
 
 ## Pattern matching ✅
 

@@ -148,10 +148,12 @@ flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode
 (`mercury_autodiff`) emits the training backward pass — both gated against the interpreter oracle.
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
-(`&mut`/`*p`), and `loop`/`break`/`continue` execute end-to-end on both backends — as do **`match`**
-(literal / range / or / enum-variant / tuple patterns, with guards), **C-style enums**, top-level
-**`const`** values, **`let` tuple destructuring**, and **radix `0xFF`/`0o17`/`0b1010` and char `'A'`
-literals**. And **constant-shape tensors run** —
+(`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`
+that a nested `break 'outer` / `continue 'outer` can target) execute end-to-end on both backends — as do
+**`match`** (literal / range / or / enum-variant / tuple patterns, with guards), **C-style enums**,
+top-level **`const`** values, **`let` tuple destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
+`'A'` literals**, and **`"string"` literals** (typed `*u8`, rendered by `print`). And
+**constant-shape tensors run** —
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
 flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a
 matmul written in tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot and accumulate spellings)
