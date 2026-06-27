@@ -349,8 +349,28 @@ impl Sema<'_> {
             Some(t) => self.lower_type(t),
             None => Ty::Unit,
         };
-        self.type_block(body);
+        let body_ty = self.type_block(body);
+        // The body's tail expression is the implicit return — check its shape against the declared
+        // return type (an explicit `return` is checked at its `StmtKind::Return` site).
+        if let Some(tail) = &body.tail {
+            self.check_return_shape(&body_ty, tail.span);
+        }
         self.generics.clear();
+    }
+
+    /// Check a returned value's type against the declared return type `self.ret_ty`. Only tensor /
+    /// vector SHAPE agreement is enforced — a function must not lie about its output shape, since
+    /// callers propagate the declared return shape into downstream shape checks (a single wrong
+    /// return silently poisons every caller). Scalars and other kinds stay lenient (numeric coercion
+    /// at lowering, like `let`/assignment), so this never over-fires on e.g. `return 5` from `-> i64`.
+    fn check_return_shape(&mut self, val_ty: &Ty, span: Span) {
+        let ret = self.ret_ty.clone();
+        if matches!(ret, Ty::Tensor { .. } | Ty::Vector { .. })
+            || matches!(val_ty, Ty::Tensor { .. } | Ty::Vector { .. })
+        {
+            let mut dims = HashMap::new();
+            self.unify(&ret, val_ty, &mut dims, span);
+        }
     }
 
     fn push_scope(&mut self) {
@@ -456,7 +476,8 @@ impl Sema<'_> {
             }
             StmtKind::Return(opt) => {
                 if let Some(e) = opt {
-                    self.type_expr(e);
+                    let t = self.type_expr(e);
+                    self.check_return_shape(&t, e.span);
                 }
             }
             StmtKind::Defer(e) => {
