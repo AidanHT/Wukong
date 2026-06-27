@@ -708,8 +708,8 @@ impl<'a> FnTranslator<'a> {
         match kind {
             SExt => self.resize_int(x, from_ty, to_ty, true),
             ZExt | Trunc => self.resize_int(x, from_ty, to_ty, false),
-            FpToSi => self.builder.ins().fcvt_to_sint_sat(to_ty, x),
-            FpToUi => self.builder.ins().fcvt_to_uint_sat(to_ty, x),
+            FpToSi => self.fcvt_to_int_sat(x, to_ty, true),
+            FpToUi => self.fcvt_to_int_sat(x, to_ty, false),
             SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
             UiToFp => self.builder.ins().fcvt_from_uint(to_ty, x),
             FpExt => {
@@ -750,6 +750,44 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             IntToPtr | PtrToInt => self.resize_int(x, from_ty, to_ty, false),
+        }
+    }
+
+    /// Saturating float→int conversion that also supports the narrow result types `i8`/`i16`, which
+    /// Cranelift's `fcvt_to_{sint,uint}_sat` cannot target directly on x64 (the emitter hits
+    /// `unreachable!`). For a narrow target, convert to `i32` saturating (NaN→0, out-of-range
+    /// clamped to the i32 range), then clamp to the *narrow* type's range and `ireduce`. This
+    /// reproduces Rust `as` / the interpreter's saturating cast bit-for-bit — including out-of-range
+    /// and NaN inputs (`300.0 as u8 == 255`, `-1.0 as u8 == 0`, `NaN as i8 == 0`) — keeping the
+    /// differential gate exact. A `>= 32`-bit target uses the direct instruction unchanged.
+    fn fcvt_to_int_sat(&mut self, x: Value, to_ty: types::Type, signed: bool) -> Value {
+        if to_ty.bits() >= 32 {
+            return if signed {
+                self.builder.ins().fcvt_to_sint_sat(to_ty, x)
+            } else {
+                self.builder.ins().fcvt_to_uint_sat(to_ty, x)
+            };
+        }
+        if signed {
+            let wide = self.builder.ins().fcvt_to_sint_sat(types::I32, x);
+            let (lo, hi) = if to_ty.bits() == 8 {
+                (-128i64, 127i64)
+            } else {
+                (-32768i64, 32767i64)
+            };
+            let hic = self.builder.ins().iconst(types::I32, hi);
+            let loc = self.builder.ins().iconst(types::I32, lo);
+            let capped = self.builder.ins().smin(wide, hic);
+            let clamped = self.builder.ins().smax(capped, loc);
+            self.builder.ins().ireduce(to_ty, clamped)
+        } else {
+            let wide = self.builder.ins().fcvt_to_uint_sat(types::I32, x);
+            let hi = if to_ty.bits() == 8 { 255i64 } else { 65535i64 };
+            let hic = self.builder.ins().iconst(types::I32, hi);
+            // The lower bound is already 0 from the unsigned saturation; only the upper bound needs
+            // clamping (unsigned min, so a saturated `u32::MAX` reads as larger than the narrow max).
+            let clamped = self.builder.ins().umin(wide, hic);
+            self.builder.ins().ireduce(to_ty, clamped)
         }
     }
 
