@@ -48,6 +48,11 @@ pub(crate) struct Parser<'a> {
     interner: &'a mut Interner,
     next_node: u32,
     pub(crate) diags: Vec<Diagnostic>,
+    /// When set, a `Path {` is NOT parsed as a struct literal — disambiguates the condition of
+    /// `if`/`while`/`for`/`match` (where `{` opens the body block) from `Name { … }`. Cleared inside
+    /// any delimited sub-expression (`(…)`, `[…]`, call args, a struct-literal body), so a
+    /// parenthesized `(Point { x: 1 }).x` still parses.
+    no_struct_lit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -59,7 +64,25 @@ impl<'a> Parser<'a> {
             interner,
             next_node: 0,
             diags: Vec::new(),
+            no_struct_lit: false,
         }
+    }
+
+    /// Parse an expression in a position where a trailing `{` opens a block (an `if`/`while`/`for`/
+    /// `match` head), so a bare `Name { … }` must NOT be read as a struct literal.
+    fn parse_cond(&mut self) -> Expr {
+        let prev = std::mem::replace(&mut self.no_struct_lit, true);
+        let e = self.parse_expr();
+        self.no_struct_lit = prev;
+        e
+    }
+
+    /// Parse `f()`-style content with struct literals re-enabled (a delimited context).
+    fn allowing_struct_lit<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = std::mem::replace(&mut self.no_struct_lit, false);
+        let out = f(self);
+        self.no_struct_lit = prev;
+        out
     }
 
     // ---- Cursor & helpers ----
@@ -575,12 +598,14 @@ impl<'a> Parser<'a> {
     fn parse_args(&mut self) -> Vec<Expr> {
         self.bump(); // (
         let mut args = Vec::new();
-        while !self.at(T::RParen) && !self.at(T::Eof) {
-            args.push(self.parse_expr());
-            if !self.eat(T::Comma) {
-                break;
+        self.allowing_struct_lit(|p| {
+            while !p.at(T::RParen) && !p.at(T::Eof) {
+                args.push(p.parse_expr());
+                if !p.eat(T::Comma) {
+                    break;
+                }
             }
-        }
+        });
         self.expect(T::RParen);
         args
     }
@@ -632,57 +657,63 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                if self.eat(T::RParen) {
-                    return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
-                }
-                let first = self.parse_expr();
-                if self.at(T::Comma) {
-                    let mut items = vec![first];
-                    while self.eat(T::Comma) {
-                        if self.at(T::RParen) {
-                            break;
+                // A delimited context: struct literals are allowed inside `(…)` even within a
+                // condition head, so `(Point { x: 1 }).x` parses.
+                self.allowing_struct_lit(|p| {
+                    if p.eat(T::RParen) {
+                        return p.finish_expr(start, ExprKind::TupleLit(Vec::new()));
+                    }
+                    let first = p.parse_expr();
+                    if p.at(T::Comma) {
+                        let mut items = vec![first];
+                        while p.eat(T::Comma) {
+                            if p.at(T::RParen) {
+                                break;
+                            }
+                            items.push(p.parse_expr());
                         }
-                        items.push(self.parse_expr());
+                        p.expect(T::RParen);
+                        p.finish_expr(start, ExprKind::TupleLit(items))
+                    } else {
+                        p.expect(T::RParen);
+                        // Parenthesized expression: keep the inner node but extend its span.
+                        Expr {
+                            id: first.id,
+                            kind: first.kind,
+                            span: start.to(p.prev_span()),
+                        }
                     }
-                    self.expect(T::RParen);
-                    self.finish_expr(start, ExprKind::TupleLit(items))
-                } else {
-                    self.expect(T::RParen);
-                    // Parenthesized expression: keep the inner node but extend its span.
-                    Expr {
-                        id: first.id,
-                        kind: first.kind,
-                        span: start.to(self.prev_span()),
-                    }
-                }
+                })
             }
             T::LBracket => {
                 self.bump();
-                if self.eat(T::RBracket) {
-                    return self.finish_expr(start, ExprKind::ArrayLit(Vec::new()));
-                }
-                let first = self.parse_expr();
-                if self.eat(T::Semi) {
-                    let count = Box::new(self.parse_expr());
-                    self.expect(T::RBracket);
-                    self.finish_expr(
-                        start,
-                        ExprKind::ArrayRepeat {
-                            value: Box::new(first),
-                            count,
-                        },
-                    )
-                } else {
-                    let mut items = vec![first];
-                    while self.eat(T::Comma) {
-                        if self.at(T::RBracket) {
-                            break;
-                        }
-                        items.push(self.parse_expr());
+                self.allowing_struct_lit(|p| {
+                    if p.eat(T::RBracket) {
+                        return p.finish_expr(start, ExprKind::ArrayLit(Vec::new()));
                     }
-                    self.expect(T::RBracket);
-                    self.finish_expr(start, ExprKind::ArrayLit(items))
-                }
+                    let first = p.parse_expr();
+                    if p.eat(T::Semi) {
+                        let count = Box::new(p.parse_expr());
+                        p.expect(T::RBracket);
+                        p.finish_expr(
+                            start,
+                            ExprKind::ArrayRepeat {
+                                value: Box::new(first),
+                                count,
+                            },
+                        )
+                    } else {
+                        let mut items = vec![first];
+                        while p.eat(T::Comma) {
+                            if p.at(T::RBracket) {
+                                break;
+                            }
+                            items.push(p.parse_expr());
+                        }
+                        p.expect(T::RBracket);
+                        p.finish_expr(start, ExprKind::ArrayLit(items))
+                    }
+                })
             }
             T::LBrace => {
                 let b = self.parse_block();
@@ -707,13 +738,16 @@ impl<'a> Parser<'a> {
                     return self.finish_expr(start, ExprKind::AlignOf(ty));
                 }
                 let id = self.ident();
-                self.finish_expr(
-                    start,
-                    ExprKind::Path(Path {
-                        segments: vec![id],
-                        span: start,
-                    }),
-                )
+                let path = Path {
+                    segments: vec![id],
+                    span: start,
+                };
+                // `Name { field: value, … }` is a struct literal — unless we are parsing the head
+                // of an `if`/`while`/`for`/`match`, where the `{` opens the body block instead.
+                if !self.no_struct_lit && self.at(T::LBrace) {
+                    return self.parse_struct_lit(path, start);
+                }
+                self.finish_expr(start, ExprKind::Path(path))
             }
             _ => {
                 let sp = self.span();
@@ -728,10 +762,37 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a struct literal `Path { name: value, … }` (the `{` is the current token). Field values
+    /// are a delimited context, so struct literals nest freely inside them.
+    fn parse_struct_lit(&mut self, path: Path, start: Span) -> Expr {
+        self.bump(); // {
+        let mut fields = Vec::new();
+        self.allowing_struct_lit(|p| {
+            while !p.at(T::RBrace) && !p.at(T::Eof) {
+                let name = p.ident();
+                p.expect(T::Colon);
+                let value = p.parse_expr();
+                fields.push(FieldInit { name, value });
+                if !p.eat(T::Comma) {
+                    break;
+                }
+            }
+        });
+        self.expect(T::RBrace);
+        self.finish_expr(
+            start,
+            ExprKind::StructLit {
+                path,
+                fields,
+                rest: None,
+            },
+        )
+    }
+
     fn parse_if(&mut self) -> Expr {
         let start = self.span();
         self.bump(); // if
-        let cond = Box::new(self.parse_expr());
+        let cond = Box::new(self.parse_cond());
         let then_branch = self.parse_block();
         let else_branch = if self.eat(T::Else) {
             if self.at(T::If) {
@@ -757,7 +818,7 @@ impl<'a> Parser<'a> {
     fn parse_match(&mut self) -> Expr {
         let start = self.span();
         self.bump(); // match
-        let scrutinee = Box::new(self.parse_expr());
+        let scrutinee = Box::new(self.parse_cond());
         self.expect(T::LBrace);
         let mut arms = Vec::new();
         while !self.at(T::RBrace) && !self.at(T::Eof) {
@@ -921,7 +982,7 @@ impl<'a> Parser<'a> {
 
     fn parse_while(&mut self) -> StmtKind {
         self.bump(); // while
-        let cond = self.parse_expr();
+        let cond = self.parse_cond();
         let body = self.parse_block();
         StmtKind::While {
             label: None,
@@ -934,7 +995,9 @@ impl<'a> Parser<'a> {
         self.bump(); // for
         let pat = self.parse_pattern();
         self.expect(T::In);
+        let prev = std::mem::replace(&mut self.no_struct_lit, true);
         let iter = self.parse_for_iter();
+        self.no_struct_lit = prev;
         let body = self.parse_block();
         StmtKind::For {
             label: None,
