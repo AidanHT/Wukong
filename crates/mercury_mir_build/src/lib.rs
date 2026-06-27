@@ -9899,11 +9899,185 @@ impl FnLowerer<'_> {
                 then_branch,
                 else_branch,
             } => self.lower_if_value(cond, then_branch, else_branch.as_deref(), e),
+            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, e),
             _ => {
                 self.unsupported(e.span, "expression");
                 let t = self.expr_mir(e);
                 self.const_zero(t)
             }
+        }
+    }
+
+    /// Lower a `match` expression (or statement) to an if-else chain over the arms. The scrutinee is
+    /// evaluated once; each arm in turn tests the scrutinee against its pattern (a literal compares
+    /// for equality; a wildcard/identifier always matches) and, if present, its guard, branching to
+    /// the arm body or the next test. An `Ident` pattern binds the scrutinee value in the arm scope.
+    /// When the `match` is used as a value, a merge-block parameter collects each arm body's result.
+    /// An unconditional catch-all arm (a bare `_`/identifier with no guard) ends the chain; if none
+    /// is present the fallthrough yields a zero default (lenient non-exhaustive semantics, identical
+    /// on both backends — no trap, mirroring div-by-zero).
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm], e: &Expr) -> ValueId {
+        let result_ty = self.expr_mir(e);
+        let produces_value = result_ty != MirType::Void;
+        let scrut_mir = self.expr_mir(scrutinee);
+        let scrut = self.lower_expr(scrutinee);
+
+        let merge = self.builder.new_block();
+        let merge_param = if produces_value {
+            Some(self.builder.block_param(merge, result_ty.clone()))
+        } else {
+            None
+        };
+
+        // Branch to `merge` with the arm body's value (or no arg for a unit match).
+        let mut handled_default = false;
+        for arm in arms {
+            let unconditional = matches!(
+                &arm.pat.kind,
+                ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit
+            ) && arm.guard.is_none();
+
+            if unconditional {
+                // Always matches: lower the body directly, then the remaining arms are unreachable.
+                self.push_scope();
+                self.bind_match_ident(&arm.pat, scrut, &scrut_mir);
+                self.emit_match_arm_body(&arm.body, merge, merge_param, &result_ty);
+                self.pop_scope();
+                handled_default = true;
+                break;
+            }
+
+            let body_bb = self.builder.new_block();
+            let next_bb = self.builder.new_block();
+            // Bind first so an `Ident` pattern's guard can reference the binding; the binding is
+            // scoped to this arm (popped after the body).
+            self.push_scope();
+            self.bind_match_ident(&arm.pat, scrut, &scrut_mir);
+            let cond = self.match_arm_cond(&arm.pat, scrut, &scrut_mir, arm.guard.as_ref());
+            self.builder
+                .cond_br(cond, body_bb, vec![], next_bb, vec![]);
+
+            self.builder.switch_to(body_bb);
+            self.terminated = false;
+            self.emit_match_arm_body(&arm.body, merge, merge_param, &result_ty);
+            self.pop_scope();
+
+            self.builder.switch_to(next_bb);
+            self.terminated = false;
+        }
+
+        // No arm matched (only reachable when there is no unconditional catch-all): yield a default.
+        if !handled_default && !self.terminated {
+            let args = match merge_param {
+                Some(_) => vec![self.const_zero(result_ty.clone())],
+                None => vec![],
+            };
+            self.builder.br(merge, args);
+        }
+
+        self.builder.switch_to(merge);
+        self.terminated = false;
+        match merge_param {
+            Some(p) => p,
+            None => self.const_zero(if result_ty == MirType::Void {
+                MirType::I32
+            } else {
+                result_ty
+            }),
+        }
+    }
+
+    /// Bind an `Ident` match pattern to the scrutinee value for the arm's scope: a scalar is stored
+    /// into a fresh slot (so a `Path` read loads it, like a param); an aggregate scrutinee binds its
+    /// base pointer directly. Literal / wildcard / unit patterns bind nothing.
+    fn bind_match_ident(&mut self, pat: &Pattern, scrut: ValueId, scrut_mir: &MirType) {
+        if let ast::PatKind::Ident(name) = &pat.kind {
+            if matches!(scrut_mir, MirType::Array(..)) {
+                self.bind(*name, scrut, scrut_mir.clone());
+            } else {
+                let slot = self.builder.alloca(scrut_mir.clone());
+                self.builder.build_void(Op::Store {
+                    ptr: slot,
+                    value: scrut,
+                });
+                self.bind(*name, slot, scrut_mir.clone());
+            }
+        }
+    }
+
+    /// The i1 condition under which a match arm fires: the pattern test (a literal compares equal; a
+    /// wildcard/identifier is always true) conjoined with the optional guard. The guard is lowered in
+    /// the current (test) block, after any `Ident` binding, so it may reference the binding.
+    fn match_arm_cond(
+        &mut self,
+        pat: &Pattern,
+        scrut: ValueId,
+        scrut_mir: &MirType,
+        guard: Option<&Expr>,
+    ) -> ValueId {
+        let pat_cond = match &pat.kind {
+            ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit => None,
+            ast::PatKind::Int { sym, neg } => {
+                let mut v = parse_int(self.interner.resolve(*sym));
+                if *neg {
+                    v = -v;
+                }
+                let c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                Some(
+                    self.builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
+                )
+            }
+            ast::PatKind::Bool(b) => {
+                let c = self
+                    .builder
+                    .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
+                Some(
+                    self.builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
+                )
+            }
+            // A tuple pattern in a match is not lowered yet; treat as always-matching so the arm
+            // still binds nothing and runs (a conservative over-match, flagged by the front end if
+            // it ever type-checks a real tuple scrutinee).
+            ast::PatKind::Tuple(_) => None,
+        };
+        match (pat_cond, guard) {
+            (Some(pc), Some(g)) => {
+                let gv = self.lower_expr(g);
+                self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
+            }
+            (Some(pc), None) => pc,
+            (None, Some(g)) => self.lower_expr(g),
+            (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
+        }
+    }
+
+    /// Lower a match arm body and, unless it diverged, branch to `merge` passing the body value when
+    /// the match produces one.
+    fn emit_match_arm_body(
+        &mut self,
+        body: &Expr,
+        merge: mercury_mir::BlockId,
+        merge_param: Option<ValueId>,
+        result_ty: &MirType,
+    ) {
+        let bv = self.lower_expr(body);
+        if !self.terminated {
+            let args = match merge_param {
+                Some(_) => vec![bv],
+                None => vec![],
+            };
+            // Guard against a body whose own type is unit while the match yields a value: coerce a
+            // missing value to a zero so the edge arg arity matches the merge param.
+            let args = if merge_param.is_some() && args.is_empty() {
+                vec![self.const_zero(result_ty.clone())]
+            } else {
+                args
+            };
+            self.builder.br(merge, args);
         }
     }
 

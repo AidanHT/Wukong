@@ -412,6 +412,11 @@ impl AstPrinter<'_> {
                     }
                 });
             }
+            PatKind::Int { sym, neg } => {
+                let s = self.sym(*sym);
+                self.line(format!("pat {}{}", if *neg { "-" } else { "" }, s));
+            }
+            PatKind::Bool(b) => self.line(format!("pat {b}")),
         }
     }
 
@@ -535,6 +540,10 @@ impl AstPrinter<'_> {
                         p.line("arm");
                         p.indented(|p| {
                             p.pattern(&arm.pat);
+                            if let Some(g) = &arm.guard {
+                                p.line("guard");
+                                p.indented(|p| p.expr(g));
+                            }
                             p.expr(&arm.body);
                         });
                     }

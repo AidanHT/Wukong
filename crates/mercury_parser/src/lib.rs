@@ -824,10 +824,18 @@ impl<'a> Parser<'a> {
         while !self.at(T::RBrace) && !self.at(T::Eof) {
             let arm_start = self.span();
             let pat = self.parse_pattern();
+            // Optional `if <expr>` guard between the pattern and `=>`. The guard head disallows a
+            // bare struct literal (like other condition heads) so `n if Foo { .. }` isn't ambiguous.
+            let guard = if self.eat(T::If) {
+                Some(self.parse_cond())
+            } else {
+                None
+            };
             self.expect(T::FatArrow);
             let body = self.parse_expr();
             arms.push(MatchArm {
                 pat,
+                guard,
                 body,
                 span: arm_start.to(self.prev_span()),
             });
@@ -1068,6 +1076,38 @@ impl<'a> Parser<'a> {
                     self.expect(T::RParen);
                     PatKind::Tuple(subs)
                 }
+            }
+            // Integer literal pattern (a `match` arm like `0 =>` / `1 =>`).
+            T::Int => {
+                let sym = self.intern_span(start);
+                self.bump();
+                PatKind::Int { sym, neg: false }
+            }
+            // Negative integer literal pattern (`-1 =>`); fold the sign into the pattern since a
+            // literal pattern has no sub-expression to negate.
+            T::Minus => {
+                self.bump();
+                if self.at(T::Int) {
+                    let isp = self.span();
+                    let sym = self.intern_span(isp);
+                    self.bump();
+                    PatKind::Int { sym, neg: true }
+                } else {
+                    self.error(
+                        start,
+                        "E0206",
+                        format!("expected an integer after `-`, found {}", self.kind().describe()),
+                    );
+                    PatKind::Wildcard
+                }
+            }
+            T::True => {
+                self.bump();
+                PatKind::Bool(true)
+            }
+            T::False => {
+                self.bump();
+                PatKind::Bool(false)
             }
             _ => {
                 self.error(

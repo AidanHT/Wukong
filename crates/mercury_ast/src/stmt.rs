@@ -83,4 +83,10 @@ pub enum PatKind {
     Ident(Symbol),
     Tuple(Vec<Pattern>),
     Unit,
+    /// An integer (or other numeric) literal pattern, e.g. `1` / `-3` in a `match` arm. The raw
+    /// source text is stored (like `ExprKind::Int`) and parsed later; a leading `-` is folded in by
+    /// the parser (`neg: true`), since a literal pattern has no sub-expressions to negate.
+    Int { sym: Symbol, neg: bool },
+    /// A boolean literal pattern (`true` / `false`).
+    Bool(bool),
 }
