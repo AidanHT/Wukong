@@ -362,7 +362,25 @@ impl Sema<'_> {
                 }
                 Ty::Scalar(elem)
             }
-            Ty::Slice(e) | Ty::Array { elem: e, .. } | Ty::Ptr { pointee: e, .. } => *e,
+            Ty::Array { elem, len } => {
+                // A constant index known at compile time must be in bounds — the headline
+                // compile-time-safety check applied to fixed-size arrays (an out-of-bounds read is
+                // otherwise undefined: the backends disagree). Only a literal index is checked; a
+                // runtime `a[i]` is unconstrained.
+                if indices.len() == 1 {
+                    if let Some(v) = crate::eval_const_int(&indices[0], self.interner) {
+                        if v < 0 || v as u64 >= len {
+                            self.error(
+                                span,
+                                "E0501",
+                                format!("index {v} is out of bounds for an array of length {len}"),
+                            );
+                        }
+                    }
+                }
+                *elem
+            }
+            Ty::Slice(e) | Ty::Ptr { pointee: e, .. } => *e,
             _ => Ty::Unknown,
         }
     }
