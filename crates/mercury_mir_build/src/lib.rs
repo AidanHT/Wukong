@@ -9836,6 +9836,12 @@ impl FnLowerer<'_> {
                     } else {
                         self.builder.build(ty.clone(), Op::Load(slot, ty))
                     }
+                } else if let Some(init) = self.sema.consts.get(&p.first().sym).cloned() {
+                    // A top-level `const`: inline its initializer at the use site (the def map records
+                    // only the const's type, not its value). The initializer was type-checked by
+                    // sema, so its nodes carry types and lower correctly; a const referencing another
+                    // const recurses through this same arm.
+                    self.lower_expr(&init)
                 } else {
                     self.unsupported(p.span, "value reference");
                     let t = self.expr_mir(e);

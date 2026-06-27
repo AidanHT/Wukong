@@ -59,6 +59,10 @@ impl DefMap {
 pub struct SemaResult {
     pub types: HashMap<NodeId, Ty>,
     pub defs: DefMap,
+    /// Top-level `const` initializer expressions, by name. Their nodes are type-checked (and adapted
+    /// literals retyped) like a `let`, so `mir_build` can lower a const reference by inlining the
+    /// initializer with correct types. The `DefMap` records only a const's *type*, not its value.
+    pub consts: HashMap<Symbol, Expr>,
 }
 
 /// Analyze a module, returning per-expression types and any diagnostics.
@@ -72,12 +76,14 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         generics: HashSet::new(),
         ret_ty: Ty::Unit,
         loop_depth: 0,
+        consts: HashMap::new(),
     };
     s.collect(module);
     s.check_bodies(module);
     let result = SemaResult {
         types: s.types,
         defs: s.defs,
+        consts: s.consts,
     };
     (result, s.diags)
 }
@@ -94,6 +100,8 @@ struct Sema<'a> {
     /// is a hard error (E0303) — without it the lowerer emits an `unreachable` terminator, which the
     /// interpreter traps but the native backend turns into a SIGILL, a differential-gate divergence.
     loop_depth: u32,
+    /// Top-level `const` initializer expressions (by name), accumulated as their bodies are checked.
+    consts: HashMap<Symbol, Expr>,
 }
 
 impl Sema<'_> {
@@ -272,12 +280,43 @@ impl Sema<'_> {
 
     fn check_bodies(&mut self, module: &Module) {
         for item in &module.items {
-            if let ItemKind::Fn(f) = &item.kind {
-                if let Some(body) = &f.body {
-                    self.check_fn(f, body);
+            match &item.kind {
+                ItemKind::Fn(f) => {
+                    if let Some(body) = &f.body {
+                        self.check_fn(f, body);
+                    }
                 }
+                ItemKind::Const(c) => self.check_const(c, item.span),
+                _ => {}
             }
         }
+    }
+
+    /// Type-check a top-level `const`'s initializer against its annotation (like a `let`, so an
+    /// unsuffixed literal adapts to the annotated type) and record the initializer so `mir_build`
+    /// can inline it at each use site. Evaluated at module scope (a const may reference another
+    /// const by name, resolved through the def map, not local scopes).
+    fn check_const(&mut self, c: &ConstDecl, span: Span) {
+        self.generics.clear();
+        self.scopes.clear();
+        self.scopes.push(HashMap::new());
+        let ann = self.lower_type(&c.ty);
+        let vty = self.type_expr(&c.value);
+        if self.let_compatible(&ann, &c.value, &vty) {
+            self.retype_adapted_literal(&c.value, &ann);
+        } else {
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "type mismatch: const `{}` is annotated `{}` but the value is `{}`",
+                    self.sym_str(c.name.sym),
+                    ann.display(self.interner),
+                    vty.display(self.interner)
+                ),
+            );
+        }
+        self.consts.insert(c.name.sym, c.value.clone());
     }
 
     fn check_fn(&mut self, f: &FnDecl, body: &Block) {

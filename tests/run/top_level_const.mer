@@ -1,0 +1,34 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 64
+// EXPECT-OUT: 128
+// EXPECT-OUT: 30
+// EXPECT-OUT: 65
+// EXPECT-OUT: 5
+module tests.run.top_level_const
+
+// A top-level `const` can be used as a value. The def map records only a const's *type*, so sema
+// type-checks each initializer (adapting an unsuffixed literal to the annotation) and records it,
+// and mir_build inlines the initializer at every use site — as a bare value, in arithmetic, as an
+// array index, as a loop bound, and when one const references another (recursive inlining). The
+// value is a compile-time constant, so the interpreter and native backend agree by construction.
+const N: i32 = 64;
+const A: i32 = 64;
+const B: i32 = A + 1;        // const referencing another const
+const IDX: i32 = 2;
+const LIM: i32 = 5;
+
+fn main() -> i32 {
+    print(N);                       // 64
+    print(N * 2);                   // 128
+
+    let a: [i32; 4] = [10, 20, 30, 40];
+    print(a[IDX]);                  // 30  (const as array index)
+
+    print(B);                       // 65  (A + 1)
+
+    let mut c: i32 = 0;
+    for i in 0..LIM { c += 1; }     // const as a loop bound
+    print(c);                       // 5
+    return 0;
+}
