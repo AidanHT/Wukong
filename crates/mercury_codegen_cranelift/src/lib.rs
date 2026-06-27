@@ -52,6 +52,26 @@ extern "C" fn rt_print_f64(x: f64) {
     }
 }
 
+// `print`/`println` of a `*u8` string lowers to this. Reads the NUL-terminated byte buffer the
+// string literal materialized on the stack and appends its bytes plus a newline — the identical
+// bytes the interpreter's `print_str` produces (the buffer is always valid UTF-8 by construction).
+extern "C" fn rt_print_str(ptr: *const u8) {
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: `ptr` is a Mercury string buffer, always NUL-terminated by the `ExprKind::Str` lowering.
+    unsafe {
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        if let Ok(mut o) = OUTPUT.lock() {
+            o.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+            o.push(b'\n');
+        }
+    }
+}
+
 extern "C" fn rt_assert(cond: i64) {
     if cond == 0 {
         ASSERT_FAILED.store(true, Ordering::SeqCst);
@@ -73,6 +93,7 @@ extern "C" fn rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// the object emitter (which leaves them as undefined imports resolved at link time).
 const RT_PRINT_I64: &str = "mercury_rt_print_i64";
 const RT_PRINT_F64: &str = "mercury_rt_print_f64";
+const RT_PRINT_STR: &str = "mercury_rt_print_str";
 const RT_ASSERT: &str = "mercury_rt_assert";
 const RT_PARALLEL_FOR: &str = "mercury_parallel_for";
 const RT_SGEMM: &str = "mercury_sgemm";
@@ -201,6 +222,7 @@ const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 enum Intrinsic {
     PrintInt,
     PrintFloat,
+    PrintStr,
     Assert,
 }
 
@@ -211,6 +233,8 @@ fn classify_intrinsic(name: &str, arg_is_float: bool) -> Option<Intrinsic> {
         } else {
             Intrinsic::PrintInt
         }),
+        // mir_build routes a `*u8` (string) argument to these symbols (see `print_str` in GemmSyms).
+        "print_str" | "println_str" => Some(Intrinsic::PrintStr),
         "assert" => Some(Intrinsic::Assert),
         _ => None,
     }
@@ -1377,6 +1401,14 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().call(fref, &[v]);
                 }
             }
+            Intrinsic::PrintStr => {
+                if let Some(&a) = args.first() {
+                    // The argument is already a pointer (the string buffer's base); pass it through.
+                    let v = self.val(a);
+                    let fref = self.rt_refs[RT_PRINT_STR];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
             Intrinsic::Assert => {
                 if let Some(&a) = args.first() {
                     let v = self.coerce_to_i64(a);
@@ -1456,6 +1488,7 @@ impl<'a> FnTranslator<'a> {
 struct RtFuncs {
     print_i64: FuncId,
     print_f64: FuncId,
+    print_str: FuncId,
     assert: FuncId,
     parallel_for: FuncId,
     sgemm: FuncId,
@@ -1796,12 +1829,18 @@ fn populate_module<M: Module>(
     sig_fmod_f32.params.push(AbiParam::new(types::F32));
     sig_fmod_f32.params.push(AbiParam::new(types::F32));
     sig_fmod_f32.returns.push(AbiParam::new(types::F32));
+    // mercury_rt_print_str(ptr) — render a NUL-terminated string buffer. Void.
+    let mut sig_print_str = Signature::new(call_conv);
+    sig_print_str.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
             .map_err(|e| e.to_string())?,
         print_f64: module
             .declare_function(RT_PRINT_F64, Linkage::Import, &sig_f)
+            .map_err(|e| e.to_string())?,
+        print_str: module
+            .declare_function(RT_PRINT_STR, Linkage::Import, &sig_print_str)
             .map_err(|e| e.to_string())?,
         assert: module
             .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
@@ -2197,6 +2236,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_PRINT_I64,
                 module.declare_func_in_func(rt.print_i64, builder.func),
+            );
+            rt_refs.insert(
+                RT_PRINT_STR,
+                module.declare_func_in_func(rt.print_str, builder.func),
             );
             rt_refs.insert(
                 RT_PRINT_F64,
@@ -2766,6 +2809,7 @@ pub fn jit_compile(
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
+    builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
@@ -3225,6 +3269,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
+    builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,

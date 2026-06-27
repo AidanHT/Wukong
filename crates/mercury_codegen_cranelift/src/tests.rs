@@ -809,6 +809,39 @@ fn differential_char_literals() {
     }
 }
 
+/// A `*u8` string argument to `print`/`println` renders its bytes; native (`rt_print_str` over the
+/// materialized NUL-terminated buffer) must produce byte-identical stdout to the interpreter (which
+/// walks its slot memory). Covers a literal argument, a `let`-bound string, the `\t`/`\n`/`\\`/`\"`
+/// escapes, an empty string, a multi-byte `\u{…}`, and strings interleaved with numeric prints (so
+/// the type-directed dispatch is exercised both ways). `assert_eq!(n, i)` compares exit code AND the
+/// whole stdout buffer.
+#[test]
+fn differential_string_literals() {
+    let programs = [
+        "fn main() -> i32 { println(\"hello\"); return 0; }",
+        // a let-bound string, then printed
+        "fn main() -> i32 { let s = \"world\"; print(s); return 0; }",
+        // escapes: tab, newline-in-string, backslash, quote
+        "fn main() -> i32 { print(\"a\\tb\"); print(\"x\\\\y\"); print(\"q\\\"r\"); return 0; }",
+        // empty string prints just a newline
+        "fn main() -> i32 { print(\"\"); print(\"after\"); return 0; }",
+        // multi-byte UTF-8 via \u{…}
+        "fn main() -> i32 { println(\"caf\\u{e9}\"); return 0; }",
+        // interleave string and numeric prints — type-directed dispatch both ways
+        "fn main() -> i32 { print(\"n=\"); print(42); print(\"done\"); return 0; }",
+        // a string returned through a helper that takes/returns *u8
+        "fn id(p: *u8) -> *u8 { return p; } \
+         fn main() -> i32 { print(id(\"piped\")); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "string native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Integer → `f32` conversion must round in a single IEEE step. The interpreter used to go int→f64→
 /// f32 (two roundings) while native does one `fcvt_from_{sint,uint}(F32)`, so they disagreed for
 /// magnitudes above 2^53 — the differential oracle was silently wrong. Pin both to the correctly
