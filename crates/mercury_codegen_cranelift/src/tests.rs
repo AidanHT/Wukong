@@ -282,6 +282,40 @@ fn differential_nested_struct() {
     }
 }
 
+/// `&&` / `||` short-circuit: the RHS runs only when the LHS doesn't decide the result. The captured
+/// stdout (the `jit`/`interp` helpers return it) is the side-effect evidence, so a regression to a
+/// bitwise `and`/`or` of both operands would change the printed trace AND must still agree
+/// native==interp. Also proves the guard idiom `n != 0 && 100/n > 0` does NOT divide by zero.
+#[test]
+fn differential_short_circuit() {
+    let programs = [
+        // side(t) prints t and returns true; falseside prints t and returns false.
+        "fn side(t: i32) -> bool { print(t); return true; } \
+         fn fs(t: i32) -> bool { print(t); return false; } \
+         fn main() -> i32 { \
+           if false && side(1) { print(91); } \
+           if true || side(2) { print(92); } \
+           if true && side(3) { print(93); } \
+           if false || side(4) { print(94); } \
+           if fs(5) && side(6) { print(95); } \
+           if side(7) || side(8) { print(97); } \
+           return 0; }",
+        // short-circuit guards an unsafe RHS: n==0 so 100/n must never be evaluated.
+        "fn main() -> i32 { let n: i32 = 0; let mut hit: i32 = 0; \
+         if n != 0 && 100 / n > 0 { hit = 1; } print(hit); return 0; }",
+        // nested / chained short-circuit with mixed operators.
+        "fn t(x: i32) -> bool { print(x); return x > 0; } \
+         fn main() -> i32 { if t(1) && (t(0) || t(2)) && t(3) { print(99); } return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "short-circuit native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// `continue` inside a range `for` must run the loop step (the step lives at the body tail, so the
 /// lowering routes `continue` to a latch that increments first) — otherwise the loop never
 /// terminates. Native must agree with interp and actually halt (the test would hang on a regression).
