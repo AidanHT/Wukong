@@ -562,6 +562,33 @@ fn differential_float_narrow_int_cast() {
     }
 }
 
+/// Top-level `const` references. The def map records only a const's *type*, so reading one as a
+/// value used to fail with C0001 ("value reference … not yet supported"). Sema now type-checks each
+/// const initializer and records it; `mir_build` inlines the initializer at every use site. Covers
+/// a bare reference, use in arithmetic / as an array index / as a loop bound, an `f32` const, and a
+/// const that references another const (recursive inlining). Both backends agree by construction.
+#[test]
+fn differential_top_level_const() {
+    let cases = [
+        ("const N: i32 = 64; fn main() -> i32 { return N; }", 64),
+        ("const N: i32 = 64; fn main() -> i32 { return N * 2 + 1; }", 129),
+        ("const I: i32 = 2; fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[I]; }", 30),
+        ("const A: i32 = 64; const B: i32 = A + 1; fn main() -> i32 { return B; }", 65),
+        ("const LIM: i32 = 5; fn main() -> i32 { let mut c: i32 = 0; \
+          for i in 0..LIM { c += 1; } return c; }", 5),
+        ("const PI: f32 = 3.5; fn main() -> i32 { return PI as i32; }", 3),
+        ("const BIG: i64 = 1000; fn main() -> i32 { return BIG as i32; }", 1000),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "const native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "const wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
