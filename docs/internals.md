@@ -109,8 +109,12 @@ both the dot-product and accumulate spellings) dispatches to the tuned `mercury_
 just like the flat `a[i*K+k]` form, because a 2-index access supplies its row stride from the
 operand's inner tensor dimension (symbolic-generic dimensions remain checked-only). The aggregate path is differentially gated
 bit-for-bit against the interpreter by the `differential_tuple`/`differential_struct`/
-`differential_nested_struct` Cranelift tests; returning an aggregate *by value* from a function still
-needs an sret ABI and does not yet lower.
+`differential_nested_struct` Cranelift tests. Returning an aggregate *by value* from a function (and a
+by-value aggregate parameter) lowers through a **MIR-level sret ABI** — the callee takes a hidden
+leading destination pointer and returns void, `return Struct{..}` deep-copies into it, and the call
+site allocates the buffer, passes it as the hidden first argument, and uses it as the call's value, so
+no aggregate ever rides in a register and the two backends still agree
+(`differential_struct_across_fns`/`differential_struct_return`).
 
 The **verifier** (`mercury_mir::verify`) checks that every used value is defined, types are
 consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled after every pass.
@@ -156,9 +160,12 @@ kernels) and runs ~1.5–2.5x faster than -O0 under the interpreter.
 ## Interpreter
 
 `mercury_interp` is a zero-dependency CFG walker over MIR. `Value` is `Int(i128) | Float(f64) |
-Ptr(usize) | VecRef(u32) | Unit`; a step limit guards against runaway loops. `run_with_output`
-returns `(exit_code, stdout)`; intrinsics like `print` format into the captured stdout buffer. `f32`
-ops are computed in `f32` (single rounding) so the interpreter matches native bit-for-bit. SIMD
+Ptr(usize) | VecRef(u32) | Unit`; a step limit guards against runaway loops, and the walk runs on a
+scoped 512 MiB-stack worker thread so deep recursion does not overflow the host stack (an uncatchable
+overflow would otherwise abort the oracle). `run_with_output` returns `(exit_code, stdout)`;
+intrinsics like `print` format into the captured stdout buffer. `f32` ops are computed in `f32`
+(single rounding), and an `int → f32` cast rounds straight to `f32` (not via `f64`), so the
+interpreter matches native's single conversion bit-for-bit. SIMD
 vectors are executed lane-wise via a side arena (`VecRef` indexes it, keeping `Value` `Copy`). The
 interpreter is the sound oracle for differential testing.
 

@@ -57,10 +57,25 @@ let x: i32 = 10;        // immutable
 let mut acc: i32 = 0;   // mutable
 acc = acc + x;          // reassignment requires `mut`
 const TILE: usize = 64; // compile-time constant
+let (a, b) = (3, 4);    // tuple destructuring (nested patterns and `_` work too)
 ```
 
 An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine. A typed
 value must match its annotation exactly (see error `E0401`).
+
+A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
+wildcard `let (keep, _) = …`, including the result of a tuple-returning call
+(`tests/run/let_destructure.mer`). A top-level **`const` is usable as a value**: its initializer is
+inlined at every use site — in arithmetic, as an array index, as a loop bound, and when one `const`
+references another (`tests/run/top_level_const.mer`).
+
+## Literals ✅
+
+Integer literals may be **decimal, hex `0xFF`, octal `0o17`, or binary `0b1010`**, with `_` digit
+separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.mer`). A
+**char literal** `'A'` is its `u32` Unicode scalar value — covering the one-character escapes (`\n`
+`\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes — so it can be cast, compared, and used
+in arithmetic (`tests/run/char_literals.mer`).
 
 ## Types
 
@@ -71,9 +86,10 @@ value must match its annotation exactly (see error `E0401`).
 | Boolean     | `bool`                                               | ✅     |
 | Pointers    | `*T`, `*mut T`, references `&T`/`&mut T`, deref `*p`  | ✅     |
 | Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
-| Tuples      | `(A, B, …)`, field access `t.0`                       | ✅     |
+| Tuples      | `(A, B, …)`, field access `t.0`, nested `t.0.1`       | ✅     |
 | Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
-| Aggregates  | slices `[]T`, `enum`                                  | 🟡  |
+| Enums       | C-style `enum E { A = 10, B }` — a variant is its `i32` discriminant | ✅     |
+| Aggregates  | slices `[]T`                                          | 🟡  |
 | SIMD vectors| `f32x4`/`i32x4` (128-bit), generic `vec[T, N]`; wider `f32x8` parses/checks but caps at the 128-bit native ISA | 🟡 |
 | Tensors     | `Tensor[f32, M, N]` (+layout) — **const-shape indexing & ops run**; symbolic generic dims shape-checked | ✅ / 🟡 |
 
@@ -95,7 +111,30 @@ break; continue;                // ✅ innermost loop (labeled `break 'l` is �
 return expr;
 ```
 
-Blocks are expressions: the trailing expression of a block (no semicolon) is its value.
+Blocks are expressions: the trailing expression of a block (no semicolon) is its value. A
+`break`/`continue` with no enclosing loop is a compile error (`E0303`).
+
+## Pattern matching ✅
+
+```mercury
+fn classify(n: i32) -> i32 {
+    return match n {
+        0 => 10,             // literal pattern
+        1 | 2 | 3 => 20,     // or-pattern
+        4..10 => 30,         // half-open range (`4..=9` is the inclusive form)
+        x if x > 100 => 99,  // identifier binding + an `if` guard
+        _ => 0,              // wildcard catch-all
+    };
+}
+```
+
+`match` evaluates its scrutinee once and lowers to an if-else chain over the arms. Patterns are
+integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
+**ranges**, **enum-variant** patterns `Color::Red` (matched by discriminant), **tuple** patterns
+`(0, _) => …` (each field tested and bound, nesting allowed — and these compose, e.g. `(0 | 1, y)`),
+an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. Any arm may carry an
+optional `if` guard, and `match` works in both value and statement position. See
+`tests/run/{match_expr,match_patterns,match_tuple}.mer`.
 
 ## Tuples and structs ✅
 
@@ -113,14 +152,30 @@ fn main() -> i32 {
 ```
 
 Tuples and structs lower to a flat, padded byte buffer (the local's value *is* its base pointer, the
-same convention arrays follow); field access is a typed load/store at the field's byte offset.
+same convention arrays follow); field access is a typed load/store at the field's byte offset, and a
+field that is itself a tuple is reached by chaining — `t.0.1`, `t.0.0.0` (`tests/run/nested_tuple_field.mer`).
 **Nested aggregates** work too: a struct/tuple field that is itself a struct (any depth), and arrays
 of structs, lay out recursively, and an aggregate field initialized from a non-literal value is
-deep-copied leaf by leaf (`tests/run/struct_nested.mer`). Both run identically on the interpreter and
-the native backend. Aggregate *literals* are construction
-sites (a `let` initializer or a value argument); passing an aggregate **by value into/out of a
-function** (a tuple/struct parameter or return) is not yet wired — pass by `*`/`&` or use array
-out-params. `enum`s parse but do not yet run (🟡).
+deep-copied leaf by leaf (`tests/run/struct_nested.mer`). Whole-aggregate **assignment** (`s = other;`)
+deep-copies leaf by leaf as well (`tests/run/struct_assign.mer`). Both run identically on the
+interpreter and the native backend. A tuple/struct also passes **by value into and out of a
+function** — a by-value parameter and a `fn … -> Struct` return are modeled with a hidden-pointer
+(sret) ABI in mir_build, so no aggregate ever rides in a register and the two backends agree
+(`tests/run/{struct_fn,struct_return}.mer`).
+
+## Enums ✅
+
+```mercury
+enum Code { Ok = 10, Err = 20 }
+enum Color { Red, Green, Blue }   // 0, 1, 2 (auto-increment from 0)
+enum Step { A = 5, B, C }         // 5, 6, 7 (continue after the last explicit value)
+```
+
+A **C-style enum** gives each variant an integer discriminant — explicit (`= 10`) or
+auto-incrementing from the previous. A variant `E::Name` *is* its discriminant, so it can be bound to
+a `let`, compared (`==`), cast (`Code::Ok as i32`), and used as a `match` pattern
+(`tests/run/enum_cstyle.mer`). Data-carrying (tagged-union) variants — and matching over an enum
+*payload* — are not supported; only C-style enums and matching by discriminant.
 
 ## Tensors and compile-time shape checking ✅ shape-check + const-shape exec (the headline feature)
 
@@ -206,6 +261,11 @@ LLVM backend, by the runtime).
   `softsign(x) = x/(1+|x|)`; `logsigmoid(x) = ln σ(x)`, the stable BCE-with-logits primitive;
   `mish(x) = x·tanh(softplus(x))`). Plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`.
 - `fmax(a, b)` / `fmin(a, b)`.
+
+These intrinsics also accept **integer** operands: `abs`/`round`/`floor`/`ceil`/`trunc` are
+type-preserving on an integer (integer `abs` is `select(x < 0, −x, x)`; rounding an integer is the
+identity), while `sqrt` and the transcendentals promote an integer operand to `f32`
+(`tests/run/int_math.mer`).
 
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
