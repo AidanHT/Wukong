@@ -12,6 +12,9 @@ pub enum TokenKind {
     Float,
     Str,
     Char,
+    /// A loop label `'name` (the leading `'` is part of the span; the value is read from source).
+    /// Disambiguated from a char literal `'a'` by the lexer (a closing `'` means a char).
+    Label,
 
     // Keywords
     Fn,
@@ -184,6 +187,7 @@ impl TokenKind {
             Float => "float literal",
             Str => "string literal",
             Char => "char literal",
+            Label => "loop label",
             Eof => "end of file",
             Error => "invalid token",
             other => other.glyph().unwrap_or("token"),
@@ -270,7 +274,7 @@ impl TokenKind {
             CaretEq => "^=",
             ShlEq => "<<=",
             ShrEq => ">>=",
-            Ident | Int | Float | Str | Char | Eof | Error => return None,
+            Ident | Int | Float | Str | Char | Label | Eof | Error => return None,
         })
     }
 
@@ -283,6 +287,7 @@ impl TokenKind {
             Float => "Float",
             Str => "Str",
             Char => "Char",
+            Label => "Label",
             Fn => "Fn",
             Let => "Let",
             Mut => "Mut",

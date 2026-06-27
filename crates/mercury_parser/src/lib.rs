@@ -924,13 +924,24 @@ impl<'a> Parser<'a> {
                 }
                 T::Break => {
                     self.bump();
+                    // Optional target label: `break 'outer;`.
+                    let label = if self.at(T::Label) {
+                        Some(self.label_ident())
+                    } else {
+                        None
+                    };
                     self.eat(T::Semi);
-                    stmts.push(self.mk_stmt(attrs, StmtKind::Break(None), stmt_start));
+                    stmts.push(self.mk_stmt(attrs, StmtKind::Break(label), stmt_start));
                 }
                 T::Continue => {
                     self.bump();
+                    let label = if self.at(T::Label) {
+                        Some(self.label_ident())
+                    } else {
+                        None
+                    };
                     self.eat(T::Semi);
-                    stmts.push(self.mk_stmt(attrs, StmtKind::Continue(None), stmt_start));
+                    stmts.push(self.mk_stmt(attrs, StmtKind::Continue(label), stmt_start));
                 }
                 T::Defer => {
                     self.bump();
@@ -939,15 +950,36 @@ impl<'a> Parser<'a> {
                     stmts.push(self.mk_stmt(attrs, StmtKind::Defer(e), stmt_start));
                 }
                 T::While => {
-                    let k = self.parse_while();
+                    let k = self.parse_while(None);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::For => {
-                    let k = self.parse_for();
+                    let k = self.parse_for(None);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::Loop => {
-                    let k = self.parse_loop();
+                    let k = self.parse_loop(None);
+                    stmts.push(self.mk_stmt(attrs, k, stmt_start));
+                }
+                // `'label: loop/while/for { … }` — a labeled loop. The label binds the loop a
+                // `break`/`continue` `'label` can target.
+                T::Label => {
+                    let label = self.label_ident();
+                    self.expect(T::Colon);
+                    let k = match self.kind() {
+                        T::While => self.parse_while(Some(label)),
+                        T::For => self.parse_for(Some(label)),
+                        T::Loop => self.parse_loop(Some(label)),
+                        _ => {
+                            let sp = self.span();
+                            self.error(
+                                sp,
+                                "E0200",
+                                "expected `loop`, `while`, or `for` after a label",
+                            );
+                            continue;
+                        }
+                    };
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 _ => {
@@ -1017,18 +1049,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_while(&mut self) -> StmtKind {
+    fn parse_while(&mut self, label: Option<Ident>) -> StmtKind {
         self.bump(); // while
         let cond = self.parse_cond();
         let body = self.parse_block();
         StmtKind::While {
-            label: None,
+            label,
             cond,
             body,
         }
     }
 
-    fn parse_for(&mut self) -> StmtKind {
+    fn parse_for(&mut self, label: Option<Ident>) -> StmtKind {
         self.bump(); // for
         let pat = self.parse_pattern();
         self.expect(T::In);
@@ -1037,17 +1069,26 @@ impl<'a> Parser<'a> {
         self.no_struct_lit = prev;
         let body = self.parse_block();
         StmtKind::For {
-            label: None,
+            label,
             pat,
             iter,
             body,
         }
     }
 
-    fn parse_loop(&mut self) -> StmtKind {
+    fn parse_loop(&mut self, label: Option<Ident>) -> StmtKind {
         self.bump(); // loop
         let body = self.parse_block();
-        StmtKind::Loop { label: None, body }
+        StmtKind::Loop { label, body }
+    }
+
+    /// Read a loop-label token `'name` at the cursor, interning the name without the leading `'`.
+    fn label_ident(&mut self) -> Ident {
+        let span = self.span();
+        self.bump();
+        let text = &self.src[span.lo as usize + 1..span.hi as usize];
+        let sym = self.interner.intern(text);
+        Ident { sym, span }
     }
 
     fn parse_for_iter(&mut self) -> ForIter {

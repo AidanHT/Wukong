@@ -346,6 +346,40 @@ fn differential_for_continue() {
     }
 }
 
+/// A labeled `break`/`continue` `'l` targets the enclosing loop named `'l` (not just the innermost),
+/// so it can escape or restart an *outer* loop from inside a nested one. Native must agree with interp
+/// that the branch goes to the labeled loop's break/continue block. Covers labeled break/continue out
+/// of a nested `for`, a labeled `break` out of a `while`, a labeled `loop`, and the interaction with an
+/// unlabeled inner break (the inner one stays innermost-scoped).
+#[test]
+fn differential_labeled_loops() {
+    let programs = [
+        // continue 'outer skips the rest of the inner loop and resumes the outer for.
+        "fn main() -> i32 { let mut c: i32 = 0; \
+         'o: for i in 0..4 { for j in 0..4 { if j == 2 { continue 'o; } c = c + 1; } } return c; }",
+        // break 'outer escapes both loops at once.
+        "fn main() -> i32 { let mut c: i32 = 0; \
+         'o: for i in 0..5 { for j in 0..5 { if i + j >= 3 { break 'o; } c = c + 1; } } return c; }",
+        // labeled break out of a while from inside a for.
+        "fn main() -> i32 { let mut k: i32 = 0; \
+         'w: while k < 1000 { for m in 0..10 { if m == 4 { break 'w; } k = k + 1; } } return k; }",
+        // labeled loop {} with a labeled break.
+        "fn main() -> i32 { let mut n: i32 = 0; \
+         'l: loop { n = n + 1; for _q in 0..3 { if n >= 7 { break 'l; } n = n + 1; } } return n; }",
+        // unlabeled inner break coexists with an outer label: inner break exits only the inner loop.
+        "fn main() -> i32 { let mut c: i32 = 0; \
+         'o: for i in 0..3 { for j in 0..9 { if j == 2 { break; } c = c + 1; } if i == 1 { break 'o; } } \
+         return c; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "labeled-loop native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Structs cross function boundaries: a struct passed **by value** (`fn f(p: Pt)`) is passed by base
 /// pointer (its registry-aware ABI is a buffer pointer, not the `I32` the free `mir_ty` gave — which
 /// is what made the native verifier reject the field GEP and `mem2reg` panic at -O2), and field
