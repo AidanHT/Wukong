@@ -562,16 +562,20 @@ fn lower_fn(
     };
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
-    // Arrays are passed by base pointer (ABI type `Ptr`); scalars by value.
-    let param_vals: Vec<ValueId> = param_tys
+    // Arrays AND aggregates (tuples/structs) are passed by base pointer (ABI type `Ptr`); scalars by
+    // value. `mir_ty_of` (registry-aware) resolves a named-struct param to its byte-buffer `Array`
+    // type — the free `mir_ty` falls back to `I32`, which mistyped a struct param as a scalar (the
+    // root of the by-value-struct miscompile and the `mem2reg` panic that promoted that bogus slot).
+    let param_abis: Vec<MirType> = param_tys.iter().map(|pty| fl.param_abi(pty)).collect();
+    let param_vals: Vec<ValueId> = param_abis
         .iter()
-        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+        .map(|abi| fl.builder.add_param(abi.clone()))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = mir_ty(pty);
+        let mty = fl.mir_ty_of(pty);
         if matches!(mty, MirType::Array(..)) {
-            // The parameter value *is* the array's base pointer; bind it directly so indexing
-            // geps off it (no copy into a local slot).
+            // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
+            // access geps off it (no copy into a local slot).
             fl.bind(p.name.sym, val, mty);
         } else {
             let slot = fl.builder.alloca(mty.clone());
@@ -1207,6 +1211,16 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// The ABI type of a parameter of semantic type `ty`: an aggregate (array/tuple/struct, whose
+    /// `mir_ty_of` is an `Array` byte buffer) is passed by base **pointer**; a scalar by value. The
+    /// registry-aware companion to the free `param_abi_ty` (which mistypes a named struct as `I32`).
+    fn param_abi(&self, ty: &Ty) -> MirType {
+        match self.mir_ty_of(ty) {
+            MirType::Array(..) => MirType::Ptr,
+            t => t,
+        }
+    }
+
     /// Size in bytes of `ty`, resolving named structs through the sema registry — the registry-aware
     /// companion to `Ty::size_of` (which returns `None` for `Ty::Named`, since the leaf type crate
     /// has no def access). Recurses through arrays/tuples so nested structs lay out correctly.
@@ -1300,10 +1314,21 @@ impl FnLowerer<'_> {
             .try_fold(1u64, |a, (_, f)| Some(a.max(self.ty_align(f)?)))
     }
 
-    /// Address + MIR type of struct field `fname` of the struct expression `base` (the local's value
-    /// is its buffer pointer, like a tuple/array). Drives `s.f` reads and `s.f = …` writes.
+    /// Address + MIR type of struct field `fname` of the struct expression `base`. The base lowers to
+    /// a pointer to the struct buffer in every case: a struct *local* (its bound value *is* the buffer
+    /// pointer, like a tuple/array), and **a pointer/reference to a struct** — `p.f` on a `&Pt` /
+    /// `*mut Pt` param auto-derefs (the bound `Ptr` slot loads the pointer, then this GEPs the field).
+    /// So a struct passed by `&`/`*` works the same as a local. Drives `s.f` reads and `s.f = …` writes.
     fn struct_field_place(&mut self, base: &Expr, fname: Symbol) -> (ValueId, MirType) {
-        if let Ty::Named(sym) = self.expr_ty(base) {
+        let struct_sym = match self.expr_ty(base) {
+            Ty::Named(sym) => Some(sym),
+            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => match *pointee {
+                Ty::Named(sym) => Some(sym),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(sym) = struct_sym {
             if let Some(layout) = self.struct_layout(sym) {
                 if let Some((_, off, fmty)) = layout.iter().find(|(n, _, _)| *n == fname) {
                     let off = *off;

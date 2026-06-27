@@ -578,10 +578,19 @@ impl Sema<'_> {
             ExprKind::Index { base, indices } => self.type_index(base, indices, e.span),
             ExprKind::Field { base, name } => {
                 let t = self.type_expr(base);
-                // A field access on a struct value resolves to the declared field type; anything
-                // else (a method, an unmodeled builtin) stays lenient (`Unknown`).
-                match t {
-                    Ty::Named(struct_name) => self
+                // A field access on a struct value — or on a pointer/reference to a struct, which
+                // auto-derefs (`p.x` on a `&Pt` / `*mut Pt`) — resolves to the declared field type.
+                // Anything else (a method, an unmodeled builtin) stays lenient (`Unknown`).
+                let struct_name = match &t {
+                    Ty::Named(n) => Some(*n),
+                    Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => match pointee.as_ref() {
+                        Ty::Named(n) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match struct_name {
+                    Some(struct_name) => self
                         .defs
                         .lookup(struct_name)
                         .and_then(|d| match &d.kind {
@@ -592,7 +601,7 @@ impl Sema<'_> {
                             _ => None,
                         })
                         .unwrap_or(Ty::Unknown),
-                    _ => Ty::Unknown,
+                    None => Ty::Unknown,
                 }
             }
             ExprKind::TupleField { base, index } => {
