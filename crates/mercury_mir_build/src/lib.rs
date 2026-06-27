@@ -1183,7 +1183,86 @@ impl FnLowerer<'_> {
     }
 
     fn expr_mir(&self, e: &Expr) -> MirType {
-        mir_ty(&self.expr_ty(e))
+        self.mir_ty_of(&self.expr_ty(e))
+    }
+
+    /// `mir_ty`, but resolves a named struct (`Ty::Named`) to its byte-buffer storage type using the
+    /// struct's field layout from sema (the free `mir_ty` has no def access and would fall back to
+    /// `I32`). A struct value, like a tuple, is a flat padded byte buffer addressed by field offset.
+    fn mir_ty_of(&self, ty: &Ty) -> MirType {
+        if let Ty::Named(sym) = ty {
+            if let Some(size) = self.struct_size(*sym) {
+                return MirType::Array(Box::new(MirType::I8), size as u32);
+            }
+        }
+        mir_ty(ty)
+    }
+
+    /// The field layout of a declared struct: `(field name, byte offset, field MIR type)` in
+    /// declaration order. Reuses `Ty::tuple_offsets` by viewing the struct as a tuple of its field
+    /// types (identical padded layout). `None` if `name` is not a struct or has an unsized field.
+    fn struct_layout(&self, name: Symbol) -> Option<Vec<(Symbol, u64, MirType)>> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        let offsets = Ty::Tuple(fields.iter().map(|(_, t)| t.clone()).collect()).tuple_offsets()?;
+        Some(
+            fields
+                .iter()
+                .zip(offsets)
+                .map(|((fname, _), (off, fty))| (*fname, off, mir_ty(&fty)))
+                .collect(),
+        )
+    }
+
+    /// Total padded byte size of a declared struct (its alloca size).
+    fn struct_size(&self, name: Symbol) -> Option<u64> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        Ty::Tuple(fields.iter().map(|(_, t)| t.clone()).collect()).size_of()
+    }
+
+    /// Address + MIR type of struct field `fname` of the struct expression `base` (the local's value
+    /// is its buffer pointer, like a tuple/array). Drives `s.f` reads and `s.f = …` writes.
+    fn struct_field_place(&mut self, base: &Expr, fname: Symbol) -> (ValueId, MirType) {
+        if let Ty::Named(sym) = self.expr_ty(base) {
+            if let Some(layout) = self.struct_layout(sym) {
+                if let Some((_, off, fmty)) = layout.iter().find(|(n, _, _)| *n == fname) {
+                    let off = *off;
+                    let fmty = fmty.clone();
+                    let base_ptr = self.lower_expr(base);
+                    let p = self.field_ptr(base_ptr, off);
+                    return (p, fmty);
+                }
+            }
+        }
+        self.unsupported(base.span, "field access on a non-struct value");
+        let ty = MirType::I32;
+        (self.builder.alloca(ty.clone()), ty)
+    }
+
+    /// Lower a struct literal `Name { f: v, … }` into the byte buffer at `base`: one typed store per
+    /// field at its declared offset (field order in the literal may differ from declaration order —
+    /// each value goes to its named field's offset). Reuses the tuple/array byte-GEP machinery.
+    fn lower_struct_init(&mut self, base: ValueId, sym: Symbol, fields: &[ast::FieldInit], span: Span) {
+        let Some(layout) = self.struct_layout(sym) else {
+            self.unsupported(span, "struct with an unsized field");
+            return;
+        };
+        for fi in fields {
+            let Some((_, off, fmty)) = layout.iter().find(|(n, _, _)| *n == fi.name.sym) else {
+                self.unsupported(fi.name.span, "unknown struct field");
+                continue;
+            };
+            let off = *off;
+            let fmty = fmty.clone();
+            let v0 = self.lower_expr(&fi.value);
+            let vty = self.expr_mir(&fi.value);
+            let v = self.coerce_to(v0, &vty, &fmty, self.signed(&fi.value));
+            let p = self.field_ptr(base, off);
+            self.builder.build_void(Op::Store { ptr: p, value: v });
+        }
     }
 
     fn signed(&self, e: &Expr) -> bool {
@@ -4092,21 +4171,33 @@ impl FnLowerer<'_> {
     fn lower_stmt(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Let { pat, ty, init, .. } => {
-                let mty = match ty {
-                    Some(t) => mir_ty_of_ast(t, self.interner),
-                    None => init
-                        .as_ref()
-                        .map(|e| self.expr_mir(e))
-                        .unwrap_or(MirType::I32),
+                let mty = match (ty, init) {
+                    // An aggregate (struct/tuple) literal sizes its slot from the init's sema type —
+                    // the free annotation lowering (`mir_ty_of_ast`) cannot size a named struct.
+                    (_, Some(e))
+                        if matches!(
+                            &e.kind,
+                            ExprKind::StructLit { .. } | ExprKind::TupleLit(_)
+                        ) =>
+                    {
+                        self.expr_mir(e)
+                    }
+                    (Some(t), _) => mir_ty_of_ast(t, self.interner),
+                    (None, Some(e)) => self.expr_mir(e),
+                    (None, None) => MirType::I32,
                 };
                 let slot = self.builder.alloca(mty.clone());
                 if let Some(e) = init {
-                    // A tuple initializer fills the byte buffer field-by-field (the slot *is* the
-                    // buffer, like an array). Detected by the literal shape so non-aggregate inits
-                    // are unaffected.
+                    // A tuple/struct initializer fills the byte buffer field-by-field (the slot *is*
+                    // the buffer, like an array). Detected by the literal shape so non-aggregate
+                    // inits are unaffected.
                     if let ExprKind::TupleLit(items) = &e.kind {
                         let tty = self.expr_ty(e);
                         self.lower_tuple_init(slot, &tty, items);
+                    } else if let ExprKind::StructLit { fields, .. } = &e.kind {
+                        if let Ty::Named(sym) = self.expr_ty(e) {
+                            self.lower_struct_init(slot, sym, fields, e.span);
+                        }
                     } else if let MirType::Array(elem, n) = &mty {
                         self.lower_array_init(slot, elem, *n, e);
                     } else {
@@ -9354,6 +9445,8 @@ impl FnLowerer<'_> {
             }
             // `t.0 = …` — assign to a tuple field at its byte offset.
             ExprKind::TupleField { base, index } => self.tuple_field_place(base, *index as usize),
+            // `s.field = …` — assign to a struct field at its declared byte offset.
+            ExprKind::Field { base, name } => self.struct_field_place(base, name.sym),
             // Multi-dimensional tensor indexing `t[i, j, …]` — the shape-typed surface. Flatten to a
             // row-major offset using the tensor's static strides.
             ExprKind::Index { base, indices } if indices.len() >= 2 => {
@@ -9421,6 +9514,22 @@ impl FnLowerer<'_> {
             ExprKind::TupleField { base, index } => {
                 let (ptr, fmty) = self.tuple_field_place(base, *index as usize);
                 self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+            }
+            // `s.field` — read a struct field by GEP to its declared byte offset + a typed load.
+            ExprKind::Field { base, name } => {
+                let (ptr, fmty) = self.struct_field_place(base, name.sym);
+                self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+            }
+            // A struct literal in value position materializes a fresh byte buffer, yielding its base
+            // pointer (the same by-pointer convention as arrays/tuples).
+            ExprKind::StructLit { fields, .. } => {
+                let ty = self.expr_ty(e);
+                let size = self.mir_ty_of(&ty);
+                let buf = self.builder.alloca(size);
+                if let Ty::Named(sym) = ty {
+                    self.lower_struct_init(buf, sym, fields, e.span);
+                }
+                buf
             }
             // A tuple literal in value position (a call argument, a nested field) materializes a
             // fresh byte buffer and yields its base pointer — the same by-pointer convention an

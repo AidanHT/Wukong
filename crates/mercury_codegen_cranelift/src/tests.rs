@@ -219,6 +219,31 @@ fn differential_tuple() {
     }
 }
 
+/// Structs lower to the same byte-buffer/byte-GEP representation as tuples, with named fields
+/// resolved through the declared layout. Native and interp must agree, including a heterogeneous
+/// struct whose float field sits at a padded offset and a literal with fields out of declaration
+/// order (each value routed to its named offset, not its position).
+#[test]
+fn differential_struct() {
+    let programs = [
+        "struct P { x: i32, y: i32 } \
+         fn main() -> i32 { let p = P { x: 3, y: 4 }; return p.x + p.y; }",
+        "struct M { a: i32, b: f32, c: i32 } \
+         fn main() -> i32 { let mut m = M { a: 10, b: 3.5, c: 20 }; m.a = m.a + m.c; \
+         print(m.a); print(m.b); return m.a + (m.b as i32); }",
+        "struct P { x: f32, y: f32 } \
+         fn main() -> i32 { let q = P { y: 100.0, x: 1.0 }; print(q.x); print(q.y); \
+         return (q.x + q.y) as i32; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Float kernels must agree too: the interpreter computes `f32` ops in `f32`, so its printed
 /// results are bit-identical to native (including division, which would otherwise double-round).
 #[test]

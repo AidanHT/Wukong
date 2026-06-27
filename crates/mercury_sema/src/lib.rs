@@ -576,9 +576,24 @@ impl Sema<'_> {
                 args,
             } => self.type_call(callee, generic_args, args, e.span),
             ExprKind::Index { base, indices } => self.type_index(base, indices, e.span),
-            ExprKind::Field { base, .. } => {
-                self.type_expr(base);
-                Ty::Unknown // methods/fields not yet modeled
+            ExprKind::Field { base, name } => {
+                let t = self.type_expr(base);
+                // A field access on a struct value resolves to the declared field type; anything
+                // else (a method, an unmodeled builtin) stays lenient (`Unknown`).
+                match t {
+                    Ty::Named(struct_name) => self
+                        .defs
+                        .lookup(struct_name)
+                        .and_then(|d| match &d.kind {
+                            DefKind::Struct(fields) => fields
+                                .iter()
+                                .find(|(fname, _)| *fname == name.sym)
+                                .map(|(_, fty)| fty.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or(Ty::Unknown),
+                    _ => Ty::Unknown,
+                }
             }
             ExprKind::TupleField { base, index } => {
                 let t = self.type_expr(base);
@@ -591,7 +606,25 @@ impl Sema<'_> {
                 self.type_expr(expr);
                 self.lower_type(ty)
             }
-            ExprKind::StructLit { .. } => Ty::Unknown,
+            ExprKind::StructLit { path, fields, rest } => {
+                // Type each field value (populates their NodeId side-table entries for lowering).
+                for f in fields {
+                    self.type_expr(&f.value);
+                }
+                if let Some(r) = rest {
+                    self.type_expr(r);
+                }
+                // A `Name { … }` whose `Name` resolves to a declared struct has that nominal type;
+                // an unknown name stays lenient.
+                match path.segments.last().map(|s| s.sym) {
+                    Some(n)
+                        if matches!(self.defs.lookup(n), Some(d) if matches!(d.kind, DefKind::Struct(_))) =>
+                    {
+                        Ty::Named(n)
+                    }
+                    _ => Ty::Unknown,
+                }
+            }
             ExprKind::ArrayLit(items) => {
                 let mut elem = Ty::Unknown;
                 for it in items {
