@@ -4435,6 +4435,25 @@ impl FnLowerer<'_> {
                 }
             }
             StmtKind::Assign { target, op, value } => {
+                // Whole-aggregate assignment — `*p = Pt{..}`, `s.f = other_struct`, `t.0 = (..)`,
+                // `a[i] = some_struct`. The destination is a flat byte buffer (a `MIR Array`), and a
+                // plain `Op::Store` of the RHS would store the RHS buffer's *base pointer* into the
+                // destination's first slot rather than its contents (a silent miscompile on both
+                // backends). Route it through `init_field`, which recurses a struct/tuple/array
+                // *literal* directly into the destination pointer and deep-copies a non-literal
+                // aggregate value leaf-by-leaf via `emit_copy` — the same GEP discipline that keeps
+                // the interpreter's slot-indexed and native's byte-indexed memory in agreement.
+                // (Compound assignment on an aggregate is not a valid program, so only `=`.) The
+                // aggregate check is a pure type query (`expr_mir` emits no MIR), so the common
+                // scalar path below keeps its original RHS-then-place evaluation order untouched.
+                if matches!(op, ast::AssignOp::Assign)
+                    && matches!(self.expr_mir(target), MirType::Array(..))
+                {
+                    let (ptr, _) = self.lower_place(target);
+                    let dst_ty = self.expr_ty(target);
+                    self.init_field(ptr, &dst_ty, value);
+                    return;
+                }
                 let rhs0 = self.lower_expr(value);
                 let rhs_ty = self.expr_mir(value);
                 let (ptr, elem) = self.lower_place(target);
