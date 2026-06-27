@@ -409,7 +409,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Expr {
-        let mut lhs = self.parse_prefix();
+        let mut lhs = self.parse_cast();
         loop {
             let Some(op) = token_to_binop(self.kind()) else {
                 break;
@@ -432,6 +432,20 @@ impl<'a> Parser<'a> {
             };
         }
         lhs
+    }
+
+    /// Cast level: `as` binds looser than every prefix unary operator but tighter than every binary
+    /// operator (the Rust precedence). Sitting it between `parse_expr_bp` and `parse_prefix` means
+    /// `*p as T` is `(*p) as T` (not `*(p as T)` — which mis-typed as a `ptrtoint` then a load), and
+    /// `-x as u8` is `(-x) as u8`. Chained `x as A as B` folds left.
+    fn parse_cast(&mut self) -> Expr {
+        let mut e = self.parse_prefix();
+        while self.kind() == T::As {
+            self.bump();
+            let ty = self.parse_type();
+            e = self.finish_expr(e.span, ExprKind::Cast { expr: Box::new(e), ty });
+        }
+        e
     }
 
     fn parse_prefix(&mut self) -> Expr {
@@ -549,17 +563,9 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
-                T::As => {
-                    self.bump();
-                    let ty = self.parse_type();
-                    lhs = self.finish_expr(
-                        start,
-                        ExprKind::Cast {
-                            expr: Box::new(lhs),
-                            ty,
-                        },
-                    );
-                }
+                // `as` is NOT handled here: it is a cast level between binary and prefix
+                // (`parse_cast`), so it binds looser than postfix `()`/`[]`/`.`/`::` (which stay on
+                // the primary) but is applied after the whole prefix expression — fixing `*p as T`.
                 _ => break,
             }
         }
@@ -1234,6 +1240,19 @@ mod tests {
         let s = expr("f32x8::load(p)");
         assert!(s.contains("call"));
         assert!(s.contains("field load"));
+    }
+
+    #[test]
+    fn cast_binds_looser_than_prefix_tighter_than_binary() {
+        // `*p as i32` is `(*p) as i32`, NOT `*(p as i32)` (the old bug, which lowered to a
+        // ptrtoint + load). The cast must be the outermost node, with the deref nested inside.
+        let s = expr("*p as i32");
+        assert_eq!(s.lines().next().unwrap(), "cast i32");
+        assert!(s.contains("unary *"), "deref must nest under the cast: {s}");
+        // `a + b as i32` is `a + (b as i32)` — `as` binds tighter than `+`.
+        assert_eq!(expr("a + b as i32").lines().next().unwrap(), "binary +");
+        // `-x as i32` is `(-x) as i32`.
+        assert_eq!(expr("-x as i32").lines().next().unwrap(), "cast i32");
     }
 
     #[test]
