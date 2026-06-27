@@ -28,14 +28,22 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
         },
         _ => Ty::Scalar(Scalar::F32),
     };
+    // `abs`/`round`/`floor`/`ceil`/`trunc` preserve the argument's type, including integers
+    // (`abs(-5): i32`, an everyday operation); for an integer they lower to an integer abs / the
+    // identity in mir_build. All the other intrinsics inherently produce a float.
+    let preserve_ty = match args.first() {
+        Some(t @ (Ty::Scalar(_) | Ty::Vector { .. })) => t.clone(),
+        _ => Ty::Scalar(Scalar::F32),
+    };
     match name {
-        "sqrt" | "rsqrt" | "abs" | "round" | "floor" | "ceil" | "trunc" | "exp" | "log" | "pow"
-        | "exp2" | "log2" | "exp10" | "log10" | "expm1" | "log1p" | "sinh" | "cosh" | "asinh"
-        | "acosh" | "atanh" | "atan" | "tan" | "asin" | "acos" | "atan2" | "hypot" | "cbrt"
-        | "erf" | "sin" | "cos" | "tanh" | "sigmoid" | "silu" | "gelu" | "silu_backward"
-        | "gelu_backward" | "sigmoid_backward" | "tanh_backward" | "elu_backward"
-        | "softplus_backward" | "elu" | "leaky_relu" | "softplus" | "mish" | "selu" | "tanhshrink"
-        | "hardsigmoid" | "hardswish" | "softsign" | "logsigmoid" | "fmax" | "fmin" => Some(float_ty),
+        "abs" | "round" | "floor" | "ceil" | "trunc" => Some(preserve_ty),
+        "sqrt" | "rsqrt" | "exp" | "log" | "pow" | "exp2" | "log2" | "exp10" | "log10" | "expm1"
+        | "log1p" | "sinh" | "cosh" | "asinh" | "acosh" | "atanh" | "atan" | "tan" | "asin"
+        | "acos" | "atan2" | "hypot" | "cbrt" | "erf" | "sin" | "cos" | "tanh" | "sigmoid"
+        | "silu" | "gelu" | "silu_backward" | "gelu_backward" | "sigmoid_backward"
+        | "tanh_backward" | "elu_backward" | "softplus_backward" | "elu" | "leaky_relu"
+        | "softplus" | "mish" | "selu" | "tanhshrink" | "hardsigmoid" | "hardswish" | "softsign"
+        | "logsigmoid" | "fmax" | "fmin" => Some(float_ty),
         _ => None,
     }
 }

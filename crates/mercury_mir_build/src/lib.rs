@@ -10578,13 +10578,30 @@ impl FnLowerer<'_> {
     fn lower_math_intrinsic(&mut self, name: Symbol, args: &[Expr], e: &Expr) -> Option<ValueId> {
         let op = math_intrinsic(self.interner.resolve(name))?;
         let rty = self.expr_mir(e);
+        // `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving on integers (sema types them as
+        // the argument's integer type): integer abs is `select(x < 0, -x, x)`; rounding an integer is
+        // the identity. Without this they would emit float ops on an int operand — MIR the verifier
+        // rejects on the native backend while the interpreter silently ran it (lossily, via f32).
+        if rty.is_int() {
+            match op {
+                MathIntrinsic::Abs => {
+                    let v = self.lower_expr(args.first()?);
+                    return Some(self.emit_int_abs(v, &rty));
+                }
+                MathIntrinsic::Round
+                | MathIntrinsic::Floor
+                | MathIntrinsic::Ceil
+                | MathIntrinsic::Trunc => return Some(self.lower_expr(args.first()?)),
+                _ => {}
+            }
+        }
         match op {
             MathIntrinsic::Sqrt => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.builder.build(rty.clone(), Op::Sqrt(x)))
             }
             MathIntrinsic::Rsqrt => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let s = self.builder.build(rty.clone(), Op::Sqrt(x));
                 let one = self.splat_const_f(1.0, &rty);
                 Some(
@@ -10593,32 +10610,32 @@ impl FnLowerer<'_> {
                 )
             }
             MathIntrinsic::Abs => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_abs(x, &rty))
             }
             MathIntrinsic::Round
             | MathIntrinsic::Floor
             | MathIntrinsic::Ceil
             | MathIntrinsic::Trunc => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(
                     self.builder
                         .build(rty.clone(), Op::Round(round_mode(op), x)),
                 )
             }
             MathIntrinsic::Exp => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_exp(x, &rty))
             }
             MathIntrinsic::Log => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_log(x, &rty))
             }
             // exp2(x)=exp(x·ln2), log2(x)=log(x)·log2(e), sinh/cosh=(eˣ∓e⁻ˣ)/2 — composed from the
             // shared exp/log so they vectorize and stay bit-exact across backends; the dispatched
             // 256-bit kernel mirrors this op-for-op.
             MathIntrinsic::Exp2 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let ln2 = self.splat_const_f(std::f64::consts::LN_2, &rty);
                 let xl = self
                     .builder
@@ -10626,7 +10643,7 @@ impl FnLowerer<'_> {
                 Some(self.emit_exp(xl, &rty))
             }
             MathIntrinsic::Log2 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let lx = self.emit_log(x, &rty);
                 let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
                 Some(
@@ -10635,7 +10652,7 @@ impl FnLowerer<'_> {
                 )
             }
             MathIntrinsic::Exp10 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let ln10 = self.splat_const_f(std::f64::consts::LN_10, &rty);
                 let xl = self
                     .builder
@@ -10643,7 +10660,7 @@ impl FnLowerer<'_> {
                 Some(self.emit_exp(xl, &rty))
             }
             MathIntrinsic::Log10 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let lx = self.emit_log(x, &rty);
                 let log10e = self.splat_const_f(std::f64::consts::LOG10_E, &rty);
                 Some(
@@ -10652,34 +10669,34 @@ impl FnLowerer<'_> {
                 )
             }
             MathIntrinsic::Sinh | MathIntrinsic::Cosh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_sinh_cosh(x, &rty, matches!(op, MathIntrinsic::Cosh)))
             }
             // asinh = sign(x)·log(|x|+√(x²+1)),  acosh = log(x+√(x²−1)),
             // atanh = ½·log((1+x)/(1−x)) — composed from the shared `log` (and `√`), so they vectorize
             // and the dispatched 256-bit kernel mirrors this op-for-op.
             MathIntrinsic::Asinh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_asinh(x, &rty))
             }
             MathIntrinsic::Acosh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_acosh(x, &rty))
             }
             MathIntrinsic::Atanh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_atanh(x, &rty))
             }
             MathIntrinsic::Atan => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_atan(x, &rty))
             }
             MathIntrinsic::Expm1 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_expm1(x, &rty))
             }
             MathIntrinsic::Log1p => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_log1p(x, &rty))
             }
             MathIntrinsic::Pow => {
@@ -10688,8 +10705,8 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let y = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let y = self.lower_math_arg(&args[1], &rty);
                 let lx = self.emit_log(x, &rty);
                 let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
                 Some(self.emit_exp(ylx, &rty))
@@ -10698,44 +10715,44 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let y = self.lower_expr(&args[0]);
-                let x = self.lower_expr(&args[1]);
+                let y = self.lower_math_arg(&args[0], &rty);
+                let x = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_atan2(y, x, &rty))
             }
             MathIntrinsic::Hypot => {
                 if args.len() != 2 {
                     return None;
                 }
-                let a = self.lower_expr(&args[0]);
-                let b = self.lower_expr(&args[1]);
+                let a = self.lower_math_arg(&args[0], &rty);
+                let b = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_hypot(a, b, &rty))
             }
             MathIntrinsic::Erf => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_erf(x, &rty))
             }
             MathIntrinsic::Sin => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_trig(x, &rty, false))
             }
             MathIntrinsic::Cos => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_trig(x, &rty, true))
             }
             MathIntrinsic::Tanh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_tanh(x, &rty))
             }
             MathIntrinsic::Sigmoid => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_sigmoid(x, &rty))
             }
             MathIntrinsic::Silu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_silu(x, &rty))
             }
             MathIntrinsic::Gelu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_gelu(x, &rty))
             }
             // Activation backward `act_backward(x, dy) = dy · act'(x)` — two args. The non-dispatched
@@ -10790,59 +10807,59 @@ impl FnLowerer<'_> {
                 Some(self.emit_softplus_backward(x, dy, &rty))
             }
             MathIntrinsic::Elu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_elu(x, &rty))
             }
             MathIntrinsic::LeakyRelu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_leaky_relu(x, &rty))
             }
             MathIntrinsic::Softplus => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_softplus(x, &rty))
             }
             MathIntrinsic::Mish => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_mish(x, &rty))
             }
             MathIntrinsic::Selu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_selu(x, &rty))
             }
             MathIntrinsic::Tanhshrink => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_tanhshrink(x, &rty))
             }
             MathIntrinsic::HardSigmoid => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_hardsigmoid(x, &rty))
             }
             MathIntrinsic::HardSwish => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_hardswish(x, &rty))
             }
             MathIntrinsic::Softsign => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_softsign(x, &rty))
             }
             MathIntrinsic::LogSigmoid => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_logsigmoid(x, &rty))
             }
             MathIntrinsic::Tan => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_tan(x, &rty))
             }
             MathIntrinsic::Asin => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_asin(x, &rty))
             }
             MathIntrinsic::Acos => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_acos(x, &rty))
             }
             MathIntrinsic::Cbrt => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_cbrt(x, &rty))
             }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
@@ -10876,6 +10893,31 @@ impl FnLowerer<'_> {
             .builder
             .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
         self.builder.build(rty.clone(), Op::Select(gtm, x, negx))
+    }
+
+    /// Integer absolute value: `select(x < 0, 0 - x, x)`. Wraps for `INT_MIN` (like C/Rust's
+    /// `wrapping_abs`) and is plain integer sub/cmp/select, so both backends agree bit-for-bit.
+    fn emit_int_abs(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let zero = self
+            .builder
+            .build(rty.clone(), Op::ConstInt(0, rty.clone()));
+        let neg = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::Sub, zero, x));
+        let isneg = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(isneg, neg, x))
+    }
+
+    /// Lower a math-intrinsic argument, coercing an integer operand to the float result type `rty`
+    /// (so `sqrt(16)` promotes the `16` to `16.0` rather than feeding a float op an int operand,
+    /// which the verifier rejects). A same-typed float operand is returned unchanged.
+    fn lower_math_arg(&mut self, arg: &Expr, rty: &MirType) -> ValueId {
+        let v = self.lower_expr(arg);
+        let from = self.expr_mir(arg);
+        let signed = self.signed(arg);
+        self.coerce_to(v, &from, rty, signed)
     }
 
     /// `exp(x)` as a fast, deterministic polynomial (≈1 ULP of the true `exp`). Always computed in

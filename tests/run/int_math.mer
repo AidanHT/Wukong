@@ -1,0 +1,27 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 5
+// EXPECT-OUT: -9
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+module tests.run.int_math
+
+// Math intrinsics on integer operands. `abs`/`round`/`floor`/`ceil`/`trunc` preserve the argument's
+// type — integer `abs` is `select(x < 0, -x, x)` and rounding an integer is the identity — while
+// `sqrt` and the transcendentals promote an integer operand to `f32`. The interpreter and native
+// backend agree (previously native rejected the float-op-on-int MIR while the interpreter ran it).
+fn main() -> i32 {
+    print(abs(-5));            // 5    (integer abs)
+    print(abs(7));             // 7
+    print(abs(-2147483647));   // 2147483647
+
+    print(round(5));           // 5    (rounding an integer is the identity)
+    print(floor(-9));          // -9
+
+    print(sqrt(16) as i32);    // 4    (sqrt promotes int -> f32)
+    print(abs(-3.5) as i32);   // 3    (float abs still works)
+    return 0;
+}
