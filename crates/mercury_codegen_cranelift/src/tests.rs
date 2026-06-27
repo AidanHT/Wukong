@@ -917,6 +917,36 @@ fn differential_return_type_coercion() {
     }
 }
 
+/// Constant folding must stay at f32 precision for an f32 chain. Folding in f64 (and only narrowing
+/// at the final store) makes `-O2` disagree with `-O0` — `(2^24 + 1) - 2^24` is `0` in f32 but `1`
+/// in f64, and `0.1 + 0.2 == 0.3` is true in f32 but false in f64. Each (backend, opt) pair must
+/// agree AND equal the f32-correct value, which also pins `-O0 == -O2`.
+#[test]
+fn differential_f32_const_fold() {
+    let cases = [
+        (
+            "fn main() -> i32 { let b: f32 = 16777216.0; let r: f32 = (b + 1.0) - b; return r as i32; }",
+            0i64,
+        ),
+        (
+            "fn main() -> i32 { if 0.1 + 0.2 == 0.3 { return 1; } return 0; }",
+            1,
+        ),
+        (
+            "fn main() -> i64 { let m: f32 = (0.1 + 0.2) * 100000000.0; return m as i64; }",
+            30000002,
+        ),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "f32-fold native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "f32-fold wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Integer → `f32` conversion must round in a single IEEE step. The interpreter used to go int→f64→
 /// f32 (two roundings) while native does one `fcvt_from_{sint,uint}(F32)`, so they disagreed for
 /// magnitudes above 2^53 — the differential oracle was silently wrong. Pin both to the correctly
