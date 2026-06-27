@@ -113,8 +113,11 @@ fn main() -> i32 {
 ```
 
 Tuples and structs lower to a flat, padded byte buffer (the local's value *is* its base pointer, the
-same convention arrays follow); field access is a typed load/store at the field's byte offset. Both
-run identically on the interpreter and the native backend. Aggregate *literals* are construction
+same convention arrays follow); field access is a typed load/store at the field's byte offset.
+**Nested aggregates** work too: a struct/tuple field that is itself a struct (any depth), and arrays
+of structs, lay out recursively, and an aggregate field initialized from a non-literal value is
+deep-copied leaf by leaf (`tests/run/struct_nested.mer`). Both run identically on the interpreter and
+the native backend. Aggregate *literals* are construction
 sites (a `let` initializer or a value argument); passing an aggregate **by value into/out of a
 function** (a tuple/struct parameter or return) is not yet wired — pass by `*`/`&` or use array
 out-params. `enum`s parse but do not yet run (🟡).
@@ -139,12 +142,13 @@ generic names, or `?` for a runtime dimension. Tensor element types must be scal
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a
 tensor is passed by base pointer, like an array out-param), so elementwise tensor kernels and tensor
-matmuls run — `tests/run/tensor_*.mer`. The dedicated GEMM/`vmath`/norm dispatch still keys on the
-**flat** index spelling (`a[i*N+j]`), so a matmul written in `a[i, k]` tensor notation currently runs
-as a scalar nest, not the tuned kernel — write the contraction in flat-index form for the kernel path
-(or `c[i,j]` for clarity where throughput is not the concern). Executing a **symbolic-generic** shape
-(`matmul<M, N, K>` with the dims only known per call) is still being wired (🟡): give the dims as
-literals (`Tensor[f32, 512, 512]`) to run today.
+matmuls run — `tests/run/tensor_*.mer`. A matmul written in tensor notation
+(`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot-product `s += a[i,k]*b[k,j]` and accumulate
+`c[i,j] += a[i,k]*b[k,j]` spellings, including the `b[j,k]` `nn.Linear` `A·Bᵀ` form) dispatches to the
+same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` spelling — a 2-index access supplies its
+row stride from the tensor's inner dimension. Executing a **symbolic-generic** shape (`matmul<M, N, K>`
+with the dims only known per call) is still being wired (🟡): give the dims as literals
+(`Tensor[f32, 512, 512]`) to run today.
 
 ## Attributes 🟡
 

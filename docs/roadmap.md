@@ -45,14 +45,16 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
   by base pointer (out-params). Real kernels run: dot, SAXPY, GEMM, matmul, ReLU, clamp, transpose.
 - **Tuples & structs**: `(a, b)` / `Name { f: v, … }` literals, field access `t.0` / `s.f` (read and
-  assign), heterogeneous fields with correct padded layout. Lowered as a flat byte buffer with
-  byte-offset field GEPs (the local's value is its base pointer, like an array), so the interpreter
-  and native backend agree bit-for-bit with no backend-specific aggregate handling
-  (`tests/run/{tuple,struct}.mer`). By-value aggregate parameters/returns are not yet wired.
+  assign), heterogeneous fields with correct padded layout, **and nested aggregates** (struct-in-struct
+  to any depth, arrays of structs, an aggregate field deep-copied from a variable). Lowered as a flat
+  byte buffer with byte-offset field GEPs (the local's value is its base pointer, like an array; nested
+  fields recurse), so the interpreter and native backend agree bit-for-bit with no backend-specific
+  aggregate handling (`tests/run/{tuple,struct,struct_nested}.mer`). By-value aggregate
+  parameters/returns are not yet wired.
 - **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
   row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
-  on both backends (`tests/run/tensor_*.mer`). Symbolic-generic dims and tensor-notation→GEMM dispatch
-  are still pending (see below).
+  on both backends (`tests/run/tensor_*.mer`) — and a matmul written in tensor notation dispatches to
+  the tuned GEMM kernel (see below). Symbolic-generic dims are still pending (see below).
 - **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
@@ -251,10 +253,10 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
 - **Symbolic-generic tensor shapes** `fn f<M, N>(a: Tensor[f32, M, N])`: a tensor with a
   **compile-time-constant** shape now lowers and **runs** end-to-end on both backends (multi-dim
   indexing `a[i, j]` → row-major GEP; elementwise tensor kernels and tensor matmuls execute — see
-  `tests/run/tensor_*.mer`). What is still pending is executing a *symbolic* generic shape, where the
-  dims `M, N` are only bound per call — those need hidden runtime dim params (give literal dims to run
-  today). Also: a matmul written in `a[i, k]` tensor notation runs as a scalar nest, not the tuned
-  GEMM (the GEMM/`vmath`/norm dispatch keys on the flat `a[i*N+k]` spelling — use that for the kernel).
+  `tests/run/tensor_*.mer`, and a matmul written in tensor notation now dispatches to the tuned GEMM
+  kernel, a 2-index access supplying its row stride from the operand's inner tensor dimension). What is
+  still pending is executing a *symbolic* generic shape, where the dims `M, N` are only bound per call
+  — those need hidden runtime dim params (give literal dims to run today).
 - **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector
   *values* are not yet executed, and the native ISA path (Cranelift) caps vector SSA at 128-bit
   (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
