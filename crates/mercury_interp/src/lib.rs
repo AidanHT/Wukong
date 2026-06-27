@@ -754,6 +754,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                 self.stdout.extend_from_slice(text.as_bytes());
                 Ok(Value::Unit)
             }
+            // A `*u8` string argument to `print`/`println` (lowered to these symbols by mir_build):
+            // walk `memory` from the base pointer, collecting bytes (each stored as a `Value::Int`
+            // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
+            // bytes via `rt_print_str`, so the differential gate holds.
+            "print_str" | "println_str" => {
+                let mut bytes = Vec::new();
+                if let Some(Value::Ptr(base)) = args.first().copied() {
+                    let mut i = base;
+                    while i < self.memory.len() {
+                        let b = self.memory[i].as_int() as u8;
+                        if b == 0 {
+                            break;
+                        }
+                        bytes.push(b);
+                        i += 1;
+                    }
+                }
+                let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                text.push('\n');
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
             "assert" => {
                 let ok = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => i != 0,

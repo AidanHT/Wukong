@@ -38,6 +38,8 @@ pub fn lower_program(
     let gemm = GemmSyms {
         mm: interner.intern("mercury_sgemm"),
         mm_par: interner.intern("mercury_sgemm_parallel"),
+        print_str: interner.intern("print_str"),
+        println_str: interner.intern("println_str"),
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         tn: interner.intern("mercury_sgemm_tn"),
@@ -778,6 +780,10 @@ fn lower_parallel(
 struct GemmSyms {
     mm: Symbol,
     mm_par: Symbol,
+    /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
+    /// as opposed to the numeric `print`/`println`. Renders the bytes, not the pointer value.
+    print_str: Symbol,
+    println_str: Symbol,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`mercury_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -1229,6 +1235,13 @@ impl FnLowerer<'_> {
 
     fn expr_ty(&self, e: &Expr) -> Ty {
         self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown)
+    }
+
+    /// Is `e`'s type a string (`*u8`)? Routes a `print`/`println` argument to the byte-rendering
+    /// `print_str` path instead of printing the raw pointer value. A string literal and a
+    /// `let s = "…"` binding both type as `*u8` in sema, so both are caught.
+    fn is_string_arg(&self, e: &Expr) -> bool {
+        matches!(self.expr_ty(e), Ty::Ptr { pointee, .. } if matches!(*pointee, Ty::Scalar(mercury_types::Scalar::U8)))
     }
 
     fn expr_mir(&self, e: &Expr) -> MirType {
@@ -9884,6 +9897,29 @@ impl FnLowerer<'_> {
                 let ty = if ty.is_int() { ty } else { MirType::I32 };
                 self.builder.build(ty.clone(), Op::ConstInt(v as i128, ty))
             }
+            // A string literal materializes its UTF-8 bytes (plus a trailing NUL) into a fresh stack
+            // byte buffer and yields the base pointer — sema types it `*u8`, so it follows the same
+            // by-pointer convention as an array. `print`/`println` of a `*u8` reads it back
+            // byte-by-byte until the NUL (see the intrinsic-call lowering). Both backends GEP/Store
+            // one element per byte, so the interpreter's slot-indexed memory and native's byte memory
+            // agree (`store_element` strides by element, which is 1 byte for `I8`).
+            ExprKind::Str(s) => {
+                let bytes = decode_string_literal(self.interner.resolve(*s));
+                let elem = MirType::I8;
+                let n = bytes.len() as u32 + 1; // + NUL terminator
+                let base = self
+                    .builder
+                    .alloca(MirType::Array(Box::new(elem.clone()), n));
+                for (i, b) in bytes.iter().enumerate() {
+                    let v = self
+                        .builder
+                        .build(MirType::I8, Op::ConstInt(*b as i128, MirType::I8));
+                    self.store_element(base, &elem, i as i128, v);
+                }
+                let nul = self.builder.build(MirType::I8, Op::ConstInt(0, MirType::I8));
+                self.store_element(base, &elem, bytes.len() as i128, nul);
+                base
+            }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
                     // An array variable *is* its storage: its value is the base pointer, so reads
@@ -10552,6 +10588,28 @@ impl FnLowerer<'_> {
                 }
                 // Built-in intrinsics (print, ...) lower to a void call the interpreter handles.
                 if is_intrinsic(self.interner.resolve(name)) {
+                    // A `*u8` (string) argument to `print`/`println` renders its bytes rather than the
+                    // pointer value: route it to the dedicated `print_str`/`println_str` symbol, which
+                    // both backends read as a null-terminated buffer. (Printing a raw pointer as a
+                    // number is already non-differential — the interpreter prints a slot index, native
+                    // a real address — so no well-formed program loses behavior here.)
+                    let nm = self.interner.resolve(name);
+                    if (nm == "print" || nm == "println")
+                        && args.len() == 1
+                        && self.is_string_arg(&args[0])
+                    {
+                        let s = self.lower_expr(&args[0]);
+                        let func = if nm == "println" {
+                            self.gemm.println_str
+                        } else {
+                            self.gemm.print_str
+                        };
+                        self.builder.build_void(Op::Call {
+                            func,
+                            args: vec![s],
+                        });
+                        return self.const_zero(MirType::I32);
+                    }
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
                     self.builder.build_void(Op::Call {
                         func: name,
@@ -17549,6 +17607,32 @@ fn decode_char_literal(text: &str) -> u32 {
         Some(c) => c as u32,
         None => 0,
     }
+}
+
+/// Decode a string literal's raw source text (including the surrounding `"`) into its UTF-8 bytes,
+/// resolving the same escapes as a char literal (`\n` `\t` `\\` `\"` `\0`, `\xHH`, `\u{…}`); each
+/// decoded code point is re-encoded as UTF-8. The caller appends the NUL terminator. Used by the
+/// `ExprKind::Str` lowering to materialize the byte buffer.
+fn decode_string_literal(text: &str) -> Vec<u8> {
+    let inner = text
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(text);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4];
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        let cp = if c == '\\' {
+            decode_escape(&mut chars)
+        } else {
+            c as u32
+        };
+        match char::from_u32(cp) {
+            Some(ch) => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
+            None => out.push(cp as u8),
+        }
+    }
+    out
 }
 
 /// Decode the body of a backslash escape (the `\` already consumed) to a code point.
