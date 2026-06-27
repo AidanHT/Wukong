@@ -1,0 +1,21 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 99
+module tests.run.for_continue
+
+// `continue` inside a range `for` must still run the loop step, or the loop never terminates. The
+// step lives at the body's tail (unlike a `while`, whose header re-evaluates the user's condition),
+// so the lowering routes `continue` to a dedicated latch block that increments `i` before branching
+// back to the header. Skip the odd values 1 and 3; print 0, 2, 4, then 99.
+fn main() -> i32 {
+    for i in 0..5 {
+        if i == 1 { continue; }
+        if i == 3 { continue; }
+        print(i);
+    }
+    print(99);
+    return 0;
+}

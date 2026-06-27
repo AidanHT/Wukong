@@ -6641,6 +6641,7 @@ impl FnLowerer<'_> {
 
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
+        let latch = self.builder.new_block();
         let exit = self.builder.new_block();
         self.builder.br(header, vec![]);
 
@@ -6660,29 +6661,37 @@ impl FnLowerer<'_> {
             .build(MirType::I1, Op::Cmp(pred, i_val, end_val));
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
-        // body; i += step
+        // body. `continue` must target the *latch* (which performs `i += step`), not the header, or
+        // the step is skipped and `for i in 0..n { …; continue; }` loops forever (the step lives at
+        // the body's tail, unlike a `while`, whose header re-evaluates the user's own condition).
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((latch, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
-            let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let step_val = match step {
-                Some(st) => self.lower_expr(st),
-                None => self
-                    .builder
-                    .build(ity.clone(), Op::ConstInt(1, ity.clone())),
-            };
-            let next = self
-                .builder
-                .build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
-            self.builder.build_void(Op::Store {
-                ptr: slot,
-                value: next,
-            });
-            self.builder.br(header, vec![]);
+            self.builder.br(latch, vec![]);
         }
+
+        // latch: i += step; back to the header. Reached by the body's fall-through and every
+        // `continue`, so the loop variable always advances.
+        self.builder.switch_to(latch);
+        self.terminated = false;
+        let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let step_val = match step {
+            Some(st) => self.lower_expr(st),
+            None => self
+                .builder
+                .build(ity.clone(), Op::ConstInt(1, ity.clone())),
+        };
+        let next = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
 
         self.pop_scope();
         self.builder.switch_to(exit);
@@ -9221,6 +9230,7 @@ impl FnLowerer<'_> {
 
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
+        let latch = self.builder.new_block();
         let exit = self.builder.new_block();
         self.builder.br(header, vec![]);
 
@@ -9232,25 +9242,31 @@ impl FnLowerer<'_> {
             .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, end));
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
+        // `continue` targets the latch (the increment), not the header — see `lower_for`.
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((latch, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
-            let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let one = self
-                .builder
-                .build(ity.clone(), Op::ConstInt(1, ity.clone()));
-            let next = self
-                .builder
-                .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
-            self.builder.build_void(Op::Store {
-                ptr: slot,
-                value: next,
-            });
-            self.builder.br(header, vec![]);
+            self.builder.br(latch, vec![]);
         }
+
+        self.builder.switch_to(latch);
+        self.terminated = false;
+        let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let one = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let next = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
+
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
