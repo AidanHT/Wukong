@@ -2918,6 +2918,19 @@ fn uval(v: i128, bits: u32) -> u128 {
     }
 }
 
+/// Pick the correctly single-rounded int→float result for the cast target. A narrow float
+/// (`f32`/`bf16`/`f16`) uses `narrow` — the integer rounded straight to `f32` — matching native's
+/// single `fcvt_from_{sint,uint}(F32)`; an `f64` target uses `wide` (the `f64` rounding). Both are
+/// computed by the caller with one Rust `as` conversion (IEEE round-to-nearest-even). Going through
+/// `f64` and re-rounding to `f32` double-rounds and disagrees with native above 2^53.
+fn int_to_float(wide: f64, narrow: f32, to: &MirType) -> f64 {
+    if matches!(to, MirType::F32 | MirType::BF16 | MirType::F16) {
+        narrow as f64
+    } else {
+        wide
+    }
+}
+
 /// Truncate an integer value to a result type's bit width (signed wrap).
 fn mask(v: i128, ty: &MirType) -> i128 {
     // `i1` is a boolean: keep the low bit unsigned (true == 1, not a sign-extended -1).
@@ -3110,10 +3123,18 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
         // Zero-extend the source's own `from`-width bits. Because ints are stored sign-extended, a
         // high-bit-set unsigned source (e.g. `u32` ≥ 2^31) would otherwise widen as negative.
         ZExt => Value::Int(mask(uval(v.as_int(), int_bits(from)) as i128, to)),
-        SiToFp => Value::Float(v.as_int() as f64),
+        // Int→float must round in ONE step to the target's precision. A narrow (`f32`/`bf16`/`f16`)
+        // target rounds the integer directly to `f32` (`as f32`), matching native's single
+        // `fcvt_from_sint(F32)`; routing through `f64` first (`as f64`, then `exec`'s `as f32`)
+        // double-rounds and disagrees with native for magnitudes above 2^53. An `f64` target rounds
+        // to `f64` (a single rounding, and `exec` does not re-round `f64`).
+        SiToFp => Value::Float(int_to_float(v.as_int() as f64, v.as_int() as f32, to)),
         // Unsigned→float: read the source as unsigned in its own width first (matches native
-        // `fcvt_from_uint`); `as_int() as f64` would be negative for a high-bit-set value.
-        UiToFp => Value::Float(uval(v.as_int(), int_bits(from)) as f64),
+        // `fcvt_from_uint`); `as_int()` would be negative for a high-bit-set value.
+        UiToFp => {
+            let u = uval(v.as_int(), int_bits(from));
+            Value::Float(int_to_float(u as f64, u as f32, to))
+        }
         // Saturating fp→int, matching the native backend's `fcvt_to_{sint,uint}_sat` (NaN→0, clamp to
         // the target range, negatives→0 for unsigned). Rust's `as` has exactly these semantics; the
         // old bit-mask of an `i128` cast diverged from native for out-of-range / negative-to-unsigned

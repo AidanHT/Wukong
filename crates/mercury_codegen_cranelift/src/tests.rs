@@ -665,6 +665,32 @@ fn differential_let_destructure() {
     }
 }
 
+/// Integer → `f32` conversion must round in a single IEEE step. The interpreter used to go int→f64→
+/// f32 (two roundings) while native does one `fcvt_from_{sint,uint}(F32)`, so they disagreed for
+/// magnitudes above 2^53 — the differential oracle was silently wrong. Pin both to the correctly
+/// rounded value (`9007199791611905 as f32 == 9007200328482816`), for signed and unsigned sources.
+#[test]
+fn differential_int_to_f32_rounding() {
+    let cases = [
+        // 2^53 + 2^29 + 1, just past where f32 (and the double-round) diverge.
+        ("fn main() -> i64 { let n: i64 = 9007199791611905; let f: f32 = n as f32; return f as i64; }",
+         9007200328482816i64),
+        ("fn main() -> i64 { let n: u64 = 9007199791611905; let f: f32 = n as f32; return f as i64; }",
+         9007200328482816),
+        // a small value is exact and unchanged.
+        ("fn main() -> i64 { let n: i64 = 1234567; let f: f32 = n as f32; return f as i64; }",
+         1234567),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "int->f32 native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "int->f32 wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
