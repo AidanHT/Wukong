@@ -460,6 +460,8 @@ impl Sema<'_> {
                 }
             }
             PatKind::Wildcard | PatKind::Unit => {}
+            // Literal patterns bind nothing — they test the scrutinee's value.
+            PatKind::Int { .. } | PatKind::Bool(_) => {}
         }
     }
 
@@ -679,10 +681,18 @@ impl Sema<'_> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                self.type_expr(scrutinee);
+                let scrut_ty = self.type_expr(scrutinee);
                 let mut result = Ty::Unknown;
                 for arm in arms {
+                    // Each arm gets its own scope: an `Ident` pattern binds the scrutinee value for
+                    // the arm's guard and body; a literal/`_` pattern binds nothing.
+                    self.push_scope();
+                    self.bind_pattern(&arm.pat, &scrut_ty);
+                    if let Some(g) = &arm.guard {
+                        self.type_expr(g);
+                    }
                     let t = self.type_expr(&arm.body);
+                    self.pop_scope();
                     result = join(result, t);
                 }
                 result

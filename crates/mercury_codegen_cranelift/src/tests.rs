@@ -461,6 +461,47 @@ fn differential_struct_return() {
     }
 }
 
+/// `match` expressions: integer/bool/negative-integer literal patterns, a wildcard / identifier
+/// catch-all (the latter binding the scrutinee), and `if` guards, in both value and statement
+/// position. Lowered to an if-else chain over the arms (scrutinee evaluated once), so the
+/// interpreter oracle and native backend agree at every `-O`. A non-exhaustive fallthrough yields a
+/// zero default (lenient, identical on both backends — no trap).
+#[test]
+fn differential_match() {
+    let programs = [
+        // integer literal arms + wildcard default.
+        "fn f(n: i32) -> i32 { match n { 0 => 10, 1 => 20, 2 => 30, _ => 99 } } \
+         fn main() -> i32 { return f(0) + f(1) + f(2) + f(5); }", // 10+20+30+99 = 159
+        // identifier binding catch-all.
+        "fn f(n: i32) -> i32 { match n { 0 => 0, x => x * 2 } } \
+         fn main() -> i32 { return f(21) + f(0); }", // 42 + 0
+        // guard arms (negative result exercises signed compare).
+        "fn sign(n: i32) -> i32 { match n { 0 => 0, x if x > 0 => 1, _ => 0 - 1 } } \
+         fn main() -> i32 { return sign(5) * 100 + sign(0) * 10 + sign(0 - 9) + 1000; }",
+        // negative literal pattern.
+        "fn f(n: i32) -> i32 { match n { -1 => 100, 0 => 0, _ => 1 } } \
+         fn main() -> i32 { return f(0 - 1) + f(0) + f(7); }", // 100 + 0 + 1
+        // bool scrutinee.
+        "fn f(b: bool) -> i32 { match b { true => 7, false => 9 } } \
+         fn main() -> i32 { return f(true) * 10 + f(false); }", // 79
+        // match as a statement with block arms and a side effect.
+        "fn main() -> i32 { let mut a: i32 = 0; let n: i32 = 2; \
+         match n { 1 => { a = 3; } 2 => { a = 5; } _ => { a = 0; } } return a; }",
+        // match bound in a `let`, and a match whose scrutinee is itself an expression.
+        "fn main() -> i32 { let n: i32 = 3; let r: i32 = match n + 0 { 3 => 30, _ => 0 }; return r; }",
+        // nested match (an arm body is itself a match).
+        "fn f(a: i32, b: i32) -> i32 { match a { 0 => match b { 0 => 1, _ => 2 }, _ => 3 } } \
+         fn main() -> i32 { return f(0,0)*100 + f(0,9)*10 + f(9,9); }", // 123
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "match native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
