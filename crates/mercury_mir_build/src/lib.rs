@@ -1364,6 +1364,22 @@ impl FnLowerer<'_> {
     /// pointer, like a tuple/array), and **a pointer/reference to a struct** — `p.f` on a `&Pt` /
     /// `*mut Pt` param auto-derefs (the bound `Ptr` slot loads the pointer, then this GEPs the field).
     /// So a struct passed by `&`/`*` works the same as a local. Drives `s.f` reads and `s.f = …` writes.
+    /// If `base.name` is a C-style enum-variant access `E::B` (a `Field` whose base is a single
+    /// segment path naming a declared enum, and `name` is one of its variants), return the variant's
+    /// integer discriminant. Lowered to that constant (the enum value's runtime representation).
+    fn enum_variant_value(&self, base: &Expr, name: Symbol) -> Option<i64> {
+        let ExprKind::Path(p) = &base.kind else {
+            return None;
+        };
+        if !p.is_single() {
+            return None;
+        }
+        let DefKind::Enum(variants) = &self.sema.defs.lookup(p.first().sym)?.kind else {
+            return None;
+        };
+        variants.iter().find(|(v, _)| *v == name).map(|(_, d)| *d)
+    }
+
     fn struct_field_place(&mut self, base: &Expr, fname: Symbol) -> (ValueId, MirType) {
         let struct_sym = match self.expr_ty(base) {
             Ty::Named(sym) => Some(sym),
@@ -9866,8 +9882,15 @@ impl FnLowerer<'_> {
             // `s.field` — read a struct field by GEP to its declared byte offset (scalar loads,
             // aggregate yields its address — see `TupleField`).
             ExprKind::Field { base, name } => {
-                let (ptr, fmty) = self.struct_field_place(base, name.sym);
-                self.load_or_addr(ptr, fmty)
+                // `E::B` parses as a field access on the enum-name path `E`; lower it to the
+                // variant's integer discriminant (a C-style enum value is its discriminant).
+                if let Some(disc) = self.enum_variant_value(base, name.sym) {
+                    self.builder
+                        .build(MirType::I32, Op::ConstInt(disc as i128, MirType::I32))
+                } else {
+                    let (ptr, fmty) = self.struct_field_place(base, name.sym);
+                    self.load_or_addr(ptr, fmty)
+                }
             }
             // A struct literal in value position materializes a fresh byte buffer, yielding its base
             // pointer (the same by-pointer convention as arrays/tuples).

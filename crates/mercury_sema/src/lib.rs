@@ -32,7 +32,10 @@ pub enum DefKind {
     Fn(FnSig),
     Const(Ty),
     Struct(Vec<(Symbol, Ty)>),
-    Enum,
+    /// A C-style enum: its variants in declaration order with their resolved integer discriminants
+    /// (auto-incremented from 0, or set by an explicit `= <int>`). `mir_build` lowers `E::Variant`
+    /// to its discriminant constant.
+    Enum(Vec<(Symbol, i64)>),
 }
 
 #[derive(Clone, Debug)]
@@ -134,7 +137,22 @@ impl Sema<'_> {
                     self.generics.clear();
                     self.register(s.name, DefKind::Struct(fields), item.span);
                 }
-                ItemKind::Enum(e) => self.register(e.name, DefKind::Enum, item.span),
+                ItemKind::Enum(e) => {
+                    // Resolve each variant's integer discriminant: an explicit `= <int>` sets it,
+                    // otherwise it auto-increments from the previous (starting at 0), as in C/Rust.
+                    let mut next = 0i64;
+                    let mut variants = Vec::with_capacity(e.variants.len());
+                    for v in &e.variants {
+                        let disc = v
+                            .discriminant
+                            .as_ref()
+                            .and_then(|d| eval_const_int(d, self.interner))
+                            .unwrap_or(next);
+                        variants.push((v.name.sym, disc));
+                        next = disc + 1;
+                    }
+                    self.register(e.name, DefKind::Enum(variants), item.span);
+                }
                 ItemKind::Extern(blk) => {
                     for f in &blk.items {
                         self.collect_fn(f);
@@ -374,7 +392,7 @@ impl Sema<'_> {
                     ret: Box::new(sig.ret.clone()),
                 },
                 DefKind::Const(t) => t.clone(),
-                DefKind::Struct(_) | DefKind::Enum => Ty::Unknown, // used as a namespace
+                DefKind::Struct(_) | DefKind::Enum(_) => Ty::Unknown, // used as a namespace
             });
         }
         let s = self.sym_str(name);
@@ -642,6 +660,24 @@ impl Sema<'_> {
             } => self.type_call(callee, generic_args, args, e.span),
             ExprKind::Index { base, indices } => self.type_index(base, indices, e.span),
             ExprKind::Field { base, name } => {
+                // `E::B` parses as a field access on the enum-name path `E`. If `E` is a declared
+                // enum and `B` is one of its variants, the whole expression has the enum's nominal
+                // type (its runtime value is the variant's integer discriminant, filled in by
+                // `mir_build`). Checked before the struct path so the enum name isn't typed as a
+                // value.
+                if let ExprKind::Path(p) = &base.kind {
+                    if p.is_single() {
+                        if let Some(Def {
+                            kind: DefKind::Enum(variants),
+                            ..
+                        }) = self.defs.lookup(p.first().sym)
+                        {
+                            if variants.iter().any(|(vname, _)| *vname == name.sym) {
+                                return Ty::Named(p.first().sym);
+                            }
+                        }
+                    }
+                }
                 let t = self.type_expr(base);
                 // A field access on a struct value — or on a pointer/reference to a struct, which
                 // auto-derefs (`p.x` on a `&Pt` / `*mut Pt`) — resolves to the declared field type.
@@ -884,6 +920,50 @@ fn has_float_suffix(text: &str) -> bool {
     ["f16", "bf16", "f32", "f64"]
         .iter()
         .any(|s| text.ends_with(s))
+}
+
+/// Evaluate a constant integer expression — an integer literal (with an optional unary minus) — to
+/// its value, for resolving an enum variant's explicit discriminant (`A = 10`). Returns `None` for
+/// anything not a compile-time integer literal (the variant then auto-increments).
+fn eval_const_int(e: &Expr, interner: &Interner) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Int(s) => parse_int_text(interner.resolve(*s)),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => eval_const_int(expr, interner).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// Parse an integer literal's source text (decimal, `0x`/`0o`/`0b` radix, `_` separators, optional
+/// type suffix, optional leading sign) to an `i64`, or `None` if it isn't a valid integer literal.
+fn parse_int_text(text: &str) -> Option<i64> {
+    let mut s = text.trim();
+    let neg = s.starts_with('-');
+    if neg || s.starts_with('+') {
+        s = &s[1..];
+    }
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(x) = s.strip_suffix(suf) {
+            s = x;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i64::from_str_radix(h, 16)
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        i64::from_str_radix(o, 8)
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        i64::from_str_radix(b, 2)
+    } else {
+        body.parse::<i64>()
+    }
+    .ok()?;
+    Some(if neg { -v } else { v })
 }
 
 #[cfg(test)]
