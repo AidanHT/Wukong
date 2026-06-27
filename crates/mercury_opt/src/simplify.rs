@@ -49,7 +49,9 @@ impl Pass for Simplify {
                         consts.insert(res.0, CV::Int(v));
                     }
                     Op::ConstFloat(v, _) => {
-                        consts.insert(res.0, CV::Float(v));
+                        // Round to the constant's own precision (an f32 literal may carry f64 bits)
+                        // so it enters the fold chain at the right precision.
+                        consts.insert(res.0, CV::Float(round_float_to_ty(v, &rty)));
                     }
                     Op::Bin(b, l, r) => {
                         let lc = consts.get(&l.0).copied();
@@ -98,7 +100,7 @@ impl Pass for Simplify {
                         if let Some(cv) = consts.get(&v.0).copied() {
                             let nv = match cv {
                                 CV::Int(i) => CV::Int(mask(i.wrapping_neg(), &rty)),
-                                CV::Float(fl) => CV::Float(-fl),
+                                CV::Float(fl) => CV::Float(round_float_to_ty(-fl, &rty)),
                             };
                             set_const(f, bi, ii, nv, &rty);
                             consts.insert(res.0, nv);
@@ -148,10 +150,25 @@ fn set_const(f: &mut Function, bi: usize, ii: usize, cv: CV, ty: &MirType) {
     };
 }
 
+/// Round a folded float constant to the precision of its MIR type, so constant folding matches the
+/// per-op rounding the backends do at runtime. Without this an f32 *chain* is folded entirely in f64
+/// and only narrowed at the final store, so `-O0` (real f32 arithmetic) and `-O2` (folded) disagree
+/// — e.g. `(2^24 + 1) - 2^24` is `0` in f32 but `1` in f64. (f16/bf16 are computed as f32 here, like
+/// the backends.) Applied both when a `ConstFloat` is read into the fold table and on every fold
+/// result, so an f32 operand and the running value stay at f32 precision through the whole chain.
+fn round_float_to_ty(v: f64, ty: &MirType) -> f64 {
+    match ty {
+        MirType::F32 | MirType::F16 | MirType::BF16 => v as f32 as f64,
+        _ => v,
+    }
+}
+
 fn fold_bin(b: BinOp, a: CV, c: CV, ty: &MirType) -> Option<CV> {
     match (a, c) {
         (CV::Int(x), CV::Int(y)) if !b.is_float() => fold_int(b, x, y, ty).map(CV::Int),
-        (CV::Float(x), CV::Float(y)) if b.is_float() => Some(CV::Float(fold_float(b, x, y))),
+        (CV::Float(x), CV::Float(y)) if b.is_float() => {
+            Some(CV::Float(round_float_to_ty(fold_float(b, x, y), ty)))
+        }
         _ => None,
     }
 }

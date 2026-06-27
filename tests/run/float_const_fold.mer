@@ -1,0 +1,22 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 111
+// EXPECT-OUT: 30000002
+module tests.run.float_const_fold
+
+// The optimizer must constant-fold an f32 chain at f32 precision, not f64 — otherwise -O2 disagrees
+// with -O0 (the hard invariant). `(2^24 + 1) - 2^24` is 0 in f32 (the +1 is lost) but 1 in f64;
+// `0.1 + 0.2 == 0.3` is true in f32 (both round to the same f32) but false in f64. The
+// optimization-invariance test re-runs this at every opt level and requires identical output.
+fn main() -> i32 {
+    let big: f32 = 16777216.0;
+    let r: f32 = (big + 1.0) - big;
+    print(r as i32);
+
+    if 0.1 + 0.2 == 0.3 { print(111); } else { print(222); }
+
+    let m: f32 = (0.1 + 0.2) * 100000000.0;
+    print(m as i64);
+
+    return 0;
+}
