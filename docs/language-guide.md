@@ -69,11 +69,13 @@ value must match its annotation exactly (see error `E0401`).
 | Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize`    | ✅     |
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
 | Boolean     | `bool`                                               | ✅     |
-| Pointers    | `*T`, `*mut T`, references `&T`                       | 🟡     |
+| Pointers    | `*T`, `*mut T`, references `&T`/`&mut T`, deref `*p`  | ✅     |
 | Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
-| Aggregates  | slices `[]T`, tuples, `struct`, `enum`               | 🟡  |
-| SIMD vectors| `f32x8`, `i32x4`, generic `vec[T, N]`                | 🟡     |
-| Tensors     | `Tensor[f32, M, N]` with optional layout suffix      | 🟡 (shape-checked) |
+| Tuples      | `(A, B, …)`, field access `t.0`                       | ✅     |
+| Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
+| Aggregates  | slices `[]T`, `enum`                                  | 🟡  |
+| SIMD vectors| `f32x4`/`i32x4` (128-bit), generic `vec[T, N]`; wider `f32x8` parses/checks but caps at the 128-bit native ISA | 🟡 |
+| Tensors     | `Tensor[f32, M, N]` (+layout) — **const-shape indexing & ops run**; symbolic generic dims shape-checked | ✅ / 🟡 |
 
 ## Operators ✅
 
@@ -88,13 +90,36 @@ if cond { ... } else { ... }
 while cond { ... }
 for i in 0..n { ... }
 for i in 0..n step 2 { ... }   // strided range; empty if lo >= hi
-loop { ... }                    // 🟡 infinite loop
+loop { ... }                    // ✅ infinite loop; exit with `break`
+break; continue;                // ✅ innermost loop (labeled `break 'l` is 🟡)
 return expr;
 ```
 
 Blocks are expressions: the trailing expression of a block (no semicolon) is its value.
 
-## Tensors and compile-time shape checking 🟡 (the headline feature)
+## Tuples and structs ✅
+
+```mercury
+struct Point { x: f32, y: f32 }
+
+fn main() -> i32 {
+    let t = (3, 4);                       // tuple; mixed types allowed: (1.5, 2)
+    let p = Point { x: 1.0, y: 2.0 };     // struct literal (fields may be out of order)
+    let mut m = p;                        // (aggregates are by-pointer locals)
+    print(t.0 + t.1);                     // tuple field access -> 7
+    print((p.x + p.y) as i32);            // struct field access -> 3
+    return 0;
+}
+```
+
+Tuples and structs lower to a flat, padded byte buffer (the local's value *is* its base pointer, the
+same convention arrays follow); field access is a typed load/store at the field's byte offset. Both
+run identically on the interpreter and the native backend. Aggregate *literals* are construction
+sites (a `let` initializer or a value argument); passing an aggregate **by value into/out of a
+function** (a tuple/struct parameter or return) is not yet wired — pass by `*`/`&` or use array
+out-params. `enum`s parse but do not yet run (🟡).
+
+## Tensors and compile-time shape checking ✅ shape-check + const-shape exec (the headline feature)
 
 ```mercury
 fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) { ... }
@@ -110,6 +135,16 @@ faults:
 
 Run `mercuryc --explain E0502` for a worked example. Dimensions may be integer literals, symbolic
 generic names, or `?` for a runtime dimension. Tensor element types must be scalars (`E0302`).
+
+**What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
+backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a
+tensor is passed by base pointer, like an array out-param), so elementwise tensor kernels and tensor
+matmuls run — `tests/run/tensor_*.mer`. The dedicated GEMM/`vmath`/norm dispatch still keys on the
+**flat** index spelling (`a[i*N+j]`), so a matmul written in `a[i, k]` tensor notation currently runs
+as a scalar nest, not the tuned kernel — write the contraction in flat-index form for the kernel path
+(or `c[i,j]` for clarity where throughput is not the concern). Executing a **symbolic-generic** shape
+(`matmul<M, N, K>` with the dims only known per call) is still being wired (🟡): give the dims as
+literals (`Tensor[f32, 512, 512]`) to run today.
 
 ## Attributes 🟡
 

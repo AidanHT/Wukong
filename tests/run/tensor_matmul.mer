@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 22
+// EXPECT-OUT: 43
+// EXPECT-OUT: 50
+module tests.run.tensor_matmul
+
+// A 2x2 matmul written in shape-typed tensor notation `c[i,j] += a[i,k]*b[k,j]` — the multi-index
+// `a[i, k]` flattens to a row-major GEP, the FMA contracts, and the nest runs bit-identically on both
+// backends. (Note: this idiomatic tensor spelling currently runs as a scalar nest; the tuned GEMM
+// kernel keys on the flat `a[i*K+k]` form — see docs/roadmap.md.)
+fn matmul(a: Tensor[f32, 2, 2], b: Tensor[f32, 2, 2], c: Tensor[f32, 2, 2]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + a[i, k] * b[k, j];
+            }
+            c[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; // [[1,2],[3,4]]
+    let b: [f32; 4] = [5.0, 6.0, 7.0, 8.0]; // [[5,6],[7,8]]
+    let mut c: [f32; 4] = [0.0; 4];
+    matmul(a, b, c);
+    print(c[0] as i32); // 1*5 + 2*7 = 19
+    print(c[1] as i32); // 1*6 + 2*8 = 22
+    print(c[2] as i32); // 3*5 + 4*7 = 43
+    print(c[3] as i32); // 3*6 + 4*8 = 50
+    return 0;
+}
