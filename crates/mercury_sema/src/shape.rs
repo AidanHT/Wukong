@@ -70,7 +70,7 @@ impl Sema<'_> {
         args: &[Expr],
         span: Span,
     ) -> Ty {
-        let arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(a)).collect();
+        let mut arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(a)).collect();
 
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
@@ -78,6 +78,21 @@ impl Sema<'_> {
                 if let Some(def) = self.defs.lookup(name) {
                     if let DefKind::Fn(sig) = &def.kind {
                         let sig = sig.clone();
+                        // Adapt an unsuffixed numeric literal argument to a concrete scalar parameter
+                        // — the same `{integer}`/`{float}` inference a `let` annotation gets — so
+                        // `process(10)` where the parameter is `usize`/`i64`/`f64` type-checks instead
+                        // of erroring on the `i32`/`f32` literal default. Only concrete scalar params
+                        // (not generics/tensors) and only adaptable literals are touched.
+                        for (i, param) in sig.params.iter().enumerate() {
+                            if matches!(param, Ty::Scalar(_)) {
+                                if let Some(arg) = args.get(i) {
+                                    if self.literal_adapts(param, arg) {
+                                        self.retype_adapted_literal(arg, param);
+                                        arg_tys[i] = param.clone();
+                                    }
+                                }
+                            }
+                        }
                         self.types.insert(
                             callee.id,
                             Ty::Fn {
