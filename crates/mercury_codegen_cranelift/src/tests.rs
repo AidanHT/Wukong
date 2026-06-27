@@ -589,6 +589,29 @@ fn differential_top_level_const() {
     }
 }
 
+/// Nested tuple-field access `t.0.0`. The lexer glues the trailing `0.0` into a single float token,
+/// so the parser now splits a plain `N.M` float into two consecutive tuple-field accesses. Covers a
+/// read, an assignment target, and a deeper `t.0.0.0`; both backends agree (this is the existing
+/// tuple-field lowering, just reachable now).
+#[test]
+fn differential_nested_tuple_field() {
+    let cases = [
+        ("fn main() -> i32 { let t = ((1, 2), 3); return t.0.0; }", 1),
+        ("fn main() -> i32 { let t = ((1, 2), 3); return t.0.1; }", 2),
+        ("fn main() -> i32 { let t = (9, (7, 8)); return t.1.0; }", 7),
+        ("fn main() -> i32 { let mut t = ((1, 2), 3); t.0.0 = 50; return t.0.0 + t.0.1; }", 52),
+        ("fn main() -> i32 { let t = (((5, 6), 7), 8); return t.0.0.0; }", 5),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "nested-tuple-field native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "nested-tuple-field wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
