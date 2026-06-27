@@ -148,21 +148,49 @@ pub fn run_with_output(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<(i64, Vec<u8>), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        accel: None,
-    };
-    let result = interp.run_function(func, Vec::new())?;
-    Ok((result.as_int() as i64, interp.stdout))
+    // The tree-walker recurses on the *host* call stack — one host frame per Mercury call — so a
+    // deeply recursive Mercury program would overflow the default main-thread stack and **abort**
+    // the process (a stack overflow is uncatchable) before the interpreter's own 100M-step guard
+    // could fire. The interpreter is the correctness oracle; an abort here would take down the
+    // whole differential gate, so run it on a worker thread with a large stack. `thread::scope`
+    // lets that worker borrow the non-`'static` program/interner.
+    with_big_stack(|| {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            accel: None,
+        };
+        let result = interp.run_function(func, Vec::new())?;
+        Ok((result.as_int() as i64, interp.stdout))
+    })
+}
+
+/// Run `f` on a worker thread with a large stack, returning its result and re-raising any panic on
+/// the caller so behavior is otherwise identical to a direct call. This gives the recursive
+/// tree-walker headroom: 512 MiB of stack is *reserved* virtual address space (committed lazily by
+/// the OS), so deep Mercury recursion hits the interpreter's 100M-step guard or completes instead
+/// of overflowing the host's ~8 MiB default and aborting the process.
+fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    const STACK: usize = 512 * 1024 * 1024;
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .name("mercury-interp".into())
+            .stack_size(STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn interpreter worker thread");
+        match handle.join() {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// Like [`run_with_output`] but offloads recognized kernel calls to `accel` (the GPU backend). This
@@ -3164,6 +3192,17 @@ mod tests {
                    return fib(n - 1) + fib(n - 2); } \
                    fn main() -> i32 { return fib(10); }";
         assert_eq!(run_main(src), 55);
+    }
+
+    #[test]
+    fn deep_recursion_does_not_overflow_oracle() {
+        // The tree-walker recurses on the host stack (one host frame per Mercury call). Without a
+        // large worker stack this depth overflows the default ~8 MiB main-thread stack and *aborts*
+        // the process, which would crash the differential oracle. `run` must run on the big stack
+        // and return the right sum: 1+2+...+1000 = 500500.
+        let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \
+                   fn main() -> i32 { return sum(1000); }";
+        assert_eq!(run_main(src), 500500);
     }
 
     #[test]
