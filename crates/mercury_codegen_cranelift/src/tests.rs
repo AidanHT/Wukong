@@ -665,6 +665,42 @@ fn differential_let_destructure() {
     }
 }
 
+/// Math intrinsics on integer operands. `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving
+/// (`abs(-5): i32`): integer abs lowers to `select(x<0,-x,x)` and the roundings to the identity;
+/// `sqrt` and the transcendentals promote an int operand to `f32`. Previously these emitted float
+/// ops on an int SSA value — MIR the verifier rejected on native while the interpreter ran it lossily
+/// (a silent divergence). Pins native==interp at every `-O`, plus that float abs is unchanged.
+#[test]
+fn differential_int_math_intrinsics() {
+    let cases = [
+        ("fn main() -> i32 { return abs(-5); }", 5),
+        ("fn main() -> i32 { return abs(7); }", 7),
+        ("fn main() -> i32 { return abs(-2147483647); }", 2147483647),
+        // round/floor/ceil/trunc on integers are the identity.
+        ("fn main() -> i32 { return round(5) + floor(-9) + ceil(3) + trunc(8); }", 7),
+        // sqrt promotes the int operand to f32 (16 -> 16.0 -> 4.0 -> 4).
+        ("fn main() -> i32 { return sqrt(16) as i32; }", 4),
+        // float abs still works (the float path is unchanged).
+        ("fn main() -> i32 { return abs(-3.5) as i32; }", 3),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "int-math native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "int-math wrong value at -O{opt} for:\n{src}");
+        }
+    }
+    // i64 abs returns i64 (no precision loss, unlike the old via-f32 detour).
+    let src64 = "fn main() -> i64 { let x: i64 = -5000000000; return abs(x); }";
+    for opt in [0u8, 1, 2, 3] {
+        let n = jit(src64, opt).expect("jit");
+        let i = interp(src64, opt).expect("interp");
+        assert_eq!(n, i, "i64-abs native vs interp mismatch at -O{opt}");
+        assert_eq!(n.0, 5000000000i64, "i64-abs wrong value at -O{opt}");
+    }
+}
+
 /// Richer `match` patterns: or-patterns `1 | 2 | 3`, half-open `lo..hi` and inclusive `lo..=hi`
 /// ranges, and enum-variant patterns `Color::Red` (compared by discriminant). Each lowers to a
 /// pure value test (an OR of equalities / a range conjunction / a discriminant equality), so native
