@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0303
+module tests.fail.break_outside_loop
+
+/// `break` (and `continue`) outside of any enclosing loop is a hard error. Without this check the
+/// lowerer emits an `unreachable` terminator, which the interpreter traps but the native backend
+/// turns into a SIGILL — a divergence between the two backends. Rejecting it at sema keeps the
+/// differential gate honest and matches the behavior of a robust compiler (cf. Rust's E0268).
+fn main() -> i32 {
+    print(1);
+    break;
+    return 0;
+}

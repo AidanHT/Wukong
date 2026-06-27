@@ -140,6 +140,13 @@ static CATALOG: &[Explanation] = &[
          compound type."
     ),
     entry!(
+        "E0303",
+        "`break`/`continue` outside of a loop",
+        "A `break` or `continue` statement appeared outside of any enclosing `while`, `for`, or \
+         `loop`. These statements only have meaning inside a loop body. Remove it, or wrap the code \
+         in a loop."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \

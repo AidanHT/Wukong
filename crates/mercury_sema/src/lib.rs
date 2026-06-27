@@ -71,6 +71,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         scopes: Vec::new(),
         generics: HashSet::new(),
         ret_ty: Ty::Unit,
+        loop_depth: 0,
     };
     s.collect(module);
     s.check_bodies(module);
@@ -89,6 +90,10 @@ struct Sema<'a> {
     scopes: Vec<HashMap<Symbol, Ty>>,
     generics: HashSet<Symbol>,
     ret_ty: Ty,
+    /// Number of enclosing loops at the current point. A `break`/`continue` with `loop_depth == 0`
+    /// is a hard error (E0303) — without it the lowerer emits an `unreachable` terminator, which the
+    /// interpreter traps but the native backend turns into a SIGILL, a differential-gate divergence.
+    loop_depth: u32,
 }
 
 impl Sema<'_> {
@@ -400,10 +405,25 @@ impl Sema<'_> {
             StmtKind::Defer(e) => {
                 self.type_expr(e);
             }
-            StmtKind::Break(_) | StmtKind::Continue(_) => {}
+            StmtKind::Break(_) | StmtKind::Continue(_) => {
+                if self.loop_depth == 0 {
+                    let kw = if matches!(s.kind, StmtKind::Break(_)) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    self.error(
+                        s.span,
+                        "E0303",
+                        format!("`{kw}` outside of a loop"),
+                    );
+                }
+            }
             StmtKind::While { cond, body, .. } => {
                 self.type_expr(cond);
+                self.loop_depth += 1;
                 self.type_block(body);
+                self.loop_depth -= 1;
             }
             StmtKind::For {
                 pat, iter, body, ..
@@ -411,11 +431,15 @@ impl Sema<'_> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                self.loop_depth += 1;
                 self.type_block(body);
+                self.loop_depth -= 1;
                 self.pop_scope();
             }
             StmtKind::Loop { body, .. } => {
+                self.loop_depth += 1;
                 self.type_block(body);
+                self.loop_depth -= 1;
             }
         }
     }
