@@ -377,6 +377,45 @@ fn differential_struct_across_fns() {
     }
 }
 
+/// Whole-aggregate **assignment** (not just initialization): storing a struct *value* into a place
+/// whose type is an aggregate must deep-copy the buffer, not store the RHS buffer's base pointer
+/// into the destination's first slot. Before the fix this silently miscompiled on *both* backends
+/// (the interpreter wrote a `Ptr` into slot 0, native wrote a 32-bit-truncated address), so the
+/// assignment path is routed through the same leaf-precise `init_field`/`emit_copy` as a `let`.
+/// Covers `*p = Struct{..}`, `*p = struct_var`, a nested struct field `s.f = Struct{..}`/`= var`.
+/// (Array-*of*-struct element assignment is excluded — that hits the documented array-of-aggregate
+/// limitation where the interpreter's slot-indexed and native's byte-indexed memory can't agree.)
+#[test]
+fn differential_struct_assign() {
+    let programs = [
+        // store a struct *literal* through a *mut pointer (the core C7 case).
+        "struct Pt { x: i32, y: i32 } \
+         fn put(p: *mut Pt) { *p = Pt { x: 3, y: 4 }; } \
+         fn main() -> i32 { let mut s = Pt { x: 1, y: 2 }; put(&mut s); return s.x + s.y; }",
+        // store a non-literal struct *value* (a by-value param) through a pointer.
+        "struct Pt { x: i32, y: i32 } \
+         fn cp(dst: *mut Pt, src: Pt) { *dst = src; } \
+         fn main() -> i32 { let mut a = Pt { x: 1, y: 1 }; let b = Pt { x: 10, y: 20 }; \
+         cp(&mut a, b); return a.x + a.y; }",
+        // assign a whole struct literal into a nested struct field.
+        "struct Pt { x: i32, y: i32 } struct Box { lo: Pt, hi: Pt } \
+         fn main() -> i32 { let mut bx = Box { lo: Pt { x: 0, y: 0 }, hi: Pt { x: 0, y: 0 } }; \
+         bx.hi = Pt { x: 5, y: 6 }; return bx.hi.x + bx.hi.y; }",
+        // assign a struct *variable* into a nested struct field.
+        "struct Pt { x: i32, y: i32 } struct Box { lo: Pt, hi: Pt } \
+         fn main() -> i32 { let b = Pt { x: 10, y: 20 }; \
+         let mut bx = Box { lo: Pt { x: 0, y: 0 }, hi: Pt { x: 0, y: 0 } }; \
+         bx.lo = b; return bx.lo.x + bx.lo.y; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct-assign native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
