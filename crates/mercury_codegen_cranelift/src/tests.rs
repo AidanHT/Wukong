@@ -665,6 +665,35 @@ fn differential_let_destructure() {
     }
 }
 
+/// Char literals lower to their Unicode scalar value (sema types a char as `u32`, which MIR carries
+/// as `i32`). Covers ASCII, the one-character escapes, `\xHH` hex, `\u{…}` Unicode, ordering, and
+/// arithmetic. The value is a compile-time constant, so native == interp at every `-O`.
+#[test]
+fn differential_char_literals() {
+    let cases = [
+        ("fn main() -> i32 { return 'A' as i32; }", 65),
+        ("fn main() -> i32 { return '0' as i32; }", 48),
+        ("fn main() -> i32 { return '\\n' as i32; }", 10),
+        ("fn main() -> i32 { return '\\t' as i32; }", 9),
+        ("fn main() -> i32 { return '\\\\' as i32; }", 92),
+        ("fn main() -> i32 { return '\\'' as i32; }", 39),
+        ("fn main() -> i32 { return '\\0' as i32; }", 0),
+        ("fn main() -> i32 { return '\\x41' as i32; }", 65),
+        ("fn main() -> i32 { return '\\u{1F600}' as i32; }", 128512),
+        ("fn main() -> i32 { let z = 'Z'; return z as i32; }", 90),
+        ("fn main() -> i32 { if 'a' < 'b' { return 1; } return 0; }", 1),
+        ("fn main() -> i32 { return ('z' as i32) - ('a' as i32); }", 25),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "char native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "char wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Integer → `f32` conversion must round in a single IEEE step. The interpreter used to go int→f64→
 /// f32 (two roundings) while native does one `fcvt_from_{sint,uint}(F32)`, so they disagreed for
 /// magnitudes above 2^53 — the differential oracle was silently wrong. Pin both to the correctly

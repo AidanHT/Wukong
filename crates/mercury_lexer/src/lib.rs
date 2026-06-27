@@ -258,27 +258,59 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     break;
                 }
-                Some(b'\\') => {
-                    self.bump();
-                    if self.peek_at(0).is_some() {
-                        self.bump();
-                    }
-                }
+                Some(b'\\') => self.consume_escape(),
                 Some(_) => self.bump(),
             }
         }
         TokenKind::Str
     }
 
-    fn lex_char(&mut self, start: usize) -> TokenKind {
-        self.bump(); // opening quote
+    /// Consume a backslash escape at the cursor (`\` is the current byte): `\xHH`, `\u{…}`, or a
+    /// one-character escape (`\n`, `\\`, `\'`, …). Stops a `\u{…}` scan at a string/char terminator
+    /// so a malformed escape can't swallow the closing quote. Validation of the escape *value* is
+    /// the decoder's job (`decode_char_literal` in mir_build); the lexer only delimits the literal.
+    fn consume_escape(&mut self) {
+        self.bump(); // backslash
         match self.peek_at(0) {
-            Some(b'\\') => {
+            Some(b'x') => {
                 self.bump();
-                if self.peek_at(0).is_some() {
+                for _ in 0..2 {
+                    if self.peek_at(0).is_some_and(|c| c.is_ascii_hexdigit()) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some(b'u') => {
+                self.bump();
+                if self.peek_at(0) == Some(b'{') {
+                    self.bump();
+                    while let Some(c) = self.peek_at(0) {
+                        if c == b'}' {
+                            self.bump();
+                            break;
+                        }
+                        if matches!(c, b'"' | b'\'' | b'\n') {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+            }
+            Some(c) => {
+                for _ in 0..utf8_len(c) {
                     self.bump();
                 }
             }
+            None => {}
+        }
+    }
+
+    fn lex_char(&mut self, start: usize) -> TokenKind {
+        self.bump(); // opening quote
+        match self.peek_at(0) {
+            Some(b'\\') => self.consume_escape(),
             Some(c) if c != b'\'' => {
                 for _ in 0..utf8_len(c) {
                     self.bump();
@@ -429,6 +461,13 @@ mod tests {
     fn strings_and_chars() {
         use TokenKind::*;
         assert_eq!(kinds(r#""hi\n" 'a' '\n'"#), vec![Str, Char, Char]);
+        // Hex and Unicode escapes are single char tokens (multi-byte escape bodies), and an
+        // escaped quote inside a string does not terminate it.
+        assert_eq!(
+            kinds(r#"'\x41' '\u{1F600}' "a\"b""#),
+            vec![Char, Char, Str]
+        );
+        assert!(diags(r#"'\x41' '\u{1F600}'"#).is_empty());
     }
 
     #[test]
