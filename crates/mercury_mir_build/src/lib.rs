@@ -9832,16 +9832,8 @@ impl FnLowerer<'_> {
                 let pred = cmp_pred(op, common.is_float(), self.signed(lhs));
                 self.builder.build(MirType::I1, Op::Cmp(pred, l, r))
             }
-            And => {
-                let l = self.lower_expr(lhs);
-                let r = self.lower_expr(rhs);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::And, l, r))
-            }
-            Or => {
-                let l = self.lower_expr(lhs);
-                let r = self.lower_expr(rhs);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::Or, l, r))
-            }
+            And => self.lower_short_circuit(lhs, rhs, true),
+            Or => self.lower_short_circuit(lhs, rhs, false),
             _ => {
                 let ty = self.expr_mir(e);
                 // Contract a float `x + y*z` into one fused multiply-add before falling back to a
@@ -9861,6 +9853,40 @@ impl FnLowerer<'_> {
                 self.builder.build(ty, Op::Bin(bin, l, r))
             }
         }
+    }
+
+    /// Short-circuit `&&` / `||`: the RHS is evaluated only when the LHS doesn't already decide the
+    /// result. `a && b` ≡ `if a { b } else { false }`; `a || b` ≡ `if a { true } else { b }`. Lowered
+    /// to a branch + a merge block param — NOT a bitwise `and`/`or` of both operands — so a
+    /// side-effecting or unsafe RHS (`p_in_bounds && load(p)`) does not run when the LHS already
+    /// settles it. Both backends execute the identical CFG, so the differential gate holds.
+    fn lower_short_circuit(&mut self, lhs: &Expr, rhs: &Expr, is_and: bool) -> ValueId {
+        let l = self.lower_expr(lhs);
+        let rhs_bb = self.builder.new_block();
+        let merge = self.builder.new_block();
+        let res = self.builder.block_param(merge, MirType::I1);
+        // The short-circuit value passed to `merge` when the LHS decides it: `false` for `&&` (LHS
+        // false), `true` for `||` (LHS true). Built in the current (predecessor) block.
+        let short = self.builder.build(
+            MirType::I1,
+            Op::ConstInt(if is_and { 0 } else { 1 }, MirType::I1),
+        );
+        if is_and {
+            // LHS true → evaluate RHS; LHS false → merge(false).
+            self.builder.cond_br(l, rhs_bb, vec![], merge, vec![short]);
+        } else {
+            // LHS true → merge(true); LHS false → evaluate RHS.
+            self.builder.cond_br(l, merge, vec![short], rhs_bb, vec![]);
+        }
+        self.builder.switch_to(rhs_bb);
+        self.terminated = false;
+        let r = self.lower_expr(rhs);
+        if !self.terminated {
+            self.builder.br(merge, vec![r]);
+        }
+        self.builder.switch_to(merge);
+        self.terminated = false;
+        res
     }
 
     /// Contract a float `x + y*z` (or `y*z + x`) into one fused multiply-add. FMA rounds once
