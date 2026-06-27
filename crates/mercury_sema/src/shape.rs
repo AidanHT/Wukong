@@ -48,6 +48,20 @@ fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     }
 }
 
+/// A short human name for a type's *kind*, for cross-kind mismatch diagnostics (`unify`).
+fn kind_name(t: &Ty) -> &'static str {
+    match t {
+        Ty::Tensor { .. } => "a tensor",
+        Ty::Vector { .. } => "a vector",
+        Ty::Scalar(_) => "a scalar",
+        Ty::Array { .. } => "an array",
+        Ty::Ptr { .. } => "a pointer",
+        Ty::Ref { .. } => "a reference",
+        Ty::Tuple(_) => "a tuple",
+        _ => "a different type",
+    }
+}
+
 impl Sema<'_> {
     pub(crate) fn type_call(
         &mut self,
@@ -127,6 +141,9 @@ impl Sema<'_> {
                         generic_args.len()
                     ),
                 );
+                // Don't continue into the misaligned `zip` below, which would bind dims off-by-one
+                // and report a spurious secondary E0502.
+                return sig.ret.clone();
             }
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
@@ -160,7 +177,7 @@ impl Sema<'_> {
         apply_subst(&sig.ret, &dims, &tys)
     }
 
-    fn unify(&mut self, param: &Ty, arg: &Ty, dims: &mut HashMap<Symbol, Dim>, span: Span) {
+    pub(crate) fn unify(&mut self, param: &Ty, arg: &Ty, dims: &mut HashMap<Symbol, Dim>, span: Span) {
         if arg.is_unknown() || arg.is_error() || param.is_unknown() || param.is_error() {
             return;
         }
@@ -245,6 +262,34 @@ impl Sema<'_> {
                     );
                 }
             }
+            // A scalar can't satisfy a tensor/vector parameter, nor a tensor a vector (or vice
+            // versa): a kind confusion the call-unification core otherwise let fall through. Array →
+            // tensor *decay* stays lenient (an `Array` argument is intentionally accepted for a
+            // tensor parameter — see `tests/run/tensor_add.mer`), so only Scalar/Vector/Tensor kind
+            // clashes are reported here.
+            (Ty::Tensor { .. }, Ty::Scalar(_) | Ty::Vector { .. })
+            | (Ty::Scalar(_) | Ty::Vector { .. }, Ty::Tensor { .. }) => {
+                self.error(
+                    span,
+                    "E0501",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
+            }
+            (Ty::Vector { .. }, Ty::Scalar(_)) | (Ty::Scalar(_), Ty::Vector { .. }) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
+            }
             // Named generic type variable, or anything else: stay lenient.
             _ => {}
         }
@@ -268,7 +313,13 @@ impl Sema<'_> {
                     }
                 }
                 None => {
-                    dims.insert(v, ad);
+                    // Don't bind a symbolic dim to `?` (Dynamic): a deferred dim carries no value,
+                    // so binding `N := ?` would make every later concrete sibling compare equal
+                    // (`dims_equal` treats `?` as matching anything), masking a real conflict. Leave
+                    // `N` unbound so a concrete sibling binds it and subsequent ones are checked.
+                    if !matches!(ad, Dim::Dynamic) {
+                        dims.insert(v, ad);
+                    }
                 }
             },
             Dim::Const(pc) => {
