@@ -282,6 +282,31 @@ fn differential_nested_struct() {
     }
 }
 
+/// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
+/// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
+/// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
+/// cast-precedence fix: `*p as T` is `(*p) as T`, not `*(p as T)`.
+#[test]
+fn differential_pointer() {
+    let programs = [
+        // &mut + store through pointer + read back.
+        "fn main() -> i32 { let mut x: i32 = 3; let p: *mut i32 = &mut x; *p = 7; return *p; }",
+        // pointer threaded through a call mutates the caller's local.
+        "fn setit(p: *mut i32, v: i32) { *p = v; } \
+         fn main() -> i32 { let mut n: i32 = 0; setit(&mut n, 99); return n; }",
+        // f32 through a pointer + the cast-precedence case `(*pf) as i32`.
+        "fn main() -> i32 { let mut x: f32 = 3.0; let pf: *mut f32 = &mut x; *pf = 7.5; \
+         print(*pf as i32); return (*pf as i32) - 7; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "pointer native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Float kernels must agree too: the interpreter computes `f32` ops in `f32`, so its printed
 /// results are bit-identical to native (including division, which would otherwise double-round).
 #[test]
@@ -1527,6 +1552,59 @@ fn tensor_matmul_is_correct() {
                     "tensor matmul wrong result (ns={ns}, tb={transposed_b}, par={parallel})"
                 );
             }
+        }
+    }
+}
+
+/// The `ikj` *accumulate* matmul (`let aik = a[i,k]; for j { c[i,j] = c[i,j] + aik*b[k,j] }`, the
+/// other canonical spelling, with a per-row zero-init for beta=0) must ALSO dispatch from tensor
+/// notation — the `aik` binding, the C read-modify-write store, and the zero-init all accept the
+/// 2-index form. Proves dispatch + native==interp==reference.
+#[test]
+fn tensor_matmul_accumulate_form() {
+    fn reference(ns: usize) -> i64 {
+        let a: Vec<f32> = (0..ns * ns).map(|i| (i % 3) as f32).collect();
+        let b: Vec<f32> = (0..ns * ns).map(|i| (i % 2) as f32).collect();
+        let mut sum = 0.0f32;
+        for i in 0..ns {
+            for j in 0..ns {
+                let mut acc = 0.0f32;
+                for k in 0..ns {
+                    acc += a[i * ns + k] * b[k * ns + j];
+                }
+                sum += acc;
+            }
+        }
+        sum as i64
+    }
+    let kernel = |ns: usize, parallel: bool| {
+        let attr = if parallel { "@parallel\n" } else { "" };
+        let n2 = ns * ns;
+        format!(
+            "module m\n{attr}fn mm(a: Tensor[f32, {ns}, {ns}], b: Tensor[f32, {ns}, {ns}], \
+             c: Tensor[f32, {ns}, {ns}]) {{\n\
+             for i in 0..{ns} {{ for j0 in 0..{ns} {{ c[i, j0] = 0.0; }} \
+             for k in 0..{ns} {{ let aik: f32 = a[i, k]; \
+             for j in 0..{ns} {{ c[i, j] = c[i, j] + aik * b[k, j]; }} }} }} }}\n\
+             fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; \
+             let mut b: [f32; {n2}] = [0.0; {n2}]; let mut c: [f32; {n2}] = [0.0; {n2}]; \
+             let mut i: i32 = 0; \
+             while i < {n2} {{ a[i] = ((i % 3) as f32); b[i] = ((i % 2) as f32); i += 1; }} \
+             mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+             while j < {n2} {{ s = s + c[j]; j += 1; }} return s as i32; }}"
+        )
+    };
+    assert!(
+        lowered_calls(&kernel(8, false), "mercury_sgemm"),
+        "tensor accumulate matmul -> mercury_sgemm"
+    );
+    for ns in [6usize, 7, 16, 17, 32] {
+        for parallel in [false, true] {
+            let src = kernel(ns, parallel);
+            let native = jit(&src, 3).expect("jit");
+            let interp = interp(&src, 3).expect("interp");
+            assert_eq!(native, interp, "tensor acc matmul native vs interp (ns={ns}, par={parallel})");
+            assert_eq!(native.0, reference(ns), "tensor acc matmul wrong (ns={ns}, par={parallel})");
         }
     }
 }
