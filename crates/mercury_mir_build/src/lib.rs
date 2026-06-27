@@ -615,7 +615,16 @@ fn lower_fn(
         } else {
             match (&ret_mir, tail) {
                 (MirType::Void, _) => fl.builder.ret(None),
-                (_, Some(v)) => fl.builder.ret(Some(v)),
+                // Coerce the implicit tail value to the return type, exactly like an explicit
+                // `return` — `fn g() -> i64 { 5 }` must not return the `i32` literal `5`.
+                (_, Some(v)) => {
+                    let cv = body
+                        .tail
+                        .as_ref()
+                        .map(|te| fl.coerce_return_value(v, te))
+                        .unwrap_or(v);
+                    fl.builder.ret(Some(cv));
+                }
                 (_, None) => fl.builder.set_term(mercury_mir::Terminator::Unreachable),
             }
         }
@@ -4614,7 +4623,10 @@ impl FnLowerer<'_> {
                     }
                     self.builder.ret(None);
                 } else {
-                    let v = opt.as_ref().map(|e| self.lower_expr(e));
+                    let v = opt.as_ref().map(|e| {
+                        let val = self.lower_expr(e);
+                        self.coerce_return_value(val, e)
+                    });
                     self.builder.ret(v);
                 }
                 self.terminated = true;
@@ -4686,6 +4698,21 @@ impl FnLowerer<'_> {
                 .copied(),
             None => self.loops.last().copied(),
         }
+    }
+
+    /// Coerce a `return`/tail value (lowered from `e`) to the function's declared return type, so the
+    /// emitted `Ret`/branch arg is well-typed. Without this, `fn f() -> i64 { return 0; }` returns an
+    /// `i32` literal from an `i64` function — MIR the native verifier and `mem2reg` reject while the
+    /// interpreter silently runs it (and truncates a too-wide value, a silent wrong answer). Mirrors
+    /// the coercion a `let`-annotation / argument / array-element already applies. A `Void` return
+    /// type (a unit fn) is left alone — there is no scalar to coerce.
+    fn coerce_return_value(&mut self, val: ValueId, e: &Expr) -> ValueId {
+        let to = self.builder.ret_type().clone();
+        if matches!(to, MirType::Void) {
+            return val;
+        }
+        let from = self.expr_mir(e);
+        self.coerce_to(val, &from, &to, self.signed(e))
     }
 
     fn lower_while(&mut self, label: Option<Symbol>, cond: &Expr, body: &Block) {

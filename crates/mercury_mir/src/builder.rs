@@ -117,6 +117,12 @@ impl Builder {
         self.set_term(Terminator::Ret(val));
     }
 
+    /// The function's declared return type (the `ret` passed to [`Builder::new`]). Lets the lowerer
+    /// coerce a `return`/tail value to it so the emitted `Ret` is well-typed.
+    pub fn ret_type(&self) -> &MirType {
+        &self.ret
+    }
+
     pub fn br(&mut self, target: BlockId, args: Vec<ValueId>) {
         self.set_term(Terminator::Br { target, args });
     }

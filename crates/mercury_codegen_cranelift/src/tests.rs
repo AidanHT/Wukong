@@ -876,6 +876,47 @@ fn differential_string_literals() {
     }
 }
 
+/// A `return`/tail value must be coerced to the function's declared return type, or `fn f() -> i64
+/// { return 0; }` emits a `Ret` of the `i32` literal `0` from an `i64` function — MIR the native
+/// verifier and `mem2reg` reject (a panic / exit-1 at -O2 and natively) while the interpreter
+/// silently runs it. Both the explicit `return` and the implicit tail are covered; native must agree
+/// with interp at every opt level (the previous corpus only ever returned type-matched literals).
+#[test]
+fn differential_return_type_coercion() {
+    let cases = [
+        // int literal from a wider return type (stays 0).
+        ("fn f() -> i64 { return 0; } fn main() -> i64 { return f(); }", 0i64),
+        // implicit tail value coerced to the return type.
+        ("fn g() -> i64 { 5 } fn main() -> i64 { return g(); }", 5),
+        // negative i32 literal sign-extends to i64.
+        (
+            "fn n() -> i64 { return 0 - 1; } fn main() -> i64 { return n(); }",
+            -1,
+        ),
+        // float literal promotes f32 -> f64 (1.5 is exact), then *4 = 6.
+        (
+            "fn h() -> f64 { return 1.5; } fn main() -> i64 { return (h() * 4.0) as i64; }",
+            6,
+        ),
+        // narrow (u8) return type.
+        ("fn b() -> u8 { return 5; } fn main() -> i64 { return b() as i64; }", 5),
+        // a recursive i64 function whose base case is `return 0;` (the field pattern the hunt hit).
+        (
+            "fn sum(n: i32) -> i64 { if n <= 0 { return 0; } return (n as i64) + sum(n - 1); } \
+             fn main() -> i64 { return sum(5); }",
+            15,
+        ),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "return-coercion native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "return-coercion wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Integer → `f32` conversion must round in a single IEEE step. The interpreter used to go int→f64→
 /// f32 (two roundings) while native does one `fcvt_from_{sint,uint}(F32)`, so they disagreed for
 /// magnitudes above 2^53 — the differential oracle was silently wrong. Pin both to the correctly
