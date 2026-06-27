@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 50
+// EXPECT-OUT: 5
+module tests.run.nested_tuple_field
+
+// `t.0.0` accesses a tuple nested inside a tuple. The lexer tokenizes the trailing `0.0` as a single
+// float literal, so the parser splits a plain `N.M` float in field position into two consecutive
+// tuple-field accesses (`(t.N).M`). Reads, assignment targets, and deeper nesting all work, and the
+// interpreter and native backend agree (this reuses the existing tuple-field lowering).
+fn main() -> i32 {
+    let t = ((1, 2), 3);
+    print(t.0.0);              // 1
+    print(t.0.1);              // 2
+
+    let u = (9, (7, 8));
+    print(u.1.0);              // 7
+
+    let mut m = ((1, 2), 3);
+    m.0.0 = 50;                // assignment through a nested tuple field
+    print(m.0.0);              // 50
+
+    let d = (((5, 6), 7), 8);
+    print(d.0.0.0);            // 5  (three levels deep)
+    return 0;
+}

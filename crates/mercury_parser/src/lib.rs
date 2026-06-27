@@ -542,6 +542,35 @@ impl<'a> Parser<'a> {
                                 index,
                             },
                         );
+                    } else if self.at(T::Float)
+                        && split_tuple_float(
+                            &self.src[self.span().lo as usize..self.span().hi as usize],
+                        )
+                        .is_some()
+                    {
+                        // `t.0.0` — the lexer glues two adjacent tuple indices into a single float
+                        // token (`0.0`). Split a plain `N.M` float into two consecutive tuple-field
+                        // accesses (`(t.N).M`). A float with an exponent/suffix is not a tuple-index
+                        // pair, so `split_tuple_float` declines and we fall through to the field-name
+                        // error path.
+                        let fsp = self.span();
+                        let (a, b) =
+                            split_tuple_float(&self.src[fsp.lo as usize..fsp.hi as usize]).unwrap();
+                        self.bump();
+                        let inner = self.finish_expr(
+                            start,
+                            ExprKind::TupleField {
+                                base: Box::new(lhs),
+                                index: a,
+                            },
+                        );
+                        lhs = self.finish_expr(
+                            start,
+                            ExprKind::TupleField {
+                                base: Box::new(inner),
+                                index: b,
+                            },
+                        );
                     } else {
                         let name = self.ident();
                         lhs = self.finish_expr(
@@ -1215,6 +1244,22 @@ impl<'a> Parser<'a> {
             }
         }
     }
+}
+
+/// Split a float-token text of the form `N.M` (two non-empty runs of ASCII digits separated by a
+/// single `.`, with no exponent or type suffix) into the tuple-index pair `(N, M)`. This recovers
+/// the two indices the lexer glues together in a nested tuple-field access like `t.0.0` (it lexes
+/// the trailing `0.0` as one float literal). Returns `None` for any genuine float (one with an
+/// exponent, a suffix, or a missing side), which is not a valid tuple-index pair.
+fn split_tuple_float(text: &str) -> Option<(u32, u32)> {
+    let (a, b) = text.split_once('.')?;
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    if !a.bytes().all(|c| c.is_ascii_digit()) || !b.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 fn token_to_binop(k: TokenKind) -> Option<BinOp> {
