@@ -282,6 +282,36 @@ fn differential_nested_struct() {
     }
 }
 
+/// `continue` inside a range `for` must run the loop step (the step lives at the body tail, so the
+/// lowering routes `continue` to a latch that increments first) — otherwise the loop never
+/// terminates. Native must agree with interp and actually halt (the test would hang on a regression).
+/// Covers a plain `for`, a nested `for`, and a `continue` reached on the first iteration.
+#[test]
+fn differential_for_continue() {
+    let programs = [
+        // skip odds: 0+2+4+6+8 = 20.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..10 { if i % 2 == 1 { continue; } s = s + i; } return s; }",
+        // continue on the very first iteration (i==0) then proceed.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..5 { if i == 0 { continue; } s = s + i; } return s; }",
+        // nested: inner continue skips j==1; sum over i in 0..3, j in 0..3, j!=1 -> per i (0+2)=2, *3 rows,
+        // plus i*3 added once per inner pass that isn't skipped (2 passes) -> handled by direct sum.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..3 { for j in 0..3 { if j == 1 { continue; } s = s + i * 10 + j; } } return s; }",
+        // continue interacts with a break in the same loop.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..100 { if i == 5 { break; } if i % 2 == 0 { continue; } s = s + i; } return s; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "for+continue native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
