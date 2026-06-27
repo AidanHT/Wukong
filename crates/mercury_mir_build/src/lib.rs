@@ -527,6 +527,7 @@ fn is_batched_norm_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -546,7 +547,12 @@ fn lower_fn(
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
     };
-    let ret_mir = mir_ty(&ret_ty);
+    // An aggregate (struct/tuple) return uses an **sret ABI**: the function returns `Void` and takes
+    // a hidden leading pointer parameter that the caller fills with a destination buffer; the body
+    // deep-copies the returned value into it. No aggregate ever rides in a register, so both backends
+    // execute only pointer passing + copies they already support.
+    let ret_is_agg = ty_is_aggregate(&ret_ty, sema);
+    let ret_mir = if ret_is_agg { MirType::Void } else { mir_ty(&ret_ty) };
 
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
@@ -559,7 +565,15 @@ fn lower_fn(
         gemm,
         parallel_fn,
         vec_loads: HashMap::new(),
+        sret: None,
     };
+
+    // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
+    // the destination buffer to the argument list.
+    if ret_is_agg {
+        let sret_ptr = fl.builder.add_param(MirType::Ptr);
+        fl.sret = Some((sret_ptr, ret_ty.clone()));
+    }
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
     // Arrays AND aggregates (tuples/structs) are passed by base pointer (ABI type `Ptr`); scalars by
@@ -589,13 +603,36 @@ fn lower_fn(
 
     let tail = fl.lower_block(body);
     if !fl.terminated {
-        match (&ret_mir, tail) {
-            (MirType::Void, _) => fl.builder.ret(None),
-            (_, Some(v)) => fl.builder.ret(Some(v)),
-            (_, None) => fl.builder.set_term(mercury_mir::Terminator::Unreachable),
+        if let Some((sret_ptr, rty)) = fl.sret.clone() {
+            // A fell-through aggregate body: its tail expression (a struct/tuple value) is the
+            // return value — deep-copy it into the sret buffer, then return void.
+            if let Some(v) = tail {
+                fl.emit_copy(sret_ptr, v, &rty);
+            }
+            fl.builder.ret(None);
+        } else {
+            match (&ret_mir, tail) {
+                (MirType::Void, _) => fl.builder.ret(None),
+                (_, Some(v)) => fl.builder.ret(Some(v)),
+                (_, None) => fl.builder.set_term(mercury_mir::Terminator::Unreachable),
+            }
         }
     }
     fl.builder.finish()
+}
+
+/// True if `ty` is an aggregate (struct/tuple/array) the ABI passes/returns by pointer — the same
+/// classification [`FnLowerer::mir_ty_of`] makes (a `Ty::Named` is aggregate iff it resolves to a
+/// declared struct). Free-standing so `lower_fn` can pick the sret ABI before the builder exists.
+fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
+    match ty {
+        Ty::Tuple(_) | Ty::Array { .. } => true,
+        Ty::Named(sym) => matches!(
+            sema.defs.lookup(*sym).map(|d| &d.kind),
+            Some(DefKind::Struct(_))
+        ),
+        _ => false,
+    }
 }
 
 /// Lower a `@parallel for idx in 0..hi { body }` function into two MIR functions:
@@ -639,6 +676,7 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::new(),
+            sret: None,
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -684,6 +722,7 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::new(),
+            sret: None,
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -1142,6 +1181,12 @@ struct FnLowerer<'a> {
     /// (keyed by its canonical text), so `x[i]` read twice (e.g. relu's `if x[i]>0 {x[i]}`) loads
     /// once. Cleared between unroll copies (addresses differ) and after any store (avoid staleness).
     vec_loads: HashMap<String, ValueId>,
+    /// Set when the function returns an aggregate (struct/tuple) by value: the hidden leading
+    /// **sret** pointer parameter the caller passes a destination buffer in, paired with the
+    /// aggregate return type. A `return <aggregate>` deep-copies into this pointer and returns void
+    /// (the function's MIR return type is `Void`), so both backends only ever pass/copy pointers —
+    /// no aggregate ever rides in a register. `None` for a scalar/void return.
+    sret: Option<(ValueId, Ty)>,
 }
 
 impl FnLowerer<'_> {
@@ -4390,13 +4435,18 @@ impl FnLowerer<'_> {
         match &s.kind {
             StmtKind::Let { pat, ty, init, .. } => {
                 let mty = match (ty, init) {
-                    // An aggregate (struct/tuple) literal sizes its slot from the init's sema type —
-                    // the free annotation lowering (`mir_ty_of_ast`) cannot size a named struct.
+                    // An aggregate (struct/tuple) initializer — a literal OR a value (a call that
+                    // returns a struct/tuple by value, or an aggregate variable) — sizes its slot
+                    // from the init's registry-aware MIR type; the free annotation lowering
+                    // (`mir_ty_of_ast`) falls back to `I32` for a named struct / tuple type. Array
+                    // literals/repeats are excluded so they keep their existing annotation-preferred
+                    // path (`mir_ty_of_ast` carries the explicit element type/length).
                     (_, Some(e))
-                        if matches!(
-                            &e.kind,
-                            ExprKind::StructLit { .. } | ExprKind::TupleLit(_)
-                        ) =>
+                        if matches!(self.expr_mir(e), MirType::Array(..))
+                            && !matches!(
+                                &e.kind,
+                                ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                            ) =>
                     {
                         self.expr_mir(e)
                     }
@@ -4416,8 +4466,19 @@ impl FnLowerer<'_> {
                         if let Ty::Named(sym) = self.expr_ty(e) {
                             self.lower_struct_init(slot, sym, fields, e.span);
                         }
-                    } else if let MirType::Array(elem, n) = &mty {
-                        self.lower_array_init(slot, elem, *n, e);
+                    } else if matches!(&e.kind, ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. })
+                    {
+                        if let MirType::Array(elem, n) = &mty {
+                            self.lower_array_init(slot, elem, *n, e);
+                        }
+                    } else if matches!(&mty, MirType::Array(..)) {
+                        // A non-literal aggregate value (a call returning a struct/tuple/array by
+                        // value, or another aggregate variable): the expression yields a base
+                        // pointer; deep-copy its leaves into the slot so the local owns its storage
+                        // (value semantics) and both backends agree.
+                        let src = self.lower_expr(e);
+                        let ty = self.expr_ty(e);
+                        self.emit_copy(slot, src, &ty);
                     } else {
                         let v = self.lower_expr(e);
                         self.builder.build_void(Op::Store {
@@ -4480,8 +4541,18 @@ impl FnLowerer<'_> {
                 self.lower_expr_stmt(e);
             }
             StmtKind::Return(opt) => {
-                let v = opt.as_ref().map(|e| self.lower_expr(e));
-                self.builder.ret(v);
+                if let Some((sret_ptr, rty)) = self.sret.clone() {
+                    // Aggregate return (sret ABI): deep-copy the value into the caller-provided
+                    // buffer — a struct/tuple *literal* recurses directly into it, a non-literal
+                    // aggregate value is copied leaf-by-leaf — then return void.
+                    if let Some(e) = opt {
+                        self.init_field(sret_ptr, &rty, e);
+                    }
+                    self.builder.ret(None);
+                } else {
+                    let v = opt.as_ref().map(|e| self.lower_expr(e));
+                    self.builder.ret(v);
+                }
                 self.terminated = true;
             }
             StmtKind::While { cond, body, .. } => self.lower_while(cond, body),
@@ -10003,6 +10074,21 @@ impl FnLowerer<'_> {
                 ) {
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
                     let ret = self.expr_mir(e);
+                    if matches!(ret, MirType::Array(..)) {
+                        // The callee returns an aggregate by value (sret ABI): allocate the
+                        // destination buffer here, pass it as the hidden leading argument, and yield
+                        // it as the call's value (the by-pointer aggregate convention — a further
+                        // `.field`/`[i]` GEPs off it).
+                        let dst = self.builder.alloca(ret);
+                        let mut call_args = Vec::with_capacity(argvals.len() + 1);
+                        call_args.push(dst);
+                        call_args.extend(argvals);
+                        self.builder.build_void(Op::Call {
+                            func: name,
+                            args: call_args,
+                        });
+                        return dst;
+                    }
                     if ret == MirType::Void {
                         self.builder.build_void(Op::Call {
                             func: name,
@@ -13631,6 +13717,7 @@ fn lower_matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -15239,6 +15326,7 @@ fn xent_bwd_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -15276,6 +15364,7 @@ fn xent_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -15321,6 +15410,7 @@ fn logsumexp_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -15448,6 +15538,7 @@ fn probe_single_for(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     check(&probe, pat, iter, lb)
 }
@@ -16447,6 +16538,7 @@ fn lower_i8matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()

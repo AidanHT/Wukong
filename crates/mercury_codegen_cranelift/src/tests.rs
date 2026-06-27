@@ -416,6 +416,51 @@ fn differential_struct_assign() {
     }
 }
 
+/// Returning an aggregate **by value** (`fn f() -> Struct`). Modeled with an sret ABI entirely in
+/// `mir_build`: an aggregate-returning function gets a hidden leading pointer parameter and returns
+/// void; `return <agg>` deep-copies into that pointer, and a call site allocates the destination
+/// buffer, prepends it, and uses it as the call's value. Both backends only ever pass/copy pointers,
+/// so no aggregate rides in a register — they agree at every `-O`. Covers an explicit `return`, a
+/// tail expression, a tuple return, a nested struct, a non-literal (`return p`) return, returned
+/// values used as arguments, and a field read off a returned temporary.
+#[test]
+fn differential_struct_return() {
+    let programs = [
+        // explicit `return Struct{..}`, let-bound and field-read off a temporary.
+        "struct Pt { x: i32, y: i32 } \
+         fn make(a: i32, b: i32) -> Pt { return Pt { x: a, y: b }; } \
+         fn main() -> i32 { let p = make(3, 4); return p.x + p.y + make(10, 20).y; }",
+        // tail-expression return (no `return` keyword).
+        "struct Pt { x: i32, y: i32 } \
+         fn make(a: i32, b: i32) -> Pt { Pt { x: a, y: b } } \
+         fn main() -> i32 { let p = make(4, 5); return p.x + p.y; }",
+        // tuple return.
+        "fn mk(a: i32, b: i32) -> (i32, i32) { return (a, b); } \
+         fn main() -> i32 { let t = mk(3, 4); return t.0 + t.1; }",
+        // nested struct return.
+        "struct Inner { a: i32 } struct Outer { inner: Inner, b: i32 } \
+         fn mk(a: i32, b: i32) -> Outer { return Outer { inner: Inner { a: a }, b: b }; } \
+         fn main() -> i32 { let o = mk(10, 5); return o.inner.a + o.b; }",
+        // non-literal return (`return p`) + returned values flowing into another call's args.
+        "struct Pt { x: i32, y: i32 } \
+         fn id(p: Pt) -> Pt { return p; } \
+         fn add(p: Pt, q: Pt) -> Pt { return Pt { x: p.x + q.x, y: p.y + q.y }; } \
+         fn main() -> i32 { let s = add(id(Pt { x: 1, y: 2 }), Pt { x: 3, y: 4 }); \
+         return s.x + s.y; }",
+        // multiple return paths (conditional), each an aggregate.
+        "struct Pt { x: i32, y: i32 } \
+         fn pick(c: i32) -> Pt { if c > 0 { return Pt { x: 1, y: 1 }; } Pt { x: 5, y: 5 } } \
+         fn main() -> i32 { return pick(1).x + pick(0).x; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct-return native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
 /// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
 /// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
