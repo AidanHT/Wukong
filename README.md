@@ -146,7 +146,13 @@ contraction, loop fusion, and `@parallel` multicore execution over fixed-size-ar
 **GPU backend** (`--features gpu`; NVIDIA, PTX via cudarc driver-JIT) adds tensor-core GEMM, fused
 flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode autodiff**
 (`mercury_autodiff`) emits the training backward pass — both gated against the interpreter oracle.
-Shape-typed *tensor* operations type-check today but do not yet lower/run. See the docs:
+Tuples, structs (including nested struct-in-struct), pointers/references (`&mut`/`*p`), and
+`loop`/`break`/`continue` execute end-to-end on both backends, and **constant-shape tensors run** —
+a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
+flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a
+matmul written in tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot and accumulate spellings)
+dispatches to the same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` form. Symbolic-generic
+tensor dimensions are still being wired. See the docs:
 
 - [Benchmarks](BENCHMARKS.md) — honest cross-language results vs C and Rust, with methodology.
 - [Language guide](docs/language-guide.md) — the language surface, with an honest maturity legend.

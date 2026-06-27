@@ -129,6 +129,25 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **Arrays**: fixed-size `[T; N]` run end to end — literal/repeat initializers, indexed load/store
   with a runtime index, and array parameters passed by base pointer (out-params work). Real kernels
   (dot product, SAXPY, a flat GEMM) run on the interpreter.
+- **Tuples, structs, pointers, `loop`, and constant-shape tensors execute**: tuples (`(a, b)`, field
+  access/assign `t.0`, heterogeneous padded fields), structs (`struct S { … }`, literals with fields
+  in any order, field access/assign), **nested structs** (struct-in-struct to any depth, an aggregate
+  field deep-copied from a variable, arrays of structs, tuple-of-struct), pointers/references
+  (`&mut x`, `*p` load/store, a pointer threaded through a call — address-taken locals stay in memory,
+  so `-O0` == `-O3`), and `loop { … }` with `break`/`continue` all run end-to-end on both the
+  interpreter and the native Cranelift backend. Aggregates lower to a flat padded byte buffer with no
+  dedicated aggregate MIR type (the local's value *is* its base pointer, like an array; nested fields
+  recurse, a non-literal aggregate field is a leaf-precise deep copy). **Constant-shape tensors** also
+  run: a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
+  flattens to a row-major GEP — the shape-typed surface executing, not just shape-checking. A matmul
+  written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot-product and accumulate
+  spellings, plus the `b[j,k]` `nn.Linear` `A·Bᵀ` form) **dispatches to the same tuned `mercury_sgemm`
+  microkernel** as the flat `a[i*K+k]` spelling — a 2-index operand access supplies its row stride
+  from the tensor's inner dimension (gated by `tensor_matmul_is_correct`/`tensor_matmul_accumulate_form`).
+  Fixtures `tests/run/{tuple,struct,struct_nested,pointer,loop,tensor_add,tensor_matmul}.mer`; the
+  aggregate path is differentially gated by `differential_{tuple,struct,nested_struct}` and pointers by
+  `differential_pointer` (native vs interpreter, bit-for-bit). By-value aggregate parameters/returns
+  (an sret ABI) and symbolic-generic tensor dimensions remain pending.
 - **Intrinsics**: `print`/`println` (captured stdout) and `assert` (traps on false).
 - **Runtime**: a bump `Arena` allocator and a deterministic `parallel_for`.
 - **Diagnostics**: rustc-style renderer, a stable error-code catalog with `--explain <CODE>`, and
@@ -156,6 +175,9 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   row (**~17× vs single-threaded C** — the multicore global argmax).
 
 ### Changed
+- **Cast precedence fixed**: `*p as T` now parses as `(*p) as T`, not `*(p as T)` (which had
+  mis-typed the deref as a `ptrtoint` then a load). `as` binds looser than `*`/unary, tighter than the
+  binary operators.
 - A construct lowering cannot yet handle (tensors, SIMD methods, generics, parallel loops) is now a
   hard `error[C0001]` instead of a warning, and the driver refuses to optimize, run, or codegen a
   module whose lowering failed — so the compiler never emits or executes invalid MIR.
@@ -186,5 +208,6 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
     *confirmation* sweep without changing the sequence of mutations.
 
 ### Notes
-- Tensors, SIMD vectors, and the parallel/GPU surface parse and type/shape-check today; full
-  execution of those paths and native LLVM linking are in progress.
+- **Constant-shape** tensors now execute end-to-end (above); **symbolic-generic** tensor dimensions,
+  SIMD vector *values*, `enum`s/slices, and by-value aggregate parameters/returns parse and
+  type/shape-check today but do not yet lower/run, and native LLVM linking is in progress.

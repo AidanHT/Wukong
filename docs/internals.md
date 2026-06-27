@@ -93,6 +93,25 @@ The front-end lowers in **clang style**: one `alloca` per local, with `load`/`st
 This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
 SSA registers (see below), which is what makes the value-based passes effective.
 
+There is **no dedicated aggregate MIR type**. A tuple or struct is a flat, padded byte buffer whose
+local value *is* its base pointer (the convention arrays already follow); `t.0` / `s.f` is a typed
+`load`/`store` at the field's byte offset, and `mem2reg` leaves the slot in memory. Nested aggregates
+(a struct/tuple field that is itself a struct, or an array of structs) lay out recursively — the
+registry-aware layout helpers resolve a named-struct field that the leaf type crate marks unsized — and
+an aggregate field initialized from a *non-literal* value is a leaf-precise deep copy, not a flat
+`memcpy` (which would skip a padded non-leading scalar slot under the interpreter's slot-indexed
+memory). Pointers/references reuse the same `Alloca`/`Load`/`Store`/`Gep` ops: `&mut x` takes a slot's
+address, `*p` loads/stores through it, and `mem2reg` refuses to promote a slot whose address escapes,
+so `-O0` ≡ `-O3`. A **constant-shape tensor** lowers like an array — the parameter is a base pointer
+and a multi-dimensional index `a[i, j]` flattens to a row-major `Gep` — so the shape-typed surface
+*executes*, not just shape-checks. A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
+both the dot-product and accumulate spellings) dispatches to the tuned `mercury_sgemm` microkernel
+just like the flat `a[i*K+k]` form, because a 2-index access supplies its row stride from the
+operand's inner tensor dimension (symbolic-generic dimensions remain checked-only). The aggregate path is differentially gated
+bit-for-bit against the interpreter by the `differential_tuple`/`differential_struct`/
+`differential_nested_struct` Cranelift tests; returning an aggregate *by value* from a function still
+needs an sret ABI and does not yet lower.
+
 The **verifier** (`mercury_mir::verify`) checks that every used value is defined, types are
 consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled after every pass.
 
