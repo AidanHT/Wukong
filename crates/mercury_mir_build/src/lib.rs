@@ -1295,6 +1295,87 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// The MIR slot type for a `let x: T;` annotation with **no** initializer — the registry-aware
+    /// companion to the free `mir_ty_of_ast` (which mistypes a named struct / a tuple as `i32`,
+    /// under-allocating the slot so a later field write GEPs off a scalar and ICEs). A named struct
+    /// resolves to its byte buffer (`mir_ty_of`), a tuple to a padded byte buffer sized from its
+    /// elements, an array recurses (so an array-of-struct element is sized correctly), and every
+    /// pointer/scalar form matches `mir_ty_of_ast`.
+    fn mir_ty_of_ann(&self, t: &ast::TypeExpr) -> MirType {
+        use ast::TypeKind::*;
+        match &t.kind {
+            Path(p) => {
+                let sym = p.segments.last().unwrap().sym;
+                let name = self.interner.resolve(sym);
+                if let Some(s) = mercury_types::Scalar::from_name(name) {
+                    MirType::from_scalar(s)
+                } else if matches!(
+                    self.sema.defs.lookup(sym).map(|d| &d.kind),
+                    Some(DefKind::Struct(_))
+                ) {
+                    self.mir_ty_of(&Ty::Named(sym))
+                } else {
+                    MirType::I32
+                }
+            }
+            Array { elem, len } => match const_usize_expr(len, self.interner) {
+                Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
+                None => MirType::Ptr,
+            },
+            Tuple(fields) => {
+                // A padded byte buffer sized from the element MIR types — the same layout the
+                // with-initializer path derives via `mir_ty_of(Ty::Tuple(..))`/`ty_size`.
+                let elems: Vec<MirType> = fields.iter().map(|f| self.mir_ty_of_ann(f)).collect();
+                let mut size = 0u64;
+                let mut align = 1u64;
+                for e in &elems {
+                    let a = mir_byte_align(e);
+                    size = round_up(size, a);
+                    size += mir_byte_size(e);
+                    align = align.max(a);
+                }
+                MirType::Array(Box::new(MirType::I8), round_up(size, align) as u32)
+            }
+            Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
+            Vector { elem, lanes } => MirType::Vec(Box::new(self.mir_ty_of_ann(elem)), *lanes),
+            Unit => MirType::Void,
+            _ => MirType::I32,
+        }
+    }
+
+    /// Zero-initialize the freshly-alloca'd slot of a no-initializer `let`. A scalar gets one typed
+    /// zero store; a scalar array fills (unrolled when small, a fill loop otherwise); an aggregate
+    /// (struct/tuple byte buffer, or an array of aggregates) recurses so every leaf is zeroed. The
+    /// effect mirrors the interpreter's zero-initialized memory, so an uninitialized read agrees
+    /// bit-for-bit across backends and opt levels. (A `Ptr`/`Vec` slot — a rare no-init form — is
+    /// left alone: there is no valid typed-zero MIR constant for those, and neither was a reported
+    /// divergence; this is strictly an improvement over the prior garbage-read behavior.)
+    fn zero_init(&mut self, slot: ValueId, ty: &MirType) {
+        if ty.is_int() || ty.is_float() {
+            let z = self.const_zero(ty.clone());
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: z,
+            });
+        } else if let MirType::Array(elem, n) = ty {
+            if elem.is_int() || elem.is_float() {
+                let z = self.const_zero((**elem).clone());
+                if *n <= REPEAT_UNROLL_LIMIT {
+                    for i in 0..*n as i128 {
+                        self.store_element(slot, elem, i, z);
+                    }
+                } else {
+                    self.lower_fill_loop(slot, elem, *n, z);
+                }
+            } else {
+                for i in 0..*n as i128 {
+                    let ep = self.gep_elem(slot, elem, i);
+                    self.zero_init(ep, elem);
+                }
+            }
+        }
+    }
+
     /// The ABI type of a parameter of semantic type `ty`: an aggregate (array/tuple/struct, whose
     /// `mir_ty_of` is an `Array` byte buffer) is passed by base **pointer**; a scalar by value. The
     /// registry-aware companion to the free `param_abi_ty` (which mistypes a named struct as `I32`).
@@ -4555,6 +4636,11 @@ impl FnLowerer<'_> {
                             (ann, _) => ann,
                         }
                     }
+                    // A `let x: T;` with no initializer. Resolve `T` registry-aware so a no-init
+                    // struct/tuple local allocates its real byte buffer — the registry-blind
+                    // `mir_ty_of_ast` falls back to `i32`, under-allocating the slot so a later
+                    // `p.f = …` GEPs off an `i32` and emits MIR the verifier/Cranelift reject (an ICE).
+                    (Some(t), None) => self.mir_ty_of_ann(t),
                     (Some(t), _) => mir_ty_of_ast(t, self.interner),
                     (None, Some(e)) => self.expr_mir(e),
                     (None, None) => MirType::I32,
@@ -4591,6 +4677,14 @@ impl FnLowerer<'_> {
                             value: v,
                         });
                     }
+                } else {
+                    // No initializer: zero-initialize the slot so a read-before-write yields a
+                    // deterministic zero on every backend — matching the interpreter oracle's
+                    // zero-initialized memory and mem2reg's read-before-write zero substitution.
+                    // Native -O0 otherwise reads stack garbage, a three-way divergence (interp 0 /
+                    // native-O0 garbage / native-O2 0 via mem2reg) that violates both hard
+                    // invariants at once. Scalars, arrays, and struct/tuple byte buffers are covered.
+                    self.zero_init(slot, &mty);
                 }
                 match &pat.kind {
                     ast::PatKind::Ident(name) => self.bind(*name, slot, mty),
@@ -12436,6 +12530,29 @@ fn round_up(x: u64, align: u64) -> u64 {
         x
     } else {
         (x + align - 1) & !(align - 1)
+    }
+}
+
+/// Byte size of a MIR type (scalars by width, an array/vector as count × element). Used to size a
+/// no-init tuple's byte buffer from its element MIR types (`mir_ty_of_ann`). Matches `Ty::size_of`'s
+/// scalar widths so the buffer is identical to the with-initializer path's `ty_size`.
+fn mir_byte_size(t: &MirType) -> u64 {
+    match t {
+        MirType::I1 | MirType::I8 => 1,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 2,
+        MirType::I32 | MirType::F32 => 4,
+        MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::Vec(e, n) | MirType::Array(e, n) => mir_byte_size(e) * (*n as u64),
+        MirType::Void => 0,
+    }
+}
+
+/// Alignment of a MIR type: a scalar aligns to its size, an array/vector to its element. Companion
+/// to [`mir_byte_size`] for padding a no-init tuple's byte buffer.
+fn mir_byte_align(t: &MirType) -> u64 {
+    match t {
+        MirType::Vec(e, _) | MirType::Array(e, _) => mir_byte_align(e),
+        other => mir_byte_size(other).max(1),
     }
 }
 
