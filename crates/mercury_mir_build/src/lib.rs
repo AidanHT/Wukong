@@ -1156,9 +1156,14 @@ enum VTerm<'b> {
 /// the (loop-invariant) coefficient exprs, lowered to ValueIds at emit time so a runtime scale such as
 /// saxpy's `a` works. `op` is the activation byte; `VE_USE_Y` is set iff `y` is present.
 struct VElemPlan<'b> {
-    out: ValueId,
-    x: ValueId,
-    y: Option<ValueId>,
+    // The operand *symbols* (not pre-resolved values): a pure matcher can't emit the load that pulls
+    // a tensor/pointer param's base out of its slot, so the base pointer is resolved at emit time via
+    // `kernel_base_ptr` (a no-op for an array operand, a `Load` for a `Tensor`/pointer one). Storing
+    // the slot value here instead would GEP off the slot address for a `Tensor[..]` param — the
+    // 1-D-tensor-kernel segfault/divergence.
+    out: Symbol,
+    x: Symbol,
+    y: Option<Symbol>,
     a: Option<&'b Expr>,
     b: Option<&'b Expr>,
     c: Option<&'b Expr>,
@@ -6192,7 +6197,11 @@ impl FnLowerer<'_> {
         let Some((s_slot, MirType::F32)) = self.lookup(s) else {
             return false;
         };
-        let (Some((xv, _)), Some((yv, _))) = (self.lookup(xb), self.lookup(yb)) else {
+        // Resolve each operand's base pointer — `kernel_base_ptr` loads it out of a `Tensor[..]`/
+        // pointer param's slot (a no-op for an array operand). A plain `self.lookup(..).0` here passed
+        // a 1-D `Tensor` param's *slot address* to the kernel: the interpreter trapped while native
+        // read past the slot — the 1-D-tensor reduction divergence.
+        let (Some(xv), Some(yv)) = (self.kernel_base_ptr(xb), self.kernel_base_ptr(yb)) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -6573,7 +6582,11 @@ impl FnLowerer<'_> {
         let Some((s_slot, MirType::F32)) = self.lookup(s) else {
             return false;
         };
-        let (Some((xv, _)), Some((yv, _))) = (self.lookup(xb), self.lookup(yb)) else {
+        // Resolve each operand's base pointer — `kernel_base_ptr` loads it out of a `Tensor[..]`/
+        // pointer param's slot (a no-op for an array operand). A plain `self.lookup(..).0` here passed
+        // a 1-D `Tensor` param's *slot address* to the kernel: the interpreter trapped while native
+        // read past the slot — the 1-D-tensor reduction divergence.
+        let (Some(xv), Some(yv)) = (self.kernel_base_ptr(xb), self.kernel_base_ptr(yb)) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -7431,16 +7444,18 @@ impl FnLowerer<'_> {
         j: Symbol,
         body: &Block,
         batch: Option<(Symbol, &Expr)>,
-    ) -> Option<Vec<(ValueId, ValueId, u32, MirType)>> {
+    ) -> Option<Vec<(Symbol, Symbol, u32, MirType)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
             let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j, batch)?;
-            let (out_base, _) = self.lookup(out_sym)?;
-            let (x_base, _) = self.lookup(x_sym)?;
-            calls.push((out_base, x_base, opcode, in_elem));
+            // Keep the operand *symbols* (validated in scope); the base pointer is resolved at emit
+            // time via `kernel_base_ptr`, which loads it out of a `Tensor[..]`/pointer param's slot.
+            self.lookup(out_sym)?;
+            self.lookup(x_sym)?;
+            calls.push((out_sym, x_sym, opcode, in_elem));
         }
         Some(calls)
     }
@@ -7452,10 +7467,18 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        calls: Vec<(ValueId, ValueId, u32, MirType)>,
+        calls: Vec<(Symbol, Symbol, u32, MirType)>,
     ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        for (out_base, x_base, opcode, in_elem) in calls {
+        for (out_sym, x_sym, opcode, in_elem) in calls {
+            // Resolve each operand's base pointer (a `Load` out of a `Tensor[..]`/pointer param's
+            // slot, a no-op for an array). The matcher validated every symbol.
+            let out_base = self
+                .kernel_base_ptr(out_sym)
+                .expect("vmath `out` operand validated in matcher");
+            let x_base = self
+                .kernel_base_ptr(x_sym)
+                .expect("vmath `x` operand validated in matcher");
             // The input strides by its element width (f32/bf16/f16) through the matching kernel; the
             // output is always f32.
             let func = match in_elem {
@@ -7681,17 +7704,19 @@ impl FnLowerer<'_> {
         &self,
         j: Symbol,
         body: &Block,
-    ) -> Option<Vec<(ValueId, ValueId, ValueId, u32)>> {
+    ) -> Option<Vec<(Symbol, Symbol, Symbol, u32)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
             let (out_sym, x_sym, y_sym, opcode) = self.match_vmath2_stmt(stmt, j)?;
-            let (out_base, _) = self.lookup(out_sym)?;
-            let (x_base, _) = self.lookup(x_sym)?;
-            let (y_base, _) = self.lookup(y_sym)?;
-            calls.push((out_base, x_base, y_base, opcode));
+            // Keep the operand symbols; the base pointer is resolved (loaded from a tensor slot) at
+            // emit time via `kernel_base_ptr`.
+            self.lookup(out_sym)?;
+            self.lookup(x_sym)?;
+            self.lookup(y_sym)?;
+            calls.push((out_sym, x_sym, y_sym, opcode));
         }
         Some(calls)
     }
@@ -7701,10 +7726,19 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        calls: Vec<(ValueId, ValueId, ValueId, u32)>,
+        calls: Vec<(Symbol, Symbol, Symbol, u32)>,
     ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        for (out_base, x_base, y_base, opcode) in calls {
+        for (out_sym, x_sym, y_sym, opcode) in calls {
+            let out_base = self
+                .kernel_base_ptr(out_sym)
+                .expect("vmath2 `out` operand validated in matcher");
+            let x_base = self
+                .kernel_base_ptr(x_sym)
+                .expect("vmath2 `x` operand validated in matcher");
+            let y_base = self
+                .kernel_base_ptr(y_sym)
+                .expect("vmath2 `y` operand validated in matcher");
             let gep = |this: &mut Self, base: ValueId, elem: MirType| {
                 this.builder.build(
                     MirType::Ptr,
@@ -7826,17 +7860,18 @@ impl FnLowerer<'_> {
             return None;
         }
         let (x_sym, a) = arrays[0];
-        let x = self.lookup(x_sym)?.0;
+        self.lookup(x_sym)?; // validate the array/tensor is a bound local/param
         let (y, b, op_y) = if arrays.len() == 2 {
             let (y_sym, b) = arrays[1];
-            (Some(self.lookup(y_sym)?.0), b, VE_USE_Y)
+            self.lookup(y_sym)?;
+            (Some(y_sym), b, VE_USE_Y)
         } else {
             (None, None, 0)
         };
-        let out = self.lookup(out_sym)?.0;
+        self.lookup(out_sym)?;
         Some(VElemPlan {
-            out,
-            x,
+            out: out_sym,
+            x: x_sym,
             y,
             a,
             b,
@@ -7879,10 +7914,13 @@ impl FnLowerer<'_> {
         if self.expr_mir(lhs) != MirType::F32 || self.expr_mir(rhs) != MirType::F32 {
             return None;
         }
+        self.lookup(out_sym)?;
+        self.lookup(x_sym)?;
+        self.lookup(y_sym)?;
         Some(VElemPlan {
-            out: self.lookup(out_sym)?.0,
-            x: self.lookup(x_sym)?.0,
-            y: Some(self.lookup(y_sym)?.0),
+            out: out_sym,
+            x: x_sym,
+            y: Some(y_sym),
             a: None,
             b: None,
             c: None,
@@ -7976,6 +8014,17 @@ impl FnLowerer<'_> {
     /// pointer — no need for a Ptr-typed null const, which is invalid MIR).
     fn emit_velem_call(&mut self, s: ValueId, e: ValueId, plan: &VElemPlan) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        // Resolve each operand's base pointer (loading it out of the slot for a `Tensor[..]`/pointer
+        // param; a no-op for an array operand). The matcher validated every symbol, so this resolves.
+        let x_base = self
+            .kernel_base_ptr(plan.x)
+            .expect("velem `x` operand validated in matcher");
+        let y_base = plan
+            .y
+            .map(|y| self.kernel_base_ptr(y).expect("velem `y` operand validated in matcher"));
+        let out_base = self
+            .kernel_base_ptr(plan.out)
+            .expect("velem `out` operand validated in matcher");
         let gep = |me: &mut Self, base: ValueId| {
             me.builder.build(
                 MirType::Ptr,
@@ -7986,12 +8035,12 @@ impl FnLowerer<'_> {
                 },
             )
         };
-        let xp = gep(self, plan.x);
-        let yp = match plan.y {
+        let xp = gep(self, x_base);
+        let yp = match y_base {
             Some(y) => gep(self, y),
             None => xp,
         };
-        let outp = gep(self, plan.out);
+        let outp = gep(self, out_base);
         // Default `b` is 1.0 when `y` is read, else 0.0 (unused); `a` defaults to 1.0, `c` to 0.0.
         let a = self.lower_coeff(plan.a, 1.0);
         let b = self.lower_coeff(plan.b, if plan.y.is_some() { 1.0 } else { 0.0 });

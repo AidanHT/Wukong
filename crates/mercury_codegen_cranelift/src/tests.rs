@@ -944,6 +944,40 @@ fn differential_char_patterns() {
     }
 }
 
+/// A 1-D `Tensor[..]` parameter fed to a recognized 1-D runtime kernel — streaming-elementwise
+/// (velem), a vmath activation, a reduction, and an `@parallel` reduction. A `Tensor` param binds to
+/// a slot holding the base pointer, so the recognizers must load the base out of the slot (as the
+/// regular index path and the GEMM path do) before GEPing. They used to GEP off the slot *address*,
+/// so the kernel read past it — the interpreter trapped while native segfaulted / returned wrong
+/// values, a backend divergence on a documented feature (only 2-D tensor params were ever tested).
+#[test]
+fn differential_tensor_1d_kernels() {
+    let cases = [
+        // velem: out[i] = a[i] * 3  -> 1*3 + 4*3 = 15
+        ("fn f(a: Tensor[f32,4], o: Tensor[f32,4]) { for i in 0..4 { o[i] = a[i] * 3.0; } } \
+          fn main() -> i32 { let a:[f32;4]=[1.0,2.0,3.0,4.0]; let o:[f32;4]=[0.0,0.0,0.0,0.0]; \
+          f(a, o); return (o[0] + o[3]) as i32; }", 15),
+        // vmath: out[i] = exp(a[i])  -> exp(0)*4 = 4
+        ("fn f(a: Tensor[f32,4], o: Tensor[f32,4]) { for i in 0..4 { o[i] = exp(a[i]); } } \
+          fn main() -> i32 { let a:[f32;4]=[0.0,0.0,0.0,0.0]; let o:[f32;4]=[0.0,0.0,0.0,0.0]; \
+          f(a, o); return (o[0] + o[1] + o[2] + o[3]) as i32; }", 4),
+        // reduction: sum -> 10
+        ("fn f(a: Tensor[f32,4]) -> f32 { let mut s:f32=0.0; for i in 0..4 { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;4]=[1.0,2.0,3.0,4.0]; return f(a) as i32; }", 10),
+        // @parallel reduction: sum of eight 1.0 -> 8
+        ("@parallel fn f(a: Tensor[f32,8]) -> f32 { let mut s:f32=0.0; for i in 0..8 { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;8]=[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]; return f(a) as i32; }", 8),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "tensor-1d-kernel native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "tensor-1d-kernel wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
 /// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
 /// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*
