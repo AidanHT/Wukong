@@ -1213,6 +1213,39 @@ fn differential_aggregate_literal_adapt() {
     }
 }
 
+/// A top-level `const` used as an array length resolves to its value. Both sema's `eval_usize` and
+/// mir_build's `const_usize_expr` were integer-literal-only, silently sizing the slot to 0 (a
+/// zero-length array, then a spurious E0501). They now both resolve a single-segment path naming a
+/// `const` to its checked initializer, MIRRORED exactly so the alloca'd length agrees with sema's
+/// index-bounds checks (a disagreement would re-introduce an interp/native slot-size divergence).
+/// Guards a plain const, a const-references-const chain, an array-repeat count, a struct field, and
+/// order-independence (consts are populated in `collect`, before any body is checked).
+#[test]
+fn differential_const_array_length() {
+    let cases = [
+        // plain const length: a[0] + a[3] = 10 + 40.
+        ("const N: usize = 4; fn main() -> i32 { let a: [i32; N] = [10, 20, 30, 40]; return a[0] + a[3]; }", 50),
+        // const-references-const chain: C = B = A = 2.
+        ("const A: usize = 2; const B: usize = A; const C: usize = B; \
+          fn main() -> i32 { let c: [i32; C] = [7, 8]; return c[0] + c[1]; }", 15),
+        // array-repeat count via const: [3; N] with N = 4 -> a[0] + a[3] = 6.
+        ("const N: usize = 4; fn main() -> i32 { let a: [i32; N] = [3; N]; return a[0] + a[3]; }", 6),
+        // struct field const-length array.
+        ("const K: usize = 3; struct Buf { data: [i32; K] } \
+          fn main() -> i32 { let b = Buf { data: [10, 20, 30] }; return b.data[2]; }", 30),
+        // const defined AFTER use (order-independent).
+        ("fn main() -> i32 { let a: [i32; M] = [1, 2, 3, 4, 5]; return a[4]; } const M: usize = 5;", 5),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "const-array-length native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "const-array-length wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}

@@ -556,6 +556,19 @@ impl Sema<'_> {
     }
 
     fn eval_usize(&self, e: &Expr) -> u64 {
+        self.eval_usize_depth(e, 0)
+    }
+
+    /// Evaluate a compile-time array length: a plain integer literal, or a single-segment path
+    /// naming a top-level `const` whose initializer is itself such a length (so `const N: usize = 4;
+    /// [i32; N]` sizes the array). `self.consts` is populated in `collect` before any body is
+    /// checked, so this is order-independent. `mir_build`'s `const_usize_expr` mirrors this exactly
+    /// — the two must agree on the length, else the slot size desyncs from these bounds checks. The
+    /// depth bound guards against a cyclic const initializer (also rejected by `check_recursive_consts`).
+    fn eval_usize_depth(&self, e: &Expr, depth: u32) -> u64 {
+        if depth > 64 {
+            return 0;
+        }
         match &e.kind {
             ExprKind::Int(s) => {
                 let text = self.sym_str(*s);
@@ -565,6 +578,10 @@ impl Sema<'_> {
                     .parse()
                     .unwrap_or(0)
             }
+            ExprKind::Path(p) if p.is_single() => match self.consts.get(&p.first().sym) {
+                Some(init) => self.eval_usize_depth(init, depth + 1),
+                None => 0,
+            },
             _ => 0,
         }
     }
