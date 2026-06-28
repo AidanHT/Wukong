@@ -421,6 +421,30 @@ impl Sema<'_> {
         }
     }
 
+    /// Evaluate a compile-time index: a literal (or negated literal) directly, or a top-level `const`
+    /// name resolved to its recorded initializer (recursing for a const-references-const). Without the
+    /// const resolution, `xs[I]` for `const I = 99` slipped past the bounds check — sema accepted it,
+    /// then mir_build inlined the const and the index went out of bounds (interp traps, native reads
+    /// past the buffer: a backend divergence on a program that should never have compiled). The depth
+    /// cap guards against a recursive const (separately reported as E0403) looping here.
+    fn eval_index_const(&self, e: &Expr) -> Option<i64> {
+        self.eval_index_const_depth(e, 0)
+    }
+
+    fn eval_index_const_depth(&self, e: &Expr, depth: u32) -> Option<i64> {
+        if depth > 32 {
+            return None;
+        }
+        if let ExprKind::Path(p) = &e.kind {
+            if p.is_single() {
+                if let Some(init) = self.consts.get(&p.first().sym) {
+                    return self.eval_index_const_depth(init, depth + 1);
+                }
+            }
+        }
+        crate::eval_const_int(e, self.interner)
+    }
+
     pub(crate) fn type_index(&mut self, base: &Expr, indices: &[Expr], span: Span) -> Ty {
         let base_ty = self.type_expr(base);
         for ix in indices {
@@ -471,7 +495,7 @@ impl Sema<'_> {
                     // symbolic/dynamic dim or a non-constant index is left unconstrained.
                     for (ix, dim) in indices.iter().zip(shape.0.iter()) {
                         if let Dim::Const(n) = dim {
-                            if let Some(v) = crate::eval_const_int(ix, self.interner) {
+                            if let Some(v) = self.eval_index_const(ix) {
                                 if v < 0 || v as u64 >= *n {
                                     self.error(
                                         ix.span,
@@ -493,7 +517,7 @@ impl Sema<'_> {
                 // otherwise undefined: the backends disagree). Only a literal index is checked; a
                 // runtime `a[i]` is unconstrained.
                 if indices.len() == 1 {
-                    if let Some(v) = crate::eval_const_int(&indices[0], self.interner) {
+                    if let Some(v) = self.eval_index_const(&indices[0]) {
                         if v < 0 || v as u64 >= len {
                             self.error(
                                 span,
