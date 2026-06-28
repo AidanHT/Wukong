@@ -9597,7 +9597,18 @@ impl FnLowerer<'_> {
         let tv = self.lower_block(then_branch);
         if !self.terminated {
             let args = match (merge_param.is_some(), tv) {
-                (true, Some(v)) => vec![v],
+                (true, Some(v)) => {
+                    // Coerce the arm's value to the merged result type (the join of the two arms) so
+                    // both arms pass the merge param the *same* MIR type. Without this, arms of
+                    // different width/kind (`if c { 1 } else { 2.5 }`) pass a mismatched value: the
+                    // native verifier rejects the merge while the interpreter runs loosely — a
+                    // backend divergence on a program the front-end accepted.
+                    let (from, signed) = match &then_branch.tail {
+                        Some(t) => (self.expr_mir(t), self.signed(t)),
+                        None => (result_ty.clone(), true),
+                    };
+                    vec![self.coerce_to(v, &from, &result_ty, signed)]
+                }
                 (true, None) => vec![self.const_zero(result_ty.clone())],
                 (false, _) => vec![],
             };
@@ -9611,7 +9622,8 @@ impl FnLowerer<'_> {
             let ev = self.lower_expr(els);
             if !self.terminated {
                 let args = if merge_param.is_some() {
-                    vec![ev]
+                    let from = self.expr_mir(els);
+                    vec![self.coerce_to(ev, &from, &result_ty, self.signed(els))]
                 } else {
                     vec![]
                 };
@@ -10480,16 +10492,20 @@ impl FnLowerer<'_> {
     ) {
         let bv = self.lower_expr(body);
         if !self.terminated {
-            let args = match merge_param {
-                Some(_) => vec![bv],
-                None => vec![],
-            };
-            // Guard against a body whose own type is unit while the match yields a value: coerce a
-            // missing value to a zero so the edge arg arity matches the merge param.
-            let args = if merge_param.is_some() && args.is_empty() {
-                vec![self.const_zero(result_ty.clone())]
+            let args = if merge_param.is_some() {
+                // Coerce the arm value to the match's merged result type, so every arm passes the
+                // merge param the *same* MIR type. Without this, arms of different width/kind
+                // (`match n { 0 => 10, _ => 2.5 }`) pass a mismatched value the native verifier
+                // rejects while the interpreter runs loosely — a backend divergence. A unit-typed
+                // body with a value-producing match yields a zero so the edge arity still matches.
+                let from = self.expr_mir(body);
+                if matches!(from, MirType::Void) {
+                    vec![self.const_zero(result_ty.clone())]
+                } else {
+                    vec![self.coerce_to(bv, &from, result_ty, self.signed(body))]
+                }
             } else {
-                args
+                vec![]
             };
             self.builder.br(merge, args);
         }
