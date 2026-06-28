@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0401
+module tests.fail.arith_struct
+
+// Arithmetic (and every other binary operator besides the already-rejected `==`/`!=`) on an
+// aggregate is undefined: `a + b` on two structs used to type-check via the lenient `join`
+// fallthrough, then mir_build emitted an `add` on the two base pointers — invalid MIR (an internal
+// compiler error). Add the corresponding fields instead. Tensors and vectors are *not* aggregates,
+// so element-wise tensor/vector arithmetic is unaffected.
+struct V2 {
+    x: f32,
+    y: f32,
+}
+
+fn main() -> i32 {
+    let a = V2 { x: 1.0, y: 2.0 };
+    let b = V2 { x: 3.0, y: 4.0 };
+    let c = a + b;
+    return c.x as i32;
+}

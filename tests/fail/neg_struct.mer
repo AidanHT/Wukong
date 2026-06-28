@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.neg_struct
+
+// Unary `-` on a struct (an aggregate) is meaningless: it used to pass the operand type through
+// unchanged, then mir_build emitted an arithmetic negate on the struct's base pointer — invalid MIR
+// (an internal compiler error). Negate a scalar field instead.
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() -> i32 {
+    let p = Point { x: 1, y: 2 };
+    let q = -p;
+    return q.x;
+}
