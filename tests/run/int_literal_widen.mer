@@ -1,0 +1,31 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9000000000
+// EXPECT-OUT: 9000000000
+// EXPECT-OUT: 12345678901
+// EXPECT-OUT: 3000000000
+// EXPECT-OUT: 5
+module tests.run.int_literal_widen
+
+// An unsuffixed integer literal that overflows i32 keeps its value instead of silently wrapping to its
+// low 32 bits. `9000000000` used to default to i32 and bake a `const.i32` (= 410065408) into the
+// shared MIR, so BOTH backends agreed on the wrong value — invisible to the interp-vs-native gate. The
+// default now widens to i64 when the value does not fit i32, so a return / field / cast / bare context
+// lowers the true value; a pinned-i32 annotation still re-adapts and range-checks (a hard E0401, see
+// tests/fail/return_literal_out_of_range.mer).
+
+struct Big { v: i64 }
+
+fn ret_i64() -> i64 { return 9000000000; }
+fn ret_u64() -> u64 { return 3000000000; }   // i64-typed literal -> u64 (same width, positive)
+
+fn main() -> i32 {
+    print(ret_i64());                 // 9000000000   (was 410065408)
+    let x = 9000000000 as i64;        // cast operand: i64 before the no-op cast
+    print(x);                         // 9000000000
+    let b = Big { v: 12345678901 };   // struct-field init of a wider field
+    print(b.v);                       // 12345678901
+    print(ret_u64());                 // 3000000000   (was 18446744072414584320)
+    let small = 5;                    // a value that fits i32 is unaffected
+    print(small);                     // 5
+    return 0;
+}

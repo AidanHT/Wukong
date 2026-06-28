@@ -1918,7 +1918,19 @@ fn int_lit_scalar(text: &str) -> Scalar {
             return sc;
         }
     }
-    Scalar::I32
+    // Unsuffixed: default to i32, but a literal that does not fit i32 widens to i64 so it is never
+    // *silently* truncated. `9000000000` baked as a `const.i32` wraps to 410065408 on BOTH backends,
+    // so the interp-vs-native differential gate cannot see the error — the only defense is to not
+    // mis-default in the first place. Growing the default to the narrowest type that holds the value
+    // mirrors an unconstrained `{integer}` literal and keeps every existing narrowing check honest: a
+    // pinned annotation still wins (`let x: i32 = 9000000000` re-adapts the literal back to i32 and
+    // range-checks it -> E0401), while a wider return / field / bare-expression context now lowers
+    // the true value. (A literal larger than i64 — a huge `u64` — stays i32 here; pin a `u64`
+    // annotation for those, which mir_build already parses correctly.)
+    match parse_int_text(text) {
+        Some(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Scalar::I64,
+        _ => Scalar::I32,
+    }
 }
 
 fn float_lit_scalar(text: &str) -> Scalar {
