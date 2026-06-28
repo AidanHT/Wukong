@@ -913,6 +913,18 @@ impl<'a> Parser<'a> {
 
     fn parse_if(&mut self) -> Expr {
         let start = self.span();
+        // Bound `if` / `else if` nesting. A long `else if` chain recurses straight back into
+        // `parse_if` (the `else` arm below) *without* passing through the `parse_prefix` choke
+        // point, so it must charge the shared depth budget here — otherwise a deep chain recurses
+        // unbounded with no diagnostic, just an ever-slower descent and a tree a later recursive
+        // walk (sema, lowering, even `Drop`) would overflow on. Mirrors the `parse_type` guard.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
+        }
         self.bump(); // if
         let cond = Box::new(self.parse_cond());
         let then_branch = self.parse_block();
@@ -927,23 +939,39 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.finish_expr(
+        let out = self.finish_expr(
             start,
             ExprKind::If {
                 cond,
                 then_branch,
                 else_branch,
             },
-        )
+        );
+        self.depth = saved;
+        out
     }
 
     fn parse_match(&mut self) -> Expr {
         let start = self.span();
+        // Bound `match` nesting (an arm body that is itself a `match`, nested deep). The arm body
+        // already passes through `parse_prefix` (which charges depth and reports E0209), but charge
+        // it here too so the limit is enforced from the structural recursion itself — and, more
+        // importantly, once that guard trips the over-deep body parse returns a placeholder
+        // *without consuming its token*, so the arm loop below must also guarantee forward progress
+        // or it would spin forever on the stuck token.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
+        }
         self.bump(); // match
         let scrutinee = Box::new(self.parse_cond());
         self.expect(T::LBrace);
         let mut arms = Vec::new();
         while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let before = self.pos;
             let arm_start = self.span();
             let pat = self.parse_pattern();
             // Optional `if <expr>` guard between the pattern and `=>`. The guard head disallows a
@@ -962,9 +990,16 @@ impl<'a> Parser<'a> {
                 span: arm_start.to(self.prev_span()),
             });
             self.eat(T::Comma);
+            // Guarantee forward progress (mirrors `module()`): if the depth limit has tripped and
+            // every sub-parse above consumed nothing, bump so this loop can't spin on a stuck token.
+            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
+                self.bump();
+            }
         }
         self.expect(T::RBrace);
-        self.finish_expr(start, ExprKind::Match { scrutinee, arms })
+        let out = self.finish_expr(start, ExprKind::Match { scrutinee, arms });
+        self.depth = saved;
+        out
     }
 
     // ---- Statements & blocks ----
@@ -972,10 +1007,31 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_block(&mut self) -> Block {
         let start = self.span();
         let id = self.nid();
+        // Bound block nesting. Every nested body funnels through here — `{ … }` blocks, the
+        // branches of `if`/`else`, and the bodies of `while`/`for`/`loop` — and several of those
+        // paths recurse without otherwise charging the depth budget (a loop body via
+        // `parse_while` → `parse_block`; a brace block via `parse_prefix`, whose own guard trips but
+        // then leaves this loop spinning on an unconsumed `{`). Charge it here so a pathologically
+        // deep nest reports E0209 once and stops, instead of overflowing the stack or stalling a
+        // later recursive walk. Mirrors the `parse_type` guard; the loop below adds the matching
+        // forward-progress guarantee.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return Block {
+                id,
+                stmts: Vec::new(),
+                tail: None,
+                span: start.to(self.prev_span()),
+            };
+        }
         self.expect(T::LBrace);
         let mut stmts = Vec::new();
         let mut tail = None;
         while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let before = self.pos;
             let stmt_start = self.span();
             let attrs = self.parse_attrs();
             match self.kind() {
@@ -1100,8 +1156,16 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // Guarantee forward progress (mirrors `module()`): once the depth limit trips, an
+            // over-deep operand parse (a nested `{` or `match`) returns a placeholder without
+            // consuming its opening token, which would otherwise spin this loop forever on it. The
+            // bump never fires for well-formed input — every statement form above consumes a token.
+            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
+                self.bump();
+            }
         }
         self.expect(T::RBrace);
+        self.depth = saved;
         Block {
             id,
             stmts,
@@ -1705,6 +1769,52 @@ mod tests {
             .expect("the parser must not overflow its stack on deeply nested input");
     }
 
+    /// Pathological *structural* nesting — deep `{ … }` blocks, `if`/`else if` chains, `match` arm
+    /// bodies, and loop bodies — must report E0209 quickly instead of hanging (the depth guard used
+    /// to leave these recursions unbounded: a brace/match nest spun the block/arm loop forever on an
+    /// unconsumed token, while an `else if` chain recursed with no depth charge at all).
+    #[test]
+    fn deeply_nested_structural_input_reports_e0209() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+                let n = 3000;
+
+                // Nested blocks `{ { { … 0 … } } }`.
+                let blocks = format!("{}0{}", "{".repeat(n), "}".repeat(n));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&blocks, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested blocks should report E0209, got {d:?}");
+
+                // A long `if … else if … else if …` chain (direct `parse_if` recursion).
+                let elifs = format!("{}{{ 0 }}", "if true { 0 } else ".repeat(n));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&elifs, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "deep else-if chain should report E0209, got {d:?}");
+
+                // A `match` whose arm body is another `match`, nested deep.
+                let matches = format!("{}0{}", "match 0 { _ => ".repeat(n), " }".repeat(n));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&matches, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested match arms should report E0209, got {d:?}");
+
+                // Nested loop bodies `while … { while … { … } }` (statement form, via parse_module).
+                let whiles = format!(
+                    "fn f() {{ {}{} }}",
+                    "while true { ".repeat(n),
+                    "}".repeat(n)
+                );
+                let mut i = Interner::new();
+                let (_m, d) = parse_module(&whiles, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested loop bodies should report E0209, got {d:?}");
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on deeply nested structural input");
+    }
+
     /// Moderately nested but entirely realistic input stays well under the limit and parses cleanly.
     #[test]
     fn moderate_nesting_parses_cleanly() {
@@ -1725,5 +1835,28 @@ mod tests {
         let mut i = Interner::new();
         let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
         assert!(d.is_empty(), "16-deep array type should parse cleanly, got {d:?}");
+
+        // 64-deep blocks, a 64-arm-deep else-if chain, a 64-deep match nest, and 64-deep loop
+        // bodies all sit far under the limit — the new structural guards must not reject them.
+        let blocks = format!("{}0{}", "{".repeat(64), "}".repeat(64));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&blocks, SourceId(0), &mut i);
+        assert!(d.is_empty(), "64-deep blocks should parse cleanly, got {d:?}");
+
+        let elifs = format!("{}{{ 0 }}", "if true { 0 } else ".repeat(64));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&elifs, SourceId(0), &mut i);
+        assert!(d.is_empty(), "64-deep else-if chain should parse cleanly, got {d:?}");
+
+        let matches = format!("{}0{}", "match 0 { _ => ".repeat(64), " }".repeat(64));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&matches, SourceId(0), &mut i);
+        assert!(d.is_empty(), "64-deep match nest should parse cleanly, got {d:?}");
+
+        // A wide-but-shallow block (many sequential statements) must not accumulate depth.
+        let wide = format!("{{ {} 0 }}", "let x = 1; ".repeat(500));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&wide, SourceId(0), &mut i);
+        assert!(d.is_empty(), "wide shallow block should parse cleanly, got {d:?}");
     }
 }
