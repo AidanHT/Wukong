@@ -157,6 +157,14 @@ static CATALOG: &[Explanation] = &[
          in a loop."
     ),
     entry!(
+        "E0304",
+        "assignment to immutable binding",
+        "A binding introduced with `let` (without `mut`) cannot be reassigned. Declare it `let mut` \
+         to allow reassignment, or introduce a new binding with another `let`. Mutating *through* \
+         the binding — an array element `a[i] = …`, a struct field `s.f = …`, or a pointee \
+         `*p = …` — is still allowed; only rebinding the name itself is rejected."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \
