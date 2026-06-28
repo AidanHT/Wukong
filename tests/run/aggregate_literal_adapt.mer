@@ -1,0 +1,32 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 127
+// EXPECT-OUT: -56
+// EXPECT-OUT: 200
+// EXPECT-OUT: 9000000000
+// EXPECT-OUT: 15
+// EXPECT-OUT: 127
+module tests.run.aggregate_literal_adapt
+
+// An array / tuple literal adapts its elements to a matching aggregate annotation, so a typed buffer
+// can be built straight from literals: `[i8; N]`, `(u8, u8)`, a wide `[i64; N]`, an `[v; N]` repeat,
+// and nested array-of-struct. Before, every one was rejected as an `[i32; N]` / `(i32, i32)` element
+// mismatch (E0401). Out-of-range elements are still a hard error (see
+// tests/fail/array_literal_elem_out_of_range.mer).
+
+struct S { x: i8 }
+
+fn main() -> i32 {
+    let xs: [i8; 2] = [127, 0];           // narrow element type
+    print(xs[0] as i32);                  // 127
+    let ov: [i8; 1] = [-56];              // negative element literal
+    print(ov[0] as i32);                  // -56
+    let t: (u8, u8) = (200, 1);           // tuple element adaptation
+    print(t.0 as i32);                    // 200
+    let wide: [i64; 2] = [9000000000, 0]; // wide element type (no truncation)
+    print(wide[0]);                       // 9000000000
+    let rep: [i8; 3] = [5; 3];            // array-repeat adaptation
+    print((rep[0] + rep[1] + rep[2]) as i32); // 15
+    let ss: [S; 2] = [S { x: 100 }, S { x: 27 }]; // nested array-of-struct, narrow field
+    print((ss[0].x + ss[1].x) as i32);    // 127
+    return 0;
+}

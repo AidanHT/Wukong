@@ -833,9 +833,23 @@ impl Sema<'_> {
         let mut seen: Vec<Symbol> = Vec::new();
         for f in inits {
             let name = f.name.sym;
-            if !decl.iter().any(|(dn, _)| *dn == name) {
-                let nm = self.sym_str(name).to_string();
-                self.error(f.name.span, "E0401", format!("struct has no field `{nm}`"));
+            match decl.iter().find(|(dn, _)| *dn == name) {
+                Some((_, fty)) => {
+                    // A literal field value adapts to (and is range-checked against) the declared
+                    // field type, exactly like a `let` annotation: `S { v: 9000000000 }` lowers the
+                    // literal at the field's i64 width instead of the default i32, and a
+                    // `S { x: 9000000000 }` for an `x: i32` field is a hard E0401, not a silent
+                    // low-32-bit truncation both backends agree on. Aggregate fields adapt
+                    // element-wise (a `[i8; N]` / tuple field).
+                    if self.literal_adapts(fty, &f.value) {
+                        self.retype_adapted_literal(&f.value, fty);
+                    }
+                    self.range_check_int_literal(&f.value, fty);
+                }
+                None => {
+                    let nm = self.sym_str(name).to_string();
+                    self.error(f.name.span, "E0401", format!("struct has no field `{nm}`"));
+                }
             }
             if seen.contains(&name) {
                 let nm = self.sym_str(name).to_string();
@@ -1000,6 +1014,18 @@ impl Sema<'_> {
             StmtKind::Assign { target, op, value } => {
                 let target_ty = self.type_expr(target);
                 let value_ty = self.type_expr(value);
+                // A literal assigned to a place adapts to (and is range-checked against) the place's
+                // type, the same rule `let` and struct-init already apply — so `p = 9000000000` for
+                // an i32 place is a hard E0401 instead of a silent low-32-bit truncation both backends
+                // agree on, and `p = 9000000000` for an i64 place lowers the literal at i64 width.
+                // Plain `=` only (a value store); the compound forms below are a different check, and
+                // the helpers no-op on a non-scalar/unknown place type.
+                if matches!(op, AssignOp::Assign) {
+                    if self.literal_adapts(&target_ty, value) {
+                        self.retype_adapted_literal(value, &target_ty);
+                    }
+                    self.range_check_int_literal(value, &target_ty);
+                }
                 // A compound assignment `a += b` (and `-= *= /= …`) means `a = a (op) b`. That implied
                 // binary operator is undefined on an aggregate (struct/tuple/array) — the explicit
                 // `a = a + b` form is already rejected above — but the compound path skipped the
@@ -1257,6 +1283,21 @@ impl Sema<'_> {
                 },
                 Ty::Scalar(_),
             ) => self.literal_adapts(ann, expr),
+            // An array / tuple literal adapts element-wise to a matching aggregate annotation, so a
+            // typed buffer can be built from literals — `let a: [i8; 2] = [127, 0]` and
+            // `let t: (u8, u8) = (200, 1)` previously failed as `[i32; 2]`/`(i32, i32)` mismatches.
+            // Lengths must match and every element must itself adapt (recursively, so nested
+            // aggregates work too).
+            (ExprKind::ArrayLit(items), Ty::Array { elem, len }) => {
+                items.len() as u64 == *len && items.iter().all(|it| self.literal_adapts(elem, it))
+            }
+            (ExprKind::ArrayRepeat { value, .. }, Ty::Array { elem, .. }) => {
+                self.literal_adapts(elem, value)
+            }
+            (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
+                items.len() == tys.len()
+                    && items.iter().zip(tys).all(|(it, t)| self.literal_adapts(t, it))
+            }
             _ => false,
         }
     }
@@ -1266,12 +1307,31 @@ impl Sema<'_> {
     /// `f64` end to end, not `-(1.5: f32)` widened to `f64` at the `Neg`).
     fn retype_adapted_literal(&mut self, e: &Expr, ann: &Ty) {
         self.types.insert(e.id, ann.clone());
-        if let ExprKind::Unary {
-            op: UnOp::Neg,
-            expr,
-        } = &e.kind
-        {
-            self.retype_adapted_literal(expr, ann);
+        match (&e.kind, ann) {
+            (
+                ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr,
+                },
+                _,
+            ) => self.retype_adapted_literal(expr, ann),
+            // Re-stamp each element of an adapted aggregate literal with the annotation's element
+            // type so MIR lowering stores it at the right width (`[127, 0]: [i8; 2]` writes two i8s,
+            // not i32s narrowed at the store). The aggregate node itself takes `ann` (above).
+            (ExprKind::ArrayLit(items), Ty::Array { elem, .. }) => {
+                for it in items {
+                    self.retype_adapted_literal(it, elem);
+                }
+            }
+            (ExprKind::ArrayRepeat { value, .. }, Ty::Array { elem, .. }) => {
+                self.retype_adapted_literal(value, elem);
+            }
+            (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
+                for (it, t) in items.iter().zip(tys) {
+                    self.retype_adapted_literal(it, t);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1282,6 +1342,27 @@ impl Sema<'_> {
     /// silently wraps (`200 as i8 == -56`), a quiet footgun in a safety-first language. Call at each
     /// site a literal adapts to a type (`let`/`const`/argument).
     fn range_check_int_literal(&mut self, e: &Expr, ty: &Ty) {
+        // Aggregate literals recurse element-wise (`[300, 0]: [i8; 2]` flags the `300`), mirroring
+        // how `retype_adapted_literal`/`literal_adapts` descend into them.
+        match (&e.kind, ty) {
+            (ExprKind::ArrayLit(items), Ty::Array { elem, .. }) => {
+                for it in items {
+                    self.range_check_int_literal(it, elem);
+                }
+                return;
+            }
+            (ExprKind::ArrayRepeat { value, .. }, Ty::Array { elem, .. }) => {
+                self.range_check_int_literal(value, elem);
+                return;
+            }
+            (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
+                for (it, t) in items.iter().zip(tys) {
+                    self.range_check_int_literal(it, t);
+                }
+                return;
+            }
+            _ => {}
+        }
         let Ty::Scalar(sc) = ty else { return };
         let Some((lo, hi)) = int_lit_range(*sc) else {
             return;
