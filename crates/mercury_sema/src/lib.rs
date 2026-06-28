@@ -1203,7 +1203,11 @@ impl Sema<'_> {
             }
             PatKind::Wildcard | PatKind::Unit => {}
             // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
-            PatKind::Int { .. } | PatKind::Bool(_) | PatKind::Path(_) | PatKind::Range { .. } => {}
+            PatKind::Int { .. }
+            | PatKind::Char(_)
+            | PatKind::Bool(_)
+            | PatKind::Path(_)
+            | PatKind::Range { .. } => {}
         }
     }
 

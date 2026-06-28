@@ -87,6 +87,10 @@ pub enum PatKind {
     /// source text is stored (like `ExprKind::Int`) and parsed later; a leading `-` is folded in by
     /// the parser (`neg: true`), since a literal pattern has no sub-expressions to negate.
     Int { sym: Symbol, neg: bool },
+    /// A char-literal pattern, e.g. `'a'` in a `match` arm. The raw source text (incl. quotes and
+    /// any escape) is stored like `ExprKind::Char` and decoded to a code point later; it matches by
+    /// comparing the scrutinee to that code point, exactly like an integer-literal pattern.
+    Char(Symbol),
     /// A boolean literal pattern (`true` / `false`).
     Bool(bool),
     /// An or-pattern `A | B | C` — matches if any alternative matches. Alternatives are typically

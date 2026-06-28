@@ -1298,7 +1298,9 @@ impl<'a> Parser<'a> {
     fn parse_pattern_range(&mut self) -> Pattern {
         let start = self.span();
         let lo = self.parse_pattern_primary();
-        if matches!(lo.kind, PatKind::Int { .. }) && (self.at(T::DotDot) || self.at(T::DotDotEq)) {
+        if matches!(lo.kind, PatKind::Int { .. } | PatKind::Char(_))
+            && (self.at(T::DotDot) || self.at(T::DotDotEq))
+        {
             let inclusive = self.at(T::DotDotEq);
             self.bump();
             let hi = self.parse_pattern_primary();
@@ -1380,6 +1382,13 @@ impl<'a> Parser<'a> {
                 let sym = self.intern_span(start);
                 self.bump();
                 PatKind::Int { sym, neg: false }
+            }
+            // Char-literal pattern (`'a' =>`). `char` is comparable / usable in arithmetic, so it is
+            // a valid literal pattern; it decodes to a code point and matches like an integer.
+            T::Char => {
+                let sym = self.intern_span(start);
+                self.bump();
+                PatKind::Char(sym)
             }
             // Negative integer literal pattern (`-1 =>`); fold the sign into the pattern since a
             // literal pattern has no sub-expression to negate.
