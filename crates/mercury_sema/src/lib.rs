@@ -1388,6 +1388,28 @@ impl Sema<'_> {
                         return Ty::Unknown;
                     }
                 }
+                // Pointer arithmetic (`p + 1`) and whole-tensor arithmetic (`a + b` on `Tensor`
+                // values) are not supported: both lowered to an `add` on a base pointer that the MIR
+                // verifier and Cranelift reject (an ICE / a backend-specific error, the two backends
+                // disagreeing). Reject them cleanly here, only for the arithmetic/bitwise/shift
+                // operators. `==`/`!=` and ordering on pointers are untouched; elementwise tensor work
+                // uses indexed scalars (`a[i] + b[i]`), and SIMD `Vector` arithmetic still lowers.
+                if matches!(op, Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr) {
+                    if let Some(bad) = [&l, &r]
+                        .into_iter()
+                        .find(|t| matches!(t, Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. }))
+                    {
+                        let msg = if matches!(bad, Ty::Tensor { .. }) {
+                            "whole-tensor arithmetic is not supported; operate on elements in a loop \
+                             (e.g. `c[i] = a[i] + b[i]`)"
+                        } else {
+                            "pointer arithmetic is not supported; take an element address with \
+                             `&arr[i]`"
+                        };
+                        self.error(e.span, "E0401", msg.to_string());
+                        return Ty::Unknown;
+                    }
+                }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
                     // base-pointer compare — two distinct values are *always* "not equal" — a wrong
