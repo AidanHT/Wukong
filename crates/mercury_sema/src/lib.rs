@@ -298,8 +298,28 @@ impl Sema<'_> {
                             .as_ref()
                             .and_then(|d| eval_const_int(d, self.interner))
                             .unwrap_or(next);
+                        // An enum value lowers to a 32-bit discriminant (the C-style repr —
+                        // mir_build emits `ConstInt(_, I32)`), so a discriminant outside the i32
+                        // range would be silently truncated (a max-`i64` sentinel printed as its low
+                        // 32 bits). Reject it with a clear diagnostic instead of truncating.
+                        if disc < i32::MIN as i64 || disc > i32::MAX as i64 {
+                            let sp = v.discriminant.as_ref().map_or(item.span, |d| d.span);
+                            self.error(
+                                sp,
+                                "E0401",
+                                format!(
+                                    "enum discriminant `{disc}` is out of range for the 32-bit \
+                                     enum representation ({}..={})",
+                                    i32::MIN,
+                                    i32::MAX
+                                ),
+                            );
+                        }
                         variants.push((v.name.sym, disc));
-                        next = disc + 1;
+                        // Wrapping, so a sentinel discriminant near `i64::MAX` doesn't panic the
+                        // compiler on the auto-increment of the *next* variant before the range
+                        // check above fires; wrapping matches two's-complement integer semantics.
+                        next = disc.wrapping_add(1);
                     }
                     self.register(e.name, DefKind::Enum(variants), item.span);
                 }
