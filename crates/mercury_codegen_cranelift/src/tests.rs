@@ -1086,6 +1086,47 @@ fn differential_match_exhaustiveness() {
     }
 }
 
+/// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
+/// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
+/// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
+/// all errored on it, but native-O0 codegen'd the wild gep into a SIGSEGV. The base is now lowered as a
+/// place (the pointer), so the explicit spelling lowers like the implicit auto-deref `p.field`. Also
+/// guards the already-working `*p = Struct{..}` whole-store and `**pp` double-deref against regression.
+#[test]
+fn differential_deref_field_access() {
+    let cases = [
+        // (*p).field read: 7 + 5 = 12.
+        ("struct S { a: i32, b: i32 } fn rd(p: *mut S) -> i32 { return (*p).a + (*p).b; } \
+          fn main() -> i32 { let mut s: S = S { a: 7, b: 5 }; return rd(&mut s); }", 12),
+        // (*p).field write: set to 99.
+        ("struct S { a: i32 } fn wr(p: *mut S) { (*p).a = 99; } \
+          fn main() -> i32 { let mut s: S = S { a: 1 }; wr(&mut s); return s.a; }", 99),
+        // (*p)[i] on a *mut array: xs[2] = 30.
+        ("fn el(p: *mut [i32; 4]) -> i32 { return (*p)[2]; } \
+          fn main() -> i32 { let mut xs: [i32; 4] = [10, 20, 30, 40]; return el(&mut xs); }", 30),
+        // &mut (*p).field, written through the borrow: 42.
+        ("struct S { a: i32 } fn bump(p: *mut S) { let q = &mut (*p).a; *q = 42; } \
+          fn main() -> i32 { let mut s: S = S { a: 0 }; bump(&mut s); return s.a; }", 42),
+        // explicit deref of a tuple pointer: (*p).0 = 5.
+        ("fn first(p: *mut (i32, i32)) -> i32 { return (*p).0; } \
+          fn main() -> i32 { let mut t: (i32, i32) = (5, 6); return first(&mut t); }", 5),
+        // regression: whole-struct store through a pointer still works.
+        ("struct S { a: i32, b: i32 } fn set(p: *mut S) { *p = S { a: 3, b: 4 }; } \
+          fn main() -> i32 { let mut s: S = S { a: 0, b: 0 }; set(&mut s); return s.a * 10 + s.b; }", 34),
+        // regression: scalar double-deref still works.
+        ("fn rd(pp: *mut *mut i32) -> i32 { return **pp; } \
+          fn main() -> i32 { let mut x: i32 = 77; let mut p: *mut i32 = &mut x; return rd(&mut p); }", 77),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "deref-field-access native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "deref-field-access wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// An `if`/`match` used as a VALUE whose result is an aggregate (tuple/struct). The value flows
 /// through the control-flow merge block as the aggregate's base POINTER, so the merge param must be
 /// typed `Ptr`, not the byte-buffer `Array` type. It used to be typed `Array`, which the arm's pointer

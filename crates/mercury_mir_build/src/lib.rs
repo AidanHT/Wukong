@@ -1544,6 +1544,24 @@ impl FnLowerer<'_> {
         variants.iter().find(|(v, _)| *v == name).map(|(_, d)| *d)
     }
 
+    /// The base pointer of an aggregate *place* expression `base` (for a `.field` / `.0` / `[i]`
+    /// access). For an explicit deref `*p` this is `p`'s pointer value — NOT a `Load` of the
+    /// aggregate, which `lower_expr(*p)` does for a by-value aggregate pointee; GEPing a field off that
+    /// loaded buffer is `gep base [N x i8]`, invalid MIR the verifier rejects (and native-O0 used to
+    /// codegen it into a SIGSEGV instead of erroring). For any other base — a struct/tuple/array local
+    /// (its bound id *is* the base pointer) or an auto-derefed `*mut S`/`&S` param (whose slot loads
+    /// the pointer) — `lower_expr` already yields the address, so this is a no-op there. This makes the
+    /// explicit `(*p).f` / `(*p)[i]` spellings lower like the implicit `p.f` one.
+    fn place_base_ptr(&mut self, base: &Expr) -> ValueId {
+        match &base.kind {
+            ExprKind::Unary {
+                op: ast::UnOp::Deref,
+                expr,
+            } => self.lower_expr(expr),
+            _ => self.lower_expr(base),
+        }
+    }
+
     fn struct_field_place(&mut self, base: &Expr, fname: Symbol) -> (ValueId, MirType) {
         let struct_sym = match self.expr_ty(base) {
             Ty::Named(sym) => Some(sym),
@@ -1558,7 +1576,7 @@ impl FnLowerer<'_> {
                 if let Some((_, off, fmty)) = layout.iter().find(|(n, _, _)| *n == fname) {
                     let off = *off;
                     let fmty = fmty.clone();
-                    let base_ptr = self.lower_expr(base);
+                    let base_ptr = self.place_base_ptr(base);
                     let p = self.field_ptr(base_ptr, off);
                     return (p, fmty);
                 }
@@ -10213,7 +10231,7 @@ impl FnLowerer<'_> {
             if let Some((offsets, _, _)) = self.aggregate_layout(&fields) {
                 if let (Some(&off), Some(fty)) = (offsets.get(index), fields.get(index)) {
                     let fmty = self.mir_ty_of(fty);
-                    let base_ptr = self.lower_expr(base);
+                    let base_ptr = self.place_base_ptr(base);
                     let p = self.field_ptr(base_ptr, off);
                     return (p, fmty);
                 }
@@ -10332,7 +10350,7 @@ impl FnLowerer<'_> {
                 (ptr, self.expr_mir(e))
             }
             ExprKind::Index { base, indices } if indices.len() == 1 => {
-                let base_ptr = self.lower_expr(base);
+                let base_ptr = self.place_base_ptr(base);
                 let idx = self.lower_expr(&indices[0]);
                 // Prefer the element type from the base's array type; fall back to the indexed
                 // expression's own type (slices/tensors/pointers). Resolve through the
