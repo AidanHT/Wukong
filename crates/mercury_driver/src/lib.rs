@@ -325,6 +325,14 @@ fn run_on_gpu_lower(
 const MERCURY_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
 #include <math.h>\n\
+#ifdef _WIN32\n\
+#include <io.h>\n\
+#include <fcntl.h>\n\
+/* Keep stdout in binary mode so the MSVCRT does not translate the runtime's `\\n` into CRLF. The\n\
+   interpreter oracle (and the JIT) emit LF; without this the *linked exe* printed CRLF on Windows,\n\
+   so its stdout differed from every other backend. Runs before main via the constructor attribute. */\n\
+__attribute__((constructor)) static void mercury_rt_init(void) { _setmode(_fileno(stdout), _O_BINARY); }\n\
+#endif\n\
 void mercury_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
 void mercury_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
 void mercury_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
