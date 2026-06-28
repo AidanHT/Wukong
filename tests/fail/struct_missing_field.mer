@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.struct_missing_field
+
+// A struct literal that omits a field used to compile with no diagnostic; then reading the omitted
+// field read an uninitialized slot — the interpreter saw 0 while the native backend saw stack
+// garbage, a backend divergence. Every declared field must now be initialized (unless `..rest`
+// supplies the remainder), and unknown/duplicate fields are rejected at the literal too.
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() -> i32 {
+    let p = Point { x: 7 }; // `y` is omitted
+    return p.y;
+}

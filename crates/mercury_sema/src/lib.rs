@@ -506,6 +506,53 @@ impl Sema<'_> {
         }
     }
 
+    /// Check a struct literal's fields against the declaration: every declared field must be
+    /// initialized (unless `..rest` supplies the remainder), none twice, and none unknown. A missing
+    /// field used to compile and then read an uninitialized slot — the interpreter saw `0`, native
+    /// saw stack garbage (a backend divergence); an unknown/duplicate field only erred late at
+    /// codegen. `decl` is `(field name, field type)` pairs cloned out of the def map by the caller.
+    fn check_struct_literal(
+        &mut self,
+        decl: &[(Symbol, Ty)],
+        inits: &[FieldInit],
+        has_rest: bool,
+        span: Span,
+    ) {
+        let mut seen: Vec<Symbol> = Vec::new();
+        for f in inits {
+            let name = f.name.sym;
+            if !decl.iter().any(|(dn, _)| *dn == name) {
+                let nm = self.sym_str(name).to_string();
+                self.error(f.name.span, "E0401", format!("struct has no field `{nm}`"));
+            }
+            if seen.contains(&name) {
+                let nm = self.sym_str(name).to_string();
+                self.error(
+                    f.name.span,
+                    "E0401",
+                    format!("field `{nm}` is initialized more than once"),
+                );
+            } else {
+                seen.push(name);
+            }
+        }
+        if !has_rest {
+            let missing: Vec<String> = decl
+                .iter()
+                .filter(|(dn, _)| !seen.contains(dn))
+                .map(|(dn, _)| format!("`{}`", self.sym_str(*dn)))
+                .collect();
+            if !missing.is_empty() {
+                let s = if missing.len() == 1 { "" } else { "s" };
+                self.error(
+                    span,
+                    "E0401",
+                    format!("missing field{s} {} in this struct initializer", missing.join(", ")),
+                );
+            }
+        }
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -996,15 +1043,28 @@ impl Sema<'_> {
                 if let Some(r) = rest {
                     self.type_expr(r);
                 }
-                // A `Name { … }` whose `Name` resolves to a declared struct has that nominal type;
-                // an unknown name stays lenient.
+                // A `Name { … }` whose `Name` resolves to a declared struct has that nominal type
+                // (and its fields are checked for completeness); an unknown name stays lenient.
                 match path.segments.last().map(|s| s.sym) {
-                    Some(n)
-                        if matches!(self.defs.lookup(n), Some(d) if matches!(d.kind, DefKind::Struct(_))) =>
-                    {
-                        Ty::Named(n)
+                    Some(n) => {
+                        // Clone the declared field list out of the def map so the immutable borrow
+                        // ends before `check_struct_literal` takes `&mut self` to emit diagnostics.
+                        let decl = match self.defs.lookup(n) {
+                            Some(Def {
+                                kind: DefKind::Struct(decl),
+                                ..
+                            }) => Some(decl.clone()),
+                            _ => None,
+                        };
+                        match decl {
+                            Some(decl) => {
+                                self.check_struct_literal(&decl, fields, rest.is_some(), e.span);
+                                Ty::Named(n)
+                            }
+                            None => Ty::Unknown,
+                        }
                     }
-                    _ => Ty::Unknown,
+                    None => Ty::Unknown,
                 }
             }
             ExprKind::ArrayLit(items) => {
