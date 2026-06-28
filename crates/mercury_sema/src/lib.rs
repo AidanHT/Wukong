@@ -1760,7 +1760,47 @@ fn eval_const_int(e: &Expr, interner: &Interner) -> Option<i64> {
         ExprKind::Unary {
             op: UnOp::Neg,
             expr,
-        } => eval_const_int(expr, interner).map(|v| -v),
+        } => eval_const_int(expr, interner).map(|v| v.wrapping_neg()),
+        ExprKind::Unary {
+            op: UnOp::Not,
+            expr,
+        } => eval_const_int(expr, interner).map(|v| !v),
+        // Fold constant integer arithmetic / bitwise / shift — the *same* ops the optimizer's
+        // constant folder evaluates before the backend runs. Without this, a constant-arithmetic
+        // index like `xs[2 + 3]` (vs the literal `xs[5]`) returned `None` here, so the compile-time
+        // bounds check silently skipped it: the optimizer then folded `2 + 3` -> 5 and the
+        // out-of-bounds access reached the backend (interp trap vs native past-the-buffer read — a
+        // divergence; or, for a multi-dim index that lands in-buffer, a silently wrong element on
+        // both). Wrapping semantics match the runtime/folder; div/rem by zero stays `None` (the
+        // runtime guards it to 0, in bounds, so skipping the check is safe and consistent).
+        ExprKind::Binary { op, lhs, rhs } => {
+            let l = eval_const_int(lhs, interner)?;
+            let r = eval_const_int(rhs, interner)?;
+            Some(match op {
+                BinOp::Add => l.wrapping_add(r),
+                BinOp::Sub => l.wrapping_sub(r),
+                BinOp::Mul => l.wrapping_mul(r),
+                BinOp::Div => {
+                    if r == 0 {
+                        return None;
+                    }
+                    l.wrapping_div(r)
+                }
+                BinOp::Rem => {
+                    if r == 0 {
+                        return None;
+                    }
+                    l.wrapping_rem(r)
+                }
+                BinOp::BitAnd => l & r,
+                BinOp::BitOr => l | r,
+                BinOp::BitXor => l ^ r,
+                BinOp::Shl => l.wrapping_shl(r as u32),
+                BinOp::Shr => l.wrapping_shr(r as u32),
+                // comparisons / logical ops don't yield an integer index value.
+                _ => return None,
+            })
+        }
         _ => None,
     }
 }
