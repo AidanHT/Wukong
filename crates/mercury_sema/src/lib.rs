@@ -1257,8 +1257,25 @@ impl Sema<'_> {
             ExprKind::Unary { op, expr } => {
                 let t = self.type_expr(expr);
                 match op {
+                    // `*x` requires a pointer/reference operand. Dereferencing a definite
+                    // non-pointer (a scalar, struct, tuple, or array) used to fall through to
+                    // `Ty::Unknown`, then mir_build lowered `*scalar` to a load off a non-pointer
+                    // operand — invalid MIR the verifier/Cranelift reject (an ICE on a program sema
+                    // had accepted). Stay lenient for `Unknown`/`Error` and pointer-like types.
                     UnOp::Deref => match t {
                         Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => *pointee,
+                        Ty::Scalar(_) | Ty::Named(_) | Ty::Tuple(_) | Ty::Array { .. } => {
+                            self.error(
+                                expr.span,
+                                "E0401",
+                                format!(
+                                    "cannot dereference a value of type `{}`; only a pointer or \
+                                     reference can be dereferenced with `*`",
+                                    t.display(self.interner)
+                                ),
+                            );
+                            Ty::Unknown
+                        }
                         _ => Ty::Unknown,
                     },
                     UnOp::Ref => Ty::Ptr {
@@ -1269,7 +1286,26 @@ impl Sema<'_> {
                         mutable: true,
                         pointee: Box::new(t),
                     },
-                    UnOp::Neg | UnOp::Not => t,
+                    // Unary `-`/`!` on an aggregate (struct/tuple/array) is meaningless and used to
+                    // pass through unchanged, then mir_build emitted an arithmetic op on a base
+                    // pointer — invalid MIR. Scalars/vectors/tensors negate fine; reject only
+                    // definite aggregates, staying lenient for `Unknown`.
+                    UnOp::Neg | UnOp::Not => {
+                        if self.is_aggregate_ty(&t) {
+                            let glyph = if matches!(op, UnOp::Neg) { "-" } else { "!" };
+                            self.error(
+                                expr.span,
+                                "E0401",
+                                format!(
+                                    "cannot apply unary `{glyph}` to a value of type `{}`",
+                                    t.display(self.interner)
+                                ),
+                            );
+                            Ty::Unknown
+                        } else {
+                            t
+                        }
+                    }
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
@@ -1279,6 +1315,21 @@ impl Sema<'_> {
                 // error regardless of whether the operator yields a value or a bool.
                 self.check_binop_shapes(&l, &r, e.span);
                 use BinOp::*;
+                // No binary operator other than `==`/`!=` (which has its own message below) is
+                // defined on an aggregate (struct/tuple/array) value: arithmetic/bitwise/shift on a
+                // base pointer, or ordering/logical on one, lowers to invalid MIR — an ICE on a
+                // program sema had accepted. Tensors and vectors are *not* aggregates here, so
+                // tensor/vector arithmetic is unaffected; `Unknown` stays lenient.
+                if !matches!(op, Eq | Ne) && (self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r)) {
+                    self.error(
+                        e.span,
+                        "E0401",
+                        "binary operators are not defined for aggregate (struct/tuple/array) \
+                         values; operate on their fields or elements instead"
+                            .to_string(),
+                    );
+                    return Ty::Unknown;
+                }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
                     // base-pointer compare — two distinct values are *always* "not equal" — a wrong
