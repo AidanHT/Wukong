@@ -349,6 +349,31 @@ impl Sema<'_> {
                     ),
                 );
             }
+            // A pointer/reference, array, or tuple versus a scalar/vector are different ABI kinds.
+            // Passing one where the other is expected slips past the lenient unification core and
+            // then either traps the interpreter or ICEs the native backend (e.g. an i64 pointer
+            // marshalled into a 32-bit scalar slot) — a backend divergence on a program that should
+            // never have compiled. Pointers/arrays/tuples here carry concrete element types (a bare
+            // generic parameter is `Named`, handled below), so reporting the clash cannot
+            // false-positive on a generic. Array→tensor decay is matched earlier and unaffected.
+            (
+                Ty::Scalar(_) | Ty::Vector { .. },
+                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_),
+            )
+            | (
+                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_),
+                Ty::Scalar(_) | Ty::Vector { .. },
+            ) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
+            }
             // Named generic type variable, or anything else: stay lenient.
             _ => {}
         }
