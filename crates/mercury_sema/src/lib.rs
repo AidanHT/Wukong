@@ -497,9 +497,45 @@ impl Sema<'_> {
                 self.type_expr(e);
             }
             StmtKind::Return(opt) => {
-                if let Some(e) = opt {
-                    let t = self.type_expr(e);
-                    self.check_return_shape(&t, e.span);
+                let ret = self.ret_ty.clone();
+                match opt {
+                    Some(e) => {
+                        let t = self.type_expr(e);
+                        // A value returned from a `-> ()` (or return-less) function: the native
+                        // backend builds a `Void` return signature and rejects the value, while the
+                        // interpreter silently discards it — a backend divergence. A returned `()`
+                        // or void call (type `Unit`) is fine; stay lenient on `Unknown`/`Error`.
+                        if matches!(ret, Ty::Unit) && !matches!(t, Ty::Unit | Ty::Unknown | Ty::Error)
+                        {
+                            self.error(
+                                e.span,
+                                "E0401",
+                                format!(
+                                    "this function returns `()`, but a value of type `{}` is \
+                                     returned here",
+                                    t.display(self.interner)
+                                ),
+                            );
+                        }
+                        self.check_return_shape(&t, e.span);
+                    }
+                    None => {
+                        // A bare `return;` where the signature demands a value: the native return
+                        // expects an operand and rejects the empty return, while the interpreter
+                        // returns a default — again a divergence. A `-> ()` / return-less function
+                        // may `return;` freely.
+                        if !matches!(ret, Ty::Unit | Ty::Unknown | Ty::Error) {
+                            self.error(
+                                s.span,
+                                "E0401",
+                                format!(
+                                    "this function must return a value of type `{}`, but this \
+                                     `return;` has none",
+                                    ret.display(self.interner)
+                                ),
+                            );
+                        }
+                    }
                 }
             }
             StmtKind::Defer(e) => {

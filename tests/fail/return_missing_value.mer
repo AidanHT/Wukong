@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+module tests.fail.return_missing_value
+
+// A bare `return;` in a function whose signature promises a value is a type error, not a silent
+// default. The native backend's return expects an operand and rejects the empty return, while the
+// interpreter would return a zero — a backend divergence. (A `-> ()` / return-less function may
+// `return;` freely.)
+fn f() -> i32 {
+    return;
+}
+
+fn main() -> i32 {
+    return f();
+}
