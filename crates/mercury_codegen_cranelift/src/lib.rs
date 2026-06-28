@@ -474,13 +474,23 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().iconst(t, *v as i64)
                 }
             }
-            Op::ConstFloat(v, ty) => {
-                if matches!(ty, MirType::F64) {
-                    self.builder.ins().f64const(*v)
-                } else {
-                    self.builder.ins().f32const(*v as f32)
-                }
-            }
+            Op::ConstFloat(v, ty) => match ty {
+                MirType::F64 => self.builder.ins().f64const(*v),
+                // A bf16/f16 const IS its grid-rounded value; materialize it rounded so it stays
+                // correct however the optimizer forwards or folds it. The per-store rounding alone is
+                // fragile — mem2reg and CSE load-forwarding bypass the store, dropping the rounding and
+                // making -O2 disagree with -O0 (`let b: bf16 = 0.1` then forwarded the f32 0.1, not the
+                // bf16-grid 0.10009765625). Rounding here is the same `half`-crate path the interp uses.
+                MirType::BF16 => self
+                    .builder
+                    .ins()
+                    .f32const(mercury_runtime::round_bf16(*v as f32)),
+                MirType::F16 => self
+                    .builder
+                    .ins()
+                    .f32const(mercury_runtime::round_f16(*v as f32)),
+                _ => self.builder.ins().f32const(*v as f32),
+            },
             Op::Bin(op, l, r) => {
                 let rt = self.ty_of(inst.result.unwrap()).clone();
                 self.lower_bin(*op, *l, *r, &rt)
@@ -785,10 +795,21 @@ impl<'a> FnTranslator<'a> {
             SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
             UiToFp => self.builder.ins().fcvt_from_uint(to_ty, x),
             FpExt => {
-                if to_ty == from_ty {
-                    x
+                // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
+                // register, so the per-store rounding is fragile — an optimizer can forward/promote a
+                // bf16 op result past its store, leaving an unrounded f32, and this widen would then be
+                // a no-op passing the wrong value (so -O2 disagreed with -O0). Round at the observation
+                // boundary too (the interpreter's `apply_cast` FpExt arm does the same).
+                let xr = match self.ty_of(v).clone() {
+                    MirType::BF16 => self.round_to_bf16(x),
+                    MirType::F16 => self.round_to_f16(x),
+                    _ => x,
+                };
+                let xr_ty = self.dfg_ty(xr);
+                if to_ty == xr_ty {
+                    xr
                 } else {
-                    self.builder.ins().fpromote(to_ty, x)
+                    self.builder.ins().fpromote(to_ty, xr)
                 }
             }
             FpTrunc => {
