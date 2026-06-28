@@ -359,6 +359,24 @@ impl Sema<'_> {
         if let Some(tail) = &body.tail {
             self.check_return_shape(&body_ty, tail.span);
         }
+        // Definite return: a function that promises a value must produce one on every path. If the
+        // body can fall off its end (no trailing tail/return, an `if` with no `else`, a breakable or
+        // non-exhaustive construct), the value it "returns" is an uninitialized default on both
+        // backends — a silent wrong answer. Require a return on all paths, like Rust. Conservative:
+        // it only fires when a fall-through path is *certain* (`block_diverges` errs toward "returns"),
+        // so a function that does return on every path is never flagged; `()`/`Unknown`/`Error`
+        // returns are exempt.
+        // The body returns a value if its tail produces one (the block type is non-unit) or every
+        // statement path diverges before the (unit) tail.
+        let returns_value = !matches!(body_ty, Ty::Unit) || block_diverges(body);
+        if !matches!(self.ret_ty, Ty::Unit | Ty::Unknown | Ty::Error) && !returns_value {
+            self.error(
+                body.span,
+                "E0401",
+                "not all control-flow paths return a value (this function can fall off its end)"
+                    .to_string(),
+            );
+        }
         self.generics.clear();
     }
 
@@ -1037,6 +1055,104 @@ fn is_vector_name(s: &str) -> bool {
 /// and for `i64`/`u64`/`usize`/`isize` — a literal that parses to an `i64` always fits those, and a
 /// `u64` near its top doesn't fit an `i64` to compare, so they are left unchecked rather than
 /// mis-flagged.
+/// Whether `b` is guaranteed to diverge on every path — return from the function or loop forever —
+/// so control never falls off its end. The basis for the definite-return check. **Conservative
+/// toward `true`**: it only reports `false` when a fall-through path is *certain*, so a function that
+/// does return on every path is never flagged. A trailing tail expression is the block's value, so
+/// it counts as a return.
+fn block_diverges(b: &Block) -> bool {
+    // A diverging statement makes the rest of the block unreachable, so the block diverges.
+    if b.stmts.iter().any(stmt_diverges) {
+        return true;
+    }
+    // The tail contributes divergence only if it is itself a diverging control-flow expression
+    // (`if a { return } else { return }` as the last expression). A plain *value* tail means the
+    // block completes normally and yields a value — which the function-level check treats as a
+    // return via the block's type, not here.
+    b.tail.as_deref().map(expr_diverges).unwrap_or(false)
+}
+
+fn stmt_diverges(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::Expr(e) => expr_diverges(e),
+        // A `loop` with no `break` anywhere in its body never exits normally (it loops forever or
+        // returns from inside) — it diverges. Any `break` means it may fall through (be lenient).
+        StmtKind::Loop { body, .. } => !block_contains_break(body),
+        _ => false,
+    }
+}
+
+fn expr_diverges(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Block(b) => block_diverges(b),
+        // Both arms must diverge; an `if` with no `else` can fall through.
+        ExprKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => match else_branch {
+            Some(els) => block_diverges(then_branch) && expr_diverges(els),
+            None => false,
+        },
+        // A `match` diverges only if it is exhaustive (some unconditional catch-all arm) and every
+        // arm body diverges; a non-exhaustive match falls through to a default.
+        ExprKind::Match { arms, .. } => {
+            !arms.is_empty()
+                && arms.iter().any(arm_is_catch_all)
+                && arms.iter().all(|a| expr_diverges(&a.body))
+        }
+        _ => false,
+    }
+}
+
+fn arm_is_catch_all(a: &MatchArm) -> bool {
+    a.guard.is_none() && matches!(a.pat.kind, PatKind::Wildcard | PatKind::Ident(_))
+}
+
+/// Whether `b` contains a `break` anywhere (recursively). Used to decide whether a `loop` is
+/// infinite. Conservative: descending into nested loops may count a `break` bound to an inner loop,
+/// which only makes the outer analysis *more* lenient (assume it can exit), never causing a false
+/// definite-return error. `break`/`continue` are statements (never inside a value expression), so
+/// only statement positions and the block/if/match that hold statements need scanning.
+fn block_contains_break(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_contains_break)
+        || b.tail.as_deref().map(expr_contains_break).unwrap_or(false)
+}
+
+fn stmt_contains_break(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Break(_) => true,
+        StmtKind::Expr(e) | StmtKind::Defer(e) => expr_contains_break(e),
+        StmtKind::Return(opt) => opt.as_ref().map(expr_contains_break).unwrap_or(false),
+        StmtKind::Let { init, .. } => init.as_ref().map(expr_contains_break).unwrap_or(false),
+        StmtKind::Assign { value, .. } => expr_contains_break(value),
+        StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Loop { body, .. } => {
+            block_contains_break(body)
+        }
+        StmtKind::Continue(_) => false,
+    }
+}
+
+fn expr_contains_break(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Block(b) => block_contains_break(b),
+        ExprKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            block_contains_break(then_branch)
+                || else_branch
+                    .as_deref()
+                    .map(expr_contains_break)
+                    .unwrap_or(false)
+        }
+        ExprKind::Match { arms, .. } => arms.iter().any(|a| expr_contains_break(&a.body)),
+        _ => false,
+    }
+}
+
 fn int_lit_range(sc: Scalar) -> Option<(i64, i64)> {
     use Scalar::*;
     Some(match sc {
