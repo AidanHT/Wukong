@@ -6993,8 +6993,20 @@ impl FnLowerer<'_> {
             }
         };
 
-        let ity = self.expr_mir(start);
-        let signed = self.signed(start);
+        // Drive the loop by the wider of the start/end bound types: a literal-`0` start lowers to
+        // `i32`, so `for i in 0..n` with `n: i64` would make an `i32` counter and then compare it to
+        // the `i64` end — verifier-invalid MIR (`cmp.i32 i32, i64`) that crashed the native backend.
+        // (Only the *scalar* loop hit this: an array loop vectorizes this away, so the bug surfaced
+        // only on the tensor-param path, which the vectorizer declines.) The body's index arithmetic
+        // widens with the counter. The `@parallel` range path already drives by the end's type.
+        let sty = self.expr_mir(start);
+        let ety = self.expr_mir(end);
+        let (ity, signed) = if ety.is_int() && sty.is_int() && mir_byte_size(&ety) > mir_byte_size(&sty)
+        {
+            (ety.clone(), self.signed(end))
+        } else {
+            (sty.clone(), self.signed(start))
+        };
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
         // `mercury_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
@@ -7012,6 +7024,7 @@ impl FnLowerer<'_> {
         // i = start
         let slot = self.builder.alloca(ity.clone());
         let s0 = self.lower_expr(start);
+        let s0 = self.coerce_to(s0, &sty, &ity, signed);
         self.builder.build_void(Op::Store {
             ptr: slot,
             value: s0,
@@ -7037,6 +7050,7 @@ impl FnLowerer<'_> {
         self.terminated = false;
         let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
         let end_val = self.lower_expr(end);
+        let end_val = self.coerce_to(end_val, &ety, &ity, signed);
         let pred = match (inclusive, signed) {
             (false, true) => CmpOp::Slt,
             (true, true) => CmpOp::Sle,

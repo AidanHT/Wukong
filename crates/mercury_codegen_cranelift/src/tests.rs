@@ -978,6 +978,38 @@ fn differential_tensor_1d_kernels() {
     }
 }
 
+/// `for i in 0..n` where the END bound is wider than the literal-`0` start (`i64`/`usize`). The
+/// counter must be driven by the wider of the two bound types: a literal `0` lowers to `i32`, so an
+/// `i64` end produced `cmp.i32 i32, i64` — verifier-invalid MIR that crashed the native backend
+/// while the interpreter trapped. Only the *scalar* loop hit it (an array loop vectorizes the
+/// counter away), so it's exercised over a `Tensor` param (vectorizer declines) plus the array
+/// variant, with both `i64` and `usize` bounds. Regression guard for the loop-counter widening.
+#[test]
+fn differential_loop_wide_bound() {
+    let cases = [
+        // Tensor param, i64 bound: sum of 1..=6 -> 21.
+        ("fn f(a: Tensor[f32,6], n: i64) -> f32 { let mut s:f32=0.0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;6]=[1.0,2.0,3.0,4.0,5.0,6.0]; return f(a, 6) as i32; }", 21),
+        // Tensor param, usize bound -> 21.
+        ("fn f(a: Tensor[f32,6], n: usize) -> f32 { let mut s:f32=0.0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;6]=[1.0,2.0,3.0,4.0,5.0,6.0]; return f(a, 6) as i32; }", 21),
+        // array param (vectorized counter path), i64 bound: sum of 1..=5 -> 15.
+        ("fn f(a: [f32;5], n: i64) -> f32 { let mut s:f32=0.0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;5]=[1.0,2.0,3.0,4.0,5.0]; return f(a, 5) as i32; }", 15),
+        // integer reduction, i64 bound, over a Tensor[i32] param -> 6.
+        ("fn f(a: Tensor[i32,4], n: i64) -> i32 { let mut s:i32=0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[i32;4]=[0,1,2,3]; return f(a, 4); }", 6),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "wide-bound loop native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "wide-bound loop wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
 /// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
 /// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*
