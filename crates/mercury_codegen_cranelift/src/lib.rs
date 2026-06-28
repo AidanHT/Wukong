@@ -46,6 +46,14 @@ extern "C" fn rt_print_i64(x: i64) {
     }
 }
 
+// `print`/`println` of an *unsigned* integer lowers to this (mir_build zero-extends the value to 64
+// bits first). Renders the bits as `u64` — the identical text the interpreter's `print_u` produces.
+extern "C" fn rt_print_u64(x: u64) {
+    if let Ok(mut o) = OUTPUT.lock() {
+        o.extend_from_slice(format!("{x}\n").as_bytes());
+    }
+}
+
 extern "C" fn rt_print_f64(x: f64) {
     if let Ok(mut o) = OUTPUT.lock() {
         o.extend_from_slice(format!("{x}\n").as_bytes());
@@ -92,6 +100,7 @@ extern "C" fn rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// Names of the runtime symbols, shared by the JIT (which binds them to the `rt_*` functions) and
 /// the object emitter (which leaves them as undefined imports resolved at link time).
 const RT_PRINT_I64: &str = "mercury_rt_print_i64";
+const RT_PRINT_U64: &str = "mercury_rt_print_u64";
 const RT_PRINT_F64: &str = "mercury_rt_print_f64";
 const RT_PRINT_STR: &str = "mercury_rt_print_str";
 const RT_ASSERT: &str = "mercury_rt_assert";
@@ -221,6 +230,7 @@ const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 #[derive(Clone, Copy)]
 enum Intrinsic {
     PrintInt,
+    PrintUint,
     PrintFloat,
     PrintStr,
     Assert,
@@ -235,6 +245,8 @@ fn classify_intrinsic(name: &str, arg_is_float: bool) -> Option<Intrinsic> {
         }),
         // mir_build routes a `*u8` (string) argument to these symbols (see `print_str` in GemmSyms).
         "print_str" | "println_str" => Some(Intrinsic::PrintStr),
+        // mir_build routes an unsigned-integer argument here (zero-extended to 64 bits).
+        "print_u" | "println_u" => Some(Intrinsic::PrintUint),
         "assert" => Some(Intrinsic::Assert),
         _ => None,
     }
@@ -1394,6 +1406,16 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().call(fref, &[v]);
                 }
             }
+            Intrinsic::PrintUint => {
+                if let Some(&a) = args.first() {
+                    // mir_build already zero-extended the value to 64 bits; pass the bits through
+                    // (Cranelift has no unsigned types — `rt_print_u64` formats the same i64 bits
+                    // as `u64`).
+                    let v = self.coerce_to_i64(a);
+                    let fref = self.rt_refs[RT_PRINT_U64];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
             Intrinsic::PrintFloat => {
                 if let Some(&a) = args.first() {
                     let v = self.coerce_to_f64(a);
@@ -1487,6 +1509,7 @@ impl<'a> FnTranslator<'a> {
 
 struct RtFuncs {
     print_i64: FuncId,
+    print_u64: FuncId,
     print_f64: FuncId,
     print_str: FuncId,
     assert: FuncId,
@@ -1835,6 +1858,9 @@ fn populate_module<M: Module>(
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
+        print_u64: module
+            .declare_function(RT_PRINT_U64, Linkage::Import, &sig_i)
             .map_err(|e| e.to_string())?,
         print_f64: module
             .declare_function(RT_PRINT_F64, Linkage::Import, &sig_f)
@@ -2236,6 +2262,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_PRINT_I64,
                 module.declare_func_in_func(rt.print_i64, builder.func),
+            );
+            rt_refs.insert(
+                RT_PRINT_U64,
+                module.declare_func_in_func(rt.print_u64, builder.func),
             );
             rt_refs.insert(
                 RT_PRINT_STR,
@@ -2849,6 +2879,7 @@ pub fn jit_compile(
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
+    builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
@@ -3309,6 +3340,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
+    builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);

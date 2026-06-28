@@ -752,6 +752,18 @@ impl<'a, 'k> Interp<'a, 'k> {
                 self.stdout.extend_from_slice(text.as_bytes());
                 Ok(Value::Unit)
             }
+            // The unsigned twin of `print`/`println` (mir_build routes an unsigned-integer argument
+            // here after zero-extending it to 64 bits): render the low 64 bits as `u64`, so a
+            // high-bit-set value prints its magnitude. Native's `rt_print_u64` formats the identical
+            // bits the same way, so the differential gate holds.
+            "print_u" | "println_u" => {
+                let text = match args.first().copied().unwrap_or(Value::Unit) {
+                    Value::Int(i) => format!("{}\n", i as u64),
+                    other => format!("{}\n", other.as_int() as u64),
+                };
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
             // A `*u8` string argument to `print`/`println` (lowered to these symbols by mir_build):
             // walk `memory` from the base pointer, collecting bytes (each stored as a `Value::Int`
             // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical

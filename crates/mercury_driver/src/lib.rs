@@ -305,6 +305,7 @@ const MERCURY_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
 #include <math.h>\n\
 void mercury_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
+void mercury_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
 void mercury_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
 void mercury_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(101); } }\n\
 double mercury_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
