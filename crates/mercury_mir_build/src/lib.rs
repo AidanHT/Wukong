@@ -9421,7 +9421,21 @@ impl FnLowerer<'_> {
                 }
                 Some(MathIntrinsic::Abs) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
-                    self.emit_abs(x, vty)
+                    if lane.is_int() {
+                        // Integer abs is `select(x < 0, -x, x)` (signed, matching the scalar
+                        // `emit_int_abs`). The float `emit_abs` (FSub/Cmp(Fogt)/Select) would emit a
+                        // float op on an int vector — MIR the verifier and Cranelift reject, which the
+                        // interpreter ran lossily at -O0; the same guard the scalar path already has.
+                        let zero = self.splat_const_i(0, vty);
+                        let neg = self
+                            .builder
+                            .build(vty.clone(), Op::Bin(BinOp::Sub, zero, x));
+                        let mty = MirType::Vec(Box::new(mask_lane_type(lane)), w);
+                        let isneg = self.builder.build(mty, Op::Cmp(CmpOp::Slt, x, zero));
+                        self.builder.build(vty.clone(), Op::Select(isneg, neg, x))
+                    } else {
+                        self.emit_abs(x, vty)
+                    }
                 }
                 Some(
                     op @ (MathIntrinsic::Round
@@ -9430,8 +9444,14 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Trunc),
                 ) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
-                    self.builder
-                        .build(vty.clone(), Op::Round(round_mode(op), x))
+                    if lane.is_int() {
+                        // Rounding an integer is the identity (matching the scalar guard); `Op::Round`
+                        // is a float op the verifier rejects on an int vector.
+                        x
+                    } else {
+                        self.builder
+                            .build(vty.clone(), Op::Round(round_mode(op), x))
+                    }
                 }
                 Some(op @ (MathIntrinsic::Fmax | MathIntrinsic::Fmin)) => {
                     let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
