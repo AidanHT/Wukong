@@ -53,6 +53,16 @@ pub(crate) struct Parser<'a> {
     /// any delimited sub-expression (`(…)`, `[…]`, call args, a struct-literal body), so a
     /// parenthesized `(Point { x: 1 }).x` still parses.
     no_struct_lit: bool,
+    /// Current nesting depth of the recursive grammar productions (grouping/prefix/cast/binary
+    /// expressions, types, and patterns). Bounded by [`Parser::MAX_DEPTH`] so pathological input —
+    /// thousands of nested `(` / `[`, or a 10k-long `1+1+…` chain — reports E0209 instead of
+    /// overflowing the stack, either in the parser's own descent or in a later recursive walk over
+    /// the resulting AST (sema, MIR lowering, even the tree's `Drop`).
+    depth: u32,
+    /// Latched once the depth limit is first hit. It keeps E0209 to a single diagnostic and (via
+    /// [`Parser::error`]) silences the follow-on recovery cascade — the unmatched `)`/`]` and
+    /// "expected …" errors that unwinding a half-parsed monster construct would otherwise spew.
+    depth_exceeded: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -65,6 +75,8 @@ impl<'a> Parser<'a> {
             next_node: 0,
             diags: Vec::new(),
             no_struct_lit: false,
+            depth: 0,
+            depth_exceeded: false,
         }
     }
 
@@ -145,8 +157,39 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
+        // Once the nesting limit is hit, a single E0209 is reported and every follow-on recovery
+        // diagnostic (the unmatched delimiters and "expected …" errors produced while unwinding the
+        // over-deep construct) is suppressed, keeping the output to one clean error.
+        if self.depth_exceeded {
+            return;
+        }
         self.diags
             .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+    }
+
+    /// Maximum nesting depth of the recursive grammar productions before the parser bails with
+    /// E0209. Generous enough that no realistic program (hand-written or generated) comes close, yet
+    /// bounded so that neither the parser's own descent nor any later recursive walk over the AST can
+    /// overflow the stack. The compiler front-end runs on a large stack (see `mercuryc::main`), so
+    /// the actual overflow threshold sits far above this limit.
+    const MAX_DEPTH: u32 = 1024;
+
+    /// Report "nesting too deep" exactly once. Pushes the diagnostic directly (bypassing the now
+    /// self-silencing [`Parser::error`]) and latches `depth_exceeded`, which dedups this code and
+    /// quiets the recovery cascade that unwinding the over-deep construct triggers.
+    fn too_deep(&mut self, span: Span) {
+        if self.depth_exceeded {
+            return;
+        }
+        self.diags.push(
+            Diagnostic::error(format!(
+                "expression or type nesting too deep (exceeds the limit of {})",
+                Self::MAX_DEPTH
+            ))
+            .with_code("E0209")
+            .primary(span, "the nesting becomes too deep here"),
+        );
+        self.depth_exceeded = true;
     }
 
     fn nid(&mut self) -> NodeId {
@@ -213,6 +256,15 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_type(&mut self) -> TypeExpr {
         let start = self.span();
+        // Bound type nesting (`[[[…; 1]; 1]`, `*****T`, deep tuples) so a pathological type cannot
+        // overflow the stack here or in a later recursive walk.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return self.finish_type(start, TypeKind::Unit);
+        }
         let kind = match self.kind() {
             T::Star => {
                 self.bump();
@@ -281,6 +333,7 @@ impl<'a> Parser<'a> {
                 TypeKind::Unit
             }
         };
+        self.depth = saved;
         self.finish_type(start, kind)
     }
 
@@ -432,6 +485,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Expr {
+        let saved = self.depth;
         let mut lhs = self.parse_cast();
         loop {
             let Some(op) = token_to_binop(self.kind()) else {
@@ -439,6 +493,16 @@ impl<'a> Parser<'a> {
             };
             let bp = binop_bp(op);
             if bp < min_bp {
+                break;
+            }
+            // Each fold deepens the left-leaning tree by one. A left-associative chain is built
+            // *iteratively* (the loop, not recursion), so the parser itself never goes deep here —
+            // but the resulting tree does, and a later recursive consumer (sema, lowering, `Drop`)
+            // would overflow on it. Charging each fold to the shared depth budget caps that tree.
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
                 break;
             }
             self.bump();
@@ -454,6 +518,8 @@ impl<'a> Parser<'a> {
                 span,
             };
         }
+        // Restores both this frame's folds and any cast-chain folds `parse_cast` charged above.
+        self.depth = saved;
         lhs
     }
 
@@ -464,6 +530,15 @@ impl<'a> Parser<'a> {
     fn parse_cast(&mut self) -> Expr {
         let mut e = self.parse_prefix();
         while self.kind() == T::As {
+            // A long cast chain (`x as A as B as …`) folds left iteratively, exactly like the binop
+            // loop, so it gets the same per-fold depth charge. The enclosing `parse_expr_bp` restores
+            // the budget (it snapshots `self.depth` before calling `parse_cast`).
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
+                break;
+            }
             self.bump();
             let ty = self.parse_type();
             e = self.finish_expr(e.span, ExprKind::Cast { expr: Box::new(e), ty });
@@ -472,6 +547,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_prefix(&mut self) -> Expr {
+        // One depth level per prefix expression. This is the choke point every operand passes
+        // through (`parse_expr_bp` → `parse_cast` → here), so it bounds *both* a deeply nested
+        // grouping descent (`((((…))))`) and a long unary chain (`----…x`, `****…p`), which recurses
+        // straight back into `parse_prefix` without going through `parse_expr_bp`.
+        let saved = self.depth;
+        self.depth += 1;
+        let out = if self.depth > Self::MAX_DEPTH {
+            let sp = self.span();
+            self.too_deep(sp);
+            self.finish_expr(sp, ExprKind::TupleLit(Vec::new()))
+        } else {
+            self.parse_prefix_inner()
+        };
+        self.depth = saved;
+        out
+    }
+
+    fn parse_prefix_inner(&mut self) -> Expr {
         let start = self.span();
         let op = match self.kind() {
             T::Minus => Some(UnOp::Neg),
@@ -1174,6 +1267,19 @@ impl<'a> Parser<'a> {
 
     fn parse_pattern_primary(&mut self) -> Pattern {
         let start = self.span();
+        // Bound deeply nested tuple patterns (`((((…))))`), which recurse through here via the
+        // `LParen` arm, the same way expressions and types are bounded.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return Pattern {
+                id: self.nid(),
+                kind: PatKind::Wildcard,
+                span: start,
+            };
+        }
         let kind = match self.kind() {
             T::Ident => {
                 let text = &self.src[start.lo as usize..start.hi as usize];
@@ -1247,6 +1353,7 @@ impl<'a> Parser<'a> {
                 PatKind::Wildcard
             }
         };
+        self.depth = saved;
         Pattern {
             id: self.nid(),
             kind,
@@ -1551,5 +1658,72 @@ mod tests {
             fn_names.contains(&"b".to_string()),
             "lost `b`: {fn_names:?}"
         );
+    }
+
+    /// Pathological deeply-nested input must report E0209 rather than overflow the stack. Each shape
+    /// mirrors one of the historical crash repros. The work runs on a roomy stack so the test itself
+    /// can build and drop the (depth-bounded) AST without overflowing — exactly as the real compiler
+    /// front-end runs (see `mercuryc::main`); the guard is what keeps the depth bounded.
+    #[test]
+    fn deeply_nested_input_reports_e0209_not_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+
+                // Case 3: a 5000-long left-associative `+` chain (iteratively built deep tree).
+                let chain = format!("1{}", "+1".repeat(5000));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&chain, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "long `+` chain should report E0209, got {d:?}");
+
+                // Case 1: 4000 nested parentheses (recursive descent).
+                let parens = format!("{}1{}", "(".repeat(4000), ")".repeat(4000));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested parens should report E0209, got {d:?}");
+
+                // Case 2: 4000 nested array types (recursive `parse_type`).
+                let ty = format!("{}i32{}", "[".repeat(4000), "; 1]".repeat(4000));
+                let mut i = Interner::new();
+                let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested array type should report E0209, got {d:?}");
+
+                // A single clean diagnostic, not a cascade: the parens case reports E0209 once.
+                let parens = format!("{}1{}", "(".repeat(4000), ")".repeat(4000));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
+                assert_eq!(
+                    d.iter().filter(|x| x.is_error()).count(),
+                    1,
+                    "depth overflow should produce exactly one error, got {d:?}"
+                );
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on deeply nested input");
+    }
+
+    /// Moderately nested but entirely realistic input stays well under the limit and parses cleanly.
+    #[test]
+    fn moderate_nesting_parses_cleanly() {
+        // A 100-term sum.
+        let sum = format!("1{}", "+1".repeat(99));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&sum, SourceId(0), &mut i);
+        assert!(d.is_empty(), "100-term sum should parse cleanly, got {d:?}");
+
+        // 50-deep parentheses.
+        let parens = format!("{}1{}", "(".repeat(50), ")".repeat(50));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
+        assert!(d.is_empty(), "50-deep parens should parse cleanly, got {d:?}");
+
+        // A 16-deep array type.
+        let ty = format!("{}i32{}", "[".repeat(16), "; 1]".repeat(16));
+        let mut i = Interner::new();
+        let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
+        assert!(d.is_empty(), "16-deep array type should parse cleanly, got {d:?}");
     }
 }
