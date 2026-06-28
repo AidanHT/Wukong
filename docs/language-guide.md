@@ -60,9 +60,17 @@ const TILE: usize = 64; // compile-time constant
 let (a, b) = (3, 4);    // tuple destructuring (nested patterns and `_` work too)
 ```
 
-An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine. A typed
-value must match its annotation exactly (see error `E0401`). An unsuffixed literal that does not fit
-the annotated type is rejected (`E0401`, e.g. `let x: i8 = 200;`), not silently wrapped.
+An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine — and that
+threading reaches every position that pins a type (a `let`/`const` annotation, a function argument, a
+`return`, a struct-field initializer, and a plain assignment) and **descends into aggregate
+literals**, so a typed buffer can be built straight from literals: `let a: [i8; 2] = [127, 0]`,
+`let t: (u8, u8) = (200, 1)` (`tests/run/aggregate_literal_adapt.mer`). A typed value must match its
+annotation exactly (see error `E0401`). An unsuffixed literal that does not fit the type it adapts to
+is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
+silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
+overflows `i32` **widens to `i64`** so its value is never silently truncated
+(`tests/run/int_literal_widen.mer`); use a suffix (`9000000000i64`, `3000000000u32`) to pick a
+specific type.
 
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
@@ -74,6 +82,9 @@ references another (`tests/run/top_level_const.mer`).
 
 Integer literals may be **decimal, hex `0xFF`, octal `0o17`, or binary `0b1010`**, with `_` digit
 separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.mer`). A
+malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit `0b2`, a garbled float
+`1.5z`, or a value past `u64` — is a compile error (`E0401`), never silently zeroed
+(`tests/fail/malformed_int_literal.mer`). A
 **char literal** `'A'` is its `u32` Unicode scalar value — covering the one-character escapes (`\n`
 `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes — so it can be cast, compared, and used
 in arithmetic (`tests/run/char_literals.mer`).
