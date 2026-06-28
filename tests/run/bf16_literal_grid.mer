@@ -1,0 +1,28 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10009
+// EXPECT-OUT: 9997
+// EXPECT-OUT: 33125
+// EXPECT-OUT: 3140
+module tests.run.bf16_literal_grid
+
+// A bf16/f16 literal — and a bf16/f16 op result — must keep its grid-rounded value at EVERY opt level.
+// The rounding must not live only in a store the optimizer can forward past: before, mem2reg/CSE
+// promoted a bf16 slot and deleted the rounding store, so `let b: bf16 = 0.1` lowered the raw f32 0.1
+// at -O2 (≈10000 below) instead of the bf16-grid 0.10009765625 (10009) — a -O0 ≠ -O2 violation. Printed
+// as scaled integers so the grid value is distinguishable from the raw f32 (the existing bf16.mer /
+// f16.mer use explicit `as bf16` casts and ×1000 truncation that happen to mask this). Covers the
+// implicit-literal form, an f16 literal, a folded bf16 const sum, and an f16 constant.
+
+fn main() -> i32 {
+    let b: bf16 = 0.1;                    // implicit literal -> bf16 grid (0.10009765625)
+    print((b as f32 * 100000.0) as i32);  // 10009  (was 10000 at -O2)
+    let h: f16 = 0.1;                     // f16 grid (0.0999755859375)
+    print((h as f32 * 100000.0) as i32);  // 9997
+    let x: bf16 = 1.6;
+    let y: bf16 = 1.7;
+    let s: bf16 = x + y;                  // bf16 const arithmetic must not fold UNROUNDED operands
+    print((s as f32 * 10000.0) as i32);   // 33125
+    let c: f16 = 3.14159;
+    print((c as f32 * 1000.0) as i32);    // 3140
+    return 0;
+}

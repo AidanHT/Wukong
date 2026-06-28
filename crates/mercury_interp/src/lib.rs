@@ -514,7 +514,14 @@ impl<'a, 'k> Interp<'a, 'k> {
     ) -> Result<Value, String> {
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
-            Op::ConstFloat(v, _) => Value::Float(*v),
+            Op::ConstFloat(v, ty) => Value::Float(match ty {
+                // A bf16/f16 const IS its grid-rounded value (see the native ConstFloat lowering) —
+                // round at materialization so optimizer value-forwarding can't drop the rounding and
+                // make -O2 disagree with -O0. Same `half`-crate path used at every bf16/f16 store/cast.
+                MirType::BF16 => mercury_runtime::round_bf16(*v as f32) as f64,
+                MirType::F16 => mercury_runtime::round_f16(*v as f32) as f64,
+                _ => *v,
+            }),
             // Vector arithmetic is lane-wise, each lane rounded to the lane type (so `<n x f32>`
             // ops round at f32, matching the native backend). Scalar bins go the fast path.
             Op::Bin(b, l, r) => {
@@ -3251,9 +3258,17 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
             };
             Value::Int(mask(i, to))
         }
-        // Widening is exact. Narrowing to bf16/f16 rounds to that grid (the native backend rounds on
-        // store / cast identically); narrowing to f32 is left to the per-op f32 rounding in `exec`.
-        FpExt => Value::Float(v.as_float()),
+        // Widening to f32/f64 is value-preserving for an f32 source, but a bf16/f16 source must first
+        // round to its grid: the per-store rounding alone is fragile (an optimizer can promote/forward
+        // a bf16 op result past its store, leaving an unrounded f32), so the observation boundary
+        // rounds too — the "round at store/cast/load" model — keeping -O0 == -O2. Narrowing to bf16/f16
+        // rounds to that grid (the native backend rounds on store/cast identically); narrowing to f32
+        // is left to the per-op f32 rounding in `exec`.
+        FpExt => match from {
+            MirType::BF16 => Value::Float(mercury_runtime::round_bf16(v.as_float() as f32) as f64),
+            MirType::F16 => Value::Float(mercury_runtime::round_f16(v.as_float() as f32) as f64),
+            _ => Value::Float(v.as_float()),
+        },
         FpTrunc => match to {
             MirType::BF16 => Value::Float(mercury_runtime::round_bf16(v.as_float() as f32) as f64),
             MirType::F16 => Value::Float(mercury_runtime::round_f16(v.as_float() as f32) as f64),

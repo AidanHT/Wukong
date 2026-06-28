@@ -166,7 +166,15 @@ fn round_float_to_ty(v: f64, ty: &MirType) -> f64 {
 fn fold_bin(b: BinOp, a: CV, c: CV, ty: &MirType) -> Option<CV> {
     match (a, c) {
         (CV::Int(x), CV::Int(y)) if !b.is_float() => fold_int(b, x, y, ty).map(CV::Int),
-        (CV::Float(x), CV::Float(y)) if b.is_float() => {
+        // Do not fold bf16/f16 arithmetic. The backends compute these in f32 and round to the narrow
+        // grid only at the store/cast, so a *runtime* `a + b` of two grid consts rounds correctly — but
+        // folding here would combine the UNROUNDED `ConstFloat` operands (the MIR const carries the
+        // literal f32, not its bf16-grid value) and bake a wrong-grid constant, making -O2 disagree
+        // with -O0. Leaving the op to run keeps both levels identical (and bf16/f16 are storage
+        // formats — seldom compile-time-constant operands, so the lost fold barely matters).
+        (CV::Float(x), CV::Float(y))
+            if b.is_float() && !matches!(ty, MirType::BF16 | MirType::F16) =>
+        {
             Some(CV::Float(round_float_to_ty(fold_float(b, x, y), ty)))
         }
         _ => None,
