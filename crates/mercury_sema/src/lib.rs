@@ -1389,8 +1389,30 @@ impl Sema<'_> {
 
     fn type_expr_inner(&mut self, e: &Expr) -> Ty {
         match &e.kind {
-            ExprKind::Int(s) => Ty::Scalar(int_lit_scalar(self.sym_str(*s))),
-            ExprKind::Float(s) => Ty::Scalar(float_lit_scalar(self.sym_str(*s))),
+            ExprKind::Int(s) => {
+                // A malformed integer literal — a mistyped radix like `0z123`, an empty radix `0x`,
+                // a bad digit `0b2`, or a value beyond u64 — lexes as one `Int` token, fails to
+                // parse, and used to lower *silently to 0* (both backends agreed on the wrong value,
+                // so the differential gate was blind). Reject it instead of miscompiling.
+                let text = self.sym_str(*s).to_string();
+                if int_literal_well_formed(&text) {
+                    Ty::Scalar(int_lit_scalar(&text))
+                } else {
+                    self.error(e.span, "E0401", format!("invalid integer literal `{text}`"));
+                    Ty::Error
+                }
+            }
+            ExprKind::Float(s) => {
+                // Likewise a malformed float literal (`1.5z`, an incomplete exponent `1.5e`) that
+                // the greedy suffix scan swept into one `Float` token; it parsed to 0.0 silently.
+                let text = self.sym_str(*s).to_string();
+                if float_literal_well_formed(&text) {
+                    Ty::Scalar(float_lit_scalar(&text))
+                } else {
+                    self.error(e.span, "E0401", format!("invalid float literal `{text}`"));
+                    Ty::Error
+                }
+            }
             ExprKind::Bool(_) => Ty::Scalar(Scalar::Bool),
             ExprKind::Str(_) => Ty::Ptr {
                 mutable: false,
@@ -2096,6 +2118,58 @@ fn eval_const_int(e: &Expr, interner: &Interner) -> Option<i64> {
 
 /// Parse an integer literal's source text (decimal, `0x`/`0o`/`0b` radix, `_` separators, optional
 /// type suffix, optional leading sign) to an `i64`, or `None` if it isn't a valid integer literal.
+/// Whether an integer literal's text denotes a value Mercury can represent — it parses, after the
+/// optional sign / type suffix / `_` separators and in its radix, as an i64 *or* a u64. A mistyped
+/// radix like `0z123` (lexed as one `Int` token with a bogus `z123` suffix), an empty/garbled radix
+/// body, or a value past u64 parses as neither; such a literal used to lower silently to 0. Mirrors
+/// `parse_int_text`'s stripping so the two agree on what a well-formed literal is.
+fn int_literal_well_formed(text: &str) -> bool {
+    let mut s = text.trim();
+    if s.starts_with('-') || s.starts_with('+') {
+        s = &s[1..];
+    }
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(x) = s.strip_suffix(suf) {
+            s = x;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    let (digits, radix): (&str, u32) =
+        if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            (h, 16)
+        } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+            (o, 8)
+        } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+            (b, 2)
+        } else {
+            (&body, 10)
+        };
+    !digits.is_empty()
+        && (i64::from_str_radix(digits, radix).is_ok() || u64::from_str_radix(digits, radix).is_ok())
+}
+
+/// Whether a float literal's text parses as an `f64` after stripping the optional sign, a float type
+/// suffix, and `_` separators — so a garbled literal the greedy suffix scan swept into one `Float`
+/// token (`1.5z`, an incomplete exponent `1.5e`) is rejected instead of silently lowering to 0.0.
+fn float_literal_well_formed(text: &str) -> bool {
+    let mut s = text.trim();
+    if s.starts_with('-') || s.starts_with('+') {
+        s = &s[1..];
+    }
+    // `f` alone is the C-style float suffix (`5f` -> f32); try the longer suffixes first.
+    for suf in ["bf16", "f16", "f32", "f64", "f"] {
+        if let Some(x) = s.strip_suffix(suf) {
+            s = x;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    !body.is_empty() && body.parse::<f64>().is_ok()
+}
+
 fn parse_int_text(text: &str) -> Option<i64> {
     let mut s = text.trim();
     let neg = s.starts_with('-');
@@ -2203,6 +2277,36 @@ mod tests {
         // A *suffixed* literal still pins its type and must conflict.
         let (diags, _) = analyze("fn f() { let x: f64 = -1.5f32; }");
         assert!(diags.iter().any(|d| d.code == Some("E0401")));
+    }
+
+    #[test]
+    fn malformed_numeric_literals_are_rejected() {
+        // A mistyped radix / empty radix / bad digit / value past u64 / garbled float lexes as one
+        // numeric token, fails to parse, and used to lower *silently to 0* (both backends agreed on
+        // the wrong value) — now a hard E0401.
+        for src in [
+            "fn f() { let x = 0z123; }",
+            "fn f() { let x = 0x; }",
+            "fn f() { let x = 0b2; }",
+            "fn f() { let x = 1.5z; }",
+        ] {
+            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+        }
+        // Every well-formed literal stays clean (guards against over-rejection): radix, separators,
+        // type suffixes, u64::MAX, and the float forms.
+        for src in [
+            "fn f() { let x = 0xFF; }",
+            "fn f() { let x = 0o17; }",
+            "fn f() { let x = 0b1010; }",
+            "fn f() { let x = 1_000_000; }",
+            "fn f() { let x: u8 = 250u8; }",
+            "fn f() { let x: u64 = 18446744073709551615; }",
+            "fn f() { let x = 1.5e3; }",
+            "fn f() { let x = 5f32; }",
+            "fn f() { let x = 9000000000; }",
+        ] {
+            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+        }
     }
 
     #[test]
