@@ -85,6 +85,127 @@ fn collect_value_structs(t: &Ty, out: &mut Vec<Symbol>) {
     }
 }
 
+/// Collect the names of top-level consts that expression `e` refers to (single-segment paths in the
+/// `consts` set). Used to detect a self-referential const initializer before `mir_build` inlines it
+/// (which would recurse forever, a compiler stack overflow). Recurses through every sub-expression,
+/// including block/`if`/`match` bodies.
+fn collect_const_refs(e: &Expr, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>) {
+    match &e.kind {
+        ExprKind::Path(p) => {
+            if p.is_single() && consts.contains(&p.first().sym) {
+                out.push(p.first().sym);
+            }
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Field { base: expr, .. }
+        | ExprKind::TupleField { base: expr, .. } => collect_const_refs(expr, consts, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_const_refs(lhs, consts, out);
+            collect_const_refs(rhs, consts, out);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_const_refs(callee, consts, out);
+            for a in args {
+                collect_const_refs(a, consts, out);
+            }
+        }
+        ExprKind::Index { base, indices } => {
+            collect_const_refs(base, consts, out);
+            for i in indices {
+                collect_const_refs(i, consts, out);
+            }
+        }
+        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
+            for x in xs {
+                collect_const_refs(x, consts, out);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            collect_const_refs(value, consts, out);
+            collect_const_refs(count, consts, out);
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            for f in fields {
+                collect_const_refs(&f.value, consts, out);
+            }
+            if let Some(r) = rest {
+                collect_const_refs(r, consts, out);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_const_refs(cond, consts, out);
+            collect_block_const_refs(then_branch, consts, out);
+            if let Some(el) = else_branch {
+                collect_const_refs(el, consts, out);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_const_refs(scrutinee, consts, out);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    collect_const_refs(g, consts, out);
+                }
+                collect_const_refs(&a.body, consts, out);
+            }
+        }
+        ExprKind::Block(b) => collect_block_const_refs(b, consts, out),
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => {}
+    }
+}
+
+/// [`collect_const_refs`] over a block's statements and tail.
+fn collect_block_const_refs(b: &Block, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>) {
+    for s in &b.stmts {
+        match &s.kind {
+            StmtKind::Let { init: Some(e), .. }
+            | StmtKind::Expr(e)
+            | StmtKind::Return(Some(e))
+            | StmtKind::Defer(e) => collect_const_refs(e, consts, out),
+            StmtKind::Assign { target, value, .. } => {
+                collect_const_refs(target, consts, out);
+                collect_const_refs(value, consts, out);
+            }
+            StmtKind::While { cond, body, .. } => {
+                collect_const_refs(cond, consts, out);
+                collect_block_const_refs(body, consts, out);
+            }
+            StmtKind::For { iter, body, .. } => {
+                match iter {
+                    ForIter::Range {
+                        start, end, step, ..
+                    } => {
+                        collect_const_refs(start, consts, out);
+                        if let Some(e) = end {
+                            collect_const_refs(e, consts, out);
+                        }
+                        if let Some(s) = step {
+                            collect_const_refs(s, consts, out);
+                        }
+                    }
+                    ForIter::Expr(e) => collect_const_refs(e, consts, out),
+                }
+                collect_block_const_refs(body, consts, out);
+            }
+            StmtKind::Loop { body, .. } => collect_block_const_refs(body, consts, out),
+            _ => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        collect_const_refs(t, consts, out);
+    }
+}
+
 pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnostic>) {
     let mut s = Sema {
         interner,
@@ -100,6 +221,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     };
     s.collect(module);
     s.check_recursive_structs(module);
+    s.check_recursive_consts(module);
     s.check_bodies(module);
     let result = SemaResult {
         types: s.types,
@@ -240,6 +362,56 @@ impl Sema<'_> {
             }
         }
         out
+    }
+
+    /// Reject a `const` whose initializer depends on its own value — directly (`const A = A + 1`) or
+    /// transitively (`A` uses `B`, `B` uses `A`). `mir_build` inlines a const's initializer at each
+    /// use site and recurses for a const-references-const, so a cycle stack-overflows the compiler
+    /// (a crash on a plausible typo). Mirrors `check_recursive_structs`: a DFS over the
+    /// const-reference graph that flags reaching the root. Runs after `collect`, when every const is
+    /// registered, and (like the struct check) before `check_bodies`, so the error halts the pipeline
+    /// ahead of mir_build's inliner.
+    fn check_recursive_consts(&mut self, module: &Module) {
+        let mut inits: HashMap<Symbol, &Expr> = HashMap::new();
+        for item in &module.items {
+            if let ItemKind::Const(c) = &item.kind {
+                inits.insert(c.name.sym, &c.value);
+            }
+        }
+        let names: HashSet<Symbol> = inits.keys().copied().collect();
+        for item in &module.items {
+            if let ItemKind::Const(c) = &item.kind {
+                let root = c.name.sym;
+                let mut stack: Vec<Symbol> = Vec::new();
+                collect_const_refs(&c.value, &names, &mut stack);
+                let mut visited: Vec<Symbol> = Vec::new();
+                let mut recursive = false;
+                while let Some(cur) = stack.pop() {
+                    if cur == root {
+                        recursive = true;
+                        break;
+                    }
+                    if visited.contains(&cur) {
+                        continue;
+                    }
+                    visited.push(cur);
+                    if let Some(e) = inits.get(&cur) {
+                        collect_const_refs(e, &names, &mut stack);
+                    }
+                }
+                if recursive {
+                    let nm = self.sym_str(root).to_string();
+                    self.error(
+                        item.span,
+                        "E0403",
+                        format!(
+                            "recursive const `{nm}` depends on its own value; a const must be \
+                             evaluable without referring back to itself"
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn collect_fn(&mut self, f: &FnDecl) {
