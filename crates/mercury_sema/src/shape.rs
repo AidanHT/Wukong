@@ -110,6 +110,26 @@ impl Sema<'_> {
                 // unmodeled (`Unknown`).
                 if let Some(ret) = intrinsic_ret_ty(self.sym_str(name), &arg_tys) {
                     self.types.insert(callee.id, Ty::Unknown);
+                    // A math intrinsic operates on a scalar/vector/tensor, never an aggregate. An
+                    // aggregate argument used to slip through (the result is still typed `f32`),
+                    // then mir_build emitted e.g. `sqrt` on the struct's base pointer — invalid MIR
+                    // the verifier and Cranelift reject, while the interpreter ran it on a pointer
+                    // value and silently produced garbage: a backend divergence on accepted input.
+                    // Reject it here. (Tensors are not aggregates by `is_aggregate_ty`, so tensor
+                    // intrinsics stay lenient.)
+                    if let Some(bad) = arg_tys.iter().find(|t| self.is_aggregate_ty(t)) {
+                        self.error(
+                            span,
+                            "E0401",
+                            format!(
+                                "`{}` expects a scalar, vector, or tensor argument, not a value of \
+                                 type `{}`",
+                                self.sym_str(name),
+                                bad.display(self.interner)
+                            ),
+                        );
+                        return Ty::Unknown;
+                    }
                     return ret;
                 }
                 // Unresolved or non-function callee: lenient (builtins like `min`).
