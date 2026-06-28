@@ -81,7 +81,7 @@ in arithmetic (`tests/run/char_literals.mer`).
 A **string literal** `"hello"` materializes its UTF-8 bytes (plus a trailing NUL) into a stack byte
 buffer and is typed `*u8` — the same by-pointer convention as an array. The escapes `\n` `\r` `\t`
 `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode (each code point re-encoded as UTF-8). `print`/`println` of
-a `*u8` — a literal, a `let s = "hi";` binding, or a `*u8` returned from a function — renders the
+a `*u8` — a literal or a `let s = "hi";` binding — renders the
 bytes, while numeric `print` still prints numbers (`tests/run/string_literal.mer`). There is **no
 string type beyond `*u8`** yet: no concatenation/indexing/length operators and no general
 static-data section — a string is just a NUL-terminated `*u8` buffer suitable for `print` (🟡).

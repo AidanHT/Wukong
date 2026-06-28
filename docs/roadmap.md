@@ -66,7 +66,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   (`tests/run/char_literals.mer`).
 - **String literals**: `"hello"` materializes its UTF-8 bytes (plus a NUL) into a stack byte buffer,
   typed `*u8`; the escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode. `print`/`println`
-  of a `*u8` (a literal, a `let`-bound string, or one returned from a function) renders the bytes, not
+  of a `*u8` (a literal or a `let`-bound string) renders the bytes, not
   the pointer value (`tests/run/string_literal.mer`). No string *type* beyond `*u8` yet — no
   concatenation/indexing/length and no general static-data section (🟡).
 - **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
@@ -348,3 +348,8 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked.
 - `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
   stay in memory (the interpreter and `cse`/`dse` handle those directly).
+- Because there is **no static-data section**, a string literal lives in the *current* function's
+  frame, so **returning a `*u8` that points at a string created inside the callee dangles on the
+  native backend** — that frame is reclaimed on return and `print` then reads freed stack (an empty
+  line), while the interpreter's persistent slot memory masks it (both backends still exit 0). Return
+  a string by having the caller pass in the destination buffer, or thread it through a `*u8` parameter.
