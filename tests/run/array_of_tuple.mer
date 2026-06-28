@@ -1,0 +1,20 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 34
+module tests.run.array_of_tuple
+
+// An array whose element is a tuple: `a[i].0` / `a[i].1` index then a tuple-field access. A tuple
+// element is wider than one slot (two i32s = 8 bytes), so this previously segfaulted native (the
+// element GEP mis-strided by a single slot); the element now strides a whole tuple on both backends.
+fn main() -> i32 {
+    let a: [(i32, i32); 2] = [(7, 8), (9, 10)];
+    print(a[0].0);   // 7
+    print(a[0].1);   // 8
+    print(a[1].0);   // 9
+    print(a[1].1);   // 10
+    print(a[0].0 + a[1].1 + a[1].0 + a[0].1);   // 7 + 10 + 9 + 8 = 34
+    return 0;
+}

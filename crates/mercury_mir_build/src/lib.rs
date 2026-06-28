@@ -4516,6 +4516,30 @@ impl FnLowerer<'_> {
                     {
                         self.expr_mir(e)
                     }
+                    // An array literal/repeat *with* an annotation prefers the annotation for its
+                    // explicit element type + length (so an unsuffixed-literal element like
+                    // `[1, 2]: [u8; 2]` takes the annotated scalar, not the i32 default). But
+                    // `mir_ty_of_ast` is registry-blind: a struct/tuple element resolves to the
+                    // `I32` fallback, under-allocating the slot and mis-striding `a[i]`, so
+                    // `a[i].field` reads past the buffer / segfaults in native. When the init's
+                    // registry-aware element is an aggregate byte buffer, splice it into the
+                    // annotated array type (keeping the annotated length).
+                    (Some(t), Some(e))
+                        if matches!(
+                            &e.kind,
+                            ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                        ) =>
+                    {
+                        match (mir_ty_of_ast(t, self.interner), self.expr_mir(e)) {
+                            (MirType::Array(ae, n), MirType::Array(re, _))
+                                if !matches!(*ae, MirType::Array(..))
+                                    && matches!(*re, MirType::Array(..)) =>
+                            {
+                                MirType::Array(re, n)
+                            }
+                            (ann, _) => ann,
+                        }
+                    }
                     (Some(t), _) => mir_ty_of_ast(t, self.interner),
                     (None, Some(e)) => self.expr_mir(e),
                     (None, None) => MirType::I32,
@@ -9612,18 +9636,39 @@ impl FnLowerer<'_> {
     /// Initialize an array alloca (`base`) of `n` elements of type `elem` from an array-literal or
     /// array-repeat initializer, storing each element through a `gep`.
     fn lower_array_init(&mut self, base: ValueId, elem: &MirType, n: u32, init: &Expr) {
+        // An aggregate element (an array of structs/tuples — `elem` is a byte-buffer `Array`) must be
+        // deep-copied into each element slot; a plain `store_element` would store the element's base
+        // *pointer* as a scalar (a silent miscompile). A scalar element keeps the store path.
+        let aggregate = matches!(elem, MirType::Array(..));
         match &init.kind {
             ExprKind::ArrayLit(elems) => {
                 for (i, el) in elems.iter().enumerate() {
-                    let v0 = self.lower_expr(el);
-                    let vty = self.expr_mir(el);
-                    // Coerce to the element type so e.g. a `[bf16; N]` literal stores bf16-rounded
-                    // 16-bit values, not raw f32. A no-op when the element already matches.
-                    let v = self.coerce_to(v0, &vty, elem, self.signed(el));
-                    self.store_element(base, elem, i as i128, v);
+                    if aggregate {
+                        let ep = self.gep_elem(base, elem, i as i128);
+                        let ety = self.expr_ty(el);
+                        self.init_field(ep, &ety, el);
+                    } else {
+                        let v0 = self.lower_expr(el);
+                        let vty = self.expr_mir(el);
+                        // Coerce to the element type so e.g. a `[bf16; N]` literal stores bf16-rounded
+                        // 16-bit values, not raw f32. A no-op when the element already matches.
+                        let v = self.coerce_to(v0, &vty, elem, self.signed(el));
+                        self.store_element(base, elem, i as i128, v);
+                    }
                 }
             }
             ExprKind::ArrayRepeat { value, .. } => {
+                if aggregate {
+                    // `[agg; n]`: deep-copy the aggregate into every element slot. Re-emitting the
+                    // literal/copy per element is correct (each element owns its storage); the scalar
+                    // fill-loop path below does not apply.
+                    let ety = self.expr_ty(value);
+                    for i in 0..n as i128 {
+                        let ep = self.gep_elem(base, elem, i);
+                        self.init_field(ep, &ety, value);
+                    }
+                    return;
+                }
                 // `[value; n]` evaluates `value` once and fills every slot with it. Small arrays
                 // unroll to straight-line stores; large ones lower to a fill loop so that, e.g.,
                 // `[0; 1_000_000]` does not generate a million instructions.
@@ -9888,9 +9933,12 @@ impl FnLowerer<'_> {
                 let base_ptr = self.lower_expr(base);
                 let idx = self.lower_expr(&indices[0]);
                 // Prefer the element type from the base's array type; fall back to the indexed
-                // expression's own type (slices/tensors/pointers).
+                // expression's own type (slices/tensors/pointers). Resolve through the
+                // registry-aware `mir_ty_of` so a struct/tuple element becomes its byte-buffer
+                // `Array` type (the GEP strides by the real element size, and the read path below
+                // treats it as an aggregate address) rather than the registry-blind `I32` fallback.
                 let elem = match self.expr_ty(base) {
-                    Ty::Array { elem, .. } => mir_ty(&elem),
+                    Ty::Array { elem, .. } => self.mir_ty_of(&elem),
                     _ => self.expr_mir(e),
                 };
                 let p = self.builder.build(
@@ -10005,7 +10053,12 @@ impl FnLowerer<'_> {
             ExprKind::Index { base, indices } if !indices.is_empty() => {
                 let (ptr, elem) = self.lower_place(e);
                 let _ = (base, indices);
-                self.builder.build(elem.clone(), Op::Load(ptr, elem))
+                // A scalar element loads; an aggregate element (an array of structs/tuples) yields
+                // its address — the by-pointer convention, so a further `.field`/`[i]`/`.0` GEPs
+                // off it. Mirrors the `Field`/`TupleField` read arms. An unconditional `Op::Load`
+                // here mis-loaded an aggregate element as a scalar (native verifier reject for a
+                // struct element, segfault for a wider tuple element).
+                self.load_or_addr(ptr, elem)
             }
             // `t.0` — read tuple field 0 by GEP to its byte offset. A scalar field loads; an
             // aggregate field (a nested struct/tuple/array) yields its address, the by-pointer
