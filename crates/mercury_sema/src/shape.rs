@@ -237,6 +237,49 @@ impl Sema<'_> {
                     self.unify_dim(*pd, *ad, dims, span);
                 }
             }
+            // Array → tensor *decay*: an `Array` argument is intentionally accepted for a tensor
+            // parameter (see `tests/run/tensor_add.mer`, which feeds a `[f32; 6]` to a
+            // `Tensor[f32, 2, 3]`). But when the tensor's shape and the array length are *both*
+            // statically known, the buffer must hold the right number of elements of the right
+            // type — otherwise a too-small/wrong array satisfies any tensor and every
+            // in-tensor-bounds index becomes an out-of-bounds read (the interpreter traps, native
+            // codegen does not: a backend divergence). A symbolic / dynamic dim stays lenient
+            // (there is no concrete element count to check against).
+            (Ty::Tensor { elem: pe, shape, .. }, Ty::Array { elem: ae, len }) => {
+                if let Ty::Scalar(ae) = ae.as_ref() {
+                    if pe != ae {
+                        self.error(
+                            span,
+                            "E0502",
+                            format!(
+                                "tensor element type mismatch: expected `{}`, found `{}`",
+                                pe.name(),
+                                ae.name()
+                            ),
+                        );
+                    }
+                }
+                let mut total: u64 = 1;
+                let mut all_const = true;
+                for d in &shape.0 {
+                    if let Dim::Const(n) = d {
+                        total = total.saturating_mul(*n);
+                    } else {
+                        all_const = false;
+                        break;
+                    }
+                }
+                if all_const && *len != total {
+                    self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "array of length {len} cannot satisfy a tensor of {total} element{}",
+                            if total == 1 { "" } else { "s" }
+                        ),
+                    );
+                }
+            }
             (Ty::Ptr { pointee: pp, .. }, Ty::Ptr { pointee: ap, .. })
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
                 self.unify(pp, ap, dims, span)
@@ -375,6 +418,28 @@ impl Sema<'_> {
                             }
                         ),
                     );
+                } else {
+                    // Each compile-time-known index into a *static* dimension must be in range —
+                    // the headline bounds check the fixed-size-array arm below enforces, extended
+                    // to the shape-typed surface. Without it an out-of-bounds tensor index is
+                    // silently accepted, then traps in the interpreter but reads out of bounds in
+                    // native codegen — the backends disagree, violating the one hard invariant. A
+                    // symbolic/dynamic dim or a non-constant index is left unconstrained.
+                    for (ix, dim) in indices.iter().zip(shape.0.iter()) {
+                        if let Dim::Const(n) = dim {
+                            if let Some(v) = crate::eval_const_int(ix, self.interner) {
+                                if v < 0 || v as u64 >= *n {
+                                    self.error(
+                                        ix.span,
+                                        "E0501",
+                                        format!(
+                                            "index {v} is out of bounds for a dimension of length {n}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 Ty::Scalar(elem)
             }

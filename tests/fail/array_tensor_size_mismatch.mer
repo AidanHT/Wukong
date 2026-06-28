@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0501
+module tests.fail.array_tensor_size_mismatch
+
+// An array argument decays to a tensor parameter (the lenient array↔tensor unify that
+// `tests/run/tensor_add.mer` relies on), but the buffer must actually be big enough: a
+// `Tensor[f32, 4, 4]` needs 16 elements, so a `[f32; 4]` cannot satisfy it. Without this check a
+// too-small array silently satisfies any tensor and every in-tensor-bounds index becomes an
+// out-of-bounds read that the interpreter traps on but native codegen does not — a backend
+// divergence. (A correctly-sized array, e.g. `[f32; 16]`, is still accepted.)
+fn sink(a: Tensor[f32, 4, 4]) -> f32 {
+    return a[3, 3];
+}
+
+fn main() -> i32 {
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let v: f32 = sink(xs);
+    print(v as i32);
+    return 0;
+}
