@@ -916,6 +916,34 @@ fn differential_match_patterns() {
     }
 }
 
+/// Char-literal `match` patterns: a single char `'a'`, an inclusive char range `'0'..='9'`, and a
+/// char or-pattern `'x' | 'y' | 'z'`. A char decodes to its code point and matches by an integer
+/// equality / range test, so native and interp agree at every `-O`. The parser previously rejected a
+/// char literal in pattern position (E0206) even though char works in `let`/arithmetic/comparison.
+#[test]
+fn differential_char_patterns() {
+    const C: &str = "fn classify(d: char) -> i32 { return match d \
+        { 'a' => 1, 'b' => 2, '0'..='9' => 3, 'x' | 'y' | 'z' => 4, _ => 0 }; } \
+        fn main() -> i32 { return classify";
+    let cases = [
+        (format!("{C}('a'); }}"), 1),
+        (format!("{C}('b'); }}"), 2),
+        (format!("{C}('0'); }}"), 3),
+        (format!("{C}('9'); }}"), 3),
+        (format!("{C}('x'); }}"), 4),
+        (format!("{C}('z'); }}"), 4),
+        (format!("{C}('q'); }}"), 0),
+    ];
+    for (src, want) in &cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "char-pattern native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, *want, "char-pattern wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
 /// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
 /// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*

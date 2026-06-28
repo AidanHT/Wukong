@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+module tests.run.char_match
+
+// A char literal is a valid `match` pattern (it works in `let`/arithmetic/comparison, and integer
+// literals are valid patterns — char was the one inconsistent omission, rejected by the parser).
+// It matches by comparing the scrutinee to the literal's decoded code point, so single chars,
+// char ranges (`'0'..='9'`), and char or-patterns all work, identically on both backends.
+fn classify(d: char) -> i32 {
+    return match d {
+        'a' => 1,
+        'b' => 2,
+        '0'..='9' => 3,
+        'x' | 'y' | 'z' => 4,
+        _ => 0,
+    };
+}
+
+fn main() -> i32 {
+    print(classify('a')); // 1
+    print(classify('b')); // 2
+    print(classify('5')); // 3
+    print(classify('y')); // 4
+    print(classify('q')); // 0
+    return 0;
+}

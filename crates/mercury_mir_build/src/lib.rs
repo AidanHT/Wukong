@@ -10642,6 +10642,15 @@ impl FnLowerer<'_> {
                     .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
                 Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
+            // A char-literal pattern compares the scrutinee (a `char` is its integer code point) to
+            // the literal's decoded code point — the same equality test as an integer-literal pattern.
+            ast::PatKind::Char(sym) => {
+                let v = decode_char_literal(self.interner.resolve(*sym)) as i128;
+                let c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+            }
             ast::PatKind::Bool(b) => {
                 let c = self
                     .builder
@@ -10714,17 +10723,20 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The integer value of an int-literal range bound (`lo`/`hi`). A non-int bound yields 0.
+    /// The integer value of an int- or char-literal range bound (`lo`/`hi`). A char decodes to its
+    /// code point, so `'a'..='z'` ranges work. A non-literal bound yields 0.
     fn pattern_int_value(&self, pat: &Pattern) -> i128 {
-        if let ast::PatKind::Int { sym, neg } = &pat.kind {
-            let v = parse_int(self.interner.resolve(*sym));
-            if *neg {
-                -v
-            } else {
-                v
+        match &pat.kind {
+            ast::PatKind::Int { sym, neg } => {
+                let v = parse_int(self.interner.resolve(*sym));
+                if *neg {
+                    -v
+                } else {
+                    v
+                }
             }
-        } else {
-            0
+            ast::PatKind::Char(sym) => decode_char_literal(self.interner.resolve(*sym)) as i128,
+            _ => 0,
         }
     }
 

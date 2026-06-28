@@ -416,6 +416,10 @@ impl AstPrinter<'_> {
                 let s = self.sym(*sym);
                 self.line(format!("pat {}{}", if *neg { "-" } else { "" }, s));
             }
+            PatKind::Char(sym) => {
+                let s = self.sym(*sym);
+                self.line(format!("pat {s}"));
+            }
             PatKind::Bool(b) => self.line(format!("pat {b}")),
             PatKind::Or(alts) => {
                 self.line("pat or");
