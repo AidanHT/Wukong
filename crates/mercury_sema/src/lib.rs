@@ -977,9 +977,31 @@ impl Sema<'_> {
                     }
                 }
             }
-            StmtKind::Assign { target, value, .. } => {
+            StmtKind::Assign { target, op, value } => {
                 let target_ty = self.type_expr(target);
                 let value_ty = self.type_expr(value);
+                // A compound assignment `a += b` (and `-= *= /= …`) means `a = a (op) b`. That implied
+                // binary operator is undefined on an aggregate (struct/tuple/array) — the explicit
+                // `a = a + b` form is already rejected above — but the compound path skipped the
+                // check, so mir_build emitted e.g. `add` on the aggregates' base pointers: invalid MIR
+                // the verifier and Cranelift reject (a crash), with the two backends disagreeing on
+                // the garbage at -O0. Reject it. A *plain* `=` aggregate copy stays valid (it deep-
+                // copies), so this fires only for the arithmetic/bitwise compound forms.
+                if !matches!(op, AssignOp::Assign)
+                    && (self.is_noncomputable_operand(&target_ty)
+                        || self.is_noncomputable_operand(&value_ty))
+                {
+                    self.error(
+                        target.span,
+                        "E0401",
+                        format!(
+                            "compound assignment `{}` is not defined for aggregate \
+                             (struct/tuple/array) values; update the individual fields or elements \
+                             instead",
+                            op.glyph()
+                        ),
+                    );
+                }
                 // Reassigning an immutable binding (`let x = 5; x = 10;`): the language requires
                 // `mut` for reassignment, but it was never enforced. Reject a direct assignment to
                 // an immutable local (a single-name target). Mutating *through* an immutable binding
