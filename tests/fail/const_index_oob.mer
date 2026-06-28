@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0501
+module tests.fail.const_index_oob
+
+// A `const` used as an array/tensor index must satisfy the same compile-time bounds check as a
+// literal index. Before, the bounds check only evaluated literals, so naming a `const` (which
+// mir_build then inlines at the index site) slipped past it: sema accepted the out-of-bounds access,
+// then the interpreter trapped while native read past the buffer — a backend divergence on a program
+// that should never have compiled.
+const I: usize = 99;
+
+fn main() -> i32 {
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let v: f32 = xs[I];
+    return v as i32;
+}

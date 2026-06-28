@@ -272,6 +272,10 @@ impl Sema<'_> {
                 ItemKind::Const(c) => {
                     let ty = self.lower_type(&c.ty);
                     self.register(c.name, DefKind::Const(ty), item.span);
+                    // Record the initializer now (it is re-recorded, with its nodes typed, by
+                    // `check_const`) so a `const` used as a tensor/array index can be resolved to its
+                    // value by the compile-time bounds check regardless of source order.
+                    self.consts.insert(c.name.sym, c.value.clone());
                 }
                 ItemKind::Struct(s) => {
                     self.generics = generic_names(&s.generics);
