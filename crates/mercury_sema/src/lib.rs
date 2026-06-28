@@ -325,6 +325,7 @@ impl Sema<'_> {
         let vty = self.type_expr(&c.value);
         if self.let_compatible(&ann, &c.value, &vty) {
             self.retype_adapted_literal(&c.value, &ann);
+            self.range_check_int_literal(&c.value, &ann);
         } else {
             self.error(
                 span,
@@ -468,6 +469,7 @@ impl Sema<'_> {
                             // An untyped literal adopts the annotated type, top to bottom (so a
                             // negated literal like `-1.5` re-stamps the inner literal too).
                             self.retype_adapted_literal(init_expr, a);
+                            self.range_check_int_literal(init_expr, a);
                         } else {
                             self.error(
                                 s.span,
@@ -646,6 +648,31 @@ impl Sema<'_> {
         } = &e.kind
         {
             self.retype_adapted_literal(expr, ann);
+        }
+    }
+
+    /// Diagnose an unsuffixed integer literal that does not fit the narrow type it adapts to
+    /// (`let x: i8 = 200;`). Only types whose whole range fits in `i64` are checked (i8..u32), and
+    /// only a literal `eval_const_int` can read (incl. a leading `-`) — so a runtime value, a float,
+    /// or an `i64`/`u64`/`usize` literal is never flagged. Rust rejects this; without it the value
+    /// silently wraps (`200 as i8 == -56`), a quiet footgun in a safety-first language. Call at each
+    /// site a literal adapts to a type (`let`/`const`/argument).
+    fn range_check_int_literal(&mut self, e: &Expr, ty: &Ty) {
+        let Ty::Scalar(sc) = ty else { return };
+        let Some((lo, hi)) = int_lit_range(*sc) else {
+            return;
+        };
+        if let Some(v) = eval_const_int(e, self.interner) {
+            if v < lo || v > hi {
+                self.error(
+                    e.span,
+                    "E0401",
+                    format!(
+                        "literal `{v}` is out of range for `{}` ({lo}..={hi})",
+                        sc.name()
+                    ),
+                );
+            }
         }
     }
 
@@ -936,6 +963,23 @@ fn is_vector_name(s: &str) -> bool {
             && Scalar::from_name(left).is_some();
     }
     false
+}
+
+/// The inclusive value range of a narrow integer scalar, as `i64` bounds. `None` for `bool`/floats
+/// and for `i64`/`u64`/`usize`/`isize` — a literal that parses to an `i64` always fits those, and a
+/// `u64` near its top doesn't fit an `i64` to compare, so they are left unchecked rather than
+/// mis-flagged.
+fn int_lit_range(sc: Scalar) -> Option<(i64, i64)> {
+    use Scalar::*;
+    Some(match sc {
+        I8 => (i8::MIN as i64, i8::MAX as i64),
+        U8 => (0, u8::MAX as i64),
+        I16 => (i16::MIN as i64, i16::MAX as i64),
+        U16 => (0, u16::MAX as i64),
+        I32 => (i32::MIN as i64, i32::MAX as i64),
+        U32 => (0, u32::MAX as i64),
+        _ => return None,
+    })
 }
 
 fn int_lit_scalar(text: &str) -> Scalar {
