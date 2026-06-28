@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.chained_comparison
+
+// `1 < a < 2` parses left-associatively as `(1 < a) < 2`. The inner `1 < a` is a `bool`, so the
+// outer `< 2` silently compared a bool against an int (the bool coerced to 0/1) and the whole thing
+// type-checked to a meaningless result with no diagnostic — `1 < 5 < 2` returned true. Ordered
+// comparison (`< <= > >=`) is now rejected on a bool operand; the chained form must be written
+// `1 < a && a < 2`.
+fn main() -> i32 {
+    let a = 5;
+    if 1 < a < 2 {
+        return 111;
+    }
+    return 222;
+}
