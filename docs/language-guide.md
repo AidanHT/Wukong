@@ -105,8 +105,10 @@ static-data section — a string is just a NUL-terminated `*u8` buffer suitable 
 ## Operators ✅
 
 Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, shifts `<< >>`, boolean
-`&& ||` (short-circuit), unary `-` and `!`. Precedence is the usual C/Rust ordering, resolved by a
-Pratt parser. Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
+`&& ||` (short-circuit), unary `-`, `!`, and `~`. Like Rust, `!`/`~` are the same operator —
+bitwise complement on an integer, logical negation on a `bool`; `~` is the conventional integer
+spelling. Precedence is the usual C/Rust ordering, resolved by a Pratt parser. Compound assignment
+(`+=`, `*=`, `<<=`, `>>=`, …) is supported.
 
 ## Control flow ✅
 
@@ -154,6 +156,12 @@ integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inc
 an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. Any arm may carry an
 optional `if` guard, and `match` works in both value and statement position. See
 `tests/run/{match_expr,match_patterns,match_tuple}.mer`.
+
+A `match` used in **value position must be exhaustive**, like Rust: an `enum` needs every variant, a
+`bool` needs both cases, and any other scalar (an unbounded domain) needs a `_` catch-all. A
+provably-incomplete value match is rejected at compile time (`E0405`); a guard (`if …`) does not count
+toward coverage. This closes a silent-wrong-answer hole — a non-exhaustive value match used to fall
+through to a zero default (`tests/fail/match_nonexhaustive.mer`).
 
 ## Tuples and structs ✅
 
