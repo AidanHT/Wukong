@@ -773,6 +773,11 @@ impl Sema<'_> {
                             );
                         }
                         self.check_return_shape(&t, e.span);
+                        // An out-of-range integer literal returned where a narrower type is declared
+                        // (`return 9999999999` from `-> i32`) was silently truncated to the low bits
+                        // (exit code 255 from a wrapped value). Range-check it against the return
+                        // type, the same rule `let`/`const` already apply to their annotation.
+                        self.range_check_int_literal(e, &ret);
                     }
                     None => {
                         // A bare `return;` where the signature demands a value: the native return
