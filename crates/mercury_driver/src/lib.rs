@@ -179,8 +179,10 @@ pub fn compile(opts: &Options) -> i32 {
     // High MIR is the pre-optimization form. It is still dumped for debugging even when lowering
     // failed, since seeing the partial MIR is useful.
     if opts.emit == EmitStage::MirHigh {
-        emit_mir(&program, &interner);
-        return if lower_diags.iter().any(|d| d.is_error()) {
+        // Dump the (possibly partial) MIR, then fail the process if lowering errored or the verifier
+        // reported an internal-compiler-error — a printed ICE must never report success.
+        let verify_failed = emit_mir(&program, &interner);
+        return if verify_failed || lower_diags.iter().any(|d| d.is_error()) {
             exit::COMPILE_ERROR
         } else {
             exit::OK
@@ -219,8 +221,12 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if opts.emit == EmitStage::Mir {
-        emit_mir(&program, &interner);
-        return exit::OK;
+        // A verifier failure means we just printed an internal-compiler-error; never report success.
+        return if emit_mir(&program, &interner) {
+            exit::COMPILE_ERROR
+        } else {
+            exit::OK
+        };
     }
 
     // --- LLVM backend ---
@@ -389,13 +395,20 @@ fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Optio
     }
 }
 
-fn emit_mir(program: &mercury_mir::Program, interner: &Interner) {
+/// Print the MIR for `program`, running the verifier first. Any verifier failure is emitted as an
+/// `internal compiler error (MIR verify)` line to stderr. Returns `true` if the verifier reported
+/// at least one failure, so callers can map an internal-compiler-error to a nonzero process exit
+/// status instead of reporting success on invalid MIR.
+fn emit_mir(program: &mercury_mir::Program, interner: &Interner) -> bool {
+    let mut verify_failed = false;
     for f in &program.funcs {
         for ice in mercury_mir::verify::verify_function(f) {
             eprintln!("internal compiler error (MIR verify): {ice}");
+            verify_failed = true;
         }
     }
     print!("{}", mercury_mir::print::print_program(program, interner));
+    verify_failed
 }
 
 /// Emit a single diagnostic to stderr in the requested format.
