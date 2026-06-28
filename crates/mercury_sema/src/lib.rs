@@ -69,6 +69,22 @@ pub struct SemaResult {
 }
 
 /// Analyze a module, returning per-expression types and any diagnostics.
+/// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
+/// array/tuple element. Pointer/reference fields are excluded: they have a fixed size and break a
+/// size cycle. Non-struct `Named`s are pushed too but resolve to nothing contained (dead ends).
+fn collect_value_structs(t: &Ty, out: &mut Vec<Symbol>) {
+    match t {
+        Ty::Named(n) => out.push(*n),
+        Ty::Array { elem, .. } => collect_value_structs(elem, out),
+        Ty::Tuple(elems) => {
+            for e in elems {
+                collect_value_structs(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnostic>) {
     let mut s = Sema {
         interner,
@@ -82,6 +98,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         consts: HashMap::new(),
     };
     s.collect(module);
+    s.check_recursive_structs(module);
     s.check_bodies(module);
     let result = SemaResult {
         types: s.types,
@@ -164,6 +181,61 @@ impl Sema<'_> {
                 ItemKind::Import(_) => {}
             }
         }
+    }
+
+    /// Reject a struct that contains itself by value — directly (`struct S { x: S }`) or transitively
+    /// (`A` holds `B` holds `A`). Such a type has infinite size; sizing or instantiating it
+    /// stack-overflows mir_build's layout pass (a compiler crash on a plausible mistake — forgetting
+    /// the indirection). A field behind a pointer/reference has fixed size and breaks the cycle, as
+    /// in C/Rust (cf. Rust's E0072). Runs after `collect`, when every struct is registered.
+    fn check_recursive_structs(&mut self, module: &Module) {
+        for item in &module.items {
+            if let ItemKind::Struct(s) = &item.kind {
+                let root = s.name.sym;
+                // DFS over by-value containment from `root`; reaching `root` means infinite size.
+                let mut stack = self.contained_structs(root);
+                let mut visited: Vec<Symbol> = Vec::new();
+                let mut recursive = false;
+                while let Some(cur) = stack.pop() {
+                    if cur == root {
+                        recursive = true;
+                        break;
+                    }
+                    if visited.contains(&cur) {
+                        continue;
+                    }
+                    visited.push(cur);
+                    stack.extend(self.contained_structs(cur));
+                }
+                if recursive {
+                    let nm = self.sym_str(root).to_string();
+                    self.error(
+                        item.span,
+                        "E0402",
+                        format!(
+                            "recursive struct `{nm}` has infinite size; store the recursive field \
+                             behind a pointer (e.g. `*{nm}`) to break the cycle"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The struct names a struct holds *by value* (a `Named` field, or one nested in an array/tuple
+    /// field). A non-struct `Named` (an enum, a generic param, an unknown) resolves to nothing.
+    fn contained_structs(&self, name: Symbol) -> Vec<Symbol> {
+        let mut out = Vec::new();
+        if let Some(Def {
+            kind: DefKind::Struct(fields),
+            ..
+        }) = self.defs.lookup(name)
+        {
+            for (_, fty) in fields {
+                collect_value_structs(fty, &mut out);
+            }
+        }
+        out
     }
 
     fn collect_fn(&mut self, f: &FnDecl) {
