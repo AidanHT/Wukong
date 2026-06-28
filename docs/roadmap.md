@@ -259,7 +259,8 @@ mobile 4050 (see `BENCHMARKS.md`):
   output proj → residual → RMSNorm → FFN(SiLU) → residual, all on device buffers with no host round-trip
   between ops, matching a CPU f64 reference to max_rel 2.7e-4 and **deterministic** run-to-run.
 
-**End-to-end `--backend=gpu`.** `mercuryc --features gpu --backend=gpu --run foo.mer` executes the
+**End-to-end `--backend=gpu`.** Built with `--features gpu` (a *cargo build* flag, not a `mercuryc`
+runtime flag), `mercuryc --backend=gpu --run foo.mer` executes the
 program through an **offloading interpreter**: the whole program is tree-walked on the CPU (identical
 control flow, buffer layout, and every non-kernel op to the oracle), but recognized GEMM / activation
 / reduction / fused-norm calls run on the device via an `Accelerator` seam (`mercury_interp`) the
