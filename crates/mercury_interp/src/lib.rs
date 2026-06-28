@@ -543,14 +543,45 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128)
                 }
             }
-            Op::Neg(v) => match reg(regs, *v) {
-                Value::Float(f) => Value::Float(-f),
-                other => Value::Int(-other.as_int()),
-            },
-            Op::Not(v) => match reg(regs, *v) {
-                Value::Int(i) => Value::Int(!i),
-                other => Value::Int(!other.as_int()),
-            },
+            Op::Neg(v) => {
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    // Lane-wise negate (the autovectorized `-x[k]`). Without this arm a `VecRef`
+                    // operand falls into the scalar path below, where `as_int()` yields 0, so every
+                    // lane is silently zeroed — a miscompile the native backend does not share.
+                    let xs = self.vec_lanes(reg(regs, *v));
+                    let is_float = lane.is_float();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| {
+                            if is_float {
+                                Value::Float(-xs[i].as_float())
+                            } else {
+                                Value::Int(-xs[i].as_int())
+                            }
+                        })
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    match reg(regs, *v) {
+                        Value::Float(f) => Value::Float(-f),
+                        other => Value::Int(-other.as_int()),
+                    }
+                }
+            }
+            Op::Not(v) => {
+                if let Some(MirType::Vec(_lane, n)) = rty {
+                    // Lane-wise bitwise complement. Latent today (the vectorizer does not yet emit a
+                    // vector `Not`), but mirror `Neg` so it can never silently zero lanes.
+                    let xs = self.vec_lanes(reg(regs, *v));
+                    let lanes: Vec<Value> =
+                        (0..*n as usize).map(|i| Value::Int(!xs[i].as_int())).collect();
+                    self.push_vec(lanes)
+                } else {
+                    match reg(regs, *v) {
+                        Value::Int(i) => Value::Int(!i),
+                        other => Value::Int(!other.as_int()),
+                    }
+                }
+            }
             Op::Cast(kind, v, to) => {
                 if let Some(MirType::Vec(to_lane, n)) = rty {
                     // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
