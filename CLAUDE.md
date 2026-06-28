@@ -128,6 +128,6 @@ reassociated form is the oracle — all backends run the same reassociated IR an
 - `docs/language-guide.md` — the language surface, with a maturity legend.
 - `docs/roadmap.md` — what runs end-to-end, what's checked-only, what's planned, sharp edges.
 - `docs/llvm-setup.md` — optional native-codegen toolchain (LLVM 19).
-- `examples/*.mer` — runnable programs (`dot`, `saxpy_array`, `gemm`, `relu`, `fib`, …); note `matmul`/`softmax`/`vadd` are library-only kernels with no `fn main` (they type-check and `--emit`, but do not `--run`).
+- `examples/*.mer` — runnable programs (`dot`, `saxpy_array`, `gemm`, `relu`, `fib`, …); note `matmul`/`softmax`/`vadd` are library-only kernels with no `fn main`: they type-check (sema passes) and `--emit=tokens|ast`, but do **not** lower to MIR — `matmul`/`softmax` use a generic-`const` parameter as a runtime loop bound and `vadd` uses explicit `f32x8` load/store intrinsics, both of which MIR lowering rejects with `C0001` — so they neither `--emit=mir` nor `--run`. (The *runnable* matmul/softmax surface is the recognized kernels in `tests/run/tensor_*.mer`, not these files.)
 - `tests/run/` (e2e `// EXPECT-*` directives) and `tests/fail/` (compile-fail `// EXPECT-CODE:`).
 - Each crate has its own `CLAUDE.md` with layout, key types, connections, and gotchas.

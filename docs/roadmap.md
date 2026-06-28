@@ -345,7 +345,12 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
 - No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
   fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
-  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked.
+  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked. On such an out-of-bounds access the
+  backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
+  debugging aid — its memory is a bounded slot vector), while the native backend reads/writes past the
+  buffer, classic UB like C (and an optimization level can even change the garbage observed). An
+  out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
+  `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
 - `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
   stay in memory (the interpreter and `cse`/`dse` handle those directly).
 - Because there is **no static-data section**, a string literal lives in the *current* function's
