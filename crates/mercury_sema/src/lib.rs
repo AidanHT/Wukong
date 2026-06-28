@@ -1582,7 +1582,31 @@ impl Sema<'_> {
                         }
                         Ty::Scalar(Scalar::Bool)
                     }
-                    Lt | Le | Gt | Ge | And | Or => Ty::Scalar(Scalar::Bool),
+                    // Ordered comparison is not defined on `bool`. The usual trigger is a chained
+                    // comparison: `a < b < c` parses left-associatively as `(a < b) < c`, and
+                    // `(a < b)` is a `bool`, so the outer `< c` silently compared a bool against an
+                    // int (the bool coerced to 0/1) — a wrong answer with no diagnostic. Reject a
+                    // concrete bool operand; `Unknown`/`Error` stay lenient (no false positives on
+                    // unmodeled operands). `And`/`Or` legitimately take bool, so they keep returning
+                    // bool unchecked.
+                    Lt | Le | Gt | Ge => {
+                        if matches!(l, Ty::Scalar(Scalar::Bool))
+                            || matches!(r, Ty::Scalar(Scalar::Bool))
+                        {
+                            self.error(
+                                e.span,
+                                "E0401",
+                                format!(
+                                    "ordered comparison `{}` is not defined for `bool`; a chained \
+                                     comparison like `a < b < c` parses as `(a < b) < c` — write \
+                                     `a < b && b < c` instead",
+                                    op.glyph()
+                                ),
+                            );
+                        }
+                        Ty::Scalar(Scalar::Bool)
+                    }
+                    And | Or => Ty::Scalar(Scalar::Bool),
                     _ => join(l, r),
                 }
             }
@@ -2401,6 +2425,30 @@ mod tests {
             "fn f(c: bool) -> f64 { let x = if c { 1.0 } else { 2.0 }; return x as f64; }",
         ] {
             assert!(!errors(src).contains(&"E0502"), "unexpected E0502 for {src:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_comparison_on_bool_is_rejected() {
+        // A chained comparison `a < b < c` parses left-associatively as `(a < b) < c`; the inner
+        // `<` yields a bool, so the outer silently compares a bool against an int. Reject a concrete
+        // bool operand to an ordered comparison (`< <= > >=`). E0401.
+        for src in [
+            "fn f(a: i32) -> bool { return 1 < a < 2; }",
+            "fn f(a: i32) -> bool { return a > 0 > 1; }",
+            "fn f() -> bool { let x = true; let y = false; return x < y; }",
+        ] {
+            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+        }
+        // No false positives: ordinary int/float ordering, the correct `&&` chain, and `==`/`!=`
+        // and `&&`/`||`/`!` on bool all stay clean (only ORDERED comparison rejects bool).
+        for src in [
+            "fn f(a: i32, b: i32) -> bool { return a < b; }",
+            "fn f(a: i32) -> bool { return 1 < a && a < 2; }",
+            "fn f(a: f32, b: f32) -> bool { return a >= b; }",
+            "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
+        ] {
+            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
         }
     }
 
