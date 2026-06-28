@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0401
+module tests.fail.malformed_int_literal
+
+// A mistyped radix prefix used to lex as a single `Int` token with a bogus suffix (`0z123` => suffix
+// `z123`), fail to parse, and lower *silently to 0* on both backends — a wrong value the differential
+// gate could not see. A literal that parses as neither i64 nor u64 in its radix is now rejected.
+fn main() -> i32 {
+    let x = 0z123; // not a valid radix prefix; `0x123` was probably meant
+    return x;
+}
