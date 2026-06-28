@@ -648,6 +648,19 @@ fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
     }
 }
 
+/// The MIR type a control-flow merge param (an `if`/`match` *value*) carries for a given result type.
+/// An aggregate flows through the CFG as its base **pointer** (the by-pointer convention the sret call
+/// path also uses), so its merge param is `Ptr`, not the byte-buffer `Array` type. Typing it `Array`
+/// matched the arm's pointer arg only under the interpreter's loose typing (-O0); `mem2reg`'s verifier
+/// rejected it (`branch arg (ptr) does not match param ([N x i8])`), so an aggregate-valued `if`/`match`
+/// compiled at -O0 but panicked at -O2. Scalars are unchanged (`merge_repr_ty(scalar) == scalar`).
+fn merge_repr_ty(result_ty: &MirType) -> MirType {
+    match result_ty {
+        MirType::Array(..) => MirType::Ptr,
+        other => other.clone(),
+    }
+}
+
 /// Lower a `@parallel for idx in 0..hi { body }` function into two MIR functions:
 ///   * `par_sym(start: i64, end: i64, env: *ptr)` — the loop body over `[start, end)`, reading the
 ///     array base pointers back from `env`;
@@ -9949,6 +9962,9 @@ impl FnLowerer<'_> {
     ) -> ValueId {
         let result_ty = self.expr_mir(e);
         let produces_value = else_branch.is_some() && result_ty != MirType::Void;
+        // An aggregate result flows as its base pointer, so the merge param is `Ptr` (see
+        // `merge_repr_ty`); scalars are unchanged.
+        let merge_ty = merge_repr_ty(&result_ty);
 
         let c = self.lower_bool_cond(cond);
         let then_bb = self.builder.new_block();
@@ -9959,7 +9975,7 @@ impl FnLowerer<'_> {
             merge
         };
         let merge_param = if produces_value {
-            Some(self.builder.block_param(merge, result_ty.clone()))
+            Some(self.builder.block_param(merge, merge_ty.clone()))
         } else {
             None
         };
@@ -9981,9 +9997,9 @@ impl FnLowerer<'_> {
                         Some(t) => (self.expr_mir(t), self.signed(t)),
                         None => (result_ty.clone(), true),
                     };
-                    vec![self.coerce_to(v, &from, &result_ty, signed)]
+                    vec![self.coerce_to(v, &from, &merge_ty, signed)]
                 }
-                (true, None) => vec![self.const_zero(result_ty.clone())],
+                (true, None) => vec![self.const_zero(merge_ty.clone())],
                 (false, _) => vec![],
             };
             self.builder.br(merge, args);
@@ -9997,7 +10013,7 @@ impl FnLowerer<'_> {
             if !self.terminated {
                 let args = if merge_param.is_some() {
                     let from = self.expr_mir(els);
-                    vec![self.coerce_to(ev, &from, &result_ty, self.signed(els))]
+                    vec![self.coerce_to(ev, &from, &merge_ty, self.signed(els))]
                 } else {
                     vec![]
                 };
@@ -10012,7 +10028,7 @@ impl FnLowerer<'_> {
             None => self.const_zero(if result_ty == MirType::Void {
                 MirType::I32
             } else {
-                result_ty
+                merge_ty
             }),
         }
     }
@@ -10516,19 +10532,22 @@ impl FnLowerer<'_> {
     /// for equality; a wildcard/identifier always matches) and, if present, its guard, branching to
     /// the arm body or the next test. An `Ident` pattern binds the scrutinee value in the arm scope.
     /// When the `match` is used as a value, a merge-block parameter collects each arm body's result.
-    /// An unconditional catch-all arm (a bare `_`/identifier with no guard) ends the chain; if none
-    /// is present the fallthrough yields a zero default (lenient non-exhaustive semantics, identical
-    /// on both backends — no trap, mirroring div-by-zero).
+    /// An unconditional catch-all arm (a bare `_`/identifier with no guard) ends the chain; if none is
+    /// present the structurally-emitted fallthrough is `Unreachable` (sema's E0405 rejects any
+    /// value-producing non-exhaustive match, so it is dynamically dead).
     fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm], e: &Expr) -> ValueId {
         let result_ty = self.expr_mir(e);
         let produces_value = result_ty != MirType::Void;
+        // An aggregate result flows as its base pointer, so the merge param is `Ptr` (see
+        // `merge_repr_ty`); scalars are unchanged.
+        let merge_ty = merge_repr_ty(&result_ty);
         let scrut_mir = self.expr_mir(scrutinee);
         let scrut_ty = self.expr_ty(scrutinee);
         let scrut = self.lower_expr(scrutinee);
 
         let merge = self.builder.new_block();
         let merge_param = if produces_value {
-            Some(self.builder.block_param(merge, result_ty.clone()))
+            Some(self.builder.block_param(merge, merge_ty.clone()))
         } else {
             None
         };
@@ -10545,7 +10564,7 @@ impl FnLowerer<'_> {
                 // Always matches: lower the body directly, then the remaining arms are unreachable.
                 self.push_scope();
                 self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
-                self.emit_match_arm_body(&arm.body, merge, merge_param, &result_ty);
+                self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
                 self.pop_scope();
                 handled_default = true;
                 break;
@@ -10564,7 +10583,7 @@ impl FnLowerer<'_> {
 
             self.builder.switch_to(body_bb);
             self.terminated = false;
-            self.emit_match_arm_body(&arm.body, merge, merge_param, &result_ty);
+            self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
             self.pop_scope();
 
             self.builder.switch_to(next_bb);
@@ -10597,7 +10616,7 @@ impl FnLowerer<'_> {
             None => self.const_zero(if result_ty == MirType::Void {
                 MirType::I32
             } else {
-                result_ty
+                merge_ty
             }),
         }
     }
