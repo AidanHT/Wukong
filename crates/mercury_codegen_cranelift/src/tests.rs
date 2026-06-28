@@ -322,6 +322,23 @@ fn differential_array_of_aggregate() {
     }
 }
 
+/// Deep recursion: JIT'd native code recurses on the host call stack (one machine frame per Mercury
+/// call), so without a big-stack worker it overflows the default ~8 MiB stack and *aborts* the
+/// process, while the interpreter (on its 512 MiB stack) completes — a divergence the opt-invariance
+/// harness misses (it only re-runs the interpreter). Both backends now run on matching 512 MiB
+/// stacks, so a depth that overflows the default stack must agree. ~30k frames is well past the
+/// default stack but fast.
+#[test]
+fn differential_deep_recursion() {
+    let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \
+               fn main() -> i32 { print(sum(30000)); return 0; }";
+    for opt in [0u8, 2] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "deep-recursion native vs interp mismatch at -O{opt}");
+    }
+}
+
 /// `&&` / `||` short-circuit: the RHS runs only when the LHS doesn't decide the result. The captured
 /// stdout (the `jit`/`interp` helpers return it) is the side-effect evidence, so a regression to a
 /// bitwise `and`/`or` of both operands would change the printed trace AND must still agree

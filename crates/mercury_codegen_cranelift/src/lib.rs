@@ -2744,25 +2744,7 @@ impl JitProgram {
     /// Invoke the entry point, transmuting to the right ABI for its return type. Caller must hold
     /// the run lock (so the shared capture buffer isn't raced).
     unsafe fn invoke(&self) -> i64 {
-        match &self.ret {
-            MirType::Void => {
-                let f: extern "C" fn() = std::mem::transmute(self.code);
-                f();
-                0
-            }
-            t if t.is_float() => {
-                let f: extern "C" fn() -> f64 = std::mem::transmute(self.code);
-                f() as i64
-            }
-            MirType::I64 => {
-                let f: extern "C" fn() -> i64 = std::mem::transmute(self.code);
-                f()
-            }
-            _ => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(self.code);
-                f() as i64
-            }
-        }
+        invoke_code(self.code as usize, &self.ret)
     }
 
     /// Run once, returning the exit code and captured stdout (the native counterpart to the
@@ -2771,7 +2753,17 @@ impl JitProgram {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
         ASSERT_FAILED.store(false, Ordering::SeqCst);
-        let exit_code = unsafe { self.invoke() };
+        // Run the JIT'd entry on a worker thread with a large stack, mirroring the interpreter's
+        // `with_big_stack`. The native code recurses on the host call stack (one machine frame per
+        // Mercury call), so a deeply recursive program would overflow the default ~8 MiB main-thread
+        // stack and *abort* the process — while the interpreter oracle, on its 512 MiB stack,
+        // completes. Without matching headroom the two backends diverge on deep recursion (a stack
+        // overflow vs a correct result), breaking the differential gate. Only the code pointer
+        // (passed as a `usize`, since a raw pointer isn't `Send`) and the return type cross the
+        // boundary; the `OUTPUT`/`ASSERT_FAILED` statics the JIT'd `rt_*` calls touch are global.
+        let code = self.code as usize;
+        let ret = self.ret.clone();
+        let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if ASSERT_FAILED.load(Ordering::SeqCst) {
             return Err("assertion failed".into());
@@ -2795,6 +2787,55 @@ impl Drop for JitProgram {
             unsafe { m.free_memory() };
         }
     }
+}
+
+/// Invoke a JIT entry's code pointer (passed as a `usize` so it can cross a thread boundary into the
+/// big-stack worker), transmuting to the ABI implied by its return type. Mirrors `JitProgram::invoke`.
+///
+/// # Safety
+/// `code` must be a finalized function pointer of the ABI implied by `ret`, valid for the call.
+unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
+    let code = code as *const u8;
+    match ret {
+        MirType::Void => {
+            let f: extern "C" fn() = std::mem::transmute(code);
+            f();
+            0
+        }
+        t if t.is_float() => {
+            let f: extern "C" fn() -> f64 = std::mem::transmute(code);
+            f() as i64
+        }
+        MirType::I64 => {
+            let f: extern "C" fn() -> i64 = std::mem::transmute(code);
+            f()
+        }
+        _ => {
+            let f: extern "C" fn() -> i32 = std::mem::transmute(code);
+            f() as i64
+        }
+    }
+}
+
+/// Run `f` on a worker thread with a large (512 MiB) stack, re-raising any panic on the caller so
+/// behavior is otherwise identical to a direct call. This gives JIT'd Mercury recursion the *same*
+/// headroom as the interpreter's `with_big_stack` worker — without it the native backend overflows
+/// the host's ~8 MiB default stack and aborts the process where the interpreter completes, a
+/// divergence the differential gate would otherwise miss (it only re-runs the interpreter across opt
+/// levels). `thread::scope` lets the worker borrow non-`'static` captures.
+fn run_on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    const STACK: usize = 512 * 1024 * 1024;
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .name("mercury-native".into())
+            .stack_size(STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn native worker thread");
+        match handle.join() {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// JIT-compile `program`, returning a callable handle to `entry`.
