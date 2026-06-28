@@ -987,20 +987,23 @@ impl Sema<'_> {
                 // the verifier and Cranelift reject (a crash), with the two backends disagreeing on
                 // the garbage at -O0. Reject it. A *plain* `=` aggregate copy stays valid (it deep-
                 // copies), so this fires only for the arithmetic/bitwise compound forms.
-                if !matches!(op, AssignOp::Assign)
-                    && (self.is_noncomputable_operand(&target_ty)
-                        || self.is_noncomputable_operand(&value_ty))
-                {
-                    self.error(
-                        target.span,
-                        "E0401",
-                        format!(
-                            "compound assignment `{}` is not defined for aggregate \
-                             (struct/tuple/array) values; update the individual fields or elements \
-                             instead",
-                            op.glyph()
-                        ),
-                    );
+                if !matches!(op, AssignOp::Assign) {
+                    if let Some(bad) = [&target_ty, &value_ty].into_iter().find(|t| {
+                        self.is_noncomputable_operand(t)
+                            || matches!(t, Ty::Tensor { .. } | Ty::Ptr { .. } | Ty::Ref { .. })
+                    }) {
+                        self.error(
+                            target.span,
+                            "E0401",
+                            format!(
+                                "compound assignment `{}` is not defined for `{}` values; only \
+                                 scalars and SIMD vectors support `{}`",
+                                op.glyph(),
+                                bad.display(self.interner),
+                                op.glyph()
+                            ),
+                        );
+                    }
                 }
                 // Reassigning an immutable binding (`let x = 5; x = 10;`): the language requires
                 // `mut` for reassignment, but it was never enforced. Reject a direct assignment to
@@ -1036,6 +1039,13 @@ impl Sema<'_> {
                         ),
                     );
                 }
+                // A whole-tensor (or whole-vector) assignment must agree in shape. `x = b` for
+                // `x: Tensor[f32, 4]` and `b: Tensor[f32, 8]` was silently accepted — assignment was
+                // the one shape-bearing context with no shape unify (the let-init, binop, and return
+                // paths all check) — storing a mis-shaped buffer past the place's length. Unify the
+                // place and value shapes (E0501 rank / E0502 dim), the same check the binops apply;
+                // a no-op for scalar/aggregate places.
+                self.check_binop_shapes(&target_ty, &value_ty, value.span);
             }
             StmtKind::Expr(e) => {
                 self.type_expr(e);
