@@ -339,6 +339,34 @@ fn differential_deep_recursion() {
     }
 }
 
+/// `if`/`match` used as a *value* whose arms have different numeric types: each arm is coerced to
+/// the expression's joined type so all arms pass the merge-block parameter the same MIR type.
+/// Without the coercion an arm of a different width/kind (`if c { 1 } else { 2.5 }`) passes a
+/// mismatched value the native verifier rejects while the interpreter runs loosely — a divergence on
+/// a program the front-end accepted. Must agree across all four `-O` levels.
+#[test]
+fn differential_mixed_branch_types() {
+    let programs = [
+        // if arms: i32 vs f32 -> f32 (1.0 and 3.5).
+        "fn main() -> i32 { let c: bool = true; let x = if c { 1 } else { 2.5 }; \
+         let d: bool = false; let y = if d { 7 } else { 3.5 }; \
+         return (x as i32) + ((y * 10.0) as i32); }",
+        // match arms: i32 vs f32 -> f32.
+        "fn pick(n: i32) -> i32 { let r = match n { 0 => 10, _ => 2.5 }; return (r * 2.0) as i32; } \
+         fn main() -> i32 { return pick(0) + pick(9); }",
+        // homogeneous arms are unaffected (the coercion is a no-op, no spurious rounding).
+        "fn main() -> i32 { let c: bool = false; let x = if c { 100 } else { 200 }; \
+         let r = match x { 100 => 1, 200 => 2, _ => 3 }; return x + r; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "mixed-branch native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// `&&` / `||` short-circuit: the RHS runs only when the LHS doesn't decide the result. The captured
 /// stdout (the `jit`/`interp` helpers return it) is the side-effect evidence, so a regression to a
 /// bitwise `and`/`or` of both operands would change the printed trace AND must still agree

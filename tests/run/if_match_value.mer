@@ -1,0 +1,26 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 35
+// EXPECT-OUT: 20
+// EXPECT-OUT: 5
+module tests.run.if_match_value
+
+// `if`/`match` used as a value whose arms have different numeric types: the arms are coerced to the
+// expression's joined type (here f32), so the merge is well-typed on both backends. Previously the
+// native backend's verifier rejected the mismatched merge while the interpreter ran loosely.
+fn classify(n: i32) -> i32 {
+    let r = match n { 0 => 10, _ => 2.5 };   // i32 vs f32 -> f32
+    return (r * 2.0) as i32;                  // n == 0 -> 20, else -> 5
+}
+
+fn main() -> i32 {
+    let c: bool = true;
+    let x = if c { 1 } else { 2.5 };          // -> f32 = 1.0
+    print(x as i32);                           // 1
+    let d: bool = false;
+    let y = if d { 7 } else { 3.5 };           // -> f32 = 3.5
+    print((y * 10.0) as i32);                  // 35
+    print(classify(0));                        // 20
+    print(classify(9));                        // 5
+    return 0;
+}
