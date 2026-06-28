@@ -1010,6 +1010,82 @@ fn differential_loop_wide_bound() {
     }
 }
 
+/// A transcendental written INLINE inside an autovectorizable elementwise `for` loop (so the generic
+/// vectorizer — not the vmath recognizer — lifts the inlined polynomial to `<N x f32>`). This used to
+/// panic the interpreter: the polynomial's range-reduction has an internal `Cmp`/`Select`, and a
+/// scalar operand (e.g. the literal `1.0` in `1.0 + exp(-z)`) was not splatted to N lanes, so the
+/// vectorized `Op::Cmp` indexed past the 1-lane operand. Now scalars broadcast to N lanes and the
+/// whole thing is bit-exact on both backends. Covers the exact in-place-SiLU trigger, a `Cmp+Select`
+/// branch with an inline `exp`, and a couple of compound transcendentals. `want == -1` means assert
+/// only the native==interp differential (transcendental f32 result not worth pinning).
+#[test]
+fn differential_vectorized_inline_transcendental() {
+    let cases: [(&str, i64); 5] = [
+        // The exact documented trigger: in-place SiLU with a scalar `1.0` operand. silu(0.1)*1000 = 52.
+        ("fn main() -> i32 { let g:[f32;8]=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]; \
+          for i in 0..8 { let z = g[i]; g[i] = z / (1.0 + exp(0.0 - z)); } return (g[0]*1000.0) as i32; }", 52),
+        // inline exp in a compound (vmath declines) form, x=0 → exp(0)*2 = 2.
+        ("fn main() -> i32 { let a:[f32;8]=[0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7]; \
+          let b:[f32;8]=[2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0]; let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { o[i] = exp(a[i]) * b[i]; } return (o[0]) as i32; }", 2),
+        // sigmoid inline, x=0 → sigmoid(0)*2 = 1.
+        ("fn main() -> i32 { let a:[f32;8]=[0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7]; \
+          let b:[f32;8]=[2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0]; let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { o[i] = sigmoid(a[i]) * b[i]; } return (o[0]) as i32; }", 1),
+        // a vectorized Cmp+Select with an inline exp on the true branch. a[0]=0.2 ≤ 0.3 → 0.2*100 = 20.
+        ("fn main() -> i32 { let a:[f32;8]=[0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]; \
+          let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { if a[i] > 0.3 { o[i] = exp(a[i]); } else { o[i] = a[i] * 100.0; } } return (o[0]*1.0) as i32; }", 20),
+        // sin+cos compound with a nonzero input (exercises range reduction); differential-only.
+        ("fn main() -> i32 { let a:[f32;8]=[0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]; \
+          let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { o[i] = sin(a[i]) + cos(a[i]); } return (o[0]*100.0) as i32; }", -1),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "inline-transcendental native vs interp mismatch at -O{opt} for:\n{src}");
+            if want >= 0 {
+                assert_eq!(n.0, want, "inline-transcendental wrong value at -O{opt} for:\n{src}");
+            }
+        }
+    }
+}
+
+/// An EXHAUSTIVE `match` with no `_` catch-all (every enum variant / both bool cases). Each arm is a
+/// conditional discriminant test, so mir_build emits the "no arm matched" fallthrough block
+/// structurally — but it is dynamically dead and now terminates in `Unreachable` (was a zero default).
+/// Pins that the dead block stays well-typed at every opt level and both backends agree. Companion to
+/// the E0405 sema rejection of *non*-exhaustive value matches (a compile-fail, covered by tests/fail).
+#[test]
+fn differential_match_exhaustiveness() {
+    let cases = [
+        // exhaustive enum, no `_`: rank(Blue) = 3.
+        ("enum Color { Red, Green, Blue } \
+          fn rank(c: Color) -> i32 { return match c { Color::Red => 1, Color::Green => 2, Color::Blue => 3 }; } \
+          fn main() -> i32 { return rank(Color::Blue); }", 3),
+        // exhaustive enum, first variant: rank(Red) = 1.
+        ("enum Color { Red, Green, Blue } \
+          fn rank(c: Color) -> i32 { return match c { Color::Red => 1, Color::Green => 2, Color::Blue => 3 }; } \
+          fn main() -> i32 { return rank(Color::Red); }", 1),
+        // exhaustive bool, no `_`: pick(false) = 20.
+        ("fn pick(b: bool) -> i32 { return match b { true => 10, false => 20 }; } \
+          fn main() -> i32 { return pick(false); }", 20),
+        // an enum match folded into an arithmetic expression (the dead fallthrough is still emitted).
+        ("enum Dir { N, S } fn dval(d: Dir) -> i32 { return match d { Dir::N => 1, Dir::S => -1 }; } \
+          fn main() -> i32 { return dval(Dir::N) * 7 + dval(Dir::S); }", 6),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "exhaustive-match native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "exhaustive-match wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
 /// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
 /// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*

@@ -10571,13 +10571,23 @@ impl FnLowerer<'_> {
             self.terminated = false;
         }
 
-        // No arm matched (only reachable when there is no unconditional catch-all): yield a default.
+        // No arm matched. With an unconditional catch-all this block is never emitted; without one it
+        // is reached only when no arm's pattern fires. Sema's exhaustiveness check (E0405) rejects any
+        // *value-producing* non-exhaustive match before lowering, so for a value match this point is
+        // dynamically dead (an exhaustive enum/bool match with no `_` still emits this block
+        // structurally — every arm is a conditional test — but one arm always matches at runtime).
+        // Emit `Unreachable` rather than a zero default: a scalar zero was a silent wrong answer and
+        // an aggregate zero was invalid MIR (`const.i32 0` into an aggregate merge param → an ICE the
+        // verifier/`mem2reg` rejected). A unit/statement match has no value to merge and just falls
+        // through. (A genuinely value-producing match always has a value-producing arm that branches
+        // to `merge`, so the merge param never lacks a provider.)
         if !handled_default && !self.terminated {
-            let args = match merge_param {
-                Some(_) => vec![self.const_zero(result_ty.clone())],
-                None => vec![],
-            };
-            self.builder.br(merge, args);
+            match merge_param {
+                Some(_) => self
+                    .builder
+                    .set_term(mercury_mir::Terminator::Unreachable),
+                None => self.builder.br(merge, vec![]),
+            }
         }
 
         self.builder.switch_to(merge);
