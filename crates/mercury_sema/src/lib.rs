@@ -568,6 +568,14 @@ impl Sema<'_> {
         };
         match (from, to) {
             (a, b) if scalar_like(a) && scalar_like(b) => true,
+            // Integer -> pointer: forming a pointer from an address, including the null pointer
+            // `0 as *T` (the only way to initialize a `*Node` leaf in a linked list / tree). The
+            // cast itself never diverges — both backends yield a pointer value; only *dereferencing*
+            // an invalid pointer is undefined, which is the programmer's responsibility under manual
+            // memory (the same accepted UB as an out-of-bounds index). `ptr as int` stays rejected
+            // below: it has no deref to blame yet silently diverges (the interpreter cannot
+            // materialise a real address). A float/bool source is rejected as nonsensical.
+            (Ty::Scalar(s), Ty::Ptr { .. } | Ty::Ref { .. }) if s.is_int() => true,
             // Pointer/reference retype: only when the pointee types are identical (mutability may
             // differ). A differing pointee reinterprets the referent's bytes — a backend divergence.
             (
