@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.literal_out_of_range
+
+// An unsuffixed integer literal that does not fit the narrow type it adapts to is a compile error,
+// not a silent wrap. The valid range of an `i8` is -128..=127, so `200` does not fit — without the
+// check it would wrap to `-56` (`200 as i8`), a quiet footgun in a safety-first language. Rust
+// rejects this identically. (A literal that fits, like `127`, is accepted; an `i64` literal is not
+// range-checked because any value that parses already fits.)
+fn main() -> i32 {
+    let x: i8 = 200;
+    return x as i32;
+}

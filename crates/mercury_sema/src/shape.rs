@@ -88,6 +88,7 @@ impl Sema<'_> {
                                 if let Some(arg) = args.get(i) {
                                     if self.literal_adapts(param, arg) {
                                         self.retype_adapted_literal(arg, param);
+                                        self.range_check_int_literal(arg, param);
                                         arg_tys[i] = param.clone();
                                     }
                                 }
