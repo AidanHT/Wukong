@@ -339,6 +339,32 @@ fn differential_deep_recursion() {
     }
 }
 
+/// Printing an unsigned integer renders its magnitude, not the signed two's-complement
+/// reinterpretation: a high-bit-set `u32`/`u64` (a quantization scale, a hash) would otherwise
+/// print negative. mir_build routes an unsigned `print` argument to `print_u`/`rt_print_u64` after
+/// zero-extending to 64 bits; the interpreter's `print_u` formats the same bits as `u64`, so the
+/// captured stdout must agree native==interp (a signed argument is unaffected).
+#[test]
+fn differential_unsigned_print() {
+    let src = "fn main() -> i32 { \
+               let g: u32 = 3221225472; print(g); \
+               let h: u64 = 18446744073709551615; print(h); \
+               let s: u8 = 200; print(s); \
+               let i: i32 = -5; print(i); \
+               return 0; }";
+    for opt in [0u8, 1, 2, 3] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "unsigned-print native vs interp mismatch at -O{opt}");
+    }
+    // The captured stdout is the actual evidence (the return value is 0 either way).
+    let (_, out) = jit(src, 0).expect("jit");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "3221225472\n18446744073709551615\n200\n-5\n"
+    );
+}
+
 /// `if`/`match` used as a *value* whose arms have different numeric types: each arm is coerced to
 /// the expression's joined type so all arms pass the merge-block parameter the same MIR type.
 /// Without the coercion an arm of a different width/kind (`if c { 1 } else { 2.5 }`) passes a

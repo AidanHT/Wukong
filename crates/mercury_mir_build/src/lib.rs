@@ -40,6 +40,8 @@ pub fn lower_program(
         mm_par: interner.intern("mercury_sgemm_parallel"),
         print_str: interner.intern("print_str"),
         println_str: interner.intern("println_str"),
+        print_u: interner.intern("print_u"),
+        println_u: interner.intern("println_u"),
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         tn: interner.intern("mercury_sgemm_tn"),
@@ -793,6 +795,11 @@ struct GemmSyms {
     /// as opposed to the numeric `print`/`println`. Renders the bytes, not the pointer value.
     print_str: Symbol,
     println_str: Symbol,
+    /// Runtime print of an **unsigned** integer (a `u8`/.../`u64`/`usize` argument): renders the
+    /// 64-bit value as `u64`, so a high-bit-set value prints its magnitude, not the signed
+    /// two's-complement reinterpretation the default signed `print` would show.
+    print_u: Symbol,
+    println_u: Symbol,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`mercury_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -1253,6 +1260,14 @@ impl FnLowerer<'_> {
     /// `let s = "…"` binding both type as `*u8` in sema, so both are caught.
     fn is_string_arg(&self, e: &Expr) -> bool {
         matches!(self.expr_ty(e), Ty::Ptr { pointee, .. } if matches!(*pointee, Ty::Scalar(mercury_types::Scalar::U8)))
+    }
+
+    /// Is `e`'s type an unsigned integer scalar (`u8`/`u16`/`u32`/`u64`/`usize`)? Routes a
+    /// `print`/`println` argument to the unsigned-rendering `print_u` path so a high-bit-set value
+    /// prints its magnitude rather than the signed reinterpretation. `bool` is excluded (`is_int`
+    /// excludes it); signed integers and floats take the default path.
+    fn is_unsigned_int_arg(&self, e: &Expr) -> bool {
+        matches!(self.expr_ty(e), Ty::Scalar(sc) if sc.is_int() && !sc.is_signed())
     }
 
     fn expr_mir(&self, e: &Expr) -> MirType {
@@ -10734,6 +10749,30 @@ impl FnLowerer<'_> {
                         self.builder.build_void(Op::Call {
                             func,
                             args: vec![s],
+                        });
+                        return self.const_zero(MirType::I32);
+                    }
+                    // An *unsigned* integer argument must format as unsigned: the value is stored
+                    // sign-extended, so a high-bit-set `u32`/`u64` (a quantization scale, a hash, a
+                    // size) would print as its negative two's-complement reinterpretation under the
+                    // default signed `print`. Zero-extend to 64 bits (clearing the high bits of a
+                    // narrow value; a no-op for `u64`/`usize`) and route to `print_u`/`println_u`,
+                    // which render the bits as `u64`. Both backends marshal the same symbol.
+                    if (nm == "print" || nm == "println")
+                        && args.len() == 1
+                        && self.is_unsigned_int_arg(&args[0])
+                    {
+                        let v0 = self.lower_expr(&args[0]);
+                        let from = self.expr_mir(&args[0]);
+                        let v = self.coerce_to(v0, &from, &MirType::I64, false);
+                        let func = if nm == "println" {
+                            self.gemm.println_u
+                        } else {
+                            self.gemm.print_u
+                        };
+                        self.builder.build_void(Op::Call {
+                            func,
+                            args: vec![v],
                         });
                         return self.const_zero(MirType::I32);
                     }
