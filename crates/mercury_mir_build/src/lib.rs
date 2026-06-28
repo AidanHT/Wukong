@@ -6871,6 +6871,16 @@ impl FnLowerer<'_> {
                 step,
             } => (start, end, *inclusive, step),
             _ => {
+                // `for <pat> in arr` over a fixed-size array desugars to the indexed range loop
+                // `for i in 0..N { let <pat> = arr[i]; <body> }` — a pure front-end rewrite reusing
+                // the existing Gep/Load/CFG, so the interpreter and native backend agree bit-for-bit
+                // with no backend change. Anything not a statically-sized array (a tensor, slice,
+                // dynamic length, or a non-`Ident`/`_` pattern) declines and stays unsupported.
+                if let ForIter::Expr(e) = iter {
+                    if self.lower_for_array(label, pat, e, body) {
+                        return;
+                    }
+                }
                 self.unsupported(body.span, "for over a non-range iterator");
                 return;
             }
@@ -6966,6 +6976,136 @@ impl FnLowerer<'_> {
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array — into the same
+    /// CFG the indexed range loop `for i in 0..N { let <pat> = <array>[i]; <body> }` produces.
+    /// Returns `true` if it handled the loop. It fires only when the iterand's sema type is a
+    /// statically sized `[T; N]` and the pattern is an identifier (`for x in a`) or `_` wildcard
+    /// (`for _ in a`); anything else (a tensor, slice, dynamic length, or a destructuring pattern)
+    /// returns `false` so the caller emits the existing `unsupported` diagnostic. Pure desugaring:
+    /// the array base pointer + per-iteration `Gep`/`Load` are exactly what `for i in 0..N { let x
+    /// = a[i]; … }` already lowers to, so the interpreter and native backend agree bit-for-bit with
+    /// **no backend change** (and `-O0`==`-O3`, since recognition runs pre-opt like the rest).
+    fn lower_for_array(
+        &mut self,
+        label: Option<Symbol>,
+        pat: &Pattern,
+        e: &Expr,
+        body: &Block,
+    ) -> bool {
+        // Only a bare identifier (`for x in a`) or wildcard (`for _ in a`) is supported; a
+        // destructuring / literal pattern declines to the `unsupported` fallback.
+        let bind_name = match &pat.kind {
+            ast::PatKind::Ident(name) => Some(*name),
+            ast::PatKind::Wildcard => None,
+            _ => return false,
+        };
+        // The iterand must be a fixed-size array; its length N and element type come straight from
+        // sema. A tensor / slice / dynamic-length iterand has no `Ty::Array` here, so it declines.
+        let Ty::Array { elem, len } = self.expr_ty(e) else {
+            return false;
+        };
+        let elem_mir = self.mir_ty_of(&elem);
+        let n = len as i128;
+
+        // The array's base pointer, evaluated once before the loop. An array local/param's bound
+        // `ValueId` *is* its base pointer; any other array-typed expression (a struct field, an
+        // element of an array-of-arrays, an array literal) likewise lowers to its base address (the
+        // by-pointer convention `lower_expr` upholds for every aggregate), so a base pointer is
+        // always recoverable for a `Ty::Array` iterand.
+        let base_ptr = self.lower_expr(e);
+
+        // i = 0 — the hidden induction variable, I64 like the array-index GEPs.
+        let ity = MirType::I64;
+        let slot = self.builder.alloca(ity.clone());
+        let zero = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(0, ity.clone()));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: zero,
+        });
+
+        self.push_scope();
+
+        let header = self.builder.new_block();
+        let body_bb = self.builder.new_block();
+        let latch = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+
+        // header: i < N
+        self.builder.switch_to(header);
+        self.terminated = false;
+        let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let nval = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(n, ity.clone()));
+        let c = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, nval));
+        self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
+
+        // body: bind `<pat>` to `array[i]`, then lower the user body. `continue` targets the
+        // *latch* (which performs `i += 1`), matching the range-`for` so `continue` advances.
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
+        if let Some(name) = bind_name {
+            let i_cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+            let elem_ptr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base_ptr,
+                    index: i_cur,
+                    elem: elem_mir.clone(),
+                },
+            );
+            if matches!(elem_mir, MirType::Array(..)) {
+                // An aggregate element (struct / tuple / array) binds **by pointer** — `x.field`
+                // / `x[k]` / `x.0` GEP off it — exactly as the `a[i]` aggregate read arm does.
+                self.bind(name, elem_ptr, elem_mir.clone());
+            } else {
+                // A scalar element loads into a fresh slot (hoisted to the entry block), so the
+                // loop variable is an ordinary mutable local — the faithful `let x = a[i]`.
+                let v = self
+                    .builder
+                    .build(elem_mir.clone(), Op::Load(elem_ptr, elem_mir.clone()));
+                let xslot = self.builder.alloca(elem_mir.clone());
+                self.builder.build_void(Op::Store {
+                    ptr: xslot,
+                    value: v,
+                });
+                self.bind(name, xslot, elem_mir.clone());
+            }
+        }
+        self.loops.push((label, latch, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            self.builder.br(latch, vec![]);
+        }
+
+        // latch: i += 1; back to the header (reached by fall-through and every `continue`).
+        self.builder.switch_to(latch);
+        self.terminated = false;
+        let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let one = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let next = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
+
+        self.pop_scope();
+        self.builder.switch_to(exit);
+        self.terminated = false;
+        true
     }
 
     // ============================ SIMD loop vectorizer ============================

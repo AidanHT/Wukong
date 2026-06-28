@@ -870,8 +870,13 @@ impl Sema<'_> {
                 }
             }
             ForIter::Expr(e) => {
-                self.type_expr(e);
-                Ty::Unknown
+                // `for x in arr` binds the loop variable to the array's *element* type, so the
+                // body type-checks (`for x in [T; N]` ⇒ `x: T`). Any non-array iterand stays
+                // `Unknown` (lenient — we don't newly reject other iterables here).
+                match self.type_expr(e) {
+                    Ty::Array { elem, .. } => *elem,
+                    _ => Ty::Unknown,
+                }
             }
         }
     }
