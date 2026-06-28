@@ -1086,6 +1086,40 @@ fn differential_match_exhaustiveness() {
     }
 }
 
+/// An `if`/`match` used as a VALUE whose result is an aggregate (tuple/struct). The value flows
+/// through the control-flow merge block as the aggregate's base POINTER, so the merge param must be
+/// typed `Ptr`, not the byte-buffer `Array` type. It used to be typed `Array`, which the arm's pointer
+/// arg matched only under the interpreter's loose -O0 typing — `mem2reg`'s verifier rejected it, so
+/// these compiled at -O0 but panicked at -O2/-O3. Pins that the merge param is now `Ptr` at every level
+/// on both backends.
+#[test]
+fn differential_aggregate_value_merge() {
+    let cases = [
+        // if → tuple, then-arm taken: (1,2) -> 1+2 = 3.
+        ("fn main() -> i32 { let c = true; let t = if c { (1, 2) } else { (3, 4) }; return t.0 + t.1; }", 3),
+        // if → tuple, else-arm taken: (3,4) -> 3*4 = 12.
+        ("fn main() -> i32 { let c = false; let t = if c { (1, 2) } else { (3, 4) }; return t.0 * t.1; }", 12),
+        // match → tuple (exhaustive enum): pair(C) = (2,3) -> 2*3 = 6.
+        ("enum Op { A, B, C } fn pair(o: Op) -> (i32, i32) { return match o { Op::A => (1, 2), Op::B => (3, 1), Op::C => (2, 3) }; } \
+          fn main() -> i32 { let m = pair(Op::C); return m.0 * m.1; }", 6),
+        // if → struct, else-arm taken: P{5,7} -> 5+7 = 12.
+        ("struct P { x: i32, y: i32 } \
+          fn main() -> i32 { let c = false; let p = if c { P { x: 1, y: 2 } } else { P { x: 5, y: 7 } }; return p.x + p.y; }", 12),
+        // match → struct used in arithmetic (the dead fallthrough is an aggregate merge param).
+        ("struct V { a: i32, b: i32 } enum K { L, R } \
+          fn mk(k: K) -> V { return match k { K::L => V { a: 2, b: 3 }, K::R => V { a: 4, b: 5 } }; } \
+          fn main() -> i32 { let v = mk(K::R); return v.a * 10 + v.b; }", 45),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "aggregate-value-merge native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "aggregate-value-merge wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
 /// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
 /// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*
