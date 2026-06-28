@@ -128,6 +128,6 @@ reassociated form is the oracle — all backends run the same reassociated IR an
 - `docs/language-guide.md` — the language surface, with a maturity legend.
 - `docs/roadmap.md` — what runs end-to-end, what's checked-only, what's planned, sharp edges.
 - `docs/llvm-setup.md` — optional native-codegen toolchain (LLVM 19).
-- `examples/*.mer` — runnable kernels (`dot`, `saxpy_array`, `matmul`, `relu`, `softmax`, …).
+- `examples/*.mer` — runnable programs (`dot`, `saxpy_array`, `gemm`, `relu`, `fib`, …); note `matmul`/`softmax`/`vadd` are library-only kernels with no `fn main` (they type-check and `--emit`, but do not `--run`).
 - `tests/run/` (e2e `// EXPECT-*` directives) and `tests/fail/` (compile-fail `// EXPECT-CODE:`).
 - Each crate has its own `CLAUDE.md` with layout, key types, connections, and gotchas.

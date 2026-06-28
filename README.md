@@ -108,7 +108,7 @@ fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], out: [f32; 4]) {
 ```
 
 ```sh
-mercuryc --run examples/saxpy_array.mer   # 12 24 36 48
+mercuryc --run examples/saxpy_array.mer   # -> 12, 24, 36, 48 (one value per line)
 mercuryc --run examples/dot.mer           # 120
 ```
 
