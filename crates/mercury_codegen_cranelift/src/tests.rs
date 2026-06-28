@@ -1180,6 +1180,39 @@ fn differential_int_literal_widening() {
     }
 }
 
+/// An array / tuple literal adapts its elements to a matching aggregate annotation, so a typed buffer
+/// can be built straight from literals (`let a: [i8; 2] = [127, 0]`). Before, each was rejected as an
+/// `[i32; 2]` / `(i32, i32)` mismatch (E0401); now the annotation's element type is threaded into each
+/// element (recursively, through nested aggregates), so the elements lower at the right width and
+/// out-of-range elements are range-checked. native ≡ interp at every opt level.
+#[test]
+fn differential_aggregate_literal_adapt() {
+    let cases = [
+        // narrow element type.
+        ("fn main() -> i32 { let xs: [i8; 2] = [127, 0]; return xs[0] as i32; }", 127),
+        // negative element literal (peels the unary minus).
+        ("fn main() -> i32 { let xs: [i8; 2] = [-56, 5]; return xs[0] as i32; }", -56),
+        // tuple element adaptation.
+        ("fn main() -> i32 { let t: (u8, u8) = (200, 1); return t.0 as i32; }", 200),
+        // array-repeat adaptation.
+        ("fn main() -> i32 { let a: [i8; 3] = [5; 3]; return (a[0] + a[1] + a[2]) as i32; }", 15),
+        // wide element type: no truncation (9000000000 / 1e9 = 9).
+        ("fn main() -> i32 { let a: [i64; 2] = [9000000000, 0]; return (a[0] / 1000000000) as i32; }", 9),
+        // nested: array of tuples.
+        ("fn main() -> i32 { let a: [(i8, i8); 2] = [(1, 2), (3, 4)]; return (a[1].0 + a[1].1) as i32; }", 7),
+        // nested: array of structs with a narrow field.
+        ("struct S { x: i8 } fn main() -> i32 { let a: [S; 2] = [S { x: 100 }, S { x: 27 }]; return (a[0].x + a[1].x) as i32; }", 127),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "aggregate-literal native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "aggregate-literal wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
