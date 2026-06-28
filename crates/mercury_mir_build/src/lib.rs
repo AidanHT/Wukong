@@ -18171,13 +18171,18 @@ fn decode_escape(chars: &mut std::str::Chars) -> u32 {
         Some('x') => chars.by_ref().take(2).fold(0u32, |v, c| {
             c.to_digit(16).map_or(v, |d| v * 16 + d)
         }),
-        // `\u{HHHH}` — the hex digits between the braces.
+        // `\u{HHHH}` — the hex digits between the braces. Saturating, so an over-long escape
+        // (`\u{100000000}`, ≥ 9 hex digits) clamps to an invalid code point instead of overflowing
+        // the accumulator and panicking the compiler; a valid code point is ≤ 6 hex digits anyway.
         Some('u') => chars
             .by_ref()
             .skip_while(|&c| c != '{')
             .skip(1)
             .take_while(|&c| c != '}')
-            .fold(0u32, |v, c| c.to_digit(16).map_or(v, |d| v * 16 + d)),
+            .fold(0u32, |v, c| {
+                c.to_digit(16)
+                    .map_or(v, |d| v.saturating_mul(16).saturating_add(d))
+            }),
         Some(c) => c as u32,
         None => 0,
     }
