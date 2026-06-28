@@ -1,9 +1,10 @@
 # Native code generation with LLVM
 
-Mercury's LLVM backend emits **textual LLVM IR** (`--emit=llvm-ir`) and then compiles it to a
-native object or executable with `clang` (`--emit=obj` / `--emit=exe`). This keeps the default
-build dependency-free: you only need LLVM tools installed when you want native binaries. To run a
-program without any LLVM install, use the interpreter: `mercuryc --run program.mer`.
+Native objects/executables are produced by the from-scratch **Cranelift** backend — no LLVM
+required: `--emit=obj` writes a host object, and `--emit=exe` links that object with a tiny C
+runtime via your system C compiler (`cc`, or `$CC`). LLVM is only relevant to `--emit=llvm-ir`,
+which emits **textual** IR for an external `clang`/`llc` if you want one. To run a program without
+any toolchain at all, use the interpreter: `mercuryc --run program.mer`.
 
 ## Why textual IR (and not inkwell in-process)
 
@@ -15,6 +16,9 @@ no build-time dependency. The MIR→IR lowering lives behind the shared `Backend
 implementation can be dropped in later without touching the driver.
 
 ## Installing LLVM (Windows)
+
+> Optional — only needed if you want to compile the textual `--emit=llvm-ir` output with an external
+> clang/llc; Mercury's own native path does not use it.
 
 You only need the command-line tools (`clang`, and optionally `opt`/`llc`):
 

@@ -341,6 +341,9 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
 - Array *length* in a type must be an integer literal (symbolic/`const`-expression lengths fall back
   to an opaque pointer), but matmul *dimensions* may be runtime values — a runtime-dimension matmul
   still dispatches to the GEMM kernel.
-- No bounds checking on array indexing (manual memory is a decided constraint).
+- No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
+  **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
+  fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
+  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked.
 - `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
   stay in memory (the interpreter and `cse`/`dse` handle those directly).

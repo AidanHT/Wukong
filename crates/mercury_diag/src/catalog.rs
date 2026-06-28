@@ -158,7 +158,10 @@ static CATALOG: &[Explanation] = &[
         "tensor rank mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
          example, passing a rank-3 tensor where a rank-2 tensor is expected. This is checked at \
-         compile time — it can never become a runtime shape bug."
+         compile time — it can never become a runtime shape bug.\n\nThis code is also reported \
+         when a compile-time-constant index is out of bounds — for a fixed-size array (e.g. \
+         `a[5]` on a `[T; 4]`) or for a static tensor dimension (e.g. `a[5, 0]` on a \
+         `Tensor[f32, 2, 2]`): the valid indices are `0..len` on each axis."
     ),
     entry!(
         "E0502",

@@ -78,8 +78,9 @@ Where Mercury is built to win for the ML/DL niche:
   general-purpose C compiler won't do to naively-written source. Underneath, an SSA optimizer
   (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM) removes ~48% of IR ops on the benchmark kernels
   (54–60% on the heavy ones). Op-graph fusion across tensor ops is still planned.
-- **Seamless interop.** A clean C ABI (`@extern("C")` / `@export`) calls into BLAS/cuBLAS and lets
-  Mercury kernels be embedded in existing C/C++/CUDA stacks.
+- **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
+  BLAS/cuBLAS and embed Mercury kernels in C/C++/CUDA stacks. The attributes parse and validate
+  today; symbol export/import is not yet wired (see the roadmap).
 
 ## The four signature features
 
@@ -128,14 +129,14 @@ MIR (Low)
    ├──────────────► interpreter      (always available, zero deps; the reference oracle)
    ├──────────────► Cranelift backend (native JIT + object/exe; NO LLVM — the fast path)
    ├──────────────► GPU backend      (PTX + cudarc driver-JIT; offload + MIR→PTX)   [feature = "gpu"]
-   └──────────────► LLVM backend     (textual IR for external clang/llc)            [feature = "llvm"]
+   └──────────────► LLVM backend     (textual IR for external clang/llc — always available, no feature flag)
 ```
 
 The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cranelift native
 backend** build and test with plain `cargo test` on any machine — no LLVM, no toolchain. The native
 backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
 interpreter bit-for-bit. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
-behind `--features gpu`, and LLVM is an optional *textual-IR* emitter behind `--features llvm`.
+behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
 
 ## Status
 
@@ -178,11 +179,8 @@ cargo run -p mercury_xbench --release      # cross-language benchmark vs C/Rust 
 ```
 
 The native backend (Cranelift) is built in by default and needs no toolchain. The optional LLVM
-backend emits textual IR only (for an external `clang`/`llc`) and lives behind a feature flag:
-
-```sh
-cargo build --features llvm
-```
+backend emits textual IR only (for an external `clang`/`llc`), exposed via `mercuryc --emit=llvm-ir`
+— it is always built and needs no feature flag.
 
 ## License
 
