@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.assign_kind_mismatch
+
+// Assigning a pointer into a scalar place reinterprets the bits: `x = &a` for `x: i32` stores a
+// truncated address, which the slot-indexed interpreter and the byte-addressed native backend
+// disagree on — a backend divergence. The assignment now checks the value kind against the place.
+fn main() -> i32 {
+    let a: i32 = 7;
+    let mut x: i32 = 0;
+    x = &a; // `&a` is `*i32`, but `x` is a scalar `i32`
+    return x;
+}
