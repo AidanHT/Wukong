@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.invalid_cast
+
+// `as` used to be an unchecked reinterpret between *any* two types. Casting an integer to a pointer
+// and dereferencing it is arbitrary-memory UB: the native backend SIGSEGVs while the interpreter
+// traps — a backend divergence on a program that should never have compiled. Casts are now
+// restricted to well-defined conversions (scalar<->scalar, scalar<->enum, same-pointee pointer
+// retype); a pointer<->integer reinterpret like this one is rejected.
+fn main() -> i32 {
+    let p: *i32 = 16 as *i32; // integer -> pointer
+    return *p;
+}

@@ -427,6 +427,58 @@ impl Sema<'_> {
         }
     }
 
+    /// Validate an `as` cast. The cast operator was an unchecked reinterpret between *any* two types:
+    /// `16 as *i32` then `*p` is arbitrary-memory UB (native SIGSEGVs, the interpreter traps — a
+    /// divergence), `&a as i64` reads a real address on native but `0` on the interpreter, and
+    /// `(&a) as *f32` reinterprets the pointee bytes (interp reads an i32, native an f32). Restrict
+    /// casts to the well-defined conversions; reject the byte-reinterprets. Lenient on Unknown/Error.
+    fn check_cast(&mut self, from: &Ty, to: &Ty, span: Span) {
+        if from.is_unknown() || from.is_error() || to.is_unknown() || to.is_error() {
+            return;
+        }
+        if !self.cast_is_valid(from, to) {
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "invalid cast: `{}` cannot be cast to `{}`",
+                    from.display(self.interner),
+                    to.display(self.interner)
+                ),
+            );
+        }
+    }
+
+    /// The permitted `as` conversions: scalar↔scalar (every numeric/bool/char pairing — a real
+    /// numeric conversion), scalar↔enum (a C-style discriminant), and pointer→pointer only when the
+    /// pointee types match (a same-layout retype). Everything else — pointer↔integer,
+    /// aggregate↔scalar, differing-element pointer casts — is a byte reinterpret the two backends
+    /// disagree on, so it is rejected.
+    fn cast_is_valid(&self, from: &Ty, to: &Ty) -> bool {
+        if from == to {
+            return true;
+        }
+        // A scalar, or an enum `Named` (its integer discriminant) — both integer-representable.
+        let scalar_like = |t: &Ty| match t {
+            Ty::Scalar(_) => true,
+            Ty::Named(n) => matches!(
+                self.defs.lookup(*n).map(|d| &d.kind),
+                Some(DefKind::Enum(_))
+            ),
+            _ => false,
+        };
+        match (from, to) {
+            (a, b) if scalar_like(a) && scalar_like(b) => true,
+            // Pointer/reference retype: only when the pointee types are identical (mutability may
+            // differ). A differing pointee reinterprets the referent's bytes — a backend divergence.
+            (
+                Ty::Ptr { pointee: a, .. } | Ty::Ref { pointee: a, .. },
+                Ty::Ptr { pointee: b, .. } | Ty::Ref { pointee: b, .. },
+            ) => a == b,
+            _ => false,
+        }
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -888,8 +940,10 @@ impl Sema<'_> {
                 }
             }
             ExprKind::Cast { expr, ty } => {
-                self.type_expr(expr);
-                self.lower_type(ty)
+                let from = self.type_expr(expr);
+                let to = self.lower_type(ty);
+                self.check_cast(&from, &to, e.span);
+                to
             }
             ExprKind::StructLit { path, fields, rest } => {
                 // Type each field value (populates their NodeId side-table entries for lowering).
