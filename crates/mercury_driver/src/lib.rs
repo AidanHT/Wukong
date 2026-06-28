@@ -200,6 +200,21 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
     if opts.run {
+        // Gate every backend on a clean MIR verify. The optimizer verifies the forms its passes
+        // produce, but at -O0 it runs no passes, so an invalid-MIR lowering bug would otherwise reach
+        // the backend unchecked — and the native -O0 JIT codegens it into a SIGSEGV rather than the
+        // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a lowering
+        // bug a diagnosable internal-compiler-error on every backend instead of a crash or miscompile.
+        let mut verify_failed = false;
+        for f in &program.funcs {
+            for ice in mercury_mir::verify::verify_function(f) {
+                eprintln!("internal compiler error (MIR verify): {ice}");
+                verify_failed = true;
+            }
+        }
+        if verify_failed {
+            return exit::COMPILE_ERROR;
+        }
         let main = interner.intern("main");
         let result = match opts.backend {
             BackendKind::Interp => mercury_interp::run_with_output(&program, main, &interner),
