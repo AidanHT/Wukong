@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -2080
+// EXPECT-OUT: -2080
+module tests.run.vec_neg
+
+// Unary negation inside an autovectorized `for` elementwise loop. The optimizer rewrites
+// `out[k] = -x[k]` into a vector `Op::Neg`. The interpreter had no vector arm for `Neg` (a `VecRef`
+// fell into the scalar path, `as_int()` returned 0, and every lane was silently zeroed), while the
+// native backend chose `ineg` vs `fneg` from the whole-vector `is_float()` (false for `Vec(f32,N)`)
+// and emitted `ineg` on a float vector — invalid CLIF. Both now negate lane-wise, dispatching on the
+// lane type. Sum of -(1..=64) = -2080, checked for both i32 and f32 lanes across both backends.
+fn main() -> i32 {
+    let mut xi: [i32; 64] = [0; 64];
+    let mut i: i32 = 0;
+    while i < 64 {
+        xi[i] = i + 1;
+        i = i + 1;
+    }
+    let mut oi: [i32; 64] = [0; 64];
+    for k in 0..64 {
+        oi[k] = -xi[k];
+    }
+    let mut si: i32 = 0;
+    for k in 0..64 {
+        si = si + oi[k];
+    }
+    print(si);
+
+    let mut xf: [f32; 64] = [0.0; 64];
+    let mut j: i32 = 0;
+    while j < 64 {
+        xf[j] = (j + 1) as f32;
+        j = j + 1;
+    }
+    let mut of: [f32; 64] = [0.0; 64];
+    for k in 0..64 {
+        of[k] = -xf[k];
+    }
+    let mut sf: f32 = 0.0;
+    for k in 0..64 {
+        sf = sf + of[k];
+    }
+    print(sf as i32);
+    return 0;
+}

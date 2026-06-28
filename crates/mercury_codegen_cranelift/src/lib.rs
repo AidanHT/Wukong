@@ -477,7 +477,14 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Neg(v) => {
                 let x = self.val(*v);
-                if self.ty_of(*v).is_float() {
+                // A lane-float vector (`Vec(f32, N)`) is not itself `is_float()`, so dispatch on the
+                // lane type for vectors. Otherwise an autovectorized `-x[k]` over `[f32; N]` emits
+                // `ineg` on a float vector — invalid CLIF that the verifier rejects.
+                let is_float = match self.ty_of(*v) {
+                    MirType::Vec(lane, _) => lane.is_float(),
+                    t => t.is_float(),
+                };
+                if is_float {
                     self.builder.ins().fneg(x)
                 } else {
                     self.builder.ins().ineg(x)
