@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0401
+module tests.fail.aggregate_equality
+
+// `==`/`!=` on a struct (or tuple/array) is rejected: an aggregate value is a base pointer, so the
+// comparison would silently compare two distinct allocations and *always* report "not equal" — a
+// wrong answer with no diagnostic. Compare the fields instead. (Enum and pointer equality are fine
+// and still accepted; only struct/tuple/array operands are rejected.)
+struct P { x: i32, y: i32 }
+
+fn main() -> i32 {
+    let a = P { x: 1, y: 2 };
+    let b = P { x: 1, y: 2 };
+    if a == b {
+        return 1;
+    }
+    return 0;
+}

@@ -394,6 +394,21 @@ impl Sema<'_> {
         }
     }
 
+    /// Whether `t` is an aggregate with no scalar value — a tuple, a fixed-size array, or a *struct*
+    /// (`Ty::Named` resolving to a `DefKind::Struct`). An *enum* `Ty::Named` is **not** an aggregate:
+    /// a C-style variant is its integer discriminant, so enum equality is well-defined. Used to
+    /// reject `==`/`!=` on values whose MIR is a base pointer (where a compare would be meaningless).
+    fn is_aggregate_ty(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Tuple(_) | Ty::Array { .. } => true,
+            Ty::Named(n) => matches!(
+                self.defs.lookup(*n).map(|d| &d.kind),
+                Some(DefKind::Struct(_))
+            ),
+            _ => false,
+        }
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -774,7 +789,24 @@ impl Sema<'_> {
                 self.check_binop_shapes(&l, &r, e.span);
                 use BinOp::*;
                 match op {
-                    Eq | Ne | Lt | Le | Gt | Ge | And | Or => Ty::Scalar(Scalar::Bool),
+                    // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
+                    // base-pointer compare — two distinct values are *always* "not equal" — a wrong
+                    // answer with no diagnostic. Reject it (compare the fields/elements instead).
+                    // An enum (a C-style integer discriminant) and a pointer compare fine, so only
+                    // struct/tuple/array operands are rejected.
+                    Eq | Ne => {
+                        if self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r) {
+                            self.error(
+                                e.span,
+                                "E0401",
+                                "`==`/`!=` is not defined for aggregate (struct/tuple/array) \
+                                 values; compare their fields or elements instead"
+                                    .to_string(),
+                            );
+                        }
+                        Ty::Scalar(Scalar::Bool)
+                    }
+                    Lt | Le | Gt | Ge | And | Or => Ty::Scalar(Scalar::Bool),
                     _ => join(l, r),
                 }
             }
