@@ -11,7 +11,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 `--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
 - Modules, functions (including recursion and mutual recursion — the interpreter oracle runs on a
-  512 MiB worker thread, so deep recursion no longer overflows the stack), and direct calls.
+  512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
+  direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
+  than the native backend's machine frames, so the interpreter overflows at a far shallower recursion
+  depth (~tens of thousands of nested calls) than native (which handles millions). Recursion past the
+  interpreter's stack bound is a **resource limit outside the bit-for-bit differential contract** — the
+  oracle aborts where the native backend may still complete, the same "outside the defined contract"
+  status as an out-of-bounds access. Matching native's depth would need ~10× the interpreter stack
+  (impractical); a real program rarely recurses that deep on a stackful backend.
 - `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
   (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.mer`), and a **top-level
   `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
