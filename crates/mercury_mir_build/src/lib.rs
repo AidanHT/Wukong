@@ -4762,7 +4762,7 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(header);
         self.terminated = false;
-        let c = self.lower_expr(cond);
+        let c = self.lower_bool_cond(cond);
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
         self.builder.switch_to(body_bb);
@@ -9546,8 +9546,38 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
+    /// Lower a condition used in a **boolean context** — the condition of `if`/`while`, the operands
+    /// of short-circuit `&&`/`||`, and the argument of `assert` — normalizing it to an `i1`.
+    ///
+    /// The language deliberately permits a C-like non-bool scalar condition (`if 5 {}`, `if x {}`):
+    /// a nonzero value is true. An `i1`/integer condition is already consistent across both backends
+    /// (nonzero int = true) and passes through unchanged. A **float** condition, however, must be
+    /// normalized to `cond != 0.0` (an `Op::Cmp(Fone)` against a float zero of the same type,
+    /// yielding an `i1`): otherwise the native (Cranelift) backend's `brif`/`fcvt` truncates
+    /// `0.5 -> 0` (so `assert(0.5)` wrongly traps) or rejects the float controlling type outright
+    /// (`brif.f32 ... has an invalid controlling type`), while the interpreter applied a *different*
+    /// truthiness (`f != 0.0` in its `assert` arm vs `as_int() != 0` for `if`/`while`, which itself
+    /// truncates `0.5 -> 0`) — a three-way divergence on a program the front-end accepts. Emitting
+    /// the compare here makes the condition an `i1` *before* it reaches any backend, so they all
+    /// agree. `NaN != 0.0` is true (intentional C-like truthiness — the interpreter's Rust `!=` and
+    /// Cranelift's `FloatCC::NotEqual` both treat NaN as nonzero/true). The integer/`i1` path is
+    /// untouched.
+    fn lower_bool_cond(&mut self, cond: &Expr) -> ValueId {
+        let v = self.lower_expr(cond);
+        let ty = self.expr_mir(cond);
+        if ty.is_float() {
+            let zero = self
+                .builder
+                .build(ty.clone(), Op::ConstFloat(0.0, ty.clone()));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Fone, v, zero))
+        } else {
+            v
+        }
+    }
+
     fn lower_if(&mut self, cond: &Expr, then_branch: &Block, else_branch: Option<&Expr>) {
-        let c = self.lower_expr(cond);
+        let c = self.lower_bool_cond(cond);
         let then_bb = self.builder.new_block();
         let merge = self.builder.new_block();
         let else_bb = if else_branch.is_some() {
@@ -9591,7 +9621,7 @@ impl FnLowerer<'_> {
         let result_ty = self.expr_mir(e);
         let produces_value = else_branch.is_some() && result_ty != MirType::Void;
 
-        let c = self.lower_expr(cond);
+        let c = self.lower_bool_cond(cond);
         let then_bb = self.builder.new_block();
         let merge = self.builder.new_block();
         let else_bb = if else_branch.is_some() {
@@ -10595,7 +10625,10 @@ impl FnLowerer<'_> {
     /// side-effecting or unsafe RHS (`p_in_bounds && load(p)`) does not run when the LHS already
     /// settles it. Both backends execute the identical CFG, so the differential gate holds.
     fn lower_short_circuit(&mut self, lhs: &Expr, rhs: &Expr, is_and: bool) -> ValueId {
-        let l = self.lower_expr(lhs);
+        // Both operands are conditions: normalize a float operand to `!= 0.0` so the LHS reaches
+        // `cond_br` as an `i1` (not a raw float native's `brif` rejects) and the RHS matches the
+        // `i1` merge param. The integer/`i1` path is unchanged.
+        let l = self.lower_bool_cond(lhs);
         let rhs_bb = self.builder.new_block();
         let merge = self.builder.new_block();
         let res = self.builder.block_param(merge, MirType::I1);
@@ -10614,7 +10647,7 @@ impl FnLowerer<'_> {
         }
         self.builder.switch_to(rhs_bb);
         self.terminated = false;
-        let r = self.lower_expr(rhs);
+        let r = self.lower_bool_cond(rhs);
         if !self.terminated {
             self.builder.br(merge, vec![r]);
         }
@@ -10773,6 +10806,18 @@ impl FnLowerer<'_> {
                         self.builder.build_void(Op::Call {
                             func,
                             args: vec![v],
+                        });
+                        return self.const_zero(MirType::I32);
+                    }
+                    // `assert(cond)` takes a boolean condition: normalize a float argument to
+                    // `cond != 0.0` (an `i1`) so a fractional `assert(0.5)` is *true* on both
+                    // backends, rather than native truncating `0.5 -> 0` and trapping while the
+                    // interpreter's `f != 0.0` passes. The integer/`i1` path is unchanged.
+                    if nm == "assert" && args.len() == 1 {
+                        let c = self.lower_bool_cond(&args[0]);
+                        self.builder.build_void(Op::Call {
+                            func: name,
+                            args: vec![c],
                         });
                         return self.const_zero(MirType::I32);
                     }
