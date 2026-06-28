@@ -1,0 +1,30 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 100
+// EXPECT-OUT: 125
+module tests.run.array_of_struct
+
+// An array whose element is a struct: indexing then a field access (`a[i].x`), at a constant or a
+// runtime index, on both a local and a by-value parameter, and a field write through a runtime
+// index. The element is a flat byte buffer, so `a[i]` strides one whole struct (sizeof = 8) and
+// `.x`/`.y` GEP at their byte offsets — bit-identical on the interpreter (slot-indexed) and native
+// (byte-indexed) backends.
+struct P { x: i32, y: i32 }
+
+fn psum(a: [P; 2]) -> i32 {
+    return a[0].x + a[0].y + a[1].x + a[1].y;
+}
+
+fn main() -> i32 {
+    let mut a: [P; 2] = [P { x: 7, y: 8 }, P { x: 9, y: 10 }];
+    print(a[0].x);     // 7
+    print(a[0].y);     // 8
+    print(a[1].x);     // 9
+    let i: i32 = 1;
+    a[i].x = 100;      // runtime-index field write
+    print(a[1].x);     // 100
+    print(psum(a));    // 7 + 8 + 100 + 10 = 125
+    return 0;
+}

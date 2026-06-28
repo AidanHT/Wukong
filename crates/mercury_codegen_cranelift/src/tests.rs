@@ -282,6 +282,46 @@ fn differential_nested_struct() {
     }
 }
 
+/// An array whose element is an aggregate (`[Struct; N]` / `[(..); N]`): indexing then a field
+/// access, a runtime-index field write, a by-value array parameter, and an `[agg; n]` repeat. The
+/// element is wider than one slot, so the element GEP must stride the whole element on *both*
+/// backends — native scales the index by `size_of(elem)` bytes; the interpreter scales by the
+/// element's `slot_count`. A scalar `Op::Load` of an aggregate element (the prior bug) verifier-
+/// rejected native for a struct element and segfaulted it for a wider tuple element while the
+/// interpreter mis-strided by a single slot — so this must agree across all four `-O` levels.
+#[test]
+fn differential_array_of_aggregate() {
+    let programs = [
+        // array of 2-field structs: const + runtime index, field read + write, by-value param.
+        "struct P { x: i32, y: i32 } \
+         fn psum(a: [P; 2]) -> i32 { return a[0].x + a[0].y + a[1].x + a[1].y; } \
+         fn main() -> i32 { let mut a: [P; 2] = [P { x: 7, y: 8 }, P { x: 9, y: 10 }]; \
+         let i: i32 = 1; a[i].x = 100; print(a[0].x); print(a[1].x); return psum(a); }",
+        // array of tuples (a wider, >4-byte element — the prior segfault case).
+        "fn main() -> i32 { let a: [(i32, i32); 2] = [(7, 8), (9, 10)]; \
+         print(a[0].0); print(a[1].1); return a[0].0 + a[1].1 + a[1].0 + a[0].1; }",
+        // mixed-precision struct element at a padded offset, read through a runtime index.
+        "struct M { a: i32, b: f32 } \
+         fn main() -> i32 { let arr: [M; 3] = [M { a: 1, b: 1.5 }, M { a: 2, b: 2.5 }, \
+         M { a: 3, b: 3.5 }]; let k: i32 = 2; print(arr[k].a); print(arr[k].b); \
+         return arr[0].a + arr[1].a + arr[k].a; }",
+        // `[agg; n]` repeat: every element is an independent deep copy.
+        "struct P { x: i32, y: i32 } \
+         fn main() -> i32 { let mut a: [P; 4] = [P { x: 5, y: 6 }; 4]; a[2].x = 50; \
+         return a[0].x + a[1].x + a[2].x + a[3].y; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "array-of-aggregate native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// `&&` / `||` short-circuit: the RHS runs only when the LHS doesn't decide the result. The captured
 /// stdout (the `jit`/`interp` helpers return it) is the side-effect evidence, so a regression to a
 /// bitwise `and`/`or` of both operands would change the printed trace AND must still agree

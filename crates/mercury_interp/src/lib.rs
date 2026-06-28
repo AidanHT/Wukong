@@ -586,16 +586,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Alloca(ty) => {
                 let idx = self.memory.len();
-                // An array alloca reserves `count` contiguous element slots; its result points at
-                // the first. `gep` then computes `base + index` into this run.
-                if let MirType::Array(elem, count) = ty {
-                    let d = default_value(elem);
-                    for _ in 0..*count {
-                        self.memory.push(d);
-                    }
-                } else {
-                    self.memory.push(default_value(ty));
-                }
+                // Reserve every leaf slot of `ty` (recursing into nested arrays so an array of
+                // structs/tuples is fully sized, not one slot per element); the result points at the
+                // first. `gep` then computes `base + index * slot_count(elem)` into this run.
+                push_defaults(ty, &mut self.memory);
                 Value::Ptr(idx)
             }
             // A vector load gathers `n` contiguous scalar slots (memory stays scalar); a scalar
@@ -645,10 +639,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Value::Unit
             }
-            Op::Gep { ptr: p, index, .. } => {
+            Op::Gep { ptr: p, index, elem } => {
                 let base = ptr(reg(regs, *p))?;
                 let off = reg(regs, *index).as_int();
-                Value::Ptr((base as i128 + off) as usize)
+                // Scale the index by the element's slot footprint so an aggregate-element array
+                // (`[Struct; N]`) strides one whole element per index, matching native's
+                // `index * size_of(elem)`. `slot_count` is 1 for scalar/byte elements, so scalar
+                // arrays and struct/tuple byte-offset field GEPs (`elem = I8`) are unchanged.
+                Value::Ptr((base as i128 + off * slot_count(elem) as i128) as usize)
             }
             Op::Call { func, args } => {
                 let argv: Vec<Value> = args.iter().map(|a| reg(regs, *a)).collect();
@@ -2914,6 +2912,35 @@ fn default_value(ty: &MirType) -> Value {
         Value::Ptr(0)
     } else {
         Value::Int(0)
+    }
+}
+
+/// The number of flat-memory slots a value of `ty` occupies — the interpreter's analogue of
+/// `size_of`. Every scalar (any width), pointer, or vector reference is one slot; an `Array(elem, n)`
+/// is `n` element-runs laid out contiguously, so it occupies `n * slot_count(elem)` slots (recursing
+/// for an array of aggregates). This is the stride a `Gep` over such an element must use so that
+/// element `i` lands at `base + i * slot_count(elem)` — matching native, which scales the GEP index
+/// by `size_of(elem)` bytes. For a scalar/byte (`I8`) element this is `1`, so a scalar array and a
+/// struct/tuple byte-buffer field GEP are unchanged; only an *aggregate-element* array (`[Struct; N]`,
+/// `[(..); N]`) is affected — previously mis-strided by a single slot.
+fn slot_count(ty: &MirType) -> usize {
+    match ty {
+        MirType::Array(elem, count) => *count as usize * slot_count(elem),
+        _ => 1,
+    }
+}
+
+/// Reserve the flat-memory slots for an `alloca` of `ty`, pushing a typed zero per leaf slot. An
+/// array recurses element-by-element (so a nested `Array(Array(I8, 8), 2)` reserves all 16 leaf
+/// slots, not 2), keeping the per-leaf default type (`Float(0.0)` for an f32 array, `Int(0)` for a
+/// byte buffer) the way the old single-level loop did for a scalar array.
+fn push_defaults(ty: &MirType, out: &mut Vec<Value>) {
+    if let MirType::Array(elem, count) = ty {
+        for _ in 0..*count {
+            push_defaults(elem, out);
+        }
+    } else {
+        out.push(default_value(ty));
     }
 }
 
