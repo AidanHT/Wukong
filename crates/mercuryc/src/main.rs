@@ -28,7 +28,7 @@ OPTIONS:
 
 EXAMPLES:
     mercuryc --emit=tokens examples/vadd.mer
-    mercuryc --run examples/matmul.mer
+    mercuryc --run examples/gemm.mer
 ";
 
 fn main() -> ExitCode {

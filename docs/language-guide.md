@@ -61,7 +61,8 @@ let (a, b) = (3, 4);    // tuple destructuring (nested patterns and `_` work too
 ```
 
 An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine. A typed
-value must match its annotation exactly (see error `E0401`).
+value must match its annotation exactly (see error `E0401`). An unsuffixed literal that does not fit
+the annotated type is rejected (`E0401`, e.g. `let x: i8 = 200;`), not silently wrapped.
 
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
@@ -103,9 +104,9 @@ static-data section — a string is just a NUL-terminated `*u8` buffer suitable 
 
 ## Operators ✅
 
-Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, boolean `&& ||` (short-
-circuit), unary `-` and `!`. Precedence is the usual C/Rust ordering, resolved by a Pratt parser.
-Compound assignment (`+=`, `*=`, …) is supported.
+Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, shifts `<< >>`, boolean
+`&& ||` (short-circuit), unary `-` and `!`. Precedence is the usual C/Rust ordering, resolved by a
+Pratt parser. Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
 
 ## Control flow ✅
 
@@ -211,6 +212,12 @@ faults:
 
 Run `mercuryc --explain E0502` for a worked example. Dimensions may be integer literals, symbolic
 generic names, or `?` for a runtime dimension. Tensor element types must be scalars (`E0302`).
+
+Shape checking is not limited to call arguments: an elementwise binary op `a + b` whose operands
+have different shapes, and a function whose returned value's shape disagrees with its declared
+`-> Tensor[…]`, are both `E0502` (see `tests/fail/shape_binop_mismatch.mer`,
+`shape_return_mismatch.mer`). A constant index past a static tensor dimension, like a fixed-size
+array, is `E0501`.
 
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a

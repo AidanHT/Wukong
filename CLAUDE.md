@@ -3,7 +3,7 @@
 Mercury (`.mer`) is a low-level systems language for ML/DL tensor kernels with **compile-time shape
 safety** (tensor shapes live in the type system). `mercuryc` is its compiler — a Rust workspace whose
 front-end, optimizer, and a from-scratch MIR interpreter build and test with plain `cargo test` (no
-LLVM). Native codegen is opt-in behind `--features llvm`.
+LLVM). Native codegen via Cranelift is built by default (no feature flag); only the GPU backend is opt-in behind `--features gpu`.
 
 ## Build / test / run
 
@@ -14,7 +14,7 @@ cargo run -p mercuryc -- --help
 cargo run -p mercuryc -- --run examples/fib.mer            # compile + interpret
 cargo run -p mercuryc -- --emit=mir -O2 examples/dot.mer   # dump an intermediate stage
 cargo run -p mercury_bench --release -- tests/run examples bench/kernels   # optimizer report
-cargo build --features llvm                  # native codegen path (requires LLVM 19; see below)
+cargo build --features gpu                   # optional GPU backend (CUDA)
 ```
 
 CLI flags (`crates/mercuryc/src/main.rs` → `mercury_driver::Options`):
@@ -29,8 +29,9 @@ CLI flags (`crates/mercuryc/src/main.rs` → `mercury_driver::Options`):
 - `-O0|-O1|-O2|-O3` — optimization level (default `-O0`; `-O3` currently runs the `-O2` pipeline).
 - `-o <path>`, `--color=auto|always|never`, `--error-format=human|json`, `--explain <CODE>`,
   `-h/--help`, `-V/--version`.
-- `--emit=obj|exe` shells out to `clang` on the textual IR; with no LLVM installed it returns
-  exit code 2 (`UNIMPLEMENTED`) after writing the `.ll` sidecar. Use `--run` or `--emit=llvm-ir` instead.
+- `--emit=obj` emits a native object via Cranelift (no LLVM). `--emit=exe` additionally links it with
+  the system C compiler (`cc`/`$CC`); if no C compiler is found it returns exit code 2 (`UNIMPLEMENTED`)
+  but the object is still written. `--emit=llvm-ir` emits textual LLVM IR (also no toolchain needed).
 
 ## Pipeline
 
