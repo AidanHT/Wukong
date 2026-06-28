@@ -700,6 +700,32 @@ impl Sema<'_> {
         }
     }
 
+    /// A value that no unary operator and no binary operator besides `==`/`!=` is defined on: an
+    /// aggregate (struct/tuple/array), `()` (the unit / a void-returning call's result), or a
+    /// function value. Each used to reach mir_build and lower to an op on a base pointer / a dummy
+    /// `i32` / a `void` operand — verifier-invalid MIR that crashed the native backend while the
+    /// interpreter ran on the placeholder and returned a silently-wrong value (e.g. `nothing() * 2`,
+    /// `-nothing()`). Scalars/vectors/tensors/pointers and `Unknown` are *not* flagged.
+    fn is_noncomputable_operand(&self, t: &Ty) -> bool {
+        self.is_aggregate_ty(t) || matches!(t, Ty::Unit | Ty::Fn { .. })
+    }
+
+    /// Type a branch/loop condition and reject a `()` (unit / void-returning call) condition: it
+    /// lowers to a `cond_br` on a non-`i1` dummy value — MIR the verifier and Cranelift reject (the
+    /// native backend crashed) while the interpreter branched on the placeholder. A non-bool numeric
+    /// "truthy" condition like `if 5` is intentionally allowed and stays unaffected.
+    fn check_condition(&mut self, cond: &Expr) {
+        let t = self.type_expr(cond);
+        if matches!(t, Ty::Unit) {
+            self.error(
+                cond.span,
+                "E0401",
+                "a condition cannot be `()` (a unit / void value); use a boolean or numeric value"
+                    .to_string(),
+            );
+        }
+    }
+
     /// True when `a` and `b` are concrete types of incompatible *kind* — one a scalar/vector, the
     /// other a pointer/reference/array/tuple. Such a pairing is never a numeric coercion: it slips
     /// past the lenient checks and then ICEs the native backend (an i64 pointer marshalled into a
@@ -1064,7 +1090,7 @@ impl Sema<'_> {
             StmtKind::While {
                 cond, body, label, ..
             } => {
-                self.type_expr(cond);
+                self.check_condition(cond);
                 self.loop_labels.push(label.as_ref().map(|l| l.sym));
                 self.type_block(body);
                 self.loop_labels.pop();
@@ -1286,12 +1312,13 @@ impl Sema<'_> {
                         mutable: true,
                         pointee: Box::new(t),
                     },
-                    // Unary `-`/`!` on an aggregate (struct/tuple/array) is meaningless and used to
-                    // pass through unchanged, then mir_build emitted an arithmetic op on a base
-                    // pointer — invalid MIR. Scalars/vectors/tensors negate fine; reject only
-                    // definite aggregates, staying lenient for `Unknown`.
+                    // Unary `-`/`!` on an aggregate (struct/tuple/array), `()` (a void call's
+                    // result), or a function value is meaningless and used to pass through unchanged,
+                    // then mir_build emitted an arithmetic op on a base pointer / a dummy / a void
+                    // operand — invalid MIR (`-nothing()` crashed native). Scalars/vectors/tensors
+                    // negate fine; stay lenient for `Unknown`.
                     UnOp::Neg | UnOp::Not => {
-                        if self.is_aggregate_ty(&t) {
+                        if self.is_noncomputable_operand(&t) {
                             let glyph = if matches!(op, UnOp::Neg) { "-" } else { "!" };
                             self.error(
                                 expr.span,
@@ -1316,19 +1343,28 @@ impl Sema<'_> {
                 self.check_binop_shapes(&l, &r, e.span);
                 use BinOp::*;
                 // No binary operator other than `==`/`!=` (which has its own message below) is
-                // defined on an aggregate (struct/tuple/array) value: arithmetic/bitwise/shift on a
-                // base pointer, or ordering/logical on one, lowers to invalid MIR — an ICE on a
-                // program sema had accepted. Tensors and vectors are *not* aggregates here, so
-                // tensor/vector arithmetic is unaffected; `Unknown` stays lenient.
-                if !matches!(op, Eq | Ne) && (self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r)) {
-                    self.error(
-                        e.span,
-                        "E0401",
-                        "binary operators are not defined for aggregate (struct/tuple/array) \
-                         values; operate on their fields or elements instead"
-                            .to_string(),
-                    );
-                    return Ty::Unknown;
+                // defined on an aggregate (struct/tuple/array), `()` (a void call's result), or a
+                // function value: arithmetic/bitwise/shift/ordering/logical on one lowers to an op on
+                // a base pointer / dummy / void operand — invalid MIR, an ICE on accepted input
+                // (`nothing() * 2`). Tensors and vectors are *not* aggregates here, so tensor/vector
+                // arithmetic is unaffected; `Unknown` stays lenient.
+                if !matches!(op, Eq | Ne) {
+                    if let Some(bad) = [&l, &r]
+                        .into_iter()
+                        .find(|t| self.is_noncomputable_operand(t))
+                    {
+                        self.error(
+                            e.span,
+                            "E0401",
+                            format!(
+                                "binary operator `{}` is not defined for `{}` values; operate on \
+                                 their fields or elements instead",
+                                op.glyph(),
+                                bad.display(self.interner)
+                            ),
+                        );
+                        return Ty::Unknown;
+                    }
                 }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
@@ -1484,7 +1520,7 @@ impl Sema<'_> {
                 then_branch,
                 else_branch,
             } => {
-                self.type_expr(cond);
+                self.check_condition(cond);
                 let then_ty = self.type_block(then_branch);
                 if let Some(e) = else_branch {
                     let else_ty = self.type_expr(e);
