@@ -123,6 +123,16 @@ static CATALOG: &[Explanation] = &[
          an `extern` block."
     ),
     entry!(
+        "E0209",
+        "nesting too deep",
+        "An expression or type nests more deeply than the parser allows (for example thousands of \
+         nested parentheses or array types, or an enormously long `a + b + c + …` operator chain). \
+         The limit exists so that pathological or machine-generated input fails with this stable \
+         diagnostic instead of crashing the compiler with a stack overflow. No realistic program \
+         comes close; if you hit this, restructure the deeply nested expression or type — for \
+         instance by introducing intermediate `let` bindings."
+    ),
+    entry!(
         "E0300",
         "duplicate definition",
         "A name was defined more than once in the same scope. Rename one of the definitions."
