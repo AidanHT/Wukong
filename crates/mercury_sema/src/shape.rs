@@ -136,6 +136,23 @@ impl Sema<'_> {
                     }
                     return ret;
                 }
+                // `assert(cond)` is a builtin taking exactly one condition argument. With the wrong
+                // arity it used to fall through to a malformed void call: the interpreter read the
+                // missing condition as false and trapped (exit 1) while native treated it as a no-op
+                // (exit 0) — a backend divergence. Pin the arity here (E0503), like a user fn's
+                // arg-count check; this fails compilation before either backend runs.
+                if self.sym_str(name) == "assert" && args.len() != 1 {
+                    self.error(
+                        span,
+                        "E0503",
+                        format!(
+                            "`assert` takes exactly 1 argument, but {} were supplied",
+                            args.len()
+                        ),
+                    );
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return Ty::Unknown;
+                }
                 // Unresolved or non-function callee: lenient (builtins like `min`).
                 self.types.insert(callee.id, Ty::Unknown);
                 return Ty::Unknown;
