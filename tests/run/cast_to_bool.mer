@@ -1,0 +1,34 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+module tests.run.cast_to_bool
+
+// Casting a numeric value to `bool` is C-like truthiness (`x != 0`), NOT a low-bit truncation. The
+// truncation made `2 as bool` *false* (low bit 0) even though `if 2` is *true* — the cast and the
+// condition path disagreed. Both now compare `!= 0`, so any nonzero value is `true`, and NaN/0.5 too.
+fn main() -> i32 {
+    let a: i32 = 0;
+    print((a as bool) as i32); // 0
+
+    let b: i32 = 2;
+    print((b as bool) as i32); // 1  (was 0 under the old low-bit cast)
+
+    let c: i32 = 255;
+    print((c as bool) as i32); // 1
+
+    let d: f32 = 0.5;
+    print((d as bool) as i32); // 1
+
+    let e: f32 = 0.0;
+    print((e as bool) as i32); // 0
+
+    // The cast now agrees with the `if`/`while` condition path on the same value.
+    let f: i32 = 2;
+    if (f as bool) { print(7); } else { print(0); } // 7
+    return 0;
+}
