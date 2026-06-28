@@ -10603,13 +10603,17 @@ impl FnLowerer<'_> {
         guard: Option<&Expr>,
     ) -> ValueId {
         let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
+        // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
+        // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
+        // arm's `And` / `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix
+        // covered if/while/short-circuit/assert but not the match-guard path).
         match (pat_cond, guard) {
             (Some(pc), Some(g)) => {
-                let gv = self.lower_expr(g);
+                let gv = self.lower_bool_cond(g);
                 self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
             }
             (Some(pc), None) => pc,
-            (None, Some(g)) => self.lower_expr(g),
+            (None, Some(g)) => self.lower_bool_cond(g),
             (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
         }
     }
