@@ -1703,8 +1703,17 @@ impl Sema<'_> {
             } => {
                 self.check_condition(cond);
                 let then_ty = self.type_block(then_branch);
-                if let Some(e) = else_branch {
-                    let else_ty = self.type_expr(e);
+                if let Some(else_expr) = else_branch {
+                    let else_ty = self.type_expr(else_expr);
+                    // The two arms merge into ONE value, so — like a binary operator's operands, a
+                    // call's arguments, and a `return` — their tensor/vector SHAPES (and element
+                    // types) must agree. `join` alone picks the then-arm's type and lets a mismatched
+                    // else-arm through: `if c { t: Tensor[f32,4] } else { u: Tensor[i32,4] }` typed as
+                    // f32[4] makes native reinterpret u's i32 bits while interp reads the i32 (a
+                    // divergence); a [2,2]-vs-[2,4] mismatch silently mis-strides the result; a
+                    // [1024]-vs-[2] lie turns a statically-valid index into a runtime OOB segfault.
+                    // Unify them — the 4th shape-bearing context, the one `check_binop_shapes` missed.
+                    self.check_binop_shapes(&then_ty, &else_ty, else_expr.span);
                     join(then_ty, else_ty)
                 } else {
                     Ty::Unit
@@ -1723,6 +1732,11 @@ impl Sema<'_> {
                     }
                     let t = self.type_expr(&arm.body);
                     self.pop_scope();
+                    // Arms merge into one value: their tensor/vector shapes (and element types) must
+                    // agree, exactly as the `if` arms above (see `check_binop_shapes`). Unify each arm
+                    // against the running result before `join` folds it in, so a shape-mismatched arm
+                    // is an E0502 — not a silently mistyped result that mis-strides or reinterprets.
+                    self.check_binop_shapes(&result, &t, arm.body.span);
                     result = join(result, t);
                 }
                 // Exhaustiveness: a value-producing `match` with no catch-all that provably misses a
@@ -2306,6 +2320,28 @@ mod tests {
             "fn f() { let x = 9000000000; }",
         ] {
             assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+        }
+    }
+
+    #[test]
+    fn if_match_arm_shapes_must_agree() {
+        // if/match arms merge into one value, so their tensor shapes / element types must agree — the
+        // 4th shape-bearing context after binop/call/return. Mismatch -> E0502.
+        for src in [
+            "fn p(c: bool, a: Tensor[f32,2,2], b: Tensor[f32,2,4]) -> f32 { let x = if c {a} else {b}; return x[0,0]; }",
+            "fn p(c: bool, a: Tensor[f32,4], b: Tensor[i32,4]) -> f32 { let x = if c {a} else {b}; return x[0]; }",
+            "fn p(s: i32, a: Tensor[f32,4], b: Tensor[i32,4]) -> f32 { let x = match s { 0 => a, _ => b }; return x[0]; }",
+        ] {
+            assert!(errors(src).contains(&"E0502"), "expected E0502 for {src:?}");
+        }
+        // No false positives: same-shape tensor arms, and scalar/float arms (which `join` handles).
+        for src in [
+            "fn p(c: bool, a: Tensor[f32,2,4], b: Tensor[f32,2,4]) -> f32 { let x = if c {a} else {b}; return x[0,0]; }",
+            "fn f(c: bool) -> i32 { let x = if c { 1 } else { 2 }; return x; }",
+            "fn f(s: i32) -> i32 { let x = match s { 0 => 10, _ => 20 }; return x; }",
+            "fn f(c: bool) -> f64 { let x = if c { 1.0 } else { 2.0 }; return x as f64; }",
+        ] {
+            assert!(!errors(src).contains(&"E0502"), "unexpected E0502 for {src:?}");
         }
     }
 

@@ -1,0 +1,25 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 12
+module tests.run.if_match_tensor_value
+
+// An `if`/`match` used as a value with SHAPE-AGREEING tensor arms still works end to end — the new
+// arm-shape unification must not over-fire on valid programs. Both arms are Tensor[f32,2,4], so the
+// merged value is well-shaped and indexes correctly, and native ≡ interp.
+fn pick_if(cond: bool, a: Tensor[f32, 2, 4], b: Tensor[f32, 2, 4]) -> f32 {
+    let c = if cond { a } else { b };
+    return c[1, 1];
+}
+
+fn pick_match(sel: i32, a: Tensor[f32, 2, 4], b: Tensor[f32, 2, 4]) -> f32 {
+    let c = match sel { 0 => a, _ => b };
+    return c[0, 2];
+}
+
+fn main() -> i32 {
+    let x: [f32; 8] = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0];
+    let y: [f32; 8] = [20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0];
+    print(pick_if(true, x, y) as i32);  // a = x, x[1,1] = x[5] = 15
+    print(pick_match(0, x, y) as i32);  // a = x, x[0,2] = x[2] = 12
+    return 0;
+}
