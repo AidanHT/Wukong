@@ -1142,6 +1142,44 @@ fn differential_bitwise_not() {
     }
 }
 
+/// An unsuffixed integer literal that overflows i32 must keep its value, not silently wrap to its
+/// low 32 bits. `9000000000` used to default to i32 and bake a `const.i32` (= 410065408) into the
+/// shared MIR, so BOTH backends agreed on the wrong value — the interp-vs-native gate was blind to
+/// it. The default now widens to i64 when the value does not fit i32. Asserted via *stdout* (the i64
+/// exit code is i32-narrow): the printed value distinguishes the true value from the old wrap.
+#[test]
+fn differential_int_literal_widening() {
+    let cases = [
+        // return position: `return 9000000000` from `-> i64`.
+        ("fn f() -> i64 { return 9000000000; } fn main() -> i32 { print(f()); return 0; }", "9000000000\n"),
+        // bare literal, type inferred (no annotation) -> i64, not a truncated i32.
+        ("fn main() -> i32 { let x = 9000000000; print(x); return 0; }", "9000000000\n"),
+        // cast operand: the literal is i64 *before* the (no-op) cast, not an i32 wrap widened after.
+        ("fn main() -> i32 { let x = 9000000000 as i64; print(x); return 0; }", "9000000000\n"),
+        // struct-field init of a wider field.
+        ("struct B { v: i64 } fn main() -> i32 { let b = B { v: 12345678901 }; print(b.v); return 0; }", "12345678901\n"),
+        // assignment to a wider field.
+        ("struct B { v: i64 } fn main() -> i32 { let mut b = B { v: 0 }; b.v = 12345678901; print(b.v); return 0; }", "12345678901\n"),
+        // unsigned return: an i64-typed literal reinterpreted as u64 (same width, positive) — the old
+        // path truncated to i32 then sign-extended, printing 18446744072414584320.
+        ("fn f() -> u64 { return 3000000000; } fn main() -> i32 { print(f()); return 0; }", "3000000000\n"),
+        // a value that fits i32 is unaffected (stays i32).
+        ("fn main() -> i32 { let x = 5; print(x); return 0; }", "5\n"),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "int-literal-widening native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                String::from_utf8_lossy(&n.1),
+                want,
+                "int-literal-widening wrong value at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
