@@ -358,3 +358,20 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   native backend** — that frame is reclaimed on return and `print` then reads freed stack (an empty
   line), while the interpreter's persistent slot memory masks it (both backends still exit 0). Return
   a string by having the caller pass in the destination buffer, or thread it through a `*u8` parameter.
+- **`--emit=exe`/`--emit=obj` link only the small C runtime** (`print`/`assert` and the parallel-for
+  shim), not the AVX2/FMA microkernels the recognizers dispatch to (`mercury_vmath_f32`, `mercury_sgemm*`,
+  `mercury_sreduce*`, `mercury_norm*`, the int8/bf16 kernels, …) — those live in the `mercury_runtime`
+  Rust crate, bound in-process by the interpreter and the Cranelift JIT but left as unresolved imports
+  in the emitted object. So a program that dispatches a recognized kernel (e.g. `for i in 0..N { y[i] =
+  exp(x[i]); }`, a `matmul`, a reduction) runs via `--run` (interp or `--backend=native`) but currently
+  **fails to link** as a standalone exe (`ld` unresolved-symbol). The fast path — and the differential
+  gate — is `--run`; emitting `mercury_runtime` as a staticlib and linking it for `--emit=exe` is future
+  work. Scalar math (a `while`-loop `exp`, which lowers to a libm call, not the vectorized kernel) links
+  fine.
+- **A by-value aggregate parameter aliases the caller's value.** A `struct`/array/tuple argument is
+  passed by pointer (the by-pointer convention), and the callee mutates *through* it, so
+  `fn clobber(p: P) { p.x = 999; }` writes back into the caller's `p` — full value semantics would
+  copy-in. This is deliberate (an ML kernel passes large buffers; copying every aggregate argument by
+  value would be a performance footgun) and **both backends agree** (it is not a differential), but it
+  surprises: take an explicit `let q = p;` copy inside the callee when you need an independent value, or
+  pass `*mut P` when mutation-through is the intent. A plain `let b = a;` *does* copy.
