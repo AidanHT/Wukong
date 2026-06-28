@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0402
+module tests.fail.recursive_struct
+
+// A struct that contains itself by value has infinite size. Sizing or instantiating it used to
+// stack-overflow the MIR layout pass — a compiler crash (exit 127) on a plausible mistake. Now it
+// is a clean compile error at the definition; store the recursive field behind a pointer (`*List`)
+// to give it a fixed size and break the cycle, as in C/Rust.
+struct List {
+    head: i32,
+    tail: List,
+}
+
+fn main() -> i32 {
+    return 0;
+}

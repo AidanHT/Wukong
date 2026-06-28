@@ -154,6 +154,14 @@ static CATALOG: &[Explanation] = &[
          literals adapt to an annotation, but typed values must match exactly."
     ),
     entry!(
+        "E0402",
+        "recursive struct has infinite size",
+        "A struct contains itself by value — directly (`struct S { x: S }`) or through a chain of \
+         structs — so its size would be infinite and the compiler cannot lay it out. Store the \
+         recursive field behind a pointer (e.g. `*S`), which has a fixed size and breaks the cycle, \
+         as in C or Rust."
+    ),
+    entry!(
         "E0501",
         "tensor rank mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
