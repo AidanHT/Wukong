@@ -1336,7 +1336,7 @@ impl FnLowerer<'_> {
                     MirType::I32
                 }
             }
-            Array { elem, len } => match const_usize_expr(len, self.interner) {
+            Array { elem, len } => match const_usize_expr(len, self.interner, &self.sema.consts) {
                 Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
                 None => MirType::Ptr,
             },
@@ -1900,7 +1900,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return None;
         }
         Some((*v, end, body))
@@ -4662,7 +4662,7 @@ impl FnLowerer<'_> {
                             ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
                         ) =>
                     {
-                        match (mir_ty_of_ast(t, self.interner), self.expr_mir(e)) {
+                        match (mir_ty_of_ast(t, self.interner, &self.sema.consts), self.expr_mir(e)) {
                             (MirType::Array(ae, n), MirType::Array(re, _))
                                 if !matches!(*ae, MirType::Array(..))
                                     && matches!(*re, MirType::Array(..)) =>
@@ -4677,7 +4677,7 @@ impl FnLowerer<'_> {
                     // `mir_ty_of_ast` falls back to `i32`, under-allocating the slot so a later
                     // `p.f = …` GEPs off an `i32` and emits MIR the verifier/Cranelift reject (an ICE).
                     (Some(t), None) => self.mir_ty_of_ann(t),
-                    (Some(t), _) => mir_ty_of_ast(t, self.interner),
+                    (Some(t), _) => mir_ty_of_ast(t, self.interner, &self.sema.consts),
                     (None, Some(e)) => self.expr_mir(e),
                     (None, None) => MirType::I32,
                 };
@@ -6092,7 +6092,7 @@ impl FnLowerer<'_> {
     fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -6211,7 +6211,7 @@ impl FnLowerer<'_> {
             return false;
         };
         // Only `0..n`; a non-zero start would need a pointer/length shift the call does not do.
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -6533,7 +6533,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -6596,7 +6596,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -6711,7 +6711,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return None;
         }
         let Pattern {
@@ -7600,7 +7600,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(r_start, self.interner) != Some(0) {
+        if const_usize_expr(r_start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -7632,7 +7632,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(j_start, self.interner) != Some(0) {
+        if const_usize_expr(j_start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -12747,7 +12747,7 @@ fn mir_ty(ty: &Ty) -> MirType {
     }
 }
 
-fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
+fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner, consts: &HashMap<Symbol, Expr>) -> MirType {
     use ast::TypeKind::*;
     match &t.kind {
         Path(p) => {
@@ -12757,14 +12757,14 @@ fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
                 None => MirType::I32,
             }
         }
-        Array { elem, len } => match const_usize_expr(len, interner) {
-            // A literal-length array lowers to an array type; otherwise fall back to an opaque ptr.
-            Some(n) => MirType::Array(Box::new(mir_ty_of_ast(elem, interner)), n),
+        Array { elem, len } => match const_usize_expr(len, interner, consts) {
+            // A literal- or const-length array lowers to an array type; otherwise an opaque ptr.
+            Some(n) => MirType::Array(Box::new(mir_ty_of_ast(elem, interner, consts)), n),
             None => MirType::Ptr,
         },
         Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
         Vector { elem, lanes } => {
-            let e = mir_ty_of_ast(elem, interner);
+            let e = mir_ty_of_ast(elem, interner, consts);
             MirType::Vec(Box::new(e), *lanes)
         }
         Unit => MirType::Void,
@@ -12772,10 +12772,29 @@ fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
     }
 }
 
-/// Evaluate a compile-time array length that is a plain integer literal.
-fn const_usize_expr(e: &Expr, interner: &Interner) -> Option<u32> {
+/// Evaluate a compile-time array length: a plain integer literal, or a single-segment path naming a
+/// top-level `const` whose initializer is itself such a length (so `const N: usize = 4; [i32; N]`
+/// sizes the array). Mirrors sema's `eval_usize` exactly — the two must agree on the length, else
+/// the alloca'd slot size desyncs from sema's index-bounds checks. The depth bound guards a cyclic
+/// const initializer (also rejected by sema's `check_recursive_consts`).
+fn const_usize_expr(e: &Expr, interner: &Interner, consts: &HashMap<Symbol, Expr>) -> Option<u32> {
+    const_usize_depth(e, interner, consts, 0)
+}
+
+fn const_usize_depth(
+    e: &Expr,
+    interner: &Interner,
+    consts: &HashMap<Symbol, Expr>,
+    depth: u32,
+) -> Option<u32> {
+    if depth > 64 {
+        return None;
+    }
     match &e.kind {
         ExprKind::Int(s) => Some(parse_int(interner.resolve(*s)) as u32),
+        ExprKind::Path(p) if p.is_single() => consts
+            .get(&p.first().sym)
+            .and_then(|init| const_usize_depth(init, interner, consts, depth + 1)),
         _ => None,
     }
 }
