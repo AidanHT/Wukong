@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0501
+module tests.fail.const_arith_index_oob
+
+// A constant-*arithmetic* index must satisfy the same compile-time bounds check as a literal one.
+// The index evaluator only folded a bare literal (and unary minus), returning None for any binary
+// expression, so `xs[2 + 3]` slipped past the bounds check that `xs[5]` catches — then the optimizer
+// folded `2 + 3` to 5 and the out-of-bounds access reached the backend (the interpreter traps while
+// native reads past the buffer: a divergence). The evaluator now folds constant integer arithmetic.
+fn main() -> i32 {
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let v: f32 = xs[2 + 3];
+    return v as i32;
+}
