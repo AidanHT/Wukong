@@ -9565,12 +9565,24 @@ impl FnLowerer<'_> {
     fn lower_bool_cond(&mut self, cond: &Expr) -> ValueId {
         let v = self.lower_expr(cond);
         let ty = self.expr_mir(cond);
-        if ty.is_float() {
+        if ty == MirType::I1 {
+            // Already a boolean (a comparison result — the common case). Pass through unchanged.
+            v
+        } else if ty.is_float() {
             let zero = self
                 .builder
                 .build(ty.clone(), Op::ConstFloat(0.0, ty.clone()));
             self.builder
                 .build(MirType::I1, Op::Cmp(CmpOp::Fone, v, zero))
+        } else if ty.is_int() {
+            // A non-bool integer condition (`if 5`, `if x` for `x: i32`): C-like truthiness, nonzero
+            // is true. Normalize to `cond != 0` -> i1 so `cond_br` never receives a wider integer.
+            // The verifier accepts that at -O0 but mem2reg rejects it at -O2 ("cond_br condition has
+            // type i32 but expected i1") — a latent compiler crash at -O2 on a program the front-end
+            // accepts. The bool/i1 path above is untouched, so the comparison-condition corpus is
+            // unaffected.
+            let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
+            self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
         } else {
             v
         }

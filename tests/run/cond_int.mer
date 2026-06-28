@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+module tests.run.cond_int
+
+// A non-bool integer used as a boolean condition: C-like truthiness, where nonzero is true. The
+// condition is normalized to `cond != 0` (an i1) so `cond_br` never receives a wider integer — which
+// the MIR verifier accepts at -O0 but mem2reg rejects at -O2 ("cond_br condition has type i32 but
+// expected i1"), a latent compiler crash. This guards both opt levels and interp/native agreement
+// for `if` and `while` over an integer condition.
+fn main() -> i32 {
+    let x: i32 = 5;
+    if x {
+        print(1);
+    } else {
+        print(0);
+    } // 5 is truthy -> 1
+
+    let z: i32 = 0;
+    if z {
+        print(1);
+    } else {
+        print(0);
+    } // 0 is falsy -> 0
+
+    let mut n: i32 = 3;
+    let mut count: i32 = 0;
+    while n {
+        n = n - 1;
+        count = count + 1;
+    } // while on an integer condition
+    print(count); // -> 3
+    return 0;
+}
