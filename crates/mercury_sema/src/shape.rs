@@ -426,6 +426,25 @@ impl Sema<'_> {
         for ix in indices {
             self.type_expr(ix);
         }
+        // Indexing `base[i]` requires an indexable base. A *definitely* non-indexable base — a scalar
+        // (`x[0]` on `x: i32`), a struct (`s[1]`), or a tuple (`t[1]`) — is a type error, not an
+        // unmodeled construct: it type-checked through the lenient fallthrough below, then mir_build
+        // GEPed off a non-pointer, which the verifier/Cranelift reject (an ICE for a scalar) or which
+        // the two backends lower divergently (a by-pointer tuple/struct base: interp 0, native the
+        // real element). Reject those three; an `Unknown`/`Ref`/other base stays lenient (it may be an
+        // indexable construct sema does not yet model, and `Unknown` unifies with anything).
+        if matches!(base_ty, Ty::Scalar(_) | Ty::Named(_) | Ty::Tuple(_)) {
+            let disp = base_ty.display(self.interner);
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "cannot index a value of type `{disp}` with `[..]`; only arrays, tensors, \
+                     slices, and pointers are indexable (use `.field` / `.0` for a struct / tuple)"
+                ),
+            );
+            return Ty::Unknown;
+        }
         match base_ty {
             Ty::Tensor { elem, shape, .. } => {
                 if indices.len() != shape.rank() {
