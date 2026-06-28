@@ -274,16 +274,20 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
     })
 }
 
-/// Size in bytes of a MIR type (for `gep` scaling and stack-slot sizing).
-fn size_of(t: &MirType) -> u32 {
-    match t {
+/// Size in bytes of a MIR type (for `gep` scaling and stack-slot sizing). Returns `None` when the
+/// layout does not fit in a `u32` byte count — an oversized array/vector extent (e.g.
+/// `[i32; 999999999999]`) whose `elem_size * count` overflows. Callers turn that into a clean
+/// "type too large to lay out" compiler error via [`FnTranslator::size_of_or_err`] instead of
+/// letting the `u32` multiply overflow-panic.
+fn size_of(t: &MirType) -> Option<u32> {
+    Some(match t {
         MirType::I1 | MirType::I8 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
-        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e) * n,
+        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e)?.checked_mul(*n)?,
         MirType::Void => 0,
-    }
+    })
 }
 
 fn int_cc(op: CmpOp) -> IntCC {
@@ -360,6 +364,10 @@ struct FnTranslator<'a> {
     /// Pre-declared FuncRefs for callees and runtime imports in this function.
     func_refs: &'a HashMap<Symbol, FuncRef>,
     rt_refs: &'a HashMap<&'static str, FuncRef>,
+    /// First "type too large to lay out" overflow seen while lowering this function, if any.
+    /// Recorded (instead of panicking) so `populate_module` can abort with a clean error before
+    /// the half-built function is finalized/defined. See [`FnTranslator::size_of_or_err`].
+    layout_err: Option<String>,
 }
 
 impl<'a> FnTranslator<'a> {
@@ -369,6 +377,26 @@ impl<'a> FnTranslator<'a> {
 
     fn set(&mut self, v: ValueId, cv: Value) {
         self.vmap[v.0 as usize] = Some(cv);
+    }
+
+    /// Byte size of `ty` for stack-slot sizing / `gep` scaling. On an unrepresentable (overflowing)
+    /// layout it records a clean compiler error and returns a harmless 1-byte placeholder so the
+    /// half-built Cranelift IR stays well-formed; `populate_module` checks `layout_err` right after
+    /// lowering and aborts the compile before this function is defined. This is why an oversized
+    /// type (e.g. `[i32; 999999999999]`) yields a diagnostic + nonzero exit, not a Rust panic.
+    fn size_of_or_err(&mut self, ty: &MirType) -> u32 {
+        match size_of(ty) {
+            Some(b) => b,
+            None => {
+                if self.layout_err.is_none() {
+                    self.layout_err = Some(format!(
+                        "type `{}` is too large to lay out: byte size exceeds 2^32 (4 GiB)",
+                        ty.display()
+                    ));
+                }
+                1
+            }
+        }
     }
 
     fn ty_of(&self, v: ValueId) -> &MirType {
@@ -530,7 +558,7 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             Op::Alloca(ty) => {
-                let bytes = size_of(ty).max(1);
+                let bytes = self.size_of_or_err(ty).max(1);
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     bytes,
@@ -598,7 +626,8 @@ impl<'a> FnTranslator<'a> {
             Op::Gep { ptr, index, elem } => {
                 let base = self.val(*ptr);
                 let idx = self.ptr_int(*index);
-                let scaled = self.builder.ins().imul_imm(idx, size_of(elem) as i64);
+                let scale = self.size_of_or_err(elem) as i64;
+                let scaled = self.builder.ins().imul_imm(idx, scale);
                 self.builder.ins().iadd(base, scaled)
             }
             Op::Call { func, args } => match self.lower_call(*func, args) {
@@ -2755,8 +2784,15 @@ fn populate_module<M: Module>(
                 blocks,
                 func_refs: &func_refs,
                 rt_refs: &rt_refs,
+                layout_err: None,
             };
             t.translate();
+            // A type whose byte layout overflows `u32` is recorded as a clean error during lowering
+            // rather than panicking; abort now, before this half-built function is finalized/defined
+            // (the `?` at each `populate_module` call site surfaces it as `error: <msg>`, exit 1).
+            if let Some(e) = t.layout_err.take() {
+                return Err(e);
+            }
             t.builder.finalize();
         }
         let fid = ids[&f.name];
