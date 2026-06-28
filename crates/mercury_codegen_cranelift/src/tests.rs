@@ -846,6 +846,34 @@ fn differential_int_math_intrinsics() {
     }
 }
 
+/// `fmax`/`fmin` on integer *variables*. Like `sqrt`/`exp`/`pow`, they promote an int operand to
+/// `f32` (the float compare-and-select). Previously their lowering used a bare `lower_expr` (no
+/// coercion), so the float `Cmp(Fogt/Folt)` ran on an `i32` operand: MIR the verifier and Cranelift
+/// reject on native, while the interpreter computed an integer max and returned silently — a backend
+/// divergence on `fmax(int, int)`. Pins native==interp at every `-O`; the float forms are unchanged.
+#[test]
+fn differential_fmax_fmin_int() {
+    let cases = [
+        ("fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmax(a, b) as i32; }", 5),
+        ("fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmin(a, b) as i32; }", 3),
+        ("fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmax(a, b) as i32; }", 2),
+        ("fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmin(a, b) as i32; }", -7),
+        // float forms unchanged (the operands were already f32).
+        ("fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmax(a, b) as i32; }", 5),
+        ("fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmin(a, b) as i32; }", 3),
+        // an integer literal already coerced before; still does.
+        ("fn main() -> i32 { return fmax(5, 3) as i32; }", 5),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "fmax/fmin-int native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "fmax/fmin-int wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Richer `match` patterns: or-patterns `1 | 2 | 3`, half-open `lo..hi` and inclusive `lo..=hi`
 /// ranges, and enum-variant patterns `Color::Red` (compared by discriminant). Each lowers to a
 /// pure value test (an OR of equalities / a range conjunction / a discriminant equality), so native

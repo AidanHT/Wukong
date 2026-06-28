@@ -11405,8 +11405,14 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let a = self.lower_expr(&args[0]);
-                let b = self.lower_expr(&args[1]);
+                // Coerce each operand to the (float) result type, exactly like sqrt/exp/pow above.
+                // Using a bare `lower_expr` here left an integer operand at its int type, then the
+                // float `Cmp(Fogt/Folt)` below ran on `i32` — MIR the verifier and Cranelift reject
+                // (the native backend errored out) while the interpreter computed an integer max and
+                // returned silently: a backend divergence on `fmax(int, int)`. `lower_math_arg`
+                // inserts the int→float coercion so both backends run the identical float compare.
+                let a = self.lower_math_arg(&args[0], &rty);
+                let b = self.lower_math_arg(&args[1], &rty);
                 let pred = if matches!(op, MathIntrinsic::Fmax) {
                     CmpOp::Fogt
                 } else {
