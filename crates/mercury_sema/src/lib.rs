@@ -1622,9 +1622,65 @@ impl Sema<'_> {
                     self.pop_scope();
                     result = join(result, t);
                 }
+                // Exhaustiveness: a value-producing `match` with no catch-all that provably misses a
+                // case would synthesize a typed-zero default in mir_build — a silent wrong answer
+                // both backends share, or invalid MIR for an aggregate result. Reject it (E0405),
+                // like Rust. A unit/statement match (result is `()`) needs no value, and an unmodeled
+                // scrutinee stays lenient (handled inside `match_is_provably_nonexhaustive`).
+                if !matches!(result, Ty::Unit | Ty::Unknown | Ty::Error)
+                    && self.match_is_provably_nonexhaustive(&scrut_ty, arms)
+                {
+                    self.error(
+                        e.span,
+                        "E0405",
+                        "non-exhaustive `match`: no arm covers all possible values; add a `_` arm \
+                         (or cover every enum variant / both `bool` cases)"
+                            .to_string(),
+                    );
+                }
                 result
             }
             ExprKind::SizeOf(_) | ExprKind::AlignOf(_) => Ty::Scalar(Scalar::Usize),
+        }
+    }
+
+    /// Whether `arms` provably fail to cover every value of `scrut_ty` (used by E0405). Conservative:
+    /// returns `true` only when incompleteness is *certain*, so a valid match is never rejected. A
+    /// guard-less `_`/identifier arm covers everything (checked first). Otherwise: an `enum` is
+    /// covered iff every variant appears in a guard-less variant arm; a `bool` iff both `true` and
+    /// `false` appear; any other scalar (`int`/`char`/`usize` — an effectively unbounded domain)
+    /// needs a catch-all. Unmodeled scrutinees (tuple/array/tensor/struct/pointer/unknown/…) stay
+    /// lenient (`false`), matching sema's overall leniency. Guarded arms never prove coverage.
+    fn match_is_provably_nonexhaustive(&self, scrut_ty: &Ty, arms: &[MatchArm]) -> bool {
+        if arms.iter().any(arm_is_catch_all) {
+            return false;
+        }
+        match scrut_ty {
+            Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
+                Some(DefKind::Enum(variants)) => {
+                    let mut covered = HashSet::new();
+                    for a in arms {
+                        if a.guard.is_none() {
+                            collect_variant_names(&a.pat, &mut covered);
+                        }
+                    }
+                    // Only reason about coverage when the arms actually use variant patterns; a match
+                    // by raw discriminant (or some unmodeled spelling) stays lenient.
+                    !covered.is_empty() && variants.iter().any(|(v, _)| !covered.contains(v))
+                }
+                _ => false, // a non-enum `Named` (struct / generic / forward ref): lenient
+            },
+            Ty::Scalar(Scalar::Bool) => {
+                let (mut t, mut f) = (false, false);
+                for a in arms {
+                    if a.guard.is_none() {
+                        collect_bool_cases(&a.pat, &mut t, &mut f);
+                    }
+                }
+                (t || f) && !(t && f) // uses bool patterns but misses one case
+            }
+            Ty::Scalar(_) => true, // int/char/usize/…: unbounded, and no catch-all reached here
+            _ => false,
         }
     }
 }
@@ -1761,6 +1817,32 @@ fn expr_diverges(e: &Expr) -> bool {
 
 fn arm_is_catch_all(a: &MatchArm) -> bool {
     a.guard.is_none() && matches!(a.pat.kind, PatKind::Wildcard | PatKind::Ident(_))
+}
+
+/// Record every enum-variant name a (guard-less) pattern covers, flattening or-patterns. A `Path`
+/// pattern's last segment is the variant name (`Color::Red` → `Red`); other pattern kinds contribute
+/// nothing. Used by `match_is_provably_nonexhaustive` for enum coverage.
+fn collect_variant_names(p: &Pattern, out: &mut HashSet<Symbol>) {
+    match &p.kind {
+        PatKind::Path(path) => {
+            if let Some(seg) = path.segments.last() {
+                out.insert(seg.sym);
+            }
+        }
+        PatKind::Or(alts) => alts.iter().for_each(|a| collect_variant_names(a, out)),
+        _ => {}
+    }
+}
+
+/// Record whether a (guard-less) pattern covers the `true` and/or `false` case, flattening
+/// or-patterns. Used by `match_is_provably_nonexhaustive` for `bool` coverage.
+fn collect_bool_cases(p: &Pattern, t: &mut bool, f: &mut bool) {
+    match &p.kind {
+        PatKind::Bool(true) => *t = true,
+        PatKind::Bool(false) => *f = true,
+        PatKind::Or(alts) => alts.iter().for_each(|a| collect_bool_cases(a, t, f)),
+        _ => {}
+    }
 }
 
 /// Whether `b` contains a `break` anywhere (recursively). Used to decide whether a `loop` is

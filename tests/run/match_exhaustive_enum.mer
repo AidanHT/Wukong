@@ -1,0 +1,38 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+module tests.run.match_exhaustive_enum
+
+enum Color { Red, Green, Blue }
+
+// An EXHAUSTIVE enum `match` with NO `_` catch-all: every arm is a conditional discriminant test, so
+// mir_build still emits the "no arm matched" fallthrough block structurally — but it is dynamically
+// dead (one variant always matches at runtime). That block now terminates in `Unreachable` instead of
+// branching a zero default into the merge, so it stays well-typed at every opt level and both backends
+// agree. (A *non*-exhaustive value match is rejected at compile time by sema, E0405 — see
+// tests/fail/match_nonexhaustive.mer.) Also covers an exhaustive `bool` match (both cases, no `_`).
+fn rank(c: Color) -> i32 {
+    return match c {
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Blue => 3,
+    };
+}
+
+fn pick(b: bool) -> i32 {
+    return match b {
+        true => 1,
+        false => 0,
+    };
+}
+
+fn main() -> i32 {
+    print(rank(Color::Red));   // 1
+    print(rank(Color::Green)); // 2
+    print(rank(Color::Blue));  // 3
+    print(pick(false));        // 0
+    return 0;
+}

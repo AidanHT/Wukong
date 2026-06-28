@@ -188,6 +188,16 @@ static CATALOG: &[Explanation] = &[
          terminate. Break the cycle so each const's value is defined in terms of already-known values."
     ),
     entry!(
+        "E0405",
+        "non-exhaustive match",
+        "A `match` used in value position does not cover every possible value of the scrutinee, and \
+         no arm is an unconditional catch-all. The value it would produce when no arm matches is an \
+         injected zero default — a silent wrong answer (or, for a tuple/struct result, invalid \
+         code). Add a `_ => …` arm (or, for an `enum`, an arm for every remaining variant; for a \
+         `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded arms (`if …`) \
+         do not count toward coverage because their guard may be false."
+    ),
+    entry!(
         "E0501",
         "tensor rank mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
