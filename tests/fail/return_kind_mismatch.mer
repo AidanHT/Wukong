@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0401
+module tests.fail.return_kind_mismatch
+
+// Returning a pointer where the signature declares a scalar builds a mismatched return ABI: the
+// native backend ICEs ("result i64 must match i32") while the interpreter silently adapts — a
+// backend divergence. The return value's kind is now checked against the declared return type.
+fn addr(a: i32) -> i32 {
+    return &a; // `&a` is `*i32`, but the function returns a scalar `i32`
+}
+
+fn main() -> i32 {
+    return addr(5);
+}

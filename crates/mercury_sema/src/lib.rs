@@ -393,6 +393,21 @@ impl Sema<'_> {
             let mut dims = HashMap::new();
             self.unify(&ret, val_ty, &mut dims, span);
         }
+        // Returning a pointer/aggregate where a scalar is declared (or vice versa) is not a numeric
+        // coercion — the native backend builds a mismatched return ABI and ICEs (e.g. `return &a`
+        // from `-> i32`), while the interpreter silently adapts: a divergence.
+        if self.scalar_aggregate_clash(&ret, val_ty) {
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "type mismatch: this function returns `{}`, but a value of type `{}` is \
+                     returned here",
+                    ret.display(self.interner),
+                    val_ty.display(self.interner)
+                ),
+            );
+        }
     }
 
     /// An elementwise binary operator requires its operand *shapes* to agree: adding two tensors of
@@ -425,6 +440,18 @@ impl Sema<'_> {
             ),
             _ => false,
         }
+    }
+
+    /// True when `a` and `b` are concrete types of incompatible *kind* — one a scalar/vector, the
+    /// other a pointer/reference/array/tuple. Such a pairing is never a numeric coercion: it slips
+    /// past the lenient checks and then ICEs the native backend (an i64 pointer marshalled into a
+    /// 32-bit slot) or silently reinterprets the bytes — a backend divergence. Mirrors the
+    /// call-argument cross-kind arm in `unify`. Unknown/Error/Named(generic)/Tensor stay lenient.
+    fn scalar_aggregate_clash(&self, a: &Ty, b: &Ty) -> bool {
+        let scalarish = |t: &Ty| matches!(t, Ty::Scalar(_) | Ty::Vector { .. });
+        let pointerish =
+            |t: &Ty| matches!(t, Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_));
+        (scalarish(a) && pointerish(b)) || (pointerish(a) && scalarish(b))
     }
 
     /// Validate an `as` cast. The cast operator was an unchecked reinterpret between *any* two types:
@@ -575,8 +602,24 @@ impl Sema<'_> {
                 self.bind_pattern(pat, &bound);
             }
             StmtKind::Assign { target, value, .. } => {
-                self.type_expr(target);
-                self.type_expr(value);
+                let target_ty = self.type_expr(target);
+                let value_ty = self.type_expr(value);
+                // Assigning a pointer/aggregate into a scalar place (or vice versa) reinterprets the
+                // bits — `x = p` for `x: i32`, `p: *i32` stores a truncated address, which the
+                // interpreter and native backend disagree on. Reject the kind clash; numeric
+                // coercion across scalars stays lenient (handled at lowering, like `let`).
+                if self.scalar_aggregate_clash(&target_ty, &value_ty) {
+                    self.error(
+                        value.span,
+                        "E0401",
+                        format!(
+                            "type mismatch: cannot assign a value of type `{}` to a place of type \
+                             `{}`",
+                            value_ty.display(self.interner),
+                            target_ty.display(self.interner)
+                        ),
+                    );
+                }
             }
             StmtKind::Expr(e) => {
                 self.type_expr(e);
