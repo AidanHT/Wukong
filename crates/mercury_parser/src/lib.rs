@@ -568,7 +568,11 @@ impl<'a> Parser<'a> {
         let start = self.span();
         let op = match self.kind() {
             T::Minus => Some(UnOp::Neg),
-            T::Bang => Some(UnOp::Not),
+            // `!` and `~` both lower to `UnOp::Not` (MIR `Op::Not`), which is bitwise complement on
+            // an integer and logical negation on a `bool` (the result is masked to its width, so
+            // `!true == false`) — the Rust-style polymorphic `!`. `~` is the conventional spelling
+            // for the integer bitwise form; it is an alias here.
+            T::Bang | T::Tilde => Some(UnOp::Not),
             T::Star => Some(UnOp::Deref),
             T::Amp => {
                 self.bump();

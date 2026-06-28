@@ -1086,6 +1086,34 @@ fn differential_match_exhaustiveness() {
     }
 }
 
+/// Bitwise complement `~x`. The parser now accepts `~` (previously E0202 "found ~") as a prefix
+/// operator aliased to `UnOp::Not` — bitwise on an integer, logical on a `bool` (masked to width).
+/// Both backends share `Op::Not`, so it is bit-exact; pins the values and that `!`/`~` agree.
+#[test]
+fn differential_bitwise_not() {
+    let cases = [
+        ("fn main() -> i32 { let x: i32 = 5; return ~x; }", -6),
+        ("fn main() -> i32 { let x: i32 = 0; return ~x; }", -1),
+        // De Morgan: ~(a & b) == (~a) | (~b).
+        ("fn main() -> i32 { let a: i32 = 12; let b: i32 = 10; \
+          if ~(a & b) == (~a) | (~b) { return 1; } else { return 0; } }", 1),
+        // width masking: ~5 as u8 = 0xFA = 250.
+        ("fn main() -> i32 { let x: u8 = 5; let y: u8 = ~x; return y as i32; }", 250),
+        // composed with arithmetic: ~3 + 10 = -4 + 10 = 6.
+        ("fn main() -> i32 { let x: i32 = 3; return ~x + 10; }", 6),
+        // `~` and `!` are the same op on an integer.
+        ("fn main() -> i32 { let x: i32 = 42; if ~x == !x { return 7; } else { return 0; } }", 7),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "bitwise-not native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "bitwise-not wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
