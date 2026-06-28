@@ -1739,12 +1739,15 @@ impl Sema<'_> {
                     self.check_binop_shapes(&result, &t, arm.body.span);
                     result = join(result, t);
                 }
-                // Exhaustiveness: a value-producing `match` with no catch-all that provably misses a
-                // case would synthesize a typed-zero default in mir_build — a silent wrong answer
-                // both backends share, or invalid MIR for an aggregate result. Reject it (E0405),
-                // like Rust. A unit/statement match (result is `()`) needs no value, and an unmodeled
-                // scrutinee stays lenient (handled inside `match_is_provably_nonexhaustive`).
-                if !matches!(result, Ty::Unit | Ty::Unknown | Ty::Error)
+                // Exhaustiveness: a `match` with no catch-all that provably misses a case is rejected
+                // (E0405), like Rust. A *value* match would synthesize a typed-zero default in mir_build
+                // (a silent wrong answer, or invalid MIR for an aggregate); a *statement* / empty match
+                // still lowers a value-merge whose "no arm matched" fallthrough is `Unreachable`, which
+                // the interpreter traps (exit 1) but the native backend hits as an illegal instruction
+                // (a backend divergence) — so the check must NOT be gated on the result type being a
+                // value. Skip only an `Error` result (its arm already reported, avoid cascading); an
+                // unmodeled scrutinee stays lenient inside `match_is_provably_nonexhaustive`.
+                if !matches!(result, Ty::Error)
                     && self.match_is_provably_nonexhaustive(&scrut_ty, arms)
                 {
                     self.error(
@@ -1771,6 +1774,20 @@ impl Sema<'_> {
     fn match_is_provably_nonexhaustive(&self, scrut_ty: &Ty, arms: &[MatchArm]) -> bool {
         if arms.iter().any(arm_is_catch_all) {
             return false;
+        }
+        if arms.is_empty() {
+            // An empty `match x {}` covers nothing, so it is non-exhaustive for any modeled, inhabited
+            // scrutinee (Mercury has no uninhabited types). The `Ty::Scalar(_)` case below already
+            // catches an empty int/char match; this also catches an empty enum / `bool` match (whose
+            // coverage arms below would read "no cases seen" as lenient). Unmodeled scrutinees stay
+            // lenient, matching the rest of this function.
+            return match scrut_ty {
+                Ty::Named(n) => {
+                    matches!(self.defs.lookup(*n).map(|d| &d.kind), Some(DefKind::Enum(_)))
+                }
+                Ty::Scalar(_) => true,
+                _ => false,
+            };
         }
         match scrut_ty {
             Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
@@ -2291,6 +2308,31 @@ mod tests {
         // A *suffixed* literal still pins its type and must conflict.
         let (diags, _) = analyze("fn f() { let x: f64 = -1.5f32; }");
         assert!(diags.iter().any(|d| d.code == Some("E0401")));
+    }
+
+    #[test]
+    fn match_nonexhaustive_in_all_positions() {
+        // A provably-non-exhaustive match is E0405 in EVERY position — value, statement (unit arms),
+        // and empty — because the "no arm matched" fallthrough lowers to `Unreachable`, which the
+        // interpreter and native backend trap differently (a divergence). Was value-position only.
+        for src in [
+            "fn f(n: i32) { match n { 0 => {}, 1 => {} } }",            // statement, unit arms
+            "fn f(n: i32) -> i32 { let x = match n {}; return x; }",    // empty match
+            "fn f(n: i32) -> i32 { return match n { 0 => 1, 1 => 2 }; }", // value (regression)
+            "enum E { A, B } fn f(e: E) { match e {} }",               // empty enum match
+            "fn f(b: bool) { match b { true => {} } }",                // bool missing a case
+        ] {
+            assert!(errors(src).contains(&"E0405"), "expected E0405 for {src:?}");
+        }
+        // Exhaustive matches stay valid in every position (no false positive).
+        for src in [
+            "fn f(b: bool) { match b { true => {}, false => {} } }",
+            "enum E { A, B, C } fn f(e: E) { match e { E::A => {}, E::B => {}, E::C => {} } }",
+            "fn f(n: i32) { match n { 0 => {}, _ => {} } }",
+            "fn f(n: i32) -> i32 { return match n { 0 => 1, _ => 2 }; }",
+        ] {
+            assert!(!errors(src).contains(&"E0405"), "unexpected E0405 for {src:?}");
+        }
     }
 
     #[test]
