@@ -92,6 +92,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         diags: Vec::new(),
         types: HashMap::new(),
         scopes: Vec::new(),
+        immutable_locals: Vec::new(),
         generics: HashSet::new(),
         ret_ty: Ty::Unit,
         loop_labels: Vec::new(),
@@ -114,6 +115,9 @@ struct Sema<'a> {
     diags: Vec<Diagnostic>,
     types: HashMap<NodeId, Ty>,
     scopes: Vec<HashMap<Symbol, Ty>>,
+    /// Per-scope set of locals bound *immutably* — a `let` without `mut` that has an initializer —
+    /// kept 1:1 with `scopes`. Used to reject reassigning such a binding (`let x = 5; x = 10;`).
+    immutable_locals: Vec<HashSet<Symbol>>,
     generics: HashSet<Symbol>,
     ret_ty: Ty,
     /// The labels of the enclosing loops at the current point (innermost last; `None` for an
@@ -393,6 +397,8 @@ impl Sema<'_> {
         self.generics.clear();
         self.scopes.clear();
         self.scopes.push(HashMap::new());
+        self.immutable_locals.clear();
+        self.immutable_locals.push(HashSet::new());
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
         if self.let_compatible(&ann, &c.value, &vty) {
@@ -417,6 +423,10 @@ impl Sema<'_> {
         self.generics = generic_names(&f.generics);
         self.scopes.clear();
         self.scopes.push(HashMap::new());
+        // Mirror the scope reset for immutability tracking (these reset `scopes` directly instead of
+        // via `push_scope`, so the two stacks would otherwise desync and the check never fires).
+        self.immutable_locals.clear();
+        self.immutable_locals.push(HashSet::new());
         for p in &f.params {
             let ty = self.lower_type(&p.ty);
             self.bind(p.name.sym, ty);
@@ -635,10 +645,27 @@ impl Sema<'_> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.immutable_locals.push(HashSet::new());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.immutable_locals.pop();
+    }
+
+    /// Whether `name` resolves (innermost scope first) to a local bound immutably. A `mut` binding,
+    /// a deferred `let x;` (no initializer — its first assignment is the initialization), a
+    /// parameter, and a global are all *not* immutable here, so none of them are rejected.
+    fn is_immutable_local(&self, name: Symbol) -> bool {
+        for i in (0..self.scopes.len()).rev() {
+            if self.scopes[i].contains_key(&name) {
+                return self
+                    .immutable_locals
+                    .get(i)
+                    .map_or(false, |s| s.contains(&name));
+            }
+        }
+        false
     }
 
     fn bind(&mut self, name: Symbol, ty: Ty) {
@@ -698,7 +725,12 @@ impl Sema<'_> {
 
     fn type_stmt(&mut self, s: &Stmt) {
         match &s.kind {
-            StmtKind::Let { pat, ty, init, .. } => {
+            StmtKind::Let {
+                pat,
+                mutable,
+                ty,
+                init,
+            } => {
                 let init_ty = init.as_ref().map(|e| self.type_expr(e));
                 let ann_ty = ty.as_ref().map(|t| self.lower_type(t));
                 let bound = match (&ann_ty, &init_ty) {
@@ -727,10 +759,43 @@ impl Sema<'_> {
                     (None, None) => Ty::Unknown,
                 };
                 self.bind_pattern(pat, &bound);
+                // Track immutability for a simple binding: a `let` without `mut` that has an
+                // initializer is fully initialized at the binding, so a later `x = …` is a
+                // reassignment to reject. A `mut` binding (or a deferred `let x;` with no
+                // initializer, whose first assignment is its initialization) is not tracked; a `mut`
+                // rebinding also clears a prior immutable mark in this scope (shadowing). Tuple /
+                // wildcard patterns stay lenient.
+                if let PatKind::Ident(s) = &pat.kind {
+                    if let Some(set) = self.immutable_locals.last_mut() {
+                        if !*mutable && init.is_some() {
+                            set.insert(*s);
+                        } else {
+                            set.remove(s);
+                        }
+                    }
+                }
             }
             StmtKind::Assign { target, value, .. } => {
                 let target_ty = self.type_expr(target);
                 let value_ty = self.type_expr(value);
+                // Reassigning an immutable binding (`let x = 5; x = 10;`): the language requires
+                // `mut` for reassignment, but it was never enforced. Reject a direct assignment to
+                // an immutable local (a single-name target). Mutating *through* an immutable binding
+                // (`a[i] = …`, `s.f = …`, `*p = …`) stays lenient — those are place projections, not
+                // a rebinding, so this conservative check never over-fires.
+                if let ExprKind::Path(p) = &target.kind {
+                    if p.is_single() && self.is_immutable_local(p.first().sym) {
+                        let nm = self.sym_str(p.first().sym).to_string();
+                        self.error(
+                            target.span,
+                            "E0304",
+                            format!(
+                                "cannot assign twice to immutable binding `{nm}`; add `mut` to its \
+                                 `let` to allow reassignment"
+                            ),
+                        );
+                    }
+                }
                 // Assigning a pointer/aggregate into a scalar place (or vice versa) reinterprets the
                 // bits — `x = p` for `x: i32`, `p: *i32` stores a truncated address, which the
                 // interpreter and native backend disagree on. Reject the kind clash; numeric
