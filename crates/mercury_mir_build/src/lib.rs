@@ -12649,6 +12649,27 @@ impl FnLowerer<'_> {
         if from == to {
             return v;
         }
+        // Casting a numeric value to `bool` is C-like truthiness — `x != 0` — NOT a low-bit
+        // truncation. Truncating made `2 as bool` *false* (its low bit is 0) while the condition path
+        // `if 2` is *true* (`lower_bool_cond` already compares `!= 0`); this aligns the two. Emitting
+        // the compare here yields an `i1` that both backends simply run as an `Op::Cmp`, so it is
+        // bit-exact with no backend change. `NaN as bool` is true, matching `if nan` (the same `Fone`).
+        if to == MirType::I1 && (from.is_int() || from.is_float()) {
+            let (zero, pred) = if from.is_float() {
+                (
+                    self.builder
+                        .build(from.clone(), Op::ConstFloat(0.0, from.clone())),
+                    CmpOp::Fone,
+                )
+            } else {
+                (
+                    self.builder
+                        .build(from.clone(), Op::ConstInt(0, from.clone())),
+                    CmpOp::Ne,
+                )
+            };
+            return self.builder.build(MirType::I1, Op::Cmp(pred, v, zero));
+        }
         // For a float→int cast the signed/unsigned choice comes from the TARGET integer (`x as i32`
         // is signed → fptosi); for every other direction (int→float, int widening) it comes from the
         // source operand. Using the operand's signedness for float→int picks fptoui, where the native

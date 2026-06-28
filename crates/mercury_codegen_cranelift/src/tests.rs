@@ -1086,6 +1086,34 @@ fn differential_match_exhaustiveness() {
     }
 }
 
+/// Casting a numeric value to `bool` is C-like truthiness (`x != 0`), not a low-bit truncation: `2
+/// as bool` used to be `false` (low bit 0) while `if 2` is `true`. Now both compare `!= 0`. Lowered
+/// to an `Op::Cmp`, so both backends run it identically. Pins nonzero→true, zero→false, NaN/float→0,
+/// and the bool→int direction (regression).
+#[test]
+fn differential_cast_to_bool() {
+    let cases = [
+        ("fn main() -> i32 { let x: i32 = 0; return (x as bool) as i32; }", 0),
+        ("fn main() -> i32 { let x: i32 = 2; return (x as bool) as i32; }", 1), // was 0 under truncation
+        ("fn main() -> i32 { let x: i32 = 255; return (x as bool) as i32; }", 1),
+        ("fn main() -> i32 { let x: i32 = 0 - 4; return (x as bool) as i32; }", 1), // negative is nonzero
+        ("fn main() -> i32 { let x: f32 = 0.5; return (x as bool) as i32; }", 1),
+        ("fn main() -> i32 { let x: f32 = 0.0; return (x as bool) as i32; }", 0),
+        // the cast now agrees with the condition path on the same value.
+        ("fn main() -> i32 { let x: i32 = 2; if (x as bool) { return 7; } else { return 0; } }", 7),
+        // regression: bool -> int is unchanged.
+        ("fn main() -> i32 { let b: bool = true; return (b as i32) + 10; }", 11),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "cast-to-bool native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "cast-to-bool wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Bitwise complement `~x`. The parser now accepts `~` (previously E0202 "found ~") as a prefix
 /// operator aliased to `UnOp::Not` — bitwise on an integer, logical on a `bool` (masked to width).
 /// Both backends share `Op::Not`, so it is bit-exact; pins the values and that `!`/`~` agree.
