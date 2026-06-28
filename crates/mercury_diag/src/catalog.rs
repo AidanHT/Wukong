@@ -180,6 +180,14 @@ static CATALOG: &[Explanation] = &[
          as in C or Rust."
     ),
     entry!(
+        "E0403",
+        "recursive const initializer",
+        "A `const`'s initializer depends on its own value — directly (`const A: i32 = A + 1;`) or \
+         through a chain of consts (`A` uses `B`, `B` uses `A`). A const must be evaluable at \
+         compile time without referring back to itself; inlining such a cycle would never \
+         terminate. Break the cycle so each const's value is defined in terms of already-known values."
+    ),
+    entry!(
         "E0501",
         "tensor rank mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
