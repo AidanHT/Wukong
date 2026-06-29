@@ -22,8 +22,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
   (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.mer`), and a **top-level
   `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
-  loop bound, const-referencing-const; `tests/run/top_level_const.mer`).
-- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
+  loop bound, **array length in a type** (`let a: [i32; N]`; `tests/run/const_array_length.mer`),
+  const-referencing-const; `tests/run/top_level_const.mer`).
+- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, `char` (a 32-bit Unicode scalar,
+  interconvertible with the integers via `as`; `tests/run/char_type.mer`), and floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
   rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
   with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
@@ -69,8 +71,8 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   still unsupported.
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
-  one-character / `\xHH` / `\u{…}` escapes) lowering to their `u32` Unicode scalar value
-  (`tests/run/char_literals.mer`).
+  one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
+  interconvertible with the integers via `as` (`tests/run/char_literals.mer`, `tests/run/char_type.mer`).
 - **String literals**: `"hello"` materializes its UTF-8 bytes (plus a NUL) into a stack byte buffer,
   typed `*u8`; the escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode. `print`/`println`
   of a `*u8` (a literal or a `let`-bound string) renders the bytes, not
@@ -346,9 +348,14 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   **transcendentals still beat scalar `libm` ~2.5–3×**. Breaking 256-bit needs a hand-written AVX2
   path (how the GEMM family already gets 256-bit — a true AVX2/FMA runtime microkernel). The loop
   vectorizer assumes distinct array parameters do not alias.
-- Array *length* in a type must be an integer literal (symbolic/`const`-expression lengths fall back
-  to an opaque pointer), but matmul *dimensions* may be runtime values — a runtime-dimension matmul
+- Array *length* in a type may be an integer literal or a top-level `const` (resolved through
+  const-to-const chains; `tests/run/const_array_length.mer`); a **symbolic** length (a generic `N`) or
+  a **computed** one (a const whose initializer is an expression, e.g. `const N = 2 + 2`) still falls
+  back to an opaque pointer. matmul *dimensions* may be runtime values — a runtime-dimension matmul
   still dispatches to the GEMM kernel.
+- Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
+  (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
+  wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.mer`).
 - No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
   fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a

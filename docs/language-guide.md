@@ -64,7 +64,10 @@ An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` i
 threading reaches every position that pins a type (a `let`/`const` annotation, a function argument, a
 `return`, a struct-field initializer, and a plain assignment) and **descends into aggregate
 literals**, so a typed buffer can be built straight from literals: `let a: [i8; 2] = [127, 0]`,
-`let t: (u8, u8) = (200, 1)` (`tests/run/aggregate_literal_adapt.mer`). A typed value must match its
+`let t: (u8, u8) = (200, 1)` (`tests/run/aggregate_literal_adapt.mer`). It also descends into a
+**constant binary expression** of literals, so `let v: i64 = 0 - 16` adapts like the unary `-16`
+already did (`tests/run/binary_const_adapt.mer`); the folded value is still range-checked, so
+`let v: i8 = 100 + 100` is rejected. A typed value must match its
 annotation exactly (see error `E0401`). An unsuffixed literal that does not fit the type it adapts to
 is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
@@ -75,8 +78,10 @@ specific type.
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
 (`tests/run/let_destructure.mer`). A top-level **`const` is usable as a value**: its initializer is
-inlined at every use site — in arithmetic, as an array index, as a loop bound, and when one `const`
-references another (`tests/run/top_level_const.mer`).
+inlined at every use site — in arithmetic, as an array index, as a loop bound, as an **array length**
+in a type (`let a: [i32; N]`, including a const-references-const chain;
+`tests/run/const_array_length.mer`), and when one `const` references another
+(`tests/run/top_level_const.mer`).
 
 ## Literals ✅
 
