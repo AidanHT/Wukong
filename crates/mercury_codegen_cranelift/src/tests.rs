@@ -1273,6 +1273,34 @@ fn differential_char_type() {
     }
 }
 
+/// A binary arithmetic/bitwise expression of constant literals adapts to a wider annotated scalar
+/// type (`let v: i64 = 0 - 16`), like the unary-minus and bare-literal forms. Both operands are
+/// retyped to the annotation so the whole expression is lowered at one width — ill-typed MIR (i32
+/// operands, i64 result) would otherwise diverge / be rejected. Only all-constant expressions adapt.
+#[test]
+fn differential_binary_const_adapt() {
+    let cases = [
+        // binary const adapts to i64 (was an i32-vs-i64 mismatch); -16.
+        ("fn main() -> i32 { let v: i64 = 0 - 16; return v as i32; }", -16),
+        // multiply + add fold, wide target: 1_000_001 / 1000 = 1000.
+        ("fn main() -> i32 { let v: i64 = 1000 * 1000 + 1; return (v / 1000) as i32; }", 1000),
+        // float binary adapts to f64: (1.5 - 0.5) * 10 = 10.
+        ("fn main() -> i32 { let v: f64 = 1.5 - 0.5; return (v * 10.0) as i32; }", 10),
+        // bitwise const adapts: 0xF0 | 0x0F = 255.
+        ("fn main() -> i32 { let v: i64 = 0xF0 | 0x0F; return v as i32; }", 255),
+        // nested binary, all literals: 3 + 2*2 = 7.
+        ("fn main() -> i32 { let v: i64 = 3 + 2 * 2; return v as i32; }", 7),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "binary-const-adapt native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "binary-const-adapt wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
