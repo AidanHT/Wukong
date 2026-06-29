@@ -1246,6 +1246,33 @@ fn differential_const_array_length() {
     }
 }
 
+/// `char` is a usable type: a char literal types as `char`, the `char` annotation resolves to the
+/// same scalar (so `let c: char = 'A'` checks), and char <-> int casts are valid both ways. char
+/// lowers to a 32-bit int in MIR, so the interpreter and native backend agree bit-for-bit.
+#[test]
+fn differential_char_type() {
+    let cases = [
+        // char literal annotated, cast to int.
+        ("fn main() -> i32 { let c: char = 'A'; return c as i32; }", 65),
+        // int -> char -> int.
+        ("fn main() -> i32 { let d: char = 66 as char; return d as i32; }", 66),
+        // ordered comparison on char (not bool — must NOT be rejected).
+        ("fn main() -> i32 { let a: char = 'a'; let b: char = 'b'; if a < b { return 1; } return 0; }", 1),
+        // char as a struct field.
+        ("struct G { code: char } fn main() -> i32 { let g = G { code: 'Z' }; return g.code as i32; }", 90),
+        // char arithmetic: 'z' - 'a' = 25.
+        ("fn main() -> i32 { return ('z' as i32) - ('a' as i32); }", 25),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "char native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "char wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}

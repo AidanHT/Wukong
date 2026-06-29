@@ -25,6 +25,9 @@ pub enum Scalar {
     F32,
     F64,
     Bool,
+    /// A Unicode scalar value (the type of a `'c'` literal). 4 bytes, unsigned; lowers to a 32-bit
+    /// integer in MIR, so it is interconvertible with the integer types via `as`.
+    Char,
 }
 
 impl Scalar {
@@ -46,6 +49,7 @@ impl Scalar {
             "f32" => F32,
             "f64" => F64,
             "bool" => Bool,
+            "char" => Char,
             _ => return None,
         })
     }
@@ -68,6 +72,7 @@ impl Scalar {
             F32 => "f32",
             F64 => "f64",
             Bool => "bool",
+            Char => "char",
         }
     }
 
@@ -77,7 +82,7 @@ impl Scalar {
         match self {
             I8 | U8 | Bool => 1,
             I16 | U16 | F16 | Bf16 => 2,
-            I32 | U32 | F32 => 4,
+            I32 | U32 | F32 | Char => 4,
             I64 | U64 | F64 | Usize | Isize => 8,
         }
     }
