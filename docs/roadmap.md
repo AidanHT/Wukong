@@ -355,7 +355,24 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   still dispatches to the GEMM kernel.
 - Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
   (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
-  wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.mer`).
+  wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.mer`). Equality `==`/`!=`
+  between a `bool` and a non-bool scalar is likewise rejected, so the `==`/`!=` chain `5 == 3 == 0` is
+  caught too (`tests/fail/chained_equality.mer`).
+- Tensor shape checking is **sound for concrete (non-generic) shapes**, with one known soundness gap
+  in the *generic* checker: when two shapes that both carry a function's own **unbound generic dims**
+  are unified — a generic function's declared-vs-returned shape, or two `if`/`match` value arms — the
+  checker binds those dims *to each other* rather than treating them as rigid, so a generic function
+  can lie about its tensor return shape (`fn f<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5]`). A
+  turbofish can make the lie concrete and over-strided, turning a type-valid index into an
+  out-of-bounds read the interpreter traps on but native does not. A dedicated fix (rigid generics in
+  the body-check) is planned. A related hole **is** closed: a rank-1 tensor parameter now binds its
+  symbolic dim from a decaying array's length, so `f<N>(a: Tensor[f32, N], b: Tensor[f32, N])` rejects
+  arrays of different lengths. An **undeclared** dim name in a tensor type is still auto-introduced as
+  a fresh implicit dim (a typo silently drops the constraint — slated for an unknown-dim diagnostic).
+- A `for i in 0..n` loop **re-reads its upper bound `n` live each iteration** (it lowers to a C-style
+  `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
+  iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
+  with a negative step runs zero iterations (the condition stays `i < hi`).
 - No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
   fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
