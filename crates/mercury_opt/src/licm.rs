@@ -12,7 +12,7 @@
 //! operations are moved (no loads, stores, calls, or integer division), so hoisting a computation
 //! onto a path that would not have executed it can never change observable behavior.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use mercury_mir::{BinOp, Function, Inst, Op, Terminator};
 
@@ -46,8 +46,15 @@ impl Pass for Licm {
 
 /// Natural loops keyed by header, each mapped to the set of blocks in the loop. Loops that share a
 /// header (multiple back edges) are merged.
-fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, HashSet<u32>)> {
-    let mut by_header: HashMap<u32, HashSet<u32>> = HashMap::new();
+///
+/// Ordered containers (`BTreeMap`/`BTreeSet`, keyed by block id) are deliberate, not incidental — the
+/// emitted-MIR order downstream depends on iteration order here: `run_function` processes the returned
+/// loops positionally and `hoist_from_loop` accumulates `moved_ops` by iterating the body. A `HashMap`/
+/// `HashSet` would make that order the per-process hash-seed order, so `--emit=mir -O2` of the same
+/// source would differ run to run (a reproducible-build break; values are unchanged, so it slips past
+/// the interp==native / -O0==-O2 gates). `mem2reg` uses `BTree*` for the same reason.
+fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, BTreeSet<u32>)> {
+    let mut by_header: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     for b in &f.blocks {
         let n = b.id.0;
         for s in cfg::successors(&b.term) {
@@ -55,7 +62,7 @@ fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, Ha
             if dominates(h, n, idom) {
                 // Back edge n -> h: collect the nodes that reach n without passing through h.
                 let body = by_header.entry(h).or_insert_with(|| {
-                    let mut s = HashSet::new();
+                    let mut s = BTreeSet::new();
                     s.insert(h);
                     s
                 });
@@ -96,7 +103,7 @@ fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
 fn preheader(
     f: &Function,
     header: u32,
-    body: &HashSet<u32>,
+    body: &BTreeSet<u32>,
     preds: &[Vec<u32>],
     idom: &[u32],
 ) -> Option<u32> {
@@ -140,7 +147,7 @@ fn safe_to_hoist(op: &Op) -> bool {
     }
 }
 
-fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> bool {
+fn hoist_from_loop(f: &mut Function, body: &BTreeSet<u32>, preheader: u32) -> bool {
     // Values defined inside the loop (block parameters and instruction results).
     let mut defined_in_loop: HashSet<u32> = HashSet::new();
     for &blk in body {
@@ -187,7 +194,7 @@ fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> boo
 
         // Mutate phase: pull the newly invariant instructions out of their loop blocks. All their
         // operands were available *before* this round, so there are no intra-round dependencies and
-        // appending them in discovery order is valid.
+        // appending them in block-id order (the `BTreeSet` walk) is both valid and deterministic.
         for &blk in body {
             let insts = std::mem::take(&mut f.blocks[blk as usize].insts);
             let mut kept = Vec::with_capacity(insts.len());
