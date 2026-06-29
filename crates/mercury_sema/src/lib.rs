@@ -1435,7 +1435,7 @@ impl Sema<'_> {
                 mutable: false,
                 pointee: Box::new(Ty::Scalar(Scalar::U8)),
             },
-            ExprKind::Char(_) => Ty::Scalar(Scalar::U32),
+            ExprKind::Char(_) => Ty::Scalar(Scalar::Char),
             ExprKind::Path(p) => {
                 if p.is_single() {
                     match self.resolve_value(p.first().sym) {
@@ -1894,7 +1894,7 @@ fn scalar_bits(s: Scalar) -> u32 {
         Bool => 1,
         I8 | U8 => 8,
         I16 | U16 | F16 | Bf16 => 16,
-        I32 | U32 | F32 => 32,
+        I32 | U32 | F32 | Char => 32,
         I64 | U64 | Usize | Isize | F64 => 64,
     }
 }
@@ -2449,6 +2449,20 @@ mod tests {
             "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
         ] {
             assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+        }
+    }
+
+    #[test]
+    fn char_type_is_usable() {
+        // A char literal types as `char`, the `char` annotation resolves to the same scalar, and
+        // char <-> int casts are valid in both directions — none of these should error.
+        for src in [
+            "fn f() -> i32 { let c: char = 'A'; return c as i32; }",
+            "fn f() -> char { return 66 as char; }",
+            "fn f() -> bool { let a: char = 'a'; let b: char = 'b'; return a < b; }",
+            "struct G { code: char } fn f() -> i32 { let g = G { code: 'Z' }; return g.code as i32; }",
+        ] {
+            assert!(errors(src).is_empty(), "unexpected errors for {src:?}: {:?}", errors(src));
         }
     }
 

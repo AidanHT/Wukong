@@ -85,9 +85,11 @@ separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix
 malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit `0b2`, a garbled float
 `1.5z`, or a value past `u64` — is a compile error (`E0401`), never silently zeroed
 (`tests/fail/malformed_int_literal.mer`). A
-**char literal** `'A'` is its `u32` Unicode scalar value — covering the one-character escapes (`\n`
-`\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes — so it can be cast, compared, and used
-in arithmetic (`tests/run/char_literals.mer`).
+**char literal** `'A'` has type **`char`** (a 32-bit Unicode scalar value) — covering the
+one-character escapes (`\n` `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes. `char` is a
+usable annotated type (`let c: char = 'A'`) and is interconvertible with the integer types via `as`
+in both directions, so it can be cast, compared, and used in arithmetic (`tests/run/char_literals.mer`,
+`tests/run/char_type.mer`).
 
 A **string literal** `"hello"` materializes its UTF-8 bytes (plus a trailing NUL) into a stack byte
 buffer and is typed `*u8` — the same by-pointer convention as an array. The escapes `\n` `\r` `\t`
