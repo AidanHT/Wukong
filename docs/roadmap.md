@@ -358,17 +358,24 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.mer`). Equality `==`/`!=`
   between a `bool` and a non-bool scalar is likewise rejected, so the `==`/`!=` chain `5 == 3 == 0` is
   caught too (`tests/fail/chained_equality.mer`).
-- Tensor shape checking is **sound for concrete (non-generic) shapes**, with one known soundness gap
-  in the *generic* checker: when two shapes that both carry a function's own **unbound generic dims**
-  are unified — a generic function's declared-vs-returned shape, or two `if`/`match` value arms — the
-  checker binds those dims *to each other* rather than treating them as rigid, so a generic function
-  can lie about its tensor return shape (`fn f<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5]`). A
-  turbofish can make the lie concrete and over-strided, turning a type-valid index into an
-  out-of-bounds read the interpreter traps on but native does not. A dedicated fix (rigid generics in
-  the body-check) is planned. A related hole **is** closed: a rank-1 tensor parameter now binds its
-  symbolic dim from a decaying array's length, so `f<N>(a: Tensor[f32, N], b: Tensor[f32, N])` rejects
-  arrays of different lengths. An **undeclared** dim name in a tensor type is still auto-introduced as
-  a fresh implicit dim (a typo silently drops the constraint — slated for an unknown-dim diagnostic).
+- Tensor shape checking is **sound for both concrete and generic shapes**. A function's own generic
+  dimension variables are **rigid** inside its body: when two shapes that both carry the function's
+  generics are checked — its declared-vs-returned shape, an elementwise operator's operands, an
+  assignment, or two `if`/`match` value arms — the dims must match by *identity* (`N` matches only
+  `N`); they are never bound to each other or to a constant. So a generic function can no longer **lie
+  about its output shape**: `fn f<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5]` is rejected
+  (`E0502`, `tests/fail/generic_return_shape_lie.mer`). Previously the body-check bound `N := M` and
+  silently accepted the constant `5` against the generic `N`, and a turbofish (`f::<2, 2>`) then made
+  the lie concrete and over-strided — turning a type-valid index into an out-of-bounds read the
+  interpreter trapped on but native did not. Call-site unification is a *different* context and still
+  **infers** a callee's dims from the argument shapes (there the callee's generics are inference
+  variables, not rigid — `matmul::<…>(a, b, c)` binds `M, N, K` from the arguments as before). A
+  related hole is also closed: a rank-1 tensor parameter binds its symbolic dim from a decaying
+  array's length, so `f<N>(a: Tensor[f32, N], b: Tensor[f32, N])` rejects arrays of different lengths
+  (`tests/fail/generic_tensor_arg_length_mismatch.mer`). One **lenience** remains by design: an
+  **undeclared** dim name in a tensor type is auto-introduced as a fresh implicit dim (a typo like
+  `Tensor[f32, KK]` for `K` silently drops the shared constraint — slated for an unknown-dim
+  diagnostic).
 - A `for i in 0..n` loop **re-reads its upper bound `n` live each iteration** (it lowers to a C-style
   `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
   iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
