@@ -2309,11 +2309,16 @@ fn populate_module<M: Module>(
         {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
 
-            // Pre-declare callee and runtime FuncRefs into this function's DFG.
+            // Pre-declare callee and runtime FuncRefs into this function's DFG. Iterate the
+            // `program.funcs` Vec (source order), not the `ids` HashMap — the latter's per-process
+            // hash order would allocate `FuncRef` indices nondeterministically. It is washed out today
+            // (every read of `func_refs` is a keyed lookup, and relocations key on the symbol and emit
+            // in code-offset order), but iterating the deterministic Vec keeps the CLIF reproducible
+            // for free and immune to any future Cranelift change that orders a table by FuncRef index.
             let mut func_refs: HashMap<Symbol, FuncRef> = HashMap::new();
-            for (&sym, &fid) in &ids {
-                let r = module.declare_func_in_func(fid, builder.func);
-                func_refs.insert(sym, r);
+            for callee in &program.funcs {
+                let r = module.declare_func_in_func(ids[&callee.name], builder.func);
+                func_refs.insert(callee.name, r);
             }
             let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
             rt_refs.insert(
