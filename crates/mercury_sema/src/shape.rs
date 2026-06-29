@@ -228,13 +228,22 @@ impl Sema<'_> {
 
         for (param, arg) in sig.params.iter().zip(arg_tys) {
             let p = apply_subst(param, &dims, &tys);
-            self.unify(&p, arg, &mut dims, span);
+            // Call site: the callee's not-yet-substituted dim vars are INFERENCE variables to bind
+            // from the argument shapes (`rigid == false`).
+            self.unify(&p, arg, &mut dims, span, false);
         }
 
         apply_subst(&sig.ret, &dims, &tys)
     }
 
-    pub(crate) fn unify(&mut self, param: &Ty, arg: &Ty, dims: &mut HashMap<Symbol, Dim>, span: Span) {
+    pub(crate) fn unify(
+        &mut self,
+        param: &Ty,
+        arg: &Ty,
+        dims: &mut HashMap<Symbol, Dim>,
+        span: Span,
+        rigid: bool,
+    ) {
         if arg.is_unknown() || arg.is_error() || param.is_unknown() || param.is_error() {
             return;
         }
@@ -275,7 +284,7 @@ impl Sema<'_> {
                     return;
                 }
                 for (pd, ad) in ps.0.iter().zip(&as_.0) {
-                    self.unify_dim(*pd, *ad, dims, span);
+                    self.unify_dim(*pd, *ad, dims, span, rigid);
                 }
             }
             // Array → tensor *decay*: an `Array` argument is intentionally accepted for a tensor
@@ -309,7 +318,7 @@ impl Sema<'_> {
                 // symbolic factors).
                 if shape.0.len() == 1 {
                     if let Dim::Var(_) = shape.0[0] {
-                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span);
+                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid);
                     }
                 }
                 let mut total: u64 = 1;
@@ -335,7 +344,7 @@ impl Sema<'_> {
             }
             (Ty::Ptr { pointee: pp, .. }, Ty::Ptr { pointee: ap, .. })
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
-                self.unify(pp, ap, dims, span)
+                self.unify(pp, ap, dims, span, rigid)
             }
             (
                 Ty::Vector {
@@ -432,7 +441,40 @@ impl Sema<'_> {
         }
     }
 
-    fn unify_dim(&mut self, pd: Dim, ad: Dim, dims: &mut HashMap<Symbol, Dim>, span: Span) {
+    fn unify_dim(
+        &mut self,
+        pd: Dim,
+        ad: Dim,
+        dims: &mut HashMap<Symbol, Dim>,
+        span: Span,
+        rigid: bool,
+    ) {
+        // RIGID mode — used by the body shape checks (return type, operator / branch-arm operands).
+        // There both shapes are FULLY DETERMINED by the signature and the body, so there is nothing
+        // to infer: a function's own generic dims are universally quantified and must match by
+        // IDENTITY (`N` matches only `N`), never bind. Without this a generic function could "unify"
+        // its declared return shape against a differently-shaped body value — binding its own `N := M`
+        // (two distinct generics), or silently accepting `Const(5)` against an unbound `Var(N)` — i.e.
+        // lie about its output shape. A turbofished caller then propagates that bogus shape into an
+        // in-type-bounds-but-real-out-of-bounds index: the interpreter traps while native reads past
+        // the buffer, a backend divergence on a program that should never have compiled. Call-site
+        // unification stays `rigid == false` and keeps inferring (a callee's dim var binds from the
+        // argument shapes). `dims_equal` already implements the rigid relation (`Var(x)==Var(y)` iff
+        // same symbol; `Const` vs `Var` = false; `Dynamic` matches anything, so `?` stays lenient).
+        if rigid {
+            if !dims_equal(pd, ad) {
+                self.error(
+                    span,
+                    "E0502",
+                    format!(
+                        "dimension mismatch: expected {}, found {}",
+                        self.dim_str(pd),
+                        self.dim_str(ad)
+                    ),
+                );
+            }
+            return;
+        }
         match pd {
             Dim::Var(v) => match dims.get(&v) {
                 Some(bound) => {

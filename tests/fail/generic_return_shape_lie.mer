@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0502
+module tests.fail.generic_return_shape_lie
+
+// A generic function's own dimension variables are RIGID inside its body: it must not declare a
+// return shape its body cannot actually produce. `grow` returns its argument `a: Tensor[f32, M, N]`
+// but claims the type `Tensor[f32, N, 5]`. Were the function's own generics treated as call-site
+// inference variables, the return check would "unify" by binding `N := M` and silently accepting the
+// constant `5` against the generic `N` — accepting the lie. A turbofished caller (`grow::<2, 2>`)
+// would then propagate a [2,5] = 10-element claim built from a 4-element buffer and index out of
+// bounds: the interpreter traps while the native backend reads past the buffer — a backend
+// divergence on a program that should never have compiled. The shape lie is rejected here (E0502).
+fn grow<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5] {
+    return a;
+}
+
+fn main() -> i32 {
+    let src: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let r: Tensor[f32, 2, 5] = grow::<2, 2>(src);
+    print(r[1, 4] as i32);
+    return 0;
+}

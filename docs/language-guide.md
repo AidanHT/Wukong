@@ -242,7 +242,12 @@ generic names, or `?` for a runtime dimension. Tensor element types must be scal
 Shape checking is not limited to call arguments: an elementwise binary op `a + b` whose operands
 have different shapes, and a function whose returned value's shape disagrees with its declared
 `-> Tensor[…]`, are both `E0502` (see `tests/fail/shape_binop_mismatch.mer`,
-`shape_return_mismatch.mer`). A constant index past a static tensor dimension, like a fixed-size
+`shape_return_mismatch.mer`). Inside a **generic** function these body checks treat the function's
+own dimension variables as **rigid** — `N` matches only `N`, never another generic or a constant — so
+a generic function cannot lie about its output shape either: `fn f<M, N>(a: Tensor[f32, M, N]) ->
+Tensor[f32, N, 5]` is `E0502` (`tests/fail/generic_return_shape_lie.mer`). Call-site unification is a
+different context and still **infers** a callee's dims from its arguments (`matmul::<…>(a, b, c)`
+binds `M, N, K` from the operands). A constant index past a static tensor dimension, like a fixed-size
 array, is `E0501`.
 
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both

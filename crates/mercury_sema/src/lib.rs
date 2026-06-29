@@ -686,7 +686,10 @@ impl Sema<'_> {
             || matches!(val_ty, Ty::Tensor { .. } | Ty::Vector { .. })
         {
             let mut dims = HashMap::new();
-            self.unify(&ret, val_ty, &mut dims, span);
+            // Body context: the declared return shape and the returned value's shape are both fully
+            // determined, and this function's own generic dims are RIGID — so a generic function
+            // cannot declare a return shape its body does not actually produce. (`rigid == true`.)
+            self.unify(&ret, val_ty, &mut dims, span, true);
         }
         // Returning a pointer/aggregate where a scalar is declared (or vice versa) is not a numeric
         // coercion — the native backend builds a mismatched return ABI and ICEs (e.g. `return &a`
@@ -718,7 +721,11 @@ impl Sema<'_> {
             (Ty::Tensor { .. }, Ty::Tensor { .. }) | (Ty::Vector { .. }, Ty::Vector { .. })
         ) {
             let mut dims = HashMap::new();
-            self.unify(l, r, &mut dims, span);
+            // Body context (operator operands, assignment, if/match arm merge): both operand shapes
+            // are fully determined and this function's generic dims are RIGID, so distinct generics
+            // (`Tensor[f32,M] + Tensor[f32,N]`) no longer "unify" by binding one to the other.
+            // (`rigid == true`.)
+            self.unify(l, r, &mut dims, span, true);
         }
     }
 
@@ -2686,6 +2693,50 @@ mod tests {
             "expected a K conflict: {:?}",
             errors(&src)
         );
+    }
+
+    #[test]
+    fn generic_function_cannot_lie_about_its_shape() {
+        // A generic function's own dimension variables are RIGID inside its body: the function must
+        // not declare a return shape (or merge / operate on operand shapes) that its body does not
+        // actually produce. Were these treated like call-site inference vars, `grow` below would
+        // type-check, and a turbofished caller (`grow::<2, 2>`) would then propagate a
+        // [2,5]=10-element claim from a 4-element buffer and index out of bounds — the interpreter
+        // traps while native reads past the buffer (a backend divergence on a program that should
+        // never have compiled). Each of these is a shape lie -> E0502.
+        for src in [
+            // Return-shape lie: a distinct generic (`N` vs `M`) AND a constant (`5`) vs a generic.
+            "fn grow<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5] { return a; }",
+            // Rank-1 lie: a constant length claimed from an arbitrary generic.
+            "fn g<N>(a: Tensor[f32, N]) -> Tensor[f32, 8] { return a; }",
+            // Swapped dims: returning `Tensor[M, N]` as `Tensor[N, M]` (mis-strides for M != N).
+            "fn t<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, M] { return a; }",
+            // An `if`-arm merge of two distinct generic shapes is the same lie in the merge context.
+            "fn pick<M, N>(c: bool, a: Tensor[f32, M], b: Tensor[f32, N]) -> f32 \
+             { let x = if c { a } else { b }; return x[0]; }",
+        ] {
+            assert!(
+                errors(src).contains(&"E0502"),
+                "expected E0502 for {src:?}: {:?}",
+                errors(src)
+            );
+        }
+        // No false positives — the patterns real generic kernels actually use stay clean: returning /
+        // merging the function's OWN declared shape (identity, multi-dim identity, same-generic merge)
+        // and reducing a generic tensor to a scalar (the declared return is not even a tensor).
+        for src in [
+            "fn id<N>(a: Tensor[f32, N]) -> Tensor[f32, N] { return a; }",
+            "fn id2<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, M, N] { return a; }",
+            "fn pick<N>(c: bool, a: Tensor[f32, N], b: Tensor[f32, N]) -> f32 \
+             { let x = if c { a } else { b }; return x[0]; }",
+            "fn sum<N>(a: Tensor[f32, N]) -> f32 { return a[0]; }",
+        ] {
+            assert!(
+                errors(src).is_empty(),
+                "unexpected errors for {src:?}: {:?}",
+                errors(src)
+            );
+        }
     }
 
     #[test]
