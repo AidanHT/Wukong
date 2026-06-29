@@ -1,0 +1,23 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 10000000000000000000
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 0
+module tests.run.u64_literal
+
+// An unsuffixed integer literal in `(i64::MAX, u64::MAX]` defaults to `u64`. It used to default to
+// i32 (after the sweep-5 i32->i64 widening) and truncate to its low 32 bits: `9223372036854775808 as
+// u64` baked `const.i32 0` on BOTH backends (gate-blind, a silent miscompile). The bare-literal path
+// now widens one more rung to u64, matching the already-correct annotated path (`let x: u64 = ...`).
+
+fn main() -> i32 {
+    print(9223372036854775808 as u64); // 2^63
+    print(10000000000000000000 as u64); // 1e19
+    print(18446744073709551615 as u64); // u64::MAX
+
+    // The cast path must equal the annotated path: both are 2^63, so the difference is 0.
+    let x: u64 = 9223372036854775808;
+    print((9223372036854775808 as u64) - x); // 0
+
+    return 0;
+}

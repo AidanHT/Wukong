@@ -1639,6 +1639,32 @@ impl Sema<'_> {
                                  values; compare their fields or elements instead"
                                     .to_string(),
                             );
+                        } else if let Some(other) = match (&l, &r) {
+                            // A `bool` compared for equality against a NON-bool scalar is almost
+                            // always a chained comparison: `a == b == c` parses as `(a == b) == c`,
+                            // and `(a == b)` is a bool, so `== c` silently compared a bool against
+                            // `c` (coerced to 0/1) — `5 == 3 == 0` evaluated to `true`. Reject the
+                            // mixed compare (ordered chains are rejected below). Concrete-scalar-only,
+                            // so `Unknown` stays lenient and `bool == bool` / same-kind compares are
+                            // unaffected.
+                            (Ty::Scalar(Scalar::Bool), Ty::Scalar(o)) if *o != Scalar::Bool => {
+                                Some(*o)
+                            }
+                            (Ty::Scalar(o), Ty::Scalar(Scalar::Bool)) if *o != Scalar::Bool => {
+                                Some(*o)
+                            }
+                            _ => None,
+                        } {
+                            self.error(
+                                e.span,
+                                "E0401",
+                                format!(
+                                    "cannot compare `bool` with `{}`; a chained comparison like \
+                                     `a == b == c` parses as `(a == b) == c` — write \
+                                     `a == b && b == c`",
+                                    other.name()
+                                ),
+                            );
                         }
                         Ty::Scalar(Scalar::Bool)
                     }
@@ -2160,11 +2186,17 @@ fn int_lit_scalar(text: &str) -> Scalar {
     // mirrors an unconstrained `{integer}` literal and keeps every existing narrowing check honest: a
     // pinned annotation still wins (`let x: i32 = 9000000000` re-adapts the literal back to i32 and
     // range-checks it -> E0401), while a wider return / field / bare-expression context now lowers
-    // the true value. (A literal larger than i64 — a huge `u64` — stays i32 here; pin a `u64`
-    // annotation for those, which mir_build already parses correctly.)
+    // the true value. A magnitude past i64 but within u64 (e.g. `9223372036854775808`) widens one
+    // more rung to `u64` — it must not silently truncate to i32 either (`… as u64` was baking
+    // `const.i32 0` on both backends, gate-blind).
     match parse_int_text(text) {
         Some(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Scalar::I64,
-        _ => Scalar::I32,
+        Some(_) => Scalar::I32,
+        // `parse_int_text` returns None for a magnitude that overflows i64. If it still fits u64 (a
+        // literal in `(i64::MAX, u64::MAX]`), default to u64; a value past u64 is malformed and is
+        // already rejected by `int_literal_well_formed`, so the i32 fallback there is unreachable.
+        None if parse_u64_text(text).is_some() => Scalar::U64,
+        None => Scalar::I32,
     }
 }
 
@@ -2328,6 +2360,37 @@ fn parse_int_text(text: &str) -> Option<i64> {
     }
     .ok()?;
     Some(if neg { -v } else { v })
+}
+
+/// Parse an integer literal's MAGNITUDE as a `u64` (no sign — a negative value fits `i64` and is
+/// handled by `parse_int_text`). Used to recognize a literal in `(i64::MAX, u64::MAX]` so it defaults
+/// to `u64` instead of silently truncating to i32. Mirrors `parse_int_text`'s radix/suffix handling.
+fn parse_u64_text(text: &str) -> Option<u64> {
+    let mut s = text.trim();
+    if s.starts_with('-') {
+        return None;
+    }
+    if s.starts_with('+') {
+        s = &s[1..];
+    }
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(x) = s.strip_suffix(suf) {
+            s = x;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16).ok()
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        u64::from_str_radix(o, 8).ok()
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        u64::from_str_radix(b, 2).ok()
+    } else {
+        body.parse::<u64>().ok()
+    }
 }
 
 #[cfg(test)]
@@ -2507,6 +2570,29 @@ mod tests {
             "fn f(a: i32) -> bool { return 1 < a && a < 2; }",
             "fn f(a: f32, b: f32) -> bool { return a >= b; }",
             "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
+        ] {
+            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+        }
+    }
+
+    #[test]
+    fn chained_equality_rejected() {
+        // `a == b == c` parses as `(a == b) == c`; the inner `==` yields a bool, so the outer
+        // compares a bool against a non-bool scalar (the bool coerced to 0/1) — `5 == 3 == 0`
+        // evaluated to `true`. Equality between bool and a non-bool scalar is rejected, completing
+        // the chained-comparison guard for `==`/`!=`. E0401.
+        for src in [
+            "fn f() -> bool { return 5 == 3 == 0; }",
+            "fn f() -> bool { return 1 != 2 != 3; }",
+            "fn f(a: i32) -> bool { return 1 < a == 0; }", // (1 < a) == 0  ->  bool == int
+        ] {
+            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+        }
+        // No false positives: `bool == bool`, `int == int`, and comparison-of-comparisons stay clean.
+        for src in [
+            "fn f() -> bool { let a = true; let b = false; return a == b; }",
+            "fn f(a: i32, b: i32) -> bool { return a == b; }",
+            "fn f(a: i32, b: i32, c: i32, d: i32) -> bool { return (a < b) == (c < d); }",
         ] {
             assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
         }
