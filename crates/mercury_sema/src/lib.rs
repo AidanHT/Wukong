@@ -1300,6 +1300,29 @@ impl Sema<'_> {
                 },
                 Ty::Scalar(_),
             ) => self.literal_adapts(ann, expr),
+            // A binary arithmetic / bitwise expression of two adapting operands adapts to a scalar
+            // annotation: `let v: i64 = 0 - 16` (only the unary form `-16` adapted before, so the
+            // binary form was a spurious i32-vs-i64 mismatch). The result type of these ops is the
+            // common operand type, so if both sides adapt to `ann`, the whole expression does. A
+            // non-literal operand (a variable / call) makes the inner `literal_adapts` false, so
+            // only all-constant expressions adapt. Shifts (result = LHS type) and comparisons
+            // (result = bool) are excluded. A narrow target still range-checks the FOLDED value
+            // (`let v: i8 = 100 + 100` -> 200, out of range) via `range_check_int_literal`.
+            (ExprKind::Binary { op, lhs, rhs }, Ty::Scalar(_))
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                ) =>
+            {
+                self.literal_adapts(ann, lhs) && self.literal_adapts(ann, rhs)
+            }
             // An array / tuple literal adapts element-wise to a matching aggregate annotation, so a
             // typed buffer can be built from literals — `let a: [i8; 2] = [127, 0]` and
             // `let t: (u8, u8) = (200, 1)` previously failed as `[i32; 2]`/`(i32, i32)` mismatches.
@@ -1332,6 +1355,26 @@ impl Sema<'_> {
                 },
                 _,
             ) => self.retype_adapted_literal(expr, ann),
+            // Re-stamp both operands of an adapted binary expression with the annotation, so MIR
+            // lowering sees one consistent width (`0 - 16: i64` is `(0: i64) - (16: i64)`, not two
+            // i32s widened at the `Sub` — which would be ill-typed MIR). Mirrors `literal_adapts`'s
+            // op set; reached only when that returned true (both operands are adapting constants).
+            (ExprKind::Binary { op, lhs, rhs }, Ty::Scalar(_))
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                ) =>
+            {
+                self.retype_adapted_literal(lhs, ann);
+                self.retype_adapted_literal(rhs, ann);
+            }
             // Re-stamp each element of an adapted aggregate literal with the annotation's element
             // type so MIR lowering stores it at the right width (`[127, 0]: [i8; 2]` writes two i8s,
             // not i32s narrowed at the store). The aggregate node itself takes `ann` (above).

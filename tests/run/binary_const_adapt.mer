@@ -1,0 +1,28 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: 10
+// EXPECT-OUT: 7
+// EXPECT-OUT: 255
+module tests.run.binary_const_adapt
+
+// A binary arithmetic / bitwise expression of constant literals adapts to a wider annotated scalar
+// type, like the unary-minus (`-16`) and bare-literal forms already did: `let v: i64 = 0 - 16` used
+// to be a spurious i32-vs-i64 mismatch. Both operands are retyped to the annotation so MIR lowering
+// sees one consistent width. Only all-constant expressions adapt (a variable operand does not); a
+// narrow target still range-checks the FOLDED value (see tests/fail/binary_const_overflow.mer).
+
+fn main() -> i32 {
+    let v: i64 = 0 - 16; // binary const adapts to i64
+    print(v as i32); // -16
+
+    let f: f64 = 1.5 - 0.5; // float binary adapts to f64
+    print((f * 10.0) as i32); // 10
+
+    let m: i64 = 3 + 2 * 2; // nested binary, all literals (3 + 4)
+    print(m as i32); // 7
+
+    let b: i64 = 0xF0 | 0x0F; // bitwise const adapts
+    print(b as i32); // 255
+
+    return 0;
+}
