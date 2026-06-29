@@ -1301,6 +1301,33 @@ fn differential_binary_const_adapt() {
     }
 }
 
+/// An unsuffixed integer literal in `(i64::MAX, u64::MAX]` defaults to `u64`, not `i32`. It used to
+/// default to i32 in a cast-source / bare-expression position and TRUNCATE to its low 32 bits — a
+/// gate-blind silent miscompile (both backends baked the same `const.i32`). The annotated path
+/// (`let x: u64 = ...`) was already correct; mir_build's `parse_int` already uses i128, so only the
+/// scalar width was wrong. Verifies the cast path now matches the annotated path, bit-for-bit.
+#[test]
+fn differential_u64_range_literal() {
+    let cases = [
+        // u64-range literal in a cast source must not truncate: 2^63 / 1e18 = 9.
+        ("fn main() -> i32 { return (9223372036854775808 as u64 / 1000000000000000000 as u64) as i32; }", 9),
+        // cast path == annotated path (both 2^63): difference 0.
+        ("fn main() -> i32 { let x: u64 = 9223372036854775808; return ((9223372036854775808 as u64) - x) as i32; }", 0),
+        // u64::MAX low byte via bitand = 255.
+        ("fn main() -> i32 { return (18446744073709551615 as u64 & 255 as u64) as i32; }", 255),
+        // bare u64-range literals (no cast), magnitude-typed u64: 1e19 - (1e19 - 10) = 10.
+        ("fn main() -> i32 { return (10000000000000000000 as u64 - 9999999999999999990 as u64) as i32; }", 10),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "u64-range-literal native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "u64-range-literal wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
 /// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
 /// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
