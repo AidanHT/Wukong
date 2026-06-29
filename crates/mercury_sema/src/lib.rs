@@ -445,7 +445,14 @@ impl Sema<'_> {
             Some(t) => self.lower_type(t),
             None => Ty::Unit,
         };
-        let generics = self.generics.iter().copied().collect();
+        // Declaration order is load-bearing: a turbofish `f::<2, 3>` binds each generic argument to
+        // the parameter in the SAME position (`check_fn_call` zips `sig.generics` with the arguments).
+        // Building this Vec from the `self.generics` HashSet collected it in per-process-random hash
+        // order, so `<M, N>` was paired with `::<2, 3>` as either {M:2,N:3} or {M:3,N:2} from one run
+        // to the next on the unchanged source — making a turbofished call's accept/reject (and its
+        // runtime result, down to an out-of-bounds trap) nondeterministic, a direct violation of the
+        // opt-invariance / backend-agreement gates. Take the order from the AST instead.
+        let generics: Vec<Symbol> = f.generics.iter().map(generic_param_sym).collect();
         self.generics.clear();
         self.register(
             f.name,
@@ -1953,13 +1960,19 @@ impl Sema<'_> {
     }
 }
 
+/// The symbol naming a single generic parameter (a type/dim var `N` or a const generic `const N`).
+fn generic_param_sym(g: &GenericParam) -> Symbol {
+    match &g.kind {
+        GenericParamKind::Type(id) => id.sym,
+        GenericParamKind::Const { name, .. } => name.sym,
+    }
+}
+
+/// The generic parameter names as an unordered set, for membership tests (`is this name a generic
+/// of the current item?`). Order is irrelevant here — use `generic_param_sym` over the AST slice
+/// directly where declaration order matters (e.g. binding a turbofish `f::<2, 3>` by position).
 fn generic_names(gs: &[GenericParam]) -> HashSet<Symbol> {
-    gs.iter()
-        .map(|g| match &g.kind {
-            GenericParamKind::Type(id) => id.sym,
-            GenericParamKind::Const { name, .. } => name.sym,
-        })
-        .collect()
+    gs.iter().map(generic_param_sym).collect()
 }
 
 /// Pick a "more concrete" type when joining two (used for arithmetic results and if/match arms).
@@ -2737,6 +2750,46 @@ mod tests {
                 errors(src)
             );
         }
+    }
+
+    #[test]
+    fn generic_param_order_is_deterministic() {
+        // A function's generic parameter list must be recorded in SOURCE declaration order. It used
+        // to be collected from the `self.generics` HashSet, so `FnSig.generics` came out in
+        // per-process hash order — and since a turbofish `f::<2, 3>` binds each argument to the
+        // generic in the SAME position (`check_fn_call` zips `sig.generics` with the arguments), the
+        // pairing of `<M, N>` with `2, 3` flipped between runs of the *unchanged* source: a call's
+        // accept-vs-`E0502` (and its runtime value, down to an out-of-bounds trap) became
+        // nondeterministic, a direct violation of the determinism / backend-agreement gates.
+        let mut interner = Interner::new();
+        let src = "fn f<M, N, K>(a: Tensor[f32, M, N], b: Tensor[f32, N, K]) {}";
+        let (module, pdiags) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse errors: {pdiags:?}");
+        let (res, _diags) = check(&module, &interner);
+        let def = res
+            .defs
+            .lookup(interner.intern("f"))
+            .expect("fn f registered");
+        let names: Vec<&str> = match &def.kind {
+            DefKind::Fn(sig) => sig.generics.iter().map(|s| interner.resolve(*s)).collect(),
+            _ => panic!("f is not a function"),
+        };
+        assert_eq!(
+            names,
+            vec!["M", "N", "K"],
+            "generic params must be in declaration order, not hash order"
+        );
+
+        // Observable consequence: an order-sensitive turbofish binds by position. `g::<2, 3>` with
+        // params `Tensor[M, N]` and `Tensor[N, M]` fed `[2,3]` and `[3,2]` type-checks only if
+        // M := 2 and N := 3 (a swapped binding makes the first parameter `Tensor[3, 2]` conflict).
+        let ok = "fn g<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N, M]) {} \
+                  fn driver(a: Tensor[f32, 2, 3], b: Tensor[f32, 3, 2]) { g::<2, 3>(a, b); }";
+        assert!(
+            !errors(ok).contains(&"E0502"),
+            "an order-sensitive turbofish must bind by position: {:?}",
+            errors(ok)
+        );
     }
 
     #[test]
