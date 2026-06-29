@@ -489,7 +489,16 @@ impl Sema<'_> {
     pub(crate) fn type_index(&mut self, base: &Expr, indices: &[Expr], span: Span) -> Ty {
         let base_ty = self.type_expr(base);
         for ix in indices {
-            self.type_expr(ix);
+            let ix_ty = self.type_expr(ix);
+            // An index is an integer offset; `bool` would silently coerce to 0/1 (`a[true]` reads
+            // `a[1]`). Reject a concrete bool index — `Unknown`/`Error` stays lenient.
+            if matches!(ix_ty, Ty::Scalar(Scalar::Bool)) {
+                self.error(
+                    ix.span,
+                    "E0401",
+                    "array index must be an integer, not `bool`".to_string(),
+                );
+            }
         }
         // Indexing `base[i]` requires an indexable base. A *definitely* non-indexable base — a scalar
         // (`x[0]` on `x: i32`), a struct (`s[1]`), or a tuple (`t[1]`) — is a type error, not an
