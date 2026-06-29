@@ -1607,6 +1607,23 @@ impl Sema<'_> {
                         return Ty::Unknown;
                     }
                 }
+                // bool is not a number: reject it as an operand to a true arithmetic or shift
+                // operator (it would silently coerce to 0/1 — `true + 1` evaluated to `2`). Bitwise
+                // `& | ^` (non-short-circuit boolean ops), `&&`/`||`, `==`/`!=`, ordered comparison
+                // (rejected above), and unary `!` all still take bool. Concrete-bool-only, so an
+                // `Unknown`/`Error` operand stays lenient (no false positives on unmodeled values).
+                if matches!(op, Add | Sub | Mul | Div | Rem | Shl | Shr)
+                    && [&l, &r]
+                        .into_iter()
+                        .any(|t| matches!(t, Ty::Scalar(Scalar::Bool)))
+                {
+                    self.error(
+                        e.span,
+                        "E0401",
+                        format!("arithmetic operator `{}` is not defined for `bool`", op.glyph()),
+                    );
+                    return Ty::Unknown;
+                }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
                     // base-pointer compare — two distinct values are *always* "not equal" — a wrong
@@ -2490,6 +2507,27 @@ mod tests {
             "fn f(a: i32) -> bool { return 1 < a && a < 2; }",
             "fn f(a: f32, b: f32) -> bool { return a >= b; }",
             "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
+        ] {
+            assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
+        }
+    }
+
+    #[test]
+    fn bool_arithmetic_and_index_rejected() {
+        // bool is not a number: it cannot be an arithmetic / shift operand or an array index (it
+        // would silently coerce to 0/1 — `true + 1 == 2`, `a[true] == a[1]`). E0401.
+        for src in [
+            "fn f() -> i32 { let x = true; return x + 1; }",
+            "fn f() -> i32 { let x = true; return x * 3; }",
+            "fn f() -> i32 { let a: [i32; 2] = [1, 2]; return a[true]; }",
+        ] {
+            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+        }
+        // Still fine: bitwise `& | ^` and `&&`/`||`/`!` on bool, and an integer index.
+        for src in [
+            "fn f() -> bool { let a = true; let b = false; return a & b | (a ^ b); }",
+            "fn f() -> bool { let a = true; return !a && (a || a); }",
+            "fn f() -> i32 { let a: [i32; 2] = [10, 20]; let i = 1; return a[i]; }",
         ] {
             assert!(!errors(src).contains(&"E0401"), "unexpected E0401 for {src:?}");
         }
