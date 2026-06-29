@@ -300,6 +300,18 @@ impl Sema<'_> {
                         );
                     }
                 }
+                // A rank-1 tensor parameter with a SYMBOLIC dim binds that dim to the array's
+                // length, so a later sibling parameter `Tensor[f32, N]` fed a different-length array
+                // conflicts. The dim was previously left unbound: two `Tensor[f32, N]` params
+                // silently accepted arrays of different lengths, and indexing past the shorter one
+                // diverged (interpreter traps OOB, native reads past the buffer). A multi-dim tensor
+                // stays on the total-element-count check below (an array length can't be split into
+                // symbolic factors).
+                if shape.0.len() == 1 {
+                    if let Dim::Var(_) = shape.0[0] {
+                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span);
+                    }
+                }
                 let mut total: u64 = 1;
                 let mut all_const = true;
                 for d in &shape.0 {

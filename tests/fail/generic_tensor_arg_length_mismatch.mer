@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0501
+module tests.fail.generic_tensor_arg_length_mismatch
+
+// A rank-1 generic tensor parameter binds its symbolic dim from a decaying array argument's length,
+// so two parameters `Tensor[f32, N]` fed arrays of DIFFERENT lengths conflict. Before, the array
+// decay left `N` unbound, so the mismatch slipped through and indexing past the shorter array
+// diverged — the interpreter trapped out-of-bounds while the native backend read past the buffer
+// (a backend divergence on a program that should never have compiled).
+fn f<N>(a: Tensor[f32, N], b: Tensor[f32, N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..8 {
+        s = s + b[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let b: [f32; 4] = [2.0, 2.0, 2.0, 2.0];
+    print(f(a, b) as i32);
+    return 0;
+}
