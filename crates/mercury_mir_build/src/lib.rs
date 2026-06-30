@@ -4210,6 +4210,39 @@ impl FnLowerer<'_> {
         Some((v as f32).to_bits() as i64)
     }
 
+    /// The fused-norm `eps`, as either an inline float literal (`float_lit_bits`) or a single-segment
+    /// path bound to one by a preceding **non-`mut`** `let eps = <literal>;` in the same block. The
+    /// norm ABI carries `eps` as a compile-time `f32::to_bits()` i64, so it must be statically known —
+    /// but the natural idiom `let eps = 1e-5; ... rsqrt(ss/N + eps)` binds it to a constant just as
+    /// surely as an inline literal does. Resolving a non-`mut` binding is sound: sema forbids
+    /// reassigning a non-`mut` local, so its value at the reciprocal is exactly that literal (a `mut`
+    /// binding could be rebound, so the nearest binding is declined if it is `mut`). `prior` is the
+    /// block's statements before the reciprocal. Without this, an `eps` bound to a `let` silently
+    /// dropped the whole window to the generic vectorizer (`velem` + a separate reduction) rather than
+    /// the one fused pass — `tests/run/l2norm.mer` did exactly that. (A *batched* norm's body is the
+    /// inner loop, so an `eps` declared in the enclosing scope is not in `prior` and still needs a
+    /// literal — the resolution is intra-block only.)
+    fn eps_lit_bits(&self, e: &Expr, prior: &[Stmt]) -> Option<i64> {
+        if let Some(b) = self.float_lit_bits(e) {
+            return Some(b);
+        }
+        let sym = single_path(e)?;
+        for st in prior.iter().rev() {
+            let StmtKind::Let { pat, init, mutable, .. } = &st.kind else {
+                continue;
+            };
+            if !matches!(&pat.kind, ast::PatKind::Ident(n) if *n == sym) {
+                continue;
+            }
+            // Nearest binding of `sym`: resolve only an immutable let bound to a float literal.
+            if *mutable {
+                return None;
+            }
+            return init.as_ref().and_then(|i| self.float_lit_bits(i));
+        }
+        None
+    }
+
     /// Does `d` denote the row length `n` as an `f32` divisor — a float literal equal to a literal
     /// count, an `(n as f32)` cast of the exact bound, or the bound expression itself? (The mean /
     /// mean-square divides the row sum by the element count; this pins that divisor to the loop trip
@@ -4412,7 +4445,13 @@ impl FnLowerer<'_> {
     /// `let inv = 1.0 / sqrt(sum/count + eps)` (or `rsqrt(...)`, `eps` either side) → `(inv, eps_bits)`,
     /// the reciprocal-standard-deviation binding shared by LayerNorm (variance sum) and RMSNorm
     /// (mean-square sum). Pure.
-    fn match_inv_rstd(&self, stmt: &Stmt, sum: Symbol, n: &Expr) -> Option<(Symbol, i64)> {
+    fn match_inv_rstd(
+        &self,
+        stmt: &Stmt,
+        sum: Symbol,
+        n: &Expr,
+        prior: &[Stmt],
+    ) -> Option<(Symbol, i64)> {
         let (name, init) = Self::let_init(stmt)?;
         let arg = self.as_rsqrt_arg(init)?;
         let ExprKind::Binary {
@@ -4423,10 +4462,11 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // One operand is the eps literal; the other is `sum / count`.
-        let (ms, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+        // One operand is the eps (an inline literal or a non-mut let-bound one); the other is
+        // `sum / count`.
+        let (ms, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.float_lit_bits(lhs) {
+        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
             (rhs.as_ref(), b)
         } else {
             return None;
@@ -4486,7 +4526,7 @@ impl FnLowerer<'_> {
             return None;
         }
         self.match_var_body(body4, v4, x, mean, vv, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr)?;
+        let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr, &b.stmts[..at + 5])?;
         let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
         if !exprs_struct_eq(n6, n_expr) {
             return None;
@@ -4532,7 +4572,7 @@ impl FnLowerer<'_> {
         // Batched: the data is indexed `row*cols + i` (cols == this inner bound); single-row: just `i`.
         let data_batch = batch.map(|row| (row, n_expr));
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr)?;
+        let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])?;
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
@@ -4553,7 +4593,7 @@ impl FnLowerer<'_> {
     /// reciprocal-norm binding: like [`Self::match_inv_rstd`] but the sqrt argument is the **raw**
     /// sum-of-squares — no `/N` mean divisor (the feature that distinguishes RMSNorm). The two are
     /// structurally disjoint (a `/N` node is present xor absent), so a window matches at most one. Pure.
-    fn match_inv_l2norm(&self, stmt: &Stmt, sum: Symbol) -> Option<(Symbol, i64)> {
+    fn match_inv_l2norm(&self, stmt: &Stmt, sum: Symbol, prior: &[Stmt]) -> Option<(Symbol, i64)> {
         let (name, init) = Self::let_init(stmt)?;
         let arg = self.as_rsqrt_arg(init)?;
         // Bare `sqrt(sum)` — no eps term: eps defaults to 0.0.
@@ -4569,9 +4609,9 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let (base, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+        let (base, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.float_lit_bits(lhs) {
+        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
             (rhs.as_ref(), b)
         } else {
             return None;
@@ -4616,7 +4656,7 @@ impl FnLowerer<'_> {
         let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
         let data_batch = batch.map(|row| (row, n_expr));
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s)?;
+        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s, &b.stmts[..at + 2])?;
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;

@@ -10,20 +10,27 @@ module tests.run.l2norm
 // Both the batched `[R, C]` nested form and the single-row flat form are recognized and dispatched to
 // one fused `mercury_norm_f32(…, NORM_L2NORM)` — the same kernel softmax/LayerNorm/RMSNorm use, so the
 // interp == native differential gate is bit-for-bit exact (it just forwards the new op code).
+// The fused-norm `eps` must be statically known: an inline float literal, or — within the *same*
+// block — a non-`mut` `let eps = <literal>`. The single-row window below binds eps with such a `let`;
+// the batched window's eps is inline because the matcher sees only the inner loop body (the enclosing
+// `let eps` is out of that scope).
 
 fn main() -> i32 {
     let mut x: [f32; 32] = [0.0; 32];
     for i in 0..32 { x[i] = (i as f32 - 16.0) * 0.5; } // -8.0 .. 7.5
     let eps: f32 = 0.00001;
 
-    // Batched L2-normalize over a [4, 8] matrix — the dispatched nested form
-    // `out[r*8+i] = x[r*8+i] / sqrt(Σ_i x[r*8+i]² + eps)`.
+    // Batched L2-normalize over a [4, 8] matrix, in place over `out` (seeded from `x`) — the dispatched
+    // nested form `out[r*8+i] = out[r*8+i] / sqrt(Σ_i out[r*8+i]² + eps)`. (The fused norm kernel is
+    // in-place, `mercury_norm_f32(p, p, ..)`, so the recognized window normalizes a buffer into itself;
+    // an out-of-place `out = x/‖x‖` is left to the generic vectorizer.)
     let mut out: [f32; 32] = [0.0; 32];
+    for i in 0..32 { out[i] = x[i]; }
     for r in 0..4 {
         let mut ss: f32 = 0.0;
-        for i in 0..8 { ss = ss + x[r * 8 + i] * x[r * 8 + i]; }
-        let inv = 1.0 / sqrt(ss + eps);
-        for i in 0..8 { out[r * 8 + i] = x[r * 8 + i] * inv; }
+        for i in 0..8 { ss = ss + out[r * 8 + i] * out[r * 8 + i]; }
+        let inv = 1.0 / sqrt(ss + 0.00001); // inline eps (the enclosing `let eps` is out of inner scope)
+        for i in 0..8 { out[r * 8 + i] = out[r * 8 + i] * inv; }
     }
 
     // Each normalized row must be unit-L2: Σ_i out[r,i]² ≈ 1.0.
