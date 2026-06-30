@@ -1,0 +1,28 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: 7
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -5
+// EXPECT-OUT: -5
+// EXPECT-OUT: -5
+// EXPECT-OUT: 1
+module tests.run.enum_cast_signext
+
+// A C-style enum value is its SIGNED i32 discriminant, so widening it to a larger integer or
+// converting it to a float must SIGN-extend, not zero-extend. Regression for a gate-blind
+// miscompile: `E::Neg as i64` produced 4294967291 (the discriminant zero-extended through u32)
+// instead of -5. Both backends agreed on the wrong value, so the interp==native differential gate
+// was blind to it — only an absolute EXPECT-OUT pins the correct result.
+enum E { Neg = -5, Pos = 7, Min = -2147483648 }
+
+fn main() -> i32 {
+    print(E::Neg as i64);              // -5            sign-extend i32 -> i64
+    print(E::Pos as i64);              // 7             positive: both extensions agree
+    print(E::Min as i64);              // -2147483648   i32::MIN widens (not 2147483648)
+    print((E::Neg as f64) as i64);     // -5            signed int -> f64 -> i64 round-trips
+    print((E::Neg as f32) as i64);     // -5            signed int -> f32 -> i64 round-trips
+    print(E::Neg as i32 as i64);       // -5            `as i32` is a no-op, so this must equal `as i64`
+    if (E::Neg as i64) == -5 { print(1); } else { print(0); }   // 1
+    return 0;
+}

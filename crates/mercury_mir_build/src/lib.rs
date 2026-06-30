@@ -1727,7 +1727,19 @@ impl FnLowerer<'_> {
     }
 
     fn signed(&self, e: &Expr) -> bool {
-        matches!(self.expr_ty(e), Ty::Scalar(s) if s.is_signed())
+        match self.expr_ty(e) {
+            Ty::Scalar(s) => s.is_signed(),
+            // A C-style enum value *is* its signed `i32` discriminant, so a widening or int→float
+            // cast — and every coercion / ordered compare routed through `signed()` — must treat it
+            // as signed: `E::Neg as i64` is `-5`, the same as `E::Neg as i32 as i64`. Without this an
+            // enum operand fell through to unsigned zero-extension (`4294967291`), a gate-blind
+            // miscompile both backends agreed on. A struct `Ty::Named` stays unsigned (never a cast
+            // operand); only an `enum` discriminant is signed.
+            Ty::Named(sym) => {
+                matches!(self.sema.defs.lookup(sym).map(|d| &d.kind), Some(DefKind::Enum(_)))
+            }
+            _ => false,
+        }
     }
 
     fn const_zero(&mut self, ty: MirType) -> ValueId {
