@@ -36,10 +36,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   read through an `as f32` widening cast (lossless: `<<16` for bf16, F16C `vcvtph2ps` for f16) with
   **f32 accumulate/compute** — the standard ML contract — are recognized and lowered to half-precision
   runtime kernels. Symmetric across both precisions:
-  - **reductions** `dot`/`sum` (`mercury_{dot,sum}_{bf16,f16}`) — ~3.0–3.5× vs C for dot, ~6–8× for
-    sum, growing as the working set spills L3 (`tests/run/reduce_{bf16,f16}.mer`);
-  - **max/min/absmax** (`mercury_reduce_{bf16,f16}(x,n,op)`) — the per-tensor absmax is the
-    symmetric-quantization scale; exact (max/min round nothing) (`reduce_bf16_minmax.mer`);
+  - **reductions** `dot`/`sum` (`mercury_{dot,sum}_{bf16,f16}[_parallel]`) — ~3.0–3.5× vs C for dot,
+    ~6–8× for sum, growing as the working set spills L3 (`tests/run/reduce_{bf16,f16}.mer`);
+  - **max/min/absmax** (`mercury_reduce_{bf16,f16}[_parallel](x,n,op)`) — the per-tensor absmax is the
+    symmetric-quantization scale; exact (max/min round nothing) (`reduce_bf16_minmax.mer`). Inside a
+    `@parallel` function each of dot/sum/max/min/absmax dispatches to its multicore `_parallel` twin —
+    a deterministic fixed-`RCHUNK` chunk fold (the per-chunk serial kernel + an ascending partial
+    combine), bit-identical regardless of thread count and the bf16/f16 analog of the f32
+    `mercury_sreduce_f32_parallel` (`tests/run/parallel_reduce_lowp.mer`);
   - **streaming axpby** `out = a·x + b·y` (`mercury_axpby_{bf16,f16}`), half-in/f32-out, ~1.3× ≫ L3
     (requires two additive terms; a 1-term scale would force a `0*inf` the source lacks);
   - **activations** — the full 36-op transcendental set over a half-precision input

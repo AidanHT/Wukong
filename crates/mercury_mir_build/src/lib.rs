@@ -83,6 +83,12 @@ pub fn lower_program(
         dot_f16: interner.intern("mercury_dot_f16"),
         sum_f16: interner.intern("mercury_sum_f16"),
         reduce_f16: interner.intern("mercury_reduce_f16"),
+        dot_bf16_par: interner.intern("mercury_dot_bf16_parallel"),
+        sum_bf16_par: interner.intern("mercury_sum_bf16_parallel"),
+        reduce_bf16_par: interner.intern("mercury_reduce_bf16_parallel"),
+        dot_f16_par: interner.intern("mercury_dot_f16_parallel"),
+        sum_f16_par: interner.intern("mercury_sum_f16_parallel"),
+        reduce_f16_par: interner.intern("mercury_reduce_f16_parallel"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
         axpby_f16: interner.intern("mercury_axpby_f16"),
         transpose: interner.intern("mercury_transpose_f32"),
@@ -939,6 +945,20 @@ struct GemmSyms {
     dot_f16: Symbol,
     sum_f16: Symbol,
     reduce_f16: Symbol,
+    /// The multicore `@parallel` twins of the bf16/f16 reductions (`mercury_{dot,sum,reduce}_{bf16,
+    /// f16}_parallel`): a bf16/f16 reduction loop inside a `@parallel` function lowers to one of these
+    /// instead of the serial symbol above. Each cuts the array on the same fixed `RCHUNK` boundary the
+    /// f32 `mercury_sreduce_f32_parallel` uses and folds the per-chunk partials in ascending order, so
+    /// the result is deterministic (thread-count-independent). Unlike the f32 path — where the interp
+    /// calls the *serial* form and relies on serial==parallel — the bf16/f16 serial kernels reduce the
+    /// *whole* array flat, so the interpreter marshals these *parallel* kernels directly (the chunked
+    /// fold reassociates vs flat); interp == native holds because the parallel kernel is deterministic.
+    dot_bf16_par: Symbol,
+    sum_bf16_par: Symbol,
+    reduce_bf16_par: Symbol,
+    dot_f16_par: Symbol,
+    sum_f16_par: Symbol,
+    reduce_f16_par: Symbol,
     /// `mercury_axpby_bf16(x, y, out, n, a, b)` — bf16→f32 streaming axpby (`out = a*x + b*y`, bf16
     /// inputs, f32 output, f32 math). The mixed-precision elementwise twin of the f32 streaming kernel.
     axpby_bf16: Symbol,
@@ -6636,8 +6656,11 @@ impl FnLowerer<'_> {
     /// `s = s + mercury_dot_bf16(x, y, n)` (or `mercury_sum_bf16(x, n)`). The kernel widens bf16→f32
     /// and accumulates in f32; the interpreter marshals the identical kernel (reconstructing the bf16
     /// bits from its bf16-rounded storage), so native and interp agree bit-for-bit despite the
-    /// kernel's reassociated 8-lane accumulation. Falls back (returns false) unless the range is
-    /// `0..n`, the accumulator is an in-scope f32 scalar, and the arrays are in scope.
+    /// kernel's reassociated 8-lane accumulation. Inside a `@parallel` function the multicore
+    /// `mercury_*_bf16_parallel` / `_f16_parallel` twin fires instead (a deterministic fixed-RCHUNK
+    /// chunk fold), so a low-precision reduction runs across cores like the f32 `@parallel` reduction.
+    /// Falls back (returns false) unless the range is `0..n`, the accumulator is an in-scope f32
+    /// scalar, and the arrays are in scope.
     fn try_emit_lowp_reduction(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
         let ForIter::Range {
             start,
@@ -6677,20 +6700,25 @@ impl FnLowerer<'_> {
         let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
         // Pick the kernel by op and precision: additive dot/sum have dedicated symbols; the max-family
         // routes through the op-coded reduce kernel. f16 uses the F16C twins, bf16 the `<<16` ones.
+        // Inside a `@parallel` function the multicore `_parallel` twin fires instead (same ABI, a
+        // deterministic fixed-RCHUNK chunk fold), so a low-precision reduction also runs across cores.
+        let par = self.parallel_fn;
         let (func, args) = match red_op {
             RED_DOT => (
-                if is_f16 {
-                    self.gemm.dot_f16
-                } else {
-                    self.gemm.dot_bf16
+                match (par, is_f16) {
+                    (false, false) => self.gemm.dot_bf16,
+                    (false, true) => self.gemm.dot_f16,
+                    (true, false) => self.gemm.dot_bf16_par,
+                    (true, true) => self.gemm.dot_f16_par,
                 },
                 vec![xv, yv, n],
             ),
             RED_SUM => (
-                if is_f16 {
-                    self.gemm.sum_f16
-                } else {
-                    self.gemm.sum_bf16
+                match (par, is_f16) {
+                    (false, false) => self.gemm.sum_bf16,
+                    (false, true) => self.gemm.sum_f16,
+                    (true, false) => self.gemm.sum_bf16_par,
+                    (true, true) => self.gemm.sum_f16_par,
                 },
                 vec![xv, n],
             ),
@@ -6699,10 +6727,11 @@ impl FnLowerer<'_> {
                     .builder
                     .build(MirType::I64, Op::ConstInt(red_op as i128, MirType::I64));
                 (
-                    if is_f16 {
-                        self.gemm.reduce_f16
-                    } else {
-                        self.gemm.reduce_bf16
+                    match (par, is_f16) {
+                        (false, false) => self.gemm.reduce_bf16,
+                        (false, true) => self.gemm.reduce_f16,
+                        (true, false) => self.gemm.reduce_bf16_par,
+                        (true, true) => self.gemm.reduce_f16_par,
                     },
                     vec![xv, n, opv],
                 )
