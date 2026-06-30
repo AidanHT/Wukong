@@ -185,4 +185,77 @@ mod tests {
             assert_eq!(got, got_par, "softmax_bwd serial vs parallel {rows}x{cols}");
         }
     }
+
+    /// Independent f64 reference for softmax backward. The per-row dot `s = Σ_j y_j·dy_j` and the
+    /// apply `dx_i = y_i·(dy_i − s)` are both recomputed directly in **f64**, with no call into any
+    /// `mercury_*` kernel — unlike the self-oracle above, which borrows the kernel's own `sreduce`
+    /// dot. This makes it a genuine external oracle (the `mercury_softmax_bwd` family is gate-blind:
+    /// the interpreter marshals the identical symbol the native backend calls, so interp==native
+    /// proves nothing about the kernel's own arithmetic). `y` is a real per-row softmax distribution
+    /// (positive, row-sums to 1) so the dot stays O(1) and well-conditioned. Shapes straddle the
+    /// 8-lane edge and the parallel row threshold (`SOFTMAX_BWD_PAR_MIN = 8`); both the serial and
+    /// the `_parallel` entry points are checked against the same f64 reference.
+    #[test]
+    fn matches_f64_reference() {
+        for &(rows, cols) in &[
+            (1usize, 1usize),
+            (3, 7),
+            (8, 8),
+            (8, 9),
+            (9, 33),
+            (16, 100),
+            (8, 257),
+            (40, 320),
+        ] {
+            // Per-row-normalized y (a genuine softmax output) + sign-mixed upstream dy; deterministic.
+            let mut y: Vec<f32> =
+                (0..rows * cols).map(|i| ((i as f32) * 0.017).sin() * 0.4 + 0.6).collect();
+            for row in 0..rows {
+                let off = row * cols;
+                let sum: f32 = (0..cols).map(|j| y[off + j]).sum();
+                for j in 0..cols {
+                    y[off + j] /= sum;
+                }
+            }
+            let dy: Vec<f32> =
+                (0..rows * cols).map(|i| ((i as f32) * 0.013 + 0.7).cos() * 1.1 - 0.2).collect();
+            let mut got = vec![0.0f32; rows * cols];
+            let mut got_par = vec![0.0f32; rows * cols];
+            unsafe {
+                mercury_softmax_bwd_f32(
+                    y.as_ptr(),
+                    dy.as_ptr(),
+                    got.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
+                mercury_softmax_bwd_f32_parallel(
+                    y.as_ptr(),
+                    dy.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                );
+            }
+            for row in 0..rows {
+                let off = row * cols;
+                // s = Σ_j y_j·dy_j accumulated in f64 — independent of the kernel's reduction.
+                let s: f64 = (0..cols).map(|j| y[off + j] as f64 * dy[off + j] as f64).sum();
+                for j in 0..cols {
+                    let want = y[off + j] as f64 * (dy[off + j] as f64 - s);
+                    let denom = want.abs().max(1.0);
+                    let val = got[off + j] as f64;
+                    assert!(
+                        (val - want).abs() / denom <= 1e-4,
+                        "softmax_bwd f64 ref mismatch {rows}x{cols} row={row} j={j}: {val} vs {want}"
+                    );
+                    let valp = got_par[off + j] as f64;
+                    assert!(
+                        (valp - want).abs() / denom <= 1e-4,
+                        "softmax_bwd parallel f64 ref {rows}x{cols} row={row} j={j}: {valp} vs {want}"
+                    );
+                }
+            }
+        }
+    }
 }
