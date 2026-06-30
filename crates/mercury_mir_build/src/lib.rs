@@ -1812,26 +1812,30 @@ impl FnLowerer<'_> {
             // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
             // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
             // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
+            // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
+            // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
             if let Some((n, arr, n_expr)) = self.match_logsoftmax(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
+                if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
                     i += n;
                     continue;
                 }
             }
             if let Some((n, arr, n_expr)) = self.match_softmax(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
+                if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
+            // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
+            // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
+            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None) {
+                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
+                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
@@ -1839,8 +1843,8 @@ impl FnLowerer<'_> {
             // L2-normalize (4 stmts, same shape as RMSNorm but `1/sqrt(Σx² + eps)` — no mean divisor).
             // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
             // so neither steals the other's window.
-            if let Some((n, arr, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, eps, NORM_L2NORM, None, None) {
+            if let Some((n, arr, dst, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
+                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_L2NORM, None, None) {
                     i += n;
                     continue;
                 }
@@ -2204,9 +2208,10 @@ impl FnLowerer<'_> {
         (core, gamma, beta)
     }
 
-    /// Body `x[v] = x[v] * inv [* gamma[v] [+ beta[v]]]` (scale by an invariant scalar, either operand
-    /// order, with an optional affine wrapper for RMSNorm). Returns the captured `(gamma, beta)`
-    /// arrays (both `None` for the plain form). Pure.
+    /// Body `out[v] = x[v] * inv [* gamma[v] [+ beta[v]]]` (scale by an invariant scalar, either operand
+    /// order, with an optional affine wrapper for RMSNorm). Returns `(dst, gamma, beta)`: `dst` is the
+    /// write-target array — `x` itself for the in-place form, or a distinct `out` for `out = norm(x)`.
+    /// gamma/beta are `None` for the plain form. Pure.
     fn match_scale_body(
         &self,
         body: &Block,
@@ -2214,7 +2219,7 @@ impl FnLowerer<'_> {
         x: Symbol,
         inv: Symbol,
         batch: Option<(Symbol, &Expr)>,
-    ) -> Option<(Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -2224,11 +2229,11 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // The data `x` is row-offset-indexed when batched; gamma/beta stay column-indexed (per-column,
-        // shared across rows), so `peel_affine` is unbatched.
-        if self.index_off(target, v, batch) != Some(x) {
-            return None;
-        }
+        // The write target is the destination buffer: `x` for the in-place form, or a distinct `out`
+        // for out-of-place. The *value* still reads the source `x` (checked below), so only the store
+        // target may differ. The data `x` is row-offset-indexed when batched; gamma/beta stay
+        // column-indexed (per-column, shared across rows), so `peel_affine` is unbatched.
+        let dst = self.index_off(target, v, batch)?;
         let (core, gamma, beta) = self.peel_affine(value, v, x);
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
@@ -2241,7 +2246,7 @@ impl FnLowerer<'_> {
         let ok = (self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(inv))
             || (self.index_off(rhs, v, batch) == Some(x) && single_path(lhs) == Some(inv));
         if ok {
-            Some((gamma, beta))
+            Some((dst, gamma, beta))
         } else {
             None
         }
@@ -2354,8 +2359,10 @@ impl FnLowerer<'_> {
             return None;
         }
         // softmax's normalize is a plain `x[i] *= inv`; reject any affine wrapper (softmax has no
-        // gamma/beta) so it falls back to the generic vectorizer rather than silently dropping it.
-        if self.match_scale_body(body6, v6, x, inv, data_batch)? != (None, None) {
+        // gamma/beta), and require it in-place (`dst == x`): the exp-sub pass above already rewrote `x`
+        // in place, so an out-of-place final scale would be an unsound hybrid (the kernel preserves the
+        // source, the source program would not). Out-of-place softmax simply isn't recognized here.
+        if self.match_scale_body(body6, v6, x, inv, data_batch)? != (x, None, None) {
             return None;
         }
         // The three internal scalars must not be read after the window — the kernel hides them.
@@ -4134,6 +4141,7 @@ impl FnLowerer<'_> {
     fn emit_norm(
         &mut self,
         arr: Symbol,
+        dst: Symbol,
         rows: Option<&Expr>,
         n: &Expr,
         eps_bits: i64,
@@ -4143,6 +4151,19 @@ impl FnLowerer<'_> {
     ) -> bool {
         let Some((xv, _)) = self.lookup(arr) else {
             return false;
+        };
+        // The destination buffer: `arr` itself for the in-place form (the args stay `(xv, xv)` — the
+        // existing corpus is byte-identical), or a distinct `out` for the out-of-place `out = norm(x)`
+        // (the residual-stream transformer pattern: the normalized output goes to a fresh buffer while
+        // `x` is preserved). The kernel reads `x` and writes `out`, which the `mercury_norm_f32(x, out,
+        // ..)` ABI and both backends already support — in-place is just the `dst == arr` special case.
+        let dstv = if dst == arr {
+            xv
+        } else {
+            match self.lookup(dst) {
+                Some((v, _)) => v,
+                None => return false,
+            }
         };
         // A batched norm (`rows > 1`) inside a `@parallel` function maps its independent rows across
         // cores via the multicore kernel; rows are normalized independently (no cross-row combine), so
@@ -4179,7 +4200,7 @@ impl FnLowerer<'_> {
             };
             self.builder.build_void(Op::Call {
                 func,
-                args: vec![xv, xv, rows, nval, epsv, opv],
+                args: vec![xv, dstv, rows, nval, epsv, opv],
             });
             return true;
         }
@@ -4207,7 +4228,7 @@ impl FnLowerer<'_> {
         };
         self.builder.build_void(Op::Call {
             func,
-            args: vec![xv, xv, gptr, bptr, rows, nval, epsv, opv],
+            args: vec![xv, dstv, gptr, bptr, rows, nval, epsv, opv],
         });
         true
     }
@@ -4386,7 +4407,9 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Body `x[v] = (x[v]-mean) * inv` (center then scale, in place; either operand order). Pure.
+    /// Body `out[v] = (x[v]-mean) * inv [* gamma[v] [+ beta[v]]]` (center then scale; either operand
+    /// order). Returns `(dst, gamma, beta)`: `dst` is the write target — `x` in-place, or a distinct
+    /// `out` for out-of-place `out = layernorm(x)`. The value still reads the source `x`. Pure.
     fn match_shift_scale_body(
         &self,
         body: &Block,
@@ -4395,7 +4418,7 @@ impl FnLowerer<'_> {
         mean: Symbol,
         inv: Symbol,
         batch: Option<(Symbol, &Expr)>,
-    ) -> Option<(Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -4405,9 +4428,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.index_off(target, v, batch) != Some(x) {
-            return None;
-        }
+        let dst = self.index_off(target, v, batch)?;
         let (core, gamma, beta) = self.peel_affine(value, v, x);
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
@@ -4420,7 +4441,7 @@ impl FnLowerer<'_> {
         let ok = (self.is_centered(lhs, v, x, mean, batch) && single_path(rhs) == Some(inv))
             || (self.is_centered(rhs, v, x, mean, batch) && single_path(lhs) == Some(inv));
         if ok {
-            Some((gamma, beta))
+            Some((dst, gamma, beta))
         } else {
             None
         }
@@ -4521,7 +4542,7 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
             return None;
@@ -4551,7 +4572,8 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n6, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_shift_scale_body(body6, v6, x, mean, inv, data_batch)?;
+        let (dst, gamma, beta) =
+            self.match_shift_scale_body(body6, v6, x, mean, inv, data_batch)?;
         let rest = &b.stmts[at + 7..];
         let tail = b.tail.as_deref();
         for sc in [s, mean, vv, inv] {
@@ -4559,7 +4581,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((7, x, n_expr.clone(), eps_bits, gamma, beta))
+        Some((7, x, dst, n_expr.clone(), eps_bits, gamma, beta))
     }
 
     /// Recognize the canonical in-place flat RMSNorm window (4 statements) at `b.stmts[at..]`:
@@ -4579,7 +4601,7 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -4597,7 +4619,8 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        // `dst` is the scale loop's write target — `x` in-place, or a distinct `out` (out-of-place).
+        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
         let rest = &b.stmts[at + 4..];
         let tail = b.tail.as_deref();
         for sc in [s, inv] {
@@ -4605,7 +4628,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((4, x, n_expr.clone(), eps_bits, gamma, beta))
+        Some((4, x, dst, n_expr.clone(), eps_bits, gamma, beta))
     }
 
     /// `let inv = 1.0 / sqrt(sum + eps)` (or `rsqrt(...)`, `eps` either side, or the bare
@@ -4664,7 +4687,7 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -4681,7 +4704,7 @@ impl FnLowerer<'_> {
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
         // L2-normalize is non-affine; a `* gamma[i]` (or `+ beta[i]`) window is not an L2 norm.
         if gamma.is_some() || beta.is_some() {
             return None;
@@ -4693,7 +4716,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((4, x, n_expr.clone(), eps_bits, None, None))
+        Some((4, x, dst, n_expr.clone(), eps_bits, None, None))
     }
 
     /// Is `e` the float literal `0.0`? Pure.
@@ -6782,7 +6805,7 @@ impl FnLowerer<'_> {
         pat: &Pattern,
         iter: &ForIter,
         body: &Block,
-    ) -> Option<(Symbol, Expr, i64, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Symbol, Expr, i64, i64, Option<Symbol>, Option<Symbol>)> {
         let ForIter::Range {
             start,
             end: Some(_),
@@ -6810,23 +6833,26 @@ impl FnLowerer<'_> {
         }
         if let Some((consumed, x, cols)) = self.match_softmax(body, 0, Some(*r)) {
             if consumed == body.stmts.len() {
-                return Some((x, cols, 0, NORM_SOFTMAX, None, None));
+                return Some((x, x, cols, 0, NORM_SOFTMAX, None, None));
             }
         }
-        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_layernorm(body, 0, Some(*r))
+        if let Some((consumed, x, dst, cols, eps, gamma, beta)) =
+            self.match_layernorm(body, 0, Some(*r))
         {
             if consumed == body.stmts.len() {
-                return Some((x, cols, eps, NORM_LAYERNORM, gamma, beta));
+                return Some((x, dst, cols, eps, NORM_LAYERNORM, gamma, beta));
             }
         }
-        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_rmsnorm(body, 0, Some(*r)) {
+        if let Some((consumed, x, dst, cols, eps, gamma, beta)) =
+            self.match_rmsnorm(body, 0, Some(*r))
+        {
             if consumed == body.stmts.len() {
-                return Some((x, cols, eps, NORM_RMSNORM, gamma, beta));
+                return Some((x, dst, cols, eps, NORM_RMSNORM, gamma, beta));
             }
         }
-        if let Some((consumed, x, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
+        if let Some((consumed, x, dst, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
             if consumed == body.stmts.len() {
-                return Some((x, cols, eps, NORM_L2NORM, None, None));
+                return Some((x, dst, cols, eps, NORM_L2NORM, None, None));
             }
         }
         None
@@ -6839,8 +6865,9 @@ impl FnLowerer<'_> {
         let ForIter::Range { end: Some(end), .. } = iter else {
             return false;
         };
-        if let Some((x, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body) {
-            return self.emit_norm(x, Some(end), &cols, eps, op, gamma, beta);
+        if let Some((x, dst, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body)
+        {
+            return self.emit_norm(x, dst, Some(end), &cols, eps, op, gamma, beta);
         }
         false
     }
@@ -13065,7 +13092,15 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
             expr_mentions(base, sym)
         }
         ExprKind::Cast { expr, .. } => expr_mentions(expr, sym),
-        // struct/array literals, if/match/block exprs, method calls, ranges, …: assume a use.
+        // Array literals mention a symbol iff one of their element expressions does — precise (and
+        // sound: the literal uses exactly those sub-expressions). Without this an array-init `let`
+        // (`let out = [0.0; N]`) in a scalar-escape window falsely reads as a use, so a preceding
+        // norm/reduction declines (e.g. the dest declaration of an out-of-place `out = norm(x)`).
+        ExprKind::ArrayLit(items) => items.iter().any(|e| expr_mentions(e, sym)),
+        ExprKind::ArrayRepeat { value, count } => {
+            expr_mentions(value, sym) || expr_mentions(count, sym)
+        }
+        // struct literals, if/match/block exprs, method calls, ranges, …: assume a use.
         _ => true,
     }
 }
