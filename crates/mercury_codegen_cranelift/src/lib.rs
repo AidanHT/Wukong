@@ -217,6 +217,13 @@ const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
 const RT_DOT_F16: &str = "mercury_dot_f16";
 const RT_SUM_F16: &str = "mercury_sum_f16";
 const RT_REDUCE_F16: &str = "mercury_reduce_f16";
+// The `@parallel` multicore twins (same ABI; deterministic fixed-RCHUNK chunk fold).
+const RT_DOT_BF16_PAR: &str = "mercury_dot_bf16_parallel";
+const RT_SUM_BF16_PAR: &str = "mercury_sum_bf16_parallel";
+const RT_REDUCE_BF16_PAR: &str = "mercury_reduce_bf16_parallel";
+const RT_DOT_F16_PAR: &str = "mercury_dot_f16_parallel";
+const RT_SUM_F16_PAR: &str = "mercury_sum_f16_parallel";
+const RT_REDUCE_F16_PAR: &str = "mercury_reduce_f16_parallel";
 // f16 has no cheap inline round (unlike bf16's `<<16`), so f16 load/store/cast call these shims —
 // the *same* `half`-crate conversion the interpreter uses, keeping native == interp bit-for-bit.
 const RT_F32_TO_F16: &str = "mercury_f32_to_f16_bits";
@@ -1313,7 +1320,9 @@ impl<'a> FnTranslator<'a> {
         // The bf16 mixed-precision reductions: mercury_dot_bf16(x, y, n) -> f32 (3 args) and
         // mercury_sum_bf16(x, n) -> f32 (2 args). bf16 storage, f32 accumulate; both return the
         // accumulated f32, so bind the call result like the sreduce kernel above.
-        if (name == RT_DOT_BF16 || name == RT_DOT_F16) && args.len() == 3 {
+        if matches!(name, RT_DOT_BF16 | RT_DOT_F16 | RT_DOT_BF16_PAR | RT_DOT_F16_PAR)
+            && args.len() == 3
+        {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
@@ -1321,16 +1330,22 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, y, n]);
             return self.builder.inst_results(call).first().copied();
         }
-        if (name == RT_SUM_BF16 || name == RT_SUM_F16) && args.len() == 2 {
+        if matches!(name, RT_SUM_BF16 | RT_SUM_F16 | RT_SUM_BF16_PAR | RT_SUM_F16_PAR)
+            && args.len() == 2
+        {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let fref = self.rt_refs[name];
             let call = self.builder.ins().call(fref, &[x, n]);
             return self.builder.inst_results(call).first().copied();
         }
-        // mercury_reduce_{bf16,f16}(x, n, op) -> f32 — the max-family reduction (max/min/absmax). Same
-        // f32 return as the sum/dot kernels above; the op selects the fold inside the kernel.
-        if (name == RT_REDUCE_BF16 || name == RT_REDUCE_F16) && args.len() == 3 {
+        // mercury_reduce_{bf16,f16}[_parallel](x, n, op) -> f32 — the max-family reduction
+        // (max/min/absmax). Same f32 return as the sum/dot kernels above; the op selects the fold.
+        if matches!(
+            name,
+            RT_REDUCE_BF16 | RT_REDUCE_F16 | RT_REDUCE_BF16_PAR | RT_REDUCE_F16_PAR
+        ) && args.len() == 3
+        {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let op = self.coerce_to_i64(args[2]);
@@ -1686,6 +1701,12 @@ struct RtFuncs {
     dot_f16: FuncId,
     sum_f16: FuncId,
     reduce_f16: FuncId,
+    dot_bf16_par: FuncId,
+    sum_bf16_par: FuncId,
+    reduce_bf16_par: FuncId,
+    dot_f16_par: FuncId,
+    sum_f16_par: FuncId,
+    reduce_f16_par: FuncId,
     f32_to_f16: FuncId,
     f16_to_f32: FuncId,
     axpby_bf16: FuncId,
@@ -2277,6 +2298,25 @@ fn populate_module<M: Module>(
         reduce_f16: module
             .declare_function(RT_REDUCE_F16, Linkage::Import, &sig_reduce_bf16)
             .map_err(|e| e.to_string())?,
+        // The `@parallel` twins share the serial signatures (identical ABI; only the impl chunks).
+        dot_bf16_par: module
+            .declare_function(RT_DOT_BF16_PAR, Linkage::Import, &sig_dot_bf16)
+            .map_err(|e| e.to_string())?,
+        sum_bf16_par: module
+            .declare_function(RT_SUM_BF16_PAR, Linkage::Import, &sig_sum_bf16)
+            .map_err(|e| e.to_string())?,
+        reduce_bf16_par: module
+            .declare_function(RT_REDUCE_BF16_PAR, Linkage::Import, &sig_reduce_bf16)
+            .map_err(|e| e.to_string())?,
+        dot_f16_par: module
+            .declare_function(RT_DOT_F16_PAR, Linkage::Import, &sig_dot_bf16)
+            .map_err(|e| e.to_string())?,
+        sum_f16_par: module
+            .declare_function(RT_SUM_F16_PAR, Linkage::Import, &sig_sum_bf16)
+            .map_err(|e| e.to_string())?,
+        reduce_f16_par: module
+            .declare_function(RT_REDUCE_F16_PAR, Linkage::Import, &sig_reduce_bf16)
+            .map_err(|e| e.to_string())?,
         f32_to_f16: module
             .declare_function(RT_F32_TO_F16, Linkage::Import, &sig_f32_to_f16)
             .map_err(|e| e.to_string())?,
@@ -2782,6 +2822,30 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_REDUCE_F16,
                 module.declare_func_in_func(rt.reduce_f16, builder.func),
+            );
+            rt_refs.insert(
+                RT_DOT_BF16_PAR,
+                module.declare_func_in_func(rt.dot_bf16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SUM_BF16_PAR,
+                module.declare_func_in_func(rt.sum_bf16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_REDUCE_BF16_PAR,
+                module.declare_func_in_func(rt.reduce_bf16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_DOT_F16_PAR,
+                module.declare_func_in_func(rt.dot_f16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SUM_F16_PAR,
+                module.declare_func_in_func(rt.sum_f16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_REDUCE_F16_PAR,
+                module.declare_func_in_func(rt.reduce_f16_par, builder.func),
             );
             rt_refs.insert(
                 RT_F32_TO_F16,
@@ -3334,6 +3398,30 @@ pub fn jit_compile(
         mercury_runtime::mercury_reduce_f16 as *const u8,
     );
     builder.symbol(
+        RT_DOT_BF16_PAR,
+        mercury_runtime::mercury_dot_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_BF16_PAR,
+        mercury_runtime::mercury_sum_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_BF16_PAR,
+        mercury_runtime::mercury_reduce_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_F16_PAR,
+        mercury_runtime::mercury_dot_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_F16_PAR,
+        mercury_runtime::mercury_sum_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_F16_PAR,
+        mercury_runtime::mercury_reduce_f16_parallel as *const u8,
+    );
+    builder.symbol(
         RT_F32_TO_F16,
         mercury_runtime::mercury_f32_to_f16_bits as *const u8,
     );
@@ -3793,6 +3881,30 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_REDUCE_F16,
         mercury_runtime::mercury_reduce_f16 as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_BF16_PAR,
+        mercury_runtime::mercury_dot_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_BF16_PAR,
+        mercury_runtime::mercury_sum_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_BF16_PAR,
+        mercury_runtime::mercury_reduce_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_F16_PAR,
+        mercury_runtime::mercury_dot_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_F16_PAR,
+        mercury_runtime::mercury_sum_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_F16_PAR,
+        mercury_runtime::mercury_reduce_f16_parallel as *const u8,
     );
     builder.symbol(
         RT_F32_TO_F16,

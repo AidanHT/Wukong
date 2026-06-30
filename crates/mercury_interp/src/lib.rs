@@ -2300,9 +2300,15 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bf16-rounded f32 value; reconstruct the exact 16 stored bits via `f32_to_bf16_bits`
             // (idempotent on an already-bf16-rounded value) so the buffer is identical to the native
             // backend's 2-byte storage, then call the identical kernel — the differential gate stays
-            // exact despite the kernel's reassociated 8-lane accumulation.
-            "mercury_dot_bf16" | "mercury_sum_bf16" => {
-                let is_dot = name == "mercury_dot_bf16";
+            // exact despite the kernel's reassociated 8-lane accumulation. The `_parallel` twins (a
+            // `@parallel` low-precision reduction) marshal identically but call the **parallel** kernel:
+            // unlike the f32 reductions (whose serial form is itself chunked, so the interp calls it),
+            // the bf16/f16 serial kernels reduce the *whole* array flat, which reassociates vs the
+            // chunked parallel fold — so we call the deterministic parallel kernel native runs, exactly.
+            "mercury_dot_bf16" | "mercury_sum_bf16" | "mercury_dot_bf16_parallel"
+            | "mercury_sum_bf16_parallel" => {
+                let is_dot = name == "mercury_dot_bf16" || name == "mercury_dot_bf16_parallel";
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
                     (ptr(args[1])?, args[2].as_int() as usize)
@@ -2327,10 +2333,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 // SAFETY: the buffers are exactly n u16 long — the kernels' contract.
                 let r = unsafe {
-                    if is_dot {
-                        mercury_runtime::mercury_dot_bf16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
-                    } else {
-                        mercury_runtime::mercury_sum_bf16(xbuf.as_ptr(), n as i64)
+                    match (is_dot, is_par) {
+                        (true, false) => {
+                            mercury_runtime::mercury_dot_bf16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
+                        }
+                        (true, true) => mercury_runtime::mercury_dot_bf16_parallel(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            n as i64,
+                        ),
+                        (false, false) => mercury_runtime::mercury_sum_bf16(xbuf.as_ptr(), n as i64),
+                        (false, true) => {
+                            mercury_runtime::mercury_sum_bf16_parallel(xbuf.as_ptr(), n as i64)
+                        }
                     }
                 };
                 Ok(Value::Float(r as f64))
@@ -2339,7 +2354,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // a `m = fmax/fmin(m, (x[k] as f32))` loop over `[bf16]` lowers to. Reconstruct the exact
             // bf16 bits (as the dot/sum path does), call the identical kernel — the widen is lossless
             // and max/min round nothing, so interp == native exactly.
-            "mercury_reduce_bf16" => {
+            "mercury_reduce_bf16" | "mercury_reduce_bf16_parallel" => {
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int() as usize;
                 let op = args[2].as_int() as i64;
@@ -2353,16 +2369,23 @@ impl<'a, 'k> Interp<'a, 'k> {
                     ));
                 }
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
-                let r =
-                    unsafe { mercury_runtime::mercury_reduce_bf16(xbuf.as_ptr(), n as i64, op) };
+                let r = unsafe {
+                    if is_par {
+                        mercury_runtime::mercury_reduce_bf16_parallel(xbuf.as_ptr(), n as i64, op)
+                    } else {
+                        mercury_runtime::mercury_reduce_bf16(xbuf.as_ptr(), n as i64, op)
+                    }
+                };
                 Ok(Value::Float(r as f64))
             }
             // The IEEE-f16 twins: `mercury_dot_f16` / `mercury_sum_f16` / `mercury_reduce_f16` — same
             // marshaling as the bf16 reductions, but reconstruct the exact f16 bits via
             // `f32_to_f16_bits` (the stored value is already f16-rounded, so this is exact) and call
             // the F16C kernels. interp == native bit-for-bit (the widen is lossless, identical kernel).
-            "mercury_dot_f16" | "mercury_sum_f16" => {
-                let is_dot = name == "mercury_dot_f16";
+            "mercury_dot_f16" | "mercury_sum_f16" | "mercury_dot_f16_parallel"
+            | "mercury_sum_f16_parallel" => {
+                let is_dot = name == "mercury_dot_f16" || name == "mercury_dot_f16_parallel";
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
                     (ptr(args[1])?, args[2].as_int() as usize)
@@ -2385,17 +2408,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                         ybuf.push(bits(y, t)?);
                     }
                 }
-                // SAFETY: the buffers are exactly n u16 long — the kernels' contract.
+                // SAFETY: the buffers are exactly n u16 long — the kernels' contract. The `_parallel`
+                // names call the deterministic parallel kernel (see the bf16 dot/sum arm above).
                 let r = unsafe {
-                    if is_dot {
-                        mercury_runtime::mercury_dot_f16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
-                    } else {
-                        mercury_runtime::mercury_sum_f16(xbuf.as_ptr(), n as i64)
+                    match (is_dot, is_par) {
+                        (true, false) => {
+                            mercury_runtime::mercury_dot_f16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
+                        }
+                        (true, true) => mercury_runtime::mercury_dot_f16_parallel(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            n as i64,
+                        ),
+                        (false, false) => mercury_runtime::mercury_sum_f16(xbuf.as_ptr(), n as i64),
+                        (false, true) => {
+                            mercury_runtime::mercury_sum_f16_parallel(xbuf.as_ptr(), n as i64)
+                        }
                     }
                 };
                 Ok(Value::Float(r as f64))
             }
-            "mercury_reduce_f16" => {
+            "mercury_reduce_f16" | "mercury_reduce_f16_parallel" => {
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int() as usize;
                 let op = args[2].as_int() as i64;
@@ -2409,7 +2443,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                     ));
                 }
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
-                let r = unsafe { mercury_runtime::mercury_reduce_f16(xbuf.as_ptr(), n as i64, op) };
+                let r = unsafe {
+                    if is_par {
+                        mercury_runtime::mercury_reduce_f16_parallel(xbuf.as_ptr(), n as i64, op)
+                    } else {
+                        mercury_runtime::mercury_reduce_f16(xbuf.as_ptr(), n as i64, op)
+                    }
+                };
                 Ok(Value::Float(r as f64))
             }
             // `mercury_axpby_bf16(x, y, out, n, a, b)` — the bf16→f32 streaming axpby a recognized

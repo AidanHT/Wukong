@@ -47,8 +47,10 @@ pub use i8gemm::{
 
 mod lowp;
 pub use lowp::{
-    mercury_axpby_bf16, mercury_axpby_f16, mercury_dot_bf16, mercury_dot_f16, mercury_reduce_bf16,
-    mercury_reduce_f16, mercury_sum_bf16, mercury_sum_f16,
+    mercury_axpby_bf16, mercury_axpby_f16, mercury_dot_bf16, mercury_dot_bf16_parallel,
+    mercury_dot_f16, mercury_dot_f16_parallel, mercury_reduce_bf16, mercury_reduce_bf16_parallel,
+    mercury_reduce_f16, mercury_reduce_f16_parallel, mercury_sum_bf16, mercury_sum_bf16_parallel,
+    mercury_sum_f16, mercury_sum_f16_parallel,
 };
 
 mod transpose;

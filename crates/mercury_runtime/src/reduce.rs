@@ -83,7 +83,8 @@ pub(crate) fn fold2(a: f32, b: f32, op: i64) -> f32 {
 // partial decomposition deterministic. 8192 f32 = 32 KB (an L1's worth) per chunk; at N=2^20 that is
 // 128 chunks, plenty for rayon work-stealing to balance the P+E hybrid, and the 128-entry partial
 // array combines in negligible time. Must stay constant for serial/parallel/interp to agree.
-const RCHUNK: usize = 8192;
+// `pub(crate)` so the bf16/f16 parallel reductions in `lowp.rs` cut on the *same* fixed boundary.
+pub(crate) const RCHUNK: usize = 8192;
 
 /// One element's contribution folded into accumulator `a` (the fused-multiply-add form, so the AVX2
 /// `_mm256_fmadd_ps` lanes match this lane-for-lane). `yi` is ignored for the unary ops.
