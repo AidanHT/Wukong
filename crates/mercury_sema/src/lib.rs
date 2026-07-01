@@ -1247,6 +1247,31 @@ impl Sema<'_> {
                             ),
                         );
                     }
+                    // The implied `a = a (op) b` produces a value of the binary operator's result
+                    // type. An integer place with a float operand yields a float that cannot
+                    // implicitly narrow back to the integer place — exactly what the plain `a = a + b`
+                    // scalar-agreement check above rejects. The compound path silently accepted it and
+                    // emitted a float->int conversion (a *negative* float even converted via `fptoui`
+                    // to 0, so `acc += -1.0` left `acc` unchanged) — a lossy value both backends
+                    // agreed on, but one the language forbids everywhere else. Reject with E0401.
+                    if let (Ty::Scalar(ts), Ty::Scalar(vs)) = (&target_ty, &value_ty) {
+                        if ts.is_int() && vs.is_float() {
+                            self.error(
+                                target.span,
+                                "E0401",
+                                format!(
+                                    "compound assignment `{}` cannot apply a `{}` value to an `{}` \
+                                     place; the result would narrow to `{}` — convert explicitly \
+                                     with `as {}`",
+                                    op.glyph(),
+                                    vs.name(),
+                                    ts.name(),
+                                    ts.name(),
+                                    ts.name()
+                                ),
+                            );
+                        }
+                    }
                 }
                 // Reassigning an immutable binding requires `mut`, but it was never enforced. Two
                 // cases, both E0304:
