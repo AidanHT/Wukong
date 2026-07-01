@@ -910,6 +910,28 @@ impl Sema<'_> {
                         self.retype_adapted_literal(&f.value, fty);
                     }
                     self.range_check_int_literal(&f.value, fty);
+                    // Scalar-type agreement, the same rule `let`/return/assignment enforce: a
+                    // NON-literal field value of a different scalar type (`S { a: x }` with `a: i32`,
+                    // `x: f32`) silently truncated/demoted it — both backends agreeing on the lossy
+                    // value — where the language demands an explicit `as`. The value's type is already
+                    // in the side table (the `StructLit` arm types each field before this runs).
+                    let vty = self.types.get(&f.value.id).cloned().unwrap_or(Ty::Unknown);
+                    if let (Ty::Scalar(fs), Ty::Scalar(vs)) = (fty, &vty) {
+                        if fs != vs && !self.literal_adapts(fty, &f.value) {
+                            self.error(
+                                f.value.span,
+                                "E0401",
+                                format!(
+                                    "type mismatch: field `{}` has type `{}`, but a value of type \
+                                     `{}` is given (use `as {}` to convert)",
+                                    self.sym_str(name),
+                                    fty.display(self.interner),
+                                    vty.display(self.interner),
+                                    fs.name()
+                                ),
+                            );
+                        }
+                    }
                 }
                 None => {
                     let nm = self.sym_str(name).to_string();
@@ -1100,6 +1122,27 @@ impl Sema<'_> {
                         self.retype_adapted_literal(value, &target_ty);
                     }
                     self.range_check_int_literal(value, &target_ty);
+                    // Scalar-type agreement, the same rule `let`/call-args/return enforce: assigning
+                    // a NON-literal value of a different scalar type to a scalar place — `y = x` with
+                    // `y: i32`, `x: f32`, or a field/element place `s.a = x` / `arr[0] = x` — silently
+                    // truncated/demoted it (both backends agreeing on the lossy value) where the
+                    // language demands an explicit `as`. An unsuffixed literal still adapts and an
+                    // out-of-range literal is caught above; only a non-literal mismatch errors.
+                    if let (Ty::Scalar(ts), Ty::Scalar(vs)) = (&target_ty, &value_ty) {
+                        if ts != vs && !self.literal_adapts(&target_ty, value) {
+                            self.error(
+                                target.span,
+                                "E0401",
+                                format!(
+                                    "type mismatch: cannot assign a value of type `{}` to a place of \
+                                     type `{}` (use `as {}` to convert)",
+                                    value_ty.display(self.interner),
+                                    target_ty.display(self.interner),
+                                    ts.name()
+                                ),
+                            );
+                        }
+                    }
                 }
                 // A compound assignment `a += b` (and `-= *= /= …`) means `a = a (op) b`. That implied
                 // binary operator is undefined on an aggregate (struct/tuple/array) — the explicit
