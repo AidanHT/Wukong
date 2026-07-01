@@ -1375,6 +1375,25 @@ impl Sema<'_> {
                                 ),
                             );
                         }
+                        // The symmetric hole: returning a `()` value where a real type is declared —
+                        // `return x;` where `x = if c { 42 }` (an else-less `if` is unit), or
+                        // `return (if c { 42 });` directly. mir_build built a `return` of a void value:
+                        // the -O0 verifier rejects it (a clean ICE) but -O2 mem2reg *panicked* on the
+                        // void branch argument. Reject at the source (E0401), like the bare `return;`
+                        // arm below — stay lenient on `Unknown`/`Error`.
+                        if !matches!(ret, Ty::Unit | Ty::Unknown | Ty::Error) && matches!(t, Ty::Unit)
+                        {
+                            self.error(
+                                e.span,
+                                "E0401",
+                                format!(
+                                    "this function must return a value of type `{}`, but a `()` \
+                                     value is returned here (an `if` with no `else`, or a `match` \
+                                     with statement arms, yields `()`)",
+                                    ret.display(self.interner)
+                                ),
+                            );
+                        }
                         self.check_return_shape(&t, e, e.span);
                         // An out-of-range integer literal returned where a narrower type is declared
                         // (`return 9999999999` from `-> i32`) was silently truncated to the low bits
