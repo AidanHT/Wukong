@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.compound_assign_float_to_int
+
+// A compound assignment `a += b` means `a = a (op) b`. With an integer place and a float operand,
+// the implied `a + b` is a float that cannot implicitly narrow back to the integer place — exactly
+// what the plain `a = a + b` (and `let x: i32 = a + b`) forms already reject. The compound path used
+// to accept it silently and emit a float->int conversion; a *negative* float even converted via
+// `fptoui` to 0, so `acc += -1.0` left `acc` unchanged (a lossy value both backends agreed on, but
+// one the language forbids everywhere else). The fix is an explicit `as i32`.
+fn main() -> i32 {
+    let mut acc: i32 = 100;
+    let d: f32 = -1.5;
+    acc += d; // E0401: convert explicitly with `as i32`
+    return acc;
+}
