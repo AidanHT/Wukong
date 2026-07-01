@@ -1939,6 +1939,19 @@ impl FnLowerer<'_> {
     /// has no def access). Recurses through arrays/tuples so nested structs lay out correctly.
     fn ty_size(&self, ty: &Ty) -> Option<u64> {
         match ty {
+            // A C-style enum lowers to its i32 discriminant (`mir_ty` resolves it to `I32`), so it is
+            // a sized 4-byte scalar field — not an unsized aggregate. Without this, an enum field in a
+            // struct/tuple (`(Color, i32)`, `struct Pixel { c: Color, v: i32 }`) sized via
+            // `struct_size` returned `None` and was rejected `C0001 "unsized field"`, even though
+            // array-of-enum (sized via `mir_ty_of` recursion) and enum scalars already worked.
+            Ty::Named(sym)
+                if matches!(
+                    self.sema.defs.lookup(*sym).map(|d| &d.kind),
+                    Some(DefKind::Enum(_))
+                ) =>
+            {
+                Some(4)
+            }
             Ty::Named(sym) => self.struct_size(*sym),
             Ty::Array { elem, len } => Some(self.ty_size(elem)? * len),
             Ty::Tuple(fields) => self.aggregate_layout(fields).map(|(_, size, _)| size),
@@ -1949,6 +1962,15 @@ impl FnLowerer<'_> {
     /// Alignment of `ty`, resolving named structs through the sema registry (see [`ty_size`]).
     fn ty_align(&self, ty: &Ty) -> Option<u64> {
         match ty {
+            // A C-style enum is its i32 discriminant — 4-byte aligned (see `ty_size`).
+            Ty::Named(sym)
+                if matches!(
+                    self.sema.defs.lookup(*sym).map(|d| &d.kind),
+                    Some(DefKind::Enum(_))
+                ) =>
+            {
+                Some(4)
+            }
             Ty::Named(sym) => self.struct_align(*sym),
             Ty::Array { elem, .. } => self.ty_align(elem),
             Ty::Tuple(fields) => fields
