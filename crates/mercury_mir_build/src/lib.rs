@@ -5252,29 +5252,25 @@ impl FnLowerer<'_> {
                     {
                         self.expr_mir(e)
                     }
-                    // An array literal/repeat *with* an annotation prefers the annotation for its
-                    // explicit element type + length (so an unsuffixed-literal element like
-                    // `[1, 2]: [u8; 2]` takes the annotated scalar, not the i32 default). But
-                    // `mir_ty_of_ast` is registry-blind: a struct/tuple element resolves to the
-                    // `I32` fallback, under-allocating the slot and mis-striding `a[i]`, so
-                    // `a[i].field` reads past the buffer / segfaults in native. When the init's
-                    // registry-aware element is an aggregate byte buffer, splice it into the
-                    // annotated array type (keeping the annotated length).
+                    // An array literal/repeat *with* an annotation takes the annotation's
+                    // registry-aware MIR type (`mir_ty_of_ann`): it carries the explicit element
+                    // type + length (so an unsuffixed-literal element like `[1, 2]: [u8; 2]` takes
+                    // the annotated scalar, not the i32 default) AND — unlike the registry-blind
+                    // `mir_ty_of_ast` — expands a struct/tuple element to its real byte buffer at
+                    // *any* nesting depth. The registry-blind path collapses a struct/tuple element
+                    // to the `I32` fallback, under-allocating the slot and mis-striding `a[i]`, so
+                    // `a[i].field` reads past the buffer (interp store-OOB trap / native stack
+                    // corruption). A prior single-level splice patched `[P; N]` / `[(i32,i32); N]`
+                    // but still fell back to the buggy annotation for a doubly-nested aggregate
+                    // element (`[[P; 2]; 2]`, `[[(i32,i32); 1]; 1]`) — whose annotated element is
+                    // *itself* an array — so the recursive resolver replaces it wholesale.
                     (Some(t), Some(e))
                         if matches!(
                             &e.kind,
                             ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
                         ) =>
                     {
-                        match (mir_ty_of_ast(t, self.interner, &self.sema.consts), self.expr_mir(e)) {
-                            (MirType::Array(ae, n), MirType::Array(re, _))
-                                if !matches!(*ae, MirType::Array(..))
-                                    && matches!(*re, MirType::Array(..)) =>
-                            {
-                                MirType::Array(re, n)
-                            }
-                            (ann, _) => ann,
-                        }
+                        self.mir_ty_of_ann(t)
                     }
                     // A `let x: T;` with no initializer. Resolve `T` registry-aware so a no-init
                     // struct/tuple local allocates its real byte buffer — the registry-blind
