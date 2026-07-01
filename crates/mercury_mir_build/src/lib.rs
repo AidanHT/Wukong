@@ -4779,6 +4779,17 @@ impl FnLowerer<'_> {
             }
             return init.as_ref().and_then(|i| self.float_lit_bits(i));
         }
+        // A top-level `const EPS: f32 = <literal>` — the near-universal transformer spelling. A `const`
+        // is immutable and always in scope (no `prior` dependency), and its checked initializer lives in
+        // `sema.consts`, so resolving its literal bits here is exactly as sound as an inline literal.
+        // Guarded by `lookup(sym).is_none()` — a local/param binding of the same name shadows the const
+        // (mirroring the `Path` value-lowering precedence), so a runtime `eps` never resolves to a
+        // const's value. Without this, `rsqrt(ss/N + EPS)` dropped the whole norm to `velem` + a reduction.
+        if self.lookup(sym).is_none() {
+            if let Some(init) = self.sema.consts.get(&sym) {
+                return self.float_lit_bits(init);
+            }
+        }
         None
     }
 
