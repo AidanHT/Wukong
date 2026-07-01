@@ -44,6 +44,13 @@ impl Builder {
         id
     }
 
+    /// The MIR type of an already-created value (mid-construction). Mirrors
+    /// [`crate::Function::value_type`], but usable before `finish()` — e.g. to tell whether a tail
+    /// value is a real aggregate base pointer or a scalar placeholder.
+    pub fn value_type(&self, v: ValueId) -> &MirType {
+        &self.value_types[v.0 as usize]
+    }
+
     pub fn new_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
         self.blocks.push(BasicBlock {

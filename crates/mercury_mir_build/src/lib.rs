@@ -616,8 +616,19 @@ fn lower_fn(
         if let Some((sret_ptr, rty)) = fl.sret.clone() {
             // A fell-through aggregate body: its tail expression (a struct/tuple value) is the
             // return value — deep-copy it into the sret buffer, then return void.
+            //
+            // Only a *genuine* aggregate tail value (a base pointer) is copied. If the body's tail
+            // diverged — both arms of a tail `if`/`match` `return`, so nothing reaches the merge
+            // block — `lower_if_value`/`lower_match` yield a scalar zero placeholder into that
+            // now-unreachable merge block. Deep-copying it as the aggregate would `gep` off a scalar
+            // base: MIR the -O0 verifier rejects (`gep base … has type i32 but expected ptr`) while
+            // -O1+ silently passes because simplify-cfg deletes the dead block before verification —
+            // an `-O0 ≠ -O3` ICE on `fn -> Struct { if c { return … } else { return … } }`. Skipping
+            // the copy leaves the dead block a valid `{ <placeholder>; ret }` (the fn returns void).
             if let Some(v) = tail {
-                fl.emit_copy(sret_ptr, v, &rty);
+                if matches!(fl.builder.value_type(v), MirType::Ptr | MirType::Array(..)) {
+                    fl.emit_copy(sret_ptr, v, &rty);
+                }
             }
             fl.builder.ret(None);
         } else {

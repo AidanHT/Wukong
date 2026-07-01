@@ -1,0 +1,75 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+module tests.run.sret_diverging_arms
+
+// Regression: an aggregate-returning function (the sret ABI) whose body's tail is an `if`/`else` or
+// `match` where EVERY arm `return`s leaves the fall-through merge block unreachable. The lowering used
+// to synthesize a scalar zero placeholder in that dead block and — on the sret path — deep-copy it as
+// the aggregate, GEPing off a scalar base: MIR the -O0 verifier rejected ("gep base ... has type i32
+// but expected ptr") while -O1+ silently passed because simplify-cfg deletes the dead block before
+// verification — a real -O0 != -O3 ICE on the idiomatic `fn -> Struct { if c { return } else { return } }`.
+// Now the sret fallback only deep-copies a genuine aggregate tail pointer, so every opt level agrees.
+
+struct P { x: i32 }
+
+// struct return, if/else where both arms return
+fn pick_s(c: i32) -> P {
+    if c > 0 { return P { x: 1 }; } else { return P { x: 2 }; }
+}
+
+// tuple return, `match` where every arm returns
+fn pick_t(c: i32) -> (i32, i32) {
+    match c {
+        0 => { return (10, 20); }
+        _ => { return (30, 40); }
+    }
+}
+
+// array return, nested diverging branches (every leaf returns)
+fn pick_a(c: i32) -> [i32; 2] {
+    if c > 5 {
+        return [1, 2];
+    } else {
+        if c > 0 { return [3, 4]; } else { return [5, 6]; }
+    }
+}
+
+// the tail-expression form (no `return` keyword) must still work — the merge IS reachable here
+fn pick_tail(c: i32) -> P {
+    if c > 0 { P { x: 7 } } else { P { x: 8 } }
+}
+
+fn main() -> i32 {
+    let s1: P = pick_s(1);
+    print(s1.x); // 1
+    let s2: P = pick_s(-1);
+    print(s2.x); // 2
+
+    let t1 = pick_t(0);
+    print(t1.0); // 10
+    print(t1.1); // 20
+    let t2 = pick_t(9);
+    print(t2.0); // 30
+    print(t2.1); // 40
+
+    let a1 = pick_a(7);
+    print(a1[0]); // 1
+    let a2 = pick_a(3);
+    print(a2[1]); // 4
+    let a3 = pick_a(-1);
+    print(a3[1]); // 6
+
+    let tl = pick_tail(1);
+    print(tl.x); // 7
+    return 0;
+}
