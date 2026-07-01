@@ -672,7 +672,7 @@ impl Sema<'_> {
         // The body's tail expression is the implicit return — check its shape against the declared
         // return type (an explicit `return` is checked at its `StmtKind::Return` site).
         if let Some(tail) = &body.tail {
-            self.check_return_shape(&body_ty, tail.span);
+            self.check_return_shape(&body_ty, tail, tail.span);
         }
         // Definite return: a function that promises a value must produce one on every path. If the
         // body can fall off its end (no trailing tail/return, an `if` with no `else`, a breakable or
@@ -700,7 +700,7 @@ impl Sema<'_> {
     /// callers propagate the declared return shape into downstream shape checks (a single wrong
     /// return silently poisons every caller). Scalars and other kinds stay lenient (numeric coercion
     /// at lowering, like `let`/assignment), so this never over-fires on e.g. `return 5` from `-> i64`.
-    fn check_return_shape(&mut self, val_ty: &Ty, span: Span) {
+    fn check_return_shape(&mut self, val_ty: &Ty, val: &Expr, span: Span) {
         let ret = self.ret_ty.clone();
         if matches!(ret, Ty::Tensor { .. } | Ty::Vector { .. })
             || matches!(val_ty, Ty::Tensor { .. } | Ty::Vector { .. })
@@ -725,6 +725,27 @@ impl Sema<'_> {
                     val_ty.display(self.interner)
                 ),
             );
+        }
+        // Scalar-type agreement, the same rule `let`/call-args enforce: a NON-literal value of a
+        // different scalar type (`return x` where `x: i64` from a `-> i32` fn, or an `f32` from a
+        // `-> i32`) was silently truncated/demoted — both backends agreeing on the lossy value, so
+        // the differential gate was blind — where the language otherwise demands an explicit `as`.
+        // An unsuffixed literal still adapts (`return 5` from `-> i64`), and an out-of-range literal
+        // is caught by `range_check_int_literal`; only a genuinely mismatched non-literal errors.
+        if let (Ty::Scalar(rs), Ty::Scalar(vs)) = (&ret, val_ty) {
+            if rs != vs && !self.literal_adapts(&ret, val) {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: this function returns `{}`, but a value of type `{}` is \
+                         returned here (use `as {}` to convert)",
+                        ret.display(self.interner),
+                        val_ty.display(self.interner),
+                        rs.name()
+                    ),
+                );
+            }
         }
     }
 
@@ -1171,7 +1192,7 @@ impl Sema<'_> {
                                 ),
                             );
                         }
-                        self.check_return_shape(&t, e.span);
+                        self.check_return_shape(&t, e, e.span);
                         // An out-of-range integer literal returned where a narrower type is declared
                         // (`return 9999999999` from `-> i32`) was silently truncated to the low bits
                         // (exit code 255 from a wrapped value). Range-check it against the return

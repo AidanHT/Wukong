@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.return_scalar_type_mismatch
+
+// A NON-literal value of a different scalar type, returned from a function, was silently
+// truncated/demoted — `return x` where `x: i64` from a `-> i32` function printed the low 32 bits,
+// both backends agreeing on the lossy value, so the differential gate was blind. The language
+// otherwise demands an explicit `as` for scalar conversions (`let`/call-args already reject the same
+// mismatch), so `return` now does too. (An unsuffixed literal still adapts: `return 5` from `-> i64`
+// is fine, and an out-of-range literal is caught by the literal range check.)
+fn f(x: i64) -> i32 {
+    return x;
+}
+
+fn main() -> i32 {
+    return 0;
+}
