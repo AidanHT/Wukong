@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0503
+module tests.fail.print_arity
+
+// `print`/`println` render a single value; extra arguments were silently dropped (`print(1, 2)`
+// printed just `1`). Both backends agreed on the drop, so it was not a divergence, but a quiet
+// footgun. A too-many-argument call is now E0503, like `assert` and user-function arity. (A
+// zero-argument `print()` for a blank line stays valid.)
+fn main() -> i32 {
+    print(1, 2);
+    return 0;
+}

@@ -136,6 +136,26 @@ impl Sema<'_> {
                     }
                     return ret;
                 }
+                // `print`/`println` render exactly one value. Extra arguments were silently dropped
+                // (`print(1, 2)` printed just `1`) — both backends agree, so it is not a divergence,
+                // but a quiet footgun where the programmer expects all arguments to appear. Reject a
+                // too-many-argument call (E0503). A zero-argument `print()` / `println()` (a blank
+                // line / newline) stays valid.
+                {
+                    let nm = self.sym_str(name);
+                    if (nm == "print" || nm == "println") && args.len() > 1 {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`{nm}` takes a single value to print, but {} were supplied",
+                                args.len()
+                            ),
+                        );
+                        self.types.insert(callee.id, Ty::Unknown);
+                        return Ty::Unknown;
+                    }
+                }
                 // `assert(cond)` is a builtin taking exactly one condition argument. With the wrong
                 // arity it used to fall through to a malformed void call: the interpreter read the
                 // missing condition as false and trapped (exit 1) while native treated it as a no-op
