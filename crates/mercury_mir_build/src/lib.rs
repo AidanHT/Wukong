@@ -1831,17 +1831,29 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The MIR slot type for a `let x: T;` annotation with **no** initializer — the registry-aware
-    /// companion to the free `mir_ty_of_ast` (which mistypes a named struct / a tuple as `i32`,
-    /// under-allocating the slot so a later field write GEPs off a scalar and ICEs). A named struct
-    /// resolves to its byte buffer (`mir_ty_of`), a tuple to a padded byte buffer sized from its
-    /// elements, an array recurses (so an array-of-struct element is sized correctly), and every
-    /// pointer/scalar form matches `mir_ty_of_ast`.
+    /// The MIR slot type for a `let x: T` annotation — the single registry- and subst-aware type
+    /// resolver for every annotated local (it replaced a free `mir_ty_of_ast` that mistyped a named
+    /// struct / a tuple / a generic parameter as `i32`, under-allocating the slot so a later field
+    /// write GEPs off a scalar and ICEs). A named struct resolves to its byte buffer (`mir_ty_of`),
+    /// a tuple to a padded byte buffer sized from its elements, an array recurses (so an
+    /// array-of-struct element is sized correctly), a monomorphized generic parameter resolves to
+    /// its concrete instantiation, and every pointer/scalar/vector form lowers to its natural slot.
     fn mir_ty_of_ann(&self, t: &ast::TypeExpr) -> MirType {
         use ast::TypeKind::*;
         match &t.kind {
             Path(p) => {
                 let sym = p.segments.last().unwrap().sym;
+                // A monomorphized generic type parameter resolves to its concrete instantiation
+                // first (mirrors `mir_ty_of`): without this, a generic-typed local annotation such
+                // as `let y: T = …` or `let a: [T; N] = …` falls through to the `I32` default and
+                // mis-sizes the slot — an ICE (scalar `T`) or a silent interp≠native miscompile
+                // (`[T; N]`, whose f32 GEPs read an `[i32]` buffer). Empty subst (a non-generic
+                // function) skips this and behaves exactly as before.
+                if !self.subst.is_empty() {
+                    if let Some(concrete) = self.subst.get(&sym) {
+                        return self.mir_ty_of(concrete);
+                    }
+                }
                 let name = self.interner.resolve(sym);
                 if let Some(s) = mercury_types::Scalar::from_name(name) {
                     MirType::from_scalar(s)
@@ -5383,10 +5395,10 @@ impl FnLowerer<'_> {
                 let mty = match (ty, init) {
                     // An aggregate (struct/tuple) initializer — a literal OR a value (a call that
                     // returns a struct/tuple by value, or an aggregate variable) — sizes its slot
-                    // from the init's registry-aware MIR type; the free annotation lowering
-                    // (`mir_ty_of_ast`) falls back to `I32` for a named struct / tuple type. Array
-                    // literals/repeats are excluded so they keep their existing annotation-preferred
-                    // path (`mir_ty_of_ast` carries the explicit element type/length).
+                    // from the init's registry-aware MIR type; a registry-blind annotation resolver
+                    // would fall back to `I32` for a named struct / tuple type. Array literals/repeats
+                    // are excluded so they keep their annotation-preferred path (which carries the
+                    // explicit element type + length).
                     (_, Some(e))
                         if matches!(self.expr_mir(e), MirType::Array(..))
                             && !matches!(
@@ -5399,8 +5411,8 @@ impl FnLowerer<'_> {
                     // An array literal/repeat *with* an annotation takes the annotation's
                     // registry-aware MIR type (`mir_ty_of_ann`): it carries the explicit element
                     // type + length (so an unsuffixed-literal element like `[1, 2]: [u8; 2]` takes
-                    // the annotated scalar, not the i32 default) AND — unlike the registry-blind
-                    // `mir_ty_of_ast` — expands a struct/tuple element to its real byte buffer at
+                    // the annotated scalar, not the i32 default) AND — unlike a registry-blind
+                    // resolver — expands a struct/tuple element to its real byte buffer at
                     // *any* nesting depth. The registry-blind path collapses a struct/tuple element
                     // to the `I32` fallback, under-allocating the slot and mis-striding `a[i]`, so
                     // `a[i].field` reads past the buffer (interp store-OOB trap / native stack
@@ -5417,11 +5429,16 @@ impl FnLowerer<'_> {
                         self.mir_ty_of_ann(t)
                     }
                     // A `let x: T;` with no initializer. Resolve `T` registry-aware so a no-init
-                    // struct/tuple local allocates its real byte buffer — the registry-blind
-                    // `mir_ty_of_ast` falls back to `i32`, under-allocating the slot so a later
-                    // `p.f = …` GEPs off an `i32` and emits MIR the verifier/Cranelift reject (an ICE).
+                    // struct/tuple local allocates its real byte buffer — a registry-blind resolver
+                    // would fall back to `i32`, under-allocating the slot so a later `p.f = …` GEPs
+                    // off an `i32` and emits MIR the verifier/Cranelift reject (an ICE).
                     (Some(t), None) => self.mir_ty_of_ann(t),
-                    (Some(t), _) => mir_ty_of_ast(t, self.interner, &self.sema.consts),
+                    // A scalar/pointer/vector annotation *with* an initializer (aggregate inits are
+                    // caught by the earlier arms). Route through the registry- and subst-aware
+                    // `mir_ty_of_ann` — a strict superset of the free `mir_ty_of_ast` for these forms
+                    // — so a generic-typed scalar local (`let y: T = x`) resolves `T` to its concrete
+                    // instantiation instead of the `I32` default (an ICE / -O0≠-O2 divergence).
+                    (Some(t), _) => self.mir_ty_of_ann(t),
                     (None, Some(e)) => self.expr_mir(e),
                     (None, None) => MirType::I32,
                 };
@@ -13534,31 +13551,6 @@ fn mir_ty(ty: &Ty) -> MirType {
             Box::new(MirType::I8),
             ty.size_of().unwrap_or(0) as u32,
         ),
-        _ => MirType::I32,
-    }
-}
-
-fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner, consts: &HashMap<Symbol, Expr>) -> MirType {
-    use ast::TypeKind::*;
-    match &t.kind {
-        Path(p) => {
-            let name = interner.resolve(p.segments.last().unwrap().sym);
-            match mercury_types::Scalar::from_name(name) {
-                Some(s) => MirType::from_scalar(s),
-                None => MirType::I32,
-            }
-        }
-        Array { elem, len } => match const_usize_expr(len, interner, consts) {
-            // A literal- or const-length array lowers to an array type; otherwise an opaque ptr.
-            Some(n) => MirType::Array(Box::new(mir_ty_of_ast(elem, interner, consts)), n),
-            None => MirType::Ptr,
-        },
-        Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
-        Vector { elem, lanes } => {
-            let e = mir_ty_of_ast(elem, interner, consts);
-            MirType::Vec(Box::new(e), *lanes)
-        }
-        Unit => MirType::Void,
         _ => MirType::I32,
     }
 }
