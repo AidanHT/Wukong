@@ -738,6 +738,7 @@ pub const VM2_SOFTPLUS_BWD: i64 = 8;
 // is bit-identical with the forward activation family. Inputs are positional `(a, b)`.
 pub const VM2_SILU_GATE: i64 = 9;
 pub const VM2_GELU_GATE: i64 = 10;
+pub const VM2_SIGMOID_GATE: i64 = 11; // sigmoid_gate(a, b) = sigmoid(a) · b — the classic GLU gate
 
 /// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
 #[inline]
@@ -870,6 +871,13 @@ fn gelu_gate_2(a: f32, b: f32) -> f32 {
     gelu1(a) * b
 }
 
+/// `sigmoid_gate(a, b) = sigmoid(a) · b` — the classic GLU gate (Dauphin et al.). Reuses the shared
+/// [`sigmoid1`] so it matches the AVX2 [`sigmoid_gate8`] and the activation family bit-for-bit.
+#[inline]
+fn sigmoid_gate_2(a: f32, b: f32) -> f32 {
+    sigmoid1(a) * b
+}
+
 /// Scalar dispatch for one element pair (the AVX2 tail and the no-AVX2 fallback). The two inputs are
 /// positional: `(base, exp)` for pow, `(y, x)` for atan2, `(a, b)` for hypot, `(x, dy)` for the
 /// activation backwards.
@@ -887,6 +895,7 @@ fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
         VM2_SOFTPLUS_BWD => softplus_bwd_2(x, y),
         VM2_SILU_GATE => silu_gate_2(x, y),
         VM2_GELU_GATE => gelu_gate_2(x, y),
+        VM2_SIGMOID_GATE => sigmoid_gate_2(x, y),
         _ => x,
     }
 }
@@ -960,6 +969,16 @@ unsafe fn gelu_gate8(
     b: std::arch::x86_64::__m256,
 ) -> std::arch::x86_64::__m256 {
     std::arch::x86_64::_mm256_mul_ps(gelu8(a), b)
+}
+
+/// `sigmoid(a) · b` over 8 lanes — mirrors [`sigmoid_gate_2`] (reuses the forward [`sigmoid8`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sigmoid_gate8(
+    a: std::arch::x86_64::__m256,
+    b: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    std::arch::x86_64::_mm256_mul_ps(sigmoid8(a), b)
 }
 
 /// `dy · silu'(x)` over 8 lanes — mirrors [`silu_bwd_2`] op-for-op (`silu'(x) = fma(x·s, 1−s, s)`,
@@ -1076,6 +1095,7 @@ fn vmath2_8_for(
         VM2_SOFTPLUS_BWD => softplus_bwd8,
         VM2_SILU_GATE => silu_gate8,
         VM2_GELU_GATE => gelu_gate8,
+        VM2_SIGMOID_GATE => sigmoid_gate8,
         _ => return None,
     })
 }
@@ -2155,6 +2175,9 @@ mod tests {
             let c0 = (2.0 / std::f64::consts::PI).sqrt();
             let c1 = 0.044715f64;
             0.5 * x * (1.0 + (c0 * (x + c1 * x * x * x)).tanh())
+        }
+        fn sigmoid_f64(x: f64) -> f64 {
+            1.0 / (1.0 + (-x).exp())
         }
         let n = 1003usize; // not a multiple of 8 → exercises the lane body and the scalar tail
         let a: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.011).collect();
