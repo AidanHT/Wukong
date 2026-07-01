@@ -10773,11 +10773,18 @@ impl FnLowerer<'_> {
         };
         self.builder.cond_br(c, then_bb, vec![], else_bb, vec![]);
 
+        // Whether any edge reaches `merge`. With no `else` the `cond_br` false edge targets `merge`
+        // directly, so it is always reachable; with an `else`, `merge` lives only if the then- or
+        // else-arm falls through (does not `return`). When both arms diverge, `merge` is dead and is
+        // terminated `Unreachable` below rather than left carrying a mistyped placeholder.
+        let mut merge_reachable = else_branch.is_none();
+
         // then arm
         self.builder.switch_to(then_bb);
         self.terminated = false;
         let tv = self.lower_block(then_branch);
         if !self.terminated {
+            merge_reachable = true;
             let args = match (merge_param.is_some(), tv) {
                 (true, Some(v)) => {
                     // Coerce the arm's value to the merged result type (the join of the two arms) so
@@ -10803,6 +10810,7 @@ impl FnLowerer<'_> {
             self.terminated = false;
             let ev = self.lower_expr(els);
             if !self.terminated {
+                merge_reachable = true;
                 let args = if merge_param.is_some() {
                     let from = self.expr_mir(els);
                     vec![self.coerce_to(ev, &from, &merge_ty, self.signed(els))]
@@ -10814,15 +10822,28 @@ impl FnLowerer<'_> {
         }
 
         self.builder.switch_to(merge);
-        self.terminated = false;
-        match merge_param {
+        let placeholder_ty = if result_ty == MirType::Void {
+            MirType::I32
+        } else {
+            merge_ty
+        };
+        let result = match merge_param {
             Some(p) => p,
-            None => self.const_zero(if result_ty == MirType::Void {
-                MirType::I32
-            } else {
-                merge_ty
-            }),
+            None => self.const_zero(placeholder_ty),
+        };
+        if merge_reachable {
+            self.terminated = false;
+        } else {
+            // Both arms diverged (each `return`s), so nothing reaches `merge`. Terminate it
+            // `Unreachable` and mark the path terminated so the caller (`lower_block`/`lower_fn`)
+            // treats the whole `if` as diverging and emits no fallthrough `ret` carrying this dead
+            // placeholder — which, mistyped as `i32` for a non-i32 return, was a -O0 MIR-verify ICE
+            // while -O1+ deleted the dead block before verification (a -O0 ≠ -O{1,2,3} gate violation).
+            self.builder
+                .set_term(mercury_mir::Terminator::Unreachable);
+            self.terminated = true;
         }
+        result
     }
 
     // ---- places (lvalues) ----
@@ -11344,8 +11365,11 @@ impl FnLowerer<'_> {
             None
         };
 
-        // Branch to `merge` with the arm body's value (or no arg for a unit match).
+        // Branch to `merge` with the arm body's value (or no arg for a unit match). `merge_reachable`
+        // records whether any arm (or the fallthrough) actually branches to `merge`; if none does —
+        // every arm `return`s — `merge` is dead and is terminated `Unreachable` below.
         let mut handled_default = false;
+        let mut merge_reachable = false;
         for arm in arms {
             let unconditional = matches!(
                 &arm.pat.kind,
@@ -11356,7 +11380,7 @@ impl FnLowerer<'_> {
                 // Always matches: lower the body directly, then the remaining arms are unreachable.
                 self.push_scope();
                 self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
-                self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
+                merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
                 self.pop_scope();
                 handled_default = true;
                 break;
@@ -11375,7 +11399,7 @@ impl FnLowerer<'_> {
 
             self.builder.switch_to(body_bb);
             self.terminated = false;
-            self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
+            merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
             self.pop_scope();
 
             self.builder.switch_to(next_bb);
@@ -11397,20 +11421,36 @@ impl FnLowerer<'_> {
                 Some(_) => self
                     .builder
                     .set_term(mercury_mir::Terminator::Unreachable),
-                None => self.builder.br(merge, vec![]),
+                None => {
+                    self.builder.br(merge, vec![]);
+                    merge_reachable = true;
+                }
             }
         }
 
         self.builder.switch_to(merge);
-        self.terminated = false;
-        match merge_param {
+        let placeholder_ty = if result_ty == MirType::Void {
+            MirType::I32
+        } else {
+            merge_ty
+        };
+        let result = match merge_param {
             Some(p) => p,
-            None => self.const_zero(if result_ty == MirType::Void {
-                MirType::I32
-            } else {
-                merge_ty
-            }),
+            None => self.const_zero(placeholder_ty),
+        };
+        if merge_reachable {
+            self.terminated = false;
+        } else {
+            // Every arm diverged (all `return`), so nothing reaches `merge`. Terminate it
+            // `Unreachable` and mark the path terminated: the caller (`lower_block`/`lower_fn`) then
+            // treats the whole `match` as diverging and emits no fallthrough `ret` carrying this dead
+            // placeholder — which, mistyped as `i32` for a non-i32 return, was a -O0 MIR-verify ICE
+            // while -O1+ deleted the dead block before verification (a -O0 ≠ -O{1,2,3} gate violation).
+            self.builder
+                .set_term(mercury_mir::Terminator::Unreachable);
+            self.terminated = true;
         }
+        result
     }
 
     /// Bind a match pattern's identifiers to the scrutinee for the arm's scope: a scalar `Ident` is
@@ -11694,13 +11734,17 @@ impl FnLowerer<'_> {
 
     /// Lower a match arm body and, unless it diverged, branch to `merge` passing the body value when
     /// the match produces one.
+    /// Lower a match arm body and branch to `merge` with its value unless the body diverged. Returns
+    /// whether it branched (i.e. the arm did *not* diverge) — the caller ORs these to learn whether
+    /// `merge` has any predecessor. When every arm diverges (all `return`), `merge` is dead and must
+    /// be terminated `Unreachable` rather than left as a live fallthrough carrying a placeholder.
     fn emit_match_arm_body(
         &mut self,
         body: &Expr,
         merge: mercury_mir::BlockId,
         merge_param: Option<ValueId>,
         result_ty: &MirType,
-    ) {
+    ) -> bool {
         let bv = self.lower_expr(body);
         if !self.terminated {
             let args = if merge_param.is_some() {
@@ -11719,6 +11763,9 @@ impl FnLowerer<'_> {
                 vec![]
             };
             self.builder.br(merge, args);
+            true
+        } else {
+            false
         }
     }
 
