@@ -862,15 +862,28 @@ impl Sema<'_> {
             return;
         }
         if !self.cast_is_valid(from, to) {
-            self.error(
-                span,
-                "E0401",
+            // A cast whose target is an enum forges a discriminant no variant need hold; give the
+            // dedicated hint rather than the generic reinterpret message.
+            let to_is_enum = matches!(
+                to,
+                Ty::Named(n) if matches!(self.defs.lookup(*n).map(|d| &d.kind), Some(DefKind::Enum(_)))
+            );
+            let msg = if to_is_enum {
+                format!(
+                    "invalid cast: `{}` cannot be cast to the enum `{}` — an integer cast can forge a \
+                     discriminant that no variant holds, which then reaches an exhaustive `match`'s \
+                     unreachable arm; `match` on the integer and return the intended variant instead",
+                    from.display(self.interner),
+                    to.display(self.interner)
+                )
+            } else {
                 format!(
                     "invalid cast: `{}` cannot be cast to `{}`",
                     from.display(self.interner),
                     to.display(self.interner)
-                ),
-            );
+                )
+            };
+            self.error(span, "E0401", msg);
         }
     }
 
@@ -893,7 +906,14 @@ impl Sema<'_> {
             _ => false,
         };
         match (from, to) {
-            (a, b) if scalar_like(a) && scalar_like(b) => true,
+            // A scalar or enum discriminant -> a numeric/bool/char SCALAR: a real, total conversion.
+            // Casting TO an enum is deliberately excluded (it falls through to the reject below): an
+            // integer cast can forge a discriminant no variant holds, and feeding that value to an
+            // exhaustive `match` reaches the `Unreachable` fall-through the enum-exhaustiveness
+            // lowering emits — a genuine backend divergence (the interpreter traps with exit 1, native
+            // executes an illegal instruction with exit 132). Rust rejects `int as Enum` for the same
+            // reason. `E as E` (identity) is already accepted above; `enum -> int` stays valid here.
+            (a, b) if scalar_like(a) && matches!(b, Ty::Scalar(_)) => true,
             // Integer -> pointer: forming a pointer from an address, including the null pointer
             // `0 as *T` (the only way to initialize a `*Node` leaf in a linked list / tree). The
             // cast itself never diverges — both backends yield a pointer value; only *dereferencing*
