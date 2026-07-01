@@ -1,0 +1,63 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 8
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 18
+module tests.run.nested_array_aggregate
+
+// An array whose element is itself a fixed array of an aggregate — `[[Struct; N]; M]` or
+// `[[(..); N]; M]` — bound as a bare local. The alloca-type lowering must expand the inner array's
+// aggregate element to its real byte buffer at every nesting depth; a prior single-level splice
+// collapsed the doubly-nested aggregate element to `i32`, under-allocating the slot so a field write
+// GEPed one word past the buffer (interp store-OOB trap / native stack corruption / hang). The slot
+// type is now resolved registry-aware (`mir_ty_of_ann`), so both backends agree bit-for-bit.
+struct P { x: i32, y: i32 }
+
+fn sumit(m: [[P; 2]; 2]) -> i32 {
+    // Passed by reference (aggregate param) — the caller's nested-array local must be laid out
+    // correctly for the callee's field GEPs to land.
+    return m[0][0].x + m[0][1].y + m[1][0].x + m[1][1].y; // 1 + 4 + 5 + 8 = 18
+}
+
+fn main() -> i32 {
+    // Struct leaf, doubly nested.
+    let ms: [[P; 2]; 2] = [[P{x:1,y:2}, P{x:3,y:4}], [P{x:5,y:6}, P{x:7,y:8}]];
+    print(ms[0][0].x); // 1
+    print(ms[0][1].y); // 4
+    print(ms[1][0].x); // 5
+    print(ms[1][1].y); // 8
+
+    // Tuple leaf, two fields, doubly nested.
+    let mt: [[(i32, i32); 2]; 2] = [[(1, 2), (3, 4)], [(5, 6), (7, 8)]];
+    print(mt[0][0].0); // 1
+    print(mt[0][1].1); // 4
+    print(mt[1][1].0); // 7
+    print(mt[1][1].1); // 8
+
+    // Triple nest, struct leaf.
+    let m3: [[[P; 1]; 1]; 1] = [[[P{x:9, y:8}]]];
+    print(m3[0][0][0].x); // 9
+    print(m3[0][0][0].y); // 8
+
+    // Mutation through the full field/index chain.
+    let mut mm: [[P; 2]; 2] = [[P{x:1,y:2}, P{x:3,y:4}], [P{x:5,y:6}, P{x:7,y:8}]];
+    mm[1][1].x = 100;
+    mm[0][1].y = 200;
+    print(mm[1][1].x); // 100
+    print(mm[0][1].y); // 200
+
+    // Pass a nested-aggregate array by value (by-reference ABI) to a function.
+    print(sumit(ms)); // 18
+
+    return 0;
+}
