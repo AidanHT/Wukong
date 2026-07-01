@@ -270,8 +270,10 @@ impl AstPrinter<'_> {
         for a in &param.attrs {
             self.line(self.attr_str(a));
         }
+        let mt = if param.mutable { "mut " } else { "" };
         self.line(format!(
-            "param {}: {}",
+            "param {}{}: {}",
+            mt,
             self.sym(param.name.sym),
             self.type_str(&param.ty)
         ));

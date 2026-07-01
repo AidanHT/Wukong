@@ -1,0 +1,64 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 101
+// EXPECT-OUT: 202
+// EXPECT-OUT: 60
+// EXPECT-OUT: 15
+// EXPECT-OUT: 10
+// EXPECT-OUT: 42
+module tests.run.mut_param
+
+// Parameter mutability. A parameter is immutable by default (like `let`); `mut` opts into mutation.
+// A `mut` AGGREGATE parameter (struct / tuple / array / tensor) is passed by reference, so an
+// in-place write is visible to the caller — the idiomatic output-buffer kernel. A `mut` SCALAR
+// parameter is a private copy (no leak). A pointer parameter may write through its pointee without
+// `mut`. Both backends agree bit-for-bit, at every opt level. (Mutating a non-`mut` parameter is
+// rejected — see tests/fail/param_field_mutation_no_mut.mer and tests/fail/param_rebind_no_mut.mer.)
+
+struct S { a: i32, b: i32 }
+
+// `mut` struct parameter: mutated in place, the change reaches the caller (by reference).
+fn bump(mut s: S) {
+    s.a = s.a + 100;
+    s.b = s.b + 200;
+}
+
+// `mut` array parameter: in-place scale, visible to the caller.
+fn scale3(mut w: [i32; 3], k: i32) {
+    for i in 0..3 {
+        w[i] = w[i] * k;
+    }
+}
+
+// `mut` scalar parameter: a private mutable copy — the caller's value is unchanged.
+fn inc(mut x: i32) -> i32 {
+    x = x + 5;
+    return x;
+}
+
+// Non-`mut` pointer parameter: writing through the pointee needs no `mut` (it mutates the pointee,
+// not the binding).
+fn setp(p: *i32) {
+    *p = 42;
+}
+
+fn main() -> i32 {
+    let x: S = S { a: 1, b: 2 };
+    bump(x);
+    print(x.a);                // 101  (caller sees the aggregate mutation)
+    print(x.b);                // 202
+
+    let w: [i32; 3] = [1, 2, 3];
+    scale3(w, 10);
+    print(w[0] + w[1] + w[2]); // 10 + 20 + 30 = 60
+
+    let v: i32 = 10;
+    print(inc(v));             // 15  (the callee's private copy)
+    print(v);                  // 10  (caller unchanged — scalar value semantics)
+
+    let mut n: i32 = 0;
+    setp(&n);
+    print(n);                  // 42
+
+    return 0;
+}

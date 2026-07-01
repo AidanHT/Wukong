@@ -495,7 +495,7 @@ fn mer_matmul(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j0 in 0..{ns} {{ c[i * {ns} + j0] = 0.0; }}\n\
          \x20       for k in 0..{ns} {{\n\
@@ -631,7 +631,7 @@ fn mer_matmul_tn(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j in 0..{ns} {{\n\
          \x20           let mut s: f32 = 0.0;\n\
@@ -747,7 +747,7 @@ fn mer_linear(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j in 0..{ns} {{\n\
          \x20           let mut s: f32 = 0.0;\n\
@@ -886,7 +886,7 @@ fn mer_ffn(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j in 0..{ns} {{\n\
          \x20           let mut s: f32 = 0.0;\n\
@@ -1033,7 +1033,7 @@ fn mer_linear_bf16(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(a: [bf16; {n2}], b: [bf16; {n2}], c: [f32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [bf16; {n2}], b: [bf16; {n2}], mut c: [f32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j in 0..{ns} {{\n\
          \x20           let mut s: f32 = 0.0;\n\
@@ -1157,7 +1157,7 @@ fn mer_transpose(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(src: [f32; {n2}], y: [f32; {n2}], dst: [f32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(src: [f32; {n2}], y: [f32; {n2}], mut dst: [f32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j in 0..{ns} {{ dst[j * {ns} + i] = src[i * {ns} + j]; }}\n\
          \x20   }}\n}}\n"
@@ -1269,7 +1269,7 @@ fn mer_colsum(m: usize, n: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let mn = m * n;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for j in 0..{n} {{\n\
          \x20       let mut s: f32 = 0.0;\n\
          \x20       for i in 0..{m} {{ s = s + x[i * {n} + j]; }}\n\
@@ -1376,7 +1376,7 @@ fn mer_biasadd(r: usize, c: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let rc = r * c;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {rc}], bias: [f32; {c}], out: [f32; {rc}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {rc}], bias: [f32; {c}], mut out: [f32; {rc}]) {{\n\
          \x20   for r in 0..{r} {{\n\
          \x20       for c in 0..{c} {{ out[r * {c} + c] = x[r * {c} + c] + bias[c]; }}\n\
          \x20   }}\n}}\n"
@@ -1498,7 +1498,7 @@ fn mer_colmax(m: usize, n: usize, parallel: bool, op: u8) -> String {
     let (lo, hi) = if op == 2 { ("abs(", ")") } else { ("", "") };
     let mn = m * n;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for j in 0..{n} {{\n\
          \x20       let mut s: f32 = {lo}x[j]{hi};\n\
          \x20       for i in 1..{m} {{ s = {f}(s, {lo}x[i * {n} + j]{hi}); }}\n\
@@ -1537,7 +1537,7 @@ fn mer_rowarg(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String 
     let n = rows * cols;
     let cmp = if is_max { ">" } else { "<" };
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [i32; {rows}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [i32; {rows}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut bv: f32 = x[r * {cols}];\n\
          \x20       let mut bi: i32 = 0;\n\
@@ -1664,7 +1664,7 @@ fn mer_colarg(rows: usize, cols: usize, is_max: bool, parallel: bool) -> String 
     let n = rows * cols;
     let cmp = if is_max { ">" } else { "<" };
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [i32; {cols}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [i32; {cols}]) {{\n\
          \x20   for j in 0..{cols} {{\n\
          \x20       let mut bv: f32 = x[j];\n\
          \x20       let mut bi: i32 = 0;\n\
@@ -1786,7 +1786,7 @@ fn mer_cumsum(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut acc: f32 = 0.0;\n\
          \x20       for i in 0..{cols} {{ acc = acc + x[r * {cols} + i]; out[r * {cols} + i] = acc; }}\n\
@@ -1815,7 +1815,7 @@ fn mer_lrscan(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut h: f32 = 0.0;\n\
          \x20       for t in 0..{cols} {{ h = a[r * {cols} + t] * h + b[r * {cols} + t]; out[r * {cols} + t] = h; }}\n\
@@ -1936,7 +1936,7 @@ fn mer_cumprod(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut p: f32 = 1.0;\n\
          \x20       for i in 0..{cols} {{ p = p * x[r * {cols} + i]; out[r * {cols} + i] = p; }}\n\
@@ -2148,7 +2148,7 @@ fn mer_cumminmax(rows: usize, cols: usize, is_max: bool, parallel: bool) -> Stri
     let n = rows * cols;
     let f = if is_max { "fmax" } else { "fmin" };
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut m: f32 = x[r * {cols}];\n\
          \x20       for i in 0..{cols} {{ m = {f}(m, x[r * {cols} + i]); out[r * {cols} + i] = m; }}\n\
@@ -2364,7 +2364,7 @@ fn mer_colstat(m: usize, n: usize, parallel: bool, op: u8) -> String {
         _ => (format!("s = s + {prod} * {prod};"), format!("sqrt(s / {m}.0)")),
     };
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {mn}], y: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for j in 0..{n} {{\n\
          \x20       let mut s: f32 = 0.0;\n\
          \x20       for i in 0..{m} {{ {fold} }}\n\
@@ -2501,7 +2501,7 @@ fn mer_softmax_bwd(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(y: [f32; {n}], dy: [f32; {n}], dx: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(y: [f32; {n}], dy: [f32; {n}], mut dx: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut s: f32 = 0.0;\n\
          \x20       for j in 0..{cols} {{ s = s + y[r * {cols} + j] * dy[r * {cols} + j]; }}\n\
@@ -2599,7 +2599,7 @@ fn mer_rmsnorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], gamma: [f32; {cols}], dx: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], gamma: [f32; {cols}], mut dx: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut ms: f32 = 0.0;\n\
          \x20       for i in 0..{cols} {{ ms = ms + x[r * {cols} + i] * x[r * {cols} + i]; }}\n\
@@ -2676,7 +2676,7 @@ fn mer_layernorm_bwd(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], gamma: [f32; {cols}], dx: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], gamma: [f32; {cols}], mut dx: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut sm: f32 = 0.0;\n\
          \x20       for i in 0..{cols} {{ sm = sm + x[r * {cols} + i]; }}\n\
@@ -2792,7 +2792,7 @@ fn mer_xent(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], target: [i32; {rows}], loss: [f32; {rows}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], target: [i32; {rows}], mut loss: [f32; {rows}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut m: f32 = x[r * {cols}];\n\
          \x20       for i in 0..{cols} {{ m = fmax(m, x[r * {cols} + i]); }}\n\
@@ -2899,7 +2899,7 @@ fn mer_rope(rows: usize, half: usize, parallel: bool) -> String {
     let d = 2 * half;
     let n = rows * d;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], inv_freq: [f32; {half}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], inv_freq: [f32; {half}], mut out: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       for j in 0..{half} {{\n\
          \x20           let theta: f32 = (r as f32) * inv_freq[j];\n\
@@ -2976,7 +2976,7 @@ fn mer_xent_bwd(rows: usize, cols: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n = rows * cols;
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], target: [i32; {rows}], dx: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], target: [i32; {rows}], mut dx: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       let mut m: f32 = x[r * {cols}];\n\
          \x20       for i in 0..{cols} {{ m = fmax(m, x[r * {cols} + i]); }}\n\
@@ -3051,7 +3051,7 @@ fn mer_rope_bwd(rows: usize, half: usize, parallel: bool) -> String {
     let d = 2 * half;
     let n = rows * d;
     format!(
-        "module bench\n{attr}fn kbench(g: [f32; {n}], inv_freq: [f32; {half}], dx: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(g: [f32; {n}], inv_freq: [f32; {half}], mut dx: [f32; {n}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20       for j in 0..{half} {{\n\
          \x20           let theta: f32 = (r as f32) * inv_freq[j];\n\
@@ -3124,7 +3124,7 @@ fn bench_gate(cc: &str, dir: &Path) {
 fn mer_gate(n: usize, act: &str, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for i in 0..{n} {{ out[i] = {act}(a[i]) * b[i]; }}\n}}\n"
     )
 }
@@ -3250,7 +3250,7 @@ fn mer_row_loss(rows: usize, cols: usize, kind: &str, parallel: bool) -> String 
         ),
     };
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], out: [f32; {rows}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {n}], b: [f32; {n}], mut out: [f32; {rows}]) {{\n\
          \x20   for r in 0..{rows} {{\n\
          \x20{body}\n\
          \x20   }}\n}}\n"
@@ -3423,7 +3423,7 @@ fn bench_act_backward(cc: &str, dir: &Path) {
 fn mer_act_backward(n: usize, op: &str, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], dx: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(x: [f32; {n}], dy: [f32; {n}], mut dx: [f32; {n}]) {{\n\
          \x20   for i in 0..{n} {{ dx[i] = {op}_backward(x[i], dy[i]); }}\n}}\n"
     )
 }
@@ -3577,7 +3577,7 @@ fn mer_i8gemm(ns: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let n2 = ns * ns;
     format!(
-        "module bench\n{attr}fn kbench(a: [u8; {n2}], b: [i8; {n2}], c: [i32; {n2}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [u8; {n2}], b: [i8; {n2}], mut c: [i32; {n2}]) {{\n\
          \x20   for i in 0..{ns} {{\n\
          \x20       for j in 0..{ns} {{\n\
          \x20           let mut s: i32 = 0;\n\
@@ -3732,7 +3732,7 @@ fn mer_bf16(n: usize, is_dot: bool) -> String {
         "(x[k] as f32)"
     };
     format!(
-        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], o: [f32; 1]) {{\n\
+        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], mut o: [f32; 1]) {{\n\
          \x20   let mut s: f32 = 0.0;\n\
          \x20   for k in 0..{n} {{ s = s + {term}; }}\n\
          \x20   o[0] = s;\n}}\n"
@@ -3860,7 +3860,7 @@ fn mer_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
     let oh = h - k + 1;
     let (hw, ohw, ckk, kk) = (h * h, oh * oh, cin * k * k, k * k);
     format!(
-        "module bench\nfn kbench(input: [f32; {inlen}], weight: [f32; {wlen}], output: [f32; {olen}]) {{\n\
+        "module bench\nfn kbench(input: [f32; {inlen}], weight: [f32; {wlen}], mut output: [f32; {olen}]) {{\n\
          \x20   let mut col: [f32; {collen}] = [0.0; {collen}];\n\
          \x20   for oy in 0..{oh} {{ for ox in 0..{oh} {{\n\
          \x20     for ic in 0..{cin} {{ for ky in 0..{k} {{ for kx in 0..{k} {{\n\
@@ -4073,7 +4073,7 @@ fn mer_norm(cols: usize, op: &str) -> String {
         ),
     };
     format!(
-        "module bench\nfn kbench(x: [f32; {cols}], y: [f32; {cols}], out: [f32; {cols}]) {{ \
+        "module bench\nfn kbench(x: [f32; {cols}], y: [f32; {cols}], mut out: [f32; {cols}]) {{ \
          for c in 0..{cols} {{ out[c] = x[c]; }} {body} }}\n"
     )
 }
@@ -4306,7 +4306,7 @@ fn mer_norm_batched(rows: usize, cols: usize, op: &str, parallel: bool) -> Strin
         ),
     };
     format!(
-        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{ \
+        "module bench\n{attr}fn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{ \
          for c in 0..{n} {{ out[c] = x[c]; }} \
          for r in 0..{rows} {{ {body} }} }}\n"
     )
@@ -5744,10 +5744,11 @@ fn kernels() -> Vec<Kernel> {
             name: "fused_linear_relu",
             bytes_per_call: 2 * N * 4,
             note: "linear→relu: Mercury auto-fuses 2 loops; C/Rust as-written stream the intermediate",
-            mer: mer_kernel(&format!(
-                "for i in 0..{N} {{ y[i] = 2.0 * x[i] + 1.0; }} \
-                 for i in 0..{N} {{ out[i] = if y[i] > 0.0 {{ y[i] }} else {{ 0.0 }}; }}"
-            )),
+            mer: format!(
+                "module bench\nfn kbench(x: [f32; {N}], mut y: [f32; {N}], mut out: [f32; {N}]) {{\n    \
+                 for i in 0..{N} {{ y[i] = 2.0 * x[i] + 1.0; }} \
+                 for i in 0..{N} {{ out[i] = if y[i] > 0.0 {{ y[i] }} else {{ 0.0 }}; }}\n}}\n"
+            ),
             c: c_kernel(
                 "float* t=(float*)y; for(long i=0;i<N;i++) t[i]=2.0f*x[i]+1.0f; \
                  for(long i=0;i<N;i++){ float v=t[i]; out[i]= v>0.0f? v:0.0f; }",
@@ -6025,14 +6026,14 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
 
 fn mer_kernel(body: &str) -> String {
     format!(
-        "module bench\nfn kbench(x: [f32; {N}], y: [f32; {N}], out: [f32; {N}]) {{\n    {body}\n}}\n"
+        "module bench\nfn kbench(x: [f32; {N}], y: [f32; {N}], mut out: [f32; {N}]) {{\n    {body}\n}}\n"
     )
 }
 
 /// A `@parallel` Mercury kernel (whole body is one `for` loop, so it parallelizes).
 fn mer_par_kernel(loop_body: &str) -> String {
     format!(
-        "module bench\n@parallel\nfn kbench(x: [f32; {N}], y: [f32; {N}], out: [f32; {N}]) {{\n    {loop_body}\n}}\n"
+        "module bench\n@parallel\nfn kbench(x: [f32; {N}], y: [f32; {N}], mut out: [f32; {N}]) {{\n    {loop_body}\n}}\n"
     )
 }
 
@@ -6060,7 +6061,7 @@ fn cpp_from_c(c_src: &str) -> String {
 // Parameterized kernel builders (an explicit element count `n`) — used by the large-tensor streaming
 // benchmark, which runs at N=2²⁴ rather than the module-global N=2²⁰.
 fn mer_kernel_n(n: usize, body: &str) -> String {
-    format!("module bench\nfn kbench(x: [f32; {n}], y: [f32; {n}], out: [f32; {n}]) {{\n    {body}\n}}\n")
+    format!("module bench\nfn kbench(x: [f32; {n}], y: [f32; {n}], mut out: [f32; {n}]) {{\n    {body}\n}}\n")
 }
 fn c_kernel_n(n: usize, body: &str) -> String {
     format!("#include <math.h>\n#define N {n}\n__declspec(dllexport) void kbench(const float* x, const float* y, float* out) {{\n  {body}\n}}\n")

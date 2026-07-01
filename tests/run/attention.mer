@@ -10,7 +10,7 @@ module tests.run.attention
 // (fmax reduction + vectorized exp + sum reduction + normalize) between them. S=8 tokens, D=8 head
 // dim; scale folded out (temperature 1) to keep the proof about composition. The gate proves the
 // whole op is bit-identical between the interpreter and native backends.
-fn attention(q: [f32; 64], k: [f32; 64], v: [f32; 64], scores: [f32; 64], out: [f32; 64]) {
+fn attention(q: [f32; 64], k: [f32; 64], v: [f32; 64], mut scores: [f32; 64], mut out: [f32; 64]) {
     // scores = Q · Kᵀ   (nn.Linear spelling)
     for i in 0..8 {
         for j in 0..8 {

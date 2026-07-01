@@ -9,7 +9,7 @@ module tests.run.saxpy
 
 /// A reusable kernel with array parameters: `out` is mutated through its base pointer (arrays pass
 /// by reference), and a separate `dot` returns a scalar. Confirms array params work both ways.
-fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], out: [f32; 4]) {
+fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
     let mut i: i32 = 0;
     while i < 4 {
         out[i] = a * x[i] + y[i];

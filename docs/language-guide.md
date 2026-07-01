@@ -50,6 +50,24 @@ Functions take typed parameters and declare a return type after `->`. A function
 returns nothing. Recursion is fully supported. Calls use ordinary `f(x, y)` syntax; generic
 functions may be called with a turbofish `f::<512, 512, 513>(a, b, c)`.
 
+Parameters are **immutable by default**, the same rule `let` follows — a function may read one but
+not reassign or mutate it. Prefix a parameter with `mut` to opt into mutation:
+
+```mercury
+fn scale(mut w: [f32; 256], k: f32) {      // `w` is mutated in place
+    for i in 0..256 { w[i] = w[i] * k; }
+}
+```
+
+A scalar `mut` parameter is a private, mutable copy — changes stay local, exactly like a `mut` `let`.
+An **aggregate** `mut` parameter (struct / tuple / array / tensor) is passed **by reference** (its
+base pointer, zero-copy — the tensor-kernel default), so mutating it in place is **visible to the
+caller**; this is the idiomatic way a kernel writes an output buffer (`out`, `c`, …). Mutating a
+non-`mut` parameter — whether a direct rebind (`p = …`) or a projection of an aggregate (`p.f = …`,
+`p[i] = …`) — is a compile error (E0304), so an accidental caller-visible write can't slip through. A
+**pointer** parameter is exempt for writes through its pointee (`*p = …` needs no `mut`, since that
+mutates the pointee, not the binding).
+
 ## Bindings ✅
 
 ```mercury
@@ -203,10 +221,12 @@ field that is itself a tuple is reached by chaining — `t.0.1`, `t.0.0.0` (`tes
 of structs, lay out recursively, and an aggregate field initialized from a non-literal value is
 deep-copied leaf by leaf (`tests/run/struct_nested.mer`). Whole-aggregate **assignment** (`s = other;`)
 deep-copies leaf by leaf as well (`tests/run/struct_assign.mer`). Both run identically on the
-interpreter and the native backend. A tuple/struct also passes **by value into and out of a
-function** — a by-value parameter and a `fn … -> Struct` return are modeled with a hidden-pointer
-(sret) ABI in mir_build, so no aggregate ever rides in a register and the two backends agree
-(`tests/run/{struct_fn,struct_return}.mer`).
+interpreter and the native backend. An aggregate passes **into a function by reference** (its base
+pointer, zero-copy) and is **returned by value** through a hidden-pointer (sret) ABI in mir_build, so
+no aggregate ever rides in a register and the two backends agree (`tests/run/{struct_fn,struct_return}.mer`).
+Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
+requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
+read-only, and a `mut` one is the in-place output buffer a kernel writes.
 
 ## Enums ✅
 

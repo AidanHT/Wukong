@@ -18,7 +18,7 @@ Semantic analysis: name resolution, type checking, and SHAPE checking. Runs afte
 Upstream: `mercury_ast` (input tree), `mercury_types` (`Ty`/`Dim`/`Shape`/`Scalar`/`Layout`), `mercury_span` (`Interner`/`Symbol`/`Span`), `mercury_diag` (`Diagnostic`). Dev-only: `mercury_parser` (tests). Downstream: `mir_build` consumes `SemaResult.types`.
 
 ## Diagnostic codes
-- `E0300` duplicate name; `E0301` unresolved name; `E0302` non-scalar tensor/vector element; `E0303` `break`/`continue` outside a loop (tracked by a `loop_depth` counter; fixes a backend divergence on the out-of-loop trap).
+- `E0300` duplicate name; `E0301` unresolved name; `E0302` non-scalar tensor/vector element; `E0303` `break`/`continue` outside a loop (tracked by a `loop_depth` counter; fixes a backend divergence on the out-of-loop trap); `E0304` assigning/mutating an immutable binding — a `let` without `mut` (direct rebind only) or a parameter without `mut` (rebind, or an aggregate projection `p.f`/`p[i]` that, by the by-reference ABI, would mutate the caller). Tracked by `immutable_locals` / `immutable_params` (both 1:1 with `scopes`); a pointer-deref target (`*p`) is exempt.
 - `E0401` scalar/vector/let type mismatch; `E0501` tensor rank / index-count mismatch; `E0502` dimension-value or tensor-element-type conflict; `E0503` wrong argument or generic-arg count.
 
 ## Gotchas

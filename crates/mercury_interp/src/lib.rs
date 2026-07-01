@@ -3393,9 +3393,9 @@ mod tests {
     fn run_kernel_f32_saxpy_and_dot() {
         let mut interner = Interner::new();
         let src = "module m\n\
-            fn saxpy(x: [f32; 8], y: [f32; 8], out: [f32; 8]) { \
+            fn saxpy(x: [f32; 8], y: [f32; 8], mut out: [f32; 8]) { \
                 for i in 0..8 { out[i] = 2.0 * x[i] + y[i]; } }\n\
-            fn dot(x: [f32; 8], y: [f32; 8], out: [f32; 8]) { \
+            fn dot(x: [f32; 8], y: [f32; 8], mut out: [f32; 8]) { \
                 let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i] * y[i]; } out[0] = s; }\n";
         let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
@@ -3441,7 +3441,7 @@ mod tests {
         // i64 reference. A=[1..8], B=[-6..1]; the recognizer dispatches this to mercury_i8gemm_nt.
         let mut interner = Interner::new();
         let src = "module m\n\
-            fn lin(a: [u8; 8], b: [i8; 8], c: [i32; 4]) { \
+            fn lin(a: [u8; 8], b: [i8; 8], mut c: [i32; 4]) { \
                 for i in 0..2 { for j in 0..2 { let mut s: i32 = 0; \
                 for k in 0..4 { s = s + (a[i*4+k] as i32) * (b[j*4+k] as i32); } \
                 c[i*2+j] = s; } } }\n";
@@ -3501,7 +3501,7 @@ mod tests {
 
     #[test]
     fn runs_array_parameter_by_reference() {
-        let src = "fn fill(a: [i32; 3]) { a[0] = 7; a[1] = 8; a[2] = 9; } \
+        let src = "fn fill(mut a: [i32; 3]) { a[0] = 7; a[1] = 8; a[2] = 9; } \
                    fn main() -> i32 { let mut a: [i32;3] = [0,0,0]; fill(a); \
                    return a[0] + a[1] + a[2]; }";
         assert_eq!(run_main(src), 24);

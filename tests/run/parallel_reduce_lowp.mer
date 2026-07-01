@@ -17,35 +17,35 @@ module tests.run.parallel_reduce_lowp
 // reduction — easy to pin); `sum_bf16_big` spans two RCHUNK chunks, exercising the real rayon fold.
 
 @parallel
-fn sum_bf16(x: [bf16; 64], o: [f32; 1]) {
+fn sum_bf16(x: [bf16; 64], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..64 { s = s + (x[k] as f32); }
     o[0] = s;
 }
 
 @parallel
-fn dot_bf16(x: [bf16; 64], y: [bf16; 64], o: [f32; 1]) {
+fn dot_bf16(x: [bf16; 64], y: [bf16; 64], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..64 { s = s + (x[k] as f32) * (y[k] as f32); }
     o[0] = s;
 }
 
 @parallel
-fn max_bf16(x: [bf16; 64], o: [f32; 1]) {
+fn max_bf16(x: [bf16; 64], mut o: [f32; 1]) {
     let mut m: f32 = -1e30;
     for k in 0..64 { m = fmax(m, (x[k] as f32)); }
     o[0] = m;
 }
 
 @parallel
-fn sum_f16(x: [f16; 64], o: [f32; 1]) {
+fn sum_f16(x: [f16; 64], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..64 { s = s + (x[k] as f32); }
     o[0] = s;
 }
 
 @parallel
-fn max_f16(x: [f16; 64], o: [f32; 1]) {
+fn max_f16(x: [f16; 64], mut o: [f32; 1]) {
     let mut m: f32 = -1e30;
     for k in 0..64 { m = fmax(m, (x[k] as f32)); }
     o[0] = m;
@@ -54,7 +54,7 @@ fn max_f16(x: [f16; 64], o: [f32; 1]) {
 // Two RCHUNK chunks (RCHUNK = 8192) — the chunked rayon fold actually runs. All-ones is bf16-exact and
 // sums exactly in f32, so the chunked partials (8192 + 8192) recombine to 16384 with no rounding.
 @parallel
-fn sum_bf16_big(x: [bf16; 16384], o: [f32; 1]) {
+fn sum_bf16_big(x: [bf16; 16384], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..16384 { s = s + (x[k] as f32); }
     o[0] = s;

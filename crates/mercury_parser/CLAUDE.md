@@ -25,6 +25,7 @@ Upstream: `mercury_lexer` (`Token`/`TokenKind`), `mercury_span` (`Interner`, `So
 - Turbofish only triggers on `::<` immediately before a call; a bare `::name` is parsed as a `Field` access. `as` is postfix `Cast`. `::<...>` not followed by `(` emits E0205 and yields an empty arg list.
 - Block tail vs statement: a trailing expr with no `;` before `}` becomes the block `tail`; otherwise it's a `StmtKind::Expr`. An assignment op (`=`, `+=`, …, via `cur_assign_op`) after an expr produces `StmtKind::Assign`. A local `const X: T = v;` is lowered to an immutable `StmtKind::Let`.
 - `fn` bodies parse two forms: a `{...}` block, or `= expr;` (synthesizes a `Block` whose `tail` is the expr). A declaration with neither (just `;`) has `body: None`.
+- `parse_params` accepts an optional leading `mut` per parameter (`fn f(mut p: T, q: U)`), stored as `Param.mutable`; sema enforces the immutability of a non-`mut` parameter (E0304). `mut` binds to the single parameter that follows it, before the name.
 - `ident_like` accepts keyword tokens by their text (used for `@`-attribute names that collide with keywords); plain `ident` does not.
 - Partially accepted-but-dropped syntax: `where` clauses (skipped to `{`/`;`/`=`/Eof), struct/enum field attrs, and enum `: repr` (parsed, not stored). Don't assume these survive into the AST.
 - `expect` consumes nothing on mismatch (only emits the diag); callers must not assume the expected token was eaten. `bump` never advances past `Eof`.

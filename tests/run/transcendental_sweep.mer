@@ -11,7 +11,7 @@ module tests.run.transcendental_sweep
 // -O0 == -O3 across the whole expanded set at once.
 
 @parallel
-fn par_sweep(x: [f32; 64], a: [f32; 64], b: [f32; 64]) {
+fn par_sweep(x: [f32; 64], mut a: [f32; 64], mut b: [f32; 64]) {
     for i in 0..64 { a[i] = exp10(x[i]); }
     for i in 0..64 { b[i] = cbrt(x[i]); }
 }

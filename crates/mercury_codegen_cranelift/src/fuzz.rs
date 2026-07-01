@@ -86,7 +86,7 @@ struct Kernel {
 /// `fn kbench(x:[f32;LEN], y:[f32;LEN], out:[f32;LEN]) { <body over 0..N> }`
 fn ew(n: usize, body: &str) -> String {
     let len = n;
-    format!("module f\nfn kbench(x:[f32;{len}], y:[f32;{len}], out:[f32;{len}]) {{ for i in 0..{n} {{ {body} }} }}\n")
+    format!("module f\nfn kbench(x:[f32;{len}], y:[f32;{len}], mut out:[f32;{len}]) {{ for i in 0..{n} {{ {body} }} }}\n")
 }
 
 fn kernels() -> Vec<Kernel> {
@@ -282,7 +282,7 @@ fn kernels() -> Vec<Kernel> {
             name: "softmax",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], mut out:[f32;{n}]) {{ \
              for c in 0..{n} {{ out[c] = x[c]; }} \
              let mut m: f32 = out[0]; \
              for i in 0..{n} {{ m = fmax(m, out[i]); }} \
@@ -304,7 +304,7 @@ fn kernels() -> Vec<Kernel> {
             name: "layernorm",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], mut out:[f32;{n}]) {{ \
              for c in 0..{n} {{ out[c] = x[c]; }} \
              let mut s: f32 = 0.0; \
              for i in 0..{n} {{ s = s + out[i]; }} \
@@ -323,7 +323,7 @@ fn kernels() -> Vec<Kernel> {
             name: "rmsnorm",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], mut out:[f32;{n}]) {{ \
              for c in 0..{n} {{ out[c] = x[c]; }} \
              let mut s: f32 = 0.0; \
              for i in 0..{n} {{ s = s + out[i] * out[i]; }} \
@@ -341,7 +341,7 @@ fn kernels() -> Vec<Kernel> {
             name: "rmsnorm_affine",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], mut out:[f32;{n}]) {{ \
              for c in 0..{n} {{ out[c] = x[c]; }} \
              let mut s: f32 = 0.0; \
              for i in 0..{n} {{ s = s + out[i] * out[i]; }} \
@@ -359,7 +359,7 @@ fn kernels() -> Vec<Kernel> {
             name: "layernorm_affine",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], out:[f32;{n}]) {{ \
+                    "module f\nfn kbench(x:[f32;{n}], y:[f32;{n}], mut out:[f32;{n}]) {{ \
              for c in 0..{n} {{ out[c] = x[c]; }} \
              let mut s: f32 = 0.0; \
              for i in 0..{n} {{ s = s + out[i]; }} \
@@ -382,7 +382,7 @@ fn kernels() -> Vec<Kernel> {
             name: "rmsnorm_batched",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], mut out:[f32;{l}]) {{ \
              for c in 0..{l} {{ out[c] = x[c]; }} \
              for r in 0..3 {{ \
              let mut s: f32 = 0.0; \
@@ -402,7 +402,7 @@ fn kernels() -> Vec<Kernel> {
             name: "rmsnorm_affine_batched",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], mut out:[f32;{l}]) {{ \
              for c in 0..{l} {{ out[c] = x[c]; }} \
              for r in 0..3 {{ \
              let mut s: f32 = 0.0; \
@@ -423,7 +423,7 @@ fn kernels() -> Vec<Kernel> {
             name: "softmax_batched",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], mut out:[f32;{l}]) {{ \
              for c in 0..{l} {{ out[c] = x[c]; }} \
              for r in 0..3 {{ \
              let mut m: f32 = out[r*{n}]; \
@@ -447,7 +447,7 @@ fn kernels() -> Vec<Kernel> {
             name: "layernorm_batched",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], mut out:[f32;{l}]) {{ \
              for c in 0..{l} {{ out[c] = x[c]; }} \
              for r in 0..3 {{ \
              let mut s: f32 = 0.0; \
@@ -468,7 +468,7 @@ fn kernels() -> Vec<Kernel> {
             name: "matmul",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], mut out:[f32;{l}]) {{ \
              for i in 0..{n} {{ for j0 in 0..{n} {{ out[i*{n}+j0] = 0.0; }} \
              for k in 0..{n} {{ let aik: f32 = x[i*{n}+k]; \
              for j in 0..{n} {{ out[i*{n}+j] = out[i*{n}+j] + aik * y[k*{n}+j]; }} }} }} }}\n",
@@ -482,7 +482,7 @@ fn kernels() -> Vec<Kernel> {
             name: "linear",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], out:[f32;{l}]) {{ \
+                    "module f\nfn kbench(x:[f32;{l}], y:[f32;{l}], mut out:[f32;{l}]) {{ \
              for i in 0..{n} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for k in 0..{n} {{ s = s + x[i*{n}+k] * y[j*{n}+k]; }} out[i*{n}+j] = s; }} }} }}\n",
                     l = n * n
@@ -497,7 +497,7 @@ fn kernels() -> Vec<Kernel> {
             name: "tensor_scale",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:Tensor[f32,{n},{n}], y:Tensor[f32,{n},{n}], out:Tensor[f32,{n},{n}]) {{ \
+                    "module f\nfn kbench(x:Tensor[f32,{n},{n}], y:Tensor[f32,{n},{n}], mut out:Tensor[f32,{n},{n}]) {{ \
              for i in 0..{n} {{ for j in 0..{n} {{ out[i, j] = x[i, j] * 2.0 + y[i, j]; }} }} }}\n"
                 )
             },
@@ -508,7 +508,7 @@ fn kernels() -> Vec<Kernel> {
             name: "tensor_matmul",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:Tensor[f32,{n},{n}], y:Tensor[f32,{n},{n}], out:Tensor[f32,{n},{n}]) {{ \
+                    "module f\nfn kbench(x:Tensor[f32,{n},{n}], y:Tensor[f32,{n},{n}], mut out:Tensor[f32,{n},{n}]) {{ \
              for i in 0..{n} {{ for j in 0..{n} {{ let mut s: f32 = 0.0; \
              for k in 0..{n} {{ s = s + x[i, k] * y[k, j]; }} out[i, j] = s; }} }} }}\n"
                 )
@@ -521,7 +521,7 @@ fn kernels() -> Vec<Kernel> {
             name: "tensor3d",
             src: |n| {
                 format!(
-                    "module f\nfn kbench(x:Tensor[f32,2,{n},{n}], y:Tensor[f32,2,{n},{n}], out:Tensor[f32,2,{n},{n}]) {{ \
+                    "module f\nfn kbench(x:Tensor[f32,2,{n},{n}], y:Tensor[f32,2,{n},{n}], mut out:Tensor[f32,2,{n},{n}]) {{ \
              for b in 0..2 {{ for i in 0..{n} {{ for j in 0..{n} {{ out[b, i, j] = x[b, i, j] - y[b, i, j]; }} }} }} }}\n"
                 )
             },
@@ -626,7 +626,7 @@ fn fuzz_full_buffer_i8_interp_vs_native() {
     for &n in SIZES {
         let len = n * n;
         let src = format!(
-            "module f\nfn lin(a:[u8;{len}], b:[i8;{len}], c:[i32;{len}]) {{ \
+            "module f\nfn lin(a:[u8;{len}], b:[i8;{len}], mut c:[i32;{len}]) {{ \
              for i in 0..{n} {{ for j in 0..{n} {{ let mut s: i32 = 0; \
              for k in 0..{n} {{ s = s + (a[i*{n}+k] as i32) * (b[j*{n}+k] as i32); }} \
              c[i*{n}+j] = s; }} }} }}\n"

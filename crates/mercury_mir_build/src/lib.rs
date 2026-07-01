@@ -19049,7 +19049,7 @@ mod tests {
     fn multi_dim_tensor_index_lowers_to_row_major_gep() {
         // The shape-typed surface: `t[i, j]` on `Tensor[f32, M, N]` must lower (no `unsupported`
         // C0001) to a flat row-major offset `i*N + j`, and the function must verify.
-        let src = "fn k(a: Tensor[f32, 3, 4], out: Tensor[f32, 3, 4]) { \
+        let src = "fn k(a: Tensor[f32, 3, 4], mut out: Tensor[f32, 3, 4]) { \
                    for i in 0..3 { for j in 0..4 { out[i, j] = a[i, j] * 2.0; } } }";
         let (prog, diags, mut interner) = lower(src);
         assert!(

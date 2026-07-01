@@ -7,7 +7,7 @@ module examples.matmul
 fn matmul<M, N, K>(
     a: Tensor[f32, M, K],
     b: Tensor[f32, K, N],
-    c: Tensor[f32, M, N],
+    mut c: Tensor[f32, M, N],
 ) {
     const MT: usize = 64;
     const NT: usize = 64;

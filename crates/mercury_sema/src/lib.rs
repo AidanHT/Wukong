@@ -214,6 +214,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         types: HashMap::new(),
         scopes: Vec::new(),
         immutable_locals: Vec::new(),
+        immutable_params: Vec::new(),
+        param_tys: HashMap::new(),
         generics: HashSet::new(),
         ret_ty: Ty::Unit,
         loop_labels: Vec::new(),
@@ -240,6 +242,16 @@ struct Sema<'a> {
     /// Per-scope set of locals bound *immutably* — a `let` without `mut` that has an initializer —
     /// kept 1:1 with `scopes`. Used to reject reassigning such a binding (`let x = 5; x = 10;`).
     immutable_locals: Vec<HashSet<Symbol>>,
+    /// Per-scope set of *parameters* declared without `mut`, kept 1:1 with `scopes` (parameters live
+    /// in the function's top scope). Stricter than `immutable_locals`: a non-`mut` parameter rejects
+    /// both direct reassignment AND mutation through a projection (`p.f = …`, `p[i] = …`), because an
+    /// aggregate parameter is passed by reference — the projection would mutate the *caller's* value.
+    immutable_params: Vec<HashSet<Symbol>>,
+    /// Declared type of each parameter of the function currently being checked, by name. Queried only
+    /// when the name resolves to an immutable parameter (so shadowing by an inner `let` can't confuse
+    /// it); used to decide whether a through-projection mutation reaches the caller (aggregate) or a
+    /// pointee (pointer/ref — legitimately mutable).
+    param_tys: HashMap<Symbol, Ty>,
     generics: HashSet<Symbol>,
     ret_ty: Ty,
     /// The labels of the enclosing loops at the current point (innermost last; `None` for an
@@ -619,6 +631,9 @@ impl Sema<'_> {
         self.scopes.push(HashMap::new());
         self.immutable_locals.clear();
         self.immutable_locals.push(HashSet::new());
+        self.immutable_params.clear();
+        self.immutable_params.push(HashSet::new());
+        self.param_tys.clear();
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
         if self.let_compatible(&ann, &c.value, &vty) {
@@ -652,6 +667,9 @@ impl Sema<'_> {
         // via `push_scope`, so the two stacks would otherwise desync and the check never fires).
         self.immutable_locals.clear();
         self.immutable_locals.push(HashSet::new());
+        self.immutable_params.clear();
+        self.immutable_params.push(HashSet::new());
+        self.param_tys.clear();
         // Two parameters may not share a name: the second would silently shadow the first in the
         // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
         // quiet footgun. Duplicate top-level `fn`s are already E0300; parameters get the same code.
@@ -662,6 +680,17 @@ impl Sema<'_> {
                 self.error(p.name.span, "E0300", format!("duplicate parameter name `{nm}`"));
             }
             let ty = self.lower_type(&p.ty);
+            // A parameter without `mut` is immutable: track it so reassigning it (`p = …`) or
+            // mutating it through a projection (`p.f = …` on an aggregate, which — passed by
+            // reference — would reach the caller) is E0304. Record its type either way, so the
+            // through-projection check can tell an aggregate (leaks) from a pointer (mutates a
+            // pointee, legitimate).
+            if !p.mutable {
+                if let Some(set) = self.immutable_params.last_mut() {
+                    set.insert(p.name.sym);
+                }
+            }
+            self.param_tys.insert(p.name.sym, ty.clone());
             self.bind(p.name.sym, ty);
         }
         self.ret_ty = match &f.ret {
@@ -969,11 +998,13 @@ impl Sema<'_> {
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
         self.immutable_locals.push(HashSet::new());
+        self.immutable_params.push(HashSet::new());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
         self.immutable_locals.pop();
+        self.immutable_params.pop();
     }
 
     /// Whether `name` resolves (innermost scope first) to a local bound immutably. A `mut` binding,
@@ -989,6 +1020,54 @@ impl Sema<'_> {
             }
         }
         false
+    }
+
+    /// Whether `name` resolves (innermost scope first) to a parameter declared without `mut`. Uses
+    /// the same innermost-first walk as `is_immutable_local`, so an inner `let` shadowing the
+    /// parameter (which is mutable-through-projection per the `let` rules) is found first and this
+    /// returns `false` for it — the parameter rule only applies where the name really is the param.
+    fn is_immutable_param(&self, name: Symbol) -> bool {
+        for i in (0..self.scopes.len()).rev() {
+            if self.scopes[i].contains_key(&name) {
+                return self
+                    .immutable_params
+                    .get(i)
+                    .map_or(false, |s| s.contains(&name));
+            }
+        }
+        false
+    }
+
+    /// The root single-name of an assignment place, walking field/index projections but STOPPING at
+    /// a dereference: past `*p` you are in a pointee, not the binding's own storage, so `*p = …` and
+    /// `(*p).f = …` return `None` (not a mutation of the binding). `None` also for any non-name root.
+    fn assign_root_param(&self, e: &Expr) -> Option<Symbol> {
+        match &e.kind {
+            ExprKind::Field { base, .. }
+            | ExprKind::TupleField { base, .. }
+            | ExprKind::Index { base, .. } => self.assign_root_param(base),
+            ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
+            _ => None,
+        }
+    }
+
+    /// Whether parameter `name`'s declared type is an aggregate passed BY REFERENCE (struct / tuple /
+    /// array / tensor / vector) — the kinds whose through-projection mutation reaches the caller.
+    /// Scalars, pointers, and references are excluded: a scalar can't be projected, and a pointer /
+    /// reference projection dereferences to a pointee that is legitimately mutable.
+    fn param_is_aggregate(&self, name: Symbol) -> bool {
+        match self.param_tys.get(&name) {
+            Some(ty) => !matches!(
+                ty,
+                Ty::Scalar(_)
+                    | Ty::Ptr { .. }
+                    | Ty::Ref { .. }
+                    | Ty::Unit
+                    | Ty::Unknown
+                    | Ty::Error
+            ),
+            None => false,
+        }
     }
 
     fn bind(&mut self, name: Symbol, ty: Ty) {
@@ -1169,23 +1248,59 @@ impl Sema<'_> {
                         );
                     }
                 }
-                // Reassigning an immutable binding (`let x = 5; x = 10;`): the language requires
-                // `mut` for reassignment, but it was never enforced. Reject a direct assignment to
-                // an immutable local (a single-name target). Mutating *through* an immutable binding
-                // (`a[i] = …`, `s.f = …`, `*p = …`) stays lenient — those are place projections, not
-                // a rebinding, so this conservative check never over-fires.
-                if let ExprKind::Path(p) = &target.kind {
-                    if p.is_single() && self.is_immutable_local(p.first().sym) {
-                        let nm = self.sym_str(p.first().sym).to_string();
-                        self.error(
-                            target.span,
-                            "E0304",
-                            format!(
-                                "cannot assign twice to immutable binding `{nm}`; add `mut` to its \
-                                 `let` to allow reassignment"
-                            ),
-                        );
+                // Reassigning an immutable binding requires `mut`, but it was never enforced. Two
+                // cases, both E0304:
+                //   • Direct rebind of a single name (`x = …`): rejected for a non-`mut` `let` AND a
+                //     non-`mut` parameter (the message differs so the fix is obvious).
+                //   • Mutation *through* a projection (`p.f = …`, `p[i] = …`): stays lenient for a
+                //     `let` (it owns its storage), but a non-`mut` *aggregate parameter* is rejected —
+                //     an aggregate is passed by reference, so `p.f = …` would silently mutate the
+                //     CALLER's value. `mut` opts into that (visible, in-place). A dereference breaks
+                //     the chain (`*p`, `(*p).f`) — that mutates a pointee, not the parameter — so
+                //     `assign_root_param` returns `None` and pointer/ref params stay lenient.
+                match &target.kind {
+                    ExprKind::Path(p) if p.is_single() => {
+                        let sym = p.first().sym;
+                        if self.is_immutable_param(sym) {
+                            let nm = self.sym_str(sym).to_string();
+                            self.error(
+                                target.span,
+                                "E0304",
+                                format!(
+                                    "cannot assign to immutable parameter `{nm}`; add `mut` to the \
+                                     parameter (`fn …(mut {nm}: …)`) to allow mutation"
+                                ),
+                            );
+                        } else if self.is_immutable_local(sym) {
+                            let nm = self.sym_str(sym).to_string();
+                            self.error(
+                                target.span,
+                                "E0304",
+                                format!(
+                                    "cannot assign twice to immutable binding `{nm}`; add `mut` to \
+                                     its `let` to allow reassignment"
+                                ),
+                            );
+                        }
                     }
+                    ExprKind::Field { .. } | ExprKind::TupleField { .. } | ExprKind::Index { .. } => {
+                        if let Some(root) = self.assign_root_param(target) {
+                            if self.is_immutable_param(root) && self.param_is_aggregate(root) {
+                                let nm = self.sym_str(root).to_string();
+                                self.error(
+                                    target.span,
+                                    "E0304",
+                                    format!(
+                                        "cannot mutate `{nm}` through a non-`mut` parameter; an \
+                                         aggregate parameter is passed by reference, so this would \
+                                         mutate the caller's value — add `mut` to the parameter \
+                                         (`fn …(mut {nm}: …)`) to allow in-place mutation"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 // Assigning a pointer/aggregate into a scalar place (or vice versa) reinterprets the
                 // bits — `x = p` for `x: i32`, `p: *i32` stores a truncated address, which the
