@@ -82,7 +82,13 @@ impl Pass for Simplify {
                         if let (Some(a), Some(bv)) =
                             (consts.get(&l.0).copied(), consts.get(&r.0).copied())
                         {
-                            let val = fold_cmp(c, a, bv);
+                            // The operands share a type (you compare like-typed values); fold at
+                            // that width so a high-bit-set constant compares the same as the runtime
+                            // register. Without the width, a signed compare of an unsigned literal
+                            // >= 2^(w-1) (or an `as iW` reinterpret) folds against the raw i128 and
+                            // -O2 disagrees with -O0.
+                            let oty = f.value_types[l.0 as usize].clone();
+                            let val = fold_cmp(c, a, bv, &oty);
                             set_const(f, bi, ii, CV::Int(val), &MirType::I1);
                             consts.insert(res.0, CV::Int(val));
                             changed = true;
@@ -250,7 +256,7 @@ fn fold_float(b: BinOp, x: f64, y: f64) -> f64 {
     }
 }
 
-fn fold_cmp(c: CmpOp, a: CV, b: CV) -> i128 {
+fn fold_cmp(c: CmpOp, a: CV, b: CV, ty: &MirType) -> i128 {
     use CmpOp::*;
     let res = match (a, b) {
         (CV::Float(x), CV::Float(y)) => match c {
@@ -263,14 +269,23 @@ fn fold_cmp(c: CmpOp, a: CV, b: CV) -> i128 {
             _ => false,
         },
         (CV::Int(x), CV::Int(y)) => {
-            let (ux, uy) = (x as u128, y as u128);
+            // Reproduce the width-correct register compare both backends do at runtime. A constant
+            // can enter the fold table wider than its type (an unsigned literal >= 2^(w-1), or an
+            // `as iW` reinterpret keeps the source bits), so signed predicates compare the
+            // sign-extended value at the operand width (`mask`) and unsigned predicates the
+            // zero-extended value (`uval`) — mirroring `fold_int`. Comparing the raw i128 instead
+            // folds e.g. `(4000000000 as i32) < 0` to false while the runtime i32 register is
+            // negative, so -O2 would disagree with -O0.
+            let w = int_bits(ty);
+            let (sx, sy) = (mask(x, ty), mask(y, ty));
+            let (ux, uy) = (uval(x, w), uval(y, w));
             match c {
-                Eq => x == y,
-                Ne => x != y,
-                Slt => x < y,
-                Sle => x <= y,
-                Sgt => x > y,
-                Sge => x >= y,
+                Eq => sx == sy,
+                Ne => sx != sy,
+                Slt => sx < sy,
+                Sle => sx <= sy,
+                Sgt => sx > sy,
+                Sge => sx >= sy,
                 Ult => ux < uy,
                 Ule => ux <= uy,
                 Ugt => ux > uy,
