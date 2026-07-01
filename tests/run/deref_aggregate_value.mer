@@ -1,0 +1,60 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 15
+// EXPECT-OUT: 56
+// EXPECT-OUT: 902
+// EXPECT-OUT: 70
+// EXPECT-OUT: 33
+module tests.run.deref_aggregate_value
+
+// Dereferencing a pointer-to-aggregate in a VALUE position — `*p` where `p: *Struct` / `*Tuple` /
+// `*[T;N]` — used to lower to `load [N x i8]`, materializing the whole byte buffer as an SSA value.
+// The consuming ABI expects a pointer (aggregates pass/return/store by base pointer), so that value
+// was never consumable: it slipped past the verifier (which does not type-check call/branch argument
+// types) into a native-JIT HANG on `f(*src)`, and tripped the -O0 gep-base verifier / -O2 mem2reg
+// panic on `*dst = *src`, `let v = *src`, and `return *src`. An aggregate IS addressed by its base
+// pointer, so `*p` of a pointer-to-aggregate now yields `p` itself; the consuming context emit_copies
+// from that base pointer for value semantics (`(*p).field` projection was always fine and is
+// unchanged). See gap-hunt sweep #13, Scout C.
+
+struct Pt { x: i32, y: i32 }
+
+fn sum(p: Pt) -> i32 { return p.x + p.y; }
+fn fwd(src: *Pt) -> i32 { return sum(*src); }             // deref'd aggregate passed BY VALUE (was a hang)
+
+fn cp_struct(dst: *mut Pt, src: *Pt) { *dst = *src; }     // whole-struct copy through two pointers
+
+fn from_deref(src: *Pt) -> i32 { let v: Pt = *src; return v.x * 10 + v.y; }  // `let v = *src`
+
+fn deref_ret(src: *Pt) -> Pt { return *src; }             // `return *src` (sret)
+
+fn cp_tuple(dst: *mut (i32, i32), src: *(i32, i32)) { *dst = *src; }
+
+fn proj(p: *Pt) -> i32 { return (*p).x + (*p).y; }         // projection control (always worked)
+
+fn main() -> i32 {
+    let s: Pt = Pt { x: 7, y: 8 };
+    print(fwd(&s));                                        // 15
+
+    let mut a: Pt = Pt { x: 3, y: 4 };
+    let b: Pt = Pt { x: 7, y: 8 };
+    cp_struct(&mut a, &b);
+    print(a.x + a.y);                                     // 15  (b copied into a)
+
+    let s2: Pt = Pt { x: 5, y: 6 };
+    print(from_deref(&s2));                               // 56
+
+    let s3: Pt = Pt { x: 9, y: 2 };
+    let r: Pt = deref_ret(&s3);
+    print(r.x * 100 + r.y);                              // 902
+
+    let mut ta: (i32, i32) = (1, 2);
+    let tb: (i32, i32) = (30, 40);
+    cp_tuple(&mut ta, &tb);
+    print(ta.0 + ta.1);                                  // 70
+
+    let s4: Pt = Pt { x: 11, y: 22 };
+    print(proj(&s4));                                    // 33
+    return 0;
+}
