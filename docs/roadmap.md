@@ -96,8 +96,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   aggregate handling (`tests/run/{tuple,struct,struct_nested}.mer`), and nested tuple-field access
   `t.0.1` / `t.0.0.0` plus whole-aggregate assignment `s = other;` both run
   (`tests/run/{nested_tuple_field,struct_assign}.mer`). A tuple/struct also crosses function
-  boundaries **by value** — a by-value parameter and a `fn … -> Struct` return via a hidden-pointer
-  (sret) ABI modeled in mir_build, so no aggregate ever rides in a register and both backends agree
+  boundaries — passed **in by reference** (base pointer, zero-copy; mutating it needs `mut`, else
+  E0304) and **returned by value** via a hidden-pointer (sret) ABI modeled in mir_build, so no
+  aggregate ever rides in a register and both backends agree
   (`tests/run/{struct_fn,struct_return}.mer`).
 - **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
   row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
@@ -410,10 +411,13 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   gate — is `--run`; emitting `mercury_runtime` as a staticlib and linking it for `--emit=exe` is future
   work. Scalar math (a `while`-loop `exp`, which lowers to a libm call, not the vectorized kernel) links
   fine.
-- **A by-value aggregate parameter aliases the caller's value.** A `struct`/array/tuple argument is
-  passed by pointer (the by-pointer convention), and the callee mutates *through* it, so
-  `fn clobber(p: P) { p.x = 999; }` writes back into the caller's `p` — full value semantics would
-  copy-in. This is deliberate (an ML kernel passes large buffers; copying every aggregate argument by
-  value would be a performance footgun) and **both backends agree** (it is not a differential), but it
-  surprises: take an explicit `let q = p;` copy inside the callee when you need an independent value, or
-  pass `*mut P` when mutation-through is the intent. A plain `let b = a;` *does* copy.
+- **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
+  (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a
+  callee that mutates one writes back into the caller's storage (copying every large buffer by value
+  would be the performance footgun). This is no longer a *silent* surprise: mutating a parameter — a
+  rebind (`p = …`) or an aggregate projection (`p.f = …`, `p[i] = …`) — now **requires `mut` on the
+  parameter**, else it is a compile error (E0304). A `mut` aggregate parameter is thus the idiomatic
+  in-place output buffer (`fn relu(mut out: […], x: […])`) and its caller-visible mutation is
+  explicit; a non-`mut` aggregate parameter is read-only. Both backends agree bit-for-bit. Take a
+  `let q = p;` for an independent copy inside the callee (a plain `let` *does* copy); a pointer
+  parameter still writes through its pointee (`*p = …`) without `mut`.

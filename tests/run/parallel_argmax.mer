@@ -12,7 +12,7 @@ module tests.run.parallel_argmax
 // index. gcc/rustc run a branchy serial scalar loop; this dispatches the whole array across cores.
 
 @parallel
-fn argextrema(x: [f32; 20000], o: [i32; 2]) {
+fn argextrema(x: [f32; 20000], mut o: [i32; 2]) {
     let mut bv: f32 = x[0];
     let mut bi: i64 = 0;
     for k in 0..20000 {

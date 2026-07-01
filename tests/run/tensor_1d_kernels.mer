@@ -13,10 +13,10 @@ module tests.run.tensor_1d_kernels
 // must load the base out of that slot (as the regular index path and the GEMM path do) before GEPing.
 // They used to GEP off the slot address, so the kernel read past the slot: the interpreter trapped
 // while native segfaulted / returned wrong values — a backend divergence on a documented feature.
-fn scale(a: Tensor[f32, 4], out: Tensor[f32, 4]) {
+fn scale(a: Tensor[f32, 4], mut out: Tensor[f32, 4]) {
     for i in 0..4 { out[i] = a[i] * 3.0; } // velem
 }
-fn act(a: Tensor[f32, 4], out: Tensor[f32, 4]) {
+fn act(a: Tensor[f32, 4], mut out: Tensor[f32, 4]) {
     for i in 0..4 { out[i] = exp(a[i]); } // vmath
 }
 fn total(a: Tensor[f32, 4]) -> f32 {

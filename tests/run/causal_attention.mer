@@ -11,7 +11,7 @@ module tests.run.causal_attention
 // to -inf before the softmax (exp(-inf-m) → 0). Both matmuls (Q·Kᵀ, P·V) dispatch to the GEMM
 // kernel; the mask is a conditional store, the softmax vectorizes. S=4 tokens, D=4. With masking,
 // row 0's output equals V row 0 exactly (it attends only to itself); the gate proves native==interp.
-fn causal_attn(q: [f32; 16], k: [f32; 16], v: [f32; 16], scores: [f32; 16], out: [f32; 16]) {
+fn causal_attn(q: [f32; 16], k: [f32; 16], v: [f32; 16], mut scores: [f32; 16], mut out: [f32; 16]) {
     // scores = Q · Kᵀ
     for i in 0..4 {
         for j in 0..4 {

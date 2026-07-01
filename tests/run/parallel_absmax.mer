@@ -11,7 +11,7 @@ module tests.run.parallel_absmax
 // so the value is exact.
 
 @parallel
-fn absmaxv(x: [f32; 256], o: [f32; 1]) {
+fn absmaxv(x: [f32; 256], mut o: [f32; 1]) {
     let mut m: f32 = 0.0;
     for k in 0..256 { m = fmax(m, abs(x[k])); }
     o[0] = m;

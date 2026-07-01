@@ -43,7 +43,7 @@ fn gpt2_block(
     ln2g: [f32; 64],  ln2b: [f32; 64],   // LayerNorm 2 gain / bias
     w1:   [f32; 16384],   // [Dff=256, D=64]  MLP up-projection
     w2:   [f32; 16384],   // [D=64, Dff=256]  MLP down-projection
-    out:  [f32; 512],     // [S, D]  output hidden states
+    mut out:  [f32; 512],     // [S, D]  output hidden states
 ) {
     let mut nrm:   [f32; 512]  = [0.0; 512];   // LayerNorm output [S, D]
     let mut q:     [f32; 512]  = [0.0; 512];   // Q = nrm·Wqᵀ   [S, D]

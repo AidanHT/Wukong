@@ -9,7 +9,7 @@ module tests.run.tensor_add
 // an array out-param), and the multi-dimensional index `a[i, j]` flattens to a row-major GEP
 // (`i*3 + j`). This is the shape-typed surface executing — not just shape-checking. Arrays are passed
 // into the tensor params (sema's lenient array↔tensor unify), and both decay to a base pointer.
-fn add(a: Tensor[f32, 2, 3], b: Tensor[f32, 2, 3], out: Tensor[f32, 2, 3]) {
+fn add(a: Tensor[f32, 2, 3], b: Tensor[f32, 2, 3], mut out: Tensor[f32, 2, 3]) {
     for i in 0..2 {
         for j in 0..3 {
             out[i, j] = a[i, j] + b[i, j];

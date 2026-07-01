@@ -10,7 +10,7 @@ module tests.run.tensor_matmul
 // `a[i, k]` supplies its row stride from the tensor's inner dim, so this idiomatic spelling now
 // dispatches to the SAME tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` form (see
 // `tensor_matmul_is_correct`), and runs bit-identically on both backends.
-fn matmul(a: Tensor[f32, 2, 2], b: Tensor[f32, 2, 2], c: Tensor[f32, 2, 2]) {
+fn matmul(a: Tensor[f32, 2, 2], b: Tensor[f32, 2, 2], mut c: Tensor[f32, 2, 2]) {
     for i in 0..2 {
         for j in 0..2 {
             let mut s: f32 = 0.0;

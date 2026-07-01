@@ -12,21 +12,21 @@ module tests.run.parallel_reduce
 // opt-invariance. Values are f32-exact so the reassociated sum is unambiguous.
 
 @parallel
-fn dotp(x: [f32; 256], y: [f32; 256], o: [f32; 1]) {
+fn dotp(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..256 { s = s + x[k] * y[k]; }
     o[0] = s;
 }
 
 @parallel
-fn ssd(x: [f32; 256], y: [f32; 256], o: [f32; 1]) {
+fn ssd(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..256 { s += (x[k] - y[k]) * (x[k] - y[k]); }
     o[0] = s;
 }
 
 @parallel
-fn sumv(x: [f32; 256], o: [f32; 1]) {
+fn sumv(x: [f32; 256], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..256 { s += x[k]; }
     o[0] = s;

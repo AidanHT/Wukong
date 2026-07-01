@@ -954,11 +954,11 @@ fn differential_char_patterns() {
 fn differential_tensor_1d_kernels() {
     let cases = [
         // velem: out[i] = a[i] * 3  -> 1*3 + 4*3 = 15
-        ("fn f(a: Tensor[f32,4], o: Tensor[f32,4]) { for i in 0..4 { o[i] = a[i] * 3.0; } } \
+        ("fn f(a: Tensor[f32,4], mut o: Tensor[f32,4]) { for i in 0..4 { o[i] = a[i] * 3.0; } } \
           fn main() -> i32 { let a:[f32;4]=[1.0,2.0,3.0,4.0]; let o:[f32;4]=[0.0,0.0,0.0,0.0]; \
           f(a, o); return (o[0] + o[3]) as i32; }", 15),
         // vmath: out[i] = exp(a[i])  -> exp(0)*4 = 4
-        ("fn f(a: Tensor[f32,4], o: Tensor[f32,4]) { for i in 0..4 { o[i] = exp(a[i]); } } \
+        ("fn f(a: Tensor[f32,4], mut o: Tensor[f32,4]) { for i in 0..4 { o[i] = exp(a[i]); } } \
           fn main() -> i32 { let a:[f32;4]=[0.0,0.0,0.0,0.0]; let o:[f32;4]=[0.0,0.0,0.0,0.0]; \
           f(a, o); return (o[0] + o[1] + o[2] + o[3]) as i32; }", 4),
         // reduction: sum -> 10
@@ -1777,7 +1777,7 @@ fn differential_vmath_dispatch() {
 /// per-element result). Exercised for gelu (a fused activation) at a size that spans many chunks.
 #[test]
 fn differential_parallel_vmath() {
-    let src = "@parallel fn act(x: [f32; 4096], out: [f32; 4096]) { \
+    let src = "@parallel fn act(x: [f32; 4096], mut out: [f32; 4096]) { \
          for i in 0..4096 { out[i] = gelu(x[i]); } } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 4096] = [0.0; 4096]; \
@@ -1799,7 +1799,7 @@ fn differential_parallel_vmath() {
 fn differential_i8gemm() {
     let body = |attr: &str| {
         format!(
-            "{attr}fn lin(a: [u8; 160], b: [i8; 160], c: [i32; 16]) {{ \
+            "{attr}fn lin(a: [u8; 160], b: [i8; 160], mut c: [i32; 16]) {{ \
              for i in 0..4 {{ for j in 0..4 {{ let mut s: i32 = 0; \
              for k in 0..40 {{ s = s + (a[i * 40 + k] as i32) * (b[j * 40 + k] as i32); }} \
              c[i * 4 + j] = s; }} }} }} \
@@ -1832,7 +1832,7 @@ fn differential_i8gemm() {
 fn i8_linear_nest_lowers_to_i8gemm() {
     let lin = |attr: &str| {
         format!(
-            "module m\n{attr}fn lin(a:[u8;160],b:[i8;160],c:[i32;16]) {{ \
+            "module m\n{attr}fn lin(a:[u8;160],b:[i8;160],mut c:[i32;16]) {{ \
              for i in 0..4 {{ for j in 0..4 {{ let mut s: i32 = 0; \
              for k in 0..40 {{ s = s + (a[i*40+k] as i32) * (b[j*40+k] as i32); }} \
              c[i*4+j] = s; }} }} }}"
@@ -1848,7 +1848,7 @@ fn i8_linear_nest_lowers_to_i8gemm() {
     );
     // Signedness mismatch (A is i8, not u8): the kernel's zero/sign-extend split would miscompile, so
     // the recognizer must bail and never emit either int8 kernel symbol.
-    let signed = "module m\nfn lin(a:[i8;160],b:[i8;160],c:[i32;16]) { \
+    let signed = "module m\nfn lin(a:[i8;160],b:[i8;160],mut c:[i32;16]) { \
         for i in 0..4 { for j in 0..4 { let mut s: i32 = 0; \
         for k in 0..40 { s = s + (a[i*40+k] as i32) * (b[j*40+k] as i32); } \
         c[i*4+j] = s; } } }";
@@ -1870,7 +1870,7 @@ fn i8_linear_nest_lowers_to_i8gemm() {
 #[test]
 fn differential_embedding() {
     // Small serial gather: T=4, V=4, H=3, ids hitting row 0, the last row, and a repeat.
-    let serial = "fn embed(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) { \
+    let serial = "fn embed(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) { \
          for t in 0..4 { for d in 0..3 { out[t * 3 + d] = weight[ids[t] * 3 + d]; } } } \
          fn main() -> i32 { let weight: [f32; 12] = [0.0,1.0,2.0,10.0,11.0,12.0,\
          20.0,21.0,22.0,30.0,31.0,32.0]; let ids: [i32; 4] = [2,0,3,0]; \
@@ -1879,7 +1879,7 @@ fn differential_embedding() {
          print(acc); print(out[0]); print(out[11]); return 0; }"
         .to_string();
     // Large @parallel gather: T=80 (> EMBEDDING_PAR_MIN=64, so the multicore split runs), V=8, H=4.
-    let parallel = "@parallel\nfn embed(ids: [i32; 80], weight: [f32; 32], out: [f32; 320]) { \
+    let parallel = "@parallel\nfn embed(ids: [i32; 80], weight: [f32; 32], mut out: [f32; 320]) { \
          for t in 0..80 { for d in 0..4 { out[t * 4 + d] = weight[ids[t] * 4 + d]; } } } \
          fn main() -> i32 { let mut weight: [f32; 32] = [0.0; 32]; \
          for i in 0..32 { weight[i] = (i as f32) * 0.5 - 3.0; } \
@@ -1908,7 +1908,7 @@ fn differential_embedding() {
 fn embedding_nest_lowers_to_kernel() {
     let embed = |attr: &str| {
         format!(
-            "module m\n{attr}fn embed(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) {{ \
+            "module m\n{attr}fn embed(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) {{ \
              for t in 0..4 {{ for d in 0..3 {{ out[t * 3 + d] = weight[ids[t] * 3 + d]; }} }} }}"
         )
     };
@@ -1922,7 +1922,7 @@ fn embedding_nest_lowers_to_kernel() {
     );
     // A direct copy `out[t*3+d] = weight[t*3+d]` (the row index is the loop var, not a gathered id) is
     // not an embedding lookup — the recognizer must bail (no `ids[t]` indirection to fold).
-    let copy = "module m\nfn cp(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) { \
+    let copy = "module m\nfn cp(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) { \
         for t in 0..4 { for d in 0..3 { out[t * 3 + d] = weight[t * 3 + d]; } } }";
     assert!(
         !lowered_calls(copy, "mercury_embedding_f32"),
@@ -1939,42 +1939,42 @@ fn embedding_nest_lowers_to_kernel() {
 fn differential_parallel_reduce() {
     let programs = [
         // dot product Σ x·y
-        "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s = s + x[k] * y[k]; } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 2.0; } dotp(x, y, o); \
          print((o[0] * 100.0) as i32); return 0; }",
         // sum of squared differences Σ (x−y)² (an L2 loss)
-        "@parallel fn ssd(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn ssd(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += (x[k] - y[k]) * (x[k] - y[k]); } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 1.0; } ssd(x, y, o); \
          print((o[0] * 10.0) as i32); return 0; }",
         // unary sum Σ x (LayerNorm-style accumulation; the recognizer passes y == x)
-        "@parallel fn sumv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn sumv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += x[k]; } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.01; } sumv(x, o); \
          print((o[0]) as i32); return 0; }",
         // running max (fold by fmax; mixed-sign fractional inputs)
-        "@parallel fn maxv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn maxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmax(m, x[k]); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } maxv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
         // running min (fold by fmin, operand order m second)
-        "@parallel fn minv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn minv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmin(x[k], m); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = 5.0 - (i as f32) * 0.001; } minv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
         // running absmax (fmax fold over abs(x[k]) → RED_MAXABS; negative-dominant tail)
-        "@parallel fn absmaxv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn absmaxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = 0.0; for k in 0..4096 { m = fmax(m, abs(x[k])); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
@@ -1993,9 +1993,9 @@ fn differential_parallel_reduce() {
     }
     // Golden, using f32-exact values so the reassociated sum is unambiguous: dot = 2·3·4096 = 24576,
     // sum = 2·4096 = 8192.
-    let golden = "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+    let golden = "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s = s + x[k] * y[k]; } o[0] = s; } \
-         @parallel fn sumv(x: [f32; 4096], o: [f32; 1]) { \
+         @parallel fn sumv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += x[k]; } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [2.0; 4096]; \
          let mut y: [f32; 4096] = [3.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
@@ -2007,9 +2007,9 @@ fn differential_parallel_reduce() {
         "parallel reduction produced the wrong value"
     );
     // Max/min golden over a ramp (exact integer elements): max(i−1000) = 3095, min = −1000.
-    let golden_mm = "@parallel fn maxv(x: [f32; 4096], o: [f32; 1]) { \
+    let golden_mm = "@parallel fn maxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmax(m, x[k]); } o[0] = m; } \
-         @parallel fn minv(x: [f32; 4096], o: [f32; 1]) { \
+         @parallel fn minv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmin(m, x[k]); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) - 1000.0; } \
@@ -2022,7 +2022,7 @@ fn differential_parallel_reduce() {
     );
     // Absmax golden over a ramp straddling zero (exact integer elements): max(|i−3000|) = 3000
     // (the negative end |−3000| beats the positive end |1095|).
-    let golden_abs = "@parallel fn absmaxv(x: [f32; 4096], o: [f32; 1]) { \
+    let golden_abs = "@parallel fn absmaxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = 0.0; for k in 0..4096 { m = fmax(m, abs(x[k])); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) - 3000.0; } absmaxv(x, o); print((o[0]) as i32); return 0; }";
@@ -2043,14 +2043,14 @@ fn differential_parallel_reduce() {
 fn differential_bf16_reduce() {
     let programs = [
         // bf16 dot Σ (x·y) with fractional, non-bf16-exact elements (real rounding + reassociation).
-        "fn dotbf(x: [bf16; 4096], y: [bf16; 4096], o: [f32; 1]) { \
+        "fn dotbf(x: [bf16; 4096], y: [bf16; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s = s + (x[k] as f32) * (y[k] as f32); } o[0] = s; } \
          fn main() -> i32 { let mut x: [bf16; 4096] = [0.0 as bf16; 4096]; \
          let mut y: [bf16; 4096] = [0.0 as bf16; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = ((i as f32) * 0.001) as bf16; y[i] = 1.5 as bf16; } dotbf(x, y, o); \
          print((o[0] * 100.0) as i32); return 0; }",
         // bf16 unary sum Σ x with fractional elements.
-        "fn sumbf(x: [bf16; 4096], o: [f32; 1]) { \
+        "fn sumbf(x: [bf16; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += (x[k] as f32); } o[0] = s; } \
          fn main() -> i32 { let mut x: [bf16; 4096] = [0.0 as bf16; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
@@ -2074,9 +2074,9 @@ fn differential_bf16_reduce() {
     }
     // Golden, bf16-exact small integers so the reassociated sum is unambiguous: dot = 2·(1+…+8) =
     // 72, sum = 36. Proves the dispatch produces the right value, not just self-consistency.
-    let golden = "fn dotbf(x: [bf16; 8], y: [bf16; 8], o: [f32; 1]) { \
+    let golden = "fn dotbf(x: [bf16; 8], y: [bf16; 8], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..8 { s = s + (x[k] as f32) * (y[k] as f32); } o[0] = s; } \
-         fn sumbf(x: [bf16; 8], o: [f32; 1]) { \
+         fn sumbf(x: [bf16; 8], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..8 { s += (x[k] as f32); } o[0] = s; } \
          fn main() -> i32 { let mut x: [bf16; 8] = [0.0 as bf16; 8]; \
          let mut y: [bf16; 8] = [0.0 as bf16; 8]; let mut o: [f32; 1] = [0.0; 1]; \
@@ -2096,26 +2096,26 @@ fn differential_bf16_reduce() {
 /// lacks). Golden small-integer case pins the value.
 #[test]
 fn differential_bf16_axpby() {
-    let axpby = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let axpby = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } }";
     assert!(
         lowered_calls(axpby, "mercury_axpby_bf16"),
         "bf16 axpby -> mercury_axpby_bf16"
     );
-    let saxpy = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let saxpy = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 3.0 * (x[k] as f32) + (y[k] as f32); } }";
     assert!(
         lowered_calls(saxpy, "mercury_axpby_bf16"),
         "bf16 saxpy (implicit b=1) -> mercury_axpby_bf16"
     );
-    let add = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let add = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = (x[k] as f32) + (y[k] as f32); } }";
     assert!(
         lowered_calls(add, "mercury_axpby_bf16"),
         "bf16 add -> mercury_axpby_bf16"
     );
     // A 1-term scale has no second additive term, so it must decline (avoids a 0*inf the source lacks).
-    let scale = "module m\nfn ax(x:[bf16;64], o:[f32;64]) { \
+    let scale = "module m\nfn ax(x:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 2.0 * (x[k] as f32); } }";
     assert!(
         !lowered_calls(scale, "mercury_axpby_bf16"),
@@ -2123,7 +2123,7 @@ fn differential_bf16_axpby() {
     );
 
     // native == interp across opt levels, fractional non-bf16-exact inputs.
-    let prog = "fn ax(x:[bf16;4096], y:[bf16;4096], o:[f32;4096]) { \
+    let prog = "fn ax(x:[bf16;4096], y:[bf16;4096], mut o:[f32;4096]) { \
          for k in 0..4096 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } } \
          fn main() -> i32 { let mut x:[bf16;4096]=[0.0 as bf16;4096]; \
          let mut y:[bf16;4096]=[0.0 as bf16;4096]; let mut o:[f32;4096]=[0.0;4096]; \
@@ -2138,7 +2138,7 @@ fn differential_bf16_axpby() {
         );
     }
     // Golden bf16-exact: o[k] = 2·(k+1) + 3·2 = 2(k+1)+6; Σ_{k=0..7} = 2·36 + 48 = 120.
-    let golden = "fn ax(x:[bf16;8], y:[bf16;8], o:[f32;8]) { \
+    let golden = "fn ax(x:[bf16;8], y:[bf16;8], mut o:[f32;8]) { \
         for k in 0..8 { o[k] = 2.0*(x[k] as f32) + 3.0*(y[k] as f32); } } \
         fn main() -> i32 { let mut x:[bf16;8]=[0.0 as bf16;8]; let mut y:[bf16;8]=[0.0 as bf16;8]; \
         let mut o:[f32;8]=[0.0;8]; for i in 0..8 { x[i]=((i+1) as f32) as bf16; y[i]=2.0 as bf16; } \
@@ -2234,14 +2234,14 @@ fn differential_batched_matmul() {
         return 0; }";
     // C[h] = A[h]·B[h]:    head0 [[19,22],[43,50]], head1 = I·B1 = [[9,10],[11,12]].
     let normal = format!(
-        "fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {{ \
+        "fn bmm(a: [f32; 8], b: [f32; 8], mut c: [f32; 8]) {{ \
         for h in 0..2 {{ for i in 0..2 {{ for j in 0..2 {{ let mut s: f32 = 0.0; \
         for k in 0..2 {{ s = s + a[h*4 + i*2 + k] * b[h*4 + k*2 + j]; }} \
         c[h*4 + i*2 + j] = s; }} }} }} }} fn main() -> i32 {{ {head}"
     );
     // C[h] = A[h]·B[h]ᵀ (attention Q·Kᵀ): head0 [[17,23],[39,53]], head1 = I·B1ᵀ = B1ᵀ [[9,11],[10,12]].
     let transposed = format!(
-        "fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {{ \
+        "fn bmm(a: [f32; 8], b: [f32; 8], mut c: [f32; 8]) {{ \
         for h in 0..2 {{ for i in 0..2 {{ for j in 0..2 {{ let mut s: f32 = 0.0; \
         for k in 0..2 {{ s = s + a[h*4 + i*2 + k] * b[h*4 + j*2 + k]; }} \
         c[h*4 + i*2 + j] = s; }} }} }} }} fn main() -> i32 {{ {head}"
@@ -2271,7 +2271,7 @@ fn differential_batched_matmul() {
 /// bias-free `silu(x·Wᵀ)` is the LLaMA SwiGLU shape (null bias through the same kernel).
 #[test]
 fn differential_linear_epilogue() {
-    let body = "fn lin(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) { \
+    let body = "fn lin(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) { \
         for i in 0..2 { for j in 0..2 { let mut s: f32 = 0.0; \
         for k in 0..2 { s = s + x[i*2+k] * w[j*2+k]; } out[i*2+j] = s; } } \
         for i in 0..2 { for j in 0..2 { out[i*2+j] = EPI; } } } \
@@ -2281,7 +2281,7 @@ fn differential_linear_epilogue() {
         print(out[0] as i32); print(out[1] as i32); print(out[2] as i32); print(out[3] as i32); \
         return 0; }";
     // Bias-free variant (LLaMA SwiGLU `silu(x·Wᵀ)`): no bias param, pre-act = [1,2,3,4].
-    let nobias = "fn lin(x: [f32; 4], w: [f32; 4], out: [f32; 4]) { \
+    let nobias = "fn lin(x: [f32; 4], w: [f32; 4], mut out: [f32; 4]) { \
         for i in 0..2 { for j in 0..2 { let mut s: f32 = 0.0; \
         for k in 0..2 { s = s + x[i*2+k] * w[j*2+k]; } out[i*2+j] = s; } } \
         for i in 0..2 { for j in 0..2 { out[i*2+j] = EPI; } } } \
@@ -2769,7 +2769,7 @@ fn matmul_is_correct() {
         let attr = if parallel { "@parallel\n" } else { "" };
         let n2 = ns * ns;
         format!(
-            "module m\n{attr}fn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+            "module m\n{attr}fn mm(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{\n\
              for i in 0..{ns} {{ for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
              for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
              fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
@@ -2831,7 +2831,7 @@ fn tensor_matmul_is_correct() {
         let b_idx = if transposed_b { "j, k" } else { "k, j" };
         format!(
             "module m\n{attr}fn mm(a: Tensor[f32, {ns}, {ns}], b: Tensor[f32, {ns}, {ns}], \
-             c: Tensor[f32, {ns}, {ns}]) {{\n\
+             mut c: Tensor[f32, {ns}, {ns}]) {{\n\
              for i in 0..{ns} {{ for j in 0..{ns} {{ let mut s: f32 = 0.0; \
              for k in 0..{ns} {{ s = s + a[i, k] * b[{b_idx}]; }} c[i, j] = s; }} }} }}\n\
              fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; \
@@ -2899,7 +2899,7 @@ fn tensor_matmul_accumulate_form() {
         let n2 = ns * ns;
         format!(
             "module m\n{attr}fn mm(a: Tensor[f32, {ns}, {ns}], b: Tensor[f32, {ns}, {ns}], \
-             c: Tensor[f32, {ns}, {ns}]) {{\n\
+             mut c: Tensor[f32, {ns}, {ns}]) {{\n\
              for i in 0..{ns} {{ for j0 in 0..{ns} {{ c[i, j0] = 0.0; }} \
              for k in 0..{ns} {{ let aik: f32 = a[i, k]; \
              for j in 0..{ns} {{ c[i, j] = c[i, j] + aik * b[k, j]; }} }} }} }}\n\
@@ -2951,7 +2951,7 @@ fn matmul_nest_lowers_to_sgemm() {
     // Accumulate form (beta = 1): no per-row zero-init.
     let acc = |attr: &str| {
         format!(
-            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) {{ \
              for i in 0..8 {{ for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
              for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
         )
@@ -2959,7 +2959,7 @@ fn matmul_nest_lowers_to_sgemm() {
     // Overwrite form (beta = 0): a per-row zero-init loop precedes the K loop.
     let ovr = |attr: &str| {
         format!(
-            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) {{ \
              for i in 0..8 {{ for j0 in 0..8 {{ c[i*8+j0] = 0.0; }} \
              for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
              for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
@@ -2978,7 +2978,7 @@ fn matmul_nest_lowers_to_sgemm() {
         "@parallel -> sgemm_parallel"
     );
     // A non-matmul triple loop (wrong B stride) must NOT be misrecognized.
-    let not_mm = "module m\nfn f(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+    let not_mm = "module m\nfn f(a:[f32;64],b:[f32;64],mut c:[f32;64]) {{ \
         for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[j*8+k]; } } } }";
     assert!(
@@ -2993,7 +2993,7 @@ fn matmul_nest_lowers_to_sgemm() {
 fn linear_nt_matmul_lowers_and_runs() {
     let nt = |attr: &str| {
         format!(
-            "module m\n{attr}fn lin(a:[f32;48],b:[f32;32],c:[f32;24]) {{ \
+            "module m\n{attr}fn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) {{ \
              for i in 0..6 {{ for j0 in 0..4 {{ c[i*4+j0] = 0.0; }} \
              for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
              for j in 0..4 {{ c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; }} }} }} }}"
@@ -3008,7 +3008,7 @@ fn linear_nt_matmul_lowers_and_runs() {
         "@parallel A·Bᵀ -> sgemm_nt_parallel"
     );
     // C=A·B (b indexed [k*4+j]) must use the non-transposed kernel, never the nt one.
-    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[k*4+j]; } } } }";
     assert!(lowered_calls(normal, "mercury_sgemm"), "C=A·B -> sgemm");
@@ -3018,7 +3018,7 @@ fn linear_nt_matmul_lowers_and_runs() {
     );
 
     // End to end: A is 6x8, B is 4x8 (so Bᵀ is 8x4), C is 6x4. Native must equal interp.
-    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j0 in 0..4 { c[i*4+j0] = 0.0; } \
         for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; } } } }\n\
@@ -3037,7 +3037,7 @@ fn linear_nt_matmul_lowers_and_runs() {
 #[test]
 fn ijk_dot_product_matmul_recognized() {
     // C = A·Bᵀ (b[j*K+k]) — the natural nn.Linear spelling.
-    let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }";
     assert!(
@@ -3045,14 +3045,14 @@ fn ijk_dot_product_matmul_recognized() {
         "ijk A·Bᵀ -> sgemm_nt"
     );
     // C = A·B (b[k*N+j]).
-    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[k*4+j]; } c[i*4+j] = s; } } }";
     assert!(lowered_calls(normal, "mercury_sgemm"), "ijk A·B -> sgemm");
     assert!(!lowered_calls(normal, "mercury_sgemm_nt"));
 
     // End to end (A·Bᵀ): native must equal interp.
-    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }\n\
         fn main() -> i32 { let mut a:[f32;48]=[0.0;48]; let mut b:[f32;32]=[0.0;32]; \
@@ -3072,7 +3072,7 @@ fn matmul_overwrite_differential() {
     let ns = 9usize; // not a multiple of MR/NR, exercises the microkernel remainders
     let n2 = ns * ns;
     let src = format!(
-        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{ \
+        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{ \
          for i in 0..{ns} {{ for j0 in 0..{ns} {{ c[i*{ns}+j0] = 0.0; }} \
          for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
          for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
@@ -3095,7 +3095,7 @@ fn matmul_overwrite_differential() {
 #[test]
 fn affine_norm_dispatch() {
     // Affine LayerNorm: (x-mean)*inv*g[i] + b[i]
-    let ln_affine = "module m\nfn f(x:[f32;8], g:[f32;8], b:[f32;8]) { \
+    let ln_affine = "module m\nfn f(mut x:[f32;8], g:[f32;8], b:[f32;8]) { \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let mean: f32 = s / 8.0; \
         let mut v: f32 = 0.0; for i in 0..8 { v = v + (x[i] - mean) * (x[i] - mean); } \
         let inv: f32 = rsqrt(v / 8.0 + 0.00001); \
@@ -3110,7 +3110,7 @@ fn affine_norm_dispatch() {
     );
 
     // Affine RMSNorm: x[i]*inv*g[i] (scale only, no shift)
-    let rn_affine = "module m\nfn f(x:[f32;8], g:[f32;8]) { \
+    let rn_affine = "module m\nfn f(mut x:[f32;8], g:[f32;8]) { \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i] * x[i]; } \
         let inv: f32 = rsqrt(s / 8.0 + 0.00001); \
         for i in 0..8 { x[i] = x[i] * inv * g[i]; } }";
@@ -3120,7 +3120,7 @@ fn affine_norm_dispatch() {
     );
 
     // Plain LayerNorm (gamma=1, beta=0) still uses the plain kernel, not the affine one.
-    let ln_plain = "module m\nfn f(x:[f32;8]) { \
+    let ln_plain = "module m\nfn f(mut x:[f32;8]) { \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let mean: f32 = s / 8.0; \
         let mut v: f32 = 0.0; for i in 0..8 { v = v + (x[i] - mean) * (x[i] - mean); } \
         let inv: f32 = rsqrt(v / 8.0 + 0.00001); \
@@ -3136,7 +3136,7 @@ fn affine_norm_dispatch() {
 
     // softmax with a trailing scale has no affine semantics; the guard makes it decline BOTH norm
     // kernels (falls back to the vectorizer) rather than dropping the scale.
-    let sm_scaled = "module m\nfn f(x:[f32;8], g:[f32;8]) { \
+    let sm_scaled = "module m\nfn f(mut x:[f32;8], g:[f32;8]) { \
         let mut m: f32 = x[0]; for i in 0..8 { m = fmax(m, x[i]); } \
         for i in 0..8 { x[i] = exp(x[i] - m); } \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let inv: f32 = 1.0 / s; \
@@ -3158,7 +3158,7 @@ fn affine_norm_dispatch() {
 #[test]
 fn batched_norm_dispatch() {
     // R = 3 rows, C = 4 cols, normalized in place over the flat [12] buffer via the `r*4 + i` offset.
-    let batched = "module m\nfn f(x:[f32;12]) { \
+    let batched = "module m\nfn f(mut x:[f32;12]) { \
         for r in 0..3 { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i] * x[r*4+i]; } \
         let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
@@ -3169,7 +3169,7 @@ fn batched_norm_dispatch() {
     );
 
     // Batched LayerNorm (two reductions: mean, then variance) over the `r*4 + i` offset must dispatch too.
-    let batched_ln = "module m\nfn f(x:[f32;12]) { \
+    let batched_ln = "module m\nfn f(mut x:[f32;12]) { \
         for r in 0..3 { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i]; } let mean: f32 = s / 4.0; \
         let mut v: f32 = 0.0; for i in 0..4 { v = v + (x[r*4+i] - mean) * (x[r*4+i] - mean); } \
@@ -3181,7 +3181,7 @@ fn batched_norm_dispatch() {
     );
 
     // Batched softmax (max/exp/sum/normalize, with the row-local `x[r*4]` max-seed) over the offset.
-    let batched_sm = "module m\nfn f(x:[f32;12]) { \
+    let batched_sm = "module m\nfn f(mut x:[f32;12]) { \
         for r in 0..3 { \
         let mut m: f32 = x[r*4]; for i in 0..4 { m = fmax(m, x[r*4+i]); } \
         for i in 0..4 { x[r*4+i] = exp(x[r*4+i] - m); } \
@@ -3194,7 +3194,7 @@ fn batched_norm_dispatch() {
 
     // Batched AFFINE RMSNorm (per-column scale g[i]) must route to the affine kernel, not the plain one
     // — the data is offset-indexed x[r*4+i] while gamma stays column-indexed g[i].
-    let batched_affine = "module m\nfn f(x:[f32;12], g:[f32;4]) { \
+    let batched_affine = "module m\nfn f(mut x:[f32;12], g:[f32;4]) { \
         for r in 0..3 { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i] * x[r*4+i]; } \
         let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
@@ -3209,7 +3209,7 @@ fn batched_norm_dispatch() {
     );
 
     // The single-row form (no outer loop) must still dispatch — rows = 1 is the `batch = None` path.
-    let single = "module m\nfn f(x:[f32;4]) { \
+    let single = "module m\nfn f(mut x:[f32;4]) { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[i] * x[i]; } \
         let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
         for i in 0..4 { x[i] = x[i] * inv; } }";
@@ -3228,7 +3228,7 @@ fn batched_norm_dispatch() {
 #[test]
 fn differential_parallel_batched_norm() {
     // 64 rows × 64 cols = 4096; many rows so the kernel genuinely spreads across cores.
-    let src = "@parallel fn rmsnorm_batch(x: [f32; 4096]) { \
+    let src = "@parallel fn rmsnorm_batch(mut x: [f32; 4096]) { \
          for r in 0..64 { \
          let mut s: f32 = 0.0; for i in 0..64 { s = s + x[r*64+i] * x[r*64+i]; } \
          let inv: f32 = rsqrt(s / 64.0 + 0.00001); \
@@ -3250,7 +3250,7 @@ fn differential_parallel_batched_norm() {
     // The affine form (a learned per-column gamma) maps rows across cores via the multicore *affine*
     // kernel `mercury_norm_affine_f32_parallel`, and must stay bit-exact vs the serial kernel the
     // interpreter marshals (rows independent, no cross-row combine).
-    let src_affine = "@parallel fn rmsnorm_affine_batch(x: [f32; 4096], g: [f32; 64]) { \
+    let src_affine = "@parallel fn rmsnorm_affine_batch(mut x: [f32; 4096], g: [f32; 64]) { \
          for r in 0..64 { \
          let mut s: f32 = 0.0; for i in 0..64 { s = s + x[r*64+i] * x[r*64+i]; } \
          let inv: f32 = rsqrt(s / 64.0 + 0.00001); \
@@ -3286,7 +3286,7 @@ fn matmul_accumulate_differential() {
     let n2 = ns * ns;
     // No per-row zero-init in `mm` => the recognizer reads it as the accumulate (beta = 1) form.
     let src = format!(
-        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{ \
+        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{ \
          for i in 0..{ns} {{ for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
          for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
          fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
@@ -3448,7 +3448,7 @@ fn vector_ops_interp_matches_native() {
 /// interpreter runs the whole range sequentially, and the observable result must be identical.
 #[test]
 fn parallel_for_matches_interpreter() {
-    let src = "@parallel fn scale(x: [i32; 4096], out: [i32; 4096]) { \
+    let src = "@parallel fn scale(x: [i32; 4096], mut out: [i32; 4096]) { \
                for i in 0..4096 { out[i] = x[i] * 3; } } \
                fn main() -> i32 { let x: [i32; 4096] = [2; 4096]; let out: [i32; 4096] = [0; 4096]; \
                scale(x, out); let mut s: i32 = 0; let mut i: i32 = 0; \

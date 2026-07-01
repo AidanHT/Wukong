@@ -148,12 +148,17 @@ impl Parser<'_> {
         while !self.at(T::RParen) && !self.at(T::Eof) {
             let start = self.span();
             let attrs = self.parse_attrs();
+            // Optional `mut`: `fn f(mut p: T)` marks the parameter mutable (reassignable, and for
+            // an aggregate — passed by reference — mutable in place with the change visible to the
+            // caller). Without it the parameter is immutable (sema enforces this, E0304).
+            let mutable = self.eat(T::Mut);
             let name = self.ident();
             self.expect(T::Colon);
             let ty = self.parse_type();
             params.push(Param {
                 id: self.nid(),
                 attrs,
+                mutable,
                 name,
                 ty,
                 span: start.to(self.prev_span()),

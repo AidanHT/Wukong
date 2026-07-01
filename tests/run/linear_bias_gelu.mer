@@ -16,7 +16,7 @@ module tests.run.linear_bias_gelu
 //   row1: gelu([3,4] + [-1,-4]) = gelu([ 2,  0]) = [gelu(2),  0       ]
 // gelu(0)=0; gelu(-2)≈-0.0454; gelu(2)≈1.9546 (tanh approx) — cross-checked against gelu.mer.
 // Printed as (out*1000) as i32: 0 / -45 / 1954 / 0.
-fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) {
+fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) {
     for i in 0..2 {
         for j in 0..2 {
             let mut s: f32 = 0.0;

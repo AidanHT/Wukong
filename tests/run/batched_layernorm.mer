@@ -10,7 +10,7 @@ module tests.run.batched_layernorm
 // to the fused single-pass norm kernel with rows = R (each row independent) — the real transformer
 // shape (LayerNorm over [batch*seq, hidden]). The mercury_bench gate proves interp == native.
 
-fn layernorm_batch(x: [f32; 12]) { // R = 3 rows, C = 4 cols
+fn layernorm_batch(mut x: [f32; 12]) { // R = 3 rows, C = 4 cols
     for r in 0..3 {
         let mut s: f32 = 0.0;
         for i in 0..4 { s = s + x[r*4+i]; }

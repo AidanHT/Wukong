@@ -36,6 +36,10 @@ pub struct FnDecl {
 pub struct Param {
     pub id: NodeId,
     pub attrs: Vec<Attr>,
+    /// `mut` on the parameter (`fn f(mut p: T)`). A non-`mut` parameter may not be reassigned or
+    /// mutated through a projection; an aggregate parameter is passed by reference, so `mut` opts
+    /// into (caller-visible) in-place mutation. `false` for the common immutable case.
+    pub mutable: bool,
     pub name: Ident,
     pub ty: TypeExpr,
     pub span: Span,
