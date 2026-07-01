@@ -26,6 +26,422 @@ use mercury_types::Ty;
 /// straight-line stores; larger ones lower to a fill loop to keep the IR compact.
 const REPEAT_UNROLL_LIMIT: u32 = 8;
 
+// ===== Type-generic monomorphization =====
+//
+// A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
+// depends on the concrete type `T` is used at (an `f32` add vs an `i32` add, an 8-byte vs a 4-byte
+// value). Lowering it a single time defaulted the generic to `i32` and miscompiled every non-`i32`
+// call (interp != native, a `mem2reg` panic, unsigned ops in a signed body). Instead we collect,
+// from every call site, the concrete types each such function is instantiated at, emit one
+// specialized copy per distinct instantiation (`id$f32`, `id$i64`), and redirect each call to the
+// matching copy — classic monomorphization. Dimension/shape generics (`fn f<N>(a: Tensor[f32, N])`)
+// need no specialization (a tensor's element layout is independent of `N`, and `N` appears as a
+// `Dim::Var`, never a `Ty::Named`), so they are excluded by construction.
+
+/// The result of the monomorphization collection pass (see [`collect_mono`]).
+struct Mono {
+    /// (original fn symbol, canonical comma-joined concrete type-arg names) -> instance symbol.
+    instance_of: HashMap<(Symbol, String), Symbol>,
+    /// Each function's *value-type* generics (those appearing as `Ty::Named` in its signature), in
+    /// generic-declaration order — the parameters we specialize over. A function absent here, or
+    /// mapped to an empty list, is not type-generic and its calls are never redirected.
+    type_generics: HashMap<Symbol, Vec<Symbol>>,
+    /// Instances to lower, in discovery order (deterministic): (instance symbol, original symbol,
+    /// substitution).
+    instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+}
+
+impl Mono {
+    /// The value-type generics of `name`, or `&[]` if it is not a (type-)generic function.
+    fn tg(&self, name: Symbol) -> &[Symbol] {
+        self.type_generics.get(&name).map_or(&[], |v| v.as_slice())
+    }
+}
+
+/// Substitute a monomorphization's concrete types for its generic type parameters throughout `ty`.
+fn subst_ty(ty: &Ty, subst: &HashMap<Symbol, Ty>) -> Ty {
+    if subst.is_empty() {
+        return ty.clone();
+    }
+    match ty {
+        Ty::Named(g) => subst.get(g).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Ptr { mutable, pointee } => Ty::Ptr {
+            mutable: *mutable,
+            pointee: Box::new(subst_ty(pointee, subst)),
+        },
+        Ty::Ref { mutable, pointee } => Ty::Ref {
+            mutable: *mutable,
+            pointee: Box::new(subst_ty(pointee, subst)),
+        },
+        Ty::Slice(inner) => Ty::Slice(Box::new(subst_ty(inner, subst))),
+        Ty::Array { elem, len } => Ty::Array {
+            elem: Box::new(subst_ty(elem, subst)),
+            len: *len,
+        },
+        Ty::Tuple(fields) => Ty::Tuple(fields.iter().map(|t| subst_ty(t, subst)).collect()),
+        Ty::Fn { params, ret } => Ty::Fn {
+            params: params.iter().map(|t| subst_ty(t, subst)).collect(),
+            ret: Box::new(subst_ty(ret, subst)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// Does `ty` still contain an unresolved generic (one of `generics`, or an `Unknown`/`Error`)? Used
+/// to decline an instantiation whose concrete type is not yet fully known.
+fn ty_has_generic(ty: &Ty, generics: &[Symbol]) -> bool {
+    match ty {
+        Ty::Named(g) => generics.contains(g),
+        Ty::Unknown | Ty::Error => true,
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            ty_has_generic(pointee, generics)
+        }
+        Ty::Array { elem, .. } => ty_has_generic(elem, generics),
+        Ty::Tuple(fields) => fields.iter().any(|t| ty_has_generic(t, generics)),
+        Ty::Fn { params, ret } => {
+            params.iter().any(|t| ty_has_generic(t, generics)) || ty_has_generic(ret, generics)
+        }
+        _ => false,
+    }
+}
+
+/// Collect which of `generics` appear as a `Ty::Named` in `ty` (a *value-type* use, as opposed to a
+/// tensor dimension, which is a `Dim::Var`), appending to `out` in first-seen order without dups.
+fn collect_named_generics(ty: &Ty, generics: &[Symbol], out: &mut Vec<Symbol>) {
+    match ty {
+        Ty::Named(g) => {
+            if generics.contains(g) && !out.contains(g) {
+                out.push(*g);
+            }
+        }
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            collect_named_generics(pointee, generics, out)
+        }
+        Ty::Array { elem, .. } => collect_named_generics(elem, generics, out),
+        Ty::Tuple(fields) => {
+            for t in fields {
+                collect_named_generics(t, generics, out);
+            }
+        }
+        Ty::Fn { params, ret } => {
+            for t in params {
+                collect_named_generics(t, generics, out);
+            }
+            collect_named_generics(ret, generics, out);
+        }
+        _ => {}
+    }
+}
+
+/// The value-type generics of a function signature, in generic-declaration order.
+fn fn_type_generics(sig: &mercury_sema::FnSig) -> Vec<Symbol> {
+    let mut seen = Vec::new();
+    for p in &sig.params {
+        collect_named_generics(p, &sig.generics, &mut seen);
+    }
+    collect_named_generics(&sig.ret, &sig.generics, &mut seen);
+    // Declaration order (turbofish / mangling are positional).
+    sig.generics
+        .iter()
+        .copied()
+        .filter(|g| seen.contains(g))
+        .collect()
+}
+
+/// A stable ASCII name for a concrete type, for a monomorphization key and instance-name suffix.
+fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
+    match ty {
+        Ty::Scalar(s) => s.name().to_string(),
+        Ty::Named(n) => interner.resolve(*n).to_string(),
+        Ty::Ptr { pointee, .. } => format!("p_{}", mono_type_name(pointee, interner)),
+        Ty::Ref { pointee, .. } => format!("r_{}", mono_type_name(pointee, interner)),
+        Ty::Slice(inner) => format!("s_{}", mono_type_name(inner, interner)),
+        Ty::Array { elem, len } => format!("a{len}_{}", mono_type_name(elem, interner)),
+        Ty::Tuple(fields) => {
+            let parts: Vec<String> = fields.iter().map(|t| mono_type_name(t, interner)).collect();
+            format!("t{}_{}", fields.len(), parts.join("_"))
+        }
+        Ty::Unit => "unit".to_string(),
+        _ => "x".to_string(),
+    }
+}
+
+/// Bind the value-type generics `tg` by matching a parameter type against a concrete argument type.
+fn bind_generics(param_ty: &Ty, arg_ty: &Ty, tg: &[Symbol], subst: &mut HashMap<Symbol, Ty>) {
+    match (param_ty, arg_ty) {
+        (Ty::Named(g), a) if tg.contains(g) => {
+            if !ty_has_generic(a, tg) {
+                subst.entry(*g).or_insert_with(|| a.clone());
+            }
+        }
+        (Ty::Ptr { pointee: p, .. }, Ty::Ptr { pointee: a, .. })
+        | (Ty::Ref { pointee: p, .. }, Ty::Ref { pointee: a, .. })
+        | (Ty::Slice(p), Ty::Slice(a)) => bind_generics(p, a, tg, subst),
+        (Ty::Array { elem: p, .. }, Ty::Array { elem: a, .. }) => bind_generics(p, a, tg, subst),
+        (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+            for (p, a) in ps.iter().zip(as_) {
+                bind_generics(p, a, tg, subst);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The canonical comma-joined concrete type-arg names for an instantiation, or `None` if any generic
+/// is still unbound (an under-constrained call we leave to lower as-is / error elsewhere).
+fn canon_type_args(
+    tg: &[Symbol],
+    subst: &HashMap<Symbol, Ty>,
+    interner: &Interner,
+) -> Option<String> {
+    let mut parts = Vec::with_capacity(tg.len());
+    for g in tg {
+        let t = subst.get(g)?;
+        if ty_has_generic(t, tg) {
+            return None;
+        }
+        parts.push(mono_type_name(t, interner));
+    }
+    Some(parts.join(","))
+}
+
+/// Walks every function body collecting the concrete instantiations of each type-generic function
+/// (transitively, via a worklist), interning one instance symbol per distinct instantiation.
+struct MonoCollector<'a> {
+    sema: &'a SemaResult,
+    interner: &'a mut Interner,
+    type_generics: HashMap<Symbol, Vec<Symbol>>,
+    fn_bodies: HashMap<Symbol, &'a Block>,
+    instance_of: HashMap<(Symbol, String), Symbol>,
+    instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+    worklist: Vec<(Symbol, HashMap<Symbol, Ty>)>,
+}
+
+impl MonoCollector<'_> {
+    /// A call to a type-generic function `g`: infer its substitution from the argument types
+    /// (resolved through the *caller's* substitution `outer`, so a generic-in-generic call resolves),
+    /// and register a fresh instance if this instantiation is new.
+    fn handle_call(&mut self, callee: &Expr, args: &[Expr], outer: &HashMap<Symbol, Ty>) {
+        let ExprKind::Path(p) = &callee.kind else {
+            return;
+        };
+        if !p.is_single() {
+            return;
+        }
+        let name = p.first().sym;
+        let tg = match self.type_generics.get(&name) {
+            Some(g) if !g.is_empty() => g.clone(),
+            _ => return,
+        };
+        let params: Vec<Ty> = match self.sema.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Fn(sig)) => sig.params.clone(),
+            _ => return,
+        };
+        let mut subst: HashMap<Symbol, Ty> = HashMap::new();
+        for (i, a) in args.iter().enumerate() {
+            let Some(pty) = params.get(i) else { break };
+            let aty = subst_ty(
+                &self.sema.types.get(&a.id).cloned().unwrap_or(Ty::Unknown),
+                outer,
+            );
+            bind_generics(pty, &aty, &tg, &mut subst);
+        }
+        let Some(canon) = canon_type_args(&tg, &subst, self.interner) else {
+            return;
+        };
+        let key = (name, canon.clone());
+        if self.instance_of.contains_key(&key) {
+            return;
+        }
+        let base = self.interner.resolve(name).to_string();
+        let mangled = self
+            .interner
+            .intern(&format!("{base}${}", canon.replace(',', "_")));
+        self.instance_of.insert(key, mangled);
+        self.instances.push((mangled, name, subst.clone()));
+        self.worklist.push((name, subst));
+    }
+
+    fn walk_block(&mut self, b: &Block, subst: &HashMap<Symbol, Ty>) {
+        for s in &b.stmts {
+            self.walk_stmt(s, subst);
+        }
+        if let Some(t) = &b.tail {
+            self.walk_expr(t, subst);
+        }
+    }
+
+    fn walk_stmt(&mut self, s: &Stmt, subst: &HashMap<Symbol, Ty>) {
+        match &s.kind {
+            StmtKind::Let { init, .. } => {
+                if let Some(e) = init {
+                    self.walk_expr(e, subst);
+                }
+            }
+            StmtKind::Assign { target, value, .. } => {
+                self.walk_expr(target, subst);
+                self.walk_expr(value, subst);
+            }
+            StmtKind::Expr(e) | StmtKind::Defer(e) => self.walk_expr(e, subst),
+            StmtKind::Return(o) => {
+                if let Some(e) = o {
+                    self.walk_expr(e, subst);
+                }
+            }
+            StmtKind::Break(_) | StmtKind::Continue(_) => {}
+            StmtKind::While { cond, body, .. } => {
+                self.walk_expr(cond, subst);
+                self.walk_block(body, subst);
+            }
+            StmtKind::For { iter, body, .. } => {
+                match iter {
+                    ForIter::Range {
+                        start, end, step, ..
+                    } => {
+                        self.walk_expr(start, subst);
+                        if let Some(e) = end {
+                            self.walk_expr(e, subst);
+                        }
+                        if let Some(e) = step {
+                            self.walk_expr(e, subst);
+                        }
+                    }
+                    ForIter::Expr(e) => self.walk_expr(e, subst),
+                }
+                self.walk_block(body, subst);
+            }
+            StmtKind::Loop { body, .. } => self.walk_block(body, subst),
+        }
+    }
+
+    fn walk_expr(&mut self, e: &Expr, subst: &HashMap<Symbol, Ty>) {
+        match &e.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Path(_)
+            | ExprKind::SizeOf(_)
+            | ExprKind::AlignOf(_) => {}
+            ExprKind::Unary { expr, .. } => self.walk_expr(expr, subst),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs, subst);
+                self.walk_expr(rhs, subst);
+            }
+            ExprKind::Call { callee, args, .. } => {
+                self.walk_expr(callee, subst);
+                for a in args {
+                    self.walk_expr(a, subst);
+                }
+                self.handle_call(callee, args, subst);
+            }
+            ExprKind::Index { base, indices } => {
+                self.walk_expr(base, subst);
+                for i in indices {
+                    self.walk_expr(i, subst);
+                }
+            }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.walk_expr(base, subst)
+            }
+            ExprKind::Cast { expr, .. } => self.walk_expr(expr, subst),
+            ExprKind::StructLit { fields, rest, .. } => {
+                for f in fields {
+                    self.walk_expr(&f.value, subst);
+                }
+                if let Some(r) = rest {
+                    self.walk_expr(r, subst);
+                }
+            }
+            ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+                for it in items {
+                    self.walk_expr(it, subst);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.walk_expr(value, subst);
+                self.walk_expr(count, subst);
+            }
+            ExprKind::Block(b) => self.walk_block(b, subst),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.walk_expr(cond, subst);
+                self.walk_block(then_branch, subst);
+                if let Some(e) = else_branch {
+                    self.walk_expr(e, subst);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.walk_expr(scrutinee, subst);
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        self.walk_expr(g, subst);
+                    }
+                    self.walk_expr(&arm.body, subst);
+                }
+            }
+        }
+    }
+}
+
+/// Collect every concrete instantiation of every type-generic function reachable from a concrete
+/// (non-type-generic) caller, plus transitively from those instances' bodies. Runs before lowering
+/// so instance names can be interned (needs `&mut interner`).
+fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> Mono {
+    let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                fn_bodies.insert(f.name.sym, body);
+                if let Some(DefKind::Fn(sig)) = sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+                    let tg = fn_type_generics(sig);
+                    if !tg.is_empty() {
+                        type_generics.insert(f.name.sym, tg);
+                    }
+                }
+            }
+        }
+    }
+    let mut c = MonoCollector {
+        sema,
+        interner,
+        type_generics,
+        fn_bodies,
+        instance_of: HashMap::new(),
+        instances: Vec::new(),
+        worklist: Vec::new(),
+    };
+    // Seed from every non-type-generic function body (the concrete callers). Their argument types are
+    // already concrete, so `handle_call` binds each callee generic to a real type.
+    let empty: HashMap<Symbol, Ty> = HashMap::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                if !c.type_generics.contains_key(&f.name.sym) {
+                    c.walk_block(body, &empty);
+                }
+            }
+        }
+    }
+    // Drain the worklist: process each new instance's body with its substitution, so a generic that
+    // calls another generic (`fn a<T>(x:T){ b(x) }`) instantiates the callee at the resolved type.
+    while let Some((g, subst)) = c.worklist.pop() {
+        if let Some(body) = c.fn_bodies.get(&g).copied() {
+            c.walk_block(body, &subst);
+        }
+    }
+    Mono {
+        instance_of: c.instance_of,
+        type_generics: c.type_generics,
+        instances: c.instances,
+    }
+}
+
 /// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered.
 pub fn lower_program(
     module: &Module,
@@ -160,9 +576,20 @@ pub fn lower_program(
         avgpool2d: interner.intern("mercury_avgpool2d_f32"),
         avgpool2d_par: interner.intern("mercury_avgpool2d_f32_parallel"),
     };
+    // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
+    // intern the instance names), then lower the module. A type-generic function is NOT lowered here
+    // (a generic type param has no single MIR type); its specialized copies are emitted afterward.
+    let mono = collect_mono(module, sema, interner);
+    let no_subst: HashMap<Symbol, Ty> = HashMap::new();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
+                // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
+                // instantiation, below — skip the generic template itself. Dimension-only generics
+                // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
+                if !mono.tg(f.name.sym).is_empty() {
+                    continue;
+                }
                 // Whole-function matmul: lower the entire nest to a single (optionally parallel)
                 // `mercury_sgemm` call — the tuned 256-bit AVX2/FMA microkernel.
                 if let Some(nest) = matmul_fn(body, sema, interner) {
@@ -191,7 +618,7 @@ pub fn lower_program(
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -201,7 +628,7 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_transpose_f32_parallel`. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -211,7 +638,7 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_{max,avg}pool2d_f32_parallel` (channels
                 // across cores, bit-equal to serial — channels independent, no cross-channel combine).
                 if has_parallel_attr(item, interner) && pool2d_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -220,7 +647,7 @@ pub fn lower_program(
                 // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
                 // `mercury_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
                 if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -228,7 +655,7 @@ pub fn lower_program(
                 // like the column reduction above. Rows are scanned per disjoint column stripe → the
                 // multicore `mercury_colarg*_i32_parallel` is bit-equal to serial.
                 if has_parallel_attr(item, interner) && colarg_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -237,7 +664,7 @@ pub fn lower_program(
                 // The embedded `match_softmax_bwd` then emits the multicore `mercury_softmax_bwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && softmax_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -247,7 +674,7 @@ pub fn lower_program(
                 // `mercury_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
                 // independent, each row reduces over its own `C` columns).
                 if has_parallel_attr(item, interner) && rmsnorm_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -255,7 +682,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && layernorm_bwd_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -264,13 +691,13 @@ pub fn lower_program(
                 // kernel). The embedded `match_xent` then emits the multicore `mercury_xent_fwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
                 if has_parallel_attr(item, interner) && xent_bwd_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -278,13 +705,13 @@ pub fn lower_program(
                 // the rows into scalar loops and lose the inline-sincos kernel). The embedded
                 // `match_rope` then emits the multicore `mercury_rope_f32_parallel` (rows independent).
                 if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
                 if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -299,7 +726,7 @@ pub fn lower_program(
                         p.match_kd_loss(pat, it, lb).is_some()
                     }))
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -311,7 +738,7 @@ pub fn lower_program(
                         p.match_rowarg(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -322,7 +749,7 @@ pub fn lower_program(
                         p.match_cumsum(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -333,7 +760,7 @@ pub fn lower_program(
                         p.match_cumprod(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -344,7 +771,7 @@ pub fn lower_program(
                         p.match_lrscan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -354,7 +781,7 @@ pub fn lower_program(
                         p.match_cumminmax(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -367,7 +794,7 @@ pub fn lower_program(
                         p.match_embedding(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -379,7 +806,7 @@ pub fn lower_program(
                         p.match_scatter(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -388,7 +815,7 @@ pub fn lower_program(
                 // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
                 // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
                 if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -401,7 +828,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && is_batched_norm_fn(f, body, sema, interner, gemm)
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -425,13 +852,30 @@ pub fn lower_program(
                     // A `@parallel` function that is not a single elementwise loop — e.g. a reduction
                     // (`let mut s = 0; for k { s += x[k]*y[k] }; …`). Lower it normally, but with any
                     // recognized reduction loop dispatched to the multicore reduction kernel.
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
-                let func = lower_fn(f, body, sema, interner, gemm, false, &mut diags);
+                let func =
+                    lower_fn(f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags);
                 program.funcs.push(func);
             }
+        }
+    }
+    // Emit one specialized copy of each type-generic function per concrete instantiation collected
+    // above. Iterated in discovery order (a `Vec`) so the emitted MIR is deterministic across runs.
+    let fn_decls: HashMap<Symbol, (&FnDecl, &Block)> = module
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => f.body.as_ref().map(|b| (f.name.sym, (f, b))),
+            _ => None,
+        })
+        .collect();
+    for (mangled, orig, subst) in &mono.instances {
+        if let Some((f, body)) = fn_decls.get(orig) {
+            let func = lower_fn(f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags);
+            program.funcs.push(func);
         }
     }
     (program, diags)
@@ -538,6 +982,8 @@ fn is_batched_norm_fn(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -550,11 +996,20 @@ fn lower_fn(
     interner: &Interner,
     gemm: GemmSyms,
     parallel_fn: bool,
+    subst: &HashMap<Symbol, Ty>,
+    name: Symbol,
+    mono: &Mono,
     diags: &mut Vec<Diagnostic>,
 ) -> Function {
-    // Recover the resolved signature for parameter/return types.
-    let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
-        Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
+    // Recover the resolved signature for parameter/return types, applying the monomorphization
+    // substitution (empty for a non-generic function) so a generic parameter/return lowers at its
+    // concrete instantiation type. `name` is the (possibly mangled) instance symbol; the signature is
+    // always looked up under the original `f.name.sym`.
+    let (param_tys, ret_ty): (Vec<Ty>, Ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => (
+            sig.params.iter().map(|t| subst_ty(t, subst)).collect(),
+            subst_ty(&sig.ret, subst),
+        ),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
     };
     // An aggregate (struct/tuple) return uses an **sret ABI**: the function returns `Void` and takes
@@ -565,7 +1020,7 @@ fn lower_fn(
     let ret_mir = if ret_is_agg { MirType::Void } else { mir_ty(&ret_ty) };
 
     let mut fl = FnLowerer {
-        builder: Builder::new(f.name.sym, ret_mir.clone()),
+        builder: Builder::new(name, ret_mir.clone()),
         sema,
         interner,
         diags,
@@ -576,6 +1031,8 @@ fn lower_fn(
         parallel_fn,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: subst.clone(),
+        mono: Some(mono),
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -720,6 +1177,10 @@ fn lower_parallel(
             parallel_fn: false,
             vec_loads: HashMap::new(),
             sret: None,
+            // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
+            // generic functions, so no monomorphization context is needed.
+            subst: HashMap::new(),
+            mono: None,
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -766,6 +1227,10 @@ fn lower_parallel(
             parallel_fn: false,
             vec_loads: HashMap::new(),
             sret: None,
+            // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
+            // generic functions, so no monomorphization context is needed.
+            subst: HashMap::new(),
+            mono: None,
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -1260,6 +1725,16 @@ struct FnLowerer<'a> {
     /// (the function's MIR return type is `Void`), so both backends only ever pass/copy pointers —
     /// no aggregate ever rides in a register. `None` for a scalar/void return.
     sret: Option<(ValueId, Ty)>,
+    /// The active type-generic monomorphization substitution: each of the enclosing instance's
+    /// generic TYPE parameters (`T` in `fn id<T>(x: T)`) mapped to the concrete type it was
+    /// instantiated at. Empty for a non-generic (or dimension-only-generic) function. Applied wherever
+    /// a `Ty::Named(generic)` is read (`expr_ty`/`mir_ty_of`), so the body lowers at the concrete
+    /// width and signedness instead of the `I32` default.
+    subst: HashMap<Symbol, Ty>,
+    /// Collected monomorphization instances (read-only), so a call to a type-generic function is
+    /// redirected to the matching specialized copy (`id` -> `id$f32`). `None` for the recognizer
+    /// probe lowerers, which never lower a user call.
+    mono: Option<&'a Mono>,
 }
 
 impl FnLowerer<'_> {
@@ -1301,7 +1776,10 @@ impl FnLowerer<'_> {
     // ---- type helpers ----
 
     fn expr_ty(&self, e: &Expr) -> Ty {
-        self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown)
+        let raw = self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown);
+        // In a monomorphized instance, resolve a generic type parameter to its concrete type so op
+        // selection, coercion, and widths all see the real type (a no-op when `subst` is empty).
+        subst_ty(&raw, &self.subst)
     }
 
     /// Is `e`'s type a string (`*u8`)? Routes a `print`/`println` argument to the byte-rendering
@@ -1329,6 +1807,15 @@ impl FnLowerer<'_> {
     /// Recurses through arrays and tuples so a *nested* struct (a struct field, or an element of an
     /// array of structs) also resolves — `mir_ty` stops at the first `Named` and mis-sizes the rest.
     fn mir_ty_of(&self, ty: &Ty) -> MirType {
+        // Resolve a monomorphized generic type parameter to its concrete instantiation first, so the
+        // param/return/local widths follow the instance's type instead of the `I32` default.
+        if !self.subst.is_empty() {
+            if let Ty::Named(g) = ty {
+                if let Some(concrete) = self.subst.get(g) {
+                    return self.mir_ty_of(concrete);
+                }
+            }
+        }
         match ty {
             Ty::Named(sym) => match self.struct_size(*sym) {
                 Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
@@ -11227,6 +11714,36 @@ impl FnLowerer<'_> {
             .build(to.clone(), Op::Cast(kind, v, to.clone()))
     }
 
+    /// The target symbol and MIR return type of a direct user-function call. For a type-generic
+    /// callee it infers the concrete instantiation from the argument types (resolved through this
+    /// function's own substitution, so a generic-in-generic call resolves) and returns the matching
+    /// monomorphized instance's symbol and its concrete return type. Otherwise the callee's own
+    /// symbol and `expr_mir(e)`.
+    fn resolve_call_target(&self, name: Symbol, args: &[Expr], e: &Expr) -> (Symbol, MirType) {
+        if let Some(mono) = self.mono {
+            let tg = mono.tg(name);
+            if !tg.is_empty() {
+                if let Some(DefKind::Fn(sig)) = self.sema.defs.lookup(name).map(|d| &d.kind) {
+                    let params = sig.params.clone();
+                    let ret_ty = sig.ret.clone();
+                    let mut subst: HashMap<Symbol, Ty> = HashMap::new();
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(pty) = params.get(i) {
+                            bind_generics(pty, &self.expr_ty(a), tg, &mut subst);
+                        }
+                    }
+                    if let Some(canon) = canon_type_args(tg, &subst, self.interner) {
+                        if let Some(&inst) = mono.instance_of.get(&(name, canon)) {
+                            let ret_mir = self.mir_ty_of(&subst_ty(&ret_ty, &subst));
+                            return (inst, ret_mir);
+                        }
+                    }
+                }
+            }
+        }
+        (name, self.expr_mir(e))
+    }
+
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
@@ -11236,7 +11753,11 @@ impl FnLowerer<'_> {
                     Some(DefKind::Fn(_))
                 ) {
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
-                    let ret = self.expr_mir(e);
+                    // A call to a type-generic function is redirected to its monomorphized instance
+                    // (`id` -> `id$f32`), and the call's MIR return type is taken from the instance's
+                    // concrete return (not the generic template), so the sret/void/scalar dispatch
+                    // below keys on the real type. A non-generic call keeps `name` + `expr_mir(e)`.
+                    let (func, ret) = self.resolve_call_target(name, args, e);
                     if matches!(ret, MirType::Array(..)) {
                         // The callee returns an aggregate by value (sret ABI): allocate the
                         // destination buffer here, pass it as the hidden leading argument, and yield
@@ -11247,14 +11768,14 @@ impl FnLowerer<'_> {
                         call_args.push(dst);
                         call_args.extend(argvals);
                         self.builder.build_void(Op::Call {
-                            func: name,
+                            func,
                             args: call_args,
                         });
                         return dst;
                     }
                     if ret == MirType::Void {
                         self.builder.build_void(Op::Call {
-                            func: name,
+                            func,
                             args: argvals,
                         });
                         return self.const_zero(MirType::I32);
@@ -11262,7 +11783,7 @@ impl FnLowerer<'_> {
                     return self.builder.build(
                         ret,
                         Op::Call {
-                            func: name,
+                            func,
                             args: argvals,
                         },
                     );
@@ -15058,6 +15579,8 @@ fn lower_matmul_fn(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -16667,6 +17190,8 @@ fn xent_bwd_fn(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -16705,6 +17230,8 @@ fn xent_fn(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -16751,6 +17278,8 @@ fn logsumexp_fn(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -16879,6 +17408,8 @@ fn probe_single_for(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     check(&probe, pat, iter, lb)
 }
@@ -17879,6 +18410,8 @@ fn lower_i8matmul_fn(
         parallel_fn: false,
         vec_loads: HashMap::new(),
         sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
