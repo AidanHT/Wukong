@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.return_unit_value
+
+// Returning a `()` value where a real return type is declared. `if n > 0 { 42 }` has no `else`, so it
+// is unit-typed (the `42` is discarded). Returning it from an `-> i32` function used to slip past
+// sema: mir_build built a `return` of a void value, which the -O0 verifier rejected as a clean ICE
+// but on which -O2 mem2reg *panicked* (a void branch argument). Sema now rejects it at the source
+// (E0401), symmetric to the existing "returns `()` but a value is returned" and bare-`return;` checks.
+fn get(n: i32) -> i32 {
+    return if n > 0 { 42 }; // E0401: returns `()` where `i32` is required
+}
+
+fn main() -> i32 {
+    return get(5);
+}

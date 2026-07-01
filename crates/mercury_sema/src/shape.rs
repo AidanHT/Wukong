@@ -143,17 +143,39 @@ impl Sema<'_> {
                 // line / newline) stays valid.
                 {
                     let nm = self.sym_str(name);
-                    if (nm == "print" || nm == "println") && args.len() > 1 {
-                        self.error(
-                            span,
-                            "E0503",
-                            format!(
-                                "`{nm}` takes a single value to print, but {} were supplied",
-                                args.len()
-                            ),
-                        );
-                        self.types.insert(callee.id, Ty::Unknown);
-                        return Ty::Unknown;
+                    if nm == "print" || nm == "println" {
+                        if args.len() > 1 {
+                            self.error(
+                                span,
+                                "E0503",
+                                format!(
+                                    "`{nm}` takes a single value to print, but {} were supplied",
+                                    args.len()
+                                ),
+                            );
+                            self.types.insert(callee.id, Ty::Unknown);
+                            return Ty::Unknown;
+                        }
+                        // A `()`/unit argument has no printable value — e.g. `print(x)` where
+                        // `x = if c { 1 }` (an else-less `if` is unit) or `x = match … { … }` with
+                        // statement arms. mir_build lowered the unit `let` to an `alloca void` and the
+                        // read to a `load void`: native -O0 read uninitialized stack (nondeterministic
+                        // garbage), while the interpreter and -O2 (mem2reg) produced 0 — a divergence
+                        // that broke BOTH invariants at once. Reject it (E0401), consistent with `()`
+                        // already being non-computable in an arithmetic operand.
+                        if matches!(arg_tys.first(), Some(Ty::Unit)) {
+                            self.error(
+                                span,
+                                "E0401",
+                                format!(
+                                    "`{nm}` cannot print a `()` value; supply a printable scalar \
+                                     (an `if` with no `else`, or a `match` with statement arms, \
+                                     yields `()`)"
+                                ),
+                            );
+                            self.types.insert(callee.id, Ty::Unknown);
+                            return Ty::Unknown;
+                        }
                     }
                 }
                 // `assert(cond)` is a builtin taking exactly one condition argument. With the wrong
