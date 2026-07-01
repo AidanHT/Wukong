@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 25
+// EXPECT-OUT: 50
+// EXPECT-OUT: 50
+// EXPECT-OUT: 30
+// EXPECT-OUT: 7
+module tests.run.generic_typed_local
+
+// A generic parameter `T` named in a LOCAL `let` annotation must resolve to the monomorphized
+// instantiation type, not the pre-monomorphization `i32` default. Three annotation shapes were
+// under-allocating an `i32` slot for a non-i32 `T`:
+//   * `let y: T = x;`         (scalar)  -> -O0 MIR-verify ICE ("return value has type i32 but
+//                                          expected f32"), hidden at -O1+ where mem2reg deletes
+//                                          the mistyped alloca and forwards the correctly-typed SSA
+//                                          value (a -O0 != -O{1,2,3} gate violation).
+//   * `let a: [T; 2] = ...;`  (array)   -> silent interp != native at EVERY opt level: the [2 x i32]
+//                                          slot is GEP'd/loaded as f32, so interp truncates each
+//                                          element while native reinterprets the int bits.
+//   * `let mut acc: T = ...;` (mut)     -> mem2reg panic (the mistyped slot cannot be promoted).
+// `mir_ty_of_ann` now resolves a generic `Path` through the active monomorphization substitution
+// (mirroring `mir_ty_of`), so all three shapes agree bit-for-bit across both backends and every
+// opt level. See gap-hunt sweep #13, Scout A.
+
+fn scalar_local<T>(x: T) -> T { let y: T = x; return y; }
+fn array_local<T>(x: T) -> T { let a: [T; 2] = [x, x]; return a[0] + a[1]; }
+fn mut_local<T>(x: T) -> T { let mut acc: T = x; acc = acc + x; return acc; }
+
+fn main() -> i32 {
+    // f32 instantiation: every slot must be f32, not the i32 default.
+    print((scalar_local(2.5) * 10.0) as i32);   // 25
+    print((array_local(2.5) * 10.0) as i32);    // 50  (2.5 + 2.5 = 5.0, x10)
+    print((mut_local(2.5) * 10.0) as i32);      // 50
+
+    // i32 instantiation still works (the pre-existing default path), and coexists with the f32
+    // instantiations of the same generic function in one program.
+    print(array_local(15));                     // 30
+    print(scalar_local(7));                     // 7
+    return 0;
+}
