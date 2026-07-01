@@ -1687,6 +1687,12 @@ fn differential_transcendentals() {
          let mut ys: [f32; 16] = [0.0; 16]; for i in 0..16 { ys[i] = pow(xs[i], 2.0); } \
          print((ys[3] * 100.0) as i32); print((ys[15] * 100.0) as i32); \
          print((pow(2.0, 20.0) + 0.5) as i32); return 0; }",
+        // GLU 2-array gate `out[j] = x[j] * sigmoid(g[j])` (distinct arrays) -> VM2_SIGMOID_GATE:
+        // native and interp both marshal the identical mercury_vmath2_f32 kernel, so they must agree.
+        "fn main() -> i32 { let mut x: [f32; 32] = [0.0; 32]; let mut g: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { x[i] = (i as f32) * 0.5 - 8.0; g[i] = (i as f32) * 0.25 - 4.0; } \
+         let mut o: [f32; 32] = [0.0; 32]; for j in 0..32 { o[j] = x[j] * sigmoid(g[j]); } \
+         print((o[3] * 1000.0) as i32); print((o[20] * 1000.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {

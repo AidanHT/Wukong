@@ -1,0 +1,24 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+module tests.run.glu_gate
+
+// GLU (classic gated linear unit, Dauphin et al.): out[j] = x[j] * sigmoid(g[j]) with x and g DISTINCT
+// arrays (the gate g is a separate projection). Dispatches to mercury_vmath2_f32 with VM2_SIGMOID_GATE
+// (sigmoid(a)·b), completing the gate family alongside SwiGLU (silu·b) and GeGLU (gelu·b). Zero
+// interp/Cranelift change — the new op code rides the existing two-input vmath wiring, so interp ==
+// native bit-for-bit. sigmoid(0) = 0.5, so out = 5*0.5 = 2.5, and (2.5) as i32 = 2 sits mid-integer,
+// robust to the ~1-ULP sigmoid polynomial approximation.
+
+fn glu(x: [f32; 256], g: [f32; 256], mut out: [f32; 256]) {
+    for j in 0..256 { out[j] = x[j] * sigmoid(g[j]); }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 256] = [5.0; 256];
+    let mut g: [f32; 256] = [0.0; 256];
+    let mut out: [f32; 256] = [0.0; 256];
+    glu(x, g, out);
+    print((out[0]) as i32); // 5 * sigmoid(0) = 5 * 0.5 = 2.5 -> 2
+    return 0;
+}

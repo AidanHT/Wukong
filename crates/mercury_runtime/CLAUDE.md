@@ -86,7 +86,8 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   `sum`/`max`/`min`/`maxabs`/`mean`/`sumsq`/`L2`/`RMS`), `softmax_bwd.rs`, `rmsnorm_bwd.rs`,
   `layernorm_bwd.rs` (the norm/softmax backward gradients — reuse `sreduce`'s bit-exact dot), `vmath`'s
   two-input twin `mercury_vmath2_f32` (`pow`/`atan2`/`hypot` + the 6 activation backwards + the
-  SwiGLU/GeGLU gate), `xent.rs` + `xent_bwd.rs` (softmax cross-entropy fwd/bwd, **i32 labels**),
+  SwiGLU/GeGLU/GLU gate `act(a)·b` for act ∈ silu/gelu/sigmoid), `xent.rs` + `xent_bwd.rs` (softmax
+  cross-entropy fwd/bwd, **i32 labels**),
   `rope.rs` + `rope_bwd.rs` (rotary embedding — reuse `vmath`'s `sincos`), `logsoftmax.rs` (per-row
   log-sum-exp), `kldiv.rs` + `entropy.rs` + `kd_loss.rs` (the per-row `logf`/`expf` losses), `rowarg.rs`
   + `colarg.rs` (per-row/column argmax/argmin → an **i32 index** buffer; AVX2 tracks 8 `(value,index)`
