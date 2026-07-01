@@ -227,6 +227,13 @@ impl Sema<'_> {
         }
 
         for (param, arg) in sig.params.iter().zip(arg_tys) {
+            // Infer VALUE-TYPE generics (a `Ty::Named(g)` parameter position) from the concrete
+            // argument type, so `id(c)` with `c: f32` binds `T := f32` and the whole call types as
+            // `f32` — its result can then be cast/used at the concrete type, and `mir_build`
+            // monomorphizes the callee to `id$f32`. A dimension generic never appears as `Ty::Named`
+            // (it is a `Dim::Var` inside a shape), so this binds only type generics; dims are still
+            // inferred by `unify` from the shapes below.
+            infer_type_generics(param, arg, &sig.generics, &mut tys);
             let p = apply_subst(param, &dims, &tys);
             // Call site: the callee's not-yet-substituted dim vars are INFERENCE variables to bind
             // from the argument shapes (`rigid == false`).
@@ -682,6 +689,32 @@ fn parse_dim_text(text: &str) -> u64 {
         .collect::<String>()
         .parse()
         .unwrap_or(0)
+}
+
+/// Infer value-type generics from a concrete argument: bind each `Ty::Named(g)` parameter position
+/// (with `g` in `generics`) to the corresponding argument type, recursing through pointer / slice /
+/// array / tuple structure exactly like [`apply_subst`]. Only *type* generics are bound (a dimension
+/// generic is a `Dim::Var` inside a shape, never a `Ty::Named`); a first binding wins.
+fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut HashMap<Symbol, Ty>) {
+    match (param, arg) {
+        (Ty::Named(g), a) if generics.contains(g) => {
+            if !matches!(a, Ty::Unknown | Ty::Error) {
+                tys.entry(*g).or_insert_with(|| a.clone());
+            }
+        }
+        (Ty::Ptr { pointee: p, .. }, Ty::Ptr { pointee: a, .. })
+        | (Ty::Ref { pointee: p, .. }, Ty::Ref { pointee: a, .. })
+        | (Ty::Slice(p), Ty::Slice(a)) => infer_type_generics(p, a, generics, tys),
+        (Ty::Array { elem: p, .. }, Ty::Array { elem: a, .. }) => {
+            infer_type_generics(p, a, generics, tys)
+        }
+        (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+            for (p, a) in ps.iter().zip(as_) {
+                infer_type_generics(p, a, generics, tys);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
