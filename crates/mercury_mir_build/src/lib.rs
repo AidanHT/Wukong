@@ -11784,7 +11784,20 @@ impl FnLowerer<'_> {
             ast::UnOp::Deref => {
                 let ptr = self.lower_expr(operand);
                 let ty = self.expr_mir(e);
-                self.builder.build(ty.clone(), Op::Load(ptr, ty))
+                // An aggregate (struct/tuple/array) is addressed by its base pointer, so `*p` of a
+                // pointer-to-aggregate IS that pointer (the same by-pointer convention `load_or_addr`
+                // uses for an aggregate field). Loading the whole byte buffer into an SSA value —
+                // `load [N x i8]` — is invalid MIR that the consuming ABI (a call argument, an
+                // aggregate assign/return, an aggregate `let`), which expects a pointer, cannot take:
+                // it slipped past the verifier (which does not type-check call/branch arg types) into
+                // a native-JIT hang, or tripped the -O0 gep-base verifier / -O2 mem2reg panic. The
+                // value copy is emitted by the consuming context (each `emit_copy`s from this base
+                // pointer for value semantics); a scalar/pointer pointee still loads normally.
+                if matches!(ty, MirType::Array(..)) {
+                    ptr
+                } else {
+                    self.builder.build(ty.clone(), Op::Load(ptr, ty))
+                }
             }
             ast::UnOp::Ref | ast::UnOp::RefMut => {
                 let (ptr, _) = self.lower_place(operand);
