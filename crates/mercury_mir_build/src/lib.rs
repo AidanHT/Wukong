@@ -2347,6 +2347,32 @@ impl FnLowerer<'_> {
                     continue;
                 }
             }
+            // Single-row / flat 1-D scans (inclusive prefix sum / product, first-order linear
+            // recurrence). The batched `for r`-wrapped forms dispatch via the for-statement path; the
+            // flat form (`let acc = 0; for i in 0..N { acc = acc (op) x[i]; out[i] = acc }`) is not an
+            // outer loop, so it fell to fully-scalar code — the loop-carried recurrence also defeats
+            // the generic vectorizer. Fold to the serial scan kernel (1 row = no parallelism). Each
+            // window is 2 statements (`let acc` + `for`). Disjoint from the norm windows above (a
+            // norm's opening reduction loop has a 1-statement inner body, never the scan's
+            // `out[i] = acc` writeback), so probe order among them is immaterial.
+            if let Some(nest) = self.match_cumsum_1d(b, i) {
+                if self.emit_cumsum(&nest, false) {
+                    i += 2;
+                    continue;
+                }
+            }
+            if let Some(nest) = self.match_cumprod_1d(b, i) {
+                if self.emit_cumprod(&nest, false) {
+                    i += 2;
+                    continue;
+                }
+            }
+            if let Some(nest) = self.match_lrscan_1d(b, i) {
+                if self.emit_lrscan(&nest, false) {
+                    i += 2;
+                    continue;
+                }
+            }
             // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
             // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
             // intermediate array through registers, cutting its memory traffic).
@@ -3872,21 +3898,41 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        // [0] let acc: f32 = 0.0;
-        let (acc, acc0) = Self::let_init(&body.stmts[0])?;
+        let (_acc, x, out, cols) = self.match_cumsum_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The `let acc = 0.0; for i in 0..C { acc = acc + x[<row·C>+i]; out[<row·C>+i] = acc }` pair
+    /// shared by the batched (`for r`) [`Self::match_cumsum`] and the single-row
+    /// [`Self::match_cumsum_1d`]. `row` is the outer batch var (`None` = a flat 1-D row, stride 0).
+    /// Returns `(acc, x, out, cols)`; the caller supplies `rows` (`R` batched, `1` single-row) and,
+    /// for the single-row form, guards `acc`'s escape. Pure (`&self`).
+    fn match_cumsum_pair(
+        &self,
+        acc_stmt: &Stmt,
+        for_stmt: &Stmt,
+        row: Option<Symbol>,
+    ) -> Option<(Symbol, Symbol, Symbol, Dim)> {
+        // let acc: f32 = 0.0;
+        let (acc, acc0) = Self::let_init(acc_stmt)?;
         if !is_float_zero(acc0, self.interner) {
             return None;
         }
-        // [1] for i in 0..C { acc = acc + x[r*C+i]; out[r*C+i] = acc; }
-        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        // for i in 0..C { acc = acc + x[..i]; out[..i] = acc; }
+        let (i, ce, ibody) = self.as_range0_for(for_stmt)?;
         let cols = as_dim(ce, self.interner)?;
-        let batch = Some((r, ce));
+        let batch = row.map(|r| (r, ce));
         if ibody.tail.is_some() || ibody.stmts.len() != 2 {
             return None;
         }
-        // inner [0] acc = acc + x[r*C+i]  (or  acc += x[r*C+i])
+        // inner [0] acc = acc + x[..i]  (or  acc += x[..i])
         let x = self.match_acc_add(&ibody.stmts[0], acc, i, batch)?;
-        // inner [1] out[r*C+i] = acc
+        // inner [1] out[..i] = acc
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -3902,10 +3948,28 @@ impl FnLowerer<'_> {
         if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
             return None;
         }
+        Some((acc, x, out, cols))
+    }
+
+    /// Recognize a **single-row / flat 1-D** inclusive prefix sum at `b.stmts[at..]`:
+    /// `let acc = 0.0; for i in 0..N { acc = acc + x[i]; out[i] = acc }`. The batched `for r`-wrapped
+    /// form is [`Self::match_cumsum`]; this is the flat form it never saw (it hard-requires the outer
+    /// loop), so a plain prefix sum fell to fully-scalar code — the loop-carried `acc` recurrence also
+    /// defeats the generic vectorizer. Emits `mercury_cumsum_f32(x, out, 1, N)` (serial; 1 row = no
+    /// parallelism). The accumulator must not be read after the window (the kernel hides it, so fusing
+    /// would drop its post-loop value). Pure (`&self`).
+    fn match_cumsum_1d(&self, b: &Block, at: usize) -> Option<CumsumNest> {
+        if at + 2 > b.stmts.len() {
+            return None;
+        }
+        let (acc, x, out, cols) = self.match_cumsum_pair(&b.stmts[at], &b.stmts[at + 1], None)?;
+        if block_mentions(&b.stmts[at + 2..], b.tail.as_deref(), acc) {
+            return None;
+        }
         Some(CumsumNest {
             x,
             out,
-            rows,
+            rows: Dim::Lit(1),
             cols,
         })
     }
@@ -3935,15 +3999,35 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        // [0] let p: f32 = 1.0;  (multiplicative identity)
-        let (p, p_init) = Self::let_init(&body.stmts[0])?;
-        if !matches!(&p_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) {
+        let (_p, x, out, cols) = self.match_cumprod_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The `let p = 1.0; for i in 0..C { p = p * x[<row·C>+i]; out[<row·C>+i] = p }` pair shared by
+    /// the batched [`Self::match_cumprod`] and the single-row [`Self::match_cumprod_1d`]. Multiplicative
+    /// twin of [`Self::match_cumsum_pair`] (seed `1.0`, a `*` accumulate). Returns `(p, x, out, cols)`.
+    /// Pure (`&self`).
+    fn match_cumprod_pair(
+        &self,
+        p_stmt: &Stmt,
+        for_stmt: &Stmt,
+        row: Option<Symbol>,
+    ) -> Option<(Symbol, Symbol, Symbol, Dim)> {
+        // let p: f32 = 1.0;  (multiplicative identity)
+        let (p, p_init) = Self::let_init(p_stmt)?;
+        if !matches!(&p_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0)
+        {
             return None;
         }
-        // [1] for i in 0..C { p = p * x[r*C+i]; out[r*C+i] = p; }
-        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        // for i in 0..C { p = p * x[..i]; out[..i] = p; }
+        let (i, ce, ibody) = self.as_range0_for(for_stmt)?;
         let cols = as_dim(ce, self.interner)?;
-        let batch = Some((r, ce));
+        let batch = row.map(|r| (r, ce));
         if ibody.tail.is_some() || ibody.stmts.len() != 2 {
             return None;
         }
@@ -3963,10 +4047,26 @@ impl FnLowerer<'_> {
         if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
             return None;
         }
+        Some((p, x, out, cols))
+    }
+
+    /// Recognize a **single-row / flat 1-D** inclusive prefix product at `b.stmts[at..]`:
+    /// `let p = 1.0; for i in 0..N { p = p * x[i]; out[i] = p }`. The flat form the batched
+    /// [`Self::match_cumprod`] never saw. Emits `mercury_cumprod_f32(x, out, 1, N)` (serial). Bit-exact
+    /// (a bare product folds strictly left-to-right, no reassociation). `p` must not escape the window.
+    /// Pure (`&self`).
+    fn match_cumprod_1d(&self, b: &Block, at: usize) -> Option<CumsumNest> {
+        if at + 2 > b.stmts.len() {
+            return None;
+        }
+        let (p, x, out, cols) = self.match_cumprod_pair(&b.stmts[at], &b.stmts[at + 1], None)?;
+        if block_mentions(&b.stmts[at + 2..], b.tail.as_deref(), p) {
+            return None;
+        }
         Some(CumsumNest {
             x,
             out,
-            rows,
+            rows: Dim::Lit(1),
             cols,
         })
     }
@@ -4080,21 +4180,40 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        // [0] let h: f32 = 0.0;  (zero initial hidden state)
-        let (h, h0) = Self::let_init(&body.stmts[0])?;
+        let (_h, a, b, out, cols) = self.match_lrscan_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(LrscanNest {
+            a,
+            b,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The `let h = 0.0; for t in 0..C { h = a[<row·C>+t]*h + b[<row·C>+t]; out[<row·C>+t] = h }` pair
+    /// shared by the batched [`Self::match_lrscan`] and the single-row [`Self::match_lrscan_1d`].
+    /// Returns `(h, a, b, out, cols)`. Pure (`&self`).
+    fn match_lrscan_pair(
+        &self,
+        h_stmt: &Stmt,
+        for_stmt: &Stmt,
+        row: Option<Symbol>,
+    ) -> Option<(Symbol, Symbol, Symbol, Symbol, Dim)> {
+        // let h: f32 = 0.0;  (zero initial hidden state)
+        let (h, h0) = Self::let_init(h_stmt)?;
         if !is_float_zero(h0, self.interner) {
             return None;
         }
-        // [1] for t in 0..C { h = a[r*C+t]*h + b[r*C+t]; out[r*C+t] = h; }
-        let (t, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        // for t in 0..C { h = a[..t]*h + b[..t]; out[..t] = h; }
+        let (t, ce, ibody) = self.as_range0_for(for_stmt)?;
         let cols = as_dim(ce, self.interner)?;
-        let batch = Some((r, ce));
+        let batch = row.map(|r| (r, ce));
         if ibody.tail.is_some() || ibody.stmts.len() != 2 {
             return None;
         }
-        // inner [0] the recurrence step h = a[r*C+t]*h + b[r*C+t]  →  (a, b)
+        // inner [0] the recurrence step h = a[..t]*h + b[..t]  →  (a, b)
         let (a, b) = self.match_lrscan_step(&ibody.stmts[0], h, t, batch)?;
-        // inner [1] out[r*C+t] = h
+        // inner [1] out[..t] = h
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -4110,11 +4229,28 @@ impl FnLowerer<'_> {
         if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
             return None;
         }
+        Some((h, a, b, out, cols))
+    }
+
+    /// Recognize a **single-row / flat 1-D** first-order linear recurrence at `b.stmts[at..]`:
+    /// `let h = 0.0; for t in 0..N { h = a[t]*h + b[t]; out[t] = h }` (SSM/Mamba/EMA). The flat form
+    /// the batched [`Self::match_lrscan`] never saw. Emits `mercury_lrscan_f32(a, b, out, 1, N)`
+    /// (serial). Bit-identical to the scalar nest (the recurrence is inherently sequential — no
+    /// reassociation). `h` must not escape the window. Pure (`&self`).
+    fn match_lrscan_1d(&self, blk: &Block, at: usize) -> Option<LrscanNest> {
+        if at + 2 > blk.stmts.len() {
+            return None;
+        }
+        let (h, a, b, out, cols) =
+            self.match_lrscan_pair(&blk.stmts[at], &blk.stmts[at + 1], None)?;
+        if block_mentions(&blk.stmts[at + 2..], blk.tail.as_deref(), h) {
+            return None;
+        }
         Some(LrscanNest {
             a,
             b,
             out,
-            rows,
+            rows: Dim::Lit(1),
             cols,
         })
     }
