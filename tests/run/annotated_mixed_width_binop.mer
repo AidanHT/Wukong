@@ -1,0 +1,53 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 105
+// EXPECT-OUT: 3750
+// EXPECT-OUT: -16
+// EXPECT-OUT: 5000
+module tests.run.annotated_mixed_width_binop
+
+// Regression: a type-annotated `let`/`const` whose initializer is a binary op mixing a NARROWER
+// variable/const operand with a wider one used to crash the compiler. `retype_adapted_literal` was
+// invoked whenever `let_compatible` held — which is true via plain `compatible` even when the
+// operands are not all literals — and it then re-stamped the narrow variable operand with the wide
+// annotation, dropping the widening `sext` mir_build owes it. The result was an operand/result width
+// clash the -O0 verifier rejected ("add: v has type i32 but expected i64") and -O1+ `mem2reg`
+// raw-panicked on (Scout 5). The re-stamp is now gated on `literal_adapts` (all-literal operands),
+// so a mixed-width variable expression keeps its real operand types and widens correctly, while the
+// all-literal adapting forms (`0 - 16 : i64`, a plain out-of-range literal) are unchanged.
+
+const CA: i32 = 1000000000;
+const CB: i64 = 3000000000;
+const CC: i64 = CA + CB; // 4000000000 — const path
+
+fn main() -> i32 {
+    // mixed-width variable operands under a wide `let` annotation (the ICE repro)
+    let a: i32 = 2000000000;
+    let b: i64 = 2000000000;
+    let c: i64 = a + b;
+    print((c / 1000000) as i32); // 4000
+
+    print((CC / 1000000) as i32); // 4000
+
+    // idiomatic index/length arithmetic: usize = u32 + usize
+    let u: u32 = 100;
+    let n: usize = 5;
+    let total: usize = u + n;
+    print(total as i32); // 105
+
+    // float mixed width: f64 = f32 + f64
+    let fa: f32 = 1.5;
+    let fb: f64 = 2.25;
+    let fs: f64 = fa + fb;
+    print((fs * 1000.0) as i32); // 3750
+
+    // regressions: the all-literal adapting forms still work
+    let v: i64 = 0 - 16;
+    print(v as i32); // -16
+    let big: i64 = 5000000000;
+    print((big / 1000000) as i32); // 5000
+
+    return 0;
+}
