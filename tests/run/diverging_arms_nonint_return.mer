@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 15
+// EXPECT-OUT: 25
+// EXPECT-OUT: 100
+// EXPECT-OUT: 300
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+module tests.run.diverging_arms_nonint_return
+
+// A `match` / `if` where EVERY arm `return`s leaves its merge block unreachable. The merge-block
+// lowering used to unconditionally switch to that block, reset the terminated flag, and hand back a
+// `const.i32 0` placeholder as the fall-through value. For a function whose return type is not i32
+// (i64/u64/i16/f32/f64/bool/pointer) that placeholder became `ret <i32 0>` into an i64 (etc.) slot:
+// the -O0 MIR verifier rejected it (an ICE), while -O1+ deleted the dead merge block before
+// verification and ran correctly — a -O0 != -O{1,2,3} gate violation (the scalar sibling of the
+// already-fixed sret/aggregate all-arms-return case). The lowering now tracks whether any arm (or
+// the fallthrough) actually reaches the merge block; when none does, it terminates that block
+// `Unreachable` and marks the path diverging, so no mistyped fall-through `ret` is ever emitted.
+// See gap-hunt sweep #13, Scout B.
+
+fn via_match(n: i64) -> i64 { match n { 0 => { return 10; } _ => { return 20; } } }
+fn via_ifelse(n: i64) -> i64 { if n == 0 { return 10; } else { return 20; } }
+fn via_f64(n: i32) -> f64 { match n { 0 => { return 1.5; } _ => { return 2.5; } } }
+fn via_u64_nested(n: i32) -> u64 {
+    if n == 0 { if n < 1 { return 100; } else { return 200; } } else { return 300; }
+}
+fn via_bool(n: i32) -> bool { match n { 0 => { return true; } _ => { return false; } } }
+
+fn main() -> i32 {
+    print(via_match(0) as i32);      // 10
+    print(via_match(1) as i32);      // 20
+    print(via_ifelse(0) as i32);     // 10
+    print(via_ifelse(9) as i32);     // 20
+    print((via_f64(0) * 10.0) as i32);   // 15
+    print((via_f64(3) * 10.0) as i32);   // 25
+    print(via_u64_nested(0) as i32);     // 100
+    print(via_u64_nested(7) as i32);     // 300
+    if via_bool(0) { print(1); } else { print(0); }   // 1
+    if via_bool(4) { print(1); } else { print(0); }   // 0
+    return 0;
+}
