@@ -622,8 +622,13 @@ impl Sema<'_> {
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
         if self.let_compatible(&ann, &c.value, &vty) {
-            self.retype_adapted_literal(&c.value, &ann);
-            self.range_check_int_literal(&c.value, &ann);
+            // Only re-stamp an all-literal initializer (see the `let` path): re-stamping a
+            // `compatible`-only mixed-width expression like `const C: i64 = A + B` would drop the
+            // narrow operand's widening and produce ill-typed MIR (an -O0 verify ICE / -O1+ panic).
+            if self.literal_adapts(&ann, &c.value) {
+                self.retype_adapted_literal(&c.value, &ann);
+                self.range_check_int_literal(&c.value, &ann);
+            }
         } else {
             self.error(
                 span,
@@ -1004,10 +1009,20 @@ impl Sema<'_> {
                     (Some(a), Some(i)) => {
                         let init_expr = init.as_ref().unwrap();
                         if self.let_compatible(a, init_expr, i) {
-                            // An untyped literal adopts the annotated type, top to bottom (so a
-                            // negated literal like `-1.5` re-stamps the inner literal too).
-                            self.retype_adapted_literal(init_expr, a);
-                            self.range_check_int_literal(init_expr, a);
+                            // Re-stamp / range-check ONLY a genuinely adapting literal expression. An
+                            // untyped literal adopts the annotation top to bottom (so `-1.5` re-stamps
+                            // the inner literal, and `0 - 16: i64` re-stamps both literal operands).
+                            // But when `let_compatible` holds merely via `compatible` — the operands
+                            // already type-check, e.g. `let c: i64 = a + b` with `a: i32` — the
+                            // operands are NOT all literals, and re-stamping would overwrite the
+                            // narrow variable `a`'s real type with the wide annotation, dropping the
+                            // widening `sext` it needs → an operand/result width clash the -O0 verifier
+                            // rejects and -O1+ `mem2reg` raw-panics on. `literal_adapts` is true only
+                            // for all-literal expressions, exactly where the operand recursion is sound.
+                            if self.literal_adapts(a, init_expr) {
+                                self.retype_adapted_literal(init_expr, a);
+                                self.range_check_int_literal(init_expr, a);
+                            }
                         } else {
                             self.error(
                                 s.span,
