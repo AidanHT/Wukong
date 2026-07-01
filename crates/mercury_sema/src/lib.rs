@@ -1969,6 +1969,44 @@ impl Sema<'_> {
                                     op.glyph()
                                 ),
                             );
+                        } else if let (Ty::Scalar(ls), Ty::Scalar(rs)) = (&l, &r) {
+                            // A mixed signed/unsigned integer comparison lowers to a `Cmp` whose
+                            // signedness is taken from ONE operand, so `a < b` (i32 vs u32) and
+                            // `b > a` give CONTRADICTORY answers (`slt` says -1 < 1, `ugt` says
+                            // 1 < 4294967295) — a gate-blind logic bug both backends agree on. Reject
+                            // a concrete opposite-signedness integer pair. An unsuffixed int LITERAL
+                            // is sign-flexible (it adapts to the other operand), so skip when either
+                            // side is one — `b < 5` / `5 < a` stay fine. Rust rejects mixed
+                            // signed/unsigned comparison for exactly this reason.
+                            if ls.is_int()
+                                && rs.is_int()
+                                && ls.is_signed() != rs.is_signed()
+                                && !matches!(&lhs.kind, ExprKind::Int(_))
+                                && !matches!(&rhs.kind, ExprKind::Int(_))
+                            {
+                                let (s, u) = if ls.is_signed() {
+                                    (ls.name(), rs.name())
+                                } else {
+                                    (rs.name(), ls.name())
+                                };
+                                self.error(
+                                    e.span,
+                                    "E0401",
+                                    format!(
+                                        "comparison mixes signed `{s}` and unsigned `{u}`: the result \
+                                         depends on which operand's signedness the compare uses, so \
+                                         `a {} b` and `b {} a` can disagree — cast one side so both \
+                                         are the same signedness",
+                                        op.glyph(),
+                                        match op {
+                                            Lt => ">",
+                                            Le => ">=",
+                                            Gt => "<",
+                                            _ => "<=",
+                                        }
+                                    ),
+                                );
+                            }
                         }
                         Ty::Scalar(Scalar::Bool)
                     }
