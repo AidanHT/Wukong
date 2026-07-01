@@ -652,7 +652,15 @@ impl Sema<'_> {
         // via `push_scope`, so the two stacks would otherwise desync and the check never fires).
         self.immutable_locals.clear();
         self.immutable_locals.push(HashSet::new());
+        // Two parameters may not share a name: the second would silently shadow the first in the
+        // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
+        // quiet footgun. Duplicate top-level `fn`s are already E0300; parameters get the same code.
+        let mut seen_params: HashSet<Symbol> = HashSet::new();
         for p in &f.params {
+            if !seen_params.insert(p.name.sym) {
+                let nm = self.sym_str(p.name.sym).to_string();
+                self.error(p.name.span, "E0300", format!("duplicate parameter name `{nm}`"));
+            }
             let ty = self.lower_type(&p.ty);
             self.bind(p.name.sym, ty);
         }
@@ -1780,7 +1788,25 @@ impl Sema<'_> {
             ExprKind::TupleField { base, index } => {
                 let t = self.type_expr(base);
                 match t {
-                    Ty::Tuple(elems) => elems.get(*index as usize).cloned().unwrap_or(Ty::Unknown),
+                    // A known tuple type range-checks the field index: `t.9` on a 3-tuple is a hard
+                    // E0501, mirroring array/tensor out-of-bounds. Without it the access silently
+                    // typed as `Unknown` and fell through to mir_build's generic "unsupported
+                    // construct" fallback, reporting a misleading `C0001: tuple field access is not
+                    // yet supported by codegen` when tuple access IS supported — it was just OOB.
+                    Ty::Tuple(elems) => match elems.get(*index as usize) {
+                        Some(ty) => ty.clone(),
+                        None => {
+                            self.error(
+                                e.span,
+                                "E0501",
+                                format!(
+                                    "tuple index {index} is out of range for a {}-element tuple",
+                                    elems.len()
+                                ),
+                            );
+                            Ty::Error
+                        }
+                    },
                     _ => Ty::Unknown,
                 }
             }

@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0300
+module tests.fail.dup_param_name
+
+// Two parameters may not share a name. Previously `fn f(a: i32, a: i64)` compiled and ran, with the
+// second parameter silently shadowing the first in the body scope (`f(7, 9000000000)` returned the
+// second argument) — a quiet footgun. Duplicate top-level definitions are already E0300; parameters
+// now get the same code.
+fn f(a: i32, a: i64) -> i64 {
+    return a;
+}
+
+fn main() -> i32 {
+    return f(1, 2) as i32;
+}
