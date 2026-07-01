@@ -30,7 +30,8 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   (`silu_bwd_2`…), AVX2 (`silu_bwd8`…), and the inlined MIR share one op sequence (bit-for-bit). Pure
   elementwise — no reduction — so the kernel is bit-identical lane-for-lane (no reassociation exception).
 - `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
-  reductions** (dot / ssd / sum / sumsq folded by `+`, **max / min folded by `fmax`/`fmin`**, and
+  reductions** (dot / ssd / sum / sumsq / **abssum `Σ|x|` (L1 norm) / absdiff `Σ|x−y|` (MAE)** folded
+  by `+`, **max / min folded by `fmax`/`fmin`**, and
   **maxabs** = `fmax` over `|x|` (AVX2 `andnot(-0, x)` / scalar `f32::abs`, bit-identical), by `RED_*`
   op code — the per-tensor max/range/absmax softmax stability and dynamic int8 quantization need). A
   `@parallel` reduction loop lowers to the `_parallel` one. The parallel result is **bit-identical** to

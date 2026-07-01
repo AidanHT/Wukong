@@ -1,10 +1,11 @@
 //! Single-precision reductions — dot product and friends, with a **deterministic multicore** variant.
 //!
-//! Computes `reduce_i f(x[i], y[i])` for `f` in `{ x·y (dot), (x−y)² (ssd), x (sum), x·x (sumsq) }`
-//! folded by `+`, and `{ x (max), x (min) }` folded by `fmax`/`fmin`. These are the reductions
-//! transformer math leans on: attention scores and projections (dot), the L2 loss (ssd),
-//! LayerNorm/RMSNorm mean & variance (sum, sumsq), and the per-tensor **max/absmax** that softmax
-//! stability and dynamic int8 quantization scale-computation need (max, min). The compiler recognizes
+//! Computes `reduce_i f(x[i], y[i])` for `f` in `{ x·y (dot), (x−y)² (ssd), x (sum), x·x (sumsq),
+//! |x| (abssum / L1 norm), |x−y| (absdiff / MAE) }` folded by `+`, and `{ x (max), x (min), |x|
+//! (maxabs) }` folded by `fmax`/`fmin`. These are the reductions transformer math leans on: attention
+//! scores and projections (dot), the L2 loss (ssd), LayerNorm/RMSNorm mean & variance (sum, sumsq),
+//! the **L1 norm / mean-absolute-error** (abssum, absdiff), and the per-tensor **max/absmax** that
+//! softmax stability and dynamic int8 quantization scale-computation need (max, min). The compiler recognizes
 //! the reduction loop in a `@parallel` function and lowers it to one of these calls — the same play as
 //! the matmul→GEMM and activation→`mercury_vmath_f32` dispatch. The interpreter marshals its abstract
 //! memory through the **identical serial kernel**, so the differential oracle stays bit-for-bit exact.
@@ -41,6 +42,12 @@ pub const RED_MAXABS: i64 = 6; // max(|x[i]|) — abs each element, fold by fmax
 // (`mercury_argreduce_f32`), not the `-> f32` `mercury_sreduce_f32`. Lowest index wins on ties.
 pub const RED_ARGMAX: i64 = 7; // argmax_i x[i] — greedy decode / classification top-1
 pub const RED_ARGMIN: i64 = 8; // argmin_i x[i]
+
+// More `-> f32` reductions on `mercury_sreduce_f32` (numbered after the arg codes 7/8 so those keep
+// their values — the recognizer and GPU paths pin RED_ARGMAX/MIN by number). Both are additive folds
+// like `RED_SUM`, so `ident`/`fold2`/`hcombine8` need no new arm; only `contrib` + the AVX2 loop do.
+pub const RED_SUMABS: i64 = 9; // sum(|x[i]|) — L1 norm / abssum (unary; recognizer passes y == x)
+pub const RED_ABSDIFF: i64 = 10; // sum(|x[i] - y[i]|) — MAE / SAD numerator (binary, like RED_SSD)
 
 /// The fold identity: `0.0` for the additive ops, `∓∞` for max/min/maxabs so the first real element
 /// wins (`maxabs` folds by max, identity `−∞`).
@@ -100,6 +107,11 @@ fn contrib(a: f32, xi: f32, yi: f32, op: i64) -> f32 {
         RED_SUMSQ => xi.mul_add(xi, a),
         RED_MAX | RED_MIN => fold2(a, xi, op), // `(a > xi) ? a : xi` ≡ `_mm256_max_ps(a, xi)`
         RED_MAXABS => fold2(a, xi.abs(), RED_MAX), // `f32::abs` clears the sign bit ≡ `andnot(-0, xi)`
+        RED_SUMABS => a + xi.abs(), // Σ|x|: same sign-bit clear, folded by + (mirrors RED_SUM)
+        RED_ABSDIFF => {
+            let d = xi - yi; // same subtract as RED_SSD, then |d| instead of d²
+            a + d.abs()
+        }
         _ => a,
     }
 }
@@ -190,6 +202,13 @@ unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, 
             RED_MIN => _mm256_min_ps(acc, xv),
             // |xv| via `andnot(-0.0, xv)` (clear the sign bit) ≡ the scalar `f32::abs`, then max.
             RED_MAXABS => _mm256_max_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), xv)),
+            // Σ|x|: clear the sign bit (andnot -0.0) then add — bit-identical to `contrib`'s xi.abs().
+            RED_SUMABS => _mm256_add_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), xv)),
+            // Σ|x−y|: subtract (as RED_SSD) then clear the sign bit, then add — matches `contrib`.
+            RED_ABSDIFF => {
+                let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
+                _mm256_add_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), d))
+            }
             _ => acc,
         };
     }
@@ -529,19 +548,22 @@ mod tests {
                     let axi = xi.abs();
                     s = if s > axi { s } else { axi }
                 }
+                RED_SUMABS => s += xi.abs(),
+                RED_ABSDIFF => s += (xi - yi).abs(),
                 _ => {}
             };
         }
         s
     }
 
-    const OPS: [i64; 7] = [
-        RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ, RED_MAX, RED_MIN, RED_MAXABS,
+    const OPS: [i64; 9] = [
+        RED_DOT, RED_SSD, RED_SUM, RED_SUMSQ, RED_MAX, RED_MIN, RED_MAXABS, RED_SUMABS, RED_ABSDIFF,
     ];
 
-    // The unary ops read only `x`; the recognizer passes `y == x` for them.
+    // The unary ops read only `x`; the recognizer passes `y == x` for them. RED_ABSDIFF is binary
+    // (reads y), so it stays OUT of this set — the tests must marshal a real y for it, like RED_SSD.
     fn unary(op: i64) -> bool {
-        matches!(op, RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN | RED_MAXABS)
+        matches!(op, RED_SUM | RED_SUMSQ | RED_MAX | RED_MIN | RED_MAXABS | RED_SUMABS)
     }
 
     #[test]
