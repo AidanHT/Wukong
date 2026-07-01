@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 103
+// EXPECT-OUT: 827
+// EXPECT-OUT: 1654
+module tests.run.rmsnorm_no_eps
+
+// RMSNorm written WITHOUT an epsilon term: `rsqrt(ss / N)` rather than `rsqrt(ss / N + eps)`. Some
+// reference implementations omit eps. The fused-norm recognizer previously required the `+ eps` add
+// (`match_inv_rstd` matched only a `Binary{Add}` argument), so the no-eps form dropped to
+// velem + a separate reduction — even though L2-norm's matcher already accepted the bare no-eps
+// `1/sqrt(Σx²)`. It now folds to `mercury_norm_f32` with eps = 0.0 (`mean + 0.0 == mean` bit-for-bit
+// for the non-negative mean-square), so the fused kernel matches the scalar `rsqrt(ss/N)`. Same value
+// as tests/run/rmsnorm.mer (eps = 1e-5 is negligible at this scale), so the output is identical; the
+// differential + opt-invariance gates prove the fused kernel agrees bit-for-bit.
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) + 1.0; // 1 .. 16
+    }
+
+    let mut ss: f32 = 0.0;
+    for i in 0..16 {
+        ss = ss + x[i] * x[i];
+    }
+    let inv: f32 = rsqrt(ss / 16.0); // no epsilon
+    for i in 0..16 {
+        x[i] = x[i] * inv;
+    }
+
+    print((x[0] * 1000.0) as i32);  // 103
+    print((x[7] * 1000.0) as i32);  // 827
+    print((x[15] * 1000.0) as i32); // 1654
+    return 0;
+}

@@ -5140,6 +5140,14 @@ impl FnLowerer<'_> {
     ) -> Option<(Symbol, i64)> {
         let (name, init) = Self::let_init(stmt)?;
         let arg = self.as_rsqrt_arg(init)?;
+        // No-eps form: the reciprocal-sqrt argument is `sum / count` directly (no `+ eps`). Some
+        // reference RMSNorm/LayerNorm impls omit the epsilon; the kernel always computes
+        // `rsqrt(mean + eps)`, so pass eps = 0.0 (bits `0`) — `mean + 0.0 == mean` bit-for-bit for the
+        // non-negative mean-square / variance, matching the scalar `rsqrt(sum / N)`. Mirrors
+        // `match_inv_l2norm`, which already accepts the bare no-eps `1/sqrt(Σx²)`.
+        if self.scaled_by_inv_count(arg, sum, n) {
+            return Some((name, 0));
+        }
         let ExprKind::Binary {
             op: ast::BinOp::Add,
             lhs,
