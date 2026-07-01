@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+module tests.fail.assign_scalar_type_mismatch
+
+// Assigning a NON-literal value of a different scalar type to a scalar place silently
+// truncated/demoted it — `y = x` with `y: i32` and `x: f32` stored `2` (both backends agreeing on
+// the lossy value), where the language demands an explicit `as` (the same rule `let`/call-args/return
+// enforce). The field/element assign forms (`s.a = x`, `arr[0] = x`) go through this same path. An
+// unsuffixed literal still adapts (`y = 5`), and an out-of-range literal is caught by the range check.
+fn main() -> i32 {
+    let mut y: i32 = 0;
+    let x: f32 = 2.5;
+    y = x;
+    return y;
+}
