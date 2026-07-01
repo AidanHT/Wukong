@@ -1691,6 +1691,8 @@ const RED_MIN: i64 = 5; // min(x[k])  — fold by fmin
 const RED_MAXABS: i64 = 6; // max(|x[k]|) — fmax(m, abs(x[k])), symmetric int8 quant absmax
 const RED_ARGMAX: i64 = 7; // argmax_i x[i] — greedy decode / top-1 (lowest index on ties)
 const RED_ARGMIN: i64 = 8; // argmin_i x[i]
+const RED_SUMABS: i64 = 9; // sum(|x[k]|) — L1 norm / abssum (unary, y == x); folds by + like RED_SUM
+const RED_ABSDIFF: i64 = 10; // sum(|x[k] - y[k]|) — MAE / SAD numerator (two-array, like RED_SSD)
 
 // Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
@@ -6786,6 +6788,27 @@ impl FnLowerer<'_> {
             ExprKind::Index { .. } => {
                 let a = idx_base(addend)?;
                 Some((s, RED_SUM, a, a))
+            }
+            // abssum `abs(a[k])` (→ RED_SUMABS, y == a — L1 norm) or MAE/SAD `abs(a[k] - b[k])`
+            // (→ RED_ABSDIFF, two-array like ssd). `abs` is the same vectorizable primitive RED_MAXABS
+            // folds by fmax; here the kernel abs's each element and folds by `+`.
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 1
+                    && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Abs)) =>
+            {
+                let inner = &args[0];
+                if let Some(a) = idx_base(inner) {
+                    return Some((s, RED_SUMABS, a, a));
+                }
+                if let ExprKind::Binary {
+                    op: ast::BinOp::Sub,
+                    lhs,
+                    rhs,
+                } = &inner.kind
+                {
+                    return Some((s, RED_ABSDIFF, idx_base(lhs)?, idx_base(rhs)?));
+                }
+                None
             }
             _ => None,
         }

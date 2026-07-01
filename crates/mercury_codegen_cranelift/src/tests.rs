@@ -1934,7 +1934,8 @@ fn embedding_nest_lowers_to_kernel() {
 /// reduction kernel (`mercury_sreduce_f32_parallel`). The native run folds across cores; the
 /// interpreter calls the *serial* kernel — both are bit-identical by construction (fixed chunking,
 /// ascending combine), so native and interp must agree at every opt level. Covers dot, ssd, the
-/// unary sum, and the running max/min (the per-tensor max/absmax for softmax / int8 quantization).
+/// unary sum, the running max/min (the per-tensor max/absmax for softmax / int8 quantization), and
+/// the L1 folds abssum `Σ|x|` (RED_SUMABS) / MAE `Σ|x−y|` (RED_ABSDIFF).
 #[test]
 fn differential_parallel_reduce() {
     let programs = [
@@ -1980,6 +1981,20 @@ fn differential_parallel_reduce() {
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = 3.0 - (i as f32) * 0.002; } absmaxv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
+        // abssum Σ|x| (L1 norm → RED_SUMABS, y == x; ramp straddling zero exercises the sign clear)
+        "@parallel fn abssumv(x: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } abssumv(x, o); \
+         print((o[0] * 100.0) as i32); return 0; }",
+        // MAE Σ|x−y| (two-array L1 distance → RED_ABSDIFF, like ssd but abs not square)
+        "@parallel fn maev(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k] - y[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 1.0; } maev(x, y, o); \
+         print((o[0] * 10.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {
@@ -2031,6 +2046,22 @@ fn differential_parallel_reduce() {
         String::from_utf8(out).unwrap(),
         "3000\n",
         "parallel absmax produced the wrong value"
+    );
+    // Abssum / MAE golden (constant arrays, exact): Σ|−2| = 2·4096 = 8192; Σ|2−5| = 3·4096 = 12288
+    // (a negative diff, so it also confirms the sign-bit clear; RED_SSD would give 9·4096 = 36864).
+    let golden_l1 = "@parallel fn abssumv(x: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k]); } o[0] = s; } \
+         @parallel fn maev(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k] - y[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = 0.0 - 2.0; } abssumv(x, o); print((o[0]) as i32); \
+         let mut a: [f32; 4096] = [2.0; 4096]; let mut b: [f32; 4096] = [5.0; 4096]; \
+         maev(a, b, o); print((o[0]) as i32); return 0; }";
+    let (_, out) = jit(golden_l1, 3).expect("jit golden_l1");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "8192\n12288\n",
+        "parallel abssum/MAE produced the wrong value"
     );
 }
 

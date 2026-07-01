@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 17140
+// EXPECT-OUT: 768
+module tests.run.parallel_abssum
+
+// `@parallel` L1 reductions dispatch to the multicore deterministic reduction kernel
+// (mercury_sreduce_f32_parallel): abssum `sum(|x[k]|)` (the L1 norm — RED_SUMABS, unary, y == x) and
+// MAE `sum(|x[k]-y[k]|)` (RED_ABSDIFF, the two-array L1 distance / mean-absolute-error numerator).
+// Both fold by `+` over the abs of each element — the kernel clears the sign bit (bit-identical to
+// f32::abs), so serial == parallel == interpreter (the mercury_bench gate proves it). Values are
+// f32-exact (integers well below 2^24) so the reassociated sum is unambiguous.
+
+@parallel
+fn abssumv(x: [f32; 256], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s += abs(x[k]); }
+    o[0] = s;
+}
+
+@parallel
+fn maev(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..256 { s += abs(x[k] - y[k]); }
+    o[0] = s;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 256] = [0.0; 256];
+    for i in 0..256 { x[i] = (i as f32) - 100.0; } // values -100 .. 155
+    let mut o: [f32; 1] = [0.0; 1];
+    abssumv(x, o); print((o[0]) as i32); // sum(|i-100|) = 5050 + 12090 = 17140
+
+    let mut a: [f32; 256] = [2.0; 256];
+    let mut b: [f32; 256] = [5.0; 256];
+    // |2-5| * 256 = 3*256 = 768 (abs of a NEGATIVE diff — proves the sign-bit clear; RED_SSD would
+    // give (2-5)^2*256 = 2304, so this value also confirms ABSDIFF is dispatched, not squared-diff).
+    maev(a, b, o); print((o[0]) as i32); // 768
+    return 0;
+}
