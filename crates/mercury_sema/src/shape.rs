@@ -321,25 +321,45 @@ impl Sema<'_> {
                         self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid);
                     }
                 }
-                let mut total: u64 = 1;
-                let mut all_const = true;
+                // The array must supply a whole number of the tensor's *known* (const) sub-slabs.
+                // With every dim const this is the exact element count (`len == const_prod`); with a
+                // symbolic/dynamic dim still free, the length must at least be divisible by the
+                // product of the const dims — otherwise NO integer value of the free dim(s) could
+                // ever produce this buffer, yet an in-shape multi-index still flattens past the end.
+                // Gating the check on *all* dims being const (the previous behavior) left that hole
+                // wide open: `Tensor[f32, ?, 4]` or `Tensor[f32, N, 4]` accepted a length-6 array and
+                // `a[1, 3]` read/wrote element 7 — the interpreter traps, native codegen does not (a
+                // backend divergence AND a memory-safety violation). The product-of-const check is
+                // also parameter-order-independent: a const inner dim rejects the bad length whether
+                // or not the sibling that binds the symbolic outer dim is unified first.
+                let mut const_prod: u64 = 1;
+                let mut has_free_dim = false;
                 for d in &shape.0 {
-                    if let Dim::Const(n) = d {
-                        total = total.saturating_mul(*n);
-                    } else {
-                        all_const = false;
-                        break;
+                    match d {
+                        Dim::Const(n) => const_prod = const_prod.saturating_mul(*n),
+                        _ => has_free_dim = true,
                     }
                 }
-                if all_const && *len != total {
-                    self.error(
-                        span,
-                        "E0501",
+                let bad = if has_free_dim {
+                    // `> 1` avoids a modulo-by-zero on a degenerate zero-size const dim and is a
+                    // no-op when no const dim constrains the length (product 1).
+                    const_prod > 1 && *len % const_prod != 0
+                } else {
+                    *len != const_prod
+                };
+                if bad {
+                    let msg = if has_free_dim {
                         format!(
-                            "array of length {len} cannot satisfy a tensor of {total} element{}",
-                            if total == 1 { "" } else { "s" }
-                        ),
-                    );
+                            "array of length {len} is not a multiple of the tensor's known \
+                             dimensions (product {const_prod})"
+                        )
+                    } else {
+                        format!(
+                            "array of length {len} cannot satisfy a tensor of {const_prod} element{}",
+                            if const_prod == 1 { "" } else { "s" }
+                        )
+                    };
+                    self.error(span, "E0501", msg);
                 }
             }
             (Ty::Ptr { pointee: pp, .. }, Ty::Ptr { pointee: ap, .. })
