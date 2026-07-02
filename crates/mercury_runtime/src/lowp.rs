@@ -42,6 +42,18 @@ impl Half {
             Half::Bf16 => bf16_bits_to_f32(bits),
         }
     }
+
+    /// Round an `f32` to this half type's stored bits — the shared `mercury_f32_to_{bf16,f16}_bits`
+    /// shim the interpreter and the native narrowing store both use, so a half-**output** kernel is
+    /// bit-for-bit consistent with a scalar `<f32> as bf16/f16` store (round at the value, not the
+    /// store — the sweep-6 lesson).
+    #[inline]
+    fn narrow(self, v: f32) -> u16 {
+        match self {
+            Half::F16 => crate::f32_to_f16_bits(v),
+            Half::Bf16 => crate::f32_to_bf16_bits(v),
+        }
+    }
 }
 
 /// Scalar twin of the SIMD sum: 8 logical lane accumulators, fixed combine, scalar tail. This is the
@@ -103,6 +115,49 @@ pub(crate) unsafe fn widen_bf16(p: *const u16) -> __m256 {
     let lo = _mm_loadu_si128(p as *const __m128i);
     let w = _mm256_cvtepu16_epi32(lo);
     _mm256_castsi256_ps(_mm256_slli_epi32(w, 16))
+}
+
+// ---- SIMD narrowing store helpers (8 f32 lanes → 8 contiguous half bits) — the reverse of the widen
+//      helpers, used by the half-**output** streaming kernels. Each is bit-identical to the scalar
+//      `f32_to_{bf16,f16}_bits` shim the interpreter narrows through (twin-tested), so a half-output
+//      kernel stays bit-for-bit consistent with the differential oracle. `pub(crate)` so `velem.rs`'s
+//      and `bias.rs`'s narrowing stores share the one definition. ----
+
+/// Round 8 f32 lanes to bf16 stored bits and store them as 8 contiguous `u16` at `out` — bit-identical
+/// to [`crate::f32_to_bf16_bits`] applied lane-by-lane (round-to-nearest-even; NaN → quieted). The
+/// round mirrors the scalar shim's integer arithmetic: `(bits + 0x7fff + ((bits>>16)&1)) >> 16`, with a
+/// blend to the quieted-NaN form `(bits>>16)|0x40` on unordered lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn narrow_bf16(v: __m256, out: *mut u16) {
+    let bits = _mm256_castps_si256(v);
+    // rounding_bias = 0x7fff + ((bits >> 16) & 1)   (round to nearest, ties to even)
+    let lsb = _mm256_and_si256(_mm256_srli_epi32::<16>(bits), _mm256_set1_epi32(1));
+    let bias = _mm256_add_epi32(lsb, _mm256_set1_epi32(0x7fff));
+    let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(bits, bias));
+    // NaN → (bits>>16) | 0x40 (force the quiet bit), matching the scalar shim's NaN branch.
+    let nan_res = _mm256_or_si256(_mm256_srli_epi32::<16>(bits), _mm256_set1_epi32(0x40));
+    let is_nan = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_UNORD_Q>(v, v));
+    let res = _mm256_blendv_epi8(rounded, nan_res, is_nan); // per-32-bit-lane mask (all-ones on NaN)
+    // Pack the 8× u32 (each a u16 in its low half, always < 0x10000 for finite/inf; NaN handled above)
+    // to 8× u16: packus within each 128-bit half, then gather the two low quadwords contiguous.
+    let packed = _mm256_packus_epi32(res, res); // [r0..3 r0..3 | r4..7 r4..7] as u16
+    let lo = _mm256_permute4x64_epi64::<0b0000_1000>(packed); // qwords [q0, q2, _, _] = r0..7
+    _mm_storeu_si128(out as *mut __m128i, _mm256_castsi256_si128(lo));
+}
+
+/// Round 8 f32 lanes to IEEE-f16 stored bits and store them as 8 contiguous `u16` — F16C `vcvtps2ph`
+/// (round to nearest even), which the `simd_equals_scalar_twin` test pins == [`crate::f32_to_f16_bits`]
+/// (the `half` crate). So the f16 narrowing store matches the shim the interpreter uses.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+#[inline]
+pub(crate) unsafe fn narrow_f16(v: __m256, out: *mut u16) {
+    // `vcvtps2ph` rounding imm is 3 bits; round-to-nearest-even (`_MM_FROUND_TO_NEAREST_INT` = 0) is
+    // what `half::f16::from_f32` uses (the narrow twin test pins F16C == the shim bit-for-bit).
+    let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
+    _mm_storeu_si128(out as *mut __m128i, h);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -501,6 +556,121 @@ pub unsafe extern "C" fn mercury_axpby_f16(
     axpby_bf16_scalar(Half::F16, x, y, out, a, b);
 }
 
+// ---- Half-precision **output** axpby: `out[i] = a·widen(x[i]) + b·widen(y[i])` narrowed to bf16/f16.
+//      The all-half twin of the bf16-in/f32-out axpby above — bf16/f16 in AND out streams 6 bytes/elem
+//      vs an all-f32 axpby's 12, so on a memory-bound elementwise it runs ~2× faster (the narrowing
+//      store halves the write traffic that dominates). Compute is f32 (widen is lossless), and the only
+//      new rounding is the narrowing store, which goes through the shared `Half::narrow` shim (== the
+//      interpreter's), so interp == native bit-for-bit and `-O0` == `-O2`. ----
+
+/// Scalar twin / no-AVX2 fallback: `out[i] = narrow(b·yw + a·xw)`, the same op order (`t = a·xw` then
+/// `fma(b, yw, t)`) and narrowing shim as the AVX2 path, so SIMD == scalar bit-for-bit.
+fn axpby_narrow_scalar(kind: Half, x: &[u16], y: &[u16], out: &mut [u16], a: f32, b: f32) {
+    for i in 0..out.len() {
+        let xw = kind.widen(x[i]);
+        let yw = kind.widen(y[i]);
+        out[i] = kind.narrow(b.mul_add(yw, a * xw));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn axpby_narrow_bf16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b: f32) {
+    let n = out.len();
+    let chunks = n / 8;
+    let av = _mm256_set1_ps(a);
+    let bv = _mm256_set1_ps(b);
+    for c in 0..chunks {
+        let xw = widen_bf16(x.as_ptr().add(c * 8));
+        let yw = widen_bf16(y.as_ptr().add(c * 8));
+        let r = _mm256_fmadd_ps(bv, yw, _mm256_mul_ps(av, xw)); // b·yw + a·xw
+        narrow_bf16(r, out.as_mut_ptr().add(c * 8));
+    }
+    for i in chunks * 8..n {
+        let r = b.mul_add(bf16_bits_to_f32(y[i]), a * bf16_bits_to_f32(x[i]));
+        out[i] = crate::f32_to_bf16_bits(r);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn axpby_narrow_f16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b: f32) {
+    let n = out.len();
+    let chunks = n / 8;
+    let av = _mm256_set1_ps(a);
+    let bv = _mm256_set1_ps(b);
+    for c in 0..chunks {
+        let xw = widen_f16(x.as_ptr().add(c * 8));
+        let yw = widen_f16(y.as_ptr().add(c * 8));
+        let r = _mm256_fmadd_ps(bv, yw, _mm256_mul_ps(av, xw));
+        narrow_f16(r, out.as_mut_ptr().add(c * 8));
+    }
+    for i in chunks * 8..n {
+        let r = b.mul_add(f16_to_f32(y[i]), a * f16_to_f32(x[i]));
+        out[i] = crate::f32_to_f16_bits(r);
+    }
+}
+
+/// `out[i] = round_bf16(a·widen(x[i]) + b·widen(y[i]))` over `n` **bf16** inputs with a **bf16 output**
+/// — the all-half streaming axpby. 6 bytes/elem vs an all-f32 axpby's 12; the compute is f32 (lossless
+/// widen) and the store rounds through the shared `f32_to_bf16_bits` shim, so interp == native.
+///
+/// # Safety
+/// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_axpby_bf16_out(
+    x: *const u16,
+    y: *const u16,
+    out: *mut u16,
+    n: i64,
+    a: f32,
+    b: f32,
+) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    let x = std::slice::from_raw_parts(x, n);
+    let y = std::slice::from_raw_parts(y, n);
+    let out = std::slice::from_raw_parts_mut(out, n);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return axpby_narrow_bf16_avx(x, y, out, a, b);
+    }
+    axpby_narrow_scalar(Half::Bf16, x, y, out, a, b);
+}
+
+/// `out[i] = round_f16(a·widen(x[i]) + b·widen(y[i]))` over `n` **f16** inputs with an **f16 output** —
+/// the F16C twin of [`mercury_axpby_bf16_out`] (widen `vcvtph2ps`, narrow `vcvtps2ph`). 6 bytes/elem.
+///
+/// # Safety
+/// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_axpby_f16_out(
+    x: *const u16,
+    y: *const u16,
+    out: *mut u16,
+    n: i64,
+    a: f32,
+    b: f32,
+) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    let x = std::slice::from_raw_parts(x, n);
+    let y = std::slice::from_raw_parts(y, n);
+    let out = std::slice::from_raw_parts_mut(out, n);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+    {
+        return axpby_narrow_f16_avx(x, y, out, a, b);
+    }
+    axpby_narrow_scalar(Half::F16, x, y, out, a, b);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +806,84 @@ mod tests {
                 axpby_bf16_scalar(kind, &xb, &yb, &mut want, a, b);
                 for i in 0..n {
                     assert_eq!(got[i].to_bits(), want[i].to_bits(), "axpby n={n} i={i}");
+                }
+            }
+        }
+    }
+
+    /// The SIMD narrowing store (`narrow_bf16`/`narrow_f16`, 8 lanes at once) must be **bit-identical**
+    /// to the scalar `f32_to_{bf16,f16}_bits` shim the interpreter narrows through — across ordinary
+    /// values, negatives, subnormals, ±inf, and NaN (the round's every branch). This is the gate that
+    /// keeps a half-**output** kernel bit-for-bit consistent with the differential oracle.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn narrow_simd_equals_scalar_shim() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("f16c") {
+            return;
+        }
+        // A spread of tricky f32s: 0/±0, small/large, subnormal, ties, ±inf, NaN, negatives.
+        let mut vals: Vec<f32> = vec![
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 3.14159, -2.71828,
+            1e-40, -1e-40, // subnormal after narrowing
+            65504.0, -65504.0, // f16 max
+            1e30, -1e30, // overflows f16 → inf
+            f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN,
+            1.0000001, 1.9999999, 0.999999, // near ties
+        ];
+        // Add a deterministic sweep that hits many mantissa bits, then pad to a multiple of 8.
+        for i in 0..128 {
+            vals.push((i as f32 * 0.013 - 0.4).sin() * 123.456);
+        }
+        while vals.len() % 8 != 0 {
+            vals.push(0.0);
+        }
+        let chunks = vals.len() / 8;
+        for c in 0..chunks {
+            let mut gb = [0u16; 8];
+            let mut gf = [0u16; 8];
+            unsafe {
+                let v = _mm256_loadu_ps(vals.as_ptr().add(c * 8));
+                narrow_bf16(v, gb.as_mut_ptr());
+                narrow_f16(v, gf.as_mut_ptr());
+            }
+            for l in 0..8 {
+                let x = vals[c * 8 + l];
+                assert_eq!(gb[l], crate::f32_to_bf16_bits(x), "bf16 narrow x={x}");
+                assert_eq!(gf[l], crate::f32_to_f16_bits(x), "f16 narrow x={x}");
+            }
+        }
+    }
+
+    /// The half-**output** axpby (`mercury_axpby_{bf16,f16}_out`) SIMD path must equal its scalar twin
+    /// bit-for-bit across tail sizes — the narrowing store rounds through the same shim, so the two
+    /// agree lane-for-lane (and it is the no-AVX2 fallback).
+    #[test]
+    fn axpby_narrow_out_simd_equals_scalar_twin() {
+        for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
+            let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011 - 2.3).sin()).collect();
+            let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017 + 0.9).cos()).collect();
+            let (a, b) = (1.5f32, -0.75f32);
+            for (kind, conv) in [
+                (Half::Bf16, bf16_bits as fn(f32) -> u16),
+                (Half::F16, f16_bits as fn(f32) -> u16),
+            ] {
+                let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
+                let yb: Vec<u16> = ys.iter().map(|&v| conv(v)).collect();
+                let mut got = vec![0u16; n];
+                unsafe {
+                    match kind {
+                        Half::Bf16 => mercury_axpby_bf16_out(
+                            xb.as_ptr(), yb.as_ptr(), got.as_mut_ptr(), n as i64, a, b,
+                        ),
+                        Half::F16 => mercury_axpby_f16_out(
+                            xb.as_ptr(), yb.as_ptr(), got.as_mut_ptr(), n as i64, a, b,
+                        ),
+                    }
+                }
+                let mut want = vec![0u16; n];
+                axpby_narrow_scalar(kind, &xb, &yb, &mut want, a, b);
+                for i in 0..n {
+                    assert_eq!(got[i], want[i], "narrow axpby n={n} i={i}");
                 }
             }
         }

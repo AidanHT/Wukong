@@ -722,6 +722,67 @@ fn differential_bf16_axpby() {
     );
 }
 
+/// The **all-half** streaming axpby `out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as {bf16,f16}` —
+/// half in AND a narrowing half store — must dispatch to `mercury_axpby_{bf16,f16}_out` and stay
+/// native==interp across opt levels. The narrowing round goes through the shared `f32_to_*_bits` shim
+/// (== a scalar `as bf16`/`as f16` store), so `-O0`==`-O3` and both backends agree bit-for-bit.
+#[test]
+fn differential_half_out_axpby() {
+    // bf16 in, bf16 out -> the narrowing kernel.
+    let bf = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[bf16;64]) { \
+        for k in 0..64 { o[k] = (1.5 * (x[k] as f32) + 2.0 * (y[k] as f32)) as bf16; } }";
+    assert!(
+        lowered_calls(bf, "mercury_axpby_bf16_out"),
+        "bf16-in/bf16-out axpby -> mercury_axpby_bf16_out"
+    );
+    // f16 in, f16 out -> the f16 twin.
+    let hf = "module m\nfn ax(x:[f16;64], y:[f16;64], o:[f16;64]) { \
+        for k in 0..64 { o[k] = (1.5 * (x[k] as f32) + 2.0 * (y[k] as f32)) as f16; } }";
+    assert!(
+        lowered_calls(hf, "mercury_axpby_f16_out"),
+        "f16-in/f16-out axpby -> mercury_axpby_f16_out"
+    );
+    // A **f32** output must NOT take the narrowing path (it's the plain bf16-in/f32-out kernel).
+    let f32out = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } }";
+    assert!(
+        !lowered_calls(f32out, "mercury_axpby_bf16_out"),
+        "f32-output axpby must not take the narrowing store path"
+    );
+
+    // native == interp across opt levels, fractional non-half-exact inputs, both halves.
+    for (ty, k) in [("bf16", "bf16"), ("f16", "f16")] {
+        let prog = format!(
+            "fn ax(x:[{ty};4096], y:[{ty};4096], o:[{k};4096]) {{ \
+             for j in 0..4096 {{ o[j] = (1.5 * (x[j] as f32) + 2.0 * (y[j] as f32)) as {k}; }} }} \
+             fn main() -> i32 {{ let mut x:[{ty};4096]=[0.0 as {ty};4096]; \
+             let mut y:[{ty};4096]=[0.0 as {ty};4096]; let mut o:[{k};4096]=[0.0 as {k};4096]; \
+             for i in 0..4096 {{ x[i]=((i as f32)*0.001) as {ty}; y[i]=((i as f32)*0.002-1.3) as {ty}; }} \
+             ax(x,y,o); let mut s:f32=0.0; for t in 0..4096 {{ s = s + (o[t] as f32); }} \
+             print((s*10.0) as i32); return 0; }}"
+        );
+        for opt in [0u8, 2, 3] {
+            assert_eq!(
+                jit(&prog, opt).expect("jit"),
+                interp(&prog, opt).expect("interp"),
+                "{ty}-out axpby native vs interp mismatch at -O{opt}"
+            );
+        }
+    }
+    // Golden half-exact: o[k] = 2·(k+1) + 3·2 = 2(k+1)+6 (all bf16-exact); Σ_{k=0..7} = 2·36 + 48 = 120.
+    let golden = "fn ax(x:[bf16;8], y:[bf16;8], o:[bf16;8]) { \
+        for k in 0..8 { o[k] = (2.0*(x[k] as f32) + 3.0*(y[k] as f32)) as bf16; } } \
+        fn main() -> i32 { let mut x:[bf16;8]=[0.0 as bf16;8]; let mut y:[bf16;8]=[0.0 as bf16;8]; \
+        let mut o:[bf16;8]=[0.0 as bf16;8]; for i in 0..8 { x[i]=((i+1) as f32) as bf16; y[i]=2.0 as bf16; } \
+        ax(x,y,o); let mut s:f32=0.0; for t in 0..8 { s = s + (o[t] as f32); } print((s) as i32); return 0; }";
+    let (_, out) = jit(golden, 3).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "120\n",
+        "bf16-out axpby produced the wrong value"
+    );
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
