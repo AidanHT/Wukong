@@ -59,10 +59,6 @@ const DQ_WIDTH_MASK: i64 = 0xff << 8;
 /// cacheable store pays. ~10 MiB ≈ this machine's L3.
 const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
 
-/// Software-prefetch distance (elements ahead). A prefetch past the buffer end is a dropped hint, never
-/// a fault, so the tail needs no guard.
-const PF_AHEAD: usize = 128;
-
 /// Scalar activation, mirroring the AVX2 `maxps` semantics exactly: `maxps(v,0)` is `(v > 0) ? v : 0`
 /// (returns the second operand for `±0`/NaN), so the `if` form agrees lane-for-lane; GELU/SiLU are the
 /// shared `vmath` scalar twins the fused kernel applies per lane. `act` is the pre-masked activation byte.
@@ -125,45 +121,8 @@ fn use_nt(n: usize, in_bytes: usize) -> bool {
     n.saturating_mul(in_bytes + 4) >= NT_MIN_BYTES
 }
 
-/// Apply scale + activation to eight already-widened `i32` lanes and store. `id`/`ReLU` stay in-vector
-/// (`_mm256_max_ps(d, 0)` == the scalar `if v>0 {v} else {0}` lane-for-lane); `GELU`/`SiLU` extract the
-/// eight dequantized `f32` and apply the shared scalar twin per lane (bit-exact with the unfused form).
-/// `vmovntps` is used when `nt` (the output is then guaranteed 32-byte aligned by the caller's prologue).
-///
-/// # Safety
-/// `outp` valid for 8 `f32`; requires `avx2`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn scale_act_store(
-    vi: std::arch::x86_64::__m256i,
-    outp: *mut f32,
-    vscale: std::arch::x86_64::__m256,
-    act: i64,
-    zero: std::arch::x86_64::__m256,
-    nt: bool,
-) {
-    use std::arch::x86_64::*;
-    let mut d = _mm256_mul_ps(_mm256_cvtepi32_ps(vi), vscale);
-    if act == DQ_RELU {
-        d = _mm256_max_ps(d, zero);
-    } else if act != DQ_ID {
-        // GELU / SiLU: apply the shared scalar twin per lane on the dequantized value.
-        let mut t = [0f32; 8];
-        _mm256_storeu_ps(t.as_mut_ptr(), d);
-        for v in &mut t {
-            *v = act1(act, *v);
-        }
-        d = _mm256_loadu_ps(t.as_ptr());
-    }
-    if nt {
-        _mm256_stream_ps(outp, d);
-    } else {
-        _mm256_storeu_ps(outp, d);
-    }
-}
-
-/// Widen eight input elements at `q.add(i)` to an `__m256i` of eight `i32`, per the width field.
+/// Widen eight input elements at `q.add(i)` to an `__m256i` of eight `i32`, per the width field. Used by
+/// the compute-bound `GELU`/`SiLU` paths (the memory-bound `id`/`ReLU` paths widen inline via macros).
 ///
 /// # Safety
 /// `q` valid for 8 elements at `i`; requires `avx2`.
@@ -183,6 +142,13 @@ unsafe fn widen8(q: *const u8, i: usize, width: i64) -> std::arch::x86_64::__m25
 /// so four independent widen→cvt→mul→store chains hide the cvt/load latency, with non-temporal stores
 /// for a large output. Bit-equal to [`dequant_scalar`].
 ///
+/// The `id`/`ReLU` hot path (the memory-bound one) is written as **macro-expanded flat loops** — one per
+/// input width — so the widen intrinsic is fixed at compile time and there is no per-element helper call
+/// (a `#[target_feature]` `fn` will not inline on stable Rust, and an out-of-line vector call every 8
+/// elements serializes the load/store stream, capping memory-level parallelism well below the gcc loop).
+/// The `nt`/`relu` flags are loop-invariant, so LLVM unswitches them. `GELU`/`SiLU` are compute-bound
+/// (the transcendental dominates), so they keep the simpler per-lane scalar-twin path.
+///
 /// # Safety
 /// `q`/`out` valid for `n` elements; requires `avx2`.
 #[cfg(target_arch = "x86_64")]
@@ -195,35 +161,106 @@ unsafe fn dequant_avx2(q: *const u8, out: *mut f32, n: usize, scale: f32, op: i6
     let vscale = _mm256_set1_ps(scale);
     let zero = _mm256_setzero_ps();
     let nt = use_nt(n, in_bytes);
-    let mut i = 0usize;
-    // Peel a scalar prologue until `out` is 32-byte aligned (vmovntps faults on a misaligned address);
-    // each 8-lane step keeps it aligned thereafter.
-    if nt {
-        while i < n && (out.add(i) as usize) & 31 != 0 {
+
+    // Load 8 input elements at index `$i` and widen to eight `i32` lanes — the width is fixed per arm, so
+    // the match on width is hoisted out of the loop (no per-element branch, no call).
+    macro_rules! w_i8 {
+        ($i:expr) => {
+            _mm256_cvtepi8_epi32(_mm_loadl_epi64((q as *const i8).add($i) as *const __m128i))
+        };
+    }
+    macro_rules! w_u8 {
+        ($i:expr) => {
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64((q as *const u8).add($i) as *const __m128i))
+        };
+    }
+    macro_rules! w_i32 {
+        ($i:expr) => {
+            _mm256_loadu_si256((q as *const i32).add($i) as *const __m256i)
+        };
+    }
+    // One full pass for a fixed widen macro `$w`. `relu`/`nt` are loop-invariant (LLVM unswitches them).
+    macro_rules! deq_pass {
+        ($w:ident, $relu:expr) => {{
+            let mut i = 0usize;
+            // Peel a scalar prologue until `out` is 32-byte aligned (`vmovntps` faults if misaligned).
+            if nt {
+                while i < n && (out.add(i) as usize) & 31 != 0 {
+                    *out.add(i) = deq1(act, load_i32(q, i, width), scale);
+                    i += 1;
+                }
+            }
+            while i + 32 <= n {
+                let mut d0 = _mm256_mul_ps(_mm256_cvtepi32_ps($w!(i)), vscale);
+                let mut d1 = _mm256_mul_ps(_mm256_cvtepi32_ps($w!(i + 8)), vscale);
+                let mut d2 = _mm256_mul_ps(_mm256_cvtepi32_ps($w!(i + 16)), vscale);
+                let mut d3 = _mm256_mul_ps(_mm256_cvtepi32_ps($w!(i + 24)), vscale);
+                if $relu {
+                    d0 = _mm256_max_ps(d0, zero);
+                    d1 = _mm256_max_ps(d1, zero);
+                    d2 = _mm256_max_ps(d2, zero);
+                    d3 = _mm256_max_ps(d3, zero);
+                }
+                if nt {
+                    _mm256_stream_ps(out.add(i), d0);
+                    _mm256_stream_ps(out.add(i + 8), d1);
+                    _mm256_stream_ps(out.add(i + 16), d2);
+                    _mm256_stream_ps(out.add(i + 24), d3);
+                } else {
+                    _mm256_storeu_ps(out.add(i), d0);
+                    _mm256_storeu_ps(out.add(i + 8), d1);
+                    _mm256_storeu_ps(out.add(i + 16), d2);
+                    _mm256_storeu_ps(out.add(i + 24), d3);
+                }
+                i += 32;
+            }
+            while i + 8 <= n {
+                let mut d = _mm256_mul_ps(_mm256_cvtepi32_ps($w!(i)), vscale);
+                if $relu {
+                    d = _mm256_max_ps(d, zero);
+                }
+                if nt {
+                    _mm256_stream_ps(out.add(i), d);
+                } else {
+                    _mm256_storeu_ps(out.add(i), d);
+                }
+                i += 8;
+            }
+            if nt {
+                _mm_sfence();
+            }
+            while i < n {
+                *out.add(i) = deq1(act, load_i32(q, i, width), scale);
+                i += 1;
+            }
+        }};
+    }
+
+    if act == DQ_ID || act == DQ_RELU {
+        let relu = act == DQ_RELU;
+        match width {
+            DQ_U8 => deq_pass!(w_u8, relu),
+            DQ_I32 => deq_pass!(w_i32, relu),
+            _ => deq_pass!(w_i8, relu), // DQ_I8 (and any unknown code, defensively)
+        }
+    } else {
+        // GELU / SiLU — compute-bound: the transcendental twin per lane dominates, so a cacheable store
+        // and the shared `widen8` helper are fine. Bit-exact with the unfused activation.
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let d = _mm256_mul_ps(_mm256_cvtepi32_ps(widen8(q, i, width)), vscale);
+            let mut t = [0f32; 8];
+            _mm256_storeu_ps(t.as_mut_ptr(), d);
+            for v in &mut t {
+                *v = act1(act, *v);
+            }
+            _mm256_storeu_ps(out.add(i), _mm256_loadu_ps(t.as_ptr()));
+            i += 8;
+        }
+        while i < n {
             *out.add(i) = deq1(act, load_i32(q, i, width), scale);
             i += 1;
         }
-    }
-    while i + 32 <= n {
-        if nt {
-            _mm_prefetch(q.wrapping_add(i * in_bytes + PF_AHEAD * in_bytes) as *const i8, _MM_HINT_T0);
-        }
-        scale_act_store(widen8(q, i, width), out.add(i), vscale, act, zero, nt);
-        scale_act_store(widen8(q, i + 8, width), out.add(i + 8), vscale, act, zero, nt);
-        scale_act_store(widen8(q, i + 16, width), out.add(i + 16), vscale, act, zero, nt);
-        scale_act_store(widen8(q, i + 24, width), out.add(i + 24), vscale, act, zero, nt);
-        i += 32;
-    }
-    while i + 8 <= n {
-        scale_act_store(widen8(q, i, width), out.add(i), vscale, act, zero, nt);
-        i += 8;
-    }
-    if nt {
-        _mm_sfence();
-    }
-    while i < n {
-        *out.add(i) = deq1(act, load_i32(q, i, width), scale);
-        i += 1;
     }
 }
 
@@ -323,7 +360,8 @@ unsafe fn perchan_row_scalar(q: *const u8, out: *mut f32, cols: usize, scale: *c
 
 /// One row of the per-channel dequant on the AVX2 path: like [`dequant_avx2`] but the scale is a
 /// per-column **vector** loaded from `scale.add(j)` (the norm-affine γ broadcast pattern) rather than a
-/// splatted scalar. Bit-equal to [`perchan_row_scalar`].
+/// splatted scalar. Flat macro-expanded loop per input width (no per-element `#[target_feature]` call —
+/// see [`dequant_avx2`]); bit-equal to [`perchan_row_scalar`].
 ///
 /// # Safety
 /// `q`/`out` valid for `cols` elements; `scale` for `cols` `f32`; requires `avx2`.
@@ -341,24 +379,78 @@ unsafe fn perchan_row_avx2(
     let act = op & DQ_ACT_MASK;
     let width = op & DQ_WIDTH_MASK;
     let zero = _mm256_setzero_ps();
-    let mut j = 0usize;
-    if nt {
-        while j < cols && (out.add(j) as usize) & 31 != 0 {
+
+    macro_rules! w_i8 {
+        ($i:expr) => {
+            _mm256_cvtepi8_epi32(_mm_loadl_epi64((q as *const i8).add($i) as *const __m128i))
+        };
+    }
+    macro_rules! w_u8 {
+        ($i:expr) => {
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64((q as *const u8).add($i) as *const __m128i))
+        };
+    }
+    macro_rules! w_i32 {
+        ($i:expr) => {
+            _mm256_loadu_si256((q as *const i32).add($i) as *const __m256i)
+        };
+    }
+    macro_rules! row_pass {
+        ($w:ident, $relu:expr) => {{
+            let mut j = 0usize;
+            if nt {
+                while j < cols && (out.add(j) as usize) & 31 != 0 {
+                    *out.add(j) = deq1(act, load_i32(q, j, width), *scale.add(j));
+                    j += 1;
+                }
+            }
+            while j + 8 <= cols {
+                let mut d =
+                    _mm256_mul_ps(_mm256_cvtepi32_ps($w!(j)), _mm256_loadu_ps(scale.add(j)));
+                if $relu {
+                    d = _mm256_max_ps(d, zero);
+                }
+                if nt {
+                    _mm256_stream_ps(out.add(j), d);
+                } else {
+                    _mm256_storeu_ps(out.add(j), d);
+                }
+                j += 8;
+            }
+            if nt {
+                _mm_sfence();
+            }
+            while j < cols {
+                *out.add(j) = deq1(act, load_i32(q, j, width), *scale.add(j));
+                j += 1;
+            }
+        }};
+    }
+
+    if act == DQ_ID || act == DQ_RELU {
+        let relu = act == DQ_RELU;
+        match width {
+            DQ_U8 => row_pass!(w_u8, relu),
+            DQ_I32 => row_pass!(w_i32, relu),
+            _ => row_pass!(w_i8, relu),
+        }
+    } else {
+        // GELU / SiLU — compute-bound: scalar-twin per lane (bit-exact with the unfused activation).
+        let mut j = 0usize;
+        while j + 8 <= cols {
+            let d = _mm256_mul_ps(_mm256_cvtepi32_ps(widen8(q, j, width)), _mm256_loadu_ps(scale.add(j)));
+            let mut t = [0f32; 8];
+            _mm256_storeu_ps(t.as_mut_ptr(), d);
+            for v in &mut t {
+                *v = act1(act, *v);
+            }
+            _mm256_storeu_ps(out.add(j), _mm256_loadu_ps(t.as_ptr()));
+            j += 8;
+        }
+        while j < cols {
             *out.add(j) = deq1(act, load_i32(q, j, width), *scale.add(j));
             j += 1;
         }
-    }
-    while j + 8 <= cols {
-        let vscale = _mm256_loadu_ps(scale.add(j));
-        scale_act_store(widen8(q, j, width), out.add(j), vscale, act, zero, nt);
-        j += 8;
-    }
-    if nt {
-        _mm_sfence();
-    }
-    while j < cols {
-        *out.add(j) = deq1(act, load_i32(q, j, width), *scale.add(j));
-        j += 1;
     }
 }
 
