@@ -144,7 +144,9 @@ impl MegaPlan {
 /// the taint pass only consults this for value-producing ops.
 fn op_operands(op: &Op) -> Vec<ValueId> {
     match op {
-        Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(_) | Op::FuncAddr(_) => Vec::new(),
+        Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(_) | Op::FuncAddr(_) | Op::GlobalAddr(_) => {
+            Vec::new()
+        }
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) => vec![*a, *b],
         Op::Neg(a) | Op::Not(a) | Op::Sqrt(a) | Op::Splat(a) | Op::Round(_, a) => vec![*a],
         Op::Cast(_, a, _) => vec![*a],

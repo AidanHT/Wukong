@@ -28,6 +28,7 @@ fn build(fwd: &Function, wrt: &[usize], interner: &mut Interner) -> (Program, Sy
     let gname = g.name;
     let prog = Program {
         funcs: vec![fwd.clone(), g],
+        statics: Vec::new(),
         level: mercury_mir::MirLevel::Low,
     };
     (prog, gname)
@@ -1266,6 +1267,7 @@ fn adamw_step_matches_reference() {
     let name = f.name;
     let prog = Program {
         funcs: vec![f],
+        statics: Vec::new(),
         level: mercury_mir::MirLevel::Low,
     };
 
@@ -1326,6 +1328,7 @@ fn mlp2_adamw_decreases_loss() {
     let a2name = adamw2.name;
     let aprog = Program {
         funcs: vec![adamw1, adamw2],
+        statics: Vec::new(),
         level: mercury_mir::MirLevel::Low,
     };
 

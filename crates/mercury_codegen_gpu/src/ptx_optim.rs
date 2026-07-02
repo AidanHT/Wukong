@@ -347,6 +347,7 @@ mod tests {
             let kname = kernel.name;
             let prog = Program {
                 funcs: vec![kernel],
+                statics: Vec::new(),
                 level: MirLevel::Low,
             };
 

@@ -785,6 +785,13 @@ impl<'a> FnEmit<'a> {
                 // never materialized as a device function pointer, so emit no instruction.
                 self.func_addr_of.insert(r.0, *sym);
             }
+            Op::GlobalAddr(_) => {
+                // A `.rodata` string address — strings never occur in GPU-eligible numeric kernels,
+                // so decline (skip to the single-thread / CPU path) rather than miscompile.
+                return Err(format!(
+                    "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"
+                ));
+            }
             Op::Store { .. } | Op::Call { .. } => unreachable!("handled above"),
         }
         Ok(())

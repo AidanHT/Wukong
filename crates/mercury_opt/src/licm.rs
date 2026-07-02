@@ -137,6 +137,7 @@ fn safe_to_hoist(op: &Op) -> bool {
         | Op::Select(..)
         | Op::Gep { .. }
         | Op::FuncAddr(..)
+        | Op::GlobalAddr(..)
         | Op::Splat(..)
         | Op::Fma(..)
         | Op::Sqrt(..)

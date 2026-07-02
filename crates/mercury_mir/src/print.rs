@@ -80,6 +80,7 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
             format!("call {}({})", interner.resolve(*func), a.join(", "))
         }
         Op::FuncAddr(func) => format!("func_addr {}", interner.resolve(*func)),
+        Op::GlobalAddr(data) => format!("global_addr {}", interner.resolve(*data)),
         Op::Splat(v) => format!("splat {}", val(*v)),
         Op::Fma(a, b, c) => format!("fma {}, {}, {}", val(*a), val(*b), val(*c)),
         Op::Sqrt(a) => format!("sqrt {}", val(*a)),
