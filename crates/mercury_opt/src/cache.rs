@@ -83,6 +83,12 @@ impl CfgAnalyses {
         }
     }
 
+    /// Predecessor lists, indexed by block id.
+    pub(crate) fn predecessors(&mut self, f: &Function) -> &[Vec<u32>] {
+        self.ensure_preds(f);
+        self.preds.as_ref().unwrap()
+    }
+
     /// Dominator-tree children, indexed by block id.
     pub(crate) fn dom_children(&mut self, f: &Function) -> &[Vec<u32>] {
         self.ensure_children(f);

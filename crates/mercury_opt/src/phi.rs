@@ -26,9 +26,13 @@ impl Pass for SimplifyPhis {
         "simplify-phis"
     }
 
-    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+        // This pass rewires block parameters and edge arguments but never the CFG's successor edges,
+        // so the predecessor map stays valid across every removal; compute it once (cached) and hand
+        // it to each scan. Removals mutate `f`, not the (successor-derived) cache.
+        let preds: Vec<Vec<u32>> = cache.predecessors(f).to_vec();
         let mut changed = false;
-        while let Some((blk, k, repl)) = find_removable(f) {
+        while let Some((blk, k, repl)) = find_removable(f, &preds) {
             if let Some(v) = repl {
                 let pv = f.blocks[blk as usize].params[k];
                 substitute(f, pv, v);
@@ -42,7 +46,7 @@ impl Pass for SimplifyPhis {
 
 /// Find one removable block parameter: `(block, param index, Some(replacement) | None)`. `None`
 /// means the parameter is dead; `Some(v)` means it is a trivial phi to be replaced by `v`.
-fn find_removable(f: &Function) -> Option<(u32, usize, Option<ValueId>)> {
+fn find_removable(f: &Function, preds: &[Vec<u32>]) -> Option<(u32, usize, Option<ValueId>)> {
     let entry = f.entry.0;
 
     let mut used: FxHashSet<u32> = FxHashSet::default();
@@ -65,10 +69,12 @@ fn find_removable(f: &Function) -> Option<(u32, usize, Option<ValueId>)> {
             if !used.contains(&p.0) {
                 return Some((b.id.0, k, None));
             }
-            // Gather the incoming arguments at this parameter position.
+            // Gather the incoming arguments at this parameter position — only predecessors of `b`
+            // can supply them, so scan `preds[b]` rather than every block. (Byte-identical: a
+            // non-predecessor contributes no edge, and predecessors are in ascending block order.)
             let mut distinct: Vec<ValueId> = Vec::new();
-            for src in &f.blocks {
-                for arg in edge_args_to(&src.term, b.id.0, k) {
+            for &src in &preds[b.id.0 as usize] {
+                for arg in edge_args_to(&f.blocks[src as usize].term, b.id.0, k) {
                     if arg != p && !distinct.contains(&arg) {
                         distinct.push(arg);
                     }
