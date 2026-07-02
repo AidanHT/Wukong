@@ -1486,6 +1486,50 @@ fn p4_vec256_general_matches_interp() {
     }
 }
 
+/// A counting `while i < N { …; i += 1 }` with a vectorizable body normalizes to the for-range
+/// vectorizer (`try_normalize_counting_while`). The rewrite must (a) match the interpreter oracle
+/// bit-for-bit, (b) preserve the while's post-loop counter — `N` if it ran, else the untouched
+/// start (the `start >= N` empty-run case), and (c) leave `i` reachable for code after the loop.
+#[test]
+fn p4_counting_while_normalizes_and_matches_interp() {
+    // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
+    // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
+    // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
+    let prog = |n: usize, lo: usize| {
+        format!(
+            "fn main() -> i32 {{ \
+               let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+               let mut c: [f32; {n}] = [0.0; {n}]; let mut e: [f32; {n}] = [0.0; {n}]; \
+               let mut p: i32 = 0; \
+               while p < {n} {{ a[p] = (p as f32) - 3.0; b[p] = (p as f32) + 1.0; e[p] = (p as f32); p += 1; }} \
+               let mut k: i32 = {lo}; \
+               while k < {n} {{ c[k] = a[k] * b[k] + e[k]; k += 1; }} \
+               let mut s: f32 = 0.0; let mut t: i32 = 0; while t < {n} {{ s = s + c[t]; t += 1; }} \
+               print(k); print(s as i32); return ((k + (s as i32)) & 255); }}"
+        )
+    };
+    for n in [8usize, 9, 16, 33, 100] {
+        for lo in [0usize, n] {
+            // lo < n runs (final k == n); lo == n never runs (final k == n == lo). Both must hold.
+            let src = prog(n, lo);
+            if lo < n {
+                let (p, _) = lowered(&src, 3);
+                assert!(
+                    p.funcs.iter().any(|f| !f.vec_kernels.is_empty()),
+                    "n={n} lo={lo}: counting while should normalize to a vector kernel"
+                );
+            }
+            let native = jit(&src, 3).expect("jit -O3");
+            assert_eq!(
+                native,
+                interp(&src, 3).expect("interp"),
+                "n={n} lo={lo}: native vs interp"
+            );
+            assert_eq!(jit(&src, 0).expect("jit -O0"), native, "n={n} lo={lo}: -O0 vs -O3");
+        }
+    }
+}
+
 /// ReLU6 streaming dispatch: `clamp(x, 0, 6)` written as the nested value-ifs `if x < 6 { if x > 0 {
 /// x } else { 0 } } else { 6 }` must lower to one `mercury_velem_f32` call (`VE_RELU6`) and stay
 /// correct across sizes. Exercises the recursive ReLU6 peel (`peel_velem_act`) that matches the outer
