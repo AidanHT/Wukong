@@ -14,7 +14,7 @@ module tests.run.scaled_gemm
 /// q[i,p] = i+1, k[j,p] = j+1, d = 4, scale = 0.5 (= 1/√4)  ⇒
 ///   scores[i,j] = 0.5 · Σ_p (i+1)(j+1) = 2·(i+1)(j+1).
 ///   scores[0,0] = 2·1·1 = 2  (→ ×100 = 200);  scores[3,3] = 2·4·4 = 32  (→ ×100 = 3200).
-fn scaled_scores(q: [f32; 16], k: [f32; 16], scores: [f32; 16], scale: f32) {
+fn scaled_scores(q: [f32; 16], k: [f32; 16], mut scores: [f32; 16], scale: f32) {
     for i in 0..4 {
         for j in 0..4 {
             let mut s: f32 = 0.0;
