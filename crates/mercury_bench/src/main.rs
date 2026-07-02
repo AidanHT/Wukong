@@ -17,8 +17,22 @@ use std::time::{Duration, Instant};
 
 use mercury_span::{Interner, SourceId};
 
+mod compile_time;
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Mode selector: `compile-time` switches to the in-process optimizer-timing report; anything
+    // else keeps the original optimizer-effectiveness + execution-timing report. Appended, not
+    // overlaid, so the default invocation is unchanged.
+    let ctime = matches!(
+        args.first().map(String::as_str),
+        Some("compile-time" | "--compile-time" | "ctime")
+    );
+    if ctime {
+        args.remove(0);
+    }
+
     let dirs: Vec<PathBuf> = if args.is_empty() {
         vec![PathBuf::from("tests/run")]
     } else {
@@ -39,6 +53,11 @@ fn main() {
         }
     }
     files.sort();
+
+    if ctime {
+        compile_time::report(&files);
+        return;
+    }
 
     println!(
         "{:<20} {:>7} {:>7} {:>9}  {:>11} {:>11} {:>9}",
