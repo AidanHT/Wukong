@@ -14,7 +14,7 @@ module tests.run.scaled_gemm_batched
 ///
 /// head 0: Q=[[1,2],[3,4]], K=[[5,6],[7,8]] ⇒ QKᵀ=[[17,23],[39,53]], ·0.5 = [[8.5,11.5],[19.5,26.5]].
 /// head 1: Q=I, K=[[9,10],[11,12]]          ⇒ QKᵀ=[[9,11],[10,12]],  ·0.5 = [[4.5,5.5],[5.0,6.0]].
-fn bscores(q: [f32; 8], k: [f32; 8], scores: [f32; 8]) {
+fn bscores(q: [f32; 8], k: [f32; 8], mut scores: [f32; 8]) {
     for h in 0..2 {
         for i in 0..2 {
             for j in 0..2 {

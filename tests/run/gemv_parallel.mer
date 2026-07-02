@@ -9,7 +9,7 @@ module tests.run.gemv_parallel
 /// kernel is bit-identical to the serial one the interpreter marshals (each row computed by the same
 /// per-row routine, no cross-row combine), so -O0..-O3 and interp/native all agree.
 @parallel
-fn gemv(a: [f32; 16], x: [f32; 4], y: [f32; 4]) {
+fn gemv(a: [f32; 16], x: [f32; 4], mut y: [f32; 4]) {
     for i in 0..4 {
         let mut s: f32 = 0.0;
         for j in 0..4 {

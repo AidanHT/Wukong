@@ -12,7 +12,7 @@ module tests.run.bias_bcast_parallel
 // is bit-identical to the serial one the interpreter calls — so -O0..-O3 and interp/native all agree.
 
 @parallel
-fn add_bias_relu(x: [f32; 96], b: [f32; 12], out: [f32; 96]) {
+fn add_bias_relu(x: [f32; 96], b: [f32; 12], mut out: [f32; 96]) {
     for i in 0..8 {
         for j in 0..12 {
             out[i * 12 + j] =

@@ -2222,7 +2222,7 @@ fn differential_dequant() {
         let val = "((q[j] as f32) * s)";
         let body = act.replace('V', val);
         format!(
-            "{attr}fn deq(q: [{ty}; 64], out: [f32; 64]) {{ let s: f32 = 0.0125; \
+            "{attr}fn deq(q: [{ty}; 64], mut out: [f32; 64]) {{ let s: f32 = 0.0125; \
              for j in 0..64 {{ out[j] = {body}; }} }} \
              fn main() -> i32 {{ let mut q: [{ty}; 64] = [0 as {ty}; 64]; \
              let mut out: [f32; 64] = [0.0; 64]; \
@@ -2258,7 +2258,7 @@ fn differential_dequant() {
 fn dequant_loop_lowers_to_dequant_kernel() {
     let deq = |attr: &str, ty: &str, act: &str| {
         format!(
-            "module m\n{attr}fn d(q: [{ty}; 64], out: [f32; 64]) {{ let s: f32 = 0.1; \
+            "module m\n{attr}fn d(q: [{ty}; 64], mut out: [f32; 64]) {{ let s: f32 = 0.1; \
              for j in 0..64 {{ out[j] = {act}; }} }}"
         )
     };
@@ -2284,7 +2284,7 @@ fn dequant_loop_lowers_to_dequant_kernel() {
         "@parallel dequant (mixed body) -> mercury_dequant_f32_parallel"
     );
     // An f32-array scale map is velem's, not dequant's — the dequant kernel must not claim it.
-    let f32_map = "module m\nfn d(x: [f32; 64], out: [f32; 64]) { let s: f32 = 0.1; \
+    let f32_map = "module m\nfn d(x: [f32; 64], mut out: [f32; 64]) { let s: f32 = 0.1; \
                    for j in 0..64 { out[j] = x[j] * s; } }";
     assert!(
         !lowered_calls(f32_map, "mercury_dequant_f32"),
@@ -2299,7 +2299,7 @@ fn dequant_loop_lowers_to_dequant_kernel() {
 #[test]
 fn differential_dequant_mixed_parallel() {
     // Two dequant loops in one @parallel fn → not a single-loop body → the parallel-symbol path.
-    let src = "@parallel fn deq2(q: [i32; 128], out: [f32; 128]) { let s: f32 = 0.03125; \
+    let src = "@parallel fn deq2(q: [i32; 128], mut out: [f32; 128]) { let s: f32 = 0.03125; \
          for j in 0..64 { out[j] = (q[j] as f32) * s; } \
          for j in 64..128 { out[j] = fmax((q[j] as f32) * s, 0.0); } } \
          fn main() -> i32 { let mut q: [i32; 128] = [0; 128]; let mut out: [f32; 128] = [0.0; 128]; \
@@ -2329,7 +2329,7 @@ fn differential_dequant_perchan() {
         let val = "((q[i * 12 + j] as f32) * scale[j])";
         let body = act.replace('V', val);
         format!(
-            "{attr}fn deq(q: [{ty}; 60], scale: [f32; 12], out: [f32; 60]) {{ \
+            "{attr}fn deq(q: [{ty}; 60], scale: [f32; 12], mut out: [f32; 60]) {{ \
              for i in 0..5 {{ for j in 0..12 {{ out[i * 12 + j] = {body}; }} }} }} \
              fn main() -> i32 {{ let mut q: [{ty}; 60] = [0 as {ty}; 60]; \
              let mut scale: [f32; 12] = [0.0; 12]; let mut out: [f32; 60] = [0.0; 60]; \
@@ -2694,21 +2694,21 @@ fn differential_bf16_axpby() {
 #[test]
 fn differential_half_out_axpby() {
     // bf16 in, bf16 out -> the narrowing kernel.
-    let bf = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[bf16;64]) { \
+    let bf = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[bf16;64]) { \
         for k in 0..64 { o[k] = (1.5 * (x[k] as f32) + 2.0 * (y[k] as f32)) as bf16; } }";
     assert!(
         lowered_calls(bf, "mercury_axpby_bf16_out"),
         "bf16-in/bf16-out axpby -> mercury_axpby_bf16_out"
     );
     // f16 in, f16 out -> the f16 twin.
-    let hf = "module m\nfn ax(x:[f16;64], y:[f16;64], o:[f16;64]) { \
+    let hf = "module m\nfn ax(x:[f16;64], y:[f16;64], mut o:[f16;64]) { \
         for k in 0..64 { o[k] = (1.5 * (x[k] as f32) + 2.0 * (y[k] as f32)) as f16; } }";
     assert!(
         lowered_calls(hf, "mercury_axpby_f16_out"),
         "f16-in/f16-out axpby -> mercury_axpby_f16_out"
     );
     // A **f32** output must NOT take the narrowing path (it's the plain bf16-in/f32-out kernel).
-    let f32out = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let f32out = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } }";
     assert!(
         !lowered_calls(f32out, "mercury_axpby_bf16_out"),
@@ -2718,7 +2718,7 @@ fn differential_half_out_axpby() {
     // native == interp across opt levels, fractional non-half-exact inputs, both halves.
     for (ty, k) in [("bf16", "bf16"), ("f16", "f16")] {
         let prog = format!(
-            "fn ax(x:[{ty};4096], y:[{ty};4096], o:[{k};4096]) {{ \
+            "fn ax(x:[{ty};4096], y:[{ty};4096], mut o:[{k};4096]) {{ \
              for j in 0..4096 {{ o[j] = (1.5 * (x[j] as f32) + 2.0 * (y[j] as f32)) as {k}; }} }} \
              fn main() -> i32 {{ let mut x:[{ty};4096]=[0.0 as {ty};4096]; \
              let mut y:[{ty};4096]=[0.0 as {ty};4096]; let mut o:[{k};4096]=[0.0 as {k};4096]; \
@@ -2735,7 +2735,7 @@ fn differential_half_out_axpby() {
         }
     }
     // Golden half-exact: o[k] = 2·(k+1) + 3·2 = 2(k+1)+6 (all bf16-exact); Σ_{k=0..7} = 2·36 + 48 = 120.
-    let golden = "fn ax(x:[bf16;8], y:[bf16;8], o:[bf16;8]) { \
+    let golden = "fn ax(x:[bf16;8], y:[bf16;8], mut o:[bf16;8]) { \
         for k in 0..8 { o[k] = (2.0*(x[k] as f32) + 3.0*(y[k] as f32)) as bf16; } } \
         fn main() -> i32 { let mut x:[bf16;8]=[0.0 as bf16;8]; let mut y:[bf16;8]=[0.0 as bf16;8]; \
         let mut o:[bf16;8]=[0.0 as bf16;8]; for i in 0..8 { x[i]=((i+1) as f32) as bf16; y[i]=2.0 as bf16; } \
@@ -2755,21 +2755,21 @@ fn differential_half_out_axpby() {
 #[test]
 fn differential_half_out_vmath() {
     // bf16 in, bf16 out -> the narrowing activation kernel.
-    let bf = "module m\nfn a(x:[bf16;64], o:[bf16;64]) { \
+    let bf = "module m\nfn a(x:[bf16;64], mut o:[bf16;64]) { \
         for k in 0..64 { o[k] = (silu((x[k] as f32))) as bf16; } }";
     assert!(
         lowered_calls(bf, "mercury_vmath_bf16_out"),
         "bf16-in/bf16-out activation -> mercury_vmath_bf16_out"
     );
     // f16 in, f16 out -> the f16 twin.
-    let hf = "module m\nfn a(x:[f16;64], o:[f16;64]) { \
+    let hf = "module m\nfn a(x:[f16;64], mut o:[f16;64]) { \
         for k in 0..64 { o[k] = (gelu((x[k] as f32))) as f16; } }";
     assert!(
         lowered_calls(hf, "mercury_vmath_f16_out"),
         "f16-in/f16-out activation -> mercury_vmath_f16_out"
     );
     // An **f32** output must NOT take the narrowing path (it's the plain half-in/f32-out kernel).
-    let f32out = "module m\nfn a(x:[bf16;64], o:[f32;64]) { \
+    let f32out = "module m\nfn a(x:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = silu((x[k] as f32)); } }";
     assert!(
         !lowered_calls(f32out, "mercury_vmath_bf16_out"),
@@ -2779,7 +2779,7 @@ fn differential_half_out_vmath() {
     // native == interp across opt levels, over a sign/magnitude spread, both halves and two activations.
     for (ty, act) in [("bf16", "silu"), ("f16", "gelu")] {
         let prog = format!(
-            "fn a(x:[{ty};4096], o:[{ty};4096]) {{ \
+            "fn a(x:[{ty};4096], mut o:[{ty};4096]) {{ \
              for j in 0..4096 {{ o[j] = ({act}((x[j] as f32))) as {ty}; }} }} \
              fn main() -> i32 {{ let mut x:[{ty};4096]=[0.0 as {ty};4096]; \
              let mut o:[{ty};4096]=[0.0 as {ty};4096]; \
@@ -3081,7 +3081,7 @@ fn bias_bcast_is_correct_across_sizes() {
 /// kernel the interpreter calls — interp == native across opt levels.
 #[test]
 fn bias_bcast_parallel_matches_interp() {
-    let src = "@parallel fn addb(x: [f32; 96], b: [f32; 12], out: [f32; 96]) { \
+    let src = "@parallel fn addb(x: [f32; 96], b: [f32; 12], mut out: [f32; 96]) { \
                for i in 0..8 { for j in 0..12 { out[i * 12 + j] = x[i * 12 + j] + b[j]; } } } \
                fn main() -> i32 { let mut x: [f32; 96] = [0.0; 96]; \
                let mut i0: i32 = 0; while i0 < 96 { x[i0] = (i0 as f32); i0 += 1; } \

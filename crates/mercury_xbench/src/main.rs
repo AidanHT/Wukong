@@ -769,7 +769,7 @@ fn mer_gemv(m: usize, n: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let mn = m * n;
     format!(
-        "module bench\n{attr}fn kbench(a: [f32; {mn}], x: [f32; {n}], y: [f32; {m}]) {{\n\
+        "module bench\n{attr}fn kbench(a: [f32; {mn}], x: [f32; {n}], mut y: [f32; {m}]) {{\n\
          \x20   for i in 0..{m} {{\n\
          \x20       let mut s: f32 = 0.0;\n\
          \x20       for j in 0..{n} {{ s = s + a[i * {n} + j] * x[j]; }}\n\
@@ -876,7 +876,7 @@ fn mer_scaled_scores(s: usize, d: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let (sd, ss) = (s * d, s * s);
     format!(
-        "module bench\n{attr}fn kbench(q: [f32; {sd}], k: [f32; {sd}], out: [f32; {ss}]) {{\n\
+        "module bench\n{attr}fn kbench(q: [f32; {sd}], k: [f32; {sd}], mut out: [f32; {ss}]) {{\n\
          \x20   for i in 0..{s} {{\n\
          \x20       for j in 0..{s} {{\n\
          \x20           let mut acc: f32 = 0.0;\n\
@@ -892,7 +892,7 @@ fn mer_scores_noscale(s: usize, d: usize, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let (sd, ss) = (s * d, s * s);
     format!(
-        "module bench\n{attr}fn kbench(q: [f32; {sd}], k: [f32; {sd}], out: [f32; {ss}]) {{\n\
+        "module bench\n{attr}fn kbench(q: [f32; {sd}], k: [f32; {sd}], mut out: [f32; {ss}]) {{\n\
          \x20   for i in 0..{s} {{\n\
          \x20       for j in 0..{s} {{\n\
          \x20           let mut acc: f32 = 0.0;\n\
@@ -1760,7 +1760,7 @@ fn mer_dequant_1d(n: usize, is_i8: bool, parallel: bool) -> String {
     let attr = if parallel { "@parallel\n" } else { "" };
     let ty = if is_i8 { "i8" } else { "i32" };
     format!(
-        "module bench\n{attr}fn kbench(q: [{ty}; {n}], u: [f32; {n}], out: [f32; {n}]) {{\n\
+        "module bench\n{attr}fn kbench(q: [{ty}; {n}], u: [f32; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for j in 0..{n} {{ out[j] = (q[j] as f32) * 0.0125; }}\n}}\n"
     )
 }
@@ -1787,7 +1787,7 @@ fn mer_dequant_perchan(r: usize, c: usize, is_i8: bool, parallel: bool) -> Strin
     let ty = if is_i8 { "i8" } else { "i32" };
     let rc = r * c;
     format!(
-        "module bench\n{attr}fn kbench(q: [{ty}; {rc}], scale: [f32; {c}], out: [f32; {rc}]) {{\n\
+        "module bench\n{attr}fn kbench(q: [{ty}; {rc}], scale: [f32; {c}], mut out: [f32; {rc}]) {{\n\
          \x20   for i in 0..{r} {{\n\
          \x20       for j in 0..{c} {{ out[i * {c} + j] = (q[i * {c} + j] as f32) * scale[j]; }}\n\
          \x20   }}\n}}\n"
@@ -4325,7 +4325,7 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
 /// Mercury all-half axpby: bf16 in AND out — the recognizer folds it to `mercury_axpby_bf16_out`.
 fn mer_axpby_half_out(n: usize, a: f32, b: f32) -> String {
     format!(
-        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], out: [bf16; {n}]) {{\n\
+        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], mut out: [bf16; {n}]) {{\n\
          \x20   for k in 0..{n} {{ out[k] = ({a:?} * (x[k] as f32) + {b:?} * (y[k] as f32)) as bf16; }}\n}}\n"
     )
 }
@@ -4333,7 +4333,7 @@ fn mer_axpby_half_out(n: usize, a: f32, b: f32) -> String {
 /// Mercury bf16-in / f32-out axpby (the wider-store sibling) — folds to `mercury_axpby_bf16`.
 fn mer_axpby_f32_out(n: usize, a: f32, b: f32) -> String {
     format!(
-        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], out: [f32; {n}]) {{\n\
+        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], mut out: [f32; {n}]) {{\n\
          \x20   for k in 0..{n} {{ out[k] = {a:?} * (x[k] as f32) + {b:?} * (y[k] as f32); }}\n}}\n"
     )
 }

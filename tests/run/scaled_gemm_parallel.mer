@@ -13,7 +13,7 @@ module tests.run.scaled_gemm_parallel
 /// Same data/values as `scaled_gemm`: scores[i,j] = 2·(i+1)(j+1); scores[0,0]=2 (×100=200),
 /// scores[3,3]=32 (×100=3200).
 @parallel
-fn scaled_scores(q: [f32; 16], k: [f32; 16], scores: [f32; 16], scale: f32) {
+fn scaled_scores(q: [f32; 16], k: [f32; 16], mut scores: [f32; 16], scale: f32) {
     for i in 0..4 {
         for j in 0..4 {
             let mut s: f32 = 0.0;
