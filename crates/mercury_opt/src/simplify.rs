@@ -19,6 +19,15 @@ enum Alg {
     Const(CV),
 }
 
+/// A foldable instruction reduced to its Copy-sized operands, so classifying it borrows the op only
+/// briefly (no whole-`Op` clone — which for `Call`/`Gep` would copy heap fields on every pass).
+enum Act {
+    Bin(BinOp, ValueId, ValueId),
+    Cmp(CmpOp, ValueId, ValueId),
+    Neg(ValueId),
+    Not(ValueId),
+}
+
 impl Pass for Simplify {
     fn name(&self) -> &'static str {
         "simplify"
@@ -35,28 +44,41 @@ impl Pass for Simplify {
         for bi in 0..nblocks {
             let ninsts = f.blocks[bi].insts.len();
             for ii in 0..ninsts {
-                // Rewrite operands through substitutions discovered so far.
-                {
+                // Rewrite operands through substitutions discovered so far. Skipped while `subst` is
+                // empty (the common early-pass case), where every rewrite is a no-op v -> v.
+                if !subst.is_empty() {
                     let s = &subst;
                     map_op_uses(&mut f.blocks[bi].insts[ii].op, |v| resolve(s, v));
                 }
                 let Some(res) = f.blocks[bi].insts[ii].result else {
                     continue;
                 };
-                let rty = f.value_types[res.0 as usize].clone();
-                let op = f.blocks[bi].insts[ii].op.clone();
 
-                match op {
+                // Classify by *borrowing* the op and copying out only its Copy operands, so the
+                // borrow of `f` ends here — no whole-`Op` clone, and the result type is cloned only
+                // in the arms that actually fold (below), not for every instruction.
+                let act = match &f.blocks[bi].insts[ii].op {
                     Op::ConstInt(v, _) => {
-                        consts.insert(res.0, CV::Int(v));
+                        consts.insert(res.0, CV::Int(*v));
+                        continue;
                     }
                     Op::ConstFloat(v, _) => {
-                        consts.insert(res.0, CV::Float(v));
+                        consts.insert(res.0, CV::Float(*v));
+                        continue;
                     }
-                    Op::Bin(b, l, r) => {
+                    Op::Bin(b, l, r) => Act::Bin(*b, *l, *r),
+                    Op::Cmp(c, l, r) => Act::Cmp(*c, *l, *r),
+                    Op::Neg(v) => Act::Neg(*v),
+                    Op::Not(v) => Act::Not(*v),
+                    _ => continue,
+                };
+
+                match act {
+                    Act::Bin(b, l, r) => {
                         let lc = consts.get(&l.0).copied();
                         let rc = consts.get(&r.0).copied();
                         if let (Some(a), Some(c)) = (lc, rc) {
+                            let rty = f.value_types[res.0 as usize].clone();
                             if let Some(folded) = fold_bin(b, a, c, &rty) {
                                 set_const(f, bi, ii, folded, &rty);
                                 consts.insert(res.0, folded);
@@ -71,6 +93,7 @@ impl Pass for Simplify {
                                     changed = true;
                                 }
                                 Alg::Const(cv) => {
+                                    let rty = f.value_types[res.0 as usize].clone();
                                     set_const(f, bi, ii, cv, &rty);
                                     consts.insert(res.0, cv);
                                     changed = true;
@@ -78,7 +101,7 @@ impl Pass for Simplify {
                             }
                         }
                     }
-                    Op::Cmp(c, l, r) => {
+                    Act::Cmp(c, l, r) => {
                         if let (Some(a), Some(bv)) =
                             (consts.get(&l.0).copied(), consts.get(&r.0).copied())
                         {
@@ -96,8 +119,9 @@ impl Pass for Simplify {
                             }
                         }
                     }
-                    Op::Neg(v) => {
+                    Act::Neg(v) => {
                         if let Some(cv) = consts.get(&v.0).copied() {
+                            let rty = f.value_types[res.0 as usize].clone();
                             let nv = match cv {
                                 CV::Int(i) => CV::Int(mask(i.wrapping_neg(), &rty)),
                                 CV::Float(fl) => CV::Float(-fl),
@@ -107,15 +131,15 @@ impl Pass for Simplify {
                             changed = true;
                         }
                     }
-                    Op::Not(v) => {
+                    Act::Not(v) => {
                         if let Some(CV::Int(i)) = consts.get(&v.0).copied() {
+                            let rty = f.value_types[res.0 as usize].clone();
                             let nv = CV::Int(mask(!i, &rty));
                             set_const(f, bi, ii, nv, &rty);
                             consts.insert(res.0, nv);
                             changed = true;
                         }
                     }
-                    _ => {}
                 }
             }
         }
