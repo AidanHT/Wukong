@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use mercury_span::{Interner, SourceId};
 
 mod compile_time;
+mod compile_vs;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +26,13 @@ fn main() {
     // Mode selector: `compile-time` switches to the in-process optimizer-timing report; anything
     // else keeps the original optimizer-effectiveness + execution-timing report. Appended, not
     // overlaid, so the default invocation is unchanged.
+    // `compile-vs [mercuryc-path]` runs the cross-compiler compile-time comparison and exits.
+    if matches!(args.first().map(String::as_str), Some("compile-vs")) {
+        let mc = args.get(1).map(std::path::PathBuf::from);
+        compile_vs::report(mc);
+        return;
+    }
+
     let ctime = matches!(
         args.first().map(String::as_str),
         Some("compile-time" | "--compile-time" | "ctime")
