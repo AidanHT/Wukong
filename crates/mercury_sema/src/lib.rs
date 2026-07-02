@@ -220,10 +220,16 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         ret_ty: Ty::Unit,
         loop_labels: Vec::new(),
         consts: HashMap::new(),
+        checking_bodies: false,
     };
     s.collect(module);
     s.check_recursive_structs(module);
     s.check_recursive_consts(module);
+    // The undeclared-tensor-dimension check (`lower_dim`) fires only from here on: by the body pass
+    // `collect` has registered every top-level `const` and this item's generics are re-established
+    // per function, so an unknown dim name can be told from a declared generic / a `const` with no
+    // forward-reference false positive (and a function signature, re-lowered here, is reported once).
+    s.checking_bodies = true;
     s.check_bodies(module);
     let result = SemaResult {
         types: s.types,
@@ -263,6 +269,12 @@ struct Sema<'a> {
     loop_labels: Vec<Option<Symbol>>,
     /// Top-level `const` initializer expressions (by name), accumulated as their bodies are checked.
     consts: HashMap<Symbol, Expr>,
+    /// `false` during the collection pass, `true` once body checking starts. Gates the
+    /// undeclared-tensor-dimension diagnostic (`lower_dim`): reporting it only in the body pass means
+    /// every top-level `const` is registered and each item's generics are re-established, so an
+    /// unknown dim name is distinguished from a declared generic / a `const` with no forward-reference
+    /// false positive, and a function signature (re-lowered in `check_fn`) is reported exactly once.
+    checking_bodies: bool,
 }
 
 impl Sema<'_> {
@@ -550,7 +562,13 @@ impl Sema<'_> {
                         Scalar::F32
                     }
                 };
-                let shape = Shape(dims.iter().map(|d| self.lower_dim(d)).collect());
+                // `lower_dim` now reports an undeclared dim name, so it needs `&mut self` — a plain
+                // `map` would double-borrow, hence the explicit loop.
+                let mut shape_dims = Vec::with_capacity(dims.len());
+                for d in dims {
+                    shape_dims.push(self.lower_dim(d));
+                }
+                let shape = Shape(shape_dims);
                 let layout = match layout {
                     Some(mercury_ast::Layout::ColMajor) => Layout::ColMajor,
                     Some(mercury_ast::Layout::Strided) => Layout::Strided,
@@ -566,12 +584,61 @@ impl Sema<'_> {
         }
     }
 
-    fn lower_dim(&self, d: &mercury_ast::Dim) -> Dim {
+    fn lower_dim(&mut self, d: &mercury_ast::Dim) -> Dim {
         match &d.kind {
             DimKind::Int(n) => Dim::Const(*n),
-            DimKind::Named(s) => Dim::Var(*s),
+            DimKind::Named(s) => {
+                // An undeclared dim name is a typo, not a fresh implicit dim. Previously
+                // `Tensor[f32, KK]` (when only `K` was declared) silently introduced a brand-new
+                // symbolic dim `KK`, dropping the shared `K` constraint the programmer meant — a
+                // shape hole the checker exists to catch. Require the name to be a declared generic
+                // of the enclosing item (or a top-level `const`); otherwise report E0504 with a
+                // did-you-mean hint. Gated on `checking_bodies` so it fires once per site, only after
+                // every generic/`const` is known (see the flag's doc-comment).
+                if self.checking_bodies
+                    && !self.generics.contains(s)
+                    && !self.consts.contains_key(s)
+                {
+                    let msg = match self.nearest_generic(*s) {
+                        Some(g) => format!(
+                            "unknown tensor dimension `{}`; did you mean `{}`? (a dimension must be \
+                             a declared generic parameter, an integer literal, `?`, or a `const`)",
+                            self.sym_str(*s),
+                            self.sym_str(g)
+                        ),
+                        None => format!(
+                            "unknown tensor dimension `{}` (a dimension must be a declared generic \
+                             parameter, an integer literal, `?`, or a `const`)",
+                            self.sym_str(*s)
+                        ),
+                    };
+                    self.error(d.span, "E0504", msg);
+                }
+                Dim::Var(*s)
+            }
             DimKind::Dynamic => Dim::Dynamic,
         }
+    }
+
+    /// The declared generic closest to an unknown dimension name `s`, for the did-you-mean hint: the
+    /// minimum edit-distance candidate, tie-broken by name so the suggestion is deterministic across
+    /// runs (`generics` is a `HashSet` with no stable order — the sweep-9 determinism discipline).
+    /// Only a *reasonably* close name is proposed (distance within half the longer name, min 2), so
+    /// an unrelated generic is not suggested.
+    fn nearest_generic(&self, s: Symbol) -> Option<Symbol> {
+        let want = self.sym_str(s);
+        let mut best: Option<(usize, &str, Symbol)> = None;
+        for &g in &self.generics {
+            let name = self.sym_str(g);
+            let dist = levenshtein(want, name);
+            best = Some(match best {
+                Some(b) if b.0 < dist || (b.0 == dist && b.1 <= name) => b,
+                _ => (dist, name, g),
+            });
+        }
+        let (dist, name, g) = best?;
+        let threshold = (want.len().max(name.len()) / 2).max(2);
+        (dist <= threshold).then_some(g)
     }
 
     fn eval_usize(&self, e: &Expr) -> u64 {
@@ -2288,6 +2355,24 @@ fn generic_param_sym(g: &GenericParam) -> Symbol {
         GenericParamKind::Type(id) => id.sym,
         GenericParamKind::Const { name, .. } => name.sym,
     }
+}
+
+/// Classic Levenshtein edit distance (insert/delete/substitute), for the unknown-tensor-dimension
+/// did-you-mean hint. Dimension names are short, so the simple two-row `O(len_a·len_b)` form is fine.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// The generic parameter names as an unordered set, for membership tests (`is this name a generic

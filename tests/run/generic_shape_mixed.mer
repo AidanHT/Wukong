@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 14
+module tests.run.generic_shape_mixed
+
+// A function generic over BOTH a value-type parameter `T` and a tensor DIMENSION `N` composes the two
+// orthogonal mechanisms: `T` drives monomorphization (one specialized copy per concrete type —
+// `copy$i32`, `copy$f32`), while `N` is threaded as a hidden runtime `i64` dim param. Each emitted
+// instance carries the hidden dim leading its real params, and the call site supplies both the
+// monomorphization target and the dim value — so the two features do not interfere. Runs at two
+// different sizes (N=4 and N=3), bit-identical interp == native, -O0 == -O{1,2,3}.
+fn copy<T, N>(x: Tensor[f32, N], tag: T, mut out: Tensor[f32, N]) {
+    let t = tag; // thread the type generic structurally (no arithmetic on `T`)
+    for i in 0..N {
+        out[i] = x[i] * 2.0;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut o1: [f32; 4] = [0.0; 4];
+    copy::<i32, 4>(x, 7, o1); // copy$i32, N=4
+    print(o1[3] as i32);      // 4 * 2 = 8
+
+    let y: [f32; 3] = [5.0, 6.0, 7.0];
+    let mut o2: [f32; 3] = [0.0; 3];
+    copy::<f32, 3>(y, 1.5, o2); // copy$f32, N=3
+    print(o2[2] as i32);        // 7 * 2 = 14
+    return 0;
+}
