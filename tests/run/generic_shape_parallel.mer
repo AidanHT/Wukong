@@ -1,0 +1,53 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 50
+// EXPECT-OUT: 11
+// EXPECT-OUT: 66
+module tests.run.generic_shape_parallel
+
+// A `@parallel` symbolic-shape function composes with the hidden runtime-dim ABI. The whole-function
+// matmul interceptor runs *before* the loop outliner, binds the hidden dims (`bind_dim_params` in
+// `lower_matmul_fn`), and dispatches to the multicore `mercury_sgemm_parallel` — so a symbolic matmul
+// parallelizes across cores at any runtime size, bit-identical to serial (the parallel kernel uses
+// deterministic fixed chunking). A `@parallel` symbolic elementwise nest runs correctly through the
+// ordinary path (tensor params don't match the array-only outliner, exactly like a constant-shape
+// `@parallel` tensor function). Gated interp == native and -O0 == -O{1,2,3} by the run suite.
+@parallel
+fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) {
+    for i in 0..M {
+        for j in 0..N {
+            let mut s: f32 = 0.0;
+            for k in 0..K {
+                s = s + a[i, k] * b[k, j];
+            }
+            c[i, j] = s;
+        }
+    }
+}
+
+@parallel
+fn add<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, M, N], mut out: Tensor[f32, M, N]) {
+    for i in 0..M {
+        for j in 0..N {
+            out[i, j] = a[i, j] + b[i, j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
+    let mut c: [f32; 4] = [0.0; 4];
+    matmul::<2, 2, 2>(a, b, c);
+    print(c[0] as i32); // 19
+    print(c[3] as i32); // 50
+
+    let x: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let y: [f32; 6] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let mut z: [f32; 6] = [0.0; 6];
+    add::<2, 3>(x, y, z);
+    print(z[0] as i32); // 11
+    print(z[5] as i32); // 66
+    return 0;
+}
