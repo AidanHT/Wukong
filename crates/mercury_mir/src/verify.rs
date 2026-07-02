@@ -98,7 +98,7 @@ impl Verifier<'_> {
     fn check_op(&mut self, op: &Op, result: Option<ValueId>) {
         // `Store` never produces a result; `Call` may be void (e.g. the `print` intrinsic) or
         // value-producing. Every other op must produce exactly one result.
-        let must_produce = !matches!(op, Op::Store { .. } | Op::Call { .. });
+        let must_produce = !matches!(op, Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. });
         if must_produce && result.is_none() {
             self.err(format!("operation {op:?} must produce a result value"));
         }
@@ -249,6 +249,23 @@ impl Verifier<'_> {
             Op::Call { args, .. } => {
                 for a in args {
                     self.use_val(*a);
+                }
+            }
+            Op::VecKernelCall {
+                ptrs, scalars, n, ..
+            } => {
+                if self.use_val(*ptrs) {
+                    self.expect_ty(*ptrs, &MirType::Ptr, "veckernel ptrs");
+                }
+                if self.use_val(*scalars) {
+                    self.expect_ty(*scalars, &MirType::Ptr, "veckernel scalars");
+                }
+                if self.use_val(*n) {
+                    if let Some(t) = self.ty(*n) {
+                        if !t.is_int() {
+                            self.err(format!("veckernel n has non-int type {}", t.display()));
+                        }
+                    }
                 }
             }
             Op::FuncAddr(_) => {

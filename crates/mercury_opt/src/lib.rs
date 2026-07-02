@@ -180,6 +180,13 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
                 *a = f(*a);
             }
         }
+        Op::VecKernelCall {
+            ptrs, scalars, n, ..
+        } => {
+            *ptrs = f(*ptrs);
+            *scalars = f(*scalars);
+            *n = f(*n);
+        }
         Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) | Op::FuncAddr(..) => {}
     }
 }
@@ -243,6 +250,13 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
                 f(*a);
             }
         }
+        Op::VecKernelCall {
+            ptrs, scalars, n, ..
+        } => {
+            f(*ptrs);
+            f(*scalars);
+            f(*n);
+        }
         Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) | Op::FuncAddr(..) => {}
     }
 }
@@ -268,7 +282,10 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
 
 /// Does this op have a side effect that prevents removing it even if its result is unused?
 pub(crate) fn has_side_effects(op: &Op) -> bool {
-    matches!(op, Op::Store { .. } | Op::Call { .. })
+    matches!(
+        op,
+        Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. }
+    )
 }
 
 #[cfg(test)]

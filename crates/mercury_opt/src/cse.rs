@@ -136,8 +136,8 @@ impl Numbering<'_> {
                         slot_val.clear(); // unknown pointer may alias any slot
                     }
                 }
-                Op::Call { .. } => {
-                    slot_val.clear(); // a call may store through pointers it was given
+                Op::Call { .. } | Op::VecKernelCall { .. } => {
+                    slot_val.clear(); // a call (or vector kernel) may store through given pointers
                 }
                 _ => {
                     let Some(res) = inst.result else { continue };
@@ -202,6 +202,8 @@ fn pure_key(op: &Op, rewrite: &HashMap<u32, u32>) -> Option<Key> {
         Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
         Op::Sqrt(a) => Key::Sqrt(m(*a)),
         Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
-        Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::Alloca(..) => return None,
+        Op::Load(..) | Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca(..) => {
+            return None
+        }
     })
 }

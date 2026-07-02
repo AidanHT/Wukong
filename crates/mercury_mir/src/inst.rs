@@ -200,6 +200,20 @@ pub enum Op {
     /// round-to-nearest-ties-to-even that `nearest` emits — *not* `round`, which is ties-away), so the
     /// two stay bit-identical. Pure and side-effect-free.
     Round(RoundMode, ValueId),
+    /// Call a synthesized 256-bit AVX2 vector kernel (P4) by index into [`crate::Program::vec_kernels`],
+    /// over the vector part `[0, n)` of a loop the general vectorizer widened past Cranelift's 128-bit
+    /// CLIF-vector ceiling. `ptrs` points at a stack array of the stream base pointers (each already
+    /// offset to the loop start); `scalars` at the loop-invariant f32s; `n` is a multiple of 8 (the
+    /// caller runs the scalar remainder). Side-effecting — it stores through the output stream
+    /// pointers — and yields no value. The interpreter marshals the recipe lane-wise (the differential
+    /// oracle); the Cranelift backend assembles it to raw AVX2 (`avx2.rs`) and calls it. `kernel` is a
+    /// pure index, not a `ValueId`, so it is invisible to SSA renaming.
+    VecKernelCall {
+        kernel: u32,
+        ptrs: ValueId,
+        scalars: ValueId,
+        n: ValueId,
+    },
 }
 
 /// Rounding direction for [`Op::Round`]. Each maps to one Cranelift instruction and one `f32`/`f64`
