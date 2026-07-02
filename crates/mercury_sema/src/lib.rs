@@ -1573,6 +1573,26 @@ impl Sema<'_> {
         matches!(&e.kind, ExprKind::Int(s) if !has_int_suffix(self.sym_str(*s)))
     }
 
+    /// Whether `t` is one of the current function's generic type parameters (`T` in `fn f<T>`) —
+    /// a `Ty::Named` whose symbol is in scope as a generic. At check time such a type is abstract
+    /// (not a scalar); it becomes concrete only at monomorphization.
+    fn is_generic_ty(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Named(s) if self.generics.contains(s))
+    }
+
+    /// Whether `e` is an *unsuffixed* numeric literal (int or float), optionally under a unary minus —
+    /// the type-flexible kind that adapts to the other operand of an arithmetic binop. Used so a
+    /// literal adapts to a generic-param operand (`2 * x` where `x: T`) instead of forcing the binop to
+    /// the literal's i32 default and truncating the generic value at monomorphization.
+    fn is_adaptable_num_literal(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Int(s) => !has_int_suffix(self.sym_str(*s)),
+            ExprKind::Float(s) => !has_float_suffix(self.sym_str(*s)),
+            ExprKind::Unary { op: UnOp::Neg, expr } => self.is_adaptable_num_literal(expr),
+            _ => false,
+        }
+    }
+
     /// Whether an *unsuffixed* numeric literal — optionally wrapped in a unary minus, e.g.
     /// `let x: f64 = -1.5;` — adapts to the integer/float annotation `ann`. A leading `-`
     /// does not change a literal's kind, so we peel `Neg` and re-check the inner literal.
@@ -2038,7 +2058,25 @@ impl Sema<'_> {
                         Ty::Scalar(Scalar::Bool)
                     }
                     And | Or => Ty::Scalar(Scalar::Bool),
-                    _ => join(l, r),
+                    _ => {
+                        // For arithmetic, adapt an unsuffixed numeric literal to a generic-param
+                        // operand on EITHER side. In a generic body `T` isn't a scalar, so `join`
+                        // (which returns its LEFT arg when the pair isn't two scalars) mis-typed
+                        // `2 * x` (i32-literal · T) as i32 — and mir_build then truncated the
+                        // monomorphized f32/i64 operand (`fptoui f32 -> i32`), a gate-blind wrong
+                        // answer. `x * 2` already worked (`join(T, i32)` returns the left T); this
+                        // makes it symmetric, so `2 * x` types as `T` and the literal re-adapts at
+                        // monomorphization.
+                        let arith = matches!(op, Add | Sub | Mul | Div | Rem);
+                        if arith && self.is_adaptable_num_literal(lhs) && self.is_generic_ty(&r) {
+                            r
+                        } else if arith && self.is_adaptable_num_literal(rhs) && self.is_generic_ty(&l)
+                        {
+                            l
+                        } else {
+                            join(l, r)
+                        }
+                    }
                 }
             }
             ExprKind::Call {
