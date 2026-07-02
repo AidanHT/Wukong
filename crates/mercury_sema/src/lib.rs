@@ -927,8 +927,12 @@ impl Sema<'_> {
     /// call-argument cross-kind arm in `unify`. Unknown/Error/Named(generic)/Tensor stay lenient.
     fn scalar_aggregate_clash(&self, a: &Ty, b: &Ty) -> bool {
         let scalarish = |t: &Ty| matches!(t, Ty::Scalar(_) | Ty::Vector { .. });
-        let pointerish =
-            |t: &Ty| matches!(t, Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_));
+        let pointerish = |t: &Ty| {
+            matches!(
+                t,
+                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_)
+            )
+        };
         (scalarish(a) && pointerish(b)) || (pointerish(a) && scalarish(b))
     }
 
@@ -1597,10 +1601,11 @@ impl Sema<'_> {
             }
             ForIter::Expr(e) => {
                 // `for x in arr` binds the loop variable to the array's *element* type, so the
-                // body type-checks (`for x in [T; N]` ⇒ `x: T`). Any non-array iterand stays
-                // `Unknown` (lenient — we don't newly reject other iterables here).
+                // body type-checks (`for x in [T; N]` ⇒ `x: T`). A slice iterates the same way
+                // (`for x in s` ⇒ `x: T` for `s: []T`). Any other iterand stays `Unknown` (lenient
+                // — we don't newly reject other iterables here).
                 match self.type_expr(e) {
-                    Ty::Array { elem, .. } => *elem,
+                    Ty::Array { elem, .. } | Ty::Slice(elem) => *elem,
                     _ => Ty::Unknown,
                 }
             }
@@ -2720,7 +2725,19 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
     if a.is_unknown() || b.is_unknown() || a.is_error() || b.is_error() {
         return true;
     }
-    a == b
+    if a == b {
+        return true;
+    }
+    // Unsizing: a fixed-size array `[T; N]` coerces to a slice `[]T` of the same element type — the
+    // one implicit array↔slice conversion (it drops the static length to a runtime one). The slice
+    // must be the *target* (`a`), e.g. `let s: []T = arr` or passing `[T; N]` where `[]T` is
+    // expected; there is no slice→array direction (a slice has no static length to restore).
+    match (a, b) {
+        (Ty::Slice(ea), Ty::Slice(eb)) | (Ty::Slice(ea), Ty::Array { elem: eb, .. }) => {
+            compatible(ea, eb)
+        }
+        _ => false,
+    }
 }
 
 fn is_vector_name(s: &str) -> bool {

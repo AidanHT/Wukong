@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+module tests.fail.slice_scalar_arg
+
+// A slice parameter `[]T` is a fat-pointer aggregate, not a scalar. Passing a bare integer where a
+// slice is expected is a kind confusion that would slip past unification and then be misread as a
+// `{ data, len }` view (the interpreter loads out of bounds, native reads garbage — a backend
+// divergence). It is rejected at the call site.
+fn head(s: []i32) -> i32 {
+    return s[0];
+}
+
+fn main() -> i32 {
+    return head(5);
+}

@@ -1,0 +1,66 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 50
+// EXPECT-OUT: 150
+// EXPECT-OUT: 30
+// EXPECT-OUT: 26
+// EXPECT-OUT: 99
+// EXPECT-OUT: 99
+// EXPECT-OUT: 11
+module tests.run.slice_basics
+
+// Slices `[]T` — a fat pointer `{ data: *T @ 0, len: i64 @ 8 }` viewing existing array storage.
+// Exercised here: length (`s.len()`), indexed read/write (`s[i]`), iteration (`for x in s`), passing
+// to a function (both an already-materialized slice AND an array *unsized* to a slice at the call
+// site), and aliasing (a write through the slice is visible in the backing array). A slice is a
+// 16-byte by-pointer aggregate; the interpreter's slot memory and native's byte offsets address it
+// identically, so interp == native bit-for-bit and -O0 == -O3.
+
+fn total(s: []i32) -> i32 {
+    let mut acc: i32 = 0;
+    for x in s {
+        acc = acc + x;
+    }
+    return acc;
+}
+
+fn nth(s: []i32, i: i32) -> i32 {
+    return s[i];
+}
+
+fn fsum(s: []f32) -> f32 {
+    let mut a: f32 = 0.0;
+    for x in s {
+        a = a + x;
+    }
+    return a;
+}
+
+fn main() -> i32 {
+    let arr: [i32; 5] = [10, 20, 30, 40, 50];
+    let s: []i32 = arr;
+    print(s.len());        // 5
+    print(s[0]);           // 10
+    print(s[4]);           // 50
+    print(total(s));       // 150
+    print(nth(s, 2));      // 30
+
+    // Call-site unsizing: a `[i32; 4]` array argument becomes a `[]i32` slice parameter.
+    let arr2: [i32; 4] = [3, 5, 7, 11];
+    print(total(arr2));    // 26
+
+    // A write through the slice aliases the backing array's storage.
+    let mut m: [i32; 3] = [1, 2, 3];
+    let mut sm: []i32 = m;
+    sm[1] = 99;
+    print(sm[1]);          // 99
+    print(m[1]);           // 99
+
+    // A float-element slice sums correctly (1.5 + 2.5 + 3.0 + 4.0 = 11.0 -> "11").
+    let fa: [f32; 4] = [1.5, 2.5, 3.0, 4.0];
+    let fs: []f32 = fa;
+    print(fsum(fs));       // 11
+    return 0;
+}
