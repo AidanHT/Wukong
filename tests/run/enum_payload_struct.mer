@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 75
+// EXPECT-OUT: 50
+// EXPECT-OUT: 12
+// EXPECT-OUT: -2
+// EXPECT-OUT: 9
+module tests.run.enum_payload_struct
+
+// Struct-payload variants `E::V { f: x }`: construction (fields may appear out of declaration order,
+// each routed by name), `{ field }` destructuring (shorthand and explicit `field: binding`), a
+// heterogeneous payload (i32 + f32 with real padding between them), and a data-carrying enum held as
+// a struct field (deep-copied leaf-by-leaf). Bit-exact across backends and opt levels.
+enum Shape {
+    Circle { r: i32 },
+    Rect { w: i32, h: i32 },
+    Weighted { v: i32, w: f32 },
+}
+
+struct Tagged { id: i32, s: Shape }
+
+fn area(s: Shape) -> i32 {
+    return match s {
+        Shape::Circle { r } => r * r * 3,
+        Shape::Rect { w, h } => w * h,
+        Shape::Weighted { v, w } => v + (w as i32),
+    };
+}
+
+fn main() -> i32 {
+    print(area(Shape::Circle { r: 5 }));            // 75
+    print(area(Shape::Rect { w: 10, h: 5 }));       // 50
+    print(area(Shape::Weighted { v: 10, w: 2.5 })); // 12
+
+    // Out-of-order fields at construction; explicit `field: binding` rename in the pattern.
+    let s = Shape::Rect { h: 3, w: 1 };
+    let n = match s {
+        Shape::Rect { w: a, h: b } => a - b,
+        _ => 0,
+    };
+    print(n);                                       // -2
+
+    // A data-carrying enum as a struct field: constructed, deep-copied into the struct, then matched.
+    let t = Tagged { id: 4, s: Shape::Rect { w: 3, h: 3 } };
+    print(area(t.s));                               // 9
+    return 0;
+}

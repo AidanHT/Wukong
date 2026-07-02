@@ -32,10 +32,45 @@ pub enum DefKind {
     Fn(FnSig),
     Const(Ty),
     Struct(Vec<(Symbol, Ty)>),
-    /// A C-style enum: its variants in declaration order with their resolved integer discriminants
-    /// (auto-incremented from 0, or set by an explicit `= <int>`). `mir_build` lowers `E::Variant`
-    /// to its discriminant constant.
-    Enum(Vec<(Symbol, i64)>),
+    /// An enum: its variants in declaration order. Each carries a resolved integer discriminant
+    /// (auto-incremented from 0, or set by an explicit `= <int>`) and its payload (unit / tuple /
+    /// struct, field types already lowered to `Ty`). A **C-style** enum has all-unit variants — a
+    /// variant *is* its discriminant, lowered to an i32 scalar. A **data-carrying** (tagged-union)
+    /// enum has ≥1 payload variant — every value is a discriminant + padded payload byte buffer.
+    Enum(Vec<EnumVariant>),
+}
+
+/// A resolved enum variant: name, computed i32 discriminant, and payload with lowered field types.
+#[derive(Clone, Debug)]
+pub struct EnumVariant {
+    pub name: Symbol,
+    pub disc: i64,
+    pub payload: VariantPayload,
+}
+
+/// The data a variant carries. Unit is the C-style variant (no payload); tuple/struct payloads make
+/// the enum a tagged union. The tagged-union layout treats every payload as a tuple of `field_tys`.
+#[derive(Clone, Debug)]
+pub enum VariantPayload {
+    Unit,
+    Tuple(Vec<Ty>),
+    Struct(Vec<(Symbol, Ty)>),
+}
+
+impl VariantPayload {
+    /// The payload field types in positional order (struct fields in declaration order); empty for a
+    /// unit variant. The single source of truth for a variant's payload layout.
+    pub fn field_tys(&self) -> Vec<Ty> {
+        match self {
+            VariantPayload::Unit => Vec::new(),
+            VariantPayload::Tuple(ts) => ts.clone(),
+            VariantPayload::Struct(fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
+        }
+    }
+
+    pub fn is_unit(&self) -> bool {
+        matches!(self, VariantPayload::Unit)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -222,7 +257,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         consts: HashMap::new(),
     };
     s.collect(module);
-    s.check_recursive_structs(module);
+    s.check_recursive_types(module);
     s.check_recursive_consts(module);
     s.check_bodies(module);
     let result = SemaResult {
@@ -300,6 +335,9 @@ impl Sema<'_> {
                     self.register(s.name, DefKind::Struct(fields), item.span);
                 }
                 ItemKind::Enum(e) => {
+                    // Payload field types are lowered in the enum's generic scope (like struct
+                    // fields), so a generic-typed payload resolves its param names.
+                    self.generics = generic_names(&e.generics);
                     // Resolve each variant's integer discriminant: an explicit `= <int>` sets it,
                     // otherwise it auto-increments from the previous (starting at 0), as in C/Rust.
                     let mut next = 0i64;
@@ -327,12 +365,29 @@ impl Sema<'_> {
                                 ),
                             );
                         }
-                        variants.push((v.name.sym, disc));
+                        let payload = match &v.data {
+                            VariantData::Unit => VariantPayload::Unit,
+                            VariantData::Tuple(tys) => {
+                                VariantPayload::Tuple(tys.iter().map(|t| self.lower_type(t)).collect())
+                            }
+                            VariantData::Struct(fields) => VariantPayload::Struct(
+                                fields
+                                    .iter()
+                                    .map(|f| (f.name.sym, self.lower_type(&f.ty)))
+                                    .collect(),
+                            ),
+                        };
+                        variants.push(EnumVariant {
+                            name: v.name.sym,
+                            disc,
+                            payload,
+                        });
                         // Wrapping, so a sentinel discriminant near `i64::MAX` doesn't panic the
                         // compiler on the auto-increment of the *next* variant before the range
                         // check above fires; wrapping matches two's-complement integer semantics.
                         next = disc.wrapping_add(1);
                     }
+                    self.generics.clear();
                     self.register(e.name, DefKind::Enum(variants), item.span);
                 }
                 ItemKind::Extern(blk) => {
@@ -350,52 +405,64 @@ impl Sema<'_> {
     /// stack-overflows mir_build's layout pass (a compiler crash on a plausible mistake — forgetting
     /// the indirection). A field behind a pointer/reference has fixed size and breaks the cycle, as
     /// in C/Rust (cf. Rust's E0072). Runs after `collect`, when every struct is registered.
-    fn check_recursive_structs(&mut self, module: &Module) {
+    fn check_recursive_types(&mut self, module: &Module) {
         for item in &module.items {
-            if let ItemKind::Struct(s) = &item.kind {
-                let root = s.name.sym;
-                // DFS over by-value containment from `root`; reaching `root` means infinite size.
-                let mut stack = self.contained_structs(root);
-                let mut visited: Vec<Symbol> = Vec::new();
-                let mut recursive = false;
-                while let Some(cur) = stack.pop() {
-                    if cur == root {
-                        recursive = true;
-                        break;
-                    }
-                    if visited.contains(&cur) {
-                        continue;
-                    }
-                    visited.push(cur);
-                    stack.extend(self.contained_structs(cur));
+            // A struct or a data-carrying enum can be recursive by value; a C-style enum holds
+            // nothing (`contained_types` returns empty for it), so it can never be flagged.
+            let (root, kind) = match &item.kind {
+                ItemKind::Struct(s) => (s.name.sym, "struct"),
+                ItemKind::Enum(e) => (e.name.sym, "enum"),
+                _ => continue,
+            };
+            // DFS over by-value containment from `root`; reaching `root` means infinite size.
+            let mut stack = self.contained_types(root);
+            let mut visited: Vec<Symbol> = Vec::new();
+            let mut recursive = false;
+            while let Some(cur) = stack.pop() {
+                if cur == root {
+                    recursive = true;
+                    break;
                 }
-                if recursive {
-                    let nm = self.sym_str(root).to_string();
-                    self.error(
-                        item.span,
-                        "E0402",
-                        format!(
-                            "recursive struct `{nm}` has infinite size; store the recursive field \
-                             behind a pointer (e.g. `*{nm}`) to break the cycle"
-                        ),
-                    );
+                if visited.contains(&cur) {
+                    continue;
                 }
+                visited.push(cur);
+                stack.extend(self.contained_types(cur));
+            }
+            if recursive {
+                let nm = self.sym_str(root).to_string();
+                self.error(
+                    item.span,
+                    "E0402",
+                    format!(
+                        "recursive {kind} `{nm}` has infinite size; store the recursive field \
+                         behind a pointer (e.g. `*{nm}`) to break the cycle"
+                    ),
+                );
             }
         }
     }
 
-    /// The struct names a struct holds *by value* (a `Named` field, or one nested in an array/tuple
-    /// field). A non-struct `Named` (an enum, a generic param, an unknown) resolves to nothing.
-    fn contained_structs(&self, name: Symbol) -> Vec<Symbol> {
+    /// The named types a struct or enum holds *by value* (a `Named` field / payload field, or one
+    /// nested in an array/tuple), for the recursive-type cycle check. A pointer/reference field is
+    /// excluded (fixed size, breaks the cycle). A C-style enum (all-unit) and a generic/unknown name
+    /// resolve to nothing.
+    fn contained_types(&self, name: Symbol) -> Vec<Symbol> {
         let mut out = Vec::new();
-        if let Some(Def {
-            kind: DefKind::Struct(fields),
-            ..
-        }) = self.defs.lookup(name)
-        {
-            for (_, fty) in fields {
-                collect_value_structs(fty, &mut out);
+        match self.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Struct(fields)) => {
+                for (_, fty) in fields {
+                    collect_value_structs(fty, &mut out);
+                }
             }
+            Some(DefKind::Enum(variants)) => {
+                for v in variants {
+                    for fty in v.payload.field_tys() {
+                        collect_value_structs(&fty, &mut out);
+                    }
+                }
+            }
+            _ => {}
         }
         out
     }
@@ -799,17 +866,30 @@ impl Sema<'_> {
         }
     }
 
-    /// Whether `t` is an aggregate with no scalar value — a tuple, a fixed-size array, or a *struct*
-    /// (`Ty::Named` resolving to a `DefKind::Struct`). An *enum* `Ty::Named` is **not** an aggregate:
-    /// a C-style variant is its integer discriminant, so enum equality is well-defined. Used to
-    /// reject `==`/`!=` on values whose MIR is a base pointer (where a compare would be meaningless).
+    /// Whether the named type `sym` is a **data-carrying** (tagged-union) enum — a declared enum with
+    /// at least one payload (tuple/struct) variant. Such a value is a discriminant + padded payload
+    /// byte buffer (an aggregate, addressed by base pointer), unlike a C-style all-unit enum, whose
+    /// value is its i32 discriminant scalar. The distinction drives layout, `==`, and cast validity.
+    fn enum_is_data_carrying(&self, sym: Symbol) -> bool {
+        matches!(
+            self.defs.lookup(sym).map(|d| &d.kind),
+            Some(DefKind::Enum(vs)) if vs.iter().any(|v| !v.payload.is_unit())
+        )
+    }
+
+    /// Whether `t` is an aggregate with no scalar value — a tuple, a fixed-size array, a slice
+    /// (a fat `(ptr, len)` view), a *struct*, or a **data-carrying enum** (a tagged union). A
+    /// *C-style* (all-unit) enum is **not** an aggregate: a variant is its integer discriminant, so
+    /// enum equality is well-defined. Used to reject `==`/`!=` on values whose MIR is a base pointer.
     fn is_aggregate_ty(&self, t: &Ty) -> bool {
         match t {
-            Ty::Tuple(_) | Ty::Array { .. } => true,
-            Ty::Named(n) => matches!(
-                self.defs.lookup(*n).map(|d| &d.kind),
-                Some(DefKind::Struct(_))
-            ),
+            Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) => true,
+            Ty::Named(n) => {
+                matches!(
+                    self.defs.lookup(*n).map(|d| &d.kind),
+                    Some(DefKind::Struct(_))
+                ) || self.enum_is_data_carrying(*n)
+            }
             _ => false,
         }
     }
@@ -896,13 +976,17 @@ impl Sema<'_> {
         if from == to {
             return true;
         }
-        // A scalar, or an enum `Named` (its integer discriminant) — both integer-representable.
+        // A scalar, or a *C-style* enum `Named` (its integer discriminant) — both integer-
+        // representable. A **data-carrying** enum is a byte buffer, not a discriminant scalar, so it
+        // is excluded (casting a tagged union to/from an integer is a byte reinterpret, rejected).
         let scalar_like = |t: &Ty| match t {
             Ty::Scalar(_) => true,
-            Ty::Named(n) => matches!(
-                self.defs.lookup(*n).map(|d| &d.kind),
-                Some(DefKind::Enum(_))
-            ),
+            Ty::Named(n) => {
+                matches!(
+                    self.defs.lookup(*n).map(|d| &d.kind),
+                    Some(DefKind::Enum(_))
+                ) && !self.enum_is_data_carrying(*n)
+            }
             _ => false,
         };
         match (from, to) {
@@ -1545,12 +1629,238 @@ impl Sema<'_> {
                 }
             }
             PatKind::Wildcard | PatKind::Unit => {}
+            // A data-carrying enum-variant pattern: validate the variant + payload shape and bind the
+            // inner fields to their declared types (so an arm body sees `x`/`y` typed).
+            PatKind::Variant { path, fields } => self.check_variant_pattern(path, fields, pat.span),
             // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
             PatKind::Int { .. }
             | PatKind::Char(_)
             | PatKind::Bool(_)
             | PatKind::Path(_)
             | PatKind::Range { .. } => {}
+        }
+    }
+
+    /// Type-check and bind a data-carrying enum-variant pattern `Enum::Variant(..)` / `Enum::Variant
+    /// { .. }`. Resolves the variant, rejects an unknown variant (E0301), a payload-kind mismatch or
+    /// a wrong tuple arity (E0401), and binds each payload sub-pattern to its declared field type.
+    /// On any error it still binds the sub-patterns (to `Unknown`) so the arm body type-checks
+    /// without cascading.
+    fn check_variant_pattern(&mut self, path: &Path, fields: &VariantPat, span: Span) {
+        let (Some(ename), Some(vname)) = (
+            path.segments.first().map(|s| s.sym),
+            path.segments.last().map(|s| s.sym),
+        ) else {
+            self.bind_variant_fields_unknown(fields);
+            return;
+        };
+        // Clone the payload out of the def map so the immutable borrow ends before we take `&mut self`.
+        let payload = match self.defs.lookup(ename) {
+            Some(Def {
+                kind: DefKind::Enum(variants),
+                ..
+            }) => match variants.iter().find(|v| v.name == vname) {
+                Some(v) => v.payload.clone(),
+                None => {
+                    let en = self.sym_str(ename).to_string();
+                    let vn = self.sym_str(vname).to_string();
+                    self.error(span, "E0301", format!("no variant `{vn}` in enum `{en}`"));
+                    self.bind_variant_fields_unknown(fields);
+                    return;
+                }
+            },
+            // `path[0]` is not a declared enum: stay lenient (an unmodeled name), bind leniently.
+            _ => {
+                self.bind_variant_fields_unknown(fields);
+                return;
+            }
+        };
+        let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
+        match (fields, &payload) {
+            (VariantPat::Tuple(subs), VariantPayload::Tuple(tys)) => {
+                if subs.len() != tys.len() {
+                    self.error(
+                        span,
+                        "E0401",
+                        format!(
+                            "enum variant `{qual}` has {} field(s), but the pattern binds {}",
+                            tys.len(),
+                            subs.len()
+                        ),
+                    );
+                }
+                for (i, sub) in subs.iter().enumerate() {
+                    let t = tys.get(i).cloned().unwrap_or(Ty::Unknown);
+                    self.bind_pattern(sub, &t);
+                }
+            }
+            (VariantPat::Struct(fps), VariantPayload::Struct(named)) => {
+                for fp in fps {
+                    match named.iter().find(|(n, _)| *n == fp.name).map(|(_, t)| t.clone()) {
+                        Some(t) => self.bind_pattern(&fp.pat, &t),
+                        None => {
+                            let fname = self.sym_str(fp.name).to_string();
+                            self.error(
+                                fp.pat.span,
+                                "E0301",
+                                format!("no field `{fname}` in enum variant `{qual}`"),
+                            );
+                            self.bind_pattern(&fp.pat, &Ty::Unknown);
+                        }
+                    }
+                }
+            }
+            (_, VariantPayload::Unit) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "enum variant `{qual}` has no payload to destructure; match it as `{qual}`"
+                    ),
+                );
+                self.bind_variant_fields_unknown(fields);
+            }
+            (VariantPat::Tuple(_), VariantPayload::Struct(_)) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!("enum variant `{qual}` is a struct variant; destructure it with `{{ .. }}`"),
+                );
+                self.bind_variant_fields_unknown(fields);
+            }
+            (VariantPat::Struct(_), VariantPayload::Tuple(_)) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!("enum variant `{qual}` is a tuple variant; destructure it with `( .. )`"),
+                );
+                self.bind_variant_fields_unknown(fields);
+            }
+        }
+    }
+
+    /// Bind every sub-pattern of a variant payload pattern to `Unknown` — the error-recovery path so
+    /// an ill-formed variant pattern doesn't leave its bindings untyped (a cascade of E0301s).
+    fn bind_variant_fields_unknown(&mut self, fields: &VariantPat) {
+        match fields {
+            VariantPat::Tuple(subs) => {
+                for s in subs {
+                    self.bind_pattern(s, &Ty::Unknown);
+                }
+            }
+            VariantPat::Struct(fps) => {
+                for fp in fps {
+                    self.bind_pattern(&fp.pat, &Ty::Unknown);
+                }
+            }
+        }
+    }
+
+    /// If `callee(args)` is `Enum::Variant(args)` constructing a **tuple-payload** variant, type-check
+    /// it (arity + per-field types) and return the enum's nominal type. Returns `None` when the callee
+    /// is not an enum-variant path (an ordinary function/method call — falls through to `type_call`).
+    /// A unit / struct variant reached this way is a mis-spelled constructor and is rejected (E0401).
+    fn type_variant_construction(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Ty> {
+        let ExprKind::Field { base, name } = &callee.kind else {
+            return None;
+        };
+        let ExprKind::Path(p) = &base.kind else {
+            return None;
+        };
+        if !p.is_single() {
+            return None;
+        }
+        let ename = p.first().sym;
+        let vname = name.sym;
+        // Resolve under a scoped immutable borrow: `None` = not an enum (defer to `type_call`);
+        // `Some(None)` = an enum but an unknown variant; `Some(Some(p))` = the variant's payload.
+        let resolved: Option<Option<VariantPayload>> = match self.defs.lookup(ename) {
+            Some(Def {
+                kind: DefKind::Enum(vs),
+                ..
+            }) => Some(vs.iter().find(|v| v.name == vname).map(|v| v.payload.clone())),
+            _ => None,
+        };
+        let payload_opt = resolved?; // not an enum → ordinary call
+        let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
+        let Some(payload) = payload_opt else {
+            for a in args {
+                self.type_expr(a);
+            }
+            self.error(span, "E0301", format!("no variant `{qual}`"));
+            return Some(Ty::Error);
+        };
+        match payload {
+            VariantPayload::Tuple(tys) => {
+                if args.len() != tys.len() {
+                    self.error(
+                        span,
+                        "E0401",
+                        format!(
+                            "enum variant `{qual}` takes {} field(s), but {} were supplied",
+                            tys.len(),
+                            args.len()
+                        ),
+                    );
+                }
+                for (i, a) in args.iter().enumerate() {
+                    let fty = tys.get(i).cloned().unwrap_or(Ty::Unknown);
+                    self.check_payload_field(a, &fty);
+                }
+            }
+            VariantPayload::Unit => {
+                for a in args {
+                    self.type_expr(a);
+                }
+                self.error(
+                    span,
+                    "E0401",
+                    format!("enum variant `{qual}` has no payload; write it as `{qual}`"),
+                );
+            }
+            VariantPayload::Struct(_) => {
+                for a in args {
+                    self.type_expr(a);
+                }
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "enum variant `{qual}` is a struct variant; construct it with `{qual} {{ .. }}`"
+                    ),
+                );
+            }
+        }
+        Some(Ty::Named(ename))
+    }
+
+    /// Type-check one payload/field initializer `arg` against its declared type `fty`: an unsuffixed
+    /// numeric literal adapts (and is range-checked), a non-literal scalar of a different type is an
+    /// E0401 (the same rule `let`/assign/struct-init apply). Non-scalar fields stay lenient.
+    fn check_payload_field(&mut self, arg: &Expr, fty: &Ty) {
+        let at = self.type_expr(arg);
+        if self.literal_adapts(fty, arg) {
+            self.retype_adapted_literal(arg, fty);
+        }
+        self.range_check_int_literal(arg, fty);
+        if let (Ty::Scalar(fs), Ty::Scalar(vs)) = (fty, &at) {
+            if fs != vs && !self.literal_adapts(fty, arg) {
+                self.error(
+                    arg.span,
+                    "E0401",
+                    format!(
+                        "type mismatch: field expects `{}` but the value is `{}` (use `as {}` to convert)",
+                        fty.display(self.interner),
+                        at.display(self.interner),
+                        fs.name()
+                    ),
+                );
+            }
         }
     }
 
@@ -2018,7 +2328,16 @@ impl Sema<'_> {
                 callee,
                 generic_args,
                 args,
-            } => self.type_call(callee, generic_args, args, e.span),
+            } => {
+                // `Enum::Variant(args)` — construct a tuple-payload variant. Checked before
+                // `type_call` (which would type the `Enum::Variant` callee as a bare value and
+                // reject it as an incomplete constructor).
+                if let Some(t) = self.type_variant_construction(callee, args, e.span) {
+                    t
+                } else {
+                    self.type_call(callee, generic_args, args, e.span)
+                }
+            }
             ExprKind::Index { base, indices } => self.type_index(base, indices, e.span),
             ExprKind::Field { base, name } => {
                 // `E::B` parses as a field access on the enum-name path `E`. If `E` is a declared
@@ -2033,7 +2352,24 @@ impl Sema<'_> {
                             ..
                         }) = self.defs.lookup(p.first().sym)
                         {
-                            if variants.iter().any(|(vname, _)| *vname == name.sym) {
+                            if let Some(v) = variants.iter().find(|v| v.name == name.sym) {
+                                // A payload-carrying variant used *bare* (not `E::V(..)` / `E::V { .. }`,
+                                // which are a `Call`/`StructLit` intercepted before this) is an
+                                // incomplete constructor — reject it with a hint rather than lowering a
+                                // value with no payload. A unit variant is a complete value.
+                                if !v.payload.is_unit() {
+                                    let ename = self.sym_str(p.first().sym).to_string();
+                                    let vname = self.sym_str(name.sym).to_string();
+                                    self.error(
+                                        e.span,
+                                        "E0401",
+                                        format!(
+                                            "enum variant `{ename}::{vname}` carries a payload; \
+                                             construct it with its fields (`{ename}::{vname}(..)` or \
+                                             `{ename}::{vname} {{ .. }}`)"
+                                        ),
+                                    );
+                                }
                                 return Ty::Named(p.first().sym);
                             }
                         }
@@ -2104,6 +2440,40 @@ impl Sema<'_> {
                 }
                 if let Some(r) = rest {
                     self.type_expr(r);
+                }
+                // `Enum::Variant { .. }` — a struct-payload variant literal (a multi-segment path
+                // whose head is a declared enum). Checked before the plain struct path.
+                if path.segments.len() >= 2 {
+                    let ename = path.segments[0].sym;
+                    let vname = path.segments.last().unwrap().sym;
+                    let vp: Option<Option<VariantPayload>> = match self.defs.lookup(ename) {
+                        Some(Def {
+                            kind: DefKind::Enum(vs),
+                            ..
+                        }) => Some(vs.iter().find(|v| v.name == vname).map(|v| v.payload.clone())),
+                        _ => None,
+                    };
+                    if let Some(payload_opt) = vp {
+                        let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
+                        match payload_opt {
+                            // A struct-payload variant's named fields are checked exactly like a
+                            // struct literal's (same `(name, ty)` shape) — arity, unknown/duplicate
+                            // fields, per-field type adaptation, and completeness.
+                            Some(VariantPayload::Struct(named)) => {
+                                self.check_struct_literal(&named, fields, rest.is_some(), e.span);
+                            }
+                            Some(_) => self.error(
+                                e.span,
+                                "E0401",
+                                format!(
+                                    "enum variant `{qual}` is not a struct variant; construct it as \
+                                     `{qual}(..)` or `{qual}`"
+                                ),
+                            ),
+                            None => self.error(e.span, "E0301", format!("no variant `{qual}`")),
+                        }
+                        return Ty::Named(ename);
+                    }
                 }
                 // A `Name { … }` whose `Name` resolves to a declared struct has that nominal type
                 // (and its fields are checked for completeness); an unknown name stays lenient.
@@ -2263,7 +2633,7 @@ impl Sema<'_> {
                     }
                     // Only reason about coverage when the arms actually use variant patterns; a match
                     // by raw discriminant (or some unmodeled spelling) stays lenient.
-                    !covered.is_empty() && variants.iter().any(|(v, _)| !covered.contains(v))
+                    !covered.is_empty() && variants.iter().any(|v| !covered.contains(&v.name))
                 }
                 _ => false, // a non-enum `Named` (struct / generic / forward ref): lenient
             },
@@ -2427,7 +2797,9 @@ fn arm_is_catch_all(a: &MatchArm) -> bool {
 /// nothing. Used by `match_is_provably_nonexhaustive` for enum coverage.
 fn collect_variant_names(p: &Pattern, out: &mut HashSet<Symbol>) {
     match &p.kind {
-        PatKind::Path(path) => {
+        // A unit-variant `Color::Red` and a payload-variant `Op::Add(a, b)` / `Shape::C { .. }` both
+        // cover their (last-segment) variant name for exhaustiveness.
+        PatKind::Path(path) | PatKind::Variant { path, .. } => {
             if let Some(seg) = path.segments.last() {
                 out.insert(seg.sym);
             }
