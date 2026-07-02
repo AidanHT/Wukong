@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0401
+module tests.fail.bitwise_on_float
+
+// Bitwise `& | ^` require integer operands. On floats, mir_build emitted an integer bitwise MIR op on
+// float SSA values — the interpreter truncated-to-int (`6.0 & 3.0` = 2) while Cranelift took the raw
+// IEEE bits then fptosi (= 3): a gate-blind interp!=native. Must be rejected E0401.
+fn main() -> i32 {
+    let x: f32 = 6.0;
+    let y: f32 = 3.0;
+    return (x & y) as i32;
+}

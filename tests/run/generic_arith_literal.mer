@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 500
+// EXPECT-OUT: 1250
+// EXPECT-OUT: -9999999997
+// EXPECT-OUT: 250
+module tests.run.generic_arith_literal
+
+// Regression (sweep #15): in a monomorphized generic body, a LEFT-hand integer literal in an
+// arithmetic binop against a generic-typed operand (`2 * x`, `10 + x`, `3 - x`, `10 / x`) truncated
+// the generic value to i32. sema's `join` returns its LEFT operand when the pair isn't two scalars,
+// so `2 * x` (i32-literal · T) was typed i32 and mir_build coerced x (f32/i64) down
+// (`fptoui f32 -> i32`) — a gate-blind wrong answer all four backends agreed on. Right-hand literals
+// (`x * 2`) already worked. Fix: an unsuffixed literal adapts to a generic-param operand on EITHER side.
+
+fn scale2<T>(x: T) -> T { return 2 * x; }    // left literal, multiply
+fn rightlit<T>(x: T) -> T { return x * 2; }  // right literal — the already-working control
+fn addl<T>(x: T) -> T { return 10 + x; }     // left literal, add
+fn subl<T>(x: T) -> T { return 3 - x; }      // left literal, subtract (order matters)
+fn divl<T>(x: T) -> T { return 10 / x; }     // left literal, divide
+
+fn main() -> i32 {
+    let v: f32 = 2.5;
+    print((scale2(v) * 100.0) as i32);      // 2*2.5=5.0   -> 500
+    print((rightlit(v) * 100.0) as i32);    // 2.5*2=5.0   -> 500 (control)
+    print((addl(v) * 100.0) as i32);        // 10+2.5=12.5 -> 1250
+
+    let w: i64 = 10000000000;
+    print(subl(w));                          // 3-1e10 = -9999999997 (i64, not truncated)
+
+    let f: f32 = 4.0;
+    print((divl(f) * 100.0) as i32);        // 10/4.0=2.5  -> 250
+
+    return 0;
+}

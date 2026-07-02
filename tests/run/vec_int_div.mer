@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 136
+// EXPECT-OUT: 18
+module tests.run.vec_int_div
+
+// Regression (sweep #16): an integer-division elementwise loop (`c[i] = a[i] / 2`) was auto-vectorized
+// to a `<4 x i32> sdiv`, but Cranelift x86 has no SIMD integer division → its verifier PANICKED (native
+// crash, exit 1) while interp ran it correctly (interp != native + compiler ICE). Fix: the vectorizer
+// only vectorizes `/` on a FLOAT lane; integer division stays scalar. Float division still vectorizes.
+
+fn main() -> i32 {
+    // integer division (was the native panic) — must run correctly on both backends now
+    let mut a: [i32; 16] = [0; 16];
+    for i in 0..16 { a[i] = (i as i32) + 10; }   // 10..25
+    let mut c: [i32; 16] = [0; 16];
+    for i in 0..16 { c[i] = a[i] / 2; }
+    let mut s: i32 = 0;
+    for k in 0..16 { s = s + c[k]; }
+    print(s);                                    // 136
+
+    // float division (still vectorizes to fdiv) — control that the fix did not over-disable
+    let mut f: [f32; 8] = [0.0; 8];
+    for i in 0..8 { f[i] = (i as f32) + 1.0; }   // 1..8
+    let mut g: [f32; 8] = [0.0; 8];
+    for i in 0..8 { g[i] = f[i] / 2.0; }         // 0.5..4.0
+    let mut fs: f32 = 0.0;
+    for k in 0..8 { fs = fs + g[k]; }
+    print(fs as i32);                            // 18
+
+    return 0;
+}

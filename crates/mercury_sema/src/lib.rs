@@ -751,6 +751,16 @@ impl Sema<'_> {
                 Some(init) => self.eval_usize_depth(init, depth + 1),
                 None => 0,
             },
+            // Const arithmetic in a length (`[i32; 2+2]`, `[i32; N+1]`): fold via the shared
+            // `BinOp::fold_const_len` that mir_build's `const_usize_expr` also uses, so the slot size
+            // and this bounds check agree. Previously this fell to `_ => 0`, sizing the array 0 (an
+            // unsized bare pointer → native segfault / interp != native / -O0 != -O2) and spuriously
+            // rejecting valid code as "length 0".
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.eval_usize_depth(lhs, depth + 1);
+                let r = self.eval_usize_depth(rhs, depth + 1);
+                op.fold_const_len(l, r)
+            }
             _ => 0,
         }
     }
@@ -1130,6 +1140,32 @@ impl Sema<'_> {
                         self.retype_adapted_literal(&f.value, fty);
                     }
                     self.range_check_int_literal(&f.value, fty);
+                    // An array field's initializer must have the declared length. `Buf { data: [11,22] }`
+                    // for `data: [i32; 4]` left the tail uninitialized (interp read 0, native read stack
+                    // garbage — a backend divergence), and an over-long one silently dropped elements.
+                    // `let`/tuple already length-check array initializers; struct fields did not.
+                    if let Ty::Array { len, .. } = fty {
+                        let init_len = match &f.value.kind {
+                            ExprKind::ArrayLit(items) => Some(items.len() as u64),
+                            ExprKind::ArrayRepeat { count, .. } => Some(self.eval_usize(count)),
+                            _ => None,
+                        };
+                        if let Some(il) = init_len {
+                            if il != *len {
+                                self.error(
+                                    f.value.span,
+                                    "E0401",
+                                    format!(
+                                        "array field `{}` has length {} but its initializer has {} \
+                                         element(s)",
+                                        self.sym_str(name),
+                                        len,
+                                        il
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     // Scalar-type agreement, the same rule `let`/return/assignment enforce: a
                     // NON-literal field value of a different scalar type (`S { a: x }` with `a: i32`,
                     // `x: f32`) silently truncated/demoted it — both backends agreeing on the lossy
@@ -2017,6 +2053,35 @@ impl Sema<'_> {
         self.literal_adapts(ann, init)
     }
 
+    /// Whether `e` is an *unsuffixed* integer literal — its signedness is not pinned by a suffix, so
+    /// it adapts to the other operand of a comparison (`u32_var < 5` stays legal: `5` becomes
+    /// unsigned). A *suffixed* literal (`5u32`, `3i32`) has a FIXED signedness and is NOT flexible,
+    /// so it must still participate in the mixed-signedness ordered-compare check — `i32 < 5u32` is a
+    /// genuine sign mismatch (`a < 5u32` and `5u32 > a` disagree), not adaptation.
+    fn is_sign_flexible_int_literal(&self, e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Int(s) if !has_int_suffix(self.sym_str(*s)))
+    }
+
+    /// Whether `t` is one of the current function's generic type parameters (`T` in `fn f<T>`) —
+    /// a `Ty::Named` whose symbol is in scope as a generic. At check time such a type is abstract
+    /// (not a scalar); it becomes concrete only at monomorphization.
+    fn is_generic_ty(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Named(s) if self.generics.contains(s))
+    }
+
+    /// Whether `e` is an *unsuffixed* numeric literal (int or float), optionally under a unary minus —
+    /// the type-flexible kind that adapts to the other operand of an arithmetic binop. Used so a
+    /// literal adapts to a generic-param operand (`2 * x` where `x: T`) instead of forcing the binop to
+    /// the literal's i32 default and truncating the generic value at monomorphization.
+    fn is_adaptable_num_literal(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Int(s) => !has_int_suffix(self.sym_str(*s)),
+            ExprKind::Float(s) => !has_float_suffix(self.sym_str(*s)),
+            ExprKind::Unary { op: UnOp::Neg, expr } => self.is_adaptable_num_literal(expr),
+            _ => false,
+        }
+    }
+
     /// Whether an *unsuffixed* numeric literal — optionally wrapped in a unary minus, e.g.
     /// `let x: f64 = -1.5;` — adapts to the integer/float annotation `ann`. A leading `-`
     /// does not change a literal's kind, so we peel `Neg` and re-check the inner literal.
@@ -2281,6 +2346,34 @@ impl Sema<'_> {
                                 ),
                             );
                             Ty::Unknown
+                        } else if matches!(op, UnOp::Not)
+                            && matches!(&t, Ty::Scalar(s) if s.is_float())
+                        {
+                            // `~`/`!` is a bitwise complement — undefined on a float. mir_build emitted
+                            // a bitwise-not on float SSA (the interpreter truncates to int, Cranelift
+                            // takes the raw IEEE bits then fptosi — a gate-blind interp!=native). E0401.
+                            self.error(
+                                expr.span,
+                                "E0401",
+                                "bitwise complement `!`/`~` requires an integer operand, not a float"
+                                    .to_string(),
+                            );
+                            Ty::Unknown
+                        } else if matches!(op, UnOp::Neg)
+                            && matches!(&expr.kind, ExprKind::Int(s)
+                                if !has_int_suffix(self.sym_str(*s))
+                                    && parse_u64_text(self.sym_str(*s)) == Some(1u64 << 63))
+                        {
+                            // `-9223372036854775808` is i64::MIN. The magnitude 2^63 alone overflows
+                            // i64, so `int_lit_scalar` defaults the bare literal to u64 (right for the
+                            // positive form `print(9223372036854775808)`) — but under a unary minus it
+                            // is i64::MIN. Re-type the inner literal (and the negation) as i64 so
+                            // mir_build bakes the i64::MIN constant and `print` treats it as signed;
+                            // otherwise the u64 negate wrapped back to +2^63 and printed positive — a
+                            // gate-blind wrong sign both backends agreed on. Mirrors how the annotated
+                            // `let x: i64 = -9223372036854775808` already lowers correctly.
+                            self.types.insert(expr.id, Ty::Scalar(Scalar::I64));
+                            Ty::Scalar(Scalar::I64)
                         } else {
                             t
                         }
@@ -2357,6 +2450,27 @@ impl Sema<'_> {
                     );
                     return Ty::Unknown;
                 }
+                // Bitwise (`& | ^`) and shift (`<< >>`) operators require INTEGER operands. A float
+                // operand reached mir_build, which emitted an integer bitwise/shift MIR op on float SSA
+                // values: the interpreter truncated-to-int-then-bitwise while Cranelift took the raw
+                // IEEE bits then fptosi (a gate-blind interp!=native), and a float SHIFT crashed the
+                // verifier at -O0 / panicked mem2reg at -O2. Reject with E0401 (Rust rejects `f32 & f32`
+                // likewise). Concrete-float-only, so Unknown/Error stay lenient.
+                if matches!(op, BitAnd | BitOr | BitXor | Shl | Shr)
+                    && [&l, &r]
+                        .into_iter()
+                        .any(|t| matches!(t, Ty::Scalar(s) if s.is_float()))
+                {
+                    self.error(
+                        e.span,
+                        "E0401",
+                        format!(
+                            "bitwise/shift operator `{}` requires integer operands, not float",
+                            op.glyph()
+                        ),
+                    );
+                    return Ty::Unknown;
+                }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
                     // base-pointer compare — two distinct values are *always* "not equal" — a wrong
@@ -2427,15 +2541,18 @@ impl Sema<'_> {
                             // signedness is taken from ONE operand, so `a < b` (i32 vs u32) and
                             // `b > a` give CONTRADICTORY answers (`slt` says -1 < 1, `ugt` says
                             // 1 < 4294967295) — a gate-blind logic bug both backends agree on. Reject
-                            // a concrete opposite-signedness integer pair. An unsuffixed int LITERAL
-                            // is sign-flexible (it adapts to the other operand), so skip when either
-                            // side is one — `b < 5` / `5 < a` stay fine. Rust rejects mixed
-                            // signed/unsigned comparison for exactly this reason.
+                            // a concrete opposite-signedness integer pair. Only an *unsuffixed* int
+                            // LITERAL is sign-flexible (it adapts to the other operand), so skip when
+                            // either side is one — `b < 5` / `5 < a` stay fine. A *suffixed* literal
+                            // (`5u32`, `200u8`, `3i32`) pins its signedness and must still be checked:
+                            // `i32 < 5u32` is a genuine mismatch that made `a < 5u32` (=1) and
+                            // `5u32 > a` (=0) disagree — the guard was bypassed whenever the literal
+                            // adopted the peer type. Rust rejects mixed signed/unsigned compares too.
                             if ls.is_int()
                                 && rs.is_int()
                                 && ls.is_signed() != rs.is_signed()
-                                && !matches!(&lhs.kind, ExprKind::Int(_))
-                                && !matches!(&rhs.kind, ExprKind::Int(_))
+                                && !self.is_sign_flexible_int_literal(lhs)
+                                && !self.is_sign_flexible_int_literal(rhs)
                             {
                                 let (s, u) = if ls.is_signed() {
                                     (ls.name(), rs.name())
@@ -2464,7 +2581,25 @@ impl Sema<'_> {
                         Ty::Scalar(Scalar::Bool)
                     }
                     And | Or => Ty::Scalar(Scalar::Bool),
-                    _ => join(l, r),
+                    _ => {
+                        // For arithmetic, adapt an unsuffixed numeric literal to a generic-param
+                        // operand on EITHER side. In a generic body `T` isn't a scalar, so `join`
+                        // (which returns its LEFT arg when the pair isn't two scalars) mis-typed
+                        // `2 * x` (i32-literal · T) as i32 — and mir_build then truncated the
+                        // monomorphized f32/i64 operand (`fptoui f32 -> i32`), a gate-blind wrong
+                        // answer. `x * 2` already worked (`join(T, i32)` returns the left T); this
+                        // makes it symmetric, so `2 * x` types as `T` and the literal re-adapts at
+                        // monomorphization.
+                        let arith = matches!(op, Add | Sub | Mul | Div | Rem);
+                        if arith && self.is_adaptable_num_literal(lhs) && self.is_generic_ty(&r) {
+                            r
+                        } else if arith && self.is_adaptable_num_literal(rhs) && self.is_generic_ty(&l)
+                        {
+                            l
+                        } else {
+                            join(l, r)
+                        }
+                    }
                 }
             }
             ExprKind::Call {

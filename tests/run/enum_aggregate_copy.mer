@@ -1,0 +1,80 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 42
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 42
+module tests.run.enum_aggregate_copy
+
+// Regression (differential sweep #14): copying an aggregate that contains an enum field/element must
+// copy the enum's i32-discriminant leaf. `emit_copy`'s `Ty::Named` arm recursed struct fields but
+// emitted NOTHING for an enum leaf (`struct_field_tys` returns None for an enum), so a `let b = a` /
+// sret return / array/tuple/nested copy left the destination's enum slot uninitialized — a gate-blind
+// wrong answer that ALSO diverged interp (zero slot -> 0) vs native (uninitialized stack garbage).
+// Covers struct, tuple, array, nested-struct, and sret-return copy shapes.
+
+enum E { Neg = -5, Pos = 7 }
+enum Color { Red, Green, Blue }   // 0, 1, 2
+
+struct S { e: E }
+struct Tag { c: Color, n: i32 }
+struct Nest { inner: Tag, k: i32 }
+
+fn make() -> Tag {
+    let t: Tag = Tag { c: Color::Blue, n: 42 };
+    return t;   // sret return copies the aggregate, including the enum leaf
+}
+
+fn main() -> i32 {
+    // 1. struct{enum} copy, negative signed discriminant
+    let a: S = S { e: E::Neg };
+    let b: S = a;
+    print(b.e as i64);          // -5
+
+    let a2: S = S { e: E::Pos };
+    let b2: S = a2;
+    print(b2.e as i64);         // 7
+
+    // 2. struct{enum, i32} copy
+    let t1: Tag = Tag { c: Color::Green, n: 9 };
+    let t2: Tag = t1;
+    print(t2.c as i32);         // 1
+    print(t2.n);                // 9
+
+    // 3. tuple (enum, i32) copy
+    let tp: (Color, i32) = (Color::Blue, 8);
+    let tp2: (Color, i32) = tp;
+    print(tp2.0 as i32);        // 2
+    print(tp2.1);               // 8
+
+    // 4. array-of-enum copy
+    let arr: [Color; 3] = [Color::Blue, Color::Red, Color::Green];
+    let cp: [Color; 3] = arr;
+    print(cp[0] as i32);        // 2
+    print(cp[1] as i32);        // 0
+    print(cp[2] as i32);        // 1
+
+    // 5. nested struct copy
+    let outer: Nest = Nest { inner: Tag { c: Color::Blue, n: 42 }, k: 7 };
+    let cp2: Nest = outer;
+    print(cp2.inner.c as i32);  // 2
+    print(cp2.inner.n);         // 42
+    print(cp2.k);               // 7
+
+    // 6. sret return copies the aggregate (incl. enum leaf)
+    let r: Tag = make();
+    print(r.c as i32);          // 2
+    print(r.n);                 // 42
+
+    return 0;
+}
