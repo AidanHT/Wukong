@@ -1,0 +1,65 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 99
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+module tests.run.aggregate_self_assign
+
+// Regression (differential sweep #14): assigning an aggregate *literal* to an existing place whose
+// field initializers read that same place (e.g. the swap `p = Pt { x: p.y, y: p.x }`) must evaluate
+// the literal into a temporary and THEN deep-copy it in. The assign path built the literal *directly*
+// into the destination, so a later field read an earlier field already overwritten — a gate-blind
+// wrong answer both backends produced identically (the swap gave `7 7` instead of `7 3`). Covers
+// struct, tuple, array, nested-field target, and loop-carried self-referential assignment.
+
+struct Pt { x: i32, y: i32 }
+struct Box2 { p: Pt, tag: i32 }
+
+fn main() -> i32 {
+    // struct swap: y reads x's PRE-assignment value
+    let mut p: Pt = Pt { x: 3, y: 7 };
+    p = Pt { x: p.y, y: p.x };
+    print(p.x);     // 7
+    print(p.y);     // 3
+
+    // tuple: later element reads an earlier element
+    let mut t: (i32, i32) = (5, 9);
+    t = (99, t.0);
+    print(t.0);     // 99
+    print(t.1);     // 5  (old t.0, not the just-written 99)
+
+    // array permute reading earlier elements
+    let mut a: [i32; 3] = [1, 2, 3];
+    a = [a[2], a[0], a[1]];
+    print(a[0]);    // 3
+    print(a[1]);    // 1
+    print(a[2]);    // 2
+
+    // nested-field target
+    let mut bx: Box2 = Box2 { p: Pt { x: 4, y: 6 }, tag: 1 };
+    bx.p = Pt { x: bx.p.y, y: bx.p.x };
+    print(bx.p.x);  // 6
+    print(bx.p.y);  // 4
+    print(bx.tag);  // 1
+
+    // loop-carried Fibonacci via a self-referential struct assign
+    let mut f: Pt = Pt { x: 0, y: 1 };
+    let mut i: i32 = 0;
+    while i < 5 {
+        f = Pt { x: f.x + f.y, y: f.x };
+        i = i + 1;
+    }
+    print(f.x);     // 5
+    print(f.y);     // 3
+
+    return 0;
+}
