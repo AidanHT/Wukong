@@ -7,20 +7,18 @@
 
 use mercury_mir::Function;
 
-use crate::cfg;
-
 const NONE: u32 = u32::MAX;
 
-/// Immediate dominators, indexed by block id. `idom[entry] == entry`. Every block's idom is set
-/// (the input must be fully reachable).
-pub(crate) fn idoms(f: &Function) -> Vec<u32> {
+/// Immediate dominators, indexed by block id, from a precomputed reverse postorder and predecessor
+/// map. `idom[entry] == entry`. Every block's idom is set (the input must be fully reachable). The
+/// analysis cache holds `rpo`/`preds` and reuses them across passes rather than recomputing them
+/// here per call.
+pub(crate) fn idoms_from(f: &Function, rpo: &[u32], preds: &[Vec<u32>]) -> Vec<u32> {
     let n = f.blocks.len();
-    let rpo = cfg::reverse_postorder(f);
     let mut rpo_num = vec![usize::MAX; n];
     for (i, &b) in rpo.iter().enumerate() {
         rpo_num[b as usize] = i;
     }
-    let preds = cfg::predecessors(f);
 
     let mut idom = vec![NONE; n];
     let entry = f.entry.0;
@@ -29,7 +27,7 @@ pub(crate) fn idoms(f: &Function) -> Vec<u32> {
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in &rpo {
+        for &b in rpo {
             if b == entry {
                 continue;
             }
@@ -68,11 +66,11 @@ fn intersect(mut a: u32, mut b: u32, idom: &[u32], rpo_num: &[usize]) -> u32 {
     a
 }
 
-/// Dominance frontiers, indexed by block id: `df[b]` is the set of blocks where `b`'s dominance
-/// ends — exactly the blocks that may need a phi for a value defined in `b`.
-pub(crate) fn dominance_frontiers(f: &Function, idom: &[u32]) -> Vec<Vec<u32>> {
+/// Dominance frontiers, indexed by block id, from precomputed idoms and predecessors: `df[b]` is
+/// the set of blocks where `b`'s dominance ends — exactly the blocks that may need a phi for a value
+/// defined in `b`.
+pub(crate) fn dominance_frontiers_from(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let n = f.blocks.len();
-    let preds = cfg::predecessors(f);
     let mut df: Vec<Vec<u32>> = vec![Vec::new(); n];
     for b in 0..n as u32 {
         let ps = &preds[b as usize];

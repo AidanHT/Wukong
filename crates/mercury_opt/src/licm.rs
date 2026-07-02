@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use mercury_mir::{BinOp, Function, Inst, Op, Terminator};
 
-use crate::{cfg, dom, each_op_use, Pass};
+use crate::{cfg, each_op_use, CfgAnalyses, Pass};
 
 pub struct Licm;
 
@@ -25,18 +25,21 @@ impl Pass for Licm {
         "licm"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
-        cfg::prune_unreachable(f);
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+        if cfg::prune_unreachable(f) {
+            cache.invalidate();
+        }
         if f.blocks.len() < 2 {
             return false;
         }
-        let idom = dom::idoms(f);
-        let preds = cfg::predecessors(f);
-        let loops = natural_loops(f, &idom, &preds);
+        // `idom`/`preds` borrow the cache; `hoist_from_loop` mutates `f` (a different object), so
+        // the two coexist for the whole loop.
+        let (idom, preds) = cache.idoms_and_preds(f);
+        let loops = natural_loops(f, idom, preds);
 
         let mut changed = false;
         for (header, body) in loops {
-            if let Some(preheader) = preheader(f, header, &body, &preds, &idom) {
+            if let Some(preheader) = preheader(f, header, &body, preds, idom) {
                 changed |= hoist_from_loop(f, &body, preheader);
             }
         }

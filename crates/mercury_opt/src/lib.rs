@@ -10,6 +10,7 @@
 //!  * **dse** — dead-store elimination (`-O2`).
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 
+mod cache;
 mod cfg;
 mod cse;
 mod dce;
@@ -22,6 +23,7 @@ mod phi;
 mod simplify;
 mod simplify_cfg;
 
+pub use cache::CfgAnalyses;
 pub use cse::Cse;
 pub use dce::Dce;
 pub use dse::Dse;
@@ -37,9 +39,14 @@ use std::time::{Duration, Instant};
 use mercury_mir::{Op, Program, Terminator, ValueId};
 
 /// A function-level transform. Returns whether it changed anything.
+///
+/// `cache` holds the CFG/dominator analyses for `f`, shared across every pass in the fixpoint. A
+/// pass reads whatever it needs from it (computed lazily, once) and — if it changes the block set or
+/// any terminator's successor edges — must call [`CfgAnalyses::invalidate`]. Passes that only touch
+/// instructions, block parameters, or edge arguments leave the cache alone.
 pub trait Pass {
     fn name(&self) -> &'static str;
-    fn run_function(&self, f: &mut mercury_mir::Function) -> bool;
+    fn run_function(&self, f: &mut mercury_mir::Function, cache: &mut CfgAnalyses) -> bool;
 }
 
 /// In-process optimizer timing, gathered by [`optimize_timed`]. This is **measurement only**: the
@@ -133,6 +140,11 @@ impl PassManager {
     /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
     /// change which passes run or in what order, so the resulting MIR is identical either way.
     fn run_function(&self, f: &mut mercury_mir::Function, mut timings: Option<&mut Timings>) {
+        // One analysis cache per function, shared across every pass and every fixpoint iteration.
+        // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
+        // stays valid — and reused — across the long tail of the fixpoint where only instructions
+        // move. The cache never changes what a pass computes, only how often it recomputes it.
+        let mut cache = CfgAnalyses::default();
         // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
         // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
         // function — re-running it on identical MIR would again be a no-op. We therefore skip
@@ -152,11 +164,11 @@ impl PassManager {
                 let did = match timings.as_deref_mut() {
                     Some(t) => {
                         let t0 = Instant::now();
-                        let did = p.run_function(f);
+                        let did = p.run_function(f, &mut cache);
                         t.record(i, p.name(), t0.elapsed());
                         did
                     }
-                    None => p.run_function(f),
+                    None => p.run_function(f, &mut cache),
                 };
                 if did {
                     changed = true;

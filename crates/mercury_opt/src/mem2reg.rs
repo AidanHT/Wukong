@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use mercury_mir::{Function, Inst, MirType, Op, Terminator, ValueId};
 
-use crate::{cfg, dom, each_op_use, each_term_use, map_op_uses, map_term_uses, Pass};
+use crate::{cfg, each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
 pub struct Mem2Reg;
 
@@ -30,14 +30,18 @@ impl Pass for Mem2Reg {
         "mem2reg"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
-        // Dominance is only defined on reachable blocks.
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+        // Dominance is only defined on reachable blocks. Pruning renumbers blocks, so any cached
+        // analysis is stale afterwards.
         let pruned = cfg::prune_unreachable(f);
+        if pruned {
+            cache.invalidate();
+        }
         let promotable = find_promotable(f);
         if promotable.is_empty() {
             return pruned;
         }
-        promote(f, &promotable);
+        promote(f, &promotable, cache);
         true
     }
 }
@@ -98,10 +102,11 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     cand
 }
 
-fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>) {
-    let idom = dom::idoms(f);
-    let df = dom::dominance_frontiers(f, &idom);
-    let children = dom::dom_children(f, &idom);
+fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut CfgAnalyses) {
+    // The iterated dominance frontier drives phi placement; the dominator-tree children drive the
+    // rename walk. Both come from the shared cache (borrow `cache`, not `f`, so the phi/rename edits
+    // to `f` below are unaffected).
+    let (df, children) = cache.df_and_children(f);
 
     // Blocks that contain a store to each promotable slot.
     let mut def_blocks: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use mercury_mir::{Function, MirType, Op, ValueId};
 
-use crate::{cfg, dom, map_op_uses, map_term_uses, Pass};
+use crate::{cfg, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
 pub struct Cse;
 
@@ -27,10 +27,11 @@ impl Pass for Cse {
         "cse"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
-        cfg::prune_unreachable(f); // dominance requires a clean CFG
-        let idom = dom::idoms(f);
-        let children = dom::dom_children(f, &idom);
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+        if cfg::prune_unreachable(f) {
+            cache.invalidate(); // dominance requires a clean CFG; pruning renumbered blocks
+        }
+        let children = cache.dom_children(f);
 
         // Alloca base pointers are function-global value ids; collect them once.
         let mut allocas: HashSet<u32> = HashSet::new();
@@ -44,7 +45,7 @@ impl Pass for Cse {
 
         let mut cx = Numbering {
             f,
-            children: &children,
+            children,
             allocas: &allocas,
             vn: HashMap::new(),
             rewrite: HashMap::new(),
