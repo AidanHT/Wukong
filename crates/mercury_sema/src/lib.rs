@@ -1857,6 +1857,19 @@ impl Sema<'_> {
                                 ),
                             );
                             Ty::Unknown
+                        } else if matches!(op, UnOp::Not)
+                            && matches!(&t, Ty::Scalar(s) if s.is_float())
+                        {
+                            // `~`/`!` is a bitwise complement — undefined on a float. mir_build emitted
+                            // a bitwise-not on float SSA (the interpreter truncates to int, Cranelift
+                            // takes the raw IEEE bits then fptosi — a gate-blind interp!=native). E0401.
+                            self.error(
+                                expr.span,
+                                "E0401",
+                                "bitwise complement `!`/`~` requires an integer operand, not a float"
+                                    .to_string(),
+                            );
+                            Ty::Unknown
                         } else if matches!(op, UnOp::Neg)
                             && matches!(&expr.kind, ExprKind::Int(s)
                                 if !has_int_suffix(self.sym_str(*s))
@@ -1945,6 +1958,27 @@ impl Sema<'_> {
                         e.span,
                         "E0401",
                         format!("arithmetic operator `{}` is not defined for `bool`", op.glyph()),
+                    );
+                    return Ty::Unknown;
+                }
+                // Bitwise (`& | ^`) and shift (`<< >>`) operators require INTEGER operands. A float
+                // operand reached mir_build, which emitted an integer bitwise/shift MIR op on float SSA
+                // values: the interpreter truncated-to-int-then-bitwise while Cranelift took the raw
+                // IEEE bits then fptosi (a gate-blind interp!=native), and a float SHIFT crashed the
+                // verifier at -O0 / panicked mem2reg at -O2. Reject with E0401 (Rust rejects `f32 & f32`
+                // likewise). Concrete-float-only, so Unknown/Error stay lenient.
+                if matches!(op, BitAnd | BitOr | BitXor | Shl | Shr)
+                    && [&l, &r]
+                        .into_iter()
+                        .any(|t| matches!(t, Ty::Scalar(s) if s.is_float()))
+                {
+                    self.error(
+                        e.span,
+                        "E0401",
+                        format!(
+                            "bitwise/shift operator `{}` requires integer operands, not float",
+                            op.glyph()
+                        ),
                     );
                     return Ty::Unknown;
                 }
