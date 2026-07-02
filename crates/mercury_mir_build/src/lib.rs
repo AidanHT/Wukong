@@ -973,7 +973,7 @@ pub fn lower_program(
                         p.match_dequant_perchan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
