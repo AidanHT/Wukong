@@ -689,6 +689,10 @@ pub fn lower_program(
         tn_par: interner.intern("mercury_sgemm_tn_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
+        sgemv: interner.intern("mercury_sgemv"),
+        sgemv_par: interner.intern("mercury_sgemv_parallel"),
+        nt_alpha: interner.intern("mercury_sgemm_nt_alpha"),
+        nt_alpha_par: interner.intern("mercury_sgemm_nt_alpha_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
         vmath2: interner.intern("mercury_vmath2_f32"),
         vmath_bf16: interner.intern("mercury_vmath_bf16"),
@@ -852,6 +856,21 @@ pub fn lower_program(
                 // matmul recognizer in `lower_for` then emits the multicore half GEMM. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function GEMV (`for i { s=0; for j { s+=a[i*N+j]*x[j] }; y[i]=s }`):
+                // intercept before the elementwise outliner (which would outline the row loop into
+                // per-chunk scalar loops and lose the kernel). Lower it normally with `parallel = true`;
+                // the embedded `match_gemv` in `lower_for` then emits `mercury_sgemv_parallel` (rows
+                // independent → bit-equal to the serial kernel the interpreter marshals). A non-`@parallel`
+                // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        match_gemv(pat, it, lb, p.sema, p.interner).is_some()
+                    })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
@@ -1593,6 +1612,21 @@ struct GemmSyms {
     /// `C = act(A·Bᵀ + bias)` fusion in a `@parallel` function, run across cores. Bit-identical to the
     /// serial `nt_epi` the interpreter calls (each C tile owned by one task), so the gate stays exact.
     nt_epi_par: Symbol,
+    /// The matrix-times-vector kernel (`mercury_sgemv(a, x, y, m, n)`): a recognized GEMV nest
+    /// `y[i] = Σ_j a[i,j]·x[j]` (decode-time attention/projection, batch 1) lowers to this — the memory-
+    /// bound row-dot gcc keeps a latency-bound scalar chain, folded 8-wide across four accumulators.
+    sgemv: Symbol,
+    /// The multicore GEMV (`mercury_sgemv_parallel`): the independent rows mapped across cores to
+    /// saturate aggregate memory bandwidth. Bit-identical to the serial `sgemv` the interpreter calls
+    /// (each row computed by the same per-row routine, no cross-row combine), so the gate stays exact.
+    sgemv_par: Symbol,
+    /// The α-scaled `nn.Linear` kernel (`mercury_sgemm_nt_alpha(a, b, c, m, k, n, beta, alpha)`):
+    /// `C = alpha·(A·Bᵀ)` — the attention score matmul `QKᵀ/√d` and every scaled projection, where a
+    /// loop-invariant scalar `alpha` multiplies the dot in the C-tile writeback (fused, no second pass).
+    nt_alpha: Symbol,
+    /// The multicore α-scaled `nn.Linear` (`mercury_sgemm_nt_alpha_parallel`): the same fused scale in a
+    /// `@parallel` function. Bit-identical to the serial `nt_alpha` the interpreter calls.
+    nt_alpha_par: Symbol,
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
@@ -6510,6 +6544,36 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        // α-scaled `C = alpha·(A·Bᵀ)` (the attention score `QKᵀ/√d`) → `mercury_sgemm_nt_alpha`, which
+        // folds the scale into the C-tile writeback (no second pass over C). The α kernel is **NT only**;
+        // any other shape (plain `A·B`, TN) declines to the scalar nest — which computes `alpha·s`
+        // correctly — rather than emitting an UNSCALED kernel that would silently drop the scale. Batch/
+        // head offsets are already applied to `a`/`b`/`c` above, so a *batched* α matmul (multi-head
+        // attention scores) works: the per-head sub-matmul is `alpha·(A·Bᵀ)` under a constant base shift.
+        if let Some(alpha) = nest.alpha {
+            if !(nest.transposed && !nest.transposed_a) {
+                return false;
+            }
+            let alpha_v = match alpha {
+                AlphaScale::Lit(f) => self
+                    .builder
+                    .build(MirType::F32, Op::ConstFloat(f as f64, MirType::F32)),
+                AlphaScale::Sym(s) => match self.lookup(s) {
+                    Some((slot, ty)) => self.builder.build(ty.clone(), Op::Load(slot, ty)),
+                    None => return false,
+                },
+            };
+            let func = if parallel {
+                self.gemm.nt_alpha_par
+            } else {
+                self.gemm.nt_alpha
+            };
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![a, b, c, m, k, n, beta, alpha_v],
+            });
+            return true;
+        }
         let func = match (parallel, nest.transposed_a, nest.transposed) {
             (false, false, false) => self.gemm.mm,
             (true, false, false) => self.gemm.mm_par,
@@ -6523,6 +6587,33 @@ impl FnLowerer<'_> {
         self.builder.build_void(Op::Call {
             func,
             args: vec![a, b, c, m, k, n, beta],
+        });
+        true
+    }
+
+    /// Emit one `mercury_sgemv[_parallel](a, x, y, m, n)` call for a recognized GEMV nest
+    /// (`y[i] = Σ_j a[i,j]·x[j]`). Bails (false) if an operand/dim is unbound at the call site, so the
+    /// caller lowers the scalar nest. `parallel` selects the multicore kernel (rows independent → the
+    /// per-row routine is bit-identical serial vs parallel, which the interpreter marshals as the oracle).
+    fn emit_gemv(&mut self, nest: &GemvNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((x, _)), Some((y, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.x),
+            self.lookup(nest.y),
+        ) else {
+            return false;
+        };
+        let (Some(m), Some(n)) = (self.dim_value(nest.m), self.dim_value(nest.n)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.sgemv_par
+        } else {
+            self.gemm.sgemv
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, x, y, m, n],
         });
         true
     }
@@ -8365,6 +8456,17 @@ impl FnLowerer<'_> {
         // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
         if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
             if self.emit_lowp_gemm(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // GEMV `for i { let s=0; for j { s += a[i*N+j]*x[j] }; y[i]=s }` → `mercury_sgemv` (the
+        // `_parallel` one in a `@parallel` fn). The 2-deep nest the 3-loop matmul matcher declines; the
+        // memory-bound row dot gcc keeps a latency-bound scalar chain, folded 8-wide across four
+        // accumulators. Tried *after* the matmul recognizers so a batched 3-loop matmul isn't mis-matched
+        // (structurally disjoint anyway — matmul's outer body is another `for`, GEMV's is the reduction).
+        // Rows independent → serial == parallel bit-for-bit (the interpreter marshals the serial form).
+        if let Some(nest) = match_gemv(pat, iter, body, self.sema, self.interner) {
+            if self.emit_gemv(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -15649,6 +15751,69 @@ struct MatmulNest<'a> {
     a_off: Vec<&'a Expr>,
     b_off: Vec<&'a Expr>,
     c_off: Vec<&'a Expr>,
+    /// A loop-invariant scalar `alpha` peeled off the store `c[i,j] = alpha·s` — the attention score
+    /// scale `QKᵀ/√d` and every scaled projection. `None` for an unscaled matmul. Only the `ijk`
+    /// dot-product form (NT) populates this; `emit_sgemm` routes it to `mercury_sgemm_nt_alpha`.
+    alpha: Option<AlphaScale>,
+}
+
+/// A loop-invariant α scale peeled off a matmul store `c[i,j] = alpha·s`: either a runtime f32 symbol
+/// (the usual `let scale = 1.0 / sqrt(d as f32)`) or a float literal (a constant temperature).
+#[derive(Clone, Copy)]
+enum AlphaScale {
+    Sym(Symbol),
+    Lit(f32),
+}
+
+/// A loop-invariant f32 scale operand: a float literal, or a single-path symbol that is **not** one of
+/// the matmul's loop variables (`bound`). Anything else (an index expr, a non-f32 value) is `None`.
+fn scale_operand(
+    e: &Expr,
+    bound: &[Symbol],
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<AlphaScale> {
+    if !is_f32_expr(e, sema) {
+        return None;
+    }
+    if let ExprKind::Float(t) = &e.kind {
+        return Some(AlphaScale::Lit(parse_float(interner.resolve(*t)) as f32));
+    }
+    let s = single_path(e)?;
+    if bound.contains(&s) {
+        return None;
+    }
+    Some(AlphaScale::Sym(s))
+}
+
+/// Match a matmul store value `cv`: either the bare accumulator `s` (`Some(None)` — unscaled) or a
+/// scaled `alpha·s` / `s·alpha` (`Some(Some(alpha))`), where `alpha` is a loop-invariant f32 scale.
+/// `None` if `cv` is neither (e.g. a residual add, an unrecognized expr).
+fn match_store_scale(
+    cv: &Expr,
+    s_sym: Symbol,
+    bound: &[Symbol],
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<Option<AlphaScale>> {
+    if single_path(cv) == Some(s_sym) {
+        return Some(None);
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &cv.kind
+    else {
+        return None;
+    };
+    if single_path(lhs) == Some(s_sym) {
+        return Some(Some(scale_operand(rhs, bound, sema, interner)?));
+    }
+    if single_path(rhs) == Some(s_sym) {
+        return Some(Some(scale_operand(lhs, bound, sema, interner)?));
+    }
+    None
 }
 
 /// Canonical text of an affine index/base expression (paths, ints, `+`/`-`/`*`, casts), used to key
@@ -16986,7 +17151,9 @@ fn match_matmul_ijk<'a>(
     // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
     let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
         match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
-    // Final store: c[i*N + j (+ off)] = s.
+    // Final store: c[i*N + j (+ off)] = s   OR   = alpha·s (a loop-invariant scalar scale, the
+    // attention `QKᵀ/√d` and every scaled projection). The α is peeled off here and folded into the
+    // GEMM writeback by `emit_sgemm` (routing to `mercury_sgemm_nt_alpha`).
     let StmtKind::Assign {
         target: ct,
         op: ast::AssignOp::Assign,
@@ -16995,10 +17162,10 @@ fn match_matmul_ijk<'a>(
     else {
         return None;
     };
-    if single_path(cv) != Some(s_sym) {
-        return None;
-    }
-    // The output store `c[i*N + j (+ off)] = s` or the shape-typed `c[i, j] = s`.
+    // The store value is `s` (α = 1) or a loop-invariant `alpha·s` (peeled off and folded into the
+    // GEMM writeback by `emit_sgemm`). `match_store_scale` generalizes the old `single_path == s_sym`.
+    let alpha = match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner)?;
+    // The output store `c[i*N + j (+ off)] = …` or the shape-typed `c[i, j] = …` (sema-aware).
     let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
     // (`A[k*M+i]`). Normal B's is N; transposed B's is K.
@@ -17037,6 +17204,7 @@ fn match_matmul_ijk<'a>(
         a_off,
         b_off,
         c_off,
+        alpha,
     })
 }
 
@@ -17234,6 +17402,7 @@ fn match_matmul_residual<'a>(
         a_off,
         b_off,
         c_off,
+        alpha: None, // the residual epilogue kernel carries no α scale
     };
     Some((nest, bias, act))
 }
@@ -17392,6 +17561,161 @@ fn match_matmul<'a>(
         a_off: Vec::new(),
         b_off: Vec::new(),
         c_off: Vec::new(),
+        // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel.
+        alpha: None,
+    })
+}
+
+/// A recognized GEMV nest `y[i] = Σ_j a[i*N+j]·x[j]` (`a` row-major `[M,N]`, `x` length `N`, `y`
+/// length `M`) — the batch-1 attention/projection shape (`nn.Linear` on a single token).
+struct GemvNest {
+    a: Symbol,
+    x: Symbol,
+    y: Symbol,
+    m: Dim,
+    n: Dim,
+}
+
+/// Match one multiplicand pair of a GEMV product: `a_e` is `a[row*N + jvar]` (row-major, stride `N`)
+/// and `x_e` is `x[jvar]` (the shared vector, indexed by the inner var alone). Returns `(a_sym, x_sym)`.
+fn match_gemv_operands(
+    a_e: &Expr,
+    x_e: &Expr,
+    row: Symbol,
+    jvar: Symbol,
+    n: Dim,
+    interner: &Interner,
+) -> Option<(Symbol, Symbol)> {
+    let (a_sym, a_idx) = as_index1(a_e)?;
+    let (stride, col) = match_row_col(a_idx, row, interner)?;
+    if stride != n || col != jvar {
+        return None;
+    }
+    let (x_sym, x_idx) = as_index1(x_e)?;
+    if single_path(x_idx) != Some(jvar) {
+        return None;
+    }
+    Some((a_sym, x_sym))
+}
+
+/// Recognize the canonical GEMV nest rooted at `for i in 0..M { let s = 0.0; for j in 0..N { s = s +
+/// a[i*N+j]*x[j] }; y[i] = s }`. A 2-deep nest the 3-loop matmul matcher declines; it maps to
+/// `mercury_sgemv`. See [`GemvNest`]. **Row-major `a` only** — a column-strided `a[j*M+i]` (`y = Aᵀx`)
+/// has a different (strided) kernel and falls through to the scalar/vectorized path.
+fn match_gemv(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<GemvNest> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    // Body: [ let s = 0.0; for j in 0..N { s = s + a[i*N+j]*x[j] }; y[i] = s ].
+    if body.tail.is_some() || body.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    // The inner reduction `for j in 0..N { s = s + a[i*N+j]*x[j] }`.
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[1])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &jbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            // s = s + a*x
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    // `a[i*N+j] * x[j]` in either factor order.
+    let (a_sym, x_sym) = match_gemv_operands(lhs, rhs, row, jvar, n, interner)
+        .or_else(|| match_gemv_operands(rhs, lhs, row, jvar, n, interner))?;
+    // Final store: y[i] = s.
+    let StmtKind::Assign {
+        target: yt,
+        op: ast::AssignOp::Assign,
+        value: yv,
+    } = &body.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(yv) != Some(s_sym) {
+        return None;
+    }
+    let (y_sym, y_idx) = as_index1(yt)?;
+    if single_path(y_idx) != Some(row) {
+        return None;
+    }
+    // The output must not alias an input (the kernel streams `a`/`x` while writing `y`).
+    if y_sym == a_sym || y_sym == x_sym {
+        return None;
+    }
+    Some(GemvNest {
+        a: a_sym,
+        x: x_sym,
+        y: y_sym,
+        m,
+        n,
     })
 }
 

@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 200
+// EXPECT-OUT: 3200
+module tests.run.scaled_gemm
+
+/// α-scaled `nn.Linear` — the attention score matmul `scores = (Q·Kᵀ)·scale` (`scale = 1/√d`), written
+/// the idiomatic `ijk` dot-product way with a loop-invariant scalar `scale` on the store. Without the
+/// α recognizer the `* scale` on the store blocks the matmul matcher and the whole nest falls to a
+/// scalar loop; here it dispatches to `mercury_sgemm_nt_alpha`, which folds the scale into the GEMM
+/// C-tile writeback. `--run` executes that same kernel via the interpreter, so this gates interp ==
+/// native and -O0 == -O3 on the scaled path.
+///
+/// q[i,p] = i+1, k[j,p] = j+1, d = 4, scale = 0.5 (= 1/√4)  ⇒
+///   scores[i,j] = 0.5 · Σ_p (i+1)(j+1) = 2·(i+1)(j+1).
+///   scores[0,0] = 2·1·1 = 2  (→ ×100 = 200);  scores[3,3] = 2·4·4 = 32  (→ ×100 = 3200).
+fn scaled_scores(q: [f32; 16], k: [f32; 16], scores: [f32; 16], scale: f32) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for p in 0..4 {
+                s = s + q[i * 4 + p] * k[j * 4 + p];
+            }
+            scores[i * 4 + j] = scale * s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 16] = [0.0; 16];
+    let mut k: [f32; 16] = [0.0; 16];
+    let mut scores: [f32; 16] = [0.0; 16];
+    let mut idx: i32 = 0;
+    while idx < 16 {
+        q[idx] = ((idx / 4) + 1) as f32;
+        k[idx] = ((idx / 4) + 1) as f32;
+        idx = idx + 1;
+    }
+    scaled_scores(q, k, scores, 0.5);
+    print((scores[0] * 100.0) as i32);
+    print((scores[15] * 100.0) as i32);
+    return 0;
+}
