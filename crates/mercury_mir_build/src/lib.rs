@@ -148,6 +148,47 @@ fn fn_type_generics(sig: &mercury_sema::FnSig) -> Vec<Symbol> {
         .collect()
 }
 
+/// Collect the symbolic tensor dimensions (`Dim::Var`) appearing in `ty`, appending each in
+/// first-seen axis order without duplicates. A tensor's dims are its only generic part (the element
+/// is always a concrete `Scalar`), so this walks through pointer/ref/slice/array/tuple structure to
+/// find any nested tensor — mirroring [`collect_named_generics`], but for *dimension* generics.
+fn collect_symbolic_dims(ty: &Ty, out: &mut Vec<Symbol>) {
+    match ty {
+        Ty::Tensor { shape, .. } => {
+            for s in shape.symbolic_dims() {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            collect_symbolic_dims(pointee, out)
+        }
+        Ty::Array { elem, .. } => collect_symbolic_dims(elem, out),
+        Ty::Tuple(fields) => {
+            for f in fields {
+                collect_symbolic_dims(f, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The ordered, de-duplicated symbolic tensor dimensions of a parameter list — the source of truth
+/// for the **hidden runtime-dim ABI**. A dependent dim shared across params (`f<N>(a: Tensor[f32, N],
+/// b: Tensor[f32, N])`) appears once and is threaded as a single hidden `i64` parameter. The order is
+/// param order, then axis order within each tensor param (never a `HashSet` — a nondeterministic ABI
+/// order would be a miscompile; the sweep-9 determinism lesson). `lower_fn` (defining the hidden
+/// params) and `lower_call` (passing the hidden args) both call this on the same signature, so their
+/// ABIs are identical by construction.
+fn symbolic_dim_params(param_tys: &[Ty]) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    for t in param_tys {
+        collect_symbolic_dims(t, &mut out);
+    }
+    out
+}
+
 /// A stable ASCII name for a concrete type, for a monomorphization key and instance-name suffix.
 fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
     match ty {
@@ -1042,6 +1083,13 @@ fn lower_fn(
         fl.sret = Some((sret_ptr, ret_ty.clone()));
     }
 
+    // Hidden runtime-dim parameters for a symbolic-generic tensor signature (`f<M, N>(a:
+    // Tensor[f32, M, N])`): each symbolic dim is threaded in as a leading `i64` param and bound
+    // under its symbol name, so the body's index strides / matmul dims / value uses resolve it at
+    // runtime. Placed right after any sret pointer, before the real params — matching the argument
+    // order `lower_call` prepends. A no-op for a non-generic function.
+    fl.bind_dim_params(&param_tys);
+
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
     // Arrays AND aggregates (tuples/structs) are passed by base pointer (ABI type `Ptr`); scalars by
     // value. `mir_ty_of` (registry-aware) resolves a named-struct param to its byte-buffer `Array`
@@ -1935,6 +1983,33 @@ impl FnLowerer<'_> {
             MirType::Array(..) => MirType::Ptr,
             t => t,
         }
+    }
+
+    /// Synthesize the **hidden runtime-dim parameters** for a symbolic-generic tensor function and
+    /// bind each under its dimension's symbol name, so `f<M, N>(a: Tensor[f32, M, N])` runs at any
+    /// size. A tensor with a symbolic interior dim cannot derive its row-major stride at compile
+    /// time — the axis-0 stride of `Tensor[f32, M, N]` is the *runtime* value of `N` — so the
+    /// standard "dependent dims become value args" lowering threads each such dim in as a leading
+    /// `i64` parameter. Binding it under its symbol name (`N`), exactly as an ordinary scalar param
+    /// is bound (an `alloca` + `store` slot), makes every existing lookup path find it with no new
+    /// state: the row-major index stride ([`lower_multi_index`]), the matmul dimension materializer
+    /// ([`dim_value`] → [`lookup`]), and a use of the dim as a plain value (`for i in 0..N`). The
+    /// order and contents come from [`symbolic_dim_params`] — identical to what [`lower_call`]
+    /// prepends at the call site, so the ABI matches by construction. Called after any sret pointer
+    /// and before the real params, so the hidden dims occupy the leading (post-sret) parameter slots.
+    /// A no-op for a non-generic function (returns `0`), keeping every existing ABI byte-identical.
+    fn bind_dim_params(&mut self, param_tys: &[Ty]) -> usize {
+        let dims = symbolic_dim_params(param_tys);
+        for &sym in &dims {
+            let val = self.builder.add_param(MirType::I64);
+            let slot = self.builder.alloca(MirType::I64);
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: val,
+            });
+            self.bind(sym, slot, MirType::I64);
+        }
+        dims.len()
     }
 
     /// Size in bytes of `ty`, resolving named structs through the sema registry — the registry-aware
@@ -11139,21 +11214,117 @@ impl FnLowerer<'_> {
     /// Lower a multi-dimensional tensor index `base[i0, i1, …]` to a single `Gep` at the row-major
     /// flat element offset `Σ iₖ·strideₖ`. Returns `None` if `base` is not a flattenable tensor.
     fn lower_multi_index(&mut self, base: &Expr, indices: &[Expr]) -> Option<(ValueId, MirType)> {
-        let (strides, elem) = self.tensor_strides(base)?;
-        if strides.len() != indices.len() {
-            return None; // rank mismatch (sema already reported E0501); fall back to unsupported
+        // Fast path: every interior dim is a compile-time constant, so the row-major strides are
+        // static. Byte-identical to before — a constant-shape tensor lowers exactly as it always has.
+        if let Some((strides, elem)) = self.tensor_strides(base) {
+            if strides.len() != indices.len() {
+                return None; // rank mismatch (sema already reported E0501); fall back to unsupported
+            }
+            let base_ptr = self.lower_expr(base);
+            let mut flat: Option<ValueId> = None;
+            for (ix, &st) in indices.iter().zip(strides.iter()) {
+                let iv = self.lower_index_i64(ix);
+                let term = if st == 1 {
+                    iv
+                } else {
+                    let s = self
+                        .builder
+                        .build(MirType::I64, Op::ConstInt(st as i128, MirType::I64));
+                    self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, iv, s))
+                };
+                flat = Some(match flat {
+                    None => term,
+                    Some(acc) => self
+                        .builder
+                        .build(MirType::I64, Op::Bin(BinOp::Add, acc, term)),
+                });
+            }
+            let flat = flat.expect("indices non-empty");
+            let p = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base_ptr,
+                    index: flat,
+                    elem: elem.clone(),
+                },
+            );
+            return Some((p, elem));
         }
+        // A symbolic interior dim (`Tensor[f32, M, N]`, where axis 0's stride is the runtime `N`):
+        // build the strides dynamically from the hidden dim params threaded in at the call site.
+        self.lower_multi_index_dyn(base, indices)
+    }
+
+    /// Materialize a tensor shape dimension as an `i64` MIR value: a `Const` directly, a symbolic
+    /// `Var` loaded from its bound hidden dim param (coerced to `i64`), or `None` for a runtime `?`
+    /// (`Dynamic`) that has no threaded value. The shape-index companion of the matmul recognizer's
+    /// [`dim_value`] (which materializes the recognizer's own `Dim` enum the same way).
+    fn tensor_dim_value(&mut self, d: mercury_types::Dim) -> Option<ValueId> {
+        match d {
+            mercury_types::Dim::Const(n) => Some(
+                self.builder
+                    .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64)),
+            ),
+            mercury_types::Dim::Var(sym) => {
+                let (slot, ty) = self.lookup(sym)?;
+                let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
+                Some(self.coerce_to(v, &ty, &MirType::I64, true))
+            }
+            mercury_types::Dim::Dynamic => None,
+        }
+    }
+
+    /// Lower a multi-index `base[i0, i1, …]` where an interior dimension is **symbolic** — its
+    /// row-major stride is unknown at compile time but is threaded in as a hidden dim param. Each
+    /// stride `strideₖ = Πⱼ₌ₖ₊₁ dimⱼ` is built as an `i64` product of the bound dim values, then the
+    /// flat offset `Σ iₖ·strideₖ` and a single `Gep`. Crucially this is **address-equivalent** to the
+    /// constant-shape path when the runtime dims equal the constants — the two compute the same
+    /// `i*N + j` — so a symbolic `f<M, N>` produces byte-identical output to the constant-dim
+    /// reference (the symbolic==constant oracle). Emits ordinary MIR (`Mul`/`Add`/`Load`/`Gep`), so
+    /// both backends execute it identically with no interpreter/codegen change. Declines (→
+    /// `unsupported`) if an interior dim is a runtime `?` (`Dynamic`, no threaded value), or the base
+    /// is non-contiguous / rank-mismatched.
+    fn lower_multi_index_dyn(
+        &mut self,
+        base: &Expr,
+        indices: &[Expr],
+    ) -> Option<(ValueId, MirType)> {
+        let Ty::Tensor {
+            elem,
+            shape,
+            layout,
+        } = self.expr_ty(base)
+        else {
+            return None;
+        };
+        if !matches!(layout, mercury_types::Layout::Contiguous) {
+            return None;
+        }
+        let dims = shape.0; // owned (`Dim` is `Copy`)
+        let rank = dims.len();
+        if rank == 0 || rank != indices.len() {
+            return None;
+        }
+        let elem_mir = mir_ty(&Ty::Scalar(elem));
         let base_ptr = self.lower_expr(base);
-        let mut flat: Option<ValueId> = None;
-        for (ix, &st) in indices.iter().zip(strides.iter()) {
-            let iv = self.lower_index_i64(ix);
-            let term = if st == 1 {
-                iv
-            } else {
-                let s = self
+        // `strides[k]` = product of the dims *after* axis `k`; the innermost axis (`None`) is the
+        // unit stride, matching the constant path's `if st == 1 { iv }` (no multiply emitted).
+        let mut strides: Vec<Option<ValueId>> = vec![None; rank];
+        for k in (0..rank.saturating_sub(1)).rev() {
+            let next = self.tensor_dim_value(dims[k + 1])?;
+            strides[k] = Some(match strides[k + 1] {
+                None => next, // strideₖ = dim_{k+1} · 1
+                Some(s_next) => self
                     .builder
-                    .build(MirType::I64, Op::ConstInt(st as i128, MirType::I64));
-                self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, iv, s))
+                    .build(MirType::I64, Op::Bin(BinOp::Mul, s_next, next)),
+            });
+        }
+        let mut flat: Option<ValueId> = None;
+        for (ix, st) in indices.iter().zip(strides.iter()) {
+            let iv = self.lower_index_i64(ix);
+            let term = match st {
+                None => iv, // innermost axis, unit stride
+                Some(s) => self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, iv, *s)),
             };
             flat = Some(match flat {
                 None => term,
@@ -11168,10 +11339,10 @@ impl FnLowerer<'_> {
             Op::Gep {
                 ptr: base_ptr,
                 index: flat,
-                elem: elem.clone(),
+                elem: elem_mir.clone(),
             },
         );
-        Some((p, elem))
+        Some((p, elem_mir))
     }
 
     fn lower_place(&mut self, e: &Expr) -> (ValueId, MirType) {
@@ -11311,7 +11482,11 @@ impl FnLowerer<'_> {
             }
             ExprKind::Unary { op, expr } => self.lower_unary(*op, expr, e),
             ExprKind::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs, e),
-            ExprKind::Call { callee, args, .. } => self.lower_call(callee, args, e),
+            ExprKind::Call {
+                callee,
+                args,
+                generic_args,
+            } => self.lower_call(callee, generic_args, args, e),
             ExprKind::Index { base, indices } if !indices.is_empty() => {
                 let (ptr, elem) = self.lower_place(e);
                 let _ = (base, indices);
@@ -12019,7 +12194,146 @@ impl FnLowerer<'_> {
         (name, self.expr_mir(e))
     }
 
-    fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
+    /// Compute the **hidden runtime-dim arguments** for a call to a symbolic-generic tensor function,
+    /// in the ABI order [`symbolic_dim_params`] defines (identical to what `lower_fn`/`lower_matmul_fn`
+    /// declare). Empty for every other callee (zero cost on the common path). Each dimension's value
+    /// is resolved, first-binding-wins, from: (a) the **turbofish** `f::<2, 3>(…)` — the direct way a
+    /// caller pins the sizes; then (b) the **argument shapes** — a const dim passes its constant, a
+    /// symbolic dim its caller-side hidden-param value (`lookup`), and a decaying array its length —
+    /// so a generic caller forwarding its own symbolic tensor (`fn g<P,Q>(a: Tensor[f32,P,Q]){ f(a) }`)
+    /// threads `P, Q` through. A dimension that neither source determines is a hard `C0001` compile
+    /// error (a placeholder `0` keeps the MIR well-formed) — better a clean error than a miscompiled
+    /// stride; the fix is an explicit turbofish.
+    fn call_dim_args(
+        &mut self,
+        name: Symbol,
+        generic_args: &[ast::TypeExpr],
+        args: &[Expr],
+        span: Span,
+    ) -> Vec<ValueId> {
+        let (generics, params) = match self.sema.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Fn(sig)) => (sig.generics.clone(), sig.params.clone()),
+            _ => return Vec::new(),
+        };
+        let hidden = symbolic_dim_params(&params);
+        if hidden.is_empty() {
+            return Vec::new();
+        }
+        let mut dim_map: HashMap<Symbol, ValueId> = HashMap::new();
+        // (a) Turbofish: `sig.generics` zipped positionally with the supplied type args. Only a
+        // generic that is one of the hidden *dimension* generics is read here (a type generic's
+        // turbofish is for monomorphization, handled elsewhere).
+        for (g, ga) in generics.iter().zip(generic_args) {
+            if hidden.contains(g) && !dim_map.contains_key(g) {
+                if let Some(v) = self.turbofish_dim_value(ga) {
+                    dim_map.insert(*g, v);
+                }
+            }
+        }
+        // (b) Argument shapes: fill any dim the turbofish did not pin.
+        for (pty, arg) in params.iter().zip(args) {
+            let aty = self.expr_ty(arg);
+            self.collect_call_dims(pty, &aty, &hidden, &mut dim_map);
+        }
+        let mut out = Vec::with_capacity(hidden.len());
+        let mut missing = false;
+        for g in &hidden {
+            match dim_map.get(g) {
+                Some(v) => out.push(*v),
+                None => {
+                    missing = true;
+                    out.push(
+                        self.builder
+                            .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                    );
+                }
+            }
+        }
+        if missing {
+            self.unsupported(
+                span,
+                "call to a symbolic-generic tensor function whose dimensions cannot be inferred \
+                 from the arguments (supply an explicit turbofish, e.g. `f::<2, 3>(…)`)",
+            );
+        }
+        out
+    }
+
+    /// Materialize a turbofish generic argument as an `i64` dimension value: an integer literal
+    /// `::<2>` directly, or a single-name `::<N>` loaded from the in-scope binding `N` (a caller's
+    /// own hidden dim / value param). `None` for anything else (a type name, a complex type), which
+    /// leaves the dimension to be resolved from the argument shapes instead.
+    fn turbofish_dim_value(&mut self, ga: &ast::TypeExpr) -> Option<ValueId> {
+        match &ga.kind {
+            ast::TypeKind::Int(s) => {
+                let v = parse_int(self.interner.resolve(*s));
+                Some(self.builder.build(MirType::I64, Op::ConstInt(v, MirType::I64)))
+            }
+            ast::TypeKind::Path(p) if p.is_single() => {
+                let (slot, ty) = self.lookup(p.first().sym)?;
+                let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
+                Some(self.coerce_to(v, &ty, &MirType::I64, true))
+            }
+            _ => None,
+        }
+    }
+
+    /// Bind any still-unresolved hidden dimension from a single argument's shape against its
+    /// parameter's shape (mirrors sema's call unification `unify`): a tensor argument supplies each
+    /// symbolic parameter dim from the argument's dim at the same axis (`tensor_dim_value` — a const,
+    /// a caller-side symbolic `Var` via `lookup`, or `None` for a runtime `?`), and a decaying array
+    /// argument supplies a rank-1 symbolic tensor param's dim from the array length. Recurses through
+    /// pointer/reference structure. First binding wins (`dim_map` already-present is skipped).
+    fn collect_call_dims(
+        &mut self,
+        pty: &Ty,
+        aty: &Ty,
+        hidden: &[Symbol],
+        dim_map: &mut HashMap<Symbol, ValueId>,
+    ) {
+        match (pty, aty) {
+            (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. }) => {
+                let pd = ps.0.clone();
+                let ad = as_.0.clone();
+                for (p, a) in pd.iter().zip(&ad) {
+                    if let mercury_types::Dim::Var(g) = p {
+                        if hidden.contains(g) && !dim_map.contains_key(g) {
+                            if let Some(v) = self.tensor_dim_value(*a) {
+                                dim_map.insert(*g, v);
+                            }
+                        }
+                    }
+                }
+            }
+            // A rank-1 tensor param fed a decaying array binds its symbolic dim to the array length
+            // (the same rank-1 length binding sema's `unify` performs).
+            (Ty::Tensor { shape: ps, .. }, Ty::Array { len, .. }) => {
+                if ps.0.len() == 1 {
+                    if let mercury_types::Dim::Var(g) = ps.0[0] {
+                        if hidden.contains(&g) && !dim_map.contains_key(&g) {
+                            let v = self
+                                .builder
+                                .build(MirType::I64, Op::ConstInt(*len as i128, MirType::I64));
+                            dim_map.insert(g, v);
+                        }
+                    }
+                }
+            }
+            (Ty::Ptr { pointee: p, .. }, Ty::Ptr { pointee: a, .. })
+            | (Ty::Ref { pointee: p, .. }, Ty::Ref { pointee: a, .. }) => {
+                self.collect_call_dims(p, a, hidden, dim_map)
+            }
+            _ => {}
+        }
+    }
+
+    fn lower_call(
+        &mut self,
+        callee: &Expr,
+        generic_args: &[ast::TypeExpr],
+        args: &[Expr],
+        e: &Expr,
+    ) -> ValueId {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
                 let name = p.first().sym;
@@ -12033,14 +12347,21 @@ impl FnLowerer<'_> {
                     // concrete return (not the generic template), so the sret/void/scalar dispatch
                     // below keys on the real type. A non-generic call keeps `name` + `expr_mir(e)`.
                     let (func, ret) = self.resolve_call_target(name, args, e);
+                    // Hidden runtime-dim args for a symbolic-generic tensor callee (`f<M, N>`): the
+                    // per-call dimension values, computed from the turbofish and the argument shapes,
+                    // in the same ABI order `lower_fn`/`lower_matmul_fn` declare the hidden params.
+                    // Empty for every non-generic-tensor callee, so those call sites stay byte-
+                    // identical. They lead the real args, after any sret pointer.
+                    let dim_args = self.call_dim_args(name, generic_args, args, e.span);
                     if matches!(ret, MirType::Array(..)) {
                         // The callee returns an aggregate by value (sret ABI): allocate the
                         // destination buffer here, pass it as the hidden leading argument, and yield
                         // it as the call's value (the by-pointer aggregate convention — a further
                         // `.field`/`[i]` GEPs off it).
                         let dst = self.builder.alloca(ret);
-                        let mut call_args = Vec::with_capacity(argvals.len() + 1);
+                        let mut call_args = Vec::with_capacity(1 + dim_args.len() + argvals.len());
                         call_args.push(dst);
+                        call_args.extend(dim_args);
                         call_args.extend(argvals);
                         self.builder.build_void(Op::Call {
                             func,
@@ -12048,10 +12369,20 @@ impl FnLowerer<'_> {
                         });
                         return dst;
                     }
+                    // Prepend the (possibly empty) hidden dim args. When empty this is exactly the
+                    // old `argvals` list (moved, not copied), so a non-generic call is unchanged.
+                    let call_args = if dim_args.is_empty() {
+                        argvals
+                    } else {
+                        let mut v = Vec::with_capacity(dim_args.len() + argvals.len());
+                        v.extend(dim_args);
+                        v.extend(argvals);
+                        v
+                    };
                     if ret == MirType::Void {
                         self.builder.build_void(Op::Call {
                             func,
-                            args: argvals,
+                            args: call_args,
                         });
                         return self.const_zero(MirType::I32);
                     }
@@ -12059,7 +12390,7 @@ impl FnLowerer<'_> {
                         ret,
                         Op::Call {
                             func,
-                            args: argvals,
+                            args: call_args,
                         },
                     );
                 }
@@ -15832,6 +16163,13 @@ fn lower_matmul_fn(
         subst: HashMap::new(),
         mono: None,
     };
+    // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
+    // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
+    // params) so `emit_sgemm`'s `dim_value(Dim::Var(M))` → `lookup(M)` finds each dimension — the
+    // recognizer already matches a symbolic matmul (strides compare `Dim::Var` by identity), so this
+    // is all it needs to dispatch to the tuned GEMM kernel at any runtime size. The order matches
+    // `lower_call`'s prepended dim args by construction. A no-op for a constant-shape matmul.
+    fl.bind_dim_params(&param_tys);
     let param_vals: Vec<ValueId> = param_tys
         .iter()
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))

@@ -1,0 +1,53 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 22
+// EXPECT-OUT: 43
+// EXPECT-OUT: 50
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+module tests.run.generic_shape_matmul
+
+// A symbolic-DIM matmul still dispatches to the tuned GEMM microkernel. The matmul recognizer
+// already compares strides by `Dim::Var` identity (so a symbolic nest is recognized); once the dims
+// are threaded in as hidden runtime params, `emit_sgemm` materializes each `Dim::Var(M/N/K)` from
+// its bound value and emits one `mercury_sgemm` call — so `matmul<M, N, K>` runs on the AVX2/FMA
+// kernel at ANY runtime size, bit-identical to the constant-shape matmul on both backends. The
+// `<M, N, K>` declaration order deliberately differs from the shape-appearance order `[M, K, N]`
+// (the hidden-param ABI), so the non-square case below also checks the call-site order mapping.
+fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) {
+    for i in 0..M {
+        for j in 0..N {
+            let mut s: f32 = 0.0;
+            for k in 0..K {
+                s = s + a[i, k] * b[k, j];
+            }
+            c[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // 2x2 · 2x2 (matches the constant-shape `tensor_matmul.mer` reference: 19, 22, 43, 50).
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
+    let mut c: [f32; 4] = [0.0; 4];
+    matmul::<2, 2, 2>(a, b, c);
+    print(c[0] as i32); // 1*5 + 2*7 = 19
+    print(c[1] as i32); // 1*6 + 2*8 = 22
+    print(c[2] as i32); // 3*5 + 4*7 = 43
+    print(c[3] as i32); // 3*6 + 4*8 = 50
+
+    // Non-square 2x4 · 4x3 = 2x3 (exercises the hidden-dim ABI order mapping).
+    let a2: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let b2: [f32; 12] = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let mut c2: [f32; 6] = [0.0; 6];
+    matmul::<2, 3, 4>(a2, b2, c2);
+    print(c2[0] as i32); // row0·col0 = 4
+    print(c2[2] as i32); // row0·col2 = 5
+    print(c2[3] as i32); // row1·col0 = 12
+    print(c2[5] as i32); // row1·col2 = 13
+    return 0;
+}
