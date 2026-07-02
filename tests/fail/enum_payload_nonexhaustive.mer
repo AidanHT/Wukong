@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0405
+module tests.fail.enum_payload_nonexhaustive
+
+// A payload `match` is still exhaustiveness-checked: a variant pattern covers its variant, so a match
+// that binds `Add`/`Neg` but omits `Nop` (with no catch-all) is provably non-exhaustive. Without this
+// the "no arm matched" fallthrough would be a silent-0 (interp) / illegal-instruction (native)
+// divergence — the sweep-4/#6 class — so it must be a diagnostic.
+enum Op { Add(i32, i32), Neg(i32), Nop }
+
+fn main() -> i32 {
+    let a = Op::Nop;
+    let r = match a {
+        Op::Add(x, y) => x + y,
+        Op::Neg(n) => n,
+    };
+    return r;
+}

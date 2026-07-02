@@ -78,8 +78,23 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   (`tests/run/{match_expr,match_patterns,match_tuple}.mer`).
 - **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
   variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
-  (`tests/run/enum_cstyle.mer`). Data-carrying (tagged-union) variants and enum-payload matching are
-  still unsupported.
+  (`tests/run/enum_cstyle.mer`).
+- **Data-carrying (tagged-union) enums** `enum Expr { Num(i32), Add(i32, i32), Nil }` — tuple *and*
+  struct payloads: construction `E::V(a, b)` / `E::V { x, y }`, and payload `match` with field
+  bindings, literal sub-patterns, `if` guards, nesting in an array of enums, and by-value passing to a
+  function. A value is a 4-byte i32 discriminant + a padded payload union, addressed by base pointer
+  exactly like a struct — no backend change; interp == native bit-for-bit and -O0 == -O3
+  (`tests/run/enum_payload_{tuple,struct}.mer`). A payload-carrying variant is *not* castable to an
+  integer, and an enum that holds itself by value (`Cons(i32, List)`) is rejected as infinitely sized
+  (E0402); a non-exhaustive `match` over the variants is E0405.
+- **Slices `[]T`** — a fat-pointer view `{ data: *T @ 0, len: i64 @ 8 }` over existing array storage:
+  length `s.len()`, indexed read/write `s[i]`, iteration `for x in s`, and passing to a function —
+  either an already-materialized slice or a fixed-size array *unsized* to a slice parameter at the
+  call site (`let s: []T = arr` / `f(arr)`). A write through the slice aliases the backing array. The
+  16-byte fat pointer is a by-pointer aggregate the two backends address identically, so interp ==
+  native bit-for-bit and -O0 == -O3 (`tests/run/slice_basics.mer`). The element types must match on
+  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is a
+  runtime-length view (unchecked, like a pointer — a slice has no static length to bounds-check).
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
@@ -339,8 +354,6 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   the recognized kernels get true 256-bit AVX2 via the runtime microkernels.)
 - **Attributes** `@simd`/`@tile`/`@align`/`@extern`/`@export`: parse and validate; consumers in
   progress. (`@parallel` now executes — see above.)
-- **Slices `[]T`**: parse and type-check but do not yet run. (C-style `enum`s and by-value aggregate
-  parameters/returns now **run** — see "Works end to end" above.)
 
 ## Planned
 
@@ -352,8 +365,8 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
   needs a raw-AVX emitter or a future Cranelift.
 - Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
-- Slices and a minimal stdlib (structs, enums, and multi-dimensional indexing `a[i, j]` now run — see
-  "Works end to end" above).
+- A minimal stdlib (structs, enums — including data-carrying tagged unions —, slices, and
+  multi-dimensional indexing `a[i, j]` now run — see "Works end to end" above).
 - AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
   reverse-mode autodiff already ships as the `mercury_autodiff` crate — both above).
 

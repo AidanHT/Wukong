@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0401
+module tests.fail.enum_payload_arity
+
+// A tuple-payload variant must be constructed with exactly its declared number of fields. `Add` has
+// two i32 fields; supplying one is a hard error, not a silently under-initialized buffer.
+enum Op { Add(i32, i32), Nop }
+
+fn main() -> i32 {
+    let a = Op::Add(1);
+    return 0;
+}

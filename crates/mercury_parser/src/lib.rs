@@ -898,6 +898,15 @@ impl<'a> Parser<'a> {
                     self.expect(T::RBracket);
                     return self.finish_expr(start, ExprKind::AlignOf(ty));
                 }
+                // `Enum::Variant { field: value, … }` — a struct-payload enum-variant literal (a
+                // multi-segment struct literal). Only when the `::`-path is *immediately* followed by
+                // `{` (so a bare `Enum::Variant` value and an `Enum::Variant(..)` call still flow
+                // through the postfix `::` path below), and only in a struct-literal-allowed context
+                // (mirrors the single-segment `Name { … }` case just below).
+                if !self.no_struct_lit && self.colon_path_before_brace() {
+                    let path = self.parse_colon_path();
+                    return self.parse_struct_lit(path, start);
+                }
                 let id = self.ident();
                 let path = Path {
                     segments: vec![id],
@@ -1353,6 +1362,23 @@ impl<'a> Parser<'a> {
         lo
     }
 
+    /// Peek (no consumption) whether the tokens from the current position form
+    /// `Ident (:: Ident)+ {` — a multi-segment path immediately followed by a struct-literal brace,
+    /// i.e. an `Enum::Variant { … }` struct-payload literal. Used to disambiguate it from a bare
+    /// `Enum::Variant` value / `Enum::Variant(..)` call, which take the postfix `::` path instead.
+    /// Requires at least one `:: Ident` segment (a single `Name {` is already handled directly).
+    fn colon_path_before_brace(&self) -> bool {
+        // Current token is the leading `Ident`.
+        if self.nth(1) != T::ColonColon || self.nth(2) != T::Ident {
+            return false;
+        }
+        let mut k = 3;
+        while self.nth(k) == T::ColonColon && self.nth(k + 1) == T::Ident {
+            k += 2;
+        }
+        self.nth(k) == T::LBrace
+    }
+
     /// Parse a `::`-separated path (`Enum::Variant`), used by enum-variant patterns.
     fn parse_colon_path(&mut self) -> Path {
         let start = self.span();
@@ -1389,8 +1415,57 @@ impl<'a> Parser<'a> {
                     self.bump();
                     PatKind::Wildcard
                 } else if self.nth(1) == T::ColonColon {
-                    // `Enum::Variant` — an enum-variant pattern (resolved to its discriminant).
-                    PatKind::Path(self.parse_colon_path())
+                    // `Enum::Variant` — an enum-variant pattern. A following `(` / `{` destructures a
+                    // data-carrying (tagged-union) payload; a bare path is a unit variant / C-style
+                    // enum, matched by discriminant.
+                    let path = self.parse_colon_path();
+                    if self.at(T::LParen) {
+                        // `Enum::Variant(p0, p1, …)` — positional (tuple) payload sub-patterns.
+                        self.bump(); // (
+                        let mut subs = Vec::new();
+                        while !self.at(T::RParen) && !self.at(T::Eof) {
+                            subs.push(self.parse_pattern());
+                            if !self.eat(T::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(T::RParen);
+                        PatKind::Variant {
+                            path,
+                            fields: VariantPat::Tuple(subs),
+                        }
+                    } else if self.at(T::LBrace) {
+                        // `Enum::Variant { f0, f1: sub, … }` — named (struct) payload sub-patterns.
+                        // Bare `{ r }` is field shorthand binding `r`; `{ r: sub }` binds via `sub`.
+                        self.bump(); // {
+                        let mut fps = Vec::new();
+                        while !self.at(T::RBrace) && !self.at(T::Eof) {
+                            let fname = self.ident();
+                            let pat = if self.eat(T::Colon) {
+                                self.parse_pattern()
+                            } else {
+                                Pattern {
+                                    id: self.nid(),
+                                    kind: PatKind::Ident(fname.sym),
+                                    span: fname.span,
+                                }
+                            };
+                            fps.push(FieldPat {
+                                name: fname.sym,
+                                pat,
+                            });
+                            if !self.eat(T::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(T::RBrace);
+                        PatKind::Variant {
+                            path,
+                            fields: VariantPat::Struct(fps),
+                        }
+                    } else {
+                        PatKind::Path(path)
+                    }
                 } else {
                     let sym = self.intern_span(start);
                     self.bump();
