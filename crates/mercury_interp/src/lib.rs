@@ -2079,6 +2079,59 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_bias_bcast_f32[_parallel](x, b, out, rows, cols, op)` — the broadcast-bias add a
+            // recognized `for i { for j { out[i*C+j] = act(x[i*C+j] + b[j]) } }` nest lowers to (a
+            // `cols`-long bias added across every row, optional fused activation). Marshal `rows*cols`
+            // f32 from x and `cols` from b, call the *serial* runtime kernel (serial == parallel
+            // bit-for-bit, rows independent), write the result back — so the differential oracle stays
+            // exact for both the serial and `_parallel` names. Read all of x/b before writing out so an
+            // in-place (x == out) case is correct.
+            "mercury_bias_bcast_f32" | "mercury_bias_bcast_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let op = args[5].as_int() as i64;
+                let n = rows.saturating_mul(cols);
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("bias_bcast operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut bbuf = Vec::with_capacity(cols);
+                for t in 0..cols {
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("bias_bcast bias out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/obuf are n f32, bbuf is cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_bias_bcast_f32(
+                        xbuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("bias_bcast output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vhorner_f32(x, out, n, coeffs, ncoeff)` — the streaming Horner-polynomial kernel
             // a recognized `r = c0; r = r*x + c1; …; out[i] = r` loop lowers to. Marshal `n` f32 from x
             // and `ncoeff` f32 from coeffs, call the identical runtime kernel, write out — so the

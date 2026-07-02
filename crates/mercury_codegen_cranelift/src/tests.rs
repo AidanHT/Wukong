@@ -962,6 +962,74 @@ fn vectorized_saxpy_is_correct_across_sizes() {
     }
 }
 
+/// The broadcast-bias dispatch: a `for i { for j { out[i*C+j] = x[i*C+j] + b[j] } }` nest must (a)
+/// lower to one `mercury_bias_bcast_f32` call (the 256-bit AVX2 broadcast-bias kernel — the row-
+/// broadcast `b[j]` is what the affine velem recognizer declines), (b) agree between interpreter and
+/// native bit-for-bit, and (c) compute the same result the scalar nest would. `x=0`, `b[j]=j` ⇒
+/// `sum = rows * C*(C-1)/2`. Sizes hit the kernel's vector body, its scalar tail, and both.
+#[test]
+fn bias_bcast_is_correct_across_sizes() {
+    let kernel = |rows: usize, cols: usize| {
+        let n = rows * cols;
+        format!(
+            "fn main() -> i32 {{ let x: [f32; {n}] = [0.0; {n}]; \
+             let mut b: [f32; {cols}] = [0.0; {cols}]; \
+             let mut j0: i32 = 0; while j0 < {cols} {{ b[j0] = (j0 as f32); j0 += 1; }} \
+             let mut out: [f32; {n}] = [0.0; {n}]; \
+             for i in 0..{rows} {{ for j in 0..{cols} {{ out[i * {cols} + j] = x[i * {cols} + j] + b[j]; }} }} \
+             let mut s: f32 = 0.0; let mut k: i32 = 0; while k < {n} {{ s = s + out[k]; k += 1; }} \
+             return s as i32; }}"
+        )
+    };
+
+    // The broadcast-bias recognizer must have fired.
+    let (prog, interner) = lowered(&kernel(8, 12), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("mercury_bias_bcast_f32"),
+        "broadcast bias `x[i*C+j] + b[j]` should dispatch to the bias kernel:\n{mir}"
+    );
+
+    // (3,4) tail-only, (2,8) one vector no tail, (5,13)/(7,3) vector+tail, (8,8)/(7,16) larger.
+    for (rows, cols) in [(3usize, 4usize), (2, 8), (5, 13), (7, 3), (8, 8), (7, 16)] {
+        let src = kernel(rows, cols);
+        let native = jit(&src, 3).expect("jit");
+        let interp = interp(&src, 3).expect("interp");
+        assert_eq!(native, interp, "bias native vs interp mismatch at {rows}x{cols}");
+        let want = (rows * (cols * (cols - 1) / 2)) as i64;
+        assert_eq!(native.0, want, "wrong bias-bcast sum at {rows}x{cols}");
+    }
+}
+
+/// The `@parallel` broadcast-bias must dispatch to `mercury_bias_bcast_f32_parallel` (via the
+/// whole-function interceptor, before the generic outliner) and stay bit-identical to the serial
+/// kernel the interpreter calls — interp == native across opt levels.
+#[test]
+fn bias_bcast_parallel_matches_interp() {
+    let src = "@parallel fn addb(x: [f32; 96], b: [f32; 12], out: [f32; 96]) { \
+               for i in 0..8 { for j in 0..12 { out[i * 12 + j] = x[i * 12 + j] + b[j]; } } } \
+               fn main() -> i32 { let mut x: [f32; 96] = [0.0; 96]; \
+               let mut i0: i32 = 0; while i0 < 96 { x[i0] = (i0 as f32); i0 += 1; } \
+               let mut b: [f32; 12] = [0.0; 12]; \
+               let mut j0: i32 = 0; while j0 < 12 { b[j0] = (j0 as f32); j0 += 1; } \
+               let mut out: [f32; 96] = [0.0; 96]; addb(x, b, out); \
+               let mut s: f32 = 0.0; let mut k: i32 = 0; while k < 96 { s = s + out[k]; k += 1; } \
+               return s as i32; }";
+    let (prog, interner) = lowered(src, 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("mercury_bias_bcast_f32_parallel"),
+        "@parallel bias should dispatch to the multicore kernel:\n{mir}"
+    );
+    for opt in [0u8, 3] {
+        let native = jit(src, opt).expect("jit");
+        let interp = interp(src, opt).expect("interp");
+        assert_eq!(native, interp, "parallel bias native vs interp mismatch at O{opt}");
+        // sum_k k (0..96) + 8 * sum_j j (0..12) = 4560 + 8*66 = 5088.
+        assert_eq!(native.0, 5088, "wrong parallel bias sum at O{opt}");
+    }
+}
+
 /// Reduction vectorization: `s = s + x[k]*y[k]` (a dot product) and `s += x[k]` (a sum) must
 /// vectorize to lane accumulators + a horizontal reduce, agree between interpreter and native, and
 /// compute the right value. Inputs are chosen so every partial sum is an exact f32 integer, so the
