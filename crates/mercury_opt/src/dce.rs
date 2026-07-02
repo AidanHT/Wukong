@@ -1,6 +1,6 @@
 //! Dead-code elimination: remove pure instructions whose results are never used.
 
-use std::collections::HashSet;
+use crate::fxhash::FxHashSet;
 
 use mercury_mir::Function;
 
@@ -14,7 +14,7 @@ impl Pass for Dce {
     }
 
     fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
-        let mut used: HashSet<u32> = HashSet::new();
+        let mut used: FxHashSet<u32> = FxHashSet::default();
         for b in &f.blocks {
             for inst in &b.insts {
                 each_op_use(&inst.op, &mut |v| {

@@ -14,7 +14,7 @@
 //! Forwarding loads to a common value lets the pure value-numbering then collapse the expressions
 //! built on top of them. DCE deletes the dead remains.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{FxHashMap, FxHashSet};
 
 use mercury_mir::{Function, MirType, Op, ValueId};
 
@@ -34,7 +34,7 @@ impl Pass for Cse {
         let children = cache.dom_children(f);
 
         // Alloca base pointers are function-global value ids; collect them once.
-        let mut allocas: HashSet<u32> = HashSet::new();
+        let mut allocas: FxHashSet<u32> = FxHashSet::default();
         for b in &f.blocks {
             for inst in &b.insts {
                 if let (Some(r), Op::Alloca(_)) = (inst.result, &inst.op) {
@@ -47,8 +47,8 @@ impl Pass for Cse {
             f,
             children,
             allocas: &allocas,
-            vn: HashMap::new(),
-            rewrite: HashMap::new(),
+            vn: FxHashMap::default(),
+            rewrite: FxHashMap::default(),
         };
         cx.visit(f.entry.0);
         let rewrite = cx.rewrite;
@@ -69,11 +69,11 @@ impl Pass for Cse {
 struct Numbering<'a> {
     f: &'a Function,
     children: &'a [Vec<u32>],
-    allocas: &'a HashSet<u32>,
+    allocas: &'a FxHashSet<u32>,
     /// pure-op key -> canonical value id, scoped to the current dominator-tree path.
-    vn: HashMap<Key, u32>,
+    vn: FxHashMap<Key, u32>,
     /// value id -> the value it is replaced by (load forwards and CSE rewrites).
-    rewrite: HashMap<u32, u32>,
+    rewrite: FxHashMap<u32, u32>,
 }
 
 /// A canonical, allocation-free value-numbering key for a pure op. One variant per cacheable
@@ -109,7 +109,7 @@ impl Numbering<'_> {
         // Keys this block introduced into `vn`, to remove when we leave its subtree.
         let mut added: Vec<Key> = Vec::new();
         // Load forwarding is intra-block: the current value of each slot, reset per block.
-        let mut slot_val: HashMap<u32, u32> = HashMap::new();
+        let mut slot_val: FxHashMap<u32, u32> = FxHashMap::default();
 
         for inst in &self.f.blocks[blk as usize].insts {
             match &inst.op {
@@ -170,7 +170,7 @@ impl Numbering<'_> {
 }
 
 /// Follow rewrite chains (`a -> b -> c`) to the final target.
-fn resolve(rewrite: &HashMap<u32, u32>, mut v: u32) -> u32 {
+fn resolve(rewrite: &FxHashMap<u32, u32>, mut v: u32) -> u32 {
     let mut guard = 0;
     while let Some(&n) = rewrite.get(&v) {
         if n == v || guard > 10_000 {
@@ -186,7 +186,7 @@ fn resolve(rewrite: &HashMap<u32, u32>, mut v: u32) -> u32 {
 /// computations hash identically. Returns `None` for impure/uncacheable ops (handled separately).
 /// The op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) are fieldless C-like enums; `as u8`
 /// is their stable discriminant, which distinguishes the same variants the old `{:?}` did.
-fn pure_key(op: &Op, rewrite: &HashMap<u32, u32>) -> Option<Key> {
+fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
     let m = |v: ValueId| -> u32 { resolve(rewrite, v.0) };
     Some(match op {
         Op::ConstInt(n, ty) => Key::ConstInt(*n, ty.clone()),

@@ -15,7 +15,7 @@
 //!
 //! Folding and merging can make blocks unreachable, so pruning always runs last.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 
 use mercury_mir::{Function, Op, Terminator, ValueId};
 
@@ -42,8 +42,8 @@ impl Pass for SimplifyCfg {
 }
 
 /// Map every value id that names an integer constant to its value.
-fn const_ints(f: &Function) -> HashMap<u32, i128> {
-    let mut m = HashMap::new();
+fn const_ints(f: &Function) -> FxHashMap<u32, i128> {
+    let mut m = FxHashMap::default();
     for b in &f.blocks {
         for inst in &b.insts {
             if let (Some(r), Op::ConstInt(n, _)) = (inst.result, &inst.op) {
@@ -112,7 +112,7 @@ fn merge_straight_line(f: &mut Function) -> bool {
         };
         let bparams = std::mem::take(&mut f.blocks[bi].params);
         // B's parameters are exactly the values A handed it.
-        let subst: HashMap<u32, ValueId> =
+        let subst: FxHashMap<u32, ValueId> =
             bparams.iter().zip(&args).map(|(p, a)| (p.0, *a)).collect();
         if !subst.is_empty() {
             for blk in &mut f.blocks {

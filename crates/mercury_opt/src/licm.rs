@@ -12,7 +12,7 @@
 //! operations are moved (no loads, stores, calls, or integer division), so hoisting a computation
 //! onto a path that would not have executed it can never change observable behavior.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{FxHashMap, FxHashSet};
 
 use mercury_mir::{BinOp, Function, Inst, Op, Terminator};
 
@@ -49,8 +49,8 @@ impl Pass for Licm {
 
 /// Natural loops keyed by header, each mapped to the set of blocks in the loop. Loops that share a
 /// header (multiple back edges) are merged.
-fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, HashSet<u32>)> {
-    let mut by_header: HashMap<u32, HashSet<u32>> = HashMap::new();
+fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, FxHashSet<u32>)> {
+    let mut by_header: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
     for b in &f.blocks {
         let n = b.id.0;
         for s in cfg::successors(&b.term) {
@@ -58,7 +58,7 @@ fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, Ha
             if dominates(h, n, idom) {
                 // Back edge n -> h: collect the nodes that reach n without passing through h.
                 let body = by_header.entry(h).or_insert_with(|| {
-                    let mut s = HashSet::new();
+                    let mut s = FxHashSet::default();
                     s.insert(h);
                     s
                 });
@@ -79,7 +79,7 @@ fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, Ha
     // Process loops in a deterministic (header-id) order. `HashMap` iteration order is randomized
     // per run, and loop processing order can change what a single LICM pass hoists (e.g. nested
     // loops) — so leaving it unordered makes the emitted MIR nondeterministic run-to-run (M12).
-    let mut loops: Vec<(u32, HashSet<u32>)> = by_header.into_iter().collect();
+    let mut loops: Vec<(u32, FxHashSet<u32>)> = by_header.into_iter().collect();
     loops.sort_by_key(|(h, _)| *h);
     loops
 }
@@ -104,7 +104,7 @@ fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
 fn preheader(
     f: &Function,
     header: u32,
-    body: &HashSet<u32>,
+    body: &FxHashSet<u32>,
     preds: &[Vec<u32>],
     idom: &[u32],
 ) -> Option<u32> {
@@ -148,7 +148,7 @@ fn safe_to_hoist(op: &Op) -> bool {
     }
 }
 
-fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> bool {
+fn hoist_from_loop(f: &mut Function, body: &FxHashSet<u32>, preheader: u32) -> bool {
     // Iterate the loop body in a deterministic (block-id) order. The order in which hoisted
     // instructions are appended to the preheader must not depend on `HashSet` iteration order —
     // that order is randomized per run, so using it directly emits nondeterministic MIR (M12). The
@@ -157,7 +157,7 @@ fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> boo
     body_blocks.sort_unstable();
 
     // Values defined inside the loop (block parameters and instruction results).
-    let mut defined_in_loop: HashSet<u32> = HashSet::new();
+    let mut defined_in_loop: FxHashSet<u32> = FxHashSet::default();
     for &blk in &body_blocks {
         let b = &f.blocks[blk as usize];
         for p in &b.params {
@@ -172,12 +172,12 @@ fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> boo
 
     // An operand is available in the preheader if it is not defined in the loop, or it has already
     // been hoisted there.
-    let mut hoisted: HashSet<u32> = HashSet::new();
+    let mut hoisted: FxHashSet<u32> = FxHashSet::default();
     let mut moved_ops: Vec<Inst> = Vec::new();
 
     loop {
         // Read phase: which still-in-loop instructions are now invariant?
-        let mut found: HashSet<u32> = HashSet::new();
+        let mut found: FxHashSet<u32> = FxHashSet::default();
         for &blk in &body_blocks {
             for inst in &f.blocks[blk as usize].insts {
                 let Some(r) = inst.result else { continue };

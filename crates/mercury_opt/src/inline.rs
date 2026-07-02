@@ -16,7 +16,7 @@
 //! (copied) entry passing the arguments; and each `ret` in the copy becomes a branch to the
 //! continuation carrying the returned value.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{FxHashMap, FxHashSet};
 
 use mercury_mir::{BasicBlock, BlockId, Function, Inst, Op, Program, Terminator, ValueId};
 use mercury_span::Symbol;
@@ -30,10 +30,10 @@ const GROWTH_LIMIT: usize = 5000;
 
 /// Inline small leaf functions throughout the program. Returns whether anything changed.
 pub fn inline_program(program: &mut Program) -> bool {
-    let names: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
+    let names: FxHashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
 
     // Snapshot the bodies eligible to be inlined: small, and leaf (no user-function calls).
-    let inlinable: HashMap<Symbol, Function> = program
+    let inlinable: FxHashMap<Symbol, Function> = program
         .funcs
         .iter()
         .filter(|f| is_leaf(f, &names) && func_insts(f) <= SIZE_LIMIT)
@@ -44,7 +44,7 @@ pub fn inline_program(program: &mut Program) -> bool {
     }
 
     let mut changed = false;
-    let mut inlined: HashSet<Symbol> = HashSet::new();
+    let mut inlined: FxHashSet<Symbol> = FxHashSet::default();
     for ci in 0..program.funcs.len() {
         loop {
             if func_insts(&program.funcs[ci]) > GROWTH_LIMIT {
@@ -68,7 +68,7 @@ pub fn inline_program(program: &mut Program) -> bool {
     // call target, so it is never in `inlined` and is always kept — making this safe without
     // knowing which function is the entry.
     if changed {
-        let mut still_called: HashSet<Symbol> = HashSet::new();
+        let mut still_called: FxHashSet<Symbol> = FxHashSet::default();
         for f in &program.funcs {
             for b in &f.blocks {
                 for inst in &b.insts {
@@ -86,7 +86,7 @@ pub fn inline_program(program: &mut Program) -> bool {
 }
 
 /// A function is a leaf if it calls no other user function (intrinsic calls are fine).
-fn is_leaf(f: &Function, names: &HashSet<Symbol>) -> bool {
+fn is_leaf(f: &Function, names: &FxHashSet<Symbol>) -> bool {
     for b in &f.blocks {
         for inst in &b.insts {
             if let Op::Call { func, .. } = &inst.op {
@@ -106,7 +106,7 @@ fn func_insts(f: &Function) -> usize {
 /// The first call to an inlinable callee in `f`, as `(block index, inst index, callee name)`.
 fn find_call_site(
     f: &Function,
-    inlinable: &HashMap<Symbol, Function>,
+    inlinable: &FxHashMap<Symbol, Function>,
 ) -> Option<(usize, usize, Symbol)> {
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, inst) in b.insts.iter().enumerate() {
@@ -131,7 +131,7 @@ fn inline_call_site(caller: &mut Function, callee: &Function, bi: usize, ii: usi
 
     // Fresh caller value id for every callee value (params included — they receive the call's
     // arguments through the entry block's parameters).
-    let mut vmap: HashMap<u32, ValueId> = HashMap::new();
+    let mut vmap: FxHashMap<u32, ValueId> = FxHashMap::default();
     for (vid, ty) in callee.value_types.iter().enumerate() {
         let nv = ValueId(caller.value_types.len() as u32);
         caller.value_types.push(ty.clone());

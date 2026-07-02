@@ -13,7 +13,7 @@
 //!
 //! Removing arguments can make further parameters dead or trivial, hence the fixpoint.
 
-use std::collections::HashSet;
+use crate::fxhash::FxHashSet;
 
 use mercury_mir::{Function, Terminator, ValueId};
 
@@ -45,7 +45,7 @@ impl Pass for SimplifyPhis {
 fn find_removable(f: &Function) -> Option<(u32, usize, Option<ValueId>)> {
     let entry = f.entry.0;
 
-    let mut used: HashSet<u32> = HashSet::new();
+    let mut used: FxHashSet<u32> = FxHashSet::default();
     for b in &f.blocks {
         for inst in &b.insts {
             each_op_use(&inst.op, &mut |v| {
