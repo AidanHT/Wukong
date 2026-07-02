@@ -45,6 +45,12 @@ pub use i8gemm::{
     mercury_i8gemm_nt_parallel,
 };
 
+mod dequant;
+pub use dequant::{
+    mercury_dequant_f32, mercury_dequant_f32_parallel, mercury_dequant_perchan_f32,
+    mercury_dequant_perchan_f32_parallel, DQ_GELU, DQ_I32, DQ_I8, DQ_ID, DQ_RELU, DQ_SILU, DQ_U8,
+};
+
 mod lowp;
 pub use lowp::{
     mercury_axpby_bf16, mercury_axpby_f16, mercury_dot_bf16, mercury_dot_bf16_parallel,

@@ -1133,6 +1133,105 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_dequant_f32[_parallel](q, out, n, scale, op)` — int-input dequant
+            // `out[j] = act((q[j] as f32)·scale)` over an `[i8]`/`[u8]`/`[i32]` array (the width is in
+            // `op`). The interpreter reconstructs the input array's **real bytes** (its memory is 1 slot
+            // per scalar leaf; each slot's low bits are the stored integer) into a width-matched buffer,
+            // so the kernel — cast to `*const i8`/`u8`/`i32` internally — sees the identical layout the
+            // native backend passes, then marshals the f32 result back. Integer→f32 is exact, so this is
+            // bit-for-bit; the *serial* runtime kernel backs both names (elementwise → parallel is
+            // identical). `mercury_runtime::DQ_*` name the width codes.
+            "mercury_dequant_f32" | "mercury_dequant_f32_parallel" => {
+                let q = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let scale = args[3].as_float() as f32;
+                let op = args[4].as_int() as i64;
+                let width = op & (0xff << 8);
+                let mut qbytes: Vec<u8> = Vec::with_capacity(n * 4);
+                for t in 0..n {
+                    let v = self.memory.get(q + t).ok_or("dequant q out of bounds")?.as_int();
+                    if width == mercury_runtime::DQ_I32 {
+                        qbytes.extend_from_slice(&(v as i32).to_ne_bytes());
+                    } else if width == mercury_runtime::DQ_U8 {
+                        qbytes.push(v as u8);
+                    } else {
+                        qbytes.push(v as i8 as u8); // DQ_I8
+                    }
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: qbytes matches the width `op` selects; obuf is n long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_dequant_f32(
+                        qbytes.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        n as i64,
+                        scale,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("dequant output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
+            // `mercury_dequant_perchan_f32[_parallel](q, out, rows, cols, scale, op)` — per-channel
+            // dequant `out[i*cols+j] = act((q[i*cols+j] as f32)·scale[j])` with a per-output-column
+            // `scale[j]` (length `cols`). Marshals the integer input exactly like `mercury_dequant_f32`
+            // (width-matched real bytes) plus the `cols`-long f32 scale vector; writes the f32 result
+            // back. Rows are independent so the serial kernel backs both names.
+            "mercury_dequant_perchan_f32" | "mercury_dequant_perchan_f32_parallel" => {
+                let q = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let rows = args[2].as_int() as usize;
+                let cols = args[3].as_int() as usize;
+                let scale_idx = ptr(args[4])?;
+                let op = args[5].as_int() as i64;
+                let width = op & (0xff << 8);
+                let n = rows * cols;
+                let mut qbytes: Vec<u8> = Vec::with_capacity(n * 4);
+                for t in 0..n {
+                    let v = self.memory.get(q + t).ok_or("dequant_perchan q out of bounds")?.as_int();
+                    if width == mercury_runtime::DQ_I32 {
+                        qbytes.extend_from_slice(&(v as i32).to_ne_bytes());
+                    } else if width == mercury_runtime::DQ_U8 {
+                        qbytes.push(v as u8);
+                    } else {
+                        qbytes.push(v as i8 as u8); // DQ_I8
+                    }
+                }
+                let mut sbuf: Vec<f32> = Vec::with_capacity(cols);
+                for t in 0..cols {
+                    sbuf.push(
+                        self.memory
+                            .get(scale_idx + t)
+                            .ok_or("dequant_perchan scale out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: qbytes width-matched, obuf n long, sbuf cols long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_dequant_perchan_f32(
+                        qbytes.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        sbuf.as_ptr(),
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("dequant_perchan output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_sgemm_nt_epi[_parallel](a, b, c, m, k, n, beta, bias, act)` — the fused-epilogue
             // Linear (`C = act(A·Bᵀ + bias)`). Like the plain GEMM, the interpreter marshals operands
             // into real f32 buffers and calls the *serial* runtime kernel as the oracle. The native
