@@ -89,9 +89,17 @@ impl VecKernel {
         mut store: impl FnMut(u32, f32),
     ) {
         let mut vals: Vec<f32> = Vec::with_capacity(self.ops.len());
+        // Store-to-load forwarding within the lane: the assembler stores each stream to memory and a
+        // later `Load` of that stream re-reads the same address, so a body that writes then reads a
+        // stream — e.g. a fused `t[k] = …; o[k] = f(t[k])` — observes the just-written value. Mirror
+        // that here so the interpreter oracle matches the machine code bit-for-bit. `self.streams`
+        // bounds every stream index.
+        let mut stored: Vec<Option<f32>> = vec![None; self.streams as usize];
         for op in &self.ops {
             let v = match *op {
-                VecOp::Load { stream } => load(stream),
+                VecOp::Load { stream } => {
+                    stored[stream as usize].unwrap_or_else(|| load(stream))
+                }
                 VecOp::Splat { scalar: k } => scalar(k),
                 VecOp::Const { bits } => f32::from_bits(bits),
                 VecOp::Bin { op, a, b } => {
@@ -130,11 +138,120 @@ impl VecKernel {
                     }
                 }
                 VecOp::Store { stream, val } => {
-                    store(stream, vals[val as usize]);
+                    let x = vals[val as usize];
+                    stored[stream as usize] = Some(x); // forward to later loads of this stream
+                    store(stream, x);
                     f32::NAN // stores carry no value; never referenced
                 }
             };
             vals.push(v);
         }
     }
+
+    /// The register pressure of this body, or `None` if it is outside the AVX2 emitter's coverage
+    /// (0 or more than [`VEC_MAX_STREAMS`] streams, or a `Const` the vectorizer should have folded
+    /// into `scalars`). Single-sourced here so the Cranelift assembler's `plan_registers` and the
+    /// vectorizer's feasibility gate compute the *same* P/H and can never disagree about whether a
+    /// body fits — a mismatch would turn a fallback-eligible body into a hard `assemble_kernel`
+    /// error. Pure over the op list.
+    pub fn pressure(&self) -> Option<VecPressure> {
+        if self.streams == 0 || self.streams > VEC_MAX_STREAMS {
+            return None;
+        }
+        if self.ops.iter().any(|o| matches!(o, VecOp::Const { .. })) {
+            return None;
+        }
+        // Distinct invariant scalars referenced by `Splat`, first-seen order (each hoisted to a reg).
+        let mut hoist_scalars: Vec<u32> = Vec::new();
+        for o in &self.ops {
+            if let VecOp::Splat { scalar } = *o {
+                if !hoist_scalars.contains(&scalar) {
+                    hoist_scalars.push(scalar);
+                }
+            }
+        }
+        let needs_signmask = self.ops.iter().any(|o| matches!(o, VecOp::Neg { .. }));
+
+        // last_use[i]: last op index that references value i.
+        let mut last_use = vec![0usize; self.ops.len()];
+        for (i, o) in self.ops.iter().enumerate() {
+            for v in op_operands(o) {
+                last_use[v as usize] = i;
+            }
+        }
+        // P = peak simultaneously-live body registers: allocate a result before freeing this op's
+        // dead operands (mirrors the emitter's ordering, so P is an exact upper bound).
+        let mut live: Vec<usize> = Vec::new();
+        let mut per_group: usize = 0;
+        for (i, o) in self.ops.iter().enumerate() {
+            if op_produces_value(o) {
+                live.push(i);
+                per_group = per_group.max(live.len());
+            }
+            for v in op_operands(o) {
+                // Hoisted (Splat/Const) values never occupy a body register.
+                let hoisted =
+                    matches!(self.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. });
+                if !hoisted && last_use[v as usize] == i {
+                    live.retain(|&x| x != v as usize);
+                }
+            }
+        }
+        Some(VecPressure {
+            hoist_scalars,
+            needs_signmask,
+            last_use,
+            per_group: per_group.max(1) as u32,
+        })
+    }
+}
+
+/// Architectural YMM registers a kernel may use.
+pub const VEC_NREG: u32 = 16;
+/// The maximum number of distinct unit-stride streams the AVX2 emitter keeps in base-pointer GPRs.
+pub const VEC_MAX_STREAMS: u32 = 4;
+
+/// A backend-agnostic register-pressure summary of a [`VecKernel`] body, consumed by the Cranelift
+/// assembler (to build a concrete register plan) and by the vectorizer (to check the body fits before
+/// committing to the 256-bit path).
+pub struct VecPressure {
+    /// Distinct invariant scalars referenced by `Splat`, first-seen order (each hoisted to a reg).
+    pub hoist_scalars: Vec<u32>,
+    /// The body negates, so a sign-mask constant occupies one more fixed register.
+    pub needs_signmask: bool,
+    /// `last_use[i]` = the last op index that references value `i`.
+    pub last_use: Vec<usize>,
+    /// P: peak simultaneously-live body registers (results that are neither hoisted nor stores).
+    pub per_group: u32,
+}
+
+impl VecPressure {
+    /// H: fixed registers taken by hoisted broadcasts (invariant scalars + an optional sign-mask).
+    pub fn hoist(&self) -> u32 {
+        self.hoist_scalars.len() as u32 + self.needs_signmask as u32
+    }
+    /// Whether one group plus the hoisted broadcasts fit the register file (unroll ≥ 1 feasible).
+    pub fn fits(&self) -> bool {
+        self.per_group + self.hoist() <= VEC_NREG
+    }
+}
+
+/// The operand value-indices an op reads (for liveness). `Load`/`Splat`/`Const` read nothing.
+pub fn op_operands(op: &VecOp) -> Vec<u32> {
+    match *op {
+        VecOp::Load { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => vec![],
+        VecOp::Bin { a, b, .. } | VecOp::Cmp { a, b, .. } => vec![a, b],
+        VecOp::Fma { a, b, c } => vec![a, b, c],
+        VecOp::Select { mask, a, b } => vec![mask, a, b],
+        VecOp::Sqrt { a } | VecOp::Neg { a } => vec![a],
+        VecOp::Store { val, .. } => vec![val],
+    }
+}
+
+/// Whether an op produces a body value that needs a (non-hoisted) register.
+pub fn op_produces_value(op: &VecOp) -> bool {
+    !matches!(
+        op,
+        VecOp::Store { .. } | VecOp::Splat { .. } | VecOp::Const { .. }
+    )
 }
