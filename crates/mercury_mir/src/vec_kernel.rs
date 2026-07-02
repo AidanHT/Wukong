@@ -65,8 +65,68 @@ pub enum VecOp {
     Store { stream: u32, val: u32 },
 }
 
+/// The fold of a reduction kernel. `Fmax`/`Fmin` use the x86 `vmaxps`/`vminps` operand order
+/// (`src1` returned only when strictly greater/less), so the reference below and the machine code
+/// agree on ties and NaN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VecRedOp {
+    Add,
+    Fmax,
+    Fmin,
+}
+
+impl VecRedOp {
+    /// The fold identity (initial accumulator): 0 for a sum, ∓∞ for max/min so empty lanes lose.
+    pub fn identity(self) -> f32 {
+        match self {
+            VecRedOp::Add => 0.0,
+            VecRedOp::Fmax => f32::NEG_INFINITY,
+            VecRedOp::Fmin => f32::INFINITY,
+        }
+    }
+    /// `fold(acc, x)` with the assembler's operand order (`acc` = src1, `x` = src2). `vmaxps`/`vminps`
+    /// return src2 unless src1 is strictly greater/less, so `if acc > x { acc } else { x }` matches
+    /// them exactly on equal values (incl. ±0) and NaN.
+    pub fn fold(self, acc: f32, x: f32) -> f32 {
+        match self {
+            VecRedOp::Add => acc + x,
+            VecRedOp::Fmax => {
+                if acc > x {
+                    acc
+                } else {
+                    x
+                }
+            }
+            VecRedOp::Fmin => {
+                if acc < x {
+                    acc
+                } else {
+                    x
+                }
+            }
+        }
+    }
+}
+
+/// The reduction a reduction-kernel performs: fold every lane's value of op `value` (the addend) into
+/// an accumulator and return the horizontal fold. Present ⇒ the kernel has no `Store` and returns an
+/// f32 (in xmm0) instead of writing memory.
+///
+/// `fma` fuses an `Add` reduction of a product: when the addend is `X*Y`, `fma = Some((X, Y))` and the
+/// per-lane fold is `acc = fma(X, Y, acc)` in *one* rounding (`vfmadd231ps` / `f32::mul_add`) — the
+/// product op never enters the recipe, so the fold matches the 128-bit path's fused accumulate, costs
+/// one fewer op, and frees a register for more accumulators. `None` ⇒ the plain fold of `value`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VecReduce {
+    pub op: VecRedOp,
+    pub value: u32,
+    pub fma: Option<(u32, u32)>,
+}
+
 /// A synthesized 256-bit vector kernel: a symbol the caller `Call`s, the stream/scalar counts, the
 /// straight-line body, and the desired unroll (the assembler may reduce it to fit 16 YMM registers).
+/// `reduce` distinguishes an *elementwise* kernel (`None` — stores its results) from a *reduction*
+/// kernel (`Some` — folds one value across all lanes and returns the horizontal result).
 #[derive(Clone, Debug)]
 pub struct VecKernel {
     pub name: Symbol,
@@ -74,6 +134,7 @@ pub struct VecKernel {
     pub scalars: u32,
     pub ops: Vec<VecOp>,
     pub unroll: u32,
+    pub reduce: Option<VecReduce>,
 }
 
 impl VecKernel {
@@ -84,10 +145,21 @@ impl VecKernel {
     /// single-rounded via `mul_add`; `Neg` flips the sign bit; ordered compares are false on NaN).
     pub fn eval_lane(
         &self,
+        load: impl FnMut(u32) -> f32,
+        scalar: impl Fn(u32) -> f32,
+        store: impl FnMut(u32, f32),
+    ) {
+        self.eval_all(load, scalar, store);
+    }
+
+    /// Evaluate every op for one lane, returning all their values (the reference used by both
+    /// [`Self::eval_lane`] for elementwise kernels and [`Self::eval_reduction`] for reductions).
+    fn eval_all(
+        &self,
         mut load: impl FnMut(u32) -> f32,
         scalar: impl Fn(u32) -> f32,
         mut store: impl FnMut(u32, f32),
-    ) {
+    ) -> Vec<f32> {
         let mut vals: Vec<f32> = Vec::with_capacity(self.ops.len());
         // Store-to-load forwarding within the lane: the assembler stores each stream to memory and a
         // later `Load` of that stream re-reads the same address, so a body that writes then reads a
@@ -146,6 +218,94 @@ impl VecKernel {
             };
             vals.push(v);
         }
+        vals
+    }
+
+    /// The unroll a reduction kernel uses: as many accumulator copies as the requested unroll, capped
+    /// so the accumulators plus one addend's live registers plus the hoisted broadcasts fit the 16
+    /// YMM registers. Single-sourced (via [`Self::pressure`]) so the assembler and the interpreter's
+    /// [`Self::eval_reduction`] pick the *same* number of accumulators — the reassociation grouping,
+    /// hence the exact float result, depends on it. `1` if the body doesn't fit at all (the caller
+    /// gates on [`Self::reduction_fits`] first).
+    pub fn reduction_unroll(&self) -> u32 {
+        let Some(p) = self.pressure() else { return 1 };
+        // Each unrolled copy needs its own `P` addend registers *and* its own accumulator, so the
+        // register cost per copy is `P + 1`; the hoisted broadcasts are shared.
+        let denom = p.per_group + 1;
+        let avail = VEC_NREG.saturating_sub(p.hoist());
+        self.unroll.max(1).min((avail / denom).max(1))
+    }
+
+    /// Whether this reduction body fits: one copy's addend registers + one accumulator + the hoisted
+    /// broadcasts fit the register file (`P + 1 + H ≤ 16`). The vectorizer checks this before
+    /// committing to the 256-bit reduction path.
+    pub fn reduction_fits(&self) -> bool {
+        matches!(self.pressure(), Some(p) if p.per_group + 1 + p.hoist() <= VEC_NREG)
+    }
+
+    /// Evaluate a reduction kernel over `n` elements (a multiple of 8) exactly as the AVX2 assembler
+    /// does, returning the horizontal fold. `load(stream, element)` reads a stream's element; the
+    /// caller folds the `[n, end)` scalar tail into this result afterward. The reassociation is fixed
+    /// and identical on both backends: `U` lane-accumulators filled by the main U-unrolled loop and a
+    /// single-group cleanup, combined lane-wise into accumulator 0, then a *sequential* lane-0..7
+    /// horizontal fold (the assembler spills the accumulator and folds the eight lanes in order, so no
+    /// tree-reduction order to match). The reassociated form is the oracle (both backends run it).
+    pub fn eval_reduction(
+        &self,
+        n: usize,
+        mut load: impl FnMut(u32, usize) -> f32,
+        scalar: impl Fn(u32) -> f32,
+    ) -> f32 {
+        let red = self.reduce.expect("eval_reduction on a non-reduction kernel");
+        let lanes = LANES_USIZE;
+        let u = self.reduction_unroll() as usize;
+        // Fold one lane's addend into its accumulator: a fused `acc = fma(X, Y, acc)` in a single
+        // rounding (bit-identical to the assembler's `vfmadd231ps`) when `fma` is set, else the plain
+        // fold of the addend value.
+        let addend = |acc: f32, vals: &[f32]| -> f32 {
+            match red.fma {
+                Some((x, y)) => vals[x as usize].mul_add(vals[y as usize], acc),
+                None => red.op.fold(acc, vals[red.value as usize]),
+            }
+        };
+        // acc[copy * lanes + lane]. The addend of element `e` is op `red.value` evaluated with the
+        // load closure reading element `e`.
+        let mut acc = vec![red.op.identity(); u * lanes];
+        let mut i = 0usize;
+        // Main loop: U independent accumulators, computed and folded one copy at a time.
+        let ustep = u * lanes;
+        while i + ustep <= n {
+            for cu in 0..u {
+                for lane in 0..lanes {
+                    let e = i + cu * lanes + lane;
+                    let vals = self.eval_all(|s| load(s, e), &scalar, |_, _| {});
+                    let idx = cu * lanes + lane;
+                    acc[idx] = addend(acc[idx], &vals);
+                }
+            }
+            i += ustep;
+        }
+        // Cleanup: remaining full 8-groups fold into accumulator 0.
+        while i + lanes <= n {
+            for lane in 0..lanes {
+                let e = i + lane;
+                let vals = self.eval_all(|s| load(s, e), &scalar, |_, _| {});
+                acc[lane] = addend(acc[lane], &vals);
+            }
+            i += lanes;
+        }
+        // Combine the U accumulators into copy 0, lane-wise.
+        for cu in 1..u {
+            for lane in 0..lanes {
+                acc[lane] = red.op.fold(acc[lane], acc[cu * lanes + lane]);
+            }
+        }
+        // Horizontal fold of the eight lanes, in order 0..8.
+        let mut r = acc[0];
+        for lane in 1..lanes {
+            r = red.op.fold(r, acc[lane]);
+        }
+        r
     }
 
     /// The register pressure of this body, or `None` if it is outside the AVX2 emitter's coverage
@@ -179,6 +339,20 @@ impl VecKernel {
                 last_use[v as usize] = i;
             }
         }
+        // A reduction's fold reads its addend operand(s) *after* the last op (the fold is not itself an
+        // op), so those registers must survive the whole body. Mark their last use one past the end so
+        // neither the peak-liveness scan below nor the emitter's `free_after` reclaims them early —
+        // essential for the fused `fma` operands, which have no consuming op at all.
+        if let Some(red) = self.reduce {
+            let end = self.ops.len();
+            match red.fma {
+                Some((x, y)) => {
+                    last_use[x as usize] = end;
+                    last_use[y as usize] = end;
+                }
+                None => last_use[red.value as usize] = end,
+            }
+        }
         // P = peak simultaneously-live body registers: allocate a result before freeing this op's
         // dead operands (mirrors the emitter's ordering, so P is an exact upper bound).
         let mut live: Vec<usize> = Vec::new();
@@ -208,6 +382,9 @@ impl VecKernel {
 
 /// Architectural YMM registers a kernel may use.
 pub const VEC_NREG: u32 = 16;
+/// f32 lanes per 256-bit YMM register.
+pub const VEC_LANES: u32 = 8;
+const LANES_USIZE: usize = VEC_LANES as usize;
 /// The maximum number of distinct unit-stride streams the AVX2 emitter keeps in base-pointer GPRs.
 pub const VEC_MAX_STREAMS: u32 = 4;
 

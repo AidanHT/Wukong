@@ -590,8 +590,12 @@ impl<'a> FnTranslator<'a> {
                 } else {
                     self.resize_int(n_raw, n_ty, types::I64, false)
                 };
-                self.builder.ins().call(fref, &[ptrs_v, scalars_v, n_v]);
-                return;
+                let call = self.builder.ins().call(fref, &[ptrs_v, scalars_v, n_v]);
+                // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
+                match res {
+                    Some(_) => self.builder.inst_results(call)[0],
+                    None => return,
+                }
             }
             Op::FuncAddr(sym) => {
                 let fref = self.func_refs[sym];
@@ -2184,18 +2188,22 @@ fn populate_module<M: Module>(
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // ptrs
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // scalars
     kernel_sig.params.push(AbiParam::new(types::I64)); // n
+    // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
+    let mut kernel_sig_reduce = kernel_sig.clone();
+    kernel_sig_reduce.returns.push(AbiParam::new(types::F32));
     let mut kernel_ids: Vec<Vec<FuncId>> = Vec::with_capacity(program.funcs.len());
     for (fi, f) in program.funcs.iter().enumerate() {
         let mut per_fn: Vec<FuncId> = Vec::with_capacity(f.vec_kernels.len());
         for (ki, k) in f.vec_kernels.iter().enumerate() {
             let bytes = crate::avx2::assemble_kernel(k)
                 .map_err(|e| format!("avx2 assemble vec kernel {fi}.{ki}: {e}"))?;
+            let sig = if k.reduce.is_some() {
+                &kernel_sig_reduce
+            } else {
+                &kernel_sig
+            };
             let id = module
-                .declare_function(
-                    &format!("__mercury_veckernel_{fi}_{ki}"),
-                    Linkage::Local,
-                    &kernel_sig,
-                )
+                .declare_function(&format!("__mercury_veckernel_{fi}_{ki}"), Linkage::Local, sig)
                 .map_err(|e| e.to_string())?;
             module
                 .define_function_bytes(id, 16, &bytes, &[])

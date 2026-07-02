@@ -22,7 +22,7 @@
 #![allow(dead_code)] // Phase A: assembler proven in isolation before the vectorizer wires it in.
 
 use iced_x86::code_asm::*;
-use mercury_mir::{VecBin, VecCmp, VecKernel, VecOp, VecPressure};
+use mercury_mir::{VecBin, VecCmp, VecKernel, VecOp, VecPressure, VecRedOp};
 
 /// f32 lanes per YMM register (256-bit / 32-bit).
 pub const LANES: u32 = 8;
@@ -68,6 +68,7 @@ struct Plan {
     hoist_scalars: Vec<u32>,     // distinct invariant scalars, each in a fixed reg
     signmask_reg: Option<u8>,    // fixed reg holding -0.0 lanes, if the body negates
     scalar_reg: Vec<(u32, u8)>,  // scalar index → fixed reg
+    acc_regs: Vec<u8>,           // reduction accumulators, one per unroll copy (empty if elementwise)
     saved: Vec<u8>,              // xmm6..xmm15 we must preserve (callee-saved on Win64)
     last_use: Vec<usize>,        // last_use[i] = last op index referencing value i
 }
@@ -95,16 +96,35 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
             "avx2: body needs {per_group}+{hoist} > {NREG} registers"
         ));
     }
-    // Interleave as many groups as fit (dense from ymm0), capped by the requested unroll.
-    let unroll = k
-        .unroll
-        .max(1)
-        .min(((NREG - hoist) / per_group) as u32)
-        .max(1);
+    // A reduction additionally needs one accumulator register per unrolled copy; an elementwise
+    // kernel needs none. The unroll comes from `mercury_mir` (single-sourced with the interpreter's
+    // `eval_reduction`, which must pick the same number of accumulators to reassociate identically).
+    let is_reduction = k.reduce.is_some();
+    let unroll = if is_reduction {
+        if !k.reduction_fits() {
+            return Err(format!(
+                "avx2: reduction body needs {per_group}+1+{hoist} > {NREG} registers"
+            ));
+        }
+        k.reduction_unroll()
+    } else {
+        // Interleave as many groups as fit (dense from ymm0), capped by the requested unroll.
+        k.unroll
+            .max(1)
+            .min(((NREG - hoist) / per_group) as u32)
+            .max(1)
+    };
 
     // Register assignment (dense, low first, to minimize callee-saved spills): body banks occupy
-    // ymm[0 .. unroll*P); the hoisted broadcasts occupy the next `hoist` registers.
+    // ymm[0 .. unroll*P); a reduction's accumulators occupy the next `unroll`; the hoisted broadcasts
+    // occupy the `hoist` after that.
     let mut next = unroll as u8 * per_group;
+    let acc_regs: Vec<u8> = if is_reduction {
+        (0..unroll as u8).map(|c| next + c).collect()
+    } else {
+        Vec::new()
+    };
+    next += acc_regs.len() as u8;
     let mut scalar_reg = Vec::new();
     for &s in &hoist_scalars {
         scalar_reg.push((s, next));
@@ -127,6 +147,7 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
         hoist_scalars,
         signmask_reg,
         scalar_reg,
+        acc_regs,
         saved,
         last_use,
     })
@@ -166,6 +187,25 @@ fn emit(k: &VecKernel, plan: &Plan) -> Result<Vec<u8>, IcedError> {
         a.vpcmpeqd(ymm(r), ymm(r), ymm(r))?; // all ones
         a.vpslld(ymm(r), ymm(r), 31u32)?; // → 0x80000000 per lane
     }
+    // Initialise the reduction accumulators to the fold identity (all lanes): 0.0 for a sum, −∞/+∞
+    // for max/min so empty tail lanes never win. The ±∞ patterns are built in-register from all-ones
+    // (no data section): −∞ = 0xFF800000 = all-ones << 23; +∞ = 0x7F800000 = (all-ones >> 24) << 23.
+    if let Some(red) = k.reduce {
+        for &r in &plan.acc_regs {
+            match red.op {
+                VecRedOp::Add => a.vxorps(ymm(r), ymm(r), ymm(r))?,
+                VecRedOp::Fmax => {
+                    a.vpcmpeqd(ymm(r), ymm(r), ymm(r))?;
+                    a.vpslld(ymm(r), ymm(r), 23u32)?; // → 0xFF800000 = −∞
+                }
+                VecRedOp::Fmin => {
+                    a.vpcmpeqd(ymm(r), ymm(r), ymm(r))?;
+                    a.vpsrld(ymm(r), ymm(r), 24u32)?; // → 0x000000FF
+                    a.vpslld(ymm(r), ymm(r), 23u32)?; // → 0x7F800000 = +∞
+                }
+            }
+        }
+    }
     // The 4th stream base reuses rdx now that the scalars have been read.
     if k.streams == 4 {
         a.mov(rdx, qword_ptr(rcx + 24))?;
@@ -186,21 +226,39 @@ fn emit(k: &VecKernel, plan: &Plan) -> Result<Vec<u8>, IcedError> {
         a.cmp(rax, r8)?;
         a.ja(single_head)?;
         for u in 0..plan.unroll {
-            emit_group(&mut a, k, plan, u, (u * LANES) as i32 * 4)?;
+            emit_group(&mut a, k, plan, u, (u * LANES) as i32 * 4, plan.acc_regs.get(u as usize).copied())?;
         }
         a.add(rcx, step)?;
         a.jmp(head)?;
     }
 
-    // --- Single-vector cleanup loop (step 8). ---
+    // --- Single-vector cleanup loop (step 8); a reduction folds into accumulator 0. ---
     a.set_label(&mut single_head)?;
     a.lea(rax, qword_ptr(rcx + LANES as i32))?;
     a.cmp(rax, r8)?;
     a.ja(done)?;
-    emit_group(&mut a, k, plan, 0, 0)?;
+    emit_group(&mut a, k, plan, 0, 0, plan.acc_regs.first().copied())?;
     a.add(rcx, LANES as i32)?;
     a.jmp(single_head)?;
     a.set_label(&mut done)?;
+
+    // --- Reduction finish: combine the accumulators into acc[0], then a sequential lane-0..7
+    // horizontal fold into xmm0 (the f32 return). Done before the epilogue restores the callee-saved
+    // xmm halves, since an accumulator may live in one of them. ---
+    if let Some(red) = k.reduce {
+        let acc0 = plan.acc_regs[0];
+        for &r in &plan.acc_regs[1..] {
+            fold_ymm(&mut a, red.op, acc0, r)?;
+        }
+        // Spill the 8 lanes and fold them in order; a local 32-byte scratch keeps rsp balanced.
+        a.sub(rsp, 32)?;
+        a.vmovups(ymmword_ptr(rsp), ymm(acc0))?;
+        a.vmovss(xmm(0), dword_ptr(rsp))?;
+        for lane in 1..LANES as i32 {
+            fold_ss(&mut a, red.op, dword_ptr(rsp + lane * 4))?;
+        }
+        a.add(rsp, 32)?;
+    }
 
     // --- Epilogue. ---
     if save_bytes > 0 {
@@ -228,6 +286,7 @@ fn emit_group(
     plan: &Plan,
     u: u32,
     disp: i32,
+    acc_reg: Option<u8>,
 ) -> Result<(), IcedError> {
     let bank_base = u as u8 * plan.per_group;
     let mut free: Vec<u8> = (0..plan.per_group).map(|r| bank_base + r).collect();
@@ -334,7 +393,41 @@ fn emit_group(
             VecOp::Store { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => unreachable!(),
         }
     }
+    // A reduction folds this group's addend into this copy's accumulator. A fused product folds in one
+    // rounding via `vfmadd231ps` (acc += X*Y), matching `eval_reduction`'s `mul_add`; otherwise the
+    // plain `fold` of the addend value.
+    if let (Some(acc), Some(red)) = (acc_reg, k.reduce) {
+        match red.fma {
+            Some((x, y)) => {
+                let (rx, ry) = (reg_of(&vreg, x), reg_of(&vreg, y));
+                a.vfmadd231ps(ymm(acc), ymm(rx), ymm(ry))?; // acc = X*Y + acc
+            }
+            None => {
+                let rv = vreg[red.value as usize].expect("reduce value has a register");
+                fold_ymm(a, red.op, acc, rv)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// `acc = fold(acc, src)` on 256-bit lanes (`acc` = src1, so `vmaxps`/`vminps` keep src2 on ties/NaN,
+/// matching [`VecRedOp::fold`]).
+fn fold_ymm(a: &mut CodeAssembler, op: VecRedOp, acc: u8, src: u8) -> Result<(), IcedError> {
+    match op {
+        VecRedOp::Add => a.vaddps(ymm(acc), ymm(acc), ymm(src)),
+        VecRedOp::Fmax => a.vmaxps(ymm(acc), ymm(acc), ymm(src)),
+        VecRedOp::Fmin => a.vminps(ymm(acc), ymm(acc), ymm(src)),
+    }
+}
+
+/// `xmm0 = fold(xmm0, [mem])` on one scalar (the horizontal reduction step).
+fn fold_ss(a: &mut CodeAssembler, op: VecRedOp, src: AsmMemoryOperand) -> Result<(), IcedError> {
+    match op {
+        VecRedOp::Add => a.addss(xmm(0), src),
+        VecRedOp::Fmax => a.maxss(xmm(0), src),
+        VecRedOp::Fmin => a.minss(xmm(0), src),
+    }
 }
 
 /// Bring-up kernel (Phase A): hand-written saxpy `out[i] = a*x[i] + y[i]` over `n` (multiple of 8)
@@ -485,10 +578,201 @@ mod tests {
         unsafe { module.free_memory() };
     }
 
+    /// Assemble a *reduction* kernel `k`, run it over `n/8*8` elements of `streams`/`scalars`, and
+    /// assert its f32 return matches [`VecKernel::eval_reduction`] **bit-for-bit** — the same
+    /// reassociation on both. Reduction kernels only read their streams, so `*const` suffices.
+    fn check_reduce(k: &VecKernel, streams: &[Vec<f32>], scalars: &[f32], n: usize) {
+        let bytes = assemble_kernel(k).expect("assemble reduction");
+        let vlen = n / LANES as usize * LANES as usize;
+        let want =
+            k.eval_reduction(vlen, |s, e| streams[s as usize][e], |c| scalars[c as usize]);
+
+        let isa = crate::make_isa(false).expect("isa");
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut module = JITModule::new(builder);
+        let ptr = module.target_config().pointer_type();
+        let mut sig = Signature::new(module.target_config().default_call_conv);
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I64));
+        sig.returns
+            .push(AbiParam::new(cranelift_codegen::ir::types::F32));
+        let fid = module.declare_function("kr", Linkage::Export, &sig).unwrap();
+        module.define_function_bytes(fid, 16, &bytes, &[]).unwrap();
+        module.finalize_definitions().unwrap();
+        let code = module.get_finalized_function(fid);
+        let kernel: extern "C" fn(*const *const f32, *const f32, u64) -> f32 =
+            unsafe { std::mem::transmute(code) };
+        let ptrs: Vec<*const f32> = streams.iter().map(|v| v.as_ptr()).collect();
+        let got = kernel(ptrs.as_ptr(), scalars.as_ptr(), vlen as u64);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "reduction kernel vs eval_reduction (n={n}): got {got}, want {want}"
+        );
+        unsafe { module.free_memory() };
+    }
+
     // Deterministic inputs that exercise negatives, zeros, and non-round values (bit-exact vs the
     // f32 reference regardless of "ugliness", including sqrt(<0)=NaN and x/0=inf).
     fn ramp(n: usize, seed: f32) -> Vec<f32> {
         (0..n).map(|i| (i as f32) * 0.375 - 5.0 + seed).collect()
+    }
+
+    #[test]
+    fn avx2_reduce_sum_and_dot() {
+        // sum: acc += a[i]
+        let sum = VecKernel {
+            name: sym(),
+            streams: 1,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 0,
+                fma: None,
+            }),
+            ops: vec![VecOp::Load { stream: 0 }],
+        };
+        // dot: acc += a[i]*b[i]
+        let dot = VecKernel {
+            name: sym(),
+            streams: 2,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 2,
+                fma: None,
+            }),
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Load { stream: 1 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 1,
+                },
+            ],
+        };
+        for n in [8usize, 16, 24, 32, 64, 128, 256, 512] {
+            check_reduce(&sum, &[ramp(n, 0.0)], &[], n);
+            check_reduce(&dot, &[ramp(n, 0.0), ramp(n, 1.0)], &[], n);
+        }
+    }
+
+    #[test]
+    fn avx2_reduce_fma_fused() {
+        // Fused dot: acc = fma(a[i], b[i], acc) — the product is *not* a recipe op; the two loads are
+        // the fma operands (kept live to the fold). One rounding, so it must match eval_reduction's
+        // mul_add bit-for-bit (that agreement is the whole point of the shared reference).
+        let fdot = VecKernel {
+            name: sym(),
+            streams: 2,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 0,
+                fma: Some((0, 1)),
+            }),
+            ops: vec![VecOp::Load { stream: 0 }, VecOp::Load { stream: 1 }],
+        };
+        // Fused product of two composite operands `(a+b)*(a-b)`: the loads feed both operands, so their
+        // last-use must extend past the two arithmetic ops to the fold (exercises the liveness guard).
+        let fcomposite = VecKernel {
+            name: sym(),
+            streams: 2,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 2,
+                fma: Some((2, 3)),
+            }),
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Load { stream: 1 },
+                VecOp::Bin { op: VecBin::Add, a: 0, b: 1 }, // X = a+b
+                VecOp::Bin { op: VecBin::Sub, a: 0, b: 1 }, // Y = a-b
+            ],
+        };
+        for n in [8usize, 16, 24, 32, 64, 128, 256, 512] {
+            check_reduce(&fdot, &[ramp(n, 0.0), ramp(n, 1.0)], &[], n);
+            check_reduce(&fcomposite, &[ramp(n, 0.0), ramp(n, 1.0)], &[], n);
+        }
+    }
+
+    #[test]
+    fn avx2_reduce_sumsq_and_weighted() {
+        // sum of squares: acc += a[i]*a[i]
+        let ssq = VecKernel {
+            name: sym(),
+            streams: 1,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 1,
+                fma: None,
+            }),
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                },
+            ],
+        };
+        // weighted sum: acc += a[i] * k  (a hoisted scalar in the addend)
+        let wsum = VecKernel {
+            name: sym(),
+            streams: 1,
+            scalars: 1,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op: VecRedOp::Add,
+                value: 2,
+                fma: None,
+            }),
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Splat { scalar: 0 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 1,
+                },
+            ],
+        };
+        for n in [8usize, 16, 24, 40, 96, 256] {
+            check_reduce(&ssq, &[ramp(n, 0.0)], &[], n);
+            check_reduce(&wsum, &[ramp(n, 0.0)], &[2.5], n);
+        }
+    }
+
+    #[test]
+    fn avx2_reduce_fmax_fmin() {
+        let mk = |op| VecKernel {
+            name: sym(),
+            streams: 1,
+            scalars: 0,
+            unroll: 4,
+            reduce: Some(mercury_mir::VecReduce {
+                op,
+                value: 0,
+                fma: None,
+            }),
+            ops: vec![VecOp::Load { stream: 0 }],
+        };
+        let fmax = mk(VecRedOp::Fmax);
+        let fmin = mk(VecRedOp::Fmin);
+        for n in [8usize, 16, 24, 32, 64, 200, 256] {
+            // ramps with both signs so the extreme isn't always at an edge lane.
+            check_reduce(&fmax, &[ramp(n, 0.0)], &[], n);
+            check_reduce(&fmin, &[ramp(n, 3.0)], &[], n);
+        }
     }
 
     fn sym() -> mercury_span::Symbol {
@@ -503,6 +787,7 @@ mod tests {
             streams: 3,
             scalars: 1,
             unroll: 4,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Splat { scalar: 0 },
@@ -524,6 +809,7 @@ mod tests {
             streams: 3,
             scalars: 0,
             unroll: 4,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Load { stream: 1 },
@@ -546,6 +832,7 @@ mod tests {
             streams: 3,
             scalars: 0,
             unroll: 2,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Load { stream: 1 },
@@ -571,6 +858,7 @@ mod tests {
             streams: 3, // 0 = x (in), 1 = t (in-place scratch), 2 = o (out)
             scalars: 3, // 0 = 2.0, 1 = 1.0, 2 = 0.0
             unroll: 4,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },                  // v0 = x
                 VecOp::Splat { scalar: 0 },                 // v1 = 2.0
@@ -605,6 +893,7 @@ mod tests {
             streams: 3,
             scalars: 0,
             unroll: 4,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Neg { a: 0 },
@@ -626,6 +915,7 @@ mod tests {
             streams: 2,
             scalars: 1,
             unroll: 4,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Splat { scalar: 0 }, // 0.0
@@ -647,6 +937,7 @@ mod tests {
             streams: 1,
             scalars: 1,
             unroll: 4,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Splat { scalar: 0 },
@@ -663,6 +954,7 @@ mod tests {
             streams: 4,
             scalars: 0,
             unroll: 2,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Load { stream: 1 },
@@ -686,6 +978,7 @@ mod tests {
             streams: 5,
             scalars: 0,
             unroll: 1,
+            reduce: None,
             ops: vec![
                 VecOp::Load { stream: 0 },
                 VecOp::Store { stream: 4, val: 0 },

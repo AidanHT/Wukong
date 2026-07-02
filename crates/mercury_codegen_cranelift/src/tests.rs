@@ -80,6 +80,54 @@ fn p4_bench_256_vs_128() {
     );
 }
 
+/// Same-run A/B of the 256-bit AVX2 *reduction* kernel vs the 128-bit CLIF reduction. Ignored by
+/// default; run with `--ignored --nocapture`. Sanity check that widening the reduction buys
+/// throughput (not a correctness gate — the differential + f64-reference tests are). Uses a
+/// *compute-bound* addend `a·(a²+b²)`: its top `*` is fused into the accumulate (`vfmadd`, matching
+/// the 128-bit path), and the several muls/adds per pair of loads keep it FP-bound, not L1-bandwidth
+/// bound — a memory-bound dot (`a·b`) merely ties, since both widths saturate the same L1 ports.
+#[test]
+#[ignore]
+fn p4_bench_reduction_256_vs_128() {
+    // One `+ addend` off `s` (so `reduction_of` claims it); the addend's top `*` fuses via FMA. N is
+    // ≥ `VEC256_REDUCTION_MIN_TRIP` so the gated 256-bit path actually fires (below it, both compile to
+    // the inlined 128-bit reduction and this would compare 128 against 128).
+    let src = "\
+        fn main() -> i32 { \
+          let mut a: [f32; 2048] = [0.0; 2048]; let mut b: [f32; 2048] = [0.0; 2048]; \
+          for i in 0..2048 { a[i] = (i as f32) * 0.001; b[i] = (i as f32) * 0.002 + 1.0; } \
+          let mut acc: f32 = 0.0; let mut r: i32 = 0; \
+          while r < 50000 { \
+            let mut s: f32 = 0.0; \
+            for i in 0..2048 { s = s + a[i] * (a[i]*a[i] + b[i]*b[i]); } \
+            acc = acc + s; r += 1; \
+          } \
+          print(acc as i32); return 0; }";
+    let best = |p: &crate::JitProgram| -> std::time::Duration {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(p.call());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    std::env::set_var("MERCURY_P4_NO_256", "1");
+    let p128 = compile_native(src, 3);
+    std::env::remove_var("MERCURY_P4_NO_256");
+    let p256 = compile_native(src, 3);
+    best(&p128);
+    best(&p256);
+    let (t128, t256) = (best(&p128), best(&p256));
+    eprintln!(
+        "p4 reduction 256-vs-128: 128-bit {:?}, 256-bit {:?}  =>  {:.2}x",
+        t128,
+        t256,
+        t128.as_secs_f64() / t256.as_secs_f64()
+    );
+}
+
 /// Broad differential sweep of the 256-bit vectorizer: many f32 elementwise body shapes (every
 /// recipe op — +−×÷, neg, sqrt, nested if/else blends, multi-stream, invariant scalars/literals,
 /// in-place output=input) crossed with trip counts that straddle the 8-lane boundary and the scalar
@@ -1286,12 +1334,14 @@ fn vectorized_reductions_are_correct() {
         )
     };
 
-    // The dot reduction must lower to a vector fma accumulator; the sum to a vector add.
+    // At this (small) trip the f32 dot reduction takes the inlined 128-bit CLIF path: reassociated
+    // lane accumulators with a fused multiply-add (the 256-bit AVX2 kernel only fires at large trips —
+    // `VEC256_REDUCTION_MIN_TRIP` — and is covered by `p4_reduction256_gate_and_differential`).
     let (prog, interner) = lowered(&dot(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
         mir.contains("fma") && mir.contains("x f32>"),
-        "dot reduction should vectorize to a vector fma:\n{mir}"
+        "dot reduction should vectorize to a 128-bit fma accumulator:\n{mir}"
     );
 
     for n in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 64, 100, 257, 1000] {
@@ -1337,6 +1387,101 @@ fn reduction_reassociation_is_backend_consistent() {
                 interp(&src, opt).unwrap(),
                 "fractional dot interp vs native mismatch at n={n} -O{opt}"
             );
+        }
+    }
+}
+
+/// The reassociated-reduction gate: the 256-bit AVX2 reduction reassociates the f32 sum, so beyond
+/// interp==native (which `reduction_reassociation_is_backend_consistent` covers) the *value* must
+/// stay within a `c·√K·ε` tolerance of an f64 reference computed from the same f32 inputs. This is
+/// the documented check for reassociated float reductions — it catches a wrong horizontal fold or a
+/// dropped lane that a bit-for-bit backend match alone would miss (both backends could agree on a
+/// wrong reassociation). Fractional inputs so the low bits genuinely differ from a strict sum.
+#[test]
+fn p4_reduction_f64_reference() {
+    for n in [64usize, 257, 1000, 4096] {
+        let src = format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [0.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i % 17) as f32) * 0.5 + 1.0; \
+             y[i] = ((i % 13) as f32) * 0.25 - 0.5; i += 1; }} \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k] * y[k]; }} \
+             print(s); return 0; }}"
+        );
+        let (_, out) = jit(&src, 3).expect("jit");
+        let got: f64 = String::from_utf8(out)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("parse printed f32 sum");
+        // f64 reference over the identical f32 inputs (widened exactly).
+        let mut refsum = 0.0f64;
+        for k in 0..n {
+            let x = (((k % 17) as f32) * 0.5 + 1.0) as f64;
+            let y = (((k % 13) as f32) * 0.25 - 0.5) as f64;
+            refsum += x * y;
+        }
+        let tol = 8.0 * (n as f64).sqrt() * f64::from(f32::EPSILON) * refsum.abs().max(1.0);
+        assert!(
+            (got - refsum).abs() <= tol,
+            "n={n}: reassociated 256-bit dot {got} vs f64 ref {refsum} exceeds tol {tol}"
+        );
+    }
+}
+
+/// The 256-bit reduction is gated on a compile-time-known trip ≥ `VEC256_REDUCTION_MIN_TRIP` (=2048):
+/// below the threshold its out-of-line call loses to the inlined 128-bit reduction, so a small (or
+/// runtime-unknown) trip must keep the 128-bit path. Verifies BOTH the gate (a `veckernel` appears only
+/// at/above the threshold) and that the gated 256-bit path is bit-exact interp-vs-native and -O0-vs-O3
+/// across the fold kinds: fused-`fma` dot/composite, a plain (non-product) addend, and non-fused
+/// `fmax`/`fmin`.
+#[test]
+fn p4_reduction256_gate_and_differential() {
+    // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
+    let mk = |n: usize, red: &str| {
+        format!(
+            "fn main() -> i32 {{ let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ a[i] = ((i % 23) as f32) * 0.5 - 3.0; \
+             b[i] = ((i % 19) as f32) * 0.25 + 0.5; i += 1; }} \
+             {red} print(s); return ((s as i32) & 1023); }}"
+        )
+    };
+    // The fold bodies, parameterized by trip `n`. Two fuse a product into the accumulate (`Add` of an
+    // `X*Y`), one has a non-product addend (no fma), two are max/min (never fma).
+    let folds = |n: usize| -> Vec<(&'static str, String)> {
+        vec![
+            ("fma dot", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + a[k]*b[k]; }}")),
+            ("fma composite", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + a[k]*(a[k]+b[k]); }}")),
+            ("plain", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k] - b[k]); }}")),
+            ("fmax", format!("let mut s: f32 = -1000.0; for k in 0..{n} {{ s = fmax(s, a[k]*b[k]); }}")),
+            ("fmin", format!("let mut s: f32 = 1000.0; for k in 0..{n} {{ s = fmin(s, a[k]*b[k]); }}")),
+        ]
+    };
+
+    // Gate — below the threshold (1024 < 2048), no 256-bit kernel: the reduction stays 128-bit.
+    for (name, red) in folds(1024) {
+        let (prog, interner) = lowered(&mk(1024, &red), 2);
+        assert!(
+            !mercury_mir::print::print_program(&prog, &interner).contains("veckernel"),
+            "N=1024 (< 2048) must keep the inlined 128-bit reduction [{name}]"
+        );
+    }
+    // At/above the threshold — the 256-bit kernel fires and stays bit-exact on both backends and opts.
+    for n in [2048usize, 4096] {
+        for (name, red) in folds(n) {
+            let src = mk(n, &red);
+            let (prog, interner) = lowered(&src, 2);
+            assert!(
+                mercury_mir::print::print_program(&prog, &interner).contains("veckernel"),
+                "N={n} (≥ 2048) must use the 256-bit reduction [{name}]"
+            );
+            for opt in [0u8, 3] {
+                let native = jit(&src, opt).expect("jit");
+                let interpd = interp(&src, opt).expect("interp");
+                assert_eq!(
+                    native, interpd,
+                    "256-bit reduction native vs interp N={n} -O{opt} [{name}]"
+                );
+            }
         }
     }
 }
@@ -1398,11 +1543,13 @@ fn vectorized_ssd_reduction() {
              return s as i32; }}"
         )
     };
+    // Small trip → the inlined 128-bit reduction (the 256-bit kernel is gated to large trips, covered
+    // by `p4_reduction256_gate_and_differential`); the squared-difference addend fuses to an `fma`.
     let (prog, interner) = lowered(&kernel(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
         mir.contains("fma") && mir.contains("x f32>"),
-        "ssd reduction should vectorize to a vector fma:\n{mir}"
+        "ssd reduction should vectorize to a 128-bit fma accumulator:\n{mir}"
     );
     for n in [1usize, 4, 7, 8, 16, 31, 64, 128] {
         let src = kernel(n);
