@@ -1032,6 +1032,7 @@ mod grad_cli_tests {
         let prog = Program {
             funcs: vec![fwd, g],
             level: MirLevel::Low,
+            statics: program.statics.clone(),
         };
         (prog, fname, gname, resolved, interner)
     }
