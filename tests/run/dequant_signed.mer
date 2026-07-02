@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 160
+// EXPECT-OUT: 248
+module tests.run.dequant_signed
+
+// Signedness gate for int-input dequant, checked against hand-computed values (NOT gate-blind — both
+// backends call the same kernel, so the recognizer picking the wrong width code would be consistently
+// wrong; only a known-value golden catches it). An [i8] array sign-extends (a high bit is negative); a
+// [u8] array zero-extends (the same byte is a large positive). The recognizer reads the width from the
+// source array's *signed* scalar type (MirType collapses i8/u8 → I8), so it must not confuse them.
+fn main() -> i32 {
+    // Signed: q[j] = j - 16 in [-16, 15]; scale 1.0 → out = q (reveals the sign of the high byte).
+    let mut q: [i8; 32] = [0 as i8; 32];
+    let mut out: [f32; 32] = [0.0; 32];
+    for j in 0..32 {
+        q[j] = ((j as i32) - 16) as i8;
+    }
+    let one: f32 = 1.0;
+    for j in 0..32 {
+        out[j] = (q[j] as f32) * one;
+    }
+    print(round(out[0]) as i32); // q[0]  = -16 → -16   (sign-extended, not 240)
+    print(round(out[15]) as i32); // q[15] =  -1 → -1    (0xFF as i8, not 255)
+    print(round(out[16]) as i32); // q[16] =   0 →  0
+
+    // Unsigned: q2[j] = j * 8 in {0, 8, .., 248}; several exceed 127. scale 1.0 → out2 = q2 (as u8,
+    // zero-extended — 160 stays 160, not -96).
+    let mut q2: [u8; 32] = [0 as u8; 32];
+    let mut out2: [f32; 32] = [0.0; 32];
+    for j in 0..32 {
+        q2[j] = (j * 8) as u8;
+    }
+    for j in 0..32 {
+        out2[j] = (q2[j] as f32) * one;
+    }
+    print(round(out2[20]) as i32); // q2[20] = 160 → 160  (zero-extended, not -96)
+    print(round(out2[31]) as i32); // q2[31] = 248 → 248
+    return 0;
+}

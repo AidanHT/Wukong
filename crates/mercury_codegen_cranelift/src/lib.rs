@@ -177,6 +177,10 @@ const RT_I8GEMM_NT: &str = "mercury_i8gemm_nt";
 const RT_I8GEMM_NT_PARALLEL: &str = "mercury_i8gemm_nt_parallel";
 const RT_I8GEMM_NT_DEQ: &str = "mercury_i8gemm_nt_deq";
 const RT_I8GEMM_NT_DEQ_PARALLEL: &str = "mercury_i8gemm_nt_deq_parallel";
+const RT_DEQUANT: &str = "mercury_dequant_f32";
+const RT_DEQUANT_PAR: &str = "mercury_dequant_f32_parallel";
+const RT_DEQUANT_PERCHAN: &str = "mercury_dequant_perchan_f32";
+const RT_DEQUANT_PERCHAN_PAR: &str = "mercury_dequant_perchan_f32_parallel";
 const RT_EMBEDDING: &str = "mercury_embedding_f32";
 const RT_EMBEDDING_PAR: &str = "mercury_embedding_f32_parallel";
 const RT_SCATTER_ADD: &str = "mercury_scatter_add_f32";
@@ -1319,6 +1323,31 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[a, b, out, m, k, n, scale_a, scale_b, bias, act]);
             return None;
         }
+        // Int-input dequant: mercury_dequant_f32[_parallel](q, out, n, scale, op) — two pointers, one
+        // i64 count, one f32 scale, one i64 op (input width + activation). 256-bit widen+scale. Void.
+        if matches!(name, RT_DEQUANT | RT_DEQUANT_PAR) && args.len() == 5 {
+            let q = self.val(args[0]);
+            let out = self.val(args[1]);
+            let n = self.coerce_to_i64(args[2]);
+            let scale = self.val(args[3]);
+            let op = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[q, out, n, scale, op]);
+            return None;
+        }
+        // Per-channel dequant: mercury_dequant_perchan_f32[_parallel](q, out, rows, cols, scale, op) —
+        // two data pointers, two i64 dims, one f32* per-column scale, one i64 op. Void.
+        if matches!(name, RT_DEQUANT_PERCHAN | RT_DEQUANT_PERCHAN_PAR) && args.len() == 6 {
+            let q = self.val(args[0]);
+            let out = self.val(args[1]);
+            let rows = self.coerce_to_i64(args[2]);
+            let cols = self.coerce_to_i64(args[3]);
+            let scale = self.val(args[4]);
+            let op = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[q, out, rows, cols, scale, op]);
+            return None;
+        }
         let arg_is_float = args
             .first()
             .map(|a| self.ty_of(*a).is_float())
@@ -1522,6 +1551,13 @@ struct RtFuncs {
     i8nt_par: FuncId,
     i8nt_deq: FuncId,
     i8nt_deq_par: FuncId,
+    /// Int-input dequant `mercury_dequant_f32[_parallel](q, out, n, scale, op)` — 2 ptr, i64, f32, i64.
+    dequant: FuncId,
+    dequant_par: FuncId,
+    /// Per-channel dequant `mercury_dequant_perchan_f32[_parallel](q, out, rows, cols, scale, op)` —
+    /// ptr, ptr, i64, i64, ptr, i64.
+    dequant_perchan: FuncId,
+    dequant_perchan_par: FuncId,
     /// Embedding lookup `mercury_embedding_f32[_parallel](out, weight, ids, t, h, v)` — token-id row
     /// gather (the first layer of every LLM). Reuses the 3-ptr + 3-i64 void `sig_i8gemm` signature.
     embedding: FuncId,
@@ -1717,6 +1753,22 @@ fn populate_module<M: Module>(
     sig_i8gemm_deq.params.push(AbiParam::new(ptr_ty));
     sig_i8gemm_deq.params.push(AbiParam::new(ptr_ty));
     sig_i8gemm_deq.params.push(AbiParam::new(types::I64));
+    // mercury_dequant_f32[_parallel](q, out: ptr, n: i64, scale: f32, op: i64) — int-input dequant (void).
+    let mut sig_dequant = Signature::new(call_conv);
+    sig_dequant.params.push(AbiParam::new(ptr_ty));
+    sig_dequant.params.push(AbiParam::new(ptr_ty));
+    sig_dequant.params.push(AbiParam::new(types::I64));
+    sig_dequant.params.push(AbiParam::new(types::F32));
+    sig_dequant.params.push(AbiParam::new(types::I64));
+    // mercury_dequant_perchan_f32[_parallel](q, out: ptr, rows, cols: i64, scale: ptr, op: i64) — per-
+    // channel dequant (void).
+    let mut sig_dequant_perchan = Signature::new(call_conv);
+    sig_dequant_perchan.params.push(AbiParam::new(ptr_ty));
+    sig_dequant_perchan.params.push(AbiParam::new(ptr_ty));
+    sig_dequant_perchan.params.push(AbiParam::new(types::I64));
+    sig_dequant_perchan.params.push(AbiParam::new(types::I64));
+    sig_dequant_perchan.params.push(AbiParam::new(ptr_ty));
+    sig_dequant_perchan.params.push(AbiParam::new(types::I64));
     // mercury_dot_bf16(x, y: ptr, n: i64) -> f32 — bf16 mixed-precision dot (f32 accumulate).
     let mut sig_dot_bf16 = Signature::new(call_conv);
     sig_dot_bf16.params.push(AbiParam::new(ptr_ty));
@@ -2077,6 +2129,18 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         i8nt_deq_par: module
             .declare_function(RT_I8GEMM_NT_DEQ_PARALLEL, Linkage::Import, &sig_i8gemm_deq)
+            .map_err(|e| e.to_string())?,
+        dequant: module
+            .declare_function(RT_DEQUANT, Linkage::Import, &sig_dequant)
+            .map_err(|e| e.to_string())?,
+        dequant_par: module
+            .declare_function(RT_DEQUANT_PAR, Linkage::Import, &sig_dequant)
+            .map_err(|e| e.to_string())?,
+        dequant_perchan: module
+            .declare_function(RT_DEQUANT_PERCHAN, Linkage::Import, &sig_dequant_perchan)
+            .map_err(|e| e.to_string())?,
+        dequant_perchan_par: module
+            .declare_function(RT_DEQUANT_PERCHAN_PAR, Linkage::Import, &sig_dequant_perchan)
             .map_err(|e| e.to_string())?,
         // Embedding lookup reuses the 3-ptr + 3-i64 void signature (the pointer element type is
         // irrelevant to the ABI — out/weight are f32*, ids is i32*).
@@ -2561,6 +2625,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_I8GEMM_NT_DEQ_PARALLEL,
                 module.declare_func_in_func(rt.i8nt_deq_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_DEQUANT,
+                module.declare_func_in_func(rt.dequant, builder.func),
+            );
+            rt_refs.insert(
+                RT_DEQUANT_PAR,
+                module.declare_func_in_func(rt.dequant_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_DEQUANT_PERCHAN,
+                module.declare_func_in_func(rt.dequant_perchan, builder.func),
+            );
+            rt_refs.insert(
+                RT_DEQUANT_PERCHAN_PAR,
+                module.declare_func_in_func(rt.dequant_perchan_par, builder.func),
             );
             rt_refs.insert(
                 RT_EMBEDDING,
@@ -3078,6 +3158,19 @@ pub fn jit_compile(
         RT_I8GEMM_NT_DEQ_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_deq_parallel as *const u8,
     );
+    builder.symbol(RT_DEQUANT, mercury_runtime::mercury_dequant_f32 as *const u8);
+    builder.symbol(
+        RT_DEQUANT_PAR,
+        mercury_runtime::mercury_dequant_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_DEQUANT_PERCHAN,
+        mercury_runtime::mercury_dequant_perchan_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_DEQUANT_PERCHAN_PAR,
+        mercury_runtime::mercury_dequant_perchan_f32_parallel as *const u8,
+    );
     builder.symbol(
         RT_EMBEDDING,
         mercury_runtime::mercury_embedding_f32 as *const u8,
@@ -3536,6 +3629,19 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_I8GEMM_NT_DEQ_PARALLEL,
         mercury_runtime::mercury_i8gemm_nt_deq_parallel as *const u8,
+    );
+    builder.symbol(RT_DEQUANT, mercury_runtime::mercury_dequant_f32 as *const u8);
+    builder.symbol(
+        RT_DEQUANT_PAR,
+        mercury_runtime::mercury_dequant_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_DEQUANT_PERCHAN,
+        mercury_runtime::mercury_dequant_perchan_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_DEQUANT_PERCHAN_PAR,
+        mercury_runtime::mercury_dequant_perchan_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_EMBEDDING,
