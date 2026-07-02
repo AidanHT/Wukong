@@ -69,7 +69,7 @@ source.mer
 - `mercury_driver` — orchestrates the compile pipeline; owns SourceMap/Interner and honors `--emit`.
 - `mercuryc` — CLI binary parsing args and delegating compilation to `mercury_driver`.
 - `mercury_bench` — benchmark harness: optimizer effectiveness, interpreter timing, equivalence gate.
-- `mercury_xbench` — cross-language benchmark: Mercury vs C vs Rust (see `BENCHMARKS.md`).
+- `mercury_xbench` — cross-language benchmark: Mercury vs C, C++, and Rust (see `BENCHMARKS.md`).
 
 Dependencies flow strictly downward (no cycles); every crate is prefixed `mercury_` (binary is `mercuryc`).
 
@@ -110,7 +110,7 @@ reassociated form is the oracle — all backends run the same reassociated IR an
   textual-LLVM `--features llvm` path cannot link/run. The native path is **Cranelift** (pure Rust,
   builds and JITs here with zero external toolchain) plus any raw-codegen microkernels we add. Plain
   `cargo test` needs no toolchain. `gcc`/`g++`/`rustc` (MSYS2) *are* present — that's what `mercury_xbench`
-  compiles the C/Rust baselines with.
+  compiles the C/C++/Rust baselines with.
 - Wider SIMD: Cranelift historically rejected `f32x8` types in CLIF. That ceiling is a target to break,
   not a law — verify the current Cranelift's capability empirically, and where it can't reach, emit
   AVX2/AVX-512 microkernels directly (the differential gate keeps any such path honest).
