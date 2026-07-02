@@ -879,6 +879,7 @@ mod grad_cli_tests {
     }
 
     /// Central finite-difference gradient of `out[loss_out][0]` w.r.t. each `wrt` element.
+    #[allow(clippy::too_many_arguments)]
     fn finite_diff(
         prog: &Program,
         fwd_name: Symbol,
@@ -903,7 +904,7 @@ mod grad_cli_tests {
                 let lp = loss(&mut bufs);
                 bufs[wi][j] = orig - eps;
                 let lm = loss(&mut bufs);
-                g[j] = (lp - lm) as f64 / (2.0 * eps as f64);
+                g[j] = (lp - lm) / (2.0 * eps as f64);
             }
             out.push(g);
         }
