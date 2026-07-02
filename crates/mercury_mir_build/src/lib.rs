@@ -5550,7 +5550,28 @@ impl FnLowerer<'_> {
                 {
                     let (ptr, _) = self.lower_place(target);
                     let dst_ty = self.expr_ty(target);
-                    self.init_field(ptr, &dst_ty, value);
+                    // A struct/tuple/array *literal* whose field initializers may read the
+                    // destination (e.g. the swap `p = Pt { x: p.y, y: p.x }`) must be materialized
+                    // into a fresh temporary and THEN deep-copied in. `init_field` builds a literal
+                    // *directly* into the destination place, so a later field would read an earlier
+                    // one already overwritten — a gate-blind wrong answer both backends produce
+                    // identically (`p` above became `7 7`, not the swapped `7 3`). A non-literal
+                    // aggregate value (`s = other`) already deep-copies leaf-by-leaf via `emit_copy`
+                    // (safe under aliasing), so only the literal case needs the temp; a fresh `let`
+                    // builds into its own new slot and is unaffected.
+                    if matches!(
+                        &value.kind,
+                        ExprKind::StructLit { .. }
+                            | ExprKind::TupleLit(_)
+                            | ExprKind::ArrayLit(_)
+                            | ExprKind::ArrayRepeat { .. }
+                    ) {
+                        let tmp = self.builder.alloca(self.mir_ty_of(&dst_ty));
+                        self.init_field(tmp, &dst_ty, value);
+                        self.emit_copy(ptr, tmp, &dst_ty);
+                    } else {
+                        self.init_field(ptr, &dst_ty, value);
+                    }
                     return;
                 }
                 let rhs0 = self.lower_expr(value);
