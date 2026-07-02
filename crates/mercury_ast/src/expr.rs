@@ -166,6 +166,52 @@ impl BinOp {
             Or => "||",
         }
     }
+
+    /// Fold this op as a compile-time array length: `l OP r` in u64. Shared by sema's `eval_usize`
+    /// and mir_build's `const_usize_expr` so the two CANNOT disagree on a length — a slot-size vs
+    /// bounds-check desync reads out of bounds (native segfault / interp != native). Division/shift by
+    /// zero, an over-wide shift, and a non-arithmetic op fold to 0 (an invalid length rejected
+    /// downstream) rather than panicking.
+    pub fn fold_const_len(self, l: u64, r: u64) -> u64 {
+        use BinOp::*;
+        match self {
+            Add => l.wrapping_add(r),
+            Sub => l.wrapping_sub(r),
+            Mul => l.wrapping_mul(r),
+            Div => {
+                if r != 0 {
+                    l / r
+                } else {
+                    0
+                }
+            }
+            Rem => {
+                if r != 0 {
+                    l % r
+                } else {
+                    0
+                }
+            }
+            Shl => {
+                if r < 64 {
+                    l.wrapping_shl(r as u32)
+                } else {
+                    0
+                }
+            }
+            Shr => {
+                if r < 64 {
+                    l.wrapping_shr(r as u32)
+                } else {
+                    0
+                }
+            }
+            BitAnd => l & r,
+            BitOr => l | r,
+            BitXor => l ^ r,
+            Eq | Ne | Lt | Le | Gt | Ge | And | Or => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

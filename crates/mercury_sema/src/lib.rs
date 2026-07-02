@@ -601,6 +601,16 @@ impl Sema<'_> {
                 Some(init) => self.eval_usize_depth(init, depth + 1),
                 None => 0,
             },
+            // Const arithmetic in a length (`[i32; 2+2]`, `[i32; N+1]`): fold via the shared
+            // `BinOp::fold_const_len` that mir_build's `const_usize_expr` also uses, so the slot size
+            // and this bounds check agree. Previously this fell to `_ => 0`, sizing the array 0 (an
+            // unsized bare pointer → native segfault / interp != native / -O0 != -O2) and spuriously
+            // rejecting valid code as "length 0".
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.eval_usize_depth(lhs, depth + 1);
+                let r = self.eval_usize_depth(rhs, depth + 1);
+                op.fold_const_len(l, r)
+            }
             _ => 0,
         }
     }

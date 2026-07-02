@@ -13716,6 +13716,14 @@ fn const_usize_depth(
         ExprKind::Path(p) if p.is_single() => consts
             .get(&p.first().sym)
             .and_then(|init| const_usize_depth(init, interner, consts, depth + 1)),
+        // Mirror sema's `eval_usize` exactly (both fold via `BinOp::fold_const_len`) so the slot size
+        // agrees with the bounds check. An unfoldable operand contributes 0, as sema's evaluator does,
+        // so a const-arithmetic length sizes correctly instead of collapsing to an unsized pointer.
+        ExprKind::Binary { op, lhs, rhs } => {
+            let l = const_usize_depth(lhs, interner, consts, depth + 1).unwrap_or(0) as u64;
+            let r = const_usize_depth(rhs, interner, consts, depth + 1).unwrap_or(0) as u64;
+            Some(op.fold_const_len(l, r) as u32)
+        }
         _ => None,
     }
 }
