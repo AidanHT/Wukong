@@ -140,23 +140,29 @@ const ACT_GELU: u32 = 2;
 const ACT_SILU: u32 = 3;
 
 /// A fused GEMM epilogue, applied to each `C` element **on the final K-block writeback only**:
-/// `c = act(c + bias[col])`. `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
-/// [`ACT_RELU`], [`ACT_GELU`], [`ACT_SILU`] (the transformer FFN activations).
-/// Folding it here means `C` is written once with the bias+activation already applied, instead of a
-/// separate read-modify-write pass over `C` — the memory traffic a `linear → bias → act` otherwise
-/// pays. Both backends call the identical kernel, so the fused result stays bit-for-bit exact.
+/// `c = act(alpha·(A·Bᵀ) + bias[col])`. `bias` is null for no bias; `act` is one of [`ACT_IDENTITY`],
+/// [`ACT_RELU`], [`ACT_GELU`], [`ACT_SILU`] (the transformer FFN activations); `alpha` is a
+/// loop-invariant scalar applied to the matmul result before the bias-add (the attention score scale
+/// `QKᵀ/√d` and every scaled projection). `alpha == 1.0` is the identity — the multiply is skipped so
+/// every existing caller (which passes `1.0`) stays byte-identical.
+/// Folding it here means `C` is written once with the scale+bias+activation already applied, instead of
+/// separate passes over `C` — the memory traffic a `α·linear → bias → act` otherwise pays. Both backends
+/// call the identical kernel, so the fused result stays bit-for-bit exact.
 #[derive(Clone, Copy)]
 struct Epilogue {
     bias: *const f32,
     act: u32,
+    alpha: f32,
 }
 
 impl Epilogue {
     /// Apply the epilogue to value `x` at tile-local column `j` (relative to this epilogue's bias
-    /// base). `# Safety`: `bias`, when non-null, must be valid at index `j`.
+    /// base): `act(alpha·x + bias[j])`. `# Safety`: `bias`, when non-null, must be valid at index `j`.
     #[inline]
     unsafe fn apply(&self, x: f32, j: usize) -> f32 {
-        let mut y = x;
+        // The α scale multiplies the matmul result before the bias-add. `alpha == 1.0` skips the
+        // multiply so the fused-epilogue callers (`nt_epi`, which pass 1.0) stay byte-identical.
+        let mut y = if self.alpha != 1.0 { self.alpha * x } else { x };
         if !self.bias.is_null() {
             y += *self.bias.add(j);
         }
@@ -172,7 +178,8 @@ impl Epilogue {
         y
     }
 
-    /// This epilogue with its bias base advanced by `cols` columns (null stays null).
+    /// This epilogue with its bias base advanced by `cols` columns (null stays null; `act`/`alpha`
+    /// are scalar and carry unchanged).
     #[inline]
     fn shift(&self, cols: usize) -> Epilogue {
         Epilogue {
@@ -183,6 +190,7 @@ impl Epilogue {
                 unsafe { self.bias.add(cols) }
             },
             act: self.act,
+            alpha: self.alpha,
         }
     }
 }
@@ -246,8 +254,66 @@ pub unsafe extern "C" fn mercury_sgemm_nt_epi(
     let epi = Epilogue {
         bias,
         act: act as u32,
+        alpha: 1.0,
     };
     gemm_dispatch(a, b, c, m, k, n, beta, true, false, Some(epi));
+}
+
+/// `C = alpha·(A·Bᵀ)` — the **α-scaled `nn.Linear`**: the attention score matmul `QKᵀ/√d` (and every
+/// scaled projection), where a loop-invariant scalar `alpha` multiplies the dot. The compiler lowers a
+/// matmul nest whose store is `c[i,j] = alpha·s` to this. `alpha` is folded into the C-tile writeback on
+/// the final K-block (no second pass over C), reusing the fused-epilogue machinery with a null bias and
+/// identity activation — so `C` is written once as `alpha·(A·Bᵀ)`. `beta` rule as usual. Single-threaded.
+///
+/// The α multiply is one exact f32 op applied to the fully-reduced dot, so the result equals the naive
+/// nest's `alpha·s` under the documented matmul reassociation (both backends call this identical kernel,
+/// and it is gated against an f64 reference).
+///
+/// # Safety
+/// `a` valid for `m*k`, `b` for `n*k`, `c` for `m*n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_nt_alpha(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    alpha: f32,
+) {
+    let epi = Epilogue {
+        bias: std::ptr::null(),
+        act: ACT_IDENTITY,
+        alpha,
+    };
+    gemm_dispatch(a, b, c, m, k, n, beta, true, false, Some(epi));
+}
+
+/// Multi-threaded `C = alpha·(A·Bᵀ)` — the α-scaled `nn.Linear` across cores (the `@parallel` attention
+/// score / scaled projection). The scale folds into each tile's final-K-block writeback, and each C tile
+/// is owned by exactly one task with the same per-(i,j) accumulation order as the serial kernel — so it
+/// is bit-identical to the serial `mercury_sgemm_nt_alpha` the interpreter oracle calls.
+///
+/// # Safety
+/// `a` valid for `m*k`, `b` for `n*k`, `c` for `m*n` `f32`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemm_nt_alpha_parallel(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    beta: i64,
+    alpha: f32,
+) {
+    let epi = Epilogue {
+        bias: std::ptr::null(),
+        act: ACT_IDENTITY,
+        alpha,
+    };
+    gemm_dispatch(a, b, c, m, k, n, beta, true, true, Some(epi));
 }
 
 /// Pick AVX2 vs scalar and serial vs parallel; `bt` selects `C = A·Bᵀ`.
@@ -368,6 +434,7 @@ pub unsafe extern "C" fn mercury_sgemm_nt_epi_parallel(
     let epi = Epilogue {
         bias,
         act: act as u32,
+        alpha: 1.0,
     };
     gemm_dispatch(a, b, c, m, k, n, beta, true, true, Some(epi));
 }
@@ -593,6 +660,7 @@ unsafe fn gemm_lowp_nt_epi(
     let epi = Epilogue {
         bias,
         act: act as u32,
+        alpha: 1.0,
     };
     gemm_lowp_nt(a, b, c, m, k, n, beta, par, widen, Some(epi));
 }
@@ -828,9 +896,9 @@ unsafe fn sgemm_avx2_parallel(
             // only — exactly as the serial path does. Captured as Send-safe primitives (a raw `bias`
             // pointer can't cross into the rayon closure), reconstructed per tile at its global column.
             let is_last_k = pc + kc == k;
-            let (epi_on, epi_bias_addr, epi_act) = match epi {
-                Some(e) if is_last_k => (true, e.bias as usize, e.act),
-                _ => (false, 0usize, 0u32),
+            let (epi_on, epi_bias_addr, epi_act, epi_alpha) = match epi {
+                Some(e) if is_last_k => (true, e.bias as usize, e.act, e.alpha),
+                _ => (false, 0usize, 0u32, 1.0f32),
             };
             // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) — in parallel, since with
             // the C compute spread across every core the serial pack would dominate (Amdahl).
@@ -860,6 +928,7 @@ unsafe fn sgemm_avx2_parallel(
                         Epilogue {
                             bias: epi_bias_addr as *const f32,
                             act: epi_act,
+                            alpha: epi_alpha,
                         }
                         .shift(jc + j0)
                     });
@@ -1392,6 +1461,10 @@ unsafe fn micro_6x16(
             } else {
                 (_mm256_setzero_ps(), _mm256_setzero_ps())
             };
+            // α scale (skipped when 1.0 so the fused-epilogue callers stay byte-identical), broadcast
+            // to all 8 lanes; applied to the matmul result before the bias-add, mirroring `apply`.
+            let apply_alpha = e.alpha != 1.0;
+            let alpha8 = _mm256_set1_ps(e.alpha);
             macro_rules! act8 {
                 ($v:expr) => {{
                     match e.act {
@@ -1415,6 +1488,10 @@ unsafe fn micro_6x16(
                     } else {
                         _mm256_add_ps(_mm256_loadu_ps(row.add(8)), $hi)
                     };
+                    if apply_alpha {
+                        lo = _mm256_mul_ps(lo, alpha8);
+                        hi = _mm256_mul_ps(hi, alpha8);
+                    }
                     if has_bias {
                         lo = _mm256_add_ps(lo, bias_lo);
                         hi = _mm256_add_ps(hi, bias_hi);
@@ -2318,6 +2395,49 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// α-scaled `C = alpha·(A·Bᵀ)` must equal the plain `nt` GEMM followed by a scalar `alpha·c` pass
+    /// (the α multiply is one exact f32 op on the fully-reduced dot — the *only* difference from the
+    /// unscaled kernel), for both `alpha == 1.0` (must be **byte-identical** to `nt`) and a general
+    /// `alpha`; and the serial and parallel α kernels must be bit-for-bit identical. `k = 300` exceeds
+    /// `KC` so the K loop blocks — verifying α is applied once, on the final K-block, not per-block.
+    #[test]
+    fn sgemm_nt_alpha_matches_scaled_nt_and_parallel() {
+        for &(m, k, n) in &[(7, 17, 13), (64, 64, 64), (40, 300, 48), (520, 300, 400)] {
+            let a = fill(61, m * k);
+            let b = fill(62, n * k);
+            let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            for &alpha in &[1.0f32, 0.125, -2.5] {
+                // Reference: the exact `nt` GEMM, then a scalar `alpha·c` pass (same single f32 multiply
+                // the α kernel folds into the writeback).
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), want.as_mut_ptr(), mi, ki, ni, 0);
+                }
+                for v in &mut want {
+                    *v *= alpha;
+                }
+                let mut got = vec![0.0f32; m * n];
+                let mut got_par = vec![0.0f32; m * n];
+                unsafe {
+                    mercury_sgemm_nt_alpha(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), mi, ki, ni, 0, alpha);
+                    mercury_sgemm_nt_alpha_parallel(
+                        a.as_ptr(), b.as_ptr(), got_par.as_mut_ptr(), mi, ki, ni, 0, alpha,
+                    );
+                }
+                assert_eq!(got, want, "nt_alpha != alpha·nt (m{m} k{k} n{n} alpha{alpha})");
+                assert_eq!(got, got_par, "nt_alpha serial vs parallel (m{m} k{k} n{n} alpha{alpha})");
+            }
+            // alpha == 1.0 must be byte-identical to the plain `nt` kernel (the multiply is skipped).
+            let mut plain = vec![0.0f32; m * n];
+            let mut a1 = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm_nt(a.as_ptr(), b.as_ptr(), plain.as_mut_ptr(), mi, ki, ni, 0);
+                mercury_sgemm_nt_alpha(a.as_ptr(), b.as_ptr(), a1.as_mut_ptr(), mi, ki, ni, 0, 1.0);
+            }
+            assert_eq!(plain, a1, "nt_alpha(1.0) must be byte-identical to nt (m{m} k{k} n{n})");
         }
     }
 

@@ -46,6 +46,8 @@ pub fn lower_program(
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         sgemv: interner.intern("mercury_sgemv"),
         sgemv_par: interner.intern("mercury_sgemv_parallel"),
+        nt_alpha: interner.intern("mercury_sgemm_nt_alpha"),
+        nt_alpha_par: interner.intern("mercury_sgemm_nt_alpha_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
         vmath2: interner.intern("mercury_vmath2_f32"),
         vmath_bf16: interner.intern("mercury_vmath_bf16"),
@@ -776,6 +778,13 @@ struct GemmSyms {
     /// saturate aggregate memory bandwidth. Bit-identical to the serial `sgemv` the interpreter calls
     /// (each row computed by the same per-row routine, no cross-row combine), so the gate stays exact.
     sgemv_par: Symbol,
+    /// The α-scaled `nn.Linear` kernel (`mercury_sgemm_nt_alpha(a, b, c, m, k, n, beta, alpha)`):
+    /// `C = alpha·(A·Bᵀ)` — the attention score matmul `QKᵀ/√d` and every scaled projection, where a
+    /// loop-invariant scalar `alpha` multiplies the dot in the C-tile writeback (fused, no second pass).
+    nt_alpha: Symbol,
+    /// The multicore α-scaled `nn.Linear` (`mercury_sgemm_nt_alpha_parallel`): the same fused scale in a
+    /// `@parallel` function. Bit-identical to the serial `nt_alpha` the interpreter calls.
+    nt_alpha_par: Symbol,
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
@@ -4299,6 +4308,36 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        // α-scaled `C = alpha·(A·Bᵀ)` (the attention score `QKᵀ/√d`) → `mercury_sgemm_nt_alpha`, which
+        // folds the scale into the C-tile writeback (no second pass over C). The α kernel is **NT only**;
+        // any other shape (plain `A·B`, TN) declines to the scalar nest — which computes `alpha·s`
+        // correctly — rather than emitting an UNSCALED kernel that would silently drop the scale. Batch/
+        // head offsets are already applied to `a`/`b`/`c` above, so a *batched* α matmul (multi-head
+        // attention scores) works: the per-head sub-matmul is `alpha·(A·Bᵀ)` under a constant base shift.
+        if let Some(alpha) = nest.alpha {
+            if !(nest.transposed && !nest.transposed_a) {
+                return false;
+            }
+            let alpha_v = match alpha {
+                AlphaScale::Lit(f) => self
+                    .builder
+                    .build(MirType::F32, Op::ConstFloat(f as f64, MirType::F32)),
+                AlphaScale::Sym(s) => match self.lookup(s) {
+                    Some((slot, ty)) => self.builder.build(ty.clone(), Op::Load(slot, ty)),
+                    None => return false,
+                },
+            };
+            let func = if parallel {
+                self.gemm.nt_alpha_par
+            } else {
+                self.gemm.nt_alpha
+            };
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![a, b, c, m, k, n, beta, alpha_v],
+            });
+            return true;
+        }
         let func = match (parallel, nest.transposed_a, nest.transposed) {
             (false, false, false) => self.gemm.mm,
             (true, false, false) => self.gemm.mm_par,
@@ -11393,6 +11432,69 @@ struct MatmulNest<'a> {
     a_off: Vec<&'a Expr>,
     b_off: Vec<&'a Expr>,
     c_off: Vec<&'a Expr>,
+    /// A loop-invariant scalar `alpha` peeled off the store `c[i,j] = alpha·s` — the attention score
+    /// scale `QKᵀ/√d` and every scaled projection. `None` for an unscaled matmul. Only the `ijk`
+    /// dot-product form (NT) populates this; `emit_sgemm` routes it to `mercury_sgemm_nt_alpha`.
+    alpha: Option<AlphaScale>,
+}
+
+/// A loop-invariant α scale peeled off a matmul store `c[i,j] = alpha·s`: either a runtime f32 symbol
+/// (the usual `let scale = 1.0 / sqrt(d as f32)`) or a float literal (a constant temperature).
+#[derive(Clone, Copy)]
+enum AlphaScale {
+    Sym(Symbol),
+    Lit(f32),
+}
+
+/// A loop-invariant f32 scale operand: a float literal, or a single-path symbol that is **not** one of
+/// the matmul's loop variables (`bound`). Anything else (an index expr, a non-f32 value) is `None`.
+fn scale_operand(
+    e: &Expr,
+    bound: &[Symbol],
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<AlphaScale> {
+    if !is_f32_expr(e, sema) {
+        return None;
+    }
+    if let ExprKind::Float(t) = &e.kind {
+        return Some(AlphaScale::Lit(parse_float(interner.resolve(*t)) as f32));
+    }
+    let s = single_path(e)?;
+    if bound.contains(&s) {
+        return None;
+    }
+    Some(AlphaScale::Sym(s))
+}
+
+/// Match a matmul store value `cv`: either the bare accumulator `s` (`Some(None)` — unscaled) or a
+/// scaled `alpha·s` / `s·alpha` (`Some(Some(alpha))`), where `alpha` is a loop-invariant f32 scale.
+/// `None` if `cv` is neither (e.g. a residual add, an unrecognized expr).
+fn match_store_scale(
+    cv: &Expr,
+    s_sym: Symbol,
+    bound: &[Symbol],
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<Option<AlphaScale>> {
+    if single_path(cv) == Some(s_sym) {
+        return Some(None);
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &cv.kind
+    else {
+        return None;
+    };
+    if single_path(lhs) == Some(s_sym) {
+        return Some(Some(scale_operand(rhs, bound, sema, interner)?));
+    }
+    if single_path(rhs) == Some(s_sym) {
+        return Some(Some(scale_operand(lhs, bound, sema, interner)?));
+    }
+    None
 }
 
 /// Canonical text of an affine index/base expression (paths, ints, `+`/`-`/`*`, casts), used to key
@@ -12638,7 +12740,9 @@ fn match_matmul_ijk<'a>(
     // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
     let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
         match_product_ab_off(prod, row, kvar, jvar, interner)?;
-    // Final store: c[i*N + j (+ off)] = s.
+    // Final store: c[i*N + j (+ off)] = s   OR   = alpha·s (a loop-invariant scalar scale, the
+    // attention `QKᵀ/√d` and every scaled projection). The α is peeled off here and folded into the
+    // GEMM writeback by `emit_sgemm` (routing to `mercury_sgemm_nt_alpha`).
     let StmtKind::Assign {
         target: ct,
         op: ast::AssignOp::Assign,
@@ -12647,9 +12751,7 @@ fn match_matmul_ijk<'a>(
     else {
         return None;
     };
-    if single_path(cv) != Some(s_sym) {
-        return None;
-    }
+    let alpha = match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner)?;
     let (cbase, cidx) = as_index1(ct)?;
     let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
@@ -12689,6 +12791,7 @@ fn match_matmul_ijk<'a>(
         a_off,
         b_off,
         c_off,
+        alpha,
     })
 }
 
@@ -12886,6 +12989,7 @@ fn match_matmul_residual<'a>(
         a_off,
         b_off,
         c_off,
+        alpha: None, // the residual epilogue kernel carries no α scale
     };
     Some((nest, bias, act))
 }
@@ -13047,6 +13151,8 @@ fn match_matmul<'a>(
         a_off: Vec::new(),
         b_off: Vec::new(),
         c_off: Vec::new(),
+        // The `ikj` accumulate store is `c[i,j] += aik·b[k,j]`, not `c[i,j] = alpha·s` — no α peel.
+        alpha: None,
     })
 }
 

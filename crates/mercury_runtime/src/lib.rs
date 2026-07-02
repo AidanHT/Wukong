@@ -11,9 +11,9 @@ pub use gemm::{
     mercury_sgemm_bf16_nt_epi_parallel, mercury_sgemm_bf16_nt_parallel, mercury_sgemm_bf16_tn,
     mercury_sgemm_bf16_tn_parallel, mercury_sgemm_f16_nt, mercury_sgemm_f16_nt_epi,
     mercury_sgemm_f16_nt_epi_parallel, mercury_sgemm_f16_nt_parallel, mercury_sgemm_f16_tn,
-    mercury_sgemm_f16_tn_parallel, mercury_sgemm_nt, mercury_sgemm_nt_epi,
-    mercury_sgemm_nt_epi_parallel, mercury_sgemm_nt_parallel, mercury_sgemm_parallel,
-    mercury_sgemm_tn, mercury_sgemm_tn_parallel,
+    mercury_sgemm_f16_tn_parallel, mercury_sgemm_nt, mercury_sgemm_nt_alpha,
+    mercury_sgemm_nt_alpha_parallel, mercury_sgemm_nt_epi, mercury_sgemm_nt_epi_parallel,
+    mercury_sgemm_nt_parallel, mercury_sgemm_parallel, mercury_sgemm_tn, mercury_sgemm_tn_parallel,
 };
 
 mod gemv;
