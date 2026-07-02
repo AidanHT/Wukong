@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.struct_field_array_length
+
+// A struct array field's initializer must match the declared length. `Buf { data: [11, 22] }` for
+// `data: [i32; 4]` left the tail (data[2], data[3]) uninitialized — reading an in-bounds constant
+// index diverged interp (0) vs native (stack garbage), a gate-blind backend divergence. Unlike `let`
+// and tuple initializers, struct fields were not length-checked. Must be E0401.
+struct Buf { data: [i32; 4] }
+fn main() -> i32 {
+    let b: Buf = Buf { data: [11, 22] };
+    return b.data[0];
+}
