@@ -254,6 +254,9 @@ impl Verifier<'_> {
             Op::FuncAddr(_) => {
                 self.check_result_is(result, &MirType::Ptr);
             }
+            Op::GlobalAddr(_) => {
+                self.check_result_is(result, &MirType::Ptr);
+            }
             Op::Fma(a, b, c) => {
                 let ok = self.use_val(*a) & self.use_val(*b) & self.use_val(*c);
                 if let Some(res) = self.result_ty(result) {

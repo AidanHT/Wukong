@@ -9,6 +9,7 @@ use mercury_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
 };
 use mercury_span::{Interner, Symbol};
+use std::collections::HashMap;
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
 /// type; pointers are indices into the interpreter's flat memory.
@@ -166,6 +167,7 @@ pub fn run_with_output(
             frames: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
+            data_addrs: HashMap::new(),
             accel: None,
         };
         let result = interp.run_function(func, Vec::new())?;
@@ -214,6 +216,7 @@ pub fn run_with_output_accel(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        data_addrs: HashMap::new(),
         accel: Some(accel),
     };
     let result = interp.run_function(func, Vec::new())?;
@@ -280,6 +283,7 @@ fn run_kernel_f32_inner(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        data_addrs: HashMap::new(),
         accel,
     };
     // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
@@ -337,6 +341,7 @@ pub fn run_kernel_f64(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        data_addrs: HashMap::new(),
         accel: None,
     };
     let mut bases = Vec::with_capacity(bufs.len());
@@ -391,6 +396,7 @@ pub fn run_kernel_i8(
         frames: Vec::new(),
         scratch: Vec::with_capacity(8),
         vecs: Vec::new(),
+        data_addrs: HashMap::new(),
         accel: None,
     };
     // u8 zero-extends, i8 sign-extends — the `as i128` casts do exactly that, matching the kernel.
@@ -434,6 +440,12 @@ struct Interp<'a, 'k> {
     /// Optional accelerator the recognized kernel calls offload to (the GPU backend). `None` for the
     /// reference oracle and every plain run, so their numerics are untouched.
     accel: Option<&'k mut (dyn Accelerator + 'k)>,
+    /// Materialized addresses of `Program::statics` string blobs, keyed by the blob's symbol. An
+    /// `Op::GlobalAddr(sym)` materializes the bytes into persistent `memory` **once** and caches the
+    /// base here, so every use of a (deduped) literal yields the *same* address — matching the
+    /// native `.rodata` (a returned/threaded `*u8` stays valid, and `*u8` pointer equality agrees
+    /// across backends). Persistent memory is never freed, so the address outlives its defining frame.
+    data_addrs: HashMap<Symbol, usize>,
 }
 
 impl<'a, 'k> Interp<'a, 'k> {
@@ -706,6 +718,30 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .position(|f| f.name == *sym)
                     .ok_or("func_addr of unknown function")?;
                 Value::Ptr(FUNC_TAG + idx)
+            }
+            // The read-only address of a static-data blob (a string literal): materialize its bytes
+            // into persistent memory **once**, caching the base by symbol so every use of a deduped
+            // literal yields the same address (matching native `.rodata`; `*u8` pointer equality then
+            // agrees across backends). Persistent memory is never freed, so a returned/threaded `*u8`
+            // stays valid after its defining frame is gone — closing the native stack-dangle divergence.
+            Op::GlobalAddr(sym) => {
+                if let Some(&base) = self.data_addrs.get(sym) {
+                    Value::Ptr(base)
+                } else {
+                    let bytes = self
+                        .program
+                        .statics
+                        .iter()
+                        .find(|s| s.name == *sym)
+                        .map(|s| s.bytes.clone())
+                        .ok_or("global_addr of unknown static data")?;
+                    let base = self.memory.len();
+                    for b in bytes {
+                        self.memory.push(Value::Int(b as i128));
+                    }
+                    self.data_addrs.insert(*sym, base);
+                    Value::Ptr(base)
+                }
             }
             // Broadcast a scalar to every lane.
             Op::Splat(v) => {

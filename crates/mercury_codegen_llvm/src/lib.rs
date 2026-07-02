@@ -84,6 +84,26 @@ impl Backend for LlvmBackend {
 pub fn emit_llvm_ir(program: &Program, interner: &Interner) -> String {
     let mut out = String::new();
     out.push_str("; Mercury -> LLVM IR\n\n");
+    // Read-only string literals live as private constants; `Op::GlobalAddr(@name)` GEPs off them.
+    for s in &program.statics {
+        let mut bytes = String::new();
+        for &b in &s.bytes {
+            if b == b'\\' || b == b'"' || !(0x20..0x7f).contains(&b) {
+                bytes.push_str(&format!("\\{b:02X}"));
+            } else {
+                bytes.push(b as char);
+            }
+        }
+        out.push_str(&format!(
+            "@{} = private unnamed_addr constant [{} x i8] c\"{}\"\n",
+            interner.resolve(s.name),
+            s.bytes.len(),
+            bytes
+        ));
+    }
+    if !program.statics.is_empty() {
+        out.push('\n');
+    }
     for f in &program.funcs {
         emit_function(&mut out, f, interner);
         out.push('\n');
@@ -286,6 +306,14 @@ impl Emitter<'_> {
                 format!(
                     "{res}getelementptr i8, ptr @{}, i64 0",
                     self.interner.resolve(*func)
+                )
+            }
+            Op::GlobalAddr(data) => {
+                // The read-only address of a `.rodata` string blob as a `ptr` (declared as a private
+                // constant in the module preamble by `emit_llvm_ir`; an identity GEP keeps it valid).
+                format!(
+                    "{res}getelementptr i8, ptr @{}, i64 0",
+                    self.interner.resolve(*data)
                 )
             }
             Op::Splat(v) => {
