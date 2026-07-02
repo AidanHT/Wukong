@@ -1,0 +1,54 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 19000
+// EXPECT-OUT: 0
+module tests.run.bias_bcast_parallel
+
+// The `@parallel` broadcast-bias `out[i*C+j] = relu(x[i*C+j] + b[j])` dispatches to the multicore
+// `mercury_bias_bcast_f32_parallel`: the whole-function interceptor (`is_bias_bcast_fn`) routes it
+// through normal lowering *before* the generic `@parallel` outliner (which would split the rows into
+// per-row 1-D loops and lose the whole-nest recognizer). Rows are independent, so the multicore kernel
+// is bit-identical to the serial one the interpreter calls — so -O0..-O3 and interp/native all agree.
+
+@parallel
+fn add_bias_relu(x: [f32; 96], b: [f32; 12], out: [f32; 96]) {
+    for i in 0..8 {
+        for j in 0..12 {
+            out[i * 12 + j] =
+                if x[i * 12 + j] + b[j] > 0.0 { x[i * 12 + j] + b[j] } else { 0.0 };
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 96] = [0.0; 96];
+    let mut i0: usize = 0;
+    while i0 < 96 { x[i0] = (i0 as f32) * 0.5 - 20.0; i0 = i0 + 1; }
+    let mut b: [f32; 12] = [0.0; 12];
+    let mut j0: usize = 0;
+    while j0 < 12 { b[j0] = (j0 as f32) - 3.0; j0 = j0 + 1; }
+
+    let mut out: [f32; 96] = [0.0; 96];
+    add_bias_relu(x, b, out);
+
+    // Independent scalar reference (nested `while`) — the multicore kernel must match it exactly.
+    let mut refr: [f32; 96] = [0.0; 96];
+    let mut ii: usize = 0;
+    while ii < 8 {
+        let mut jj: usize = 0;
+        while jj < 12 {
+            let s: f32 = x[ii * 12 + jj] + b[jj];
+            refr[ii * 12 + jj] = if s > 0.0 { s } else { 0.0 };
+            jj = jj + 1;
+        }
+        ii = ii + 1;
+    }
+    let mut mism: i32 = 0;
+    for k in 0..96 { if out[k] != refr[k] { mism = mism + 1; } }
+    print(mism);                                   // 0 — parallel dispatch == scalar reference
+
+    print(round(out[5 * 12 + 8] * 1000.0) as i32); // x[68]=14, b[8]=5 → relu(19)=19 → 19000
+    print(round(out[0] * 1000.0) as i32);          // x[0]+b[0]=-23 → relu = 0
+    return 0;
+}

@@ -2348,6 +2348,62 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_vmath_{bf16,f16}_out(x, out, n, op)` — the **half-output** activation twin: read a
+            // `[bf16]`/`[f16]` input, call the *identical* runtime kernel (which computes the activation
+            // in f32 and narrows the result back to the half width through the shared shim), then widen
+            // the stored half bits back to the interpreter's f32 slot. Same reconstruct-exact-bits +
+            // call-the-kernel discipline as the reduction/axpby-out arms, so interp == native bit-exact.
+            "mercury_vmath_bf16_out" | "mercury_vmath_f16_out" => {
+                let is_f16 = name == "mercury_vmath_f16_out";
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let op = args[3].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    let f = self
+                        .memory
+                        .get(x + t)
+                        .ok_or("vmath-out operand out of bounds")?
+                        .as_float() as f32;
+                    xbuf.push(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    });
+                }
+                let mut obuf = vec![0u16; n];
+                // SAFETY: xbuf and obuf are each n u16 — the kernel's contract.
+                unsafe {
+                    if is_f16 {
+                        mercury_runtime::mercury_vmath_f16_out(
+                            xbuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            op,
+                        );
+                    } else {
+                        mercury_runtime::mercury_vmath_bf16_out(
+                            xbuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            op,
+                        );
+                    }
+                }
+                for (t, &obits) in obuf.iter().enumerate() {
+                    let widened = if is_f16 {
+                        mercury_runtime::f16_bits_to_f32(obits)
+                    } else {
+                        mercury_runtime::bf16_bits_to_f32(obits)
+                    };
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("vmath-out output out of bounds")? = Value::Float(widened as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_velem_f32(x, y, out, n, a, b, c, op)` — the streaming affine+activation kernel
             // (saxpy / scale / residual-add / bias / ReLU) a recognized `out[i] = act(a·x[i] + b·y[i]
             // + c)` map lowers to. Marshal `n` f32 from x and y, call the *identical* runtime kernel
@@ -2400,6 +2456,59 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get_mut(out + t)
                         .ok_or("velem output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
+            // `mercury_bias_bcast_f32[_parallel](x, b, out, rows, cols, op)` — the broadcast-bias add a
+            // recognized `for i { for j { out[i*C+j] = act(x[i*C+j] + b[j]) } }` nest lowers to (a
+            // `cols`-long bias added across every row, optional fused activation). Marshal `rows*cols`
+            // f32 from x and `cols` from b, call the *serial* runtime kernel (serial == parallel
+            // bit-for-bit, rows independent), write the result back — so the differential oracle stays
+            // exact for both the serial and `_parallel` names. Read all of x/b before writing out so an
+            // in-place (x == out) case is correct.
+            "mercury_bias_bcast_f32" | "mercury_bias_bcast_f32_parallel" => {
+                let x = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let rows = args[3].as_int() as usize;
+                let cols = args[4].as_int() as usize;
+                let op = args[5].as_int() as i64;
+                let n = rows.saturating_mul(cols);
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(
+                        self.memory
+                            .get(x + t)
+                            .ok_or("bias_bcast operand out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut bbuf = Vec::with_capacity(cols);
+                for t in 0..cols {
+                    bbuf.push(
+                        self.memory
+                            .get(b + t)
+                            .ok_or("bias_bcast bias out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                let mut obuf = vec![0.0f32; n];
+                // SAFETY: xbuf/obuf are n f32, bbuf is cols f32 — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_bias_bcast_f32(
+                        xbuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        op,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("bias_bcast output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
             }
@@ -2736,6 +2845,76 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get_mut(out + t)
                         .ok_or("lowp axpby output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
+            // `mercury_axpby_{bf16,f16}_out(x, y, out, n, a, b)` — the **all-half** streaming axpby (half
+            // in AND a half output): the axpby sum is narrowed back to bf16/f16 on store. Reconstruct the
+            // half input bits exactly, call the identical kernel into a real `u16` output buffer, then
+            // widen each stored half back to the `f32` an `[bf16]`/`[f16]` element observes (`Value::Float`
+            // of the widened bits) — bit-identical to the native backend's write-then-load. The
+            // narrowing round lives in the shared shim (== the recognizer's `as bf16` store), so interp
+            // == native and `-O0` == `-O2` (value-rounded).
+            "mercury_axpby_bf16_out" | "mercury_axpby_f16_out" => {
+                let is_f16 = name == "mercury_axpby_f16_out";
+                let x = ptr(args[0])?;
+                let y = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let n = args[3].as_int() as usize;
+                let a = args[4].as_float() as f32;
+                let b = args[5].as_float() as f32;
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    let f = self
+                        .memory
+                        .get(idx + t)
+                        .ok_or("lowp axpby-out operand out of bounds")?
+                        .as_float() as f32;
+                    Ok(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    })
+                };
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(bits(x, t)?);
+                    ybuf.push(bits(y, t)?);
+                }
+                let mut obuf = vec![0u16; n];
+                // SAFETY: xbuf/ybuf/obuf are each n u16 — the kernel's contract.
+                unsafe {
+                    if is_f16 {
+                        mercury_runtime::mercury_axpby_f16_out(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        );
+                    } else {
+                        mercury_runtime::mercury_axpby_bf16_out(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        );
+                    }
+                }
+                for (t, &obits) in obuf.iter().enumerate() {
+                    let widened = if is_f16 {
+                        mercury_runtime::f16_bits_to_f32(obits)
+                    } else {
+                        mercury_runtime::bf16_bits_to_f32(obits)
+                    };
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("lowp axpby-out output out of bounds")? =
+                        Value::Float(widened as f64);
                 }
                 Ok(Value::Unit)
             }

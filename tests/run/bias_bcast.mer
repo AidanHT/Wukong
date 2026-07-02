@@ -1,0 +1,88 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 19000
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1762
+module tests.run.bias_bcast
+
+// Broadcast-bias add `out[i*C + j] = act(x[i*C + j] + b[j])` — a `cols`-long bias `b` added across
+// every row of a `[rows, cols]` matrix (the pre-activation `+ bias` add every FFN/attention projection
+// ends with). Dispatches to the 256-bit `mercury_bias_bcast_f32`: the row-broadcast operand `b[j]`
+// (indexed by the inner loop var alone) is what the affine `velem` recognizer declines, so without this
+// the nest would fall to the 128-bit generic vectorizer / scalar. The mercury_bench / cranelift
+// differential gate proves interp == native bit-for-bit through the dispatched kernel, at every opt
+// level; the internal cross-checks below pin the add/ReLU against an independent scalar reference.
+
+fn main() -> i32 {
+    // x = a [8, 12] matrix; b = a 12-long bias vector. cols = 12 is not a multiple of 8 → the kernel's
+    // scalar tail runs on every row.
+    let mut x: [f32; 96] = [0.0; 96];
+    let mut i0: usize = 0;
+    while i0 < 96 { x[i0] = (i0 as f32) * 0.5 - 20.0; i0 = i0 + 1; }
+    let mut b: [f32; 12] = [0.0; 12];
+    let mut j0: usize = 0;
+    while j0 < 12 { b[j0] = (j0 as f32) - 3.0; j0 = j0 + 1; }
+
+    // --- (1) identity broadcast-bias add → mercury_bias_bcast_f32 (pure add) ---
+    let mut out: [f32; 96] = [0.0; 96];
+    for i in 0..8 {
+        for j in 0..12 {
+            out[i * 12 + j] = x[i * 12 + j] + b[j];
+        }
+    }
+    // Independent scalar reference (nested `while` → not recognized/vectorized): must agree exactly
+    // (one IEEE f32 add per element, no reassociation).
+    let mut refb: [f32; 96] = [0.0; 96];
+    let mut ii: usize = 0;
+    while ii < 8 {
+        let mut jj: usize = 0;
+        while jj < 12 {
+            refb[ii * 12 + jj] = x[ii * 12 + jj] + b[jj];
+            jj = jj + 1;
+        }
+        ii = ii + 1;
+    }
+    let mut mism: i32 = 0;
+    for k in 0..96 { if out[k] != refb[k] { mism = mism + 1; } }
+    print(mism); // 0 — dispatched add == scalar reference
+
+    // --- (2) fused ReLU broadcast-bias → mercury_bias_bcast_f32 (VM_RELU) ---
+    let mut outr: [f32; 96] = [0.0; 96];
+    for i in 0..8 {
+        for j in 0..12 {
+            outr[i * 12 + j] =
+                if x[i * 12 + j] + b[j] > 0.0 { x[i * 12 + j] + b[j] } else { 0.0 };
+        }
+    }
+    let mut refr: [f32; 96] = [0.0; 96];
+    let mut ir: usize = 0;
+    while ir < 96 {
+        let sr: f32 = refb[ir];
+        refr[ir] = if sr > 0.0 { sr } else { 0.0 };
+        ir = ir + 1;
+    }
+    let mut mismr: i32 = 0;
+    for k in 0..96 { if outr[k] != refr[k] { mismr = mismr + 1; } }
+    print(mismr); // 0 — dispatched relu == scalar reference
+
+    // Spot: row 5, col 8 → x[68] = 68*0.5 - 20 = 14.0, b[8] = 5.0 → 19.0.
+    print(round(out[5 * 12 + 8] * 1000.0) as i32); // 19000
+    // ReLU clamp: row 0, col 0 → x[0]+b[0] = -20 + -3 = -23 → relu = 0.
+    print(round(outr[0] * 1000.0) as i32); // 0
+
+    // --- (3) fused GELU broadcast-bias → mercury_bias_bcast_f32 (VM_GELU) ---
+    let mut outg: [f32; 96] = [0.0; 96];
+    for i in 0..8 {
+        for j in 0..12 {
+            outg[i * 12 + j] = gelu(x[i * 12 + j] + b[j]);
+        }
+    }
+    // silu(2.0) = 2*sigmoid(2) ≈ 1.7616 — a stable anchor for the shared activation family; the GELU
+    // dispatch itself is pinned bit-for-bit by the differential gate (interp == native, -O0 == -O3).
+    let g0: f32 = outg[0]; // keep the GELU dispatch live (used).
+    if g0 > 1.0e30 { print(1); } // never taken — guards against DCE of outg.
+    print(round(silu(2.0) * 1000.0) as i32); // 1762
+    return 0;
+}
