@@ -74,6 +74,21 @@ struct MeasureBf16 {
     out: f32,
 }
 
+/// The **all-half** streaming ABI: `(x, y, out)` all `*const/*mut u16` (bf16 stored bits). Unlike
+/// [`Bf16KernelFn`] (bf16 in, f32 scalar out) the output is a full half buffer — the narrowing store.
+type HalfOutKernelFn = unsafe extern "C" fn(*const u16, *const u16, *mut u16);
+
+/// The all-half twin of [`Measure`]: a full snapshot of the half output buffer widened to f32, so the
+/// cross-language check diffs *every* element (bf16 rounds to ~8 mantissa bits, so a bf16-scale
+/// relative tolerance is the honest bar — Mercury's FMA'd sum vs C's `a·x+b·y` can round to a
+/// neighbouring bf16 in the last bit).
+#[derive(Clone)]
+struct MeasureHalfOut {
+    compile: Duration,
+    ns_per_call: f64,
+    out: Vec<f32>,
+}
+
 /// The maximum relative element-wise error between two output buffers, and the index where it
 /// occurs. NaN-vs-NaN and same-sign-Inf agree; a small absolute floor keeps near-zero elements from
 /// blowing up the ratio. This is the honest full-buffer cross-language equality check: the three
@@ -286,6 +301,9 @@ fn main() {
     }
     if want("biasadd") {
         bench_biasadd(&cc, &dir);
+    }
+    if want("axpby_half") {
+        bench_axpby_half_out(&cc, &dir);
     }
     if want("colmax") {
         bench_colmax(&cc, &dir);
@@ -3618,6 +3636,11 @@ fn to_bf16_bits(x: f32) -> u16 {
     ((b + bias) >> 16) as u16
 }
 
+/// Widen bf16 stored bits back to f32 (the 16 bits are the high half of the f32; low half is zero).
+fn widen_bf16(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
 /// bf16 **mixed-precision reductions** (bf16 storage, f32 accumulate — the standard ML contract):
 /// dot `Σ x·y` and unary sum `Σ x` over `[bf16; N]` arrays. Mercury folds the loop to one
 /// `mercury_dot_bf16` / `mercury_sum_bf16` SIMD kernel (F16C-class widen + 8-lane f32 accumulate);
@@ -3772,6 +3795,172 @@ fn rust_bf16(n: usize, is_dot: bool) -> String {
          \x20   let mut s = 0.0f32;\n\
          \x20   for k in 0..{n} {{ s += {term}; }}\n\
          \x20   *o = s;\n}} }}\n"
+    )
+}
+
+/// **All-half streaming axpby** `out[k] = (a·(x[k] as f32) + b·(y[k] as f32)) as bf16` — bf16 in AND a
+/// bf16 (narrowing) store. Two same-run levers (the only honest instrument on this throttling laptop):
+///   1. **Write-traffic halving**: vs the bf16-in / **f32-out** axpby (same kernel family, wider store)
+///      the half output moves 6 bytes/elem instead of 8 (read x,y bf16 = 4 + write 2 vs + write 4), so
+///      on a >L3, store-bound stream it runs faster per call. Reported as the ns ratio (each on its own
+///      traffic for GB/s).
+///   2. **vs a C all-half peer** that does the identical `<<16` widen + round-to-nearest-even bf16
+///      narrow: gcc/rustc leave the bf16 round scalar, so Mercury's 256-bit `narrow_bf16` (pack +
+///      permute) wins. Cross-checked full-buffer at a bf16-scale tolerance (Mercury FMAs the sum, C
+///      does not, so the last bf16 bit can differ).
+/// N = 1<<24 (32 MB per bf16 array ≫ L3) so the narrowing store dominates.
+fn bench_axpby_half_out(cc: &str, dir: &Path) {
+    let n = 1usize << 24;
+    let (a, b) = (1.5f32, 2.0f32);
+    // bf16-stored small positive inputs (well-conditioned).
+    let x: Vec<u16> = (0..n)
+        .map(|i| to_bf16_bits((i as f32 % 17.0) * 0.05 + 0.5))
+        .collect();
+    let y: Vec<u16> = (0..n)
+        .map(|i| to_bf16_bits((i as f32 % 13.0) * 0.03 + 0.25))
+        .collect();
+    let mut oh = vec![0u16; n]; // bf16 output buffer
+    let mut of = vec![0.0f32; n]; // f32 output buffer (for the write-halving A/B)
+    let (xp, yp, ohp) = (x.as_ptr(), y.as_ptr(), oh.as_mut_ptr());
+    let ofp = of.as_mut_ptr(); // taken before the &mut of borrow (raw ptr holds no borrow)
+
+    println!(
+        "=== all-half axpby out=(a·x+b·y) as bf16, N=2^24 (bf16 in AND out; GB/s, higher is better) ==="
+    );
+    // Lever 1: the half-out kernel vs the f32-out kernel (same math, wider store) — Mercury vs Mercury.
+    let mer_half = bench_mercury_halfout(&mer_axpby_half_out(n, a, b), &mut oh, xp, yp, ohp);
+    let mer_f32 = bench_mercury_bf16(&mer_axpby_f32_out(n, a, b), &mut of, xp, yp, ofp);
+    // Lever 2: a C all-half peer (same round).
+    let cm = bench_external_halfout(
+        "c",
+        &c_axpby_half_out(n, a, b),
+        dir,
+        "axpbyhalf",
+        cc,
+        &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        &mut oh,
+        xp,
+        yp,
+        ohp,
+    );
+    let rm = bench_external_halfout(
+        "rs",
+        &rust_axpby_half_out(n, a, b),
+        dir,
+        "axpbyhalf",
+        "rustc",
+        &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &mut oh,
+        xp,
+        yp,
+        ohp,
+    );
+    // GB/s: half-out moves 6·n bytes (read x,y bf16 + write bf16); f32-out moves 8·n (write f32).
+    let half_bytes = 6.0 * n as f64;
+    let f32_bytes = 8.0 * n as f64;
+    let gbps = |m: &Option<MeasureHalfOut>, bytes: f64| {
+        m.as_ref()
+            .map(|x| format!("{:.1}", bytes / x.ns_per_call))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    let gbps_bf = |m: &Option<MeasureBf16>, bytes: f64| {
+        m.as_ref()
+            .map(|x| format!("{:.1}", bytes / x.ns_per_call))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    println!(
+        "  {:<12} {:>12} {:>12} {:>12} {:>12}",
+        "", "Mer half-out", "Mer f32-out", "C half-out", "Rust half-out"
+    );
+    println!(
+        "  {:<12} {:>12} {:>12} {:>12} {:>12}",
+        "GB/s",
+        gbps(&mer_half, half_bytes),
+        gbps_bf(&mer_f32, f32_bytes),
+        gbps(&cm, half_bytes),
+        gbps(&rm, half_bytes)
+    );
+    // Cross-check the C/Rust half output against Mercury's (bf16-scale tolerance: 8-bit mantissa ≈ 4e-3).
+    if let Some(m) = &mer_half {
+        for (lang, other) in [("C", &cm), ("Rust", &rm)] {
+            if let Some(o2) = other {
+                let (rel, at) = max_rel_err(&m.out, &o2.out);
+                if rel > 8e-3 {
+                    println!(
+                        "  ! {lang} half-out drift: rel {rel:.2e} at [{at}] ({} vs Mercury {})",
+                        o2.out[at], m.out[at]
+                    );
+                }
+            }
+        }
+    }
+    // Lever 1 payoff: the halved write should make the half-out kernel faster per call than f32-out.
+    if let (Some(h), Some(f)) = (&mer_half, &mer_f32) {
+        let r = f.ns_per_call / h.ns_per_call;
+        println!(
+            "  -> half-out is {r:.2}x the f32-out axpby (narrowing store halves the write traffic)"
+        );
+    }
+    // Lever 2 payoff: vs the C all-half peer.
+    if let (Some(h), Some(c2)) = (&mer_half, &cm) {
+        let r = c2.ns_per_call / h.ns_per_call;
+        println!(
+            "  -> Mercury half-out is {:.2}x {} than C (vectorized widen+narrow vs scalar bf16 round)",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    // Compile time (Mercury front-end + JIT vs gcc/rustc to a shared lib).
+    let cms = |m: &Option<MeasureHalfOut>| {
+        m.as_ref()
+            .map(|x| format!("{:.0}", x.compile.as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    println!(
+        "  {:<12} {:>12} {:>12} {:>12} {:>12}",
+        "compile ms",
+        cms(&mer_half),
+        "-",
+        cms(&cm),
+        cms(&rm)
+    );
+    println!();
+}
+
+/// Mercury all-half axpby: bf16 in AND out — the recognizer folds it to `mercury_axpby_bf16_out`.
+fn mer_axpby_half_out(n: usize, a: f32, b: f32) -> String {
+    format!(
+        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], out: [bf16; {n}]) {{\n\
+         \x20   for k in 0..{n} {{ out[k] = ({a:?} * (x[k] as f32) + {b:?} * (y[k] as f32)) as bf16; }}\n}}\n"
+    )
+}
+
+/// Mercury bf16-in / f32-out axpby (the wider-store sibling) — folds to `mercury_axpby_bf16`.
+fn mer_axpby_f32_out(n: usize, a: f32, b: f32) -> String {
+    format!(
+        "module bench\nfn kbench(x: [bf16; {n}], y: [bf16; {n}], out: [f32; {n}]) {{\n\
+         \x20   for k in 0..{n} {{ out[k] = {a:?} * (x[k] as f32) + {b:?} * (y[k] as f32); }}\n}}\n"
+    )
+}
+
+/// Idiomatic C all-half axpby: widen bf16 (`<<16`), compute `a·x+b·y`, round to nearest-even bf16, store.
+fn c_axpby_half_out(n: usize, a: f32, b: f32) -> String {
+    format!(
+        "#include <stdint.h>\n#include <string.h>\n#define N {n}\n\
+         static inline float bf(uint16_t b){{ uint32_t u=((uint32_t)b)<<16; float f; memcpy(&f,&u,4); return f; }}\n\
+         static inline uint16_t nb(float f){{ uint32_t u; memcpy(&u,&f,4); uint32_t bias=0x7fffu+((u>>16)&1u); return (uint16_t)((u+bias)>>16); }}\n\
+         __declspec(dllexport) void kbench(const uint16_t* x, const uint16_t* y, uint16_t* out){{\n\
+         \x20   for (long k=0;k<N;k++) out[k] = nb({a:?}f*bf(x[k]) + {b:?}f*bf(y[k]));\n}}\n"
+    )
+}
+
+/// Idiomatic Rust all-half axpby (same widen + round-to-nearest-even bf16 narrow).
+fn rust_axpby_half_out(n: usize, a: f32, b: f32) -> String {
+    format!(
+        "#[inline(always)]\nfn bf(b: u16) -> f32 {{ f32::from_bits((b as u32) << 16) }}\n\
+         #[inline(always)]\nfn nb(f: f32) -> u16 {{ let u = f.to_bits(); let bias = 0x7fffu32 + ((u>>16)&1); ((u+bias)>>16) as u16 }}\n\
+         #[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const u16, y:*const u16, out:*mut u16) {{\n\
+         \x20   for k in 0..{n} {{ *out.add(k) = nb({a:?}f32*bf(*x.add(k)) + {b:?}f32*bf(*y.add(k))); }}\n}}\n"
     )
 }
 
@@ -4930,6 +5119,130 @@ fn bench_external_bf16(
         let ns = time_ns(|| f(xp, yp, op));
         let snapshot = out[0];
         Some(MeasureBf16 {
+            compile,
+            ns_per_call: ns,
+            out: snapshot,
+        })
+    }
+}
+
+/// The all-half twin of [`bench_mercury_bf16`]: JIT a Mercury kernel with the `(x, y, out)` all-`u16`
+/// (bf16) ABI, time it, and snapshot the half output buffer widened to f32 for the cross-check.
+fn bench_mercury_halfout(
+    src: &str,
+    out: &mut [u16],
+    xp: *const u16,
+    yp: *const u16,
+    op: *mut u16,
+) -> Option<MeasureHalfOut> {
+    let t = Instant::now();
+    let mut interner = Interner::new();
+    let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    if pd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury parse error");
+        return None;
+    }
+    let (sema, sd) = mercury_sema::check(&module, &interner);
+    if sd.iter().any(|d| d.is_error()) {
+        eprintln!("mercury sema error: {sd:?}");
+        return None;
+    }
+    let (mut program, ld) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    if ld.iter().any(|d| d.is_error()) {
+        eprintln!("mercury lower error: {ld:?}");
+        return None;
+    }
+    mercury_opt::optimize(&mut program, 3);
+    let handle = match mercury_codegen_cranelift::jit_module(&program, &interner) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("mercury codegen error: {e}");
+            return None;
+        }
+    };
+    let sym = interner.intern("kbench");
+    let ptr = handle.func_ptr(sym)?;
+    let compile = t.elapsed();
+    let f: HalfOutKernelFn = unsafe { std::mem::transmute(ptr) };
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
+    drop(handle); // keep alive through timing
+    Some(MeasureHalfOut {
+        compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// The all-half twin of [`bench_external_bf16`]: compile a C/Rust all-half kernel to a shared lib,
+/// time it, and snapshot the widened half output.
+#[allow(clippy::too_many_arguments)]
+fn bench_external_halfout(
+    ext: &str,
+    src: &str,
+    dir: &Path,
+    name: &str,
+    compiler: &str,
+    args: &[&str],
+    out: &mut [u16],
+    xp: *const u16,
+    yp: *const u16,
+    op: *mut u16,
+) -> Option<MeasureHalfOut> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let src_path = dir.join(format!("{safe}.{ext}"));
+    let dll: PathBuf = dir.join(format!("{safe}_{ext}.dll"));
+    if std::fs::write(&src_path, src).is_err() {
+        return None;
+    }
+    let t = Instant::now();
+    let status = Command::new(compiler)
+        .args(args)
+        .arg("-o")
+        .arg(&dll)
+        .arg(&src_path)
+        .status();
+    let compile = t.elapsed();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("{compiler} failed to compile {name}.{ext}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("could not run `{compiler}` (skipping)");
+            return None;
+        }
+    }
+
+    unsafe {
+        let lib = match libloading::Library::new(&dll) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("load {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let sym: libloading::Symbol<HalfOutKernelFn> = match lib.get(b"kbench\0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("symbol kbench in {}: {e}", dll.display());
+                return None;
+            }
+        };
+        let f: HalfOutKernelFn = *sym;
+        let ns = time_ns(|| f(xp, yp, op));
+        let snapshot: Vec<f32> = out.iter().map(|&b| widen_bf16(b)).collect();
+        Some(MeasureHalfOut {
             compile,
             ns_per_call: ns,
             out: snapshot,
