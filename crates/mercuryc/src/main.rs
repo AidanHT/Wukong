@@ -15,9 +15,15 @@ OPTIONS:
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
-    --grad-of=<fn>     Function to differentiate for --emit=grad  (default: loss)
+    --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss)
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
-                       buffer parameters of the loss function)
+                       buffer parameters of the loss function). For --train, these are the
+                       trainable weights; other buffers are fixed data; the last param is the loss.
+    --train            Run a fwd->bwd->optimizer loop on the loss fn and print the loss trajectory
+    --train-steps=<n>  Number of training steps  (default: 100)
+    --train-lr=<f>     Learning rate  (default: 0.01)
+    --train-opt=<o>    Optimizer: sgd, adamw  (default: sgd)
+    --train-seed=<n>   Seed for deterministic buffer initialization
     --run              Compile and run (interpreter by default; see --backend)
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
@@ -135,6 +141,35 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .map_err(|_| {
                         format!("--grad-wrt expects comma-separated parameter indices, got `{list}`")
                     })?;
+            }
+            "--train" => opts.grad.train = true,
+            _ if arg.starts_with("--train-steps=") => {
+                let v = &arg["--train-steps=".len()..];
+                opts.grad.train_steps = v
+                    .parse()
+                    .map_err(|_| format!("--train-steps expects a non-negative integer, got `{v}`"))?;
+            }
+            _ if arg.starts_with("--train-lr=") => {
+                let v = &arg["--train-lr=".len()..];
+                opts.grad.train_lr = v
+                    .parse()
+                    .map_err(|_| format!("--train-lr expects a float, got `{v}`"))?;
+            }
+            _ if arg.starts_with("--train-opt=") => {
+                let v = &arg["--train-opt=".len()..];
+                opts.grad.train_opt = match v {
+                    "sgd" => mercury_driver::TrainOpt::Sgd,
+                    "adamw" => mercury_driver::TrainOpt::AdamW,
+                    other => {
+                        return Err(format!("--train-opt expects sgd or adamw, got `{other}`"))
+                    }
+                };
+            }
+            _ if arg.starts_with("--train-seed=") => {
+                let v = &arg["--train-seed=".len()..];
+                opts.grad.train_seed = v
+                    .parse()
+                    .map_err(|_| format!("--train-seed expects an integer, got `{v}`"))?;
             }
             _ if arg.starts_with("--error-format=") => {
                 let fmt = &arg["--error-format=".len()..];
