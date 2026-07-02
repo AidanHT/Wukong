@@ -167,9 +167,14 @@ Blocks are expressions: the trailing expression of a block (no semicolon) is its
 A **loop label** `'name:` on a `loop`/`while`/`for` lets a nested `break 'name` / `continue 'name`
 target that named outer loop instead of the innermost one — the lexer tells a label `'outer` from a
 char literal `'a'` exactly as Rust does (`tests/run/labeled_loop.mer`). A labeled `break`/`continue`
-naming an **undeclared** label is rejected with `E0303` (`tests/fail/break_unknown_label.mer`). A
-loop is still **statement-only**: loop-as-expression / break-with-value (`let x = loop { break 5; };`)
-is not yet supported — `break` carries an optional label but no value (🟡).
+naming an **undeclared** label is rejected with `E0303` (`tests/fail/break_unknown_label.mer`).
+
+`loop` is a **value-producing expression** and `break` carries a value (`let x = loop { break 5; };` ✅).
+The loop's type is inferred by unifying every `break <value>` (composing with `if`/`match` value merges),
+so a value `loop` can be a `let` initializer, call argument, array element, block tail / `return` value,
+or aggregate field; a labeled `break 'outer v` carries a value out of an outer loop. A `break <value>`
+targeting a *statement-position* loop (its value discarded, like `while`/`for`) is rejected `E0401`, and
+breaks whose shapes disagree are `E0502` — the same merge rules as `if`/`match` arms.
 
 ## Pattern matching ✅
 
