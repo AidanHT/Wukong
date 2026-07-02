@@ -433,6 +433,166 @@ fn i8_linear_nest_lowers_to_i8gemm() {
     );
 }
 
+/// An int-input dequant `out[j] = act((q[j] as f32)·scale)` over an `[i8]`/`[u8]`/`[i32]` array
+/// dispatches to `mercury_dequant_f32` (256-bit widen+scale). Integer→f32 is exact, so the kernel
+/// equals the scalar loop bit-for-bit — native and interp must agree at every opt level, for every
+/// input width, activation (identity / `fmax` ReLU / GELU / SiLU), and the serial *and* `@parallel`
+/// forms. The width sweep pins signedness (`i8` sign-extends, `u8` zero-extends): the fill spans past
+/// the byte boundary in both directions, so a wrong extension would diverge — but *consistently* in
+/// both backends (gate-blind), which is why the hand-computed golden fixture `tests/run/dequant*.mer`
+/// is the independent signedness gate; this pins the two backends to each other across the matrix.
+#[test]
+fn differential_dequant() {
+    // `V` is the dequant value `(q[j] as f32)·s`; each `act` wraps it.
+    let make = |attr: &str, ty: &str, act: &str| {
+        let val = "((q[j] as f32) * s)";
+        let body = act.replace('V', val);
+        format!(
+            "{attr}fn deq(q: [{ty}; 64], out: [f32; 64]) {{ let s: f32 = 0.0125; \
+             for j in 0..64 {{ out[j] = {body}; }} }} \
+             fn main() -> i32 {{ let mut q: [{ty}; 64] = [0 as {ty}; 64]; \
+             let mut out: [f32; 64] = [0.0; 64]; \
+             for j in 0..64 {{ q[j] = ((j * 37 + 5) % 251 - 100) as {ty}; }} \
+             deq(q, out); \
+             let mut acc: f32 = 0.0; for j in 0..64 {{ acc = acc + out[j]; }} \
+             print((acc * 1000.0) as i32); print((out[3] * 1000.0) as i32); \
+             print((out[63] * 1000.0) as i32); return 0; }}"
+        )
+    };
+    for ty in ["i8", "u8", "i32"] {
+        for act in ["V", "fmax(V, 0.0)", "gelu(V)", "silu(V)"] {
+            for attr in ["", "@parallel "] {
+                let src = make(attr, ty, act);
+                for opt in [0u8, 2, 3] {
+                    let n = jit(&src, opt).expect("jit");
+                    let i = interp(&src, opt).expect("interp");
+                    assert_eq!(
+                        n, i,
+                        "dequant native vs interp mismatch ty={ty} act={act} attr={attr:?} at -O{opt}\n{src}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An int-input dequant loop dispatches to `mercury_dequant_f32` for every supported width and
+/// activation (the `@parallel` form reaches it via the outliner's per-chunk `try_vectorize_ranged`).
+/// An f32-array elementwise map must NOT reach the dequant kernel (that is velem's job — dequant reads
+/// an *int* array through an `as f32` cast, which velem declines and vice-versa).
+#[test]
+fn dequant_loop_lowers_to_dequant_kernel() {
+    let deq = |attr: &str, ty: &str, act: &str| {
+        format!(
+            "module m\n{attr}fn d(q: [{ty}; 64], out: [f32; 64]) {{ let s: f32 = 0.1; \
+             for j in 0..64 {{ out[j] = {act}; }} }}"
+        )
+    };
+    for ty in ["i8", "u8", "i32"] {
+        assert!(
+            lowered_calls(&deq("", ty, "(q[j] as f32) * s"), "mercury_dequant_f32"),
+            "{ty} pure dequant -> mercury_dequant_f32"
+        );
+    }
+    for act in ["fmax((q[j] as f32) * s, 0.0)", "gelu((q[j] as f32) * s)", "silu((q[j] as f32) * s)"] {
+        assert!(
+            lowered_calls(&deq("", "i8", act), "mercury_dequant_f32"),
+            "activated dequant `{act}` -> mercury_dequant_f32"
+        );
+    }
+    // A `@parallel` dequant whose body has a leading `let s` (so it is not a single-loop body the
+    // outliner claims) is lowered `parallel_fn = true` and dispatches to the rayon parallel kernel.
+    assert!(
+        lowered_calls(
+            &deq("@parallel\n", "i32", "(q[j] as f32) * s"),
+            "mercury_dequant_f32_parallel"
+        ),
+        "@parallel dequant (mixed body) -> mercury_dequant_f32_parallel"
+    );
+    // An f32-array scale map is velem's, not dequant's — the dequant kernel must not claim it.
+    let f32_map = "module m\nfn d(x: [f32; 64], out: [f32; 64]) { let s: f32 = 0.1; \
+                   for j in 0..64 { out[j] = x[j] * s; } }";
+    assert!(
+        !lowered_calls(f32_map, "mercury_dequant_f32"),
+        "f32 elementwise map must not reach the dequant kernel"
+    );
+}
+
+/// A *mixed* `@parallel` function (not a single elementwise loop, so the outliner declines it and it is
+/// lowered with `parallel_fn = true`) dispatches its dequant loops to the rayon
+/// `mercury_dequant_f32_parallel` — bit-identical to serial (elementwise), so native and interp agree.
+/// This exercises the parallel-symbol emission path the outlined common case skips.
+#[test]
+fn differential_dequant_mixed_parallel() {
+    // Two dequant loops in one @parallel fn → not a single-loop body → the parallel-symbol path.
+    let src = "@parallel fn deq2(q: [i32; 128], out: [f32; 128]) { let s: f32 = 0.03125; \
+         for j in 0..64 { out[j] = (q[j] as f32) * s; } \
+         for j in 64..128 { out[j] = fmax((q[j] as f32) * s, 0.0); } } \
+         fn main() -> i32 { let mut q: [i32; 128] = [0; 128]; let mut out: [f32; 128] = [0.0; 128]; \
+         for j in 0..128 { q[j] = (j - 64) * 3; } deq2(q, out); \
+         let mut acc: f32 = 0.0; for j in 0..128 { acc = acc + out[j]; } \
+         print((acc * 100.0) as i32); print((out[0] * 100.0) as i32); \
+         print((out[127] * 100.0) as i32); return 0; }";
+    assert!(
+        lowered_calls(src, "mercury_dequant_f32_parallel"),
+        "mixed @parallel dequant -> mercury_dequant_f32_parallel"
+    );
+    for opt in [0u8, 2, 3] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "mixed-parallel dequant native vs interp mismatch at -O{opt}");
+    }
+}
+
+/// A per-channel dequant nest `out[i*C+j] = act((q[i*C+j] as f32)·scale[j])` over a `[R,C]` matrix
+/// dispatches to `mercury_dequant_perchan_f32` (the `@parallel` whole-function form to `_parallel`,
+/// intercepted before the outliner so rows map across cores rather than being scalarized). Integer→f32
+/// is exact, so native and interp agree at every opt level, for every input width, activation, and the
+/// serial *and* `@parallel` forms. `C = 12` (not a multiple of 8) exercises the kernel's column tail.
+#[test]
+fn differential_dequant_perchan() {
+    let make = |attr: &str, ty: &str, act: &str| {
+        let val = "((q[i * 12 + j] as f32) * scale[j])";
+        let body = act.replace('V', val);
+        format!(
+            "{attr}fn deq(q: [{ty}; 60], scale: [f32; 12], out: [f32; 60]) {{ \
+             for i in 0..5 {{ for j in 0..12 {{ out[i * 12 + j] = {body}; }} }} }} \
+             fn main() -> i32 {{ let mut q: [{ty}; 60] = [0 as {ty}; 60]; \
+             let mut scale: [f32; 12] = [0.0; 12]; let mut out: [f32; 60] = [0.0; 60]; \
+             for j in 0..12 {{ scale[j] = ((j % 4) as f32) * 0.01 + 0.005; }} \
+             for t in 0..60 {{ q[t] = ((t * 29 + 7) % 233 - 110) as {ty}; }} \
+             deq(q, scale, out); \
+             let mut acc: f32 = 0.0; for t in 0..60 {{ acc = acc + out[t]; }} \
+             print((acc * 10000.0) as i32); print((out[13] * 10000.0) as i32); \
+             print((out[59] * 10000.0) as i32); return 0; }}"
+        )
+    };
+    // Dispatch: serial and @parallel both reach the (parallel) kernel.
+    assert!(
+        lowered_calls(&make("", "i32", "V"), "mercury_dequant_perchan_f32"),
+        "per-channel dequant -> mercury_dequant_perchan_f32"
+    );
+    assert!(
+        lowered_calls(&make("@parallel ", "i8", "V"), "mercury_dequant_perchan_f32_parallel"),
+        "@parallel per-channel dequant -> mercury_dequant_perchan_f32_parallel"
+    );
+    for ty in ["i8", "u8", "i32"] {
+        for act in ["V", "fmax(V, 0.0)", "gelu(V)", "silu(V)"] {
+            for attr in ["", "@parallel "] {
+                let src = make(attr, ty, act);
+                for opt in [0u8, 2, 3] {
+                    let n = jit(&src, opt).expect("jit");
+                    let i = interp(&src, opt).expect("interp");
+                    assert_eq!(
+                        n, i,
+                        "per-channel dequant native vs interp mismatch ty={ty} act={act} attr={attr:?} at -O{opt}\n{src}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The embedding lookup `out[t,:] = weight[ids[t],:]` (the first layer of every LLM) dispatches to
 /// `mercury_embedding_f32`. The native run gathers via the AVX2 kernel; the interpreter marshals the
 /// identical serial kernel — pure data movement (a row copy), so they are bit-identical by
