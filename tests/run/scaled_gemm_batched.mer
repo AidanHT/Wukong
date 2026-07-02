@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 85
+// EXPECT-OUT: 265
+// EXPECT-OUT: 45
+// EXPECT-OUT: 60
+module tests.run.scaled_gemm_batched
+
+/// Batched (multi-head) α-scaled attention scores `scores[h] = (Q[h]·K[h]ᵀ)·scale` over H=2 heads with
+/// a **literal** scale `0.5`. The recognizer peels the per-head base offset `h*4` off each flattened
+/// index (as in `batched_matmul`) AND the loop-invariant `0.5` off the store, dispatching every head to
+/// `mercury_sgemm_nt_alpha` (GEP-ing the base pointers per head). Exercises the batched-offset path and
+/// the literal-scale (`AlphaScale::Lit`) branch; the gate proves interp == native and -O0 == -O3.
+///
+/// head 0: Q=[[1,2],[3,4]], K=[[5,6],[7,8]] ⇒ QKᵀ=[[17,23],[39,53]], ·0.5 = [[8.5,11.5],[19.5,26.5]].
+/// head 1: Q=I, K=[[9,10],[11,12]]          ⇒ QKᵀ=[[9,11],[10,12]],  ·0.5 = [[4.5,5.5],[5.0,6.0]].
+fn bscores(q: [f32; 8], k: [f32; 8], scores: [f32; 8]) {
+    for h in 0..2 {
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut s: f32 = 0.0;
+                for p in 0..2 {
+                    s = s + q[h * 4 + i * 2 + p] * k[h * 4 + j * 2 + p];
+                }
+                scores[h * 4 + i * 2 + j] = 0.5 * s;
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    let q: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 1.0];
+    let k: [f32; 8] = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let mut scores: [f32; 8] = [0.0; 8];
+    bscores(q, k, scores);
+    print((scores[0] * 10.0) as i32); // head0 [0,0] = 8.5  → 85
+    print((scores[3] * 10.0) as i32); // head0 [1,1] = 26.5 → 265
+    print((scores[4] * 10.0) as i32); // head1 [0,0] = 4.5  → 45
+    print((scores[7] * 10.0) as i32); // head1 [1,1] = 6.0  → 60
+    return 0;
+}

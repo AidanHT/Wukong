@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 200
+// EXPECT-OUT: 3200
+module tests.run.scaled_gemm_parallel
+
+/// A `@parallel` whole-function α-scaled attention score matmul `scores = (Q·Kᵀ)·scale`. Intercepted as
+/// a whole-function matmul and lowered with `parallel = true`, so the α store dispatches to
+/// `mercury_sgemm_nt_alpha_parallel` — the scale folded into each C tile's writeback AND the tiles spread
+/// across cores. The parallel α kernel is bit-identical to the serial one the interpreter marshals (each
+/// C tile owned by one task, same per-(i,j) accumulation order), so -O0..-O3 and interp/native agree.
+///
+/// Same data/values as `scaled_gemm`: scores[i,j] = 2·(i+1)(j+1); scores[0,0]=2 (×100=200),
+/// scores[3,3]=32 (×100=3200).
+@parallel
+fn scaled_scores(q: [f32; 16], k: [f32; 16], scores: [f32; 16], scale: f32) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for p in 0..4 {
+                s = s + q[i * 4 + p] * k[j * 4 + p];
+            }
+            scores[i * 4 + j] = scale * s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 16] = [0.0; 16];
+    let mut k: [f32; 16] = [0.0; 16];
+    let mut scores: [f32; 16] = [0.0; 16];
+    let mut idx: i32 = 0;
+    while idx < 16 {
+        q[idx] = ((idx / 4) + 1) as f32;
+        k[idx] = ((idx / 4) + 1) as f32;
+        idx = idx + 1;
+    }
+    scaled_scores(q, k, scores, 0.5);
+    print((scores[0] * 100.0) as i32);
+    print((scores[15] * 100.0) as i32);
+    return 0;
+}

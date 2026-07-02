@@ -1119,6 +1119,55 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_sgemm_nt_alpha[_parallel](a, b, c, m, k, n, beta, alpha)` — the α-scaled Linear
+            // (`C = alpha·(A·Bᵀ)`, the attention score matmul `QKᵀ/√d`). Like the plain GEMM, the
+            // interpreter marshals operands into real f32 buffers and calls the *serial* runtime kernel
+            // as the oracle (the parallel form is bit-identical — each C tile owned by one task, same
+            // per-(i,j) accumulation order). `alpha` rides an f32 slot, read as a scalar value.
+            "mercury_sgemm_nt_alpha" | "mercury_sgemm_nt_alpha_parallel" => {
+                let a = ptr(args[0])?;
+                let b = ptr(args[1])?;
+                let c = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let k = args[4].as_int() as usize;
+                let n = args[5].as_int() as usize;
+                let beta = args[6].as_int() as i64;
+                let alpha = args[7].as_float() as f32;
+                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                    let mut v = Vec::with_capacity(len);
+                    for t in 0..len {
+                        v.push(
+                            mem.get(base + t)
+                                .ok_or("sgemm_alpha operand out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                    Ok(v)
+                };
+                let abuf = read(&self.memory, a, m * k)?;
+                let bbuf = read(&self.memory, b, n * k)?;
+                let mut cbuf = read(&self.memory, c, m * n)?;
+                // SAFETY: buffers are exactly m*k, n*k, m*n long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_sgemm_nt_alpha(
+                        abuf.as_ptr(),
+                        bbuf.as_ptr(),
+                        cbuf.as_mut_ptr(),
+                        m as i64,
+                        k as i64,
+                        n as i64,
+                        beta,
+                        alpha,
+                    );
+                }
+                for (t, &val) in cbuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(c + t)
+                        .ok_or("sgemm_alpha output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_vmath_f32(x, out, n, op)` — the 256-bit AVX2 elementwise transcendental kernel
             // (exp/log/tanh/sigmoid) the compiler lowers an `out[i] = f(x[i])` loop to. Marshal `n`
             // f32 from x, call the *identical* runtime kernel the native backend calls, write the
