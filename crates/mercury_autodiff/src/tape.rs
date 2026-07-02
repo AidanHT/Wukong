@@ -22,6 +22,19 @@ const VM_EXP: i64 = 0;
 const VM_TANH: i64 = 2;
 const VM_SIGMOID: i64 = 3;
 const VM_RELU: i64 = 4;
+const VM_SILU: i64 = 5;
+const VM_GELU: i64 = 6;
+const VM_ELU: i64 = 7;
+const VM_SOFTPLUS: i64 = 9;
+// `mercury_vmath2_f32(x, dy, dx, n, op)` *backward* op codes: the kernel fuses the upstream multiply
+// into a 256-bit activation derivative (`dx = dy · act'(x)`), so a whole activation-backward pass is
+// one call — and is bit-identical with the forward (it reuses the same sigmoid/tanh polynomials). The
+// smooth activations whose derivative is a *transcendental* (so no closed form in `x`/`y` alone) ride
+// this instead of the synthesized loop the algebraic ones (relu/sigmoid/tanh/exp) use.
+const VM2_SILU_BWD: i64 = 3;
+const VM2_GELU_BWD: i64 = 4;
+const VM2_ELU_BWD: i64 = 7;
+const VM2_SOFTPLUS_BWD: i64 = 8;
 const RED_DOT: i64 = 0;
 const RED_SSD: i64 = 1;
 const RED_SUM: i64 = 2;
@@ -45,7 +58,15 @@ pub(crate) struct Syms {
     pub sgemm_nt: Symbol,
     pub vmath: Symbol,
     pub sreduce: Symbol,
+    /// The `@parallel` reduction — same `(x, y, n, op)` ABI and identical (deterministic, fixed
+    /// chunking) result as the serial `sreduce`, so it differentiates through the very same rule.
+    /// A `.mer` reduction lowered from source produces *this* symbol (the recognizer emits the
+    /// parallel kernel), while the hand-built tape tests use the serial one — the tape accepts both.
+    pub sreduce_parallel: Symbol,
     pub velem: Symbol,
+    /// The two-input transcendental kernel; the tape emits its `*_BWD` op codes for the smooth
+    /// activation backwards (`dx = dy · act'(x)` in one fused pass).
+    pub vmath2: Symbol,
     pub norm: Symbol,
 }
 
@@ -56,10 +77,25 @@ impl Syms {
             sgemm_nt: it.intern("mercury_sgemm_nt"),
             vmath: it.intern("mercury_vmath_f32"),
             sreduce: it.intern("mercury_sreduce_f32"),
+            sreduce_parallel: it.intern("mercury_sreduce_f32_parallel"),
             velem: it.intern("mercury_velem_f32"),
+            vmath2: it.intern("mercury_vmath2_f32"),
             norm: it.intern("mercury_norm_f32"),
         }
     }
+}
+
+/// Map a forward `vmath` activation op code to the `vmath2` *backward* op code that computes its
+/// `dx = dy·act'(x)` in one fused pass — or `None` for the algebraic activations (relu/sigmoid/tanh/
+/// exp) that the synthesized loop handles without a transcendental.
+fn vm2_bwd_code(fwd_op: i64) -> Option<i64> {
+    Some(match fwd_op {
+        VM_SILU => VM2_SILU_BWD,
+        VM_GELU => VM2_GELU_BWD,
+        VM_ELU => VM2_ELU_BWD,
+        VM_SOFTPLUS => VM2_SOFTPLUS_BWD,
+        _ => return None,
+    })
 }
 
 /// A synthesized counted loop, threaded between [`Vjp::open_loop`] and [`Vjp::close_loop`]. After
@@ -78,18 +114,49 @@ impl<'a> Vjp<'a> {
         func == self.syms.sgemm_nt
             || func == self.syms.vmath
             || func == self.syms.sreduce
+            || func == self.syms.sreduce_parallel
             || func == self.syms.velem
             || func == self.syms.norm
+    }
+
+    /// Canonicalize a kernel buffer argument to the base buffer it addresses: peel a whole-buffer
+    /// `gep(buf, 0)` (the form MIR lowering emits for *some* kernel operands — e.g. `vmath`'s output —
+    /// while others, like `sreduce`'s input, pass the bare `alloca`). Without this, the two forms key
+    /// *different* buffer-adjoint entries and the gradient chain silently breaks between the ops. A
+    /// non-zero-offset gep is a genuine sub-slice and is left alone. Dim/op-code operands are constants
+    /// (not geps), so canonicalizing the whole argument list is a no-op for them.
+    fn canon(&self, v: ValueId) -> ValueId {
+        if let Some(Op::Gep { ptr, index, .. }) = self.def_op.get(&v) {
+            if self.is_const_zero(*index) {
+                return self.canon(*ptr);
+            }
+        }
+        v
+    }
+
+    /// Whether `v` is the integer constant 0, tracing through the sign-/zero-extend casts lowering
+    /// inserts on a loop index (`gep buf, sext(const.i32 0)` is still the buffer base).
+    fn is_const_zero(&self, v: ValueId) -> bool {
+        match self.def_op.get(&v) {
+            Some(Op::ConstInt(0, _)) => true,
+            Some(Op::Cast(_, inner, _)) => self.is_const_zero(*inner),
+            _ => false,
+        }
     }
 
     /// Differentiate one recognized kernel call. `args`/`result` are the forward (old) value ids.
     pub(crate) fn diff_kernel_call(
         &mut self,
         func: Symbol,
-        args: &[ValueId],
+        raw_args: &[ValueId],
         result: Option<ValueId>,
     ) -> Result<(), String> {
-        if func == self.syms.sreduce {
+        // Normalize every buffer operand to its base alloca/param so the buffer-adjoint bookkeeping
+        // is keyed consistently regardless of which whole-buffer pointer form lowering chose. (The
+        // scalar `result` of a reduction is never a gep, so it needs no canonicalization.)
+        let args: Vec<ValueId> = raw_args.iter().map(|&a| self.canon(a)).collect();
+        let args = &args[..];
+        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
             self.diff_sreduce(args, result)
         } else if func == self.syms.sgemm_nt {
             self.diff_sgemm_nt(args)
@@ -223,9 +290,27 @@ impl<'a> Vjp<'a> {
         };
         self.single(x)?;
         let xn = self.remap_v(x);
+        // The smooth activations whose derivative is a transcendental (silu folds a sigmoid, gelu a
+        // tanh, softplus a sigmoid, elu an exp) ride the fused two-input backward kernel
+        // `mercury_vmath2_f32(x, dy, dx, n, *_BWD)` — one pass, `dx = dy·act'(x)`, bit-identical with
+        // the forward. The algebraic ones (relu/sigmoid/tanh/exp) stay on the synthesized loop below.
+        if let Some(bwd) = vm2_bwd_code(op) {
+            self.vmath2_bwd(xn, dout, dx, n, bwd);
+            return Ok(());
+        }
         let yn = self.remap_v(out); // forward output buffer (for the smooth derivatives)
         self.activation_backward(op, dout, xn, yn, dx, n)?;
         Ok(())
+    }
+
+    /// Emit `mercury_vmath2_f32(x, dy, dx, n, op)` — the fused activation backward `dx = dy·act'(x)`.
+    fn vmath2_bwd(&mut self, x: ValueId, dy: ValueId, dx: ValueId, n: ValueId, op: i64) {
+        let opv = self.cint(op);
+        let f = self.syms.vmath2;
+        self.b.build_void(Op::Call {
+            func: f,
+            args: vec![x, dy, dx, n, opv],
+        });
     }
 
     // --- streaming affine / residual (velem) ---------------------------------------------------
