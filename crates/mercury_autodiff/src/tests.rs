@@ -1082,6 +1082,85 @@ fn rmsnorm_dot_vjp() {
     tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
 }
 
+/// A full **pre-norm transformer block** tape: `h = rmsnorm(x); p = h·Wᵀ; a = silu(p); loss = Σa`.
+/// Its backward composes all three recognized-kernel backward families in one reverse pass — the sum
+/// seed, the silu backward (`mercury_vmath2_f32`), the matmul adjoints (transpose + two GEMMs), and
+/// the RMSNorm backward (per-row reductions + an elementwise combine) — the exact composition a
+/// transformer layer differentiates through. Params: X, W, out; intermediates h, p, a (allocas).
+fn build_prenorm_block(it: &mut Interner, rows: usize, cols: usize, n: usize, eps_bits: i64) -> Fwd {
+    let norm = it.intern("mercury_norm_f32");
+    let sgemm_nt = it.intern("mercury_sgemm_nt");
+    let vmath = it.intern("mercury_vmath_f32");
+    let sreduce = it.intern("mercury_sreduce_f32");
+    let mut b = Builder::new(it.intern("prenorm_block"), MirType::Void);
+    let x = b.add_param(PTR);
+    let w = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let h = b.alloca(arr(rows * cols));
+    let p = b.alloca(arr(rows * n));
+    let a = b.alloca(arr(rows * n));
+
+    // h = rmsnorm(x) per row (NOT in place — the backward recomputes the row statistics from x).
+    let (rv, cv, epsv, rmsop) = (
+        ci(&mut b, rows as i64),
+        ci(&mut b, cols as i64),
+        ci(&mut b, eps_bits),
+        ci(&mut b, NORM_RMSNORM),
+    );
+    b.build_void(Op::Call {
+        func: norm,
+        args: vec![x, h, rv, cv, epsv, rmsop],
+    });
+    // p = h · Wᵀ   (M=rows, K=cols, N=n)
+    let (mv, kv, nv, beta) = (
+        ci(&mut b, rows as i64),
+        ci(&mut b, cols as i64),
+        ci(&mut b, n as i64),
+        ci(&mut b, 0),
+    );
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![h, w, p, mv, kv, nv, beta],
+    });
+    // a = silu(p)
+    let (rn, siluop) = (ci(&mut b, (rows * n) as i64), ci(&mut b, VM_SILU));
+    b.build_void(Op::Call {
+        func: vmath,
+        args: vec![p, a, rn, siluop],
+    });
+    // loss = Σ a
+    let sumop = ci(&mut b, RED_SUM);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![a, a, rn, sumop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: loss });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![rows * cols, n * cols, 1],
+        loss_out: 2,
+    }
+}
+
+#[test]
+fn prenorm_block_vjp() {
+    // The composite gradient of rmsnorm → linear → silu → sum, w.r.t. both the input x and the
+    // weight W — finite-difference-gated (all ops smooth, so the central difference is valid).
+    let (rows, cols, n) = (3, 4, 2);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_prenorm_block(&mut it, rows, cols, n, eps.to_bits() as i64);
+    let mut seed = 0xB10Cu64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let wb = rand_vec(&mut seed, n * cols);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
 // ---------------------------------------------------------------------------------------------
 // A real two-layer kernel MLP: P1 = X.W1^T; H = relu(P1); P2 = H.W2^T; loss = sum((P2 - T)^2).
 // Chains two sgemm_nt matmuls through a relu and an MSE loss — the full backward path the engine
