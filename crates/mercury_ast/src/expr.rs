@@ -79,6 +79,14 @@ pub enum ExprKind {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    /// `[label:] loop { body }` — a loop as a value-producing expression. Its value comes from
+    /// `break <expr>` (the loop's type is the join of every break value; a break-less loop is
+    /// infinite and has type unit). A statement-position `loop` is this same node wrapped in
+    /// `StmtKind::Expr`, and `while`/`for` remain statement-only (`StmtKind`).
+    Loop {
+        label: Option<Ident>,
+        body: Block,
+    },
     SizeOf(TypeExpr),
     AlignOf(TypeExpr),
 }
