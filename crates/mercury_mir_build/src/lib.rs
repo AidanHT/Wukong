@@ -4195,7 +4195,105 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Normalize a counting `while i < N { … ; i += 1 }` — unit step, `i` a mutable int local, `N`
+    /// loop-invariant, the increment the last statement — into the `for i in i..N` form the
+    /// vectorizer accepts, so its elementwise body reaches the 256-bit AVX2 / SIMD path instead of a
+    /// scalar loop. Runs the vectorized loop over `[i, N)` with a fresh index, then sets `i` to its
+    /// post-loop value (`if i < N { N } else { i }`, exactly the while's), so code after the loop
+    /// sees the same `i`. Returns false — emitting nothing — unless the pattern matches *and* the
+    /// stripped body is vectorizable (a pure check with no side effects); the caller then lowers the
+    /// while normally. Only `<` with a unit step is handled; everything else falls back.
+    fn try_normalize_counting_while(&mut self, cond: &Expr, body: &Block) -> bool {
+        // `i < N` with `i` a single path and `N` free of `i`.
+        let ExprKind::Binary {
+            op: ast::BinOp::Lt,
+            lhs,
+            rhs,
+        } = &cond.kind
+        else {
+            return false;
+        };
+        let Some(i) = single_path(lhs) else {
+            return false;
+        };
+        if expr_mentions(rhs, i) {
+            return false;
+        }
+        // `i` must be a mutable int local already in scope (its slot is the loop counter).
+        let Some((islot, ity)) = self.lookup(i) else {
+            return false;
+        };
+        if !ity.is_int() {
+            return false;
+        }
+        // The last statement must be the unit increment; strip it for the for-body.
+        if body.tail.is_some() || body.stmts.is_empty() {
+            return false;
+        }
+        if !self.is_unit_incr(body.stmts.last().unwrap(), i) {
+            return false;
+        }
+        let stripped = Block {
+            id: body.id,
+            stmts: body.stmts[..body.stmts.len() - 1].to_vec(),
+            tail: None,
+            span: body.span,
+        };
+        // Commit only if the stripped body is vectorizable — a pure analysis (no MIR emitted, so no
+        // risk of double-evaluating a side-effecting bound on the fallback path). This also scopes
+        // normalization to elementwise loops and guarantees `try_vectorize_ranged` will succeed.
+        if self.vectorizable(&stripped, i).is_none() {
+            return false;
+        }
+        // Lower the bounds and run the vectorized loop over `[start, N)` with a fresh index slot.
+        let start_val = self.builder.build(ity.clone(), Op::Load(islot, ity.clone()));
+        let end_ty = self.expr_mir(rhs);
+        let e0 = self.lower_expr(rhs);
+        let end_val = self.coerce_to(e0, &end_ty, &ity, true);
+        let ok = self.try_vectorize_ranged(i, start_val, end_val, &ity, &stripped);
+        debug_assert!(ok, "a vectorizable body must vectorize");
+        // Restore `i` to the value the while would have left: `N` if it ran (`start < N`), else the
+        // untouched start — the vectorizer used a fresh slot, so `i`'s own slot still holds `start`.
+        let cmp = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, start_val, end_val));
+        let final_i = self
+            .builder
+            .build(ity.clone(), Op::Select(cmp, end_val, start_val));
+        self.builder.build_void(Op::Store {
+            ptr: islot,
+            value: final_i,
+        });
+        self.terminated = false;
+        true
+    }
+
+    /// Is `stmt` exactly `i += 1` / `i = i + 1` / `i = 1 + i` (a unit increment of `i`)?
+    fn is_unit_incr(&self, stmt: &Stmt, i: Symbol) -> bool {
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return false;
+        };
+        if single_path(target) != Some(i) {
+            return false;
+        }
+        let is_one =
+            |e: &Expr| matches!(&e.kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 1);
+        match op {
+            ast::AssignOp::Add => is_one(value),
+            ast::AssignOp::Assign => matches!(&value.kind,
+                ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs }
+                    if (single_path(lhs) == Some(i) && is_one(rhs))
+                        || (single_path(rhs) == Some(i) && is_one(lhs))),
+            _ => false,
+        }
+    }
+
     fn lower_while(&mut self, cond: &Expr, body: &Block) {
+        // A counting `while i < N { …; i += 1 }` with a vectorizable body normalizes to the for-range
+        // vectorizer (256-bit AVX2 / SIMD); on any mismatch this is a no-op and we lower it as a loop.
+        if self.try_normalize_counting_while(cond, body) {
+            return;
+        }
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
         let exit = self.builder.new_block();
