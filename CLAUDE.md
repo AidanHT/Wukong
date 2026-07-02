@@ -124,7 +124,8 @@ reassociated form is the oracle — all backends run the same reassociated IR an
 - `docs/internals.md` — architecture, crate layering, MIR, optimizer, testing strategy.
 - `docs/language-guide.md` — the language surface, with a maturity legend.
 - `docs/roadmap.md` — what runs end-to-end, what's checked-only, what's planned, sharp edges.
-- `docs/llvm-setup.md` — optional native-codegen toolchain (LLVM 19).
+- `docs/llvm-setup.md` — the **optional** textual-LLVM-IR path (`--emit=llvm-ir`); native codegen is
+  Cranelift and needs no LLVM.
 - `examples/*.mer` — runnable kernels (`dot`, `saxpy_array`, `matmul`, `relu`, `softmax`, …).
 - `tests/run/` (e2e `// EXPECT-*` directives) and `tests/fail/` (compile-fail `// EXPECT-CODE:`).
 - Each crate has its own `CLAUDE.md` with layout, key types, connections, and gotchas.
