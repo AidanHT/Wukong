@@ -159,7 +159,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   writeback — so `C` is written once instead of paying a separate read-modify-write pass over it. The
   saving is a fraction of the C-pass traffic, so it grows as K shrinks: ~1.0× at 512³ (compute-bound,
   no harm), ~1.34× at K=64/N=2048, ~1.65× at K=32/N=4096 — exactly the small-K/large-N projections
-  (attention-output, down-projection). Serial; the activation set is identity (bias-only), **ReLU,
+  (attention-output, down-projection). Serial **and `@parallel`** — the multicore
+  `mercury_sgemm_nt_epi_parallel` is bit-identical to the serial kernel (a fixed-chunk parallel
+  reduction), dispatched from a `@parallel` fused-epilogue nest (`tests/run/linear_bias_relu_parallel.mer`).
+  The activation set is identity (bias-only), **ReLU,
   GELU, and SiLU** — the transformer FFNs — with **bias optional**, so the bias-free `silu(x·Wᵀ)`
   **SwiGLU** projection (LLaMA/Mistral) fuses too. Both backends call the identical kernel, so it
   stays bit-exact. See `tests/run/{linear_bias_relu,linear_bias_gelu,linear_silu}.mer`. The
@@ -215,8 +218,12 @@ the interp oracle and the GPU over identical buffers and matches within toleranc
 silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
 
 Run the kernel suite with `cargo test -p mercury_codegen_gpu --features gpu` (skips cleanly with no
-GPU). A full MIR→PTX scalar compiler (so arbitrary, non-recognized kernels run GPU-side too) is the
-remaining stretch; today unrecognized ops execute on the CPU within the same offloading run.
+GPU). Beyond this recognizer-offload mode, a **general MIR→PTX backend** now exists as
+`--backend=gpu-native`: it lowers the *whole* program's MIR to PTX (Phase 4, additive to and
+independent of the offload path), optionally fusing an eligible program into one cooperative
+single-block megakernel — so arbitrary, non-recognized kernels can run GPU-side too. Its coverage is
+partial (unsupported ops are skipped, never miscompiled). Within the `--backend=gpu` offload mode,
+unrecognized ops still run on the CPU in the same offloading run.
 
 ## Checked but not yet executed
 
@@ -229,18 +236,22 @@ remaining stretch; today unrecognized ops execute on the CPU within the same off
 
 ## Planned
 
-- Fusing chains *under* `@parallel`; a **parallel** fused-epilogue GEMM kernel (the serial one already
-  folds bias + ReLU/GELU/SiLU, bias optional, into the microkernel write-back — a multicore
-  `mercury_sgemm_nt_epi_parallel` is the remaining step).
-- A **GPU backend** (the next major frontier — where flash-attention and large-batch throughput
-  actually win). Scoped in `next-steps.md` at the repo root.
+- Fusing elementwise chains *under* `@parallel` (the serial fusion already folds adjacent loops).
+  Note the multicore **fused-epilogue GEMM** `mercury_sgemm_nt_epi_parallel` already ships — see the
+  GEMM-epilogue-fusion entry above.
 - 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
-  value (verified — pinned as a tripwire test), so the elementwise vectorizer is 128-bit + unrolling;
-  the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
-  needs a raw-AVX emitter or a future Cranelift.
-- Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
+  value (verified — pinned as a tripwire test, `cranelift_still_rejects_f32x8`), so the elementwise
+  vectorizer is 128-bit + unrolling; the GEMM and transcendental families already get true AVX2/FMA
+  via the runtime microkernels. Closing the general case needs a raw-AVX emitter or a future Cranelift.
+- Execution of explicit `f32x8`-typed values in *source*, and lowering of native `Tensor[…]`-typed
+  operations (shape-checked but not yet executed — see "Checked but not yet executed" above).
 - Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
-- GPU device codegen (PTX/AMDGPU), autodiff — designed-for, explicitly deferred.
+- Wiring the **autodiff engine** to the compiler CLI. `mercury_autodiff` already implements
+  reverse-mode AD as a MIR→MIR transform (scalar-SSA + tensor-tape VJP rules whose matmul gradients
+  ride the tuned GEMM, plus a fused AdamW step), gated bit-for-bit against finite-difference and
+  closed-form references by 22 tests — but it is not yet reachable from `mercuryc`; a `--emit`/train
+  entry point is the remaining step. (The GPU backend, including `--backend=gpu-native` PTX device
+  codegen, has shipped — see the GPU section above.)
 
 ## Known limitations / sharp edges
 
