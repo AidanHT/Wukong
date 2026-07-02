@@ -121,6 +121,10 @@ const RT_SGEMM_F16_TN: &str = "mercury_sgemm_f16_tn";
 const RT_SGEMM_F16_TN_PARALLEL: &str = "mercury_sgemm_f16_tn_parallel";
 const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_SGEMM_NT_EPI_PAR: &str = "mercury_sgemm_nt_epi_parallel";
+const RT_SGEMV: &str = "mercury_sgemv";
+const RT_SGEMV_PAR: &str = "mercury_sgemv_parallel";
+const RT_SGEMM_NT_ALPHA: &str = "mercury_sgemm_nt_alpha";
+const RT_SGEMM_NT_ALPHA_PAR: &str = "mercury_sgemm_nt_alpha_parallel";
 const RT_SGEMM_BF16_NT_EPI: &str = "mercury_sgemm_bf16_nt_epi";
 const RT_SGEMM_BF16_NT_EPI_PAR: &str = "mercury_sgemm_bf16_nt_epi_parallel";
 const RT_SGEMM_F16_NT_EPI: &str = "mercury_sgemm_f16_nt_epi";
@@ -1061,6 +1065,34 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[a, b, c, m, k, n, beta, bias, act]);
             return None;
         }
+        // GEMV: mercury_sgemv[_parallel](a, x, y, m, n) — three pointers and two i64. Void.
+        if matches!(name, RT_SGEMV | RT_SGEMV_PAR) && args.len() == 5 {
+            let a = self.val(args[0]);
+            let x = self.val(args[1]);
+            let y = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let n = self.coerce_to_i64(args[4]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, x, y, m, n]);
+            return None;
+        }
+        // α-scaled Linear: mercury_sgemm_nt_alpha[_parallel](a, b, c, m, k, n, beta, alpha) — three
+        // pointers, four i64, and one f32 scalar `alpha` (passed by value, like the i8 dequant scale).
+        if matches!(name, RT_SGEMM_NT_ALPHA | RT_SGEMM_NT_ALPHA_PAR) && args.len() == 8 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let c = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let k = self.coerce_to_i64(args[4]);
+            let n = self.coerce_to_i64(args[5]);
+            let beta = self.coerce_to_i64(args[6]);
+            let alpha = self.val(args[7]);
+            let fref = self.rt_refs[name];
+            self.builder
+                .ins()
+                .call(fref, &[a, b, c, m, k, n, beta, alpha]);
+            return None;
+        }
         // The vectorized elementwise transcendental: mercury_vmath_f32(x, out, n, op) — two pointers
         // and two i64 (element count, op code). The 256-bit AVX2 kernel an `out[i]=f(x[i])` loop
         // lowers to.
@@ -1642,6 +1674,10 @@ struct RtFuncs {
     sgemm_f16_tn_parallel: FuncId,
     sgemm_nt_epi: FuncId,
     sgemm_nt_epi_par: FuncId,
+    sgemv: FuncId,
+    sgemv_par: FuncId,
+    sgemm_nt_alpha: FuncId,
+    sgemm_nt_alpha_par: FuncId,
     sgemm_bf16_nt_epi: FuncId,
     sgemm_bf16_nt_epi_par: FuncId,
     sgemm_f16_nt_epi: FuncId,
@@ -1840,7 +1876,24 @@ fn populate_module<M: Module>(
     }
     sig_gemm_epi.params.push(AbiParam::new(ptr_ty)); // bias
     sig_gemm_epi.params.push(AbiParam::new(types::I64)); // act
-                                                         // mercury_vmath_f32(x: ptr, out: ptr, n: i64, op: i64) — vectorized elementwise transcendental.
+    // mercury_sgemv[_parallel](a: ptr, x: ptr, y: ptr, m: i64, n: i64) — matrix-times-vector (void).
+    let mut sig_gemv = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_gemv.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..2 {
+        sig_gemv.params.push(AbiParam::new(types::I64));
+    }
+    // mercury_sgemm_nt_alpha[_parallel](a, b, c: ptr, m, k, n, beta: i64, alpha: f32) — α-scaled Linear.
+    let mut sig_gemm_alpha = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_gemm_alpha.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..4 {
+        sig_gemm_alpha.params.push(AbiParam::new(types::I64));
+    }
+    sig_gemm_alpha.params.push(AbiParam::new(types::F32)); // alpha
+    // mercury_vmath_f32(x: ptr, out: ptr, n: i64, op: i64) — vectorized elementwise transcendental.
     let mut sig_vmath = Signature::new(call_conv);
     sig_vmath.params.push(AbiParam::new(ptr_ty));
     sig_vmath.params.push(AbiParam::new(ptr_ty));
@@ -2062,6 +2115,18 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sgemm_nt_epi_par: module
             .declare_function(RT_SGEMM_NT_EPI_PAR, Linkage::Import, &sig_gemm_epi)
+            .map_err(|e| e.to_string())?,
+        sgemv: module
+            .declare_function(RT_SGEMV, Linkage::Import, &sig_gemv)
+            .map_err(|e| e.to_string())?,
+        sgemv_par: module
+            .declare_function(RT_SGEMV_PAR, Linkage::Import, &sig_gemv)
+            .map_err(|e| e.to_string())?,
+        sgemm_nt_alpha: module
+            .declare_function(RT_SGEMM_NT_ALPHA, Linkage::Import, &sig_gemm_alpha)
+            .map_err(|e| e.to_string())?,
+        sgemm_nt_alpha_par: module
+            .declare_function(RT_SGEMM_NT_ALPHA_PAR, Linkage::Import, &sig_gemm_alpha)
             .map_err(|e| e.to_string())?,
         sgemm_bf16_nt_epi: module
             .declare_function(RT_SGEMM_BF16_NT_EPI, Linkage::Import, &sig_gemm_epi)
@@ -2545,6 +2610,22 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMM_NT_EPI_PAR,
                 module.declare_func_in_func(rt.sgemm_nt_epi_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMV,
+                module.declare_func_in_func(rt.sgemv, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMV_PAR,
+                module.declare_func_in_func(rt.sgemv_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_NT_ALPHA,
+                module.declare_func_in_func(rt.sgemm_nt_alpha, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMM_NT_ALPHA_PAR,
+                module.declare_func_in_func(rt.sgemm_nt_alpha_par, builder.func),
             );
             rt_refs.insert(
                 RT_SGEMM_BF16_NT_EPI,
@@ -3189,6 +3270,19 @@ pub fn jit_compile(
         RT_SGEMM_NT_EPI_PAR,
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
     );
+    builder.symbol(RT_SGEMV, mercury_runtime::mercury_sgemv as *const u8);
+    builder.symbol(
+        RT_SGEMV_PAR,
+        mercury_runtime::mercury_sgemv_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_NT_ALPHA,
+        mercury_runtime::mercury_sgemm_nt_alpha as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_NT_ALPHA_PAR,
+        mercury_runtime::mercury_sgemm_nt_alpha_parallel as *const u8,
+    );
     builder.symbol(
         RT_SGEMM_BF16_NT_EPI,
         mercury_runtime::mercury_sgemm_bf16_nt_epi as *const u8,
@@ -3686,6 +3780,19 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SGEMM_NT_EPI_PAR,
         mercury_runtime::mercury_sgemm_nt_epi_parallel as *const u8,
+    );
+    builder.symbol(RT_SGEMV, mercury_runtime::mercury_sgemv as *const u8);
+    builder.symbol(
+        RT_SGEMV_PAR,
+        mercury_runtime::mercury_sgemv_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_NT_ALPHA,
+        mercury_runtime::mercury_sgemm_nt_alpha as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMM_NT_ALPHA_PAR,
+        mercury_runtime::mercury_sgemm_nt_alpha_parallel as *const u8,
     );
     builder.symbol(
         RT_SGEMM_BF16_NT_EPI,
