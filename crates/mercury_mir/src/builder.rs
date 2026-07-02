@@ -51,6 +51,13 @@ impl Builder {
         &self.value_types[v.0 as usize]
     }
 
+    /// A read-only view of an already-created block (mid-construction). Mirrors
+    /// [`crate::Function::block`], but usable before `finish()` — e.g. to read a merge block's
+    /// param type when threading a `break <value>` branch argument to it.
+    pub fn block(&self, b: BlockId) -> &BasicBlock {
+        &self.blocks[b.0 as usize]
+    }
+
     pub fn new_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
         self.blocks.push(BasicBlock {

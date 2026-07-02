@@ -338,7 +338,12 @@ impl AstPrinter<'_> {
                     self.indented(|p| p.expr(e));
                 }
             }
-            StmtKind::Break(l) => self.line(format!("break{}", self.label(l))),
+            StmtKind::Break(l, val) => {
+                self.line(format!("break{}", self.label(l)));
+                if let Some(e) = val {
+                    self.indented(|p| p.expr(e));
+                }
+            }
             StmtKind::Continue(l) => self.line(format!("continue{}", self.label(l))),
             StmtKind::Defer(e) => {
                 self.line("defer");
@@ -364,10 +369,6 @@ impl AstPrinter<'_> {
                     p.for_iter(iter);
                     p.block(body);
                 });
-            }
-            StmtKind::Loop { label, body } => {
-                self.line(format!("loop{}", self.label(label)));
-                self.indented(|p| p.block(body));
             }
         }
     }
@@ -574,6 +575,10 @@ impl AstPrinter<'_> {
                         });
                     }
                 });
+            }
+            ExprKind::Loop { label, body } => {
+                self.line(format!("loop{}", self.label(label)));
+                self.indented(|p| p.block(body));
             }
             ExprKind::SizeOf(ty) => self.line(format!("sizeof {}", self.type_str(ty))),
             ExprKind::AlignOf(ty) => self.line(format!("alignof {}", self.type_str(ty))),
