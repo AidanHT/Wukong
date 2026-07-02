@@ -118,9 +118,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   to the tuned GEMM kernel** (the recognizer already compares strides by dimension identity; once the
   dims are runtime values `emit_sgemm` materializes them from the hidden params), so `matmul<M, N, K>`
   runs on the AVX2/FMA microkernel at any size (`tests/run/generic_shape_matmul.mer`). Ranks 1–3,
-  elementwise kernels, and a generic caller forwarding its own symbolic tensors all run. *(A
-  `@parallel` symbolic-shape function is the remaining edge — the loop outliner does not yet thread the
-  hidden dims, so give it literal dims for now.)*
+  elementwise kernels, and a generic caller forwarding its own symbolic tensors all run — and so does
+  a `@parallel` symbolic-shape function (a matmul reaches the multicore `mercury_sgemm_parallel`; an
+  elementwise nest runs correctly through the ordinary path, exactly as a constant-shape `@parallel`
+  tensor function does).
 - **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
