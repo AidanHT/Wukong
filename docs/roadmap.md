@@ -271,7 +271,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   writeback — so `C` is written once instead of paying a separate read-modify-write pass over it. The
   saving is a fraction of the C-pass traffic, so it grows as K shrinks: ~1.0× at 512³ (compute-bound,
   no harm), ~1.34× at K=64/N=2048, ~1.65× at K=32/N=4096 — exactly the small-K/large-N projections
-  (attention-output, down-projection). Serial; the activation set is identity (bias-only), **ReLU,
+  (attention-output, down-projection). Serial **and `@parallel`** — the multicore
+  `mercury_sgemm_nt_epi_parallel` is bit-identical to the serial kernel (a fixed-chunk parallel
+  reduction), dispatched from a `@parallel` fused-epilogue nest (`tests/run/linear_bias_relu_parallel.mer`).
+  The activation set is identity (bias-only), **ReLU,
   GELU, and SiLU** — the transformer FFNs — with **bias optional**, so the bias-free `silu(x·Wᵀ)`
   **SwiGLU** projection (LLaMA/Mistral) fuses too. Both backends call the identical kernel, so it
   stays bit-exact. See `tests/run/{linear_bias_relu,linear_bias_gelu,linear_silu}.mer`. The
@@ -343,7 +346,9 @@ Reverse-mode autodiff runs as a **MIR→MIR transform**: given a forward functio
 loss, it emits a new function that also accumulates the gradient w.r.t. designated input buffers (the
 vector-Jacobian product). Matmul adjoints ride the same tuned GEMM kernels, and a fused AdamW step is
 emitted as one kernel. Every VJP rule is **finite-difference-gated** (forward + backward run in f64)
-against a closed-form reference. It is a library transform today, not yet a CLI surface.
+against a closed-form reference. It is reachable from `mercuryc`: `--emit=grad` dumps the backward MIR
+of a loss function, and `--train` runs a fwd→bwd→optimizer loop (`--grad-of`/`--grad-wrt` select the
+loss and parameters; `--train-opt=sgd|adamw` the optimizer).
 
 ## Checked but not yet executed
 

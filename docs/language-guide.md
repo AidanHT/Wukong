@@ -370,10 +370,10 @@ stay differentially equal. Allocator selection and `defer` are still being wired
 ```
 mercuryc [OPTIONS] <input.mer>
 
---run                 compile and execute (via --backend; default the interpreter)
---backend=<b>         interp | native | gpu | gpu-native  (execution backend for --run;
-                      gpu / gpu-native require a --features gpu build)
---emit=<stage>        tokens | ast | mir-high | mir | llvm-ir | obj | exe
+--run                 compile and execute (interpreter by default; see --backend)
+--backend=<b>         interp | native | gpu | gpu-native   (default: interp)
+                      native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
+--emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | llvm-ir | obj | exe
 -O0|-O1|-O2|-O3       optimization level (-O3 currently runs the -O2 pipeline)
 -o <path>             output path
 --error-format=<f>    human | json

@@ -38,6 +38,8 @@ mercury_mir       MIR data, builder, pretty-printer, verifier, MirLevel
 mercury_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 mercury_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
                   mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
+mercury_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
+                  rules, fused AdamW; finite-difference-gated) — the training backward path
 mercury_backend   `Backend` trait + `Artifact`
 mercury_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
 mercury_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
@@ -50,7 +52,7 @@ mercury_autodiff  reverse-mode autodiff as a MIR→MIR transform (the training b
 mercury_driver    Session + compile() pipeline + --emit / --backend handling
 mercuryc          thin CLI binary
 mercury_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
-mercury_xbench    cross-language benchmark (Mercury vs C vs Rust) — see BENCHMARKS.md
+mercury_xbench    cross-language benchmark (Mercury vs C, C++, and Rust) — see BENCHMARKS.md
 ```
 
 `mercury_types` is shared by sema and MIR; `mercury_mir` is independent of the front-end; all
@@ -68,6 +70,8 @@ source
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
                  | GPU (--features gpu: --backend=gpu offload, --backend=gpu-native MIR→PTX)
                  | textual LLVM IR (--emit=llvm-ir)
+                 | GPU offload (--backend=gpu) | GPU MIR->PTX (--backend=gpu-native)
+                                                          [both --features gpu]
 ```
 
 `mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early and print the
