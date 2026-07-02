@@ -26,7 +26,10 @@ impl Pass for Licm {
     }
 
     fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
-        if cfg::prune_unreachable(f) {
+        // Skip the reachability DFS when the CFG is already fully reachable (the steady state);
+        // `all_reachable` is free off the cached rpo `idoms` needs anyway.
+        if !cache.all_reachable(f) {
+            cfg::prune_unreachable(f);
             cache.invalidate();
         }
         if f.blocks.len() < 2 {

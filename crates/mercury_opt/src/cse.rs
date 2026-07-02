@@ -28,8 +28,11 @@ impl Pass for Cse {
     }
 
     fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
-        if cfg::prune_unreachable(f) {
-            cache.invalidate(); // dominance requires a clean CFG; pruning renumbered blocks
+        // Dominance requires a clean CFG. Skip the reachability DFS when nothing is unreachable
+        // (the steady state) — `all_reachable` is free off the cached rpo `idoms` needs anyway.
+        if !cache.all_reachable(f) {
+            cfg::prune_unreachable(f);
+            cache.invalidate(); // pruning renumbered blocks
         }
         let children = cache.dom_children(f);
 

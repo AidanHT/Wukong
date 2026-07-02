@@ -33,9 +33,12 @@ impl Pass for Mem2Reg {
 
     fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
         // Dominance is only defined on reachable blocks. Pruning renumbers blocks, so any cached
-        // analysis is stale afterwards.
-        let pruned = cfg::prune_unreachable(f);
+        // analysis is stale afterwards. When the CFG is already fully reachable (the steady state)
+        // pruning is a no-op, so skip its reachability DFS — `all_reachable` is free off the cached
+        // rpo that `idoms` needs anyway.
+        let pruned = !cache.all_reachable(f);
         if pruned {
+            cfg::prune_unreachable(f);
             cache.invalidate();
         }
         let promotable = find_promotable(f);
