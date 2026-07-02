@@ -1,0 +1,9 @@
+// EXPECT-CODE: E0401
+module tests.fail.bitnot_on_float
+
+// Unary `~` (bitwise complement) requires an integer operand. On a float the interpreter truncated to
+// int while Cranelift took the raw IEEE bits then fptosi — a gate-blind interp!=native. Must be E0401.
+fn main() -> i32 {
+    let x: f32 = 6.0;
+    return (~x) as i32;
+}

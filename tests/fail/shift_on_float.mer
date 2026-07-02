@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0401
+module tests.fail.shift_on_float
+
+// Shift `<< >>` require integer operands. A float shift previously slipped past sema and reached the
+// optimizer, where it PANICKED mem2reg at -O2 ("int op shl on non-int type f32") — an invalid program
+// crashing the compiler. It must be rejected in sema with E0401.
+fn main() -> i32 {
+    let x: f32 = 6.0;
+    return (x << 1.0) as i32;
+}
