@@ -20,7 +20,7 @@ This is the `mercury_` crate workspace; dependencies flow strictly downward (no 
 - [`mercury_codegen_cranelift`](mercury_codegen_cranelift/CLAUDE.md) — Native backend via Cranelift (no LLVM): JIT + object/exe.
 - [`mercury_codegen_llvm`](mercury_codegen_llvm/CLAUDE.md) — LLVM backend: lowers MIR to textual LLVM IR.
 - [`mercury_codegen_gpu`](mercury_codegen_gpu/CLAUDE.md) — GPU backend (feature `gpu`): emits PTX, driver-JIT via cudarc; tensor-core GEMM (fp16/bf16/fp8), flash-attention, norms, conv, whole transformer layer.
-- [`mercury_runtime`](mercury_runtime/CLAUDE.md) — Minimal runtime: bump Arena allocator and sequential parallel_for.
+- [`mercury_runtime`](mercury_runtime/CLAUDE.md) — Runtime: bump Arena allocator, rayon-backed parallel_for, and the AVX2/FMA microkernels (GEMM, vmath transcendentals, reductions, norms, int8 + bf16/f16 — the symbols the recognizers dispatch to).
 - [`mercury_driver`](mercury_driver/CLAUDE.md) — Orchestrates the compile pipeline; owns SourceMap/Interner and honors --emit.
 - [`mercuryc`](mercuryc/CLAUDE.md) — CLI binary parsing args and delegating compilation to `mercury_driver`.
 - [`mercury_bench`](mercury_bench/CLAUDE.md) — Benchmark harness: optimizer effectiveness, interpreter timing, equivalence gate.

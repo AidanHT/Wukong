@@ -1,0 +1,37 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: -294967296
+// EXPECT-OUT: 294967296
+// EXPECT-OUT: 1
+module tests.run.signed_cmp_highbit_fold
+
+// A signed comparison of a compile-time constant whose sign bit is set — here an unsigned literal
+// reinterpreted as a signed integer (`4000000000_u32 as i32 == -294967296`). The optimizer's
+// constant folder must compare at the operand width (sign-extending the low 32 bits) so the folded
+// result matches the runtime register compare; folding against the raw i128 `4000000000` would make
+// every signed predicate flip and -O2 disagree with -O0 (a differential-gate violation). The
+// opt-invariance test (`-O0` vs `-O{1,2,3}`) is what guards this — no prior fixture exercised a
+// high-bit-set signed compare.
+fn main() -> i32 {
+    let a: u32 = 4000000000;
+    let b: i32 = a as i32; // reinterpret -> -294967296 (sign bit set)
+
+    let mut r: i32 = 0;
+    if b < 0 { r = r + 1; }    // true  -> +1
+    if b < 1 { r = r + 10; }   // true  -> +10
+    if b > 0 { r = r + 100; }  // false
+    if b >= 0 { r = r + 1000; } // false
+    print(r); // 11 (buggy fold would give 1100)
+    print(b); // -294967296
+
+    // abs() forces a signed `x < 0` compare internally; on a high-bit-set constant that compare
+    // must also fold width-correctly.
+    print(abs(b)); // 294967296
+
+    // Unsigned compare of the same bits stays unsigned (zero-extended), unaffected.
+    let u: u32 = 4000000000;
+    if u > 3000000000 { print(1); } else { print(0); } // 1
+
+    return 0;
+}

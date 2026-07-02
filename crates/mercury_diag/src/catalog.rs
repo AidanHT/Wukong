@@ -123,6 +123,16 @@ static CATALOG: &[Explanation] = &[
          an `extern` block."
     ),
     entry!(
+        "E0209",
+        "nesting too deep",
+        "An expression or type nests more deeply than the parser allows (for example thousands of \
+         nested parentheses or array types, or an enormously long `a + b + c + …` operator chain). \
+         The limit exists so that pathological or machine-generated input fails with this stable \
+         diagnostic instead of crashing the compiler with a stack overflow. No realistic program \
+         comes close; if you hit this, restructure the deeply nested expression or type — for \
+         instance by introducing intermediate `let` bindings."
+    ),
+    entry!(
         "E0300",
         "duplicate definition",
         "A name was defined more than once in the same scope. Rename one of the definitions."
@@ -140,6 +150,21 @@ static CATALOG: &[Explanation] = &[
          compound type."
     ),
     entry!(
+        "E0303",
+        "`break`/`continue` outside of a loop",
+        "A `break` or `continue` statement appeared outside of any enclosing `while`, `for`, or \
+         `loop`. These statements only have meaning inside a loop body. Remove it, or wrap the code \
+         in a loop."
+    ),
+    entry!(
+        "E0304",
+        "assignment to immutable binding",
+        "A binding introduced with `let` (without `mut`) cannot be reassigned. Declare it `let mut` \
+         to allow reassignment, or introduce a new binding with another `let`. Mutating *through* \
+         the binding — an array element `a[i] = …`, a struct field `s.f = …`, or a pointee \
+         `*p = …` — is still allowed; only rebinding the name itself is rejected."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \
@@ -147,11 +172,40 @@ static CATALOG: &[Explanation] = &[
          literals adapt to an annotation, but typed values must match exactly."
     ),
     entry!(
+        "E0402",
+        "recursive struct has infinite size",
+        "A struct contains itself by value — directly (`struct S { x: S }`) or through a chain of \
+         structs — so its size would be infinite and the compiler cannot lay it out. Store the \
+         recursive field behind a pointer (e.g. `*S`), which has a fixed size and breaks the cycle, \
+         as in C or Rust."
+    ),
+    entry!(
+        "E0403",
+        "recursive const initializer",
+        "A `const`'s initializer depends on its own value — directly (`const A: i32 = A + 1;`) or \
+         through a chain of consts (`A` uses `B`, `B` uses `A`). A const must be evaluable at \
+         compile time without referring back to itself; inlining such a cycle would never \
+         terminate. Break the cycle so each const's value is defined in terms of already-known values."
+    ),
+    entry!(
+        "E0405",
+        "non-exhaustive match",
+        "A `match` used in value position does not cover every possible value of the scrutinee, and \
+         no arm is an unconditional catch-all. The value it would produce when no arm matches is an \
+         injected zero default — a silent wrong answer (or, for a tuple/struct result, invalid \
+         code). Add a `_ => …` arm (or, for an `enum`, an arm for every remaining variant; for a \
+         `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded arms (`if …`) \
+         do not count toward coverage because their guard may be false."
+    ),
+    entry!(
         "E0501",
         "tensor rank mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
          example, passing a rank-3 tensor where a rank-2 tensor is expected. This is checked at \
-         compile time — it can never become a runtime shape bug."
+         compile time — it can never become a runtime shape bug.\n\nThis code is also reported \
+         when a compile-time-constant index is out of bounds — for a fixed-size array (e.g. \
+         `a[5]` on a `[T; 4]`) or for a static tensor dimension (e.g. `a[5, 0]` on a \
+         `Tensor[f32, 2, 2]`): the valid indices are `0..len` on each axis."
     ),
     entry!(
         "E0502",

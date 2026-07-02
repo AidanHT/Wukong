@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.index_scalar
+
+// Indexing a scalar with `[..]` is a type error. It used to type-check through a lenient fallthrough,
+// then mir_build emitted a GEP off a non-pointer i32 — invalid MIR the verifier and Cranelift reject
+// (an internal compiler error / backend crash on a program sema had accepted). Only arrays, tensors,
+// slices, and pointers are indexable.
+fn main() -> i32 {
+    let x: i32 = 5;
+    let y: i32 = x[0];
+    return y;
+}

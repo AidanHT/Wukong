@@ -1,0 +1,48 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 12
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 10
+// EXPECT-OUT: 8
+module tests.run.tensor_1d_kernels
+
+// A 1-D Tensor[..] parameter fed to a recognized 1-D runtime kernel (streaming-elementwise / vmath
+// activation / reduction). A Tensor param binds to a slot holding the base pointer; the recognizers
+// must load the base out of that slot (as the regular index path and the GEMM path do) before GEPing.
+// They used to GEP off the slot address, so the kernel read past the slot: the interpreter trapped
+// while native segfaulted / returned wrong values — a backend divergence on a documented feature.
+fn scale(a: Tensor[f32, 4], mut out: Tensor[f32, 4]) {
+    for i in 0..4 { out[i] = a[i] * 3.0; } // velem
+}
+fn act(a: Tensor[f32, 4], mut out: Tensor[f32, 4]) {
+    for i in 0..4 { out[i] = exp(a[i]); } // vmath
+}
+fn total(a: Tensor[f32, 4]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..4 { s = s + a[i]; } // reduction
+    return s;
+}
+@parallel fn ptotal(a: Tensor[f32, 8]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..8 { s = s + a[i]; } // @parallel reduction
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let o: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    scale(a, o);
+    print(o[0] as i32); // 3
+    print(o[3] as i32); // 12
+    let e: [f32; 4] = [0.0, 2.0, 0.0, 0.0];
+    let eo: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    act(e, eo);
+    print(eo[0] as i32); // exp(0) = 1
+    print(eo[1] as i32); // exp(2) = 7
+    print(total(a) as i32); // 10
+    let b: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    print(ptotal(b) as i32); // 8
+    return 0;
+}

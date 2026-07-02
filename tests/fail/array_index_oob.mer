@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0501
+module tests.fail.array_index_oob
+
+// A constant index past the end of a fixed-size array is caught at compile time — the valid indices
+// of a `[i32; 4]` are 0..=3, so `a[5]` is out of bounds. Without the check this is an undefined
+// out-of-bounds read whose result differs between backends.
+fn main() -> i32 {
+    let a: [i32; 4] = [10, 20, 30, 40];
+    return a[5];
+}

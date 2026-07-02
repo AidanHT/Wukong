@@ -1,0 +1,25 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+module tests.run.match_guard_truthy
+
+// A `match` guard that is not already `bool` is normalized to a C-like truthiness test (`!= 0`),
+// exactly like an `if`/`while` condition. Previously the guard's raw value (e.g. an `i32`) flowed
+// straight into the arm's `And` / `cond_br`, which expect `i1` — MIR the verifier and Cranelift
+// reject (an ICE), while the `lower_bool_cond` normalization only covered if/while/short-circuit.
+fn main() -> i32 {
+    let k: i32 = 5;
+    let r1 = match k { x if x => 1, _ => 0 };   // 5 is truthy  -> 1
+    print(r1);
+
+    let z: i32 = 0;
+    let r2 = match z { x if x => 1, _ => 0 };   // 0 is falsy   -> 0
+    print(r2);
+
+    let f: f32 = 2.5;
+    let r3 = match k { _ if f => 1, _ => 0 };   // 2.5 is truthy -> 1
+    print(r3);
+
+    return 0;
+}

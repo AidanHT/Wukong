@@ -14,7 +14,7 @@ module tests.run.i8_linear_parallel
 // bit-for-bit and the differential gate stays exact. A is [2,4] u8, B is [2,4] i8 (its rows are the
 // weight vectors), so C is [2,2] i32.
 @parallel
-fn i8mm(a: [u8; 8], b: [i8; 8], c: [i32; 4], m: i64, n: i64, k: i64) {
+fn i8mm(a: [u8; 8], b: [i8; 8], mut c: [i32; 4], m: i64, n: i64, k: i64) {
     for i in 0..m {
         for j in 0..n {
             let mut s: i32 = 0;

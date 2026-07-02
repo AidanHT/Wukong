@@ -12,14 +12,14 @@ module tests.run.parallel_reduce_minmax
 // element, so the values are exact.
 
 @parallel
-fn maxv(x: [f32; 256], o: [f32; 1]) {
+fn maxv(x: [f32; 256], mut o: [f32; 1]) {
     let mut m: f32 = x[0];
     for k in 0..256 { m = fmax(m, x[k]); }
     o[0] = m;
 }
 
 @parallel
-fn minv(x: [f32; 256], o: [f32; 1]) {
+fn minv(x: [f32; 256], mut o: [f32; 1]) {
     let mut m: f32 = x[0];
     for k in 0..256 { m = fmin(m, x[k]); }
     o[0] = m;

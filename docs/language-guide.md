@@ -50,6 +50,24 @@ Functions take typed parameters and declare a return type after `->`. A function
 returns nothing. Recursion is fully supported. Calls use ordinary `f(x, y)` syntax; generic
 functions may be called with a turbofish `f::<512, 512, 513>(a, b, c)`.
 
+Parameters are **immutable by default**, the same rule `let` follows — a function may read one but
+not reassign or mutate it. Prefix a parameter with `mut` to opt into mutation:
+
+```mercury
+fn scale(mut w: [f32; 256], k: f32) {      // `w` is mutated in place
+    for i in 0..256 { w[i] = w[i] * k; }
+}
+```
+
+A scalar `mut` parameter is a private, mutable copy — changes stay local, exactly like a `mut` `let`.
+An **aggregate** `mut` parameter (struct / tuple / array / tensor) is passed **by reference** (its
+base pointer, zero-copy — the tensor-kernel default), so mutating it in place is **visible to the
+caller**; this is the idiomatic way a kernel writes an output buffer (`out`, `c`, …). Mutating a
+non-`mut` parameter — whether a direct rebind (`p = …`) or a projection of an aggregate (`p.f = …`,
+`p[i] = …`) — is a compile error (E0304), so an accidental caller-visible write can't slip through. A
+**pointer** parameter is exempt for writes through its pointee (`*p = …` needs no `mut`, since that
+mutates the pointee, not the binding).
+
 ## Bindings ✅
 
 ```mercury
@@ -57,10 +75,52 @@ let x: i32 = 10;        // immutable
 let mut acc: i32 = 0;   // mutable
 acc = acc + x;          // reassignment requires `mut`
 const TILE: usize = 64; // compile-time constant
+let (a, b) = (3, 4);    // tuple destructuring (nested patterns and `_` work too)
 ```
 
-An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine. A typed
-value must match its annotation exactly (see error `E0401`).
+An unsuffixed numeric literal adapts to its annotation, so `let i: usize = 0;` is fine — and that
+threading reaches every position that pins a type (a `let`/`const` annotation, a function argument, a
+`return`, a struct-field initializer, and a plain assignment) and **descends into aggregate
+literals**, so a typed buffer can be built straight from literals: `let a: [i8; 2] = [127, 0]`,
+`let t: (u8, u8) = (200, 1)` (`tests/run/aggregate_literal_adapt.mer`). It also descends into a
+**constant binary expression** of literals, so `let v: i64 = 0 - 16` adapts like the unary `-16`
+already did (`tests/run/binary_const_adapt.mer`); the folded value is still range-checked, so
+`let v: i8 = 100 + 100` is rejected. A typed value must match its
+annotation exactly (see error `E0401`). An unsuffixed literal that does not fit the type it adapts to
+is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
+silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
+overflows `i32` **widens to `i64`** so its value is never silently truncated
+(`tests/run/int_literal_widen.mer`); use a suffix (`9000000000i64`, `3000000000u32`) to pick a
+specific type.
+
+A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
+wildcard `let (keep, _) = …`, including the result of a tuple-returning call
+(`tests/run/let_destructure.mer`). A top-level **`const` is usable as a value**: its initializer is
+inlined at every use site — in arithmetic, as an array index, as a loop bound, as an **array length**
+in a type (`let a: [i32; N]`, including a const-references-const chain;
+`tests/run/const_array_length.mer`), and when one `const` references another
+(`tests/run/top_level_const.mer`).
+
+## Literals ✅
+
+Integer literals may be **decimal, hex `0xFF`, octal `0o17`, or binary `0b1010`**, with `_` digit
+separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.mer`). A
+malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit `0b2`, a garbled float
+`1.5z`, or a value past `u64` — is a compile error (`E0401`), never silently zeroed
+(`tests/fail/malformed_int_literal.mer`). A
+**char literal** `'A'` has type **`char`** (a 32-bit Unicode scalar value) — covering the
+one-character escapes (`\n` `\t` `\\` `\'` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes. `char` is a
+usable annotated type (`let c: char = 'A'`) and is interconvertible with the integer types via `as`
+in both directions, so it can be cast, compared, and used in arithmetic (`tests/run/char_literals.mer`,
+`tests/run/char_type.mer`).
+
+A **string literal** `"hello"` materializes its UTF-8 bytes (plus a trailing NUL) into a stack byte
+buffer and is typed `*u8` — the same by-pointer convention as an array. The escapes `\n` `\r` `\t`
+`\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode (each code point re-encoded as UTF-8). `print`/`println` of
+a `*u8` — a literal or a `let s = "hi";` binding — renders the
+bytes, while numeric `print` still prints numbers (`tests/run/string_literal.mer`). There is **no
+string type beyond `*u8`** yet: no concatenation/indexing/length operators and no general
+static-data section — a string is just a NUL-terminated `*u8` buffer suitable for `print` (🟡).
 
 ## Types
 
@@ -69,17 +129,22 @@ value must match its annotation exactly (see error `E0401`).
 | Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize`    | ✅     |
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
 | Boolean     | `bool`                                               | ✅     |
-| Pointers    | `*T`, `*mut T`, references `&T`                       | 🟡     |
+| Pointers    | `*T`, `*mut T`, references `&T`/`&mut T`, deref `*p`  | ✅     |
 | Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
-| Aggregates  | slices `[]T`, tuples, `struct`, `enum`               | 🟡  |
-| SIMD vectors| `f32x8`, `i32x4`, generic `vec[T, N]`                | 🟡     |
-| Tensors     | `Tensor[f32, M, N]` with optional layout suffix      | 🟡 (shape-checked) |
+| Tuples      | `(A, B, …)`, field access `t.0`, nested `t.0.1`       | ✅     |
+| Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
+| Enums       | C-style `enum E { A = 10, B }` — a variant is its `i32` discriminant | ✅     |
+| Aggregates  | slices `[]T`                                          | 🟡  |
+| SIMD vectors| `f32x4`/`i32x4` (128-bit), generic `vec[T, N]`; wider `f32x8` parses/checks but caps at the 128-bit native ISA | 🟡 |
+| Tensors     | `Tensor[f32, M, N]` (+layout) — **const-shape indexing & ops run**; symbolic generic dims shape-checked | ✅ / 🟡 |
 
 ## Operators ✅
 
-Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, boolean `&& ||` (short-
-circuit), unary `-` and `!`. Precedence is the usual C/Rust ordering, resolved by a Pratt parser.
-Compound assignment (`+=`, `*=`, …) is supported.
+Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, shifts `<< >>`, boolean
+`&& ||` (short-circuit), unary `-`, `!`, and `~`. Like Rust, `!`/`~` are the same operator —
+bitwise complement on an integer, logical negation on a `bool`; `~` is the conventional integer
+spelling. Precedence is the usual C/Rust ordering, resolved by a Pratt parser. Compound assignment
+(`+=`, `*=`, `<<=`, `>>=`, …) is supported.
 
 ## Control flow ✅
 
@@ -88,13 +153,96 @@ if cond { ... } else { ... }
 while cond { ... }
 for i in 0..n { ... }
 for i in 0..n step 2 { ... }   // strided range; empty if lo >= hi
-loop { ... }                    // 🟡 infinite loop
+loop { ... }                    // ✅ infinite loop; exit with `break`
+break; continue;                // ✅ innermost loop
+'outer: for i in 0..n {         // ✅ a loop label
+    for j in 0..n { break 'outer; continue 'outer; }  // target an outer loop by name
+}
 return expr;
 ```
 
-Blocks are expressions: the trailing expression of a block (no semicolon) is its value.
+Blocks are expressions: the trailing expression of a block (no semicolon) is its value. A
+`break`/`continue` with no enclosing loop is a compile error (`E0303`).
 
-## Tensors and compile-time shape checking 🟡 (the headline feature)
+A **loop label** `'name:` on a `loop`/`while`/`for` lets a nested `break 'name` / `continue 'name`
+target that named outer loop instead of the innermost one — the lexer tells a label `'outer` from a
+char literal `'a'` exactly as Rust does (`tests/run/labeled_loop.mer`). A labeled `break`/`continue`
+naming an **undeclared** label is rejected with `E0303` (`tests/fail/break_unknown_label.mer`). A
+loop is still **statement-only**: loop-as-expression / break-with-value (`let x = loop { break 5; };`)
+is not yet supported — `break` carries an optional label but no value (🟡).
+
+## Pattern matching ✅
+
+```mercury
+fn classify(n: i32) -> i32 {
+    return match n {
+        0 => 10,             // literal pattern
+        1 | 2 | 3 => 20,     // or-pattern
+        4..10 => 30,         // half-open range (`4..=9` is the inclusive form)
+        x if x > 100 => 99,  // identifier binding + an `if` guard
+        _ => 0,              // wildcard catch-all
+    };
+}
+```
+
+`match` evaluates its scrutinee once and lowers to an if-else chain over the arms. Patterns are
+integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
+**ranges**, **enum-variant** patterns `Color::Red` (matched by discriminant), **tuple** patterns
+`(0, _) => …` (each field tested and bound, nesting allowed — and these compose, e.g. `(0 | 1, y)`),
+an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. Any arm may carry an
+optional `if` guard, and `match` works in both value and statement position. See
+`tests/run/{match_expr,match_patterns,match_tuple}.mer`.
+
+A `match` used in **value position must be exhaustive**, like Rust: an `enum` needs every variant, a
+`bool` needs both cases, and any other scalar (an unbounded domain) needs a `_` catch-all. A
+provably-incomplete value match is rejected at compile time (`E0405`); a guard (`if …`) does not count
+toward coverage. This closes a silent-wrong-answer hole — a non-exhaustive value match used to fall
+through to a zero default (`tests/fail/match_nonexhaustive.mer`).
+
+## Tuples and structs ✅
+
+```mercury
+struct Point { x: f32, y: f32 }
+
+fn main() -> i32 {
+    let t = (3, 4);                       // tuple; mixed types allowed: (1.5, 2)
+    let p = Point { x: 1.0, y: 2.0 };     // struct literal (fields may be out of order)
+    let mut m = p;                        // (aggregates are by-pointer locals)
+    print(t.0 + t.1);                     // tuple field access -> 7
+    print((p.x + p.y) as i32);            // struct field access -> 3
+    return 0;
+}
+```
+
+Tuples and structs lower to a flat, padded byte buffer (the local's value *is* its base pointer, the
+same convention arrays follow); field access is a typed load/store at the field's byte offset, and a
+field that is itself a tuple is reached by chaining — `t.0.1`, `t.0.0.0` (`tests/run/nested_tuple_field.mer`).
+**Nested aggregates** work too: a struct/tuple field that is itself a struct (any depth), and arrays
+of structs, lay out recursively, and an aggregate field initialized from a non-literal value is
+deep-copied leaf by leaf (`tests/run/struct_nested.mer`). Whole-aggregate **assignment** (`s = other;`)
+deep-copies leaf by leaf as well (`tests/run/struct_assign.mer`). Both run identically on the
+interpreter and the native backend. An aggregate passes **into a function by reference** (its base
+pointer, zero-copy) and is **returned by value** through a hidden-pointer (sret) ABI in mir_build, so
+no aggregate ever rides in a register and the two backends agree (`tests/run/{struct_fn,struct_return}.mer`).
+Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
+requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
+read-only, and a `mut` one is the in-place output buffer a kernel writes.
+
+## Enums ✅
+
+```mercury
+enum Code { Ok = 10, Err = 20 }
+enum Color { Red, Green, Blue }   // 0, 1, 2 (auto-increment from 0)
+enum Step { A = 5, B, C }         // 5, 6, 7 (continue after the last explicit value)
+```
+
+A **C-style enum** gives each variant an integer discriminant — explicit (`= 10`) or
+auto-incrementing from the previous. A variant `E::Name` *is* its discriminant, so it can be bound to
+a `let`, compared (`==`), cast (`Code::Ok as i32`), and used as a `match` pattern
+(`tests/run/enum_cstyle.mer`). Data-carrying (tagged-union) variants — and matching over an enum
+*payload* — are not supported; only C-style enums and matching by discriminant.
+
+## Tensors and compile-time shape checking ✅ shape-check + const-shape exec (the headline feature)
 
 ```mercury
 fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) { ... }
@@ -110,6 +258,28 @@ faults:
 
 Run `mercuryc --explain E0502` for a worked example. Dimensions may be integer literals, symbolic
 generic names, or `?` for a runtime dimension. Tensor element types must be scalars (`E0302`).
+
+Shape checking is not limited to call arguments: an elementwise binary op `a + b` whose operands
+have different shapes, and a function whose returned value's shape disagrees with its declared
+`-> Tensor[…]`, are both `E0502` (see `tests/fail/shape_binop_mismatch.mer`,
+`shape_return_mismatch.mer`). Inside a **generic** function these body checks treat the function's
+own dimension variables as **rigid** — `N` matches only `N`, never another generic or a constant — so
+a generic function cannot lie about its output shape either: `fn f<M, N>(a: Tensor[f32, M, N]) ->
+Tensor[f32, N, 5]` is `E0502` (`tests/fail/generic_return_shape_lie.mer`). Call-site unification is a
+different context and still **infers** a callee's dims from its arguments (`matmul::<…>(a, b, c)`
+binds `M, N, K` from the operands). A constant index past a static tensor dimension, like a fixed-size
+array, is `E0501`.
+
+**What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
+backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a
+tensor is passed by base pointer, like an array out-param), so elementwise tensor kernels and tensor
+matmuls run — `tests/run/tensor_*.mer`. A matmul written in tensor notation
+(`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot-product `s += a[i,k]*b[k,j]` and accumulate
+`c[i,j] += a[i,k]*b[k,j]` spellings, including the `b[j,k]` `nn.Linear` `A·Bᵀ` form) dispatches to the
+same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` spelling — a 2-index access supplies its
+row stride from the tensor's inner dimension. Executing a **symbolic-generic** shape (`matmul<M, N, K>`
+with the dims only known per call) is still being wired (🟡): give the dims as literals
+(`Tensor[f32, 512, 512]`) to run today.
 
 ## Attributes 🟡
 
@@ -168,11 +338,16 @@ LLVM backend, by the runtime).
   `mish(x) = x·tanh(softplus(x))`). Plus the hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh`.
 - `fmax(a, b)` / `fmin(a, b)`.
 
+These intrinsics also accept **integer** operands: `abs`/`round`/`floor`/`ceil`/`trunc` are
+type-preserving on an integer (integer `abs` is `select(x < 0, −x, x)`; rounding an integer is the
+identity), while `sqrt` and the transcendentals promote an integer operand to `f32`
+(`tests/run/int_math.mer`).
+
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
 are **dispatched to a tuned 256-bit
 AVX2/FMA kernel** (`mercury_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
-activation family runs ~5–7.5× faster than C's scalar `libm`, and ~28× across cores under
+activation family runs ~2–13× faster than C's scalar `libm`, and ~28× across cores under
 `@parallel`. Composed/scalar uses (and `erf`/`sin`/`cos`) auto-vectorize the inlined poly at 128-bit.
 Every form is bit-identical across the interpreter and native backends.
 
@@ -190,9 +365,11 @@ stay differentially equal. Allocator selection and `defer` are still being wired
 ```
 mercuryc [OPTIONS] <input.mer>
 
---run                 compile and execute via the built-in interpreter
+--run                 compile and execute (via --backend; default the interpreter)
+--backend=<b>         interp | native | gpu | gpu-native  (execution backend for --run;
+                      gpu / gpu-native require a --features gpu build)
 --emit=<stage>        tokens | ast | mir-high | mir | llvm-ir | obj | exe
--O0|-O1|-O2|-O3       optimization level
+-O0|-O1|-O2|-O3       optimization level (-O3 currently runs the -O2 pipeline)
 -o <path>             output path
 --error-format=<f>    human | json
 --explain <CODE>      print an extended explanation for an error code

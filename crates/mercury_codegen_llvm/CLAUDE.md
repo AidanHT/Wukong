@@ -1,6 +1,6 @@
 # mercury_codegen_llvm
 
-LLVM backend: lowers a MIR `Program` to **textual** LLVM IR. Sits at the end of the pipeline, parallel to the interpreter backend, behind the shared `Backend` trait. Gating is in the driver (`--features llvm`); the crate itself has no `[features]`.
+LLVM backend: lowers a MIR `Program` to **textual** LLVM IR. Sits at the end of the pipeline, parallel to the interpreter backend, behind the shared `Backend` trait. The crate has no `[features]`; `emit_llvm_ir` is always compiled and reachable via `--emit=llvm-ir` (the driver does not gate it).
 
 ## Layout
 - `src/lib.rs` — entire crate: `Backend` impl, MIR-to-IR emitter, type/op name mappers, `#[cfg(test)]` inline tests.

@@ -28,13 +28,13 @@ OPTIONS:
 
 EXAMPLES:
     mercuryc --emit=tokens examples/vadd.mer
-    mercuryc --run examples/matmul.mer
+    mercuryc --run examples/gemm.mer
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
-        Ok(Some(opts)) => ExitCode::from(compile(&opts) as u8),
+        Ok(Some(opts)) => ExitCode::from(run_compile(opts) as u8),
         Ok(None) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}\n");
@@ -42,6 +42,25 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Run the compile on a worker thread with a large stack.
+///
+/// The recursive-descent parser and the recursive AST consumers (sema, MIR lowering, and even the
+/// AST's `Drop`) descend in lock-step with how deeply the source nests. Legitimately deep but
+/// bounded input — up to the parser's `E0209` nesting limit — would exhaust the default ~1 MB main
+/// thread stack and crash the process with no diagnostic. A roomy stack keeps the real overflow
+/// threshold far above the parser's limit, so pathological input is rejected cleanly by `E0209`
+/// rather than overflowing. (This mirrors how `rustc` runs its front-end on a dedicated stack.)
+fn run_compile(opts: Options) -> i32 {
+    const STACK_SIZE: usize = 256 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("mercuryc-compile".to_string())
+        .stack_size(STACK_SIZE)
+        .spawn(move || compile(&opts))
+        .expect("failed to spawn compiler thread")
+        .join()
+        .unwrap_or(mercury_driver::exit::COMPILE_ERROR)
 }
 
 /// Print the extended explanation for an error code to stdout.

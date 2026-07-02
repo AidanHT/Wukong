@@ -10,7 +10,7 @@ module tests.run.gram
 // self-attention scores Q·Kᵀ when Q and K share a buffer). The recognizer dispatches it to the GEMM
 // kernel: both operands are read-only, packed into separate scratch, so aliasing is safe. The gate
 // proves native == interp (both marshal the identical kernel with a == b).
-fn gram(a: [f32; 12], g: [f32; 16]) {
+fn gram(a: [f32; 12], mut g: [f32; 16]) {
     // A is 4x3; G = A·Aᵀ is 4x4.  G[i,j] = sum_k A[i,k]*A[j,k].
     for i in 0..4 {
         for j in 0..4 {

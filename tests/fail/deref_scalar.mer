@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.deref_scalar
+
+// `*x` requires a pointer or reference operand. Dereferencing a scalar used to fall through sema's
+// lenient `Ty::Unknown` path, then mir_build lowered it to a load off a non-pointer i32 — invalid
+// MIR the verifier and Cranelift reject (an internal compiler error on a program sema had accepted).
+// Take a reference first (`&x`) if you mean to round-trip through a pointer.
+fn main() -> i32 {
+    let x: i32 = 5;
+    let y: i32 = *x;
+    return y;
+}

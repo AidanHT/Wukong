@@ -11,7 +11,7 @@ module tests.run.batched_matmul
 // per-head base offset `h*4` off each flattened index and lowers the inner `i,j,k` nest to the tuned
 // GEMM microkernel, GEP-ing each base pointer by the offset per head — so every head dispatches, not
 // just a single 2-D matmul. The gate proves native == interp (both run the offset GEP + kernel).
-fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {
+fn bmm(a: [f32; 8], b: [f32; 8], mut c: [f32; 8]) {
     for h in 0..2 {
         for i in 0..2 {
             for j in 0..2 {

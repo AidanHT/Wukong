@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 99
+// EXPECT-OUT: 42
+// EXPECT-OUT: 1
+// EXPECT-OUT: 100
+// EXPECT-OUT: 7
+// EXPECT-OUT: 5
+module tests.run.match_expr
+
+// `match` lowers to an if-else chain over the arms (the scrutinee is evaluated once): integer and
+// bool literal patterns compare for equality, a negative literal folds its sign, a wildcard `_` or
+// an identifier binding is a catch-all (the identifier binds the scrutinee value), and an optional
+// `if` guard further constrains an arm. The interpreter oracle and the native backend agree.
+fn dispatch(n: i32) -> i32 { match n { 0 => 10, 1 => 20, 2 => 30, _ => 99 } }
+fn double_or_zero(n: i32) -> i32 { match n { 0 => 0, x => x * 2 } }
+fn sign(n: i32) -> i32 { match n { 0 => 0, x if x > 0 => 1, _ => 0 - 1 } }
+fn neg_pat(n: i32) -> i32 { match n { -1 => 100, 0 => 0, _ => 1 } }
+fn from_bool(b: bool) -> i32 { match b { true => 7, false => 9 } }
+
+fn main() -> i32 {
+    print(dispatch(1));            // 20  (literal arm)
+    print(dispatch(42));           // 99  (wildcard default)
+    print(double_or_zero(21));     // 42  (identifier binding)
+    print(sign(5));                // 1   (guard arm)
+    print(neg_pat(0 - 1));         // 100 (negative literal pattern)
+    print(from_bool(true));        // 7   (bool scrutinee)
+
+    // `match` as a statement with block arms + a side effect.
+    let mut a: i32 = 0;
+    let k: i32 = 2;
+    match k {
+        1 => { a = 3; }
+        2 => { a = 5; }
+        _ => { a = 0; }
+    }
+    print(a);                      // 5
+    return 0;
+}

@@ -1,0 +1,24 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3221225472
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 200
+// EXPECT-OUT: 4294967295
+// EXPECT-OUT: -5
+module tests.run.unsigned_print
+
+// Printing an unsigned integer renders its magnitude, not the signed two's-complement
+// reinterpretation. A `u32` with the high bit set (0xC0000000) prints 3221225472, not
+// -1073741824; `u64::MAX` prints in full. A signed value still prints signed (`-5`).
+fn main() -> i32 {
+    let g: u32 = 3221225472;        // 0xC0000000, high bit set
+    print(g);                        // 3221225472
+    let h: u64 = 18446744073709551615;
+    print(h);                        // u64::MAX
+    let s: u8 = 200;
+    print(s);                        // 200
+    let m: u32 = 4294967295;         // u32::MAX
+    print(m);                        // 4294967295
+    let i: i32 = -5;
+    print(i);                        // -5 (signed path unaffected)
+    return 0;
+}

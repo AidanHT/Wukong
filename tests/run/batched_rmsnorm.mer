@@ -10,7 +10,7 @@ module tests.run.batched_rmsnorm
 // fused single-pass norm kernel with rows = R (each row normalized independently) — the real
 // transformer shape (norm over [batch*seq, hidden]). The mercury_bench gate proves interp == native.
 
-fn rmsnorm_batch(x: [f32; 12]) { // R = 3 rows, C = 4 cols
+fn rmsnorm_batch(mut x: [f32; 12]) { // R = 3 rows, C = 4 cols
     for r in 0..3 {
         let mut s: f32 = 0.0;
         for i in 0..4 { s += x[r*4+i] * x[r*4+i]; }

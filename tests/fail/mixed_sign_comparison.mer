@@ -1,0 +1,20 @@
+// EXPECT-CODE: E0401
+module tests.fail.mixed_sign_comparison
+
+// An ordered comparison between a SIGNED and an UNSIGNED integer is rejected. It lowers to a `Cmp`
+// whose signedness is taken from one operand, so the same relation gives contradictory answers
+// depending on operand order: `a < b` becomes `slt` (−1 < 1 is true) while `b > a` becomes `ugt`
+// (1 > 4294967295 is false). Both backends agree on the (order-dependent) wrong answer — a gate-blind
+// logic bug. An unsuffixed int literal is sign-flexible and does NOT trigger this (`b < 5` is fine);
+// only two concrete opposite-signedness operands are rejected. Cast one side to make both the same
+// signedness. Rust rejects mixed signed/unsigned comparison for the same reason. See sweep #13, Scout D.
+fn main() -> i32 {
+    let a: i32 = -1;
+    let b: u32 = 1;
+    if a < b {          // E0401: comparison mixes signed `i32` and unsigned `u32`
+        print(1);
+    } else {
+        print(0);
+    }
+    return 0;
+}

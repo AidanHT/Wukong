@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 30
+// EXPECT-OUT: 6
+// EXPECT-OUT: 5
+module tests.run.let_destructure
+
+// `let (a, b) = …` destructures a tuple, binding each sub-pattern to its field's place within the
+// initialized tuple buffer. Covers a literal tuple, a triple, a tuple-returning call, a nested
+// pattern, and a wildcard `_`. The interpreter and native backend agree.
+fn pair() -> (i32, i32) { return (10, 20); }
+
+fn main() -> i32 {
+    let (a, b) = (3, 4);
+    print(a + b);                 // 7
+
+    let (x, y, z) = (1, 2, 3);
+    print(x + y + z);             // 6
+
+    let (p, q) = pair();          // destructure a call result
+    print(p + q);                 // 30
+
+    let ((m, n), o) = ((1, 2), 3); // nested destructuring
+    print(m + n + o);             // 6
+
+    let (keep, _) = (5, 99);      // wildcard skips a field
+    print(keep);                  // 5
+    return 0;
+}

@@ -195,6 +195,1435 @@ fn differential_against_interpreter() {
     }
 }
 
+/// Tuples lower to a padded byte buffer with byte-offset field GEPs (no aggregate MIR type). The
+/// native backend writes the real packed layout; the interpreter indexes the byte offset as a slot.
+/// Distinct field offsets never alias, so both must agree on the observed field values — including a
+/// heterogeneous `(f32, i32)` whose `i32` field sits at a padded offset, and a field assignment.
+#[test]
+fn differential_tuple() {
+    let programs = [
+        "fn main() -> i32 { let t = (3, 4); return t.0 + t.1; }",
+        "fn main() -> i32 { let mut u = (1.5, 2); u.0 = u.0 + 0.5; \
+         print(u.0); print(t_dummy(u.1)); return 0; } fn t_dummy(x: i32) -> i32 { return x * 3; }",
+        "fn main() -> i32 { let v = (10, 20, 30); let w = (v.0 + v.1, v.2); \
+         return w.0 + w.1; }",
+        "fn main() -> i32 { let p = (1, 2.5, 7); print(p.0); print(p.2); \
+         let q: f32 = p.1 * 2.0; print(q as i32); return p.0 + p.2; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "tuple native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Structs lower to the same byte-buffer/byte-GEP representation as tuples, with named fields
+/// resolved through the declared layout. Native and interp must agree, including a heterogeneous
+/// struct whose float field sits at a padded offset and a literal with fields out of declaration
+/// order (each value routed to its named offset, not its position).
+#[test]
+fn differential_struct() {
+    let programs = [
+        "struct P { x: i32, y: i32 } \
+         fn main() -> i32 { let p = P { x: 3, y: 4 }; return p.x + p.y; }",
+        "struct M { a: i32, b: f32, c: i32 } \
+         fn main() -> i32 { let mut m = M { a: 10, b: 3.5, c: 20 }; m.a = m.a + m.c; \
+         print(m.a); print(m.b); return m.a + (m.b as i32); }",
+        "struct P { x: f32, y: f32 } \
+         fn main() -> i32 { let q = P { y: 100.0, x: 1.0 }; print(q.x); print(q.y); \
+         return (q.x + q.y) as i32; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Nested aggregates: a struct field that is itself a struct (and a tuple field that is a struct)
+/// lays out recursively, reads as a *pointer* (the by-pointer convention, so `o.inner.a` GEPs twice
+/// rather than loading a whole buffer through a register), and initializes either by recursing into
+/// a nested literal or by a leaf-precise deep copy of a non-literal aggregate value. Native and
+/// interp must agree across all four `-O` levels, including a 3-deep chain and an out-of-order
+/// initializer.
+#[test]
+fn differential_nested_struct() {
+    let programs = [
+        // struct-in-struct, nested literal.
+        "struct Inner { a: i32, b: i32 } struct Outer { inner: Inner, c: i32 } \
+         fn main() -> i32 { let o = Outer { inner: Inner { a: 10, b: 20 }, c: 5 }; \
+         print(o.inner.a); print(o.inner.b); return o.inner.a + o.inner.b + o.c; }",
+        // aggregate field initialized from a *variable* (exercises the leaf-precise deep copy).
+        "struct Inner { a: i32, b: i32 } struct Outer { inner: Inner, c: i32 } \
+         fn main() -> i32 { let src = Inner { a: 10, b: 20 }; \
+         let o = Outer { inner: src, c: 5 }; return o.inner.a + o.inner.b + o.c; }",
+        // 3-deep nesting + a mixed-precision inner field at a padded offset.
+        "struct A { v: f32 } struct B { a: A, w: i32 } struct C { b: B, x: i32 } \
+         fn main() -> i32 { let c = C { b: B { a: A { v: 2.5 }, w: 2 }, x: 4 }; \
+         print(c.b.a.v); return (c.b.a.v as i32) + c.b.w + c.x; }",
+        // tuple whose first field is a struct.
+        "struct A { v: i32, w: i32 } \
+         fn main() -> i32 { let t = (A { v: 100, w: 1 }, 8); return t.0.v + t.0.w + t.1; }",
+        // write through a nested field path.
+        "struct Inner { a: i32 } struct Outer { inner: Inner, c: i32 } \
+         fn main() -> i32 { let mut o = Outer { inner: Inner { a: 1 }, c: 2 }; \
+         o.inner.a = o.inner.a + 40; return o.inner.a + o.c; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "nested-struct native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// An array whose element is an aggregate (`[Struct; N]` / `[(..); N]`): indexing then a field
+/// access, a runtime-index field write, a by-value array parameter, and an `[agg; n]` repeat. The
+/// element is wider than one slot, so the element GEP must stride the whole element on *both*
+/// backends — native scales the index by `size_of(elem)` bytes; the interpreter scales by the
+/// element's `slot_count`. A scalar `Op::Load` of an aggregate element (the prior bug) verifier-
+/// rejected native for a struct element and segfaulted it for a wider tuple element while the
+/// interpreter mis-strided by a single slot — so this must agree across all four `-O` levels.
+#[test]
+fn differential_array_of_aggregate() {
+    let programs = [
+        // array of 2-field structs: const + runtime index, field read + write, by-value param.
+        "struct P { x: i32, y: i32 } \
+         fn psum(a: [P; 2]) -> i32 { return a[0].x + a[0].y + a[1].x + a[1].y; } \
+         fn main() -> i32 { let mut a: [P; 2] = [P { x: 7, y: 8 }, P { x: 9, y: 10 }]; \
+         let i: i32 = 1; a[i].x = 100; print(a[0].x); print(a[1].x); return psum(a); }",
+        // array of tuples (a wider, >4-byte element — the prior segfault case).
+        "fn main() -> i32 { let a: [(i32, i32); 2] = [(7, 8), (9, 10)]; \
+         print(a[0].0); print(a[1].1); return a[0].0 + a[1].1 + a[1].0 + a[0].1; }",
+        // mixed-precision struct element at a padded offset, read through a runtime index.
+        "struct M { a: i32, b: f32 } \
+         fn main() -> i32 { let arr: [M; 3] = [M { a: 1, b: 1.5 }, M { a: 2, b: 2.5 }, \
+         M { a: 3, b: 3.5 }]; let k: i32 = 2; print(arr[k].a); print(arr[k].b); \
+         return arr[0].a + arr[1].a + arr[k].a; }",
+        // `[agg; n]` repeat: every element is an independent deep copy.
+        "struct P { x: i32, y: i32 } \
+         fn main() -> i32 { let mut a: [P; 4] = [P { x: 5, y: 6 }; 4]; a[2].x = 50; \
+         return a[0].x + a[1].x + a[2].x + a[3].y; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(
+                n, i,
+                "array-of-aggregate native vs interp mismatch at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
+/// Deep recursion: JIT'd native code recurses on the host call stack (one machine frame per Mercury
+/// call), so without a big-stack worker it overflows the default ~8 MiB stack and *aborts* the
+/// process, while the interpreter (on its 512 MiB stack) completes — a divergence the opt-invariance
+/// harness misses (it only re-runs the interpreter). Both backends now run on matching 512 MiB
+/// stacks, so a depth that overflows the default stack must agree. ~30k frames is well past the
+/// default stack but fast.
+#[test]
+fn differential_deep_recursion() {
+    let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \
+               fn main() -> i32 { print(sum(30000)); return 0; }";
+    for opt in [0u8, 2] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "deep-recursion native vs interp mismatch at -O{opt}");
+    }
+}
+
+/// Printing an unsigned integer renders its magnitude, not the signed two's-complement
+/// reinterpretation: a high-bit-set `u32`/`u64` (a quantization scale, a hash) would otherwise
+/// print negative. mir_build routes an unsigned `print` argument to `print_u`/`rt_print_u64` after
+/// zero-extending to 64 bits; the interpreter's `print_u` formats the same bits as `u64`, so the
+/// captured stdout must agree native==interp (a signed argument is unaffected).
+#[test]
+fn differential_unsigned_print() {
+    let src = "fn main() -> i32 { \
+               let g: u32 = 3221225472; print(g); \
+               let h: u64 = 18446744073709551615; print(h); \
+               let s: u8 = 200; print(s); \
+               let i: i32 = -5; print(i); \
+               return 0; }";
+    for opt in [0u8, 1, 2, 3] {
+        let n = jit(src, opt).expect("jit");
+        let i = interp(src, opt).expect("interp");
+        assert_eq!(n, i, "unsigned-print native vs interp mismatch at -O{opt}");
+    }
+    // The captured stdout is the actual evidence (the return value is 0 either way).
+    let (_, out) = jit(src, 0).expect("jit");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "3221225472\n18446744073709551615\n200\n-5\n"
+    );
+}
+
+/// `if`/`match` used as a *value* whose arms have different numeric types: each arm is coerced to
+/// the expression's joined type so all arms pass the merge-block parameter the same MIR type.
+/// Without the coercion an arm of a different width/kind (`if c { 1 } else { 2.5 }`) passes a
+/// mismatched value the native verifier rejects while the interpreter runs loosely — a divergence on
+/// a program the front-end accepted. Must agree across all four `-O` levels.
+#[test]
+fn differential_mixed_branch_types() {
+    let programs = [
+        // if arms: i32 vs f32 -> f32 (1.0 and 3.5).
+        "fn main() -> i32 { let c: bool = true; let x = if c { 1 } else { 2.5 }; \
+         let d: bool = false; let y = if d { 7 } else { 3.5 }; \
+         return (x as i32) + ((y * 10.0) as i32); }",
+        // match arms: i32 vs f32 -> f32.
+        "fn pick(n: i32) -> i32 { let r = match n { 0 => 10, _ => 2.5 }; return (r * 2.0) as i32; } \
+         fn main() -> i32 { return pick(0) + pick(9); }",
+        // homogeneous arms are unaffected (the coercion is a no-op, no spurious rounding).
+        "fn main() -> i32 { let c: bool = false; let x = if c { 100 } else { 200 }; \
+         let r = match x { 100 => 1, 200 => 2, _ => 3 }; return x + r; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "mixed-branch native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// `&&` / `||` short-circuit: the RHS runs only when the LHS doesn't decide the result. The captured
+/// stdout (the `jit`/`interp` helpers return it) is the side-effect evidence, so a regression to a
+/// bitwise `and`/`or` of both operands would change the printed trace AND must still agree
+/// native==interp. Also proves the guard idiom `n != 0 && 100/n > 0` does NOT divide by zero.
+#[test]
+fn differential_short_circuit() {
+    let programs = [
+        // side(t) prints t and returns true; falseside prints t and returns false.
+        "fn side(t: i32) -> bool { print(t); return true; } \
+         fn fs(t: i32) -> bool { print(t); return false; } \
+         fn main() -> i32 { \
+           if false && side(1) { print(91); } \
+           if true || side(2) { print(92); } \
+           if true && side(3) { print(93); } \
+           if false || side(4) { print(94); } \
+           if fs(5) && side(6) { print(95); } \
+           if side(7) || side(8) { print(97); } \
+           return 0; }",
+        // short-circuit guards an unsafe RHS: n==0 so 100/n must never be evaluated.
+        "fn main() -> i32 { let n: i32 = 0; let mut hit: i32 = 0; \
+         if n != 0 && 100 / n > 0 { hit = 1; } print(hit); return 0; }",
+        // nested / chained short-circuit with mixed operators.
+        "fn t(x: i32) -> bool { print(x); return x > 0; } \
+         fn main() -> i32 { if t(1) && (t(0) || t(2)) && t(3) { print(99); } return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "short-circuit native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// `continue` inside a range `for` must run the loop step (the step lives at the body tail, so the
+/// lowering routes `continue` to a latch that increments first) — otherwise the loop never
+/// terminates. Native must agree with interp and actually halt (the test would hang on a regression).
+/// Covers a plain `for`, a nested `for`, and a `continue` reached on the first iteration.
+#[test]
+fn differential_for_continue() {
+    let programs = [
+        // skip odds: 0+2+4+6+8 = 20.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..10 { if i % 2 == 1 { continue; } s = s + i; } return s; }",
+        // continue on the very first iteration (i==0) then proceed.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..5 { if i == 0 { continue; } s = s + i; } return s; }",
+        // nested: inner continue skips j==1; sum over i in 0..3, j in 0..3, j!=1 -> per i (0+2)=2, *3 rows,
+        // plus i*3 added once per inner pass that isn't skipped (2 passes) -> handled by direct sum.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..3 { for j in 0..3 { if j == 1 { continue; } s = s + i * 10 + j; } } return s; }",
+        // continue interacts with a break in the same loop.
+        "fn main() -> i32 { let mut s: i32 = 0; \
+         for i in 0..100 { if i == 5 { break; } if i % 2 == 0 { continue; } s = s + i; } return s; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "for+continue native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A labeled `break`/`continue` `'l` targets the enclosing loop named `'l` (not just the innermost),
+/// so it can escape or restart an *outer* loop from inside a nested one. Native must agree with interp
+/// that the branch goes to the labeled loop's break/continue block. Covers labeled break/continue out
+/// of a nested `for`, a labeled `break` out of a `while`, a labeled `loop`, and the interaction with an
+/// unlabeled inner break (the inner one stays innermost-scoped).
+#[test]
+fn differential_labeled_loops() {
+    let programs = [
+        // continue 'outer skips the rest of the inner loop and resumes the outer for.
+        "fn main() -> i32 { let mut c: i32 = 0; \
+         'o: for i in 0..4 { for j in 0..4 { if j == 2 { continue 'o; } c = c + 1; } } return c; }",
+        // break 'outer escapes both loops at once.
+        "fn main() -> i32 { let mut c: i32 = 0; \
+         'o: for i in 0..5 { for j in 0..5 { if i + j >= 3 { break 'o; } c = c + 1; } } return c; }",
+        // labeled break out of a while from inside a for.
+        "fn main() -> i32 { let mut k: i32 = 0; \
+         'w: while k < 1000 { for m in 0..10 { if m == 4 { break 'w; } k = k + 1; } } return k; }",
+        // labeled loop {} with a labeled break.
+        "fn main() -> i32 { let mut n: i32 = 0; \
+         'l: loop { n = n + 1; for _q in 0..3 { if n >= 7 { break 'l; } n = n + 1; } } return n; }",
+        // unlabeled inner break coexists with an outer label: inner break exits only the inner loop.
+        "fn main() -> i32 { let mut c: i32 = 0; \
+         'o: for i in 0..3 { for j in 0..9 { if j == 2 { break; } c = c + 1; } if i == 1 { break 'o; } } \
+         return c; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "labeled-loop native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Structs cross function boundaries: a struct passed **by value** (`fn f(p: Pt)`) is passed by base
+/// pointer (its registry-aware ABI is a buffer pointer, not the `I32` the free `mir_ty` gave — which
+/// is what made the native verifier reject the field GEP and `mem2reg` panic at -O2), and field
+/// access **through a pointer/reference** (`p.x` on a `&Pt` / `*mut Pt`) auto-derefs. Native == interp
+/// across -O0..-O3, including a mutation written through a `*mut Pt` that the caller observes.
+#[test]
+fn differential_struct_across_fns() {
+    let programs = [
+        // struct by value: param passed by pointer, fields read in the callee.
+        "struct Pt { x: i32, y: i32 } fn f(p: Pt) -> i32 { return p.x + p.y; } \
+         fn main() -> i32 { let p = Pt { x: 8, y: 9 }; return f(p); }",
+        // field through &Pt (read) and *mut Pt (write the caller observes).
+        "struct Pt { x: i32, y: i32 } \
+         fn rd(p: &Pt) -> i32 { return p.x + p.y; } \
+         fn setx(p: *mut Pt, v: i32) { p.x = v; } \
+         fn main() -> i32 { let mut s = Pt { x: 1, y: 2 }; let a = rd(&s); \
+         setx(&mut s, 40); return a + s.x + s.y; }",
+        // a struct param alongside scalar params (ABI ordering) + a nested struct field through a ref.
+        "struct Inner { a: i32 } struct Outer { inner: Inner, b: i32 } \
+         fn sum(o: &Outer, k: i32) -> i32 { return o.inner.a + o.b + k; } \
+         fn main() -> i32 { let o = Outer { inner: Inner { a: 10 }, b: 5 }; return sum(&o, 100); }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct-across-fns native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Whole-aggregate **assignment** (not just initialization): storing a struct *value* into a place
+/// whose type is an aggregate must deep-copy the buffer, not store the RHS buffer's base pointer
+/// into the destination's first slot. Before the fix this silently miscompiled on *both* backends
+/// (the interpreter wrote a `Ptr` into slot 0, native wrote a 32-bit-truncated address), so the
+/// assignment path is routed through the same leaf-precise `init_field`/`emit_copy` as a `let`.
+/// Covers `*p = Struct{..}`, `*p = struct_var`, a nested struct field `s.f = Struct{..}`/`= var`.
+/// (Array-*of*-struct element assignment is excluded — that hits the documented array-of-aggregate
+/// limitation where the interpreter's slot-indexed and native's byte-indexed memory can't agree.)
+#[test]
+fn differential_struct_assign() {
+    let programs = [
+        // store a struct *literal* through a *mut pointer (the core C7 case).
+        "struct Pt { x: i32, y: i32 } \
+         fn put(p: *mut Pt) { *p = Pt { x: 3, y: 4 }; } \
+         fn main() -> i32 { let mut s = Pt { x: 1, y: 2 }; put(&mut s); return s.x + s.y; }",
+        // store a non-literal struct *value* (a by-value param) through a pointer.
+        "struct Pt { x: i32, y: i32 } \
+         fn cp(dst: *mut Pt, src: Pt) { *dst = src; } \
+         fn main() -> i32 { let mut a = Pt { x: 1, y: 1 }; let b = Pt { x: 10, y: 20 }; \
+         cp(&mut a, b); return a.x + a.y; }",
+        // assign a whole struct literal into a nested struct field.
+        "struct Pt { x: i32, y: i32 } struct Box { lo: Pt, hi: Pt } \
+         fn main() -> i32 { let mut bx = Box { lo: Pt { x: 0, y: 0 }, hi: Pt { x: 0, y: 0 } }; \
+         bx.hi = Pt { x: 5, y: 6 }; return bx.hi.x + bx.hi.y; }",
+        // assign a struct *variable* into a nested struct field.
+        "struct Pt { x: i32, y: i32 } struct Box { lo: Pt, hi: Pt } \
+         fn main() -> i32 { let b = Pt { x: 10, y: 20 }; \
+         let mut bx = Box { lo: Pt { x: 0, y: 0 }, hi: Pt { x: 0, y: 0 } }; \
+         bx.lo = b; return bx.lo.x + bx.lo.y; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct-assign native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Returning an aggregate **by value** (`fn f() -> Struct`). Modeled with an sret ABI entirely in
+/// `mir_build`: an aggregate-returning function gets a hidden leading pointer parameter and returns
+/// void; `return <agg>` deep-copies into that pointer, and a call site allocates the destination
+/// buffer, prepends it, and uses it as the call's value. Both backends only ever pass/copy pointers,
+/// so no aggregate rides in a register — they agree at every `-O`. Covers an explicit `return`, a
+/// tail expression, a tuple return, a nested struct, a non-literal (`return p`) return, returned
+/// values used as arguments, and a field read off a returned temporary.
+#[test]
+fn differential_struct_return() {
+    let programs = [
+        // explicit `return Struct{..}`, let-bound and field-read off a temporary.
+        "struct Pt { x: i32, y: i32 } \
+         fn make(a: i32, b: i32) -> Pt { return Pt { x: a, y: b }; } \
+         fn main() -> i32 { let p = make(3, 4); return p.x + p.y + make(10, 20).y; }",
+        // tail-expression return (no `return` keyword).
+        "struct Pt { x: i32, y: i32 } \
+         fn make(a: i32, b: i32) -> Pt { Pt { x: a, y: b } } \
+         fn main() -> i32 { let p = make(4, 5); return p.x + p.y; }",
+        // tuple return.
+        "fn mk(a: i32, b: i32) -> (i32, i32) { return (a, b); } \
+         fn main() -> i32 { let t = mk(3, 4); return t.0 + t.1; }",
+        // nested struct return.
+        "struct Inner { a: i32 } struct Outer { inner: Inner, b: i32 } \
+         fn mk(a: i32, b: i32) -> Outer { return Outer { inner: Inner { a: a }, b: b }; } \
+         fn main() -> i32 { let o = mk(10, 5); return o.inner.a + o.b; }",
+        // non-literal return (`return p`) + returned values flowing into another call's args.
+        "struct Pt { x: i32, y: i32 } \
+         fn id(p: Pt) -> Pt { return p; } \
+         fn add(p: Pt, q: Pt) -> Pt { return Pt { x: p.x + q.x, y: p.y + q.y }; } \
+         fn main() -> i32 { let s = add(id(Pt { x: 1, y: 2 }), Pt { x: 3, y: 4 }); \
+         return s.x + s.y; }",
+        // multiple return paths (conditional), each an aggregate.
+        "struct Pt { x: i32, y: i32 } \
+         fn pick(c: i32) -> Pt { if c > 0 { return Pt { x: 1, y: 1 }; } Pt { x: 5, y: 5 } } \
+         fn main() -> i32 { return pick(1).x + pick(0).x; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "struct-return native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// `match` expressions: integer/bool/negative-integer literal patterns, a wildcard / identifier
+/// catch-all (the latter binding the scrutinee), and `if` guards, in both value and statement
+/// position. Lowered to an if-else chain over the arms (scrutinee evaluated once), so the
+/// interpreter oracle and native backend agree at every `-O`. A non-exhaustive fallthrough yields a
+/// zero default (lenient, identical on both backends — no trap).
+#[test]
+fn differential_match() {
+    let programs = [
+        // integer literal arms + wildcard default.
+        "fn f(n: i32) -> i32 { match n { 0 => 10, 1 => 20, 2 => 30, _ => 99 } } \
+         fn main() -> i32 { return f(0) + f(1) + f(2) + f(5); }", // 10+20+30+99 = 159
+        // identifier binding catch-all.
+        "fn f(n: i32) -> i32 { match n { 0 => 0, x => x * 2 } } \
+         fn main() -> i32 { return f(21) + f(0); }", // 42 + 0
+        // guard arms (negative result exercises signed compare).
+        "fn sign(n: i32) -> i32 { match n { 0 => 0, x if x > 0 => 1, _ => 0 - 1 } } \
+         fn main() -> i32 { return sign(5) * 100 + sign(0) * 10 + sign(0 - 9) + 1000; }",
+        // negative literal pattern.
+        "fn f(n: i32) -> i32 { match n { -1 => 100, 0 => 0, _ => 1 } } \
+         fn main() -> i32 { return f(0 - 1) + f(0) + f(7); }", // 100 + 0 + 1
+        // bool scrutinee.
+        "fn f(b: bool) -> i32 { match b { true => 7, false => 9 } } \
+         fn main() -> i32 { return f(true) * 10 + f(false); }", // 79
+        // match as a statement with block arms and a side effect.
+        "fn main() -> i32 { let mut a: i32 = 0; let n: i32 = 2; \
+         match n { 1 => { a = 3; } 2 => { a = 5; } _ => { a = 0; } } return a; }",
+        // match bound in a `let`, and a match whose scrutinee is itself an expression.
+        "fn main() -> i32 { let n: i32 = 3; let r: i32 = match n + 0 { 3 => 30, _ => 0 }; return r; }",
+        // nested match (an arm body is itself a match).
+        "fn f(a: i32, b: i32) -> i32 { match a { 0 => match b { 0 => 1, _ => 2 }, _ => 3 } } \
+         fn main() -> i32 { return f(0,0)*100 + f(0,9)*10 + f(9,9); }", // 123
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "match native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Radix integer literals — hex `0xFF`, octal `0o17`, binary `0b1010`, with `_` separators and type
+/// suffixes — must evaluate to their real value, not `0`. The literal value is a compile-time MIR
+/// constant, so both backends agree by construction; these assertions pin the *value* (the bug was
+/// that `parse_int` kept only the leading decimal-digit run, so every non-decimal literal was `0`).
+#[test]
+fn differential_radix_literals() {
+    // (program, expected exit code) — `main` returns the literal-derived value directly.
+    let cases = [
+        ("fn main() -> i32 { return 0xFF; }", 255),
+        ("fn main() -> i32 { return 0o17; }", 15),
+        ("fn main() -> i32 { return 0b1010; }", 10),
+        ("fn main() -> i32 { return 0xFF & 0x0F; }", 15),
+        ("fn main() -> i32 { return 0xFF_FF; }", 65535),
+        ("fn main() -> i32 { return 1_000 + 0x10; }", 1016),
+        // hex array index and a decimal literal sanity check.
+        ("fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[0x2]; }", 30),
+        ("fn main() -> i32 { return 1_000_000; }", 1_000_000),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "radix native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "radix literal wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Float → narrow integer (`i8`/`i16`/`u8`/`u16`) casts. Cranelift's `fcvt_to_{sint,uint}_sat`
+/// cannot target a sub-32-bit result on x64 and used to panic the backend (an ICE on a perfectly
+/// valid program). The fix converts to `i32` saturating, clamps to the narrow type's range, and
+/// `ireduce`s — reproducing Rust `as` / the interpreter's saturating semantics, so in-range,
+/// out-of-range, negative-to-unsigned, and truncating inputs all agree with the oracle.
+#[test]
+fn differential_float_narrow_int_cast() {
+    let cases = [
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as u8) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as i8) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as u16) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 7.0;          return (a as i16) as i32; }", 7),
+        ("fn main() -> i32 { let a: f32 = 300.0;        return (a as u8) as i32; }", 255),
+        ("fn main() -> i32 { let a: f32 = 300.0;        return (a as i8) as i32; }", 127),
+        ("fn main() -> i32 { let a: f32 = 0.0 - 1.0;    return (a as u8) as i32; }", 0),
+        ("fn main() -> i32 { let a: f32 = 0.0 - 300.0;  return (a as i8) as i32; }", -128),
+        ("fn main() -> i32 { let a: f32 = 70000.0;      return (a as u16) as i32; }", 65535),
+        ("fn main() -> i32 { let a: f32 = 0.0 - 70000.0; return (a as i16) as i32; }", -32768),
+        ("fn main() -> i32 { let a: f64 = 3.9;          return (a as u8) as i32; }", 3),
+        // a >= 32-bit target still uses the direct path.
+        ("fn main() -> i32 { let a: f32 = 1000000.0;    return (a as i32); }", 1_000_000),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "float->narrow-int native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "float->narrow-int wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Top-level `const` references. The def map records only a const's *type*, so reading one as a
+/// value used to fail with C0001 ("value reference … not yet supported"). Sema now type-checks each
+/// const initializer and records it; `mir_build` inlines the initializer at every use site. Covers
+/// a bare reference, use in arithmetic / as an array index / as a loop bound, an `f32` const, and a
+/// const that references another const (recursive inlining). Both backends agree by construction.
+#[test]
+fn differential_top_level_const() {
+    let cases = [
+        ("const N: i32 = 64; fn main() -> i32 { return N; }", 64),
+        ("const N: i32 = 64; fn main() -> i32 { return N * 2 + 1; }", 129),
+        ("const I: i32 = 2; fn main() -> i32 { let a: [i32; 4] = [10,20,30,40]; return a[I]; }", 30),
+        ("const A: i32 = 64; const B: i32 = A + 1; fn main() -> i32 { return B; }", 65),
+        ("const LIM: i32 = 5; fn main() -> i32 { let mut c: i32 = 0; \
+          for i in 0..LIM { c += 1; } return c; }", 5),
+        ("const PI: f32 = 3.5; fn main() -> i32 { return PI as i32; }", 3),
+        ("const BIG: i64 = 1000; fn main() -> i32 { return BIG as i32; }", 1000),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "const native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "const wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Nested tuple-field access `t.0.0`. The lexer glues the trailing `0.0` into a single float token,
+/// so the parser now splits a plain `N.M` float into two consecutive tuple-field accesses. Covers a
+/// read, an assignment target, and a deeper `t.0.0.0`; both backends agree (this is the existing
+/// tuple-field lowering, just reachable now).
+#[test]
+fn differential_nested_tuple_field() {
+    let cases = [
+        ("fn main() -> i32 { let t = ((1, 2), 3); return t.0.0; }", 1),
+        ("fn main() -> i32 { let t = ((1, 2), 3); return t.0.1; }", 2),
+        ("fn main() -> i32 { let t = (9, (7, 8)); return t.1.0; }", 7),
+        ("fn main() -> i32 { let mut t = ((1, 2), 3); t.0.0 = 50; return t.0.0 + t.0.1; }", 52),
+        ("fn main() -> i32 { let t = (((5, 6), 7), 8); return t.0.0.0; }", 5),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "nested-tuple-field native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "nested-tuple-field wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// C-style enums: a variant `E::B` lowers to its integer discriminant (auto-incremented from 0, or
+/// set by an explicit `= <int>` and continuing from there). Covers an explicit discriminant, plain
+/// auto-increment, continuation after an explicit value, a `let x: E = E::A` binding, an equality
+/// comparison, and arithmetic via `as i32`. The value is a compile-time constant, so both backends
+/// agree.
+#[test]
+fn differential_enum() {
+    let cases = [
+        ("enum E { A = 10, B = 20 } fn main() -> i32 { return E::B as i32; }", 20),
+        ("enum Color { Red, Green, Blue } fn main() -> i32 { return Color::Blue as i32; }", 2),
+        ("enum E { A = 5, B, C } fn main() -> i32 { return E::C as i32; }", 7),
+        ("enum E { A = 10, B = 20 } fn main() -> i32 { let x: E = E::A; return x as i32; }", 10),
+        ("enum E { A = 10, B = 20 } \
+          fn main() -> i32 { let x: E = E::B; if x == E::B { return 1; } return 0; }", 1),
+        ("enum E { A = 10, B = 20 } \
+          fn main() -> i32 { return (E::A as i32) + (E::B as i32); }", 30),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "enum native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "enum wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Tuple-destructuring `let (a, b) = …`. The `let` lowering binds each sub-pattern to its field's
+/// place within the initialized tuple buffer (a scalar reads via a `Load`, an aggregate field by
+/// pointer; a nested tuple pattern recurses; `_` skips). Covers a literal tuple, a triple, a
+/// struct-returning… (here a tuple-returning) call, a nested pattern, a wildcard, and mutating a
+/// destructured binding. Both backends agree.
+#[test]
+fn differential_let_destructure() {
+    let cases = [
+        ("fn main() -> i32 { let (a, b) = (3, 4); return a + b; }", 7),
+        ("fn main() -> i32 { let (a, b, c) = (1, 2, 3); return a + b + c; }", 6),
+        ("fn mk() -> (i32, i32) { return (10, 20); } \
+          fn main() -> i32 { let (x, y) = mk(); return x + y; }", 30),
+        ("fn main() -> i32 { let ((a, b), c) = ((1, 2), 3); return a + b + c; }", 6),
+        ("fn main() -> i32 { let (a, _) = (5, 99); return a; }", 5),
+        ("fn main() -> i32 { let (a, b) = (10, 20); a = 30; return a + b; }", 50),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "let-destructure native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "let-destructure wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Math intrinsics on integer operands. `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving
+/// (`abs(-5): i32`): integer abs lowers to `select(x<0,-x,x)` and the roundings to the identity;
+/// `sqrt` and the transcendentals promote an int operand to `f32`. Previously these emitted float
+/// ops on an int SSA value — MIR the verifier rejected on native while the interpreter ran it lossily
+/// (a silent divergence). Pins native==interp at every `-O`, plus that float abs is unchanged.
+#[test]
+fn differential_int_math_intrinsics() {
+    let cases = [
+        ("fn main() -> i32 { return abs(-5); }", 5),
+        ("fn main() -> i32 { return abs(7); }", 7),
+        ("fn main() -> i32 { return abs(-2147483647); }", 2147483647),
+        // round/floor/ceil/trunc on integers are the identity.
+        ("fn main() -> i32 { return round(5) + floor(-9) + ceil(3) + trunc(8); }", 7),
+        // sqrt promotes the int operand to f32 (16 -> 16.0 -> 4.0 -> 4).
+        ("fn main() -> i32 { return sqrt(16) as i32; }", 4),
+        // float abs still works (the float path is unchanged).
+        ("fn main() -> i32 { return abs(-3.5) as i32; }", 3),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "int-math native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "int-math wrong value at -O{opt} for:\n{src}");
+        }
+    }
+    // i64 abs returns i64 (no precision loss, unlike the old via-f32 detour).
+    let src64 = "fn main() -> i64 { let x: i64 = -5000000000; return abs(x); }";
+    for opt in [0u8, 1, 2, 3] {
+        let n = jit(src64, opt).expect("jit");
+        let i = interp(src64, opt).expect("interp");
+        assert_eq!(n, i, "i64-abs native vs interp mismatch at -O{opt}");
+        assert_eq!(n.0, 5000000000i64, "i64-abs wrong value at -O{opt}");
+    }
+}
+
+/// `fmax`/`fmin` on integer *variables*. Like `sqrt`/`exp`/`pow`, they promote an int operand to
+/// `f32` (the float compare-and-select). Previously their lowering used a bare `lower_expr` (no
+/// coercion), so the float `Cmp(Fogt/Folt)` ran on an `i32` operand: MIR the verifier and Cranelift
+/// reject on native, while the interpreter computed an integer max and returned silently — a backend
+/// divergence on `fmax(int, int)`. Pins native==interp at every `-O`; the float forms are unchanged.
+#[test]
+fn differential_fmax_fmin_int() {
+    let cases = [
+        ("fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmax(a, b) as i32; }", 5),
+        ("fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmin(a, b) as i32; }", 3),
+        ("fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmax(a, b) as i32; }", 2),
+        ("fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmin(a, b) as i32; }", -7),
+        // float forms unchanged (the operands were already f32).
+        ("fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmax(a, b) as i32; }", 5),
+        ("fn main() -> i32 { let a: f32 = 5.0; let b: f32 = 3.0; return fmin(a, b) as i32; }", 3),
+        // an integer literal already coerced before; still does.
+        ("fn main() -> i32 { return fmax(5, 3) as i32; }", 5),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "fmax/fmin-int native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "fmax/fmin-int wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Richer `match` patterns: or-patterns `1 | 2 | 3`, half-open `lo..hi` and inclusive `lo..=hi`
+/// ranges, and enum-variant patterns `Color::Red` (compared by discriminant). Each lowers to a
+/// pure value test (an OR of equalities / a range conjunction / a discriminant equality), so native
+/// and interp agree at every `-O`. Also covers an or-pattern nested in a tuple field and a negative
+/// range bound.
+#[test]
+fn differential_match_patterns() {
+    const FIZZ: &str = "fn fizz(n: i32) -> i32 { return match n \
+        { 0 | 1 | 2 => 100, 3..10 => 200, 10..=20 => 300, _ => 400 }; } \
+        fn main() -> i32 { return fizz";
+    const NAME: &str = "enum Color { Red, Green, Blue } \
+        fn name(c: Color) -> i32 { return match c \
+        { Color::Red => 1, Color::Green => 2, Color::Blue => 3 }; } \
+        fn main() -> i32 { return name";
+    let cases = [
+        (format!("{FIZZ}(0); }}"), 100),
+        (format!("{FIZZ}(2); }}"), 100),
+        (format!("{FIZZ}(3); }}"), 200),
+        (format!("{FIZZ}(9); }}"), 200),
+        (format!("{FIZZ}(10); }}"), 300),
+        (format!("{FIZZ}(20); }}"), 300),
+        (format!("{FIZZ}(21); }}"), 400),
+        (format!("{FIZZ}(-5); }}"), 400),
+        (format!("{NAME}(Color::Red); }}"), 1),
+        (format!("{NAME}(Color::Green); }}"), 2),
+        (format!("{NAME}(Color::Blue); }}"), 3),
+        // an or-pattern nested in a tuple field.
+        ("fn main() -> i32 { return match (1, 7) { (0 | 1, y) => y, _ => 0 }; }".to_string(), 7),
+        // a negative range bound, signed comparison.
+        ("fn f(n: i32) -> i32 { return match n { -5..0 => 1, 0..=5 => 2, _ => 3 }; } \
+          fn main() -> i32 { return f(-3); }".to_string(), 1),
+    ];
+    for (src, want) in &cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "match-patterns native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, *want, "match-patterns wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Char-literal `match` patterns: a single char `'a'`, an inclusive char range `'0'..='9'`, and a
+/// char or-pattern `'x' | 'y' | 'z'`. A char decodes to its code point and matches by an integer
+/// equality / range test, so native and interp agree at every `-O`. The parser previously rejected a
+/// char literal in pattern position (E0206) even though char works in `let`/arithmetic/comparison.
+#[test]
+fn differential_char_patterns() {
+    const C: &str = "fn classify(d: char) -> i32 { return match d \
+        { 'a' => 1, 'b' => 2, '0'..='9' => 3, 'x' | 'y' | 'z' => 4, _ => 0 }; } \
+        fn main() -> i32 { return classify";
+    let cases = [
+        (format!("{C}('a'); }}"), 1),
+        (format!("{C}('b'); }}"), 2),
+        (format!("{C}('0'); }}"), 3),
+        (format!("{C}('9'); }}"), 3),
+        (format!("{C}('x'); }}"), 4),
+        (format!("{C}('z'); }}"), 4),
+        (format!("{C}('q'); }}"), 0),
+    ];
+    for (src, want) in &cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "char-pattern native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, *want, "char-pattern wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A 1-D `Tensor[..]` parameter fed to a recognized 1-D runtime kernel — streaming-elementwise
+/// (velem), a vmath activation, a reduction, and an `@parallel` reduction. A `Tensor` param binds to
+/// a slot holding the base pointer, so the recognizers must load the base out of the slot (as the
+/// regular index path and the GEMM path do) before GEPing. They used to GEP off the slot *address*,
+/// so the kernel read past it — the interpreter trapped while native segfaulted / returned wrong
+/// values, a backend divergence on a documented feature (only 2-D tensor params were ever tested).
+#[test]
+fn differential_tensor_1d_kernels() {
+    let cases = [
+        // velem: out[i] = a[i] * 3  -> 1*3 + 4*3 = 15
+        ("fn f(a: Tensor[f32,4], mut o: Tensor[f32,4]) { for i in 0..4 { o[i] = a[i] * 3.0; } } \
+          fn main() -> i32 { let a:[f32;4]=[1.0,2.0,3.0,4.0]; let o:[f32;4]=[0.0,0.0,0.0,0.0]; \
+          f(a, o); return (o[0] + o[3]) as i32; }", 15),
+        // vmath: out[i] = exp(a[i])  -> exp(0)*4 = 4
+        ("fn f(a: Tensor[f32,4], mut o: Tensor[f32,4]) { for i in 0..4 { o[i] = exp(a[i]); } } \
+          fn main() -> i32 { let a:[f32;4]=[0.0,0.0,0.0,0.0]; let o:[f32;4]=[0.0,0.0,0.0,0.0]; \
+          f(a, o); return (o[0] + o[1] + o[2] + o[3]) as i32; }", 4),
+        // reduction: sum -> 10
+        ("fn f(a: Tensor[f32,4]) -> f32 { let mut s:f32=0.0; for i in 0..4 { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;4]=[1.0,2.0,3.0,4.0]; return f(a) as i32; }", 10),
+        // @parallel reduction: sum of eight 1.0 -> 8
+        ("@parallel fn f(a: Tensor[f32,8]) -> f32 { let mut s:f32=0.0; for i in 0..8 { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;8]=[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]; return f(a) as i32; }", 8),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "tensor-1d-kernel native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "tensor-1d-kernel wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// `for i in 0..n` where the END bound is wider than the literal-`0` start (`i64`/`usize`). The
+/// counter must be driven by the wider of the two bound types: a literal `0` lowers to `i32`, so an
+/// `i64` end produced `cmp.i32 i32, i64` — verifier-invalid MIR that crashed the native backend
+/// while the interpreter trapped. Only the *scalar* loop hit it (an array loop vectorizes the
+/// counter away), so it's exercised over a `Tensor` param (vectorizer declines) plus the array
+/// variant, with both `i64` and `usize` bounds. Regression guard for the loop-counter widening.
+#[test]
+fn differential_loop_wide_bound() {
+    let cases = [
+        // Tensor param, i64 bound: sum of 1..=6 -> 21.
+        ("fn f(a: Tensor[f32,6], n: i64) -> f32 { let mut s:f32=0.0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;6]=[1.0,2.0,3.0,4.0,5.0,6.0]; return f(a, 6) as i32; }", 21),
+        // Tensor param, usize bound -> 21.
+        ("fn f(a: Tensor[f32,6], n: usize) -> f32 { let mut s:f32=0.0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;6]=[1.0,2.0,3.0,4.0,5.0,6.0]; return f(a, 6) as i32; }", 21),
+        // array param (vectorized counter path), i64 bound: sum of 1..=5 -> 15.
+        ("fn f(a: [f32;5], n: i64) -> f32 { let mut s:f32=0.0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[f32;5]=[1.0,2.0,3.0,4.0,5.0]; return f(a, 5) as i32; }", 15),
+        // integer reduction, i64 bound, over a Tensor[i32] param -> 6.
+        ("fn f(a: Tensor[i32,4], n: i64) -> i32 { let mut s:i32=0; for i in 0..n { s = s + a[i]; } return s; } \
+          fn main() -> i32 { let a:[i32;4]=[0,1,2,3]; return f(a, 4); }", 6),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "wide-bound loop native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "wide-bound loop wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A transcendental written INLINE inside an autovectorizable elementwise `for` loop (so the generic
+/// vectorizer — not the vmath recognizer — lifts the inlined polynomial to `<N x f32>`). This used to
+/// panic the interpreter: the polynomial's range-reduction has an internal `Cmp`/`Select`, and a
+/// scalar operand (e.g. the literal `1.0` in `1.0 + exp(-z)`) was not splatted to N lanes, so the
+/// vectorized `Op::Cmp` indexed past the 1-lane operand. Now scalars broadcast to N lanes and the
+/// whole thing is bit-exact on both backends. Covers the exact in-place-SiLU trigger, a `Cmp+Select`
+/// branch with an inline `exp`, and a couple of compound transcendentals. `want == -1` means assert
+/// only the native==interp differential (transcendental f32 result not worth pinning).
+#[test]
+fn differential_vectorized_inline_transcendental() {
+    let cases: [(&str, i64); 5] = [
+        // The exact documented trigger: in-place SiLU with a scalar `1.0` operand. silu(0.1)*1000 = 52.
+        ("fn main() -> i32 { let g:[f32;8]=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]; \
+          for i in 0..8 { let z = g[i]; g[i] = z / (1.0 + exp(0.0 - z)); } return (g[0]*1000.0) as i32; }", 52),
+        // inline exp in a compound (vmath declines) form, x=0 → exp(0)*2 = 2.
+        ("fn main() -> i32 { let a:[f32;8]=[0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7]; \
+          let b:[f32;8]=[2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0]; let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { o[i] = exp(a[i]) * b[i]; } return (o[0]) as i32; }", 2),
+        // sigmoid inline, x=0 → sigmoid(0)*2 = 1.
+        ("fn main() -> i32 { let a:[f32;8]=[0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7]; \
+          let b:[f32;8]=[2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0]; let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { o[i] = sigmoid(a[i]) * b[i]; } return (o[0]) as i32; }", 1),
+        // a vectorized Cmp+Select with an inline exp on the true branch. a[0]=0.2 ≤ 0.3 → 0.2*100 = 20.
+        ("fn main() -> i32 { let a:[f32;8]=[0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]; \
+          let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { if a[i] > 0.3 { o[i] = exp(a[i]); } else { o[i] = a[i] * 100.0; } } return (o[0]*1.0) as i32; }", 20),
+        // sin+cos compound with a nonzero input (exercises range reduction); differential-only.
+        ("fn main() -> i32 { let a:[f32;8]=[0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]; \
+          let o:[f32;8]=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]; \
+          for i in 0..8 { o[i] = sin(a[i]) + cos(a[i]); } return (o[0]*100.0) as i32; }", -1),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "inline-transcendental native vs interp mismatch at -O{opt} for:\n{src}");
+            if want >= 0 {
+                assert_eq!(n.0, want, "inline-transcendental wrong value at -O{opt} for:\n{src}");
+            }
+        }
+    }
+}
+
+/// An EXHAUSTIVE `match` with no `_` catch-all (every enum variant / both bool cases). Each arm is a
+/// conditional discriminant test, so mir_build emits the "no arm matched" fallthrough block
+/// structurally — but it is dynamically dead and now terminates in `Unreachable` (was a zero default).
+/// Pins that the dead block stays well-typed at every opt level and both backends agree. Companion to
+/// the E0405 sema rejection of *non*-exhaustive value matches (a compile-fail, covered by tests/fail).
+#[test]
+fn differential_match_exhaustiveness() {
+    let cases = [
+        // exhaustive enum, no `_`: rank(Blue) = 3.
+        ("enum Color { Red, Green, Blue } \
+          fn rank(c: Color) -> i32 { return match c { Color::Red => 1, Color::Green => 2, Color::Blue => 3 }; } \
+          fn main() -> i32 { return rank(Color::Blue); }", 3),
+        // exhaustive enum, first variant: rank(Red) = 1.
+        ("enum Color { Red, Green, Blue } \
+          fn rank(c: Color) -> i32 { return match c { Color::Red => 1, Color::Green => 2, Color::Blue => 3 }; } \
+          fn main() -> i32 { return rank(Color::Red); }", 1),
+        // exhaustive bool, no `_`: pick(false) = 20.
+        ("fn pick(b: bool) -> i32 { return match b { true => 10, false => 20 }; } \
+          fn main() -> i32 { return pick(false); }", 20),
+        // an enum match folded into an arithmetic expression (the dead fallthrough is still emitted).
+        ("enum Dir { N, S } fn dval(d: Dir) -> i32 { return match d { Dir::N => 1, Dir::S => -1 }; } \
+          fn main() -> i32 { return dval(Dir::N) * 7 + dval(Dir::S); }", 6),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "exhaustive-match native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "exhaustive-match wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Casting a numeric value to `bool` is C-like truthiness (`x != 0`), not a low-bit truncation: `2
+/// as bool` used to be `false` (low bit 0) while `if 2` is `true`. Now both compare `!= 0`. Lowered
+/// to an `Op::Cmp`, so both backends run it identically. Pins nonzero→true, zero→false, NaN/float→0,
+/// and the bool→int direction (regression).
+#[test]
+fn differential_cast_to_bool() {
+    let cases = [
+        ("fn main() -> i32 { let x: i32 = 0; return (x as bool) as i32; }", 0),
+        ("fn main() -> i32 { let x: i32 = 2; return (x as bool) as i32; }", 1), // was 0 under truncation
+        ("fn main() -> i32 { let x: i32 = 255; return (x as bool) as i32; }", 1),
+        ("fn main() -> i32 { let x: i32 = 0 - 4; return (x as bool) as i32; }", 1), // negative is nonzero
+        ("fn main() -> i32 { let x: f32 = 0.5; return (x as bool) as i32; }", 1),
+        ("fn main() -> i32 { let x: f32 = 0.0; return (x as bool) as i32; }", 0),
+        // the cast now agrees with the condition path on the same value.
+        ("fn main() -> i32 { let x: i32 = 2; if (x as bool) { return 7; } else { return 0; } }", 7),
+        // regression: bool -> int is unchanged.
+        ("fn main() -> i32 { let b: bool = true; return (b as i32) + 10; }", 11),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "cast-to-bool native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "cast-to-bool wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Bitwise complement `~x`. The parser now accepts `~` (previously E0202 "found ~") as a prefix
+/// operator aliased to `UnOp::Not` — bitwise on an integer, logical on a `bool` (masked to width).
+/// Both backends share `Op::Not`, so it is bit-exact; pins the values and that `!`/`~` agree.
+#[test]
+fn differential_bitwise_not() {
+    let cases = [
+        ("fn main() -> i32 { let x: i32 = 5; return ~x; }", -6),
+        ("fn main() -> i32 { let x: i32 = 0; return ~x; }", -1),
+        // De Morgan: ~(a & b) == (~a) | (~b).
+        ("fn main() -> i32 { let a: i32 = 12; let b: i32 = 10; \
+          if ~(a & b) == (~a) | (~b) { return 1; } else { return 0; } }", 1),
+        // width masking: ~5 as u8 = 0xFA = 250.
+        ("fn main() -> i32 { let x: u8 = 5; let y: u8 = ~x; return y as i32; }", 250),
+        // composed with arithmetic: ~3 + 10 = -4 + 10 = 6.
+        ("fn main() -> i32 { let x: i32 = 3; return ~x + 10; }", 6),
+        // `~` and `!` are the same op on an integer.
+        ("fn main() -> i32 { let x: i32 = 42; if ~x == !x { return 7; } else { return 0; } }", 7),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "bitwise-not native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "bitwise-not wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// An unsuffixed integer literal that overflows i32 must keep its value, not silently wrap to its
+/// low 32 bits. `9000000000` used to default to i32 and bake a `const.i32` (= 410065408) into the
+/// shared MIR, so BOTH backends agreed on the wrong value — the interp-vs-native gate was blind to
+/// it. The default now widens to i64 when the value does not fit i32. Asserted via *stdout* (the i64
+/// exit code is i32-narrow): the printed value distinguishes the true value from the old wrap.
+#[test]
+fn differential_int_literal_widening() {
+    let cases = [
+        // return position: `return 9000000000` from `-> i64`.
+        ("fn f() -> i64 { return 9000000000; } fn main() -> i32 { print(f()); return 0; }", "9000000000\n"),
+        // bare literal, type inferred (no annotation) -> i64, not a truncated i32.
+        ("fn main() -> i32 { let x = 9000000000; print(x); return 0; }", "9000000000\n"),
+        // cast operand: the literal is i64 *before* the (no-op) cast, not an i32 wrap widened after.
+        ("fn main() -> i32 { let x = 9000000000 as i64; print(x); return 0; }", "9000000000\n"),
+        // struct-field init of a wider field.
+        ("struct B { v: i64 } fn main() -> i32 { let b = B { v: 12345678901 }; print(b.v); return 0; }", "12345678901\n"),
+        // assignment to a wider field.
+        ("struct B { v: i64 } fn main() -> i32 { let mut b = B { v: 0 }; b.v = 12345678901; print(b.v); return 0; }", "12345678901\n"),
+        // unsigned return: an i64-typed literal reinterpreted as u64 (same width, positive) — the old
+        // path truncated to i32 then sign-extended, printing 18446744072414584320.
+        ("fn f() -> u64 { return 3000000000; } fn main() -> i32 { print(f()); return 0; }", "3000000000\n"),
+        // a value that fits i32 is unaffected (stays i32).
+        ("fn main() -> i32 { let x = 5; print(x); return 0; }", "5\n"),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "int-literal-widening native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(
+                String::from_utf8_lossy(&n.1),
+                want,
+                "int-literal-widening wrong value at -O{opt} for:\n{src}"
+            );
+        }
+    }
+}
+
+/// An array / tuple literal adapts its elements to a matching aggregate annotation, so a typed buffer
+/// can be built straight from literals (`let a: [i8; 2] = [127, 0]`). Before, each was rejected as an
+/// `[i32; 2]` / `(i32, i32)` mismatch (E0401); now the annotation's element type is threaded into each
+/// element (recursively, through nested aggregates), so the elements lower at the right width and
+/// out-of-range elements are range-checked. native ≡ interp at every opt level.
+#[test]
+fn differential_aggregate_literal_adapt() {
+    let cases = [
+        // narrow element type.
+        ("fn main() -> i32 { let xs: [i8; 2] = [127, 0]; return xs[0] as i32; }", 127),
+        // negative element literal (peels the unary minus).
+        ("fn main() -> i32 { let xs: [i8; 2] = [-56, 5]; return xs[0] as i32; }", -56),
+        // tuple element adaptation.
+        ("fn main() -> i32 { let t: (u8, u8) = (200, 1); return t.0 as i32; }", 200),
+        // array-repeat adaptation.
+        ("fn main() -> i32 { let a: [i8; 3] = [5; 3]; return (a[0] + a[1] + a[2]) as i32; }", 15),
+        // wide element type: no truncation (9000000000 / 1e9 = 9).
+        ("fn main() -> i32 { let a: [i64; 2] = [9000000000, 0]; return (a[0] / 1000000000) as i32; }", 9),
+        // nested: array of tuples.
+        ("fn main() -> i32 { let a: [(i8, i8); 2] = [(1, 2), (3, 4)]; return (a[1].0 + a[1].1) as i32; }", 7),
+        // nested: array of structs with a narrow field.
+        ("struct S { x: i8 } fn main() -> i32 { let a: [S; 2] = [S { x: 100 }, S { x: 27 }]; return (a[0].x + a[1].x) as i32; }", 127),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "aggregate-literal native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "aggregate-literal wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A top-level `const` used as an array length resolves to its value. Both sema's `eval_usize` and
+/// mir_build's `const_usize_expr` were integer-literal-only, silently sizing the slot to 0 (a
+/// zero-length array, then a spurious E0501). They now both resolve a single-segment path naming a
+/// `const` to its checked initializer, MIRRORED exactly so the alloca'd length agrees with sema's
+/// index-bounds checks (a disagreement would re-introduce an interp/native slot-size divergence).
+/// Guards a plain const, a const-references-const chain, an array-repeat count, a struct field, and
+/// order-independence (consts are populated in `collect`, before any body is checked).
+#[test]
+fn differential_const_array_length() {
+    let cases = [
+        // plain const length: a[0] + a[3] = 10 + 40.
+        ("const N: usize = 4; fn main() -> i32 { let a: [i32; N] = [10, 20, 30, 40]; return a[0] + a[3]; }", 50),
+        // const-references-const chain: C = B = A = 2.
+        ("const A: usize = 2; const B: usize = A; const C: usize = B; \
+          fn main() -> i32 { let c: [i32; C] = [7, 8]; return c[0] + c[1]; }", 15),
+        // array-repeat count via const: [3; N] with N = 4 -> a[0] + a[3] = 6.
+        ("const N: usize = 4; fn main() -> i32 { let a: [i32; N] = [3; N]; return a[0] + a[3]; }", 6),
+        // struct field const-length array.
+        ("const K: usize = 3; struct Buf { data: [i32; K] } \
+          fn main() -> i32 { let b = Buf { data: [10, 20, 30] }; return b.data[2]; }", 30),
+        // const defined AFTER use (order-independent).
+        ("fn main() -> i32 { let a: [i32; M] = [1, 2, 3, 4, 5]; return a[4]; } const M: usize = 5;", 5),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "const-array-length native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "const-array-length wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// `char` is a usable type: a char literal types as `char`, the `char` annotation resolves to the
+/// same scalar (so `let c: char = 'A'` checks), and char <-> int casts are valid both ways. char
+/// lowers to a 32-bit int in MIR, so the interpreter and native backend agree bit-for-bit.
+#[test]
+fn differential_char_type() {
+    let cases = [
+        // char literal annotated, cast to int.
+        ("fn main() -> i32 { let c: char = 'A'; return c as i32; }", 65),
+        // int -> char -> int.
+        ("fn main() -> i32 { let d: char = 66 as char; return d as i32; }", 66),
+        // ordered comparison on char (not bool — must NOT be rejected).
+        ("fn main() -> i32 { let a: char = 'a'; let b: char = 'b'; if a < b { return 1; } return 0; }", 1),
+        // char as a struct field.
+        ("struct G { code: char } fn main() -> i32 { let g = G { code: 'Z' }; return g.code as i32; }", 90),
+        // char arithmetic: 'z' - 'a' = 25.
+        ("fn main() -> i32 { return ('z' as i32) - ('a' as i32); }", 25),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "char native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "char wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A binary arithmetic/bitwise expression of constant literals adapts to a wider annotated scalar
+/// type (`let v: i64 = 0 - 16`), like the unary-minus and bare-literal forms. Both operands are
+/// retyped to the annotation so the whole expression is lowered at one width — ill-typed MIR (i32
+/// operands, i64 result) would otherwise diverge / be rejected. Only all-constant expressions adapt.
+#[test]
+fn differential_binary_const_adapt() {
+    let cases = [
+        // binary const adapts to i64 (was an i32-vs-i64 mismatch); -16.
+        ("fn main() -> i32 { let v: i64 = 0 - 16; return v as i32; }", -16),
+        // multiply + add fold, wide target: 1_000_001 / 1000 = 1000.
+        ("fn main() -> i32 { let v: i64 = 1000 * 1000 + 1; return (v / 1000) as i32; }", 1000),
+        // float binary adapts to f64: (1.5 - 0.5) * 10 = 10.
+        ("fn main() -> i32 { let v: f64 = 1.5 - 0.5; return (v * 10.0) as i32; }", 10),
+        // bitwise const adapts: 0xF0 | 0x0F = 255.
+        ("fn main() -> i32 { let v: i64 = 0xF0 | 0x0F; return v as i32; }", 255),
+        // nested binary, all literals: 3 + 2*2 = 7.
+        ("fn main() -> i32 { let v: i64 = 3 + 2 * 2; return v as i32; }", 7),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "binary-const-adapt native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "binary-const-adapt wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// An unsuffixed integer literal in `(i64::MAX, u64::MAX]` defaults to `u64`, not `i32`. It used to
+/// default to i32 in a cast-source / bare-expression position and TRUNCATE to its low 32 bits — a
+/// gate-blind silent miscompile (both backends baked the same `const.i32`). The annotated path
+/// (`let x: u64 = ...`) was already correct; mir_build's `parse_int` already uses i128, so only the
+/// scalar width was wrong. Verifies the cast path now matches the annotated path, bit-for-bit.
+#[test]
+fn differential_u64_range_literal() {
+    let cases = [
+        // u64-range literal in a cast source must not truncate: 2^63 / 1e18 = 9.
+        ("fn main() -> i32 { return (9223372036854775808 as u64 / 1000000000000000000 as u64) as i32; }", 9),
+        // cast path == annotated path (both 2^63): difference 0.
+        ("fn main() -> i32 { let x: u64 = 9223372036854775808; return ((9223372036854775808 as u64) - x) as i32; }", 0),
+        // u64::MAX low byte via bitand = 255.
+        ("fn main() -> i32 { return (18446744073709551615 as u64 & 255 as u64) as i32; }", 255),
+        // bare u64-range literals (no cast), magnitude-typed u64: 1e19 - (1e19 - 10) = 10.
+        ("fn main() -> i32 { return (10000000000000000000 as u64 - 9999999999999999990 as u64) as i32; }", 10),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "u64-range-literal native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "u64-range-literal wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Field / element access through an EXPLICIT pointer deref — `(*p).field`, `(*p)[i]`, `(*p).0`,
+/// `&mut (*p).field`. The base `*p` was lowered as a *value* (a `Load` of the whole aggregate), and
+/// GEPing a field off the loaded buffer is invalid MIR (`gep base [N x i8]`): interp and native-O{1,2,3}
+/// all errored on it, but native-O0 codegen'd the wild gep into a SIGSEGV. The base is now lowered as a
+/// place (the pointer), so the explicit spelling lowers like the implicit auto-deref `p.field`. Also
+/// guards the already-working `*p = Struct{..}` whole-store and `**pp` double-deref against regression.
+#[test]
+fn differential_deref_field_access() {
+    let cases = [
+        // (*p).field read: 7 + 5 = 12.
+        ("struct S { a: i32, b: i32 } fn rd(p: *mut S) -> i32 { return (*p).a + (*p).b; } \
+          fn main() -> i32 { let mut s: S = S { a: 7, b: 5 }; return rd(&mut s); }", 12),
+        // (*p).field write: set to 99.
+        ("struct S { a: i32 } fn wr(p: *mut S) { (*p).a = 99; } \
+          fn main() -> i32 { let mut s: S = S { a: 1 }; wr(&mut s); return s.a; }", 99),
+        // (*p)[i] on a *mut array: xs[2] = 30.
+        ("fn el(p: *mut [i32; 4]) -> i32 { return (*p)[2]; } \
+          fn main() -> i32 { let mut xs: [i32; 4] = [10, 20, 30, 40]; return el(&mut xs); }", 30),
+        // &mut (*p).field, written through the borrow: 42.
+        ("struct S { a: i32 } fn bump(p: *mut S) { let q = &mut (*p).a; *q = 42; } \
+          fn main() -> i32 { let mut s: S = S { a: 0 }; bump(&mut s); return s.a; }", 42),
+        // explicit deref of a tuple pointer: (*p).0 = 5.
+        ("fn first(p: *mut (i32, i32)) -> i32 { return (*p).0; } \
+          fn main() -> i32 { let mut t: (i32, i32) = (5, 6); return first(&mut t); }", 5),
+        // regression: whole-struct store through a pointer still works.
+        ("struct S { a: i32, b: i32 } fn set(p: *mut S) { *p = S { a: 3, b: 4 }; } \
+          fn main() -> i32 { let mut s: S = S { a: 0, b: 0 }; set(&mut s); return s.a * 10 + s.b; }", 34),
+        // regression: scalar double-deref still works.
+        ("fn rd(pp: *mut *mut i32) -> i32 { return **pp; } \
+          fn main() -> i32 { let mut x: i32 = 77; let mut p: *mut i32 = &mut x; return rd(&mut p); }", 77),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "deref-field-access native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "deref-field-access wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// An `if`/`match` used as a VALUE whose result is an aggregate (tuple/struct). The value flows
+/// through the control-flow merge block as the aggregate's base POINTER, so the merge param must be
+/// typed `Ptr`, not the byte-buffer `Array` type. It used to be typed `Array`, which the arm's pointer
+/// arg matched only under the interpreter's loose -O0 typing — `mem2reg`'s verifier rejected it, so
+/// these compiled at -O0 but panicked at -O2/-O3. Pins that the merge param is now `Ptr` at every level
+/// on both backends.
+#[test]
+fn differential_aggregate_value_merge() {
+    let cases = [
+        // if → tuple, then-arm taken: (1,2) -> 1+2 = 3.
+        ("fn main() -> i32 { let c = true; let t = if c { (1, 2) } else { (3, 4) }; return t.0 + t.1; }", 3),
+        // if → tuple, else-arm taken: (3,4) -> 3*4 = 12.
+        ("fn main() -> i32 { let c = false; let t = if c { (1, 2) } else { (3, 4) }; return t.0 * t.1; }", 12),
+        // match → tuple (exhaustive enum): pair(C) = (2,3) -> 2*3 = 6.
+        ("enum Op { A, B, C } fn pair(o: Op) -> (i32, i32) { return match o { Op::A => (1, 2), Op::B => (3, 1), Op::C => (2, 3) }; } \
+          fn main() -> i32 { let m = pair(Op::C); return m.0 * m.1; }", 6),
+        // if → struct, else-arm taken: P{5,7} -> 5+7 = 12.
+        ("struct P { x: i32, y: i32 } \
+          fn main() -> i32 { let c = false; let p = if c { P { x: 1, y: 2 } } else { P { x: 5, y: 7 } }; return p.x + p.y; }", 12),
+        // match → struct used in arithmetic (the dead fallthrough is an aggregate merge param).
+        ("struct V { a: i32, b: i32 } enum K { L, R } \
+          fn mk(k: K) -> V { return match k { K::L => V { a: 2, b: 3 }, K::R => V { a: 4, b: 5 } }; } \
+          fn main() -> i32 { let v = mk(K::R); return v.a * 10 + v.b; }", 45),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "aggregate-value-merge native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "aggregate-value-merge wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Tuple-scrutinee `match`: each field's sub-pattern is tested (literals compare, `_`/identifiers
+/// match anything, nested tuples recurse) and identifier sub-patterns bind to the tuple's fields.
+/// Regression guard — a tuple pattern was previously treated as always-matching, a *silent*
+/// miscompile both backends shared (so the differential gate couldn't catch it). Pins the real
+/// per-field semantics, including a binding arm, a tuple-pattern guard, a nested pattern, and bools.
+#[test]
+fn differential_tuple_match() {
+    const F: &str = "fn f(a: i32, b: i32) -> i32 { return match (a, b) \
+        { (0, 0) => 1, (0, _) => 2, (x, y) => x + y }; } fn main() -> i32 { return f";
+    const N: &str = "fn f(a: i32, b: i32, c: i32) -> i32 { return match ((a, b), c) \
+        { ((0, 0), 0) => 1, ((0, y), _) => y, ((x, _), z) => x + z }; } fn main() -> i32 { return f";
+    let cases = [
+        (format!("{F}(0, 0); }}"), 1),
+        (format!("{F}(0, 5); }}"), 2),
+        (format!("{F}(7, 3); }}"), 10),
+        (format!("{F}(4, 0); }}"), 4),
+        (format!("{N}(0, 9, 1); }}"), 9),
+        (format!("{N}(3, 4, 5); }}"), 8),
+        // a tuple-pattern guard (the binding precedes the guard, so the guard reads it).
+        ("fn f(a: i32, b: i32) -> i32 { return match (a, b) { (x, y) if x > y => 1, _ => 0 }; } \
+          fn main() -> i32 { return f(5, 2); }".to_string(), 1),
+        ("fn f(a: i32, b: i32) -> i32 { return match (a, b) { (x, y) if x > y => 1, _ => 0 }; } \
+          fn main() -> i32 { return f(2, 5); }".to_string(), 0),
+        // bool fields.
+        ("fn f(a: bool, b: bool) -> i32 { return match (a, b) { (true, _) => 1, (_, true) => 2, _ => 3 }; } \
+          fn main() -> i32 { return f(false, true); }".to_string(), 2),
+    ];
+    for (src, want) in &cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "tuple-match native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, *want, "tuple-match wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Char literals lower to their Unicode scalar value (sema types a char as `u32`, which MIR carries
+/// as `i32`). Covers ASCII, the one-character escapes, `\xHH` hex, `\u{…}` Unicode, ordering, and
+/// arithmetic. The value is a compile-time constant, so native == interp at every `-O`.
+#[test]
+fn differential_char_literals() {
+    let cases = [
+        ("fn main() -> i32 { return 'A' as i32; }", 65),
+        ("fn main() -> i32 { return '0' as i32; }", 48),
+        ("fn main() -> i32 { return '\\n' as i32; }", 10),
+        ("fn main() -> i32 { return '\\t' as i32; }", 9),
+        ("fn main() -> i32 { return '\\\\' as i32; }", 92),
+        ("fn main() -> i32 { return '\\'' as i32; }", 39),
+        ("fn main() -> i32 { return '\\0' as i32; }", 0),
+        ("fn main() -> i32 { return '\\x41' as i32; }", 65),
+        ("fn main() -> i32 { return '\\u{1F600}' as i32; }", 128512),
+        ("fn main() -> i32 { let z = 'Z'; return z as i32; }", 90),
+        ("fn main() -> i32 { if 'a' < 'b' { return 1; } return 0; }", 1),
+        ("fn main() -> i32 { return ('z' as i32) - ('a' as i32); }", 25),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "char native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "char wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A `*u8` string argument to `print`/`println` renders its bytes; native (`rt_print_str` over the
+/// materialized NUL-terminated buffer) must produce byte-identical stdout to the interpreter (which
+/// walks its slot memory). Covers a literal argument, a `let`-bound string, the `\t`/`\n`/`\\`/`\"`
+/// escapes, an empty string, a multi-byte `\u{…}`, and strings interleaved with numeric prints (so
+/// the type-directed dispatch is exercised both ways). `assert_eq!(n, i)` compares exit code AND the
+/// whole stdout buffer.
+#[test]
+fn differential_string_literals() {
+    let programs = [
+        "fn main() -> i32 { println(\"hello\"); return 0; }",
+        // a let-bound string, then printed
+        "fn main() -> i32 { let s = \"world\"; print(s); return 0; }",
+        // escapes: tab, newline-in-string, backslash, quote
+        "fn main() -> i32 { print(\"a\\tb\"); print(\"x\\\\y\"); print(\"q\\\"r\"); return 0; }",
+        // empty string prints just a newline
+        "fn main() -> i32 { print(\"\"); print(\"after\"); return 0; }",
+        // multi-byte UTF-8 via \u{…}
+        "fn main() -> i32 { println(\"caf\\u{e9}\"); return 0; }",
+        // interleave string and numeric prints — type-directed dispatch both ways
+        "fn main() -> i32 { print(\"n=\"); print(42); print(\"done\"); return 0; }",
+        // a string returned through a helper that takes/returns *u8
+        "fn id(p: *u8) -> *u8 { return p; } \
+         fn main() -> i32 { print(id(\"piped\")); return 0; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "string native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// A `return`/tail value must be coerced to the function's declared return type, or `fn f() -> i64
+/// { return 0; }` emits a `Ret` of the `i32` literal `0` from an `i64` function — MIR the native
+/// verifier and `mem2reg` reject (a panic / exit-1 at -O2 and natively) while the interpreter
+/// silently runs it. Both the explicit `return` and the implicit tail are covered; native must agree
+/// with interp at every opt level (the previous corpus only ever returned type-matched literals).
+#[test]
+fn differential_return_type_coercion() {
+    let cases = [
+        // int literal from a wider return type (stays 0).
+        ("fn f() -> i64 { return 0; } fn main() -> i64 { return f(); }", 0i64),
+        // implicit tail value coerced to the return type.
+        ("fn g() -> i64 { 5 } fn main() -> i64 { return g(); }", 5),
+        // negative i32 literal sign-extends to i64.
+        (
+            "fn n() -> i64 { return 0 - 1; } fn main() -> i64 { return n(); }",
+            -1,
+        ),
+        // float literal promotes f32 -> f64 (1.5 is exact), then *4 = 6.
+        (
+            "fn h() -> f64 { return 1.5; } fn main() -> i64 { return (h() * 4.0) as i64; }",
+            6,
+        ),
+        // narrow (u8) return type.
+        ("fn b() -> u8 { return 5; } fn main() -> i64 { return b() as i64; }", 5),
+        // a recursive i64 function whose base case is `return 0;` (the field pattern the hunt hit).
+        (
+            "fn sum(n: i32) -> i64 { if n <= 0 { return 0; } return (n as i64) + sum(n - 1); } \
+             fn main() -> i64 { return sum(5); }",
+            15,
+        ),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "return-coercion native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "return-coercion wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Constant folding must stay at f32 precision for an f32 chain. Folding in f64 (and only narrowing
+/// at the final store) makes `-O2` disagree with `-O0` — `(2^24 + 1) - 2^24` is `0` in f32 but `1`
+/// in f64, and `0.1 + 0.2 == 0.3` is true in f32 but false in f64. Each (backend, opt) pair must
+/// agree AND equal the f32-correct value, which also pins `-O0 == -O2`.
+#[test]
+fn differential_f32_const_fold() {
+    let cases = [
+        (
+            "fn main() -> i32 { let b: f32 = 16777216.0; let r: f32 = (b + 1.0) - b; return r as i32; }",
+            0i64,
+        ),
+        (
+            "fn main() -> i32 { if 0.1 + 0.2 == 0.3 { return 1; } return 0; }",
+            1,
+        ),
+        (
+            "fn main() -> i64 { let m: f32 = (0.1 + 0.2) * 100000000.0; return m as i64; }",
+            30000002,
+        ),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "f32-fold native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "f32-fold wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Integer → `f32` conversion must round in a single IEEE step. The interpreter used to go int→f64→
+/// f32 (two roundings) while native does one `fcvt_from_{sint,uint}(F32)`, so they disagreed for
+/// magnitudes above 2^53 — the differential oracle was silently wrong. Pin both to the correctly
+/// rounded value (`9007199791611905 as f32 == 9007200328482816`), for signed and unsigned sources.
+#[test]
+fn differential_int_to_f32_rounding() {
+    let cases = [
+        // 2^53 + 2^29 + 1, just past where f32 (and the double-round) diverge.
+        ("fn main() -> i64 { let n: i64 = 9007199791611905; let f: f32 = n as f32; return f as i64; }",
+         9007200328482816i64),
+        ("fn main() -> i64 { let n: u64 = 9007199791611905; let f: f32 = n as f32; return f as i64; }",
+         9007200328482816),
+        // a small value is exact and unchanged.
+        ("fn main() -> i64 { let n: i64 = 1234567; let f: f32 = n as f32; return f as i64; }",
+         1234567),
+    ];
+    for (src, want) in cases {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "int->f32 native vs interp mismatch at -O{opt} for:\n{src}");
+            assert_eq!(n.0, want, "int->f32 wrong value at -O{opt} for:\n{src}");
+        }
+    }
+}
+
+/// Pointers/references: `&mut x` takes an address, `*p` loads/stores through it, and a pointer
+/// threads through a function call. An address-taken local must stay in memory (mem2reg refuses to
+/// promote a slot whose address escapes), so native == interp at every `-O`. Also pins the
+/// cast-precedence fix: `*p as T` is `(*p) as T`, not `*(p as T)`.
+#[test]
+fn differential_pointer() {
+    let programs = [
+        // &mut + store through pointer + read back.
+        "fn main() -> i32 { let mut x: i32 = 3; let p: *mut i32 = &mut x; *p = 7; return *p; }",
+        // pointer threaded through a call mutates the caller's local.
+        "fn setit(p: *mut i32, v: i32) { *p = v; } \
+         fn main() -> i32 { let mut n: i32 = 0; setit(&mut n, 99); return n; }",
+        // f32 through a pointer + the cast-precedence case `(*pf) as i32`.
+        "fn main() -> i32 { let mut x: f32 = 3.0; let pf: *mut f32 = &mut x; *pf = 7.5; \
+         print(*pf as i32); return (*pf as i32) - 7; }",
+    ];
+    for src in programs {
+        for opt in [0u8, 1, 2, 3] {
+            let n = jit(src, opt).expect("jit");
+            let i = interp(src, opt).expect("interp");
+            assert_eq!(n, i, "pointer native vs interp mismatch at -O{opt} for:\n{src}");
+        }
+    }
+}
+
 /// Float kernels must agree too: the interpreter computes `f32` ops in `f32`, so its printed
 /// results are bit-identical to native (including division, which would otherwise double-round).
 #[test]
@@ -258,6 +1687,12 @@ fn differential_transcendentals() {
          let mut ys: [f32; 16] = [0.0; 16]; for i in 0..16 { ys[i] = pow(xs[i], 2.0); } \
          print((ys[3] * 100.0) as i32); print((ys[15] * 100.0) as i32); \
          print((pow(2.0, 20.0) + 0.5) as i32); return 0; }",
+        // GLU 2-array gate `out[j] = x[j] * sigmoid(g[j])` (distinct arrays) -> VM2_SIGMOID_GATE:
+        // native and interp both marshal the identical mercury_vmath2_f32 kernel, so they must agree.
+        "fn main() -> i32 { let mut x: [f32; 32] = [0.0; 32]; let mut g: [f32; 32] = [0.0; 32]; \
+         for i in 0..32 { x[i] = (i as f32) * 0.5 - 8.0; g[i] = (i as f32) * 0.25 - 4.0; } \
+         let mut o: [f32; 32] = [0.0; 32]; for j in 0..32 { o[j] = x[j] * sigmoid(g[j]); } \
+         print((o[3] * 1000.0) as i32); print((o[20] * 1000.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {
@@ -348,7 +1783,7 @@ fn differential_vmath_dispatch() {
 /// per-element result). Exercised for gelu (a fused activation) at a size that spans many chunks.
 #[test]
 fn differential_parallel_vmath() {
-    let src = "@parallel fn act(x: [f32; 4096], out: [f32; 4096]) { \
+    let src = "@parallel fn act(x: [f32; 4096], mut out: [f32; 4096]) { \
          for i in 0..4096 { out[i] = gelu(x[i]); } } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 4096] = [0.0; 4096]; \
@@ -370,7 +1805,7 @@ fn differential_parallel_vmath() {
 fn differential_i8gemm() {
     let body = |attr: &str| {
         format!(
-            "{attr}fn lin(a: [u8; 160], b: [i8; 160], c: [i32; 16]) {{ \
+            "{attr}fn lin(a: [u8; 160], b: [i8; 160], mut c: [i32; 16]) {{ \
              for i in 0..4 {{ for j in 0..4 {{ let mut s: i32 = 0; \
              for k in 0..40 {{ s = s + (a[i * 40 + k] as i32) * (b[j * 40 + k] as i32); }} \
              c[i * 4 + j] = s; }} }} }} \
@@ -403,7 +1838,7 @@ fn differential_i8gemm() {
 fn i8_linear_nest_lowers_to_i8gemm() {
     let lin = |attr: &str| {
         format!(
-            "module m\n{attr}fn lin(a:[u8;160],b:[i8;160],c:[i32;16]) {{ \
+            "module m\n{attr}fn lin(a:[u8;160],b:[i8;160],mut c:[i32;16]) {{ \
              for i in 0..4 {{ for j in 0..4 {{ let mut s: i32 = 0; \
              for k in 0..40 {{ s = s + (a[i*40+k] as i32) * (b[j*40+k] as i32); }} \
              c[i*4+j] = s; }} }} }}"
@@ -419,7 +1854,7 @@ fn i8_linear_nest_lowers_to_i8gemm() {
     );
     // Signedness mismatch (A is i8, not u8): the kernel's zero/sign-extend split would miscompile, so
     // the recognizer must bail and never emit either int8 kernel symbol.
-    let signed = "module m\nfn lin(a:[i8;160],b:[i8;160],c:[i32;16]) { \
+    let signed = "module m\nfn lin(a:[i8;160],b:[i8;160],mut c:[i32;16]) { \
         for i in 0..4 { for j in 0..4 { let mut s: i32 = 0; \
         for k in 0..40 { s = s + (a[i*40+k] as i32) * (b[j*40+k] as i32); } \
         c[i*4+j] = s; } } }";
@@ -441,7 +1876,7 @@ fn i8_linear_nest_lowers_to_i8gemm() {
 #[test]
 fn differential_embedding() {
     // Small serial gather: T=4, V=4, H=3, ids hitting row 0, the last row, and a repeat.
-    let serial = "fn embed(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) { \
+    let serial = "fn embed(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) { \
          for t in 0..4 { for d in 0..3 { out[t * 3 + d] = weight[ids[t] * 3 + d]; } } } \
          fn main() -> i32 { let weight: [f32; 12] = [0.0,1.0,2.0,10.0,11.0,12.0,\
          20.0,21.0,22.0,30.0,31.0,32.0]; let ids: [i32; 4] = [2,0,3,0]; \
@@ -450,7 +1885,7 @@ fn differential_embedding() {
          print(acc); print(out[0]); print(out[11]); return 0; }"
         .to_string();
     // Large @parallel gather: T=80 (> EMBEDDING_PAR_MIN=64, so the multicore split runs), V=8, H=4.
-    let parallel = "@parallel\nfn embed(ids: [i32; 80], weight: [f32; 32], out: [f32; 320]) { \
+    let parallel = "@parallel\nfn embed(ids: [i32; 80], weight: [f32; 32], mut out: [f32; 320]) { \
          for t in 0..80 { for d in 0..4 { out[t * 4 + d] = weight[ids[t] * 4 + d]; } } } \
          fn main() -> i32 { let mut weight: [f32; 32] = [0.0; 32]; \
          for i in 0..32 { weight[i] = (i as f32) * 0.5 - 3.0; } \
@@ -479,7 +1914,7 @@ fn differential_embedding() {
 fn embedding_nest_lowers_to_kernel() {
     let embed = |attr: &str| {
         format!(
-            "module m\n{attr}fn embed(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) {{ \
+            "module m\n{attr}fn embed(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) {{ \
              for t in 0..4 {{ for d in 0..3 {{ out[t * 3 + d] = weight[ids[t] * 3 + d]; }} }} }}"
         )
     };
@@ -493,7 +1928,7 @@ fn embedding_nest_lowers_to_kernel() {
     );
     // A direct copy `out[t*3+d] = weight[t*3+d]` (the row index is the loop var, not a gathered id) is
     // not an embedding lookup — the recognizer must bail (no `ids[t]` indirection to fold).
-    let copy = "module m\nfn cp(ids: [i32; 4], weight: [f32; 12], out: [f32; 12]) { \
+    let copy = "module m\nfn cp(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) { \
         for t in 0..4 { for d in 0..3 { out[t * 3 + d] = weight[t * 3 + d]; } } }";
     assert!(
         !lowered_calls(copy, "mercury_embedding_f32"),
@@ -505,52 +1940,67 @@ fn embedding_nest_lowers_to_kernel() {
 /// reduction kernel (`mercury_sreduce_f32_parallel`). The native run folds across cores; the
 /// interpreter calls the *serial* kernel — both are bit-identical by construction (fixed chunking,
 /// ascending combine), so native and interp must agree at every opt level. Covers dot, ssd, the
-/// unary sum, and the running max/min (the per-tensor max/absmax for softmax / int8 quantization).
+/// unary sum, the running max/min (the per-tensor max/absmax for softmax / int8 quantization), and
+/// the L1 folds abssum `Σ|x|` (RED_SUMABS) / MAE `Σ|x−y|` (RED_ABSDIFF).
 #[test]
 fn differential_parallel_reduce() {
     let programs = [
         // dot product Σ x·y
-        "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s = s + x[k] * y[k]; } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 2.0; } dotp(x, y, o); \
          print((o[0] * 100.0) as i32); return 0; }",
         // sum of squared differences Σ (x−y)² (an L2 loss)
-        "@parallel fn ssd(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn ssd(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += (x[k] - y[k]) * (x[k] - y[k]); } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 1.0; } ssd(x, y, o); \
          print((o[0] * 10.0) as i32); return 0; }",
         // unary sum Σ x (LayerNorm-style accumulation; the recognizer passes y == x)
-        "@parallel fn sumv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn sumv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += x[k]; } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.01; } sumv(x, o); \
          print((o[0]) as i32); return 0; }",
         // running max (fold by fmax; mixed-sign fractional inputs)
-        "@parallel fn maxv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn maxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmax(m, x[k]); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } maxv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
         // running min (fold by fmin, operand order m second)
-        "@parallel fn minv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn minv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmin(x[k], m); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = 5.0 - (i as f32) * 0.001; } minv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
         // running absmax (fmax fold over abs(x[k]) → RED_MAXABS; negative-dominant tail)
-        "@parallel fn absmaxv(x: [f32; 4096], o: [f32; 1]) { \
+        "@parallel fn absmaxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = 0.0; for k in 0..4096 { m = fmax(m, abs(x[k])); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = 3.0 - (i as f32) * 0.002; } absmaxv(x, o); \
          print((o[0] * 1000.0) as i32); return 0; }",
+        // abssum Σ|x| (L1 norm → RED_SUMABS, y == x; ramp straddling zero exercises the sign clear)
+        "@parallel fn abssumv(x: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001 - 2.0; } abssumv(x, o); \
+         print((o[0] * 100.0) as i32); return 0; }",
+        // MAE Σ|x−y| (two-array L1 distance → RED_ABSDIFF, like ssd but abs not square)
+        "@parallel fn maev(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k] - y[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; \
+         let mut y: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = (i as f32) * 0.001; y[i] = 1.0; } maev(x, y, o); \
+         print((o[0] * 10.0) as i32); return 0; }",
     ];
     for src in programs {
         for opt in [0u8, 2, 3] {
@@ -564,9 +2014,9 @@ fn differential_parallel_reduce() {
     }
     // Golden, using f32-exact values so the reassociated sum is unambiguous: dot = 2·3·4096 = 24576,
     // sum = 2·4096 = 8192.
-    let golden = "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], o: [f32; 1]) { \
+    let golden = "@parallel fn dotp(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s = s + x[k] * y[k]; } o[0] = s; } \
-         @parallel fn sumv(x: [f32; 4096], o: [f32; 1]) { \
+         @parallel fn sumv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += x[k]; } o[0] = s; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [2.0; 4096]; \
          let mut y: [f32; 4096] = [3.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
@@ -578,9 +2028,9 @@ fn differential_parallel_reduce() {
         "parallel reduction produced the wrong value"
     );
     // Max/min golden over a ramp (exact integer elements): max(i−1000) = 3095, min = −1000.
-    let golden_mm = "@parallel fn maxv(x: [f32; 4096], o: [f32; 1]) { \
+    let golden_mm = "@parallel fn maxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmax(m, x[k]); } o[0] = m; } \
-         @parallel fn minv(x: [f32; 4096], o: [f32; 1]) { \
+         @parallel fn minv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = x[0]; for k in 0..4096 { m = fmin(m, x[k]); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) - 1000.0; } \
@@ -593,7 +2043,7 @@ fn differential_parallel_reduce() {
     );
     // Absmax golden over a ramp straddling zero (exact integer elements): max(|i−3000|) = 3000
     // (the negative end |−3000| beats the positive end |1095|).
-    let golden_abs = "@parallel fn absmaxv(x: [f32; 4096], o: [f32; 1]) { \
+    let golden_abs = "@parallel fn absmaxv(x: [f32; 4096], mut o: [f32; 1]) { \
          let mut m: f32 = 0.0; for k in 0..4096 { m = fmax(m, abs(x[k])); } o[0] = m; } \
          fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = (i as f32) - 3000.0; } absmaxv(x, o); print((o[0]) as i32); return 0; }";
@@ -602,6 +2052,22 @@ fn differential_parallel_reduce() {
         String::from_utf8(out).unwrap(),
         "3000\n",
         "parallel absmax produced the wrong value"
+    );
+    // Abssum / MAE golden (constant arrays, exact): Σ|−2| = 2·4096 = 8192; Σ|2−5| = 3·4096 = 12288
+    // (a negative diff, so it also confirms the sign-bit clear; RED_SSD would give 9·4096 = 36864).
+    let golden_l1 = "@parallel fn abssumv(x: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k]); } o[0] = s; } \
+         @parallel fn maev(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) { \
+         let mut s: f32 = 0.0; for k in 0..4096 { s += abs(x[k] - y[k]); } o[0] = s; } \
+         fn main() -> i32 { let mut x: [f32; 4096] = [0.0; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
+         for i in 0..4096 { x[i] = 0.0 - 2.0; } abssumv(x, o); print((o[0]) as i32); \
+         let mut a: [f32; 4096] = [2.0; 4096]; let mut b: [f32; 4096] = [5.0; 4096]; \
+         maev(a, b, o); print((o[0]) as i32); return 0; }";
+    let (_, out) = jit(golden_l1, 3).expect("jit golden_l1");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "8192\n12288\n",
+        "parallel abssum/MAE produced the wrong value"
     );
 }
 
@@ -614,14 +2080,14 @@ fn differential_parallel_reduce() {
 fn differential_bf16_reduce() {
     let programs = [
         // bf16 dot Σ (x·y) with fractional, non-bf16-exact elements (real rounding + reassociation).
-        "fn dotbf(x: [bf16; 4096], y: [bf16; 4096], o: [f32; 1]) { \
+        "fn dotbf(x: [bf16; 4096], y: [bf16; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s = s + (x[k] as f32) * (y[k] as f32); } o[0] = s; } \
          fn main() -> i32 { let mut x: [bf16; 4096] = [0.0 as bf16; 4096]; \
          let mut y: [bf16; 4096] = [0.0 as bf16; 4096]; let mut o: [f32; 1] = [0.0; 1]; \
          for i in 0..4096 { x[i] = ((i as f32) * 0.001) as bf16; y[i] = 1.5 as bf16; } dotbf(x, y, o); \
          print((o[0] * 100.0) as i32); return 0; }",
         // bf16 unary sum Σ x with fractional elements.
-        "fn sumbf(x: [bf16; 4096], o: [f32; 1]) { \
+        "fn sumbf(x: [bf16; 4096], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..4096 { s += (x[k] as f32); } o[0] = s; } \
          fn main() -> i32 { let mut x: [bf16; 4096] = [0.0 as bf16; 4096]; \
          let mut o: [f32; 1] = [0.0; 1]; \
@@ -645,9 +2111,9 @@ fn differential_bf16_reduce() {
     }
     // Golden, bf16-exact small integers so the reassociated sum is unambiguous: dot = 2·(1+…+8) =
     // 72, sum = 36. Proves the dispatch produces the right value, not just self-consistency.
-    let golden = "fn dotbf(x: [bf16; 8], y: [bf16; 8], o: [f32; 1]) { \
+    let golden = "fn dotbf(x: [bf16; 8], y: [bf16; 8], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..8 { s = s + (x[k] as f32) * (y[k] as f32); } o[0] = s; } \
-         fn sumbf(x: [bf16; 8], o: [f32; 1]) { \
+         fn sumbf(x: [bf16; 8], mut o: [f32; 1]) { \
          let mut s: f32 = 0.0; for k in 0..8 { s += (x[k] as f32); } o[0] = s; } \
          fn main() -> i32 { let mut x: [bf16; 8] = [0.0 as bf16; 8]; \
          let mut y: [bf16; 8] = [0.0 as bf16; 8]; let mut o: [f32; 1] = [0.0; 1]; \
@@ -667,26 +2133,26 @@ fn differential_bf16_reduce() {
 /// lacks). Golden small-integer case pins the value.
 #[test]
 fn differential_bf16_axpby() {
-    let axpby = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let axpby = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } }";
     assert!(
         lowered_calls(axpby, "mercury_axpby_bf16"),
         "bf16 axpby -> mercury_axpby_bf16"
     );
-    let saxpy = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let saxpy = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 3.0 * (x[k] as f32) + (y[k] as f32); } }";
     assert!(
         lowered_calls(saxpy, "mercury_axpby_bf16"),
         "bf16 saxpy (implicit b=1) -> mercury_axpby_bf16"
     );
-    let add = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+    let add = "module m\nfn ax(x:[bf16;64], y:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = (x[k] as f32) + (y[k] as f32); } }";
     assert!(
         lowered_calls(add, "mercury_axpby_bf16"),
         "bf16 add -> mercury_axpby_bf16"
     );
     // A 1-term scale has no second additive term, so it must decline (avoids a 0*inf the source lacks).
-    let scale = "module m\nfn ax(x:[bf16;64], o:[f32;64]) { \
+    let scale = "module m\nfn ax(x:[bf16;64], mut o:[f32;64]) { \
         for k in 0..64 { o[k] = 2.0 * (x[k] as f32); } }";
     assert!(
         !lowered_calls(scale, "mercury_axpby_bf16"),
@@ -694,7 +2160,7 @@ fn differential_bf16_axpby() {
     );
 
     // native == interp across opt levels, fractional non-bf16-exact inputs.
-    let prog = "fn ax(x:[bf16;4096], y:[bf16;4096], o:[f32;4096]) { \
+    let prog = "fn ax(x:[bf16;4096], y:[bf16;4096], mut o:[f32;4096]) { \
          for k in 0..4096 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } } \
          fn main() -> i32 { let mut x:[bf16;4096]=[0.0 as bf16;4096]; \
          let mut y:[bf16;4096]=[0.0 as bf16;4096]; let mut o:[f32;4096]=[0.0;4096]; \
@@ -709,7 +2175,7 @@ fn differential_bf16_axpby() {
         );
     }
     // Golden bf16-exact: o[k] = 2·(k+1) + 3·2 = 2(k+1)+6; Σ_{k=0..7} = 2·36 + 48 = 120.
-    let golden = "fn ax(x:[bf16;8], y:[bf16;8], o:[f32;8]) { \
+    let golden = "fn ax(x:[bf16;8], y:[bf16;8], mut o:[f32;8]) { \
         for k in 0..8 { o[k] = 2.0*(x[k] as f32) + 3.0*(y[k] as f32); } } \
         fn main() -> i32 { let mut x:[bf16;8]=[0.0 as bf16;8]; let mut y:[bf16;8]=[0.0 as bf16;8]; \
         let mut o:[f32;8]=[0.0;8]; for i in 0..8 { x[i]=((i+1) as f32) as bf16; y[i]=2.0 as bf16; } \
@@ -805,14 +2271,14 @@ fn differential_batched_matmul() {
         return 0; }";
     // C[h] = A[h]·B[h]:    head0 [[19,22],[43,50]], head1 = I·B1 = [[9,10],[11,12]].
     let normal = format!(
-        "fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {{ \
+        "fn bmm(a: [f32; 8], b: [f32; 8], mut c: [f32; 8]) {{ \
         for h in 0..2 {{ for i in 0..2 {{ for j in 0..2 {{ let mut s: f32 = 0.0; \
         for k in 0..2 {{ s = s + a[h*4 + i*2 + k] * b[h*4 + k*2 + j]; }} \
         c[h*4 + i*2 + j] = s; }} }} }} }} fn main() -> i32 {{ {head}"
     );
     // C[h] = A[h]·B[h]ᵀ (attention Q·Kᵀ): head0 [[17,23],[39,53]], head1 = I·B1ᵀ = B1ᵀ [[9,11],[10,12]].
     let transposed = format!(
-        "fn bmm(a: [f32; 8], b: [f32; 8], c: [f32; 8]) {{ \
+        "fn bmm(a: [f32; 8], b: [f32; 8], mut c: [f32; 8]) {{ \
         for h in 0..2 {{ for i in 0..2 {{ for j in 0..2 {{ let mut s: f32 = 0.0; \
         for k in 0..2 {{ s = s + a[h*4 + i*2 + k] * b[h*4 + j*2 + k]; }} \
         c[h*4 + i*2 + j] = s; }} }} }} }} fn main() -> i32 {{ {head}"
@@ -842,7 +2308,7 @@ fn differential_batched_matmul() {
 /// bias-free `silu(x·Wᵀ)` is the LLaMA SwiGLU shape (null bias through the same kernel).
 #[test]
 fn differential_linear_epilogue() {
-    let body = "fn lin(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) { \
+    let body = "fn lin(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) { \
         for i in 0..2 { for j in 0..2 { let mut s: f32 = 0.0; \
         for k in 0..2 { s = s + x[i*2+k] * w[j*2+k]; } out[i*2+j] = s; } } \
         for i in 0..2 { for j in 0..2 { out[i*2+j] = EPI; } } } \
@@ -852,7 +2318,7 @@ fn differential_linear_epilogue() {
         print(out[0] as i32); print(out[1] as i32); print(out[2] as i32); print(out[3] as i32); \
         return 0; }";
     // Bias-free variant (LLaMA SwiGLU `silu(x·Wᵀ)`): no bias param, pre-act = [1,2,3,4].
-    let nobias = "fn lin(x: [f32; 4], w: [f32; 4], out: [f32; 4]) { \
+    let nobias = "fn lin(x: [f32; 4], w: [f32; 4], mut out: [f32; 4]) { \
         for i in 0..2 { for j in 0..2 { let mut s: f32 = 0.0; \
         for k in 0..2 { s = s + x[i*2+k] * w[j*2+k]; } out[i*2+j] = s; } } \
         for i in 0..2 { for j in 0..2 { out[i*2+j] = EPI; } } } \
@@ -1340,7 +2806,7 @@ fn matmul_is_correct() {
         let attr = if parallel { "@parallel\n" } else { "" };
         let n2 = ns * ns;
         format!(
-            "module m\n{attr}fn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{\n\
+            "module m\n{attr}fn mm(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{\n\
              for i in 0..{ns} {{ for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
              for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
              fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
@@ -1370,6 +2836,133 @@ fn matmul_is_correct() {
     }
 }
 
+/// The idiomatic shape-typed matmul — `c[i,j] = Σ a[i,k]·b[k,j]` written with multi-index tensor
+/// accesses on `Tensor[f32,N,N]` params — must dispatch to the SAME tuned `mercury_sgemm` kernel as
+/// the flat `a[i*N+k]` spelling (the 2-index access supplies the row stride from the tensor's inner
+/// dim), agree native==interp, and compute the right result. The transposed `b[j,k]` spelling is the
+/// `nn.Linear` `A·Bᵀ` form and must reach `mercury_sgemm_nt`. Arrays are passed into the tensor
+/// params (sema's lenient array↔tensor unify) and both decay to a base pointer.
+#[test]
+fn tensor_matmul_is_correct() {
+    fn reference(ns: usize, transposed_b: bool) -> i64 {
+        let a: Vec<f32> = (0..ns * ns).map(|i| (i % 3) as f32).collect();
+        let b: Vec<f32> = (0..ns * ns).map(|i| (i % 2) as f32).collect();
+        let mut sum = 0.0f32;
+        for i in 0..ns {
+            for j in 0..ns {
+                let mut acc = 0.0f32;
+                for k in 0..ns {
+                    let bkj = if transposed_b { b[j * ns + k] } else { b[k * ns + j] };
+                    acc += a[i * ns + k] * bkj;
+                }
+                sum += acc;
+            }
+        }
+        sum as i64
+    }
+
+    // `ijk` dot form in shape-typed tensor notation; `b_idx` is `k,j` (normal) or `j,k` (nn.Linear).
+    let kernel = |ns: usize, transposed_b: bool, parallel: bool| {
+        let attr = if parallel { "@parallel\n" } else { "" };
+        let n2 = ns * ns;
+        let b_idx = if transposed_b { "j, k" } else { "k, j" };
+        format!(
+            "module m\n{attr}fn mm(a: Tensor[f32, {ns}, {ns}], b: Tensor[f32, {ns}, {ns}], \
+             mut c: Tensor[f32, {ns}, {ns}]) {{\n\
+             for i in 0..{ns} {{ for j in 0..{ns} {{ let mut s: f32 = 0.0; \
+             for k in 0..{ns} {{ s = s + a[i, k] * b[{b_idx}]; }} c[i, j] = s; }} }} }}\n\
+             fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; \
+             let mut b: [f32; {n2}] = [0.0; {n2}]; let mut c: [f32; {n2}] = [0.0; {n2}]; \
+             let mut i: i32 = 0; \
+             while i < {n2} {{ a[i] = ((i % 3) as f32); b[i] = ((i % 2) as f32); i += 1; }} \
+             mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+             while j < {n2} {{ s = s + c[j]; j += 1; }} return s as i32; }}"
+        )
+    };
+
+    // The 2-index tensor spelling must reach the kernel, not fall to a scalar nest.
+    assert!(
+        lowered_calls(&kernel(8, false, false), "mercury_sgemm"),
+        "tensor a[i,k]*b[k,j] -> mercury_sgemm"
+    );
+    assert!(
+        lowered_calls(&kernel(8, true, false), "mercury_sgemm_nt"),
+        "tensor a[i,k]*b[j,k] -> mercury_sgemm_nt"
+    );
+
+    for ns in [6usize, 7, 16, 17, 32] {
+        for transposed_b in [false, true] {
+            for parallel in [false, true] {
+                let src = kernel(ns, transposed_b, parallel);
+                let native = jit(&src, 3).expect("jit");
+                let interp = interp(&src, 3).expect("interp");
+                assert_eq!(
+                    native, interp,
+                    "tensor matmul native vs interp (ns={ns}, tb={transposed_b}, par={parallel})"
+                );
+                assert_eq!(
+                    native.0,
+                    reference(ns, transposed_b),
+                    "tensor matmul wrong result (ns={ns}, tb={transposed_b}, par={parallel})"
+                );
+            }
+        }
+    }
+}
+
+/// The `ikj` *accumulate* matmul (`let aik = a[i,k]; for j { c[i,j] = c[i,j] + aik*b[k,j] }`, the
+/// other canonical spelling, with a per-row zero-init for beta=0) must ALSO dispatch from tensor
+/// notation — the `aik` binding, the C read-modify-write store, and the zero-init all accept the
+/// 2-index form. Proves dispatch + native==interp==reference.
+#[test]
+fn tensor_matmul_accumulate_form() {
+    fn reference(ns: usize) -> i64 {
+        let a: Vec<f32> = (0..ns * ns).map(|i| (i % 3) as f32).collect();
+        let b: Vec<f32> = (0..ns * ns).map(|i| (i % 2) as f32).collect();
+        let mut sum = 0.0f32;
+        for i in 0..ns {
+            for j in 0..ns {
+                let mut acc = 0.0f32;
+                for k in 0..ns {
+                    acc += a[i * ns + k] * b[k * ns + j];
+                }
+                sum += acc;
+            }
+        }
+        sum as i64
+    }
+    let kernel = |ns: usize, parallel: bool| {
+        let attr = if parallel { "@parallel\n" } else { "" };
+        let n2 = ns * ns;
+        format!(
+            "module m\n{attr}fn mm(a: Tensor[f32, {ns}, {ns}], b: Tensor[f32, {ns}, {ns}], \
+             mut c: Tensor[f32, {ns}, {ns}]) {{\n\
+             for i in 0..{ns} {{ for j0 in 0..{ns} {{ c[i, j0] = 0.0; }} \
+             for k in 0..{ns} {{ let aik: f32 = a[i, k]; \
+             for j in 0..{ns} {{ c[i, j] = c[i, j] + aik * b[k, j]; }} }} }} }}\n\
+             fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; \
+             let mut b: [f32; {n2}] = [0.0; {n2}]; let mut c: [f32; {n2}] = [0.0; {n2}]; \
+             let mut i: i32 = 0; \
+             while i < {n2} {{ a[i] = ((i % 3) as f32); b[i] = ((i % 2) as f32); i += 1; }} \
+             mm(a, b, c); let mut s: f32 = 0.0; let mut j: i32 = 0; \
+             while j < {n2} {{ s = s + c[j]; j += 1; }} return s as i32; }}"
+        )
+    };
+    assert!(
+        lowered_calls(&kernel(8, false), "mercury_sgemm"),
+        "tensor accumulate matmul -> mercury_sgemm"
+    );
+    for ns in [6usize, 7, 16, 17, 32] {
+        for parallel in [false, true] {
+            let src = kernel(ns, parallel);
+            let native = jit(&src, 3).expect("jit");
+            let interp = interp(&src, 3).expect("interp");
+            assert_eq!(native, interp, "tensor acc matmul native vs interp (ns={ns}, par={parallel})");
+            assert_eq!(native.0, reference(ns), "tensor acc matmul wrong (ns={ns}, par={parallel})");
+        }
+    }
+}
+
 /// Lower `src` and report whether any function calls the named runtime symbol — used to prove the
 /// matmul recognizer fired (and picked the serial vs parallel variant), not merely that a scalar
 /// fallback happened to compute the right answer.
@@ -1395,7 +2988,7 @@ fn matmul_nest_lowers_to_sgemm() {
     // Accumulate form (beta = 1): no per-row zero-init.
     let acc = |attr: &str| {
         format!(
-            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) {{ \
              for i in 0..8 {{ for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
              for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
         )
@@ -1403,7 +2996,7 @@ fn matmul_nest_lowers_to_sgemm() {
     // Overwrite form (beta = 0): a per-row zero-init loop precedes the K loop.
     let ovr = |attr: &str| {
         format!(
-            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+            "module m\n{attr}fn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) {{ \
              for i in 0..8 {{ for j0 in 0..8 {{ c[i*8+j0] = 0.0; }} \
              for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
              for j in 0..8 {{ c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; }} }} }} }}"
@@ -1422,7 +3015,7 @@ fn matmul_nest_lowers_to_sgemm() {
         "@parallel -> sgemm_parallel"
     );
     // A non-matmul triple loop (wrong B stride) must NOT be misrecognized.
-    let not_mm = "module m\nfn f(a:[f32;64],b:[f32;64],c:[f32;64]) {{ \
+    let not_mm = "module m\nfn f(a:[f32;64],b:[f32;64],mut c:[f32;64]) {{ \
         for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[j*8+k]; } } } }";
     assert!(
@@ -1437,7 +3030,7 @@ fn matmul_nest_lowers_to_sgemm() {
 fn linear_nt_matmul_lowers_and_runs() {
     let nt = |attr: &str| {
         format!(
-            "module m\n{attr}fn lin(a:[f32;48],b:[f32;32],c:[f32;24]) {{ \
+            "module m\n{attr}fn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) {{ \
              for i in 0..6 {{ for j0 in 0..4 {{ c[i*4+j0] = 0.0; }} \
              for k in 0..8 {{ let aik: f32 = a[i*8+k]; \
              for j in 0..4 {{ c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; }} }} }} }}"
@@ -1452,7 +3045,7 @@ fn linear_nt_matmul_lowers_and_runs() {
         "@parallel A·Bᵀ -> sgemm_nt_parallel"
     );
     // C=A·B (b indexed [k*4+j]) must use the non-transposed kernel, never the nt one.
-    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[k*4+j]; } } } }";
     assert!(lowered_calls(normal, "mercury_sgemm"), "C=A·B -> sgemm");
@@ -1462,7 +3055,7 @@ fn linear_nt_matmul_lowers_and_runs() {
     );
 
     // End to end: A is 6x8, B is 4x8 (so Bᵀ is 8x4), C is 6x4. Native must equal interp.
-    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j0 in 0..4 { c[i*4+j0] = 0.0; } \
         for k in 0..8 { let aik: f32 = a[i*8+k]; \
         for j in 0..4 { c[i*4+j] = c[i*4+j] + aik * b[j*8+k]; } } } }\n\
@@ -1481,7 +3074,7 @@ fn linear_nt_matmul_lowers_and_runs() {
 #[test]
 fn ijk_dot_product_matmul_recognized() {
     // C = A·Bᵀ (b[j*K+k]) — the natural nn.Linear spelling.
-    let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let nt = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }";
     assert!(
@@ -1489,14 +3082,14 @@ fn ijk_dot_product_matmul_recognized() {
         "ijk A·Bᵀ -> sgemm_nt"
     );
     // C = A·B (b[k*N+j]).
-    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let normal = "module m\nfn mm(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[k*4+j]; } c[i*4+j] = s; } } }";
     assert!(lowered_calls(normal, "mercury_sgemm"), "ijk A·B -> sgemm");
     assert!(!lowered_calls(normal, "mercury_sgemm_nt"));
 
     // End to end (A·Bᵀ): native must equal interp.
-    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],c:[f32;24]) { \
+    let src = "module m\nfn lin(a:[f32;48],b:[f32;32],mut c:[f32;24]) { \
         for i in 0..6 { for j in 0..4 { let mut s: f32 = 0.0; \
         for k in 0..8 { s = s + a[i*8+k] * b[j*8+k]; } c[i*4+j] = s; } } }\n\
         fn main() -> i32 { let mut a:[f32;48]=[0.0;48]; let mut b:[f32;32]=[0.0;32]; \
@@ -1516,7 +3109,7 @@ fn matmul_overwrite_differential() {
     let ns = 9usize; // not a multiple of MR/NR, exercises the microkernel remainders
     let n2 = ns * ns;
     let src = format!(
-        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{ \
+        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{ \
          for i in 0..{ns} {{ for j0 in 0..{ns} {{ c[i*{ns}+j0] = 0.0; }} \
          for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
          for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
@@ -1539,7 +3132,7 @@ fn matmul_overwrite_differential() {
 #[test]
 fn affine_norm_dispatch() {
     // Affine LayerNorm: (x-mean)*inv*g[i] + b[i]
-    let ln_affine = "module m\nfn f(x:[f32;8], g:[f32;8], b:[f32;8]) { \
+    let ln_affine = "module m\nfn f(mut x:[f32;8], g:[f32;8], b:[f32;8]) { \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let mean: f32 = s / 8.0; \
         let mut v: f32 = 0.0; for i in 0..8 { v = v + (x[i] - mean) * (x[i] - mean); } \
         let inv: f32 = rsqrt(v / 8.0 + 0.00001); \
@@ -1554,7 +3147,7 @@ fn affine_norm_dispatch() {
     );
 
     // Affine RMSNorm: x[i]*inv*g[i] (scale only, no shift)
-    let rn_affine = "module m\nfn f(x:[f32;8], g:[f32;8]) { \
+    let rn_affine = "module m\nfn f(mut x:[f32;8], g:[f32;8]) { \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i] * x[i]; } \
         let inv: f32 = rsqrt(s / 8.0 + 0.00001); \
         for i in 0..8 { x[i] = x[i] * inv * g[i]; } }";
@@ -1564,7 +3157,7 @@ fn affine_norm_dispatch() {
     );
 
     // Plain LayerNorm (gamma=1, beta=0) still uses the plain kernel, not the affine one.
-    let ln_plain = "module m\nfn f(x:[f32;8]) { \
+    let ln_plain = "module m\nfn f(mut x:[f32;8]) { \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let mean: f32 = s / 8.0; \
         let mut v: f32 = 0.0; for i in 0..8 { v = v + (x[i] - mean) * (x[i] - mean); } \
         let inv: f32 = rsqrt(v / 8.0 + 0.00001); \
@@ -1580,7 +3173,7 @@ fn affine_norm_dispatch() {
 
     // softmax with a trailing scale has no affine semantics; the guard makes it decline BOTH norm
     // kernels (falls back to the vectorizer) rather than dropping the scale.
-    let sm_scaled = "module m\nfn f(x:[f32;8], g:[f32;8]) { \
+    let sm_scaled = "module m\nfn f(mut x:[f32;8], g:[f32;8]) { \
         let mut m: f32 = x[0]; for i in 0..8 { m = fmax(m, x[i]); } \
         for i in 0..8 { x[i] = exp(x[i] - m); } \
         let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i]; } let inv: f32 = 1.0 / s; \
@@ -1602,7 +3195,7 @@ fn affine_norm_dispatch() {
 #[test]
 fn batched_norm_dispatch() {
     // R = 3 rows, C = 4 cols, normalized in place over the flat [12] buffer via the `r*4 + i` offset.
-    let batched = "module m\nfn f(x:[f32;12]) { \
+    let batched = "module m\nfn f(mut x:[f32;12]) { \
         for r in 0..3 { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i] * x[r*4+i]; } \
         let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
@@ -1613,7 +3206,7 @@ fn batched_norm_dispatch() {
     );
 
     // Batched LayerNorm (two reductions: mean, then variance) over the `r*4 + i` offset must dispatch too.
-    let batched_ln = "module m\nfn f(x:[f32;12]) { \
+    let batched_ln = "module m\nfn f(mut x:[f32;12]) { \
         for r in 0..3 { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i]; } let mean: f32 = s / 4.0; \
         let mut v: f32 = 0.0; for i in 0..4 { v = v + (x[r*4+i] - mean) * (x[r*4+i] - mean); } \
@@ -1625,7 +3218,7 @@ fn batched_norm_dispatch() {
     );
 
     // Batched softmax (max/exp/sum/normalize, with the row-local `x[r*4]` max-seed) over the offset.
-    let batched_sm = "module m\nfn f(x:[f32;12]) { \
+    let batched_sm = "module m\nfn f(mut x:[f32;12]) { \
         for r in 0..3 { \
         let mut m: f32 = x[r*4]; for i in 0..4 { m = fmax(m, x[r*4+i]); } \
         for i in 0..4 { x[r*4+i] = exp(x[r*4+i] - m); } \
@@ -1638,7 +3231,7 @@ fn batched_norm_dispatch() {
 
     // Batched AFFINE RMSNorm (per-column scale g[i]) must route to the affine kernel, not the plain one
     // — the data is offset-indexed x[r*4+i] while gamma stays column-indexed g[i].
-    let batched_affine = "module m\nfn f(x:[f32;12], g:[f32;4]) { \
+    let batched_affine = "module m\nfn f(mut x:[f32;12], g:[f32;4]) { \
         for r in 0..3 { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[r*4+i] * x[r*4+i]; } \
         let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
@@ -1653,7 +3246,7 @@ fn batched_norm_dispatch() {
     );
 
     // The single-row form (no outer loop) must still dispatch — rows = 1 is the `batch = None` path.
-    let single = "module m\nfn f(x:[f32;4]) { \
+    let single = "module m\nfn f(mut x:[f32;4]) { \
         let mut s: f32 = 0.0; for i in 0..4 { s = s + x[i] * x[i]; } \
         let inv: f32 = rsqrt(s / 4.0 + 0.00001); \
         for i in 0..4 { x[i] = x[i] * inv; } }";
@@ -1672,7 +3265,7 @@ fn batched_norm_dispatch() {
 #[test]
 fn differential_parallel_batched_norm() {
     // 64 rows × 64 cols = 4096; many rows so the kernel genuinely spreads across cores.
-    let src = "@parallel fn rmsnorm_batch(x: [f32; 4096]) { \
+    let src = "@parallel fn rmsnorm_batch(mut x: [f32; 4096]) { \
          for r in 0..64 { \
          let mut s: f32 = 0.0; for i in 0..64 { s = s + x[r*64+i] * x[r*64+i]; } \
          let inv: f32 = rsqrt(s / 64.0 + 0.00001); \
@@ -1694,7 +3287,7 @@ fn differential_parallel_batched_norm() {
     // The affine form (a learned per-column gamma) maps rows across cores via the multicore *affine*
     // kernel `mercury_norm_affine_f32_parallel`, and must stay bit-exact vs the serial kernel the
     // interpreter marshals (rows independent, no cross-row combine).
-    let src_affine = "@parallel fn rmsnorm_affine_batch(x: [f32; 4096], g: [f32; 64]) { \
+    let src_affine = "@parallel fn rmsnorm_affine_batch(mut x: [f32; 4096], g: [f32; 64]) { \
          for r in 0..64 { \
          let mut s: f32 = 0.0; for i in 0..64 { s = s + x[r*64+i] * x[r*64+i]; } \
          let inv: f32 = rsqrt(s / 64.0 + 0.00001); \
@@ -1730,7 +3323,7 @@ fn matmul_accumulate_differential() {
     let n2 = ns * ns;
     // No per-row zero-init in `mm` => the recognizer reads it as the accumulate (beta = 1) form.
     let src = format!(
-        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], c: [f32; {n2}]) {{ \
+        "module m\nfn mm(a: [f32; {n2}], b: [f32; {n2}], mut c: [f32; {n2}]) {{ \
          for i in 0..{ns} {{ for k in 0..{ns} {{ let aik: f32 = a[i*{ns}+k]; \
          for j in 0..{ns} {{ c[i*{ns}+j] = c[i*{ns}+j] + aik * b[k*{ns}+j]; }} }} }} }}\n\
          fn main() -> i32 {{ let mut a: [f32; {n2}] = [0.0; {n2}]; let mut b: [f32; {n2}] = [0.0; {n2}]; \
@@ -1892,7 +3485,7 @@ fn vector_ops_interp_matches_native() {
 /// interpreter runs the whole range sequentially, and the observable result must be identical.
 #[test]
 fn parallel_for_matches_interpreter() {
-    let src = "@parallel fn scale(x: [i32; 4096], out: [i32; 4096]) { \
+    let src = "@parallel fn scale(x: [i32; 4096], mut out: [i32; 4096]) { \
                for i in 0..4096 { out[i] = x[i] * 3; } } \
                fn main() -> i32 { let x: [i32; 4096] = [2; 4096]; let out: [i32; 4096] = [0; 4096]; \
                scale(x, out); let mut s: i32 = 0; let mut i: i32 = 0; \

@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0501
+module tests.fail.tensor_decay_nonconst_size
+
+// The array→tensor decay size check must fire even when a tensor dimension is symbolic or dynamic,
+// not only when every dim is const. A `Tensor[f32, ?, 4]` (a dynamic batch dim over rows of 4) can
+// only ever be satisfied by an array whose length is a multiple of 4 — no integer row count produces
+// a length-6 buffer. Without the divisibility check a length-6 array satisfied `[?, 4]`, and `a[1, 3]`
+// (flat offset 1*4+3 = 7) read/wrote past the 6-element buffer: the interpreter trapped while native
+// codegen silently indexed out of bounds — a backend divergence AND a memory-safety violation. (A
+// length-8 array, i.e. two whole rows, is still accepted.)
+fn g(a: Tensor[f32, ?, 4]) -> f32 {
+    return a[1, 3];
+}
+
+fn main() -> i32 {
+    let xs: [f32; 6] = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+    print(g(xs) as i32);
+    return 0;
+}

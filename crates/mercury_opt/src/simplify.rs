@@ -63,7 +63,11 @@ impl Pass for Simplify {
                         continue;
                     }
                     Op::ConstFloat(v, _) => {
-                        consts.insert(res.0, CV::Float(*v));
+                        // Round to the constant's own precision (an f32 literal may carry f64 bits)
+                        // so it enters the fold chain at the right precision. (`rty` was per-inst on
+                        // the language branch; main folds lazily, so read the result type here.)
+                        let rty = f.value_types[res.0 as usize].clone();
+                        consts.insert(res.0, CV::Float(round_float_to_ty(*v, &rty)));
                         continue;
                     }
                     Op::Bin(b, l, r) => Act::Bin(*b, *l, *r),
@@ -105,7 +109,13 @@ impl Pass for Simplify {
                         if let (Some(a), Some(bv)) =
                             (consts.get(&l.0).copied(), consts.get(&r.0).copied())
                         {
-                            let val = fold_cmp(c, a, bv);
+                            // The operands share a type (you compare like-typed values); fold at
+                            // that width so a high-bit-set constant compares the same as the runtime
+                            // register. Without the width, a signed compare of an unsigned literal
+                            // >= 2^(w-1) (or an `as iW` reinterpret) folds against the raw i128 and
+                            // -O2 disagrees with -O0.
+                            let oty = f.value_types[l.0 as usize].clone();
+                            let val = fold_cmp(c, a, bv, &oty);
                             set_const(f, bi, ii, CV::Int(val), &MirType::I1);
                             consts.insert(res.0, CV::Int(val));
                             changed = true;
@@ -124,7 +134,7 @@ impl Pass for Simplify {
                             let rty = f.value_types[res.0 as usize].clone();
                             let nv = match cv {
                                 CV::Int(i) => CV::Int(mask(i.wrapping_neg(), &rty)),
-                                CV::Float(fl) => CV::Float(-fl),
+                                CV::Float(fl) => CV::Float(round_float_to_ty(-fl, &rty)),
                             };
                             set_const(f, bi, ii, nv, &rty);
                             consts.insert(res.0, nv);
@@ -174,10 +184,33 @@ fn set_const(f: &mut Function, bi: usize, ii: usize, cv: CV, ty: &MirType) {
     };
 }
 
+/// Round a folded float constant to the precision of its MIR type, so constant folding matches the
+/// per-op rounding the backends do at runtime. Without this an f32 *chain* is folded entirely in f64
+/// and only narrowed at the final store, so `-O0` (real f32 arithmetic) and `-O2` (folded) disagree
+/// — e.g. `(2^24 + 1) - 2^24` is `0` in f32 but `1` in f64. (f16/bf16 are computed as f32 here, like
+/// the backends.) Applied both when a `ConstFloat` is read into the fold table and on every fold
+/// result, so an f32 operand and the running value stay at f32 precision through the whole chain.
+fn round_float_to_ty(v: f64, ty: &MirType) -> f64 {
+    match ty {
+        MirType::F32 | MirType::F16 | MirType::BF16 => v as f32 as f64,
+        _ => v,
+    }
+}
+
 fn fold_bin(b: BinOp, a: CV, c: CV, ty: &MirType) -> Option<CV> {
     match (a, c) {
         (CV::Int(x), CV::Int(y)) if !b.is_float() => fold_int(b, x, y, ty).map(CV::Int),
-        (CV::Float(x), CV::Float(y)) if b.is_float() => Some(CV::Float(fold_float(b, x, y))),
+        // Do not fold bf16/f16 arithmetic. The backends compute these in f32 and round to the narrow
+        // grid only at the store/cast, so a *runtime* `a + b` of two grid consts rounds correctly — but
+        // folding here would combine the UNROUNDED `ConstFloat` operands (the MIR const carries the
+        // literal f32, not its bf16-grid value) and bake a wrong-grid constant, making -O2 disagree
+        // with -O0. Leaving the op to run keeps both levels identical (and bf16/f16 are storage
+        // formats — seldom compile-time-constant operands, so the lost fold barely matters).
+        (CV::Float(x), CV::Float(y))
+            if b.is_float() && !matches!(ty, MirType::BF16 | MirType::F16) =>
+        {
+            Some(CV::Float(round_float_to_ty(fold_float(b, x, y), ty)))
+        }
         _ => None,
     }
 }
@@ -251,7 +284,7 @@ fn fold_float(b: BinOp, x: f64, y: f64) -> f64 {
     }
 }
 
-fn fold_cmp(c: CmpOp, a: CV, b: CV) -> i128 {
+fn fold_cmp(c: CmpOp, a: CV, b: CV, ty: &MirType) -> i128 {
     use CmpOp::*;
     let res = match (a, b) {
         (CV::Float(x), CV::Float(y)) => match c {
@@ -264,14 +297,23 @@ fn fold_cmp(c: CmpOp, a: CV, b: CV) -> i128 {
             _ => false,
         },
         (CV::Int(x), CV::Int(y)) => {
-            let (ux, uy) = (x as u128, y as u128);
+            // Reproduce the width-correct register compare both backends do at runtime. A constant
+            // can enter the fold table wider than its type (an unsigned literal >= 2^(w-1), or an
+            // `as iW` reinterpret keeps the source bits), so signed predicates compare the
+            // sign-extended value at the operand width (`mask`) and unsigned predicates the
+            // zero-extended value (`uval`) — mirroring `fold_int`. Comparing the raw i128 instead
+            // folds e.g. `(4000000000 as i32) < 0` to false while the runtime i32 register is
+            // negative, so -O2 would disagree with -O0.
+            let w = int_bits(ty);
+            let (sx, sy) = (mask(x, ty), mask(y, ty));
+            let (ux, uy) = (uval(x, w), uval(y, w));
             match c {
-                Eq => x == y,
-                Ne => x != y,
-                Slt => x < y,
-                Sle => x <= y,
-                Sgt => x > y,
-                Sge => x >= y,
+                Eq => sx == sy,
+                Ne => sx != sy,
+                Slt => sx < sy,
+                Sle => sx <= sy,
+                Sgt => sx > sy,
+                Sge => sx >= sy,
                 Ult => ux < uy,
                 Ule => ux <= uy,
                 Ugt => ux > uy,

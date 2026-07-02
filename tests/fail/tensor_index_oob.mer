@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0501
+module tests.fail.tensor_index_oob
+
+// A constant index past a static tensor dimension is caught at compile time — the same headline
+// bounds safety a fixed-size array gets (see `array_index_oob.mer`), extended to the shape-typed
+// surface. `Tensor[f32, 2, 2]` has valid indices 0..=1 on each axis, so `a[5, 5]` is out of bounds.
+// Without the check this is a silent out-of-bounds read whose behavior diverges between the
+// interpreter (traps) and native codegen (reads past the buffer) — a violation of the differential
+// invariant that every backend must agree with the oracle.
+fn read(a: Tensor[f32, 2, 2]) -> f32 {
+    return a[5, 5];
+}
+
+fn main() -> i32 {
+    return 0;
+}

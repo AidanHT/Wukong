@@ -71,6 +71,8 @@ impl MirType {
             Bf16 => MirType::BF16,
             F32 => MirType::F32,
             F64 => MirType::F64,
+            // A Unicode scalar value is a 32-bit integer in MIR (signless, like every int).
+            Char => MirType::I32,
         }
     }
 

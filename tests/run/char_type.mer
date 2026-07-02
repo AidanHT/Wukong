@@ -1,0 +1,35 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 65
+// EXPECT-OUT: 66
+// EXPECT-OUT: 1
+// EXPECT-OUT: 90
+module tests.run.char_type
+
+// The `char` type is usable as a DECLARED/annotated type, not just an inferred literal. A char
+// literal types as `char` (so `let c: char = 'A'` checks by plain compatibility — it used to be
+// typed `u32` and the `char` annotation was an unresolved name, so this was an E0401), `char` is
+// interconvertible with the integer types via `as` in both directions, and char lives in struct
+// fields and ordered comparisons. char lowers to a 32-bit int in MIR, so interp == native, -O0 == -O2.
+
+struct Glyph {
+    code: char,
+}
+
+fn main() -> i32 {
+    let c: char = 'A';
+    print(c as i32); // 65
+
+    let d: char = 66 as char; // int -> char
+    print(d as i32); // 66
+
+    if c < d {
+        print(1);
+    } else {
+        print(0);
+    } // 1 (ordered comparison on char, not bool)
+
+    let g = Glyph { code: 'Z' }; // char as a struct field
+    print(g.code as i32); // 90
+
+    return 0;
+}

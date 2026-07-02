@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0401
+module tests.fail.assign_literal_out_of_range
+
+// Assigning an out-of-range integer literal to a place was a silent low-32-bit truncation, while the
+// equivalent `let x: i32 = 9000000000;` was already a hard error — an inconsistency. A plain `=` now
+// range-checks the literal against the place's type, the same rule `let` and struct-init apply.
+struct S { x: i32 }
+
+fn main() -> i32 {
+    let mut s = S { x: 0 };
+    s.x = 9000000000; // exceeds i32's range (-2147483648..=2147483647)
+    return s.x;
+}

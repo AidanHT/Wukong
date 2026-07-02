@@ -16,7 +16,7 @@ module tests.run.linear_bias_relu_parallel
 // Same data as the serial linear_bias_relu: x=[[1,2],[3,4]], W=I, bias=[-10,-1]
 //   row0: relu([1,2]+[-10,-1]) = [0,1];  row1: relu([3,4]+[-10,-1]) = [0,3].
 @parallel
-fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], out: [f32; 4]) {
+fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) {
     for i in 0..2 {
         for j in 0..2 {
             let mut s: f32 = 0.0;

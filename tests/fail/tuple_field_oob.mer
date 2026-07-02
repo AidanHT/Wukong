@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0501
+module tests.fail.tuple_field_oob
+
+// An out-of-range tuple field index is a static error, exactly like an out-of-bounds array/tensor
+// index. Previously `t.9` on a 3-tuple typed as `Unknown` and fell through to mir_build's generic
+// "unsupported construct" path, reporting a misleading `C0001: tuple field access is not yet
+// supported by codegen` — when tuple field access IS supported (`t.0`/`t.2` run fine); the index was
+// just out of range. sema now range-checks the index against the known tuple arity → E0501.
+fn main() -> i32 {
+    let t = (10, 20, 30);
+    print(t.9);
+    return 0;
+}

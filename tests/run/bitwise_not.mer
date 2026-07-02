@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -6
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -9
+// EXPECT-OUT: -9
+// EXPECT-OUT: 250
+// EXPECT-OUT: 2
+module tests.run.bitwise_not
+
+// Bitwise complement `~x`. The lexer already produced `~` (Tilde); the parser now accepts it as a
+// prefix operator aliased to `UnOp::Not` — MIR `Op::Not`, which is bitwise on an integer and logical
+// on a `bool` (masked to width), the Rust-style polymorphic `!`. `~` is the conventional integer
+// spelling. Both backends share `Op::Not`, so it is bit-exact by construction.
+fn main() -> i32 {
+    let x: i32 = 5;
+    print(~x); // ~5 = -6
+
+    let z: i32 = 0;
+    print(~z); // ~0 = -1
+
+    let n1: i32 = 0 - 1;
+    print(~n1); // ~(-1) = 0
+
+    // De Morgan: ~(a & b) == (~a) | (~b).
+    let a: i32 = 12;
+    let b: i32 = 10;
+    print(~(a & b));     // -9
+    print((~a) | (~b));  // -9
+
+    // Width masking: ~5 in u8 is 0xFA = 250.
+    let u: u8 = 5;
+    let c: u8 = ~u;
+    print(c as i32); // 250
+
+    // `!` still negates a bool (logical), distinct use of the same op.
+    let flag: bool = true;
+    if !flag { print(1); } else { print(2); } // 2
+    return 0;
+}

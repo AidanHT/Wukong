@@ -1,0 +1,46 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 50
+// EXPECT-OUT: 15
+// EXPECT-OUT: 6
+// EXPECT-OUT: 30
+// EXPECT-OUT: 6
+module tests.run.const_array_length
+
+// A top-level `const` used as an array length resolves to its value. It used to evaluate to 0 (a
+// silent zero-length array + spurious E0501 "index out of bounds"): sema's `eval_usize` and
+// mir_build's `const_usize_expr` were both integer-literal-only. Both now resolve a single-segment
+// path naming a `const` to its checked initializer (mirrored EXACTLY, so the alloca'd slot size
+// agrees with sema's index-bounds checks — a disagreement was the regression to avoid). Covers a
+// plain const, a const-references-const chain, an array-repeat count, a struct field, and a nested
+// array. Bit-identical interp == native, -O0 == -O2.
+
+const N: usize = 4;
+const A: usize = 2;
+const B: usize = A;
+const C: usize = B; // chain: C = B = A = 2
+const K: usize = 3;
+const R: usize = 2;
+const COLS: usize = 3;
+
+struct Buf {
+    data: [i32; K],
+}
+
+fn main() -> i32 {
+    let a: [i32; N] = [10, 20, 30, 40];
+    print(a[0] + a[3]); // 50
+
+    let c: [i32; C] = [7, 8]; // const chain as length
+    print(c[0] + c[1]); // 15
+
+    let r: [i32; N] = [3; N]; // array-repeat count via const
+    print(r[0] + r[3]); // 6
+
+    let b = Buf { data: [10, 20, 30] }; // struct field const-length array
+    print(b.data[2]); // 30
+
+    let m: [[i32; COLS]; R] = [[1, 2, 3], [4, 5, 6]]; // nested const-length arrays
+    print(m[1][2]); // 6
+
+    return 0;
+}

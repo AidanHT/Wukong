@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0401
+module tests.fail.intrinsic_pointer
+
+// A math intrinsic operates on a scalar (an integer is promoted to float), a vector, or a tensor —
+// never a pointer. Passing a `*mut f32` used to slip through sema (the result is still typed `f32`),
+// then mir_build emitted `sqrt` on the raw pointer value: invalid MIR the verifier and Cranelift
+// reject, while the interpreter ran it on the pointer and silently produced garbage — a backend
+// divergence on accepted input. Dereference the pointer first: `sqrt(*q)`.
+fn main() -> i32 {
+    let mut x: f32 = 16.0;
+    let q: *mut f32 = &mut x;
+    return sqrt(q) as i32;
+}

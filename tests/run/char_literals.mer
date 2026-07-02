@@ -1,0 +1,39 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 65
+// EXPECT-OUT: 48
+// EXPECT-OUT: 90
+// EXPECT-OUT: 10
+// EXPECT-OUT: 9
+// EXPECT-OUT: 92
+// EXPECT-OUT: 39
+// EXPECT-OUT: 0
+// EXPECT-OUT: 65
+// EXPECT-OUT: 128512
+// EXPECT-OUT: 1
+// EXPECT-OUT: 25
+module tests.run.char_literals
+
+// A char literal lowers to its Unicode scalar value (sema types it `char`, a 32-bit code point that
+// is interconvertible with the integer types via `as`; see char_type.mer). Covers ASCII, the
+// one-character escapes, `\x` hex and `\u{…}` Unicode escapes, ordering, and arithmetic. Each value
+// is a compile-time constant, so the interpreter and native backend agree.
+fn main() -> i32 {
+    print('A' as i32);          // 65
+    print('0' as i32);          // 48
+    let z = 'Z';
+    print(z as i32);            // 90   (bound to a let, then cast)
+
+    print('\n' as i32);         // 10
+    print('\t' as i32);         // 9
+    print('\\' as i32);         // 92
+    print('\'' as i32);         // 39
+    print('\0' as i32);         // 0
+
+    print('\x41' as i32);       // 65       (hex escape)
+    print('\u{1F600}' as i32);  // 128512   (Unicode escape — 😀)
+
+    if 'a' < 'b' { print(1); } else { print(0); }   // 1   (ordering)
+    print(('z' as i32) - ('a' as i32));              // 25  (arithmetic)
+    return 0;
+}

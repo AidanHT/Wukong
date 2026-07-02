@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0401
+module tests.fail.bool_arithmetic
+
+// `bool` is not a number: using it as an operand to a true arithmetic operator silently coerced it
+// to 0/1, so `true + 1` evaluated to `2` with no diagnostic. Arithmetic (`+ - * / %`) and shifts
+// reject a bool operand; bitwise `& | ^` (non-short-circuit boolean ops) and `&&`/`||`/`!` still
+// take bool.
+fn main() -> i32 {
+    let x = true;
+    return x + 1;
+}

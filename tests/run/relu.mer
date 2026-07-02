@@ -10,7 +10,7 @@ module tests.run.relu
 
 /// ReLU activation kernel (out[i] = max(0, x[i])) with an array out-parameter — a real ML
 /// elementwise op running end to end.
-fn relu(x: [i32; 6], out: [i32; 6]) {
+fn relu(x: [i32; 6], mut out: [i32; 6]) {
     let mut i: i32 = 0;
     while i < 6 {
         if x[i] > 0 {

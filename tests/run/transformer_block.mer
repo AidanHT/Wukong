@@ -13,7 +13,7 @@ module tests.run.transformer_block
 // reductions (sum-of-squares + rsqrt + scale), a row softmax (fmax reduction + vectorized exp + sum +
 // normalize), a vectorized GELU, and residual adds. S=8 tokens, D=8 model dim, H=16 FFN hidden. The
 // gate proves the whole block is bit-identical between the interpreter and native backends.
-fn block(x: [f32; 64], w1: [f32; 128], w2: [f32; 128], out: [f32; 64]) {
+fn block(x: [f32; 64], w1: [f32; 128], w2: [f32; 128], mut out: [f32; 64]) {
     let mut n1: [f32; 64] = [0.0; 64];
     let mut scores: [f32; 64] = [0.0; 64];
     let mut attn: [f32; 64] = [0.0; 64];

@@ -48,6 +48,21 @@ pub(crate) struct Parser<'a> {
     interner: &'a mut Interner,
     next_node: u32,
     pub(crate) diags: Vec<Diagnostic>,
+    /// When set, a `Path {` is NOT parsed as a struct literal — disambiguates the condition of
+    /// `if`/`while`/`for`/`match` (where `{` opens the body block) from `Name { … }`. Cleared inside
+    /// any delimited sub-expression (`(…)`, `[…]`, call args, a struct-literal body), so a
+    /// parenthesized `(Point { x: 1 }).x` still parses.
+    no_struct_lit: bool,
+    /// Current nesting depth of the recursive grammar productions (grouping/prefix/cast/binary
+    /// expressions, types, and patterns). Bounded by [`Parser::MAX_DEPTH`] so pathological input —
+    /// thousands of nested `(` / `[`, or a 10k-long `1+1+…` chain — reports E0209 instead of
+    /// overflowing the stack, either in the parser's own descent or in a later recursive walk over
+    /// the resulting AST (sema, MIR lowering, even the tree's `Drop`).
+    depth: u32,
+    /// Latched once the depth limit is first hit. It keeps E0209 to a single diagnostic and (via
+    /// [`Parser::error`]) silences the follow-on recovery cascade — the unmatched `)`/`]` and
+    /// "expected …" errors that unwinding a half-parsed monster construct would otherwise spew.
+    depth_exceeded: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -59,7 +74,27 @@ impl<'a> Parser<'a> {
             interner,
             next_node: 0,
             diags: Vec::new(),
+            no_struct_lit: false,
+            depth: 0,
+            depth_exceeded: false,
         }
+    }
+
+    /// Parse an expression in a position where a trailing `{` opens a block (an `if`/`while`/`for`/
+    /// `match` head), so a bare `Name { … }` must NOT be read as a struct literal.
+    fn parse_cond(&mut self) -> Expr {
+        let prev = std::mem::replace(&mut self.no_struct_lit, true);
+        let e = self.parse_expr();
+        self.no_struct_lit = prev;
+        e
+    }
+
+    /// Parse `f()`-style content with struct literals re-enabled (a delimited context).
+    fn allowing_struct_lit<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = std::mem::replace(&mut self.no_struct_lit, false);
+        let out = f(self);
+        self.no_struct_lit = prev;
+        out
     }
 
     // ---- Cursor & helpers ----
@@ -122,8 +157,39 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
+        // Once the nesting limit is hit, a single E0209 is reported and every follow-on recovery
+        // diagnostic (the unmatched delimiters and "expected …" errors produced while unwinding the
+        // over-deep construct) is suppressed, keeping the output to one clean error.
+        if self.depth_exceeded {
+            return;
+        }
         self.diags
             .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+    }
+
+    /// Maximum nesting depth of the recursive grammar productions before the parser bails with
+    /// E0209. Generous enough that no realistic program (hand-written or generated) comes close, yet
+    /// bounded so that neither the parser's own descent nor any later recursive walk over the AST can
+    /// overflow the stack. The compiler front-end runs on a large stack (see `mercuryc::main`), so
+    /// the actual overflow threshold sits far above this limit.
+    const MAX_DEPTH: u32 = 1024;
+
+    /// Report "nesting too deep" exactly once. Pushes the diagnostic directly (bypassing the now
+    /// self-silencing [`Parser::error`]) and latches `depth_exceeded`, which dedups this code and
+    /// quiets the recovery cascade that unwinding the over-deep construct triggers.
+    fn too_deep(&mut self, span: Span) {
+        if self.depth_exceeded {
+            return;
+        }
+        self.diags.push(
+            Diagnostic::error(format!(
+                "expression or type nesting too deep (exceeds the limit of {})",
+                Self::MAX_DEPTH
+            ))
+            .with_code("E0209")
+            .primary(span, "the nesting becomes too deep here"),
+        );
+        self.depth_exceeded = true;
     }
 
     fn nid(&mut self) -> NodeId {
@@ -190,6 +256,15 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_type(&mut self) -> TypeExpr {
         let start = self.span();
+        // Bound type nesting (`[[[…; 1]; 1]`, `*****T`, deep tuples) so a pathological type cannot
+        // overflow the stack here or in a later recursive walk.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return self.finish_type(start, TypeKind::Unit);
+        }
         let kind = match self.kind() {
             T::Star => {
                 self.bump();
@@ -258,6 +333,7 @@ impl<'a> Parser<'a> {
                 TypeKind::Unit
             }
         };
+        self.depth = saved;
         self.finish_type(start, kind)
     }
 
@@ -409,13 +485,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Expr {
-        let mut lhs = self.parse_prefix();
+        let saved = self.depth;
+        let mut lhs = self.parse_cast();
         loop {
             let Some(op) = token_to_binop(self.kind()) else {
                 break;
             };
             let bp = binop_bp(op);
             if bp < min_bp {
+                break;
+            }
+            // Each fold deepens the left-leaning tree by one. A left-associative chain is built
+            // *iteratively* (the loop, not recursion), so the parser itself never goes deep here —
+            // but the resulting tree does, and a later recursive consumer (sema, lowering, `Drop`)
+            // would overflow on it. Charging each fold to the shared depth budget caps that tree.
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
                 break;
             }
             self.bump();
@@ -431,14 +518,61 @@ impl<'a> Parser<'a> {
                 span,
             };
         }
+        // Restores both this frame's folds and any cast-chain folds `parse_cast` charged above.
+        self.depth = saved;
         lhs
     }
 
+    /// Cast level: `as` binds looser than every prefix unary operator but tighter than every binary
+    /// operator (the Rust precedence). Sitting it between `parse_expr_bp` and `parse_prefix` means
+    /// `*p as T` is `(*p) as T` (not `*(p as T)` — which mis-typed as a `ptrtoint` then a load), and
+    /// `-x as u8` is `(-x) as u8`. Chained `x as A as B` folds left.
+    fn parse_cast(&mut self) -> Expr {
+        let mut e = self.parse_prefix();
+        while self.kind() == T::As {
+            // A long cast chain (`x as A as B as …`) folds left iteratively, exactly like the binop
+            // loop, so it gets the same per-fold depth charge. The enclosing `parse_expr_bp` restores
+            // the budget (it snapshots `self.depth` before calling `parse_cast`).
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
+                break;
+            }
+            self.bump();
+            let ty = self.parse_type();
+            e = self.finish_expr(e.span, ExprKind::Cast { expr: Box::new(e), ty });
+        }
+        e
+    }
+
     fn parse_prefix(&mut self) -> Expr {
+        // One depth level per prefix expression. This is the choke point every operand passes
+        // through (`parse_expr_bp` → `parse_cast` → here), so it bounds *both* a deeply nested
+        // grouping descent (`((((…))))`) and a long unary chain (`----…x`, `****…p`), which recurses
+        // straight back into `parse_prefix` without going through `parse_expr_bp`.
+        let saved = self.depth;
+        self.depth += 1;
+        let out = if self.depth > Self::MAX_DEPTH {
+            let sp = self.span();
+            self.too_deep(sp);
+            self.finish_expr(sp, ExprKind::TupleLit(Vec::new()))
+        } else {
+            self.parse_prefix_inner()
+        };
+        self.depth = saved;
+        out
+    }
+
+    fn parse_prefix_inner(&mut self) -> Expr {
         let start = self.span();
         let op = match self.kind() {
             T::Minus => Some(UnOp::Neg),
-            T::Bang => Some(UnOp::Not),
+            // `!` and `~` both lower to `UnOp::Not` (MIR `Op::Not`), which is bitwise complement on
+            // an integer and logical negation on a `bool` (the result is masked to its width, so
+            // `!true == false`) — the Rust-style polymorphic `!`. `~` is the conventional spelling
+            // for the integer bitwise form; it is an alias here.
+            T::Bang | T::Tilde => Some(UnOp::Not),
             T::Star => Some(UnOp::Deref),
             T::Amp => {
                 self.bump();
@@ -505,6 +639,35 @@ impl<'a> Parser<'a> {
                                 index,
                             },
                         );
+                    } else if self.at(T::Float)
+                        && split_tuple_float(
+                            &self.src[self.span().lo as usize..self.span().hi as usize],
+                        )
+                        .is_some()
+                    {
+                        // `t.0.0` — the lexer glues two adjacent tuple indices into a single float
+                        // token (`0.0`). Split a plain `N.M` float into two consecutive tuple-field
+                        // accesses (`(t.N).M`). A float with an exponent/suffix is not a tuple-index
+                        // pair, so `split_tuple_float` declines and we fall through to the field-name
+                        // error path.
+                        let fsp = self.span();
+                        let (a, b) =
+                            split_tuple_float(&self.src[fsp.lo as usize..fsp.hi as usize]).unwrap();
+                        self.bump();
+                        let inner = self.finish_expr(
+                            start,
+                            ExprKind::TupleField {
+                                base: Box::new(lhs),
+                                index: a,
+                            },
+                        );
+                        lhs = self.finish_expr(
+                            start,
+                            ExprKind::TupleField {
+                                base: Box::new(inner),
+                                index: b,
+                            },
+                        );
                     } else {
                         let name = self.ident();
                         lhs = self.finish_expr(
@@ -549,17 +712,9 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
-                T::As => {
-                    self.bump();
-                    let ty = self.parse_type();
-                    lhs = self.finish_expr(
-                        start,
-                        ExprKind::Cast {
-                            expr: Box::new(lhs),
-                            ty,
-                        },
-                    );
-                }
+                // `as` is NOT handled here: it is a cast level between binary and prefix
+                // (`parse_cast`), so it binds looser than postfix `()`/`[]`/`.`/`::` (which stay on
+                // the primary) but is applied after the whole prefix expression — fixing `*p as T`.
                 _ => break,
             }
         }
@@ -569,12 +724,14 @@ impl<'a> Parser<'a> {
     fn parse_args(&mut self) -> Vec<Expr> {
         self.bump(); // (
         let mut args = Vec::new();
-        while !self.at(T::RParen) && !self.at(T::Eof) {
-            args.push(self.parse_expr());
-            if !self.eat(T::Comma) {
-                break;
+        self.allowing_struct_lit(|p| {
+            while !p.at(T::RParen) && !p.at(T::Eof) {
+                args.push(p.parse_expr());
+                if !p.eat(T::Comma) {
+                    break;
+                }
             }
-        }
+        });
         self.expect(T::RParen);
         args
     }
@@ -626,57 +783,63 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                if self.eat(T::RParen) {
-                    return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
-                }
-                let first = self.parse_expr();
-                if self.at(T::Comma) {
-                    let mut items = vec![first];
-                    while self.eat(T::Comma) {
-                        if self.at(T::RParen) {
-                            break;
+                // A delimited context: struct literals are allowed inside `(…)` even within a
+                // condition head, so `(Point { x: 1 }).x` parses.
+                self.allowing_struct_lit(|p| {
+                    if p.eat(T::RParen) {
+                        return p.finish_expr(start, ExprKind::TupleLit(Vec::new()));
+                    }
+                    let first = p.parse_expr();
+                    if p.at(T::Comma) {
+                        let mut items = vec![first];
+                        while p.eat(T::Comma) {
+                            if p.at(T::RParen) {
+                                break;
+                            }
+                            items.push(p.parse_expr());
                         }
-                        items.push(self.parse_expr());
+                        p.expect(T::RParen);
+                        p.finish_expr(start, ExprKind::TupleLit(items))
+                    } else {
+                        p.expect(T::RParen);
+                        // Parenthesized expression: keep the inner node but extend its span.
+                        Expr {
+                            id: first.id,
+                            kind: first.kind,
+                            span: start.to(p.prev_span()),
+                        }
                     }
-                    self.expect(T::RParen);
-                    self.finish_expr(start, ExprKind::TupleLit(items))
-                } else {
-                    self.expect(T::RParen);
-                    // Parenthesized expression: keep the inner node but extend its span.
-                    Expr {
-                        id: first.id,
-                        kind: first.kind,
-                        span: start.to(self.prev_span()),
-                    }
-                }
+                })
             }
             T::LBracket => {
                 self.bump();
-                if self.eat(T::RBracket) {
-                    return self.finish_expr(start, ExprKind::ArrayLit(Vec::new()));
-                }
-                let first = self.parse_expr();
-                if self.eat(T::Semi) {
-                    let count = Box::new(self.parse_expr());
-                    self.expect(T::RBracket);
-                    self.finish_expr(
-                        start,
-                        ExprKind::ArrayRepeat {
-                            value: Box::new(first),
-                            count,
-                        },
-                    )
-                } else {
-                    let mut items = vec![first];
-                    while self.eat(T::Comma) {
-                        if self.at(T::RBracket) {
-                            break;
-                        }
-                        items.push(self.parse_expr());
+                self.allowing_struct_lit(|p| {
+                    if p.eat(T::RBracket) {
+                        return p.finish_expr(start, ExprKind::ArrayLit(Vec::new()));
                     }
-                    self.expect(T::RBracket);
-                    self.finish_expr(start, ExprKind::ArrayLit(items))
-                }
+                    let first = p.parse_expr();
+                    if p.eat(T::Semi) {
+                        let count = Box::new(p.parse_expr());
+                        p.expect(T::RBracket);
+                        p.finish_expr(
+                            start,
+                            ExprKind::ArrayRepeat {
+                                value: Box::new(first),
+                                count,
+                            },
+                        )
+                    } else {
+                        let mut items = vec![first];
+                        while p.eat(T::Comma) {
+                            if p.at(T::RBracket) {
+                                break;
+                            }
+                            items.push(p.parse_expr());
+                        }
+                        p.expect(T::RBracket);
+                        p.finish_expr(start, ExprKind::ArrayLit(items))
+                    }
+                })
             }
             T::LBrace => {
                 let b = self.parse_block();
@@ -701,13 +864,16 @@ impl<'a> Parser<'a> {
                     return self.finish_expr(start, ExprKind::AlignOf(ty));
                 }
                 let id = self.ident();
-                self.finish_expr(
-                    start,
-                    ExprKind::Path(Path {
-                        segments: vec![id],
-                        span: start,
-                    }),
-                )
+                let path = Path {
+                    segments: vec![id],
+                    span: start,
+                };
+                // `Name { field: value, … }` is a struct literal — unless we are parsing the head
+                // of an `if`/`while`/`for`/`match`, where the `{` opens the body block instead.
+                if !self.no_struct_lit && self.at(T::LBrace) {
+                    return self.parse_struct_lit(path, start);
+                }
+                self.finish_expr(start, ExprKind::Path(path))
             }
             _ => {
                 let sp = self.span();
@@ -722,10 +888,49 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a struct literal `Path { name: value, … }` (the `{` is the current token). Field values
+    /// are a delimited context, so struct literals nest freely inside them.
+    fn parse_struct_lit(&mut self, path: Path, start: Span) -> Expr {
+        self.bump(); // {
+        let mut fields = Vec::new();
+        self.allowing_struct_lit(|p| {
+            while !p.at(T::RBrace) && !p.at(T::Eof) {
+                let name = p.ident();
+                p.expect(T::Colon);
+                let value = p.parse_expr();
+                fields.push(FieldInit { name, value });
+                if !p.eat(T::Comma) {
+                    break;
+                }
+            }
+        });
+        self.expect(T::RBrace);
+        self.finish_expr(
+            start,
+            ExprKind::StructLit {
+                path,
+                fields,
+                rest: None,
+            },
+        )
+    }
+
     fn parse_if(&mut self) -> Expr {
         let start = self.span();
+        // Bound `if` / `else if` nesting. A long `else if` chain recurses straight back into
+        // `parse_if` (the `else` arm below) *without* passing through the `parse_prefix` choke
+        // point, so it must charge the shared depth budget here — otherwise a deep chain recurses
+        // unbounded with no diagnostic, just an ever-slower descent and a tree a later recursive
+        // walk (sema, lowering, even `Drop`) would overflow on. Mirrors the `parse_type` guard.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
+        }
         self.bump(); // if
-        let cond = Box::new(self.parse_expr());
+        let cond = Box::new(self.parse_cond());
         let then_branch = self.parse_block();
         let else_branch = if self.eat(T::Else) {
             if self.at(T::If) {
@@ -738,36 +943,67 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.finish_expr(
+        let out = self.finish_expr(
             start,
             ExprKind::If {
                 cond,
                 then_branch,
                 else_branch,
             },
-        )
+        );
+        self.depth = saved;
+        out
     }
 
     fn parse_match(&mut self) -> Expr {
         let start = self.span();
+        // Bound `match` nesting (an arm body that is itself a `match`, nested deep). The arm body
+        // already passes through `parse_prefix` (which charges depth and reports E0209), but charge
+        // it here too so the limit is enforced from the structural recursion itself — and, more
+        // importantly, once that guard trips the over-deep body parse returns a placeholder
+        // *without consuming its token*, so the arm loop below must also guarantee forward progress
+        // or it would spin forever on the stuck token.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
+        }
         self.bump(); // match
-        let scrutinee = Box::new(self.parse_expr());
+        let scrutinee = Box::new(self.parse_cond());
         self.expect(T::LBrace);
         let mut arms = Vec::new();
         while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let before = self.pos;
             let arm_start = self.span();
             let pat = self.parse_pattern();
+            // Optional `if <expr>` guard between the pattern and `=>`. The guard head disallows a
+            // bare struct literal (like other condition heads) so `n if Foo { .. }` isn't ambiguous.
+            let guard = if self.eat(T::If) {
+                Some(self.parse_cond())
+            } else {
+                None
+            };
             self.expect(T::FatArrow);
             let body = self.parse_expr();
             arms.push(MatchArm {
                 pat,
+                guard,
                 body,
                 span: arm_start.to(self.prev_span()),
             });
             self.eat(T::Comma);
+            // Guarantee forward progress (mirrors `module()`): if the depth limit has tripped and
+            // every sub-parse above consumed nothing, bump so this loop can't spin on a stuck token.
+            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
+                self.bump();
+            }
         }
         self.expect(T::RBrace);
-        self.finish_expr(start, ExprKind::Match { scrutinee, arms })
+        let out = self.finish_expr(start, ExprKind::Match { scrutinee, arms });
+        self.depth = saved;
+        out
     }
 
     // ---- Statements & blocks ----
@@ -775,10 +1011,31 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_block(&mut self) -> Block {
         let start = self.span();
         let id = self.nid();
+        // Bound block nesting. Every nested body funnels through here — `{ … }` blocks, the
+        // branches of `if`/`else`, and the bodies of `while`/`for`/`loop` — and several of those
+        // paths recurse without otherwise charging the depth budget (a loop body via
+        // `parse_while` → `parse_block`; a brace block via `parse_prefix`, whose own guard trips but
+        // then leaves this loop spinning on an unconsumed `{`). Charge it here so a pathologically
+        // deep nest reports E0209 once and stops, instead of overflowing the stack or stalling a
+        // later recursive walk. Mirrors the `parse_type` guard; the loop below adds the matching
+        // forward-progress guarantee.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return Block {
+                id,
+                stmts: Vec::new(),
+                tail: None,
+                span: start.to(self.prev_span()),
+            };
+        }
         self.expect(T::LBrace);
         let mut stmts = Vec::new();
         let mut tail = None;
         while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let before = self.pos;
             let stmt_start = self.span();
             let attrs = self.parse_attrs();
             match self.kind() {
@@ -820,13 +1077,24 @@ impl<'a> Parser<'a> {
                 }
                 T::Break => {
                     self.bump();
+                    // Optional target label: `break 'outer;`.
+                    let label = if self.at(T::Label) {
+                        Some(self.label_ident())
+                    } else {
+                        None
+                    };
                     self.eat(T::Semi);
-                    stmts.push(self.mk_stmt(attrs, StmtKind::Break(None), stmt_start));
+                    stmts.push(self.mk_stmt(attrs, StmtKind::Break(label), stmt_start));
                 }
                 T::Continue => {
                     self.bump();
+                    let label = if self.at(T::Label) {
+                        Some(self.label_ident())
+                    } else {
+                        None
+                    };
                     self.eat(T::Semi);
-                    stmts.push(self.mk_stmt(attrs, StmtKind::Continue(None), stmt_start));
+                    stmts.push(self.mk_stmt(attrs, StmtKind::Continue(label), stmt_start));
                 }
                 T::Defer => {
                     self.bump();
@@ -835,15 +1103,36 @@ impl<'a> Parser<'a> {
                     stmts.push(self.mk_stmt(attrs, StmtKind::Defer(e), stmt_start));
                 }
                 T::While => {
-                    let k = self.parse_while();
+                    let k = self.parse_while(None);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::For => {
-                    let k = self.parse_for();
+                    let k = self.parse_for(None);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::Loop => {
-                    let k = self.parse_loop();
+                    let k = self.parse_loop(None);
+                    stmts.push(self.mk_stmt(attrs, k, stmt_start));
+                }
+                // `'label: loop/while/for { … }` — a labeled loop. The label binds the loop a
+                // `break`/`continue` `'label` can target.
+                T::Label => {
+                    let label = self.label_ident();
+                    self.expect(T::Colon);
+                    let k = match self.kind() {
+                        T::While => self.parse_while(Some(label)),
+                        T::For => self.parse_for(Some(label)),
+                        T::Loop => self.parse_loop(Some(label)),
+                        _ => {
+                            let sp = self.span();
+                            self.error(
+                                sp,
+                                "E0200",
+                                "expected `loop`, `while`, or `for` after a label",
+                            );
+                            continue;
+                        }
+                    };
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 _ => {
@@ -871,8 +1160,16 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // Guarantee forward progress (mirrors `module()`): once the depth limit trips, an
+            // over-deep operand parse (a nested `{` or `match`) returns a placeholder without
+            // consuming its opening token, which would otherwise spin this loop forever on it. The
+            // bump never fires for well-formed input — every statement form above consumes a token.
+            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
+                self.bump();
+            }
         }
         self.expect(T::RBrace);
+        self.depth = saved;
         Block {
             id,
             stmts,
@@ -913,35 +1210,46 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_while(&mut self) -> StmtKind {
+    fn parse_while(&mut self, label: Option<Ident>) -> StmtKind {
         self.bump(); // while
-        let cond = self.parse_expr();
+        let cond = self.parse_cond();
         let body = self.parse_block();
         StmtKind::While {
-            label: None,
+            label,
             cond,
             body,
         }
     }
 
-    fn parse_for(&mut self) -> StmtKind {
+    fn parse_for(&mut self, label: Option<Ident>) -> StmtKind {
         self.bump(); // for
         let pat = self.parse_pattern();
         self.expect(T::In);
+        let prev = std::mem::replace(&mut self.no_struct_lit, true);
         let iter = self.parse_for_iter();
+        self.no_struct_lit = prev;
         let body = self.parse_block();
         StmtKind::For {
-            label: None,
+            label,
             pat,
             iter,
             body,
         }
     }
 
-    fn parse_loop(&mut self) -> StmtKind {
+    fn parse_loop(&mut self, label: Option<Ident>) -> StmtKind {
         self.bump(); // loop
         let body = self.parse_block();
-        StmtKind::Loop { label: None, body }
+        StmtKind::Loop { label, body }
+    }
+
+    /// Read a loop-label token `'name` at the cursor, interning the name without the leading `'`.
+    fn label_ident(&mut self) -> Ident {
+        let span = self.span();
+        self.bump();
+        let text = &self.src[span.lo as usize + 1..span.hi as usize];
+        let sym = self.interner.intern(text);
+        Ident { sym, span }
     }
 
     fn parse_for_iter(&mut self) -> ForIter {
@@ -970,14 +1278,87 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a pattern, including an or-pattern `A | B | C` at the top level (each alternative may
+    /// itself be a range or path pattern).
     fn parse_pattern(&mut self) -> Pattern {
         let start = self.span();
+        let first = self.parse_pattern_range();
+        if !self.at(T::Pipe) {
+            return first;
+        }
+        let mut alts = vec![first];
+        while self.eat(T::Pipe) {
+            alts.push(self.parse_pattern_range());
+        }
+        Pattern {
+            id: self.nid(),
+            kind: PatKind::Or(alts),
+            span: start.to(self.prev_span()),
+        }
+    }
+
+    /// A primary pattern optionally followed by a range tail `..hi` / `..=hi`. A range is recognized
+    /// only after an integer-literal lower bound, so it never shadows `_`/identifier/tuple patterns.
+    fn parse_pattern_range(&mut self) -> Pattern {
+        let start = self.span();
+        let lo = self.parse_pattern_primary();
+        if matches!(lo.kind, PatKind::Int { .. } | PatKind::Char(_))
+            && (self.at(T::DotDot) || self.at(T::DotDotEq))
+        {
+            let inclusive = self.at(T::DotDotEq);
+            self.bump();
+            let hi = self.parse_pattern_primary();
+            return Pattern {
+                id: self.nid(),
+                kind: PatKind::Range {
+                    lo: Box::new(lo),
+                    hi: Box::new(hi),
+                    inclusive,
+                },
+                span: start.to(self.prev_span()),
+            };
+        }
+        lo
+    }
+
+    /// Parse a `::`-separated path (`Enum::Variant`), used by enum-variant patterns.
+    fn parse_colon_path(&mut self) -> Path {
+        let start = self.span();
+        let mut segments = vec![self.ident()];
+        while self.at(T::ColonColon) && self.nth(1) == T::Ident {
+            self.bump(); // ::
+            segments.push(self.ident());
+        }
+        Path {
+            segments,
+            span: start.to(self.prev_span()),
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> Pattern {
+        let start = self.span();
+        // Bound deeply nested tuple patterns (`((((…))))`), which recurse through here via the
+        // `LParen` arm, the same way expressions and types are bounded.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(start);
+            self.depth = saved;
+            return Pattern {
+                id: self.nid(),
+                kind: PatKind::Wildcard,
+                span: start,
+            };
+        }
         let kind = match self.kind() {
             T::Ident => {
                 let text = &self.src[start.lo as usize..start.hi as usize];
                 if text == "_" {
                     self.bump();
                     PatKind::Wildcard
+                } else if self.nth(1) == T::ColonColon {
+                    // `Enum::Variant` — an enum-variant pattern (resolved to its discriminant).
+                    PatKind::Path(self.parse_colon_path())
                 } else {
                     let sym = self.intern_span(start);
                     self.bump();
@@ -1000,6 +1381,45 @@ impl<'a> Parser<'a> {
                     PatKind::Tuple(subs)
                 }
             }
+            // Integer literal pattern (a `match` arm like `0 =>` / `1 =>`).
+            T::Int => {
+                let sym = self.intern_span(start);
+                self.bump();
+                PatKind::Int { sym, neg: false }
+            }
+            // Char-literal pattern (`'a' =>`). `char` is comparable / usable in arithmetic, so it is
+            // a valid literal pattern; it decodes to a code point and matches like an integer.
+            T::Char => {
+                let sym = self.intern_span(start);
+                self.bump();
+                PatKind::Char(sym)
+            }
+            // Negative integer literal pattern (`-1 =>`); fold the sign into the pattern since a
+            // literal pattern has no sub-expression to negate.
+            T::Minus => {
+                self.bump();
+                if self.at(T::Int) {
+                    let isp = self.span();
+                    let sym = self.intern_span(isp);
+                    self.bump();
+                    PatKind::Int { sym, neg: true }
+                } else {
+                    self.error(
+                        start,
+                        "E0206",
+                        format!("expected an integer after `-`, found {}", self.kind().describe()),
+                    );
+                    PatKind::Wildcard
+                }
+            }
+            T::True => {
+                self.bump();
+                PatKind::Bool(true)
+            }
+            T::False => {
+                self.bump();
+                PatKind::Bool(false)
+            }
             _ => {
                 self.error(
                     start,
@@ -1010,6 +1430,7 @@ impl<'a> Parser<'a> {
                 PatKind::Wildcard
             }
         };
+        self.depth = saved;
         Pattern {
             id: self.nid(),
             kind,
@@ -1106,6 +1527,22 @@ impl<'a> Parser<'a> {
             }
         }
     }
+}
+
+/// Split a float-token text of the form `N.M` (two non-empty runs of ASCII digits separated by a
+/// single `.`, with no exponent or type suffix) into the tuple-index pair `(N, M)`. This recovers
+/// the two indices the lexer glues together in a nested tuple-field access like `t.0.0` (it lexes
+/// the trailing `0.0` as one float literal). Returns `None` for any genuine float (one with an
+/// exponent, a suffix, or a missing side), which is not a valid tuple-index pair.
+fn split_tuple_float(text: &str) -> Option<(u32, u32)> {
+    let (a, b) = text.split_once('.')?;
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    if !a.bytes().all(|c| c.is_ascii_digit()) || !b.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 fn token_to_binop(k: TokenKind) -> Option<BinOp> {
@@ -1237,6 +1674,19 @@ mod tests {
     }
 
     #[test]
+    fn cast_binds_looser_than_prefix_tighter_than_binary() {
+        // `*p as i32` is `(*p) as i32`, NOT `*(p as i32)` (the old bug, which lowered to a
+        // ptrtoint + load). The cast must be the outermost node, with the deref nested inside.
+        let s = expr("*p as i32");
+        assert_eq!(s.lines().next().unwrap(), "cast i32");
+        assert!(s.contains("unary *"), "deref must nest under the cast: {s}");
+        // `a + b as i32` is `a + (b as i32)` — `as` binds tighter than `+`.
+        assert_eq!(expr("a + b as i32").lines().next().unwrap(), "binary +");
+        // `-x as i32` is `(-x) as i32`.
+        assert_eq!(expr("-x as i32").lines().next().unwrap(), "cast i32");
+    }
+
+    #[test]
     fn turbofish_call() {
         let s = expr("matmul::<512, 512, 512>(a, b, c)");
         assert!(s.contains("call"));
@@ -1285,5 +1735,141 @@ mod tests {
             fn_names.contains(&"b".to_string()),
             "lost `b`: {fn_names:?}"
         );
+    }
+
+    /// Pathological deeply-nested input must report E0209 rather than overflow the stack. Each shape
+    /// mirrors one of the historical crash repros. The work runs on a roomy stack so the test itself
+    /// can build and drop the (depth-bounded) AST without overflowing — exactly as the real compiler
+    /// front-end runs (see `mercuryc::main`); the guard is what keeps the depth bounded.
+    #[test]
+    fn deeply_nested_input_reports_e0209_not_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+
+                // Case 3: a 5000-long left-associative `+` chain (iteratively built deep tree).
+                let chain = format!("1{}", "+1".repeat(5000));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&chain, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "long `+` chain should report E0209, got {d:?}");
+
+                // Case 1: 4000 nested parentheses (recursive descent).
+                let parens = format!("{}1{}", "(".repeat(4000), ")".repeat(4000));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested parens should report E0209, got {d:?}");
+
+                // Case 2: 4000 nested array types (recursive `parse_type`).
+                let ty = format!("{}i32{}", "[".repeat(4000), "; 1]".repeat(4000));
+                let mut i = Interner::new();
+                let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested array type should report E0209, got {d:?}");
+
+                // A single clean diagnostic, not a cascade: the parens case reports E0209 once.
+                let parens = format!("{}1{}", "(".repeat(4000), ")".repeat(4000));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
+                assert_eq!(
+                    d.iter().filter(|x| x.is_error()).count(),
+                    1,
+                    "depth overflow should produce exactly one error, got {d:?}"
+                );
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on deeply nested input");
+    }
+
+    /// Pathological *structural* nesting — deep `{ … }` blocks, `if`/`else if` chains, `match` arm
+    /// bodies, and loop bodies — must report E0209 quickly instead of hanging (the depth guard used
+    /// to leave these recursions unbounded: a brace/match nest spun the block/arm loop forever on an
+    /// unconsumed token, while an `else if` chain recursed with no depth charge at all).
+    #[test]
+    fn deeply_nested_structural_input_reports_e0209() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+                let n = 3000;
+
+                // Nested blocks `{ { { … 0 … } } }`.
+                let blocks = format!("{}0{}", "{".repeat(n), "}".repeat(n));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&blocks, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested blocks should report E0209, got {d:?}");
+
+                // A long `if … else if … else if …` chain (direct `parse_if` recursion).
+                let elifs = format!("{}{{ 0 }}", "if true { 0 } else ".repeat(n));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&elifs, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "deep else-if chain should report E0209, got {d:?}");
+
+                // A `match` whose arm body is another `match`, nested deep.
+                let matches = format!("{}0{}", "match 0 { _ => ".repeat(n), " }".repeat(n));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&matches, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested match arms should report E0209, got {d:?}");
+
+                // Nested loop bodies `while … { while … { … } }` (statement form, via parse_module).
+                let whiles = format!(
+                    "fn f() {{ {}{} }}",
+                    "while true { ".repeat(n),
+                    "}".repeat(n)
+                );
+                let mut i = Interner::new();
+                let (_m, d) = parse_module(&whiles, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "nested loop bodies should report E0209, got {d:?}");
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on deeply nested structural input");
+    }
+
+    /// Moderately nested but entirely realistic input stays well under the limit and parses cleanly.
+    #[test]
+    fn moderate_nesting_parses_cleanly() {
+        // A 100-term sum.
+        let sum = format!("1{}", "+1".repeat(99));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&sum, SourceId(0), &mut i);
+        assert!(d.is_empty(), "100-term sum should parse cleanly, got {d:?}");
+
+        // 50-deep parentheses.
+        let parens = format!("{}1{}", "(".repeat(50), ")".repeat(50));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&parens, SourceId(0), &mut i);
+        assert!(d.is_empty(), "50-deep parens should parse cleanly, got {d:?}");
+
+        // A 16-deep array type.
+        let ty = format!("{}i32{}", "[".repeat(16), "; 1]".repeat(16));
+        let mut i = Interner::new();
+        let (_t, d) = parse_type_str(&ty, SourceId(0), &mut i);
+        assert!(d.is_empty(), "16-deep array type should parse cleanly, got {d:?}");
+
+        // 64-deep blocks, a 64-arm-deep else-if chain, a 64-deep match nest, and 64-deep loop
+        // bodies all sit far under the limit — the new structural guards must not reject them.
+        let blocks = format!("{}0{}", "{".repeat(64), "}".repeat(64));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&blocks, SourceId(0), &mut i);
+        assert!(d.is_empty(), "64-deep blocks should parse cleanly, got {d:?}");
+
+        let elifs = format!("{}{{ 0 }}", "if true { 0 } else ".repeat(64));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&elifs, SourceId(0), &mut i);
+        assert!(d.is_empty(), "64-deep else-if chain should parse cleanly, got {d:?}");
+
+        let matches = format!("{}0{}", "match 0 { _ => ".repeat(64), " }".repeat(64));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&matches, SourceId(0), &mut i);
+        assert!(d.is_empty(), "64-deep match nest should parse cleanly, got {d:?}");
+
+        // A wide-but-shallow block (many sequential statements) must not accumulate depth.
+        let wide = format!("{{ {} 0 }}", "let x = 1; ".repeat(500));
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(&wide, SourceId(0), &mut i);
+        assert!(d.is_empty(), "wide shallow block should parse cleanly, got {d:?}");
     }
 }

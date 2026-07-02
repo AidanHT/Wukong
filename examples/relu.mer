@@ -3,7 +3,7 @@ module examples.relu
 /// ReLU activation over a fixed-size array: out[i] = max(0, x[i]).
 /// A reusable kernel with an array out-parameter.
 /// Run: mercuryc --run examples/relu.mer    (prints 0 5 0 0 8 0)
-fn relu(x: [i32; 6], out: [i32; 6]) {
+fn relu(x: [i32; 6], mut out: [i32; 6]) {
     let mut i: i32 = 0;
     while i < 6 {
         if x[i] > 0 {

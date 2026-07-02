@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0304
+module tests.fail.assign_immutable
+
+// A binding introduced with `let` (without `mut`) cannot be reassigned. The language documents that
+// reassignment requires `mut`, but it was never enforced — `let x = 5; x = 10;` silently mutated.
+// Declaring `let mut x` allows the reassignment; mutating *through* an immutable binding (an array
+// element, a struct field, a pointee) is still permitted — only rebinding the name is rejected.
+fn main() -> i32 {
+    let x: i32 = 5;
+    x = 10; // reassigning an immutable binding
+    return x;
+}

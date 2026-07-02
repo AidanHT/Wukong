@@ -25,6 +25,9 @@ pub enum Scalar {
     F32,
     F64,
     Bool,
+    /// A Unicode scalar value (the type of a `'c'` literal). 4 bytes, unsigned; lowers to a 32-bit
+    /// integer in MIR, so it is interconvertible with the integer types via `as`.
+    Char,
 }
 
 impl Scalar {
@@ -46,6 +49,7 @@ impl Scalar {
             "f32" => F32,
             "f64" => F64,
             "bool" => Bool,
+            "char" => Char,
             _ => return None,
         })
     }
@@ -68,6 +72,7 @@ impl Scalar {
             F32 => "f32",
             F64 => "f64",
             Bool => "bool",
+            Char => "char",
         }
     }
 
@@ -77,7 +82,7 @@ impl Scalar {
         match self {
             I8 | U8 | Bool => 1,
             I16 | U16 | F16 | Bf16 => 2,
-            I32 | U32 | F32 => 4,
+            I32 | U32 | F32 | Char => 4,
             I64 | U64 | F64 | Usize | Isize => 8,
         }
     }
@@ -227,6 +232,24 @@ impl Ty {
                 .try_fold(1u64, |a, f| Some(a.max(f.align_of()?))),
             _ => None,
         }
+    }
+
+    /// The padded byte offset and type of each field of a `Tuple`, in declaration order — the
+    /// single source of truth for aggregate layout (the same `round_up` accumulation as
+    /// [`size_of`](Ty::size_of)). `None` for a non-tuple or a tuple with an unsized field. The MIR
+    /// builder uses this to lower tuple construction/field-access as byte-offset GEPs.
+    pub fn tuple_offsets(&self) -> Option<Vec<(u64, Ty)>> {
+        let Ty::Tuple(fields) = self else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(fields.len());
+        let mut off = 0u64;
+        for f in fields {
+            off = round_up(off, f.align_of()?);
+            out.push((off, f.clone()));
+            off += f.size_of()?;
+        }
+        Some(out)
     }
 
     /// A human-readable rendering for diagnostics (resolves interned symbols).

@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.struct_field_scalar_mismatch
+
+// A struct-literal field initialized with a NON-literal value of a different scalar type silently
+// truncated/demoted it — `S { a: x }` with `a: i32` and `x: f32` stored `2` (both backends agreeing
+// on the lossy value), where the language demands an explicit `as`. A literal field value still
+// adapts (`S { a: 5 }`), and an out-of-range literal is caught by the field range check.
+struct S {
+    a: i32,
+}
+
+fn main() -> i32 {
+    let x: f32 = 2.5;
+    let s: S = S { a: x };
+    return s.a;
+}

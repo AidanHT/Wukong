@@ -46,9 +46,37 @@ extern "C" fn rt_print_i64(x: i64) {
     }
 }
 
+// `print`/`println` of an *unsigned* integer lowers to this (mir_build zero-extends the value to 64
+// bits first). Renders the bits as `u64` — the identical text the interpreter's `print_u` produces.
+extern "C" fn rt_print_u64(x: u64) {
+    if let Ok(mut o) = OUTPUT.lock() {
+        o.extend_from_slice(format!("{x}\n").as_bytes());
+    }
+}
+
 extern "C" fn rt_print_f64(x: f64) {
     if let Ok(mut o) = OUTPUT.lock() {
         o.extend_from_slice(format!("{x}\n").as_bytes());
+    }
+}
+
+// `print`/`println` of a `*u8` string lowers to this. Reads the NUL-terminated byte buffer the
+// string literal materialized on the stack and appends its bytes plus a newline — the identical
+// bytes the interpreter's `print_str` produces (the buffer is always valid UTF-8 by construction).
+extern "C" fn rt_print_str(ptr: *const u8) {
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: `ptr` is a Mercury string buffer, always NUL-terminated by the `ExprKind::Str` lowering.
+    unsafe {
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        if let Ok(mut o) = OUTPUT.lock() {
+            o.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+            o.push(b'\n');
+        }
     }
 }
 
@@ -72,7 +100,9 @@ extern "C" fn rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// Names of the runtime symbols, shared by the JIT (which binds them to the `rt_*` functions) and
 /// the object emitter (which leaves them as undefined imports resolved at link time).
 const RT_PRINT_I64: &str = "mercury_rt_print_i64";
+const RT_PRINT_U64: &str = "mercury_rt_print_u64";
 const RT_PRINT_F64: &str = "mercury_rt_print_f64";
+const RT_PRINT_STR: &str = "mercury_rt_print_str";
 const RT_ASSERT: &str = "mercury_rt_assert";
 const RT_PARALLEL_FOR: &str = "mercury_parallel_for";
 const RT_SGEMM: &str = "mercury_sgemm";
@@ -187,6 +217,13 @@ const RT_REDUCE_BF16: &str = "mercury_reduce_bf16";
 const RT_DOT_F16: &str = "mercury_dot_f16";
 const RT_SUM_F16: &str = "mercury_sum_f16";
 const RT_REDUCE_F16: &str = "mercury_reduce_f16";
+// The `@parallel` multicore twins (same ABI; deterministic fixed-RCHUNK chunk fold).
+const RT_DOT_BF16_PAR: &str = "mercury_dot_bf16_parallel";
+const RT_SUM_BF16_PAR: &str = "mercury_sum_bf16_parallel";
+const RT_REDUCE_BF16_PAR: &str = "mercury_reduce_bf16_parallel";
+const RT_DOT_F16_PAR: &str = "mercury_dot_f16_parallel";
+const RT_SUM_F16_PAR: &str = "mercury_sum_f16_parallel";
+const RT_REDUCE_F16_PAR: &str = "mercury_reduce_f16_parallel";
 // f16 has no cheap inline round (unlike bf16's `<<16`), so f16 load/store/cast call these shims —
 // the *same* `half`-crate conversion the interpreter uses, keeping native == interp bit-for-bit.
 const RT_F32_TO_F16: &str = "mercury_f32_to_f16_bits";
@@ -200,7 +237,9 @@ const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 #[derive(Clone, Copy)]
 enum Intrinsic {
     PrintInt,
+    PrintUint,
     PrintFloat,
+    PrintStr,
     Assert,
 }
 
@@ -211,6 +250,10 @@ fn classify_intrinsic(name: &str, arg_is_float: bool) -> Option<Intrinsic> {
         } else {
             Intrinsic::PrintInt
         }),
+        // mir_build routes a `*u8` (string) argument to these symbols (see `print_str` in GemmSyms).
+        "print_str" | "println_str" => Some(Intrinsic::PrintStr),
+        // mir_build routes an unsigned-integer argument here (zero-extended to 64 bits).
+        "print_u" | "println_u" => Some(Intrinsic::PrintUint),
         "assert" => Some(Intrinsic::Assert),
         _ => None,
     }
@@ -238,16 +281,20 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
     })
 }
 
-/// Size in bytes of a MIR type (for `gep` scaling and stack-slot sizing).
-fn size_of(t: &MirType) -> u32 {
-    match t {
+/// Size in bytes of a MIR type (for `gep` scaling and stack-slot sizing). Returns `None` when the
+/// layout does not fit in a `u32` byte count — an oversized array/vector extent (e.g.
+/// `[i32; 999999999999]`) whose `elem_size * count` overflows. Callers turn that into a clean
+/// "type too large to lay out" compiler error via [`FnTranslator::size_of_or_err`] instead of
+/// letting the `u32` multiply overflow-panic.
+fn size_of(t: &MirType) -> Option<u32> {
+    Some(match t {
         MirType::I1 | MirType::I8 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
-        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e) * n,
+        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e)?.checked_mul(*n)?,
         MirType::Void => 0,
-    }
+    })
 }
 
 fn int_cc(op: CmpOp) -> IntCC {
@@ -324,6 +371,10 @@ struct FnTranslator<'a> {
     /// Pre-declared FuncRefs for callees and runtime imports in this function.
     func_refs: &'a HashMap<Symbol, FuncRef>,
     rt_refs: &'a HashMap<&'static str, FuncRef>,
+    /// First "type too large to lay out" overflow seen while lowering this function, if any.
+    /// Recorded (instead of panicking) so `populate_module` can abort with a clean error before
+    /// the half-built function is finalized/defined. See [`FnTranslator::size_of_or_err`].
+    layout_err: Option<String>,
 }
 
 impl<'a> FnTranslator<'a> {
@@ -333,6 +384,26 @@ impl<'a> FnTranslator<'a> {
 
     fn set(&mut self, v: ValueId, cv: Value) {
         self.vmap[v.0 as usize] = Some(cv);
+    }
+
+    /// Byte size of `ty` for stack-slot sizing / `gep` scaling. On an unrepresentable (overflowing)
+    /// layout it records a clean compiler error and returns a harmless 1-byte placeholder so the
+    /// half-built Cranelift IR stays well-formed; `populate_module` checks `layout_err` right after
+    /// lowering and aborts the compile before this function is defined. This is why an oversized
+    /// type (e.g. `[i32; 999999999999]`) yields a diagnostic + nonzero exit, not a Rust panic.
+    fn size_of_or_err(&mut self, ty: &MirType) -> u32 {
+        match size_of(ty) {
+            Some(b) => b,
+            None => {
+                if self.layout_err.is_none() {
+                    self.layout_err = Some(format!(
+                        "type `{}` is too large to lay out: byte size exceeds 2^32 (4 GiB)",
+                        ty.display()
+                    ));
+                }
+                1
+            }
+        }
     }
 
     fn ty_of(&self, v: ValueId) -> &MirType {
@@ -410,13 +481,23 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().iconst(t, *v as i64)
                 }
             }
-            Op::ConstFloat(v, ty) => {
-                if matches!(ty, MirType::F64) {
-                    self.builder.ins().f64const(*v)
-                } else {
-                    self.builder.ins().f32const(*v as f32)
-                }
-            }
+            Op::ConstFloat(v, ty) => match ty {
+                MirType::F64 => self.builder.ins().f64const(*v),
+                // A bf16/f16 const IS its grid-rounded value; materialize it rounded so it stays
+                // correct however the optimizer forwards or folds it. The per-store rounding alone is
+                // fragile — mem2reg and CSE load-forwarding bypass the store, dropping the rounding and
+                // making -O2 disagree with -O0 (`let b: bf16 = 0.1` then forwarded the f32 0.1, not the
+                // bf16-grid 0.10009765625). Rounding here is the same `half`-crate path the interp uses.
+                MirType::BF16 => self
+                    .builder
+                    .ins()
+                    .f32const(mercury_runtime::round_bf16(*v as f32)),
+                MirType::F16 => self
+                    .builder
+                    .ins()
+                    .f32const(mercury_runtime::round_f16(*v as f32)),
+                _ => self.builder.ins().f32const(*v as f32),
+            },
             Op::Bin(op, l, r) => {
                 let rt = self.ty_of(inst.result.unwrap()).clone();
                 self.lower_bin(*op, *l, *r, &rt)
@@ -441,7 +522,14 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Neg(v) => {
                 let x = self.val(*v);
-                if self.ty_of(*v).is_float() {
+                // A lane-float vector (`Vec(f32, N)`) is not itself `is_float()`, so dispatch on the
+                // lane type for vectors. Otherwise an autovectorized `-x[k]` over `[f32; N]` emits
+                // `ineg` on a float vector — invalid CLIF that the verifier rejects.
+                let is_float = match self.ty_of(*v) {
+                    MirType::Vec(lane, _) => lane.is_float(),
+                    t => t.is_float(),
+                };
+                if is_float {
                     self.builder.ins().fneg(x)
                 } else {
                     self.builder.ins().ineg(x)
@@ -487,7 +575,7 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             Op::Alloca(ty) => {
-                let bytes = size_of(ty).max(1);
+                let bytes = self.size_of_or_err(ty).max(1);
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     bytes,
@@ -555,7 +643,8 @@ impl<'a> FnTranslator<'a> {
             Op::Gep { ptr, index, elem } => {
                 let base = self.val(*ptr);
                 let idx = self.ptr_int(*index);
-                let scaled = self.builder.ins().imul_imm(idx, size_of(elem) as i64);
+                let scale = self.size_of_or_err(elem) as i64;
+                let scaled = self.builder.ins().imul_imm(idx, scale);
                 self.builder.ins().iadd(base, scaled)
             }
             Op::Call { func, args } => match self.lower_call(*func, args) {
@@ -708,15 +797,26 @@ impl<'a> FnTranslator<'a> {
         match kind {
             SExt => self.resize_int(x, from_ty, to_ty, true),
             ZExt | Trunc => self.resize_int(x, from_ty, to_ty, false),
-            FpToSi => self.builder.ins().fcvt_to_sint_sat(to_ty, x),
-            FpToUi => self.builder.ins().fcvt_to_uint_sat(to_ty, x),
+            FpToSi => self.fcvt_to_int_sat(x, to_ty, true),
+            FpToUi => self.fcvt_to_int_sat(x, to_ty, false),
             SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
             UiToFp => self.builder.ins().fcvt_from_uint(to_ty, x),
             FpExt => {
-                if to_ty == from_ty {
-                    x
+                // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
+                // register, so the per-store rounding is fragile — an optimizer can forward/promote a
+                // bf16 op result past its store, leaving an unrounded f32, and this widen would then be
+                // a no-op passing the wrong value (so -O2 disagreed with -O0). Round at the observation
+                // boundary too (the interpreter's `apply_cast` FpExt arm does the same).
+                let xr = match self.ty_of(v).clone() {
+                    MirType::BF16 => self.round_to_bf16(x),
+                    MirType::F16 => self.round_to_f16(x),
+                    _ => x,
+                };
+                let xr_ty = self.dfg_ty(xr);
+                if to_ty == xr_ty {
+                    xr
                 } else {
-                    self.builder.ins().fpromote(to_ty, x)
+                    self.builder.ins().fpromote(to_ty, xr)
                 }
             }
             FpTrunc => {
@@ -750,6 +850,44 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             IntToPtr | PtrToInt => self.resize_int(x, from_ty, to_ty, false),
+        }
+    }
+
+    /// Saturating float→int conversion that also supports the narrow result types `i8`/`i16`, which
+    /// Cranelift's `fcvt_to_{sint,uint}_sat` cannot target directly on x64 (the emitter hits
+    /// `unreachable!`). For a narrow target, convert to `i32` saturating (NaN→0, out-of-range
+    /// clamped to the i32 range), then clamp to the *narrow* type's range and `ireduce`. This
+    /// reproduces Rust `as` / the interpreter's saturating cast bit-for-bit — including out-of-range
+    /// and NaN inputs (`300.0 as u8 == 255`, `-1.0 as u8 == 0`, `NaN as i8 == 0`) — keeping the
+    /// differential gate exact. A `>= 32`-bit target uses the direct instruction unchanged.
+    fn fcvt_to_int_sat(&mut self, x: Value, to_ty: types::Type, signed: bool) -> Value {
+        if to_ty.bits() >= 32 {
+            return if signed {
+                self.builder.ins().fcvt_to_sint_sat(to_ty, x)
+            } else {
+                self.builder.ins().fcvt_to_uint_sat(to_ty, x)
+            };
+        }
+        if signed {
+            let wide = self.builder.ins().fcvt_to_sint_sat(types::I32, x);
+            let (lo, hi) = if to_ty.bits() == 8 {
+                (-128i64, 127i64)
+            } else {
+                (-32768i64, 32767i64)
+            };
+            let hic = self.builder.ins().iconst(types::I32, hi);
+            let loc = self.builder.ins().iconst(types::I32, lo);
+            let capped = self.builder.ins().smin(wide, hic);
+            let clamped = self.builder.ins().smax(capped, loc);
+            self.builder.ins().ireduce(to_ty, clamped)
+        } else {
+            let wide = self.builder.ins().fcvt_to_uint_sat(types::I32, x);
+            let hi = if to_ty.bits() == 8 { 255i64 } else { 65535i64 };
+            let hic = self.builder.ins().iconst(types::I32, hi);
+            // The lower bound is already 0 from the unsigned saturation; only the upper bound needs
+            // clamping (unsigned min, so a saturated `u32::MAX` reads as larger than the narrow max).
+            let clamped = self.builder.ins().umin(wide, hic);
+            self.builder.ins().ireduce(to_ty, clamped)
         }
     }
 
@@ -1182,7 +1320,9 @@ impl<'a> FnTranslator<'a> {
         // The bf16 mixed-precision reductions: mercury_dot_bf16(x, y, n) -> f32 (3 args) and
         // mercury_sum_bf16(x, n) -> f32 (2 args). bf16 storage, f32 accumulate; both return the
         // accumulated f32, so bind the call result like the sreduce kernel above.
-        if (name == RT_DOT_BF16 || name == RT_DOT_F16) && args.len() == 3 {
+        if matches!(name, RT_DOT_BF16 | RT_DOT_F16 | RT_DOT_BF16_PAR | RT_DOT_F16_PAR)
+            && args.len() == 3
+        {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
@@ -1190,16 +1330,22 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, y, n]);
             return self.builder.inst_results(call).first().copied();
         }
-        if (name == RT_SUM_BF16 || name == RT_SUM_F16) && args.len() == 2 {
+        if matches!(name, RT_SUM_BF16 | RT_SUM_F16 | RT_SUM_BF16_PAR | RT_SUM_F16_PAR)
+            && args.len() == 2
+        {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let fref = self.rt_refs[name];
             let call = self.builder.ins().call(fref, &[x, n]);
             return self.builder.inst_results(call).first().copied();
         }
-        // mercury_reduce_{bf16,f16}(x, n, op) -> f32 — the max-family reduction (max/min/absmax). Same
-        // f32 return as the sum/dot kernels above; the op selects the fold inside the kernel.
-        if (name == RT_REDUCE_BF16 || name == RT_REDUCE_F16) && args.len() == 3 {
+        // mercury_reduce_{bf16,f16}[_parallel](x, n, op) -> f32 — the max-family reduction
+        // (max/min/absmax). Same f32 return as the sum/dot kernels above; the op selects the fold.
+        if matches!(
+            name,
+            RT_REDUCE_BF16 | RT_REDUCE_F16 | RT_REDUCE_BF16_PAR | RT_REDUCE_F16_PAR
+        ) && args.len() == 3
+        {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let op = self.coerce_to_i64(args[2]);
@@ -1332,10 +1478,28 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().call(fref, &[v]);
                 }
             }
+            Intrinsic::PrintUint => {
+                if let Some(&a) = args.first() {
+                    // mir_build already zero-extended the value to 64 bits; pass the bits through
+                    // (Cranelift has no unsigned types — `rt_print_u64` formats the same i64 bits
+                    // as `u64`).
+                    let v = self.coerce_to_i64(a);
+                    let fref = self.rt_refs[RT_PRINT_U64];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
             Intrinsic::PrintFloat => {
                 if let Some(&a) = args.first() {
                     let v = self.coerce_to_f64(a);
                     let fref = self.rt_refs[RT_PRINT_F64];
+                    self.builder.ins().call(fref, &[v]);
+                }
+            }
+            Intrinsic::PrintStr => {
+                if let Some(&a) = args.first() {
+                    // The argument is already a pointer (the string buffer's base); pass it through.
+                    let v = self.val(a);
+                    let fref = self.rt_refs[RT_PRINT_STR];
                     self.builder.ins().call(fref, &[v]);
                 }
             }
@@ -1417,7 +1581,9 @@ impl<'a> FnTranslator<'a> {
 
 struct RtFuncs {
     print_i64: FuncId,
+    print_u64: FuncId,
     print_f64: FuncId,
+    print_str: FuncId,
     assert: FuncId,
     parallel_for: FuncId,
     sgemm: FuncId,
@@ -1535,6 +1701,12 @@ struct RtFuncs {
     dot_f16: FuncId,
     sum_f16: FuncId,
     reduce_f16: FuncId,
+    dot_bf16_par: FuncId,
+    sum_bf16_par: FuncId,
+    reduce_bf16_par: FuncId,
+    dot_f16_par: FuncId,
+    sum_f16_par: FuncId,
+    reduce_f16_par: FuncId,
     f32_to_f16: FuncId,
     f16_to_f32: FuncId,
     axpby_bf16: FuncId,
@@ -1758,12 +1930,21 @@ fn populate_module<M: Module>(
     sig_fmod_f32.params.push(AbiParam::new(types::F32));
     sig_fmod_f32.params.push(AbiParam::new(types::F32));
     sig_fmod_f32.returns.push(AbiParam::new(types::F32));
+    // mercury_rt_print_str(ptr) — render a NUL-terminated string buffer. Void.
+    let mut sig_print_str = Signature::new(call_conv);
+    sig_print_str.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
             .map_err(|e| e.to_string())?,
+        print_u64: module
+            .declare_function(RT_PRINT_U64, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
         print_f64: module
             .declare_function(RT_PRINT_F64, Linkage::Import, &sig_f)
+            .map_err(|e| e.to_string())?,
+        print_str: module
+            .declare_function(RT_PRINT_STR, Linkage::Import, &sig_print_str)
             .map_err(|e| e.to_string())?,
         assert: module
             .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
@@ -2117,6 +2298,25 @@ fn populate_module<M: Module>(
         reduce_f16: module
             .declare_function(RT_REDUCE_F16, Linkage::Import, &sig_reduce_bf16)
             .map_err(|e| e.to_string())?,
+        // The `@parallel` twins share the serial signatures (identical ABI; only the impl chunks).
+        dot_bf16_par: module
+            .declare_function(RT_DOT_BF16_PAR, Linkage::Import, &sig_dot_bf16)
+            .map_err(|e| e.to_string())?,
+        sum_bf16_par: module
+            .declare_function(RT_SUM_BF16_PAR, Linkage::Import, &sig_sum_bf16)
+            .map_err(|e| e.to_string())?,
+        reduce_bf16_par: module
+            .declare_function(RT_REDUCE_BF16_PAR, Linkage::Import, &sig_reduce_bf16)
+            .map_err(|e| e.to_string())?,
+        dot_f16_par: module
+            .declare_function(RT_DOT_F16_PAR, Linkage::Import, &sig_dot_bf16)
+            .map_err(|e| e.to_string())?,
+        sum_f16_par: module
+            .declare_function(RT_SUM_F16_PAR, Linkage::Import, &sig_sum_bf16)
+            .map_err(|e| e.to_string())?,
+        reduce_f16_par: module
+            .declare_function(RT_REDUCE_F16_PAR, Linkage::Import, &sig_reduce_bf16)
+            .map_err(|e| e.to_string())?,
         f32_to_f16: module
             .declare_function(RT_F32_TO_F16, Linkage::Import, &sig_f32_to_f16)
             .map_err(|e| e.to_string())?,
@@ -2149,16 +2349,29 @@ fn populate_module<M: Module>(
         {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
 
-            // Pre-declare callee and runtime FuncRefs into this function's DFG.
+            // Pre-declare callee and runtime FuncRefs into this function's DFG. Iterate the
+            // `program.funcs` Vec (source order), not the `ids` HashMap — the latter's per-process
+            // hash order would allocate `FuncRef` indices nondeterministically. It is washed out today
+            // (every read of `func_refs` is a keyed lookup, and relocations key on the symbol and emit
+            // in code-offset order), but iterating the deterministic Vec keeps the CLIF reproducible
+            // for free and immune to any future Cranelift change that orders a table by FuncRef index.
             let mut func_refs: HashMap<Symbol, FuncRef> = HashMap::new();
-            for (&sym, &fid) in &ids {
-                let r = module.declare_func_in_func(fid, builder.func);
-                func_refs.insert(sym, r);
+            for callee in &program.funcs {
+                let r = module.declare_func_in_func(ids[&callee.name], builder.func);
+                func_refs.insert(callee.name, r);
             }
             let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
             rt_refs.insert(
                 RT_PRINT_I64,
                 module.declare_func_in_func(rt.print_i64, builder.func),
+            );
+            rt_refs.insert(
+                RT_PRINT_U64,
+                module.declare_func_in_func(rt.print_u64, builder.func),
+            );
+            rt_refs.insert(
+                RT_PRINT_STR,
+                module.declare_func_in_func(rt.print_str, builder.func),
             );
             rt_refs.insert(
                 RT_PRINT_F64,
@@ -2611,6 +2824,30 @@ fn populate_module<M: Module>(
                 module.declare_func_in_func(rt.reduce_f16, builder.func),
             );
             rt_refs.insert(
+                RT_DOT_BF16_PAR,
+                module.declare_func_in_func(rt.dot_bf16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SUM_BF16_PAR,
+                module.declare_func_in_func(rt.sum_bf16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_REDUCE_BF16_PAR,
+                module.declare_func_in_func(rt.reduce_bf16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_DOT_F16_PAR,
+                module.declare_func_in_func(rt.dot_f16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SUM_F16_PAR,
+                module.declare_func_in_func(rt.sum_f16_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_REDUCE_F16_PAR,
+                module.declare_func_in_func(rt.reduce_f16_par, builder.func),
+            );
+            rt_refs.insert(
                 RT_F32_TO_F16,
                 module.declare_func_in_func(rt.f32_to_f16, builder.func),
             );
@@ -2637,8 +2874,15 @@ fn populate_module<M: Module>(
                 blocks,
                 func_refs: &func_refs,
                 rt_refs: &rt_refs,
+                layout_err: None,
             };
             t.translate();
+            // A type whose byte layout overflows `u32` is recorded as a clean error during lowering
+            // rather than panicking; abort now, before this half-built function is finalized/defined
+            // (the `?` at each `populate_module` call site surfaces it as `error: <msg>`, exit 1).
+            if let Some(e) = t.layout_err.take() {
+                return Err(e);
+            }
             t.builder.finalize();
         }
         let fid = ids[&f.name];
@@ -2663,25 +2907,7 @@ impl JitProgram {
     /// Invoke the entry point, transmuting to the right ABI for its return type. Caller must hold
     /// the run lock (so the shared capture buffer isn't raced).
     unsafe fn invoke(&self) -> i64 {
-        match &self.ret {
-            MirType::Void => {
-                let f: extern "C" fn() = std::mem::transmute(self.code);
-                f();
-                0
-            }
-            t if t.is_float() => {
-                let f: extern "C" fn() -> f64 = std::mem::transmute(self.code);
-                f() as i64
-            }
-            MirType::I64 => {
-                let f: extern "C" fn() -> i64 = std::mem::transmute(self.code);
-                f()
-            }
-            _ => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(self.code);
-                f() as i64
-            }
-        }
+        invoke_code(self.code as usize, &self.ret)
     }
 
     /// Run once, returning the exit code and captured stdout (the native counterpart to the
@@ -2690,7 +2916,17 @@ impl JitProgram {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
         ASSERT_FAILED.store(false, Ordering::SeqCst);
-        let exit_code = unsafe { self.invoke() };
+        // Run the JIT'd entry on a worker thread with a large stack, mirroring the interpreter's
+        // `with_big_stack`. The native code recurses on the host call stack (one machine frame per
+        // Mercury call), so a deeply recursive program would overflow the default ~8 MiB main-thread
+        // stack and *abort* the process — while the interpreter oracle, on its 512 MiB stack,
+        // completes. Without matching headroom the two backends diverge on deep recursion (a stack
+        // overflow vs a correct result), breaking the differential gate. Only the code pointer
+        // (passed as a `usize`, since a raw pointer isn't `Send`) and the return type cross the
+        // boundary; the `OUTPUT`/`ASSERT_FAILED` statics the JIT'd `rt_*` calls touch are global.
+        let code = self.code as usize;
+        let ret = self.ret.clone();
+        let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if ASSERT_FAILED.load(Ordering::SeqCst) {
             return Err("assertion failed".into());
@@ -2716,6 +2952,55 @@ impl Drop for JitProgram {
     }
 }
 
+/// Invoke a JIT entry's code pointer (passed as a `usize` so it can cross a thread boundary into the
+/// big-stack worker), transmuting to the ABI implied by its return type. Mirrors `JitProgram::invoke`.
+///
+/// # Safety
+/// `code` must be a finalized function pointer of the ABI implied by `ret`, valid for the call.
+unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
+    let code = code as *const u8;
+    match ret {
+        MirType::Void => {
+            let f: extern "C" fn() = std::mem::transmute(code);
+            f();
+            0
+        }
+        t if t.is_float() => {
+            let f: extern "C" fn() -> f64 = std::mem::transmute(code);
+            f() as i64
+        }
+        MirType::I64 => {
+            let f: extern "C" fn() -> i64 = std::mem::transmute(code);
+            f()
+        }
+        _ => {
+            let f: extern "C" fn() -> i32 = std::mem::transmute(code);
+            f() as i64
+        }
+    }
+}
+
+/// Run `f` on a worker thread with a large (512 MiB) stack, re-raising any panic on the caller so
+/// behavior is otherwise identical to a direct call. This gives JIT'd Mercury recursion the *same*
+/// headroom as the interpreter's `with_big_stack` worker — without it the native backend overflows
+/// the host's ~8 MiB default stack and aborts the process where the interpreter completes, a
+/// divergence the differential gate would otherwise miss (it only re-runs the interpreter across opt
+/// levels). `thread::scope` lets the worker borrow non-`'static` captures.
+fn run_on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    const STACK: usize = 512 * 1024 * 1024;
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .name("mercury-native".into())
+            .stack_size(STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn native worker thread");
+        match handle.join() {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
 /// JIT-compile `program`, returning a callable handle to `entry`.
 pub fn jit_compile(
     program: &Program,
@@ -2727,7 +3012,9 @@ pub fn jit_compile(
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
+    builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
+    builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
@@ -3109,6 +3396,30 @@ pub fn jit_compile(
     builder.symbol(
         RT_REDUCE_F16,
         mercury_runtime::mercury_reduce_f16 as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_BF16_PAR,
+        mercury_runtime::mercury_dot_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_BF16_PAR,
+        mercury_runtime::mercury_sum_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_BF16_PAR,
+        mercury_runtime::mercury_reduce_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_F16_PAR,
+        mercury_runtime::mercury_dot_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_F16_PAR,
+        mercury_runtime::mercury_sum_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_F16_PAR,
+        mercury_runtime::mercury_reduce_f16_parallel as *const u8,
     );
     builder.symbol(
         RT_F32_TO_F16,
@@ -3186,7 +3497,9 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
+    builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
+    builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
@@ -3568,6 +3881,30 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_REDUCE_F16,
         mercury_runtime::mercury_reduce_f16 as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_BF16_PAR,
+        mercury_runtime::mercury_dot_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_BF16_PAR,
+        mercury_runtime::mercury_sum_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_BF16_PAR,
+        mercury_runtime::mercury_reduce_bf16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_DOT_F16_PAR,
+        mercury_runtime::mercury_dot_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SUM_F16_PAR,
+        mercury_runtime::mercury_sum_f16_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_REDUCE_F16_PAR,
+        mercury_runtime::mercury_reduce_f16_parallel as *const u8,
     );
     builder.symbol(
         RT_F32_TO_F16,

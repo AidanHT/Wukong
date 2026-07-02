@@ -1,0 +1,69 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 103
+// EXPECT-OUT: 1654
+// EXPECT-OUT: -1626
+// EXPECT-OUT: 1626
+// EXPECT-OUT: 413
+// EXPECT-OUT: -1584
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -8000
+module tests.run.norm_out_of_place
+
+// Out-of-place normalizations `out = norm(x)` (the residual-stream transformer pattern: the normalized
+// activations go to a fresh buffer while `x` — the residual — is preserved). The same fused
+// `mercury_norm_f32(x, out, .., NORM_*)` the in-place form uses, but the kernel reads `x` and writes a
+// distinct `out` (the ABI's two pointers, which both backends already marshal separately). RMSNorm /
+// LayerNorm / L2-norm accept the out-of-place form; the differential gate proves interp == native and
+// opt-invariance proves -O0 == -O3. Each `out` here equals the in-place result (same math), and the
+// source `x` stays intact (the last print of each block).
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 { x[i] = (i as f32) + 1.0; } // 1 .. 16
+
+    // --- out-of-place RMSNorm: r = x · rsqrt(mean(x²)+eps) ---
+    let mut r: [f32; 16] = [0.0; 16];
+    let mut ss: f32 = 0.0;
+    for i in 0..16 { ss = ss + x[i] * x[i]; }
+    let inv: f32 = rsqrt(ss / 16.0 + 0.00001);
+    for i in 0..16 { r[i] = x[i] * inv; }
+    print((r[0] * 1000.0) as i32);
+    print((r[15] * 1000.0) as i32);
+
+    // --- out-of-place LayerNorm: l = (x-mean)·rsqrt(var+eps) ---
+    let mut l: [f32; 16] = [0.0; 16];
+    let mut s: f32 = 0.0;
+    for i in 0..16 { s = s + x[i]; }
+    let mean: f32 = s / 16.0;
+    let mut vv: f32 = 0.0;
+    for i in 0..16 { vv = vv + (x[i] - mean) * (x[i] - mean); }
+    let iv: f32 = rsqrt(vv / 16.0 + 0.00001);
+    for i in 0..16 { l[i] = (x[i] - mean) * iv; }
+    print((l[0] * 1000.0) as i32);
+    print((l[15] * 1000.0) as i32);
+
+    // --- out-of-place L2-norm: u = x · 1/sqrt(Σx²+eps) (no mean divisor) ---
+    let mut u: [f32; 16] = [0.0; 16];
+    let mut s2: f32 = 0.0;
+    for i in 0..16 { s2 = s2 + x[i] * x[i]; }
+    let iu: f32 = 1.0 / sqrt(s2 + 0.00001);
+    for i in 0..16 { u[i] = x[i] * iu; }
+    print((u[15] * 1000.0) as i32);
+
+    // --- batched [4,8] out-of-place RMSNorm: each row normalized into `b` ---
+    let mut g: [f32; 32] = [0.0; 32];
+    for i in 0..32 { g[i] = (i as f32) - 16.0; }
+    let mut b: [f32; 32] = [0.0; 32];
+    for rr in 0..4 {
+        let mut rs: f32 = 0.0;
+        for i in 0..8 { rs = rs + g[rr * 8 + i] * g[rr * 8 + i]; }
+        let ri: f32 = rsqrt(rs / 8.0 + 0.00001);
+        for i in 0..8 { b[rr * 8 + i] = g[rr * 8 + i] * ri; }
+    }
+    print((b[8] * 1000.0) as i32);
+
+    // The sources are preserved (out-of-place never wrote them).
+    print((x[0] * 1000.0) as i32);  // 1000
+    print((g[8] * 1000.0) as i32);  // (8-16) = -8 -> -8000
+    return 0;
+}

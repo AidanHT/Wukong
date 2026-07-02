@@ -8,7 +8,7 @@ module tests.run.ffn_block
 // A transformer feed-forward block: h = gelu(x · W1ᵀ), out = h · W2ᵀ — two nn.Linear matmuls with
 // a GELU between. Both matmul nests should dispatch to the tuned GEMM kernel; the GELU loop
 // vectorizes. M=2 tokens, D=4 model dim, H=8 hidden.
-fn ffn(x: [f32; 8], w1: [f32; 32], w2: [f32; 32], h: [f32; 16], out: [f32; 8]) {
+fn ffn(x: [f32; 8], w1: [f32; 32], w2: [f32; 32], mut h: [f32; 16], mut out: [f32; 8]) {
     // h = x · W1ᵀ   (x is [2,4], W1 is [8,4] → h is [2,8]); nn.Linear spelling.
     for i in 0..2 {
         for j in 0..8 {

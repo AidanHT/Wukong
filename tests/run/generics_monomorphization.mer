@@ -1,0 +1,35 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3750
+// EXPECT-OUT: -4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 9
+// EXPECT-OUT: 5
+module tests.run.generics_monomorphization
+
+// Type-generic value functions are monomorphized: one specialized copy per distinct concrete
+// instantiation (`id$f32`, `id$i32`, ...), each call redirected to the matching copy. Before this a
+// generic type parameter defaulted to `i32`, so any non-i32 instantiation produced interp != native
+// output plus a compiler ICE / mem2reg panic, and signed `/` `>>` `<` inside a generic body lowered
+// as UNSIGNED (`dv(-8)` gave `2147483644` instead of `-4`). The differential gate (interp == native,
+// -O0 == -O3) now holds for every instance; dimension/shape generics are unaffected.
+
+fn id<T>(x: T) -> T { return x; }
+fn add<T>(a: T, b: T) -> T { return a + b; }
+fn dv<T>(x: T) -> T { return x / 2; }            // signed division must stay signed
+fn islt<T>(x: T, y: T) -> bool { return x < y; } // signed less-than must stay signed
+fn inner<U>(y: U) -> U { return y + y; }
+fn outer<T>(x: T) -> T { return inner(x) + x; }  // a generic calling another generic (transitive)
+
+fn main() -> i32 {
+    print((id(2.5) * 1000.0) as i32);                   // 2500  (id$f32)
+    print(id(7));                                       // 7     (id$i32)
+    print((add(1.5, 2.25) * 1000.0) as i32);            // 3750  (add$f32)
+    print(dv(0 - 8));                                   // -4    (dv$i32, signed div)
+    if islt(0 - 1, 1) { print(1); } else { print(0); } // 1     (islt$i32, signed lt)
+    print(outer(3));                                    // 9     (outer$i32 -> inner$i32)
+    print(id(id(5)));                                   // 5     (nested instantiation)
+    return 0;
+}

@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.call_arg_kind_mismatch
+
+// Passing a pointer where a scalar parameter is expected (or an array/tuple, or vice versa) is a
+// kind confusion that the lenient call-unification core used to let through with no diagnostic. The
+// interpreter then trapped while the native backend ICE'd on the mismatched ABI — an i64 pointer
+// marshalled into a 32-bit scalar slot — a backend divergence on a program that should never have
+// compiled. The argument kind is now checked against the parameter kind at the call site.
+fn takes_scalar(n: i32) -> i32 {
+    return n;
+}
+
+fn main() -> i32 {
+    let a: i32 = 5;
+    return takes_scalar(&a); // `&a` is `*i32`, but the parameter is a scalar `i32`
+}

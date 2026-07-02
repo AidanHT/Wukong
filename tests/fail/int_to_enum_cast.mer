@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0401
+module tests.fail.int_to_enum_cast
+
+// Casting an integer TO an enum (`99 as E`) is rejected. The `as` operator on enums is meant for the
+// well-defined `enum -> integer` discriminant widening; the reverse forges a discriminant that no
+// variant holds. Feeding such a value to an exhaustive `match` reaches the `Unreachable` fall-through
+// the enum-exhaustiveness lowering emits, and the two backends disagree on it: the interpreter traps
+// (exit 1) while native executes an illegal instruction (exit 132) — a real backend divergence on a
+// program the front-end used to accept. Rust rejects `int as Enum` for the same reason; a `match` on
+// the integer is the checked conversion. `enum -> int` stays valid. See gap-hunt sweep #13, Scout B.
+enum E { A = 0, B = 1, C = 2 }
+
+fn f(e: E) -> i32 {
+    return match e { E::A => 10, E::B => 20, E::C => 30 };
+}
+
+fn main() -> i32 {
+    let bogus: E = 99 as E;   // E0401: cannot cast `i32` to the enum `E`
+    print(f(bogus));
+    return 0;
+}

@@ -30,7 +30,8 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   (`silu_bwd_2`…), AVX2 (`silu_bwd8`…), and the inlined MIR share one op sequence (bit-for-bit). Pure
   elementwise — no reduction — so the kernel is bit-identical lane-for-lane (no reassociation exception).
 - `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
-  reductions** (dot / ssd / sum / sumsq folded by `+`, **max / min folded by `fmax`/`fmin`**, and
+  reductions** (dot / ssd / sum / sumsq / **abssum `Σ|x|` (L1 norm) / absdiff `Σ|x−y|` (MAE)** folded
+  by `+`, **max / min folded by `fmax`/`fmin`**, and
   **maxabs** = `fmax` over `|x|` (AVX2 `andnot(-0, x)` / scalar `f32::abs`, bit-identical), by `RED_*`
   op code — the per-tensor max/range/absmax softmax stability and dynamic int8 quantization need). A
   `@parallel` reduction loop lowers to the `_parallel` one. The parallel result is **bit-identical** to
@@ -85,7 +86,8 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   `sum`/`max`/`min`/`maxabs`/`mean`/`sumsq`/`L2`/`RMS`), `softmax_bwd.rs`, `rmsnorm_bwd.rs`,
   `layernorm_bwd.rs` (the norm/softmax backward gradients — reuse `sreduce`'s bit-exact dot), `vmath`'s
   two-input twin `mercury_vmath2_f32` (`pow`/`atan2`/`hypot` + the 6 activation backwards + the
-  SwiGLU/GeGLU gate), `xent.rs` + `xent_bwd.rs` (softmax cross-entropy fwd/bwd, **i32 labels**),
+  SwiGLU/GeGLU/GLU gate `act(a)·b` for act ∈ silu/gelu/sigmoid), `xent.rs` + `xent_bwd.rs` (softmax
+  cross-entropy fwd/bwd, **i32 labels**),
   `rope.rs` + `rope_bwd.rs` (rotary embedding — reuse `vmath`'s `sincos`), `logsoftmax.rs` (per-row
   log-sum-exp), `kldiv.rs` + `entropy.rs` + `kd_loss.rs` (the per-row `logf`/`expf` losses), `rowarg.rs`
   + `colarg.rs` (per-row/column argmax/argmin → an **i32 index** buffer; AVX2 tracks 8 `(value,index)`

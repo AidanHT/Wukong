@@ -148,21 +148,49 @@ pub fn run_with_output(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<(i64, Vec<u8>), String> {
-    let func = program
-        .function(entry)
-        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    let mut interp = Interp {
-        program,
-        interner,
-        memory: Vec::new(),
-        stdout: Vec::new(),
-        frames: Vec::new(),
-        scratch: Vec::with_capacity(8),
-        vecs: Vec::new(),
-        accel: None,
-    };
-    let result = interp.run_function(func, Vec::new())?;
-    Ok((result.as_int() as i64, interp.stdout))
+    // The tree-walker recurses on the *host* call stack — one host frame per Mercury call — so a
+    // deeply recursive Mercury program would overflow the default main-thread stack and **abort**
+    // the process (a stack overflow is uncatchable) before the interpreter's own 100M-step guard
+    // could fire. The interpreter is the correctness oracle; an abort here would take down the
+    // whole differential gate, so run it on a worker thread with a large stack. `thread::scope`
+    // lets that worker borrow the non-`'static` program/interner.
+    with_big_stack(|| {
+        let func = program
+            .function(entry)
+            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let mut interp = Interp {
+            program,
+            interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            scratch: Vec::with_capacity(8),
+            vecs: Vec::new(),
+            accel: None,
+        };
+        let result = interp.run_function(func, Vec::new())?;
+        Ok((result.as_int() as i64, interp.stdout))
+    })
+}
+
+/// Run `f` on a worker thread with a large stack, returning its result and re-raising any panic on
+/// the caller so behavior is otherwise identical to a direct call. This gives the recursive
+/// tree-walker headroom: 512 MiB of stack is *reserved* virtual address space (committed lazily by
+/// the OS), so deep Mercury recursion hits the interpreter's 100M-step guard or completes instead
+/// of overflowing the host's ~8 MiB default and aborting the process.
+fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    const STACK: usize = 512 * 1024 * 1024;
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .name("mercury-interp".into())
+            .stack_size(STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn interpreter worker thread");
+        match handle.join() {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// Like [`run_with_output`] but offloads recognized kernel calls to `accel` (the GPU backend). This
@@ -486,7 +514,14 @@ impl<'a, 'k> Interp<'a, 'k> {
     ) -> Result<Value, String> {
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
-            Op::ConstFloat(v, _) => Value::Float(*v),
+            Op::ConstFloat(v, ty) => Value::Float(match ty {
+                // A bf16/f16 const IS its grid-rounded value (see the native ConstFloat lowering) —
+                // round at materialization so optimizer value-forwarding can't drop the rounding and
+                // make -O2 disagree with -O0. Same `half`-crate path used at every bf16/f16 store/cast.
+                MirType::BF16 => mercury_runtime::round_bf16(*v as f32) as f64,
+                MirType::F16 => mercury_runtime::round_f16(*v as f32) as f64,
+                _ => *v,
+            }),
             // Vector arithmetic is lane-wise, each lane rounded to the lane type (so `<n x f32>`
             // ops round at f32, matching the native backend). Scalar bins go the fast path.
             Op::Bin(b, l, r) => {
@@ -515,14 +550,45 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128)
                 }
             }
-            Op::Neg(v) => match reg(regs, *v) {
-                Value::Float(f) => Value::Float(-f),
-                other => Value::Int(-other.as_int()),
-            },
-            Op::Not(v) => match reg(regs, *v) {
-                Value::Int(i) => Value::Int(!i),
-                other => Value::Int(!other.as_int()),
-            },
+            Op::Neg(v) => {
+                if let Some(MirType::Vec(lane, n)) = rty {
+                    // Lane-wise negate (the autovectorized `-x[k]`). Without this arm a `VecRef`
+                    // operand falls into the scalar path below, where `as_int()` yields 0, so every
+                    // lane is silently zeroed — a miscompile the native backend does not share.
+                    let xs = self.vec_lanes(reg(regs, *v));
+                    let is_float = lane.is_float();
+                    let lanes: Vec<Value> = (0..*n as usize)
+                        .map(|i| {
+                            if is_float {
+                                Value::Float(-xs[i].as_float())
+                            } else {
+                                Value::Int(-xs[i].as_int())
+                            }
+                        })
+                        .collect();
+                    self.push_vec(lanes)
+                } else {
+                    match reg(regs, *v) {
+                        Value::Float(f) => Value::Float(-f),
+                        other => Value::Int(-other.as_int()),
+                    }
+                }
+            }
+            Op::Not(v) => {
+                if let Some(MirType::Vec(_lane, n)) = rty {
+                    // Lane-wise bitwise complement. Latent today (the vectorizer does not yet emit a
+                    // vector `Not`), but mirror `Neg` so it can never silently zero lanes.
+                    let xs = self.vec_lanes(reg(regs, *v));
+                    let lanes: Vec<Value> =
+                        (0..*n as usize).map(|i| Value::Int(!xs[i].as_int())).collect();
+                    self.push_vec(lanes)
+                } else {
+                    match reg(regs, *v) {
+                        Value::Int(i) => Value::Int(!i),
+                        other => Value::Int(!other.as_int()),
+                    }
+                }
+            }
             Op::Cast(kind, v, to) => {
                 if let Some(MirType::Vec(to_lane, n)) = rty {
                     // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
@@ -558,16 +624,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Alloca(ty) => {
                 let idx = self.memory.len();
-                // An array alloca reserves `count` contiguous element slots; its result points at
-                // the first. `gep` then computes `base + index` into this run.
-                if let MirType::Array(elem, count) = ty {
-                    let d = default_value(elem);
-                    for _ in 0..*count {
-                        self.memory.push(d);
-                    }
-                } else {
-                    self.memory.push(default_value(ty));
-                }
+                // Reserve every leaf slot of `ty` (recursing into nested arrays so an array of
+                // structs/tuples is fully sized, not one slot per element); the result points at the
+                // first. `gep` then computes `base + index * slot_count(elem)` into this run.
+                push_defaults(ty, &mut self.memory);
                 Value::Ptr(idx)
             }
             // A vector load gathers `n` contiguous scalar slots (memory stays scalar); a scalar
@@ -617,10 +677,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Value::Unit
             }
-            Op::Gep { ptr: p, index, .. } => {
+            Op::Gep { ptr: p, index, elem } => {
                 let base = ptr(reg(regs, *p))?;
                 let off = reg(regs, *index).as_int();
-                Value::Ptr((base as i128 + off) as usize)
+                // Scale the index by the element's slot footprint so an aggregate-element array
+                // (`[Struct; N]`) strides one whole element per index, matching native's
+                // `index * size_of(elem)`. `slot_count` is 1 for scalar/byte elements, so scalar
+                // arrays and struct/tuple byte-offset field GEPs (`elem = I8`) are unchanged.
+                Value::Ptr((base as i128 + off * slot_count(elem) as i128) as usize)
             }
             Op::Call { func, args } => {
                 let argv: Vec<Value> = args.iter().map(|a| reg(regs, *a)).collect();
@@ -723,6 +787,40 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::VecRef(_) => "<vector>\n".to_string(),
                     Value::Unit => "\n".to_string(),
                 };
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
+            // The unsigned twin of `print`/`println` (mir_build routes an unsigned-integer argument
+            // here after zero-extending it to 64 bits): render the low 64 bits as `u64`, so a
+            // high-bit-set value prints its magnitude. Native's `rt_print_u64` formats the identical
+            // bits the same way, so the differential gate holds.
+            "print_u" | "println_u" => {
+                let text = match args.first().copied().unwrap_or(Value::Unit) {
+                    Value::Int(i) => format!("{}\n", i as u64),
+                    other => format!("{}\n", other.as_int() as u64),
+                };
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
+            // A `*u8` string argument to `print`/`println` (lowered to these symbols by mir_build):
+            // walk `memory` from the base pointer, collecting bytes (each stored as a `Value::Int`
+            // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
+            // bytes via `rt_print_str`, so the differential gate holds.
+            "print_str" | "println_str" => {
+                let mut bytes = Vec::new();
+                if let Some(Value::Ptr(base)) = args.first().copied() {
+                    let mut i = base;
+                    while i < self.memory.len() {
+                        let b = self.memory[i].as_int() as u8;
+                        if b == 0 {
+                            break;
+                        }
+                        bytes.push(b);
+                        i += 1;
+                    }
+                }
+                let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                text.push('\n');
                 self.stdout.extend_from_slice(text.as_bytes());
                 Ok(Value::Unit)
             }
@@ -2202,9 +2300,15 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bf16-rounded f32 value; reconstruct the exact 16 stored bits via `f32_to_bf16_bits`
             // (idempotent on an already-bf16-rounded value) so the buffer is identical to the native
             // backend's 2-byte storage, then call the identical kernel — the differential gate stays
-            // exact despite the kernel's reassociated 8-lane accumulation.
-            "mercury_dot_bf16" | "mercury_sum_bf16" => {
-                let is_dot = name == "mercury_dot_bf16";
+            // exact despite the kernel's reassociated 8-lane accumulation. The `_parallel` twins (a
+            // `@parallel` low-precision reduction) marshal identically but call the **parallel** kernel:
+            // unlike the f32 reductions (whose serial form is itself chunked, so the interp calls it),
+            // the bf16/f16 serial kernels reduce the *whole* array flat, which reassociates vs the
+            // chunked parallel fold — so we call the deterministic parallel kernel native runs, exactly.
+            "mercury_dot_bf16" | "mercury_sum_bf16" | "mercury_dot_bf16_parallel"
+            | "mercury_sum_bf16_parallel" => {
+                let is_dot = name == "mercury_dot_bf16" || name == "mercury_dot_bf16_parallel";
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
                     (ptr(args[1])?, args[2].as_int() as usize)
@@ -2229,10 +2333,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 // SAFETY: the buffers are exactly n u16 long — the kernels' contract.
                 let r = unsafe {
-                    if is_dot {
-                        mercury_runtime::mercury_dot_bf16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
-                    } else {
-                        mercury_runtime::mercury_sum_bf16(xbuf.as_ptr(), n as i64)
+                    match (is_dot, is_par) {
+                        (true, false) => {
+                            mercury_runtime::mercury_dot_bf16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
+                        }
+                        (true, true) => mercury_runtime::mercury_dot_bf16_parallel(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            n as i64,
+                        ),
+                        (false, false) => mercury_runtime::mercury_sum_bf16(xbuf.as_ptr(), n as i64),
+                        (false, true) => {
+                            mercury_runtime::mercury_sum_bf16_parallel(xbuf.as_ptr(), n as i64)
+                        }
                     }
                 };
                 Ok(Value::Float(r as f64))
@@ -2241,7 +2354,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // a `m = fmax/fmin(m, (x[k] as f32))` loop over `[bf16]` lowers to. Reconstruct the exact
             // bf16 bits (as the dot/sum path does), call the identical kernel — the widen is lossless
             // and max/min round nothing, so interp == native exactly.
-            "mercury_reduce_bf16" => {
+            "mercury_reduce_bf16" | "mercury_reduce_bf16_parallel" => {
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int() as usize;
                 let op = args[2].as_int() as i64;
@@ -2255,16 +2369,23 @@ impl<'a, 'k> Interp<'a, 'k> {
                     ));
                 }
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
-                let r =
-                    unsafe { mercury_runtime::mercury_reduce_bf16(xbuf.as_ptr(), n as i64, op) };
+                let r = unsafe {
+                    if is_par {
+                        mercury_runtime::mercury_reduce_bf16_parallel(xbuf.as_ptr(), n as i64, op)
+                    } else {
+                        mercury_runtime::mercury_reduce_bf16(xbuf.as_ptr(), n as i64, op)
+                    }
+                };
                 Ok(Value::Float(r as f64))
             }
             // The IEEE-f16 twins: `mercury_dot_f16` / `mercury_sum_f16` / `mercury_reduce_f16` — same
             // marshaling as the bf16 reductions, but reconstruct the exact f16 bits via
             // `f32_to_f16_bits` (the stored value is already f16-rounded, so this is exact) and call
             // the F16C kernels. interp == native bit-for-bit (the widen is lossless, identical kernel).
-            "mercury_dot_f16" | "mercury_sum_f16" => {
-                let is_dot = name == "mercury_dot_f16";
+            "mercury_dot_f16" | "mercury_sum_f16" | "mercury_dot_f16_parallel"
+            | "mercury_sum_f16_parallel" => {
+                let is_dot = name == "mercury_dot_f16" || name == "mercury_dot_f16_parallel";
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let (y, n) = if is_dot {
                     (ptr(args[1])?, args[2].as_int() as usize)
@@ -2287,17 +2408,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                         ybuf.push(bits(y, t)?);
                     }
                 }
-                // SAFETY: the buffers are exactly n u16 long — the kernels' contract.
+                // SAFETY: the buffers are exactly n u16 long — the kernels' contract. The `_parallel`
+                // names call the deterministic parallel kernel (see the bf16 dot/sum arm above).
                 let r = unsafe {
-                    if is_dot {
-                        mercury_runtime::mercury_dot_f16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
-                    } else {
-                        mercury_runtime::mercury_sum_f16(xbuf.as_ptr(), n as i64)
+                    match (is_dot, is_par) {
+                        (true, false) => {
+                            mercury_runtime::mercury_dot_f16(xbuf.as_ptr(), ybuf.as_ptr(), n as i64)
+                        }
+                        (true, true) => mercury_runtime::mercury_dot_f16_parallel(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            n as i64,
+                        ),
+                        (false, false) => mercury_runtime::mercury_sum_f16(xbuf.as_ptr(), n as i64),
+                        (false, true) => {
+                            mercury_runtime::mercury_sum_f16_parallel(xbuf.as_ptr(), n as i64)
+                        }
                     }
                 };
                 Ok(Value::Float(r as f64))
             }
-            "mercury_reduce_f16" => {
+            "mercury_reduce_f16" | "mercury_reduce_f16_parallel" => {
+                let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int() as usize;
                 let op = args[2].as_int() as i64;
@@ -2311,7 +2443,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                     ));
                 }
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
-                let r = unsafe { mercury_runtime::mercury_reduce_f16(xbuf.as_ptr(), n as i64, op) };
+                let r = unsafe {
+                    if is_par {
+                        mercury_runtime::mercury_reduce_f16_parallel(xbuf.as_ptr(), n as i64, op)
+                    } else {
+                        mercury_runtime::mercury_reduce_f16(xbuf.as_ptr(), n as i64, op)
+                    }
+                };
                 Ok(Value::Float(r as f64))
             }
             // `mercury_axpby_bf16(x, y, out, n, a, b)` — the bf16→f32 streaming axpby a recognized
@@ -2867,6 +3005,35 @@ fn default_value(ty: &MirType) -> Value {
     }
 }
 
+/// The number of flat-memory slots a value of `ty` occupies — the interpreter's analogue of
+/// `size_of`. Every scalar (any width), pointer, or vector reference is one slot; an `Array(elem, n)`
+/// is `n` element-runs laid out contiguously, so it occupies `n * slot_count(elem)` slots (recursing
+/// for an array of aggregates). This is the stride a `Gep` over such an element must use so that
+/// element `i` lands at `base + i * slot_count(elem)` — matching native, which scales the GEP index
+/// by `size_of(elem)` bytes. For a scalar/byte (`I8`) element this is `1`, so a scalar array and a
+/// struct/tuple byte-buffer field GEP are unchanged; only an *aggregate-element* array (`[Struct; N]`,
+/// `[(..); N]`) is affected — previously mis-strided by a single slot.
+fn slot_count(ty: &MirType) -> usize {
+    match ty {
+        MirType::Array(elem, count) => *count as usize * slot_count(elem),
+        _ => 1,
+    }
+}
+
+/// Reserve the flat-memory slots for an `alloca` of `ty`, pushing a typed zero per leaf slot. An
+/// array recurses element-by-element (so a nested `Array(Array(I8, 8), 2)` reserves all 16 leaf
+/// slots, not 2), keeping the per-leaf default type (`Float(0.0)` for an f32 array, `Int(0)` for a
+/// byte buffer) the way the old single-level loop did for a scalar array.
+fn push_defaults(ty: &MirType, out: &mut Vec<Value>) {
+    if let MirType::Array(elem, count) = ty {
+        for _ in 0..*count {
+            push_defaults(elem, out);
+        }
+    } else {
+        out.push(default_value(ty));
+    }
+}
+
 fn int_bits(ty: &MirType) -> u32 {
     match ty {
         MirType::I1 => 1,
@@ -2887,6 +3054,19 @@ fn uval(v: i128, bits: u32) -> u128 {
         v as u128
     } else {
         (v as u128) & ((1u128 << bits) - 1)
+    }
+}
+
+/// Pick the correctly single-rounded int→float result for the cast target. A narrow float
+/// (`f32`/`bf16`/`f16`) uses `narrow` — the integer rounded straight to `f32` — matching native's
+/// single `fcvt_from_{sint,uint}(F32)`; an `f64` target uses `wide` (the `f64` rounding). Both are
+/// computed by the caller with one Rust `as` conversion (IEEE round-to-nearest-even). Going through
+/// `f64` and re-rounding to `f32` double-rounds and disagrees with native above 2^53.
+fn int_to_float(wide: f64, narrow: f32, to: &MirType) -> f64 {
+    if matches!(to, MirType::F32 | MirType::BF16 | MirType::F16) {
+        narrow as f64
+    } else {
+        wide
     }
 }
 
@@ -3082,10 +3262,18 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
         // Zero-extend the source's own `from`-width bits. Because ints are stored sign-extended, a
         // high-bit-set unsigned source (e.g. `u32` ≥ 2^31) would otherwise widen as negative.
         ZExt => Value::Int(mask(uval(v.as_int(), int_bits(from)) as i128, to)),
-        SiToFp => Value::Float(v.as_int() as f64),
+        // Int→float must round in ONE step to the target's precision. A narrow (`f32`/`bf16`/`f16`)
+        // target rounds the integer directly to `f32` (`as f32`), matching native's single
+        // `fcvt_from_sint(F32)`; routing through `f64` first (`as f64`, then `exec`'s `as f32`)
+        // double-rounds and disagrees with native for magnitudes above 2^53. An `f64` target rounds
+        // to `f64` (a single rounding, and `exec` does not re-round `f64`).
+        SiToFp => Value::Float(int_to_float(v.as_int() as f64, v.as_int() as f32, to)),
         // Unsigned→float: read the source as unsigned in its own width first (matches native
-        // `fcvt_from_uint`); `as_int() as f64` would be negative for a high-bit-set value.
-        UiToFp => Value::Float(uval(v.as_int(), int_bits(from)) as f64),
+        // `fcvt_from_uint`); `as_int()` would be negative for a high-bit-set value.
+        UiToFp => {
+            let u = uval(v.as_int(), int_bits(from));
+            Value::Float(int_to_float(u as f64, u as f32, to))
+        }
         // Saturating fp→int, matching the native backend's `fcvt_to_{sint,uint}_sat` (NaN→0, clamp to
         // the target range, negatives→0 for unsigned). Rust's `as` has exactly these semantics; the
         // old bit-mask of an `i128` cast diverged from native for out-of-range / negative-to-unsigned
@@ -3110,9 +3298,17 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
             };
             Value::Int(mask(i, to))
         }
-        // Widening is exact. Narrowing to bf16/f16 rounds to that grid (the native backend rounds on
-        // store / cast identically); narrowing to f32 is left to the per-op f32 rounding in `exec`.
-        FpExt => Value::Float(v.as_float()),
+        // Widening to f32/f64 is value-preserving for an f32 source, but a bf16/f16 source must first
+        // round to its grid: the per-store rounding alone is fragile (an optimizer can promote/forward
+        // a bf16 op result past its store, leaving an unrounded f32), so the observation boundary
+        // rounds too — the "round at store/cast/load" model — keeping -O0 == -O2. Narrowing to bf16/f16
+        // rounds to that grid (the native backend rounds on store/cast identically); narrowing to f32
+        // is left to the per-op f32 rounding in `exec`.
+        FpExt => match from {
+            MirType::BF16 => Value::Float(mercury_runtime::round_bf16(v.as_float() as f32) as f64),
+            MirType::F16 => Value::Float(mercury_runtime::round_f16(v.as_float() as f32) as f64),
+            _ => Value::Float(v.as_float()),
+        },
         FpTrunc => match to {
             MirType::BF16 => Value::Float(mercury_runtime::round_bf16(v.as_float() as f32) as f64),
             MirType::F16 => Value::Float(mercury_runtime::round_f16(v.as_float() as f32) as f64),
@@ -3167,6 +3363,17 @@ mod tests {
     }
 
     #[test]
+    fn deep_recursion_does_not_overflow_oracle() {
+        // The tree-walker recurses on the host stack (one host frame per Mercury call). Without a
+        // large worker stack this depth overflows the default ~8 MiB main-thread stack and *aborts*
+        // the process, which would crash the differential oracle. `run` must run on the big stack
+        // and return the right sum: 1+2+...+1000 = 500500.
+        let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \
+                   fn main() -> i32 { return sum(1000); }";
+        assert_eq!(run_main(src), 500500);
+    }
+
+    #[test]
     fn print_intrinsic_captures_stdout() {
         let mut interner = Interner::new();
         let src = "fn main() -> i32 { print(42); print(7 * 6); return 0; }";
@@ -3186,9 +3393,9 @@ mod tests {
     fn run_kernel_f32_saxpy_and_dot() {
         let mut interner = Interner::new();
         let src = "module m\n\
-            fn saxpy(x: [f32; 8], y: [f32; 8], out: [f32; 8]) { \
+            fn saxpy(x: [f32; 8], y: [f32; 8], mut out: [f32; 8]) { \
                 for i in 0..8 { out[i] = 2.0 * x[i] + y[i]; } }\n\
-            fn dot(x: [f32; 8], y: [f32; 8], out: [f32; 8]) { \
+            fn dot(x: [f32; 8], y: [f32; 8], mut out: [f32; 8]) { \
                 let mut s: f32 = 0.0; for i in 0..8 { s = s + x[i] * y[i]; } out[0] = s; }\n";
         let (module, pd) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
@@ -3234,7 +3441,7 @@ mod tests {
         // i64 reference. A=[1..8], B=[-6..1]; the recognizer dispatches this to mercury_i8gemm_nt.
         let mut interner = Interner::new();
         let src = "module m\n\
-            fn lin(a: [u8; 8], b: [i8; 8], c: [i32; 4]) { \
+            fn lin(a: [u8; 8], b: [i8; 8], mut c: [i32; 4]) { \
                 for i in 0..2 { for j in 0..2 { let mut s: i32 = 0; \
                 for k in 0..4 { s = s + (a[i*4+k] as i32) * (b[j*4+k] as i32); } \
                 c[i*2+j] = s; } } }\n";
@@ -3294,7 +3501,7 @@ mod tests {
 
     #[test]
     fn runs_array_parameter_by_reference() {
-        let src = "fn fill(a: [i32; 3]) { a[0] = 7; a[1] = 8; a[2] = 9; } \
+        let src = "fn fill(mut a: [i32; 3]) { a[0] = 7; a[1] = 8; a[2] = 9; } \
                    fn main() -> i32 { let mut a: [i32;3] = [0,0,0]; fill(a); \
                    return a[0] + a[1] + a[2]; }";
         assert_eq!(run_main(src), 24);

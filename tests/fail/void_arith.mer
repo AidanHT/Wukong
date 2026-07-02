@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.void_arith
+
+// Arithmetic on the result of a void (no-return-type) function is undefined: `nothing()` yields `()`,
+// which used to slip through to mir_build, which emitted `mul` on the void call's dummy operand —
+// invalid MIR the verifier and Cranelift reject (a backend crash), while the interpreter computed on
+// the placeholder and returned silently: a divergence on accepted input.
+fn nothing() {}
+
+fn main() -> i32 {
+    return nothing() * 2;
+}

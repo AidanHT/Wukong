@@ -1,0 +1,38 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 12
+module tests.run.aggregate_value_merge
+
+// An `if`/`match` used as a VALUE whose result is an aggregate (tuple/struct). The value flows through
+// the control-flow merge block as the aggregate's base POINTER, so the merge-block param must be typed
+// `Ptr` — not the byte-buffer `Array` type. It used to be typed `Array`, which matched the arm's
+// pointer arg only under the interpreter's loose -O0 typing; `mem2reg`'s verifier rejected it, so these
+// compiled at -O0 but panicked at -O2/-O3 (`branch arg (ptr) does not match param ([N x i8])`). Now the
+// merge param is `Ptr` (`merge_repr_ty`), so every opt level and both backends agree.
+
+struct P { x: i32, y: i32 }
+enum Op { A, B, C }
+
+fn pair(o: Op) -> (i32, i32) {
+    return match o {
+        Op::A => (1, 2),
+        Op::B => (3, 1),
+        Op::C => (2, 3),
+    };
+}
+
+fn main() -> i32 {
+    let c = true;
+    let t = if c { (1, 2) } else { (3, 4) }; // if → tuple
+    print(t.0 + t.1);                        // 1 + 2 = 3
+
+    let m = pair(Op::C);                     // match → tuple
+    print(m.0 * m.1);                        // 2 * 3 = 6
+
+    let want_else = false;
+    let p = if want_else { P { x: 1, y: 2 } } else { P { x: 5, y: 7 } }; // if → struct
+    print(p.x + p.y);                        // 5 + 7 = 12
+    return 0;
+}

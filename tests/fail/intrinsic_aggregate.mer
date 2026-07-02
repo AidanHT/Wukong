@@ -1,0 +1,18 @@
+// EXPECT-CODE: E0401
+module tests.fail.intrinsic_aggregate
+
+// A math intrinsic (sqrt/exp/log/sin/abs/...) operates on a scalar, vector, or tensor — never an
+// aggregate. Passing a struct used to slip through sema (the result is still typed `f32`), then
+// mir_build emitted `sqrt` on the struct's base pointer: invalid MIR that the verifier and Cranelift
+// reject, while the interpreter ran the op on a raw pointer value and silently produced garbage — a
+// backend divergence on a program sema had accepted. Apply the intrinsic to a scalar field instead.
+struct P {
+    x: f32,
+    y: f32,
+}
+
+fn main() -> i32 {
+    let p = P { x: 4.0, y: 9.0 };
+    let r: f32 = sqrt(p);
+    return r as i32;
+}

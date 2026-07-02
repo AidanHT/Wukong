@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0401
+module tests.fail.return_literal_out_of_range
+
+// An integer literal returned where a narrower type is declared used to be silently truncated to its
+// low bits: `return 9999999999` from a `-> i32` function exited with the wrapped value (exit 255),
+// not a diagnostic. The returned value is now range-checked against the declared return type, the
+// same rule `let` and `const` already apply to their annotation.
+fn main() -> i32 {
+    return 9999999999; // exceeds i32's range (-2147483648..=2147483647)
+}

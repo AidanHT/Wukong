@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0502
+module tests.fail.shape_return_mismatch
+
+// A function must not lie about its output shape: the declared return `Tensor[f32, 3, 2]` does not
+// match the returned value's shape `Tensor[f32, 2, 3]`. Without this check the wrong shape silently
+// propagates into every caller's shape reasoning — the return type is exactly what callers trust.
+fn mislabeled(a: Tensor[f32, 2, 3]) -> Tensor[f32, 3, 2] {
+    return a;
+}
+
+fn main() -> i32 {
+    return 0;
+}

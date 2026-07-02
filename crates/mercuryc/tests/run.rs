@@ -124,16 +124,76 @@ fn optimization_is_observationally_invariant() {
     }
 }
 
-/// Run a program at a given optimization level, returning (exit_code, stdout).
+/// Run a program at a given optimization level on the interpreter, returning (exit_code, stdout).
 fn run_at(path: &Path, opt: &str) -> (Option<i32>, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_mercuryc"))
-        .arg("--run")
-        .arg(opt)
-        .arg(path)
-        .output()
-        .expect("failed to spawn mercuryc");
+    run_backend(path, opt, None)
+}
+
+/// Run a program at a given optimization level on a chosen execution backend (`None` = the default
+/// interpreter, `Some("native")` = the Cranelift JIT), returning (exit_code, stdout).
+fn run_backend(path: &Path, opt: &str, backend: Option<&str>) -> (Option<i32>, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mercuryc"));
+    cmd.arg("--run").arg(opt);
+    if let Some(b) = backend {
+        cmd.arg(format!("--backend={b}"));
+    }
+    let output = cmd.arg(path).output().expect("failed to spawn mercuryc");
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
     )
+}
+
+/// The hard invariant, extended to native: the Cranelift backend must agree with the interpreter
+/// oracle (stdout + exit code) for every program at every optimization level. The interpreter is
+/// the differential oracle, and `optimization_is_observationally_invariant` above only re-runs the
+/// *interpreter* across opt levels — so this is the guard that the *native* path never silently
+/// diverges from the oracle. (All mismatches are collected so one failure reports the full set.)
+#[test]
+fn native_matches_interpreter() {
+    let mut mismatches = Vec::new();
+    for p in &collect_programs() {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        for opt in ["-O0", "-O2"] {
+            let interp = run_backend(p, opt, None);
+            let native = run_backend(p, opt, Some("native"));
+            if interp != native {
+                mismatches.push(format!(
+                    "{name} @ {opt}:\n    interp = {interp:?}\n    native = {native:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "interpreter/native divergence ({} case(s)):\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+/// Native optimization must be observationally invariant too: the Cranelift backend at -O0 must
+/// produce identical stdout and exit code to -O1/-O2/-O3 (the interpreter analogue is
+/// `optimization_is_observationally_invariant`).
+#[test]
+fn native_optimization_is_observationally_invariant() {
+    let mut mismatches = Vec::new();
+    for p in &collect_programs() {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        let base = run_backend(p, "-O0", Some("native"));
+        for level in ["-O1", "-O2", "-O3"] {
+            let other = run_backend(p, level, Some("native"));
+            if base != other {
+                mismatches.push(format!(
+                    "{name}: native {level} differs from -O0:\n    -O0   = {base:?}\n    {level} = {other:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "native optimization divergence ({} case(s)):\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
 }

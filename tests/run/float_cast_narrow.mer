@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 255
+// EXPECT-OUT: 127
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 65535
+module tests.run.float_cast_narrow
+
+// Casting a float to a narrow integer type (`i8`/`i16`/`u8`/`u16`) used to crash the native
+// backend (Cranelift's `fcvt_to_{sint,uint}_sat` can't target a sub-32-bit result on x64). The
+// backend now converts to `i32` saturating, clamps to the narrow type's range, and reduces — Rust
+// `as` saturation semantics, matching the interpreter oracle: in-range truncates, out-of-range
+// clamps to the type bounds, and a negative source clamps to 0 for an unsigned target.
+fn main() -> i32 {
+    let a: f32 = 7.0;
+    print((a as u8) as i32);            // 7    (in range)
+
+    let big: f32 = 300.0;
+    print((big as u8) as i32);          // 255  (saturate to u8 max)
+    print((big as i8) as i32);          // 127  (saturate to i8 max)
+
+    let neg: f32 = 0.0 - 1.0;
+    print((neg as u8) as i32);          // 0    (negative -> 0 for unsigned)
+
+    let nbig: f32 = 0.0 - 300.0;
+    print((nbig as i8) as i32);         // -128 (saturate to i8 min)
+
+    let huge: f32 = 70000.0;
+    print((huge as u16) as i32);        // 65535 (saturate to u16 max)
+    return 0;
+}
