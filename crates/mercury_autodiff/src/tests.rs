@@ -472,6 +472,8 @@ use mercury_interp::run_kernel_f32;
 const VM_TANH: i64 = 2;
 const VM_SIGMOID: i64 = 3;
 const VM_RELU: i64 = 4;
+const VM_SILU: i64 = 5;
+const VM_GELU: i64 = 6;
 const RED_SUM: i64 = 2;
 const RED_SSD: i64 = 1;
 const VE_ID: i64 = 0;
@@ -903,6 +905,34 @@ fn linear_tanh_sum_vjp() {
     let mut it = Interner::default();
     let fwd = build_linear(&mut it, m, k, n, Some(VM_TANH), false);
     let mut seed = 0x4444u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_silu_sum_vjp() {
+    // loss = sum(silu(X . W^T)); the silu backward rides the fused mercury_vmath2_f32 (VM2_SILU_BWD),
+    // dx = dy·silu'(x) in one pass, bit-identical with the forward silu (shared sigmoid polynomial).
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_SILU), false);
+    let mut seed = 0x5170u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let inputs = vec![xb, wb, vec![0.0]];
+    tape_gate_fd(&fwd, &[0, 1], &inputs, &mut it);
+}
+
+#[test]
+fn linear_gelu_sum_vjp() {
+    // loss = sum(gelu(X . W^T)); the gelu backward rides mercury_vmath2_f32 (VM2_GELU_BWD), matching
+    // the forward gelu's tanh-approximation derivative exactly.
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear(&mut it, m, k, n, Some(VM_GELU), false);
+    let mut seed = 0x6E10u64;
     let xb = rand_vec(&mut seed, m * k);
     let wb = rand_vec(&mut seed, n * k);
     let inputs = vec![xb, wb, vec![0.0]];

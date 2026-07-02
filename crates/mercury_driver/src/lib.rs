@@ -814,6 +814,64 @@ mod grad_cli_tests {
         let gx = gate(src, "loss", &[0], &inputs, &lens, 3, 5e-3, 5e-2, 5e-3);
         assert_close(&gx[0], &dx_ref, "dX = dp·w");
     }
+
+    // --- Activation backward: a `matmul → act → sum` model, act backward riding mercury_vmath2_f32. ---
+
+    /// The printed MIR of `{loss, loss_grad}` for the given source, so a test can assert the emitted
+    /// backward rides a particular runtime kernel (the recognized backward is otherwise gate-blind).
+    fn grad_mir(src: &str, of: &str, wrt: &[usize]) -> String {
+        let (prog, _fwd, _g, _wrt, it) = grad_prog(src, of, wrt);
+        mercury_mir::print::print_program(&prog, &it)
+    }
+
+    /// `p = x·wᵀ; h = act(p); loss = Σ h` — the smallest model that exercises a nonlinear activation
+    /// backward composed with the matmul backward.
+    fn act_sum_src(act: &str) -> String {
+        format!(
+            "@parallel fn loss(x:[f32;12], w:[f32;8], out:[f32;1]) -> f32 {{\n\
+             let mut p: [f32; 6] = [0.0; 6];\n\
+             for i in 0..3 {{ for j in 0..2 {{ let mut s: f32 = 0.0;\n\
+               for kk in 0..4 {{ s = s + x[i*4+kk] * w[j*4+kk]; }}\n\
+               p[i*2+j] = s; }} }}\n\
+             let mut h: [f32; 6] = [0.0; 6];\n\
+             for i in 0..6 {{ h[i] = {act}(p[i]); }}\n\
+             let mut loss: f32 = 0.0;\n\
+             for i in 0..6 {{ loss = loss + h[i]; }}\n\
+             out[0] = loss; return loss; }}"
+        )
+    }
+
+    /// silu and gelu — the modern-transformer activations — differentiate from source: the backward
+    /// rides the fused `mercury_vmath2_f32` (`dx = dy·act'(x)`, bit-identical with the forward) for the
+    /// activation and `mercury_sgemm` for the matmul adjoint. Finite-difference-gated against the
+    /// forward loss (the runtime activation's own derivative is the oracle, so no closed form to
+    /// re-derive — the fused kernel and the forward share the same sigmoid/tanh polynomials).
+    #[test]
+    fn silu_and_gelu_backward_from_source() {
+        let (m, k, n) = (3usize, 4usize, 2usize);
+        let lens = [m * k, n * k, 1];
+        for act in ["silu", "gelu"] {
+            let src = act_sum_src(act);
+            // The backward must ride the fused activation kernel + the tuned GEMM.
+            let mir = grad_mir(&src, "loss", &[1]);
+            assert!(
+                mir.contains("mercury_vmath2_f32"),
+                "{act}: backward does not ride mercury_vmath2_f32\n{mir}"
+            );
+            assert!(
+                mir.contains("mercury_sgemm("),
+                "{act}: matmul backward does not ride mercury_sgemm\n{mir}"
+            );
+            // Data kept modest so the activations stay in a well-conditioned range for the difference.
+            let mut seed = 0xE1F5u64 ^ (act.as_bytes()[0] as u64);
+            let x = rand_vec(&mut seed, m * k);
+            let w = rand_vec(&mut seed, n * k);
+            let inputs = vec![x, w, vec![0.0]];
+            // wrt w and wrt x — both adjoints flow through the activation backward.
+            gate(&src, "loss", &[1], &inputs, &lens, 2, 1e-2, 4e-2, 1e-2);
+            gate(&src, "loss", &[0], &inputs, &lens, 2, 1e-2, 4e-2, 1e-2);
+        }
+    }
 }
 
 /// End-to-end GPU-backend gate: the `--backend=gpu` path (offloading interpreter + [`gpu_accel`])
