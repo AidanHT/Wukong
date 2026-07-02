@@ -55,46 +55,72 @@ fn bias_scalar(x: &[f32], b: &[f32], out: &mut [f32], rows: usize, cols: usize, 
 #[target_feature(enable = "avx2,fma")]
 unsafe fn bias_avx2(x: *const f32, b: *const f32, out: *mut f32, rows: usize, cols: usize, op: i64) {
     use std::arch::x86_64::*;
-    // The 8-lane activation (or `None` for identity / an unrecognized op → leave the sum unmodified).
-    // Resolved once, out of the hot loop; the vector twin of `apply1`, so lanes == scalar tail.
+    // The 8-lane activation (or `None` for identity / an unrecognized op → the sum unmodified). Resolved
+    // once here and dispatched on **once** (the `match` below), so the hot loop carries no per-block
+    // branch — the identity bias-add compiles to gcc's own tight load→add→store loop, and the activation
+    // path folds `f` inline. `vmath8_for` is the vector twin of `apply1`, so lanes == the scalar tail.
     let act8 = crate::vmath::vmath8_for(op);
     let nt = use_nt(rows.saturating_mul(cols));
-    for i in 0..rows {
-        let xr = x.add(i * cols);
-        let outr = out.add(i * cols);
-        let mut j = 0usize;
-        // Peel a scalar prologue until this row's `out` is 32-byte aligned, so the streaming store
-        // (`vmovntps`, which faults on a misaligned address) is safe; regular stores don't need it but
-        // the peel is cheap. `cols % 8` handled by the scalar tail below.
-        if nt {
-            while j < cols && (outr.add(j) as usize) & 31 != 0 {
-                *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
-                j += 1;
-            }
-        }
-        while j + 8 <= cols {
+    let addv = |xr: *const f32, j: usize| {
+        _mm256_add_ps(_mm256_loadu_ps(xr.add(j)), _mm256_loadu_ps(b.add(j)))
+    };
+    macro_rules! store {
+        ($p:expr, $v:expr) => {
             if nt {
-                _mm_prefetch(xr.add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
-            }
-            let sum = _mm256_add_ps(_mm256_loadu_ps(xr.add(j)), _mm256_loadu_ps(b.add(j)));
-            let r = match act8 {
-                Some(f) => f(sum),
-                None => sum,
-            };
-            if nt {
-                _mm256_stream_ps(outr.add(j), r);
+                _mm256_stream_ps($p, $v);
             } else {
-                _mm256_storeu_ps(outr.add(j), r);
+                _mm256_storeu_ps($p, $v);
             }
-            j += 8;
-        }
-        // Scalar tail (`cols` not a multiple of 8) — the identical per-element op as the lanes.
-        while j < cols {
-            *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
-            j += 1;
-        }
+        };
     }
-    #[cfg(target_arch = "x86_64")]
+    // The per-row loop, parameterized by `$mk(xr, j)` → the 8-lane result at column `j`. Instantiated
+    // once per activation branch (below), so `$mk` is a fixed inlined expression — the ×4 unroll then
+    // runs four independent load→add(→act) chains with no branch, hiding the load/add latency the way
+    // gcc's unrolled auto-vectorization of this (fully inner-unit-stride) nest does.
+    macro_rules! run {
+        ($mk:expr) => {
+            for i in 0..rows {
+                let xr = x.add(i * cols);
+                let outr = out.add(i * cols);
+                let mut j = 0usize;
+                // Peel a scalar prologue until this row's `out` is 32-byte aligned (vmovntps faults on a
+                // misaligned address); regular stores don't need it.
+                if nt {
+                    while j < cols && (outr.add(j) as usize) & 31 != 0 {
+                        *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
+                        j += 1;
+                    }
+                }
+                while j + 32 <= cols {
+                    if nt {
+                        _mm_prefetch(xr.add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
+                    }
+                    let r0 = $mk(xr, j);
+                    let r1 = $mk(xr, j + 8);
+                    let r2 = $mk(xr, j + 16);
+                    let r3 = $mk(xr, j + 24);
+                    store!(outr.add(j), r0);
+                    store!(outr.add(j + 8), r1);
+                    store!(outr.add(j + 16), r2);
+                    store!(outr.add(j + 24), r3);
+                    j += 32;
+                }
+                while j + 8 <= cols {
+                    store!(outr.add(j), $mk(xr, j));
+                    j += 8;
+                }
+                // Scalar tail (`cols` not a multiple of 8) — the identical per-element op as the lanes.
+                while j < cols {
+                    *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
+                    j += 1;
+                }
+            }
+        };
+    }
+    match act8 {
+        None => run!(|xr, j| addv(xr, j)),
+        Some(f) => run!(|xr, j| f(addv(xr, j))),
+    }
     if nt {
         _mm_sfence(); // non-temporal stores are weakly ordered; fence before the buffer is read back.
     }
