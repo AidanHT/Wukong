@@ -2024,6 +2024,62 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_vmath_{bf16,f16}_out(x, out, n, op)` — the **half-output** activation twin: read a
+            // `[bf16]`/`[f16]` input, call the *identical* runtime kernel (which computes the activation
+            // in f32 and narrows the result back to the half width through the shared shim), then widen
+            // the stored half bits back to the interpreter's f32 slot. Same reconstruct-exact-bits +
+            // call-the-kernel discipline as the reduction/axpby-out arms, so interp == native bit-exact.
+            "mercury_vmath_bf16_out" | "mercury_vmath_f16_out" => {
+                let is_f16 = name == "mercury_vmath_f16_out";
+                let x = ptr(args[0])?;
+                let out = ptr(args[1])?;
+                let n = args[2].as_int() as usize;
+                let op = args[3].as_int() as i64;
+                let mut xbuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    let f = self
+                        .memory
+                        .get(x + t)
+                        .ok_or("vmath-out operand out of bounds")?
+                        .as_float() as f32;
+                    xbuf.push(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    });
+                }
+                let mut obuf = vec![0u16; n];
+                // SAFETY: xbuf and obuf are each n u16 — the kernel's contract.
+                unsafe {
+                    if is_f16 {
+                        mercury_runtime::mercury_vmath_f16_out(
+                            xbuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            op,
+                        );
+                    } else {
+                        mercury_runtime::mercury_vmath_bf16_out(
+                            xbuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            op,
+                        );
+                    }
+                }
+                for (t, &obits) in obuf.iter().enumerate() {
+                    let widened = if is_f16 {
+                        mercury_runtime::f16_bits_to_f32(obits)
+                    } else {
+                        mercury_runtime::bf16_bits_to_f32(obits)
+                    };
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("vmath-out output out of bounds")? = Value::Float(widened as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_velem_f32(x, y, out, n, a, b, c, op)` — the streaming affine+activation kernel
             // (saxpy / scale / residual-add / bias / ReLU) a recognized `out[i] = act(a·x[i] + b·y[i]
             // + c)` map lowers to. Marshal `n` f32 from x and y, call the *identical* runtime kernel

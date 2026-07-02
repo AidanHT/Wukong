@@ -143,6 +143,8 @@ const RT_AVGPOOL2D: &str = "mercury_avgpool2d_f32";
 const RT_AVGPOOL2D_PAR: &str = "mercury_avgpool2d_f32_parallel";
 const RT_VMATH_BF16: &str = "mercury_vmath_bf16";
 const RT_VMATH_F16: &str = "mercury_vmath_f16";
+const RT_VMATH_BF16_OUT: &str = "mercury_vmath_bf16_out";
+const RT_VMATH_F16_OUT: &str = "mercury_vmath_f16_out";
 const RT_TRANSPOSE: &str = "mercury_transpose_f32";
 const RT_TRANSPOSE_PAR: &str = "mercury_transpose_f32_parallel";
 const RT_TRANSPOSE_U16: &str = "mercury_transpose_u16";
@@ -917,7 +919,13 @@ impl<'a> FnTranslator<'a> {
         // lowers to.
         // Same 4-arg shape for the bf16/f16-input twins (x is a 2-byte-element pointer; the kernel
         // widens losslessly). Identical signature, so just route by name.
-        if (name == RT_VMATH || name == RT_VMATH_BF16 || name == RT_VMATH_F16) && args.len() == 4 {
+        if (name == RT_VMATH
+            || name == RT_VMATH_BF16
+            || name == RT_VMATH_F16
+            || name == RT_VMATH_BF16_OUT
+            || name == RT_VMATH_F16_OUT)
+            && args.len() == 4
+        {
             let x = self.val(args[0]);
             let out = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
@@ -1509,6 +1517,8 @@ struct RtFuncs {
     kd_loss_par: FuncId,
     vmath_bf16: FuncId,
     vmath_f16: FuncId,
+    vmath_bf16_out: FuncId,
+    vmath_f16_out: FuncId,
     transpose: FuncId,
     transpose_par: FuncId,
     transpose_u16: FuncId,
@@ -2010,6 +2020,13 @@ fn populate_module<M: Module>(
         vmath_f16: module
             .declare_function(RT_VMATH_F16, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
+        // Half-output activation twins (bf16/f16 in AND out): same (ptr, ptr, i64, i64) signature.
+        vmath_bf16_out: module
+            .declare_function(RT_VMATH_BF16_OUT, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        vmath_f16_out: module
+            .declare_function(RT_VMATH_F16_OUT, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
         transpose: module
             .declare_function(RT_TRANSPOSE, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
@@ -2474,6 +2491,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VMATH_F16,
                 module.declare_func_in_func(rt.vmath_f16, builder.func),
+            );
+            rt_refs.insert(
+                RT_VMATH_BF16_OUT,
+                module.declare_func_in_func(rt.vmath_bf16_out, builder.func),
+            );
+            rt_refs.insert(
+                RT_VMATH_F16_OUT,
+                module.declare_func_in_func(rt.vmath_f16_out, builder.func),
             );
             rt_refs.insert(
                 RT_TRANSPOSE,
@@ -3029,6 +3054,14 @@ pub fn jit_compile(
         mercury_runtime::mercury_vmath_f16 as *const u8,
     );
     builder.symbol(
+        RT_VMATH_BF16_OUT,
+        mercury_runtime::mercury_vmath_bf16_out as *const u8,
+    );
+    builder.symbol(
+        RT_VMATH_F16_OUT,
+        mercury_runtime::mercury_vmath_f16_out as *const u8,
+    );
+    builder.symbol(
         RT_TRANSPOSE,
         mercury_runtime::mercury_transpose_f32 as *const u8,
     );
@@ -3502,6 +3535,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_VMATH_F16,
         mercury_runtime::mercury_vmath_f16 as *const u8,
+    );
+    builder.symbol(
+        RT_VMATH_BF16_OUT,
+        mercury_runtime::mercury_vmath_bf16_out as *const u8,
+    );
+    builder.symbol(
+        RT_VMATH_F16_OUT,
+        mercury_runtime::mercury_vmath_f16_out as *const u8,
     );
     builder.symbol(
         RT_TRANSPOSE,
