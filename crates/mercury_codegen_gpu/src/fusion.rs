@@ -156,6 +156,10 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         Op::Store { ptr, value } => vec![*ptr, *value],
         Op::Gep { ptr, index, .. } => vec![*ptr, *index],
         Op::Call { args, .. } => args.clone(),
+        // A CPU raw-AVX2 microkernel call reads its buffer, scalar, and length operands. It is not
+        // PTX-lowerable (see `lower.rs`), so a function containing one is reported ineligible upstream;
+        // reporting its reads keeps the taint fixpoint total.
+        Op::VecKernelCall { ptrs, scalars, n, .. } => vec![*ptrs, *scalars, *n],
     }
 }
 
