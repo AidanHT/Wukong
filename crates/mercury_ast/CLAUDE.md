@@ -17,7 +17,7 @@ The Mercury abstract syntax tree: a data-only crate the parser produces and sema
 - `print_module` / `print_expr` / `print_type` (`src/print.rs`) — public render entry points for `--emit=ast` and parser/snapshot tests; all three take `&Interner` to resolve `Symbol`s.
 
 ## Connects to
-Upstream (depends on): `mercury_span` only (`Span`, `Symbol`, `Interner`). Downstream (consumers): `mercury_parse` builds it; `mercury_sema` reads it and annotates via `NodeId`-keyed tables; `mercury_mir_build` lowers the typed AST to MIR. `TypeKind` is resolved to `mercury_types::Type` in sema.
+Upstream (depends on): `mercury_span` only (`Span`, `Symbol`, `Interner`). Downstream (consumers): `mercury_parser` builds it; `mercury_sema` reads it and annotates via `NodeId`-keyed tables; `mercury_mir_build` lowers the typed AST to MIR. `TypeKind` is resolved to `mercury_types::Type` in sema.
 
 ## Gotchas
 - Side-table model: sema must NOT mutate the tree — it stores results keyed by `NodeId`. Allocate a fresh `NodeId` for any synthesized node (or use `DUMMY`); never reuse one.

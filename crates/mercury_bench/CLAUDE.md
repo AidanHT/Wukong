@@ -3,7 +3,9 @@
 Standalone binary `mercury-bench`: runs the full front-end + optimizer + interpreter on `.mer` files to quantify optimizer effectiveness (`-O0` vs `-O3`) and interpreter timing, doubling as an optimization-equivalence correctness gate. Tooling/CI harness; sits outside the compiler pipeline.
 
 ## Layout
-- `src/main.rs` — the entire crate: arg parsing, per-file benchmarking, op counting, adaptive timing, report table.
+- `src/main.rs` — arg parsing, per-file benchmarking, op counting, adaptive timing, report table, and the `-O0`-vs-`-O3` optimization-equivalence gate.
+- `src/compile_time.rs` — in-process per-pass compile-time measurement (via `mercury_opt::optimize_timed`).
+- `src/compile_vs.rs` — same-run compile-time comparison of `mercuryc` vs `gcc`/`g++`/`rustc`.
 
 ## Key types & entry points
 - `main` (`src/main.rs`) — collects `.mer` files from CLI dirs (default `tests/run`), sorts, benchmarks each, prints a table + TOTAL/geomean row, and `exit(1)` if any program failed optimization equivalence.

@@ -57,6 +57,8 @@ source.mer
 - `mercury_mir` — typed block-structured SSA IR: types, builder, printer, verifier.
 - `mercury_mir_build` — lowers type-checked Mercury AST into MIR (alloca-per-local).
 - `mercury_opt` — pass manager, CFG/dominator analyses, and SSA MIR transforms.
+- `mercury_autodiff` — reverse-mode autodiff as a MIR→MIR transform (the training backward path):
+  VJP rules + a fused AdamW kernel, finite-difference-gated.
 - `mercury_backend` — `Backend` trait + `Artifact` enum: the MIR-to-execution/emission seam.
 - `mercury_interp` — zero-dep tree-walking MIR interpreter; default backend and differential oracle.
 - `mercury_codegen_cranelift` — native backend via Cranelift (no LLVM): JIT + object/exe; the fast path.

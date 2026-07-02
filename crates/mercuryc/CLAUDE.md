@@ -3,7 +3,7 @@
 The `mercuryc` command-line binary: parses CLI args into a `mercury_driver::Options` and delegates the whole compile to `mercury_driver::compile`. The user-facing front door at the end of the pipeline.
 
 ## Layout
-- `src/main.rs` — the entire binary (~143 lines): `USAGE` string, `main`, `parse_args`, `print_explanation`. No other modules.
+- `src/main.rs` — the entire binary (~160 lines): `USAGE` string, `main`, `parse_args`, `print_explanation`. No other modules.
 - `tests/run.rs` — e2e suite: runs `<repo>/tests/run/*.mer` through the real binary, defaulting to `--run`, checking stdout/exit against in-file `// EXPECT-OUT:` / `// EXPECT-EXIT:` / `// RUN:` directives; also asserts -O1/-O2/-O3 are observationally identical to -O0.
 - `tests/fail.rs` — compile-fail suite: drives `<repo>/tests/fail/*.mer` with `--error-format=json --emit=mir`, asserts the `// EXPECT-CODE:` `E…` code appears in stderr JSON and exit is non-zero.
 - `tests/emit.rs` — smoke-tests every `--emit` stage: `tokens`,`ast` for all examples + run-suite; `mir-high`,`mir`,`llvm-ir` for run-suite at -O0 and -O2 (checks no verifier "internal compiler error" leaks).
