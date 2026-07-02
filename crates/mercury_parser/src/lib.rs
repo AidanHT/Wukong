@@ -847,6 +847,41 @@ impl<'a> Parser<'a> {
             }
             T::If => self.parse_if(),
             T::Match => self.parse_match(),
+            // `loop { … }` as a value-producing expression: its value is `break v`. A statement
+            // `loop` reaches here too (the statement dispatcher routes bare/labeled `loop` through
+            // the expression path), so this is the single loop-parsing site.
+            T::Loop => {
+                self.bump();
+                let body = self.parse_block();
+                self.finish_expr(start, ExprKind::Loop { label: None, body })
+            }
+            // A labeled loop in value position: `'l: loop { … }` (so `break 'l v` targets it). Only
+            // `loop` is an expression; a labeled `while`/`for` is a statement handled in
+            // `parse_block`, so a non-`loop` construct after a label here is a stray form — report
+            // and recover with an empty tuple, like the fallthrough below.
+            T::Label => {
+                let label = self.label_ident();
+                self.expect(T::Colon);
+                if self.at(T::Loop) {
+                    self.bump();
+                    let body = self.parse_block();
+                    self.finish_expr(
+                        start,
+                        ExprKind::Loop {
+                            label: Some(label),
+                            body,
+                        },
+                    )
+                } else {
+                    let sp = self.span();
+                    self.error(
+                        sp,
+                        "E0200",
+                        "expected `loop` after a label in expression position",
+                    );
+                    self.finish_expr(start, ExprKind::TupleLit(Vec::new()))
+                }
+            }
             T::Ident => {
                 let text = &self.src[start.lo as usize..start.hi as usize];
                 if text == "sizeof" && self.nth(1) == T::LBracket {
@@ -1077,14 +1112,21 @@ impl<'a> Parser<'a> {
                 }
                 T::Break => {
                     self.bump();
-                    // Optional target label: `break 'outer;`.
+                    // Optional target label: `break 'outer;` / `break 'outer v;`.
                     let label = if self.at(T::Label) {
                         Some(self.label_ident())
                     } else {
                         None
                     };
+                    // Optional break value: `break v;` yields `v` from a value-producing `loop`.
+                    // Absent before `;`/`}` (a plain `break`); otherwise the trailing expression.
+                    let value = if self.at(T::Semi) || self.at(T::RBrace) {
+                        None
+                    } else {
+                        Some(self.parse_expr())
+                    };
                     self.eat(T::Semi);
-                    stmts.push(self.mk_stmt(attrs, StmtKind::Break(label), stmt_start));
+                    stmts.push(self.mk_stmt(attrs, StmtKind::Break(label, value), stmt_start));
                 }
                 T::Continue => {
                     self.bump();
@@ -1110,19 +1152,15 @@ impl<'a> Parser<'a> {
                     let k = self.parse_for(None);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
-                T::Loop => {
-                    let k = self.parse_loop(None);
-                    stmts.push(self.mk_stmt(attrs, k, stmt_start));
-                }
-                // `'label: loop/while/for { … }` — a labeled loop. The label binds the loop a
-                // `break`/`continue` `'label` can target.
-                T::Label => {
+                // `'label: while/for { … }` — a labeled statement loop. A labeled `loop` (which is a
+                // value expression) is *not* handled here: the `nth(2) == Loop` guard lets it fall
+                // through to the expression path below, so `'l: loop {…}` can be a value / block tail.
+                T::Label if self.nth(2) != T::Loop => {
                     let label = self.label_ident();
                     self.expect(T::Colon);
                     let k = match self.kind() {
                         T::While => self.parse_while(Some(label)),
                         T::For => self.parse_for(Some(label)),
-                        T::Loop => self.parse_loop(Some(label)),
                         _ => {
                             let sp = self.span();
                             self.error(
@@ -1235,12 +1273,6 @@ impl<'a> Parser<'a> {
             iter,
             body,
         }
-    }
-
-    fn parse_loop(&mut self, label: Option<Ident>) -> StmtKind {
-        self.bump(); // loop
-        let body = self.parse_block();
-        StmtKind::Loop { label, body }
     }
 
     /// Read a loop-label token `'name` at the cursor, interning the name without the leading `'`.
