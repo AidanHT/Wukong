@@ -1113,7 +1113,8 @@ fn lower_fn(
 /// declared struct). Free-standing so `lower_fn` can pick the sret ABI before the builder exists.
 fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
     match ty {
-        Ty::Tuple(_) | Ty::Array { .. } => true,
+        // A slice is a fat-pointer aggregate (passed/returned by base pointer), like a tuple/array.
+        Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) => true,
         Ty::Named(sym) => {
             matches!(
                 sema.defs.lookup(*sym).map(|d| &d.kind),
@@ -1142,6 +1143,12 @@ enum VariantCtor<'a> {
     Tuple(&'a [Expr]),
     Struct(&'a [ast::FieldInit]),
 }
+
+/// A slice value is a fat pointer laid out like a 2-field struct: an 8-byte data pointer at offset 0
+/// and an 8-byte `i64` element count at offset 8 — a 16-byte aggregate addressed by base pointer.
+const SLICE_SIZE: u64 = 16;
+const SLICE_PTR_OFF: u64 = 0;
+const SLICE_LEN_OFF: u64 = 8;
 
 /// The MIR type a control-flow merge param (an `if`/`match` *value*) carries for a given result type.
 /// An aggregate flows through the CFG as its base **pointer** (the by-pointer convention the sret call
@@ -1857,6 +1864,9 @@ impl FnLowerer<'_> {
             Ty::Tuple(_) => {
                 MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
             }
+            // A slice is a fat-pointer aggregate `{ data: *T @ 0, len: i64 @ 8 }` — a 16-byte byte
+            // buffer addressed by base pointer, like a 2-field struct.
+            Ty::Slice(_) => MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32),
             _ => mir_ty(ty),
         }
     }
@@ -1917,7 +1927,9 @@ impl FnLowerer<'_> {
                 }
                 MirType::Array(Box::new(MirType::I8), round_up(size, align) as u32)
             }
-            Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
+            // A slice annotation resolves to its 16-byte fat-pointer buffer (not a thin `Ptr`).
+            Slice(_) => MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32),
+            Pointer { .. } | Ref { .. } | Tensor { .. } => MirType::Ptr,
             Vector { elem, lanes } => MirType::Vec(Box::new(self.mir_ty_of_ann(elem)), *lanes),
             Unit => MirType::Void,
             _ => MirType::I32,
@@ -2224,6 +2236,71 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Whether a `let` binds a slice — either an explicit `[]T` annotation or an initializer of slice
+    /// type. Such a binding coerces its initializer to the fat-pointer buffer rather than deep-copying
+    /// it as a wholesale aggregate.
+    fn let_is_slice(&self, ann: &Option<ast::TypeExpr>, init: &Expr) -> bool {
+        if let Some(t) = ann {
+            if matches!(&t.kind, ast::TypeKind::Slice(_)) {
+                return true;
+            }
+        }
+        matches!(self.expr_ty(init), Ty::Slice(_))
+    }
+
+    /// Build a slice (fat pointer) into the pre-allocated 16-byte buffer `dst` from source `src`. An
+    /// **array** source stores the array's base pointer at offset 0 and its static length at offset 8
+    /// (the array→slice "unsizing" coercion); a **slice** source (or any other 16-byte view) copies
+    /// the fat pointer verbatim. The slice then views the source's storage — no element copy.
+    fn lower_slice_from_source(&mut self, dst: ValueId, src: &Expr) {
+        if let Ty::Array { len, .. } = self.expr_ty(src) {
+            let base = self.lower_expr(src);
+            self.store_slice_fat_ptr(dst, base, len);
+        } else {
+            // A slice value (already a fat pointer) or another 16-byte view: copy it verbatim.
+            let base = self.lower_expr(src);
+            self.emit_copy_bytes(dst, base, SLICE_SIZE);
+        }
+    }
+
+    /// Write a fat pointer `{ data = base @ 0, len @ 8 }` into the pre-allocated 16-byte slice buffer
+    /// `dst`. The data pointer aliases the source storage (no element copy). Shared by slice `let`
+    /// binding and the call-site array→slice unsizing coercion so both build byte-identical views.
+    fn store_slice_fat_ptr(&mut self, dst: ValueId, base: ValueId, len: u64) {
+        let dp = self.field_ptr(dst, SLICE_PTR_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: dp,
+            value: base,
+        });
+        let lp = self.field_ptr(dst, SLICE_LEN_OFF);
+        let lv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(len as i128, MirType::I64));
+        self.builder.build_void(Op::Store {
+            ptr: lp,
+            value: lv,
+        });
+    }
+
+    /// Lower a call argument, applying the array→slice *unsizing* coercion when the parameter is a
+    /// slice `[]T` but the argument is a fixed-size array `[T; N]`: materialize a fresh 16-byte
+    /// fat-pointer temporary `{ data = &arr, len = N }` and pass *its* address, so the callee's slice
+    /// reads (`s[i]`, `s.len()`, `for x in s`) resolve. Any other argument — including one already a
+    /// slice (a 16-byte buffer whose base pointer IS the fat pointer) — lowers verbatim.
+    fn lower_arg_coerced(&mut self, arg: &Expr, param_ty: Option<&Ty>) -> ValueId {
+        if let Some(Ty::Slice(_)) = param_ty {
+            if let Ty::Array { len, .. } = self.expr_ty(arg) {
+                let base = self.lower_expr(arg);
+                let sbuf = self
+                    .builder
+                    .alloca(MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32));
+                self.store_slice_fat_ptr(sbuf, base, len);
+                return sbuf;
+            }
+        }
+        self.lower_expr(arg)
+    }
+
     /// Allocate a fresh tagged-union buffer for `enum_sym::vname` and construct the variant into it,
     /// yielding the base pointer (the by-pointer aggregate convention — a value-position variant).
     fn lower_enum_value(&mut self, enum_sym: Symbol, vname: Symbol, payload: VariantCtor) -> ValueId {
@@ -2414,6 +2491,10 @@ impl FnLowerer<'_> {
                 let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
                 self.emit_copy_bytes(dst, src, size);
             }
+            // A slice is a fat pointer: copy the 16-byte view (data pointer + length). A per-byte copy
+            // is correct on both backends (the interpreter moves the `Ptr` at slot 0 and the `Int` len
+            // at slot 8; native moves the raw bytes).
+            Ty::Slice(_) => self.emit_copy_bytes(dst, src, SLICE_SIZE),
             Ty::Named(sym) => {
                 if let Some(layout) = self.struct_field_tys(*sym) {
                     for (off, fty) in layout {
@@ -5639,7 +5720,13 @@ impl FnLowerer<'_> {
                             && !matches!(
                                 &e.kind,
                                 ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
-                            ) =>
+                            )
+                            // A slice binding must size its slot from the 16-byte fat-pointer buffer
+                            // (`mir_ty_of_ann` below), never from the array *initializer*'s type: a
+                            // `let s: []T = arr` view over a `[T; N]` would otherwise allocate `[N x
+                            // T]` slots, and storing the length at byte offset 8 lands past the end
+                            // (interp store-OOB / native stack corruption).
+                            && !self.let_is_slice(ty, e) =>
                     {
                         self.expr_mir(e)
                     }
@@ -5679,10 +5766,16 @@ impl FnLowerer<'_> {
                 };
                 let slot = self.builder.alloca(mty.clone());
                 if let Some(e) = init {
+                    // A slice binding coerces its initializer to the fat-pointer buffer (an array
+                    // source becomes `{ base, len }`; a slice source is copied) — checked first so a
+                    // slice-of-an-array isn't mistaken for a wholesale aggregate deep-copy.
+                    if self.let_is_slice(ty, e) {
+                        self.lower_slice_from_source(slot, e);
+                    }
                     // A tuple/struct initializer fills the byte buffer field-by-field (the slot *is*
                     // the buffer, like an array). Detected by the literal shape so non-aggregate
                     // inits are unaffected.
-                    if let ExprKind::TupleLit(items) = &e.kind {
+                    else if let ExprKind::TupleLit(items) = &e.kind {
                         let tty = self.expr_ty(e);
                         self.lower_tuple_init(slot, &tty, items);
                     } else if let ExprKind::StructLit { path, fields, .. } = &e.kind {
@@ -8189,23 +8282,38 @@ impl FnLowerer<'_> {
             ast::PatKind::Wildcard => None,
             _ => return false,
         };
-        // The iterand must be a fixed-size array; its length N and element type come straight from
-        // sema. A tensor / slice / dynamic-length iterand has no `Ty::Array` here, so it declines.
-        let Ty::Array { elem, len } = self.expr_ty(e) else {
-            return false;
+        // The iterand must be a fixed-size **array** or a **slice**; both desugar to the indexed range
+        // loop `for i in 0..N { let <pat> = it[i]; <body> }`. A tensor / dynamic-length iterand has
+        // neither type here, so it declines to the `unsupported` fallback.
+        let (elem, is_slice) = match self.expr_ty(e) {
+            Ty::Array { elem, .. } => (*elem, false),
+            Ty::Slice(elem) => (*elem, true),
+            _ => return false,
         };
         let elem_mir = self.mir_ty_of(&elem);
-        let n = len as i128;
 
-        // The array's base pointer, evaluated once before the loop. An array local/param's bound
-        // `ValueId` *is* its base pointer; any other array-typed expression (a struct field, an
-        // element of an array-of-arrays, an array literal) likewise lowers to its base address (the
-        // by-pointer convention `lower_expr` upholds for every aggregate), so a base pointer is
-        // always recoverable for a `Ty::Array` iterand.
-        let base_ptr = self.lower_expr(e);
-
-        // i = 0 — the hidden induction variable, I64 like the array-index GEPs.
+        // Base pointer + trip count, evaluated **once** before the loop. An array's base is its own
+        // pointer (an array local/param/field/element all lower to a base address — the by-pointer
+        // aggregate convention) and its count a compile-time constant. A slice's base is its *data*
+        // pointer (loaded from the fat pointer's offset 0) and its count the runtime length (offset 8).
         let ity = MirType::I64;
+        let (base_ptr, count) = if is_slice {
+            let sbuf = self.lower_expr(e);
+            let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+            let base = self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr));
+            let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
+            let n = self.builder.build(ity.clone(), Op::Load(lp, ity.clone()));
+            (base, n)
+        } else {
+            let Ty::Array { len, .. } = self.expr_ty(e) else {
+                return false;
+            };
+            let base = self.lower_expr(e);
+            let n = self
+                .builder
+                .build(ity.clone(), Op::ConstInt(len as i128, ity.clone()));
+            (base, n)
+        };
         let slot = self.builder.alloca(ity.clone());
         let zero = self
             .builder
@@ -8227,12 +8335,12 @@ impl FnLowerer<'_> {
         self.builder.switch_to(header);
         self.terminated = false;
         let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let nval = self
-            .builder
-            .build(ity.clone(), Op::ConstInt(n, ity.clone()));
+        // `count` is the trip count evaluated once before the loop (a constant for an array, a runtime
+        // length load for a slice); it dominates the header, so comparing against it every iteration
+        // is sound.
         let c = self
             .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, nval));
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, count));
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
         // body: bind `<pat>` to `array[i]`, then lower the user body. `continue` targets the
@@ -11408,15 +11516,24 @@ impl FnLowerer<'_> {
                 (ptr, self.expr_mir(e))
             }
             ExprKind::Index { base, indices } if indices.len() == 1 => {
-                let base_ptr = self.place_base_ptr(base);
+                let base_ty = self.expr_ty(base);
+                // For a slice `s[i]`, the GEP base is the slice's *data* pointer — loaded from the fat
+                // pointer's offset 0 — not the 16-byte fat-pointer buffer itself. An array/pointer base
+                // GEPs off its own base directly.
+                let base_ptr = if matches!(base_ty, Ty::Slice(_)) {
+                    let sbuf = self.place_base_ptr(base);
+                    let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+                    self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr))
+                } else {
+                    self.place_base_ptr(base)
+                };
                 let idx = self.lower_expr(&indices[0]);
-                // Prefer the element type from the base's array type; fall back to the indexed
-                // expression's own type (slices/tensors/pointers). Resolve through the
-                // registry-aware `mir_ty_of` so a struct/tuple element becomes its byte-buffer
-                // `Array` type (the GEP strides by the real element size, and the read path below
-                // treats it as an aggregate address) rather than the registry-blind `I32` fallback.
-                let elem = match self.expr_ty(base) {
-                    Ty::Array { elem, .. } => self.mir_ty_of(&elem),
+                // Prefer the element type from the base's array/slice type; fall back to the indexed
+                // expression's own type (tensors/pointers). Resolve through the registry-aware
+                // `mir_ty_of` so a struct/tuple element becomes its byte-buffer `Array` type (the GEP
+                // strides by the real element size) rather than the registry-blind `I32` fallback.
+                let elem = match &base_ty {
+                    Ty::Array { elem, .. } | Ty::Slice(elem) => self.mir_ty_of(elem),
                     _ => self.expr_mir(e),
                 };
                 let p = self.builder.build(
@@ -12411,6 +12528,15 @@ impl FnLowerer<'_> {
             if let Some(enum_sym) = self.field_base_data_enum(base, name.sym) {
                 return self.lower_enum_value(enum_sym, name.sym, VariantCtor::Tuple(args));
             }
+            // `s.len()` on a slice — the element count, loaded from the fat pointer's offset 8.
+            if args.is_empty()
+                && self.interner.resolve(name.sym) == "len"
+                && matches!(self.expr_ty(base), Ty::Slice(_))
+            {
+                let sbuf = self.place_base_ptr(base);
+                let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
+                return self.builder.build(MirType::I64, Op::Load(lp, MirType::I64));
+            }
         }
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
@@ -12419,7 +12545,20 @@ impl FnLowerer<'_> {
                     self.sema.defs.lookup(name).map(|d| &d.kind),
                     Some(DefKind::Fn(_))
                 ) {
-                    let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
+                    // Coerce each argument against its declared parameter type so an array→slice
+                    // *unsizing* (`[]T` param fed a `[T; N]` arg) materializes a fat pointer rather
+                    // than passing the raw array buffer (which the callee would misread as a fat
+                    // pointer — interp load-OOB, native garbage). Slice-ness is preserved under
+                    // monomorphization, so the generic sig's param types are the right key.
+                    let param_tys: Vec<Ty> = match self.sema.defs.lookup(name).map(|d| &d.kind) {
+                        Some(DefKind::Fn(sig)) => sig.params.clone(),
+                        _ => Vec::new(),
+                    };
+                    let argvals: Vec<ValueId> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| self.lower_arg_coerced(a, param_tys.get(i)))
+                        .collect();
                     // A call to a type-generic function is redirected to its monomorphized instance
                     // (`id` -> `id$f32`), and the call's MIR return type is taken from the instance's
                     // concrete return (not the generic template), so the sret/void/scalar dispatch

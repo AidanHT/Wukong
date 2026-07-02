@@ -204,6 +204,10 @@ impl Ty {
             Ty::Unit => Some(0),
             Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
             Ty::Vector { elem, lanes } => Some(elem.size() * *lanes as u64),
+            // A slice is a fat pointer — a `(data: *T, len: usize)` view — so it is a sized 16-byte
+            // aggregate (8-byte pointer + 8-byte length), even though the *pointee* is unsized. This
+            // is what lets a slice be a struct/tuple field and be passed/returned by value.
+            Ty::Slice(_) => Some(16),
             Ty::Array { elem, len } => Some(elem.size_of()? * len),
             Ty::Tuple(fields) => {
                 let mut size = 0u64;
@@ -226,6 +230,8 @@ impl Ty {
             Ty::Unit => Some(1),
             Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
             Ty::Vector { elem, lanes } => Some(elem.size() * *lanes as u64),
+            // A slice's fat pointer is 8-byte aligned (its data pointer and length are both 8 bytes).
+            Ty::Slice(_) => Some(8),
             Ty::Array { elem, .. } => elem.align_of(),
             Ty::Tuple(fields) => fields
                 .iter()
