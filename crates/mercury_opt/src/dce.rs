@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use mercury_mir::Function;
 
-use crate::{each_op_use, each_term_use, has_side_effects, Pass};
+use crate::{each_op_use, each_term_use, has_side_effects, CfgAnalyses, Pass};
 
 pub struct Dce;
 
@@ -13,7 +13,7 @@ impl Pass for Dce {
         "dce"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
+    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
         let mut used: HashSet<u32> = HashSet::new();
         for b in &f.blocks {
             for inst in &b.insts {

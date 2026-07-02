@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use mercury_mir::{BinOp, CmpOp, Function, MirType, Op, ValueId};
 
-use crate::{map_op_uses, map_term_uses, Pass};
+use crate::{map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
 pub struct Simplify;
 
@@ -24,7 +24,9 @@ impl Pass for Simplify {
         "simplify"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
+    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
+        // Rewrites operands and folds constants — never changes the block graph, so the CFG cache
+        // stays valid (untouched).
         let mut changed = false;
         let mut consts: HashMap<u32, CV> = HashMap::new();
         let mut subst: HashMap<u32, ValueId> = HashMap::new();

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use mercury_mir::{Function, Op, Terminator, ValueId};
 
-use crate::{cfg, map_op_uses, map_term_uses, Pass};
+use crate::{cfg, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
 pub struct SimplifyCfg;
 
@@ -28,10 +28,15 @@ impl Pass for SimplifyCfg {
         "simplify-cfg"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
         let mut changed = fold_constant_branches(f);
         changed |= merge_straight_line(f);
         changed |= cfg::prune_unreachable(f);
+        // This is the one pass that restructures the CFG (folded branches, merged/removed blocks),
+        // so the cached dominator analyses no longer describe `f`.
+        if changed {
+            cache.invalidate();
+        }
         changed
     }
 }

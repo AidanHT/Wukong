@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use mercury_mir::{Function, Terminator, ValueId};
 
-use crate::{each_op_use, each_term_use, map_op_uses, map_term_uses, Pass};
+use crate::{each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
 pub struct SimplifyPhis;
 
@@ -26,7 +26,7 @@ impl Pass for SimplifyPhis {
         "simplify-phis"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
+    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
         let mut changed = false;
         while let Some((blk, k, repl)) = find_removable(f) {
             if let Some(v) = repl {

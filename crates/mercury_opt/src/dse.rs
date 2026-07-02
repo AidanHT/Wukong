@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use mercury_mir::{Function, Op};
 
-use crate::Pass;
+use crate::{CfgAnalyses, Pass};
 
 pub struct Dse;
 
@@ -21,7 +21,7 @@ impl Pass for Dse {
         "dse"
     }
 
-    fn run_function(&self, f: &mut Function) -> bool {
+    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
         // Allocas are function-global value ids; collect them once.
         let mut allocas: HashSet<u32> = HashSet::new();
         for b in &f.blocks {
