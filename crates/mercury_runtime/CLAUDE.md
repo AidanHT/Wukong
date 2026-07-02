@@ -128,12 +128,15 @@ programs (link as a static lib).
 - `parallel_for` (the closure form) is the **sequential** reference order; `mercury_parallel_for`
   (the C-ABI form) is the **rayon** multicore dispatch. They must agree on observable results for
   data-parallel bodies (the interpreter runs the sequential one, native the parallel one).
-- **GEMM block sizes** (`MR=6, NR=16, MC=144, KC=256, NC=4080`) are tuned for AVX2 + a typical
+- **GEMM block sizes** (`MR=6, NR=16, MC=144, KC=384, NC=4080`) are tuned for AVX2 + a typical
   L1/L2/L3 hierarchy. The microkernel keeps 12 `__m256` accumulators (of 16 ymm). `MC=144` (a ~144 KB
   A-block) measured the sweet spot — bigger re-streams the B-panel from L3 fewer times, smaller leaves
-  L2 headroom for the streaming B-block; 216/288 both regressed. Re-measure if you change `KC`/`NR`. AVX-512 is **not**
-  used (this CPU lacks it; Cranelift can't emit f32x8 either — `gemm.rs` and `vmath.rs` are the two
-  hand-written AVX2 paths that give the compute-bound kernels their 256-bit width).
+  L2 headroom for the streaming B-block; 216/288 both regressed. `KC` was retuned 256→384 (256 left
+  ~10% on the table at ≥1024³). Re-measure if you change `KC`/`NR`. AVX-512 is **present but dead on
+  this dev box**: `gemm.rs` has an `avx512f`-gated `__m512` 6×16 microkernel (`micro_6x16_avx512`),
+  runtime-dispatched only where `avx512f` is detected — this consumer part lacks it, so the AVX2 path
+  carries the compute here (Cranelift can't emit `f32x8` either, so `gemm.rs` and `vmath.rs` remain the
+  two hand-written 256-bit paths on this box).
 - **`mercury_vmath_f32` is also a differential contract.** Like the GEMM, the interpreter marshals its
   memory through this exact kernel, so any change to its math changes the oracle too. The AVX2 lanes
   and the scalar twins must stay bit-identical (a test pins this at a non-multiple-of-8 length).

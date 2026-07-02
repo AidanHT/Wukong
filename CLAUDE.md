@@ -78,7 +78,7 @@ source.mer
 - `mercury_driver` — orchestrates the compile pipeline; owns SourceMap/Interner and honors `--emit`.
 - `mercuryc` — CLI binary parsing args and delegating compilation to `mercury_driver`.
 - `mercury_bench` — benchmark harness: optimizer effectiveness, interpreter timing, equivalence gate.
-- `mercury_xbench` — cross-language benchmark: Mercury vs C vs Rust (see `BENCHMARKS.md`).
+- `mercury_xbench` — cross-language benchmark: Mercury vs C, C++, and Rust (see `BENCHMARKS.md`).
 
 Dependencies flow strictly downward (no cycles); every crate is prefixed `mercury_` (binary is `mercuryc`).
 
@@ -119,7 +119,7 @@ reassociated form is the oracle — all backends run the same reassociated IR an
   textual-LLVM `--features llvm` path cannot link/run. The native path is **Cranelift** (pure Rust,
   builds and JITs here with zero external toolchain) plus any raw-codegen microkernels we add. Plain
   `cargo test` needs no toolchain. `gcc`/`g++`/`rustc` (MSYS2) *are* present — that's what `mercury_xbench`
-  compiles the C/Rust baselines with.
+  compiles the C/C++/Rust baselines with.
 - Wider SIMD: Cranelift historically rejected `f32x8` types in CLIF. That ceiling is a target to break,
   not a law — verify the current Cranelift's capability empirically, and where it can't reach, emit
   AVX2/AVX-512 microkernels directly (the differential gate keeps any such path honest).
@@ -131,7 +131,8 @@ reassociated form is the oracle — all backends run the same reassociated IR an
 - `docs/internals.md` — architecture, crate layering, MIR, optimizer, testing strategy.
 - `docs/language-guide.md` — the language surface, with a maturity legend.
 - `docs/roadmap.md` — what runs end-to-end, what's checked-only, what's planned, sharp edges.
-- `docs/llvm-setup.md` — optional native-codegen toolchain (LLVM 19).
+- `docs/llvm-setup.md` — the **optional** textual-LLVM-IR path (`--emit=llvm-ir`); native codegen is
+  Cranelift and needs no LLVM.
 - `examples/*.mer` — runnable programs (`dot`, `saxpy_array`, `gemm`, `relu`, `fib`, …); note `matmul`/`softmax`/`vadd` are library-only kernels with no `fn main`: they type-check (sema passes) and `--emit=tokens|ast`, but do **not** lower to MIR — `matmul`/`softmax` use a generic-`const` parameter as a runtime loop bound and `vadd` uses explicit `f32x8` load/store intrinsics, both of which MIR lowering rejects with `C0001` — so they neither `--emit=mir` nor `--run`. (The *runnable* matmul/softmax surface is the recognized kernels in `tests/run/tensor_*.mer`, not these files.)
 - `tests/run/` (e2e `// EXPECT-*` directives) and `tests/fail/` (compile-fail `// EXPECT-CODE:`).
 - Each crate has its own `CLAUDE.md` with layout, key types, connections, and gotchas.
