@@ -17,6 +17,175 @@ fn jit(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     crate::jit_run(&program, main, &interner)
 }
 
+/// Compile `src` to a callable native handle (no run), for timing. Honors `MERCURY_P4_NO_256`.
+fn compile_native(src: &str, opt: u8) -> crate::JitProgram {
+    let mut interner = Interner::new();
+    let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    let (sema, _) = mercury_sema::check(&module, &interner);
+    let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    mercury_opt::optimize(&mut program, opt);
+    let main = interner.intern("main");
+    crate::jit_compile(&program, main, &interner).expect("jit compile")
+}
+
+/// A same-run A/B of the 256-bit AVX2 recipe vs the 128-bit CLIF vectorizer on one compute-heavy
+/// elementwise kernel. Reports the best-of-N wall-clock ratio (best-of controls for this laptop's
+/// clock/thermal drift; alternating A/B/A/B keeps the two measurements adjacent). Ignored by default
+/// — timing is noisy in CI; run with `--ignored --nocapture`. Not a correctness gate (the differential
+/// tests are); a sanity check that widening to 256 bits actually buys throughput.
+#[test]
+#[ignore]
+fn p4_bench_256_vs_128() {
+    // Compute-bound, L1-resident body: a high arithmetic-intensity FMA chain (no sqrt, no memory
+    // spill) over a 512-element array (3×2KB ≪ L1), repeated so wall-clock dominates setup. This
+    // isolates the SIMD-width win; memory-bound bodies (large arrays, few flops/elem) see less
+    // because both widths saturate the same bandwidth.
+    let src = "\
+        fn main() -> i32 { \
+          let mut a: [f32; 512] = [0.0; 512]; let mut b: [f32; 512] = [0.0; 512]; \
+          let mut o: [f32; 512] = [0.0; 512]; \
+          for i in 0..512 { a[i] = (i as f32) * 0.001; } \
+          for i in 0..512 { b[i] = (i as f32) * 0.002 + 1.0; } \
+          let mut r: i32 = 0; \
+          while r < 200000 { \
+            for i in 0..512 { o[i] = a[i]*b[i] + a[i]*a[i] - b[i]*b[i] + a[i]*b[i]*a[i] - b[i]; } r += 1; \
+          } \
+          print(o[100] as i32); return 0; }";
+
+    let best = |p: &crate::JitProgram| -> std::time::Duration {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(p.call());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+
+    std::env::set_var("MERCURY_P4_NO_256", "1");
+    let p128 = compile_native(src, 3);
+    std::env::remove_var("MERCURY_P4_NO_256");
+    let p256 = compile_native(src, 3);
+
+    // Warm, then alternate to keep the two adjacent under one clock state.
+    best(&p128);
+    best(&p256);
+    let (t128, t256) = (best(&p128), best(&p256));
+    eprintln!(
+        "p4 256-vs-128: 128-bit {:?}, 256-bit {:?}  =>  {:.2}x",
+        t128,
+        t256,
+        t128.as_secs_f64() / t256.as_secs_f64()
+    );
+}
+
+/// Same-run A/B of the 256-bit AVX2 *reduction* kernel vs the 128-bit CLIF reduction. Ignored by
+/// default; run with `--ignored --nocapture`. Sanity check that widening the reduction buys
+/// throughput (not a correctness gate — the differential + f64-reference tests are). Uses a
+/// *compute-bound* addend `a·(a²+b²)`: its top `*` is fused into the accumulate (`vfmadd`, matching
+/// the 128-bit path), and the several muls/adds per pair of loads keep it FP-bound, not L1-bandwidth
+/// bound — a memory-bound dot (`a·b`) merely ties, since both widths saturate the same L1 ports.
+#[test]
+#[ignore]
+fn p4_bench_reduction_256_vs_128() {
+    // One `+ addend` off `s` (so `reduction_of` claims it); the addend's top `*` fuses via FMA. N is
+    // ≥ `VEC256_REDUCTION_MIN_TRIP` so the gated 256-bit path actually fires (below it, both compile to
+    // the inlined 128-bit reduction and this would compare 128 against 128).
+    let src = "\
+        fn main() -> i32 { \
+          let mut a: [f32; 2048] = [0.0; 2048]; let mut b: [f32; 2048] = [0.0; 2048]; \
+          for i in 0..2048 { a[i] = (i as f32) * 0.001; b[i] = (i as f32) * 0.002 + 1.0; } \
+          let mut acc: f32 = 0.0; let mut r: i32 = 0; \
+          while r < 50000 { \
+            let mut s: f32 = 0.0; \
+            for i in 0..2048 { s = s + a[i] * (a[i]*a[i] + b[i]*b[i]); } \
+            acc = acc + s; r += 1; \
+          } \
+          print(acc as i32); return 0; }";
+    let best = |p: &crate::JitProgram| -> std::time::Duration {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(p.call());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    std::env::set_var("MERCURY_P4_NO_256", "1");
+    let p128 = compile_native(src, 3);
+    std::env::remove_var("MERCURY_P4_NO_256");
+    let p256 = compile_native(src, 3);
+    best(&p128);
+    best(&p256);
+    let (t128, t256) = (best(&p128), best(&p256));
+    eprintln!(
+        "p4 reduction 256-vs-128: 128-bit {:?}, 256-bit {:?}  =>  {:.2}x",
+        t128,
+        t256,
+        t128.as_secs_f64() / t256.as_secs_f64()
+    );
+}
+
+/// Broad differential sweep of the 256-bit vectorizer: many f32 elementwise body shapes (every
+/// recipe op — +−×÷, neg, sqrt, nested if/else blends, multi-stream, invariant scalars/literals,
+/// in-place output=input) crossed with trip counts that straddle the 8-lane boundary and the scalar
+/// tail, in both `for` and normalized-`while` form. Each must agree native-vs-interp AND -O0-vs-O3.
+/// This is the regression lock for the whole feature — if a lane, a tail, or an aliasing case ever
+/// drifts, one of these fails.
+#[test]
+fn p4_vec256_coverage_sweep() {
+    // Each body computes `o[i]` (or updates a stream in place) from streams a,b,c and scalar `k`.
+    let bodies: &[&str] = &[
+        "o[i] = a[i] + b[i] - c[i]",
+        "o[i] = a[i] * b[i] * c[i]",
+        "o[i] = a[i] / (b[i] + 1.0)",
+        "o[i] = -a[i] + b[i] * c[i]",
+        "o[i] = sqrt(a[i] * a[i] + b[i] * b[i])",
+        "o[i] = a[i] * k + b[i]",                                    // invariant scalar
+        "o[i] = if a[i] > b[i] { a[i] } else { b[i] }",              // max via blend
+        "o[i] = if a[i] > 0.0 { a[i] } else { 0.0 }",                // relu
+        "o[i] = if a[i] < 6.0 { if a[i] > 0.0 { a[i] } else { 0.0 } } else { 6.0 }", // relu6 (nested)
+        "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",     // load reuse (CSE)
+        "a[i] = a[i] * a[i] + 1.0",                                  // in-place, output=input
+        "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",         // mixed, 3 streams + scalar
+    ];
+    // Trip counts around the 8-lane group boundary, its multiples, and non-multiples (tail).
+    let sizes: &[usize] = &[1, 2, 7, 8, 9, 15, 16, 17, 24, 63, 64, 65, 100, 255, 256, 257];
+
+    for body in bodies {
+        for &n in sizes {
+            for form in ["for", "while"] {
+                let loop_src = if form == "for" {
+                    format!("for i in 0..{n} {{ {body}; }}")
+                } else {
+                    format!("let mut i: i32 = 0; while i < {n} {{ {body}; i += 1; }}")
+                };
+                let src = format!(
+                    "fn main() -> i32 {{ \
+                       let mut a: [f32; {m}] = [0.0; {m}]; let mut b: [f32; {m}] = [0.0; {m}]; \
+                       let mut c: [f32; {m}] = [0.0; {m}]; let mut o: [f32; {m}] = [0.0; {m}]; \
+                       let k: f32 = 1.5; \
+                       for j in 0..{n} {{ a[j] = (j as f32) * 0.5 - 3.0; b[j] = (j as f32) * 0.25 + 1.0; c[j] = (j as f32) - 7.0; }} \
+                       {loop_src} \
+                       let mut s: f32 = 0.0; for j in 0..{n} {{ s = s + a[j] + o[j]; }} \
+                       print(s as i32); return ((s as i32) & 255); }}",
+                    m = n.max(1),
+                );
+                let native = jit(&src, 3)
+                    .unwrap_or_else(|e| panic!("jit -O3 [{form} n={n}] `{body}`: {e}"));
+                let oracle = interp(&src, 3)
+                    .unwrap_or_else(|e| panic!("interp [{form} n={n}] `{body}`: {e}"));
+                assert_eq!(native, oracle, "native vs interp [{form} n={n}] `{body}`");
+                let o0 = jit(&src, 0)
+                    .unwrap_or_else(|e| panic!("jit -O0 [{form} n={n}] `{body}`: {e}"));
+                assert_eq!(o0, native, "-O0 vs -O3 [{form} n={n}] `{body}`");
+            }
+        }
+    }
+}
+
 /// Run `src` through the interpreter for differential comparison.
 fn interp(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     let mut interner = Interner::new();
@@ -90,6 +259,176 @@ fn cranelift_still_rejects_f32x8() {
         "Cranelift now accepts f32x8 — widen VEC_REG_BYTES and revisit the AVX dispatch"
     );
     unsafe { module.free_memory() };
+}
+
+/// P4 exploratory probe: which 256-bit vector ops does Cranelift 0.124.3 legalize on THIS host
+/// (AVX2/FMA on)? Each op is built in a fresh module inside `catch_unwind`, so a panic in one does
+/// not stop the others. Prints OK / ERR(msg) / PANIC per op. Run with `--nocapture`. Not a gate —
+/// pure fact-finding for the raw-AVX2-vs-CLIF-widen architecture decision. Deleted before commit.
+#[test]
+fn p4_probe_vec256_ops() {
+    use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
+    use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_jit::{JITBuilder, JITModule};
+    use cranelift_module::{Linkage, Module};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // Build a function with 4 ptr params, run `body(&mut b, &params, vty)`, define+finalize.
+    // Returns Ok(()) if it compiled to machine code, Err(msg) otherwise.
+    fn probe<F>(vty: types::Type, body: F) -> Result<(), String>
+    where
+        F: Fn(&mut FunctionBuilder, &[Value], types::Type),
+    {
+        let isa = crate::make_isa(false).map_err(|e| format!("isa: {e}"))?;
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut module = JITModule::new(builder);
+        let ptr = module.target_config().pointer_type();
+        let mut sig = Signature::new(module.target_config().default_call_conv);
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(ptr));
+        }
+        let fid = module
+            .declare_function("probe", Linkage::Export, &sig)
+            .map_err(|e| format!("declare: {e}"))?;
+        let mut ctx = module.make_context();
+        ctx.func.signature = sig;
+        let mut fbctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+            let blk = b.create_block();
+            b.append_block_params_for_function_params(blk);
+            b.switch_to_block(blk);
+            let params: Vec<Value> = b.block_params(blk).to_vec();
+            body(&mut b, &params, vty);
+            b.ins().return_(&[]);
+            b.seal_all_blocks();
+            b.finalize();
+        }
+        module
+            .define_function(fid, &mut ctx)
+            .map_err(|e| format!("define: {e}"))?;
+        module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize: {e}"))?;
+        unsafe { module.free_memory() };
+        Ok(())
+    }
+
+    let f32x8 = types::F32.by(8).unwrap();
+    let f32x4 = types::F32.by(4).unwrap();
+    let i32x8 = types::I32.by(8).unwrap();
+
+    // (name, vty, builder). Each loads from params, applies the op, stores to params[last].
+    type B = Box<dyn Fn(&mut FunctionBuilder, &[Value], types::Type)>;
+    let cases: Vec<(&str, types::Type, B)> = vec![
+        ("f32x4 fadd (control)", f32x4, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fadd(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 load+store", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            b.ins().store(MemFlags::trusted(), va, p[3], 0);
+        })),
+        ("f32x8 fadd", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fadd(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fsub", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fsub(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fmul", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fmul(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fdiv", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fdiv(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fma", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let vc = b.ins().load(vt, MemFlags::trusted(), p[2], 0);
+            let r = b.ins().fma(va, vb, vc);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fneg", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let r = b.ins().fneg(va);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 sqrt", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let r = b.ins().sqrt(va);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fmin/fmax", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fmax(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fcmp->bitselect", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let mask = b.ins().fcmp(FloatCC::GreaterThan, va, vb);
+            let r = b.ins().bitselect(mask, va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 splat(scalar)", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let s = b.ins().load(types::F32, MemFlags::trusted(), p[0], 0);
+            let r = b.ins().splat(vt, s);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("i32x8 iadd", i32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().iadd(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("i32x8 icmp->bitselect", i32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let mask = b.ins().icmp(IntCC::SignedGreaterThan, va, vb);
+            let r = b.ins().bitselect(mask, va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+    ];
+
+    println!("\n=== P4 vec256 legalization probe (Cranelift 0.124.3, AVX2/FMA host) ===");
+    let mut any_f32x8_ok = false;
+    for (name, vty, f) in &cases {
+        let res = catch_unwind(AssertUnwindSafe(|| probe(*vty, f)));
+        let verdict = match res {
+            Ok(Ok(())) => {
+                if name.starts_with("f32x8") {
+                    any_f32x8_ok = true;
+                }
+                "OK".to_string()
+            }
+            Ok(Err(e)) => format!("ERR: {}", e.lines().next().unwrap_or("").trim()),
+            Err(_) => "PANIC".to_string(),
+        };
+        println!("  {name:<28} -> {verdict}");
+    }
+    println!("=== any f32x8 op legalized: {any_f32x8_ok} ===\n");
+    // The whole reason the P4 raw-AVX2 emitter (`avx2.rs`) exists. If a future Cranelift starts
+    // legalizing *any* 256-bit op, revisit whether CLIF vectors can replace the raw emitter.
+    assert!(
+        !any_f32x8_ok,
+        "Cranelift now legalizes an f32x8 op — revisit the raw-AVX2 vs CLIF-vector decision"
+    );
 }
 
 /// A function with a stack frame larger than a page (here a ~200 KB local array — the kind an
@@ -2799,12 +3138,14 @@ fn vectorized_reductions_are_correct() {
         )
     };
 
-    // The dot reduction must lower to a vector fma accumulator; the sum to a vector add.
+    // At this (small) trip the f32 dot reduction takes the inlined 128-bit CLIF path: reassociated
+    // lane accumulators with a fused multiply-add (the 256-bit AVX2 kernel only fires at large trips —
+    // `VEC256_REDUCTION_MIN_TRIP` — and is covered by `p4_reduction256_gate_and_differential`).
     let (prog, interner) = lowered(&dot(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
         mir.contains("fma") && mir.contains("x f32>"),
-        "dot reduction should vectorize to a vector fma:\n{mir}"
+        "dot reduction should vectorize to a 128-bit fma accumulator:\n{mir}"
     );
 
     for n in [1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 64, 100, 257, 1000] {
@@ -2850,6 +3191,101 @@ fn reduction_reassociation_is_backend_consistent() {
                 interp(&src, opt).unwrap(),
                 "fractional dot interp vs native mismatch at n={n} -O{opt}"
             );
+        }
+    }
+}
+
+/// The reassociated-reduction gate: the 256-bit AVX2 reduction reassociates the f32 sum, so beyond
+/// interp==native (which `reduction_reassociation_is_backend_consistent` covers) the *value* must
+/// stay within a `c·√K·ε` tolerance of an f64 reference computed from the same f32 inputs. This is
+/// the documented check for reassociated float reductions — it catches a wrong horizontal fold or a
+/// dropped lane that a bit-for-bit backend match alone would miss (both backends could agree on a
+/// wrong reassociation). Fractional inputs so the low bits genuinely differ from a strict sum.
+#[test]
+fn p4_reduction_f64_reference() {
+    for n in [64usize, 257, 1000, 4096] {
+        let src = format!(
+            "fn main() -> i32 {{ let mut x: [f32; {n}] = [0.0; {n}]; let mut y: [f32; {n}] = [0.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ x[i] = ((i % 17) as f32) * 0.5 + 1.0; \
+             y[i] = ((i % 13) as f32) * 0.25 - 0.5; i += 1; }} \
+             let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k] * y[k]; }} \
+             print(s); return 0; }}"
+        );
+        let (_, out) = jit(&src, 3).expect("jit");
+        let got: f64 = String::from_utf8(out)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("parse printed f32 sum");
+        // f64 reference over the identical f32 inputs (widened exactly).
+        let mut refsum = 0.0f64;
+        for k in 0..n {
+            let x = (((k % 17) as f32) * 0.5 + 1.0) as f64;
+            let y = (((k % 13) as f32) * 0.25 - 0.5) as f64;
+            refsum += x * y;
+        }
+        let tol = 8.0 * (n as f64).sqrt() * f64::from(f32::EPSILON) * refsum.abs().max(1.0);
+        assert!(
+            (got - refsum).abs() <= tol,
+            "n={n}: reassociated 256-bit dot {got} vs f64 ref {refsum} exceeds tol {tol}"
+        );
+    }
+}
+
+/// The 256-bit reduction is gated on a compile-time-known trip ≥ `VEC256_REDUCTION_MIN_TRIP` (=2048):
+/// below the threshold its out-of-line call loses to the inlined 128-bit reduction, so a small (or
+/// runtime-unknown) trip must keep the 128-bit path. Verifies BOTH the gate (a `veckernel` appears only
+/// at/above the threshold) and that the gated 256-bit path is bit-exact interp-vs-native and -O0-vs-O3
+/// across the fold kinds: fused-`fma` dot/composite, a plain (non-product) addend, and non-fused
+/// `fmax`/`fmin`.
+#[test]
+fn p4_reduction256_gate_and_differential() {
+    // Full program: init streams a,b (deterministic, both signs), then the reduction `red`, print s.
+    let mk = |n: usize, red: &str| {
+        format!(
+            "fn main() -> i32 {{ let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+             let mut i: i32 = 0; while i < {n} {{ a[i] = ((i % 23) as f32) * 0.5 - 3.0; \
+             b[i] = ((i % 19) as f32) * 0.25 + 0.5; i += 1; }} \
+             {red} print(s); return ((s as i32) & 1023); }}"
+        )
+    };
+    // The fold bodies, parameterized by trip `n`. Two fuse a product into the accumulate (`Add` of an
+    // `X*Y`), one has a non-product addend (no fma), two are max/min (never fma).
+    let folds = |n: usize| -> Vec<(&'static str, String)> {
+        vec![
+            ("fma dot", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + a[k]*b[k]; }}")),
+            ("fma composite", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + a[k]*(a[k]+b[k]); }}")),
+            ("plain", format!("let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + (a[k] - b[k]); }}")),
+            ("fmax", format!("let mut s: f32 = -1000.0; for k in 0..{n} {{ s = fmax(s, a[k]*b[k]); }}")),
+            ("fmin", format!("let mut s: f32 = 1000.0; for k in 0..{n} {{ s = fmin(s, a[k]*b[k]); }}")),
+        ]
+    };
+
+    // Gate — below the threshold (1024 < 2048), no 256-bit kernel: the reduction stays 128-bit.
+    for (name, red) in folds(1024) {
+        let (prog, interner) = lowered(&mk(1024, &red), 2);
+        assert!(
+            !mercury_mir::print::print_program(&prog, &interner).contains("veckernel"),
+            "N=1024 (< 2048) must keep the inlined 128-bit reduction [{name}]"
+        );
+    }
+    // At/above the threshold — the 256-bit kernel fires and stays bit-exact on both backends and opts.
+    for n in [2048usize, 4096] {
+        for (name, red) in folds(n) {
+            let src = mk(n, &red);
+            let (prog, interner) = lowered(&src, 2);
+            assert!(
+                mercury_mir::print::print_program(&prog, &interner).contains("veckernel"),
+                "N={n} (≥ 2048) must use the 256-bit reduction [{name}]"
+            );
+            for opt in [0u8, 3] {
+                let native = jit(&src, opt).expect("jit");
+                let interpd = interp(&src, opt).expect("interp");
+                assert_eq!(
+                    native, interpd,
+                    "256-bit reduction native vs interp N={n} -O{opt} [{name}]"
+                );
+            }
         }
     }
 }
@@ -2911,11 +3347,13 @@ fn vectorized_ssd_reduction() {
              return s as i32; }}"
         )
     };
+    // Small trip → the inlined 128-bit reduction (the 256-bit kernel is gated to large trips, covered
+    // by `p4_reduction256_gate_and_differential`); the squared-difference addend fuses to an `fma`.
     let (prog, interner) = lowered(&kernel(64), 2);
     let mir = mercury_mir::print::print_program(&prog, &interner);
     assert!(
         mir.contains("fma") && mir.contains("x f32>"),
-        "ssd reduction should vectorize to a vector fma:\n{mir}"
+        "ssd reduction should vectorize to a 128-bit fma accumulator:\n{mir}"
     );
     for n in [1usize, 4, 7, 8, 16, 31, 64, 128] {
         let src = kernel(n);
@@ -3082,6 +3520,86 @@ fn fusion_collapses_adjacent_loops() {
         "fused native vs interp"
     );
     assert_eq!(native.0, 2500);
+}
+
+/// The general 256-bit AVX2 recipe path (`Op::VecKernelCall`, raw-AVX2 `avx2.rs`) must agree with the
+/// interpreter oracle bit-for-bit on the f32 elementwise bodies it claims — a stream×stream product,
+/// an in-place ReLU (load-before-store), `sqrt` composed with arithmetic, and negation over a third
+/// stream — across trip counts spanning the vector part and the non-multiple-of-8 scalar tail. Also
+/// pins native -O0 == -O3 (the recipe is opaque to the optimizer, so both must match).
+#[test]
+fn p4_vec256_general_matches_interp() {
+    let prog = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ \
+               let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+               let mut c: [f32; {n}] = [0.0; {n}]; let mut d: [f32; {n}] = [0.0; {n}]; \
+               let mut k: i32 = 0; \
+               while k < {n} {{ a[k] = ((k - {n}/2) as f32) * 0.5; b[k] = (k as f32) + 1.0; k += 1; }} \
+               for i in 0..{n} {{ c[i] = a[i] * b[i]; }} \
+               for i in 0..{n} {{ c[i] = if c[i] > 0.0 {{ c[i] }} else {{ 0.0 }}; }} \
+               for i in 0..{n} {{ d[i] = sqrt(a[i] * a[i]) + (-b[i]); }} \
+               let mut s: f32 = 0.0; let mut j: i32 = 0; \
+               while j < {n} {{ s = s + c[j] + d[j]; j += 1; }} \
+               print(s as i32); return (s as i32) & 255; }}"
+        )
+    };
+    for n in [1usize, 7, 8, 9, 15, 16, 17, 64, 100, 257] {
+        let src = prog(n);
+        // The product loop must actually reach the recipe (else the test is vacuous).
+        let (p, _) = lowered(&src, 3);
+        assert!(
+            p.funcs.iter().any(|f| !f.vec_kernels.is_empty()),
+            "n={n}: expected a synthesized vector kernel in the MIR"
+        );
+        let native = jit(&src, 3).expect("jit -O3");
+        assert_eq!(native, interp(&src, 3).expect("interp"), "n={n}: native vs interp");
+        assert_eq!(jit(&src, 0).expect("jit -O0"), native, "n={n}: native -O0 vs -O3");
+    }
+}
+
+/// A counting `while i < N { …; i += 1 }` with a vectorizable body normalizes to the for-range
+/// vectorizer (`try_normalize_counting_while`). The rewrite must (a) match the interpreter oracle
+/// bit-for-bit, (b) preserve the while's post-loop counter — `N` if it ran, else the untouched
+/// start (the `start >= N` empty-run case), and (c) leave `i` reachable for code after the loop.
+#[test]
+fn p4_counting_while_normalizes_and_matches_interp() {
+    // `lo` lets us cover both the ran case (lo < N) and the empty case (lo == N ⇒ never runs). The
+    // counting-while body is a stream×stream product plus a third stream (`a*b + e`) — velem can't
+    // claim that shape, so it reaches the general recipe (a real `vec_kernels` entry).
+    let prog = |n: usize, lo: usize| {
+        format!(
+            "fn main() -> i32 {{ \
+               let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+               let mut c: [f32; {n}] = [0.0; {n}]; let mut e: [f32; {n}] = [0.0; {n}]; \
+               let mut p: i32 = 0; \
+               while p < {n} {{ a[p] = (p as f32) - 3.0; b[p] = (p as f32) + 1.0; e[p] = (p as f32); p += 1; }} \
+               let mut k: i32 = {lo}; \
+               while k < {n} {{ c[k] = a[k] * b[k] + e[k]; k += 1; }} \
+               let mut s: f32 = 0.0; let mut t: i32 = 0; while t < {n} {{ s = s + c[t]; t += 1; }} \
+               print(k); print(s as i32); return ((k + (s as i32)) & 255); }}"
+        )
+    };
+    for n in [8usize, 9, 16, 33, 100] {
+        for lo in [0usize, n] {
+            // lo < n runs (final k == n); lo == n never runs (final k == n == lo). Both must hold.
+            let src = prog(n, lo);
+            if lo < n {
+                let (p, _) = lowered(&src, 3);
+                assert!(
+                    p.funcs.iter().any(|f| !f.vec_kernels.is_empty()),
+                    "n={n} lo={lo}: counting while should normalize to a vector kernel"
+                );
+            }
+            let native = jit(&src, 3).expect("jit -O3");
+            assert_eq!(
+                native,
+                interp(&src, 3).expect("interp"),
+                "n={n} lo={lo}: native vs interp"
+            );
+            assert_eq!(jit(&src, 0).expect("jit -O0"), native, "n={n} lo={lo}: -O0 vs -O3");
+        }
+    }
 }
 
 /// ReLU6 streaming dispatch: `clamp(x, 0, 6)` written as the nested value-ifs `if x < 6 { if x > 0 {
