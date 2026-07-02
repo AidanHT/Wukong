@@ -122,6 +122,20 @@ impl Shape {
     pub fn rank(&self) -> usize {
         self.0.len()
     }
+
+    /// The symbolic (`Var`) dimensions of this shape, in axis order (repeats preserved — a shape
+    /// like `[N, N]` yields `[N, N]`; de-duplication across a whole signature is the caller's job).
+    /// This is the source of truth for the hidden runtime-dim ABI that lets a symbolic-generic tensor
+    /// function execute: each such dim is threaded to the callee as a hidden `i64` parameter.
+    pub fn symbolic_dims(&self) -> Vec<Symbol> {
+        self.0
+            .iter()
+            .filter_map(|d| match d {
+                Dim::Var(s) => Some(*s),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Physical memory layout of a tensor.
