@@ -84,6 +84,17 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Splat(v) => format!("splat {}", val(*v)),
         Op::Fma(a, b, c) => format!("fma {}, {}, {}", val(*a), val(*b), val(*c)),
         Op::Sqrt(a) => format!("sqrt {}", val(*a)),
+        Op::VecKernelCall {
+            kernel,
+            ptrs,
+            scalars,
+            n,
+        } => format!(
+            "veckernel #{kernel}(ptrs={}, scalars={}, n={})",
+            val(*ptrs),
+            val(*scalars),
+            val(*n)
+        ),
         Op::Round(mode, a) => {
             let m = match mode {
                 crate::inst::RoundMode::Nearest => "nearest",

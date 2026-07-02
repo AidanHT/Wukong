@@ -16,7 +16,8 @@ use mercury_ast::{
 };
 use mercury_diag::Diagnostic;
 use mercury_mir::{
-    BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId,
+    BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId, VecBin,
+    VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
 use mercury_sema::{DefKind, EnumVariant, SemaResult, VariantPayload};
 use mercury_span::{Interner, Span, Symbol};
@@ -6500,7 +6501,105 @@ impl FnLowerer<'_> {
         self.coerce_to(val, &from, &to, self.signed(e))
     }
 
+    /// Normalize a counting `while i < N { … ; i += 1 }` — unit step, `i` a mutable int local, `N`
+    /// loop-invariant, the increment the last statement — into the `for i in i..N` form the
+    /// vectorizer accepts, so its elementwise body reaches the 256-bit AVX2 / SIMD path instead of a
+    /// scalar loop. Runs the vectorized loop over `[i, N)` with a fresh index, then sets `i` to its
+    /// post-loop value (`if i < N { N } else { i }`, exactly the while's), so code after the loop
+    /// sees the same `i`. Returns false — emitting nothing — unless the pattern matches *and* the
+    /// stripped body is vectorizable (a pure check with no side effects); the caller then lowers the
+    /// while normally. Only `<` with a unit step is handled; everything else falls back.
+    fn try_normalize_counting_while(&mut self, cond: &Expr, body: &Block) -> bool {
+        // `i < N` with `i` a single path and `N` free of `i`.
+        let ExprKind::Binary {
+            op: ast::BinOp::Lt,
+            lhs,
+            rhs,
+        } = &cond.kind
+        else {
+            return false;
+        };
+        let Some(i) = single_path(lhs) else {
+            return false;
+        };
+        if expr_mentions(rhs, i) {
+            return false;
+        }
+        // `i` must be a mutable int local already in scope (its slot is the loop counter).
+        let Some((islot, ity)) = self.lookup(i) else {
+            return false;
+        };
+        if !ity.is_int() {
+            return false;
+        }
+        // The last statement must be the unit increment; strip it for the for-body.
+        if body.tail.is_some() || body.stmts.is_empty() {
+            return false;
+        }
+        if !self.is_unit_incr(body.stmts.last().unwrap(), i) {
+            return false;
+        }
+        let stripped = Block {
+            id: body.id,
+            stmts: body.stmts[..body.stmts.len() - 1].to_vec(),
+            tail: None,
+            span: body.span,
+        };
+        // Commit only if the stripped body is vectorizable — a pure analysis (no MIR emitted, so no
+        // risk of double-evaluating a side-effecting bound on the fallback path). This also scopes
+        // normalization to elementwise loops and guarantees `try_vectorize_ranged` will succeed.
+        if self.vectorizable(&stripped, i).is_none() {
+            return false;
+        }
+        // Lower the bounds and run the vectorized loop over `[start, N)` with a fresh index slot.
+        let start_val = self.builder.build(ity.clone(), Op::Load(islot, ity.clone()));
+        let end_ty = self.expr_mir(rhs);
+        let e0 = self.lower_expr(rhs);
+        let end_val = self.coerce_to(e0, &end_ty, &ity, true);
+        let ok = self.try_vectorize_ranged(i, start_val, end_val, &ity, &stripped);
+        debug_assert!(ok, "a vectorizable body must vectorize");
+        // Restore `i` to the value the while would have left: `N` if it ran (`start < N`), else the
+        // untouched start — the vectorizer used a fresh slot, so `i`'s own slot still holds `start`.
+        let cmp = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, start_val, end_val));
+        let final_i = self
+            .builder
+            .build(ity.clone(), Op::Select(cmp, end_val, start_val));
+        self.builder.build_void(Op::Store {
+            ptr: islot,
+            value: final_i,
+        });
+        self.terminated = false;
+        true
+    }
+
+    /// Is `stmt` exactly `i += 1` / `i = i + 1` / `i = 1 + i` (a unit increment of `i`)?
+    fn is_unit_incr(&self, stmt: &Stmt, i: Symbol) -> bool {
+        let StmtKind::Assign { target, op, value } = &stmt.kind else {
+            return false;
+        };
+        if single_path(target) != Some(i) {
+            return false;
+        }
+        let is_one =
+            |e: &Expr| matches!(&e.kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 1);
+        match op {
+            ast::AssignOp::Add => is_one(value),
+            ast::AssignOp::Assign => matches!(&value.kind,
+                ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs }
+                    if (single_path(lhs) == Some(i) && is_one(rhs))
+                        || (single_path(rhs) == Some(i) && is_one(lhs))),
+            _ => false,
+        }
+    }
+
     fn lower_while(&mut self, label: Option<Symbol>, cond: &Expr, body: &Block) {
+        // A counting `while i < N { …; i += 1 }` with a vectorizable body normalizes to the for-range
+        // vectorizer (256-bit AVX2 / SIMD); on any mismatch this is a no-op and we lower it as a loop.
+        if self.try_normalize_counting_while(cond, body) {
+            return;
+        }
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
         let exit = self.builder.new_block();
@@ -10958,7 +11057,17 @@ impl FnLowerer<'_> {
         let e0 = self.lower_expr(end);
         let e0 = self.coerce_to(e0, &end_ty, &ity, true);
         if let Some((s_sym, addend, lane, w, redop)) = reduction {
-            self.emit_reduction(j, s0, e0, &ity, s_sym, addend, &lane, w, redop);
+            // A compile-time-known trip (literal `for i in A..B`) lets the 256-bit reduction gate on
+            // size; a runtime bound stays `None` and keeps the 128-bit path (see
+            // `VEC256_REDUCTION_MIN_TRIP`).
+            let known_trip = match (
+                const_usize_expr(start, self.interner, &self.sema.consts),
+                const_usize_expr(end, self.interner, &self.sema.consts),
+            ) {
+                (Some(a), Some(b)) if b >= a => Some((b - a) as u64),
+                _ => None,
+            };
+            self.emit_reduction(j, s0, e0, &ity, s_sym, addend, &lane, w, redop, known_trip);
             true
         } else {
             self.try_vectorize_ranged(j, s0, e0, &ity, body)
@@ -11425,6 +11534,319 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Capture a validated (`vectorizable`-passing) f32 loop body as a flat [`VecKernel`] recipe for
+    /// the raw-AVX2 path, or `None` if it uses anything outside the assembler's coverage (a
+    /// transcendental, `abs`/rounding, `fmax`/`fmin`, a compound assign) — in which case the caller
+    /// keeps the 128-bit CLIF vectorizer. Records each distinct unit-stride `(base, index)` as a
+    /// stream and each loop-invariant value (a param/outer local, a stride-0 array read, or a numeric
+    /// literal) as a pre-loaded scalar; the emitter lowers those sources. Pure (emits no MIR).
+    fn build_vec_recipe<'b>(&self, body: &'b Block, j: Symbol) -> Option<VecRecipe<'b>> {
+        let mut r = VecRecipe {
+            ops: Vec::new(),
+            streams: Vec::new(),
+            scalars: Vec::new(),
+            load_cache: HashMap::new(),
+        };
+        // inner `let`/`let mut` temps: name -> the recipe value index it currently holds.
+        let mut locals: HashMap<Symbol, u32> = HashMap::new();
+        for s in &body.stmts {
+            match &s.kind {
+                StmtKind::Let {
+                    pat:
+                        Pattern {
+                            kind: ast::PatKind::Ident(name),
+                            ..
+                        },
+                    init: Some(e),
+                    ..
+                } => {
+                    let vi = self.rec_value(e, j, &locals, &mut r)?;
+                    locals.insert(*name, vi);
+                }
+                StmtKind::Assign { target, op, value } => {
+                    // A compound assign (`out[j] += …`, `r *= …`) is a read-modify-write; keep v1 to
+                    // plain `=` and let the 128-bit path handle those (correctness over coverage).
+                    if !matches!(op, ast::AssignOp::Assign) {
+                        return None;
+                    }
+                    let vi = self.rec_value(value, j, &locals, &mut r)?;
+                    match &target.kind {
+                        // reassign an inner temp (Horner-style `r = r*v + c`).
+                        ExprKind::Path(p) if p.is_single() && locals.contains_key(&p.first().sym) => {
+                            locals.insert(p.first().sym, vi);
+                        }
+                        // store to a unit-stride array element.
+                        ExprKind::Index { base, indices } if indices.len() == 1 => {
+                            let bsym = single_path(base)?;
+                            if affine_stride(&indices[0], j) != Some(1) {
+                                return None;
+                            }
+                            let stream = rec_stream(&mut r, bsym, &indices[0]);
+                            r.ops.push(VecOp::Store { stream, val: vi });
+                            // The stream now holds `vi`; a later read forwards it (no reload).
+                            r.load_cache.insert(stream, vi);
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Need at least one stream and one store for a kernel to do anything.
+        if r.streams.is_empty() || !r.ops.iter().any(|o| matches!(o, VecOp::Store { .. })) {
+            return None;
+        }
+        Some(r)
+    }
+
+    /// Lower one value-expression of a recipe body into `VecOp`s (operands first, so every op index
+    /// references only earlier ops), returning the value index it produced. `None` on any construct
+    /// the AVX2 recipe cannot express.
+    fn rec_value<'b>(
+        &self,
+        e: &'b Expr,
+        j: Symbol,
+        locals: &HashMap<Symbol, u32>,
+        r: &mut VecRecipe<'b>,
+    ) -> Option<u32> {
+        let push = |r: &mut VecRecipe<'b>, op: VecOp| -> u32 {
+            r.ops.push(op);
+            (r.ops.len() - 1) as u32
+        };
+        match &e.kind {
+            // an inner vector temp.
+            ExprKind::Path(p) if p.is_single() && locals.contains_key(&p.first().sym) => {
+                Some(locals[&p.first().sym])
+            }
+            // an invariant scalar (param / outer local): broadcast a pre-loaded scalar.
+            ExprKind::Path(p) if p.is_single() => {
+                if p.first().sym == j {
+                    return None; // the loop var used as a value would need an index vector
+                }
+                let scalar = rec_scalar(r, e);
+                Some(push(r, VecOp::Splat { scalar }))
+            }
+            // a numeric literal: also a pre-loaded scalar (the assembler rejects inline `Const`).
+            ExprKind::Int(_) | ExprKind::Float(_) => {
+                let scalar = rec_scalar(r, e);
+                Some(push(r, VecOp::Splat { scalar }))
+            }
+            ExprKind::Index { base, indices } if indices.len() == 1 => {
+                let bsym = single_path(base)?;
+                match affine_stride(&indices[0], j) {
+                    // unit stride: a streaming load, CSE'd — reuse the stream's cached value (an
+                    // earlier load or a just-stored value) instead of reloading.
+                    Some(1) => {
+                        let stream = rec_stream(r, bsym, &indices[0]);
+                        if let Some(&v) = r.load_cache.get(&stream) {
+                            return Some(v);
+                        }
+                        let v = push(r, VecOp::Load { stream });
+                        r.load_cache.insert(stream, v);
+                        Some(v)
+                    }
+                    // stride 0: a loop-invariant element → a pre-loaded scalar.
+                    Some(0) => {
+                        let scalar = rec_scalar(r, e);
+                        Some(push(r, VecOp::Splat { scalar }))
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                use ast::BinOp::*;
+                let vop = match op {
+                    Add => VecBin::Add,
+                    Sub => VecBin::Sub,
+                    Mul => VecBin::Mul,
+                    Div => VecBin::Div,
+                    _ => return None,
+                };
+                let a = self.rec_value(lhs, j, locals, r)?;
+                let b = self.rec_value(rhs, j, locals, r)?;
+                Some(push(r, VecOp::Bin { op: vop, a, b }))
+            }
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => {
+                let a = self.rec_value(expr, j, locals, r)?;
+                Some(push(r, VecOp::Neg { a }))
+            }
+            // Only `sqrt` maps to a recipe op; other intrinsics (exp/log/abs/round/fmax/…) fall back.
+            ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
+                Some(MathIntrinsic::Sqrt) if args.len() == 1 => {
+                    let a = self.rec_value(&args[0], j, locals, r)?;
+                    Some(push(r, VecOp::Sqrt { a }))
+                }
+                _ => None,
+            },
+            // `if lhs OP rhs { t } else { e }` if-converts to a lane compare + blend (ReLU etc.).
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let else_e = else_branch.as_deref()?;
+                let tv = block_value(then_branch)?;
+                let ev = branch_value(else_e)?;
+                let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+                    return None;
+                };
+                use ast::BinOp::*;
+                let pred = match op {
+                    Lt => VecCmp::Lt,
+                    Le => VecCmp::Le,
+                    Gt => VecCmp::Gt,
+                    Ge => VecCmp::Ge,
+                    Eq => VecCmp::Eq,
+                    Ne => VecCmp::Ne,
+                    _ => return None,
+                };
+                let a = self.rec_value(lhs, j, locals, r)?;
+                let b = self.rec_value(rhs, j, locals, r)?;
+                let mask = push(r, VecOp::Cmp { pred, a, b });
+                let ta = self.rec_value(tv, j, locals, r)?;
+                let eb = self.rec_value(ev, j, locals, r)?;
+                Some(push(r, VecOp::Select { mask, a: ta, b: eb }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit the 256-bit path: register `kern`, marshal the stream base pointers and invariant
+    /// scalars onto the stack, call the kernel over the multiple-of-8 vector part `[s, s+n)`, then
+    /// run the ordinary scalar loop over the tail `[s+n, end)`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_veckernel_for(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        kern: VecKernel,
+        recipe: &VecRecipe,
+        body: &Block,
+    ) {
+        let kidx = self.builder.add_vec_kernel(kern);
+
+        // n = largest multiple of 8 not exceeding the trip count (0 if it is under 8 or negative, so
+        // a short/empty loop runs entirely in the scalar tail and the kernel is never entered).
+        let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
+        let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
+        let trip = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
+        let neg8 = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
+        let masked = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::And, trip, neg8));
+        let eight = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        let lt8 = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let n = self
+            .builder
+            .build(MirType::I64, Op::Select(lt8, zero, masked));
+
+        // Bind `j` to a slot holding the start element, so lowering each stream's index expression
+        // yields its first element and the (j-independent) scalar sources lower cleanly.
+        let jslot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: jslot,
+            value: s0,
+        });
+        self.push_scope();
+        self.bind(j, jslot, ity.clone());
+
+        // ptrs[k] = &base_k[start + offset_k] — one entry per stream, offset to the loop start.
+        let ptrs = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::Ptr), recipe.streams.len() as u32));
+        for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
+            let base = self.lookup(*base_sym).expect("stream base in scope").0;
+            let idxv = self.lower_expr(idx_expr);
+            let idx_ty = self.expr_mir(idx_expr);
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            let sp = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base,
+                    index: idx64,
+                    elem: MirType::F32,
+                },
+            );
+            let ki = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let dst = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: ptrs,
+                    index: ki,
+                    elem: MirType::Ptr,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: dst,
+                value: sp,
+            });
+        }
+
+        // scalars[k] = the k-th loop-invariant f32 (a param/outer local, a stride-0 read, or a
+        // literal). At least one slot so the pointer is always valid even with no scalars.
+        let scalars = self.builder.alloca(MirType::Array(
+            Box::new(MirType::F32),
+            recipe.scalars.len().max(1) as u32,
+        ));
+        for (k, sexpr) in recipe.scalars.iter().enumerate() {
+            let sv0 = self.lower_expr(sexpr);
+            let sty = self.expr_mir(sexpr);
+            let sv = self.coerce_to(sv0, &sty, &MirType::F32, true);
+            let ki = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let dst = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: scalars,
+                    index: ki,
+                    elem: MirType::F32,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: dst,
+                value: sv,
+            });
+        }
+
+        self.builder.build_void(Op::VecKernelCall {
+            kernel: kidx,
+            ptrs,
+            scalars,
+            n,
+        });
+
+        // Scalar remainder over [start + n, end): the original body via the ordinary scalar loop.
+        let n_ity = self.coerce_to(n, &MirType::I64, ity, true);
+        let tail_start = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, s0, n_ity));
+        let tslot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: tslot,
+            value: tail_start,
+        });
+        self.emit_scalar_tail(j, tslot, end_v, ity, body);
+
+        self.pop_scope();
+    }
+
     /// Emit the vectorized loop as three strips that share one index slot `j`: an unrolled vector
     /// loop (`VEC_UNROLL` independent vector groups per iteration), then a single-vector loop, then
     /// a scalar remainder. The bounds are already-lowered `ity` values.
@@ -11439,6 +11861,30 @@ impl FnLowerer<'_> {
         w: u32,
         body: &Block,
     ) {
+        // First try the true 256-bit AVX2 path: capture the body as a flat `VecKernel` recipe and
+        // run it over the multiple-of-8 vector part, with a scalar tail. Only the f32 arithmetic
+        // subset the raw-AVX2 assembler covers is eligible; anything else (other lanes, a
+        // transcendental, too many streams/registers) falls through to the 128-bit CLIF strips
+        // below. Elementwise ⇒ each lane is the same f32 op order as scalar, so no reassociation:
+        // the kernel is bit-exact to the tail element-for-element, and the interp marshals the same
+        // recipe as the oracle. `MERCURY_P4_NO_256` forces the 128-bit path — a same-run A/B knob for
+        // measuring the 256-bit win, and a kill-switch should a body ever be found miscompiled.
+        if *lane == MirType::F32 && std::env::var_os("MERCURY_P4_NO_256").is_none() {
+            if let Some(recipe) = self.build_vec_recipe(body, j) {
+                let kern = VecKernel {
+                    name: self.builder.func_name(),
+                    streams: recipe.streams.len() as u32,
+                    scalars: recipe.scalars.len() as u32,
+                    ops: recipe.ops.clone(),
+                    unroll: VEC_UNROLL,
+                    reduce: None,
+                };
+                if kern.pressure().is_some_and(|p| p.fits()) {
+                    self.emit_veckernel_for(j, s0, end_v, ity, kern, &recipe, body);
+                    return;
+                }
+            }
+        }
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
@@ -11591,6 +12037,239 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
+    /// Build a reduction recipe from a single addend expression (no store): the flat op body plus its
+    /// stream/scalar sources, and the value index of the addend (the op folded into the accumulator).
+    /// `None` if the addend isn't an f32 recipe or has no stream (a pure-scalar "reduction" is silly).
+    /// Build the recipe for a reduction addend. Returns `(recipe, value, fma)`: `fma = Some((X, Y))`
+    /// when `fuse_mul` (an `Add` reduction) and the addend is a product `X*Y` — the product op is *not*
+    /// emitted, and the fold becomes `acc = fma(X, Y, acc)` (matching the 128-bit path's fused
+    /// accumulate: one op, one rounding, one fewer live register). Otherwise `fma = None` and the fold
+    /// reads `value` directly.
+    fn build_reduce_recipe<'b>(
+        &self,
+        addend: &'b Expr,
+        j: Symbol,
+        fuse_mul: bool,
+    ) -> Option<(VecRecipe<'b>, u32, Option<(u32, u32)>)> {
+        let fresh = || VecRecipe {
+            ops: Vec::new(),
+            streams: Vec::new(),
+            scalars: Vec::new(),
+            load_cache: HashMap::new(),
+        };
+        // Fusion attempt: lower the two product operands (not the product) into a fresh recipe. Each
+        // may be a load, a scalar broadcast, or a composite — the assembler's fold reads them via
+        // `reg_of`, so a hoisted operand is fine as long as the kernel has a stream to loop over.
+        if fuse_mul {
+            if let ExprKind::Binary {
+                op: ast::BinOp::Mul,
+                lhs,
+                rhs,
+            } = &addend.kind
+            {
+                let mut r = fresh();
+                if let Some(x) = self.rec_value(lhs, j, &HashMap::new(), &mut r) {
+                    if let Some(y) = self.rec_value(rhs, j, &HashMap::new(), &mut r) {
+                        if !r.streams.is_empty() {
+                            return Some((r, x, Some((x, y))));
+                        }
+                    }
+                }
+                // Not fusable (an operand didn't lower, or no stream) → fall through to the plain form.
+            }
+        }
+        // Plain: fold the addend value itself.
+        let mut r = fresh();
+        let value = self.rec_value(addend, j, &HashMap::new(), &mut r)?;
+        // Need a stream, and the folded value must be a real body register (never a hoisted Splat —
+        // the assembler reads it from a body register that a Splat would not occupy).
+        if r.streams.is_empty()
+            || matches!(
+                r.ops[value as usize],
+                VecOp::Splat { .. } | VecOp::Const { .. }
+            )
+        {
+            return None;
+        }
+        Some((r, value, None))
+    }
+
+    /// Emit the 256-bit AVX2 reduction path for `s <fold>= addend` over `[s0, end)`: fold the addend
+    /// across 8-wide lane accumulators (kernel), combine with the initial `s`, then a scalar tail.
+    /// Returns false (emitting nothing) if the addend can't be an f32 reduction kernel that fits — the
+    /// caller then keeps the 128-bit reduction. The reassociated form is the oracle (both backends run
+    /// `eval_reduction`'s exact grouping); the initial-`s` combine and the tail reuse the same
+    /// `fold` the 128-bit path uses, so all three of interp/native and -O0/-O3 agree.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_reduction_256(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        s_sym: Symbol,
+        addend: &Expr,
+        redop: RedOp,
+    ) -> bool {
+        let vred = match redop {
+            RedOp::Add => VecRedOp::Add,
+            RedOp::Fmax => VecRedOp::Fmax,
+            RedOp::Fmin => VecRedOp::Fmin,
+        };
+        // Only a sum fuses a product into its accumulate (`vfmadd`); max/min have no fused form.
+        let fuse_mul = matches!(redop, RedOp::Add);
+        let Some((recipe, value, fma)) = self.build_reduce_recipe(addend, j, fuse_mul) else {
+            return false;
+        };
+        let kern = VecKernel {
+            name: self.builder.func_name(),
+            streams: recipe.streams.len() as u32,
+            scalars: recipe.scalars.len() as u32,
+            ops: recipe.ops.clone(),
+            unroll: VEC_UNROLL,
+            reduce: Some(VecReduce {
+                op: vred,
+                value,
+                fma,
+            }),
+        };
+        if !kern.reduction_fits() {
+            return false;
+        }
+        let kidx = self.builder.add_vec_kernel(kern);
+
+        // n = largest multiple of 8 ≤ trip count (0 if under 8 / negative), like the elementwise path.
+        let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
+        let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
+        let trip = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
+        let neg8 = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
+        let masked = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::And, trip, neg8));
+        let eight = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        let lt8 = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let n = self
+            .builder
+            .build(MirType::I64, Op::Select(lt8, zero, masked));
+
+        // Bind j to a start slot so the stream index expressions and scalar sources lower cleanly.
+        let jslot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: jslot,
+            value: s0,
+        });
+        self.push_scope();
+        self.bind(j, jslot, ity.clone());
+
+        // ptrs[k] = &base_k[start + offset_k]; scalars[k] = the k-th invariant f32 (as the elementwise
+        // emitter does).
+        let ptrs = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::Ptr), recipe.streams.len() as u32));
+        for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
+            let base = self.lookup(*base_sym).expect("stream base in scope").0;
+            let idxv = self.lower_expr(idx_expr);
+            let idx_ty = self.expr_mir(idx_expr);
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            let sp = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base,
+                    index: idx64,
+                    elem: MirType::F32,
+                },
+            );
+            let ki = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let dst = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: ptrs,
+                    index: ki,
+                    elem: MirType::Ptr,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: dst,
+                value: sp,
+            });
+        }
+        let scalars = self.builder.alloca(MirType::Array(
+            Box::new(MirType::F32),
+            recipe.scalars.len().max(1) as u32,
+        ));
+        for (k, sexpr) in recipe.scalars.iter().enumerate() {
+            let sv0 = self.lower_expr(sexpr);
+            let sty = self.expr_mir(sexpr);
+            let sv = self.coerce_to(sv0, &sty, &MirType::F32, true);
+            let ki = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let dst = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: scalars,
+                    index: ki,
+                    elem: MirType::F32,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: dst,
+                value: sv,
+            });
+        }
+
+        // The kernel returns the horizontal fold of the addends over `[start, start+n)`.
+        let r = self.builder.build(
+            MirType::F32,
+            Op::VecKernelCall {
+                kernel: kidx,
+                ptrs,
+                scalars,
+                n,
+            },
+        );
+
+        // Combine with the accumulator's initial value: `s = fold(s, r)` — the same fold the loop and
+        // tail use, so max/min operand order and NaN behavior match the kernel's horizontal reduce.
+        // `reduction_of` requires the accumulator type to equal the lane type (f32 here), so `s_ty`
+        // is f32 and the kernel's f32 result needs no coercion.
+        let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
+        let s_init = self
+            .builder
+            .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
+        let combined = self.reduce_combine_scalar(redop, &s_ty, s_init, r);
+        self.builder.build_void(Op::Store {
+            ptr: s_slot,
+            value: combined,
+        });
+
+        // Scalar remainder over `[start + n, end)`: fold each addend into `s`.
+        let n_ity = self.coerce_to(n, &MirType::I64, ity, true);
+        let tail_start = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, s0, n_ity));
+        let tslot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: tslot,
+            value: tail_start,
+        });
+        self.emit_reduction_tail(j, tslot, end_v, ity, s_sym, addend, redop);
+
+        self.pop_scope();
+        true
+    }
+
     /// Emit a vectorized float reduction over `[s0, end)`: `VEC_UNROLL` independent vector-lane
     /// accumulators summed in an unrolled main loop, a single-vector cleanup loop, then a horizontal
     /// reduce of the lanes into `s`, then a scalar remainder. This reassociates the sum (vs strict
@@ -11608,7 +12287,22 @@ impl FnLowerer<'_> {
         lane: &MirType,
         w: u32,
         redop: RedOp,
+        known_trip: Option<u64>,
     ) {
+        // First try the 256-bit AVX2 reduction kernel (f32 sum/max/min): fold the addend across
+        // 8-wide lane accumulators and return the horizontal result, with a scalar tail. The
+        // reassociation is the oracle (both backends run the identical `eval_reduction` order). Falls
+        // through to the 128-bit CLIF reduction below when the addend isn't an f32 recipe or won't fit,
+        // or when the trip isn't known to be large enough to amortize the out-of-line call (the 256-bit
+        // path loses to the inlined 128-bit reduction on small arrays — see `VEC256_REDUCTION_MIN_TRIP`).
+        let trip_ok = known_trip.is_some_and(|t| t >= VEC256_REDUCTION_MIN_TRIP);
+        if trip_ok
+            && *lane == MirType::F32
+            && std::env::var_os("MERCURY_P4_NO_256").is_none()
+            && self.try_emit_reduction_256(j, s0, end_v, ity, s_sym, addend, redop)
+        {
+            return;
+        }
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
@@ -21232,6 +21926,47 @@ fn lower_i8matmul_fn(
     fl.builder.finish()
 }
 
+/// A captured recipe for the 256-bit AVX2 vectorizer (`build_vec_recipe`): the flat op body plus the
+/// AST sources of its streams and invariant scalars, which `emit_veckernel_for` lowers to base
+/// pointers and stored f32s. Borrows the loop body it was built from.
+struct VecRecipe<'b> {
+    ops: Vec<VecOp>,
+    /// `(base array symbol, index expr)` per stream, unit-stride in the loop var. Dedup'd, so a
+    /// read and an in-place write at the same index share one stream.
+    streams: Vec<(Symbol, &'b Expr)>,
+    /// Loop-invariant f32 source expressions (a param/outer-local path, a stride-0 array read, or a
+    /// numeric literal). Dedup'd by structure to keep the hoisted-register count small.
+    scalars: Vec<&'b Expr>,
+    /// Load CSE / store-forward cache: stream index → the recipe value that currently holds its
+    /// element. A repeated `a[i]` reuses one load (lower register pressure ⇒ more unroll), and a
+    /// store updates it so a later read of that stream forwards the just-stored value with no
+    /// reload. Build-time only; ignored once the recipe is emitted.
+    load_cache: HashMap<u32, u32>,
+}
+
+/// Intern a stream by `(base, index)` — dedup by base symbol + structural index equality — returning
+/// its stream index.
+fn rec_stream<'b>(r: &mut VecRecipe<'b>, base: Symbol, idx: &'b Expr) -> u32 {
+    if let Some(pos) = r
+        .streams
+        .iter()
+        .position(|(b, e)| *b == base && exprs_struct_eq(e, idx))
+    {
+        return pos as u32;
+    }
+    r.streams.push((base, idx));
+    (r.streams.len() - 1) as u32
+}
+
+/// Intern an invariant scalar source (dedup by structural equality), returning its scalar index.
+fn rec_scalar<'b>(r: &mut VecRecipe<'b>, e: &'b Expr) -> u32 {
+    if let Some(pos) = r.scalars.iter().position(|x| exprs_struct_eq(x, e)) {
+        return pos as u32;
+    }
+    r.scalars.push(e);
+    (r.scalars.len() - 1) as u32
+}
+
 /// SIMD width for a lane type: lanes per `VEC_REG_BYTES`-wide register (f32x8, f64x4 at 256-bit).
 /// Returns `None` for lane types we don't vectorize.
 fn vector_width(lane: &MirType) -> Option<u32> {
@@ -21252,6 +21987,18 @@ const VEC_REG_BYTES: u32 = 16;
 /// issue across the core's multiple FP units (≈ AVX throughput from SSE ops) and hide FP latency in
 /// reduction-style bodies (Horner, matmul accumulate). 4×f32x4 = 16 f32/iteration.
 const VEC_UNROLL: u32 = 4;
+
+/// Minimum (compile-time-known) trip count before a float reduction takes the 256-bit AVX2 kernel
+/// instead of the inlined 128-bit CLIF reduction. The 256-bit path is an *out-of-line call* (marshal
+/// stream pointers, save/restore callee-saved YMM halves, a horizontal-reduce tail) whose fixed
+/// per-invocation overhead the 128-bit inlined path avoids entirely. Measured same-run A/B (this
+/// laptop, compute-bound `a·(a²+b²)`): N=512 → 0.52×, N=1024 → ~0.9×, N=2048 → ~1.35×. The crossover
+/// for the worst (highest-register) bodies sits below 2048, so gating on a *known* trip ≥ this value
+/// guarantees the wider kernel only fires where it wins; unknown/small trips keep the 128-bit path and
+/// never regress. (Runtime-`N` reductions could be captured with a runtime trip guard branching to the
+/// two paths — deferred, as it would wrap the correctness-critical 128-bit lowering in new control
+/// flow.)
+const VEC256_REDUCTION_MIN_TRIP: u64 = 2048;
 
 /// Default signedness for a lane type (only affects integer div/rem op selection).
 fn lane_signed(lane: &MirType) -> bool {

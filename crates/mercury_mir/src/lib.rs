@@ -9,10 +9,15 @@
 mod builder;
 mod inst;
 pub mod print;
+pub mod vec_kernel;
 pub mod verify;
 
 pub use builder::Builder;
 pub use inst::{BinOp, CastKind, CmpOp, Inst, Op, RoundMode, Terminator};
+pub use vec_kernel::{
+    op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecOp, VecPressure, VecRedOp,
+    VecReduce, VEC_LANES, VEC_MAX_STREAMS, VEC_NREG,
+};
 
 use mercury_span::Symbol;
 use mercury_types::Scalar;
@@ -140,6 +145,12 @@ pub struct Function {
     pub blocks: Vec<BasicBlock>,
     pub value_types: Vec<MirType>,
     pub entry: BlockId,
+    /// Synthesized 256-bit AVX2 vector kernels (P4) this function calls, indexed by
+    /// [`Op::VecKernelCall`]'s `kernel` field. Function-local so lowering can register a recipe on
+    /// the same [`crate::Builder`] it is already threading — no program-wide side table. The
+    /// interpreter marshals these lane-wise (the oracle); the Cranelift backend assembles each to
+    /// raw AVX2 (`avx2.rs`). Empty for every function the vectorizer did not widen.
+    pub vec_kernels: Vec<VecKernel>,
 }
 
 impl Function {

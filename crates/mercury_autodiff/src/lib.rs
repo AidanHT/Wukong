@@ -448,6 +448,17 @@ impl<'a> Vjp<'a> {
             Op::Fma(a, b, c) => Op::Fma(self.remap(*a), self.remap(*b), self.remap(*c)),
             Op::Sqrt(v) => Op::Sqrt(self.remap(*v)),
             Op::Round(m, v) => Op::Round(*m, self.remap(*v)),
+            Op::VecKernelCall {
+                kernel,
+                ptrs,
+                scalars,
+                n,
+            } => Op::VecKernelCall {
+                kernel: *kernel,
+                ptrs: self.remap(*ptrs),
+                scalars: self.remap(*scalars),
+                n: self.remap(*n),
+            },
         }
     }
 }
@@ -474,6 +485,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Fma(..) => "fma",
         Op::Sqrt(..) => "sqrt",
         Op::Round(..) => "round",
+        Op::VecKernelCall { .. } => "veckernel",
     }
 }
 

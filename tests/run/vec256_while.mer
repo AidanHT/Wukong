@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 610
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 49
+module tests.run.vec256_while
+
+// A counting `while i < N { …; i += 1 }` with a vectorizable elementwise body normalizes to the
+// for-range vectorizer (`try_normalize_counting_while`), so it reaches the 256-bit path — either the
+// general AVX2 recipe or a recognized kernel (e.g. `a[k]*b[k]` and the ReLU below dispatch to
+// `mercury_velem_f32`) — instead of a scalar loop. The rewrite preserves the while's post-loop
+// counter value exactly — `N` if the loop ran, else the untouched start — so code after the loop is
+// unchanged. Bit-exact across interp/native and -O0..-O3.
+
+fn main() -> i32 {
+    let mut a: [f32; 100] = [0.0; 100];
+    let mut b: [f32; 100] = [0.0; 100];
+    let mut c: [f32; 100] = [0.0; 100];
+
+    // Setup whiles use the loop var as a value, so they stay scalar (not vectorizable) — fine.
+    let mut i: i32 = 0;
+    while i < 100 { a[i] = (i as f32) - 50.0; i += 1; }
+    let mut j: i32 = 0;
+    while j < 100 { b[j] = (j as f32) + 1.0; j += 1; }
+
+    // Counting while with a stream×stream body → normalized to the 256-bit recipe.
+    let mut k: i32 = 0;
+    while k < 100 { c[k] = a[k] * b[k]; k += 1; }
+    print(c[60] as i32); // (60-50)*(60+1) = 610
+    print(k);            // preserved: the loop ran, so k = 100
+
+    // Empty-run case: start already ≥ end ⇒ the loop never runs, m is unchanged.
+    let mut m: i32 = 100;
+    while m < 100 { c[m] = 0.0; m += 1; }
+    print(m); // still 100
+
+    // In-place ReLU via a counting while, then a couple of non-negative counts.
+    let mut p: i32 = 0;
+    while p < 100 { c[p] = if c[p] > 0.0 { c[p] } else { 0.0 }; p += 1; }
+    let mut cnt: i32 = 0;
+    let mut q: i32 = 0;
+    while q < 100 { cnt = cnt + (if c[q] > 0.0 { 1 } else { 0 }); q += 1; }
+    print(cnt); // number of strictly-positive products a[k]*b[k], k=0..99
+    return 0;
+}

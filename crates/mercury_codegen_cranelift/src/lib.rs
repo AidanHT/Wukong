@@ -29,6 +29,10 @@ use mercury_span::{Interner, Symbol};
 mod backend;
 pub use backend::CraneliftBackend;
 
+// P4: raw-AVX2 emitter for the general vectorizer's 256-bit path (Cranelift caps CLIF vectors at
+// 128-bit). Owned by this session; additive.
+mod avx2;
+
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
 // `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust
@@ -388,6 +392,9 @@ struct FnTranslator<'a> {
     /// Pre-declared GlobalValues for the read-only static-data blobs (`Op::GlobalAddr`), one per
     /// unique string literal, imported into this function's DFG.
     data_refs: &'a HashMap<Symbol, GlobalValue>,
+    /// FuncRefs for this function's synthesized AVX2 vector kernels, indexed by `Op::VecKernelCall`'s
+    /// `kernel` field (the position in the owning `Function::vec_kernels`).
+    kernel_refs: &'a [FuncRef],
     /// First "type too large to lay out" overflow seen while lowering this function, if any.
     /// Recorded (instead of panicking) so `populate_module` can abort with a clean error before
     /// the half-built function is finalized/defined. See [`FnTranslator::size_of_or_err`].
@@ -668,6 +675,34 @@ impl<'a> FnTranslator<'a> {
                 Some(v) => v,
                 None => return,
             },
+            // A synthesized 256-bit AVX2 vector kernel. The kernel is installed as raw machine code
+            // (see `avx2::assemble_kernel` + `define_function_bytes`) under the module's default call
+            // conv (Win64 here: ptrs->RCX, scalars->RDX, n->R8), so a plain Cranelift `call` reaches
+            // it. It writes through the stream pointers and returns nothing.
+            Op::VecKernelCall {
+                kernel,
+                ptrs,
+                scalars,
+                n,
+            } => {
+                let fref = self.kernel_refs[*kernel as usize];
+                let ptrs_v = self.val(*ptrs);
+                let scalars_v = self.val(*scalars);
+                // The kernel's `n` parameter is i64; the count is non-negative, so zero-extend.
+                let n_raw = self.val(*n);
+                let n_ty = self.dfg_ty(n_raw);
+                let n_v = if n_ty == types::I64 {
+                    n_raw
+                } else {
+                    self.resize_int(n_raw, n_ty, types::I64, false)
+                };
+                let call = self.builder.ins().call(fref, &[ptrs_v, scalars_v, n_v]);
+                // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
+                match res {
+                    Some(_) => self.builder.inst_results(call)[0],
+                    None => return,
+                }
+            }
             Op::FuncAddr(sym) => {
                 let fref = self.func_refs[sym];
                 self.builder.ins().func_addr(self.ptr_ty, fref)
@@ -2561,9 +2596,45 @@ fn populate_module<M: Module>(
         data_ids.insert(s.name, id);
     }
 
+    // Declare and install the synthesized 256-bit AVX2 vector kernels as raw machine code. They are
+    // function-local (a loop the vectorizer widened registers its recipe on that function), so we
+    // walk every function's `vec_kernels` and give each a module-unique FuncId keyed by (function
+    // index, kernel index). Each is a self-contained `fn(ptrs: *const *mut u8, scalars: *const f32,
+    // n: u64)` under the module's default call conv (Win64 on this target), so ordinary Cranelift
+    // `call`s from the owning function reach it. `define_function_bytes` copies the bytes into the
+    // module's code region; the empty reloc slice reflects that the kernels reference no externals.
+    let mut kernel_sig = Signature::new(call_conv);
+    kernel_sig.params.push(AbiParam::new(ptr_ty)); // ptrs
+    kernel_sig.params.push(AbiParam::new(ptr_ty)); // scalars
+    kernel_sig.params.push(AbiParam::new(types::I64)); // n
+    // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
+    let mut kernel_sig_reduce = kernel_sig.clone();
+    kernel_sig_reduce.returns.push(AbiParam::new(types::F32));
+    let mut kernel_ids: Vec<Vec<FuncId>> = Vec::with_capacity(program.funcs.len());
+    for (fi, f) in program.funcs.iter().enumerate() {
+        let mut per_fn: Vec<FuncId> = Vec::with_capacity(f.vec_kernels.len());
+        for (ki, k) in f.vec_kernels.iter().enumerate() {
+            let bytes = crate::avx2::assemble_kernel(k)
+                .map_err(|e| format!("avx2 assemble vec kernel {fi}.{ki}: {e}"))?;
+            let sig = if k.reduce.is_some() {
+                &kernel_sig_reduce
+            } else {
+                &kernel_sig
+            };
+            let id = module
+                .declare_function(&format!("__mercury_veckernel_{fi}_{ki}"), Linkage::Local, sig)
+                .map_err(|e| e.to_string())?;
+            module
+                .define_function_bytes(id, 16, &bytes, &[])
+                .map_err(|e| format!("cranelift define vec kernel {fi}.{ki}: {e:?}"))?;
+            per_fn.push(id);
+        }
+        kernel_ids.push(per_fn);
+    }
+
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
-    for f in &program.funcs {
+    for (fi, f) in program.funcs.iter().enumerate() {
         ctx.func.signature = signature_of(f, ptr_ty, call_conv);
         {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
@@ -2585,6 +2656,11 @@ fn populate_module<M: Module>(
                 let gv = module.declare_data_in_func(data_ids[&s.name], builder.func);
                 data_refs.insert(s.name, gv);
             }
+            // This function's own vector-kernel FuncRefs, indexed by `Op::VecKernelCall`'s `kernel`.
+            let kernel_refs: Vec<FuncRef> = kernel_ids[fi]
+                .iter()
+                .map(|&kid| module.declare_func_in_func(kid, builder.func))
+                .collect();
             let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
             rt_refs.insert(
                 RT_PRINT_I64,
@@ -3156,6 +3232,7 @@ fn populate_module<M: Module>(
                 func_refs: &func_refs,
                 rt_refs: &rt_refs,
                 data_refs: &data_refs,
+                kernel_refs: &kernel_refs,
                 layout_err: None,
             };
             t.translate();

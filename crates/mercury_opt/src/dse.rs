@@ -58,8 +58,8 @@ impl Pass for Dse {
                             pending.clear();
                         }
                     }
-                    Op::Call { .. } => {
-                        // A call may read through any pointer it was given.
+                    Op::Call { .. } | Op::VecKernelCall { .. } => {
+                        // A call (or vector kernel) may read through any pointer it was given.
                         pending.clear();
                     }
                     _ => {}
