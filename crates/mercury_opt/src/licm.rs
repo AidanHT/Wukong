@@ -73,7 +73,12 @@ fn natural_loops(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Vec<(u32, Ha
             }
         }
     }
-    by_header.into_iter().collect()
+    // Process loops in a deterministic (header-id) order. `HashMap` iteration order is randomized
+    // per run, and loop processing order can change what a single LICM pass hoists (e.g. nested
+    // loops) — so leaving it unordered makes the emitted MIR nondeterministic run-to-run (M12).
+    let mut loops: Vec<(u32, HashSet<u32>)> = by_header.into_iter().collect();
+    loops.sort_by_key(|(h, _)| *h);
+    loops
 }
 
 /// Does `a` dominate `b`? Walks the immediate-dominator chain from `b` up to the entry.
@@ -141,9 +146,16 @@ fn safe_to_hoist(op: &Op) -> bool {
 }
 
 fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> bool {
+    // Iterate the loop body in a deterministic (block-id) order. The order in which hoisted
+    // instructions are appended to the preheader must not depend on `HashSet` iteration order —
+    // that order is randomized per run, so using it directly emits nondeterministic MIR (M12). The
+    // hoisted instructions in a round are mutually independent, so any fixed order is equally valid.
+    let mut body_blocks: Vec<u32> = body.iter().copied().collect();
+    body_blocks.sort_unstable();
+
     // Values defined inside the loop (block parameters and instruction results).
     let mut defined_in_loop: HashSet<u32> = HashSet::new();
-    for &blk in body {
+    for &blk in &body_blocks {
         let b = &f.blocks[blk as usize];
         for p in &b.params {
             defined_in_loop.insert(p.0);
@@ -163,7 +175,7 @@ fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> boo
     loop {
         // Read phase: which still-in-loop instructions are now invariant?
         let mut found: HashSet<u32> = HashSet::new();
-        for &blk in body {
+        for &blk in &body_blocks {
             for inst in &f.blocks[blk as usize].insts {
                 let Some(r) = inst.result else { continue };
                 if !safe_to_hoist(&inst.op) {
@@ -187,8 +199,8 @@ fn hoist_from_loop(f: &mut Function, body: &HashSet<u32>, preheader: u32) -> boo
 
         // Mutate phase: pull the newly invariant instructions out of their loop blocks. All their
         // operands were available *before* this round, so there are no intra-round dependencies and
-        // appending them in discovery order is valid.
-        for &blk in body {
+        // appending them in (deterministic block-id) discovery order is valid.
+        for &blk in &body_blocks {
             let insts = std::mem::take(&mut f.blocks[blk as usize].insts);
             let mut kept = Vec::with_capacity(insts.len());
             for inst in insts {
