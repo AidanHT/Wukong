@@ -32,12 +32,58 @@ pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
 
+use std::time::{Duration, Instant};
+
 use mercury_mir::{Op, Program, Terminator, ValueId};
 
 /// A function-level transform. Returns whether it changed anything.
 pub trait Pass {
     fn name(&self) -> &'static str;
     fn run_function(&self, f: &mut mercury_mir::Function) -> bool;
+}
+
+/// In-process optimizer timing, gathered by [`optimize_timed`]. This is **measurement only**: the
+/// timed path runs the identical pipeline with the identical sequence of mutations, so it produces
+/// byte-identical MIR to [`optimize`] — the only difference is an `Instant` around each pass call.
+/// The production [`optimize`] path pays zero timing overhead (the timing branch is never taken).
+#[derive(Clone, Default)]
+pub struct Timings {
+    /// Per-pass accumulated wall time and invocation count, in pipeline order.
+    pub per_pass: Vec<PassStat>,
+    /// Whole-program inlining time (runs at `-O2`+).
+    pub inline: Duration,
+    /// Total time inside `optimize` (inlining + every pass + fixpoint bookkeeping).
+    pub total: Duration,
+    /// The largest per-function fixpoint iteration count observed across the program.
+    pub max_iterations: u32,
+}
+
+/// One pass's accumulated cost over a whole `optimize_timed` run.
+#[derive(Clone)]
+pub struct PassStat {
+    pub name: &'static str,
+    pub time: Duration,
+    /// How many times this pass's `run_function` was invoked (skipped clean passes don't count).
+    pub calls: u64,
+}
+
+impl Timings {
+    fn record(&mut self, idx: usize, name: &'static str, dur: Duration) {
+        if self.per_pass.len() <= idx {
+            self.per_pass.resize(
+                idx + 1,
+                PassStat {
+                    name,
+                    time: Duration::ZERO,
+                    calls: 0,
+                },
+            );
+        }
+        let s = &mut self.per_pass[idx];
+        s.name = name;
+        s.time += dur;
+        s.calls += 1;
+    }
 }
 
 /// An ordered list of passes, run to a per-function fixpoint.
@@ -79,11 +125,14 @@ impl PassManager {
 
     pub fn run(&self, program: &mut Program) {
         for f in &mut program.funcs {
-            self.run_function(f);
+            self.run_function(f, None);
         }
     }
 
-    fn run_function(&self, f: &mut mercury_mir::Function) {
+    /// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
+    /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
+    /// change which passes run or in what order, so the resulting MIR is identical either way.
+    fn run_function(&self, f: &mut mercury_mir::Function, mut timings: Option<&mut Timings>) {
         // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
         // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
         // function — re-running it on identical MIR would again be a no-op. We therefore skip
@@ -100,7 +149,16 @@ impl PassManager {
                 if clean[i] {
                     continue; // at fixpoint: nothing has mutated the MIR since this pass last ran
                 }
-                if p.run_function(f) {
+                let did = match timings.as_deref_mut() {
+                    Some(t) => {
+                        let t0 = Instant::now();
+                        let did = p.run_function(f);
+                        t.record(i, p.name(), t0.elapsed());
+                        did
+                    }
+                    None => p.run_function(f),
+                };
+                if did {
                     changed = true;
                     // A mutation may have created work for every pass again (including earlier ones
                     // already run this sweep, and `p` itself). Re-dirty all; they re-run next sweep.
@@ -125,6 +183,9 @@ impl PassManager {
                 break;
             }
         }
+        if let Some(t) = timings.as_deref_mut() {
+            t.max_iterations = t.max_iterations.max(iterations);
+        }
     }
 }
 
@@ -142,6 +203,26 @@ pub fn optimize(program: &mut Program, opt_level: u8) {
         inline_program(program);
     }
     PassManager::standard(opt_level).run(program);
+}
+
+/// Like [`optimize`], but returns an in-process [`Timings`] breakdown (whole-optimizer total,
+/// inlining, and per-pass accumulated wall time + call counts). Produces MIR **byte-identical** to
+/// [`optimize`] — it runs the same pipeline in the same order, only wrapped in `Instant` timing.
+/// For the bench harness; the production compile path uses [`optimize`] and pays no timing cost.
+pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
+    let mut t = Timings::default();
+    let start = Instant::now();
+    if opt_level >= 2 {
+        let i0 = Instant::now();
+        inline_program(program);
+        t.inline = i0.elapsed();
+    }
+    let pm = PassManager::standard(opt_level);
+    for f in &mut program.funcs {
+        pm.run_function(f, Some(&mut t));
+    }
+    t.total = start.elapsed();
+    t
 }
 
 // ---- shared use-visiting helpers ----
