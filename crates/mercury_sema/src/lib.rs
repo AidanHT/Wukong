@@ -1837,6 +1837,21 @@ impl Sema<'_> {
                                 ),
                             );
                             Ty::Unknown
+                        } else if matches!(op, UnOp::Neg)
+                            && matches!(&expr.kind, ExprKind::Int(s)
+                                if !has_int_suffix(self.sym_str(*s))
+                                    && parse_u64_text(self.sym_str(*s)) == Some(1u64 << 63))
+                        {
+                            // `-9223372036854775808` is i64::MIN. The magnitude 2^63 alone overflows
+                            // i64, so `int_lit_scalar` defaults the bare literal to u64 (right for the
+                            // positive form `print(9223372036854775808)`) — but under a unary minus it
+                            // is i64::MIN. Re-type the inner literal (and the negation) as i64 so
+                            // mir_build bakes the i64::MIN constant and `print` treats it as signed;
+                            // otherwise the u64 negate wrapped back to +2^63 and printed positive — a
+                            // gate-blind wrong sign both backends agreed on. Mirrors how the annotated
+                            // `let x: i64 = -9223372036854775808` already lowers correctly.
+                            self.types.insert(expr.id, Ty::Scalar(Scalar::I64));
+                            Ty::Scalar(Scalar::I64)
                         } else {
                             t
                         }
