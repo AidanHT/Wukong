@@ -328,8 +328,8 @@ struct FnTranslator<'a> {
     /// Pre-declared FuncRefs for callees and runtime imports in this function.
     func_refs: &'a HashMap<Symbol, FuncRef>,
     rt_refs: &'a HashMap<&'static str, FuncRef>,
-    /// FuncRefs for the synthesized AVX2 vector kernels, indexed by `Op::VecKernelCall`'s `kernel`
-    /// field (the position in `Program::vec_kernels`).
+    /// FuncRefs for this function's synthesized AVX2 vector kernels, indexed by `Op::VecKernelCall`'s
+    /// `kernel` field (the position in the owning `Function::vec_kernels`).
     kernel_refs: &'a [FuncRef],
 }
 
@@ -2173,31 +2173,41 @@ fn populate_module<M: Module>(
         ids.insert(f.name, id);
     }
 
-    // Declare and install the synthesized 256-bit AVX2 vector kernels as raw machine code. Each is a
-    // self-contained `fn(ptrs: *const *mut u8, scalars: *const f32, n: u64)` under the module's
-    // default call conv (Win64 on this target), so ordinary Cranelift `call`s from user functions
-    // reach them. `define_function_bytes` copies the bytes into the module's code region; the empty
-    // reloc slice reflects that the kernels reference no external symbols.
+    // Declare and install the synthesized 256-bit AVX2 vector kernels as raw machine code. They are
+    // function-local (a loop the vectorizer widened registers its recipe on that function), so we
+    // walk every function's `vec_kernels` and give each a module-unique FuncId keyed by (function
+    // index, kernel index). Each is a self-contained `fn(ptrs: *const *mut u8, scalars: *const f32,
+    // n: u64)` under the module's default call conv (Win64 on this target), so ordinary Cranelift
+    // `call`s from the owning function reach it. `define_function_bytes` copies the bytes into the
+    // module's code region; the empty reloc slice reflects that the kernels reference no externals.
     let mut kernel_sig = Signature::new(call_conv);
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // ptrs
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // scalars
     kernel_sig.params.push(AbiParam::new(types::I64)); // n
-    let mut kernel_ids: Vec<FuncId> = Vec::with_capacity(program.vec_kernels.len());
-    for (ki, k) in program.vec_kernels.iter().enumerate() {
-        let bytes = crate::avx2::assemble_kernel(k)
-            .map_err(|e| format!("avx2 assemble vec kernel #{ki}: {e}"))?;
-        let id = module
-            .declare_function(&format!("__mercury_veckernel_{ki}"), Linkage::Local, &kernel_sig)
-            .map_err(|e| e.to_string())?;
-        module
-            .define_function_bytes(id, 16, &bytes, &[])
-            .map_err(|e| format!("cranelift define vec kernel #{ki}: {e:?}"))?;
-        kernel_ids.push(id);
+    let mut kernel_ids: Vec<Vec<FuncId>> = Vec::with_capacity(program.funcs.len());
+    for (fi, f) in program.funcs.iter().enumerate() {
+        let mut per_fn: Vec<FuncId> = Vec::with_capacity(f.vec_kernels.len());
+        for (ki, k) in f.vec_kernels.iter().enumerate() {
+            let bytes = crate::avx2::assemble_kernel(k)
+                .map_err(|e| format!("avx2 assemble vec kernel {fi}.{ki}: {e}"))?;
+            let id = module
+                .declare_function(
+                    &format!("__mercury_veckernel_{fi}_{ki}"),
+                    Linkage::Local,
+                    &kernel_sig,
+                )
+                .map_err(|e| e.to_string())?;
+            module
+                .define_function_bytes(id, 16, &bytes, &[])
+                .map_err(|e| format!("cranelift define vec kernel {fi}.{ki}: {e:?}"))?;
+            per_fn.push(id);
+        }
+        kernel_ids.push(per_fn);
     }
 
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
-    for f in &program.funcs {
+    for (fi, f) in program.funcs.iter().enumerate() {
         ctx.func.signature = signature_of(f, ptr_ty, call_conv);
         {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
@@ -2208,8 +2218,8 @@ fn populate_module<M: Module>(
                 let r = module.declare_func_in_func(fid, builder.func);
                 func_refs.insert(sym, r);
             }
-            // Vector-kernel FuncRefs, indexed by kernel number (position in `vec_kernels`).
-            let kernel_refs: Vec<FuncRef> = kernel_ids
+            // This function's own vector-kernel FuncRefs, indexed by `Op::VecKernelCall`'s `kernel`.
+            let kernel_refs: Vec<FuncRef> = kernel_ids[fi]
                 .iter()
                 .map(|&kid| module.declare_func_in_func(kid, builder.func))
                 .collect();

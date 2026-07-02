@@ -1,6 +1,6 @@
 //! A convenience builder for constructing MIR functions imperatively.
 
-use crate::{BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId};
+use crate::{BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId, VecKernel};
 use mercury_span::Symbol;
 
 /// Builds one [`Function`]. Create it, add parameters, carve out blocks, append instructions to
@@ -12,6 +12,8 @@ pub struct Builder {
     blocks: Vec<BasicBlock>,
     entry: BlockId,
     current: BlockId,
+    /// Synthesized 256-bit AVX2 vector kernels registered during lowering, in call-index order.
+    vec_kernels: Vec<VecKernel>,
 }
 
 impl Builder {
@@ -23,6 +25,7 @@ impl Builder {
             blocks: Vec::new(),
             entry: BlockId(0),
             current: BlockId(0),
+            vec_kernels: Vec::new(),
         };
         let entry = b.new_block();
         b.entry = entry;
@@ -32,6 +35,19 @@ impl Builder {
 
     pub fn entry(&self) -> BlockId {
         self.entry
+    }
+
+    /// The symbol of the function being built (used to label synthesized vector kernels).
+    pub fn func_name(&self) -> Symbol {
+        self.name
+    }
+
+    /// Register a synthesized vector kernel and return its function-local index, the value an
+    /// [`Op::VecKernelCall`] stores in its `kernel` field.
+    pub fn add_vec_kernel(&mut self, k: VecKernel) -> u32 {
+        let i = self.vec_kernels.len() as u32;
+        self.vec_kernels.push(k);
+        i
     }
 
     pub fn current(&self) -> BlockId {
@@ -147,6 +163,7 @@ impl Builder {
             blocks: self.blocks,
             value_types: self.value_types,
             entry: self.entry,
+            vec_kernels: self.vec_kernels,
         }
     }
 }
