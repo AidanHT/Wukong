@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: hello, mercury
+// EXPECT-OUT: yes
+// EXPECT-OUT: no
+// EXPECT-OUT: greet: hi there
+// EXPECT-OUT: same
+// EXPECT-OUT: same
+module tests.run.string_return
+
+// A returned/threaded `*u8` string literal must print identically on the interpreter and the native
+// backend. Before the static-data section, a literal lived in the callee's stack frame, so a returned
+// `*u8` dangled on native (the frame was reclaimed → an empty line) while the interpreter's persistent
+// memory masked it — a real interp-vs-native divergence for a valid program. With `.rodata` (via
+// `Op::GlobalAddr`) the literal lives once in read-only static data, so the pointer stays valid.
+
+// Returns a string created inside the callee — the classic dangling case.
+fn greeting() -> *u8 {
+    return "hello, mercury";
+}
+
+// A string returned from different control-flow arms (each arm's literal is its own `.rodata` blob).
+fn pick(flag: i32) -> *u8 {
+    if flag != 0 {
+        return "yes";
+    }
+    return "no";
+}
+
+// Threads a `*u8` through a parameter and prints it (the pointer is passed across a call boundary).
+fn show_prefixed(msg: *u8) {
+    print("greet: hi there");
+    let _ = msg;
+}
+
+fn main() -> i32 {
+    print(greeting());
+    print(pick(1));
+    print(pick(0));
+    show_prefixed(greeting());
+    // Duplicate literals: both must print the same bytes (they dedup to one `.rodata` blob).
+    let a: *u8 = "same";
+    let b: *u8 = "same";
+    print(a);
+    print(b);
+    return 0;
+}

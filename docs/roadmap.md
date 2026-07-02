@@ -77,11 +77,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
   interconvertible with the integers via `as` (`tests/run/char_literals.mer`, `tests/run/char_type.mer`).
-- **String literals**: `"hello"` materializes its UTF-8 bytes (plus a NUL) into a stack byte buffer,
-  typed `*u8`; the escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode. `print`/`println`
-  of a `*u8` (a literal or a `let`-bound string) renders the bytes, not
-  the pointer value (`tests/run/string_literal.mer`). No string *type* beyond `*u8` yet — no
-  concatenation/indexing/length and no general static-data section (🟡).
+- **String literals**: `"hello"` lives once in a read-only static-data section (`.rodata`), typed
+  `*u8`; the escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode. Each *unique* literal is
+  emitted once (deduped by content) and referenced by address via `Op::GlobalAddr`, so a **returned or
+  threaded `*u8` no longer dangles** — the pointer stays valid after the callee's frame is gone, and
+  the interpreter and native backend agree (`tests/run/string_return.mer`). `print`/`println` of a
+  `*u8` (a literal or a `let`-bound string) renders the bytes, not the pointer value
+  (`tests/run/string_literal.mer`). No string *type* beyond `*u8` yet — no concatenation/indexing/
+  length (🟡).
 - **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
   pointer parameter threads through calls — address-taken locals correctly stay in memory under the
   optimizer (`tests/run/pointer.mer`). `as` casts bind looser than `*`/unary, tighter than binary
@@ -396,21 +399,22 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
 - `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
   stay in memory (the interpreter and `cse`/`dse` handle those directly).
-- Because there is **no static-data section**, a string literal lives in the *current* function's
-  frame, so **returning a `*u8` that points at a string created inside the callee dangles on the
-  native backend** — that frame is reclaimed on return and `print` then reads freed stack (an empty
-  line), while the interpreter's persistent slot memory masks it (both backends still exit 0). Return
-  a string by having the caller pass in the destination buffer, or thread it through a `*u8` parameter.
-- **`--emit=exe`/`--emit=obj` link only the small C runtime** (`print`/`assert` and the parallel-for
-  shim), not the AVX2/FMA microkernels the recognizers dispatch to (`mercury_vmath_f32`, `mercury_sgemm*`,
-  `mercury_sreduce*`, `mercury_norm*`, the int8/bf16 kernels, …) — those live in the `mercury_runtime`
-  Rust crate, bound in-process by the interpreter and the Cranelift JIT but left as unresolved imports
-  in the emitted object. So a program that dispatches a recognized kernel (e.g. `for i in 0..N { y[i] =
-  exp(x[i]); }`, a `matmul`, a reduction) runs via `--run` (interp or `--backend=native`) but currently
-  **fails to link** as a standalone exe (`ld` unresolved-symbol). The fast path — and the differential
-  gate — is `--run`; emitting `mercury_runtime` as a staticlib and linking it for `--emit=exe` is future
-  work. Scalar math (a `while`-loop `exp`, which lowers to a libm call, not the vectorized kernel) links
-  fine.
+- **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
+  `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
+  `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,
+  and the interpreter and native backend print it identically (`tests/run/string_return.mer`). (This
+  closed a real interp-vs-native divergence: a literal used to live in the caller's frame, so a
+  returned `*u8` dangled on native — freed stack, an empty line — while the interpreter's persistent
+  memory masked it.)
+- **`--emit=exe` links the `mercury_runtime` kernels**, so a program that dispatches a recognized
+  kernel (`for i in 0..N { y[i] = exp(x[i]); }`, a `matmul`, a reduction) compiles to a standalone
+  executable whose output matches `--run` (`crates/mercuryc/tests/exe.rs`). The Cranelift object is
+  linked by a **rustc-driven link** (rustc invokes the object's native platform linker and links
+  `mercury_runtime` as a dependency; a generated shim supplies the `mercury_rt_*` runtime), which also
+  links the string `.rodata` relocations — neither of which the MinGW `cc` path on this host can do.
+  It falls back to the C-runtime `cc` link (scalar, no-data, no-kernel programs) when rustc or the
+  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. `--emit=obj`
+  writes the object unchanged. The differential oracle remains `--run`.
 - **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
   (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a
   callee that mutates one writes back into the caller's storage (copying every large buffer by value
