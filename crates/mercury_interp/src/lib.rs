@@ -637,16 +637,15 @@ impl<'a, 'k> Interp<'a, 'k> {
             // element-by-element through slot memory so the two agree bit-for-bit. `ptrs` points at
             // `streams` slots each holding a stream's (already `start`-offset) base pointer, `scalars`
             // at `scalars` invariant f32s, and `n` is the multiple-of-8 lane count (the caller runs
-            // the scalar tail). `self.program` is a shared reference, so borrowing the recipe from it
-            // is independent of the `&mut self.memory` writes below.
+            // the scalar tail). The recipe is a function-local list borrowed from `func` (a shared
+            // reference), independent of the `&mut self.memory` writes below.
             Op::VecKernelCall {
                 kernel,
                 ptrs,
                 scalars,
                 n,
             } => {
-                let prog = self.program;
-                let kern = prog
+                let kern = func
                     .vec_kernels
                     .get(*kernel as usize)
                     .ok_or("veckernel: unknown kernel index")?;

@@ -140,6 +140,12 @@ pub struct Function {
     pub blocks: Vec<BasicBlock>,
     pub value_types: Vec<MirType>,
     pub entry: BlockId,
+    /// Synthesized 256-bit AVX2 vector kernels (P4) this function calls, indexed by
+    /// [`Op::VecKernelCall`]'s `kernel` field. Function-local so lowering can register a recipe on
+    /// the same [`crate::Builder`] it is already threading — no program-wide side table. The
+    /// interpreter marshals these lane-wise (the oracle); the Cranelift backend assembles each to
+    /// raw AVX2 (`avx2.rs`). Empty for every function the vectorizer did not widen.
+    pub vec_kernels: Vec<VecKernel>,
 }
 
 impl Function {
@@ -164,9 +170,6 @@ pub enum MirLevel {
 pub struct Program {
     pub funcs: Vec<Function>,
     pub level: MirLevel,
-    /// Synthesized 256-bit AVX2 vector kernels (P4): each is `Call`ed by name from a lowered loop.
-    /// The interpreter marshals these lane-wise; the Cranelift backend assembles them to raw AVX2.
-    pub vec_kernels: Vec<VecKernel>,
 }
 
 impl Program {
@@ -174,17 +177,11 @@ impl Program {
         Program {
             funcs: Vec::new(),
             level: MirLevel::Low,
-            vec_kernels: Vec::new(),
         }
     }
 
     pub fn function(&self, name: Symbol) -> Option<&Function> {
         self.funcs.iter().find(|f| f.name == name)
-    }
-
-    /// The synthesized vector kernel a `Call` targets, if `name` is one.
-    pub fn vec_kernel(&self, name: Symbol) -> Option<&VecKernel> {
-        self.vec_kernels.iter().find(|k| k.name == name)
     }
 }
 

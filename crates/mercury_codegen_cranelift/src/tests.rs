@@ -2043,7 +2043,6 @@ fn vector_ops_interp_matches_native() {
     let prog = Program {
         funcs: vec![b.finish()],
         level: MirLevel::Low,
-        vec_kernels: Vec::new(),
     };
     for f in &prog.funcs {
         assert!(
