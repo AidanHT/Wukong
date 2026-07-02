@@ -92,6 +92,176 @@ fn cranelift_still_rejects_f32x8() {
     unsafe { module.free_memory() };
 }
 
+/// P4 exploratory probe: which 256-bit vector ops does Cranelift 0.124.3 legalize on THIS host
+/// (AVX2/FMA on)? Each op is built in a fresh module inside `catch_unwind`, so a panic in one does
+/// not stop the others. Prints OK / ERR(msg) / PANIC per op. Run with `--nocapture`. Not a gate —
+/// pure fact-finding for the raw-AVX2-vs-CLIF-widen architecture decision. Deleted before commit.
+#[test]
+fn p4_probe_vec256_ops() {
+    use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
+    use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_jit::{JITBuilder, JITModule};
+    use cranelift_module::{Linkage, Module};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // Build a function with 4 ptr params, run `body(&mut b, &params, vty)`, define+finalize.
+    // Returns Ok(()) if it compiled to machine code, Err(msg) otherwise.
+    fn probe<F>(vty: types::Type, body: F) -> Result<(), String>
+    where
+        F: Fn(&mut FunctionBuilder, &[Value], types::Type),
+    {
+        let isa = crate::make_isa(false).map_err(|e| format!("isa: {e}"))?;
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut module = JITModule::new(builder);
+        let ptr = module.target_config().pointer_type();
+        let mut sig = Signature::new(module.target_config().default_call_conv);
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(ptr));
+        }
+        let fid = module
+            .declare_function("probe", Linkage::Export, &sig)
+            .map_err(|e| format!("declare: {e}"))?;
+        let mut ctx = module.make_context();
+        ctx.func.signature = sig;
+        let mut fbctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+            let blk = b.create_block();
+            b.append_block_params_for_function_params(blk);
+            b.switch_to_block(blk);
+            let params: Vec<Value> = b.block_params(blk).to_vec();
+            body(&mut b, &params, vty);
+            b.ins().return_(&[]);
+            b.seal_all_blocks();
+            b.finalize();
+        }
+        module
+            .define_function(fid, &mut ctx)
+            .map_err(|e| format!("define: {e}"))?;
+        module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize: {e}"))?;
+        unsafe { module.free_memory() };
+        Ok(())
+    }
+
+    let f32x8 = types::F32.by(8).unwrap();
+    let f32x4 = types::F32.by(4).unwrap();
+    let i32x8 = types::I32.by(8).unwrap();
+
+    // (name, vty, builder). Each loads from params, applies the op, stores to params[last].
+    type B = Box<dyn Fn(&mut FunctionBuilder, &[Value], types::Type)>;
+    let cases: Vec<(&str, types::Type, B)> = vec![
+        ("f32x4 fadd (control)", f32x4, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fadd(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 load+store", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            b.ins().store(MemFlags::trusted(), va, p[3], 0);
+        })),
+        ("f32x8 fadd", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fadd(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fsub", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fsub(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fmul", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fmul(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fdiv", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fdiv(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fma", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let vc = b.ins().load(vt, MemFlags::trusted(), p[2], 0);
+            let r = b.ins().fma(va, vb, vc);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fneg", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let r = b.ins().fneg(va);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 sqrt", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let r = b.ins().sqrt(va);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fmin/fmax", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().fmax(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 fcmp->bitselect", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let mask = b.ins().fcmp(FloatCC::GreaterThan, va, vb);
+            let r = b.ins().bitselect(mask, va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("f32x8 splat(scalar)", f32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let s = b.ins().load(types::F32, MemFlags::trusted(), p[0], 0);
+            let r = b.ins().splat(vt, s);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("i32x8 iadd", i32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let r = b.ins().iadd(va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+        ("i32x8 icmp->bitselect", i32x8, Box::new(|b: &mut FunctionBuilder, p: &[Value], vt| {
+            let va = b.ins().load(vt, MemFlags::trusted(), p[0], 0);
+            let vb = b.ins().load(vt, MemFlags::trusted(), p[1], 0);
+            let mask = b.ins().icmp(IntCC::SignedGreaterThan, va, vb);
+            let r = b.ins().bitselect(mask, va, vb);
+            b.ins().store(MemFlags::trusted(), r, p[3], 0);
+        })),
+    ];
+
+    println!("\n=== P4 vec256 legalization probe (Cranelift 0.124.3, AVX2/FMA host) ===");
+    let mut any_f32x8_ok = false;
+    for (name, vty, f) in &cases {
+        let res = catch_unwind(AssertUnwindSafe(|| probe(*vty, f)));
+        let verdict = match res {
+            Ok(Ok(())) => {
+                if name.starts_with("f32x8") {
+                    any_f32x8_ok = true;
+                }
+                "OK".to_string()
+            }
+            Ok(Err(e)) => format!("ERR: {}", e.lines().next().unwrap_or("").trim()),
+            Err(_) => "PANIC".to_string(),
+        };
+        println!("  {name:<28} -> {verdict}");
+    }
+    println!("=== any f32x8 op legalized: {any_f32x8_ok} ===\n");
+    // The whole reason the P4 raw-AVX2 emitter (`avx2.rs`) exists. If a future Cranelift starts
+    // legalizing *any* 256-bit op, revisit whether CLIF vectors can replace the raw emitter.
+    assert!(
+        !any_f32x8_ok,
+        "Cranelift now legalizes an f32x8 op — revisit the raw-AVX2 vs CLIF-vector decision"
+    );
+}
+
 /// A function with a stack frame larger than a page (here a ~200 KB local array — the kind an
 /// im2col/conv scratch buffer needs) must touch each guard page in its prologue instead of jumping
 /// past it. Without `enable_probestack` the JIT'd entry faults when called at a shallow stack depth
@@ -1873,6 +2043,7 @@ fn vector_ops_interp_matches_native() {
     let prog = Program {
         funcs: vec![b.finish()],
         level: MirLevel::Low,
+        vec_kernels: Vec::new(),
     };
     for f in &prog.funcs {
         assert!(
