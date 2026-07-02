@@ -16,6 +16,9 @@ pub use gemm::{
     mercury_sgemm_tn, mercury_sgemm_tn_parallel,
 };
 
+mod gemv;
+pub use gemv::{mercury_sgemv, mercury_sgemv_parallel};
+
 mod vmath;
 pub use vmath::{
     mercury_vmath2_f32, mercury_vmath_bf16, mercury_vmath_f16, mercury_vmath_f32, VM_ACOS,

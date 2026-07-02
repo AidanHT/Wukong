@@ -856,6 +856,48 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_sgemv[_parallel](a, x, y, m, n)` — matrix-times-vector `y[i] = Σ_j a[i,j]·x[j]`.
+            // The interpreter marshals the abstract memory into real f32 buffers and calls the *serial*
+            // runtime kernel as the oracle (rows independent → the parallel form is bit-identical), so
+            // the differential gate stays exact despite the kernel's 8-wide reassociated row dot.
+            "mercury_sgemv" | "mercury_sgemv_parallel" => {
+                let a = ptr(args[0])?;
+                let x = ptr(args[1])?;
+                let y = ptr(args[2])?;
+                let m = args[3].as_int() as usize;
+                let n = args[4].as_int() as usize;
+                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                    let mut v = Vec::with_capacity(len);
+                    for t in 0..len {
+                        v.push(
+                            mem.get(base + t)
+                                .ok_or("sgemv operand out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                    Ok(v)
+                };
+                let abuf = read(&self.memory, a, m * n)?;
+                let xbuf = read(&self.memory, x, n)?;
+                let mut ybuf = vec![0.0f32; m];
+                // SAFETY: buffers are exactly m*n, n, m long — the kernel's contract.
+                unsafe {
+                    mercury_runtime::mercury_sgemv(
+                        abuf.as_ptr(),
+                        xbuf.as_ptr(),
+                        ybuf.as_mut_ptr(),
+                        m as i64,
+                        n as i64,
+                    );
+                }
+                for (t, &val) in ybuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(y + t)
+                        .ok_or("sgemv output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)` — the int8 quantized `nn.Linear` kernel
             // (`u8` activations × `i8` weights → `i32`, `C = A·Bᵀ`). The interpreter recovers each
             // operand byte (`as u8`/`as i8` takes the low 8 bits — bit-identical to the native buffer
