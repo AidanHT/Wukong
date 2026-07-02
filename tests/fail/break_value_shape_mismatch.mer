@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0502
+module tests.fail.break_value_shape_mismatch
+
+// Every `break <value>` of a value loop merges into one result, so their tensor shapes must agree —
+// exactly like `if`/`match` arms. Here two breaks yield `Tensor[f32, 4]` and `Tensor[f32, 8]`: a
+// dimension conflict (E0502), not a silently mistyped merge that would mis-stride or reinterpret.
+fn pick(c: bool, a: Tensor[f32, 4], b: Tensor[f32, 8]) -> Tensor[f32, 4] {
+    let r = loop {
+        if c { break a; }
+        break b;
+    };
+    r
+}

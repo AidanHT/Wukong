@@ -1,0 +1,44 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 20
+// EXPECT-OUT: 16
+// EXPECT-OUT: 20
+// EXPECT-OUT: 2.5
+module tests.run.loop_break_compose
+
+// A value `loop` composes everywhere an expression can appear: a call argument, an array element, a
+// returned aggregate, a tuple, and a float. An aggregate break value flows by pointer through the
+// merge param (the same by-pointer path `if`/`match` aggregate merges use), so a struct/tuple loop
+// value works at `-O2` too (no `mem2reg` panic on a typed `Ptr` merge). interp == native.
+
+struct P { x: i32, y: i32 }
+
+fn id(v: i32) -> i32 { v }
+
+fn make() -> P {
+    // A value loop yielding a struct — the by-pointer merge path.
+    loop { break P { x: 7, y: 9 }; }
+}
+
+fn main() -> i32 {
+    // loop as a call argument
+    print(id(loop { break 3; }));                  // 3
+    // loop as array elements, mixed with a plain element
+    let arr = [loop { break 3; }, 8, loop { break 9; }];
+    print(arr[0] + arr[1] + arr[2]);               // 20
+    // aggregate (struct) break value via a returning fn
+    let p = make();
+    print(p.x + p.y);                              // 16
+    // tuple break value
+    let t = loop { break (4, 5); };
+    print(t.0 * t.1);                              // 20
+    // float break value
+    let mut i = 0;
+    let f = loop {
+        i = i + 1;
+        if i == 3 { break 2.5; }
+    };
+    print(f);                                      // 2.5
+    0
+}
