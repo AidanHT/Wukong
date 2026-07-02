@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 610
+// EXPECT-OUT: 0
+// EXPECT-OUT: 610
+// EXPECT-OUT: 3
+// EXPECT-OUT: 9
+module tests.run.vec256_general
+
+// Exercises the general 256-bit AVX2 vectorizer recipe path — `mercury_mir_build::build_vec_recipe`
+// → `Op::VecKernelCall` → the raw-AVX2 kernel (`mercury_codegen_cranelift::avx2`) — for f32
+// elementwise bodies the recognized-kernel dispatchers (vmath/velem/vhorner) do *not* claim: a
+// stream×stream product, an in-place if/else ReLU, and `sqrt` composed with arithmetic. The
+// interpreter marshals the *same* `VecKernel` recipe the native backend assembles, so all of
+// interp/native and -O0..-O3 agree bit-for-bit (this file gates the interp opt-invariance; the
+// cranelift `p4_vec256_general_matches_interp` test gates interp-vs-native). n=100 spans the 12
+// full 8-lane groups plus a 4-element scalar tail.
+
+fn main() -> i32 {
+    let mut a: [f32; 100] = [0.0; 100];
+    let mut b: [f32; 100] = [0.0; 100];
+    let mut c: [f32; 100] = [0.0; 100];
+    for i in 0..100 { a[i] = (i as f32) - 50.0; } // -50 .. 49
+    for i in 0..100 { b[i] = (i as f32) + 1.0; }  // 1 .. 100
+
+    // stream × stream (two array operands, not a saxpy) → the general recipe.
+    for i in 0..100 { c[i] = a[i] * b[i]; }
+    print(c[60] as i32); // a=10, b=61 → 610
+
+    // in-place ReLU (reads then writes the same stream: load-before-store).
+    for i in 0..100 { c[i] = if c[i] > 0.0 { c[i] } else { 0.0 }; }
+    print(c[10] as i32); // (10-50)*(10+1) = -440 → 0
+    print(c[60] as i32); // 610 > 0 → 610
+
+    // sqrt of a stream × stream: `sqrt(a[i]*a[i])` = |a[i]|.
+    let mut d: [f32; 100] = [0.0; 100];
+    for i in 0..100 { d[i] = sqrt(a[i] * a[i]); } // |i - 50|
+    print(d[47] as i32); // |47-50| = 3
+    print(d[59] as i32); // |59-50| = 9
+    return 0;
+}

@@ -16,7 +16,8 @@ use mercury_ast::{
 };
 use mercury_diag::Diagnostic;
 use mercury_mir::{
-    BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId,
+    BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId, VecBin,
+    VecCmp, VecKernel, VecOp,
 };
 use mercury_sema::{DefKind, SemaResult};
 use mercury_span::{Interner, Span, Symbol};
@@ -7873,6 +7874,310 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Capture a validated (`vectorizable`-passing) f32 loop body as a flat [`VecKernel`] recipe for
+    /// the raw-AVX2 path, or `None` if it uses anything outside the assembler's coverage (a
+    /// transcendental, `abs`/rounding, `fmax`/`fmin`, a compound assign) — in which case the caller
+    /// keeps the 128-bit CLIF vectorizer. Records each distinct unit-stride `(base, index)` as a
+    /// stream and each loop-invariant value (a param/outer local, a stride-0 array read, or a numeric
+    /// literal) as a pre-loaded scalar; the emitter lowers those sources. Pure (emits no MIR).
+    fn build_vec_recipe<'b>(&self, body: &'b Block, j: Symbol) -> Option<VecRecipe<'b>> {
+        let mut r = VecRecipe {
+            ops: Vec::new(),
+            streams: Vec::new(),
+            scalars: Vec::new(),
+        };
+        // inner `let`/`let mut` temps: name -> the recipe value index it currently holds.
+        let mut locals: HashMap<Symbol, u32> = HashMap::new();
+        for s in &body.stmts {
+            match &s.kind {
+                StmtKind::Let {
+                    pat:
+                        Pattern {
+                            kind: ast::PatKind::Ident(name),
+                            ..
+                        },
+                    init: Some(e),
+                    ..
+                } => {
+                    let vi = self.rec_value(e, j, &locals, &mut r)?;
+                    locals.insert(*name, vi);
+                }
+                StmtKind::Assign { target, op, value } => {
+                    // A compound assign (`out[j] += …`, `r *= …`) is a read-modify-write; keep v1 to
+                    // plain `=` and let the 128-bit path handle those (correctness over coverage).
+                    if !matches!(op, ast::AssignOp::Assign) {
+                        return None;
+                    }
+                    let vi = self.rec_value(value, j, &locals, &mut r)?;
+                    match &target.kind {
+                        // reassign an inner temp (Horner-style `r = r*v + c`).
+                        ExprKind::Path(p) if p.is_single() && locals.contains_key(&p.first().sym) => {
+                            locals.insert(p.first().sym, vi);
+                        }
+                        // store to a unit-stride array element.
+                        ExprKind::Index { base, indices } if indices.len() == 1 => {
+                            let bsym = single_path(base)?;
+                            if affine_stride(&indices[0], j) != Some(1) {
+                                return None;
+                            }
+                            let stream = rec_stream(&mut r, bsym, &indices[0]);
+                            r.ops.push(VecOp::Store { stream, val: vi });
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Need at least one stream and one store for a kernel to do anything.
+        if r.streams.is_empty() || !r.ops.iter().any(|o| matches!(o, VecOp::Store { .. })) {
+            return None;
+        }
+        Some(r)
+    }
+
+    /// Lower one value-expression of a recipe body into `VecOp`s (operands first, so every op index
+    /// references only earlier ops), returning the value index it produced. `None` on any construct
+    /// the AVX2 recipe cannot express.
+    fn rec_value<'b>(
+        &self,
+        e: &'b Expr,
+        j: Symbol,
+        locals: &HashMap<Symbol, u32>,
+        r: &mut VecRecipe<'b>,
+    ) -> Option<u32> {
+        let push = |r: &mut VecRecipe<'b>, op: VecOp| -> u32 {
+            r.ops.push(op);
+            (r.ops.len() - 1) as u32
+        };
+        match &e.kind {
+            // an inner vector temp.
+            ExprKind::Path(p) if p.is_single() && locals.contains_key(&p.first().sym) => {
+                Some(locals[&p.first().sym])
+            }
+            // an invariant scalar (param / outer local): broadcast a pre-loaded scalar.
+            ExprKind::Path(p) if p.is_single() => {
+                if p.first().sym == j {
+                    return None; // the loop var used as a value would need an index vector
+                }
+                let scalar = rec_scalar(r, e);
+                Some(push(r, VecOp::Splat { scalar }))
+            }
+            // a numeric literal: also a pre-loaded scalar (the assembler rejects inline `Const`).
+            ExprKind::Int(_) | ExprKind::Float(_) => {
+                let scalar = rec_scalar(r, e);
+                Some(push(r, VecOp::Splat { scalar }))
+            }
+            ExprKind::Index { base, indices } if indices.len() == 1 => {
+                let bsym = single_path(base)?;
+                match affine_stride(&indices[0], j) {
+                    // unit stride: a streaming load.
+                    Some(1) => {
+                        let stream = rec_stream(r, bsym, &indices[0]);
+                        Some(push(r, VecOp::Load { stream }))
+                    }
+                    // stride 0: a loop-invariant element → a pre-loaded scalar.
+                    Some(0) => {
+                        let scalar = rec_scalar(r, e);
+                        Some(push(r, VecOp::Splat { scalar }))
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                use ast::BinOp::*;
+                let vop = match op {
+                    Add => VecBin::Add,
+                    Sub => VecBin::Sub,
+                    Mul => VecBin::Mul,
+                    Div => VecBin::Div,
+                    _ => return None,
+                };
+                let a = self.rec_value(lhs, j, locals, r)?;
+                let b = self.rec_value(rhs, j, locals, r)?;
+                Some(push(r, VecOp::Bin { op: vop, a, b }))
+            }
+            ExprKind::Unary {
+                op: ast::UnOp::Neg,
+                expr,
+            } => {
+                let a = self.rec_value(expr, j, locals, r)?;
+                Some(push(r, VecOp::Neg { a }))
+            }
+            // Only `sqrt` maps to a recipe op; other intrinsics (exp/log/abs/round/fmax/…) fall back.
+            ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
+                Some(MathIntrinsic::Sqrt) if args.len() == 1 => {
+                    let a = self.rec_value(&args[0], j, locals, r)?;
+                    Some(push(r, VecOp::Sqrt { a }))
+                }
+                _ => None,
+            },
+            // `if lhs OP rhs { t } else { e }` if-converts to a lane compare + blend (ReLU etc.).
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let else_e = else_branch.as_deref()?;
+                let tv = block_value(then_branch)?;
+                let ev = branch_value(else_e)?;
+                let ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+                    return None;
+                };
+                use ast::BinOp::*;
+                let pred = match op {
+                    Lt => VecCmp::Lt,
+                    Le => VecCmp::Le,
+                    Gt => VecCmp::Gt,
+                    Ge => VecCmp::Ge,
+                    Eq => VecCmp::Eq,
+                    Ne => VecCmp::Ne,
+                    _ => return None,
+                };
+                let a = self.rec_value(lhs, j, locals, r)?;
+                let b = self.rec_value(rhs, j, locals, r)?;
+                let mask = push(r, VecOp::Cmp { pred, a, b });
+                let ta = self.rec_value(tv, j, locals, r)?;
+                let eb = self.rec_value(ev, j, locals, r)?;
+                Some(push(r, VecOp::Select { mask, a: ta, b: eb }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit the 256-bit path: register `kern`, marshal the stream base pointers and invariant
+    /// scalars onto the stack, call the kernel over the multiple-of-8 vector part `[s, s+n)`, then
+    /// run the ordinary scalar loop over the tail `[s+n, end)`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_veckernel_for(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        kern: VecKernel,
+        recipe: &VecRecipe,
+        body: &Block,
+    ) {
+        let kidx = self.builder.add_vec_kernel(kern);
+
+        // n = largest multiple of 8 not exceeding the trip count (0 if it is under 8 or negative, so
+        // a short/empty loop runs entirely in the scalar tail and the kernel is never entered).
+        let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
+        let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
+        let trip = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
+        let neg8 = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
+        let masked = self
+            .builder
+            .build(MirType::I64, Op::Bin(BinOp::And, trip, neg8));
+        let eight = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        let lt8 = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let n = self
+            .builder
+            .build(MirType::I64, Op::Select(lt8, zero, masked));
+
+        // Bind `j` to a slot holding the start element, so lowering each stream's index expression
+        // yields its first element and the (j-independent) scalar sources lower cleanly.
+        let jslot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: jslot,
+            value: s0,
+        });
+        self.push_scope();
+        self.bind(j, jslot, ity.clone());
+
+        // ptrs[k] = &base_k[start + offset_k] — one entry per stream, offset to the loop start.
+        let ptrs = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::Ptr), recipe.streams.len() as u32));
+        for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
+            let base = self.lookup(*base_sym).expect("stream base in scope").0;
+            let idxv = self.lower_expr(idx_expr);
+            let idx_ty = self.expr_mir(idx_expr);
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            let sp = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base,
+                    index: idx64,
+                    elem: MirType::F32,
+                },
+            );
+            let ki = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let dst = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: ptrs,
+                    index: ki,
+                    elem: MirType::Ptr,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: dst,
+                value: sp,
+            });
+        }
+
+        // scalars[k] = the k-th loop-invariant f32 (a param/outer local, a stride-0 read, or a
+        // literal). At least one slot so the pointer is always valid even with no scalars.
+        let scalars = self.builder.alloca(MirType::Array(
+            Box::new(MirType::F32),
+            recipe.scalars.len().max(1) as u32,
+        ));
+        for (k, sexpr) in recipe.scalars.iter().enumerate() {
+            let sv0 = self.lower_expr(sexpr);
+            let sty = self.expr_mir(sexpr);
+            let sv = self.coerce_to(sv0, &sty, &MirType::F32, true);
+            let ki = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let dst = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: scalars,
+                    index: ki,
+                    elem: MirType::F32,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: dst,
+                value: sv,
+            });
+        }
+
+        self.builder.build_void(Op::VecKernelCall {
+            kernel: kidx,
+            ptrs,
+            scalars,
+            n,
+        });
+
+        // Scalar remainder over [start + n, end): the original body via the ordinary scalar loop.
+        let n_ity = self.coerce_to(n, &MirType::I64, ity, true);
+        let tail_start = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, s0, n_ity));
+        let tslot = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: tslot,
+            value: tail_start,
+        });
+        self.emit_scalar_tail(j, tslot, end_v, ity, body);
+
+        self.pop_scope();
+    }
+
     /// Emit the vectorized loop as three strips that share one index slot `j`: an unrolled vector
     /// loop (`VEC_UNROLL` independent vector groups per iteration), then a single-vector loop, then
     /// a scalar remainder. The bounds are already-lowered `ity` values.
@@ -7887,6 +8192,28 @@ impl FnLowerer<'_> {
         w: u32,
         body: &Block,
     ) {
+        // First try the true 256-bit AVX2 path: capture the body as a flat `VecKernel` recipe and
+        // run it over the multiple-of-8 vector part, with a scalar tail. Only the f32 arithmetic
+        // subset the raw-AVX2 assembler covers is eligible; anything else (other lanes, a
+        // transcendental, too many streams/registers) falls through to the 128-bit CLIF strips
+        // below. Elementwise ⇒ each lane is the same f32 op order as scalar, so no reassociation:
+        // the kernel is bit-exact to the tail element-for-element, and the interp marshals the same
+        // recipe as the oracle.
+        if *lane == MirType::F32 {
+            if let Some(recipe) = self.build_vec_recipe(body, j) {
+                let kern = VecKernel {
+                    name: self.builder.func_name(),
+                    streams: recipe.streams.len() as u32,
+                    scalars: recipe.scalars.len() as u32,
+                    ops: recipe.ops.clone(),
+                    unroll: VEC_UNROLL,
+                };
+                if kern.pressure().is_some_and(|p| p.fits()) {
+                    self.emit_veckernel_for(j, s0, end_v, ity, kern, &recipe, body);
+                    return;
+                }
+            }
+        }
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
@@ -15881,6 +16208,42 @@ fn lower_i8matmul_fn(
         }
     }
     fl.builder.finish()
+}
+
+/// A captured recipe for the 256-bit AVX2 vectorizer (`build_vec_recipe`): the flat op body plus the
+/// AST sources of its streams and invariant scalars, which `emit_veckernel_for` lowers to base
+/// pointers and stored f32s. Borrows the loop body it was built from.
+struct VecRecipe<'b> {
+    ops: Vec<VecOp>,
+    /// `(base array symbol, index expr)` per stream, unit-stride in the loop var. Dedup'd, so a
+    /// read and an in-place write at the same index share one stream.
+    streams: Vec<(Symbol, &'b Expr)>,
+    /// Loop-invariant f32 source expressions (a param/outer-local path, a stride-0 array read, or a
+    /// numeric literal). Dedup'd by structure to keep the hoisted-register count small.
+    scalars: Vec<&'b Expr>,
+}
+
+/// Intern a stream by `(base, index)` — dedup by base symbol + structural index equality — returning
+/// its stream index.
+fn rec_stream<'b>(r: &mut VecRecipe<'b>, base: Symbol, idx: &'b Expr) -> u32 {
+    if let Some(pos) = r
+        .streams
+        .iter()
+        .position(|(b, e)| *b == base && exprs_struct_eq(e, idx))
+    {
+        return pos as u32;
+    }
+    r.streams.push((base, idx));
+    (r.streams.len() - 1) as u32
+}
+
+/// Intern an invariant scalar source (dedup by structural equality), returning its scalar index.
+fn rec_scalar<'b>(r: &mut VecRecipe<'b>, e: &'b Expr) -> u32 {
+    if let Some(pos) = r.scalars.iter().position(|x| exprs_struct_eq(x, e)) {
+        return pos as u32;
+    }
+    r.scalars.push(e);
+    (r.scalars.len() - 1) as u32
 }
 
 /// SIMD width for a lane type: lanes per `VEC_REG_BYTES`-wide register (f32x8, f64x4 at 256-bit).

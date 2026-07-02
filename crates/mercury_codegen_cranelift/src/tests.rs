@@ -1450,6 +1450,42 @@ fn fusion_collapses_adjacent_loops() {
     assert_eq!(native.0, 2500);
 }
 
+/// The general 256-bit AVX2 recipe path (`Op::VecKernelCall`, raw-AVX2 `avx2.rs`) must agree with the
+/// interpreter oracle bit-for-bit on the f32 elementwise bodies it claims — a stream×stream product,
+/// an in-place ReLU (load-before-store), `sqrt` composed with arithmetic, and negation over a third
+/// stream — across trip counts spanning the vector part and the non-multiple-of-8 scalar tail. Also
+/// pins native -O0 == -O3 (the recipe is opaque to the optimizer, so both must match).
+#[test]
+fn p4_vec256_general_matches_interp() {
+    let prog = |n: usize| {
+        format!(
+            "fn main() -> i32 {{ \
+               let mut a: [f32; {n}] = [0.0; {n}]; let mut b: [f32; {n}] = [0.0; {n}]; \
+               let mut c: [f32; {n}] = [0.0; {n}]; let mut d: [f32; {n}] = [0.0; {n}]; \
+               let mut k: i32 = 0; \
+               while k < {n} {{ a[k] = ((k - {n}/2) as f32) * 0.5; b[k] = (k as f32) + 1.0; k += 1; }} \
+               for i in 0..{n} {{ c[i] = a[i] * b[i]; }} \
+               for i in 0..{n} {{ c[i] = if c[i] > 0.0 {{ c[i] }} else {{ 0.0 }}; }} \
+               for i in 0..{n} {{ d[i] = sqrt(a[i] * a[i]) + (-b[i]); }} \
+               let mut s: f32 = 0.0; let mut j: i32 = 0; \
+               while j < {n} {{ s = s + c[j] + d[j]; j += 1; }} \
+               print(s as i32); return (s as i32) & 255; }}"
+        )
+    };
+    for n in [1usize, 7, 8, 9, 15, 16, 17, 64, 100, 257] {
+        let src = prog(n);
+        // The product loop must actually reach the recipe (else the test is vacuous).
+        let (p, _) = lowered(&src, 3);
+        assert!(
+            p.funcs.iter().any(|f| !f.vec_kernels.is_empty()),
+            "n={n}: expected a synthesized vector kernel in the MIR"
+        );
+        let native = jit(&src, 3).expect("jit -O3");
+        assert_eq!(native, interp(&src, 3).expect("interp"), "n={n}: native vs interp");
+        assert_eq!(jit(&src, 0).expect("jit -O0"), native, "n={n}: native -O0 vs -O3");
+    }
+}
+
 /// ReLU6 streaming dispatch: `clamp(x, 0, 6)` written as the nested value-ifs `if x < 6 { if x > 0 {
 /// x } else { 0 } } else { 6 }` must lower to one `mercury_velem_f32` call (`VE_RELU6`) and stay
 /// correct across sizes. Exercises the recursive ReLU6 peel (`peel_velem_act`) that matches the outer

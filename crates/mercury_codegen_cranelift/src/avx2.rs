@@ -22,15 +22,13 @@
 #![allow(dead_code)] // Phase A: assembler proven in isolation before the vectorizer wires it in.
 
 use iced_x86::code_asm::*;
-use mercury_mir::{VecBin, VecCmp, VecKernel, VecOp};
+use mercury_mir::{VecBin, VecCmp, VecKernel, VecOp, VecPressure};
 
 /// f32 lanes per YMM register (256-bit / 32-bit).
 pub const LANES: u32 = 8;
 const GROUP_BYTES: i32 = (LANES * 4) as i32;
 /// Total architectural YMM registers.
 const NREG: u8 = 16;
-/// The maximum number of distinct streams we keep in GPRs (`r9`, `r10`, `r11`, `rdx`-after-hoist).
-const MAX_STREAMS: u32 = 4;
 
 fn ymm(n: u8) -> AsmRegisterYmm {
     [
@@ -74,72 +72,23 @@ struct Plan {
     last_use: Vec<usize>,        // last_use[i] = last op index referencing value i
 }
 
-/// The operand value-indices an op reads (for liveness); `Store`/`Load`/`Splat`/`Const` read 0..1.
-fn operands(op: &VecOp) -> Vec<u32> {
-    match *op {
-        VecOp::Load { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => vec![],
-        VecOp::Bin { a, b, .. } | VecOp::Cmp { a, b, .. } => vec![a, b],
-        VecOp::Fma { a, b, c } => vec![a, b, c],
-        VecOp::Select { mask, a, b } => vec![mask, a, b],
-        VecOp::Sqrt { a } | VecOp::Neg { a } => vec![a],
-        VecOp::Store { val, .. } => vec![val],
-    }
-}
-/// Whether an op produces a body value that needs a (non-hoisted) register.
-fn produces_body_value(op: &VecOp) -> bool {
-    !matches!(
-        op,
-        VecOp::Store { .. } | VecOp::Splat { .. } | VecOp::Const { .. }
-    )
-}
-
 /// Plan the register allocation, or return `Err` (→ the caller keeps the 128-bit fallback) when the
 /// body cannot be expressed in this emitter (too many streams, a `Const` the vectorizer should have
 /// folded into `scalars`, or a single group that will not fit in 16 YMM registers).
 fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
-    if k.streams == 0 || k.streams > MAX_STREAMS {
-        return Err(format!("avx2: {} streams (max {MAX_STREAMS})", k.streams));
-    }
-    if k.ops.iter().any(|o| matches!(o, VecOp::Const { .. })) {
-        return Err("avx2: Const must be folded into scalars".into());
-    }
-    // Distinct invariant scalars referenced by Splat, in first-seen order.
-    let mut hoist_scalars: Vec<u32> = Vec::new();
-    for o in &k.ops {
-        if let VecOp::Splat { scalar } = *o {
-            if !hoist_scalars.contains(&scalar) {
-                hoist_scalars.push(scalar);
-            }
-        }
-    }
-    let needs_signmask = k.ops.iter().any(|o| matches!(o, VecOp::Neg { .. }));
-
-    // last_use[i]: last op index that references value i.
-    let mut last_use = vec![0usize; k.ops.len()];
-    for (i, o) in k.ops.iter().enumerate() {
-        for v in operands(o) {
-            last_use[v as usize] = i;
-        }
-    }
-
-    // P = peak simultaneously-live body registers (alloc result before freeing this op's dead
-    // operands, mirroring the emitter's ordering, so P is an exact upper bound).
-    let mut live: Vec<usize> = Vec::new();
-    let mut per_group: usize = 0;
-    for (i, o) in k.ops.iter().enumerate() {
-        if produces_body_value(o) {
-            live.push(i);
-            per_group = per_group.max(live.len());
-        }
-        for v in operands(o) {
-            // hoisted (Splat/Const) values never occupy a body register.
-            let is_hoisted = matches!(k.ops[v as usize], VecOp::Splat { .. } | VecOp::Const { .. });
-            if !is_hoisted && last_use[v as usize] == i {
-                live.retain(|&x| x != v as usize);
-            }
-        }
-    }
-    let per_group = per_group.max(1) as u8;
+    // P (peak live), H's parts (hoisted scalars + sign-mask) and last_use come from the
+    // backend-agnostic `pressure()` in `mercury_mir`, single-sourced with the vectorizer's gate so a
+    // body the vectorizer accepted never fails to assemble here.
+    let pressure = k.pressure().ok_or_else(|| {
+        format!("avx2: body outside emitter coverage (streams={}, or Const present)", k.streams)
+    })?;
+    let VecPressure {
+        hoist_scalars,
+        needs_signmask,
+        last_use,
+        per_group,
+    } = pressure;
+    let per_group = per_group as u8;
     let hoist = hoist_scalars.len() as u8 + needs_signmask as u8;
     if per_group as u32 + hoist as u32 > NREG as u32 {
         return Err(format!(
@@ -607,6 +556,44 @@ mod tests {
         };
         for n in [8usize, 24, 64] {
             check(&k, &[ramp(n, 0.0), ramp(n, 0.0), vec![0.0; n]], &[], n);
+        }
+    }
+
+    #[test]
+    fn avx2_kernel_store_to_load_forward() {
+        // A fused body `t = 2*x + 1; o = if t > 0 { t } else { 0 }`: stream 1 (`t`) is STORED then
+        // LOADED twice in the same lane, so the loads must observe the just-stored value. The
+        // assembler forwards through memory; `eval_lane` forwards internally — this test pins that
+        // they agree. `t` is pre-seeded with poison the forwarding must overwrite (without it, the
+        // relu would read poison and the reference would diverge from the machine code).
+        let k = VecKernel {
+            name: sym(),
+            streams: 3, // 0 = x (in), 1 = t (in-place scratch), 2 = o (out)
+            scalars: 3, // 0 = 2.0, 1 = 1.0, 2 = 0.0
+            unroll: 4,
+            ops: vec![
+                VecOp::Load { stream: 0 },                  // v0 = x
+                VecOp::Splat { scalar: 0 },                 // v1 = 2.0
+                VecOp::Bin { op: VecBin::Mul, a: 0, b: 1 }, // v2 = 2*x
+                VecOp::Splat { scalar: 1 },                 // v3 = 1.0
+                VecOp::Bin { op: VecBin::Add, a: 2, b: 3 }, // v4 = 2*x + 1
+                VecOp::Store { stream: 1, val: 4 },         // t = 2*x + 1
+                VecOp::Load { stream: 1 },                  // v6 = t   (forwarded)
+                VecOp::Splat { scalar: 2 },                 // v7 = 0.0
+                VecOp::Cmp { pred: VecCmp::Gt, a: 6, b: 7 }, // v8 = t > 0
+                VecOp::Load { stream: 1 },                  // v9 = t   (forwarded again)
+                VecOp::Select { mask: 8, a: 9, b: 7 },      // v10 = t>0 ? t : 0
+                VecOp::Store { stream: 2, val: 10 },        // o = relu(t)
+            ],
+        };
+        for n in [8usize, 16, 40, 96] {
+            // stream 1 poison-seeded (-999); forwarding must overwrite it before the relu reads it.
+            check(
+                &k,
+                &[ramp(n, 0.0), vec![-999.0; n], vec![0.0; n]],
+                &[2.0, 1.0, 0.0],
+                n,
+            );
         }
     }
 
