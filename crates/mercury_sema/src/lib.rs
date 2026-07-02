@@ -1564,6 +1564,15 @@ impl Sema<'_> {
         self.literal_adapts(ann, init)
     }
 
+    /// Whether `e` is an *unsuffixed* integer literal — its signedness is not pinned by a suffix, so
+    /// it adapts to the other operand of a comparison (`u32_var < 5` stays legal: `5` becomes
+    /// unsigned). A *suffixed* literal (`5u32`, `3i32`) has a FIXED signedness and is NOT flexible,
+    /// so it must still participate in the mixed-signedness ordered-compare check — `i32 < 5u32` is a
+    /// genuine sign mismatch (`a < 5u32` and `5u32 > a` disagree), not adaptation.
+    fn is_sign_flexible_int_literal(&self, e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Int(s) if !has_int_suffix(self.sym_str(*s)))
+    }
+
     /// Whether an *unsuffixed* numeric literal — optionally wrapped in a unary minus, e.g.
     /// `let x: f64 = -1.5;` — adapts to the integer/float annotation `ann`. A leading `-`
     /// does not change a literal's kind, so we peel `Neg` and re-check the inner literal.
@@ -1974,15 +1983,18 @@ impl Sema<'_> {
                             // signedness is taken from ONE operand, so `a < b` (i32 vs u32) and
                             // `b > a` give CONTRADICTORY answers (`slt` says -1 < 1, `ugt` says
                             // 1 < 4294967295) — a gate-blind logic bug both backends agree on. Reject
-                            // a concrete opposite-signedness integer pair. An unsuffixed int LITERAL
-                            // is sign-flexible (it adapts to the other operand), so skip when either
-                            // side is one — `b < 5` / `5 < a` stay fine. Rust rejects mixed
-                            // signed/unsigned comparison for exactly this reason.
+                            // a concrete opposite-signedness integer pair. Only an *unsuffixed* int
+                            // LITERAL is sign-flexible (it adapts to the other operand), so skip when
+                            // either side is one — `b < 5` / `5 < a` stay fine. A *suffixed* literal
+                            // (`5u32`, `200u8`, `3i32`) pins its signedness and must still be checked:
+                            // `i32 < 5u32` is a genuine mismatch that made `a < 5u32` (=1) and
+                            // `5u32 > a` (=0) disagree — the guard was bypassed whenever the literal
+                            // adopted the peer type. Rust rejects mixed signed/unsigned compares too.
                             if ls.is_int()
                                 && rs.is_int()
                                 && ls.is_signed() != rs.is_signed()
-                                && !matches!(&lhs.kind, ExprKind::Int(_))
-                                && !matches!(&rhs.kind, ExprKind::Int(_))
+                                && !self.is_sign_flexible_int_literal(lhs)
+                                && !self.is_sign_flexible_int_literal(rhs)
                             {
                                 let (s, u) = if ls.is_signed() {
                                     (ls.name(), rs.name())
