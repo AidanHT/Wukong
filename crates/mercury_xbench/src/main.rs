@@ -272,6 +272,9 @@ fn main() {
     if want("i8gemm") {
         bench_i8gemm(&cc, &dir);
     }
+    if want("dequant") {
+        bench_dequant(&cc, &dir);
+    }
     if want("bf16") {
         bench_bf16(&cc, &dir);
     }
@@ -1395,6 +1398,170 @@ fn rust_biasadd(r: usize, c: usize) -> String {
     format!(
         "const R: usize = {r};\nconst C: usize = {c};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(x:*const f32, bias:*const f32, out:*mut f32) {{\n\
          \x20 for r in 0..R {{ for c in 0..C {{ *out.add(r*C+c) = *x.add(r*C+c) + *bias.add(c); }} }}\n}}\n"
+    )
+}
+
+/// Int-input **dequant** `out[j] = (q[j] as f32)·scale` over an `[i8]`/`[i32]` array, plus the
+/// **per-channel** form `out[i*C+j] = (q[i*C+j] as f32)·scale[j]`. The int buffer is reinterpreted
+/// through the shared 3-pointer `(x, y, out)` harness (the pointer element type is irrelevant to the
+/// ABI). gcc/rustc vectorize the `i32 -> f32` widen (`vcvtdq2ps`) but leave the **`i8 -> i32 -> f32`**
+/// narrowing-load widen scalar, and neither emits non-temporal stores for the streamed `f32` output —
+/// the two levers Mercury's `mercury_dequant_f32` pulls (folded 256-bit widen+scale + `vmovntps` past
+/// L3). Reported as GB/s (`(in_bytes + 4)·N`, read once + written once); the dequant is exact so the
+/// cross-check is bit-exact. Sizes past L3 so the streaming-store advantage is exercised.
+fn bench_dequant(cc: &str, dir: &Path) {
+    let ext_flags_c = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
+    let ext_flags_rs = ["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"];
+
+    // --- 1-D dequant: out[j] = (q[j] as f32)·scale, for i32 and i8 inputs -------------------------
+    for (ty, in_bytes, is_i8) in [("i32", 4usize, false), ("i8", 1usize, true)] {
+        let n = 1usize << 23; // 8M elements: f32 output = 32 MiB ≫ L3, so NT stores engage.
+        // A varied signed int fill (both signs, magnitudes past the i8 boundary for i32).
+        let qi32: Vec<i32> = (0..n).map(|i| (((i as i64 * 1103515245 + 12345) >> 9) as i32) % 4096 - 2048).collect();
+        let qi8: Vec<i8> = (0..n).map(|i| ((i * 37 + 5) % 251) as i64 as i8).collect();
+        let mut out = vec![0.0f32; n];
+        let qp = if is_i8 { qi8.as_ptr() as *const f32 } else { qi32.as_ptr() as *const f32 };
+        let dummy = out.as_ptr(); // the unused middle pointer (kernel never reads it)
+        let op = out.as_mut_ptr();
+        let bytes = (in_bytes + 4) as f64 * n as f64;
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== dequant-1d ({ty}: out[j] = (q[j] as f32)*scale) N={n} (GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_dequant_1d(n, is_i8, false), &mut out, qp, dummy, op);
+        let mer_par = bench_mercury(&mer_dequant_1d(n, is_i8, true), &mut out, qp, dummy, op);
+        let cm = bench_external("c", &c_dequant_1d(n, is_i8), dir, "dequant1d", cc, &ext_flags_c, &mut out, qp, dummy, op);
+        let cpp = bench_external("cpp", &cpp_from_c(&c_dequant_1d(n, is_i8)), dir, "dequant1d", "g++", &ext_flags_c, &mut out, qp, dummy, op);
+        let rm = bench_external("rs", &rust_dequant_1d(n, is_i8), dir, "dequant1d", "rustc", &ext_flags_rs, &mut out, qp, dummy, op);
+        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "", "Mer(1core)", "Mer(par)", "C (gcc)", "C++ (g++)", "Rust");
+        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&cpp), gbps(&rm));
+        dequant_check(&mer, &cm, "C");
+        dequant_ratio(&mer, &mer_par, &cm, &cpp, &rm);
+        println!();
+    }
+
+    // --- per-channel dequant: out[i*C+j] = (q[i*C+j] as f32)·scale[j] -----------------------------
+    for (ty, in_bytes, is_i8) in [("i32", 4usize, false), ("i8", 1usize, true)] {
+        let (r, c) = (8192usize, 1024usize); // 8M elements, 32 MiB f32 out ≫ L3
+        let rc = r * c;
+        let qi32: Vec<i32> = (0..rc).map(|i| (((i as i64 * 22695477 + 1) >> 7) as i32) % 4096 - 2048).collect();
+        let qi8: Vec<i8> = (0..rc).map(|i| ((i * 29 + 7) % 251) as i64 as i8).collect();
+        let scale: Vec<f32> = (0..c).map(|j| (j % 7) as f32 * 0.003 + 0.002).collect();
+        let mut out = vec![0.0f32; rc];
+        let qp = if is_i8 { qi8.as_ptr() as *const f32 } else { qi32.as_ptr() as *const f32 };
+        let sp = scale.as_ptr();
+        let op = out.as_mut_ptr();
+        let bytes = (in_bytes + 4) as f64 * rc as f64; // scale[C] is negligible
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|m| format!("{:.1}", bytes / m.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== dequant-perchan ({ty}: out[i*C+j] = (q as f32)*scale[j]) {r}x{c} (GB/s) ===");
+        let mer = bench_mercury(&mer_dequant_perchan(r, c, is_i8, false), &mut out, qp, sp, op);
+        let mer_par = bench_mercury(&mer_dequant_perchan(r, c, is_i8, true), &mut out, qp, sp, op);
+        let cm = bench_external("c", &c_dequant_perchan(r, c, is_i8), dir, "dequantpc", cc, &ext_flags_c, &mut out, qp, sp, op);
+        let cpp = bench_external("cpp", &cpp_from_c(&c_dequant_perchan(r, c, is_i8)), dir, "dequantpc", "g++", &ext_flags_c, &mut out, qp, sp, op);
+        let rm = bench_external("rs", &rust_dequant_perchan(r, c, is_i8), dir, "dequantpc", "rustc", &ext_flags_rs, &mut out, qp, sp, op);
+        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "", "Mer(1core)", "Mer(par)", "C (gcc)", "C++ (g++)", "Rust");
+        println!("  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}", "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&cpp), gbps(&rm));
+        dequant_check(&mer, &cm, "C");
+        dequant_ratio(&mer, &mer_par, &cm, &cpp, &rm);
+        println!();
+    }
+}
+
+/// Exact cross-check: the dequant is integer→f32 exact, so every backend must produce the identical
+/// f32 buffer. A mismatch is a real miscompile, not tolerance.
+fn dequant_check(mer: &Option<Measure>, peer: &Option<Measure>, lang: &str) {
+    if let (Some(m), Some(p)) = (mer, peer) {
+        if m.out != p.out {
+            let at = m.out.iter().zip(&p.out).position(|(x, y)| x != y).unwrap_or(0);
+            println!("  ! dequant output mismatch vs {lang} at [{at}]: {} vs {}", m.out[at], p.out[at]);
+        }
+    }
+}
+
+/// Report the single-core and `@parallel` C-ratios (clock-invariant; ~3× swing on this laptop).
+fn dequant_ratio(
+    mer: &Option<Measure>,
+    mer_par: &Option<Measure>,
+    cm: &Option<Measure>,
+    cpp: &Option<Measure>,
+    rm: &Option<Measure>,
+) {
+    if let (Some(m), Some(c)) = (mer, cm) {
+        let r = c.ns_per_call / m.ns_per_call;
+        println!("  -> Mercury single-core is {:.2}x {} than C (gcc -O3 -march=native)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+    }
+    if let (Some(m), Some(cpp)) = (mer, cpp) {
+        let r = cpp.ns_per_call / m.ns_per_call;
+        println!("  -> Mercury single-core is {:.2}x {} than C++ (g++)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+    }
+    if let (Some(m), Some(rm)) = (mer, rm) {
+        let r = rm.ns_per_call / m.ns_per_call;
+        println!("  -> Mercury single-core is {:.2}x {} than Rust (rustc -O)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+    }
+    if let (Some(mp), Some(c)) = (mer_par, cm) {
+        let r = c.ns_per_call / mp.ns_per_call;
+        println!("  -> Mercury @parallel is {r:.2}x single-threaded C");
+    }
+}
+
+fn mer_dequant_1d(n: usize, is_i8: bool, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let ty = if is_i8 { "i8" } else { "i32" };
+    format!(
+        "module bench\n{attr}fn kbench(q: [{ty}; {n}], u: [f32; {n}], out: [f32; {n}]) {{\n\
+         \x20   for j in 0..{n} {{ out[j] = (q[j] as f32) * 0.0125; }}\n}}\n"
+    )
+}
+
+fn c_dequant_1d(n: usize, is_i8: bool) -> String {
+    let ty = if is_i8 { "signed char" } else { "int" };
+    format!(
+        "#define N {n}\n\
+         __declspec(dllexport) void kbench(const {ty}* q, const float* u, float* out){{\n\
+         \x20 (void)u; for (long j=0;j<N;j++){{ out[j] = (float)q[j] * 0.0125f; }}\n}}\n"
+    )
+}
+
+fn rust_dequant_1d(n: usize, is_i8: bool) -> String {
+    let ty = if is_i8 { "i8" } else { "i32" };
+    format!(
+        "const N: usize = {n};\n#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn kbench(q:*const {ty}, u:*const f32, out:*mut f32) {{\n\
+         \x20 for j in 0..N {{ *out.add(j) = (*q.add(j) as f32) * 0.0125; }}\n}}\n"
+    )
+}
+
+fn mer_dequant_perchan(r: usize, c: usize, is_i8: bool, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let ty = if is_i8 { "i8" } else { "i32" };
+    let rc = r * c;
+    format!(
+        "module bench\n{attr}fn kbench(q: [{ty}; {rc}], scale: [f32; {c}], out: [f32; {rc}]) {{\n\
+         \x20   for i in 0..{r} {{\n\
+         \x20       for j in 0..{c} {{ out[i * {c} + j] = (q[i * {c} + j] as f32) * scale[j]; }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
+    let ty = if is_i8 { "signed char" } else { "int" };
+    format!(
+        "#define R {r}\n#define C {c}\n\
+         __declspec(dllexport) void kbench(const {ty}* q, const float* scale, float* out){{\n\
+         \x20 for (long i=0;i<R;i++){{ for (long j=0;j<C;j++){{ out[i*C+j] = (float)q[i*C+j] * scale[j]; }} }}\n}}\n"
+    )
+}
+
+fn rust_dequant_perchan(r: usize, c: usize, is_i8: bool) -> String {
+    let ty = if is_i8 { "i8" } else { "i32" };
+    format!(
+        "const R: usize = {r};\nconst C: usize = {c};\n#[no_mangle]\npub unsafe extern \"C\" fn kbench(q:*const {ty}, scale:*const f32, out:*mut f32) {{\n\
+         \x20 for i in 0..R {{ for j in 0..C {{ *out.add(i*C+j) = (*q.add(i*C+j) as f32) * *scale.add(j); }} }}\n}}\n"
     )
 }
 

@@ -706,6 +706,10 @@ pub fn lower_program(
         i8nt_par: interner.intern("mercury_i8gemm_nt_parallel"),
         i8deq: interner.intern("mercury_i8gemm_nt_deq"),
         i8deq_par: interner.intern("mercury_i8gemm_nt_deq_parallel"),
+        dequant: interner.intern("mercury_dequant_f32"),
+        dequant_par: interner.intern("mercury_dequant_f32_parallel"),
+        dequant_perchan: interner.intern("mercury_dequant_perchan_f32"),
+        dequant_perchan_par: interner.intern("mercury_dequant_perchan_f32_parallel"),
         bf16_nt: interner.intern("mercury_sgemm_bf16_nt"),
         bf16_nt_par: interner.intern("mercury_sgemm_bf16_nt_parallel"),
         f16_nt: interner.intern("mercury_sgemm_f16_nt"),
@@ -958,6 +962,18 @@ pub fn lower_program(
                     }))
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // `@parallel` whole-function per-channel dequant: intercept before the outliner (which
+                // would split the rows into per-row scalar loops and lose the kernel). Rows independent →
+                // serial == parallel, so the multicore `mercury_dequant_perchan_f32_parallel` is bit-equal.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        p.match_dequant_perchan(pat, it, lb).is_some()
+                    })
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -1639,6 +1655,19 @@ struct GemmSyms {
     /// is the fusion they structurally can't express. Both backends marshal the identical kernel.
     i8deq: Symbol,
     i8deq_par: Symbol,
+    /// The int-input **dequant** kernels (`mercury_dequant_f32[_parallel](q, out, n, scale, op)`): a
+    /// recognized `out[j] = act((q[j] as f32)·scale)` streaming map over an `[i8]`/`[u8]`/`[i32]` array
+    /// lowers here — the widen+scale gcc/rustc leave scalar, folded into one 256-bit pass. The input
+    /// width and activation are encoded in `op` (`DQ_*`). Integer→f32 is exact, so the kernel equals the
+    /// scalar loop bit-for-bit (no reassociation), and the interpreter marshals the identical kernel.
+    dequant: Symbol,
+    dequant_par: Symbol,
+    /// The **per-channel** dequant kernels (`mercury_dequant_perchan_f32[_parallel](q, out, rows, cols,
+    /// scale, op)`): `out[i*cols+j] = act((q[i*cols+j] as f32)·scale[j])` over a `[rows, cols]` matrix
+    /// with a per-output-column `scale[j]` (the quantized `nn.Linear` writeback shape). Rows independent,
+    /// so `_parallel` is bit-equal to serial; both backends marshal the identical kernel.
+    dequant_perchan: Symbol,
+    dequant_perchan_par: Symbol,
     /// The bf16 / f16 mixed-precision GEMM kernels (`mercury_sgemm_{bf16,f16}_nt[_parallel](a, b, c,
     /// m, k, n, beta)`): a `C = A·Bᵀ` nest whose `A`/`B` are `[bf16]`/`[f16]` arrays widened with
     /// `as f32` and accumulated in an f32 `s` lowers here — the standard mixed-precision transformer
@@ -1920,6 +1949,16 @@ const VE_USE_Y: i64 = 256;
 const VE_HADAMARD: i64 = 512; // out = act(x·y) — Hadamard product (kernel reads y)
 const VE_DIV: i64 = 1024; // out = act(x / y) — elementwise quotient
 
+// Dequant op codes — must match `mercury_runtime::dequant`'s `DQ_*`. Low byte = activation; the second
+// byte selects the input element width (the recognizer reads it off the source array's element type).
+const DQ_ID: i64 = 0; // out = (q as f32)·scale
+const DQ_RELU: i64 = 1; // out = max(.., 0)
+const DQ_GELU: i64 = 2; // out = gelu(..)
+const DQ_SILU: i64 = 3; // out = silu(..)
+const DQ_I8: i64 = 0 << 8; // q: [i8]  (signed weights)
+const DQ_U8: i64 = 1 << 8; // q: [u8]  (unsigned activations)
+const DQ_I32: i64 = 2 << 8; // q: [i32] (a quantized GEMM accumulator)
+
 /// One additive term of a recognized streaming affine body. `Scaled(arr, s)` is `arr[j]` (`s = None`,
 /// coefficient 1) or `s·arr[j]` / `arr[j]·s` for a loop-invariant f32 scalar `s`; `Const(s)` is a
 /// loop-invariant f32 scalar added in (the bias). Borrows the coefficient exprs from the body.
@@ -1943,6 +1982,31 @@ struct VElemPlan<'b> {
     a: Option<&'b Expr>,
     b: Option<&'b Expr>,
     c: Option<&'b Expr>,
+    op: i64,
+}
+
+/// A recognized int-input dequant map `out[j] = act((q[j] as f32)·scale)`: the resolved `out`/`q` base
+/// pointers, the source array's MIR element type (for the GEP stride: `I8` for `[i8]`/`[u8]`, `I32` for
+/// `[i32]`), the loop-invariant f32 `scale` expr (lowered at emit time), and the packed op (activation
+/// byte | input-width code from the source array's *signed* scalar type).
+struct DequantPlan<'b> {
+    out: ValueId,
+    q: ValueId,
+    q_elem: MirType,
+    scale: &'b Expr,
+    op: i64,
+}
+
+/// A recognized **per-channel** dequant nest `out[i*C+j] = act((q[i*C+j] as f32)·scale[j])` over a
+/// `[rows, cols]` matrix with a per-output-column scale (the quantized `nn.Linear` writeback). Resolved
+/// `out`/`q`/`scale` base symbols, the input MIR element type, the two dims, and the packed op.
+struct DequantPerchanNest {
+    out: Symbol,
+    q: Symbol,
+    scale: Symbol,
+    q_elem: MirType,
+    rows: Dim,
+    cols: Dim,
     op: i64,
 }
 
@@ -8413,6 +8477,16 @@ impl FnLowerer<'_> {
                 return;
             }
         }
+        // Per-channel dequant nest `out[i*C+j] = act((q[i*C+j] as f32)·scale[j])` over a `[R,C]` matrix
+        // → one `mercury_dequant_perchan_f32` call (`_parallel` in a `@parallel` fn; rows independent →
+        // bit-equal to serial). The per-column scale broadcast + the int widen keep gcc/rustc scalar;
+        // the AVX2 kernel folds widen+per-column-scale into one 256-bit pass. Checked in this batched
+        // phase (the body is a nested loop, which the elementwise recognizers below never match).
+        if let Some(nest) = self.match_dequant_perchan(pat, iter, body) {
+            if self.emit_dequant_perchan(&nest, self.parallel_fn) {
+                return;
+            }
+        }
         // Batched per-row argmax/argmin (classification top-1 / greedy decode) → the index-returning
         // `mercury_rowarg{max,min}_i32` (`_parallel` in a `@parallel` fn). The (value,index) bookkeeping
         // keeps gcc/rustc scalar; the AVX2 kernel tracks 8 lanes of (value,index) via blend.
@@ -9636,6 +9710,331 @@ impl FnLowerer<'_> {
         true
     }
 
+    // ---- int-input dequant (mercury_dequant_f32) ------------------------------------------------
+
+    /// Peel an optional activation wrapper off a dequant value, returning the inner (pre-activation)
+    /// expr and the `DQ_*` activation code. ReLU is `fmax(INNER, 0.0)` (either operand order — the
+    /// idiomatic quantized-ReLU, and the form whose single-statement body the recognizer needs); GELU /
+    /// SiLU are the intrinsic calls `gelu(..)` / `silu(..)`. A bare value is `DQ_ID`. Pure.
+    fn peel_dequant_act<'b>(&self, value: &'b Expr) -> (&'b Expr, i64) {
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return (value, DQ_ID);
+        };
+        // ReLU: fmax(INNER, 0.0) / fmax(0.0, INNER).
+        if args.len() == 2 && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Fmax))
+        {
+            let is_zero = |e: &Expr| {
+                matches!(&e.kind, ExprKind::Float(t)
+                    if parse_float(self.interner.resolve(*t)) as f32 == 0.0)
+            };
+            if is_zero(&args[1]) {
+                return (&args[0], DQ_RELU);
+            }
+            if is_zero(&args[0]) {
+                return (&args[1], DQ_RELU);
+            }
+        }
+        if args.len() == 1 {
+            match self.vectorizable_intrinsic(callee) {
+                Some(MathIntrinsic::Gelu) => return (&args[0], DQ_GELU),
+                Some(MathIntrinsic::Silu) => return (&args[0], DQ_SILU),
+                _ => {}
+            }
+        }
+        (value, DQ_ID)
+    }
+
+    /// Recognize a cast operand `(q[j] as f32)` where `q` is a unit-stride `[i8]`/`[u8]`/`[i32]` array
+    /// read of the loop var — the integer factor of a dequant. Returns the array symbol, its MIR element
+    /// type (for the GEP stride), and the `DQ_*` width code. The width comes from the **signed** scalar
+    /// type (`MirType` collapses `i8`/`u8` → `I8`, so signedness — which selects sign- vs zero-extension
+    /// in the kernel — must be read from sema). Pure.
+    fn dequant_cast_operand(&self, e: &Expr, j: Symbol) -> Option<(Symbol, MirType, i64)> {
+        let ExprKind::Cast { expr, .. } = &e.kind else {
+            return None;
+        };
+        // The cast's result must be f32 (the dequant target type).
+        if self.expr_mir(e) != MirType::F32 {
+            return None;
+        }
+        let q_sym = self.index_by_loopvar(expr, j)?;
+        let (elem, width) = match scalar_of(expr, self.sema)? {
+            mercury_types::Scalar::I8 => (MirType::I8, DQ_I8),
+            mercury_types::Scalar::U8 => (MirType::I8, DQ_U8),
+            mercury_types::Scalar::I32 => (MirType::I32, DQ_I32),
+            _ => return None,
+        };
+        Some((q_sym, elem, width))
+    }
+
+    /// Recognize the dequant product `(q[j] as f32)·scale` (either factor order), where `scale` is a
+    /// loop-invariant f32. Returns the array symbol, its MIR element type, the width code, and the scale
+    /// expr. Pure.
+    fn match_dequant_mul<'b>(
+        &self,
+        inner: &'b Expr,
+        j: Symbol,
+    ) -> Option<(Symbol, MirType, i64, &'b Expr)> {
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &inner.kind
+        else {
+            return None;
+        };
+        if let Some((q, elem, width)) = self.dequant_cast_operand(lhs, j) {
+            if let Some(scale) = self.velem_coeff(rhs, j) {
+                return Some((q, elem, width, scale));
+            }
+        }
+        if let Some((q, elem, width)) = self.dequant_cast_operand(rhs, j) {
+            if let Some(scale) = self.velem_coeff(lhs, j) {
+                return Some((q, elem, width, scale));
+            }
+        }
+        None
+    }
+
+    /// Recognize a streaming int-input dequant map body — one statement `out[j] = act((q[j] as f32)·
+    /// scale)` over an `[i8]`/`[u8]`/`[i32]` array `q`, an f32 output, and a loop-invariant f32 `scale`
+    /// — covering the ubiquitous weight/activation/accumulator dequant. Pure (emits no MIR); `None` to
+    /// fall through to the generic vectorizer. Disjoint from `match_velem_body` (velem reads *f32*
+    /// arrays directly; dequant reads an *int* array through an `as f32` cast, which velem declines).
+    fn match_dequant_body<'b>(&self, j: Symbol, body: &'b Block) -> Option<DequantPlan<'b>> {
+        let stmt = single_stmt(body)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        let out_sym = self.index_by_loopvar(target, j)?;
+        if self.expr_mir(target) != MirType::F32 {
+            return None;
+        }
+        let (inner, act) = self.peel_dequant_act(value);
+        let (q_sym, q_elem, width, scale) = self.match_dequant_mul(inner, j)?;
+        let out = self.lookup(out_sym)?.0;
+        let q = self.lookup(q_sym)?.0;
+        Some(DequantPlan {
+            out,
+            q,
+            q_elem,
+            scale,
+            op: act | width,
+        })
+    }
+
+    /// Emit one `mercury_dequant_f32(q+s, out+s, e-s, scale, op)` call for a recognized dequant map over
+    /// the i64 range `[s, e)`. The `q` GEP strides by the source array's element type (`I8`/`I32`), the
+    /// `out` GEP by `F32`; `scale` is lowered to an f32 ValueId. The serial kernel is used on both the
+    /// sequential and the `@parallel`-chunk paths (the outliner supplies the threading, so each chunk is
+    /// one serial call — bit-equal to the whole-range interpreter marshal, like velem).
+    fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) {
+        let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        let qp = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: plan.q,
+                index: s,
+                elem: plan.q_elem.clone(),
+            },
+        );
+        let outp = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: plan.out,
+                index: s,
+                elem: MirType::F32,
+            },
+        );
+        let scale = self.lower_coeff(Some(plan.scale), 1.0);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(plan.op as i128, MirType::I64));
+        // A whole-function single-loop `@parallel` dequant is parallelized by the outliner (chunk
+        // workers, `parallel_fn = false`, each a serial call), so this uses the serial kernel there. In
+        // a *mixed* `@parallel` function (not outlined; `parallel_fn = true`, like a reduction body) the
+        // dequant loop dispatches to the rayon `mercury_dequant_f32_parallel` — bit-identical to serial
+        // (elementwise → thread-count-independent), and the interpreter marshals the serial form.
+        let func = if self.parallel_fn {
+            self.gemm.dequant_par
+        } else {
+            self.gemm.dequant
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![qp, outp, n, scale, opv],
+        });
+    }
+
+    /// Recognize a streaming int-input dequant `for j in lo..hi { out[j] = act((q[j] as f32)·scale) }`
+    /// and lower it to one `mercury_dequant_f32` call — the 256-bit widen+scale gcc/rustc leave scalar.
+    /// The interpreter marshals the identical kernel (integer→f32 is exact), so the differential oracle
+    /// stays bit-for-bit. Returns false (fall through) unless the body matches.
+    fn try_dequant_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        let Some(plan) = self.match_dequant_body(j, body) else {
+            return false;
+        };
+        let sty = self.expr_mir(start);
+        let s = self.lower_expr(start);
+        let s = self.coerce_to(s, &sty, &MirType::I64, true);
+        let ety = self.expr_mir(end);
+        let e = self.lower_expr(end);
+        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        self.emit_dequant_call(s, e, &plan);
+        true
+    }
+
+    /// Recognize a **batched** cast operand `(q[i*C+j] as f32)` (the integer factor of a per-channel
+    /// dequant, `q` a `[i8]`/`[u8]`/`[i32]` matrix read at the row-major index). Returns the array
+    /// symbol, its MIR element type, and the `DQ_*` width code (from the signed scalar type). Pure.
+    fn dequant_cast_operand_batched(
+        &self,
+        e: &Expr,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, MirType, i64)> {
+        let ExprKind::Cast { expr, .. } = &e.kind else {
+            return None;
+        };
+        if self.expr_mir(e) != MirType::F32 {
+            return None;
+        }
+        let q_sym = self.index_off(expr, j, batch)?;
+        let (elem, width) = match scalar_of(expr, self.sema)? {
+            mercury_types::Scalar::I8 => (MirType::I8, DQ_I8),
+            mercury_types::Scalar::U8 => (MirType::I8, DQ_U8),
+            mercury_types::Scalar::I32 => (MirType::I32, DQ_I32),
+            _ => return None,
+        };
+        Some((q_sym, elem, width))
+    }
+
+    /// Recognize a per-column scale operand `scale[j]` — a unit-stride f32 read indexed by the inner
+    /// column var only (length `cols`, broadcast down every row). Returns the scale array symbol. Pure.
+    fn perchan_scale_operand(&self, e: &Expr, j: Symbol) -> Option<Symbol> {
+        let s = self.index_by_loopvar(e, j)?;
+        if self.expr_mir(e) != MirType::F32 {
+            return None;
+        }
+        Some(s)
+    }
+
+    /// Recognize a per-channel dequant nest `for i in 0..R { for j in 0..C { out[i*C+j] =
+    /// act((q[i*C+j] as f32)·scale[j]) } }` and return the resolved bases + dims + op. `pat`/`iter`/
+    /// `body` are the *outer* row loop (the shape `lower_for` hands the batched recognizers). Pure.
+    fn match_dequant_perchan(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+    ) -> Option<DequantPerchanNest> {
+        let ast::PatKind::Ident(r) = &pat.kind else {
+            return None;
+        };
+        let r = *r;
+        // Outer row loop `0..R`, exclusive, unstepped.
+        let ForIter::Range {
+            start: rs,
+            end: Some(re),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return None;
+        };
+        if as_int_lit(rs, self.interner)? != 0 {
+            return None;
+        }
+        let rows = as_dim(re, self.interner)?;
+        // The body is exactly one inner column loop `for j in 0..C { … }`.
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let (j, cols_expr, jb) = self.as_range0_for(&body.stmts[0])?;
+        let cols = as_dim(cols_expr, self.interner)?;
+        // Inner body: a single `out[i*C+j] = act((q[i*C+j] as f32)·scale[j])`.
+        let stmt = single_stmt(jb)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        let batch = Some((r, cols_expr));
+        let out_sym = self.index_off(target, j, batch)?;
+        if self.expr_mir(target) != MirType::F32 {
+            return None;
+        }
+        let (inner, act) = self.peel_dequant_act(value);
+        let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &inner.kind
+        else {
+            return None;
+        };
+        // `(q[i*C+j] as f32) · scale[j]`, either factor order.
+        let (q_sym, q_elem, width, scale_sym) = if let Some((q, el, w)) =
+            self.dequant_cast_operand_batched(lhs, j, batch)
+        {
+            (q, el, w, self.perchan_scale_operand(rhs, j)?)
+        } else if let Some((q, el, w)) = self.dequant_cast_operand_batched(rhs, j, batch) {
+            (q, el, w, self.perchan_scale_operand(lhs, j)?)
+        } else {
+            return None;
+        };
+        Some(DequantPerchanNest {
+            out: out_sym,
+            q: q_sym,
+            scale: scale_sym,
+            q_elem,
+            rows,
+            cols,
+            op: act | width,
+        })
+    }
+
+    /// Emit `mercury_dequant_perchan_f32[_parallel](q, out, rows, cols, scale, op)` for a recognized
+    /// per-channel dequant nest — one call over the whole `[rows, cols]` matrix (the `_parallel` one
+    /// maps independent rows across cores, bit-equal to serial). Returns false (fall through) if a base
+    /// or dim cannot be resolved.
+    fn emit_dequant_perchan(&mut self, nest: &DequantPerchanNest, parallel: bool) -> bool {
+        let (Some((q, _)), Some((out, _)), Some((scale, _))) = (
+            self.lookup(nest.q),
+            self.lookup(nest.out),
+            self.lookup(nest.scale),
+        ) else {
+            return false;
+        };
+        let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols)) else {
+            return false;
+        };
+        // The GEP element type does not matter here (offset 0 — the whole matrix), but the kernel needs
+        // the width in `op`, which `nest.op` already carries; `q_elem` is retained only for symmetry.
+        let _ = &nest.q_elem;
+        let op = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(nest.op as i128, MirType::I64));
+        let func = if parallel {
+            self.gemm.dequant_perchan_par
+        } else {
+            self.gemm.dequant_perchan
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![q, out, rows, cols, scale, op],
+        });
+        true
+    }
+
     /// Match `r = r·v + Ck` (the running Horner step) for accumulator `r` and per-element value `v`,
     /// either factor order and either `Add` operand order. `Ck` must be a loop-invariant f32 (free of
     /// the loop var `j`). Returns the coefficient expr. Pure.
@@ -9841,6 +10240,14 @@ impl FnLowerer<'_> {
         if self.try_vhorner_for(j, start, end, body) {
             return true;
         }
+        // An int-input dequant `out[j] = act((q[j] as f32)·scale)` over an `[i8]`/`[u8]`/`[i32]` array
+        // dispatches to the 256-bit widen+scale kernel — the widening `cvt` chain gcc/rustc leave
+        // scalar. Disjoint from velem (which reads f32 arrays directly and declines the `as f32` cast),
+        // so probe order among them is immaterial; placed before the generic vectorizer, which would
+        // otherwise lower the widen at 128-bit with cacheable stores.
+        if self.try_dequant_for(j, start, end, body) {
+            return true;
+        }
         // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
         // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
         // only on this (sequential) path — not the `@parallel` per-thread path, where folding into
@@ -9970,6 +10377,15 @@ impl FnLowerer<'_> {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
             self.emit_velem_call(s, e, &plan);
+            return true;
+        }
+        // An int-input dequant per `@parallel` chunk → the same 256-bit `mercury_dequant_f32` over
+        // `[s, e)`, so a `@parallel` dequant runs multicore × 256-bit (each thread's chunk is one serial
+        // call). Elementwise, so each per-chunk pass agrees with the interpreter's whole-range marshal.
+        if let Some(plan) = self.match_dequant_body(j, body) {
+            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+            self.emit_dequant_call(s, e, &plan);
             return true;
         }
         // A bf16/f16→f32 axpby per `@parallel` chunk → `mercury_axpby_{bf16,f16}` over `[s, e)`, so a

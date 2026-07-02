@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 36
+// EXPECT-OUT: 27
+// EXPECT-OUT: 0
+// EXPECT-OUT: 20
+module tests.run.dequant_perchan
+
+// Per-channel dequant: out[i*C+j] = act((q[i*C+j] as f32) * scale[j]) over a [R, C] matrix with a
+// per-output-column scale (the shape a quantized nn.Linear writeback takes — one scale per output
+// channel). The compiler recognizes the 2D nest and lowers it to one mercury_dequant_perchan_f32 call
+// (256-bit widen + per-column scale broadcast; the strided per-channel scale keeps gcc/rustc scalar).
+// Integer→f32 is exact, so it equals the scalar nest bit-for-bit; -O0 == -O3 and interp == native.
+// Powers-of-two scales + multiples of 8 in q keep the printed values exact. R = 4, C = 8.
+fn main() -> i32 {
+    let mut q: [i32; 32] = [0; 32];
+    let mut out: [f32; 32] = [0.0; 32];
+    for j in 0..32 {
+        q[j] = (j as i32) * 8;
+    }
+    let mut scale: [f32; 8] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+    for i in 0..4 {
+        for j in 0..8 {
+            out[i * 8 + j] = (q[i * 8 + j] as f32) * scale[j];
+        }
+    }
+    print(round(out[1]) as i32); // q=8   * 0.5   = 4
+    print(round(out[3]) as i32); // q=24  * 0.125 = 3
+    print(round(out[9]) as i32); // q=72  * 0.5   = 36
+    print(round(out[27]) as i32); // q=216 * 0.125 = 27
+
+    // A per-channel dequant with a fused ReLU over a signed [i8] matrix (negative rows zeroed).
+    let mut w: [i8; 32] = [0 as i8; 32];
+    let mut o2: [f32; 32] = [0.0; 32];
+    for j in 0..32 {
+        w[j] = ((j as i32) - 16) as i8; // -16 .. 15
+    }
+    let mut s2: [f32; 8] = [2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0];
+    for i in 0..4 {
+        for j in 0..8 {
+            o2[i * 8 + j] = fmax((w[i * 8 + j] as f32) * s2[j], 0.0);
+        }
+    }
+    print(round(o2[0]) as i32); // i=0,j=0: w=-16 * 2.0 = -32 → relu → 0
+    print(round(o2[26]) as i32); // i=3,j=2: w=10  * 2.0 =  20 → relu → 20
+    return 0;
+}
