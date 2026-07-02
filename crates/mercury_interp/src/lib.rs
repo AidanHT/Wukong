@@ -632,6 +632,76 @@ impl<'a, 'k> Interp<'a, 'k> {
                     self.intrinsic(&name, &argv)?
                 }
             }
+            // A synthesized 256-bit AVX2 vector kernel (the general vectorizer's output). The native
+            // backend executes hand-assembled AVX2; the oracle marshals the same `VecKernel` recipe
+            // element-by-element through slot memory so the two agree bit-for-bit. `ptrs` points at
+            // `streams` slots each holding a stream's (already `start`-offset) base pointer, `scalars`
+            // at `scalars` invariant f32s, and `n` is the multiple-of-8 lane count (the caller runs
+            // the scalar tail). `self.program` is a shared reference, so borrowing the recipe from it
+            // is independent of the `&mut self.memory` writes below.
+            Op::VecKernelCall {
+                kernel,
+                ptrs,
+                scalars,
+                n,
+            } => {
+                let prog = self.program;
+                let kern = prog
+                    .vec_kernels
+                    .get(*kernel as usize)
+                    .ok_or("veckernel: unknown kernel index")?;
+                let ptrs_base = ptr(reg(regs, *ptrs))?;
+                let scalars_base = ptr(reg(regs, *scalars))?;
+                let count = reg(regs, *n).as_int().max(0) as usize;
+                // Resolve the stream base slots and the invariant scalars once.
+                let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
+                for s in 0..kern.streams as usize {
+                    stream_bases.push(ptr(
+                        *self
+                            .memory
+                            .get(ptrs_base + s)
+                            .ok_or("veckernel ptrs out of bounds")?,
+                    )?);
+                }
+                let mut scalar_vals: Vec<f32> = Vec::with_capacity(kern.scalars as usize);
+                for k in 0..kern.scalars as usize {
+                    scalar_vals.push(
+                        self.memory
+                            .get(scalars_base + k)
+                            .ok_or("veckernel scalars out of bounds")?
+                            .as_float() as f32,
+                    );
+                }
+                // One `eval_lane` per element: snapshot this lane's stream inputs, run the recipe,
+                // write its stores back. Load-before-store within a lane keeps in-place streams exact;
+                // distinct lanes never alias (the vectorizer's no-alias precondition), so no hazard.
+                let mut stores: Vec<(u32, f32)> = Vec::new();
+                for i in 0..count {
+                    let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
+                    for &b in &stream_bases {
+                        loads.push(
+                            self.memory
+                                .get(b + i)
+                                .ok_or("veckernel load out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                    stores.clear();
+                    kern.eval_lane(
+                        |s| loads[s as usize],
+                        |k| scalar_vals[k as usize],
+                        |s, v| stores.push((s, v)),
+                    );
+                    for &(s, v) in &stores {
+                        let slot = stream_bases[s as usize] + i;
+                        *self
+                            .memory
+                            .get_mut(slot)
+                            .ok_or("veckernel store out of bounds")? = Value::Float(v as f64);
+                    }
+                }
+                Value::Unit
+            }
             // A function address: a pointer the interpreter tags with the function's index so the
             // `parallel_for` intrinsic can call it back. (The native backend uses a real address.)
             Op::FuncAddr(sym) => {

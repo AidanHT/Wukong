@@ -367,6 +367,24 @@ impl Emitter<'_> {
                 };
                 format!("call {ty} @llvm.{intr}.{suffix}({ty} {})", self.operand(*a))
             }
+            Op::VecKernelCall {
+                kernel,
+                ptrs,
+                scalars,
+                n,
+            } => {
+                // The synthesized 256-bit AVX2 kernel, emitted as an external void call (like the
+                // recognized `mercury_*` runtime kernels above). This text-IR path is not the
+                // differential oracle and is not assembled here — the AVX2 body lives only in the
+                // Cranelift backend — so a well-formed, round-trippable call is the faithful form.
+                format!(
+                    "call void @__mercury_veckernel_{kernel}(ptr {}, ptr {}, {} {})",
+                    self.operand(*ptrs),
+                    self.operand(*scalars),
+                    self.ty(*n),
+                    self.operand(*n),
+                )
+            }
         };
         let _ = writeln!(out, "  {line}");
     }
