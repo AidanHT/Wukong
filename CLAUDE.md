@@ -29,9 +29,13 @@ CLI flags (`crates/mercuryc/src/main.rs` → `mercury_driver::Options`):
 - `-O0|-O1|-O2|-O3` — optimization level (default `-O0`; `-O3` currently runs the `-O2` pipeline).
 - `-o <path>`, `--color=auto|always|never`, `--error-format=human|json`, `--explain <CODE>`,
   `-h/--help`, `-V/--version`.
-- `--emit=obj` emits a native object via Cranelift (no LLVM). `--emit=exe` additionally links it with
-  the system C compiler (`cc`/`$CC`); if no C compiler is found it returns exit code 2 (`UNIMPLEMENTED`)
-  but the object is still written. `--emit=llvm-ir` emits textual LLVM IR (also no toolchain needed).
+- `--emit=obj` emits a native object via Cranelift (no LLVM). `--emit=exe` additionally links it into a
+  runnable executable, preferring a **rustc-driven link** (rustc invokes the object's native linker and
+  links the `mercury_runtime` kernels as a dependency, so a recognized-kernel program and string
+  `.rodata` both resolve; a generated shim supplies the `mercury_rt_*` runtime). It falls back to a
+  `cc`/`$CC` C-runtime link (scalar, no-data programs) when rustc or the runtime rlib is unavailable; if
+  neither can link it returns exit code 2 (`UNIMPLEMENTED`) with the object still written. `--emit=llvm-ir`
+  emits textual LLVM IR (also no toolchain needed).
 
 ## Pipeline
 
