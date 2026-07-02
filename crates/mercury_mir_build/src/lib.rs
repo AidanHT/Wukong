@@ -7983,6 +7983,7 @@ impl FnLowerer<'_> {
             ops: Vec::new(),
             streams: Vec::new(),
             scalars: Vec::new(),
+            load_cache: HashMap::new(),
         };
         // inner `let`/`let mut` temps: name -> the recipe value index it currently holds.
         let mut locals: HashMap<Symbol, u32> = HashMap::new();
@@ -8020,6 +8021,8 @@ impl FnLowerer<'_> {
                             }
                             let stream = rec_stream(&mut r, bsym, &indices[0]);
                             r.ops.push(VecOp::Store { stream, val: vi });
+                            // The stream now holds `vi`; a later read forwards it (no reload).
+                            r.load_cache.insert(stream, vi);
                         }
                         _ => return None,
                     }
@@ -8069,10 +8072,16 @@ impl FnLowerer<'_> {
             ExprKind::Index { base, indices } if indices.len() == 1 => {
                 let bsym = single_path(base)?;
                 match affine_stride(&indices[0], j) {
-                    // unit stride: a streaming load.
+                    // unit stride: a streaming load, CSE'd — reuse the stream's cached value (an
+                    // earlier load or a just-stored value) instead of reloading.
                     Some(1) => {
                         let stream = rec_stream(r, bsym, &indices[0]);
-                        Some(push(r, VecOp::Load { stream }))
+                        if let Some(&v) = r.load_cache.get(&stream) {
+                            return Some(v);
+                        }
+                        let v = push(r, VecOp::Load { stream });
+                        r.load_cache.insert(stream, v);
+                        Some(v)
                     }
                     // stride 0: a loop-invariant element → a pre-loaded scalar.
                     Some(0) => {
@@ -8296,8 +8305,9 @@ impl FnLowerer<'_> {
         // transcendental, too many streams/registers) falls through to the 128-bit CLIF strips
         // below. Elementwise ⇒ each lane is the same f32 op order as scalar, so no reassociation:
         // the kernel is bit-exact to the tail element-for-element, and the interp marshals the same
-        // recipe as the oracle.
-        if *lane == MirType::F32 {
+        // recipe as the oracle. `MERCURY_P4_NO_256` forces the 128-bit path — a same-run A/B knob for
+        // measuring the 256-bit win, and a kill-switch should a body ever be found miscompiled.
+        if *lane == MirType::F32 && std::env::var_os("MERCURY_P4_NO_256").is_none() {
             if let Some(recipe) = self.build_vec_recipe(body, j) {
                 let kern = VecKernel {
                     name: self.builder.func_name(),
@@ -16319,6 +16329,11 @@ struct VecRecipe<'b> {
     /// Loop-invariant f32 source expressions (a param/outer-local path, a stride-0 array read, or a
     /// numeric literal). Dedup'd by structure to keep the hoisted-register count small.
     scalars: Vec<&'b Expr>,
+    /// Load CSE / store-forward cache: stream index → the recipe value that currently holds its
+    /// element. A repeated `a[i]` reuses one load (lower register pressure ⇒ more unroll), and a
+    /// store updates it so a later read of that stream forwards the just-stored value with no
+    /// reload. Build-time only; ignored once the recipe is emitted.
+    load_cache: HashMap<u32, u32>,
 }
 
 /// Intern a stream by `(base, index)` — dedup by base symbol + structural index equality — returning
