@@ -969,6 +969,32 @@ impl Sema<'_> {
                         self.retype_adapted_literal(&f.value, fty);
                     }
                     self.range_check_int_literal(&f.value, fty);
+                    // An array field's initializer must have the declared length. `Buf { data: [11,22] }`
+                    // for `data: [i32; 4]` left the tail uninitialized (interp read 0, native read stack
+                    // garbage — a backend divergence), and an over-long one silently dropped elements.
+                    // `let`/tuple already length-check array initializers; struct fields did not.
+                    if let Ty::Array { len, .. } = fty {
+                        let init_len = match &f.value.kind {
+                            ExprKind::ArrayLit(items) => Some(items.len() as u64),
+                            ExprKind::ArrayRepeat { count, .. } => Some(self.eval_usize(count)),
+                            _ => None,
+                        };
+                        if let Some(il) = init_len {
+                            if il != *len {
+                                self.error(
+                                    f.value.span,
+                                    "E0401",
+                                    format!(
+                                        "array field `{}` has length {} but its initializer has {} \
+                                         element(s)",
+                                        self.sym_str(name),
+                                        len,
+                                        il
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     // Scalar-type agreement, the same rule `let`/return/assignment enforce: a
                     // NON-literal field value of a different scalar type (`S { a: x }` with `a: i32`,
                     // `x: f32`) silently truncated/demoted it — both backends agreeing on the lossy
