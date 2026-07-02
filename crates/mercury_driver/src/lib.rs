@@ -223,6 +223,21 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
 
+    // For `--train`, recover the loss function's buffer element counts from the semantic types now,
+    // while the `[f32; N]` / `Tensor[..]` annotations are still available (they are lost once the
+    // params lower to `Ptr`).
+    let train_lens = if opts.grad.train {
+        match loss_param_lens(&sema, &mut interner, opts) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("error: --train: {e}");
+                return exit::COMPILE_ERROR;
+            }
+        }
+    } else {
+        None
+    };
+
     // --- MIR construction ---
     let (mut program, lower_diags) =
         mercury_mir_build::lower_program(&module, &sema, &mut interner);
@@ -259,6 +274,10 @@ pub fn compile(opts: &Options) -> i32 {
     mercury_opt::optimize(&mut program, opt_level);
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
+    if opts.grad.train {
+        let lens = train_lens.expect("train_lens computed when --train is set");
+        return run_train(&program, &mut interner, opts, &lens);
+    }
     if opts.emit == EmitStage::Grad {
         return emit_grad(&program, &mut interner, opts);
     }
@@ -523,6 +542,238 @@ fn grad_wrt(func: &mercury_mir::Function, requested: &[usize]) -> Result<Vec<usi
         }
     }
     Ok(requested.to_vec())
+}
+
+/// The number of `f32` leaf elements in a buffer parameter's semantic type — the count the
+/// interpreter's `run_kernel_f32` ABI expects (one slot per scalar leaf). `Array` multiplies by its
+/// concrete length, `Tensor` by the product of its (fully-const) dims. `None` for a param whose size
+/// is not statically known (a symbolic tensor dim, a slice) — `--train` needs a concrete size.
+fn ty_elem_count(ty: &mercury_types::Ty) -> Option<u64> {
+    use mercury_types::{Dim, Ty};
+    match ty {
+        Ty::Scalar(_) => Some(1),
+        Ty::Array { elem, len } => Some(ty_elem_count(elem)? * len),
+        Ty::Tensor { shape, .. } => shape.0.iter().try_fold(1u64, |acc, d| match d {
+            Dim::Const(n) => Some(acc * n),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Recover the element count of each parameter of the `--train` / `--grad-of` loss function from the
+/// semantic types (the `[f32; N]` / `Tensor[..]` annotations lost when the params lower to `Ptr`).
+fn loss_param_lens(
+    sema: &mercury_sema::SemaResult,
+    interner: &mut Interner,
+    opts: &Options,
+) -> Result<Vec<usize>, String> {
+    let name = opts.grad.of.clone().unwrap_or_else(|| "loss".to_string());
+    let sym = interner.intern(&name);
+    let def = sema
+        .defs
+        .lookup(sym)
+        .ok_or_else(|| format!("no function `{name}` in the module"))?;
+    let sig = match &def.kind {
+        mercury_sema::DefKind::Fn(sig) => sig,
+        _ => return Err(format!("`{name}` is not a function")),
+    };
+    sig.params
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            ty_elem_count(ty).map(|n| n as usize).ok_or_else(|| {
+                format!(
+                    "parameter {i} of `{name}` has no statically-known element count \
+                     (a symbolic tensor dim or slice); --train needs concrete buffer sizes"
+                )
+            })
+        })
+        .collect()
+}
+
+/// A tiny deterministic LCG producing `f32` in ~`[-0.4, 0.4]` — seeds the `--train` buffers so a run
+/// is reproducible (honest: no hidden entropy) and a test can assert a specific loss trajectory.
+fn train_rand(seed: &mut u64, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|_| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((*seed >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8
+        })
+        .collect()
+}
+
+/// `--train`: run a fwd→bwd→optimizer loop on the loss function and print the loss trajectory.
+///
+/// Convention: `--grad-wrt` names the **trainable** buffer parameters (the weights); every other
+/// buffer is fixed input data; the **last** parameter is the scalar loss output `[f32; 1]`. All
+/// buffers are seeded deterministically (`--train-seed`); each step runs the gradient kernel (which
+/// replays the forward, so it yields both the loss and the gradients), then applies SGD or the fused
+/// AdamW kernel to the weights. The printed trajectory is the honest end-to-end signal — on a
+/// convex objective it strictly decreases.
+fn run_train(
+    program: &mercury_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> i32 {
+    match train_loop(program, interner, opts, lens) {
+        Ok(traj) => {
+            use std::io::Write;
+            let mut out = String::new();
+            let opt = match opts.grad.train_opt {
+                TrainOpt::Sgd => "sgd",
+                TrainOpt::AdamW => "adamw",
+            };
+            out.push_str(&format!(
+                "train: {} step(s), lr={}, optimizer={opt}\n",
+                traj.len().saturating_sub(1),
+                opts.grad.train_lr
+            ));
+            for (i, l) in traj.iter().enumerate() {
+                out.push_str(&format!("step {i:>4}: loss {l:.6}\n"));
+            }
+            if let (Some(&first), Some(&last)) = (traj.first(), traj.last()) {
+                out.push_str(&format!(
+                    "loss {first:.6} -> {last:.6}  ({:.2}x reduction)\n",
+                    if last != 0.0 { first / last } else { f32::INFINITY }
+                ));
+            }
+            let _ = std::io::stdout().write_all(out.as_bytes());
+            exit::OK
+        }
+        Err(e) => {
+            eprintln!("error: --train: {e}");
+            exit::COMPILE_ERROR
+        }
+    }
+}
+
+/// The testable core of `--train`: build the {forward, backward, optimizer} program, initialize the
+/// buffers, run the loop, and return the loss trajectory (`traj[i]` = loss after `i` updates, with a
+/// final entry after the last update — so `traj.len() == steps + 1`).
+fn train_loop(
+    program: &mercury_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> Result<Vec<f32>, String> {
+    use mercury_autodiff::optim::{self, hp};
+    use mercury_mir::Program;
+
+    let name = opts.grad.of.clone().unwrap_or_else(|| "loss".to_string());
+    let fsym = interner.intern(&name);
+    let (nparams, wrt) = {
+        let loss_fn = program
+            .function(fsym)
+            .ok_or_else(|| format!("no function `{name}` in the module"))?;
+        (loss_fn.params.len(), grad_wrt(loss_fn, &opts.grad.wrt)?)
+    };
+    if lens.len() != nparams {
+        return Err(format!(
+            "internal: {} param sizes for a {nparams}-param loss function",
+            lens.len()
+        ));
+    }
+    let loss_out = nparams - 1;
+    if lens[loss_out] != 1 {
+        return Err(
+            "the last parameter must be the scalar loss output `[f32; 1]` (the `--train` convention)"
+                .into(),
+        );
+    }
+    if wrt.contains(&loss_out) {
+        return Err("--grad-wrt must not include the loss-output parameter (the last one)".into());
+    }
+
+    // Build {forward, backward} plus one fused AdamW kernel per distinct trainable-tensor size.
+    let (fwd, gradfn) = build_grad(program, interner, opts)?;
+    let (fwd_name, gname) = (fwd.name, gradfn.name);
+    let mut funcs = vec![fwd, gradfn];
+    let mut adamw: std::collections::HashMap<usize, mercury_span::Symbol> =
+        std::collections::HashMap::new();
+    if opts.grad.train_opt == TrainOpt::AdamW {
+        let mut sizes: Vec<usize> = wrt.iter().map(|&wi| lens[wi]).collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        for n in sizes {
+            let f = optim::build_adamw_step(interner, n);
+            adamw.insert(n, f.name);
+            funcs.push(f);
+        }
+    }
+    let train_prog = Program {
+        funcs,
+        level: program.level,
+    };
+
+    // Deterministic buffer init; the loss output is zeroed, moment state starts at zero.
+    let mut seed = opts.grad.train_seed;
+    let mut bufs: Vec<Vec<f32>> = lens.iter().map(|&n| train_rand(&mut seed, n)).collect();
+    bufs[loss_out] = vec![0.0; 1];
+    let mut mstate: Vec<Vec<f32>> = wrt.iter().map(|&wi| vec![0.0; lens[wi]]).collect();
+    let mut vstate: Vec<Vec<f32>> = wrt.iter().map(|&wi| vec![0.0; lens[wi]]).collect();
+
+    let lr = opts.grad.train_lr;
+    let (beta1, beta2, eps) = (0.9f64, 0.999f64, 1e-8f64);
+    let mut traj = Vec::with_capacity(opts.grad.train_steps + 1);
+
+    let run = |prog: &Program, entry, bufs: &mut [Vec<f32>], it: &Interner| -> Result<(), String> {
+        let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        mercury_interp::run_kernel_f32(prog, entry, &mut views, it)
+    };
+
+    for step in 0..opts.grad.train_steps {
+        // The gradient kernel replays the forward, so one call gives the current loss + the gradients.
+        let mut gbufs: Vec<Vec<f32>> = bufs.clone();
+        for &wi in &wrt {
+            gbufs.push(vec![0.0; lens[wi]]);
+        }
+        run(&train_prog, gname, &mut gbufs, interner)?;
+        traj.push(gbufs[loss_out][0]);
+
+        match opts.grad.train_opt {
+            TrainOpt::Sgd => {
+                for (i, &wi) in wrt.iter().enumerate() {
+                    let g = &gbufs[nparams + i];
+                    for (wv, &gv) in bufs[wi].iter_mut().zip(g) {
+                        *wv -= lr * gv;
+                    }
+                }
+            }
+            TrainOpt::AdamW => {
+                let t = (step + 1) as i32;
+                let mut hpbuf = vec![0.0f32; hp::LEN];
+                hpbuf[hp::LR] = lr;
+                hpbuf[hp::BETA1] = beta1 as f32;
+                hpbuf[hp::BETA2] = beta2 as f32;
+                hpbuf[hp::EPS] = eps as f32;
+                hpbuf[hp::WD] = 0.0;
+                hpbuf[hp::BC1] = (1.0 - beta1.powi(t)) as f32;
+                hpbuf[hp::BC2] = (1.0 - beta2.powi(t)) as f32;
+                for (i, &wi) in wrt.iter().enumerate() {
+                    let aname = adamw[&lens[wi]];
+                    let mut ab = vec![
+                        bufs[wi].clone(),
+                        gbufs[nparams + i].clone(),
+                        mstate[i].clone(),
+                        vstate[i].clone(),
+                        hpbuf.clone(),
+                    ];
+                    run(&train_prog, aname, &mut ab, interner)?;
+                    bufs[wi] = ab[0].clone();
+                    mstate[i] = ab[2].clone();
+                    vstate[i] = ab[3].clone();
+                }
+            }
+        }
+    }
+    // One final forward to report the loss after the last update.
+    run(&train_prog, fwd_name, &mut bufs, interner)?;
+    traj.push(bufs[loss_out][0]);
+    Ok(traj)
 }
 
 fn emit_mir(program: &mercury_mir::Program, interner: &Interner) {
@@ -871,6 +1122,87 @@ mod grad_cli_tests {
             gate(&src, "loss", &[1], &inputs, &lens, 2, 1e-2, 4e-2, 1e-2);
             gate(&src, "loss", &[0], &inputs, &lens, 2, 1e-2, 4e-2, 1e-2);
         }
+    }
+
+    // --- --train: fwd → bwd → optimizer, the end-to-end loss-decrease signal. -----------------------
+
+    /// A least-squares linear regression `loss = Σ(x·wᵀ − t)²` — convex in the weights `w`, so
+    /// full-batch gradient descent with a small step descends monotonically.
+    const REGRESSION_SRC: &str = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], out:[f32;1]) -> f32 {\n\
+         let mut p: [f32; 6] = [0.0; 6];\n\
+         for i in 0..3 { for j in 0..2 { let mut s: f32 = 0.0;\n\
+           for kk in 0..4 { s = s + x[i*4+kk] * w[j*4+kk]; }\n\
+           p[i*2+j] = s; } }\n\
+         let mut loss: f32 = 0.0;\n\
+         for i in 0..6 { loss = loss + (p[i]-t[i])*(p[i]-t[i]); }\n\
+         out[0] = loss; return loss; }";
+
+    #[allow(clippy::too_many_arguments)]
+    fn train_traj(
+        src: &str,
+        wrt: &[usize],
+        lens: &[usize],
+        steps: usize,
+        lr: f32,
+        opt: TrainOpt,
+        seed: u64,
+    ) -> Vec<f32> {
+        let (program, mut interner) = compile_o1(src);
+        let opts = Options {
+            grad: GradOptions {
+                of: Some("loss".to_string()),
+                wrt: wrt.to_vec(),
+                train: true,
+                train_steps: steps,
+                train_lr: lr,
+                train_opt: opt,
+                train_seed: seed,
+            },
+            ..Options::default()
+        };
+        train_loop(&program, &mut interner, &opts, lens).expect("train_loop")
+    }
+
+    /// The loss function's buffer sizes are recovered from the semantic types (`[f32; N]`), not the
+    /// `Ptr`-erased MIR — so `--train` can allocate the right buffers with no user-supplied shapes.
+    #[test]
+    fn param_sizes_recovered_from_types() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("sz.mer".to_string(), REGRESSION_SRC.to_string());
+        let (tokens, _) = mercury_lexer::tokenize(sm.source(id), id);
+        let mut interner = Interner::new();
+        let (module, _) = mercury_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()));
+        let opts = Options {
+            grad: GradOptions {
+                of: Some("loss".to_string()),
+                ..GradOptions::default()
+            },
+            ..Options::default()
+        };
+        let lens = loss_param_lens(&sema, &mut interner, &opts).expect("param sizes");
+        assert_eq!(lens, vec![12, 8, 6, 1], "x[12], w[8], t[6], out[1]");
+    }
+
+    #[test]
+    fn train_sgd_loss_strictly_decreases() {
+        // Full-batch GD on a convex least-squares objective: the loss never rises (f32 rounding slack).
+        let traj = train_traj(REGRESSION_SRC, &[1], &[12, 8, 6, 1], 120, 0.05, TrainOpt::Sgd, 0xA5A5);
+        for w in traj.windows(2) {
+            assert!(w[1] <= w[0] + 1e-6, "SGD loss rose: {} -> {}", w[0], w[1]);
+        }
+        let (l0, lf) = (traj[0], *traj.last().unwrap());
+        assert!(l0 > 0.05, "test setup: initial loss should be substantial, got {l0}");
+        assert!(lf < 0.3 * l0, "SGD did not reduce the loss enough: {l0} -> {lf}");
+    }
+
+    #[test]
+    fn train_adamw_reduces_loss() {
+        // The fused AdamW kernel drives a much larger reduction than plain SGD in the same budget.
+        let traj = train_traj(REGRESSION_SRC, &[1], &[12, 8, 6, 1], 150, 0.05, TrainOpt::AdamW, 0xA5A5);
+        let (l0, lf) = (traj[0], *traj.last().unwrap());
+        assert!(lf.is_finite() && lf < 0.05 * l0, "AdamW did not converge: {l0} -> {lf}");
     }
 }
 

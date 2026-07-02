@@ -541,6 +541,7 @@ dependencies = [
  "mercury_parser",
  "mercury_sema",
  "mercury_span",
+ "mercury_types",
 ]
 
 [[package]]
