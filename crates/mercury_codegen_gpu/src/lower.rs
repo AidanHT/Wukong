@@ -695,6 +695,13 @@ impl<'a> FnEmit<'a> {
         match &inst.op {
             Op::Store { ptr, value } => return self.lower_store(*ptr, *value),
             Op::Call { func, args } => return self.lower_call(*func, args, inst.result),
+            // A raw-AVX2 CPU microkernel call (the general 256-bit loop vectorizer's `VecKernelCall`)
+            // has no PTX analog; report it UNSUPPORTED so the coverage gate skips this function.
+            Op::VecKernelCall { .. } => {
+                return Err(format!(
+                    "{UNSUPPORTED} `VecKernelCall` (CPU raw-AVX2 kernel) not lowered to PTX"
+                ))
+            }
             _ => {}
         }
         let r = inst
@@ -792,7 +799,9 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"
                 ));
             }
-            Op::Store { .. } | Op::Call { .. } => unreachable!("handled above"),
+            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } => {
+                unreachable!("handled above")
+            }
         }
         Ok(())
     }
