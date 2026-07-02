@@ -80,6 +80,64 @@ fn p4_bench_256_vs_128() {
     );
 }
 
+/// Broad differential sweep of the 256-bit vectorizer: many f32 elementwise body shapes (every
+/// recipe op — +−×÷, neg, sqrt, nested if/else blends, multi-stream, invariant scalars/literals,
+/// in-place output=input) crossed with trip counts that straddle the 8-lane boundary and the scalar
+/// tail, in both `for` and normalized-`while` form. Each must agree native-vs-interp AND -O0-vs-O3.
+/// This is the regression lock for the whole feature — if a lane, a tail, or an aliasing case ever
+/// drifts, one of these fails.
+#[test]
+fn p4_vec256_coverage_sweep() {
+    // Each body computes `o[i]` (or updates a stream in place) from streams a,b,c and scalar `k`.
+    let bodies: &[&str] = &[
+        "o[i] = a[i] + b[i] - c[i]",
+        "o[i] = a[i] * b[i] * c[i]",
+        "o[i] = a[i] / (b[i] + 1.0)",
+        "o[i] = -a[i] + b[i] * c[i]",
+        "o[i] = sqrt(a[i] * a[i] + b[i] * b[i])",
+        "o[i] = a[i] * k + b[i]",                                    // invariant scalar
+        "o[i] = if a[i] > b[i] { a[i] } else { b[i] }",              // max via blend
+        "o[i] = if a[i] > 0.0 { a[i] } else { 0.0 }",                // relu
+        "o[i] = if a[i] < 6.0 { if a[i] > 0.0 { a[i] } else { 0.0 } } else { 6.0 }", // relu6 (nested)
+        "o[i] = a[i] * b[i] + a[i] * c[i] - b[i] * c[i] + a[i]",     // load reuse (CSE)
+        "a[i] = a[i] * a[i] + 1.0",                                  // in-place, output=input
+        "o[i] = sqrt(a[i]) * k - b[i] / c[i] + a[i] * b[i]",         // mixed, 3 streams + scalar
+    ];
+    // Trip counts around the 8-lane group boundary, its multiples, and non-multiples (tail).
+    let sizes: &[usize] = &[1, 2, 7, 8, 9, 15, 16, 17, 24, 63, 64, 65, 100, 255, 256, 257];
+
+    for body in bodies {
+        for &n in sizes {
+            for form in ["for", "while"] {
+                let loop_src = if form == "for" {
+                    format!("for i in 0..{n} {{ {body}; }}")
+                } else {
+                    format!("let mut i: i32 = 0; while i < {n} {{ {body}; i += 1; }}")
+                };
+                let src = format!(
+                    "fn main() -> i32 {{ \
+                       let mut a: [f32; {m}] = [0.0; {m}]; let mut b: [f32; {m}] = [0.0; {m}]; \
+                       let mut c: [f32; {m}] = [0.0; {m}]; let mut o: [f32; {m}] = [0.0; {m}]; \
+                       let k: f32 = 1.5; \
+                       for j in 0..{n} {{ a[j] = (j as f32) * 0.5 - 3.0; b[j] = (j as f32) * 0.25 + 1.0; c[j] = (j as f32) - 7.0; }} \
+                       {loop_src} \
+                       let mut s: f32 = 0.0; for j in 0..{n} {{ s = s + a[j] + o[j]; }} \
+                       print(s as i32); return ((s as i32) & 255); }}",
+                    m = n.max(1),
+                );
+                let native = jit(&src, 3)
+                    .unwrap_or_else(|e| panic!("jit -O3 [{form} n={n}] `{body}`: {e}"));
+                let oracle = interp(&src, 3)
+                    .unwrap_or_else(|e| panic!("interp [{form} n={n}] `{body}`: {e}"));
+                assert_eq!(native, oracle, "native vs interp [{form} n={n}] `{body}`");
+                let o0 = jit(&src, 0)
+                    .unwrap_or_else(|e| panic!("jit -O0 [{form} n={n}] `{body}`: {e}"));
+                assert_eq!(o0, native, "-O0 vs -O3 [{form} n={n}] `{body}`");
+            }
+        }
+    }
+}
+
 /// Run `src` through the interpreter for differential comparison.
 fn interp(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     let mut interner = Interner::new();
