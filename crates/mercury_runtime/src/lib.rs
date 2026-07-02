@@ -49,7 +49,7 @@ mod lowp;
 pub use lowp::{
     mercury_axpby_bf16, mercury_axpby_bf16_out, mercury_axpby_f16, mercury_axpby_f16_out,
     mercury_dot_bf16, mercury_dot_f16, mercury_reduce_bf16, mercury_reduce_f16, mercury_sum_bf16,
-    mercury_sum_f16,
+    mercury_sum_f16, mercury_vmath_bf16_out, mercury_vmath_f16_out,
 };
 
 mod transpose;

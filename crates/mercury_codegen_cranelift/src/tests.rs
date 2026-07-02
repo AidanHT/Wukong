@@ -783,6 +783,55 @@ fn differential_half_out_axpby() {
     );
 }
 
+/// The **half-output** activation `out[k] = (f((x[k] as f32))) as {bf16,f16}` — half in AND a narrowing
+/// half store — must dispatch to `mercury_vmath_{bf16,f16}_out` and stay native==interp across opt
+/// levels. The activation is the shared `vmath` kernel and the narrowing store the shared shim, so the
+/// half-out result equals the half-in/f32-out activation narrowed with `as {bf16,f16}` bit-for-bit.
+#[test]
+fn differential_half_out_vmath() {
+    // bf16 in, bf16 out -> the narrowing activation kernel.
+    let bf = "module m\nfn a(x:[bf16;64], o:[bf16;64]) { \
+        for k in 0..64 { o[k] = (silu((x[k] as f32))) as bf16; } }";
+    assert!(
+        lowered_calls(bf, "mercury_vmath_bf16_out"),
+        "bf16-in/bf16-out activation -> mercury_vmath_bf16_out"
+    );
+    // f16 in, f16 out -> the f16 twin.
+    let hf = "module m\nfn a(x:[f16;64], o:[f16;64]) { \
+        for k in 0..64 { o[k] = (gelu((x[k] as f32))) as f16; } }";
+    assert!(
+        lowered_calls(hf, "mercury_vmath_f16_out"),
+        "f16-in/f16-out activation -> mercury_vmath_f16_out"
+    );
+    // An **f32** output must NOT take the narrowing path (it's the plain half-in/f32-out kernel).
+    let f32out = "module m\nfn a(x:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = silu((x[k] as f32)); } }";
+    assert!(
+        !lowered_calls(f32out, "mercury_vmath_bf16_out"),
+        "f32-output activation must not take the narrowing store path"
+    );
+
+    // native == interp across opt levels, over a sign/magnitude spread, both halves and two activations.
+    for (ty, act) in [("bf16", "silu"), ("f16", "gelu")] {
+        let prog = format!(
+            "fn a(x:[{ty};4096], o:[{ty};4096]) {{ \
+             for j in 0..4096 {{ o[j] = ({act}((x[j] as f32))) as {ty}; }} }} \
+             fn main() -> i32 {{ let mut x:[{ty};4096]=[0.0 as {ty};4096]; \
+             let mut o:[{ty};4096]=[0.0 as {ty};4096]; \
+             for i in 0..4096 {{ x[i]=(((i as f32)-2048.0)*0.01) as {ty}; }} \
+             a(x,o); let mut s:f32=0.0; for t in 0..4096 {{ s = s + (o[t] as f32); }} \
+             print((s*100.0) as i32); return 0; }}"
+        );
+        for opt in [0u8, 2, 3] {
+            assert_eq!(
+                jit(&prog, opt).expect("jit"),
+                interp(&prog, opt).expect("interp"),
+                "{ty}-out {act} native vs interp mismatch at -O{opt}"
+            );
+        }
+    }
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
