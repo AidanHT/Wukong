@@ -2224,6 +2224,16 @@ impl FnLowerer<'_> {
                         let d = self.field_ptr(dst, off);
                         self.emit_copy(d, s, &fty);
                     }
+                } else {
+                    // An enum has no struct fields (`struct_field_tys` → None); its value is a
+                    // scalar leaf — the i32 discriminant. Fall through to a scalar load+store, like
+                    // the `_` arm. Without this the enum leaf was silently skipped, so copying any
+                    // aggregate that contains an enum (`let b = a`, sret return, array/tuple element,
+                    // nested struct) left the destination's enum slot uninitialized — a gate-blind
+                    // wrong answer that also diverged interp (zero slot → 0) vs native (stack garbage).
+                    let mir = self.mir_ty_of(ty);
+                    let v = self.builder.build(mir.clone(), Op::Load(src, mir.clone()));
+                    self.builder.build_void(Op::Store { ptr: dst, value: v });
                 }
             }
             Ty::Tuple(fields) => {
