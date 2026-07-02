@@ -103,7 +103,24 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
   row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
   on both backends (`tests/run/tensor_*.mer`) — and a matmul written in tensor notation dispatches to
-  the tuned GEMM kernel (see below). Symbolic-generic dims are still pending (see below).
+  the tuned GEMM kernel (see below).
+- **Symbolic-generic tensor shapes** `fn f<M, N>(a: Tensor[f32, M, N])` **execute** — the capstone of
+  the shape-safety story: a shape-generic tensor function *proves* its shapes at compile time (the
+  dims are rigid generics in the body, so no shape-lie; see the shape-checking limitation note below)
+  **and runs at any per-call size**. The per-call dims are threaded in as hidden leading `i64`
+  parameters (the standard "dependent dims become value args" lowering): the row-major index stride of
+  `a[i, j]` becomes `i*N + j` with `N` a runtime value, `0..M` reads the dim as a value, and the caller
+  supplies each dim from a turbofish (`f::<2, 3>(…)`) or infers it from the argument shapes (a const
+  dim, a caller-side symbolic dim, or a decaying array's length). Because the symbolic address
+  arithmetic is identical to the constant-shape form when the runtime dims equal the constants, a
+  symbolic `f<M, N>` is **byte-identical** to the same kernel written with literal dims — interp ==
+  native, `-O0` == `-O{1,2,3}` (`tests/run/generic_shape.mer`). A **symbolic-dim matmul still dispatches
+  to the tuned GEMM kernel** (the recognizer already compares strides by dimension identity; once the
+  dims are runtime values `emit_sgemm` materializes them from the hidden params), so `matmul<M, N, K>`
+  runs on the AVX2/FMA microkernel at any size (`tests/run/generic_shape_matmul.mer`). Ranks 1–3,
+  elementwise kernels, and a generic caller forwarding its own symbolic tensors all run. *(A
+  `@parallel` symbolic-shape function is the remaining edge — the loop outliner does not yet thread the
+  hidden dims, so give it literal dims for now.)*
 - **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
@@ -304,13 +321,6 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
 
 ## Checked but not yet executed
 
-- **Symbolic-generic tensor shapes** `fn f<M, N>(a: Tensor[f32, M, N])`: a tensor with a
-  **compile-time-constant** shape now lowers and **runs** end-to-end on both backends (multi-dim
-  indexing `a[i, j]` → row-major GEP; elementwise tensor kernels and tensor matmuls execute — see
-  `tests/run/tensor_*.mer`, and a matmul written in tensor notation now dispatches to the tuned GEMM
-  kernel, a 2-index access supplying its row stride from the operand's inner tensor dimension). What is
-  still pending is executing a *symbolic* generic shape, where the dims `M, N` are only bound per call
-  — those need hidden runtime dim params (give literal dims to run today).
 - **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector
   *values* are not yet executed, and the native ISA path (Cranelift) caps vector SSA at 128-bit
   (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
@@ -377,10 +387,11 @@ against a closed-form reference. It is a library transform today, not yet a CLI 
   variables, not rigid — `matmul::<…>(a, b, c)` binds `M, N, K` from the arguments as before). A
   related hole is also closed: a rank-1 tensor parameter binds its symbolic dim from a decaying
   array's length, so `f<N>(a: Tensor[f32, N], b: Tensor[f32, N])` rejects arrays of different lengths
-  (`tests/fail/generic_tensor_arg_length_mismatch.mer`). One **lenience** remains by design: an
-  **undeclared** dim name in a tensor type is auto-introduced as a fresh implicit dim (a typo like
-  `Tensor[f32, KK]` for `K` silently drops the shared constraint — slated for an unknown-dim
-  diagnostic).
+  (`tests/fail/generic_tensor_arg_length_mismatch.mer`). The former undeclared-dim **lenience** is now
+  a diagnostic: an **undeclared** dim name in a tensor type (not a declared generic, integer, `?`, or
+  `const`) is rejected with **E0504** and a did-you-mean hint, so a typo like `Tensor[f32, KK]` for `K`
+  no longer silently introduces a fresh implicit dim and drops the shared constraint
+  (`tests/fail/generic_shape_unknown_dim.mer`).
 - A `for i in 0..n` loop **re-reads its upper bound `n` live each iteration** (it lowers to a C-style
   `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
   iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
