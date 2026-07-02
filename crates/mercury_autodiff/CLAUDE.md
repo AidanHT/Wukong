@@ -27,9 +27,15 @@ the gradient of that loss w.r.t. designated input buffers (the vector-Jacobian p
   consumer's VJP and read by the producer's. The two meet at a reduction (a scalar-returning
   `sreduce` call seeds a buffer gradient via broadcast). Covered kernels: `sgemm_nt` (nn.Linear:
   dA = dC·B, dB = dCᵀ·A — one transpose loop + two NN GEMMs, `beta=1` to accumulate when a buffer
-  feeds two matmuls), `vmath` activation (relu/sigmoid/tanh/exp, `dx = dout⊙f'(x)`), `sreduce`
-  (SUM/SSD/DOT), `velem` identity (residual/scale), and `mercury_norm_f32` (softmax / LayerNorm /
-  RMSNorm backward, per-row reductions + an elementwise combine in nested loops).
+  feeds two matmuls), `vmath` activation — the algebraic ones (relu/sigmoid/tanh/exp) via a
+  synthesized `dx = dout⊙f'(x)` loop, the smooth transcendental ones (**silu/gelu/elu/softplus**) via
+  one fused `mercury_vmath2_f32(x, dout, dx, n, *_BWD)` call (bit-identical with the forward),
+  `sreduce` **and** `sreduce_parallel` (SUM/SSD/DOT — a `.mer` reduction lowers to the `@parallel`
+  symbol), `velem` identity (residual/scale), and `mercury_norm_f32` (softmax / LayerNorm / RMSNorm
+  backward, per-row reductions + an elementwise combine in nested loops). Kernel buffer operands are
+  canonicalized (`Vjp::canon`) so a whole-buffer `gep(buf, 0)` — the form lowering emits for some
+  operands — keys the same buffer-adjoint entry as the bare `alloca`; without it a real multi-kernel
+  tape from source would silently break the gradient chain between ops.
 
 ## Key entry points
 - `grad(func, wrt, interner)` — the transform. `func`: a single-block, SSA-form forward function
@@ -72,10 +78,29 @@ matmul / activation / reduction / norm work to the device with no new kernels.
   be in-place (it would overwrite `x` with `y`).
 - Op codes (`VM_*`, `RED_*`, `NORM_*`, `VE_*`) are mirrored from `mercury_runtime`; keep them in sync.
 
+## CLI surface (`mercury_driver`)
+Autodiff is exposed on the command line (the roadmap's "library transform, not yet a CLI surface" is
+resolved for the recognized-kernel set):
+- `mercuryc --emit=grad --grad-of=<fn> [--grad-wrt=i,j] model.mer` — force ≥`-O1`, run `grad`, and
+  print the forward + `{fn}_grad` MIR. `--grad-wrt` defaults to every buffer parameter (an unread /
+  output buffer just gets a correct zero gradient). Driven from real `.mer` source, so the *forward*
+  must lower to a single-block tape — every loop recognized into a kernel call (matmul → `sgemm_nt`,
+  activation → `vmath`, reduction → `sreduce_f32_parallel`); a bare scalar loss uses the scalar core.
+- `mercuryc --train --grad-wrt=<weights> [--train-opt=sgd|adamw] [--train-steps] [--train-lr] model.mer`
+  — a fwd→bwd→optimizer loop printing the loss trajectory. Convention: `--grad-wrt` = trainable
+  weights, other buffers = fixed data, **last param = the scalar loss output `[f32;1]`**. Buffer sizes
+  come from the semantic types (`ty_elem_count` / `loss_param_lens`), not the `Ptr`-erased MIR.
+- Gated end to end in `mercury_driver`'s `grad_cli_tests` (compile → optimize → differentiate →
+  finite-difference-check on the interpreter): the scalar core, a linear-MSE model, silu/gelu, a
+  transformer FFN block, the all-buffers default, and both training optimizers (loss strictly decreases).
+
 ## Status / frontier
-Done & gated: the full scalar core; the tensor tape (matmul, relu/sigmoid/tanh activations, sum/SSD/
-dot reductions, residual, softmax/LayerNorm/RMSNorm); the fused AdamW kernel; and end-to-end MLP
-training with SGD and AdamW (loss decreases). **Frontier (M8):** a GPU-resident training step that
+Done & gated: the full scalar core; the tensor tape (matmul, relu/sigmoid/tanh/**silu/gelu/elu/
+softplus** activations — the smooth ones via the fused `mercury_vmath2_f32` `*_BWD` kernel, sum/SSD/
+dot reductions serial **and `@parallel`**, residual, softmax/LayerNorm/RMSNorm); the fused AdamW
+kernel; a full pre-norm block (norm+matmul+activation composite); the **`--emit=grad` / `--train` CLI
+surface** (above); and end-to-end MLP training with SGD and AdamW (loss decreases). **Frontier (M8):**
+a GPU-resident training step that
 beats PyTorch eager. The pieces in place: the backward emits GPU-offloadable kernels, and AdamW is a
 single fused kernel. Remaining: lower the synthesized loops (transpose / activation-backward / the
 optimizer) to GPU kernels so the whole step stays device-resident, add the attention (FA2 dQ/dK/dV)
