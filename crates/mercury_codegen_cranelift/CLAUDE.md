@@ -9,6 +9,13 @@ Mercury's runtime competitive; see `BENCHMARKS.md`.
 - `src/lib.rs` — entire backend: type/size/condcode mappers, `FnTranslator` (per-function MIR→CLIF),
   module driving (`populate_module`), `JitProgram`/`JitModuleHandle`, `jit_compile`/`jit_run`/
   `jit_module`/`emit_object`, and the runtime `rt_*` symbols.
+- `src/avx2.rs` — raw-AVX2 **256-bit** machine-code emitter (via `iced-x86` `code_asm`, so VEX/ModRM
+  and branch fixups are correct by construction) for the general (non-recognized) loop vectorizer's
+  256-bit path: `assemble_kernel` turns a backend-agnostic `VecKernel` recipe (produced by the
+  `mercury_mir_build` vectorizer) into a self-contained `fn(ptrs, scalars, n)` that the module driver
+  installs with `define_function_bytes`; the interpreter marshals the *same* recipe lane-wise, so the
+  two stay bit-identical (the differential gate polices it). Exists because Cranelift caps CLIF vectors
+  at 128-bit (see Gotchas).
 - `src/backend.rs` — `CraneliftBackend` implementing the `mercury_backend::Backend` trait.
 - `src/tests.rs` — correctness + differential tests (native vs interpreter) incl. the vectorizer and
   `@parallel`.
@@ -39,8 +46,13 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
 ## Gotchas
 - **PIC differs by product:** the JIT needs `is_pic=false`, the object emitter `true` —
   `make_isa(pic)` is parametrized. JIT entry points must take no parameters.
-- **Vectors are 128-bit only.** Cranelift does not legalize `f32x8` ("Unexpected SSA-value type"), so
-  the vectorizer (in `mercury_mir_build`) targets `VEC_REG_BYTES=16` and unrolls for throughput.
+- **CLIF vectors are 128-bit only; wider SIMD is raw AVX2.** Cranelift still does not legalize `f32x8`
+  ("Unexpected SSA-value type" — guarded by the `cranelift_still_rejects_f32x8` / `p4_probe_vec256_ops`
+  tripwires in `tests.rs`), so the CLIF vectorizer (in `mercury_mir_build`) targets `VEC_REG_BYTES=16`
+  and 4×-unrolls for throughput. For large f32 trip counts that vectorizer instead emits a `VecKernel`
+  recipe this crate assembles to a **256-bit** AVX2 kernel (`src/avx2.rs`); the kill-switch env var
+  `MERCURY_P4_NO_256=1` (read in `mercury_mir_build`) forces the 128-bit CLIF path. The differential
+  gate covers the 256-bit lanes too.
 - **Vector memory is unaligned-safe**, but vector `Select` lowers to `bitselect` after bitcasting the
   compare mask to the value vector type (Cranelift has no scalar-cond vector `select`).
 - **Float typing must be consistent in the incoming MIR.** Cranelift's verifier rejects `fadd` on
@@ -50,7 +62,7 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   or 128-bit vector). The front-end contracts float `x + y*z` into it; the interpreter mirrors it
   with `mul_add`, and the two agree bit-for-bit (gated by `fma_contraction_is_bit_exact`). This is
   why `mercury_xbench` gives gcc `-ffp-contract=fast` — both sides fuse.
-- Runtime symbols (`mercury_rt_print_i64`/`_f64`/`_assert`, `mercury_parallel_for`, the GEMM
+- Runtime symbols (`mercury_rt_print_i64`/`_u64`/`_f64`/`_str`/`mercury_rt_assert`, `mercury_parallel_for`, the GEMM
   microkernels `mercury_sgemm`/`_parallel`/`_nt`/`_nt_parallel`/`_nt_epi` (the `_nt_epi` fused-epilogue
   one takes a bias pointer + an `act` code: identity/ReLU/GELU/SiLU, bias may be a null pointer), the
   int8 GEMM `mercury_i8gemm_nt`/`_parallel`, the 256-bit elementwise transcendental
@@ -59,7 +71,16 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   `mercury_vhorner_f32` (ptr,ptr,i64,ptr,i64), the reduction `mercury_sreduce_f32`/`_parallel`, the
   fused row-wise norm `mercury_norm_f32`/`_parallel` and its affine sibling `mercury_norm_affine_f32`/`_parallel`
   (4 ptr + 4 i64; gamma/beta may be a null pointer; the `_parallel` ones map rows across cores)) are bound to Rust fns in the JIT and left as
-  imports in the object (resolved by the driver's C runtime). A global run lock serialises JIT runs
+  imports in the object (resolved by the driver's C runtime). That list is only a slice — the recognized
+  symbol set has since grown to ~150: the rest of the GEMM family (`_tn`, α-scaled `_nt_alpha`, GEMV
+  `mercury_sgemv`, bf16/f16 `mercury_sgemm_{bf16,f16}_*` incl. fused epilogues, int8 `_deq` dequant),
+  pooling (`mercury_{max,avg}pool2d_f32`), `mercury_embedding_f32` + `mercury_scatter_add_f32`,
+  `mercury_rope_f32`, column/row reductions (`mercury_col{sum,max,min,maxabs,mean,l2,rms}_f32`,
+  `mercury_{row,col}arg{max,min}_i32`), cumulative scans (`mercury_{cumsum,cumprod,cummax,cummin,lrscan}_f32`),
+  `mercury_transpose_{f32,u16}`, backward kernels (`mercury_{softmax,layernorm,rmsnorm,rope}_bwd_f32`,
+  two-arg `mercury_vmath2_f32`), and a fused `mercury_attention_f32` (a memory-efficient SDPA — *not* a
+  CPU throughput win over the GEMM-dispatch attention path) — every one wired through the same sites
+  below, with `_parallel` siblings mapping rows/tiles across cores. A global run lock serialises JIT runs
   that share the stdout-capture buffer.
 - **A runtime call may return a value.** Most (`mercury_sgemm*`, `mercury_vmath_f32`) are void, but
   `mercury_sreduce_f32[_parallel]` returns an **f32** — its `lower_call` arm binds the call result

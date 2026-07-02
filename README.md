@@ -86,7 +86,7 @@ Where Mercury is built to win for the ML/DL niche:
 
 ```mercury
 // (1) shape-typed tensors  (2) SIMD vectors  (3) explicit memory/layout  (4) parallelism
-fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], out: Tensor[f32, N]) {
+fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], mut out: Tensor[f32, N]) {
     @parallel @simd
     for i in 0..N {
         out[i] = a * x[i] + y[i];   // fused multiply-add, vectorized, parallelized
@@ -98,7 +98,7 @@ That tensor/`@parallel`/`@simd` form is the target surface (it type- and shape-c
 same kernel over fixed-size arrays **runs today** on the interpreter:
 
 ```mercury
-fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], out: [f32; 4]) {
+fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
     let mut i: i32 = 0;
     while i < 4 {
         out[i] = a * x[i] + y[i];   // arrays pass by reference; `out` is mutated in place
@@ -128,7 +128,7 @@ Mercury IR (MIR)         one SSA IR that lowers progressively from "High" to "Lo
 MIR (Low)
    ├──────────────► interpreter      (always available, zero deps; the reference oracle)
    ├──────────────► Cranelift backend (native JIT + object/exe; NO LLVM — the fast path)
-   ├──────────────► GPU backend      (PTX + cudarc driver-JIT; offload + MIR→PTX)   [feature = "gpu"]
+   ├──────────────► GPU backend      (PTX + cudarc driver-JIT; --backend=gpu offload + --backend=gpu-native MIR→PTX)   [feature = "gpu"]
    └──────────────► LLVM backend     (textual IR for external clang/llc — always available, no feature flag)
 ```
 
@@ -146,22 +146,25 @@ and `@parallel`, incl. `nn.Linear` `A·Bᵀ`), SIMD auto-vectorization (elementw
 contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels. A
 **GPU backend** (`--features gpu`; NVIDIA, PTX via cudarc driver-JIT) adds tensor-core GEMM, fused
 flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode autodiff**
-(`mercury_autodiff`) emits the training backward pass — both gated against the interpreter oracle.
+(`mercury_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
+pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop — both gated against the interpreter oracle.
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
 (`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`
 that a nested `break 'outer` / `continue 'outer` can target) execute end-to-end on both backends — as do
-**`match`** (literal / range / or / enum-variant / tuple patterns, with guards), **C-style enums**,
-top-level **`const`** values, **`let` tuple destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
+**`match`** (literal / range / or / enum-variant / tuple patterns, with guards), **C-style and
+data-carrying (tagged-union) enums**, **slices `[]T`** (fat-pointer views with `.len()`, indexing,
+iteration, and array→slice unsizing), top-level **`const`** values, **`let` tuple destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
 `'A'` literals**, and **`"string"` literals** (typed `*u8`, rendered by `print`). And
 **constant-shape tensors run** —
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
 flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a
 matmul written in tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot and accumulate spellings)
-dispatches to the same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` form. Symbolic-generic
-tensor dimensions are still being wired. See the docs:
+dispatches to the same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` form. **Symbolic-generic
+tensor dimensions execute too** — `fn f<M, N>(t: Tensor[f32, M, N])` runs at any per-call size via
+hidden runtime dim params (`tests/run/generic_shape.mer`). See the docs:
 
-- [Benchmarks](BENCHMARKS.md) — honest cross-language results vs C and Rust, with methodology.
+- [Benchmarks](BENCHMARKS.md) — honest cross-language results vs C, C++, and Rust, with methodology.
 - [Language guide](docs/language-guide.md) — the language surface, with an honest maturity legend.
 - [Compiler internals](docs/internals.md) — architecture, MIR, optimizer, the native backend, and testing.
 - [Roadmap & limitations](docs/roadmap.md) — what runs, what's checked-only, what's planned.
@@ -175,7 +178,7 @@ cargo test                  # unit + golden + end-to-end + differential (interp 
 cargo run -p mercuryc -- --help
 cargo run -p mercuryc -- --run examples/fib.mer
 cargo run -p mercury_bench --release -- tests/run examples bench/kernels   # optimizer report
-cargo run -p mercury_xbench --release      # cross-language benchmark vs C/Rust (needs gcc/rustc)
+cargo run -p mercury_xbench --release      # cross-language benchmark vs C/C++/Rust (needs gcc/g++/rustc)
 ```
 
 The native backend (Cranelift) is built in by default and needs no toolchain. The optional LLVM

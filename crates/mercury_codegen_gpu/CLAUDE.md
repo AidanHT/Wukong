@@ -163,6 +163,13 @@ toolkit — only **running** needs the driver + a device.
   `_geglu`). 128×64 dual-B tile (fp8 = 1 byte/elem ⇒ three staged tiles fit 40 KiB); gated by
   `fp8_swiglu_gate_match_reference_within_tol` (max_abs ≤ 9.6e-2 at K=192 — the single fp8 GEMM's ~1e-2
   precision amplified by the product, honest fp8). Completes fp16/bf16/fp8 parity for the gated FFN.
+- `src/ptx_fp8_train.rs` — **fp8 *training* kernels** (Phase 6): the **E5M2** backward GEMM (E5M2 grad ×
+  E4M3 weight/act → f32, `mma.sync.m16n8k32.f32.e5m2.e4m3.f32`), per-tensor `amax` reduction, and
+  delayed-scaling quantization — the Transformer-Engine two-format recipe (E4M3 forward / E5M2 backward).
+  E5M2 and E4M3 share the 8-bit `m16n8k32` fragment layout, so this is `ptx_fp8.rs`'s fragment-reuse GEMM
+  with only the `mma` operand-type tokens swapped, kept in its own file so the load-bearing forward E4M3
+  path is never touched. Gated to the ordinary `c·√K·ε_f32` GEMM tolerance vs an f64 ref that decodes the
+  same e5m2/e4m3 bits (the quant rounding is baked into both sides).
 - `src/ptx_int4.rs` — **W4A16 int4 weight-only decode** (M4 — the LLM-decode workhorse, an *immature*
   GPU-library field so a documented lead). Host group-wise int4 quant (`quantize_weight_symmetric` /
   `quantize_weight_asymmetric` — AWQ/GPTQ zero-point, group=128) into the **Marlin/AWQ-interleaved**
@@ -211,7 +218,50 @@ toolkit — only **running** needs the driver + a device.
   separate. Owned by the int8 slice (`gpu-int8-gemm`).
 - `src/ptx_norm.rs` — fused row-norm generators (softmax/LayerNorm/RMSNorm, one warp/row, shfl reduce).
 - `src/ptx_flash.rs` — fused flash-attention generator (online softmax, warp-per-query-row, D∈{32,64,128}).
+- `src/paged_kv.rs` — **paged KV-cache** (serving): a vLLM-style block-table-indexed K/V cache. `BlockManager`
+  is **pure host logic** (free-list allocator + per-slot block tables + context lengths, unit-tested with no
+  device); `PagedKvCache` is the **device storage** — f16 K/V slabs `[layers, num_blocks, block_size, heads,
+  head_dim]` plus the block-table/context-length upload the decode kernel reads (f16 halves the dominant
+  serving-time footprint). First-law property: the block table changes only *where* a token's K/V is read,
+  never the value or accumulation order → a paged read is bit-identical to a contiguous one.
+- `src/paged_attention.rs` — **paged decode-attention kernel** (serving): single-query attention against the
+  paged KV-cache, gathering each sequence's K/V through its block table, with a numerically-stable **online
+  softmax** in **fp32 accumulators**. Correctness-first v1 is one thread per `(slot, head)`, fully sequential
+  over its context → trivially **bit-exact across physical block layouts** and no SMEM logits buffer (so no
+  v2-style split-K at long context). Tolerance-gated vs an f64 full-softmax CPU reference; a warp-cooperative
+  rewrite is the documented next perf lever.
+- `src/serving.rs` — **batched autoregressive decode** layer/model over the paged KV-cache — the serving
+  forward pass (`gpu.rs`'s `ResidentLayerF16` is prefill-only). `DecodeLayer` runs one pre-norm transformer
+  layer over a batch of `Bcap` single-token rows (the same tuned WMMA f16 GEMMs, M=`Bcap` a multiple of 64 ⇒
+  static, graph-capturable), appending projected K/V to the cache (`launch_kv_append`) and attending via
+  `launch_paged_attn_decode` per-sequence — Orca selective batching (token-wise ops batched, attention
+  per-sequence). `DecodeModel` is the `N`-layer stack owning the `PagedKvCache`/`DevicePool`/metadata buffers;
+  one `step_on` advances every active sequence by one token, GPU-resident — the unit a whole-model CUDA graph
+  captures (P4) and a continuous-batching scheduler drives (P5).
 - `src/ptx_conv.rs` — direct conv2d (one thread per output element).
+- `src/ptx_winograd.rs` — **Winograd** convolution F(2×2,3×3) and F(4×4,3×3) as a **verified f64 CPU
+  reference** — the correctness oracle the GPU Winograd kernel builds on. Pure `f64` Rust with **no GPU
+  symbols**, so a plain `cargo test` (no `--features gpu`) checks it via a `#[cfg(test)]` differential against
+  the naive direct conv (`winograd ≈ direct` < 1e-9). Same op as the crate's conv2d: single batch, stride 1,
+  no padding, valid cross-correlation.
+- `src/ptx_autodiff_bwd.rs` — **backward (gradient) GPU kernels for the autodiff tape** — the device twin of
+  the counted loops `mercury_autodiff::tape` synthesizes on the CPU (buffer transpose for `dB = dCᵀ·A`, the
+  elementwise activation-backward `dx = dout ⊙ f'(x)`, per-row norm-backward combines), plus the
+  **flash-attention backward** (dQ/dK/dV). Each kernel mirrors the exact math the tape emits, so it is gated
+  tolerance-/bit-equal to that op; the tape's CPU form is finite-difference-gated, transitively making the
+  device form correct. Grid-stride / one-CTA-per-row → correctness is grid-independent.
+- `src/ptx_optim.rs` — **fused optimizer-step PTX kernels**: **AdamW** and **SGD**. Every parameter's
+  `(w, g, m, v)` buffers are laid out contiguously and updated in **one grid-stride launch** (the fusion a
+  tensor library splits into one launch per parameter — the M8 lever). The AdamW kernel mirrors
+  `mercury_autodiff::optim::build_adamw_step` **op-for-op** (IEEE-754 single-rounded f32), gated against that
+  MIR run on the interpreter oracle — most lanes bit-exact, the residual a ≤1-ulp double-rounding difference.
+- `src/train_resident.rs` — a **GPU-resident MLP training step** (M8): forward + backward + optimizer with no
+  per-op host round-trip, assembled from `ptx_autodiff_bwd` + `ptx_optim`. The net is a 2-layer MLP
+  (`X→W1→relu→W2→Y`, MSE loss); forward is two NT GEMMs + relu, backward is the tape's VJP structure as direct
+  launches (`dW2=dYᵀ·H`, `dH=dY·W2`, `dH_pre=dH⊙relu'(H_pre)`, `dW1=dH_preᵀ·X`), the update the fused AdamW
+  kernel. All intermediates stay in device buffers (`MlpTrainer`) across the step; only the inputs (once) and
+  the scalar loss (gate) cross the bus. Gated: gradients vs an f64 closed-form backprop, and the loss strictly
+  falls. Benched vs PyTorch eager.
 - `src/diff.rs` — tolerance harness (`Rng`, `assert_close`/`assert_scalar_close`).
 - `src/lower.rs` — **general MIR→PTX lowering** (Phase 4, `--backend=gpu-native`): lowers an *arbitrary*
   Mercury program to one PTX kernel (SSA→vregs, block params→register copies, control flow→predicated

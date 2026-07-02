@@ -114,13 +114,15 @@ usable annotated type (`let c: char = 'A'`) and is interconvertible with the int
 in both directions, so it can be cast, compared, and used in arithmetic (`tests/run/char_literals.mer`,
 `tests/run/char_type.mer`).
 
-A **string literal** `"hello"` materializes its UTF-8 bytes (plus a trailing NUL) into a stack byte
-buffer and is typed `*u8` — the same by-pointer convention as an array. The escapes `\n` `\r` `\t`
-`\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode (each code point re-encoded as UTF-8). `print`/`println` of
-a `*u8` — a literal or a `let s = "hi";` binding — renders the
-bytes, while numeric `print` still prints numbers (`tests/run/string_literal.mer`). There is **no
-string type beyond `*u8`** yet: no concatenation/indexing/length operators and no general
-static-data section — a string is just a NUL-terminated `*u8` buffer suitable for `print` (🟡).
+A **string literal** `"hello"` is typed `*u8` — the same by-pointer convention as an array. Each
+unique literal is interned once into a read-only **`.rodata`** static blob (deduplicated by content,
+plus a trailing NUL) and its value is that blob's address (`Op::GlobalAddr`). The escapes `\n` `\r`
+`\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode (each code point re-encoded as UTF-8). `print`/`println`
+of a `*u8` — a literal or a `let s = "hi";` binding — renders the bytes, while numeric `print` still
+prints numbers (`tests/run/string_literal.mer`). Because the blob lives in static data (not the
+stack frame), a `*u8` can be **returned from a function and threaded across calls** without dangling
+(`tests/run/string_return.mer`). There is still **no string type beyond `*u8`**: no
+concatenation/indexing/length operators — a string is a NUL-terminated `*u8` into `.rodata` (🟡).
 
 ## Types
 
@@ -133,10 +135,10 @@ static-data section — a string is just a NUL-terminated `*u8` buffer suitable 
 | Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
 | Tuples      | `(A, B, …)`, field access `t.0`, nested `t.0.1`       | ✅     |
 | Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
-| Enums       | C-style `enum E { A = 10, B }` — a variant is its `i32` discriminant | ✅     |
-| Aggregates  | slices `[]T`                                          | 🟡  |
+| Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
+| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, indexed load/store, iteration, array→slice unsizing | ✅ |
 | SIMD vectors| `f32x4`/`i32x4` (128-bit), generic `vec[T, N]`; wider `f32x8` parses/checks but caps at the 128-bit native ISA | 🟡 |
-| Tensors     | `Tensor[f32, M, N]` (+layout) — **const-shape indexing & ops run**; symbolic generic dims shape-checked | ✅ / 🟡 |
+| Tensors     | `Tensor[f32, M, N]` (+layout) — indexing & ops run for **const *and* symbolic-generic** dims | ✅ |
 
 ## Operators ✅
 
@@ -239,18 +241,26 @@ read-only, and a `mut` one is the in-place output buffer a kernel writes.
 enum Code { Ok = 10, Err = 20 }
 enum Color { Red, Green, Blue }   // 0, 1, 2 (auto-increment from 0)
 enum Step { A = 5, B, C }         // 5, 6, 7 (continue after the last explicit value)
+enum Expr { Num(i32), Add(i32, i32), Nil }                 // tuple-payload (tagged-union) variants
+enum Shape { Circle { r: i32 }, Rect { w: i32, h: i32 } }  // struct-payload variants
 ```
 
 A **C-style enum** gives each variant an integer discriminant — explicit (`= 10`) or
 auto-incrementing from the previous. A variant `E::Name` *is* its discriminant, so it can be bound to
 a `let`, compared (`==`), cast (`Code::Ok as i32`), and used as a `match` pattern
-(`tests/run/enum_cstyle.mer`). Data-carrying (tagged-union) variants — and matching over an enum
-*payload* — are not supported; only C-style enums and matching by discriminant.
+(`tests/run/enum_cstyle.mer`). **Data-carrying (tagged-union) variants** also run: a variant may
+carry a tuple payload (`Num(i32)`, `Add(i32, i32)`) or named struct fields (`Circle { r: i32 }`), is
+constructed as `Expr::Add(3, 4)` / `Shape::Circle { r: 5 }`, and is taken apart by a **payload
+`match`** that binds each field — with literal sub-patterns (`Add(0, y)`), `if` guards, nesting in an
+array of enums, and embedding in a struct field (`tests/run/enum_payload_tuple.mer`,
+`enum_payload_struct.mer`). A value is a 4-byte `i32` discriminant plus a padded payload union
+addressed by base pointer, so the interpreter and the native backend address it identically
+(interp == native, `-O0` == `-O3`).
 
-## Tensors and compile-time shape checking ✅ shape-check + const-shape exec (the headline feature)
+## Tensors and compile-time shape checking ✅ shape-check + const- and symbolic-shape exec (the headline feature)
 
 ```mercury
-fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) { ... }
+fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) { ... }
 ```
 
 Tensor dimensions are part of the type. The semantic analyzer unifies dimensions across a call:
@@ -282,9 +292,13 @@ matmuls run — `tests/run/tensor_*.mer`. A matmul written in tensor notation
 (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot-product `s += a[i,k]*b[k,j]` and accumulate
 `c[i,j] += a[i,k]*b[k,j]` spellings, including the `b[j,k]` `nn.Linear` `A·Bᵀ` form) dispatches to the
 same tuned `mercury_sgemm` microkernel as the flat `a[i*K+k]` spelling — a 2-index access supplies its
-row stride from the tensor's inner dimension. Executing a **symbolic-generic** shape (`matmul<M, N, K>`
-with the dims only known per call) is still being wired (🟡): give the dims as literals
-(`Tensor[f32, 512, 512]`) to run today.
+row stride from the tensor's inner dimension. A **symbolic-generic** shape now executes too (✅):
+`fn add<M, N>(a: Tensor[f32, M, N], …)` runs at any per-call size — the dims are threaded in as
+hidden runtime `i64` parameters, so `a[i, j]`'s row stride (`i*N + j`, with `N` a runtime value) and
+the loop bounds (`0..M`) resolve at run time, and a turbofish supplies them (`add::<2, 3>(…)`)
+(`tests/run/generic_shape.mer`). Because the symbolic address arithmetic matches the constant-shape
+form, it is byte-identical to the same kernels written with literal dims — and even a matmul with
+runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.mer`).
 
 ## Attributes 🟡
 
@@ -316,8 +330,8 @@ vector values are still under construction (🔵).
 - `println(x)` — alias of `print`.
 - `assert(cond)` — trap with a nonzero exit code if `cond` is false (zero); a no-op otherwise.
 
-These are recognized by the MIR builder and implemented directly by the interpreter (and, with the
-LLVM backend, by the runtime).
+These are recognized by the MIR builder and implemented directly by the interpreter (and, on the
+native backend, by the runtime).
 
 ### Math intrinsics ✅
 
@@ -373,7 +387,12 @@ mercuryc [OPTIONS] <input.mer>
 --run                 compile and execute (interpreter by default; see --backend)
 --backend=<b>         interp | native | gpu | gpu-native   (default: interp)
                       native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
---emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | llvm-ir | obj | exe
+--emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
+                      grad = reverse-mode backward MIR of a loss fn (see --grad-of/--grad-wrt)
+--grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss)
+--grad-wrt=<i,..>     parameter indices to differentiate w.r.t.             (default: all buffer params)
+--train               run a fwd→bwd→optimizer loop and print the loss trajectory
+--train-steps=<n>     training steps (default 100); pair with --train-lr, --train-opt=sgd|adamw, --train-seed
 -O0|-O1|-O2|-O3       optimization level (-O3 currently runs the -O2 pipeline)
 -o <path>             output path
 --error-format=<f>    human | json
@@ -382,4 +401,6 @@ mercuryc [OPTIONS] <input.mer>
 ```
 
 Use `--emit` to inspect any stage of the pipeline, e.g. `mercuryc --emit=mir -O2 kernel.mer` to see
-the optimized IR, or `mercuryc --emit=ast kernel.mer` to see the parse tree.
+the optimized IR, or `mercuryc --emit=ast kernel.mer` to see the parse tree. Reverse-mode autodiff is
+CLI-driven too: `mercuryc --emit=grad --grad-of=loss model.mer` prints the backward MIR of a loss
+function, and `mercuryc --train --train-opt=adamw model.mer` runs its fwd→bwd→optimizer training loop.

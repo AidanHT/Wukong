@@ -7,7 +7,7 @@ The semantic type vocabulary shared by sema and MIR: scalars, SIMD vectors, shap
 
 ## Key types & entry points
 - `Ty` (`src/lib.rs`) — the central enum. Variants: `Scalar`, `Unit`, `Ptr`/`Ref` (both `{mutable, pointee: Box<Ty>}`), `Slice(Box<Ty>)`, `Array{elem,len}`, `Tuple(Vec<Ty>)`, `Vector{elem: Scalar, lanes: u32}` (SIMD), `Tensor{elem: Scalar, shape: Shape, layout: Layout}`, `Named(Symbol)` (struct/enum by interned name), `Fn{params,ret}`, `Unknown`, `Error`. Constructor `Ty::scalar(s)`.
-- `Scalar` — the 15 primitive numeric/bool kinds. `from_name`/`name` round-trip the source spelling; `size`/`align`/`is_float`/`is_int`/`is_signed` are the layout/category predicates.
+- `Scalar` — the 16 primitive kinds (the numeric types plus `Bool` and `Char`). `from_name`/`name` round-trip the source spelling; `size`/`align`/`is_float`/`is_int`/`is_signed` are the layout/category predicates.
 - `Dim` — one tensor extent: `Const(u64)`, `Var(Symbol)` (bound symbolic), or `Dynamic` (runtime `?`). This three-way split is what enables compile-time shape checking.
 - `Shape(pub Vec<Dim>)` — ordered dims; `rank()` is the length.
 - `Layout` — tensor physical layout: `Contiguous`, `ColMajor`, `Strided`, `Tiled(Vec<u64>)`.

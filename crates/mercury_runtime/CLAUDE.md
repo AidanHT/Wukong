@@ -1,7 +1,8 @@
 # mercury_runtime
 
 The runtime Mercury programs call into: a bump arena allocator, a multicore `parallel_for`, and the
-tuned **GEMM microkernels** (`mercury_sgemm*`) the compiler lowers a matmul nest to. The native
+tuned AVX2/FMA **microkernels** the compiler's kernel recognizers dispatch to — GEMM (`mercury_sgemm*`)
+the flagship, alongside vmath, reductions, norms, attention, scans, and the quant / training family (see Layout). The native
 backend binds these as JIT symbols; the interpreter calls the *same* functions (marshalling its
 abstract memory through real buffers) so the differential oracle stays bit-exact.
 
@@ -11,8 +12,13 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
 - `src/gemm.rs` — f32 GEMM: `mercury_sgemm[_nt][_parallel]`, the 6×16 packed AVX2/FMA microkernel
   (full tiles store straight to C; K loop unrolled ×4), cache-block packing (parallel path reuses one
   pack-scratch allocation across all blocks), and a scalar fallback. Plus `mercury_sgemm_nt_epi` — the
-  fused-epilogue `nn.Linear` (`C = act(A·Bᵀ + bias)`): bias-add + activation (identity / ReLU) folded
-  into the C-tile writeback on the final K-block, so C is written once (serial-only).
+  fused-epilogue `nn.Linear` (`C = act(A·Bᵀ + bias)`): bias-add + activation (identity / ReLU / GELU / SiLU) folded
+  into the C-tile writeback on the final K-block, so C is written once; `mercury_sgemm_nt_epi_parallel`
+  is the multicore twin.
+- `src/gemv.rs` — f32 GEMV `y = A·x` (`mercury_sgemv[_parallel]`): the batch-1 / decode-time projection
+  where the GEMM 3-loop register-blocking collapses — each `A` element is read once (no reuse), so it is
+  **memory-bound**, streaming `A` from DRAM with `x` cache-resident; the `_parallel` twin splits the `M`
+  output rows across cores.
 - `src/vmath.rs` — `mercury_vmath_f32(x, out, n, op)`: the **256-bit AVX2/FMA elementwise
   transcendental** kernel (exp/log/tanh/sigmoid/relu/silu/gelu/**elu/leaky_relu/softplus/mish/selu/tanhshrink/hardsigmoid/hardswish**, by
   `VM_*` op code) — the width Cranelift can't emit. 8 lanes/step + a scalar tail; the per-element op
@@ -29,6 +35,10 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   The backward derivatives reuse `sigmoid8`/`tanh8`, so they agree with the forward family; scalar twin
   (`silu_bwd_2`…), AVX2 (`silu_bwd8`…), and the inlined MIR share one op sequence (bit-for-bit). Pure
   elementwise — no reduction — so the kernel is bit-identical lane-for-lane (no reassociation exception).
+- `src/velem.rs` — streaming elementwise affine + activation `out = act(a·x + b·y + c)`
+  (`mercury_velem_f32`) plus a Horner polynomial evaluator (`mercury_vhorner_f32`): the **256-bit AVX2**
+  kernel a recognized saxpy / scale / residual-add / bias / ReLU / ReLU6 map loop lowers to — restoring
+  the width Cranelift's 128-bit SSE vectorizer can't legalize (`f32x8`), 8 lanes/step.
 - `src/reduce.rs` — `mercury_sreduce_f32[_parallel](x, y, n, op) -> f32`: **deterministic f32
   reductions** (dot / ssd / sum / sumsq / **abssum `Σ|x|` (L1 norm) / absdiff `Σ|x−y|` (MAE)** folded
   by `+`, **max / min folded by `fmax`/`fmin`**, and
@@ -46,6 +56,11 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   NaN/±0, but serial and parallel evaluate the *identical* expression tree). AVX2 single accumulator
   (memory-bound at N=2^20, so one is enough) + a scalar tail/twin that matches lane-for-lane (`mul_add`
   == `fmadd`, `(a > b) ? a : b` == `max_ps`).
+- `src/lowp.rs` — **bf16 / f16 CPU reductions with an f32 accumulator** (`mercury_{reduce,dot,sum}_{bf16,f16}[_parallel]`,
+  `mercury_axpby_{bf16,f16}[_out]`, `mercury_vmath_{bf16,f16}_out`): with no native half MAC on this
+  AVX2+F16C box, low precision is a **bandwidth / footprint** win — half the bytes streamed, so a
+  memory-bound reduction runs ~2× its f32 twin — widening on load (F16C `vcvtph2ps` for f16, a lossless
+  `<<16` bit-extend for bf16) and accumulating in f32.
 - `src/norm.rs` — `mercury_norm_f32[_parallel](x, out, rows, cols, eps_bits, op)`: **fused
   single-pass row-wise normalizations** (softmax / LayerNorm / RMSNorm, by `NORM_*` op code) over the
   last axis of a `[rows, cols]` matrix. Memory-bound, so the win is fusing the 2–3 passes (each row
@@ -79,6 +94,12 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   parallel. Measured **~1.5–2.5× faster than gcc single-core** (`-O3 -march=native`, which also uses
   `vpdpbusd`) — the lead widens with size — and **~4.6–14.7× with `@parallel`** (clock-sensitive;
   absolute GOP/s swings ~2–3× with thermal state, so the ratio is what's reported).
+- `src/attention.rs` — fused **scaled-dot-product / flash attention** for one head,
+  `O[S,D] = softmax(scale·Q·Kᵀ [+ causal]) · V` (`mercury_attention_f32(q, k, v, o, s, d, scale, causal)`):
+  an **online softmax** (running max, running denominator, rescaled `D`-wide accumulator) that never
+  materializes the `S×S` score matrix, so it is **memory-efficient**. On CPU it is *not* a throughput win
+  over the GEMM-dispatch attention path — that path stays the recommended default; the value here is the
+  smaller footprint.
 - **The training / inference auxiliary kernel family** (one file each, same `#[no_mangle] extern "C"` +
   AVX2/scalar-twin/rayon `_parallel` + bit-exact-test discipline; each is the symbol a `mercury_mir_build`
   recognizer dispatches to, and the interpreter marshals the *identical* function for the differential
@@ -97,7 +118,11 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
   `lrscan.rs` (the SSM/Mamba first-order linear-recurrence / selective scan `out[r,t] = a[r,t]·h_{t-1} +
   b[r,t]` — a loop-carried recurrence gcc/rustc run as one serial chain per row; the lever here is *not*
   SIMD but **4 independent rows interleaved** for ILP, with plain `mul`+`add` — **not** `f32::mul_add`,
-  which on a non-`fma`-target build lowers to a libm `fmaf` *call* that re-serializes the chain), and
+  which on a non-`fma`-target build lowers to a libm `fmaf` *call* that re-serializes the chain), `cumsum.rs` / `cumprod.rs` / `cumminmax.rs` (per-row inclusive prefix sum /
+  product and running max/min — the same loop-carried-scan lever as `lrscan`, mapped across independent
+  rows for the `_parallel` twin), `dequant.rs` (the quantized-dataflow boundary `out = act((q as f32)·scale)`
+  for `i8`/`u8`/`i32` inputs, plus a **per-channel** `scale[c]` sibling), `bias.rs` (broadcast-bias add
+  `out = act(x[i·C+j] + b[j])` — the `cols`-long bias `b` broadcast down every row), and
   `scatter.rs` (the embedding-gradient backward `grad_w[ids[t],:] += grad_out[t,:]` — the gather's dual;
   the `_parallel` one splits the **output rows** across cores so writes never collide → lock-free and
   **bit-identical to serial**, the structural win over a C author's non-deterministic atomic scatter).

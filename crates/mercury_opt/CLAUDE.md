@@ -6,6 +6,7 @@ The optimizer: a function-level pass manager, CFG/dominator analyses, and the MI
 - `src/lib.rs` — `Pass` trait, `PassManager`, `optimize()` entry, and the shared use-visiting helpers (`map_op_uses`/`each_op_use`/`map_term_uses`/`each_term_use`/`has_side_effects`). Source->run integration tests live here.
 - `src/cfg.rs` — CFG analyses: `successors`, `predecessors`, `reverse_postorder`, `reachable`, `prune_unreachable`.
 - `src/dom.rs` — dominator analysis (Cooper–Harvey–Kennedy): `idoms`, `dominance_frontiers`, `dom_children`.
+- `src/cache.rs` — `CfgAnalyses`: a per-function CFG/dominator analysis cache threaded through the pass fixpoint; `predecessors`/`reverse_postorder`/`idoms`/`dominance_frontiers`/`dom_children` are computed lazily and reused across iterations until a structural CFG mutation (simplify-cfg / unreachable pruning) invalidates it.
 - `src/mem2reg.rs` — `Mem2Reg`: promote scalar `alloca`/`load`/`store` to block-parameter SSA.
 - `src/simplify.rs` — `Simplify`: constant folding + algebraic identities.
 - `src/simplify_cfg.rs` — `SimplifyCfg`: constant-branch folding, straight-line block merging, unreachable pruning.
@@ -15,6 +16,7 @@ The optimizer: a function-level pass manager, CFG/dominator analyses, and the MI
 - `src/dce.rs` — `Dce`: remove unused pure instructions and unused allocas.
 - `src/licm.rs` — `Licm`: hoist loop-invariant, non-trapping ops into an existing preheader.
 - `src/inline.rs` — `inline_program`: whole-program inlining of small leaf functions.
+- `src/fxhash.rs` — a fast, dependency-free FxHash hasher for the optimizer's integer-keyed internal maps (the optimizer is HashMap-bound); a pure function of the key bytes, so iteration order is fixed run-to-run and output-neutral under the `--emit=mir -O2` gate.
 
 ## Key types & entry points
 - `optimize(program, opt_level)` (`src/lib.rs`) — top-level entry. At `-O2`+ runs `inline_program` (whole-program) first, then the function-level pipeline. `-O0` does nothing.
@@ -23,7 +25,7 @@ The optimizer: a function-level pass manager, CFG/dominator analyses, and the MI
 - `inline_program(program)` (`src/inline.rs`) — the only program-level transform; a free function, not a `Pass`.
 
 ## Connects to
-Upstream: operates on `mercury_mir` `Function`/`Program` (`Op`, `Terminator`, `BasicBlock`, `BlockId`, `ValueId`, `MirType`); `mercury_span::Symbol` for function names. Consumes the output of `mercury_mir_build`. Downstream: the optimized `Program` goes to a backend (interpreter or LLVM). Dev-deps (`mercury_parser`/`sema`/`mir_build`/`interp`) are only for the source->run integration tests in `lib.rs`.
+Upstream: operates on `mercury_mir` `Function`/`Program` (`Op`, `Terminator`, `BasicBlock`, `BlockId`, `ValueId`, `MirType`); `mercury_span::Symbol` for function names. Consumes the output of `mercury_mir_build`. Downstream: the optimized `Program` goes to a backend (interpreter, Cranelift, or LLVM). Dev-deps (`mercury_parser`/`sema`/`mir_build`/`interp`) are only for the source->run integration tests in `lib.rs`.
 
 ## Gotchas
 - Pipeline order is load-bearing: mem2reg runs first because every value-based pass is far more effective on SSA than on memory traffic. Don't reorder casually.
@@ -33,7 +35,7 @@ Upstream: operates on `mercury_mir` `Function`/`Program` (`Op`, `Terminator`, `B
 - mem2reg only promotes scalar int/float slots (`is_promotable_ty`); pointer/array/vector allocas stay in memory (avoids synthesizing typed "undef"). A slot is promotable only if its pointer is used *solely* as the address of `load`/`store` — any `gep`/call/stored-pointer/terminator use disqualifies it. Read-before-write slots get a zero constant in the entry block (one cached const *per type*, matching interpreter zero-init memory).
 - mem2reg renames in three phases: a non-mutating dominator-tree walk (`Rename::visit`) collects edits (`replace`/`delete`/`append_*` maps), then phase 3 applies them; deletes are keyed by *original* `(block, inst index)`.
 - CSE's pure-op equality is a packed, allocation-free `Key` enum (`pure_key`) — one variant per cacheable `Op`, operands as `ValueId` inner `u32`s resolved through prior rewrites, op sub-kinds as `as u8` discriminants, types as the `Hash + Eq` `MirType` itself. New cacheable `Op` variants must be added there (a `Key` variant + a `pure_key` arm) or CSE ignores them.
-- CSE load forwarding and DSE are both intra-block only and conservatively clear all slot tracking on a store/load through an unknown (non-alloca) pointer or any `Call`. Cross-block memory is left to the LLVM backend.
+- CSE load forwarding and DSE are both intra-block only and conservatively clear all slot tracking on a store/load through an unknown (non-alloca) pointer or any `Call`. Cross-block memory is left to the backend.
 - `simplify` keeps integer self-comparisons constant (`fold_cmp_self`) but never folds float self-comparison (`NaN != NaN`); `fold_int` returns `None` (skips folding) on division/remainder by zero rather than trapping; `mask` treats `i1` as unsigned low bit.
 - LICM never synthesizes a preheader — it only hoists into a loop that already has one (single out-of-loop predecessor branching unconditionally to and dominating the header). `safe_to_hoist` excludes loads/stores/calls/allocas and integer div/rem (trapping).
 - Inlining is leaf-only (callee calls no *user* function; intrinsic calls are fine) and size-capped (`SIZE_LIMIT = 40`, per-caller `GROWTH_LIMIT = 5000`). Leaf-only is what makes recursion/runaway inlining impossible — no cycle detection exists (a redundant self-call guard remains anyway). Inlined-and-now-uncalled callees are dropped; `main` survives because it is never a call target.

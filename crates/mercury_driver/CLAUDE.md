@@ -3,7 +3,7 @@
 Orchestrates the full compile pipeline: owns the `SourceMap`/`Interner`/`DiagnosticSink`, runs each stage in order, and honors `--emit`. Sits between the CLI (`mercuryc`) and every front-end/back-end crate.
 
 ## Layout
-- `src/lib.rs` — the whole crate: `Options`, `EmitStage`, `ErrorFormat`, `BackendKind`, the `exit` codes module, and `compile()` plus the private `emit_native`/`emit_mir`/`emit_diag`/`render_all`/`run_on_gpu` helpers.
+- `src/lib.rs` — the whole crate: `Options`, `EmitStage`, `ErrorFormat`, `BackendKind`, `GradOptions`, `TrainOpt`, the `exit` codes module, and `compile()` plus the private `emit_native`/`emit_mir`/`emit_diag`/`render_all`/`build_grad`/`run_train`/`run_on_gpu`/`run_on_gpu_lower` helpers.
 - `src/gpu_accel.rs` — **(behind `--features gpu`)** `GpuAccel`, the `mercury_interp::Accelerator` impl that forwards recognized kernels to `mercury_codegen_gpu` launch wrappers — incl. `sgemm_nt_epi`, which routes a source-level `act(matmul [+ bias])` to the single fused WMMA kernel: bias-free → `gemm_nt_f16_sm_db_{relu,silu,gelu}`, with a per-column bias → `gemm_nt_f16_sm_db_bias{,_relu,_silu,_gelu}` (the canonical `nn.Linear`/FFN `act(x·Wᵀ+bias)`; ACT_IDENTITY+bias = affine Linear). relu/gelu/silu, aligned shapes (M,N %64, K %16); a bias-free identity GEMM and everything else decline to CPU. It counts device calls (`calls`) so the e2e tests can assert the offload actually fired. A GPU error becomes `Some(Err(..))` (never `None`/silent CPU fallback when the user asked for the GPU).
 
 ## Backends & the `gpu` feature
@@ -11,14 +11,15 @@ Orchestrates the full compile pipeline: owns the `SourceMap`/`Interner`/`Diagnos
 
 ## Key types & entry points
 - `compile(opts: &Options) -> i32` (`src/lib.rs`) — single entry point. Reads the input file, runs lexer -> parser -> sema -> mir_build -> opt -> backend, returns a process exit code. Each `--emit` stage short-circuits with its own dump.
-- `Options` (`src/lib.rs`) — invocation config (`input`, `output`, `emit`, `run`, `opt_level`, `color`, `error_format`). `Default` emits `Exe` at `opt_level 0`, color on, human errors, `input` empty.
-- `EmitStage` (`src/lib.rs`) — `Tokens`/`Ast`/`MirHigh`/`Mir`/`LlvmIr`/`Obj`/`Exe`. `EmitStage::parse` maps CLI strings; note `"mir" | "mir-low"` both map to `Mir`.
+- `Options` (`src/lib.rs`) — invocation config (`input`, `output`, `emit`, `run`, `opt_level`, `color`, `error_format`, `backend`, and `grad: GradOptions`). `Default` emits `Exe` at `opt_level 0` on the `Interp` backend, color on, human errors, default `grad` options, `input` empty.
+- `EmitStage` (`src/lib.rs`) — `Tokens`/`Ast`/`MirHigh`/`Mir`/`Grad`/`LlvmIr`/`Obj`/`Exe`. `EmitStage::parse` maps CLI strings; note `"mir" | "mir-low"` both map to `Mir`, and `"grad"` maps to `Grad` (the reverse-mode backward MIR of the `--grad-of` loss fn, emitted after optimization).
 - `ErrorFormat` (`src/lib.rs`) — `Human` (rustc-style via `Renderer`) or `Json` (JSON Lines via `mercury_diag::to_json`).
 - `exit` module — `OK=0`, `COMPILE_ERROR=1`, `UNIMPLEMENTED=2`, `IO_ERROR=3`.
+- `GradOptions` / `TrainOpt` + the `build_grad`/`run_train` helpers (`src/lib.rs`) — the autodiff CLI surface. `--emit=grad` runs `build_grad`, appending the reverse-mode backward MIR of the `--grad-of` loss (w.r.t. `--grad-wrt`, default every buffer parameter) via `mercury_autodiff`; `--train` runs `run_train`, a fwd→bwd→optimizer loop (`--train-steps`/`--train-lr`/`--train-opt=sgd|adamw`/`--train-seed`) that prints the loss trajectory. Both force at least `-O1` (the autodiff transform requires single-block SSA input).
 - Re-exports `explain`, `all_explanations`, `Explanation` from `mercury_diag` for the CLI's `--explain`.
 
 ## Connects to
-Upstream: `mercury_span` (`SourceMap`/`Interner`), `mercury_diag` (`Diagnostic`/`DiagnosticSink`/`Renderer`/`to_json`), `mercury_lexer::{tokenize,dump}`, `mercury_parser::parse_module_tokens`, `mercury_ast::print::print_module`, `mercury_sema::check`, `mercury_mir_build::lower_program`, `mercury_mir::{print,verify}`, `mercury_opt::optimize`, `mercury_backend` (`Backend` trait + `Artifact`), `mercury_interp::Interpreter`, `mercury_codegen_llvm::emit_llvm_ir`, and `mercury_codegen_gpu` (optional, behind feature `gpu`). Downstream: the `mercuryc` binary calls `compile()`.
+Upstream: `mercury_span` (`SourceMap`/`Interner`), `mercury_diag` (`Diagnostic`/`DiagnosticSink`/`Renderer`/`to_json`), `mercury_lexer::{tokenize,dump}`, `mercury_parser::parse_module_tokens`, `mercury_ast::print::print_module`, `mercury_sema::check`, `mercury_mir_build::lower_program`, `mercury_mir::{print,verify}`, `mercury_opt::optimize`, `mercury_backend` (`Backend` trait + `Artifact`), `mercury_interp::Interpreter`, `mercury_codegen_cranelift` (native JIT + object/exe), `mercury_codegen_llvm::emit_llvm_ir`, `mercury_autodiff` (the `--emit=grad`/`--train` backward transform + fused AdamW), `mercury_types` (loss-parameter buffer sizing for `--train`), and `mercury_codegen_gpu` (optional, behind feature `gpu`). Downstream: the `mercuryc` binary calls `compile()`.
 
 ## Gotchas
 - Diagnostic plumbing is split: lexer+parser diags go into a `DiagnosticSink`, flushed via `render_all`; sema/mir_build diags are emitted one-by-one via `emit_diag` (never enter the sink). `sink.has_errors()` only reflects lex/parse — later stages re-check with `diags.iter().any(|d| d.is_error())`.

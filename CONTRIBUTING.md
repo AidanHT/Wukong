@@ -5,8 +5,11 @@ Thanks for your interest! Mercury is built incrementally, one small, tested chan
 ## Ground rules
 
 - **Everything builds and tests without LLVM.** The front-end, optimizer, and the MIR interpreter
-  must keep working with plain `cargo test`. LLVM lives behind `--features llvm` and may never be a
-  hard build dependency of the default workspace.
+  must keep working with plain `cargo test`; native codegen is Cranelift (pure Rust, no toolchain).
+  The textual LLVM IR backend (`--emit=llvm-ir`) is also pure Rust and always built — `clang`/`llc`
+  are only needed to compile the *emitted* IR, never by the build or tests. No backend may become a
+  hard toolchain dependency of the default workspace; the GPU backend is the only opt-in one
+  (`--features gpu`).
 - **Each change is small and self-contained**, with tests, and leaves the tree green.
 - **No new warnings.** CI builds with `-D warnings` and runs `cargo fmt --check` and
   `cargo clippy --all-targets`.

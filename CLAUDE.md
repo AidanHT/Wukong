@@ -25,7 +25,11 @@ CLI flags (`crates/mercuryc/src/main.rs` → `mercury_driver::Options`):
   interpreter, while `gpu-native` lowers the *whole* program's MIR to PTX (general MIR→PTX, optionally
   fused into one cooperative megakernel). See the GPU backend section below.
 - `--emit=<stage>` — emit one artifact and stop: `tokens`, `ast`, `mir-high`, `mir` (alias `mir-low`),
-  `llvm-ir`, `obj`, `exe` (default `exe`). Artifacts go to stdout; diagnostics to stderr.
+  `grad`, `llvm-ir`, `obj`, `exe` (default `exe`). Artifacts go to stdout; diagnostics to stderr.
+- `--emit=grad` / `--train` — the reverse-mode autodiff surface (`mercury_autodiff`): `--emit=grad`
+  prints the backward MIR of a loss fn; `--train` runs a fwd→bwd→optimizer loop and prints the loss
+  trajectory. Tuned by `--grad-of=<fn>` (default `loss`), `--grad-wrt=<i,..>` (param indices),
+  `--train-steps`, `--train-lr`, `--train-opt=sgd|adamw`, `--train-seed`.
 - `-O0|-O1|-O2|-O3` — optimization level (default `-O0`; `-O3` currently runs the `-O2` pipeline).
 - `-o <path>`, `--color=auto|always|never`, `--error-format=human|json`, `--explain <CODE>`,
   `-h/--help`, `-V/--version`.
@@ -46,8 +50,8 @@ source.mer
   → sema        mercury_sema::check                  name res, types, SHAPE check
   → mir_build   mercury_mir_build::lower_program     -> MIR (High, alloca-per-local)
   → opt         mercury_opt::optimize                fixpoint SSA passes -> MIR (Low)
-  → backend     mercury_interp (--run) | mercury_codegen_cranelift (--backend=native)
-                | mercury_codegen_gpu (--backend=gpu offload | --backend=gpu-native MIR→PTX) | mercury_codegen_llvm (--emit=llvm-ir|obj|exe)
+  → backend     mercury_interp (--run) | mercury_codegen_cranelift (--backend=native | --emit=obj|exe)
+                | mercury_codegen_gpu (--backend=gpu offload | --backend=gpu-native MIR→PTX) | mercury_codegen_llvm (--emit=llvm-ir)
 ```
 
 `mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early.
@@ -116,7 +120,8 @@ reassociated form is the oracle — all backends run the same reassociated IR an
 - Development is on **Windows 11 with PowerShell** as the primary shell (a Bash tool is also available —
   use POSIX syntax there). Use absolute paths in agent threads.
 - **LLVM is NOT installed here** (a physical fact, not a rule): `clang`/`llc` do not exist, so the
-  textual-LLVM `--features llvm` path cannot link/run. The native path is **Cranelift** (pure Rust,
+  textual LLVM IR that `--emit=llvm-ir` prints cannot be compiled or linked here (the emitter itself
+  is pure-Rust and always built — there is no `--features llvm`). The native path is **Cranelift** (pure Rust,
   builds and JITs here with zero external toolchain) plus any raw-codegen microkernels we add. Plain
   `cargo test` needs no toolchain. `gcc`/`g++`/`rustc` (MSYS2) *are* present — that's what `mercury_xbench`
   compiles the C/C++/Rust baselines with.

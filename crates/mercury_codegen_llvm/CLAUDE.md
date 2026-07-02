@@ -14,7 +14,7 @@ LLVM backend: lowers a MIR `Program` to **textual** LLVM IR. Sits at the end of 
 - `llvm_ty`, `bin_name`, `cmp_instr`, `cast_name`, `fmt_float` — pure free-fn mappers from MIR enums to IR strings. `cmp_instr` returns `(instr, predicate)`, e.g. `("icmp","slt")` / `("fcmp","oeq")`.
 
 ## Connects to
-Upstream: `mercury_mir` (`Program`/`Function`/`BasicBlock`/`Inst`/`Op`/`Terminator`/`MirType`/`BinOp`/`CmpOp`/`CastKind`/`ValueId`), `mercury_backend` (`Backend`/`Artifact`), `mercury_span` (`Interner`/`Symbol`). Tests also use `mercury_parser`, `mercury_sema`, `mercury_mir_build`, `mercury_opt`. Downstream: the driver (`mercuryc`) when built with `--features llvm`; emitted text is meant for external `clang`/`llc` (not invoked here).
+Upstream: `mercury_mir` (`Program`/`Function`/`BasicBlock`/`Inst`/`Op`/`Terminator`/`MirType`/`BinOp`/`CmpOp`/`CastKind`/`ValueId`), `mercury_backend` (`Backend`/`Artifact`), `mercury_span` (`Interner`/`Symbol`). Tests also use `mercury_parser`, `mercury_sema`, `mercury_mir_build`, `mercury_opt`. Downstream: the driver (`mercuryc`) reaches this via `--emit=llvm-ir` — always compiled, with no `llvm` feature gate on either this crate or the driver; emitted text is meant for external `clang`/`llc` (not invoked here).
 
 ## Gotchas
 - **Block-param SSA -> phi bridge.** Non-entry block params become `phi` nodes built from `edge_args`; entry-block params are the function signature args (no phi — guarded by `b.id != f.entry`). At `-O0` the front-end emits no block params, so no phis; phis only appear after `mem2reg`. Phis must lead the block — `emit_phis` runs before instructions.

@@ -3,9 +3,11 @@
 **You do not need LLVM to build, run, or produce native binaries with Mercury.** The default native
 path is **Cranelift** (pure Rust, in-process): `--run --backend=native` JITs, and `--emit=obj` /
 `--emit=exe` write a native object / executable with **no LLVM toolchain** (verified on a box with no
-`clang` installed — `--emit=obj` emits a COFF/ELF object directly from Cranelift). `--emit=exe` links
-that object with the system C compiler (`cc` / `$CC`); if none is found it exits with code 2
-(`UNIMPLEMENTED`) but still writes the object. To run with zero external toolchain at all, use the
+`clang` installed — `--emit=obj` emits a COFF/ELF object directly from Cranelift). `--emit=exe` then
+links that object into an executable — preferring a **`rustc`-driven link** (rustc drives the
+platform's native linker and pulls in the `mercury_runtime`), falling back to the system C compiler
+(`cc` / `$CC`); if neither is available it exits with code 2 (`UNIMPLEMENTED`) but still writes the
+object. To run with zero external toolchain at all, use the
 interpreter: `mercuryc --run program.mer`.
 
 LLVM enters **only** through `--emit=llvm-ir`, which prints **textual LLVM IR** for inspection — and
@@ -56,6 +58,6 @@ MinGW/UCRT gcc, whose ABI does not match.
 ## The everyday native path (no LLVM)
 
 ```sh
-mercuryc --emit=exe -O2 examples/fib.mer   # -> fib.exe, via Cranelift + system cc
+mercuryc --emit=exe -O2 examples/fib.mer   # -> fib.exe, via Cranelift + the rustc/cc link
 ./fib.exe                                   # prints 55 (main returns 0)
 ```

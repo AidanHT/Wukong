@@ -1408,13 +1408,15 @@ decode into **one `cuGraphLaunch` (~6.5–6.9× eager)**.
 **Honest status & what is pending (the honesty law).** Authored + oracle-gated + compile-latency-measured
 here; the GPU-resident *inference* numbers are the resident-layer benches above (same computation, same
 device). **Not yet measured, so not claimed:** the full 124M-GPT-2 / 7B-Llama run driven straight from
-these `.mer` files through the general lowerer (recognized-op GPU dispatch is the Phase-4 *perf* tail,
-owned by a sibling session); a **training-step** tokens/s vs PyTorch-eager (the autodiff engine is built
-but its branch is not yet integrated on this trunk); the **whole-model megakernel** path (Phase 8, not
-started); and a **PyTorch-eager / TensorRT-LLM** same-run peer for the full model. This trunk
-(`gpu-integrate`) currently integrates the general MIR→PTX lowerer, the Phase-7 device pool + CUDA
-graphs, and the conv2d slice; the int8 / autodiff / large-GEMM-fusion branches are pending coordinated
-integration.
+these `.mer` files through the general lowerer (recognized-op GPU dispatch is the Phase-4 *perf* tail);
+a **training-step** tokens/s vs PyTorch-eager (the autodiff engine is built and integrated — see the
+`--train` CLI surface — but this specific benchmark is not yet run); a full-model run through the
+**whole-program cooperative megakernel** (the megakernel is built; an end-to-end full-model pass through
+it is not yet measured); and a **PyTorch-eager / TensorRT-LLM** same-run peer for the full model. This
+integration branch now carries the general MIR→PTX lowerer, the Phase-7 device pool + CUDA graphs, the
+conv2d slice, the int8 GEMM stack (the section above), the whole-program megakernel, and the autodiff /
+large-GEMM-fusion work — the branches this note earlier listed as pending are now merged; what remains
+open is the *end-to-end full-model* measurement, not the per-op kernels.
 
 ## Honest summary
 
