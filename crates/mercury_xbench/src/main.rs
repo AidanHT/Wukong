@@ -262,6 +262,12 @@ fn main() {
     if want("matmul_tn") {
         bench_matmul_tn(&cc, &dir, roof);
     }
+    if want("gemv") {
+        bench_gemv(&cc, &dir);
+    }
+    if want("scaled_gemm") {
+        bench_scaled_gemm(&cc, &dir);
+    }
     if want("conv") {
         bench_conv(&cc, &dir);
     }
@@ -667,6 +673,228 @@ fn rust_matmul_tn(ns: usize) -> String {
          \x20     *c.add(i*NS+j)=s;\n\
          \x20   }}\n\
          \x20 }}\n}}\n"
+    )
+}
+
+// ---- GEMV (matrix-times-vector, the batch-1 attention/projection shape) -------------------------
+
+/// GEMV `y[M] = A[M,N]·x[N]` — memory-bound (each A element read once, no reuse), so the figure of
+/// merit is A-streaming GB/s. gcc/rustc keep the row dot a latency-bound in-order scalar/`vfmadd…ss`
+/// chain (they will not reassociate an f32 reduction without `-ffast-math`); Mercury dispatches
+/// `mercury_sgemv[_parallel]`, folding each row 8-wide across four accumulators, and the `@parallel`
+/// form spreads the rows across cores to saturate aggregate bandwidth.
+fn bench_gemv(cc: &str, dir: &Path) {
+    for (m, n) in [(4096usize, 4096usize), (8192, 2048), (16384, 1024)] {
+        let a: Vec<f32> = (0..m * n).map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.2 - 0.5).collect();
+        let mut y = vec![0.0f32; m];
+        let (ap, xp, yp) = (a.as_ptr(), x.as_ptr(), y.as_mut_ptr());
+        let bytes = (m * n) as f64 * 4.0; // A streamed once — the DRAM roofline traffic
+        let gbps = |v: &Option<Measure>| {
+            v.as_ref()
+                .map(|mm| format!("{:.1}", bytes / mm.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== gemv (y[i] = Sum_j A[i,j]*x[j]) {m}x{n} (A-stream GB/s, higher is better) ===");
+        let mer = bench_mercury(&mer_gemv(m, n, false), &mut y, ap, xp, yp);
+        let mer_par = bench_mercury(&mer_gemv(m, n, true), &mut y, ap, xp, yp);
+        let cm = bench_external(
+            "c", &c_gemv(m, n), dir, "gemv", cc,
+            &["-O3", "-march=native", "-shared"], &mut y, ap, xp, yp,
+        );
+        let rm = bench_external(
+            "rs", &rust_gemv(m, n), dir, "gemv", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut y, ap, xp, yp,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&rm)
+        );
+        // The 8-wide row dot reassociates → magnitude-normalized tolerance (max|Δ| / max|C|), not a
+        // pointwise ratio (mean-zero inputs put outputs near 0). Same basis as the reduction cross-checks.
+        if let (Some(a2), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-6);
+            let maxerr = a2
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |mx, (&u, &v)| mx.max((u - v).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! gemv mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than idiomatic C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x idiomatic single-threaded C");
+        }
+        println!();
+    }
+}
+
+fn mer_gemv(m: usize, n: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let mn = m * n;
+    format!(
+        "module bench\n{attr}fn kbench(a: [f32; {mn}], x: [f32; {n}], y: [f32; {m}]) {{\n\
+         \x20   for i in 0..{m} {{\n\
+         \x20       let mut s: f32 = 0.0;\n\
+         \x20       for j in 0..{n} {{ s = s + a[i * {n} + j] * x[j]; }}\n\
+         \x20       y[i] = s;\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_gemv(m: usize, n: usize) -> String {
+    format!(
+        "#define M {m}\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* a, const float* x, float* y){{\n\
+         \x20 for (long i=0;i<M;i++){{ float s=0.0f; for (long j=0;j<N;j++) s+=a[i*N+j]*x[j]; y[i]=s; }} }}\n"
+    )
+}
+
+fn rust_gemv(m: usize, n: usize) -> String {
+    format!(
+        "const M: usize = {m};\nconst N: usize = {n};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(a:*const f32, x:*const f32, y:*mut f32) {{\n\
+         \x20 for i in 0..M {{ let mut s=0.0f32; for j in 0..N {{ s += *a.add(i*N+j) * *x.add(j); }} *y.add(i)=s; }} }}\n"
+    )
+}
+
+// ---- α-scaled GEMM (attention scores QKᵀ·(1/√d)) ------------------------------------------------
+
+/// α-scaled attention scores `scores[S,S] = (Q[S,D]·K[S,D]ᵀ)·scale` (`scale = 1/√d`, a literal here).
+/// The `* scale` on the store previously blocked the matmul matcher and dropped the whole GEMM to a
+/// scalar nest; Mercury now dispatches `mercury_sgemm_nt_alpha[_parallel]`, folding the scale into the
+/// tuned GEMM C-tile writeback. Compute-bound → GFLOP/s. We also report Mer(α) vs Mer(unscaled) to
+/// show the α is *free* (one FMA folded into a writeback the GEMM already does), not a second pass.
+fn bench_scaled_gemm(cc: &str, dir: &Path) {
+    for (s, d) in [(256usize, 64usize), (512, 64), (512, 128)] {
+        let q: Vec<f32> = (0..s * d).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect();
+        let k: Vec<f32> = (0..s * d).map(|i| (i % 5) as f32 * 0.2 - 0.4).collect();
+        let mut out = vec![0.0f32; s * s];
+        let (qp, kp, op) = (q.as_ptr(), k.as_ptr(), out.as_mut_ptr());
+        let flops = 2.0 * (s as f64) * (s as f64) * (d as f64); // the GEMM; the S² scale mults are noise
+        let gflops = |m: &Option<Measure>| {
+            m.as_ref()
+                .map(|x| format!("{:.1}", flops / x.ns_per_call))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!("=== scaled_gemm (scores = (Q·Kᵀ)·scale) S={s} D={d} (GFLOP/s, higher is better) ===");
+        let mer = bench_mercury(&mer_scaled_scores(s, d, false), &mut out, qp, kp, op);
+        let mer_par = bench_mercury(&mer_scaled_scores(s, d, true), &mut out, qp, kp, op);
+        // Unscaled QKᵀ (plain nt) — same tuned kernel without the α; the ratio isolates the α cost.
+        let mer_noscale = bench_mercury(&mer_scores_noscale(s, d, false), &mut out, qp, kp, op);
+        let cm = bench_external(
+            "c", &c_scaled_scores(s, d), dir, "scaled_gemm", cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"], &mut out, qp, kp, op,
+        );
+        let rm = bench_external(
+            "rs", &rust_scaled_scores(s, d), dir, "scaled_gemm", "rustc",
+            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, qp, kp, op,
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+        );
+        println!(
+            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "GFLOP/s", gflops(&mer), gflops(&mer_par), gflops(&cm), gflops(&rm)
+        );
+        // The D-long score dot reassociates (FMA + blocked accumulation vs C's naive scalar order), and
+        // the small mixed-sign Q/K put some scores near 0 → a pointwise relative check divides by ~0 and
+        // blows up on a purely-reassociation Δ. Use the magnitude-normalized tolerance (max|Δ| / max|C|),
+        // the same basis as gemv and the reduction cross-checks. The bit-exact gate is the runtime f64
+        // reference + interp==native unit test; this is only a sanity ceiling.
+        if let (Some(a2), Some(c2)) = (&mer, &cm) {
+            let maxabs = c2.out.iter().fold(0.0f32, |mx, &v| mx.max(v.abs())).max(1e-6);
+            let maxerr = a2
+                .out
+                .iter()
+                .zip(&c2.out)
+                .fold(0.0f32, |mx, (&u, &v)| mx.max((u - v).abs()));
+            let rel = (maxerr / maxabs) as f64;
+            if rel > 1e-3 {
+                println!("  ! scaled_gemm mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            }
+        }
+        if let (Some(ms), Some(c2)) = (&mer, &cm) {
+            let r = c2.ns_per_call / ms.ns_per_call;
+            println!(
+                "  -> Mercury single-core is {:.2}x {} than idiomatic C",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(c2)) = (&mer_par, &cm) {
+            let r = c2.ns_per_call / mp.ns_per_call;
+            println!("  -> Mercury @parallel is {r:.2}x idiomatic single-threaded C");
+        }
+        if let (Some(ms), Some(mn)) = (&mer, &mer_noscale) {
+            // >1 ⇒ the α costs time; ~1.0 ⇒ the scale is free (folded into the writeback).
+            let r = ms.ns_per_call / mn.ns_per_call;
+            println!("  -> α overhead vs unscaled QKᵀ (same kernel): {r:.3}x (≈1.0 ⇒ the scale is free)");
+        }
+        println!();
+    }
+}
+
+fn mer_scaled_scores(s: usize, d: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let (sd, ss) = (s * d, s * s);
+    format!(
+        "module bench\n{attr}fn kbench(q: [f32; {sd}], k: [f32; {sd}], out: [f32; {ss}]) {{\n\
+         \x20   for i in 0..{s} {{\n\
+         \x20       for j in 0..{s} {{\n\
+         \x20           let mut acc: f32 = 0.0;\n\
+         \x20           for p in 0..{d} {{ acc = acc + q[i * {d} + p] * k[j * {d} + p]; }}\n\
+         \x20           out[i * {s} + j] = 0.125 * acc;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+/// The unscaled twin (plain `Q·Kᵀ`, dispatches `mercury_sgemm_nt`) — the α-overhead baseline.
+fn mer_scores_noscale(s: usize, d: usize, parallel: bool) -> String {
+    let attr = if parallel { "@parallel\n" } else { "" };
+    let (sd, ss) = (s * d, s * s);
+    format!(
+        "module bench\n{attr}fn kbench(q: [f32; {sd}], k: [f32; {sd}], out: [f32; {ss}]) {{\n\
+         \x20   for i in 0..{s} {{\n\
+         \x20       for j in 0..{s} {{\n\
+         \x20           let mut acc: f32 = 0.0;\n\
+         \x20           for p in 0..{d} {{ acc = acc + q[i * {d} + p] * k[j * {d} + p]; }}\n\
+         \x20           out[i * {s} + j] = acc;\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n"
+    )
+}
+
+fn c_scaled_scores(s: usize, d: usize) -> String {
+    format!(
+        "#define S {s}\n#define D {d}\n\
+         __declspec(dllexport) void kbench(const float* q, const float* k, float* out){{\n\
+         \x20 for (long i=0;i<S;i++){{ for (long j=0;j<S;j++){{ float s=0.0f; for (long p=0;p<D;p++) s+=q[i*D+p]*k[j*D+p]; out[i*S+j]=0.125f*s; }} }} }}\n"
+    )
+}
+
+fn rust_scaled_scores(s: usize, d: usize) -> String {
+    format!(
+        "const S: usize = {s};\nconst D: usize = {d};\n#[no_mangle]\n\
+         pub unsafe extern \"C\" fn kbench(q:*const f32, k:*const f32, out:*mut f32) {{\n\
+         \x20 for i in 0..S {{ for j in 0..S {{ let mut s=0.0f32; for p in 0..D {{ s += *q.add(i*D+p) * *k.add(j*D+p); }} *out.add(i*S+j)=0.125f32*s; }} }} }}\n"
     )
 }
 
