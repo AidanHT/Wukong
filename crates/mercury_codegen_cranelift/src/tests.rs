@@ -17,6 +17,69 @@ fn jit(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     crate::jit_run(&program, main, &interner)
 }
 
+/// Compile `src` to a callable native handle (no run), for timing. Honors `MERCURY_P4_NO_256`.
+fn compile_native(src: &str, opt: u8) -> crate::JitProgram {
+    let mut interner = Interner::new();
+    let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
+    let (sema, _) = mercury_sema::check(&module, &interner);
+    let (mut program, _) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+    mercury_opt::optimize(&mut program, opt);
+    let main = interner.intern("main");
+    crate::jit_compile(&program, main, &interner).expect("jit compile")
+}
+
+/// A same-run A/B of the 256-bit AVX2 recipe vs the 128-bit CLIF vectorizer on one compute-heavy
+/// elementwise kernel. Reports the best-of-N wall-clock ratio (best-of controls for this laptop's
+/// clock/thermal drift; alternating A/B/A/B keeps the two measurements adjacent). Ignored by default
+/// — timing is noisy in CI; run with `--ignored --nocapture`. Not a correctness gate (the differential
+/// tests are); a sanity check that widening to 256 bits actually buys throughput.
+#[test]
+#[ignore]
+fn p4_bench_256_vs_128() {
+    // Compute-bound, L1-resident body: a high arithmetic-intensity FMA chain (no sqrt, no memory
+    // spill) over a 512-element array (3×2KB ≪ L1), repeated so wall-clock dominates setup. This
+    // isolates the SIMD-width win; memory-bound bodies (large arrays, few flops/elem) see less
+    // because both widths saturate the same bandwidth.
+    let src = "\
+        fn main() -> i32 { \
+          let mut a: [f32; 512] = [0.0; 512]; let mut b: [f32; 512] = [0.0; 512]; \
+          let mut o: [f32; 512] = [0.0; 512]; \
+          for i in 0..512 { a[i] = (i as f32) * 0.001; } \
+          for i in 0..512 { b[i] = (i as f32) * 0.002 + 1.0; } \
+          let mut r: i32 = 0; \
+          while r < 200000 { \
+            for i in 0..512 { o[i] = a[i]*b[i] + a[i]*a[i] - b[i]*b[i] + a[i]*b[i]*a[i] - b[i]; } r += 1; \
+          } \
+          print(o[100] as i32); return 0; }";
+
+    let best = |p: &crate::JitProgram| -> std::time::Duration {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(p.call());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+
+    std::env::set_var("MERCURY_P4_NO_256", "1");
+    let p128 = compile_native(src, 3);
+    std::env::remove_var("MERCURY_P4_NO_256");
+    let p256 = compile_native(src, 3);
+
+    // Warm, then alternate to keep the two adjacent under one clock state.
+    best(&p128);
+    best(&p256);
+    let (t128, t256) = (best(&p128), best(&p256));
+    eprintln!(
+        "p4 256-vs-128: 128-bit {:?}, 256-bit {:?}  =>  {:.2}x",
+        t128,
+        t256,
+        t128.as_secs_f64() / t256.as_secs_f64()
+    );
+}
+
 /// Run `src` through the interpreter for differential comparison.
 fn interp(src: &str, opt: u8) -> Result<(i64, Vec<u8>), String> {
     let mut interner = Interner::new();
