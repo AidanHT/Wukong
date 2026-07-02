@@ -22,6 +22,11 @@ pub enum EmitStage {
     Ast,
     MirHigh,
     Mir,
+    /// The **backward** MIR of a designated loss function (reverse-mode autodiff): the forward
+    /// function followed by its `{name}_grad` twin (see `--grad-of` / `--grad-wrt`). Additive to
+    /// the other stages — it runs after optimization (forcing at least `-O1`, which the autodiff
+    /// transform requires for its single-block SSA input) and emits both functions' MIR.
+    Grad,
     LlvmIr,
     Obj,
     Exe,
@@ -34,6 +39,7 @@ impl EmitStage {
             "ast" => EmitStage::Ast,
             "mir-high" => EmitStage::MirHigh,
             "mir" | "mir-low" => EmitStage::Mir,
+            "grad" => EmitStage::Grad,
             "llvm-ir" => EmitStage::LlvmIr,
             "obj" => EmitStage::Obj,
             "exe" => EmitStage::Exe,
@@ -81,6 +87,53 @@ pub struct Options {
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
     /// native object/exe emission always uses Cranelift.
     pub backend: BackendKind,
+    /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
+    /// `--train`; inert for every other stage.
+    pub grad: GradOptions,
+}
+
+/// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
+/// parameters to differentiate with respect to, and (for `--train`) the optimizer loop settings.
+#[derive(Clone, Debug)]
+pub struct GradOptions {
+    /// The function to differentiate (`--grad-of=<name>`). Defaults to `loss` when unset.
+    pub of: Option<String>,
+    /// Parameter indices to differentiate w.r.t. (`--grad-wrt=0,1`). Empty means *every* pointer
+    /// (buffer) parameter — the gradient of an unread/output buffer is simply zero, so this is safe.
+    pub wrt: Vec<usize>,
+    /// Run a fwd→bwd→optimizer training loop instead of just emitting the backward (`--train`).
+    pub train: bool,
+    /// Number of training steps (`--train-steps=N`).
+    pub train_steps: usize,
+    /// Learning rate for the training loop (`--train-lr=<f>`).
+    pub train_lr: f32,
+    /// Which optimizer the training loop uses (`--train-opt=sgd|adamw`).
+    pub train_opt: TrainOpt,
+    /// Seed for the deterministic buffer initialization the training loop uses (`--train-seed=<u64>`).
+    pub train_seed: u64,
+}
+
+impl Default for GradOptions {
+    fn default() -> GradOptions {
+        GradOptions {
+            of: None,
+            wrt: Vec::new(),
+            train: false,
+            train_steps: 100,
+            train_lr: 0.01,
+            train_opt: TrainOpt::Sgd,
+            train_seed: 0x5EED_1234,
+        }
+    }
+}
+
+/// The optimizer the `--train` loop applies to the differentiated parameters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrainOpt {
+    /// Plain SGD (`w -= lr·g`) — needs no kernel of its own.
+    Sgd,
+    /// Fused decoupled-weight-decay AdamW (the `mercury_autodiff::optim` kernel).
+    AdamW,
 }
 
 impl Default for Options {
@@ -94,6 +147,7 @@ impl Default for Options {
             color: true,
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
+            grad: GradOptions::default(),
         }
     }
 }
@@ -194,7 +248,20 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- Optimization ---
-    mercury_opt::optimize(&mut program, opts.opt_level);
+    // The autodiff transform (`--emit=grad` / `--train`) consumes single-block SSA, so it forces at
+    // least `-O1` (mem2reg + simplify-cfg) regardless of the requested level. Every other path honors
+    // the requested level exactly.
+    let opt_level = if opts.emit == EmitStage::Grad || opts.grad.train {
+        opts.opt_level.max(1)
+    } else {
+        opts.opt_level
+    };
+    mercury_opt::optimize(&mut program, opt_level);
+
+    // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
+    if opts.emit == EmitStage::Grad {
+        return emit_grad(&program, &mut interner, opts);
+    }
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
     if opts.run {
@@ -388,6 +455,76 @@ fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Optio
     }
 }
 
+/// `--emit=grad`: differentiate the designated loss function and print the forward + backward MIR.
+///
+/// The loss function must already be single-block SSA (the caller forces `-O1`); its buffer
+/// parameters lower to `Ptr` and the scalar loss is `ret`-ed. Any recognized kernel calls in it
+/// (`mercury_sgemm_nt`, `mercury_vmath_f32`, `mercury_sreduce_f32[_parallel]`, `mercury_norm_f32`,
+/// `mercury_velem_f32`) get their **tuned-kernel** backward — so the emitted gradient rides the same
+/// kernels as the forward. A differentiable value with no VJP rule is a hard error, never a
+/// silently-zero gradient (see `mercury_autodiff`).
+fn emit_grad(program: &mercury_mir::Program, interner: &mut Interner, opts: &Options) -> i32 {
+    let (fwd, gradfn) = match build_grad(program, interner, opts) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: --emit=grad: {e}");
+            return exit::COMPILE_ERROR;
+        }
+    };
+    let out = mercury_mir::Program {
+        funcs: vec![fwd, gradfn],
+        level: program.level,
+    };
+    emit_mir(&out, interner);
+    exit::OK
+}
+
+/// Shared core of `--emit=grad` and `--train`: resolve the target loss function and its `wrt` list
+/// from `opts`, run the autodiff transform, and return `(forward_clone, gradient_function)`.
+fn build_grad(
+    program: &mercury_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+) -> Result<(mercury_mir::Function, mercury_mir::Function), String> {
+    let name = opts.grad.of.clone().unwrap_or_else(|| "loss".to_string());
+    let sym = interner.intern(&name);
+    let func = program.function(sym).ok_or_else(|| {
+        format!("no function `{name}` in the module (choose the target with --grad-of=<fn>)")
+    })?;
+    let wrt = grad_wrt(func, &opts.grad.wrt)?;
+    let gradfn = mercury_autodiff::grad(func, &wrt, interner)?;
+    Ok((func.clone(), gradfn))
+}
+
+/// The parameter indices to differentiate w.r.t.: the explicit `--grad-wrt` list (validated to be
+/// in-range pointer parameters), or — when empty — *every* pointer (buffer) parameter of the loss.
+/// Differentiating an unread or output buffer is harmless (its gradient is simply zero), so the
+/// "all buffers" default never produces a wrong answer, only occasionally an unused zero buffer.
+fn grad_wrt(func: &mercury_mir::Function, requested: &[usize]) -> Result<Vec<usize>, String> {
+    let is_ptr = |i: usize| *func.value_type(func.params[i]) == mercury_mir::MirType::Ptr;
+    if requested.is_empty() {
+        let all: Vec<usize> = (0..func.params.len()).filter(|&i| is_ptr(i)).collect();
+        if all.is_empty() {
+            return Err("the loss function has no buffer (pointer) parameters to differentiate".into());
+        }
+        return Ok(all);
+    }
+    for &wi in requested {
+        if wi >= func.params.len() {
+            return Err(format!(
+                "--grad-wrt index {wi} is out of range (the function has {} parameter(s))",
+                func.params.len()
+            ));
+        }
+        if !is_ptr(wi) {
+            return Err(format!(
+                "--grad-wrt index {wi} is not a buffer (pointer) parameter"
+            ));
+        }
+    }
+    Ok(requested.to_vec())
+}
+
 fn emit_mir(program: &mercury_mir::Program, interner: &Interner) {
     for f in &program.funcs {
         for ice in mercury_mir::verify::verify_function(f) {
@@ -408,6 +545,197 @@ fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceM
 fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
     for d in sink.diagnostics() {
         emit_diag(d, fmt, renderer, sm);
+    }
+}
+
+/// The `--emit=grad` CLI surface, end to end from `.mer` source: compile → optimize → differentiate
+/// the loss function, then **finite-difference-gate** the emitted backward. This is the real proof
+/// that autodiff-from-source is correct — the recognized backward kernels are gate-blind (both
+/// backends call the same symbol), so the f64/closed-form finite-difference check, not interp==native,
+/// is what proves the gradient. Toolchain-free: it runs entirely on the interpreter oracle.
+#[cfg(test)]
+mod grad_cli_tests {
+    use super::*;
+    use mercury_mir::{MirLevel, Program};
+    use mercury_span::{SourceMap, Symbol};
+
+    /// Lex → parse → sema → mir_build → opt(1). Panics with the offending stage's diagnostics.
+    fn compile_o1(src: &str) -> (Program, Interner) {
+        let mut sm = SourceMap::new();
+        let id = sm.add("grad_test.mer".to_string(), src.to_string());
+        let (tokens, ld) = mercury_lexer::tokenize(sm.source(id), id);
+        assert!(!ld.iter().any(|d| d.is_error()), "lex errors");
+        let mut interner = Interner::new();
+        let (module, pd) =
+            mercury_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        assert!(!pd.iter().any(|d| d.is_error()), "parse errors");
+        let (sema, sd) = mercury_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema errors: {sd:?}");
+        let (mut program, md) = mercury_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(!md.iter().any(|d| d.is_error()), "mir_build errors: {md:?}");
+        mercury_opt::optimize(&mut program, 1);
+        (program, interner)
+    }
+
+    /// Drive the real `build_grad` path (`--grad-of`/`--grad-wrt`) and return the `{fwd, fwd_grad}`
+    /// program, the forward and gradient function names, the **resolved** `wrt` list (so `[]`
+    /// expands to every buffer parameter, matching the appended gradient buffers), and the interner.
+    fn grad_prog(src: &str, of: &str, wrt: &[usize]) -> (Program, Symbol, Symbol, Vec<usize>, Interner) {
+        let (program, mut interner) = compile_o1(src);
+        let opts = Options {
+            grad: GradOptions {
+                of: Some(of.to_string()),
+                wrt: wrt.to_vec(),
+                ..GradOptions::default()
+            },
+            ..Options::default()
+        };
+        let fsym = interner.intern(of);
+        let resolved = grad_wrt(program.function(fsym).expect("loss fn"), wrt).expect("wrt");
+        let (fwd, g) = build_grad(&program, &mut interner, &opts).expect("build_grad failed");
+        let (fname, gname) = (fwd.name, g.name);
+        let prog = Program {
+            funcs: vec![fwd, g],
+            level: MirLevel::Low,
+        };
+        (prog, fname, gname, resolved, interner)
+    }
+
+    fn run_f32(prog: &Program, name: Symbol, bufs: &mut [Vec<f32>], it: &Interner) {
+        let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        mercury_interp::run_kernel_f32(prog, name, &mut views, it).expect("kernel run failed");
+    }
+
+    /// Run the gradient kernel over `inputs` (one zeroed gradient buffer appended per `wrt`) and
+    /// return the gradient buffer for each `wrt` (as f64).
+    fn analytic(
+        prog: &Program,
+        gname: Symbol,
+        inputs: &[Vec<f32>],
+        lens: &[usize],
+        wrt: &[usize],
+        it: &Interner,
+    ) -> Vec<Vec<f64>> {
+        let mut bufs = inputs.to_vec();
+        for &wi in wrt {
+            bufs.push(vec![0.0; lens[wi]]);
+        }
+        run_f32(prog, gname, &mut bufs, it);
+        let np = inputs.len();
+        (0..wrt.len())
+            .map(|i| bufs[np + i].iter().map(|&v| v as f64).collect())
+            .collect()
+    }
+
+    /// Central finite-difference gradient of `out[loss_out][0]` w.r.t. each `wrt` element.
+    fn finite_diff(
+        prog: &Program,
+        fwd_name: Symbol,
+        inputs: &[Vec<f32>],
+        lens: &[usize],
+        wrt: &[usize],
+        loss_out: usize,
+        eps: f32,
+        it: &Interner,
+    ) -> Vec<Vec<f64>> {
+        let loss = |bufs: &mut [Vec<f32>]| -> f64 {
+            run_f32(prog, fwd_name, bufs, it);
+            bufs[loss_out][0] as f64
+        };
+        let mut out = Vec::new();
+        for &wi in wrt {
+            let mut g = vec![0.0; lens[wi]];
+            for j in 0..lens[wi] {
+                let mut bufs = inputs.to_vec();
+                let orig = bufs[wi][j];
+                bufs[wi][j] = orig + eps;
+                let lp = loss(&mut bufs);
+                bufs[wi][j] = orig - eps;
+                let lm = loss(&mut bufs);
+                g[j] = (lp - lm) as f64 / (2.0 * eps as f64);
+            }
+            out.push(g);
+        }
+        out
+    }
+
+    /// Full gate: analytic gradient (from the emitted backward) vs the finite difference, over every
+    /// element. Returns the analytic gradients so a caller can additionally assert a closed form.
+    #[allow(clippy::too_many_arguments)]
+    fn gate(
+        src: &str,
+        of: &str,
+        wrt: &[usize],
+        inputs: &[Vec<f32>],
+        lens: &[usize],
+        loss_out: usize,
+        eps: f32,
+        rel: f64,
+        abs: f64,
+    ) -> Vec<Vec<f64>> {
+        let (prog, fwd_name, gname, wrt, it) = grad_prog(src, of, wrt);
+        let analytic = analytic(&prog, gname, inputs, lens, &wrt, &it);
+        let fd = finite_diff(&prog, fwd_name, inputs, lens, &wrt, loss_out, eps, &it);
+        for (gi, (a, f)) in analytic.iter().zip(fd.iter()).enumerate() {
+            for (j, (&av, &fv)) in a.iter().zip(f.iter()).enumerate() {
+                let tol = abs + rel * fv.abs();
+                assert!(
+                    (av - fv).abs() <= tol,
+                    "wrt#{gi}[{j}]: analytic {av} vs finite-diff {fv} (|d|={:.3e} > {:.3e})",
+                    (av - fv).abs(),
+                    tol
+                );
+            }
+        }
+        analytic
+    }
+
+    fn assert_close(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length mismatch");
+        for (j, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 3e-3 + 3e-3 * w.abs(),
+                "{what}[{j}]: got {g}, want {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn cubic_scalar_grad() {
+        // loss = x^3  ->  dL/dx = 3x^2. Differentiated straight from `.mer` source via --emit=grad.
+        let src = "module m\nfn loss(x:[f32;1], out:[f32;1]) -> f32 {\n\
+                   let a: f32 = x[0]; let l: f32 = a*a*a; out[0] = l; return l; }";
+        let x = 1.3f32;
+        let inputs = vec![vec![x], vec![0.0]];
+        let g = gate(src, "loss", &[0], &inputs, &[1, 1], 1, 1e-2, 2e-2, 1e-3);
+        assert_close(&g[0], &[3.0 * (x * x) as f64], "d(x^3)/dx");
+    }
+
+    #[test]
+    fn bilinear_two_input_grad() {
+        // loss = a * b^2  ->  dL/da = b^2, dL/db = 2ab.
+        let src = "module m\nfn loss(a:[f32;1], b:[f32;1], out:[f32;1]) -> f32 {\n\
+                   let av: f32 = a[0]; let bv: f32 = b[0]; let l: f32 = av*bv*bv;\n\
+                   out[0] = l; return l; }";
+        let (a, b) = (0.7f32, 1.1f32);
+        let inputs = vec![vec![a], vec![b], vec![0.0]];
+        let g = gate(src, "loss", &[0, 1], &inputs, &[1, 1, 1], 2, 1e-2, 3e-2, 1e-3);
+        assert_close(&g[0], &[(b * b) as f64], "dL/da = b^2");
+        assert_close(&g[1], &[(2.0 * a * b) as f64], "dL/db = 2ab");
+    }
+
+    #[test]
+    fn default_wrt_is_all_buffers() {
+        // With no --grad-wrt, every buffer parameter is differentiated; the output buffer (only
+        // stored, never read) gets a correct zero gradient.
+        let src = "module m\nfn loss(x:[f32;1], out:[f32;1]) -> f32 {\n\
+                   let a: f32 = x[0]; let l: f32 = a*a; out[0] = l; return l; }";
+        let x = 2.0f32;
+        let inputs = vec![vec![x], vec![0.0]];
+        // wrt defaults to [0, 1] (both buffers).
+        let g = gate(src, "loss", &[], &inputs, &[1, 1], 1, 1e-2, 2e-2, 1e-3);
+        assert_close(&g[0], &[2.0 * x as f64], "dL/dx = 2x");
+        assert_close(&g[1], &[0.0], "dL/d(out) = 0");
     }
 }
 

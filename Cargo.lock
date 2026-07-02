@@ -527,6 +527,7 @@ name = "mercury_driver"
 version = "0.1.0"
 dependencies = [
  "mercury_ast",
+ "mercury_autodiff",
  "mercury_backend",
  "mercury_codegen_cranelift",
  "mercury_codegen_gpu",

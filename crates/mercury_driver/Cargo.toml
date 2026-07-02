@@ -21,6 +21,9 @@ mercury_interp = { workspace = true }
 mercury_opt = { workspace = true }
 mercury_codegen_llvm = { workspace = true }
 mercury_codegen_cranelift = { workspace = true }
+# Reverse-mode autodiff: powers the `--emit=grad` stage and `--train` mode (differentiate a `.mer`
+# loss function into its backward MIR, then run fwd→bwd→optimizer training steps).
+mercury_autodiff = { workspace = true }
 # The GPU backend (`--backend=gpu`) is opt-in: behind the driver's `gpu` feature so the default
 # build stays toolchain-free (no `cudarc`, no device needed). Enabling it turns on the offloading
 # interpreter path in `compile()`.

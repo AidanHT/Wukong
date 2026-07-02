@@ -13,7 +13,11 @@ USAGE:
 
 OPTIONS:
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
-                       tokens, ast, mir-high, mir, llvm-ir, obj, exe  (default: exe)
+                       tokens, ast, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
+                       (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
+    --grad-of=<fn>     Function to differentiate for --emit=grad  (default: loss)
+    --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
+                       buffer parameters of the loss function)
     --run              Compile and run (interpreter by default; see --backend)
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
@@ -29,6 +33,7 @@ OPTIONS:
 EXAMPLES:
     mercuryc --emit=tokens examples/vadd.mer
     mercuryc --run examples/matmul.mer
+    mercuryc --emit=grad --grad-of=loss model.mer
 ";
 
 fn main() -> ExitCode {
@@ -115,6 +120,21 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 opts.emit = EmitStage::parse(stage)
                     .ok_or_else(|| format!("unknown --emit target `{stage}`"))?;
                 emit_explicit = true;
+            }
+            _ if arg.starts_with("--grad-of=") => {
+                opts.grad.of = Some(arg["--grad-of=".len()..].to_string());
+            }
+            _ if arg.starts_with("--grad-wrt=") => {
+                let list = &arg["--grad-wrt=".len()..];
+                opts.grad.wrt = list
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<usize>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        format!("--grad-wrt expects comma-separated parameter indices, got `{list}`")
+                    })?;
             }
             _ if arg.starts_with("--error-format=") => {
                 let fmt = &arg["--error-format=".len()..];
