@@ -36,7 +36,10 @@ pub enum StmtKind {
     },
     Expr(Expr),
     Return(Option<Expr>),
-    Break(Option<Ident>),
+    /// `break [label] [value]` — the optional value flows out of a value-producing `loop`
+    /// (`ExprKind::Loop`). A `break` targeting a statement-position loop must carry no value
+    /// (sema rejects `break v` there).
+    Break(Option<Ident>, Option<Expr>),
     Continue(Option<Ident>),
     Defer(Expr),
     While {
@@ -48,10 +51,6 @@ pub enum StmtKind {
         label: Option<Ident>,
         pat: Pattern,
         iter: ForIter,
-        body: Block,
-    },
-    Loop {
-        label: Option<Ident>,
         body: Block,
     },
 }

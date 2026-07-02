@@ -1,0 +1,60 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 203
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+module tests.run.loop_break_labeled
+
+// A labeled `break 'outer v` carries a value out of an *outer* value-producing loop from inside a
+// nested inner loop. The value merges on the outer loop's exit-block param; the inner loop's plain
+// `break` (no value) targets the inner loop as before. interp == native, `-O0` == `-O3`.
+
+fn search() -> i32 {
+    // Walk a 2-D space; the first hit `a == 2 && b == 3` breaks all the way out with a value.
+    let mut a = 0;
+    'outer: loop {
+        let mut b = 0;
+        loop {
+            if a == 2 {
+                if b == 3 { break 'outer a * 100 + b; }
+            }
+            b = b + 1;
+            if b > 5 { break; }
+        }
+        a = a + 1;
+        if a > 10 { break 'outer 0 - 1; }
+    }
+}
+
+fn first_sum(target: i32) -> i32 {
+    // The labeled loop is a `let` initializer: return the first (i, j) with i + j == target,
+    // encoded as i * 10 + j.
+    let mut i = 0;
+    let r = 'scan: loop {
+        let mut j = 0;
+        loop {
+            if i + j == target { break 'scan i * 10 + j; }
+            j = j + 1;
+            if j > 9 { break; }
+        }
+        i = i + 1;
+        if i > 9 { break 'scan 0 - 1; }
+    };
+    r
+}
+
+fn labeled_self() -> i32 {
+    // `break 'l v` targeting the loop it is directly inside (label resolves to the nearest match).
+    let mut n = 0;
+    'l: loop {
+        n = n + 1;
+        if n == 7 { break 'l n; }
+    }
+}
+
+fn main() -> i32 {
+    print(search());        // 203  (a == 2, b == 3 -> 2*100 + 3)
+    print(first_sum(5));    // 5    (i == 0, j == 5 -> 0*10 + 5)
+    print(labeled_self());  // 7
+    0
+}

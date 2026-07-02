@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.break_value_in_stmt_loop
+
+// A `break <value>` is only legal in a `loop` used as an *expression* (its value consumed). Here the
+// loop is in statement position (a trailing `;` discards its value, like `while`/`for`), so the
+// value has nowhere to go — reject it (E0401) rather than silently discarding a computed value.
+fn main() -> i32 {
+    loop {
+        break 5;
+    };
+    0
+}

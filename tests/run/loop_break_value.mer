@@ -1,0 +1,73 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 40
+// EXPECT-OUT: 10
+// EXPECT-OUT: 22
+// EXPECT-OUT: 1003
+module tests.run.loop_break_value
+
+// `loop` is a value-producing expression: its value is the operand of `break`. The loop's type is
+// inferred by unifying every break value (composing with `if`/`match` value merges), and the merge
+// happens on a typed block param on the loop's exit block — the same machinery `if`/`match` value
+// merges use — so the interpreter oracle and the Cranelift native backend agree bit-for-bit at
+// every `-O` level.
+
+fn simple() -> i32 {
+    // A single `break v`: the loop yields v.
+    let x = loop { break 5; };
+    x
+}
+
+fn counted() -> i32 {
+    // `break` reached through an `if` inside the loop body.
+    let mut i = 0;
+    let y = loop {
+        i = i + 1;
+        if i == 4 { break i * 10; }
+    };
+    y
+}
+
+fn sum_to(n: i32) -> i32 {
+    // The loop is the function's tail (implicit return); its value is the accumulator at exit.
+    let mut i = 0;
+    let mut acc = 0;
+    loop {
+        if i >= n { break acc; }
+        acc = acc + i;
+        i = i + 1;
+    }
+}
+
+fn multi() -> i32 {
+    // Two `break v` sites unify to one type; the second fires at runtime (c == 1 on the first
+    // iteration), exercising the fall-through break edge as well as the guarded one.
+    let mut c = 0;
+    loop {
+        c = c + 1;
+        if c == 2 { break 11; }
+        break 22;
+    }
+}
+
+fn via_match() -> i32 {
+    // `break` inside a `match` arm.
+    let mut k = 0;
+    loop {
+        k = k + 1;
+        match k {
+            3 => { break k + 1000; }
+            _ => {}
+        }
+    }
+}
+
+fn main() -> i32 {
+    print(simple());        // 5
+    print(counted());       // 40   (i == 4 -> 4 * 10)
+    print(sum_to(5));       // 10   (0+1+2+3+4)
+    print(multi());         // 22   (second break fires first)
+    print(via_match());     // 1003 (k == 3 -> 3 + 1000)
+    0
+}

@@ -154,6 +154,7 @@ fn collect_const_refs(e: &Expr, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>)
             }
         }
         ExprKind::Block(b) => collect_block_const_refs(b, consts, out),
+        ExprKind::Loop { body, .. } => collect_block_const_refs(body, consts, out),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -197,7 +198,8 @@ fn collect_block_const_refs(b: &Block, consts: &HashSet<Symbol>, out: &mut Vec<S
                 }
                 collect_block_const_refs(body, consts, out);
             }
-            StmtKind::Loop { body, .. } => collect_block_const_refs(body, consts, out),
+            // A `break <value>` may reference a top-level `const`.
+            StmtKind::Break(_, Some(e)) => collect_const_refs(e, consts, out),
             _ => {}
         }
     }
@@ -218,7 +220,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         param_tys: HashMap::new(),
         generics: HashSet::new(),
         ret_ty: Ty::Unit,
-        loop_labels: Vec::new(),
+        loop_ctx: Vec::new(),
         consts: HashMap::new(),
         checking_bodies: false,
     };
@@ -260,13 +262,13 @@ struct Sema<'a> {
     param_tys: HashMap<Symbol, Ty>,
     generics: HashSet<Symbol>,
     ret_ty: Ty,
-    /// The labels of the enclosing loops at the current point (innermost last; `None` for an
-    /// unlabeled loop). A `break`/`continue` with an empty stack is a hard error (E0303) — without it
-    /// the lowerer emits an `unreachable` terminator, which the interpreter traps but the native
-    /// backend turns into a SIGILL, a differential-gate divergence. A labeled `break`/`continue` `'l`
-    /// whose label is not on the stack is likewise E0303 (an undeclared label would otherwise leave
-    /// mir_build with a terminator-less block).
-    loop_labels: Vec<Option<Symbol>>,
+    /// The enclosing loops at the current point (innermost last). A `break`/`continue` with an empty
+    /// stack is a hard error (E0303) — without it the lowerer emits an `unreachable` terminator,
+    /// which the interpreter traps but the native backend turns into a SIGILL, a differential-gate
+    /// divergence. A labeled `break`/`continue` `'l` whose label is not on the stack is likewise
+    /// E0303. Each frame also carries whether the loop is used as a *value* (so `break v` is legal)
+    /// and the running join of its break-value types (the loop's inferred type).
+    loop_ctx: Vec<LoopCtx>,
     /// Top-level `const` initializer expressions (by name), accumulated as their bodies are checked.
     consts: HashMap<Symbol, Expr>,
     /// `false` during the collection pass, `true` once body checking starts. Gates the
@@ -275,6 +277,20 @@ struct Sema<'a> {
     /// unknown dim name is distinguished from a declared generic / a `const` with no forward-reference
     /// false positive, and a function signature (re-lowered in `check_fn`) is reported exactly once.
     checking_bodies: bool,
+}
+
+/// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
+struct LoopCtx {
+    /// The loop's label (`None` for an unlabeled loop), matched by a labeled `break`/`continue`.
+    label: Option<Symbol>,
+    /// Whether the loop is used in value position (a `let` init, call arg, block tail, `return`, …),
+    /// so `break <value>` is permitted. A statement-position loop (`StmtKind::Expr`) and every
+    /// `while`/`for` set this `false`: a `break` there must carry no value.
+    is_value: bool,
+    /// The join of every `break <value>` type seen so far (`None` until the first value break). The
+    /// loop's inferred type is this (or unit if it stays `None`). Tensor/vector shapes are unified
+    /// across breaks exactly like `if`/`match` arms.
+    break_ty: Option<Ty>,
 }
 
 impl Sema<'_> {
@@ -1439,7 +1455,15 @@ impl Sema<'_> {
                 self.check_binop_shapes(&target_ty, &value_ty, value.span);
             }
             StmtKind::Expr(e) => {
-                self.type_expr(e);
+                // A statement-position `loop` (`loop {…};` or `loop {…}` before another statement)
+                // discards its value, so a `break <value>` inside it is rejected. Type it in
+                // non-value mode; every other expression statement types normally.
+                if let ExprKind::Loop { label, body } = &e.kind {
+                    let ty = self.type_loop(label.as_ref().map(|l| l.sym), body, false);
+                    self.types.insert(e.id, ty);
+                } else {
+                    self.type_expr(e);
+                }
             }
             StmtKind::Return(opt) => {
                 let ret = self.ret_ty.clone();
@@ -1510,17 +1534,61 @@ impl Sema<'_> {
             StmtKind::Defer(e) => {
                 self.type_expr(e);
             }
-            StmtKind::Break(lbl) | StmtKind::Continue(lbl) => {
-                let kw = if matches!(s.kind, StmtKind::Break(_)) {
-                    "break"
-                } else {
-                    "continue"
-                };
-                if self.loop_labels.is_empty() {
-                    self.error(s.span, "E0303", format!("`{kw}` outside of a loop"));
+            StmtKind::Break(lbl, val) => {
+                // Type the value (for its side-table entry) regardless of whether the target loop
+                // accepts it, so a malformed value still reports its own errors.
+                let vty = val.as_ref().map(|v| self.type_expr(v));
+                // Resolve the target loop frame (innermost, or the named label).
+                let target = if self.loop_ctx.is_empty() {
+                    self.error(s.span, "E0303", "`break` outside of a loop".to_string());
+                    None
                 } else if let Some(l) = lbl {
-                    // A labeled `break`/`continue` must name an enclosing loop's label.
-                    if !self.loop_labels.iter().any(|x| *x == Some(l.sym)) {
+                    match self.loop_ctx.iter().rposition(|c| c.label == Some(l.sym)) {
+                        Some(i) => Some(i),
+                        None => {
+                            self.error(
+                                l.span,
+                                "E0303",
+                                format!("use of undeclared loop label `'{}`", self.sym_str(l.sym)),
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    Some(self.loop_ctx.len() - 1)
+                };
+                if let (Some(idx), Some(v), Some(vt)) = (target, val.as_ref(), vty) {
+                    if self.loop_ctx[idx].is_value {
+                        // Merge this break value into the loop's running type. Tensor/vector shapes
+                        // (and element types) must agree across all breaks — the same unification the
+                        // `if`/`match` arms use (`check_binop_shapes`) — so a shape-mismatched break
+                        // is an E0502, not a silently mistyped merge that mis-strides or reinterprets.
+                        let prev = self.loop_ctx[idx].break_ty.take();
+                        let joined = match prev {
+                            None => vt,
+                            Some(p) => {
+                                self.check_binop_shapes(&p, &vt, v.span);
+                                join(p, vt)
+                            }
+                        };
+                        self.loop_ctx[idx].break_ty = Some(joined);
+                    } else {
+                        self.error(
+                            v.span,
+                            "E0401",
+                            "`break` with a value is only allowed in a `loop` used as an \
+                             expression; this loop's value is discarded"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            StmtKind::Continue(lbl) => {
+                if self.loop_ctx.is_empty() {
+                    self.error(s.span, "E0303", "`continue` outside of a loop".to_string());
+                } else if let Some(l) = lbl {
+                    // A labeled `continue` must name an enclosing loop's label.
+                    if !self.loop_ctx.iter().any(|c| c.label == Some(l.sym)) {
                         self.error(
                             l.span,
                             "E0303",
@@ -1533,9 +1601,13 @@ impl Sema<'_> {
                 cond, body, label, ..
             } => {
                 self.check_condition(cond);
-                self.loop_labels.push(label.as_ref().map(|l| l.sym));
+                self.loop_ctx.push(LoopCtx {
+                    label: label.as_ref().map(|l| l.sym),
+                    is_value: false,
+                    break_ty: None,
+                });
                 self.type_block(body);
-                self.loop_labels.pop();
+                self.loop_ctx.pop();
             }
             StmtKind::For {
                 pat,
@@ -1547,15 +1619,14 @@ impl Sema<'_> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
-                self.loop_labels.push(label.as_ref().map(|l| l.sym));
+                self.loop_ctx.push(LoopCtx {
+                    label: label.as_ref().map(|l| l.sym),
+                    is_value: false,
+                    break_ty: None,
+                });
                 self.type_block(body);
-                self.loop_labels.pop();
+                self.loop_ctx.pop();
                 self.pop_scope();
-            }
-            StmtKind::Loop { body, label, .. } => {
-                self.loop_labels.push(label.as_ref().map(|l| l.sym));
-                self.type_block(body);
-                self.loop_labels.pop();
             }
         }
     }
@@ -2290,7 +2361,30 @@ impl Sema<'_> {
                 }
                 result
             }
+            // A value-position `loop` (a `let` init, call arg, block tail, `return`, …): its type is
+            // the join of every `break <value>`, inferred while checking the body.
+            ExprKind::Loop { label, body } => {
+                self.type_loop(label.as_ref().map(|l| l.sym), body, true)
+            }
             ExprKind::SizeOf(_) | ExprKind::AlignOf(_) => Ty::Scalar(Scalar::Usize),
+        }
+    }
+
+    /// Type-check a `loop`, inferring its type from its `break` values. `is_value` says whether the
+    /// loop's value is consumed (a value-position loop, where `break v` is legal). A break-less loop
+    /// is infinite and types unit; a statement loop always types unit.
+    fn type_loop(&mut self, label: Option<Symbol>, body: &Block, is_value: bool) -> Ty {
+        self.loop_ctx.push(LoopCtx {
+            label,
+            is_value,
+            break_ty: None,
+        });
+        self.type_block(body);
+        let ctx = self.loop_ctx.pop().expect("loop_ctx push/pop balanced");
+        if is_value {
+            ctx.break_ty.unwrap_or(Ty::Unit)
+        } else {
+            Ty::Unit
         }
     }
 
@@ -2473,9 +2567,6 @@ fn stmt_diverges(s: &Stmt) -> bool {
     match &s.kind {
         StmtKind::Return(_) => true,
         StmtKind::Expr(e) => expr_diverges(e),
-        // A `loop` with no `break` anywhere in its body never exits normally (it loops forever or
-        // returns from inside) — it diverges. Any `break` means it may fall through (be lenient).
-        StmtKind::Loop { body, .. } => !block_contains_break(body),
         _ => false,
     }
 }
@@ -2483,6 +2574,10 @@ fn stmt_diverges(s: &Stmt) -> bool {
 fn expr_diverges(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Block(b) => block_diverges(b),
+        // A `loop` with no `break` anywhere in its body never exits normally (it loops forever or
+        // returns from inside) — it diverges, and its value never materializes. Any `break` means it
+        // may fall through to its merge (be lenient). Covers both statement and value loops.
+        ExprKind::Loop { body, .. } => !block_contains_break(body),
         // Both arms must diverge; an `if` with no `else` can fall through.
         ExprKind::If {
             then_branch,
@@ -2545,14 +2640,12 @@ fn block_contains_break(b: &Block) -> bool {
 
 fn stmt_contains_break(s: &Stmt) -> bool {
     match &s.kind {
-        StmtKind::Break(_) => true,
+        StmtKind::Break(..) => true,
         StmtKind::Expr(e) | StmtKind::Defer(e) => expr_contains_break(e),
         StmtKind::Return(opt) => opt.as_ref().map(expr_contains_break).unwrap_or(false),
         StmtKind::Let { init, .. } => init.as_ref().map(expr_contains_break).unwrap_or(false),
         StmtKind::Assign { value, .. } => expr_contains_break(value),
-        StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Loop { body, .. } => {
-            block_contains_break(body)
-        }
+        StmtKind::While { body, .. } | StmtKind::For { body, .. } => block_contains_break(body),
         StmtKind::Continue(_) => false,
     }
 }
@@ -2560,6 +2653,10 @@ fn stmt_contains_break(s: &Stmt) -> bool {
 fn expr_contains_break(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Block(b) => block_contains_break(b),
+        // A nested `loop` is itself breakable, so descending counts a `break` bound to it — the same
+        // lenient over-count the statement-loop arm made before `loop` became an expression (only
+        // ever makes the enclosing loop analysis assume it *can* exit, never a false definite-return).
+        ExprKind::Loop { body, .. } => block_contains_break(body),
         ExprKind::If {
             then_branch,
             else_branch,

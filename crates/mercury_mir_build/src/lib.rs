@@ -335,7 +335,12 @@ impl MonoCollector<'_> {
                     self.walk_expr(e, subst);
                 }
             }
-            StmtKind::Break(_) | StmtKind::Continue(_) => {}
+            StmtKind::Break(_, val) => {
+                if let Some(v) = val {
+                    self.walk_expr(v, subst);
+                }
+            }
+            StmtKind::Continue(_) => {}
             StmtKind::While { cond, body, .. } => {
                 self.walk_expr(cond, subst);
                 self.walk_block(body, subst);
@@ -357,7 +362,6 @@ impl MonoCollector<'_> {
                 }
                 self.walk_block(body, subst);
             }
-            StmtKind::Loop { body, .. } => self.walk_block(body, subst),
         }
     }
 
@@ -431,6 +435,7 @@ impl MonoCollector<'_> {
                     self.walk_expr(&arm.body, subst);
                 }
             }
+            ExprKind::Loop { body, .. } => self.walk_block(body, subst),
         }
     }
 }
@@ -5851,10 +5856,38 @@ impl FnLowerer<'_> {
                 label,
                 ..
             } => self.lower_for(label.map(|l| l.sym), pat, iter, body),
-            StmtKind::Loop { body, label, .. } => self.lower_loop(label.map(|l| l.sym), body),
-            StmtKind::Break(label) => {
+            StmtKind::Break(label, value) => {
                 if let Some((_, _, brk)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
-                    self.builder.br(brk, vec![]);
+                    // A value loop's break target (its exit/merge block) carries a typed param;
+                    // branch to it passing the coerced break value. A statement loop / while / for
+                    // has no param — an empty arg vec, the original behavior. (`break v` targeting a
+                    // param-less loop is rejected by sema, so `value` is `None` in that case.)
+                    let args = match self.builder.block(brk).params.first().copied() {
+                        Some(param) => {
+                            let merge_ty = self.builder.value_type(param).clone();
+                            match value {
+                                Some(v) => {
+                                    let vv = self.lower_expr(v);
+                                    let from = self.expr_mir(v);
+                                    vec![self.coerce_to(vv, &from, &merge_ty, self.signed(v))]
+                                }
+                                // A bare `break;` in a value loop (mixed with value breaks): pass a
+                                // zero of the merge type so the edge stays well-typed on both backends.
+                                None => vec![self.const_zero(merge_ty)],
+                            }
+                        }
+                        None => {
+                            // No merge param: lower any (sema-rejected) value for effects, pass none.
+                            if let Some(v) = value {
+                                let _ = self.lower_expr(v);
+                            }
+                            vec![]
+                        }
+                    };
+                    self.builder.br(brk, args);
+                } else if let Some(v) = value {
+                    // No enclosing loop (sema E0303 already reported): lower the value for effects.
+                    let _ = self.lower_expr(v);
                 }
                 self.terminated = true;
             }
@@ -5884,6 +5917,12 @@ impl FnLowerer<'_> {
             }
             ExprKind::Block(b) => {
                 self.lower_block(b);
+            }
+            // A statement-position loop discards its value (sema typed it unit and rejected any
+            // `break <value>`), so reuse the plain statement lowering — its MIR is byte-identical to
+            // the pre-existing statement `loop` (no merge param).
+            ExprKind::Loop { label, body } => {
+                self.lower_loop(label.map(|l| l.sym), body);
             }
             _ => {
                 self.lower_expr(e);
@@ -5963,6 +6002,49 @@ impl FnLowerer<'_> {
         }
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    /// Lower a value-producing `loop` (an `ExprKind::Loop` in value position). Its value comes from
+    /// `break <expr>`: the exit block takes a typed merge param that each `break v` branches to (see
+    /// the `StmtKind::Break` lowering), and the loop yields that param. A break-less loop is infinite,
+    /// so its exit is unreachable and its (unit) value never materializes. Mirrors
+    /// `lower_if_value`/`lower_match`, except a `loop` body only reaches the exit via a `break` —
+    /// control otherwise loops back to the header, never falling through.
+    fn lower_loop_value(&mut self, label: Option<Symbol>, body: &Block, e: &Expr) -> ValueId {
+        let result_ty = self.expr_mir(e);
+        let produces_value = result_ty != MirType::Void;
+        // An aggregate result flows as its base pointer, so the merge param is `Ptr` (see
+        // `merge_repr_ty`); scalars are unchanged.
+        let merge_ty = merge_repr_ty(&result_ty);
+
+        let header = self.builder.new_block();
+        let exit = self.builder.new_block();
+        // The exit is the value merge: give it the typed param each `break v` passes its value to.
+        // The `StmtKind::Break` lowering reads this param off the break-target block and coerces to it.
+        if produces_value {
+            self.builder.block_param(exit, merge_ty.clone());
+        }
+        self.builder.br(header, vec![]);
+        self.builder.switch_to(header);
+        self.terminated = false;
+        self.loops.push((label, header, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        // A `loop` body never falls through to its exit — control loops back to the header. (A
+        // `break` set `terminated`, so this only re-branches the natural end-of-body path.)
+        if !self.terminated {
+            self.builder.br(header, vec![]);
+        }
+        self.builder.switch_to(exit);
+        self.terminated = false;
+        if produces_value {
+            // The merge param is the loop's value.
+            self.builder.block(exit).params[0]
+        } else {
+            // A unit/void loop (break-less, or `break;`-only): its value is never used. Yield a
+            // dummy zero (the exit is unreachable for a break-less loop).
+            self.const_zero(MirType::I32)
+        }
     }
 
     /// Emit a call to the GEMM microkernel for a recognized nest. Returns `false` (and emits
@@ -11748,6 +11830,9 @@ impl FnLowerer<'_> {
                 else_branch,
             } => self.lower_if_value(cond, then_branch, else_branch.as_deref(), e),
             ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, e),
+            ExprKind::Loop { label, body } => {
+                self.lower_loop_value(label.map(|l| l.sym), body, e)
+            }
             _ => {
                 self.unsupported(e.span, "expression");
                 let t = self.expr_mir(e);
@@ -14425,14 +14510,16 @@ fn stmt_mentions(s: &Stmt, sym: Symbol) -> bool {
         }
         StmtKind::Expr(e) | StmtKind::Defer(e) => expr_mentions(e, sym),
         StmtKind::Return(o) => o.as_ref().is_some_and(|e| expr_mentions(e, sym)),
-        StmtKind::Break(_) | StmtKind::Continue(_) => false,
+        // A `break <value>` may mention the symbol; `continue`/valueless `break` cannot. (A loop body
+        // is scanned via `StmtKind::Expr(ExprKind::Loop)`, which `expr_mentions` covers.)
+        StmtKind::Break(_, val) => val.as_ref().is_some_and(|e| expr_mentions(e, sym)),
+        StmtKind::Continue(_) => false,
         StmtKind::While { cond, body, .. } => {
             expr_mentions(cond, sym) || block_mentions(&body.stmts, body.tail.as_deref(), sym)
         }
         StmtKind::For { iter, body, .. } => {
             for_iter_mentions(iter, sym) || block_mentions(&body.stmts, body.tail.as_deref(), sym)
         }
-        StmtKind::Loop { body, .. } => block_mentions(&body.stmts, body.tail.as_deref(), sym),
     }
 }
 

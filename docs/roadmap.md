@@ -61,8 +61,15 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   tells a label `'outer` from a char literal `'a'` the way Rust does; `tests/run/labeled_loop.mer`).
   `continue` in a range `for` runs the loop step (`tests/run/for_continue.mer`); a `break`/`continue`
   outside any loop, or one naming an undeclared label, is rejected with `E0303`
-  (`tests/fail/{break_outside_loop,break_unknown_label}.mer`). Loop-as-expression / break-with-value
-  (`let x = loop { break 5; };`) is still pending — loops are statement-only and `break` carries no value (🟡).
+  (`tests/fail/{break_outside_loop,break_unknown_label}.mer`). **Loop-as-expression / break-with-value**
+  (`let x = loop { break 5; };`) works: `loop` is a value-producing expression whose type is inferred by
+  unifying every `break <value>` (composing with `if`/`match` value merges), so a value `loop` is a call
+  argument, array element, tail/return value, or aggregate field; a labeled `break 'outer v` carries a
+  value out of an outer loop. The value merges on a typed block param on the loop's exit block — the same
+  machinery `if`/`match` merges use, so interp == native, `-O0` == `-O3`. A `break <value>` targeting a
+  statement-position loop (value discarded, like `while`/`for`) is rejected `E0401`, and breaks with
+  mismatched shapes `E0502` (`tests/run/loop_break_{value,labeled,compose}.mer`,
+  `tests/fail/break_value_{in_stmt_loop,shape_mismatch}.mer`).
 - **`match`** in value and statement position: integer/bool literal, identifier-binding, and wildcard
   `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
   **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
