@@ -49,6 +49,12 @@ struct Mono {
     /// Instances to lower, in discovery order (deterministic): (instance symbol, original symbol,
     /// substitution).
     instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+    /// Module string table: decoded UTF-8 bytes (with the trailing NUL) -> the `.rodata` blob's
+    /// symbol. Built by [`collect_static_strings`] and read by the `ExprKind::Str` lowering to emit
+    /// `Op::GlobalAddr(sym)`. Threaded to the real function lowerer via the already-passed `&Mono`,
+    /// so no per-call-site plumbing is needed; a probe/kernel lowerer (`mono == None`) falls back to
+    /// the frame-local byte buffer (fine — those never return a string literal).
+    strings: HashMap<Vec<u8>, Symbol>,
 }
 
 impl Mono {
@@ -439,6 +445,174 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         instance_of: c.instance_of,
         type_generics: c.type_generics,
         instances: c.instances,
+        // Populated separately by the caller (`lower_program`) via `collect_static_strings`, which
+        // also needs `&mut interner`; kept out of the generic-collection walk to avoid coupling.
+        strings: HashMap::new(),
+    }
+}
+
+/// Collect every string literal in the module (function bodies + `const` initializers, which inline
+/// at their use sites), decode each to its UTF-8 bytes plus a trailing NUL, and dedup by content:
+/// each *unique* blob is interned once (`mercury$rodata$<i>` — the `$` can't appear in a Mercury
+/// identifier, so it never collides with a user or runtime symbol) and recorded as a `StaticData`.
+/// Returns the content->symbol table (for the `ExprKind::Str` lowering) and the ordered blob list
+/// (for `Program::statics`). Runs before lowering because it needs `&mut interner` to mint the names.
+fn collect_static_strings(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+) -> (HashMap<Vec<u8>, Symbol>, Vec<mercury_mir::StaticData>) {
+    let mut lits: Vec<Symbol> = Vec::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                collect_str_block(body, &mut lits);
+            }
+        }
+    }
+    // A `const MSG: *u8 = "…"` inlines its initializer at each use, so its literal needs a blob too.
+    for init in sema.consts.values() {
+        collect_str_expr(init, &mut lits);
+    }
+    let mut by_content: HashMap<Vec<u8>, Symbol> = HashMap::new();
+    let mut statics: Vec<mercury_mir::StaticData> = Vec::new();
+    for lit in lits {
+        let mut bytes = decode_string_literal(interner.resolve(lit));
+        bytes.push(0); // NUL terminator, so the blob address is directly `print_str`-usable.
+        if by_content.contains_key(&bytes) {
+            continue; // already have this exact content — dedup to one `.rodata` entry.
+        }
+        let name = interner.intern(&format!("mercury$rodata${}", statics.len()));
+        by_content.insert(bytes.clone(), name);
+        statics.push(mercury_mir::StaticData { name, bytes });
+    }
+    (by_content, statics)
+}
+
+/// Recursively collect the raw symbols of every `ExprKind::Str` in a block (mirrors the exhaustive
+/// `MonoCollector` walk, so a new AST variant forces this to be revisited — a missed literal only
+/// falls back to the frame-local buffer, never miscompiles).
+fn collect_str_block(b: &Block, out: &mut Vec<Symbol>) {
+    for s in &b.stmts {
+        collect_str_stmt(s, out);
+    }
+    if let Some(t) = &b.tail {
+        collect_str_expr(t, out);
+    }
+}
+
+fn collect_str_stmt(s: &Stmt, out: &mut Vec<Symbol>) {
+    match &s.kind {
+        StmtKind::Let { init, .. } => {
+            if let Some(e) = init {
+                collect_str_expr(e, out);
+            }
+        }
+        StmtKind::Assign { target, value, .. } => {
+            collect_str_expr(target, out);
+            collect_str_expr(value, out);
+        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => collect_str_expr(e, out),
+        StmtKind::Return(o) => {
+            if let Some(e) = o {
+                collect_str_expr(e, out);
+            }
+        }
+        StmtKind::Break(_) | StmtKind::Continue(_) => {}
+        StmtKind::While { cond, body, .. } => {
+            collect_str_expr(cond, out);
+            collect_str_block(body, out);
+        }
+        StmtKind::For { iter, body, .. } => {
+            match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    collect_str_expr(start, out);
+                    if let Some(e) = end {
+                        collect_str_expr(e, out);
+                    }
+                    if let Some(e) = step {
+                        collect_str_expr(e, out);
+                    }
+                }
+                ForIter::Expr(e) => collect_str_expr(e, out),
+            }
+            collect_str_block(body, out);
+        }
+        StmtKind::Loop { body, .. } => collect_str_block(body, out),
+    }
+}
+
+fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
+    match &e.kind {
+        ExprKind::Str(s) => out.push(*s),
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => {}
+        ExprKind::Unary { expr, .. } => collect_str_expr(expr, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_str_expr(lhs, out);
+            collect_str_expr(rhs, out);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_str_expr(callee, out);
+            for a in args {
+                collect_str_expr(a, out);
+            }
+        }
+        ExprKind::Index { base, indices } => {
+            collect_str_expr(base, out);
+            for i in indices {
+                collect_str_expr(i, out);
+            }
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            collect_str_expr(base, out)
+        }
+        ExprKind::Cast { expr, .. } => collect_str_expr(expr, out),
+        ExprKind::StructLit { fields, rest, .. } => {
+            for f in fields {
+                collect_str_expr(&f.value, out);
+            }
+            if let Some(r) = rest {
+                collect_str_expr(r, out);
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+            for it in items {
+                collect_str_expr(it, out);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            collect_str_expr(value, out);
+            collect_str_expr(count, out);
+        }
+        ExprKind::Block(b) => collect_str_block(b, out),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_str_expr(cond, out);
+            collect_str_block(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_str_expr(e, out);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_str_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_str_expr(g, out);
+                }
+                collect_str_expr(&arm.body, out);
+            }
+        }
     }
 }
 
@@ -579,7 +753,13 @@ pub fn lower_program(
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
     // (a generic type param has no single MIR type); its specialized copies are emitted afterward.
-    let mono = collect_mono(module, sema, interner);
+    let mut mono = collect_mono(module, sema, interner);
+    // Intern every unique string literal into a read-only `.rodata` blob (deduped by content) and
+    // hand the content->symbol table to the lowerer via `mono`, so `ExprKind::Str` yields a stable
+    // `Op::GlobalAddr` address instead of a per-use stack buffer (a returned `*u8` no longer dangles).
+    let (str_table, statics) = collect_static_strings(module, sema, interner);
+    mono.strings = str_table;
+    program.statics = statics;
     let no_subst: HashMap<Symbol, Ty> = HashMap::new();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
@@ -11272,21 +11452,35 @@ impl FnLowerer<'_> {
             // one element per byte, so the interpreter's slot-indexed memory and native's byte memory
             // agree (`store_element` strides by element, which is 1 byte for `I8`).
             ExprKind::Str(s) => {
-                let bytes = decode_string_literal(self.interner.resolve(*s));
-                let elem = MirType::I8;
-                let n = bytes.len() as u32 + 1; // + NUL terminator
-                let base = self
-                    .builder
-                    .alloca(MirType::Array(Box::new(elem.clone()), n));
-                for (i, b) in bytes.iter().enumerate() {
-                    let v = self
+                // Preferred path: the literal lives once in `.rodata` (registered by
+                // `collect_static_strings`), so its value is that blob's address via `Op::GlobalAddr`.
+                // A returned/threaded `*u8` then points at stable read-only storage, valid after the
+                // callee's frame is gone (interp==native) — the dangling-string divergence closed.
+                // The lookup key is the decoded bytes plus the trailing NUL (how blobs are stored).
+                let mut key = decode_string_literal(self.interner.resolve(*s));
+                key.push(0);
+                if let Some(sym) = self.mono.and_then(|m| m.strings.get(&key)).copied() {
+                    self.builder.build(MirType::Ptr, Op::GlobalAddr(sym))
+                } else {
+                    // Fallback (a probe/kernel lowerer without the table, or a literal the collector
+                    // did not pre-scan): materialize a frame-local NUL-terminated byte buffer and
+                    // yield its base — correct, just frame-local (the pre-`.rodata` behavior).
+                    let bytes = &key[..key.len() - 1];
+                    let elem = MirType::I8;
+                    let n = key.len() as u32; // bytes + NUL terminator
+                    let base = self
                         .builder
-                        .build(MirType::I8, Op::ConstInt(*b as i128, MirType::I8));
-                    self.store_element(base, &elem, i as i128, v);
+                        .alloca(MirType::Array(Box::new(elem.clone()), n));
+                    for (i, b) in bytes.iter().enumerate() {
+                        let v = self
+                            .builder
+                            .build(MirType::I8, Op::ConstInt(*b as i128, MirType::I8));
+                        self.store_element(base, &elem, i as i128, v);
+                    }
+                    let nul = self.builder.build(MirType::I8, Op::ConstInt(0, MirType::I8));
+                    self.store_element(base, &elem, bytes.len() as i128, nul);
+                    base
                 }
-                let nul = self.builder.build(MirType::I8, Op::ConstInt(0, MirType::I8));
-                self.store_element(base, &elem, bytes.len() as i128, nul);
-                base
             }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
