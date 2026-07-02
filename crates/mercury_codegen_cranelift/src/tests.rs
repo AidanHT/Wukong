@@ -2348,6 +2348,116 @@ fn differential_bf16_axpby() {
     );
 }
 
+/// The **all-half** streaming axpby `out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as {bf16,f16}` —
+/// half in AND a narrowing half store — must dispatch to `mercury_axpby_{bf16,f16}_out` and stay
+/// native==interp across opt levels. The narrowing round goes through the shared `f32_to_*_bits` shim
+/// (== a scalar `as bf16`/`as f16` store), so `-O0`==`-O3` and both backends agree bit-for-bit.
+#[test]
+fn differential_half_out_axpby() {
+    // bf16 in, bf16 out -> the narrowing kernel.
+    let bf = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[bf16;64]) { \
+        for k in 0..64 { o[k] = (1.5 * (x[k] as f32) + 2.0 * (y[k] as f32)) as bf16; } }";
+    assert!(
+        lowered_calls(bf, "mercury_axpby_bf16_out"),
+        "bf16-in/bf16-out axpby -> mercury_axpby_bf16_out"
+    );
+    // f16 in, f16 out -> the f16 twin.
+    let hf = "module m\nfn ax(x:[f16;64], y:[f16;64], o:[f16;64]) { \
+        for k in 0..64 { o[k] = (1.5 * (x[k] as f32) + 2.0 * (y[k] as f32)) as f16; } }";
+    assert!(
+        lowered_calls(hf, "mercury_axpby_f16_out"),
+        "f16-in/f16-out axpby -> mercury_axpby_f16_out"
+    );
+    // A **f32** output must NOT take the narrowing path (it's the plain bf16-in/f32-out kernel).
+    let f32out = "module m\nfn ax(x:[bf16;64], y:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = 1.5 * (x[k] as f32) + 2.0 * (y[k] as f32); } }";
+    assert!(
+        !lowered_calls(f32out, "mercury_axpby_bf16_out"),
+        "f32-output axpby must not take the narrowing store path"
+    );
+
+    // native == interp across opt levels, fractional non-half-exact inputs, both halves.
+    for (ty, k) in [("bf16", "bf16"), ("f16", "f16")] {
+        let prog = format!(
+            "fn ax(x:[{ty};4096], y:[{ty};4096], o:[{k};4096]) {{ \
+             for j in 0..4096 {{ o[j] = (1.5 * (x[j] as f32) + 2.0 * (y[j] as f32)) as {k}; }} }} \
+             fn main() -> i32 {{ let mut x:[{ty};4096]=[0.0 as {ty};4096]; \
+             let mut y:[{ty};4096]=[0.0 as {ty};4096]; let mut o:[{k};4096]=[0.0 as {k};4096]; \
+             for i in 0..4096 {{ x[i]=((i as f32)*0.001) as {ty}; y[i]=((i as f32)*0.002-1.3) as {ty}; }} \
+             ax(x,y,o); let mut s:f32=0.0; for t in 0..4096 {{ s = s + (o[t] as f32); }} \
+             print((s*10.0) as i32); return 0; }}"
+        );
+        for opt in [0u8, 2, 3] {
+            assert_eq!(
+                jit(&prog, opt).expect("jit"),
+                interp(&prog, opt).expect("interp"),
+                "{ty}-out axpby native vs interp mismatch at -O{opt}"
+            );
+        }
+    }
+    // Golden half-exact: o[k] = 2·(k+1) + 3·2 = 2(k+1)+6 (all bf16-exact); Σ_{k=0..7} = 2·36 + 48 = 120.
+    let golden = "fn ax(x:[bf16;8], y:[bf16;8], o:[bf16;8]) { \
+        for k in 0..8 { o[k] = (2.0*(x[k] as f32) + 3.0*(y[k] as f32)) as bf16; } } \
+        fn main() -> i32 { let mut x:[bf16;8]=[0.0 as bf16;8]; let mut y:[bf16;8]=[0.0 as bf16;8]; \
+        let mut o:[bf16;8]=[0.0 as bf16;8]; for i in 0..8 { x[i]=((i+1) as f32) as bf16; y[i]=2.0 as bf16; } \
+        ax(x,y,o); let mut s:f32=0.0; for t in 0..8 { s = s + (o[t] as f32); } print((s) as i32); return 0; }";
+    let (_, out) = jit(golden, 3).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "120\n",
+        "bf16-out axpby produced the wrong value"
+    );
+}
+
+/// The **half-output** activation `out[k] = (f((x[k] as f32))) as {bf16,f16}` — half in AND a narrowing
+/// half store — must dispatch to `mercury_vmath_{bf16,f16}_out` and stay native==interp across opt
+/// levels. The activation is the shared `vmath` kernel and the narrowing store the shared shim, so the
+/// half-out result equals the half-in/f32-out activation narrowed with `as {bf16,f16}` bit-for-bit.
+#[test]
+fn differential_half_out_vmath() {
+    // bf16 in, bf16 out -> the narrowing activation kernel.
+    let bf = "module m\nfn a(x:[bf16;64], o:[bf16;64]) { \
+        for k in 0..64 { o[k] = (silu((x[k] as f32))) as bf16; } }";
+    assert!(
+        lowered_calls(bf, "mercury_vmath_bf16_out"),
+        "bf16-in/bf16-out activation -> mercury_vmath_bf16_out"
+    );
+    // f16 in, f16 out -> the f16 twin.
+    let hf = "module m\nfn a(x:[f16;64], o:[f16;64]) { \
+        for k in 0..64 { o[k] = (gelu((x[k] as f32))) as f16; } }";
+    assert!(
+        lowered_calls(hf, "mercury_vmath_f16_out"),
+        "f16-in/f16-out activation -> mercury_vmath_f16_out"
+    );
+    // An **f32** output must NOT take the narrowing path (it's the plain half-in/f32-out kernel).
+    let f32out = "module m\nfn a(x:[bf16;64], o:[f32;64]) { \
+        for k in 0..64 { o[k] = silu((x[k] as f32)); } }";
+    assert!(
+        !lowered_calls(f32out, "mercury_vmath_bf16_out"),
+        "f32-output activation must not take the narrowing store path"
+    );
+
+    // native == interp across opt levels, over a sign/magnitude spread, both halves and two activations.
+    for (ty, act) in [("bf16", "silu"), ("f16", "gelu")] {
+        let prog = format!(
+            "fn a(x:[{ty};4096], o:[{ty};4096]) {{ \
+             for j in 0..4096 {{ o[j] = ({act}((x[j] as f32))) as {ty}; }} }} \
+             fn main() -> i32 {{ let mut x:[{ty};4096]=[0.0 as {ty};4096]; \
+             let mut o:[{ty};4096]=[0.0 as {ty};4096]; \
+             for i in 0..4096 {{ x[i]=(((i as f32)-2048.0)*0.01) as {ty}; }} \
+             a(x,o); let mut s:f32=0.0; for t in 0..4096 {{ s = s + (o[t] as f32); }} \
+             print((s*100.0) as i32); return 0; }}"
+        );
+        for opt in [0u8, 2, 3] {
+            assert_eq!(
+                jit(&prog, opt).expect("jit"),
+                interp(&prog, opt).expect("interp"),
+                "{ty}-out {act} native vs interp mismatch at -O{opt}"
+            );
+        }
+    }
+}
+
 /// `erf` (and thus exact GELU) is built from primitive ops + the exp polynomial, so the native
 /// backend must match the interpreter bit-for-bit across opt levels — scalar and vectorized,
 /// including the odd-function sign (`erf(-x) = -erf(x)`) and saturation toward ±1 for large |x|.
@@ -2585,6 +2695,74 @@ fn vectorized_saxpy_is_correct_across_sizes() {
             "vectorized native vs interp mismatch at n={n}"
         );
         assert_eq!(native.0, (n * n) as i64, "wrong saxpy result at n={n}");
+    }
+}
+
+/// The broadcast-bias dispatch: a `for i { for j { out[i*C+j] = x[i*C+j] + b[j] } }` nest must (a)
+/// lower to one `mercury_bias_bcast_f32` call (the 256-bit AVX2 broadcast-bias kernel — the row-
+/// broadcast `b[j]` is what the affine velem recognizer declines), (b) agree between interpreter and
+/// native bit-for-bit, and (c) compute the same result the scalar nest would. `x=0`, `b[j]=j` ⇒
+/// `sum = rows * C*(C-1)/2`. Sizes hit the kernel's vector body, its scalar tail, and both.
+#[test]
+fn bias_bcast_is_correct_across_sizes() {
+    let kernel = |rows: usize, cols: usize| {
+        let n = rows * cols;
+        format!(
+            "fn main() -> i32 {{ let x: [f32; {n}] = [0.0; {n}]; \
+             let mut b: [f32; {cols}] = [0.0; {cols}]; \
+             let mut j0: i32 = 0; while j0 < {cols} {{ b[j0] = (j0 as f32); j0 += 1; }} \
+             let mut out: [f32; {n}] = [0.0; {n}]; \
+             for i in 0..{rows} {{ for j in 0..{cols} {{ out[i * {cols} + j] = x[i * {cols} + j] + b[j]; }} }} \
+             let mut s: f32 = 0.0; let mut k: i32 = 0; while k < {n} {{ s = s + out[k]; k += 1; }} \
+             return s as i32; }}"
+        )
+    };
+
+    // The broadcast-bias recognizer must have fired.
+    let (prog, interner) = lowered(&kernel(8, 12), 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("mercury_bias_bcast_f32"),
+        "broadcast bias `x[i*C+j] + b[j]` should dispatch to the bias kernel:\n{mir}"
+    );
+
+    // (3,4) tail-only, (2,8) one vector no tail, (5,13)/(7,3) vector+tail, (8,8)/(7,16) larger.
+    for (rows, cols) in [(3usize, 4usize), (2, 8), (5, 13), (7, 3), (8, 8), (7, 16)] {
+        let src = kernel(rows, cols);
+        let native = jit(&src, 3).expect("jit");
+        let interp = interp(&src, 3).expect("interp");
+        assert_eq!(native, interp, "bias native vs interp mismatch at {rows}x{cols}");
+        let want = (rows * (cols * (cols - 1) / 2)) as i64;
+        assert_eq!(native.0, want, "wrong bias-bcast sum at {rows}x{cols}");
+    }
+}
+
+/// The `@parallel` broadcast-bias must dispatch to `mercury_bias_bcast_f32_parallel` (via the
+/// whole-function interceptor, before the generic outliner) and stay bit-identical to the serial
+/// kernel the interpreter calls — interp == native across opt levels.
+#[test]
+fn bias_bcast_parallel_matches_interp() {
+    let src = "@parallel fn addb(x: [f32; 96], b: [f32; 12], out: [f32; 96]) { \
+               for i in 0..8 { for j in 0..12 { out[i * 12 + j] = x[i * 12 + j] + b[j]; } } } \
+               fn main() -> i32 { let mut x: [f32; 96] = [0.0; 96]; \
+               let mut i0: i32 = 0; while i0 < 96 { x[i0] = (i0 as f32); i0 += 1; } \
+               let mut b: [f32; 12] = [0.0; 12]; \
+               let mut j0: i32 = 0; while j0 < 12 { b[j0] = (j0 as f32); j0 += 1; } \
+               let mut out: [f32; 96] = [0.0; 96]; addb(x, b, out); \
+               let mut s: f32 = 0.0; let mut k: i32 = 0; while k < 96 { s = s + out[k]; k += 1; } \
+               return s as i32; }";
+    let (prog, interner) = lowered(src, 2);
+    let mir = mercury_mir::print::print_program(&prog, &interner);
+    assert!(
+        mir.contains("mercury_bias_bcast_f32_parallel"),
+        "@parallel bias should dispatch to the multicore kernel:\n{mir}"
+    );
+    for opt in [0u8, 3] {
+        let native = jit(src, opt).expect("jit");
+        let interp = interp(src, opt).expect("interp");
+        assert_eq!(native, interp, "parallel bias native vs interp mismatch at O{opt}");
+        // sum_k k (0..96) + 8 * sum_j j (0..12) = 4560 + 8*66 = 5088.
+        assert_eq!(native.0, 5088, "wrong parallel bias sum at O{opt}");
     }
 }
 

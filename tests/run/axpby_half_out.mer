@@ -1,0 +1,69 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 12
+// EXPECT-OUT: 24
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+module tests.run.axpby_half_out
+
+// All-half streaming axpby: `out[i] = (a*(x[i] as f32) + b*(y[i] as f32)) as bf16` over `[bf16]`
+// inputs with a **bf16 output** (and the f16 twin) lowers to mercury_axpby_{bf16,f16}_out — half in AND
+// out, so 6 bytes/elem vs an all-f32 axpby's 12 (the narrowing store halves the write traffic). The
+// narrowing round goes through the shared f32_to_{bf16,f16}_bits shim (== a scalar `as bf16` store), so
+// interp and native agree bit-for-bit and -O0 == -O3. x=[1,2,3,4], y=[10,20,30,40] (half-exact), a=2,
+// b=1 → out = round(2x + y) = round([12,24,36,48]) = [12,24,36,48] (all bf16/f16-exact).
+
+fn main() -> i32 {
+    // bf16 in/out.
+    let mut xb: [bf16; 32] = [0.0 as bf16; 32];
+    let mut yb: [bf16; 32] = [0.0 as bf16; 32];
+    for i in 0..32 {
+        xb[i] = ((i + 1) as f32) as bf16;
+        yb[i] = (((i + 1) * 10) as f32) as bf16;
+    }
+    let mut ob: [bf16; 32] = [0.0 as bf16; 32];
+    for i in 0..32 {
+        ob[i] = (2.0 * (xb[i] as f32) + 1.0 * (yb[i] as f32)) as bf16;
+    }
+    // Independent scalar reference via a `while` loop (not recognized) — the dispatched kernel must
+    // match the general `as bf16` narrowing store bit-for-bit (both round through the shared shim).
+    let mut rb: [bf16; 32] = [0.0 as bf16; 32];
+    let mut i0: usize = 0;
+    while i0 < 32 {
+        rb[i0] = (2.0 * (xb[i0] as f32) + 1.0 * (yb[i0] as f32)) as bf16;
+        i0 = i0 + 1;
+    }
+    let mut mb: i32 = 0;
+    for i in 0..32 { if (ob[i] as f32) != (rb[i] as f32) { mb = mb + 1; } }
+    print(mb); // 0 — bf16-out dispatch == scalar reference
+
+    // f16 in/out.
+    let mut xf: [f16; 32] = [0.0 as f16; 32];
+    let mut yf: [f16; 32] = [0.0 as f16; 32];
+    for i in 0..32 {
+        xf[i] = ((i + 1) as f32) as f16;
+        yf[i] = (((i + 1) * 10) as f32) as f16;
+    }
+    let mut of: [f16; 32] = [0.0 as f16; 32];
+    for i in 0..32 {
+        of[i] = (2.0 * (xf[i] as f32) + 1.0 * (yf[i] as f32)) as f16;
+    }
+    let mut rf: [f16; 32] = [0.0 as f16; 32];
+    let mut i1: usize = 0;
+    while i1 < 32 {
+        rf[i1] = (2.0 * (xf[i1] as f32) + 1.0 * (yf[i1] as f32)) as f16;
+        i1 = i1 + 1;
+    }
+    let mut mf: i32 = 0;
+    for i in 0..32 { if (of[i] as f32) != (rf[i] as f32) { mf = mf + 1; } }
+    print(mf); // 0 — f16-out dispatch == scalar reference
+
+    // Spot values: out[i] = 12*(i+1), all half-exact.
+    print((ob[0] as f32) as i32); // 12
+    print((of[1] as f32) as i32); // 24
+    print((ob[2] as f32) as i32); // 36
+    print((of[3] as f32) as i32); // 48
+    return 0;
+}

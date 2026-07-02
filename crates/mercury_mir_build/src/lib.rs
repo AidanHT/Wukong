@@ -699,6 +699,8 @@ pub fn lower_program(
         vmath_f16: interner.intern("mercury_vmath_f16"),
         velem: interner.intern("mercury_velem_f32"),
         vhorner: interner.intern("mercury_vhorner_f32"),
+        bias_bcast: interner.intern("mercury_bias_bcast_f32"),
+        bias_bcast_par: interner.intern("mercury_bias_bcast_f32_parallel"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         argreduce: interner.intern("mercury_argreduce_f32"),
         argreduce_par: interner.intern("mercury_argreduce_f32_parallel"),
@@ -740,6 +742,10 @@ pub fn lower_program(
         reduce_f16_par: interner.intern("mercury_reduce_f16_parallel"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
         axpby_f16: interner.intern("mercury_axpby_f16"),
+        axpby_bf16_out: interner.intern("mercury_axpby_bf16_out"),
+        axpby_f16_out: interner.intern("mercury_axpby_f16_out"),
+        vmath_bf16_out: interner.intern("mercury_vmath_bf16_out"),
+        vmath_f16_out: interner.intern("mercury_vmath_f16_out"),
         transpose: interner.intern("mercury_transpose_f32"),
         transpose_par: interner.intern("mercury_transpose_f32_parallel"),
         transpose_u16: interner.intern("mercury_transpose_u16"),
@@ -1098,6 +1104,19 @@ pub fn lower_program(
                     program.funcs.push(func);
                     continue;
                 }
+                // A `@parallel` *broadcast-bias* nest (`fn f(x,b,out){ for i { for j { out[i*C+j] =
+                // act(x[i*C+j] + b[j]) } } }`) dispatches to the multicore `mercury_bias_bcast_f32_parallel`:
+                // rows are independent (deterministic, bit-equal to the serial kernel the interpreter
+                // calls). Intercepted *before* the generic outliner below — which would split the rows
+                // into per-row 1-D loops and lose the whole-nest recognizer — mirroring the batched-norm
+                // interception above.
+                if has_parallel_attr(item, interner)
+                    && is_bias_bcast_fn(f, body, sema, interner, gemm)
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
                 // `@parallel` on a function whose whole body is `for i in 0..n { … }` over array
                 // (pointer) parameters is lowered to a multi-threaded runtime dispatch: the loop
                 // body becomes a separate ranged function, and the original becomes a thin wrapper
@@ -1252,6 +1271,51 @@ fn is_batched_norm_fn(
         mono: None,
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
+}
+
+/// Is this function body a single broadcast-bias nest (`for i in 0..R { for j in 0..C { out[i*C+j] =
+/// act(x[i*C+j] + b[j]) } }`)? Probed with a throwaway lowerer — [`FnLowerer::match_bias_bcast`] is pure
+/// (reads sema/interner, emits no MIR), so a never-built `Builder` is harmless. The `@parallel` driver
+/// runs this *before* the generic loop outliner so a `@parallel` bias nest is routed through normal
+/// lowering (where `try_emit_bias_bcast` dispatches to `mercury_bias_bcast_f32_parallel`, mapping the
+/// independent rows across cores) rather than outlined into per-row 1-D loops — mirroring
+/// [`is_batched_norm_fn`].
+fn is_bias_bcast_fn(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    let mut diags = Vec::new();
+    let probe = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::I64),
+        sema,
+        interner,
+        diags: &mut diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
+    };
+    probe.match_bias_bcast(pat, iter, lb).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1646,6 +1710,17 @@ struct GemmSyms {
     /// The streaming Horner-polynomial kernel (`mercury_vhorner_f32(x, out, n, coeffs, ncoeff)`): a
     /// recognized `r = c0; r = r*x + c1; …; out[i] = r` per-element polynomial lowers to this.
     vhorner: Symbol,
+    /// The broadcast-bias kernel (`mercury_bias_bcast_f32(x, b, out, rows, cols, op)`): a recognized
+    /// `for i { for j { out[i*C+j] = act(x[i*C+j] + b[j]) } }` nest — a `cols`-long bias added across
+    /// every row, with an optional fused activation — lowers to this. `op` is the runtime `VM_*`
+    /// activation code (or `-1` for a pure add). 256-bit AVX2 vs the 128-bit generic vectorizer /
+    /// scalar the row-broadcast operand would otherwise fall to. The interpreter marshals the identical
+    /// kernel, so the differential oracle stays exact.
+    bias_bcast: Symbol,
+    /// The multicore broadcast-bias (`mercury_bias_bcast_f32_parallel`): a `@parallel` bias nest maps
+    /// its independent rows across cores here — bit-identical to the serial kernel the interpreter
+    /// calls (no cross-row combine).
+    bias_bcast_par: Symbol,
     /// The multicore deterministic f32 reduction kernel (`mercury_sreduce_f32_parallel(x, y, n, op)
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
@@ -1769,6 +1844,18 @@ struct GemmSyms {
     axpby_bf16: Symbol,
     /// `mercury_axpby_f16` — the F16C twin of `axpby_bf16` (f16 inputs widened with `vcvtph2ps`).
     axpby_f16: Symbol,
+    /// `mercury_vmath_bf16_out(x, out, n, op)` — the **half-output** activation (bf16 in AND out): the
+    /// activation is computed in f32 then narrowed back to bf16 on store (activation-store / KV-write
+    /// path). 4 bytes/elem (2 in + 2 out) vs the half-in/f32-out activation's 6.
+    vmath_bf16_out: Symbol,
+    /// `mercury_vmath_f16_out` — the F16C twin (f16 in AND out; narrow via `vcvtps2ph`).
+    vmath_f16_out: Symbol,
+    /// `mercury_axpby_bf16_out(x, y, out, n, a, b)` — the **all-half** streaming axpby (bf16 in AND a
+    /// **bf16 output**): the axpby sum is narrowed back to bf16 on store through the shared round shim.
+    /// 6 bytes/elem vs an all-f32 axpby's 12 (the narrowing store halves the write traffic).
+    axpby_bf16_out: Symbol,
+    /// `mercury_axpby_f16_out` — the F16C twin (f16 in AND out; narrow via `vcvtps2ph`).
+    axpby_f16_out: Symbol,
     /// `mercury_transpose_f32[_parallel](src, dst, rows, cols)` — the cache-blocked matrix transpose
     /// (`dst[j,i] = src[i,j]`, `[rows,cols]` → `[cols,rows]`). A recognized transpose nest dispatches
     /// here; it is pure data movement (a permutation), so bit-identical to the scalar nest on both
@@ -1992,6 +2079,12 @@ const DQ_SILU: i64 = 3; // out = silu(..)
 const DQ_I8: i64 = 0 << 8; // q: [i8]  (signed weights)
 const DQ_U8: i64 = 1 << 8; // q: [u8]  (unsigned activations)
 const DQ_I32: i64 = 2 << 8; // q: [i32] (a quantized GEMM accumulator)
+
+// Broadcast-bias `op` codes — the activation is a `mercury_runtime::vmath` `VM_*` code (identical value
+// space to `VMATH_*` above), or `BIAS_ACT_NONE` for a pure add. `VMATH_RELU` (= 4, no `MathIntrinsic`
+// variant since ReLU is written `if x>0 {x} else {0}`) is remapped from the `VE_RELU` peel.
+const BIAS_ACT_NONE: i64 = -1;
+const VMATH_RELU: i64 = 4;
 
 /// One additive term of a recognized streaming affine body. `Scaled(arr, s)` is `arr[j]` (`s = None`,
 /// coefficient 1) or `s·arr[j]` / `arr[j]·s` for a loop-invariant f32 scalar `s`; `Const(s)` is a
@@ -8065,40 +8158,15 @@ impl FnLowerer<'_> {
     /// `0*inf=NaN` the source never has — and the interp==native gate, both calling the same kernel,
     /// would not catch it). Returns `(out, x, y, a_coef?, b_coef?)`, where a `None` coef means literal 1.
     #[allow(clippy::type_complexity)]
-    fn match_lowp_axpby<'b>(
+    /// Match the axpby **sum** `a*(x[k] as f32) + b*(y[k] as f32)` (either coefficient implicit) over
+    /// `[bf16]`/`[f16]` inputs, returning `(x, y, a?, b?, is_f16)` — the shared body of both the
+    /// f32-output ([`Self::match_lowp_axpby`]) and half-output ([`Self::match_lowp_axpby_narrow`])
+    /// recognizers. Pure. Both inputs must be the same precision (one kernel widens one width).
+    fn match_lowp_axpby_sum<'b>(
         &self,
-        body: &'b Block,
+        value: &'b Expr,
         k: Symbol,
-    ) -> Option<(
-        Symbol,
-        Symbol,
-        Symbol,
-        Option<&'b Expr>,
-        Option<&'b Expr>,
-        bool,
-    )> {
-        if body.tail.is_some() || body.stmts.len() != 1 {
-            return None;
-        }
-        let StmtKind::Assign {
-            target,
-            op: ast::AssignOp::Assign,
-            value,
-        } = &body.stmts[0].kind
-        else {
-            return None;
-        };
-        // Target is `out[k]` with `out` an f32 array indexed exactly by k.
-        let ExprKind::Index { base, indices } = &target.kind else {
-            return None;
-        };
-        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
-            return None;
-        }
-        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
-            return None;
-        }
-        let out = single_path(base)?;
+    ) -> Option<(Symbol, Symbol, Option<&'b Expr>, Option<&'b Expr>, bool)> {
         // `(arr[k] as f32)` with arr `[bf16]`/`[f16]`, indexed exactly by k → (arr symbol, is_f16).
         let lowp_load = |e: &Expr| -> Option<(Symbol, bool)> {
             let ExprKind::Cast { expr: inner, .. } = &e.kind else {
@@ -8155,11 +8223,108 @@ impl FnLowerer<'_> {
         };
         let (a, x, xf) = term(lhs)?;
         let (b, y, yf) = term(rhs)?;
-        // Both inputs must be the same precision (one kernel widens one width).
         if xf != yf {
             return None;
         }
+        Some((x, y, a, b, xf))
+    }
+
+    fn match_lowp_axpby<'b>(
+        &self,
+        body: &'b Block,
+        k: Symbol,
+    ) -> Option<(
+        Symbol,
+        Symbol,
+        Symbol,
+        Option<&'b Expr>,
+        Option<&'b Expr>,
+        bool,
+    )> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        // Target is `out[k]` with `out` an f32 array indexed exactly by k.
+        let ExprKind::Index { base, indices } = &target.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        let out = single_path(base)?;
+        let (x, y, a, b, xf) = self.match_lowp_axpby_sum(value, k)?;
         Some((out, x, y, a, b, xf))
+    }
+
+    /// Match a half-**output** axpby `out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16/f16` — the
+    /// all-half streaming axpby (bf16/f16 in AND out). The target `out` is a `[bf16]`/`[f16]` array and
+    /// the value is the axpby sum cast to that same half type; the inputs must be the same precision as
+    /// the output (one kernel, one width). Returns `(out, x, y, a?, b?, is_f16)`. Pure.
+    fn match_lowp_axpby_narrow<'b>(
+        &self,
+        body: &'b Block,
+        k: Symbol,
+    ) -> Option<(
+        Symbol,
+        Symbol,
+        Symbol,
+        Option<&'b Expr>,
+        Option<&'b Expr>,
+        bool,
+    )> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        // Target `out[k]` with `out` a `[bf16]`/`[f16]` array → the output precision.
+        let ExprKind::Index { base, indices } = &target.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+            return None;
+        }
+        let out_f16 = match scalar_of(target, self.sema) {
+            Some(mercury_types::Scalar::Bf16) => false,
+            Some(mercury_types::Scalar::F16) => true,
+            _ => return None,
+        };
+        let out = single_path(base)?;
+        // The value is the axpby sum cast to the output half type: `(<sum>) as bf16/f16`.
+        let ExprKind::Cast { expr: inner, .. } = &value.kind else {
+            return None;
+        };
+        let cast_f16 = match scalar_of(value, self.sema) {
+            Some(mercury_types::Scalar::Bf16) => false,
+            Some(mercury_types::Scalar::F16) => true,
+            _ => return None,
+        };
+        if cast_f16 != out_f16 {
+            return None;
+        }
+        let (x, y, a, b, xf) = self.match_lowp_axpby_sum(inner, k)?;
+        // All-half: the inputs' precision must equal the output's (one kernel widens/narrows one width).
+        if xf != out_f16 {
+            return None;
+        }
+        Some((out, x, y, a, b, out_f16))
     }
 
     /// Lower a recognized bf16→f32 axpby `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as f32) }`
@@ -8220,6 +8385,194 @@ impl FnLowerer<'_> {
                 self.gemm.axpby_bf16
             },
             args: vec![xv, yv, outv, n, av, bv],
+        });
+        true
+    }
+
+    /// Lower a recognized **half-output** axpby `for k in 0..n { out[k] = (a*(x[k] as f32) + b*(y[k] as
+    /// f32)) as bf16/f16 }` (bf16/f16 in AND out) to one `mercury_axpby_{bf16,f16}_out` call — the
+    /// all-half streaming axpby. The narrowing store rounds through the shared `f32_to_{bf16,f16}_bits`
+    /// shim (the interpreter's), so both backends marshal the identical kernel and the differential gate
+    /// stays exact (value-rounded, `-O0` == `-O2`). 6 bytes/elem vs an all-f32 axpby's 12. Falls back
+    /// unless the range is `0..n` and out / x / y are in scope. Tried after the f32-output axpby (the two
+    /// target shapes — `out:[f32]` vs `out:[bf16]` with an `as bf16` cast — are disjoint).
+    fn try_emit_lowp_axpby_narrow(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby_narrow(body, *k) else {
+            return false;
+        };
+        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
+            (self.lookup(out), self.lookup(x), self.lookup(y))
+        else {
+            return false;
+        };
+        let mut coef = |e: Option<&Expr>| -> ValueId {
+            match e {
+                Some(e) => {
+                    let ty = self.expr_mir(e);
+                    let v = self.lower_expr(e);
+                    self.coerce_to(v, &ty, &MirType::F32, true)
+                }
+                None => self
+                    .builder
+                    .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
+            }
+        };
+        let av = coef(a_expr);
+        let bv = coef(b_expr);
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        self.builder.build_void(Op::Call {
+            func: if is_f16 {
+                self.gemm.axpby_f16_out
+            } else {
+                self.gemm.axpby_bf16_out
+            },
+            args: vec![xv, yv, outv, n, av, bv],
+        });
+        true
+    }
+
+    /// Match a half-**output** activation `out[k] = (f((x[k] as f32))) as bf16/f16` — a bf16/f16 input
+    /// widened losslessly to f32, a unary intrinsic activation `f`, then the result narrowed back to the
+    /// SAME half width and stored (the activation-store / KV-cache-write path). `out` and `x` must be the
+    /// same half precision (one kernel, one width). Returns `(out, x, opcode, is_f16)`. Pure — no MIR.
+    fn match_vmath_narrow(&self, body: &Block, k: Symbol) -> Option<(Symbol, Symbol, u32, bool)> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        // Target `out[k]` with `out` a `[bf16]`/`[f16]` array → the output precision.
+        let ExprKind::Index { base, indices } = &target.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+            return None;
+        }
+        let out_f16 = match scalar_of(target, self.sema) {
+            Some(mercury_types::Scalar::Bf16) => false,
+            Some(mercury_types::Scalar::F16) => true,
+            _ => return None,
+        };
+        let out = single_path(base)?;
+        // The value is the activation result narrowed to the output half type: `(<call>) as bf16/f16`.
+        let ExprKind::Cast { expr: inner, .. } = &value.kind else {
+            return None;
+        };
+        match scalar_of(value, self.sema) {
+            Some(mercury_types::Scalar::Bf16) if !out_f16 => {}
+            Some(mercury_types::Scalar::F16) if out_f16 => {}
+            _ => return None,
+        }
+        // `inner` = `f((x[k] as f32))`, a unary intrinsic activation whose result is f32.
+        let ExprKind::Call { callee, args, .. } = &inner.kind else {
+            return None;
+        };
+        if args.len() != 1 || self.expr_mir(inner) != MirType::F32 {
+            return None;
+        }
+        let opcode = self.vmath_opcode_of(callee)?;
+        // The arg is `x[k] as f32` with `x` a `[bf16]`/`[f16]` array of the SAME width as the output.
+        let ExprKind::Cast { expr: xread, .. } = &args[0].kind else {
+            return None;
+        };
+        if scalar_of(&args[0], self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        let in_f16 = match scalar_of(xread, self.sema) {
+            Some(mercury_types::Scalar::Bf16) => false,
+            Some(mercury_types::Scalar::F16) => true,
+            _ => return None,
+        };
+        if in_f16 != out_f16 {
+            return None;
+        }
+        let ExprKind::Index {
+            base: xbase,
+            indices: xidx,
+        } = &xread.kind
+        else {
+            return None;
+        };
+        if xidx.len() != 1 || single_path(&xidx[0]) != Some(k) {
+            return None;
+        }
+        let x = single_path(xbase)?;
+        Some((out, x, opcode, out_f16))
+    }
+
+    /// Lower a recognized **half-output** activation `for k in 0..n { out[k] = (f((x[k] as f32))) as
+    /// bf16/f16 }` (bf16/f16 in AND out) to one `mercury_vmath_{bf16,f16}_out(x, out, n, op)` call — the
+    /// half-output activation. The activation is the shared `vmath` kernel and the narrowing store the
+    /// shared `f32_to_{bf16,f16}_bits` shim (the interpreter's), so both backends marshal the identical
+    /// kernel and the differential gate stays exact (value-rounded, `-O0` == `-O2`). 4 bytes/elem (2 in +
+    /// 2 out) vs the half-in/f32-out activation's 6. Falls back unless the range is `0..n` and out / x
+    /// are in scope. Tried after the f32-output vmath recognizer (disjoint: `out:[f32]` vs `out:[bf16]`).
+    fn try_emit_lowp_vmath_narrow(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((out, x, opcode, is_f16)) = self.match_vmath_narrow(body, *k) else {
+            return false;
+        };
+        let (Some((outv, _)), Some((xv, _))) = (self.lookup(out), self.lookup(x)) else {
+            return false;
+        };
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
+        self.builder.build_void(Op::Call {
+            func: if is_f16 {
+                self.gemm.vmath_f16_out
+            } else {
+                self.gemm.vmath_bf16_out
+            },
+            args: vec![xv, outv, n, opv],
         });
         true
     }
@@ -8666,6 +9019,28 @@ impl FnLowerer<'_> {
         if self.try_emit_bf16_axpby(pat, iter, body) {
             return;
         }
+        // A half-**output** axpby `for k { out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16 }`
+        // (bf16/f16 in AND out) dispatches to the narrowing streaming kernel — 6 bytes/elem vs an
+        // all-f32 axpby's 12 (the narrowing store halves the write traffic). Tried after the f32-output
+        // axpby (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
+        if self.try_emit_lowp_axpby_narrow(pat, iter, body) {
+            return;
+        }
+        // A half-**output** activation `for k { out[k] = (f((x[k] as f32))) as bf16 }` (bf16/f16 in AND
+        // out) dispatches to the narrowing activation kernel — 4 bytes/elem vs the half-in/f32-out
+        // activation's 6 (the KV-cache / activation-store path). Tried after the f32-output vmath
+        // recognizer (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
+        if self.try_emit_lowp_vmath_narrow(pat, iter, body) {
+            return;
+        }
+        // A `for i in 0..R { for j in 0..C { out[i*C+j] = act(x[i*C+j] + b[j]) } }` broadcast-bias nest
+        // (the pre-activation `+ bias` add every FFN/attention projection ends with) dispatches to the
+        // 256-bit `mercury_bias_bcast_f32` (the `_parallel` one in a `@parallel` fn). The row-broadcast
+        // operand `b[j]` is what the affine velem recognizer declines and the 128-bit generic
+        // vectorizer under-widens; the kernel folds it into one 256-bit pass with the fused activation.
+        if self.try_emit_bias_bcast(pat, iter, body) {
+            return;
+        }
         // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
         // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
         // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
@@ -9018,50 +9393,12 @@ impl FnLowerer<'_> {
                     || (single_path(rhs) == Some(row) && exprs_struct_eq(lhs, cols)))
     }
 
-    /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
-    /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
-    fn match_vmath_stmt(
-        &self,
-        stmt: &Stmt,
-        j: Symbol,
-        batch: Option<(Symbol, &Expr)>,
-    ) -> Option<(Symbol, Symbol, u32, MirType)> {
-        let StmtKind::Assign {
-            target,
-            op: ast::AssignOp::Assign,
-            value,
-        } = &stmt.kind
-        else {
-            return None;
-        };
-        let out_sym = self.index_off(target, j, batch)?;
-        // Gated SiLU / swish written as a product — `out[j] = x[j] * sigmoid(x[j])` — the textbook
-        // definition a programmer writes before reaching for the `silu()` intrinsic (and the value==gate
-        // case of a SwiGLU gate). Dispatch to the existing 256-bit `VMATH_SILU` kernel, which *is*
-        // `x·sigmoid(x)` (`vmath::silu1`), so it is bit-identical to the inlined `emit_silu` the generic
-        // 128-bit vectorizer would otherwise lower it to. `tests/run/activations.mer` writes this form.
-        if let ExprKind::Binary {
-            op: ast::BinOp::Mul,
-            lhs,
-            rhs,
-        } = &value.kind
-        {
-            if self.expr_mir(value) == MirType::F32 {
-                if let Some(x_sym) = self
-                    .match_gated_silu(lhs, rhs, j, batch)
-                    .or_else(|| self.match_gated_silu(rhs, lhs, j, batch))
-                {
-                    return Some((out_sym, x_sym, VMATH_SILU, MirType::F32));
-                }
-            }
-        }
-        let ExprKind::Call { callee, args, .. } = &value.kind else {
-            return None;
-        };
-        if args.len() != 1 {
-            return None;
-        }
-        let opcode = match self.vectorizable_intrinsic(callee) {
+    /// Resolve a unary math-intrinsic callee to its `VMATH_*` kernel opcode, or `None` if it is not one
+    /// of the ~35 vectorizable activations/transcendentals. Shared by the f32 activation recognizer
+    /// ([`Self::match_vmath_stmt`]) and the half-output one ([`Self::match_vmath_narrow`]) so the two
+    /// can never drift on which ops dispatch. Pure.
+    fn vmath_opcode_of(&self, callee: &Expr) -> Option<u32> {
+        Some(match self.vectorizable_intrinsic(callee) {
             Some(MathIntrinsic::Exp) => VMATH_EXP,
             Some(MathIntrinsic::Log) => VMATH_LOG,
             Some(MathIntrinsic::Tanh) => VMATH_TANH,
@@ -9116,7 +9453,53 @@ impl FnLowerer<'_> {
             // composed.
             Some(MathIntrinsic::Cbrt) => VMATH_CBRT,
             _ => return None,
+        })
+    }
+
+    /// Match one statement `out[j] = f(x[j])` for a supported unary intrinsic `f` (exp/log/tanh/
+    /// sigmoid/silu/gelu) over `f32` arrays, returning `(out_array, x_array, op_code)`. Pure.
+    fn match_vmath_stmt(
+        &self,
+        stmt: &Stmt,
+        j: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<(Symbol, Symbol, u32, MirType)> {
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
         };
+        let out_sym = self.index_off(target, j, batch)?;
+        // Gated SiLU / swish written as a product — `out[j] = x[j] * sigmoid(x[j])` — the textbook
+        // definition a programmer writes before reaching for the `silu()` intrinsic (and the value==gate
+        // case of a SwiGLU gate). Dispatch to the existing 256-bit `VMATH_SILU` kernel, which *is*
+        // `x·sigmoid(x)` (`vmath::silu1`), so it is bit-identical to the inlined `emit_silu` the generic
+        // 128-bit vectorizer would otherwise lower it to. `tests/run/activations.mer` writes this form.
+        if let ExprKind::Binary {
+            op: ast::BinOp::Mul,
+            lhs,
+            rhs,
+        } = &value.kind
+        {
+            if self.expr_mir(value) == MirType::F32 {
+                if let Some(x_sym) = self
+                    .match_gated_silu(lhs, rhs, j, batch)
+                    .or_else(|| self.match_gated_silu(rhs, lhs, j, batch))
+                {
+                    return Some((out_sym, x_sym, VMATH_SILU, MirType::F32));
+                }
+            }
+        }
+        let ExprKind::Call { callee, args, .. } = &value.kind else {
+            return None;
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        let opcode = self.vmath_opcode_of(callee)?;
         // The kernel computes (and writes) f32, so the activation's result must be f32.
         if self.expr_mir(value) != MirType::F32 {
             return None;
@@ -9350,6 +9733,215 @@ impl FnLowerer<'_> {
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
         self.emit_vmath_calls(zero, total, calls);
+        true
+    }
+
+    /// The broadcast-bias fused-activation `op` code for a transcendental activation call `f(..)`, or
+    /// `None` if `f` is not a supported activation. The value space is the runtime `VM_*`/`VMATH_*`
+    /// codes (the kernel dispatches through the identical `vmath::apply1`). Only the activations that
+    /// sensibly follow a Linear's bias are mapped (transcendental/saturating); trig/log are excluded.
+    fn bias_activation_code(&self, callee: &Expr) -> Option<i64> {
+        Some(match self.vectorizable_intrinsic(callee)? {
+            MathIntrinsic::Sigmoid => VMATH_SIGMOID,
+            MathIntrinsic::Tanh => VMATH_TANH,
+            MathIntrinsic::Silu => VMATH_SILU,
+            MathIntrinsic::Gelu => VMATH_GELU,
+            MathIntrinsic::Elu => VMATH_ELU,
+            MathIntrinsic::LeakyRelu => VMATH_LEAKYRELU,
+            MathIntrinsic::Softplus => VMATH_SOFTPLUS,
+            MathIntrinsic::Mish => VMATH_MISH,
+            MathIntrinsic::Selu => VMATH_SELU,
+            MathIntrinsic::HardSigmoid => VMATH_HARDSIGMOID,
+            MathIntrinsic::HardSwish => VMATH_HARDSWISH,
+            MathIntrinsic::Erf => VMATH_ERF,
+            _ => return None,
+        } as i64)
+    }
+
+    /// Peel an optional activation off the inner value of a broadcast bias, returning the inner
+    /// `x[i*C+j] + b[j]` add and the bias-kernel op code. Handles a bare add (identity), a
+    /// transcendental-activation call `f(add)` (silu/gelu/…), and the ReLU `if add > 0 { add } else { 0 }`
+    /// form (reusing [`Self::peel_velem_act`] and remapping its `VE_RELU` → the `VMATH_RELU` the bias
+    /// kernel's `apply1` expects). Pure.
+    fn peel_bias_act<'b>(&self, value: &'b Expr) -> Option<(&'b Expr, i64)> {
+        // Bare additive form → identity.
+        if matches!(&value.kind, ExprKind::Binary { op: ast::BinOp::Add, .. }) {
+            return Some((value, BIAS_ACT_NONE));
+        }
+        // Transcendental activation call `f(add)`.
+        if let ExprKind::Call { callee, args, .. } = &value.kind {
+            if args.len() == 1 {
+                if let Some(code) = self.bias_activation_code(callee) {
+                    if matches!(&args[0].kind, ExprKind::Binary { op: ast::BinOp::Add, .. }) {
+                        return Some((&args[0], code));
+                    }
+                }
+            }
+        }
+        // ReLU `if add > 0 { add } else { 0 }` — reuse the velem peel, remap VE_RELU → VMATH_RELU.
+        if let Some((inner, act)) = self.peel_velem_act(value) {
+            if act == VE_RELU
+                && matches!(&inner.kind, ExprKind::Binary { op: ast::BinOp::Add, .. })
+            {
+                return Some((inner, VMATH_RELU));
+            }
+        }
+        None
+    }
+
+    /// Match the inner body of a broadcast-bias nest — one statement `out[i*C+j] = act(x[i*C+j] + b[j])`
+    /// (`i` = outer row var, `j` = inner col var, `cols` = the inner loop bound). `out`/`x` are batched
+    /// row-major reads `base[i*cols + j]`; `b` is the **broadcast** operand indexed by `j` alone (the
+    /// row-invariant bias). Returns `(out, x, b, op)` symbols + the activation code. Pure — emits no MIR.
+    fn match_bias_bcast_inner(
+        &self,
+        ivar: Symbol,
+        jvar: Symbol,
+        cols: &Expr,
+        inner: &Block,
+    ) -> Option<(Symbol, Symbol, Symbol, i64)> {
+        let stmt = single_stmt(inner)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        // Target `out[i*cols + j]` and an f32 result (the kernel writes f32).
+        let out = self.index_off(target, jvar, Some((ivar, cols)))?;
+        if self.expr_mir(value) != MirType::F32 {
+            return None;
+        }
+        // Peel the optional activation → the `x[i*C+j] + b[j]` add.
+        let (add, op) = self.peel_bias_act(value)?;
+        if self.expr_mir(add) != MirType::F32 {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &add.kind
+        else {
+            return None;
+        };
+        // One operand is the batched data `x[i*cols + j]`, the other the broadcast bias `b[j]` (indexed
+        // by the inner var alone). Either order. `index_off` (batched) and `index_by_loopvar` (bare)
+        // are disjoint on the two index shapes, so only the correct assignment matches.
+        let split = |data: &Expr, bias: &Expr| -> Option<(Symbol, Symbol)> {
+            let x = self.index_off(data, jvar, Some((ivar, cols)))?;
+            let b = self.index_by_loopvar(bias, jvar)?;
+            if self.expr_mir(data) != MirType::F32 || self.expr_mir(bias) != MirType::F32 {
+                return None;
+            }
+            Some((x, b))
+        };
+        let (x, b) = split(lhs, rhs).or_else(|| split(rhs, lhs))?;
+        Some((out, x, b, op))
+    }
+
+    /// Pure structural match of a **broadcast-bias** nest `for i in 0..R { for j in 0..C { out[i*C+j] =
+    /// act(x[i*C+j] + b[j]) } }`. Returns `(out, x, b, rows, cols, op)` — the resolved base symbols, the
+    /// bound exprs (borrowed from `iter`/`body`), and the activation code — or `None`. Emits no MIR (so
+    /// a throwaway [`FnLowerer`] probe can reuse it for the `@parallel` whole-function interceptor).
+    /// Both `i` and `j` start at literal 0 (the flat `[0, R*C)` the kernel streams).
+    fn match_bias_bcast<'b>(
+        &self,
+        pat: &Pattern,
+        iter: &'b ForIter,
+        body: &'b Block,
+    ) -> Option<(Symbol, Symbol, Symbol, &'b Expr, &'b Expr, i64)> {
+        let ForIter::Range {
+            start: i_start,
+            end: Some(rows),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return None;
+        };
+        if const_usize_expr(i_start, self.interner, &self.sema.consts) != Some(0) {
+            return None;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(ivar),
+            ..
+        } = pat
+        else {
+            return None;
+        };
+        // The outer body is exactly one inner `for j in 0..C { <bias stmt> }`.
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::For {
+            pat: jpat,
+            iter: jiter,
+            body: inner,
+            ..
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        let ForIter::Range {
+            start: j_start,
+            end: Some(cols),
+            inclusive: false,
+            step: None,
+        } = jiter
+        else {
+            return None;
+        };
+        if const_usize_expr(j_start, self.interner, &self.sema.consts) != Some(0) {
+            return None;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(jvar),
+            ..
+        } = jpat
+        else {
+            return None;
+        };
+        let (out, x, b, op) = self.match_bias_bcast_inner(*ivar, *jvar, cols, inner)?;
+        Some((out, x, b, rows, cols, op))
+    }
+
+    /// Recognize a **broadcast-bias** nest (see [`Self::match_bias_bcast`]) — a `cols`-long bias `b`
+    /// added across every row (the pre-activation `+ bias` / `+ position` add), with an optional fused
+    /// activation — and lower it to one `mercury_bias_bcast_f32` call (256-bit AVX2, fused activation).
+    /// The row-broadcast operand `b[j]` (indexed by the inner var alone) is what the affine `velem`
+    /// recognizer declines and the generic 128-bit vectorizer under-widens. In a `@parallel` function
+    /// the multicore variant runs (rows independent → deterministic, so the differential gate stays
+    /// exact). Returns false (fall through) unless the nest matches.
+    fn try_emit_bias_bcast(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let Some((out, x, b, rows, cols, op)) = self.match_bias_bcast(pat, iter, body) else {
+            return false;
+        };
+        let (Some((outv, _)), Some((xv, _)), Some((bv, _))) =
+            (self.lookup(out), self.lookup(x), self.lookup(b))
+        else {
+            return false;
+        };
+        let rty = self.expr_mir(rows);
+        let rv = self.lower_expr(rows);
+        let rv = self.coerce_to(rv, &rty, &MirType::I64, true);
+        let cty = self.expr_mir(cols);
+        let cv = self.lower_expr(cols);
+        let cv = self.coerce_to(cv, &cty, &MirType::I64, true);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let func = if self.parallel_fn {
+            self.gemm.bias_bcast_par
+        } else {
+            self.gemm.bias_bcast
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![xv, bv, outv, rv, cv, opv],
+        });
         true
     }
 

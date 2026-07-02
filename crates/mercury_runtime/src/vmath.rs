@@ -573,9 +573,12 @@ fn log1p_1(x: f32) -> f32 {
     }
 }
 
-/// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback).
+/// Scalar dispatch for one element (used by the AVX2 tail and the no-AVX2 fallback). `pub(crate)` so
+/// the broadcast-bias kernel in `bias.rs` folds the *identical* fused activation onto its `x + b[j]`
+/// sum — one source of truth for the scalar activation, keeping bias-with-activation bit-for-bit
+/// consistent with `mercury_vmath_f32` (an unrecognized/sentinel `op` returns `x`, i.e. identity).
 #[inline]
-fn apply1(op: i64, x: f32) -> f32 {
+pub(crate) fn apply1(op: i64, x: f32) -> f32 {
     match op {
         VM_EXP => exp1(x),
         VM_LOG => log1(x),
@@ -647,9 +650,13 @@ pub unsafe extern "C" fn mercury_vmath_f32(x: *const f32, out: *mut f32, n: i64,
 /// Shared by the f32 ([`vmath_avx2`]) and bf16-input ([`vmath_bf16_avx2`]) dispatchers so both apply
 /// the *identical* activation — the only difference is how the 8 lanes are loaded (f32 vs widened
 /// bf16), which keeps `mercury_vmath_bf16` bit-for-bit consistent with `mercury_vmath_f32`.
+/// `pub(crate)` so the broadcast-bias AVX2 kernel in `bias.rs` applies the *identical* 8-lane
+/// activation to its `x + b[j]` sum vector — the vector twin of [`apply1`], keeping the fused-activation
+/// bias bit-for-bit consistent with `mercury_vmath_f32`. Returns `None` for an unrecognized/sentinel
+/// `op` (the caller then leaves the sum unmodified — identity).
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn vmath8_for(
+pub(crate) fn vmath8_for(
     op: i64,
 ) -> Option<unsafe fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256> {
     Some(match op {

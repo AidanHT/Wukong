@@ -56,10 +56,11 @@ pub use dequant::{
 
 mod lowp;
 pub use lowp::{
-    mercury_axpby_bf16, mercury_axpby_f16, mercury_dot_bf16, mercury_dot_bf16_parallel,
-    mercury_dot_f16, mercury_dot_f16_parallel, mercury_reduce_bf16, mercury_reduce_bf16_parallel,
-    mercury_reduce_f16, mercury_reduce_f16_parallel, mercury_sum_bf16, mercury_sum_bf16_parallel,
-    mercury_sum_f16, mercury_sum_f16_parallel,
+    mercury_axpby_bf16, mercury_axpby_bf16_out, mercury_axpby_f16, mercury_axpby_f16_out,
+    mercury_dot_bf16, mercury_dot_bf16_parallel, mercury_dot_f16, mercury_dot_f16_parallel,
+    mercury_reduce_bf16, mercury_reduce_bf16_parallel, mercury_reduce_f16,
+    mercury_reduce_f16_parallel, mercury_sum_bf16, mercury_sum_bf16_parallel, mercury_sum_f16,
+    mercury_sum_f16_parallel, mercury_vmath_bf16_out, mercury_vmath_f16_out,
 };
 
 mod transpose;
@@ -150,6 +151,9 @@ pub use scatter::{mercury_scatter_add_f32, mercury_scatter_add_f32_parallel};
 
 mod cumprod;
 pub use cumprod::{mercury_cumprod_f32, mercury_cumprod_f32_parallel};
+
+mod bias;
+pub use bias::{mercury_bias_bcast_f32, mercury_bias_bcast_f32_parallel, BIAS_ACT_NONE};
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
