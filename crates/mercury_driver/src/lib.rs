@@ -1140,7 +1140,7 @@ mod grad_cli_tests {
     #[test]
     fn cubic_scalar_grad() {
         // loss = x^3  ->  dL/dx = 3x^2. Differentiated straight from `.mer` source via --emit=grad.
-        let src = "module m\nfn loss(x:[f32;1], out:[f32;1]) -> f32 {\n\
+        let src = "module m\nfn loss(x:[f32;1], mut out:[f32;1]) -> f32 {\n\
                    let a: f32 = x[0]; let l: f32 = a*a*a; out[0] = l; return l; }";
         let x = 1.3f32;
         let inputs = vec![vec![x], vec![0.0]];
@@ -1151,7 +1151,7 @@ mod grad_cli_tests {
     #[test]
     fn bilinear_two_input_grad() {
         // loss = a * b^2  ->  dL/da = b^2, dL/db = 2ab.
-        let src = "module m\nfn loss(a:[f32;1], b:[f32;1], out:[f32;1]) -> f32 {\n\
+        let src = "module m\nfn loss(a:[f32;1], b:[f32;1], mut out:[f32;1]) -> f32 {\n\
                    let av: f32 = a[0]; let bv: f32 = b[0]; let l: f32 = av*bv*bv;\n\
                    out[0] = l; return l; }";
         let (a, b) = (0.7f32, 1.1f32);
@@ -1165,7 +1165,7 @@ mod grad_cli_tests {
     fn default_wrt_is_all_buffers() {
         // With no --grad-wrt, every buffer parameter is differentiated; the output buffer (only
         // stored, never read) gets a correct zero gradient.
-        let src = "module m\nfn loss(x:[f32;1], out:[f32;1]) -> f32 {\n\
+        let src = "module m\nfn loss(x:[f32;1], mut out:[f32;1]) -> f32 {\n\
                    let a: f32 = x[0]; let l: f32 = a*a; out[0] = l; return l; }";
         let x = 2.0f32;
         let inputs = vec![vec![x], vec![0.0]];
@@ -1227,7 +1227,7 @@ mod grad_cli_tests {
     #[test]
     fn linear_mse_from_source() {
         let (m, k, n) = (3usize, 4usize, 2usize);
-        let src = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], out:[f32;1]) -> f32 {\n\
+        let src = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], mut out:[f32;1]) -> f32 {\n\
                    let mut p: [f32; 6] = [0.0; 6];\n\
                    for i in 0..3 { for j in 0..2 { let mut s: f32 = 0.0;\n\
                      for kk in 0..4 { s = s + x[i*4+kk] * w[j*4+kk]; }\n\
@@ -1265,7 +1265,7 @@ mod grad_cli_tests {
     /// backward composed with the matmul backward.
     fn act_sum_src(act: &str) -> String {
         format!(
-            "@parallel fn loss(x:[f32;12], w:[f32;8], out:[f32;1]) -> f32 {{\n\
+            "@parallel fn loss(x:[f32;12], w:[f32;8], mut out:[f32;1]) -> f32 {{\n\
              let mut p: [f32; 6] = [0.0; 6];\n\
              for i in 0..3 {{ for j in 0..2 {{ let mut s: f32 = 0.0;\n\
                for kk in 0..4 {{ s = s + x[i*4+kk] * w[j*4+kk]; }}\n\
@@ -1314,7 +1314,7 @@ mod grad_cli_tests {
 
     /// A least-squares linear regression `loss = Σ(x·wᵀ − t)²` — convex in the weights `w`, so
     /// full-batch gradient descent with a small step descends monotonically.
-    const REGRESSION_SRC: &str = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], out:[f32;1]) -> f32 {\n\
+    const REGRESSION_SRC: &str = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], mut out:[f32;1]) -> f32 {\n\
          let mut p: [f32; 6] = [0.0; 6];\n\
          for i in 0..3 { for j in 0..2 { let mut s: f32 = 0.0;\n\
            for kk in 0..4 { s = s + x[i*4+kk] * w[j*4+kk]; }\n\
@@ -1400,7 +1400,7 @@ mod grad_cli_tests {
     #[test]
     fn transformer_ffn_block_from_source() {
         // x[M=2,K=4], W1[H=3,K=4] -> p[2,3]; a=silu(p); W2[N=2,H=3] -> y[2,2]; loss=Σy.
-        let src = "@parallel fn loss(x:[f32;8], w1:[f32;12], w2:[f32;6], out:[f32;1]) -> f32 {\n\
+        let src = "@parallel fn loss(x:[f32;8], w1:[f32;12], w2:[f32;6], mut out:[f32;1]) -> f32 {\n\
              let mut p: [f32; 6] = [0.0; 6];\n\
              for i in 0..2 { for j in 0..3 { let mut s: f32 = 0.0;\n\
                for kk in 0..4 { s = s + x[i*4+kk] * w1[j*4+kk]; } p[i*3+j] = s; } }\n\
@@ -1735,7 +1735,7 @@ mod gpu_e2e_tests {
         {
             let n = 64usize;
             let src = format!(
-                "module m\nfn act(x:[f32;{n}], out:[f32;{n}]) {{ \
+                "module m\nfn act(x:[f32;{n}], mut out:[f32;{n}]) {{ \
                  for i in 0..{n} {{ out[i] = silu(x[i]); }} }}"
             );
             let (program, mut interner) = build(&src);
@@ -1754,7 +1754,7 @@ mod gpu_e2e_tests {
         {
             let n = 1024usize;
             let src = format!(
-                "@parallel fn dotp(x:[f32;{n}], y:[f32;{n}], o:[f32;1]) {{ \
+                "@parallel fn dotp(x:[f32;{n}], y:[f32;{n}], mut o:[f32;1]) {{ \
                  let mut s: f32 = 0.0; for k in 0..{n} {{ s = s + x[k] * y[k]; }} o[0] = s; }}"
             );
             let (program, mut interner) = build(&src);
