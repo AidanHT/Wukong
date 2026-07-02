@@ -19202,7 +19202,10 @@ fn parse_float(text: &str) -> f64 {
             break;
         }
     }
-    core.parse().unwrap_or(0.0)
+    // Strip digit-group separators before parsing: a `_` makes Rust's float `parse()` return Err, and
+    // the `unwrap_or(0.0)` fallback then silently turned a valid literal like `1_000.5` into 0.0 — a
+    // gate-blind wrong value (both backends agreed on 0.0). The integer path already strips `_`.
+    core.replace('_', "").parse().unwrap_or(0.0)
 }
 
 /// Decode a char literal's raw source text (including the surrounding single quotes) into its
