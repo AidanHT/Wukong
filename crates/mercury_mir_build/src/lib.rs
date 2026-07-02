@@ -815,6 +815,7 @@ pub fn lower_program(
         maxpool2d_par: interner.intern("mercury_maxpool2d_f32_parallel"),
         avgpool2d: interner.intern("mercury_avgpool2d_f32"),
         avgpool2d_par: interner.intern("mercury_avgpool2d_f32_parallel"),
+        attn: interner.intern("mercury_attention_f32"),
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -2006,6 +2007,9 @@ struct GemmSyms {
     maxpool2d_par: Symbol,
     avgpool2d: Symbol,
     avgpool2d_par: Symbol,
+    /// The fused scaled-dot-product-attention kernel (`mercury_attention_f32`), which `sdpa(...)`
+    /// lowers to — bundled here so it threads down the lowerer with the GEMM symbols.
+    attn: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -15057,6 +15061,10 @@ impl FnLowerer<'_> {
                         },
                     );
                 }
+                // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
+                if let Some(v) = self.lower_attention(name, args) {
+                    return v;
+                }
                 // Math builtins (sqrt/rsqrt/exp/fmax/fmin) lower to primitive ops. User functions
                 // shadow them (handled just above), so this catches only the genuine builtins.
                 if let Some(v) = self.lower_math_intrinsic(name, args, e) {
@@ -15138,6 +15146,39 @@ impl FnLowerer<'_> {
         self.unsupported(e.span, "call");
         let t = self.expr_mir(e);
         self.const_zero(t)
+    }
+
+    /// Recognize `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention —
+    /// and lower it to one `mercury_attention_f32` runtime call (computing
+    /// `out = softmax(scale·Q·Kᵀ [+causal])·V` for one `[s,d]` head without materializing the S×S
+    /// scores). The array args lower to their base pointers (an array `Path` *is* its pointer); `s`,
+    /// `d`, `causal` coerce to `i64` and `scale` to `f32`. Returns `None` for any other name/arity so
+    /// `lower_call` falls through. Both backends call the identical kernel, so the fused online
+    /// softmax stays bit-for-bit exact — the same contract as the GEMM dispatch.
+    fn lower_attention(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
+        if self.interner.resolve(name) != "sdpa" || args.len() != 8 {
+            return None;
+        }
+        let q = self.lower_expr(&args[0]);
+        let k = self.lower_expr(&args[1]);
+        let v = self.lower_expr(&args[2]);
+        let out = self.lower_expr(&args[3]);
+        let s = self.lower_coerced(&args[4], &MirType::I64);
+        let d = self.lower_coerced(&args[5], &MirType::I64);
+        let scale = self.lower_coerced(&args[6], &MirType::F32);
+        let causal = self.lower_coerced(&args[7], &MirType::I64);
+        self.builder.build_void(Op::Call {
+            func: self.gemm.attn,
+            args: vec![q, k, v, out, s, d, scale, causal],
+        });
+        Some(self.const_zero(MirType::I32))
+    }
+
+    /// Lower `e` and coerce the result to `target` (the float/int conversion the call ABI needs).
+    fn lower_coerced(&mut self, e: &Expr, target: &MirType) -> ValueId {
+        let ty = self.expr_mir(e);
+        let v = self.lower_expr(e);
+        self.coerce_to(v, &ty, target, true)
     }
 
     /// Lower a math builtin (`sqrt`/`rsqrt`/`exp`/`fmax`/`fmin`) to primitive MIR ops, or `None`

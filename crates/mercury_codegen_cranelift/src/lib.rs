@@ -225,6 +225,7 @@ const RT_DEQUANT_PERCHAN: &str = "mercury_dequant_perchan_f32";
 const RT_DEQUANT_PERCHAN_PAR: &str = "mercury_dequant_perchan_f32_parallel";
 const RT_EMBEDDING: &str = "mercury_embedding_f32";
 const RT_EMBEDDING_PAR: &str = "mercury_embedding_f32_parallel";
+const RT_ATTENTION: &str = "mercury_attention_f32";
 const RT_SCATTER_ADD: &str = "mercury_scatter_add_f32";
 const RT_SCATTER_ADD_PAR: &str = "mercury_scatter_add_f32_parallel";
 const RT_DOT_BF16: &str = "mercury_dot_bf16";
@@ -1540,6 +1541,24 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[out, weight, ids, t, h, v]);
             return None;
         }
+        // Fused scaled-dot-product attention: mercury_attention_f32(q, k, v, out, s, d, scale, causal)
+        // — four f32* pointers, two i64 dims (seq-len `s`, head-dim `d`), an f32 `scale`, and an i64
+        // `causal` flag. Online-softmax kernel (no S×S scores materialized). Void.
+        if name == RT_ATTENTION && args.len() == 8 {
+            let q = self.val(args[0]);
+            let k = self.val(args[1]);
+            let v = self.val(args[2]);
+            let out = self.val(args[3]);
+            let s = self.coerce_to_i64(args[4]);
+            let d = self.coerce_to_i64(args[5]);
+            let scale = self.coerce_to_f32(args[6]);
+            let causal = self.coerce_to_i64(args[7]);
+            let fref = self.rt_refs[name];
+            self.builder
+                .ins()
+                .call(fref, &[q, k, v, out, s, d, scale, causal]);
+            return None;
+        }
 
         // Scatter-add / embedding-gradient backward: mercury_scatter_add_f32[_parallel](grad_w, grad_out,
         // ids, t, h, v) — same 3-ptr + 3-i64 ABI as the embedding gather (grad_w/grad_out f32*, ids i32*),
@@ -1667,6 +1686,19 @@ impl<'a> FnTranslator<'a> {
             x
         } else {
             self.builder.ins().fpromote(types::F64, x)
+        }
+    }
+
+    fn coerce_to_f32(&mut self, v: ValueId) -> Value {
+        let x = self.val(v);
+        let from = self.dfg_ty(x);
+        if from == types::F32 {
+            x
+        } else if from == types::F64 {
+            self.builder.ins().fdemote(types::F32, x)
+        } else {
+            // Integer scale (unusual, but keep the call well-typed): signed int → f32.
+            self.builder.ins().fcvt_from_sint(types::F32, x)
         }
     }
 
@@ -1843,6 +1875,9 @@ struct RtFuncs {
     /// gather (the first layer of every LLM). Reuses the 3-ptr + 3-i64 void `sig_i8gemm` signature.
     embedding: FuncId,
     embedding_par: FuncId,
+    /// Fused scaled-dot-product attention `mercury_attention_f32(q, k, v, out, s, d, scale, causal)` —
+    /// four ptrs, two i64 dims, an f32 scale, an i64 causal flag (its own 8-arg signature).
+    attention: FuncId,
     scatter_add: FuncId,
     scatter_add_par: FuncId,
     dot_bf16: FuncId,
@@ -2055,6 +2090,15 @@ fn populate_module<M: Module>(
     for _ in 0..3 {
         sig_i8gemm.params.push(AbiParam::new(types::I64));
     }
+    // mercury_attention_f32(q, k, v, out: ptr, s, d: i64, scale: f32, causal: i64) — fused SDPA (void).
+    let mut sig_attn = Signature::new(call_conv);
+    for _ in 0..4 {
+        sig_attn.params.push(AbiParam::new(ptr_ty));
+    }
+    sig_attn.params.push(AbiParam::new(types::I64));
+    sig_attn.params.push(AbiParam::new(types::I64));
+    sig_attn.params.push(AbiParam::new(types::F32));
+    sig_attn.params.push(AbiParam::new(types::I64));
     // mercury_i8gemm_nt_deq[_parallel](a, b, out: ptr, m, k, n: i64, scale_a: f32, scale_b, bias: ptr,
     // act: i64) — int8 quantized nn.Linear with fused dequant epilogue (void).
     let mut sig_i8gemm_deq = Signature::new(call_conv);
@@ -2498,6 +2542,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         embedding_par: module
             .declare_function(RT_EMBEDDING_PAR, Linkage::Import, &sig_i8gemm)
+            .map_err(|e| e.to_string())?,
+        attention: module
+            .declare_function(RT_ATTENTION, Linkage::Import, &sig_attn)
             .map_err(|e| e.to_string())?,
         scatter_add: module
             .declare_function(RT_SCATTER_ADD, Linkage::Import, &sig_i8gemm)
@@ -3131,6 +3178,10 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_EMBEDDING_PAR,
                 module.declare_func_in_func(rt.embedding_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_ATTENTION,
+                module.declare_func_in_func(rt.attention, builder.func),
             );
             rt_refs.insert(
                 RT_SCATTER_ADD,
@@ -3775,6 +3826,10 @@ pub fn jit_compile(
         mercury_runtime::mercury_embedding_f32_parallel as *const u8,
     );
     builder.symbol(
+        RT_ATTENTION,
+        mercury_runtime::mercury_attention_f32 as *const u8,
+    );
+    builder.symbol(
         RT_SCATTER_ADD,
         mercury_runtime::mercury_scatter_add_f32 as *const u8,
     );
@@ -4308,6 +4363,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_EMBEDDING_PAR,
         mercury_runtime::mercury_embedding_f32_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_ATTENTION,
+        mercury_runtime::mercury_attention_f32 as *const u8,
     );
     builder.symbol(
         RT_SCATTER_ADD,
