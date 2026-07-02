@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1000000
+// EXPECT-OUT: 1000
+module tests.run.float_underscore
+
+// Regression (sweep #15): a float literal containing digit-group separators `_` silently evaluated
+// to 0.0 — mir_build's `parse_float` handed the raw text (with `_`) to Rust's float `parse()`, which
+// errors on `_`, then fell back to 0.0 (a gate-blind wrong value both backends agreed on; the integer
+// path already strips `_`). The lexer accepts `1_000.5`, so the value must parse to 1000.5.
+
+fn main() -> i32 {
+    let a: f32 = 1_000.5;
+    print(a as i32);                    // 1000
+
+    // proves it is a real value, not a print-format glitch
+    let b: f32 = 1_000.5 + 0.5;         // 1001.0
+    print(b as i32);                    // 1001
+
+    let c: f64 = 1_000_000.0;
+    print(c as i32);                    // 1000000
+
+    // separator in the fraction; 0.0625 = 1/16 is exact in f32
+    let d: f32 = 0.062_5;
+    print((d * 16000.0) as i32);        // 0.0625 * 16000 = 1000
+
+    return 0;
+}

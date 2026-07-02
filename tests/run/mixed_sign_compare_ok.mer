@@ -1,0 +1,24 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+module tests.run.mixed_sign_compare_ok
+
+// Guard the other direction of the mixed-sign fix: the guard rejects a SUFFIXED literal (fixed
+// signedness) but must NOT reject an UNSUFFIXED literal, which is sign-flexible and adapts to the
+// other operand. A same-signedness suffixed compare is also fine. All of these stay legal and give
+// the correct answer on both backends at every opt level.
+fn main() -> i32 {
+    let u: u32 = 5;
+    let s: i32 = 5;
+    // unsuffixed literal adapts to the unsigned var (no E0401)
+    if u < 10 { print(1); } else { print(0); }      // 5 < 10  -> 1
+    if 3 < u { print(1); } else { print(0); }       // 3 < 5   -> 1
+    // unsuffixed literal with a signed var
+    if s < 10 { print(1); } else { print(0); }      // 5 < 10  -> 1
+    // same-signedness suffixed compare (both unsigned) is not a mismatch
+    if 10u32 < u { print(1); } else { print(0); }   // 10 < 5  -> 0
+    return 0;
+}

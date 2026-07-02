@@ -2767,6 +2767,16 @@ impl FnLowerer<'_> {
                         let d = self.field_ptr(dst, off);
                         self.emit_copy(d, s, &fty);
                     }
+                } else {
+                    // An enum has no struct fields (`struct_field_tys` → None); its value is a
+                    // scalar leaf — the i32 discriminant. Fall through to a scalar load+store, like
+                    // the `_` arm. Without this the enum leaf was silently skipped, so copying any
+                    // aggregate that contains an enum (`let b = a`, sret return, array/tuple element,
+                    // nested struct) left the destination's enum slot uninitialized — a gate-blind
+                    // wrong answer that also diverged interp (zero slot → 0) vs native (stack garbage).
+                    let mir = self.mir_ty_of(ty);
+                    let v = self.builder.build(mir.clone(), Op::Load(src, mir.clone()));
+                    self.builder.build_void(Op::Store { ptr: dst, value: v });
                 }
             }
             Ty::Tuple(fields) => {
@@ -6114,7 +6124,28 @@ impl FnLowerer<'_> {
                 {
                     let (ptr, _) = self.lower_place(target);
                     let dst_ty = self.expr_ty(target);
-                    self.init_field(ptr, &dst_ty, value);
+                    // A struct/tuple/array *literal* whose field initializers may read the
+                    // destination (e.g. the swap `p = Pt { x: p.y, y: p.x }`) must be materialized
+                    // into a fresh temporary and THEN deep-copied in. `init_field` builds a literal
+                    // *directly* into the destination place, so a later field would read an earlier
+                    // one already overwritten — a gate-blind wrong answer both backends produce
+                    // identically (`p` above became `7 7`, not the swapped `7 3`). A non-literal
+                    // aggregate value (`s = other`) already deep-copies leaf-by-leaf via `emit_copy`
+                    // (safe under aliasing), so only the literal case needs the temp; a fresh `let`
+                    // builds into its own new slot and is unaffected.
+                    if matches!(
+                        &value.kind,
+                        ExprKind::StructLit { .. }
+                            | ExprKind::TupleLit(_)
+                            | ExprKind::ArrayLit(_)
+                            | ExprKind::ArrayRepeat { .. }
+                    ) {
+                        let tmp = self.builder.alloca(self.mir_ty_of(&dst_ty));
+                        self.init_field(tmp, &dst_ty, value);
+                        self.emit_copy(ptr, tmp, &dst_ty);
+                    } else {
+                        self.init_field(ptr, &dst_ty, value);
+                    }
                     return;
                 }
                 let rhs0 = self.lower_expr(value);
@@ -10147,8 +10178,21 @@ impl FnLowerer<'_> {
                 if !matches!(op, Add | Sub | Mul | Div) {
                     return false;
                 }
-                self.vec_check_value(lhs, j, locals, lane, acc)
-                    && self.vec_check_value(rhs, j, locals, lane, acc)
+                if !(self.vec_check_value(lhs, j, locals, lane, acc)
+                    && self.vec_check_value(rhs, j, locals, lane, acc))
+                {
+                    return false;
+                }
+                // Cranelift x86 has no SIMD integer division, so a vectorized `<N x iK> sdiv/udiv`
+                // fails its verifier (a native panic) while the interpreter runs it lane-wise
+                // (interp != native + ICE). Vector float division (`fdiv`) is fine. So only vectorize
+                // `/` on a float lane; an integer-division loop stays scalar. Operands are validated
+                // first, so `lane` is already pinned by the array access.
+                !matches!(op, Div)
+                    || matches!(
+                        lane,
+                        Some(MirType::F32 | MirType::F64 | MirType::F16 | MirType::BF16)
+                    )
             }
             ExprKind::Unary {
                 op: ast::UnOp::Neg,
@@ -14831,6 +14875,14 @@ fn const_usize_depth(
         ExprKind::Path(p) if p.is_single() => consts
             .get(&p.first().sym)
             .and_then(|init| const_usize_depth(init, interner, consts, depth + 1)),
+        // Mirror sema's `eval_usize` exactly (both fold via `BinOp::fold_const_len`) so the slot size
+        // agrees with the bounds check. An unfoldable operand contributes 0, as sema's evaluator does,
+        // so a const-arithmetic length sizes correctly instead of collapsing to an unsized pointer.
+        ExprKind::Binary { op, lhs, rhs } => {
+            let l = const_usize_depth(lhs, interner, consts, depth + 1).unwrap_or(0) as u64;
+            let r = const_usize_depth(rhs, interner, consts, depth + 1).unwrap_or(0) as u64;
+            Some(op.fold_const_len(l, r) as u32)
+        }
         _ => None,
     }
 }
@@ -20326,7 +20378,10 @@ fn parse_float(text: &str) -> f64 {
             break;
         }
     }
-    core.parse().unwrap_or(0.0)
+    // Strip digit-group separators before parsing: a `_` makes Rust's float `parse()` return Err, and
+    // the `unwrap_or(0.0)` fallback then silently turned a valid literal like `1_000.5` into 0.0 — a
+    // gate-blind wrong value (both backends agreed on 0.0). The integer path already strips `_`.
+    core.replace('_', "").parse().unwrap_or(0.0)
 }
 
 /// Decode a char literal's raw source text (including the surrounding single quotes) into its

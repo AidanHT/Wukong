@@ -1,0 +1,20 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 100
+// EXPECT-OUT: 5
+module tests.run.struct_field_array_ok
+
+// Guard the other direction of the struct-field array-length check: a correctly-sized array field —
+// as an array literal AND as an array-repeat `[v; N]` — must still be accepted and run correctly.
+
+struct Buf { data: [i32; 4], tag: i32 }
+
+fn main() -> i32 {
+    let b: Buf = Buf { data: [10, 20, 30, 40], tag: 0 };   // literal, length 4
+    print(b.data[0] + b.data[1] + b.data[2] + b.data[3]);   // 100
+
+    let c: Buf = Buf { data: [5; 4], tag: 0 };              // repeat, count 4
+    print(c.data[3]);                                       // 5
+
+    return 0;
+}

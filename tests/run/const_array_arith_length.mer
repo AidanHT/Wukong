@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 28
+// EXPECT-OUT: 6
+// EXPECT-OUT: 15
+module tests.run.const_array_arith_length
+
+// Regression (sweep #16, CRITICAL): an arithmetic array length (`[i32; 2+2]`, `[i32; N+1]`) evaluated
+// to 0 — eval_usize (sema) and const_usize_expr (mir_build) folded only bare literals/const-paths, so
+// the array became an unsized bare pointer: native SEGFAULT / interp != native / -O0 != -O2 / gate-blind
+// garbage, and valid code was wrongly rejected "length 0". Fix: a shared BinOp::fold_const_len drives
+// BOTH evaluators, so slot size and bounds check can no longer desync. Indexed dynamically (fn param /
+// loop counter, which escapes the compile-time bounds check) to exercise the slot size AND the read.
+
+const A: usize = 2;
+const B: usize = 3;
+const N: usize = A + B;              // 5
+
+fn sum(a: [i32; N], n: usize) -> i32 {
+    let mut s: i32 = 0;
+    for i in 0..n { s = s + a[i]; }
+    return s;
+}
+
+fn main() -> i32 {
+    // fn param with arithmetic-const length, dynamic index
+    let a: [i32; N] = [4; N];        // [4,4,4,4,4], sum = 20
+    print(sum(a, N));                // 20
+
+    // inline arithmetic length, loop index
+    let b: [i32; 2 + 2] = [7; 2 + 2];   // [7,7,7,7]
+    let mut s: i32 = 0;
+    for i in 0..4 { s = s + b[i]; }
+    print(s);                        // 28
+
+    // the N+1 padding idiom
+    let c: [i32; A + 1] = [2; A + 1];   // len 3, [2,2,2]
+    let mut t: i32 = 0;
+    for i in 0..3 { t = t + c[i]; }
+    print(t);                        // 6
+
+    // multiplicative length + a WRITE through a dynamic index (the segfault repro)
+    let mut d: [i32; A * B] = [0; A * B];   // len 6
+    let mut u: i32 = 0;
+    for i in 0..6 { d[i] = i as i32; u = u + d[i]; }   // d = [0,1,2,3,4,5]
+    print(u);                        // 15
+
+    return 0;
+}

@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: -9223372036854775807
+// EXPECT-OUT: 9223372036854775808
+module tests.run.int_min_literal
+
+// Regression (differential sweep #14): the unannotated i64::MIN literal `-9223372036854775808`.
+// The magnitude 2^63 overflows i64, so int_lit_scalar defaults the bare literal to u64 (correct for
+// the positive form); but under a unary minus it is i64::MIN. Before the fix, the u64 negate wrapped
+// back to +2^63 and printed `9223372036854775808` — a gate-blind wrong sign both backends agreed on.
+
+fn main() -> i32 {
+    // unannotated i64::MIN — the bug (was printing +9223372036854775808)
+    print(-9223372036854775808);   // -9223372036854775808
+
+    // the annotated form already worked; it must still match
+    let m: i64 = -9223372036854775808;
+    print(m);                      // -9223372036854775808
+
+    // i64::MAX (magnitude fits i64) is unaffected
+    print(9223372036854775807);    // 9223372036854775807
+
+    // -i64::MAX (magnitude != 2^63) is unaffected
+    print(-9223372036854775807);   // -9223372036854775807
+
+    // the POSITIVE 2^63 literal stays u64 and prints unsigned — the fix must NOT touch this
+    print(9223372036854775808);    // 9223372036854775808
+
+    return 0;
+}
