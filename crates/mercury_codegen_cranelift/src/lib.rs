@@ -165,6 +165,8 @@ const RT_COLRMS: &str = "mercury_colrms_f32";
 const RT_COLRMS_PAR: &str = "mercury_colrms_f32_parallel";
 const RT_VELEM: &str = "mercury_velem_f32";
 const RT_VHORNER: &str = "mercury_vhorner_f32";
+const RT_BIAS_BCAST: &str = "mercury_bias_bcast_f32";
+const RT_BIAS_BCAST_PAR: &str = "mercury_bias_bcast_f32_parallel";
 const RT_SREDUCE: &str = "mercury_sreduce_f32";
 const RT_SREDUCE_PARALLEL: &str = "mercury_sreduce_f32_parallel";
 const RT_ARGREDUCE: &str = "mercury_argreduce_f32";
@@ -1144,6 +1146,19 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[x, y, out, n, a, b, c, op]);
             return None;
         }
+        // The broadcast-bias kernel: mercury_bias_bcast_f32[_parallel](x, b, out, rows, cols, op) —
+        // three pointers (x, b, out) and three i64 (rows, cols, activation op). Void, like velem.
+        if matches!(name, RT_BIAS_BCAST | RT_BIAS_BCAST_PAR) && args.len() == 6 {
+            let x = self.val(args[0]);
+            let b = self.val(args[1]);
+            let out = self.val(args[2]);
+            let rows = self.coerce_to_i64(args[3]);
+            let cols = self.coerce_to_i64(args[4]);
+            let op = self.coerce_to_i64(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[x, b, out, rows, cols, op]);
+            return None;
+        }
         // The streaming Horner-polynomial kernel: mercury_vhorner_f32(x, out, n, coeffs, ncoeff) —
         // three pointers (x, out, coeffs) and two i64 (element count, coefficient count). Void.
         if name == RT_VHORNER && args.len() == 5 {
@@ -1510,6 +1525,8 @@ struct RtFuncs {
     colrms_par: FuncId,
     velem: FuncId,
     vhorner: FuncId,
+    bias_bcast: FuncId,
+    bias_bcast_par: FuncId,
     sred: FuncId,
     sred_par: FuncId,
     argreduce: FuncId,
@@ -1651,6 +1668,15 @@ fn populate_module<M: Module>(
     sig_vhorner.params.push(AbiParam::new(types::I64));
     sig_vhorner.params.push(AbiParam::new(ptr_ty));
     sig_vhorner.params.push(AbiParam::new(types::I64));
+    // mercury_bias_bcast_f32[_parallel](x, b, out: ptr, rows, cols, op: i64) — broadcast-bias add
+    // (3 ptr + 3 i64, void).
+    let mut sig_bias_bcast = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_bias_bcast.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..3 {
+        sig_bias_bcast.params.push(AbiParam::new(types::I64));
+    }
     // mercury_sreduce_f32[_parallel](x, y: ptr, n, op: i64) -> f32 — deterministic reduction kernel.
     let mut sig_sreduce = Signature::new(call_conv);
     sig_sreduce.params.push(AbiParam::new(ptr_ty));
@@ -2041,6 +2067,12 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         vhorner: module
             .declare_function(RT_VHORNER, Linkage::Import, &sig_vhorner)
+            .map_err(|e| e.to_string())?,
+        bias_bcast: module
+            .declare_function(RT_BIAS_BCAST, Linkage::Import, &sig_bias_bcast)
+            .map_err(|e| e.to_string())?,
+        bias_bcast_par: module
+            .declare_function(RT_BIAS_BCAST_PAR, Linkage::Import, &sig_bias_bcast)
             .map_err(|e| e.to_string())?,
         sred: module
             .declare_function(RT_SREDUCE, Linkage::Import, &sig_sreduce)
@@ -2516,6 +2548,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_VHORNER,
                 module.declare_func_in_func(rt.vhorner, builder.func),
+            );
+            rt_refs.insert(
+                RT_BIAS_BCAST,
+                module.declare_func_in_func(rt.bias_bcast, builder.func),
+            );
+            rt_refs.insert(
+                RT_BIAS_BCAST_PAR,
+                module.declare_func_in_func(rt.bias_bcast_par, builder.func),
             );
             rt_refs.insert(
                 RT_SREDUCE,
@@ -3034,6 +3074,14 @@ pub fn jit_compile(
         mercury_runtime::mercury_vhorner_f32 as *const u8,
     );
     builder.symbol(
+        RT_BIAS_BCAST,
+        mercury_runtime::mercury_bias_bcast_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_BIAS_BCAST_PAR,
+        mercury_runtime::mercury_bias_bcast_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_SREDUCE,
         mercury_runtime::mercury_sreduce_f32 as *const u8,
     );
@@ -3491,6 +3539,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_VHORNER,
         mercury_runtime::mercury_vhorner_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_BIAS_BCAST,
+        mercury_runtime::mercury_bias_bcast_f32 as *const u8,
+    );
+    builder.symbol(
+        RT_BIAS_BCAST_PAR,
+        mercury_runtime::mercury_bias_bcast_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_SREDUCE,

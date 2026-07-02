@@ -140,6 +140,9 @@ pub use scatter::{mercury_scatter_add_f32, mercury_scatter_add_f32_parallel};
 mod cumprod;
 pub use cumprod::{mercury_cumprod_f32, mercury_cumprod_f32_parallel};
 
+mod bias;
+pub use bias::{mercury_bias_bcast_f32, mercury_bias_bcast_f32_parallel, BIAS_ACT_NONE};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer

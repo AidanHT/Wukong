@@ -50,6 +50,8 @@ pub fn lower_program(
         vmath_f16: interner.intern("mercury_vmath_f16"),
         velem: interner.intern("mercury_velem_f32"),
         vhorner: interner.intern("mercury_vhorner_f32"),
+        bias_bcast: interner.intern("mercury_bias_bcast_f32"),
+        bias_bcast_par: interner.intern("mercury_bias_bcast_f32_parallel"),
         sred_par: interner.intern("mercury_sreduce_f32_parallel"),
         argreduce: interner.intern("mercury_argreduce_f32"),
         argreduce_par: interner.intern("mercury_argreduce_f32_parallel"),
@@ -395,6 +397,19 @@ pub fn lower_program(
                     program.funcs.push(func);
                     continue;
                 }
+                // A `@parallel` *broadcast-bias* nest (`fn f(x,b,out){ for i { for j { out[i*C+j] =
+                // act(x[i*C+j] + b[j]) } } }`) dispatches to the multicore `mercury_bias_bcast_f32_parallel`:
+                // rows are independent (deterministic, bit-equal to the serial kernel the interpreter
+                // calls). Intercepted *before* the generic outliner below — which would split the rows
+                // into per-row 1-D loops and lose the whole-nest recognizer — mirroring the batched-norm
+                // interception above.
+                if has_parallel_attr(item, interner)
+                    && is_bias_bcast_fn(f, body, sema, interner, gemm)
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
                 // `@parallel` on a function whose whole body is `for i in 0..n { … }` over array
                 // (pointer) parameters is lowered to a multi-threaded runtime dispatch: the loop
                 // body becomes a separate ranged function, and the original becomes a thin wrapper
@@ -529,6 +544,48 @@ fn is_batched_norm_fn(
         vec_loads: HashMap::new(),
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
+}
+
+/// Is this function body a single broadcast-bias nest (`for i in 0..R { for j in 0..C { out[i*C+j] =
+/// act(x[i*C+j] + b[j]) } }`)? Probed with a throwaway lowerer — [`FnLowerer::match_bias_bcast`] is pure
+/// (reads sema/interner, emits no MIR), so a never-built `Builder` is harmless. The `@parallel` driver
+/// runs this *before* the generic loop outliner so a `@parallel` bias nest is routed through normal
+/// lowering (where `try_emit_bias_bcast` dispatches to `mercury_bias_bcast_f32_parallel`, mapping the
+/// independent rows across cores) rather than outlined into per-row 1-D loops — mirroring
+/// [`is_batched_norm_fn`].
+fn is_bias_bcast_fn(
+    f: &FnDecl,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+    gemm: GemmSyms,
+) -> bool {
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return false;
+    }
+    let StmtKind::For {
+        pat,
+        iter,
+        body: lb,
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return false;
+    };
+    let mut diags = Vec::new();
+    let probe = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::I64),
+        sema,
+        interner,
+        diags: &mut diags,
+        scopes: vec![HashMap::new()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::new(),
+    };
+    probe.match_bias_bcast(pat, iter, lb).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -770,6 +827,17 @@ struct GemmSyms {
     /// The streaming Horner-polynomial kernel (`mercury_vhorner_f32(x, out, n, coeffs, ncoeff)`): a
     /// recognized `r = c0; r = r*x + c1; …; out[i] = r` per-element polynomial lowers to this.
     vhorner: Symbol,
+    /// The broadcast-bias kernel (`mercury_bias_bcast_f32(x, b, out, rows, cols, op)`): a recognized
+    /// `for i { for j { out[i*C+j] = act(x[i*C+j] + b[j]) } }` nest — a `cols`-long bias added across
+    /// every row, with an optional fused activation — lowers to this. `op` is the runtime `VM_*`
+    /// activation code (or `-1` for a pure add). 256-bit AVX2 vs the 128-bit generic vectorizer /
+    /// scalar the row-broadcast operand would otherwise fall to. The interpreter marshals the identical
+    /// kernel, so the differential oracle stays exact.
+    bias_bcast: Symbol,
+    /// The multicore broadcast-bias (`mercury_bias_bcast_f32_parallel`): a `@parallel` bias nest maps
+    /// its independent rows across cores here — bit-identical to the serial kernel the interpreter
+    /// calls (no cross-row combine).
+    bias_bcast_par: Symbol,
     /// The multicore deterministic f32 reduction kernel (`mercury_sreduce_f32_parallel(x, y, n, op)
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `mercury_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
@@ -1078,6 +1146,12 @@ const VE_RELU6: i64 = 2; // out = min(max(.., 0), 6)
 const VE_USE_Y: i64 = 256;
 const VE_HADAMARD: i64 = 512; // out = act(x·y) — Hadamard product (kernel reads y)
 const VE_DIV: i64 = 1024; // out = act(x / y) — elementwise quotient
+
+// Broadcast-bias `op` codes — the activation is a `mercury_runtime::vmath` `VM_*` code (identical value
+// space to `VMATH_*` above), or `BIAS_ACT_NONE` for a pure add. `VMATH_RELU` (= 4, no `MathIntrinsic`
+// variant since ReLU is written `if x>0 {x} else {0}`) is remapped from the `VE_RELU` peel.
+const BIAS_ACT_NONE: i64 = -1;
+const VMATH_RELU: i64 = 4;
 
 /// One additive term of a recognized streaming affine body. `Scaled(arr, s)` is `arr[j]` (`s = None`,
 /// coefficient 1) or `s·arr[j]` / `arr[j]·s` for a loop-invariant f32 scalar `s`; `Const(s)` is a
@@ -6276,6 +6350,14 @@ impl FnLowerer<'_> {
         if self.try_emit_bf16_axpby(pat, iter, body) {
             return;
         }
+        // A `for i in 0..R { for j in 0..C { out[i*C+j] = act(x[i*C+j] + b[j]) } }` broadcast-bias nest
+        // (the pre-activation `+ bias` add every FFN/attention projection ends with) dispatches to the
+        // 256-bit `mercury_bias_bcast_f32` (the `_parallel` one in a `@parallel` fn). The row-broadcast
+        // operand `b[j]` is what the affine velem recognizer declines and the 128-bit generic
+        // vectorizer under-widens; the kernel folds it into one 256-bit pass with the fused activation.
+        if self.try_emit_bias_bcast(pat, iter, body) {
+            return;
+        }
         // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
         // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
         // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
@@ -6772,6 +6854,215 @@ impl FnLowerer<'_> {
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
         self.emit_vmath_calls(zero, total, calls);
+        true
+    }
+
+    /// The broadcast-bias fused-activation `op` code for a transcendental activation call `f(..)`, or
+    /// `None` if `f` is not a supported activation. The value space is the runtime `VM_*`/`VMATH_*`
+    /// codes (the kernel dispatches through the identical `vmath::apply1`). Only the activations that
+    /// sensibly follow a Linear's bias are mapped (transcendental/saturating); trig/log are excluded.
+    fn bias_activation_code(&self, callee: &Expr) -> Option<i64> {
+        Some(match self.vectorizable_intrinsic(callee)? {
+            MathIntrinsic::Sigmoid => VMATH_SIGMOID,
+            MathIntrinsic::Tanh => VMATH_TANH,
+            MathIntrinsic::Silu => VMATH_SILU,
+            MathIntrinsic::Gelu => VMATH_GELU,
+            MathIntrinsic::Elu => VMATH_ELU,
+            MathIntrinsic::LeakyRelu => VMATH_LEAKYRELU,
+            MathIntrinsic::Softplus => VMATH_SOFTPLUS,
+            MathIntrinsic::Mish => VMATH_MISH,
+            MathIntrinsic::Selu => VMATH_SELU,
+            MathIntrinsic::HardSigmoid => VMATH_HARDSIGMOID,
+            MathIntrinsic::HardSwish => VMATH_HARDSWISH,
+            MathIntrinsic::Erf => VMATH_ERF,
+            _ => return None,
+        } as i64)
+    }
+
+    /// Peel an optional activation off the inner value of a broadcast bias, returning the inner
+    /// `x[i*C+j] + b[j]` add and the bias-kernel op code. Handles a bare add (identity), a
+    /// transcendental-activation call `f(add)` (silu/gelu/…), and the ReLU `if add > 0 { add } else { 0 }`
+    /// form (reusing [`Self::peel_velem_act`] and remapping its `VE_RELU` → the `VMATH_RELU` the bias
+    /// kernel's `apply1` expects). Pure.
+    fn peel_bias_act<'b>(&self, value: &'b Expr) -> Option<(&'b Expr, i64)> {
+        // Bare additive form → identity.
+        if matches!(&value.kind, ExprKind::Binary { op: ast::BinOp::Add, .. }) {
+            return Some((value, BIAS_ACT_NONE));
+        }
+        // Transcendental activation call `f(add)`.
+        if let ExprKind::Call { callee, args, .. } = &value.kind {
+            if args.len() == 1 {
+                if let Some(code) = self.bias_activation_code(callee) {
+                    if matches!(&args[0].kind, ExprKind::Binary { op: ast::BinOp::Add, .. }) {
+                        return Some((&args[0], code));
+                    }
+                }
+            }
+        }
+        // ReLU `if add > 0 { add } else { 0 }` — reuse the velem peel, remap VE_RELU → VMATH_RELU.
+        if let Some((inner, act)) = self.peel_velem_act(value) {
+            if act == VE_RELU
+                && matches!(&inner.kind, ExprKind::Binary { op: ast::BinOp::Add, .. })
+            {
+                return Some((inner, VMATH_RELU));
+            }
+        }
+        None
+    }
+
+    /// Match the inner body of a broadcast-bias nest — one statement `out[i*C+j] = act(x[i*C+j] + b[j])`
+    /// (`i` = outer row var, `j` = inner col var, `cols` = the inner loop bound). `out`/`x` are batched
+    /// row-major reads `base[i*cols + j]`; `b` is the **broadcast** operand indexed by `j` alone (the
+    /// row-invariant bias). Returns `(out, x, b, op)` symbols + the activation code. Pure — emits no MIR.
+    fn match_bias_bcast_inner(
+        &self,
+        ivar: Symbol,
+        jvar: Symbol,
+        cols: &Expr,
+        inner: &Block,
+    ) -> Option<(Symbol, Symbol, Symbol, i64)> {
+        let stmt = single_stmt(inner)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        // Target `out[i*cols + j]` and an f32 result (the kernel writes f32).
+        let out = self.index_off(target, jvar, Some((ivar, cols)))?;
+        if self.expr_mir(value) != MirType::F32 {
+            return None;
+        }
+        // Peel the optional activation → the `x[i*C+j] + b[j]` add.
+        let (add, op) = self.peel_bias_act(value)?;
+        if self.expr_mir(add) != MirType::F32 {
+            return None;
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &add.kind
+        else {
+            return None;
+        };
+        // One operand is the batched data `x[i*cols + j]`, the other the broadcast bias `b[j]` (indexed
+        // by the inner var alone). Either order. `index_off` (batched) and `index_by_loopvar` (bare)
+        // are disjoint on the two index shapes, so only the correct assignment matches.
+        let split = |data: &Expr, bias: &Expr| -> Option<(Symbol, Symbol)> {
+            let x = self.index_off(data, jvar, Some((ivar, cols)))?;
+            let b = self.index_by_loopvar(bias, jvar)?;
+            if self.expr_mir(data) != MirType::F32 || self.expr_mir(bias) != MirType::F32 {
+                return None;
+            }
+            Some((x, b))
+        };
+        let (x, b) = split(lhs, rhs).or_else(|| split(rhs, lhs))?;
+        Some((out, x, b, op))
+    }
+
+    /// Pure structural match of a **broadcast-bias** nest `for i in 0..R { for j in 0..C { out[i*C+j] =
+    /// act(x[i*C+j] + b[j]) } }`. Returns `(out, x, b, rows, cols, op)` — the resolved base symbols, the
+    /// bound exprs (borrowed from `iter`/`body`), and the activation code — or `None`. Emits no MIR (so
+    /// a throwaway [`FnLowerer`] probe can reuse it for the `@parallel` whole-function interceptor).
+    /// Both `i` and `j` start at literal 0 (the flat `[0, R*C)` the kernel streams).
+    fn match_bias_bcast<'b>(
+        &self,
+        pat: &Pattern,
+        iter: &'b ForIter,
+        body: &'b Block,
+    ) -> Option<(Symbol, Symbol, Symbol, &'b Expr, &'b Expr, i64)> {
+        let ForIter::Range {
+            start: i_start,
+            end: Some(rows),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return None;
+        };
+        if const_usize_expr(i_start, self.interner) != Some(0) {
+            return None;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(ivar),
+            ..
+        } = pat
+        else {
+            return None;
+        };
+        // The outer body is exactly one inner `for j in 0..C { <bias stmt> }`.
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::For {
+            pat: jpat,
+            iter: jiter,
+            body: inner,
+            ..
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        let ForIter::Range {
+            start: j_start,
+            end: Some(cols),
+            inclusive: false,
+            step: None,
+        } = jiter
+        else {
+            return None;
+        };
+        if const_usize_expr(j_start, self.interner) != Some(0) {
+            return None;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(jvar),
+            ..
+        } = jpat
+        else {
+            return None;
+        };
+        let (out, x, b, op) = self.match_bias_bcast_inner(*ivar, *jvar, cols, inner)?;
+        Some((out, x, b, rows, cols, op))
+    }
+
+    /// Recognize a **broadcast-bias** nest (see [`Self::match_bias_bcast`]) — a `cols`-long bias `b`
+    /// added across every row (the pre-activation `+ bias` / `+ position` add), with an optional fused
+    /// activation — and lower it to one `mercury_bias_bcast_f32` call (256-bit AVX2, fused activation).
+    /// The row-broadcast operand `b[j]` (indexed by the inner var alone) is what the affine `velem`
+    /// recognizer declines and the generic 128-bit vectorizer under-widens. In a `@parallel` function
+    /// the multicore variant runs (rows independent → deterministic, so the differential gate stays
+    /// exact). Returns false (fall through) unless the nest matches.
+    fn try_emit_bias_bcast(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let Some((out, x, b, rows, cols, op)) = self.match_bias_bcast(pat, iter, body) else {
+            return false;
+        };
+        let (Some((outv, _)), Some((xv, _)), Some((bv, _))) =
+            (self.lookup(out), self.lookup(x), self.lookup(b))
+        else {
+            return false;
+        };
+        let rty = self.expr_mir(rows);
+        let rv = self.lower_expr(rows);
+        let rv = self.coerce_to(rv, &rty, &MirType::I64, true);
+        let cty = self.expr_mir(cols);
+        let cv = self.lower_expr(cols);
+        let cv = self.coerce_to(cv, &cty, &MirType::I64, true);
+        let opv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let func = if self.parallel_fn {
+            self.gemm.bias_bcast_par
+        } else {
+            self.gemm.bias_bcast
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![xv, bv, outv, rv, cv, opv],
+        });
         true
     }
 
