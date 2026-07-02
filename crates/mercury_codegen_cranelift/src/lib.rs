@@ -195,6 +195,8 @@ const RT_F32_TO_F16: &str = "mercury_f32_to_f16_bits";
 const RT_F16_TO_F32: &str = "mercury_f16_bits_to_f32";
 const RT_AXPBY_BF16: &str = "mercury_axpby_bf16";
 const RT_AXPBY_F16: &str = "mercury_axpby_f16";
+const RT_AXPBY_BF16_OUT: &str = "mercury_axpby_bf16_out";
+const RT_AXPBY_F16_OUT: &str = "mercury_axpby_f16_out";
 const RT_FMOD_F64: &str = "mercury_rt_fmod_f64";
 const RT_FMOD_F32: &str = "mercury_rt_fmod_f32";
 
@@ -1225,7 +1227,11 @@ impl<'a> FnTranslator<'a> {
         // The bf16/f16 mixed-precision streaming axpby: mercury_axpby_{bf16,f16}(x, y, out, n, a, b) —
         // two half-precision input pointers, one f32 output pointer, an i64 count, and two f32
         // coefficients (half in, f32 out, f32 math — the saxpy/axpby a recognized loop lowers to). Void.
-        if (name == RT_AXPBY_BF16 || name == RT_AXPBY_F16) && args.len() == 6 {
+        if matches!(
+            name,
+            RT_AXPBY_BF16 | RT_AXPBY_F16 | RT_AXPBY_BF16_OUT | RT_AXPBY_F16_OUT
+        ) && args.len() == 6
+        {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
             let out = self.val(args[2]);
@@ -1555,6 +1561,8 @@ struct RtFuncs {
     f32_to_f16: FuncId,
     f16_to_f32: FuncId,
     axpby_bf16: FuncId,
+    axpby_bf16_out: FuncId,
+    axpby_f16_out: FuncId,
     fmod_f64: FuncId,
     fmod_f32: FuncId,
 }
@@ -2127,6 +2135,12 @@ fn populate_module<M: Module>(
         axpby_bf16: module
             .declare_function(RT_AXPBY_BF16, Linkage::Import, &sig_axpby_bf16)
             .unwrap(),
+        axpby_bf16_out: module
+            .declare_function(RT_AXPBY_BF16_OUT, Linkage::Import, &sig_axpby_bf16)
+            .unwrap(),
+        axpby_f16_out: module
+            .declare_function(RT_AXPBY_F16_OUT, Linkage::Import, &sig_axpby_bf16)
+            .unwrap(),
         dot_bf16: module
             .declare_function(RT_DOT_BF16, Linkage::Import, &sig_dot_bf16)
             .map_err(|e| e.to_string())?,
@@ -2621,6 +2635,14 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_AXPBY_BF16,
                 module.declare_func_in_func(rt.axpby_bf16, builder.func),
+            );
+            rt_refs.insert(
+                RT_AXPBY_BF16_OUT,
+                module.declare_func_in_func(rt.axpby_bf16_out, builder.func),
+            );
+            rt_refs.insert(
+                RT_AXPBY_F16_OUT,
+                module.declare_func_in_func(rt.axpby_f16_out, builder.func),
             );
             rt_refs.insert(
                 RT_DOT_BF16,
@@ -3170,6 +3192,14 @@ pub fn jit_compile(
         RT_AXPBY_BF16,
         mercury_runtime::mercury_axpby_bf16 as *const u8,
     );
+    builder.symbol(
+        RT_AXPBY_BF16_OUT,
+        mercury_runtime::mercury_axpby_bf16_out as *const u8,
+    );
+    builder.symbol(
+        RT_AXPBY_F16_OUT,
+        mercury_runtime::mercury_axpby_f16_out as *const u8,
+    );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     let mut module = JITModule::new(builder);
@@ -3636,6 +3666,14 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_AXPBY_BF16,
         mercury_runtime::mercury_axpby_bf16 as *const u8,
+    );
+    builder.symbol(
+        RT_AXPBY_BF16_OUT,
+        mercury_runtime::mercury_axpby_bf16_out as *const u8,
+    );
+    builder.symbol(
+        RT_AXPBY_F16_OUT,
+        mercury_runtime::mercury_axpby_f16_out as *const u8,
     );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);

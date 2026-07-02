@@ -2428,6 +2428,76 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_axpby_{bf16,f16}_out(x, y, out, n, a, b)` — the **all-half** streaming axpby (half
+            // in AND a half output): the axpby sum is narrowed back to bf16/f16 on store. Reconstruct the
+            // half input bits exactly, call the identical kernel into a real `u16` output buffer, then
+            // widen each stored half back to the `f32` an `[bf16]`/`[f16]` element observes (`Value::Float`
+            // of the widened bits) — bit-identical to the native backend's write-then-load. The
+            // narrowing round lives in the shared shim (== the recognizer's `as bf16` store), so interp
+            // == native and `-O0` == `-O2` (value-rounded).
+            "mercury_axpby_bf16_out" | "mercury_axpby_f16_out" => {
+                let is_f16 = name == "mercury_axpby_f16_out";
+                let x = ptr(args[0])?;
+                let y = ptr(args[1])?;
+                let out = ptr(args[2])?;
+                let n = args[3].as_int() as usize;
+                let a = args[4].as_float() as f32;
+                let b = args[5].as_float() as f32;
+                let bits = |idx: usize, t: usize| -> Result<u16, String> {
+                    let f = self
+                        .memory
+                        .get(idx + t)
+                        .ok_or("lowp axpby-out operand out of bounds")?
+                        .as_float() as f32;
+                    Ok(if is_f16 {
+                        mercury_runtime::f32_to_f16_bits(f)
+                    } else {
+                        mercury_runtime::f32_to_bf16_bits(f)
+                    })
+                };
+                let mut xbuf = Vec::with_capacity(n);
+                let mut ybuf = Vec::with_capacity(n);
+                for t in 0..n {
+                    xbuf.push(bits(x, t)?);
+                    ybuf.push(bits(y, t)?);
+                }
+                let mut obuf = vec![0u16; n];
+                // SAFETY: xbuf/ybuf/obuf are each n u16 — the kernel's contract.
+                unsafe {
+                    if is_f16 {
+                        mercury_runtime::mercury_axpby_f16_out(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        );
+                    } else {
+                        mercury_runtime::mercury_axpby_bf16_out(
+                            xbuf.as_ptr(),
+                            ybuf.as_ptr(),
+                            obuf.as_mut_ptr(),
+                            n as i64,
+                            a,
+                            b,
+                        );
+                    }
+                }
+                for (t, &obits) in obuf.iter().enumerate() {
+                    let widened = if is_f16 {
+                        mercury_runtime::f16_bits_to_f32(obits)
+                    } else {
+                        mercury_runtime::bf16_bits_to_f32(obits)
+                    };
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("lowp axpby-out output out of bounds")? =
+                        Value::Float(widened as f64);
+                }
+                Ok(Value::Unit)
+            }
             // `mercury_sgemm_{bf16,f16}_{nt,tn}[_parallel](a, b, c, m, k, n, beta)` — the low-precision
             // GEMM (bf16/f16 inputs stored as `u16` bits, f32 accumulate, f32 output) a matmul nest over
             // `[bf16; _]`/`[f16; _]` operands lowers to: NT = `C = A·Bᵀ` (nn.Linear forward), TN =

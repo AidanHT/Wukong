@@ -83,6 +83,8 @@ pub fn lower_program(
         reduce_f16: interner.intern("mercury_reduce_f16"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
         axpby_f16: interner.intern("mercury_axpby_f16"),
+        axpby_bf16_out: interner.intern("mercury_axpby_bf16_out"),
+        axpby_f16_out: interner.intern("mercury_axpby_f16_out"),
         transpose: interner.intern("mercury_transpose_f32"),
         transpose_par: interner.intern("mercury_transpose_f32_parallel"),
         transpose_u16: interner.intern("mercury_transpose_u16"),
@@ -934,6 +936,12 @@ struct GemmSyms {
     axpby_bf16: Symbol,
     /// `mercury_axpby_f16` — the F16C twin of `axpby_bf16` (f16 inputs widened with `vcvtph2ps`).
     axpby_f16: Symbol,
+    /// `mercury_axpby_bf16_out(x, y, out, n, a, b)` — the **all-half** streaming axpby (bf16 in AND a
+    /// **bf16 output**): the axpby sum is narrowed back to bf16 on store through the shared round shim.
+    /// 6 bytes/elem vs an all-f32 axpby's 12 (the narrowing store halves the write traffic).
+    axpby_bf16_out: Symbol,
+    /// `mercury_axpby_f16_out` — the F16C twin (f16 in AND out; narrow via `vcvtps2ph`).
+    axpby_f16_out: Symbol,
     /// `mercury_transpose_f32[_parallel](src, dst, rows, cols)` — the cache-blocked matrix transpose
     /// (`dst[j,i] = src[i,j]`, `[rows,cols]` → `[cols,rows]`). A recognized transpose nest dispatches
     /// here; it is pure data movement (a permutation), so bit-identical to the scalar nest on both
@@ -5787,40 +5795,15 @@ impl FnLowerer<'_> {
     /// `0*inf=NaN` the source never has — and the interp==native gate, both calling the same kernel,
     /// would not catch it). Returns `(out, x, y, a_coef?, b_coef?)`, where a `None` coef means literal 1.
     #[allow(clippy::type_complexity)]
-    fn match_lowp_axpby<'b>(
+    /// Match the axpby **sum** `a*(x[k] as f32) + b*(y[k] as f32)` (either coefficient implicit) over
+    /// `[bf16]`/`[f16]` inputs, returning `(x, y, a?, b?, is_f16)` — the shared body of both the
+    /// f32-output ([`Self::match_lowp_axpby`]) and half-output ([`Self::match_lowp_axpby_narrow`])
+    /// recognizers. Pure. Both inputs must be the same precision (one kernel widens one width).
+    fn match_lowp_axpby_sum<'b>(
         &self,
-        body: &'b Block,
+        value: &'b Expr,
         k: Symbol,
-    ) -> Option<(
-        Symbol,
-        Symbol,
-        Symbol,
-        Option<&'b Expr>,
-        Option<&'b Expr>,
-        bool,
-    )> {
-        if body.tail.is_some() || body.stmts.len() != 1 {
-            return None;
-        }
-        let StmtKind::Assign {
-            target,
-            op: ast::AssignOp::Assign,
-            value,
-        } = &body.stmts[0].kind
-        else {
-            return None;
-        };
-        // Target is `out[k]` with `out` an f32 array indexed exactly by k.
-        let ExprKind::Index { base, indices } = &target.kind else {
-            return None;
-        };
-        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
-            return None;
-        }
-        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
-            return None;
-        }
-        let out = single_path(base)?;
+    ) -> Option<(Symbol, Symbol, Option<&'b Expr>, Option<&'b Expr>, bool)> {
         // `(arr[k] as f32)` with arr `[bf16]`/`[f16]`, indexed exactly by k → (arr symbol, is_f16).
         let lowp_load = |e: &Expr| -> Option<(Symbol, bool)> {
             let ExprKind::Cast { expr: inner, .. } = &e.kind else {
@@ -5877,11 +5860,108 @@ impl FnLowerer<'_> {
         };
         let (a, x, xf) = term(lhs)?;
         let (b, y, yf) = term(rhs)?;
-        // Both inputs must be the same precision (one kernel widens one width).
         if xf != yf {
             return None;
         }
+        Some((x, y, a, b, xf))
+    }
+
+    fn match_lowp_axpby<'b>(
+        &self,
+        body: &'b Block,
+        k: Symbol,
+    ) -> Option<(
+        Symbol,
+        Symbol,
+        Symbol,
+        Option<&'b Expr>,
+        Option<&'b Expr>,
+        bool,
+    )> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        // Target is `out[k]` with `out` an f32 array indexed exactly by k.
+        let ExprKind::Index { base, indices } = &target.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+            return None;
+        }
+        if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
+            return None;
+        }
+        let out = single_path(base)?;
+        let (x, y, a, b, xf) = self.match_lowp_axpby_sum(value, k)?;
         Some((out, x, y, a, b, xf))
+    }
+
+    /// Match a half-**output** axpby `out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16/f16` — the
+    /// all-half streaming axpby (bf16/f16 in AND out). The target `out` is a `[bf16]`/`[f16]` array and
+    /// the value is the axpby sum cast to that same half type; the inputs must be the same precision as
+    /// the output (one kernel, one width). Returns `(out, x, y, a?, b?, is_f16)`. Pure.
+    fn match_lowp_axpby_narrow<'b>(
+        &self,
+        body: &'b Block,
+        k: Symbol,
+    ) -> Option<(
+        Symbol,
+        Symbol,
+        Symbol,
+        Option<&'b Expr>,
+        Option<&'b Expr>,
+        bool,
+    )> {
+        if body.tail.is_some() || body.stmts.len() != 1 {
+            return None;
+        }
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &body.stmts[0].kind
+        else {
+            return None;
+        };
+        // Target `out[k]` with `out` a `[bf16]`/`[f16]` array → the output precision.
+        let ExprKind::Index { base, indices } = &target.kind else {
+            return None;
+        };
+        if indices.len() != 1 || single_path(&indices[0]) != Some(k) {
+            return None;
+        }
+        let out_f16 = match scalar_of(target, self.sema) {
+            Some(mercury_types::Scalar::Bf16) => false,
+            Some(mercury_types::Scalar::F16) => true,
+            _ => return None,
+        };
+        let out = single_path(base)?;
+        // The value is the axpby sum cast to the output half type: `(<sum>) as bf16/f16`.
+        let ExprKind::Cast { expr: inner, .. } = &value.kind else {
+            return None;
+        };
+        let cast_f16 = match scalar_of(value, self.sema) {
+            Some(mercury_types::Scalar::Bf16) => false,
+            Some(mercury_types::Scalar::F16) => true,
+            _ => return None,
+        };
+        if cast_f16 != out_f16 {
+            return None;
+        }
+        let (x, y, a, b, xf) = self.match_lowp_axpby_sum(inner, k)?;
+        // All-half: the inputs' precision must equal the output's (one kernel widens/narrows one width).
+        if xf != out_f16 {
+            return None;
+        }
+        Some((out, x, y, a, b, out_f16))
     }
 
     /// Lower a recognized bf16→f32 axpby `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as f32) }`
@@ -5940,6 +6020,69 @@ impl FnLowerer<'_> {
                 self.gemm.axpby_f16
             } else {
                 self.gemm.axpby_bf16
+            },
+            args: vec![xv, yv, outv, n, av, bv],
+        });
+        true
+    }
+
+    /// Lower a recognized **half-output** axpby `for k in 0..n { out[k] = (a*(x[k] as f32) + b*(y[k] as
+    /// f32)) as bf16/f16 }` (bf16/f16 in AND out) to one `mercury_axpby_{bf16,f16}_out` call — the
+    /// all-half streaming axpby. The narrowing store rounds through the shared `f32_to_{bf16,f16}_bits`
+    /// shim (the interpreter's), so both backends marshal the identical kernel and the differential gate
+    /// stays exact (value-rounded, `-O0` == `-O2`). 6 bytes/elem vs an all-f32 axpby's 12. Falls back
+    /// unless the range is `0..n` and out / x / y are in scope. Tried after the f32-output axpby (the two
+    /// target shapes — `out:[f32]` vs `out:[bf16]` with an `as bf16` cast — are disjoint).
+    fn try_emit_lowp_axpby_narrow(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        let ForIter::Range {
+            start,
+            end: Some(end),
+            inclusive: false,
+            step: None,
+        } = iter
+        else {
+            return false;
+        };
+        if const_usize_expr(start, self.interner) != Some(0) {
+            return false;
+        }
+        let Pattern {
+            kind: ast::PatKind::Ident(k),
+            ..
+        } = pat
+        else {
+            return false;
+        };
+        let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby_narrow(body, *k) else {
+            return false;
+        };
+        let (Some((outv, _)), Some((xv, _)), Some((yv, _))) =
+            (self.lookup(out), self.lookup(x), self.lookup(y))
+        else {
+            return false;
+        };
+        let mut coef = |e: Option<&Expr>| -> ValueId {
+            match e {
+                Some(e) => {
+                    let ty = self.expr_mir(e);
+                    let v = self.lower_expr(e);
+                    self.coerce_to(v, &ty, &MirType::F32, true)
+                }
+                None => self
+                    .builder
+                    .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
+            }
+        };
+        let av = coef(a_expr);
+        let bv = coef(b_expr);
+        let n_ty = self.expr_mir(end);
+        let n = self.lower_expr(end);
+        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        self.builder.build_void(Op::Call {
+            func: if is_f16 {
+                self.gemm.axpby_f16_out
+            } else {
+                self.gemm.axpby_bf16_out
             },
             args: vec![xv, yv, outv, n, av, bv],
         });
@@ -6348,6 +6491,13 @@ impl FnLowerer<'_> {
         // f32) }` (bf16 inputs, f32 output) dispatches to the streaming axpby kernel — half-width
         // inputs, so ~1.5× the bytes saved on this memory-bound shape. Same exact-gate rationale.
         if self.try_emit_bf16_axpby(pat, iter, body) {
+            return;
+        }
+        // A half-**output** axpby `for k { out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16 }`
+        // (bf16/f16 in AND out) dispatches to the narrowing streaming kernel — 6 bytes/elem vs an
+        // all-f32 axpby's 12 (the narrowing store halves the write traffic). Tried after the f32-output
+        // axpby (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
+        if self.try_emit_lowp_axpby_narrow(pat, iter, body) {
             return;
         }
         // A `for i in 0..R { for j in 0..C { out[i*C+j] = act(x[i*C+j] + b[j]) } }` broadcast-bias nest
