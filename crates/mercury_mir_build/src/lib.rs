@@ -9512,8 +9512,21 @@ impl FnLowerer<'_> {
                 if !matches!(op, Add | Sub | Mul | Div) {
                     return false;
                 }
-                self.vec_check_value(lhs, j, locals, lane, acc)
-                    && self.vec_check_value(rhs, j, locals, lane, acc)
+                if !(self.vec_check_value(lhs, j, locals, lane, acc)
+                    && self.vec_check_value(rhs, j, locals, lane, acc))
+                {
+                    return false;
+                }
+                // Cranelift x86 has no SIMD integer division, so a vectorized `<N x iK> sdiv/udiv`
+                // fails its verifier (a native panic) while the interpreter runs it lane-wise
+                // (interp != native + ICE). Vector float division (`fdiv`) is fine. So only vectorize
+                // `/` on a float lane; an integer-division loop stays scalar. Operands are validated
+                // first, so `lane` is already pinned by the array access.
+                !matches!(op, Div)
+                    || matches!(
+                        lane,
+                        Some(MirType::F32 | MirType::F64 | MirType::F16 | MirType::BF16)
+                    )
             }
             ExprKind::Unary {
                 op: ast::UnOp::Neg,
