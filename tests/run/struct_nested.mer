@@ -1,0 +1,31 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 35
+// EXPECT-OUT: 7
+module tests.run.struct_nested
+
+// Nested aggregates run end to end on both backends. A struct field that is itself a struct lays
+// out recursively (the registry-aware `aggregate_layout` resolves the `Ty::Named` field the leaf
+// type crate marks unsized), reads as a *pointer* so `o.inner.a` GEPs twice, and initializes by
+// recursing into the nested literal (or, for a non-literal aggregate field, a leaf-precise deep
+// copy). `-O0 == -O3` and interp == native (see `differential_nested_struct`).
+struct Inner { a: i32, b: i32 }
+struct Outer { inner: Inner, c: i32 }
+
+struct A { v: i32 }
+struct B { a: A, w: i32 }
+struct C { b: B, x: i32 }
+
+fn main() -> i32 {
+    let o: Outer = Outer { inner: Inner { a: 10, b: 20 }, c: 5 };
+    print(o.inner.a);                          // 10
+    print(o.inner.b);                          // 20
+    print(o.inner.a + o.inner.b + o.c);        // 35
+
+    // 3-deep nesting reads through three field GEPs.
+    let c: C = C { b: B { a: A { v: 1 }, w: 2 }, x: 4 };
+    print(c.b.a.v + c.b.w + c.x);              // 7
+    return 0;
+}

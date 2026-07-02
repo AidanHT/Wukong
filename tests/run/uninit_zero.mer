@@ -1,0 +1,37 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 100
+module tests.run.uninit_zero
+
+// A `let` without an initializer reads as zero on every backend and opt level — the language defines
+// an uninitialized local as the interpreter oracle's zero-initialized memory (Go-style zero value),
+// so `mir_build` zero-fills the slot. Before this, native -O0 read stack garbage (a three-way split:
+// interp 0 / native-O0 garbage / native-O2 0 via mem2reg), an uninitialized array diverged at every
+// opt level, and an uninitialized struct ICE'd (its slot was mis-allocated as a scalar `i32`).
+struct P { a: i32, b: f32 }
+
+fn main() -> i32 {
+    let x: i32;            // uninitialized scalar -> 0
+    print(x);
+
+    let y: f32;            // uninitialized float -> 0.0
+    print((y + 2.0) as i32);
+
+    let xs: [i32; 4];      // uninitialized array element -> 0
+    print(xs[2]);
+
+    let mut p: P;          // uninitialized struct: `a` written, `b` reads its zero default
+    p.a = 7;
+    print(p.a);
+    print((p.b + 0.0) as i32);
+
+    let mut z: i32;        // deferred initialization, then assigned
+    z = 100;
+    print(z);
+
+    return 0;
+}

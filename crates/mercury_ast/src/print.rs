@@ -270,8 +270,10 @@ impl AstPrinter<'_> {
         for a in &param.attrs {
             self.line(self.attr_str(a));
         }
+        let mt = if param.mutable { "mut " } else { "" };
         self.line(format!(
-            "param {}: {}",
+            "param {}{}: {}",
+            mt,
             self.sym(param.name.sym),
             self.type_str(&param.ty)
         ));
@@ -412,6 +414,35 @@ impl AstPrinter<'_> {
                     }
                 });
             }
+            PatKind::Int { sym, neg } => {
+                let s = self.sym(*sym);
+                self.line(format!("pat {}{}", if *neg { "-" } else { "" }, s));
+            }
+            PatKind::Char(sym) => {
+                let s = self.sym(*sym);
+                self.line(format!("pat {s}"));
+            }
+            PatKind::Bool(b) => self.line(format!("pat {b}")),
+            PatKind::Or(alts) => {
+                self.line("pat or");
+                self.indented(|p| {
+                    for a in alts {
+                        p.pattern(a);
+                    }
+                });
+            }
+            PatKind::Path(path) => self.line(format!("pat {}", self.path_str(path, "::"))),
+            PatKind::Range {
+                lo,
+                hi,
+                inclusive,
+            } => {
+                self.line(format!("pat range{}", if *inclusive { "=" } else { "" }));
+                self.indented(|p| {
+                    p.pattern(lo);
+                    p.pattern(hi);
+                });
+            }
         }
     }
 
@@ -535,6 +566,10 @@ impl AstPrinter<'_> {
                         p.line("arm");
                         p.indented(|p| {
                             p.pattern(&arm.pat);
+                            if let Some(g) = &arm.guard {
+                                p.line("guard");
+                                p.indented(|p| p.expr(g));
+                            }
                             p.expr(&arm.body);
                         });
                     }

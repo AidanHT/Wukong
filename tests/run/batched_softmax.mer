@@ -11,7 +11,7 @@ module tests.run.batched_softmax
 // score rows). The row-local max seed is x[r*C] (the row's first element). mercury_bench proves interp ==
 // native.
 
-fn softmax_batch(x: [f32; 12]) { // R = 3 rows, C = 4 cols
+fn softmax_batch(mut x: [f32; 12]) { // R = 3 rows, C = 4 cols
     for r in 0..3 {
         let mut m: f32 = x[r*4];
         for i in 0..4 { m = fmax(m, x[r*4+i]); }

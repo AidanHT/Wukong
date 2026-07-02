@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0503
+module tests.fail.assert_arity
+
+// `assert(cond)` takes exactly one argument. With no argument it used to fall through to a malformed
+// void call: the interpreter read the missing condition as false and trapped (exit 1) while the
+// native backend treated it as a no-op (exit 0) — a silent backend divergence. The arity is now
+// pinned, failing compilation before either backend runs.
+fn main() -> i32 {
+    assert();
+    return 0;
+}

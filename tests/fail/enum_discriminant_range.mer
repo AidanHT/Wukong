@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.enum_discriminant_range
+
+// An enum value lowers to a 32-bit discriminant, so a discriminant outside the i32 range cannot be
+// represented. Before, two things went wrong with a max-i64 sentinel: the discriminant auto-increment
+// `disc + 1` for the next variant panicked the compiler (non-wrapping add over i64::MAX), and the
+// value itself was silently truncated to its low 32 bits (0x7FFF...F printed as 4294967295). The
+// auto-increment now wraps (no panic) and an out-of-i32-range discriminant is a clean error.
+enum Tok {
+    Eof = 0x7FFFFFFFFFFFFFFF,
+}
+
+fn main() -> i32 {
+    return Tok::Eof as i32;
+}

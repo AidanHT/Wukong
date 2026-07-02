@@ -499,7 +499,7 @@ mod tests {
         // The `if` condition is a compile-time constant, so one arm is dead. After -O1 the dead
         // block should be pruned and the result must be unchanged.
         let src =
-            "fn main() -> i32 { let x: i32 = 0; if 1 < 2 { x = 10; } else { x = 20; } return x; }";
+            "fn main() -> i32 { let mut x: i32 = 0; if 1 < 2 { x = 10; } else { x = 20; } return x; }";
         let mut interner = Interner::new();
         let (module, _) = mercury_parser::parse_module(src, SourceId(0), &mut interner);
         let (sema, sd) = mercury_sema::check(&module, &interner);

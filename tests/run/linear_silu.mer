@@ -15,7 +15,7 @@ module tests.run.linear_silu
 //   silu([1,2,3,4]) = [silu(1), silu(2), silu(3), silu(4)]
 // silu(z) = z·sigmoid(z): silu(1)≈0.7311, silu(2)≈1.7616, silu(3)≈2.8577, silu(4)≈3.9281.
 // Printed as (out*1000) as i32: 731 / 1761 / 2857 / 3928.
-fn linear(x: [f32; 4], w: [f32; 4], out: [f32; 4]) {
+fn linear(x: [f32; 4], w: [f32; 4], mut out: [f32; 4]) {
     for i in 0..2 {
         for j in 0..2 {
             let mut s: f32 = 0.0;

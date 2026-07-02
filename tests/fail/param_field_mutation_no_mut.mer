@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0304
+module tests.fail.param_field_mutation_no_mut
+
+// An aggregate parameter is passed BY REFERENCE (its base pointer), so mutating it through a
+// projection — `p.a = …` here, or `p[i] = …` for an array/tensor — would silently mutate the
+// CALLER's value. The language requires `mut` on the parameter to opt into that (caller-visible,
+// in-place) mutation; a non-`mut` aggregate parameter is read-only. Declaring `fn poke(mut p: S)`
+// makes this legal. (A pointer parameter writing through its pointee, `*p = …`, needs no `mut`.)
+struct S {
+    a: i32,
+}
+
+fn poke(p: S) {
+    p.a = 9; // mutating a non-`mut` aggregate parameter through a field projection
+}
+
+fn main() -> i32 {
+    let s: S = S { a: 1 };
+    poke(s);
+    return s.a;
+}

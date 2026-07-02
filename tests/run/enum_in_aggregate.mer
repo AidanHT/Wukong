@@ -1,0 +1,43 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 42
+// EXPECT-OUT: 2
+// EXPECT-OUT: 300
+// EXPECT-OUT: 3
+module tests.run.enum_in_aggregate
+
+// A C-style enum lowers to its i32 discriminant, so it is a sized 4-byte scalar. Array-of-enum
+// (sized via `mir_ty_of` recursion) and enum scalars already worked, but an enum field of a STRUCT
+// or TUPLE was sized via `struct_size` / `aggregate_layout` -> `ty_size`, whose `Ty::Named` arm only
+// knew structs and returned `None` for an enum -> rejected `C0001 "unsized field"`. `ty_size` /
+// `ty_align` now report a 4-byte, 4-aligned scalar for an enum `Ty::Named`, so an enum field lays
+// out and reads/writes like the i32 it is. See gap-hunt sweep #13, Scout B.
+
+enum Color { R = 0, G = 1, B = 2 }
+struct Pixel { c: Color, v: i32 }
+
+fn main() -> i32 {
+    // Enum as a tuple element.
+    let t: (Color, i32) = (Color::G, 5);
+    print(t.0 as i32);          // 1
+    print(t.1);                 // 5
+
+    // Enum as a struct field: read, then mutate.
+    let mut p: Pixel = Pixel { c: Color::R, v: 42 };
+    print(p.c as i32);          // 0
+    print(p.v);                 // 42
+    p.c = Color::B;
+    print(p.c as i32);          // 2
+
+    // Match on an enum field.
+    let val = match p.c { Color::R => 100, Color::G => 200, Color::B => 300 };
+    print(val);                 // 300
+
+    // Array-of-enum still works (the pre-existing sized path).
+    let a: [Color; 3] = [Color::B, Color::R, Color::G];
+    print(a[0] as i32 + a[2] as i32);   // 2 + 1 = 3
+    return 0;
+}

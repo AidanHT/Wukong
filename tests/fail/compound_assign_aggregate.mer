@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+module tests.fail.compound_assign_aggregate
+
+// A compound assignment `a += b` means `a = a + b`. That implied `+` is undefined on an aggregate:
+// the explicit `a = a + b` form is rejected, but the compound path skipped the operand check, so
+// mir_build emitted `add` on the arrays' base pointers — invalid MIR the verifier and Cranelift
+// reject, the two backends disagreeing on the garbage at -O0. Update the elements individually. (A
+// plain `=` aggregate copy is still valid; only the arithmetic compound forms are rejected.)
+fn main() -> i32 {
+    let mut a: [i32; 2] = [1, 2];
+    let b: [i32; 2] = [3, 4];
+    a += b;
+    return a[0];
+}

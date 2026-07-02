@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.invalid_cast
+
+// `as` is restricted to well-defined conversions; reading a pointer's bits as an integer is not one.
+// The interpreter cannot materialise a real address (it yields 0) while the native backend yields
+// the true address — a silent backend divergence, with no dereference to excuse it. Rejected.
+// (Integer->pointer is permitted: that is how a null `0 as *T` is formed, and the cast itself agrees
+// on both backends — only dereferencing an invalid pointer is undefined, the programmer's concern.)
+fn main() -> i32 {
+    let a: i32 = 5;
+    return &a as i32; // pointer -> integer
+}

@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0502
+module tests.fail.tensor_assign_shape
+
+// A whole-tensor assignment must agree in shape. Assignment was the one shape-bearing context with
+// no shape unify (the let-init, binary-op, and return paths all check), so `x = b` where `x` is a
+// Tensor[f32, 4] place and `b` is a Tensor[f32, 8] value was silently accepted, storing a mis-shaped
+// buffer past the place's length — a hole in the headline compile-time shape guarantee.
+fn f(a: Tensor[f32, 4], b: Tensor[f32, 8]) -> f32 {
+    let mut x: Tensor[f32, 4] = a;
+    x = b;
+    return x[0];
+}
+
+fn main() -> i32 {
+    return 0;
+}

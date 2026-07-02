@@ -1,0 +1,20 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 60
+// EXPECT-OUT: 8
+module tests.run.call_literal_args
+
+// An unsuffixed numeric literal passed as a call argument adapts to the parameter's concrete scalar
+// type — the same `{integer}`/`{float}` inference a `let` annotation gets — so a literal works for an
+// `i64`/`f64`/`usize` parameter, not only an `i32`/`f32` one. (A genuine non-literal type mismatch is
+// still rejected with E0401.)
+fn process(n: i64) -> i64 { return n * 2; }
+fn scale(x: f64) -> f64 { return x * 1.5; }
+fn idx(i: usize) -> usize { return i + 1; }
+
+fn main() -> i32 {
+    print(process(10) as i32);
+    print((scale(4.0) * 10.0) as i32);
+    print(idx(7) as i32);
+    return 0;
+}

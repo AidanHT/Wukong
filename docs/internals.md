@@ -42,7 +42,11 @@ mercury_backend   `Backend` trait + `Artifact`
 mercury_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
 mercury_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
 mercury_codegen_llvm  textual LLVM IR backend
-mercury_runtime   C-ABI arena allocator + rayon-backed parallel_for
+mercury_codegen_gpu   GPU backend (--features gpu): PTX emit + cudarc driver-JIT — recognizer
+                  offload (--backend=gpu) + general MIR→PTX (--backend=gpu-native), no CUDA toolkit
+mercury_runtime   C-ABI arena + rayon parallel_for + the AVX2/FMA microkernels (GEMM, vmath,
+                  reductions, norms, int8 — the symbols the recognizers dispatch to)
+mercury_autodiff  reverse-mode autodiff as a MIR→MIR transform (the training backward pass)
 mercury_driver    Session + compile() pipeline + --emit / --backend handling
 mercuryc          thin CLI binary
 mercury_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
@@ -62,6 +66,7 @@ source
   → mir_build    (mercury_mir_build::lower_program)     -> MIR (High)
   → opt          (mercury_opt::optimize)                fixpoint passes
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
+                 | GPU (--features gpu: --backend=gpu offload, --backend=gpu-native MIR→PTX)
                  | textual LLVM IR (--emit=llvm-ir)
 ```
 
@@ -88,6 +93,29 @@ The front-end lowers in **clang style**: one `alloca` per local, with `load`/`st
 This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
 SSA registers (see below), which is what makes the value-based passes effective.
 
+There is **no dedicated aggregate MIR type**. A tuple or struct is a flat, padded byte buffer whose
+local value *is* its base pointer (the convention arrays already follow); `t.0` / `s.f` is a typed
+`load`/`store` at the field's byte offset, and `mem2reg` leaves the slot in memory. Nested aggregates
+(a struct/tuple field that is itself a struct, or an array of structs) lay out recursively — the
+registry-aware layout helpers resolve a named-struct field that the leaf type crate marks unsized — and
+an aggregate field initialized from a *non-literal* value is a leaf-precise deep copy, not a flat
+`memcpy` (which would skip a padded non-leading scalar slot under the interpreter's slot-indexed
+memory). Pointers/references reuse the same `Alloca`/`Load`/`Store`/`Gep` ops: `&mut x` takes a slot's
+address, `*p` loads/stores through it, and `mem2reg` refuses to promote a slot whose address escapes,
+so `-O0` ≡ `-O3`. A **constant-shape tensor** lowers like an array — the parameter is a base pointer
+and a multi-dimensional index `a[i, j]` flattens to a row-major `Gep` — so the shape-typed surface
+*executes*, not just shape-checks. A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
+both the dot-product and accumulate spellings) dispatches to the tuned `mercury_sgemm` microkernel
+just like the flat `a[i*K+k]` form, because a 2-index access supplies its row stride from the
+operand's inner tensor dimension (symbolic-generic dimensions remain checked-only). The aggregate path is differentially gated
+bit-for-bit against the interpreter by the `differential_tuple`/`differential_struct`/
+`differential_nested_struct` Cranelift tests. Returning an aggregate *by value* from a function (and a
+by-value aggregate parameter) lowers through a **MIR-level sret ABI** — the callee takes a hidden
+leading destination pointer and returns void, `return Struct{..}` deep-copies into it, and the call
+site allocates the buffer, passes it as the hidden first argument, and uses it as the call's value, so
+no aggregate ever rides in a register and the two backends still agree
+(`differential_struct_across_fns`/`differential_struct_return`).
+
 The **verifier** (`mercury_mir::verify`) checks that every used value is defined, types are
 consistent, and CFG edges are valid. It runs in `--emit=mir` and can be enabled after every pass.
 
@@ -110,6 +138,9 @@ list of function-level `Pass`es to a per-function fixpoint. Two shared analyses 
 | `Dse`         | -O2   | dead-store elimination (overwritten stores to a slot with no intervening read) |
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader |
 
+`-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
+(`PassManager::standard` adds passes at `-O1` and `-O2` only).
+
 `Mem2Reg` is the keystone: the front-end's memory traffic hides constants, common subexpressions,
 and induction variables, so promoting slots to SSA is what lets the rest of the pipeline fire. It
 leaves arrays, address-taken, and pointer slots in memory; a read before any write becomes a zero
@@ -129,9 +160,12 @@ kernels) and runs ~1.5–2.5x faster than -O0 under the interpreter.
 ## Interpreter
 
 `mercury_interp` is a zero-dependency CFG walker over MIR. `Value` is `Int(i128) | Float(f64) |
-Ptr(usize) | VecRef(u32) | Unit`; a step limit guards against runaway loops. `run_with_output`
-returns `(exit_code, stdout)`; intrinsics like `print` format into the captured stdout buffer. `f32`
-ops are computed in `f32` (single rounding) so the interpreter matches native bit-for-bit. SIMD
+Ptr(usize) | VecRef(u32) | Unit`; a step limit guards against runaway loops, and the walk runs on a
+scoped 512 MiB-stack worker thread so deep recursion does not overflow the host stack (an uncatchable
+overflow would otherwise abort the oracle). `run_with_output` returns `(exit_code, stdout)`;
+intrinsics like `print` format into the captured stdout buffer. `f32` ops are computed in `f32`
+(single rounding), and an `int → f32` cast rounds straight to `f32` (not via `f64`), so the
+interpreter matches native's single conversion bit-for-bit. SIMD
 vectors are executed lane-wise via a side arena (`VecRef` indexes it, keeping `Value` `Copy`). The
 interpreter is the sound oracle for differential testing.
 
@@ -191,6 +225,19 @@ Crucially this stays inside the differential oracle: the interpreter, on a `merc
 **marshals its abstract `Value` memory into real f32 buffers and calls the identical kernel**, then
 marshals the result back — so native and interpreter agree bit-for-bit despite the reassociated
 accumulation (the parallel kernel is bit-identical to the serial one by construction).
+
+## GPU backend
+
+`mercury_codegen_gpu` (behind `--features gpu`) is a third execution path: being a compiler, it
+**emits PTX text** and **driver-JIT-loads it via `cudarc`** (`cuModuleLoadData`), so no `nvcc`/CUDA
+toolkit is needed — only the NVIDIA driver. It offers two modes. `--backend=gpu` runs the program on
+an **offloading interpreter** (the CPU tree-walks every op as the oracle does, but recognized
+GEMM/activation/reduction/norm calls execute on the device). `--backend=gpu-native` (the `GpuLower`
+backend) instead lowers the **whole** MIR to PTX, so arbitrary non-recognized kernels run GPU-side
+too; an eligible program can be fused into a single-block cooperative *megakernel* (one launch, no
+host round-trips). The CPU↔GPU boundary is **tolerance-gated** (`c·√K·ε`) rather than bit-exact — the
+GPU analogue of the CPU differential oracle — and the path stays optimization-invariant (`-O0` ≡
+`-O3`). It builds but is inert without the feature, so plain `cargo test` is unaffected.
 
 ## Testing strategy
 

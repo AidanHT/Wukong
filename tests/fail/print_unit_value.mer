@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+module tests.fail.print_unit_value
+
+// An `if` with no `else` (and a `match` with statement arms) has type `()` — the value of the
+// then-branch is discarded. Binding that to a `let` and printing it used to slip past sema: mir_build
+// lowered the unit `let` to an `alloca void` and the read to a `load void`, so native -O0 read
+// uninitialized stack (nondeterministic garbage) while the interpreter and -O2 (mem2reg) produced 0 —
+// a divergence that broke BOTH the interp==native and -O0==-O{1,2,3} invariants at once. `print` now
+// rejects a `()` argument (E0401), the same way `()` is already rejected as an arithmetic operand.
+fn main() -> i32 {
+    let x = if true { 1 }; // `x: ()` — the `1` is discarded (no else)
+    print(x); // E0401: cannot print a `()` value
+    return 0;
+}

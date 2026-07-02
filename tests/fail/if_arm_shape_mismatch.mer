@@ -1,0 +1,20 @@
+// EXPECT-CODE: E0502
+module tests.fail.if_arm_shape_mismatch
+
+// The two arms of an `if` used as a value merge into ONE tensor, so their shapes must agree — the same
+// rule binary operators, call arguments, and `return` already enforce. Before, the lenient result-type
+// `join` typed the value as the then-arm and let a mismatched else-arm through: `if c { Tensor[f32,2,2] }
+// else { Tensor[f32,2,4] }` typed as [2,2] then mis-strided the [2,4] data (a silent wrong element), and
+// a [1024]-vs-[2] mismatch even turned a statically-valid index into a runtime OOB. Unifying the arms
+// catches it at compile time.
+fn pick(cond: bool, a: Tensor[f32, 2, 2], b: Tensor[f32, 2, 4]) -> f32 {
+    let c = if cond { a } else { b }; // [2,2] vs [2,4] — dimension mismatch
+    return c[0, 0];
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f32; 8] = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0];
+    print(pick(false, a, b) as i32);
+    return 0;
+}

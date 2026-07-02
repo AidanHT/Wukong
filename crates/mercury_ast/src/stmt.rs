@@ -1,6 +1,6 @@
 //! Statements, blocks, and patterns.
 
-use crate::{AssignOp, Attr, Expr, Ident, NodeId, TypeExpr};
+use crate::{AssignOp, Attr, Expr, Ident, NodeId, Path, TypeExpr};
 use mercury_span::{Span, Symbol};
 
 /// A braced block: zero or more statements and an optional trailing expression (its value).
@@ -83,4 +83,26 @@ pub enum PatKind {
     Ident(Symbol),
     Tuple(Vec<Pattern>),
     Unit,
+    /// An integer (or other numeric) literal pattern, e.g. `1` / `-3` in a `match` arm. The raw
+    /// source text is stored (like `ExprKind::Int`) and parsed later; a leading `-` is folded in by
+    /// the parser (`neg: true`), since a literal pattern has no sub-expressions to negate.
+    Int { sym: Symbol, neg: bool },
+    /// A char-literal pattern, e.g. `'a'` in a `match` arm. The raw source text (incl. quotes and
+    /// any escape) is stored like `ExprKind::Char` and decoded to a code point later; it matches by
+    /// comparing the scrutinee to that code point, exactly like an integer-literal pattern.
+    Char(Symbol),
+    /// A boolean literal pattern (`true` / `false`).
+    Bool(bool),
+    /// An or-pattern `A | B | C` — matches if any alternative matches. Alternatives are typically
+    /// literals / enum variants (binding-free); a binding inside one is not recommended.
+    Or(Vec<Pattern>),
+    /// A path pattern — an enum variant such as `Color::Red`, matched by its integer discriminant.
+    Path(Path),
+    /// A range pattern `lo..hi` (half-open) or `lo..=hi` (inclusive). The bounds are integer-literal
+    /// patterns (`PatKind::Int`); the scrutinee matches when it falls within the range.
+    Range {
+        lo: Box<Pattern>,
+        hi: Box<Pattern>,
+        inclusive: bool,
+    },
 }

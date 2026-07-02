@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0401
+module tests.fail.index_tuple
+
+// Indexing a tuple with `[..]` (instead of `.0` / `.1`) is a type error. It used to type-check, then
+// the two backends lowered the bogus index divergently — the interpreter yielded 0 while native read
+// the real element — a silent backend disagreement. Use `t.1` to access a tuple field.
+fn main() -> i32 {
+    let t = (10, 20, 30);
+    let v: i32 = t[1];
+    return v;
+}

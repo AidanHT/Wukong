@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0401
+module tests.fail.array_literal_elem_out_of_range
+
+// An array literal now adapts its elements to the annotated element type (so a typed buffer can be
+// built from literals), and that adaptation range-checks each element — `300` does not fit `i8`, so
+// it is a hard error instead of a silent wrap to `44`. Mirrors the scalar `let x: i8 = 300;` rule.
+fn main() -> i32 {
+    let a: [i8; 2] = [300, 0]; // 300 is out of range for i8 (-128..=127)
+    return a[0] as i32;
+}

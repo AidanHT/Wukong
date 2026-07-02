@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.missing_return
+
+// A function that promises a value must produce one on every path. Here the `n <= 0` path falls off
+// the end with no `return` and no tail expression, so the value "returned" is an uninitialized
+// default on both backends — a silent wrong answer. Rust rejects this identically ("not all control
+// paths return a value"). Adding an `else { return 0; }` or a trailing expression fixes it.
+fn pick(n: i32) -> i32 {
+    if n > 0 {
+        return 1;
+    }
+}
+
+fn main() -> i32 {
+    return pick(-5);
+}

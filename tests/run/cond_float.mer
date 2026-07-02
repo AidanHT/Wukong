@@ -1,0 +1,46 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 111
+module tests.run.cond_float
+
+// A non-bool FLOAT used as a boolean condition has C-like truthiness on BOTH backends: nonzero =
+// true, zero = false. The fractional values (0.5 / 0.25 / 0.9999 / -0.5) are the load-bearing case:
+// mir_build normalizes a float condition to `cond != 0.0` (an i1) BEFORE either backend sees it, so
+// native can't truncate `0.5 -> 0` (which would mis-take the branch / trap the assert) and the
+// interpreter can't disagree with itself (its `assert` used `f != 0.0` but `if`/`while` used
+// `as_int() != 0`). The directives below are the interpreter oracle; `native_matches_interpreter`
+// re-runs this on the Cranelift backend and asserts they agree at every -O level.
+fn main() -> i32 {
+    // Fractional float `if`: 0.5 is nonzero -> true (must NOT truncate to 0).
+    let h: f32 = 0.5;
+    if h { print(1); } else { print(0); }   // -> 1
+
+    // Float zero is false.
+    let z: f32 = 0.0;
+    if z { print(9); } else { print(0); }    // -> 0
+
+    // Fractional float `while`: 3.0 -> 2.0 -> 1.0 -> 0.0 (exit), so it runs 3 times.
+    let mut c: f32 = 3.0;
+    let mut n: i32 = 0;
+    while c { c = c - 1.0; n = n + 1; }
+    print(n);                                 // -> 3
+
+    // Float operands to short-circuit `&&` / `||` (both normalized to i1).
+    let q: f32 = 0.25;
+    if h && q { print(5); } else { print(6); } // both nonzero -> true  -> 5
+    if z || q { print(7); } else { print(8); } // z false, q true       -> 7
+    if z && q { print(8); } else { print(2); } // z false -> short-circuit false -> 2
+
+    // Fractional-float `assert` PASSES (nonzero != 0.0). -0.5 is negative-but-nonzero -> true.
+    assert(h);
+    assert(0.9999);
+    assert(-0.5);
+    print(111);                               // reached only if every assert passed
+    return 0;
+}

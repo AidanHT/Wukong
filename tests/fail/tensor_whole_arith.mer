@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.tensor_whole_arith
+
+// Whole-tensor arithmetic (`a + b` on two Tensor values) is not supported — it type-checks (the
+// shapes even match), but mir_build has no whole-tensor add and emitted an `add` on the tensors'
+// base pointers: invalid MIR the verifier and Cranelift reject (an internal compiler error), the
+// backends disagreeing at -O0. Operate on elements in a loop: `for i { c[i] = a[i] + b[i] }`.
+fn f(a: Tensor[f32, 4], b: Tensor[f32, 4]) -> f32 {
+    let c = a + b;
+    return 0.0;
+}
+
+fn main() -> i32 {
+    return 0;
+}

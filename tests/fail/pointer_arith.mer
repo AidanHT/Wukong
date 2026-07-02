@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0401
+module tests.fail.pointer_arith
+
+// Pointer arithmetic (`p + 1`) is not supported. Sema used to accept it, then mir_build emitted an
+// `add` on a non-integer pointer operand — invalid MIR the verifier and Cranelift reject, and the
+// interpreter reported a different error ("expected a pointer"): an ICE / inconsistent failure on a
+// program sema had accepted. Take an element address with `&arr[i]` instead.
+fn main() -> i32 {
+    let mut x: i32 = 5;
+    let p: *i32 = &x;
+    let q: *i32 = p + 1;
+    return 0;
+}

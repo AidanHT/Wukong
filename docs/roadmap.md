@@ -5,14 +5,27 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
-Two execution backends now run the full language and agree bit-for-bit (a differential gate proves
+Two CPU execution backends now run the full language and agree bit-for-bit (a differential gate proves
 it across opt levels): the zero-dependency tree-walking interpreter (the reference oracle) and a
 from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, object/exe via
 `--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
-- Modules, functions (including recursion and mutual recursion), and direct calls.
-- `let`/`let mut`/`const`, shadowing, block-as-expression values.
-- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, and floats. `f32` is computed at **`f32`
+- Modules, functions (including recursion and mutual recursion — the interpreter oracle runs on a
+  512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
+  direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
+  than the native backend's machine frames, so the interpreter overflows at a far shallower recursion
+  depth (~tens of thousands of nested calls) than native (which handles millions). Recursion past the
+  interpreter's stack bound is a **resource limit outside the bit-for-bit differential contract** — the
+  oracle aborts where the native backend may still complete, the same "outside the defined contract"
+  status as an out-of-bounds access. Matching native's depth would need ~10× the interpreter stack
+  (impractical); a real program rarely recurses that deep on a stackful backend.
+- `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
+  (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.mer`), and a **top-level
+  `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
+  loop bound, **array length in a type** (`let a: [i32; N]`; `tests/run/const_array_length.mer`),
+  const-referencing-const; `tests/run/top_level_const.mer`).
+- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, `char` (a 32-bit Unicode scalar,
+  interconvertible with the integers via `as`; `tests/run/char_type.mer`), and floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
   rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
   with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
@@ -23,10 +36,14 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   read through an `as f32` widening cast (lossless: `<<16` for bf16, F16C `vcvtph2ps` for f16) with
   **f32 accumulate/compute** — the standard ML contract — are recognized and lowered to half-precision
   runtime kernels. Symmetric across both precisions:
-  - **reductions** `dot`/`sum` (`mercury_{dot,sum}_{bf16,f16}`) — ~3.0–3.5× vs C for dot, ~6–8× for
-    sum, growing as the working set spills L3 (`tests/run/reduce_{bf16,f16}.mer`);
-  - **max/min/absmax** (`mercury_reduce_{bf16,f16}(x,n,op)`) — the per-tensor absmax is the
-    symmetric-quantization scale; exact (max/min round nothing) (`reduce_bf16_minmax.mer`);
+  - **reductions** `dot`/`sum` (`mercury_{dot,sum}_{bf16,f16}[_parallel]`) — ~3.0–3.5× vs C for dot,
+    ~6–8× for sum, growing as the working set spills L3 (`tests/run/reduce_{bf16,f16}.mer`);
+  - **max/min/absmax** (`mercury_reduce_{bf16,f16}[_parallel](x,n,op)`) — the per-tensor absmax is the
+    symmetric-quantization scale; exact (max/min round nothing) (`reduce_bf16_minmax.mer`). Inside a
+    `@parallel` function each of dot/sum/max/min/absmax dispatches to its multicore `_parallel` twin —
+    a deterministic fixed-`RCHUNK` chunk fold (the per-chunk serial kernel + an ascending partial
+    combine), bit-identical regardless of thread count and the bf16/f16 analog of the f32
+    `mercury_sreduce_f32_parallel` (`tests/run/parallel_reduce_lowp.mer`);
   - **streaming axpby** `out = a·x + b·y` (`mercury_axpby_{bf16,f16}`), half-in/f32-out, ~1.3× ≫ L3
     (requires two additive terms; a 1-term scale would force a `0*inf` the source lacks);
   - **activations** — the full 36-op transcendental set over a half-precision input
@@ -35,15 +52,63 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   and the interpreter marshals through the identical kernel, so native == interp bit-for-bit. C/Rust
   can vectorize neither a `libm` call nor the half→f32 widen, so the gap is structural. A half-precision
   *output* (→ ~2× on the streaming ops) needs a narrowing store and is future work.
-- All arithmetic/comparison/bitwise/boolean operators, compound assignment, casts.
-- `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`.
+- All arithmetic/comparison/bitwise/boolean operators (`&&`/`||` **short-circuit**), compound
+  assignment, casts — including a float → narrow-int cast (`1e30 as i8`) that **saturates** identically
+  on both backends (`tests/run/float_cast_narrow.mer`).
+- `if`/`else` (statement and value position), `while`, `for … in a..b [step s]`, `loop { … }` with
+  `break`/`continue`, including **labeled loops** `'outer: for … { … break 'outer; continue 'outer; }`
+  — a labeled `break`/`continue` targets the named enclosing loop, not just the innermost (the lexer
+  tells a label `'outer` from a char literal `'a'` the way Rust does; `tests/run/labeled_loop.mer`).
+  `continue` in a range `for` runs the loop step (`tests/run/for_continue.mer`); a `break`/`continue`
+  outside any loop, or one naming an undeclared label, is rejected with `E0303`
+  (`tests/fail/{break_outside_loop,break_unknown_label}.mer`). Loop-as-expression / break-with-value
+  (`let x = loop { break 5; };`) is still pending — loops are statement-only and `break` carries no value (🟡).
+- **`match`** in value and statement position: integer/bool literal, identifier-binding, and wildcard
+  `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
+  **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
+  (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), each with an optional `if`
+  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain
+  (`tests/run/{match_expr,match_patterns,match_tuple}.mer`).
+- **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
+  variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
+  (`tests/run/enum_cstyle.mer`). Data-carrying (tagged-union) variants and enum-payload matching are
+  still unsupported.
+- **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
+  digit separators and type suffixes (`tests/run/radix_literals.mer`), and char literals `'A'` (the
+  one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
+  interconvertible with the integers via `as` (`tests/run/char_literals.mer`, `tests/run/char_type.mer`).
+- **String literals**: `"hello"` materializes its UTF-8 bytes (plus a NUL) into a stack byte buffer,
+  typed `*u8`; the escapes `\n` `\r` `\t` `\\` `\"` `\'` `\0` `\xHH` `\u{…}` decode. `print`/`println`
+  of a `*u8` (a literal or a `let`-bound string) renders the bytes, not
+  the pointer value (`tests/run/string_literal.mer`). No string *type* beyond `*u8` yet — no
+  concatenation/indexing/length and no general static-data section (🟡).
+- **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
+  pointer parameter threads through calls — address-taken locals correctly stay in memory under the
+  optimizer (`tests/run/pointer.mer`). `as` casts bind looser than `*`/unary, tighter than binary
+  (`*p as T` is `(*p) as T`).
 - **Fixed-size arrays** `[T; N]`: literal/repeat init, indexed load/store, array parameters passed
   by base pointer (out-params). Real kernels run: dot, SAXPY, GEMM, matmul, ReLU, clamp, transpose.
+- **Tuples & structs**: `(a, b)` / `Name { f: v, … }` literals, field access `t.0` / `s.f` (read and
+  assign), heterogeneous fields with correct padded layout, **and nested aggregates** (struct-in-struct
+  to any depth, arrays of structs, an aggregate field deep-copied from a variable). Lowered as a flat
+  byte buffer with byte-offset field GEPs (the local's value is its base pointer, like an array; nested
+  fields recurse), so the interpreter and native backend agree bit-for-bit with no backend-specific
+  aggregate handling (`tests/run/{tuple,struct,struct_nested}.mer`), and nested tuple-field access
+  `t.0.1` / `t.0.0.0` plus whole-aggregate assignment `s = other;` both run
+  (`tests/run/{nested_tuple_field,struct_assign}.mer`). A tuple/struct also crosses function
+  boundaries — passed **in by reference** (base pointer, zero-copy; mutating it needs `mut`, else
+  E0304) and **returned by value** via a hidden-pointer (sret) ABI modeled in mir_build, so no
+  aggregate ever rides in a register and both backends agree
+  (`tests/run/{struct_fn,struct_return}.mer`).
+- **Constant-shape tensors** `Tensor[f32, R, C]`: multi-dimensional indexing `a[i, j]` lowers to a
+  row-major GEP (the shape-typed surface), so elementwise tensor kernels and tensor matmuls execute
+  on both backends (`tests/run/tensor_*.mer`) — and a matmul written in tensor notation dispatches to
+  the tuned GEMM kernel (see below). Symbolic-generic dims are still pending (see below).
 - **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
   the way XLA/TVM/oneDNN lower a matmul op. Serial and `@parallel`. Beats gcc/rustc's naive nest
-  ~2.4–3.5× single-thread and up to ~13× parallel on `C = A·B` (~19–70× on `nn.Linear`), the lead
+  ~3–3.6× single-thread (~110–120 GFLOP/s ≈ 90% of one P-core's roofline) and up to ~18× parallel on `C = A·B` (~19–26× single-core / up to ~104× parallel on `nn.Linear`), the lead
   growing with size. Dimensions may be compile-time literals **or runtime values** (function
   params/locals): the recognizer checks strides symbolically, so a general matmul function dispatches
   to the kernel, not just fixed-size benchmark kernels. The two factors may even be the **same array**
@@ -89,7 +154,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   for i { dx = y·(dy−s) } }` (the gradient through a row softmax — attention + classifier training) folds to
   `mercury_softmax_bwd_f32[_parallel]`, which delegates the per-row dot to the bit-exact `sreduce` (8 lane
   accumulators) then applies `y·(dy−s)` 8-wide. gcc/rustc keep the dot's *accumulation* scalar (a serial
-  `vaddss` chain), so Mercury wins ~1.0–1.85× single-core (the apply is already vectorized in both) and
+  `vaddss` chain), so Mercury wins ~1.0–2.0× single-core (the apply is already vectorized in both) and
   ~5–6× `@parallel` (rows across cores). The dot reassociates (the reduction exception), so the differential
   gate is bit-exact while the cross-language check is a tolerance (`tests/run/softmax_bwd.mer`).
 - **Activation backward → 256-bit transcendental gradient**: a `for i { dx[i] = act_backward(x[i],
@@ -143,9 +208,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   to a tuned 256-bit AVX2/FMA kernel** (`mercury_vmath_f32`) — the width Cranelift's general (128-bit)
   vectorizer can't reach; a *composed* use auto-vectorizes the inlined poly at 128-bit. So softmax, layernorm,
   GELU (tanh and exact erf), SiLU/swish, ELU, softplus, mish, tanh, RoPE, and **log-softmax /
-  cross-entropy** run on SIMD instead of scalar `libm` — **~4–11.5× faster** than gcc/rustc's scalar
+  cross-entropy** run on SIMD instead of scalar `libm` — **~2–13× faster** than gcc/rustc's scalar
   `libm` call (which can't vectorize a loop containing it; ~28× across cores under `@parallel`). See `tests/run/{transcendental,softmax,
   layernorm,gelu,elu,leaky_relu,softplus,mish,activations,log,erf,trig,ihyp,atan,log_softmax,ffn_block}.mer`.
+- **Math intrinsics on integer operands**: `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving on
+  an integer (integer `abs` = `select(x<0, −x, x)`; rounding an integer is the identity), and `sqrt` /
+  the transcendentals promote an integer operand to `f32` — so they no longer emit the float-op-on-int
+  MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.mer`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Mercury
   runs a 3×3 conv **~6–7× faster** than idiomatic hand-written direct convolution in C. See
@@ -183,7 +252,7 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 
 ## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
 
-A third backend, `mercury_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
+A GPU backend, `mercury_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
 toolkit** is needed to build or run, only the driver). Every transformer op category is a device
 kernel, each gated against a CPU reference by a **tolerance** differential (`c·√K·ε`, deterministic
@@ -196,14 +265,16 @@ mobile 4050 (see `BENCHMARKS.md`):
   16×8 tiles per warp) is now the **fastest** tensor-core path — ~2.1–2.4× the naive single-tile fp8 and
   ~1.3–2.3× fp16/bf16 in the same run (single-tile retained as the fallback for non-divisible shapes).
 - **Fused flash-attention** (online softmax, never materializes the `S×S` scores — the kernel that
-  *loses* on CPU): warp-per-query-row, 183→372 GFLOP/s as context grows to 4 K.
+  *loses* on CPU): warp-per-query-row + `cp.async` double-buffering, **3.6–5.0× a cuBLAS unfused
+  attention chain** (205–738× naive CUDA-C), and faster than PyTorch eager at every sequence length.
 - **Fused row norms** (softmax/LayerNorm/RMSNorm, one warp per row), **activations** (SFU), **reductions**
   (deterministic; max bit-exact), **conv2d**, and elementwise.
 - **A whole pre-norm transformer layer runs end-to-end GPU-resident** — RMSNorm → QKV → flash-attn →
   output proj → residual → RMSNorm → FFN(SiLU) → residual, all on device buffers with no host round-trip
   between ops, matching a CPU f64 reference to max_rel 2.7e-4 and **deterministic** run-to-run.
 
-**End-to-end `--backend=gpu`.** `mercuryc --features gpu --backend=gpu --run foo.mer` executes the
+**End-to-end `--backend=gpu`.** Built with `--features gpu` (a *cargo build* flag, not a `mercuryc`
+runtime flag), `mercuryc --backend=gpu --run foo.mer` executes the
 program through an **offloading interpreter**: the whole program is tree-walked on the CPU (identical
 control flow, buffer layout, and every non-kernel op to the oracle), but recognized GEMM / activation
 / reduction / fused-norm calls run on the device via an `Accelerator` seam (`mercury_interp`) the
@@ -215,32 +286,55 @@ the interp oracle and the GPU over identical buffers and matches within toleranc
 silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
 
 Run the kernel suite with `cargo test -p mercury_codegen_gpu --features gpu` (skips cleanly with no
-GPU). A full MIR→PTX scalar compiler (so arbitrary, non-recognized kernels run GPU-side too) is the
-remaining stretch; today unrecognized ops execute on the CPU within the same offloading run.
+GPU).
+
+**General MIR→PTX — `--backend=gpu-native`.** Beyond the recognizer-offload path above, a fourth
+backend (`GpuLower`) lowers the *whole* program's MIR to PTX, so arbitrary non-recognized kernels run
+GPU-side too; an eligible program is fused into a single-block cooperative **megakernel** (one launch,
+no host round-trips). It is tolerance-gated against the interpreter oracle and optimization-invariant
+(`-O0` ≡ `-O3`), the same contract as the offload path.
+
+## Automatic differentiation (`mercury_autodiff`)
+
+Reverse-mode autodiff runs as a **MIR→MIR transform**: given a forward function computing a scalar
+loss, it emits a new function that also accumulates the gradient w.r.t. designated input buffers (the
+vector-Jacobian product). Matmul adjoints ride the same tuned GEMM kernels, and a fused AdamW step is
+emitted as one kernel. Every VJP rule is **finite-difference-gated** (forward + backward run in f64)
+against a closed-form reference. It is a library transform today, not yet a CLI surface.
 
 ## Checked but not yet executed
 
-- **Shape-typed tensors** `Tensor[f32, M, N]`: parse and pass compile-time shape checking
-  (`E0501`/`E0502`), the headline feature — but tensor *operations* are not yet lowered/run.
+- **Symbolic-generic tensor shapes** `fn f<M, N>(a: Tensor[f32, M, N])`: a tensor with a
+  **compile-time-constant** shape now lowers and **runs** end-to-end on both backends (multi-dim
+  indexing `a[i, j]` → row-major GEP; elementwise tensor kernels and tensor matmuls execute — see
+  `tests/run/tensor_*.mer`, and a matmul written in tensor notation now dispatches to the tuned GEMM
+  kernel, a 2-index access supplying its row stride from the operand's inner tensor dimension). What is
+  still pending is executing a *symbolic* generic shape, where the dims `M, N` are only bound per call
+  — those need hidden runtime dim params (give literal dims to run today).
 - **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector
-  values are not yet executed. (Loop auto-vectorization above is separate and *does* run.)
+  *values* are not yet executed, and the native ISA path (Cranelift) caps vector SSA at 128-bit
+  (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
+  128-bit halves. (Loop auto-vectorization above is separate and *does* run, at 128-bit + unrolling;
+  the recognized kernels get true 256-bit AVX2 via the runtime microkernels.)
 - **Attributes** `@simd`/`@tile`/`@align`/`@extern`/`@export`: parse and validate; consumers in
   progress. (`@parallel` now executes — see above.)
+- **Slices `[]T`**: parse and type-check but do not yet run. (C-style `enum`s and by-value aggregate
+  parameters/returns now **run** — see "Works end to end" above.)
 
 ## Planned
 
 - Fusing chains *under* `@parallel`; a **parallel** fused-epilogue GEMM kernel (the serial one already
   folds bias + ReLU/GELU/SiLU, bias optional, into the microkernel write-back — a multicore
   `mercury_sgemm_nt_epi_parallel` is the remaining step).
-- A **GPU backend** (the next major frontier — where flash-attention and large-batch throughput
-  actually win). Scoped in `next-steps.md` at the repo root.
 - 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
   value (verified — pinned as a tripwire test), so the elementwise vectorizer is 128-bit + unrolling;
   the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
   needs a raw-AVX emitter or a future Cranelift.
 - Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
-- Structs/enums, slices, multi-dimensional indexing `a[i, j]`, and a minimal stdlib.
-- GPU device codegen (PTX/AMDGPU), autodiff — designed-for, explicitly deferred.
+- Slices and a minimal stdlib (structs, enums, and multi-dimensional indexing `a[i, j]` now run — see
+  "Works end to end" above).
+- AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
+  reverse-mode autodiff already ships as the `mercury_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
 
@@ -259,9 +353,71 @@ remaining stretch; today unrecognized ops execute on the CPU within the same off
   **transcendentals still beat scalar `libm` ~2.5–3×**. Breaking 256-bit needs a hand-written AVX2
   path (how the GEMM family already gets 256-bit — a true AVX2/FMA runtime microkernel). The loop
   vectorizer assumes distinct array parameters do not alias.
-- Array *length* in a type must be an integer literal (symbolic/`const`-expression lengths fall back
-  to an opaque pointer), but matmul *dimensions* may be runtime values — a runtime-dimension matmul
+- Array *length* in a type may be an integer literal or a top-level `const` (resolved through
+  const-to-const chains; `tests/run/const_array_length.mer`); a **symbolic** length (a generic `N`) or
+  a **computed** one (a const whose initializer is an expression, e.g. `const N = 2 + 2`) still falls
+  back to an opaque pointer. matmul *dimensions* may be runtime values — a runtime-dimension matmul
   still dispatches to the GEMM kernel.
-- No bounds checking on array indexing (manual memory is a decided constraint).
+- Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
+  (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
+  wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.mer`). Equality `==`/`!=`
+  between a `bool` and a non-bool scalar is likewise rejected, so the `==`/`!=` chain `5 == 3 == 0` is
+  caught too (`tests/fail/chained_equality.mer`).
+- Tensor shape checking is **sound for both concrete and generic shapes**. A function's own generic
+  dimension variables are **rigid** inside its body: when two shapes that both carry the function's
+  generics are checked — its declared-vs-returned shape, an elementwise operator's operands, an
+  assignment, or two `if`/`match` value arms — the dims must match by *identity* (`N` matches only
+  `N`); they are never bound to each other or to a constant. So a generic function can no longer **lie
+  about its output shape**: `fn f<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5]` is rejected
+  (`E0502`, `tests/fail/generic_return_shape_lie.mer`). Previously the body-check bound `N := M` and
+  silently accepted the constant `5` against the generic `N`, and a turbofish (`f::<2, 2>`) then made
+  the lie concrete and over-strided — turning a type-valid index into an out-of-bounds read the
+  interpreter trapped on but native did not. Call-site unification is a *different* context and still
+  **infers** a callee's dims from the argument shapes (there the callee's generics are inference
+  variables, not rigid — `matmul::<…>(a, b, c)` binds `M, N, K` from the arguments as before). A
+  related hole is also closed: a rank-1 tensor parameter binds its symbolic dim from a decaying
+  array's length, so `f<N>(a: Tensor[f32, N], b: Tensor[f32, N])` rejects arrays of different lengths
+  (`tests/fail/generic_tensor_arg_length_mismatch.mer`). One **lenience** remains by design: an
+  **undeclared** dim name in a tensor type is auto-introduced as a fresh implicit dim (a typo like
+  `Tensor[f32, KK]` for `K` silently drops the shared constraint — slated for an unknown-dim
+  diagnostic).
+- A `for i in 0..n` loop **re-reads its upper bound `n` live each iteration** (it lowers to a C-style
+  `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
+  iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
+  with a negative step runs zero iterations (the condition stays `i < hi`).
+- No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
+  **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
+  fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
+  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked. On such an out-of-bounds access the
+  backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
+  debugging aid — its memory is a bounded slot vector), while the native backend reads/writes past the
+  buffer, classic UB like C (and an optimization level can even change the garbage observed). An
+  out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
+  `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
 - `mem2reg` promotes only scalar integer/float slots; arrays, pointers, and address-taken locals
   stay in memory (the interpreter and `cse`/`dse` handle those directly).
+- Because there is **no static-data section**, a string literal lives in the *current* function's
+  frame, so **returning a `*u8` that points at a string created inside the callee dangles on the
+  native backend** — that frame is reclaimed on return and `print` then reads freed stack (an empty
+  line), while the interpreter's persistent slot memory masks it (both backends still exit 0). Return
+  a string by having the caller pass in the destination buffer, or thread it through a `*u8` parameter.
+- **`--emit=exe`/`--emit=obj` link only the small C runtime** (`print`/`assert` and the parallel-for
+  shim), not the AVX2/FMA microkernels the recognizers dispatch to (`mercury_vmath_f32`, `mercury_sgemm*`,
+  `mercury_sreduce*`, `mercury_norm*`, the int8/bf16 kernels, …) — those live in the `mercury_runtime`
+  Rust crate, bound in-process by the interpreter and the Cranelift JIT but left as unresolved imports
+  in the emitted object. So a program that dispatches a recognized kernel (e.g. `for i in 0..N { y[i] =
+  exp(x[i]); }`, a `matmul`, a reduction) runs via `--run` (interp or `--backend=native`) but currently
+  **fails to link** as a standalone exe (`ld` unresolved-symbol). The fast path — and the differential
+  gate — is `--run`; emitting `mercury_runtime` as a staticlib and linking it for `--emit=exe` is future
+  work. Scalar math (a `while`-loop `exp`, which lowers to a libm call, not the vectorized kernel) links
+  fine.
+- **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
+  (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a
+  callee that mutates one writes back into the caller's storage (copying every large buffer by value
+  would be the performance footgun). This is no longer a *silent* surprise: mutating a parameter — a
+  rebind (`p = …`) or an aggregate projection (`p.f = …`, `p[i] = …`) — now **requires `mut` on the
+  parameter**, else it is a compile error (E0304). A `mut` aggregate parameter is thus the idiomatic
+  in-place output buffer (`fn relu(mut out: […], x: […])`) and its caller-visible mutation is
+  explicit; a non-`mut` aggregate parameter is read-only. Both backends agree bit-for-bit. Take a
+  `let q = p;` for an independent copy inside the callee (a plain `let` *does* copy); a pointer
+  parameter still writes through its pointee (`*p = …`) without `mut`.

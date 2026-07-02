@@ -179,8 +179,10 @@ pub fn compile(opts: &Options) -> i32 {
     // High MIR is the pre-optimization form. It is still dumped for debugging even when lowering
     // failed, since seeing the partial MIR is useful.
     if opts.emit == EmitStage::MirHigh {
-        emit_mir(&program, &interner);
-        return if lower_diags.iter().any(|d| d.is_error()) {
+        // Dump the (possibly partial) MIR, then fail the process if lowering errored or the verifier
+        // reported an internal-compiler-error — a printed ICE must never report success.
+        let verify_failed = emit_mir(&program, &interner);
+        return if verify_failed || lower_diags.iter().any(|d| d.is_error()) {
             exit::COMPILE_ERROR
         } else {
             exit::OK
@@ -198,6 +200,21 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
     if opts.run {
+        // Gate every backend on a clean MIR verify. The optimizer verifies the forms its passes
+        // produce, but at -O0 it runs no passes, so an invalid-MIR lowering bug would otherwise reach
+        // the backend unchecked — and the native -O0 JIT codegens it into a SIGSEGV rather than the
+        // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a lowering
+        // bug a diagnosable internal-compiler-error on every backend instead of a crash or miscompile.
+        let mut verify_failed = false;
+        for f in &program.funcs {
+            for ice in mercury_mir::verify::verify_function(f) {
+                eprintln!("internal compiler error (MIR verify): {ice}");
+                verify_failed = true;
+            }
+        }
+        if verify_failed {
+            return exit::COMPILE_ERROR;
+        }
         let main = interner.intern("main");
         let result = match opts.backend {
             BackendKind::Interp => mercury_interp::run_with_output(&program, main, &interner),
@@ -219,8 +236,12 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if opts.emit == EmitStage::Mir {
-        emit_mir(&program, &interner);
-        return exit::OK;
+        // A verifier failure means we just printed an internal-compiler-error; never report success.
+        return if emit_mir(&program, &interner) {
+            exit::COMPILE_ERROR
+        } else {
+            exit::OK
+        };
     }
 
     // --- LLVM backend ---
@@ -304,7 +325,16 @@ fn run_on_gpu_lower(
 const MERCURY_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
 #include <math.h>\n\
+#ifdef _WIN32\n\
+#include <io.h>\n\
+#include <fcntl.h>\n\
+/* Keep stdout in binary mode so the MSVCRT does not translate the runtime's `\\n` into CRLF. The\n\
+   interpreter oracle (and the JIT) emit LF; without this the *linked exe* printed CRLF on Windows,\n\
+   so its stdout differed from every other backend. Runs before main via the constructor attribute. */\n\
+__attribute__((constructor)) static void mercury_rt_init(void) { _setmode(_fileno(stdout), _O_BINARY); }\n\
+#endif\n\
 void mercury_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
+void mercury_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
 void mercury_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
 void mercury_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(101); } }\n\
 double mercury_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
@@ -388,13 +418,20 @@ fn emit_native(program: &mercury_mir::Program, interner: &Interner, opts: &Optio
     }
 }
 
-fn emit_mir(program: &mercury_mir::Program, interner: &Interner) {
+/// Print the MIR for `program`, running the verifier first. Any verifier failure is emitted as an
+/// `internal compiler error (MIR verify)` line to stderr. Returns `true` if the verifier reported
+/// at least one failure, so callers can map an internal-compiler-error to a nonzero process exit
+/// status instead of reporting success on invalid MIR.
+fn emit_mir(program: &mercury_mir::Program, interner: &Interner) -> bool {
+    let mut verify_failed = false;
     for f in &program.funcs {
         for ice in mercury_mir::verify::verify_function(f) {
             eprintln!("internal compiler error (MIR verify): {ice}");
+            verify_failed = true;
         }
     }
     print!("{}", mercury_mir::print::print_program(program, interner));
+    verify_failed
 }
 
 /// Emit a single diagnostic to stderr in the requested format.

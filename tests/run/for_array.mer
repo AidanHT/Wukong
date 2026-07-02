@@ -1,0 +1,64 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 60
+// EXPECT-OUT: 7
+// EXPECT-OUT: 66
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 22
+module tests.run.for_array
+
+// `for x in arr` — iterate the *elements* of a fixed-size array — desugars to the indexed range
+// loop `for i in 0..N { let x = arr[i]; <body> }`: the loop variable binds to the i-th element (a
+// scalar by `Load`, an aggregate by pointer), N and the element type come from sema. Pure front-end
+// rewrite, no backend change, so the interpreter and native backend agree bit-for-bit and -O0==-O3.
+struct Point { x: i32, y: i32 }
+
+fn sum(a: [i32; 4]) -> i32 {
+    // Iterating an array *parameter* (passed by base pointer).
+    let mut s: i32 = 0;
+    for x in a { s = s + x; }
+    return s;
+}
+
+fn main() -> i32 {
+    // Scalar i32 elements — the headline case.
+    let a: [i32; 3] = [10, 20, 30];
+    let mut s: i32 = 0;
+    for x in a { s = s + x; }
+    print(s);                           // 60
+
+    // f32 elements.
+    let fs: [f32; 3] = [1.5, 2.5, 3.0];
+    let mut fsum: f32 = 0.0;
+    for v in fs { fsum = fsum + v; }
+    print(fsum as i32);                 // 7
+
+    // Aggregate (struct) elements — bound by pointer, so `p.x`/`p.y` GEP off the element.
+    let pts: [Point; 3] = [Point { x: 1, y: 10 }, Point { x: 2, y: 20 }, Point { x: 3, y: 30 }];
+    let mut psum: i32 = 0;
+    for p in pts { psum = psum + p.x + p.y; }
+    print(psum);                        // 66
+
+    // `break` / `continue` keep working (they reuse the range loop's latch/exit blocks).
+    let b: [i32; 5] = [1, -2, 3, 99, 5];
+    let mut acc: i32 = 0;
+    for x in b {
+        if x < 0 { continue; }          // skip negatives
+        if x == 99 { break; }           // stop at the sentinel
+        acc = acc + x;
+    }
+    print(acc);                         // 1 + 3 = 4
+
+    // `_` wildcard — iterate without binding (here, just count).
+    let c: [i32; 5] = [9, 9, 9, 9, 9];
+    let mut cnt: i32 = 0;
+    for _ in c { cnt = cnt + 1; }
+    print(cnt);                         // 5
+
+    // Array-parameter iteration.
+    let xs: [i32; 4] = [4, 5, 6, 7];
+    print(sum(xs));                     // 22
+
+    return 0;
+}

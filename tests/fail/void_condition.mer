@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.void_condition
+
+// A branch condition cannot be `()` (the result of a void-returning call): it lowered to a `cond_br`
+// on a non-boolean dummy value — MIR the verifier and Cranelift reject (the native backend crashed)
+// while the interpreter branched on the placeholder. (A numeric "truthy" condition like `if 5` is
+// allowed; only a unit/void condition is rejected.)
+fn nothing() {}
+
+fn main() -> i32 {
+    if nothing() {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,24 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 60
+module tests.run.tuple
+
+// Tuples are lowered as a flat, padded byte buffer (the local's value *is* the base pointer, like an
+// array): a tuple literal stores each field at its `tuple_offsets` byte offset, and `t.0` GEPs to that
+// offset for a typed load/store. No backend change — Cranelift writes the real packed layout while the
+// interpreter indexes the byte offset as a slot (distinct offsets never alias), so the two agree
+// bit-for-bit. Mixed field types (f32, i32) and field assignment both exercise the layout/coercion.
+fn main() -> i32 {
+    let t = (3, 4);          // (i32, i32)
+    let mut u = (1.5, 2);    // (f32, i32) — heterogeneous, so padding/offsets matter
+    u.0 = u.0 + 0.5;         // field assignment, narrowing-coerced to the field type
+    print(t.0 + t.1);        // 7
+    print(u.0);              // 2  (1.5 + 0.5)
+    print(t.0 * u.1);        // 6  (3 * 2)
+    let v = (10, 20, 30);    // 3-tuple
+    print(v.0 + v.1 + v.2);  // 60
+    return 0;
+}

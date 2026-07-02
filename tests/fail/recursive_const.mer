@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0403
+module tests.fail.recursive_const
+
+// A `const` whose initializer refers back to its own value (here directly; a chain `A` uses `B`,
+// `B` uses `A` is rejected the same way). `mir_build` inlines a const's initializer at each use site
+// and recurses for a const-references-const, so without this check the cycle stack-overflowed the
+// compiler. It is rejected at compile time, before lowering.
+const A: i32 = A + 1;
+
+fn main() -> i32 {
+    return A;
+}

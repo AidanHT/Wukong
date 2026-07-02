@@ -1,0 +1,22 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: hello
+// EXPECT-OUT: world
+// EXPECT-OUT: back\slash
+// EXPECT-OUT: quote"here
+// EXPECT-OUT: 42
+// EXPECT-OUT: done
+module tests.run.string_literal
+
+// A string literal lowers to a NUL-terminated stack byte buffer (sema types it `*u8`); `print`/
+// `println` of a `*u8` renders the bytes. Both a literal argument and a `let`-bound string work, and
+// the escapes `\\` and `\"` decode. Numeric `print` still prints numbers (the dispatch is by type).
+fn main() -> i32 {
+    println("hello");
+    let s = "world";
+    print(s);
+    print("back\\slash");
+    print("quote\"here");
+    print(42);
+    println("done");
+    return 0;
+}

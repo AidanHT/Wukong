@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+module tests.fail.return_value_in_void_fn
+
+// Returning a value from a function with no declared return type (`-> ()`) is a type error. The
+// native backend builds a void return signature and rejects the value, while the interpreter would
+// silently discard it — a backend divergence. (A bare `return;` here is fine.)
+fn f(x: i32) {
+    return x + 1;
+}
+
+fn main() -> i32 {
+    f(5);
+    return 0;
+}

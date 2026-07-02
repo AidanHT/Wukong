@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0303
+module tests.fail.break_unknown_label
+
+// `break 'inner` names a label that is not on any enclosing loop. Sema rejects it (E0303) — an
+// undeclared label would otherwise leave mir_build's `find_loop` with no target and emit a
+// terminator-less block (invalid MIR).
+fn main() -> i32 {
+    'outer: for i in 0..3 {
+        break 'inner;
+    }
+    return 0;
+}

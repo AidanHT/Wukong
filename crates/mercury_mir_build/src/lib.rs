@@ -26,6 +26,422 @@ use mercury_types::Ty;
 /// straight-line stores; larger ones lower to a fill loop to keep the IR compact.
 const REPEAT_UNROLL_LIMIT: u32 = 8;
 
+// ===== Type-generic monomorphization =====
+//
+// A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
+// depends on the concrete type `T` is used at (an `f32` add vs an `i32` add, an 8-byte vs a 4-byte
+// value). Lowering it a single time defaulted the generic to `i32` and miscompiled every non-`i32`
+// call (interp != native, a `mem2reg` panic, unsigned ops in a signed body). Instead we collect,
+// from every call site, the concrete types each such function is instantiated at, emit one
+// specialized copy per distinct instantiation (`id$f32`, `id$i64`), and redirect each call to the
+// matching copy — classic monomorphization. Dimension/shape generics (`fn f<N>(a: Tensor[f32, N])`)
+// need no specialization (a tensor's element layout is independent of `N`, and `N` appears as a
+// `Dim::Var`, never a `Ty::Named`), so they are excluded by construction.
+
+/// The result of the monomorphization collection pass (see [`collect_mono`]).
+struct Mono {
+    /// (original fn symbol, canonical comma-joined concrete type-arg names) -> instance symbol.
+    instance_of: HashMap<(Symbol, String), Symbol>,
+    /// Each function's *value-type* generics (those appearing as `Ty::Named` in its signature), in
+    /// generic-declaration order — the parameters we specialize over. A function absent here, or
+    /// mapped to an empty list, is not type-generic and its calls are never redirected.
+    type_generics: HashMap<Symbol, Vec<Symbol>>,
+    /// Instances to lower, in discovery order (deterministic): (instance symbol, original symbol,
+    /// substitution).
+    instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+}
+
+impl Mono {
+    /// The value-type generics of `name`, or `&[]` if it is not a (type-)generic function.
+    fn tg(&self, name: Symbol) -> &[Symbol] {
+        self.type_generics.get(&name).map_or(&[], |v| v.as_slice())
+    }
+}
+
+/// Substitute a monomorphization's concrete types for its generic type parameters throughout `ty`.
+fn subst_ty(ty: &Ty, subst: &HashMap<Symbol, Ty>) -> Ty {
+    if subst.is_empty() {
+        return ty.clone();
+    }
+    match ty {
+        Ty::Named(g) => subst.get(g).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Ptr { mutable, pointee } => Ty::Ptr {
+            mutable: *mutable,
+            pointee: Box::new(subst_ty(pointee, subst)),
+        },
+        Ty::Ref { mutable, pointee } => Ty::Ref {
+            mutable: *mutable,
+            pointee: Box::new(subst_ty(pointee, subst)),
+        },
+        Ty::Slice(inner) => Ty::Slice(Box::new(subst_ty(inner, subst))),
+        Ty::Array { elem, len } => Ty::Array {
+            elem: Box::new(subst_ty(elem, subst)),
+            len: *len,
+        },
+        Ty::Tuple(fields) => Ty::Tuple(fields.iter().map(|t| subst_ty(t, subst)).collect()),
+        Ty::Fn { params, ret } => Ty::Fn {
+            params: params.iter().map(|t| subst_ty(t, subst)).collect(),
+            ret: Box::new(subst_ty(ret, subst)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// Does `ty` still contain an unresolved generic (one of `generics`, or an `Unknown`/`Error`)? Used
+/// to decline an instantiation whose concrete type is not yet fully known.
+fn ty_has_generic(ty: &Ty, generics: &[Symbol]) -> bool {
+    match ty {
+        Ty::Named(g) => generics.contains(g),
+        Ty::Unknown | Ty::Error => true,
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            ty_has_generic(pointee, generics)
+        }
+        Ty::Array { elem, .. } => ty_has_generic(elem, generics),
+        Ty::Tuple(fields) => fields.iter().any(|t| ty_has_generic(t, generics)),
+        Ty::Fn { params, ret } => {
+            params.iter().any(|t| ty_has_generic(t, generics)) || ty_has_generic(ret, generics)
+        }
+        _ => false,
+    }
+}
+
+/// Collect which of `generics` appear as a `Ty::Named` in `ty` (a *value-type* use, as opposed to a
+/// tensor dimension, which is a `Dim::Var`), appending to `out` in first-seen order without dups.
+fn collect_named_generics(ty: &Ty, generics: &[Symbol], out: &mut Vec<Symbol>) {
+    match ty {
+        Ty::Named(g) => {
+            if generics.contains(g) && !out.contains(g) {
+                out.push(*g);
+            }
+        }
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            collect_named_generics(pointee, generics, out)
+        }
+        Ty::Array { elem, .. } => collect_named_generics(elem, generics, out),
+        Ty::Tuple(fields) => {
+            for t in fields {
+                collect_named_generics(t, generics, out);
+            }
+        }
+        Ty::Fn { params, ret } => {
+            for t in params {
+                collect_named_generics(t, generics, out);
+            }
+            collect_named_generics(ret, generics, out);
+        }
+        _ => {}
+    }
+}
+
+/// The value-type generics of a function signature, in generic-declaration order.
+fn fn_type_generics(sig: &mercury_sema::FnSig) -> Vec<Symbol> {
+    let mut seen = Vec::new();
+    for p in &sig.params {
+        collect_named_generics(p, &sig.generics, &mut seen);
+    }
+    collect_named_generics(&sig.ret, &sig.generics, &mut seen);
+    // Declaration order (turbofish / mangling are positional).
+    sig.generics
+        .iter()
+        .copied()
+        .filter(|g| seen.contains(g))
+        .collect()
+}
+
+/// A stable ASCII name for a concrete type, for a monomorphization key and instance-name suffix.
+fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
+    match ty {
+        Ty::Scalar(s) => s.name().to_string(),
+        Ty::Named(n) => interner.resolve(*n).to_string(),
+        Ty::Ptr { pointee, .. } => format!("p_{}", mono_type_name(pointee, interner)),
+        Ty::Ref { pointee, .. } => format!("r_{}", mono_type_name(pointee, interner)),
+        Ty::Slice(inner) => format!("s_{}", mono_type_name(inner, interner)),
+        Ty::Array { elem, len } => format!("a{len}_{}", mono_type_name(elem, interner)),
+        Ty::Tuple(fields) => {
+            let parts: Vec<String> = fields.iter().map(|t| mono_type_name(t, interner)).collect();
+            format!("t{}_{}", fields.len(), parts.join("_"))
+        }
+        Ty::Unit => "unit".to_string(),
+        _ => "x".to_string(),
+    }
+}
+
+/// Bind the value-type generics `tg` by matching a parameter type against a concrete argument type.
+fn bind_generics(param_ty: &Ty, arg_ty: &Ty, tg: &[Symbol], subst: &mut HashMap<Symbol, Ty>) {
+    match (param_ty, arg_ty) {
+        (Ty::Named(g), a) if tg.contains(g) => {
+            if !ty_has_generic(a, tg) {
+                subst.entry(*g).or_insert_with(|| a.clone());
+            }
+        }
+        (Ty::Ptr { pointee: p, .. }, Ty::Ptr { pointee: a, .. })
+        | (Ty::Ref { pointee: p, .. }, Ty::Ref { pointee: a, .. })
+        | (Ty::Slice(p), Ty::Slice(a)) => bind_generics(p, a, tg, subst),
+        (Ty::Array { elem: p, .. }, Ty::Array { elem: a, .. }) => bind_generics(p, a, tg, subst),
+        (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+            for (p, a) in ps.iter().zip(as_) {
+                bind_generics(p, a, tg, subst);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The canonical comma-joined concrete type-arg names for an instantiation, or `None` if any generic
+/// is still unbound (an under-constrained call we leave to lower as-is / error elsewhere).
+fn canon_type_args(
+    tg: &[Symbol],
+    subst: &HashMap<Symbol, Ty>,
+    interner: &Interner,
+) -> Option<String> {
+    let mut parts = Vec::with_capacity(tg.len());
+    for g in tg {
+        let t = subst.get(g)?;
+        if ty_has_generic(t, tg) {
+            return None;
+        }
+        parts.push(mono_type_name(t, interner));
+    }
+    Some(parts.join(","))
+}
+
+/// Walks every function body collecting the concrete instantiations of each type-generic function
+/// (transitively, via a worklist), interning one instance symbol per distinct instantiation.
+struct MonoCollector<'a> {
+    sema: &'a SemaResult,
+    interner: &'a mut Interner,
+    type_generics: HashMap<Symbol, Vec<Symbol>>,
+    fn_bodies: HashMap<Symbol, &'a Block>,
+    instance_of: HashMap<(Symbol, String), Symbol>,
+    instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+    worklist: Vec<(Symbol, HashMap<Symbol, Ty>)>,
+}
+
+impl MonoCollector<'_> {
+    /// A call to a type-generic function `g`: infer its substitution from the argument types
+    /// (resolved through the *caller's* substitution `outer`, so a generic-in-generic call resolves),
+    /// and register a fresh instance if this instantiation is new.
+    fn handle_call(&mut self, callee: &Expr, args: &[Expr], outer: &HashMap<Symbol, Ty>) {
+        let ExprKind::Path(p) = &callee.kind else {
+            return;
+        };
+        if !p.is_single() {
+            return;
+        }
+        let name = p.first().sym;
+        let tg = match self.type_generics.get(&name) {
+            Some(g) if !g.is_empty() => g.clone(),
+            _ => return,
+        };
+        let params: Vec<Ty> = match self.sema.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Fn(sig)) => sig.params.clone(),
+            _ => return,
+        };
+        let mut subst: HashMap<Symbol, Ty> = HashMap::new();
+        for (i, a) in args.iter().enumerate() {
+            let Some(pty) = params.get(i) else { break };
+            let aty = subst_ty(
+                &self.sema.types.get(&a.id).cloned().unwrap_or(Ty::Unknown),
+                outer,
+            );
+            bind_generics(pty, &aty, &tg, &mut subst);
+        }
+        let Some(canon) = canon_type_args(&tg, &subst, self.interner) else {
+            return;
+        };
+        let key = (name, canon.clone());
+        if self.instance_of.contains_key(&key) {
+            return;
+        }
+        let base = self.interner.resolve(name).to_string();
+        let mangled = self
+            .interner
+            .intern(&format!("{base}${}", canon.replace(',', "_")));
+        self.instance_of.insert(key, mangled);
+        self.instances.push((mangled, name, subst.clone()));
+        self.worklist.push((name, subst));
+    }
+
+    fn walk_block(&mut self, b: &Block, subst: &HashMap<Symbol, Ty>) {
+        for s in &b.stmts {
+            self.walk_stmt(s, subst);
+        }
+        if let Some(t) = &b.tail {
+            self.walk_expr(t, subst);
+        }
+    }
+
+    fn walk_stmt(&mut self, s: &Stmt, subst: &HashMap<Symbol, Ty>) {
+        match &s.kind {
+            StmtKind::Let { init, .. } => {
+                if let Some(e) = init {
+                    self.walk_expr(e, subst);
+                }
+            }
+            StmtKind::Assign { target, value, .. } => {
+                self.walk_expr(target, subst);
+                self.walk_expr(value, subst);
+            }
+            StmtKind::Expr(e) | StmtKind::Defer(e) => self.walk_expr(e, subst),
+            StmtKind::Return(o) => {
+                if let Some(e) = o {
+                    self.walk_expr(e, subst);
+                }
+            }
+            StmtKind::Break(_) | StmtKind::Continue(_) => {}
+            StmtKind::While { cond, body, .. } => {
+                self.walk_expr(cond, subst);
+                self.walk_block(body, subst);
+            }
+            StmtKind::For { iter, body, .. } => {
+                match iter {
+                    ForIter::Range {
+                        start, end, step, ..
+                    } => {
+                        self.walk_expr(start, subst);
+                        if let Some(e) = end {
+                            self.walk_expr(e, subst);
+                        }
+                        if let Some(e) = step {
+                            self.walk_expr(e, subst);
+                        }
+                    }
+                    ForIter::Expr(e) => self.walk_expr(e, subst),
+                }
+                self.walk_block(body, subst);
+            }
+            StmtKind::Loop { body, .. } => self.walk_block(body, subst),
+        }
+    }
+
+    fn walk_expr(&mut self, e: &Expr, subst: &HashMap<Symbol, Ty>) {
+        match &e.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Path(_)
+            | ExprKind::SizeOf(_)
+            | ExprKind::AlignOf(_) => {}
+            ExprKind::Unary { expr, .. } => self.walk_expr(expr, subst),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs, subst);
+                self.walk_expr(rhs, subst);
+            }
+            ExprKind::Call { callee, args, .. } => {
+                self.walk_expr(callee, subst);
+                for a in args {
+                    self.walk_expr(a, subst);
+                }
+                self.handle_call(callee, args, subst);
+            }
+            ExprKind::Index { base, indices } => {
+                self.walk_expr(base, subst);
+                for i in indices {
+                    self.walk_expr(i, subst);
+                }
+            }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.walk_expr(base, subst)
+            }
+            ExprKind::Cast { expr, .. } => self.walk_expr(expr, subst),
+            ExprKind::StructLit { fields, rest, .. } => {
+                for f in fields {
+                    self.walk_expr(&f.value, subst);
+                }
+                if let Some(r) = rest {
+                    self.walk_expr(r, subst);
+                }
+            }
+            ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+                for it in items {
+                    self.walk_expr(it, subst);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.walk_expr(value, subst);
+                self.walk_expr(count, subst);
+            }
+            ExprKind::Block(b) => self.walk_block(b, subst),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.walk_expr(cond, subst);
+                self.walk_block(then_branch, subst);
+                if let Some(e) = else_branch {
+                    self.walk_expr(e, subst);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.walk_expr(scrutinee, subst);
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        self.walk_expr(g, subst);
+                    }
+                    self.walk_expr(&arm.body, subst);
+                }
+            }
+        }
+    }
+}
+
+/// Collect every concrete instantiation of every type-generic function reachable from a concrete
+/// (non-type-generic) caller, plus transitively from those instances' bodies. Runs before lowering
+/// so instance names can be interned (needs `&mut interner`).
+fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> Mono {
+    let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                fn_bodies.insert(f.name.sym, body);
+                if let Some(DefKind::Fn(sig)) = sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+                    let tg = fn_type_generics(sig);
+                    if !tg.is_empty() {
+                        type_generics.insert(f.name.sym, tg);
+                    }
+                }
+            }
+        }
+    }
+    let mut c = MonoCollector {
+        sema,
+        interner,
+        type_generics,
+        fn_bodies,
+        instance_of: HashMap::new(),
+        instances: Vec::new(),
+        worklist: Vec::new(),
+    };
+    // Seed from every non-type-generic function body (the concrete callers). Their argument types are
+    // already concrete, so `handle_call` binds each callee generic to a real type.
+    let empty: HashMap<Symbol, Ty> = HashMap::new();
+    for item in &module.items {
+        if let ast::ItemKind::Fn(f) = &item.kind {
+            if let Some(body) = &f.body {
+                if !c.type_generics.contains_key(&f.name.sym) {
+                    c.walk_block(body, &empty);
+                }
+            }
+        }
+    }
+    // Drain the worklist: process each new instance's body with its substitution, so a generic that
+    // calls another generic (`fn a<T>(x:T){ b(x) }`) instantiates the callee at the resolved type.
+    while let Some((g, subst)) = c.worklist.pop() {
+        if let Some(body) = c.fn_bodies.get(&g).copied() {
+            c.walk_block(body, &subst);
+        }
+    }
+    Mono {
+        instance_of: c.instance_of,
+        type_generics: c.type_generics,
+        instances: c.instances,
+    }
+}
+
 /// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered.
 pub fn lower_program(
     module: &Module,
@@ -38,6 +454,10 @@ pub fn lower_program(
     let gemm = GemmSyms {
         mm: interner.intern("mercury_sgemm"),
         mm_par: interner.intern("mercury_sgemm_parallel"),
+        print_str: interner.intern("print_str"),
+        println_str: interner.intern("println_str"),
+        print_u: interner.intern("print_u"),
+        println_u: interner.intern("println_u"),
         nt: interner.intern("mercury_sgemm_nt"),
         nt_par: interner.intern("mercury_sgemm_nt_parallel"),
         tn: interner.intern("mercury_sgemm_tn"),
@@ -79,6 +499,12 @@ pub fn lower_program(
         dot_f16: interner.intern("mercury_dot_f16"),
         sum_f16: interner.intern("mercury_sum_f16"),
         reduce_f16: interner.intern("mercury_reduce_f16"),
+        dot_bf16_par: interner.intern("mercury_dot_bf16_parallel"),
+        sum_bf16_par: interner.intern("mercury_sum_bf16_parallel"),
+        reduce_bf16_par: interner.intern("mercury_reduce_bf16_parallel"),
+        dot_f16_par: interner.intern("mercury_dot_f16_parallel"),
+        sum_f16_par: interner.intern("mercury_sum_f16_parallel"),
+        reduce_f16_par: interner.intern("mercury_reduce_f16_parallel"),
         axpby_bf16: interner.intern("mercury_axpby_bf16"),
         axpby_f16: interner.intern("mercury_axpby_f16"),
         transpose: interner.intern("mercury_transpose_f32"),
@@ -150,9 +576,20 @@ pub fn lower_program(
         avgpool2d: interner.intern("mercury_avgpool2d_f32"),
         avgpool2d_par: interner.intern("mercury_avgpool2d_f32_parallel"),
     };
+    // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
+    // intern the instance names), then lower the module. A type-generic function is NOT lowered here
+    // (a generic type param has no single MIR type); its specialized copies are emitted afterward.
+    let mono = collect_mono(module, sema, interner);
+    let no_subst: HashMap<Symbol, Ty> = HashMap::new();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
+                // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
+                // instantiation, below — skip the generic template itself. Dimension-only generics
+                // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
+                if !mono.tg(f.name.sym).is_empty() {
+                    continue;
+                }
                 // Whole-function matmul: lower the entire nest to a single (optionally parallel)
                 // `mercury_sgemm` call — the tuned 256-bit AVX2/FMA microkernel.
                 if let Some(nest) = matmul_fn(body, sema, interner) {
@@ -181,7 +618,7 @@ pub fn lower_program(
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -191,7 +628,7 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_transpose_f32_parallel`. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -201,7 +638,7 @@ pub fn lower_program(
                 // `lower_for` then emits the multicore `mercury_{max,avg}pool2d_f32_parallel` (channels
                 // across cores, bit-equal to serial — channels independent, no cross-channel combine).
                 if has_parallel_attr(item, interner) && pool2d_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -210,7 +647,7 @@ pub fn lower_program(
                 // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
                 // `mercury_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
                 if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -218,7 +655,7 @@ pub fn lower_program(
                 // like the column reduction above. Rows are scanned per disjoint column stripe → the
                 // multicore `mercury_colarg*_i32_parallel` is bit-equal to serial.
                 if has_parallel_attr(item, interner) && colarg_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -227,7 +664,7 @@ pub fn lower_program(
                 // The embedded `match_softmax_bwd` then emits the multicore `mercury_softmax_bwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && softmax_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -237,7 +674,7 @@ pub fn lower_program(
                 // `mercury_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
                 // independent, each row reduces over its own `C` columns).
                 if has_parallel_attr(item, interner) && rmsnorm_bwd_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -245,7 +682,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && layernorm_bwd_fn(body, sema, interner).is_some()
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -254,13 +691,13 @@ pub fn lower_program(
                 // kernel). The embedded `match_xent` then emits the multicore `mercury_xent_fwd_f32_parallel`
                 // (rows across cores, bit-equal to serial — rows independent).
                 if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
                 if has_parallel_attr(item, interner) && xent_bwd_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -268,13 +705,13 @@ pub fn lower_program(
                 // the rows into scalar loops and lose the inline-sincos kernel). The embedded
                 // `match_rope` then emits the multicore `mercury_rope_f32_parallel` (rows independent).
                 if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
                 // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
                 if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -289,7 +726,7 @@ pub fn lower_program(
                         p.match_kd_loss(pat, it, lb).is_some()
                     }))
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -301,7 +738,7 @@ pub fn lower_program(
                         p.match_rowarg(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -312,7 +749,7 @@ pub fn lower_program(
                         p.match_cumsum(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -323,7 +760,7 @@ pub fn lower_program(
                         p.match_cumprod(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -334,7 +771,7 @@ pub fn lower_program(
                         p.match_lrscan(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -344,7 +781,7 @@ pub fn lower_program(
                         p.match_cumminmax(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -357,7 +794,7 @@ pub fn lower_program(
                         p.match_embedding(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -369,7 +806,7 @@ pub fn lower_program(
                         p.match_scatter(pat, it, lb).is_some()
                     })
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -378,7 +815,7 @@ pub fn lower_program(
                 // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
                 // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
                 if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner) {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -391,7 +828,7 @@ pub fn lower_program(
                 if has_parallel_attr(item, interner)
                     && is_batched_norm_fn(f, body, sema, interner, gemm)
                 {
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
@@ -415,13 +852,30 @@ pub fn lower_program(
                     // A `@parallel` function that is not a single elementwise loop — e.g. a reduction
                     // (`let mut s = 0; for k { s += x[k]*y[k] }; …`). Lower it normally, but with any
                     // recognized reduction loop dispatched to the multicore reduction kernel.
-                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &no_subst, f.name.sym, &mono, &mut diags);
                     program.funcs.push(func);
                     continue;
                 }
-                let func = lower_fn(f, body, sema, interner, gemm, false, &mut diags);
+                let func =
+                    lower_fn(f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags);
                 program.funcs.push(func);
             }
+        }
+    }
+    // Emit one specialized copy of each type-generic function per concrete instantiation collected
+    // above. Iterated in discovery order (a `Vec`) so the emitted MIR is deterministic across runs.
+    let fn_decls: HashMap<Symbol, (&FnDecl, &Block)> = module
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => f.body.as_ref().map(|b| (f.name.sym, (f, b))),
+            _ => None,
+        })
+        .collect();
+    for (mangled, orig, subst) in &mono.instances {
+        if let Some((f, body)) = fn_decls.get(orig) {
+            let func = lower_fn(f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags);
+            program.funcs.push(func);
         }
     }
     (program, diags)
@@ -527,6 +981,9 @@ fn is_batched_norm_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -539,17 +996,31 @@ fn lower_fn(
     interner: &Interner,
     gemm: GemmSyms,
     parallel_fn: bool,
+    subst: &HashMap<Symbol, Ty>,
+    name: Symbol,
+    mono: &Mono,
     diags: &mut Vec<Diagnostic>,
 ) -> Function {
-    // Recover the resolved signature for parameter/return types.
-    let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
-        Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
+    // Recover the resolved signature for parameter/return types, applying the monomorphization
+    // substitution (empty for a non-generic function) so a generic parameter/return lowers at its
+    // concrete instantiation type. `name` is the (possibly mangled) instance symbol; the signature is
+    // always looked up under the original `f.name.sym`.
+    let (param_tys, ret_ty): (Vec<Ty>, Ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => (
+            sig.params.iter().map(|t| subst_ty(t, subst)).collect(),
+            subst_ty(&sig.ret, subst),
+        ),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
     };
-    let ret_mir = mir_ty(&ret_ty);
+    // An aggregate (struct/tuple) return uses an **sret ABI**: the function returns `Void` and takes
+    // a hidden leading pointer parameter that the caller fills with a destination buffer; the body
+    // deep-copies the returned value into it. No aggregate ever rides in a register, so both backends
+    // execute only pointer passing + copies they already support.
+    let ret_is_agg = ty_is_aggregate(&ret_ty, sema);
+    let ret_mir = if ret_is_agg { MirType::Void } else { mir_ty(&ret_ty) };
 
     let mut fl = FnLowerer {
-        builder: Builder::new(f.name.sym, ret_mir.clone()),
+        builder: Builder::new(name, ret_mir.clone()),
         sema,
         interner,
         diags,
@@ -559,19 +1030,33 @@ fn lower_fn(
         gemm,
         parallel_fn,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: subst.clone(),
+        mono: Some(mono),
     };
 
+    // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
+    // the destination buffer to the argument list.
+    if ret_is_agg {
+        let sret_ptr = fl.builder.add_param(MirType::Ptr);
+        fl.sret = Some((sret_ptr, ret_ty.clone()));
+    }
+
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
-    // Arrays are passed by base pointer (ABI type `Ptr`); scalars by value.
-    let param_vals: Vec<ValueId> = param_tys
+    // Arrays AND aggregates (tuples/structs) are passed by base pointer (ABI type `Ptr`); scalars by
+    // value. `mir_ty_of` (registry-aware) resolves a named-struct param to its byte-buffer `Array`
+    // type — the free `mir_ty` falls back to `I32`, which mistyped a struct param as a scalar (the
+    // root of the by-value-struct miscompile and the `mem2reg` panic that promoted that bogus slot).
+    let param_abis: Vec<MirType> = param_tys.iter().map(|pty| fl.param_abi(pty)).collect();
+    let param_vals: Vec<ValueId> = param_abis
         .iter()
-        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+        .map(|abi| fl.builder.add_param(abi.clone()))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
-        let mty = mir_ty(pty);
+        let mty = fl.mir_ty_of(pty);
         if matches!(mty, MirType::Array(..)) {
-            // The parameter value *is* the array's base pointer; bind it directly so indexing
-            // geps off it (no copy into a local slot).
+            // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
+            // access geps off it (no copy into a local slot).
             fl.bind(p.name.sym, val, mty);
         } else {
             let slot = fl.builder.alloca(mty.clone());
@@ -585,13 +1070,69 @@ fn lower_fn(
 
     let tail = fl.lower_block(body);
     if !fl.terminated {
-        match (&ret_mir, tail) {
-            (MirType::Void, _) => fl.builder.ret(None),
-            (_, Some(v)) => fl.builder.ret(Some(v)),
-            (_, None) => fl.builder.set_term(mercury_mir::Terminator::Unreachable),
+        if let Some((sret_ptr, rty)) = fl.sret.clone() {
+            // A fell-through aggregate body: its tail expression (a struct/tuple value) is the
+            // return value — deep-copy it into the sret buffer, then return void.
+            //
+            // Only a *genuine* aggregate tail value (a base pointer) is copied. If the body's tail
+            // diverged — both arms of a tail `if`/`match` `return`, so nothing reaches the merge
+            // block — `lower_if_value`/`lower_match` yield a scalar zero placeholder into that
+            // now-unreachable merge block. Deep-copying it as the aggregate would `gep` off a scalar
+            // base: MIR the -O0 verifier rejects (`gep base … has type i32 but expected ptr`) while
+            // -O1+ silently passes because simplify-cfg deletes the dead block before verification —
+            // an `-O0 ≠ -O3` ICE on `fn -> Struct { if c { return … } else { return … } }`. Skipping
+            // the copy leaves the dead block a valid `{ <placeholder>; ret }` (the fn returns void).
+            if let Some(v) = tail {
+                if matches!(fl.builder.value_type(v), MirType::Ptr | MirType::Array(..)) {
+                    fl.emit_copy(sret_ptr, v, &rty);
+                }
+            }
+            fl.builder.ret(None);
+        } else {
+            match (&ret_mir, tail) {
+                (MirType::Void, _) => fl.builder.ret(None),
+                // Coerce the implicit tail value to the return type, exactly like an explicit
+                // `return` — `fn g() -> i64 { 5 }` must not return the `i32` literal `5`.
+                (_, Some(v)) => {
+                    let cv = body
+                        .tail
+                        .as_ref()
+                        .map(|te| fl.coerce_return_value(v, te))
+                        .unwrap_or(v);
+                    fl.builder.ret(Some(cv));
+                }
+                (_, None) => fl.builder.set_term(mercury_mir::Terminator::Unreachable),
+            }
         }
     }
     fl.builder.finish()
+}
+
+/// True if `ty` is an aggregate (struct/tuple/array) the ABI passes/returns by pointer — the same
+/// classification [`FnLowerer::mir_ty_of`] makes (a `Ty::Named` is aggregate iff it resolves to a
+/// declared struct). Free-standing so `lower_fn` can pick the sret ABI before the builder exists.
+fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
+    match ty {
+        Ty::Tuple(_) | Ty::Array { .. } => true,
+        Ty::Named(sym) => matches!(
+            sema.defs.lookup(*sym).map(|d| &d.kind),
+            Some(DefKind::Struct(_))
+        ),
+        _ => false,
+    }
+}
+
+/// The MIR type a control-flow merge param (an `if`/`match` *value*) carries for a given result type.
+/// An aggregate flows through the CFG as its base **pointer** (the by-pointer convention the sret call
+/// path also uses), so its merge param is `Ptr`, not the byte-buffer `Array` type. Typing it `Array`
+/// matched the arm's pointer arg only under the interpreter's loose typing (-O0); `mem2reg`'s verifier
+/// rejected it (`branch arg (ptr) does not match param ([N x i8])`), so an aggregate-valued `if`/`match`
+/// compiled at -O0 but panicked at -O2. Scalars are unchanged (`merge_repr_ty(scalar) == scalar`).
+fn merge_repr_ty(result_ty: &MirType) -> MirType {
+    match result_ty {
+        MirType::Array(..) => MirType::Ptr,
+        other => other.clone(),
+    }
 }
 
 /// Lower a `@parallel for idx in 0..hi { body }` function into two MIR functions:
@@ -635,6 +1176,11 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::new(),
+            sret: None,
+            // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
+            // generic functions, so no monomorphization context is needed.
+            subst: HashMap::new(),
+            mono: None,
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -680,6 +1226,11 @@ fn lower_parallel(
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::new(),
+            sret: None,
+            // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
+            // generic functions, so no monomorphization context is needed.
+            subst: HashMap::new(),
+            mono: None,
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -735,6 +1286,15 @@ fn lower_parallel(
 struct GemmSyms {
     mm: Symbol,
     mm_par: Symbol,
+    /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
+    /// as opposed to the numeric `print`/`println`. Renders the bytes, not the pointer value.
+    print_str: Symbol,
+    println_str: Symbol,
+    /// Runtime print of an **unsigned** integer (a `u8`/.../`u64`/`usize` argument): renders the
+    /// 64-bit value as `u64`, so a high-bit-set value prints its magnitude, not the signed
+    /// two's-complement reinterpretation the default signed `print` would show.
+    print_u: Symbol,
+    println_u: Symbol,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`mercury_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -861,6 +1421,20 @@ struct GemmSyms {
     dot_f16: Symbol,
     sum_f16: Symbol,
     reduce_f16: Symbol,
+    /// The multicore `@parallel` twins of the bf16/f16 reductions (`mercury_{dot,sum,reduce}_{bf16,
+    /// f16}_parallel`): a bf16/f16 reduction loop inside a `@parallel` function lowers to one of these
+    /// instead of the serial symbol above. Each cuts the array on the same fixed `RCHUNK` boundary the
+    /// f32 `mercury_sreduce_f32_parallel` uses and folds the per-chunk partials in ascending order, so
+    /// the result is deterministic (thread-count-independent). Unlike the f32 path — where the interp
+    /// calls the *serial* form and relies on serial==parallel — the bf16/f16 serial kernels reduce the
+    /// *whole* array flat, so the interpreter marshals these *parallel* kernels directly (the chunked
+    /// fold reassociates vs flat); interp == native holds because the parallel kernel is deterministic.
+    dot_bf16_par: Symbol,
+    sum_bf16_par: Symbol,
+    reduce_bf16_par: Symbol,
+    dot_f16_par: Symbol,
+    sum_f16_par: Symbol,
+    reduce_f16_par: Symbol,
     /// `mercury_axpby_bf16(x, y, out, n, a, b)` — bf16→f32 streaming axpby (`out = a*x + b*y`, bf16
     /// inputs, f32 output, f32 math). The mixed-precision elementwise twin of the f32 streaming kernel.
     axpby_bf16: Symbol,
@@ -1065,10 +1639,11 @@ const VMATH2_SIGMOID_BWD: u32 = 5;
 const VMATH2_TANH_BWD: u32 = 6;
 const VMATH2_ELU_BWD: u32 = 7;
 const VMATH2_SOFTPLUS_BWD: u32 = 8;
-// Gated-FFN activation `out = act(a)·b` (SwiGLU/GeGLU) — must match `mercury_runtime::vmath`'s
-// `VM2_{SILU,GELU}_GATE`. Inputs positional `(a, b)`.
+// Gated-FFN activation `out = act(a)·b` (SwiGLU / GeGLU / classic GLU) — must match
+// `mercury_runtime::vmath`'s `VM2_{SILU,GELU,SIGMOID}_GATE`. Inputs positional `(a, b)`.
 const VMATH2_SILU_GATE: u32 = 9;
 const VMATH2_GELU_GATE: u32 = 10;
+const VMATH2_SIGMOID_GATE: u32 = 11; // sigmoid(a)·b — the classic GLU gate
 
 // Streaming affine+activation op codes — must match `mercury_runtime::velem`'s `VE_*`. The low byte
 // is the activation; `VE_USE_Y` (bit 8) flags that the kernel reads `y`.
@@ -1091,9 +1666,14 @@ enum VTerm<'b> {
 /// the (loop-invariant) coefficient exprs, lowered to ValueIds at emit time so a runtime scale such as
 /// saxpy's `a` works. `op` is the activation byte; `VE_USE_Y` is set iff `y` is present.
 struct VElemPlan<'b> {
-    out: ValueId,
-    x: ValueId,
-    y: Option<ValueId>,
+    // The operand *symbols* (not pre-resolved values): a pure matcher can't emit the load that pulls
+    // a tensor/pointer param's base out of its slot, so the base pointer is resolved at emit time via
+    // `kernel_base_ptr` (a no-op for an array operand, a `Load` for a `Tensor`/pointer one). Storing
+    // the slot value here instead would GEP off the slot address for a `Tensor[..]` param — the
+    // 1-D-tensor-kernel segfault/divergence.
+    out: Symbol,
+    x: Symbol,
+    y: Option<Symbol>,
     a: Option<&'b Expr>,
     b: Option<&'b Expr>,
     c: Option<&'b Expr>,
@@ -1112,6 +1692,8 @@ const RED_MIN: i64 = 5; // min(x[k])  — fold by fmin
 const RED_MAXABS: i64 = 6; // max(|x[k]|) — fmax(m, abs(x[k])), symmetric int8 quant absmax
 const RED_ARGMAX: i64 = 7; // argmax_i x[i] — greedy decode / top-1 (lowest index on ties)
 const RED_ARGMIN: i64 = 8; // argmin_i x[i]
+const RED_SUMABS: i64 = 9; // sum(|x[k]|) — L1 norm / abssum (unary, y == x); folds by + like RED_SUM
+const RED_ABSDIFF: i64 = 10; // sum(|x[k] - y[k]|) — MAE / SAD numerator (two-array, like RED_SSD)
 
 // Fused-normalization op codes — must match `mercury_runtime::norm`'s `NORM_*`.
 const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row
@@ -1127,8 +1709,10 @@ struct FnLowerer<'a> {
     diags: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<Symbol, (ValueId, MirType)>>,
     terminated: bool,
-    /// (continue target, break target) for the innermost loops.
-    loops: Vec<(mercury_mir::BlockId, mercury_mir::BlockId)>,
+    /// (optional label, continue target, break target) for the enclosing loops, innermost last. A
+    /// labeled `break`/`continue` `'l` searches this stack for the matching label; an unlabeled one
+    /// targets the innermost (the top).
+    loops: Vec<(Option<Symbol>, mercury_mir::BlockId, mercury_mir::BlockId)>,
     /// Pre-interned runtime symbols the matmul recognizer lowers a GEMM nest to.
     gemm: GemmSyms,
     /// True while lowering the body of a `@parallel` function: a recognized reduction loop dispatches
@@ -1138,6 +1722,22 @@ struct FnLowerer<'a> {
     /// (keyed by its canonical text), so `x[i]` read twice (e.g. relu's `if x[i]>0 {x[i]}`) loads
     /// once. Cleared between unroll copies (addresses differ) and after any store (avoid staleness).
     vec_loads: HashMap<String, ValueId>,
+    /// Set when the function returns an aggregate (struct/tuple) by value: the hidden leading
+    /// **sret** pointer parameter the caller passes a destination buffer in, paired with the
+    /// aggregate return type. A `return <aggregate>` deep-copies into this pointer and returns void
+    /// (the function's MIR return type is `Void`), so both backends only ever pass/copy pointers —
+    /// no aggregate ever rides in a register. `None` for a scalar/void return.
+    sret: Option<(ValueId, Ty)>,
+    /// The active type-generic monomorphization substitution: each of the enclosing instance's
+    /// generic TYPE parameters (`T` in `fn id<T>(x: T)`) mapped to the concrete type it was
+    /// instantiated at. Empty for a non-generic (or dimension-only-generic) function. Applied wherever
+    /// a `Ty::Named(generic)` is read (`expr_ty`/`mir_ty_of`), so the body lowers at the concrete
+    /// width and signedness instead of the `I32` default.
+    subst: HashMap<Symbol, Ty>,
+    /// Collected monomorphization instances (read-only), so a call to a type-generic function is
+    /// redirected to the matching specialized copy (`id` -> `id$f32`). `None` for the recognizer
+    /// probe lowerers, which never lower a user call.
+    mono: Option<&'a Mono>,
 }
 
 impl FnLowerer<'_> {
@@ -1179,15 +1779,522 @@ impl FnLowerer<'_> {
     // ---- type helpers ----
 
     fn expr_ty(&self, e: &Expr) -> Ty {
-        self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown)
+        let raw = self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown);
+        // In a monomorphized instance, resolve a generic type parameter to its concrete type so op
+        // selection, coercion, and widths all see the real type (a no-op when `subst` is empty).
+        subst_ty(&raw, &self.subst)
+    }
+
+    /// Is `e`'s type a string (`*u8`)? Routes a `print`/`println` argument to the byte-rendering
+    /// `print_str` path instead of printing the raw pointer value. A string literal and a
+    /// `let s = "…"` binding both type as `*u8` in sema, so both are caught.
+    fn is_string_arg(&self, e: &Expr) -> bool {
+        matches!(self.expr_ty(e), Ty::Ptr { pointee, .. } if matches!(*pointee, Ty::Scalar(mercury_types::Scalar::U8)))
+    }
+
+    /// Is `e`'s type an unsigned integer scalar (`u8`/`u16`/`u32`/`u64`/`usize`)? Routes a
+    /// `print`/`println` argument to the unsigned-rendering `print_u` path so a high-bit-set value
+    /// prints its magnitude rather than the signed reinterpretation. `bool` is excluded (`is_int`
+    /// excludes it); signed integers and floats take the default path.
+    fn is_unsigned_int_arg(&self, e: &Expr) -> bool {
+        matches!(self.expr_ty(e), Ty::Scalar(sc) if sc.is_int() && !sc.is_signed())
     }
 
     fn expr_mir(&self, e: &Expr) -> MirType {
-        mir_ty(&self.expr_ty(e))
+        self.mir_ty_of(&self.expr_ty(e))
+    }
+
+    /// `mir_ty`, but resolves a named struct (`Ty::Named`) to its byte-buffer storage type using the
+    /// struct's field layout from sema (the free `mir_ty` has no def access and would fall back to
+    /// `I32`). A struct value, like a tuple, is a flat padded byte buffer addressed by field offset.
+    /// Recurses through arrays and tuples so a *nested* struct (a struct field, or an element of an
+    /// array of structs) also resolves — `mir_ty` stops at the first `Named` and mis-sizes the rest.
+    fn mir_ty_of(&self, ty: &Ty) -> MirType {
+        // Resolve a monomorphized generic type parameter to its concrete instantiation first, so the
+        // param/return/local widths follow the instance's type instead of the `I32` default.
+        if !self.subst.is_empty() {
+            if let Ty::Named(g) = ty {
+                if let Some(concrete) = self.subst.get(g) {
+                    return self.mir_ty_of(concrete);
+                }
+            }
+        }
+        match ty {
+            Ty::Named(sym) => match self.struct_size(*sym) {
+                Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
+                None => mir_ty(ty),
+            },
+            Ty::Array { elem, len } => {
+                MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32)
+            }
+            Ty::Tuple(_) => {
+                MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
+            }
+            _ => mir_ty(ty),
+        }
+    }
+
+    /// The MIR slot type for a `let x: T` annotation — the single registry- and subst-aware type
+    /// resolver for every annotated local (it replaced a free `mir_ty_of_ast` that mistyped a named
+    /// struct / a tuple / a generic parameter as `i32`, under-allocating the slot so a later field
+    /// write GEPs off a scalar and ICEs). A named struct resolves to its byte buffer (`mir_ty_of`),
+    /// a tuple to a padded byte buffer sized from its elements, an array recurses (so an
+    /// array-of-struct element is sized correctly), a monomorphized generic parameter resolves to
+    /// its concrete instantiation, and every pointer/scalar/vector form lowers to its natural slot.
+    fn mir_ty_of_ann(&self, t: &ast::TypeExpr) -> MirType {
+        use ast::TypeKind::*;
+        match &t.kind {
+            Path(p) => {
+                let sym = p.segments.last().unwrap().sym;
+                // A monomorphized generic type parameter resolves to its concrete instantiation
+                // first (mirrors `mir_ty_of`): without this, a generic-typed local annotation such
+                // as `let y: T = …` or `let a: [T; N] = …` falls through to the `I32` default and
+                // mis-sizes the slot — an ICE (scalar `T`) or a silent interp≠native miscompile
+                // (`[T; N]`, whose f32 GEPs read an `[i32]` buffer). Empty subst (a non-generic
+                // function) skips this and behaves exactly as before.
+                if !self.subst.is_empty() {
+                    if let Some(concrete) = self.subst.get(&sym) {
+                        return self.mir_ty_of(concrete);
+                    }
+                }
+                let name = self.interner.resolve(sym);
+                if let Some(s) = mercury_types::Scalar::from_name(name) {
+                    MirType::from_scalar(s)
+                } else if matches!(
+                    self.sema.defs.lookup(sym).map(|d| &d.kind),
+                    Some(DefKind::Struct(_))
+                ) {
+                    self.mir_ty_of(&Ty::Named(sym))
+                } else {
+                    MirType::I32
+                }
+            }
+            Array { elem, len } => match const_usize_expr(len, self.interner, &self.sema.consts) {
+                Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
+                None => MirType::Ptr,
+            },
+            Tuple(fields) => {
+                // A padded byte buffer sized from the element MIR types — the same layout the
+                // with-initializer path derives via `mir_ty_of(Ty::Tuple(..))`/`ty_size`.
+                let elems: Vec<MirType> = fields.iter().map(|f| self.mir_ty_of_ann(f)).collect();
+                let mut size = 0u64;
+                let mut align = 1u64;
+                for e in &elems {
+                    let a = mir_byte_align(e);
+                    size = round_up(size, a);
+                    size += mir_byte_size(e);
+                    align = align.max(a);
+                }
+                MirType::Array(Box::new(MirType::I8), round_up(size, align) as u32)
+            }
+            Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
+            Vector { elem, lanes } => MirType::Vec(Box::new(self.mir_ty_of_ann(elem)), *lanes),
+            Unit => MirType::Void,
+            _ => MirType::I32,
+        }
+    }
+
+    /// Zero-initialize the freshly-alloca'd slot of a no-initializer `let`. A scalar gets one typed
+    /// zero store; a scalar array fills (unrolled when small, a fill loop otherwise); an aggregate
+    /// (struct/tuple byte buffer, or an array of aggregates) recurses so every leaf is zeroed. The
+    /// effect mirrors the interpreter's zero-initialized memory, so an uninitialized read agrees
+    /// bit-for-bit across backends and opt levels. (A `Ptr`/`Vec` slot — a rare no-init form — is
+    /// left alone: there is no valid typed-zero MIR constant for those, and neither was a reported
+    /// divergence; this is strictly an improvement over the prior garbage-read behavior.)
+    fn zero_init(&mut self, slot: ValueId, ty: &MirType) {
+        if ty.is_int() || ty.is_float() {
+            let z = self.const_zero(ty.clone());
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: z,
+            });
+        } else if let MirType::Array(elem, n) = ty {
+            if elem.is_int() || elem.is_float() {
+                let z = self.const_zero((**elem).clone());
+                if *n <= REPEAT_UNROLL_LIMIT {
+                    for i in 0..*n as i128 {
+                        self.store_element(slot, elem, i, z);
+                    }
+                } else {
+                    self.lower_fill_loop(slot, elem, *n, z);
+                }
+            } else {
+                for i in 0..*n as i128 {
+                    let ep = self.gep_elem(slot, elem, i);
+                    self.zero_init(ep, elem);
+                }
+            }
+        }
+    }
+
+    /// The ABI type of a parameter of semantic type `ty`: an aggregate (array/tuple/struct, whose
+    /// `mir_ty_of` is an `Array` byte buffer) is passed by base **pointer**; a scalar by value. The
+    /// registry-aware companion to the free `param_abi_ty` (which mistypes a named struct as `I32`).
+    fn param_abi(&self, ty: &Ty) -> MirType {
+        match self.mir_ty_of(ty) {
+            MirType::Array(..) => MirType::Ptr,
+            t => t,
+        }
+    }
+
+    /// Size in bytes of `ty`, resolving named structs through the sema registry — the registry-aware
+    /// companion to `Ty::size_of` (which returns `None` for `Ty::Named`, since the leaf type crate
+    /// has no def access). Recurses through arrays/tuples so nested structs lay out correctly.
+    fn ty_size(&self, ty: &Ty) -> Option<u64> {
+        match ty {
+            // A C-style enum lowers to its i32 discriminant (`mir_ty` resolves it to `I32`), so it is
+            // a sized 4-byte scalar field — not an unsized aggregate. Without this, an enum field in a
+            // struct/tuple (`(Color, i32)`, `struct Pixel { c: Color, v: i32 }`) sized via
+            // `struct_size` returned `None` and was rejected `C0001 "unsized field"`, even though
+            // array-of-enum (sized via `mir_ty_of` recursion) and enum scalars already worked.
+            Ty::Named(sym)
+                if matches!(
+                    self.sema.defs.lookup(*sym).map(|d| &d.kind),
+                    Some(DefKind::Enum(_))
+                ) =>
+            {
+                Some(4)
+            }
+            Ty::Named(sym) => self.struct_size(*sym),
+            Ty::Array { elem, len } => Some(self.ty_size(elem)? * len),
+            Ty::Tuple(fields) => self.aggregate_layout(fields).map(|(_, size, _)| size),
+            _ => ty.size_of(),
+        }
+    }
+
+    /// Alignment of `ty`, resolving named structs through the sema registry (see [`ty_size`]).
+    fn ty_align(&self, ty: &Ty) -> Option<u64> {
+        match ty {
+            // A C-style enum is its i32 discriminant — 4-byte aligned (see `ty_size`).
+            Ty::Named(sym)
+                if matches!(
+                    self.sema.defs.lookup(*sym).map(|d| &d.kind),
+                    Some(DefKind::Enum(_))
+                ) =>
+            {
+                Some(4)
+            }
+            Ty::Named(sym) => self.struct_align(*sym),
+            Ty::Array { elem, .. } => self.ty_align(elem),
+            Ty::Tuple(fields) => fields
+                .iter()
+                .try_fold(1u64, |a, f| Some(a.max(self.ty_align(f)?))),
+            _ => ty.align_of(),
+        }
+    }
+
+    /// Padded field offsets + total size + alignment for a sequence of field types — the single
+    /// layout authority shared by structs and tuples (the same `round_up` accumulation as
+    /// `Ty::size_of`, but registry-aware so a named-struct field is sized recursively). `None` if any
+    /// field is genuinely unsized (a slice/tensor/unresolved name).
+    fn aggregate_layout(&self, fields: &[Ty]) -> Option<(Vec<u64>, u64, u64)> {
+        let mut offsets = Vec::with_capacity(fields.len());
+        let mut size = 0u64;
+        let mut align = 1u64;
+        for f in fields {
+            let fa = self.ty_align(f)?;
+            let fs = self.ty_size(f)?;
+            size = round_up(size, fa);
+            offsets.push(size);
+            size += fs;
+            align = align.max(fa);
+        }
+        Some((offsets, round_up(size, align), align))
+    }
+
+    /// The field layout of a declared struct: `(field name, byte offset, field MIR type)` in
+    /// declaration order. Uses the registry-aware `aggregate_layout` (so a field that is itself a
+    /// struct lays out correctly) and `mir_ty_of` for each field type (so a nested-struct field gets
+    /// its byte-buffer type, not the `I32` fallback). `None` if `name` is not a struct or is unsized.
+    fn struct_layout(&self, name: Symbol) -> Option<Vec<(Symbol, u64, MirType)>> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+        let (offsets, _, _) = self.aggregate_layout(&tys)?;
+        Some(
+            fields
+                .iter()
+                .zip(offsets)
+                .map(|((fname, fty), off)| (*fname, off, self.mir_ty_of(fty)))
+                .collect(),
+        )
+    }
+
+    /// `(byte offset, field type)` for each field of struct `name`, in declaration order — the
+    /// semantic-type companion to `struct_layout` (which gives MIR types). Drives nested aggregate
+    /// initialization and copies, which need the `Ty` to recurse.
+    fn struct_field_tys(&self, name: Symbol) -> Option<Vec<(u64, Ty)>> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+        let (offsets, _, _) = self.aggregate_layout(&tys)?;
+        Some(tys.into_iter().zip(offsets).map(|(t, o)| (o, t)).collect())
+    }
+
+    /// Total padded byte size of a declared struct (its alloca size), registry-aware.
+    fn struct_size(&self, name: Symbol) -> Option<u64> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+        self.aggregate_layout(&tys).map(|(_, size, _)| size)
+    }
+
+    /// Alignment of a declared struct (the max field alignment), registry-aware.
+    fn struct_align(&self, name: Symbol) -> Option<u64> {
+        let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
+            return None;
+        };
+        fields
+            .iter()
+            .try_fold(1u64, |a, (_, f)| Some(a.max(self.ty_align(f)?)))
+    }
+
+    /// Address + MIR type of struct field `fname` of the struct expression `base`. The base lowers to
+    /// a pointer to the struct buffer in every case: a struct *local* (its bound value *is* the buffer
+    /// pointer, like a tuple/array), and **a pointer/reference to a struct** — `p.f` on a `&Pt` /
+    /// `*mut Pt` param auto-derefs (the bound `Ptr` slot loads the pointer, then this GEPs the field).
+    /// So a struct passed by `&`/`*` works the same as a local. Drives `s.f` reads and `s.f = …` writes.
+    /// Bind a tuple destructuring pattern `(a, b, …)` against an aggregate `base` of tuple type
+    /// `tty`: each sub-pattern is bound to its field's place (byte offset within `base`). A scalar
+    /// field binds a pointer that reads via `Load` (like a `let` slot); an aggregate field binds its
+    /// pointer directly (the by-pointer convention); a nested tuple pattern recurses; a wildcard
+    /// binds nothing. Used by `let (a, b) = …`.
+    fn bind_tuple_pattern(&mut self, base: ValueId, tty: &Ty, subs: &[Pattern]) {
+        let Ty::Tuple(fields) = tty else {
+            return;
+        };
+        let Some((offsets, _, _)) = self.aggregate_layout(fields) else {
+            return;
+        };
+        for (i, sub) in subs.iter().enumerate() {
+            let (Some(off), Some(fty)) = (offsets.get(i), fields.get(i)) else {
+                continue;
+            };
+            let fmir = self.mir_ty_of(fty);
+            let fptr = self.field_ptr(base, *off);
+            match &sub.kind {
+                ast::PatKind::Ident(name) => self.bind(*name, fptr, fmir),
+                ast::PatKind::Tuple(inner) => self.bind_tuple_pattern(fptr, fty, inner),
+                _ => {}
+            }
+        }
+    }
+
+    /// If `base.name` is a C-style enum-variant access `E::B` (a `Field` whose base is a single
+    /// segment path naming a declared enum, and `name` is one of its variants), return the variant's
+    /// integer discriminant. Lowered to that constant (the enum value's runtime representation).
+    fn enum_variant_value(&self, base: &Expr, name: Symbol) -> Option<i64> {
+        let ExprKind::Path(p) = &base.kind else {
+            return None;
+        };
+        if !p.is_single() {
+            return None;
+        }
+        let DefKind::Enum(variants) = &self.sema.defs.lookup(p.first().sym)?.kind else {
+            return None;
+        };
+        variants.iter().find(|(v, _)| *v == name).map(|(_, d)| *d)
+    }
+
+    /// The base pointer of an aggregate *place* expression `base` (for a `.field` / `.0` / `[i]`
+    /// access). For an explicit deref `*p` this is `p`'s pointer value — NOT a `Load` of the
+    /// aggregate, which `lower_expr(*p)` does for a by-value aggregate pointee; GEPing a field off that
+    /// loaded buffer is `gep base [N x i8]`, invalid MIR the verifier rejects (and native-O0 used to
+    /// codegen it into a SIGSEGV instead of erroring). For any other base — a struct/tuple/array local
+    /// (its bound id *is* the base pointer) or an auto-derefed `*mut S`/`&S` param (whose slot loads
+    /// the pointer) — `lower_expr` already yields the address, so this is a no-op there. This makes the
+    /// explicit `(*p).f` / `(*p)[i]` spellings lower like the implicit `p.f` one.
+    fn place_base_ptr(&mut self, base: &Expr) -> ValueId {
+        match &base.kind {
+            ExprKind::Unary {
+                op: ast::UnOp::Deref,
+                expr,
+            } => self.lower_expr(expr),
+            _ => self.lower_expr(base),
+        }
+    }
+
+    fn struct_field_place(&mut self, base: &Expr, fname: Symbol) -> (ValueId, MirType) {
+        let struct_sym = match self.expr_ty(base) {
+            Ty::Named(sym) => Some(sym),
+            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => match *pointee {
+                Ty::Named(sym) => Some(sym),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(sym) = struct_sym {
+            if let Some(layout) = self.struct_layout(sym) {
+                if let Some((_, off, fmty)) = layout.iter().find(|(n, _, _)| *n == fname) {
+                    let off = *off;
+                    let fmty = fmty.clone();
+                    let base_ptr = self.place_base_ptr(base);
+                    let p = self.field_ptr(base_ptr, off);
+                    return (p, fmty);
+                }
+            }
+        }
+        self.unsupported(base.span, "field access on a non-struct value");
+        let ty = MirType::I32;
+        (self.builder.alloca(ty.clone()), ty)
+    }
+
+    /// Lower a struct literal `Name { f: v, … }` into the byte buffer at `base`: each field value is
+    /// initialized at its declared byte offset (literal field order may differ from declaration order
+    /// — each value goes to its named field's offset). A field that is itself a struct/tuple/array
+    /// recurses (or byte-copies) via `init_field`, so nested aggregates work.
+    fn lower_struct_init(&mut self, base: ValueId, sym: Symbol, fields: &[ast::FieldInit], span: Span) {
+        let Some(field_tys) = self.struct_field_tys(sym) else {
+            self.unsupported(span, "struct with an unsized field");
+            return;
+        };
+        let by_name: HashMap<Symbol, (u64, Ty)> = self
+            .sema
+            .defs
+            .lookup(sym)
+            .and_then(|d| match &d.kind {
+                DefKind::Struct(decl) => Some(
+                    decl.iter()
+                        .map(|(n, _)| *n)
+                        .zip(field_tys.iter().cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        for fi in fields {
+            let Some((off, fty)) = by_name.get(&fi.name.sym).cloned() else {
+                self.unsupported(fi.name.span, "unknown struct field");
+                continue;
+            };
+            let p = self.field_ptr(base, off);
+            self.init_field(p, &fty, &fi.value);
+        }
+    }
+
+    /// Initialize the location `dst` (a pointer into an aggregate buffer) of semantic type `fty` from
+    /// initializer `value`. A nested struct/tuple/array literal recurses *directly* into `dst` (no
+    /// temporary buffer + copy); a non-literal aggregate value is deep-copied from its buffer; a
+    /// scalar is coerced to the field type and stored. The one initializer primitive shared by struct,
+    /// tuple, and (aggregate-element) array lowering.
+    fn init_field(&mut self, dst: ValueId, fty: &Ty, value: &Expr) {
+        match (&value.kind, fty) {
+            (ExprKind::StructLit { fields, .. }, Ty::Named(sym)) => {
+                self.lower_struct_init(dst, *sym, fields, value.span);
+            }
+            (ExprKind::TupleLit(items), Ty::Tuple(_)) => {
+                self.lower_tuple_init(dst, fty, items);
+            }
+            (ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }, Ty::Array { elem, len }) => {
+                let emir = self.mir_ty_of(elem);
+                self.lower_array_init(dst, &emir, *len as u32, value);
+            }
+            _ => {
+                let fmty = self.mir_ty_of(fty);
+                if matches!(fmty, MirType::Array(..)) {
+                    // An aggregate value from a non-literal expression (a variable, a call result, a
+                    // field): the expression yields a base pointer; deep-copy its leaves into `dst`.
+                    let src = self.lower_expr(value);
+                    self.emit_copy(dst, src, fty);
+                } else {
+                    let v0 = self.lower_expr(value);
+                    let vty = self.expr_mir(value);
+                    let v = self.coerce_to(v0, &vty, &fmty, self.signed(value));
+                    self.builder.build_void(Op::Store { ptr: dst, value: v });
+                }
+            }
+        }
+    }
+
+    /// Deep-copy a value of type `ty` from buffer `src` to buffer `dst` (both base pointers), using
+    /// the *same* GEP discipline as field/element access so it is correct under both the interpreter's
+    /// slot-indexed memory and native's byte-indexed memory: struct/tuple fields recurse through the
+    /// byte-offset `field_ptr`, array elements through an element-typed GEP, and scalar leaves are a
+    /// single load+store. A flat byte `memcpy` would be wrong for the interpreter (a non-leading
+    /// scalar field lives at its byte-offset slot, which an 8-byte chunked copy would skip).
+    fn emit_copy(&mut self, dst: ValueId, src: ValueId, ty: &Ty) {
+        match ty {
+            Ty::Named(sym) => {
+                if let Some(layout) = self.struct_field_tys(*sym) {
+                    for (off, fty) in layout {
+                        let s = self.field_ptr(src, off);
+                        let d = self.field_ptr(dst, off);
+                        self.emit_copy(d, s, &fty);
+                    }
+                }
+            }
+            Ty::Tuple(fields) => {
+                if let Some((offsets, _, _)) = self.aggregate_layout(fields) {
+                    let pairs: Vec<(u64, Ty)> =
+                        offsets.into_iter().zip(fields.iter().cloned()).collect();
+                    for (off, fty) in pairs {
+                        let s = self.field_ptr(src, off);
+                        let d = self.field_ptr(dst, off);
+                        self.emit_copy(d, s, &fty);
+                    }
+                }
+            }
+            Ty::Array { elem, len } => {
+                let emir = self.mir_ty_of(elem);
+                for i in 0..*len as i128 {
+                    let s = self.gep_elem(src, &emir, i);
+                    let d = self.gep_elem(dst, &emir, i);
+                    self.emit_copy(d, s, elem);
+                }
+            }
+            _ => {
+                let mir = self.mir_ty_of(ty);
+                let v = self.builder.build(mir.clone(), Op::Load(src, mir.clone()));
+                self.builder.build_void(Op::Store { ptr: dst, value: v });
+            }
+        }
+    }
+
+    /// Read a field/element at `ptr` of MIR type `fmty`: a scalar/pointer field is loaded; an
+    /// aggregate field (`MirType::Array`, i.e. a nested struct/tuple/inline array) yields `ptr`
+    /// itself — the by-pointer convention arrays follow, so a further field/index access GEPs off it
+    /// rather than trying to load (and copy) the whole buffer through a register.
+    fn load_or_addr(&mut self, ptr: ValueId, fmty: MirType) -> ValueId {
+        if matches!(fmty, MirType::Array(..)) {
+            ptr
+        } else {
+            self.builder.build(fmty.clone(), Op::Load(ptr, fmty))
+        }
+    }
+
+    /// Pointer to element `index` of `base` for an element of MIR type `elem` (the element-typed GEP
+    /// the array machinery uses: native scales by `size_of(elem)`, the interpreter indexes slots).
+    fn gep_elem(&mut self, base: ValueId, elem: &MirType, index: i128) -> ValueId {
+        let idx = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(index, MirType::I64));
+        self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: elem.clone(),
+            },
+        )
     }
 
     fn signed(&self, e: &Expr) -> bool {
-        matches!(self.expr_ty(e), Ty::Scalar(s) if s.is_signed())
+        match self.expr_ty(e) {
+            Ty::Scalar(s) => s.is_signed(),
+            // A C-style enum value *is* its signed `i32` discriminant, so a widening or int→float
+            // cast — and every coercion / ordered compare routed through `signed()` — must treat it
+            // as signed: `E::Neg as i64` is `-5`, the same as `E::Neg as i32 as i64`. Without this an
+            // enum operand fell through to unsigned zero-extension (`4294967291`), a gate-blind
+            // miscompile both backends agreed on. A struct `Ty::Named` stays unsigned (never a cast
+            // operand); only an `enum` discriminant is signed.
+            Ty::Named(sym) => {
+                matches!(self.sema.defs.lookup(sym).map(|d| &d.kind), Some(DefKind::Enum(_)))
+            }
+            _ => false,
+        }
     }
 
     fn const_zero(&mut self, ty: MirType) -> ValueId {
@@ -1240,26 +2347,30 @@ impl FnLowerer<'_> {
             // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
             // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
             // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
+            // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
+            // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
             if let Some((n, arr, n_expr)) = self.match_logsoftmax(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
+                if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
                     i += n;
                     continue;
                 }
             }
             if let Some((n, arr, n_expr)) = self.match_softmax(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
+                if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
+            // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
+            // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
+            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None) {
+                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
+                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
                     i += n;
                     continue;
                 }
@@ -1267,9 +2378,35 @@ impl FnLowerer<'_> {
             // L2-normalize (4 stmts, same shape as RMSNorm but `1/sqrt(Σx² + eps)` — no mean divisor).
             // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
             // so neither steals the other's window.
-            if let Some((n, arr, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
-                if self.emit_norm(arr, None, &n_expr, eps, NORM_L2NORM, None, None) {
+            if let Some((n, arr, dst, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
+                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_L2NORM, None, None) {
                     i += n;
+                    continue;
+                }
+            }
+            // Single-row / flat 1-D scans (inclusive prefix sum / product, first-order linear
+            // recurrence). The batched `for r`-wrapped forms dispatch via the for-statement path; the
+            // flat form (`let acc = 0; for i in 0..N { acc = acc (op) x[i]; out[i] = acc }`) is not an
+            // outer loop, so it fell to fully-scalar code — the loop-carried recurrence also defeats
+            // the generic vectorizer. Fold to the serial scan kernel (1 row = no parallelism). Each
+            // window is 2 statements (`let acc` + `for`). Disjoint from the norm windows above (a
+            // norm's opening reduction loop has a 1-statement inner body, never the scan's
+            // `out[i] = acc` writeback), so probe order among them is immaterial.
+            if let Some(nest) = self.match_cumsum_1d(b, i) {
+                if self.emit_cumsum(&nest, false) {
+                    i += 2;
+                    continue;
+                }
+            }
+            if let Some(nest) = self.match_cumprod_1d(b, i) {
+                if self.emit_cumprod(&nest, false) {
+                    i += 2;
+                    continue;
+                }
+            }
+            if let Some(nest) = self.match_lrscan_1d(b, i) {
+                if self.emit_lrscan(&nest, false) {
+                    i += 2;
                     continue;
                 }
             }
@@ -1330,7 +2467,7 @@ impl FnLowerer<'_> {
         for m in (2..=run).rev() {
             let fused = fuse_for_bodies(&stmts[..m]);
             if self.vectorizable(&fused, var).is_some() {
-                self.lower_for(pat0, iter0, &fused);
+                self.lower_for(None, pat0, iter0, &fused);
                 return Some(m);
             }
         }
@@ -1360,7 +2497,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return None;
         }
         Some((*v, end, body))
@@ -1632,9 +2769,10 @@ impl FnLowerer<'_> {
         (core, gamma, beta)
     }
 
-    /// Body `x[v] = x[v] * inv [* gamma[v] [+ beta[v]]]` (scale by an invariant scalar, either operand
-    /// order, with an optional affine wrapper for RMSNorm). Returns the captured `(gamma, beta)`
-    /// arrays (both `None` for the plain form). Pure.
+    /// Body `out[v] = x[v] * inv [* gamma[v] [+ beta[v]]]` (scale by an invariant scalar, either operand
+    /// order, with an optional affine wrapper for RMSNorm). Returns `(dst, gamma, beta)`: `dst` is the
+    /// write-target array — `x` itself for the in-place form, or a distinct `out` for `out = norm(x)`.
+    /// gamma/beta are `None` for the plain form. Pure.
     fn match_scale_body(
         &self,
         body: &Block,
@@ -1642,7 +2780,7 @@ impl FnLowerer<'_> {
         x: Symbol,
         inv: Symbol,
         batch: Option<(Symbol, &Expr)>,
-    ) -> Option<(Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -1652,11 +2790,11 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // The data `x` is row-offset-indexed when batched; gamma/beta stay column-indexed (per-column,
-        // shared across rows), so `peel_affine` is unbatched.
-        if self.index_off(target, v, batch) != Some(x) {
-            return None;
-        }
+        // The write target is the destination buffer: `x` for the in-place form, or a distinct `out`
+        // for out-of-place. The *value* still reads the source `x` (checked below), so only the store
+        // target may differ. The data `x` is row-offset-indexed when batched; gamma/beta stay
+        // column-indexed (per-column, shared across rows), so `peel_affine` is unbatched.
+        let dst = self.index_off(target, v, batch)?;
         let (core, gamma, beta) = self.peel_affine(value, v, x);
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
@@ -1669,7 +2807,7 @@ impl FnLowerer<'_> {
         let ok = (self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(inv))
             || (self.index_off(rhs, v, batch) == Some(x) && single_path(lhs) == Some(inv));
         if ok {
-            Some((gamma, beta))
+            Some((dst, gamma, beta))
         } else {
             None
         }
@@ -1782,8 +2920,10 @@ impl FnLowerer<'_> {
             return None;
         }
         // softmax's normalize is a plain `x[i] *= inv`; reject any affine wrapper (softmax has no
-        // gamma/beta) so it falls back to the generic vectorizer rather than silently dropping it.
-        if self.match_scale_body(body6, v6, x, inv, data_batch)? != (None, None) {
+        // gamma/beta), and require it in-place (`dst == x`): the exp-sub pass above already rewrote `x`
+        // in place, so an out-of-place final scale would be an unsound hybrid (the kernel preserves the
+        // source, the source program would not). Out-of-place softmax simply isn't recognized here.
+        if self.match_scale_body(body6, v6, x, inv, data_batch)? != (x, None, None) {
             return None;
         }
         // The three internal scalars must not be read after the window — the kernel hides them.
@@ -2795,21 +3935,41 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        // [0] let acc: f32 = 0.0;
-        let (acc, acc0) = Self::let_init(&body.stmts[0])?;
+        let (_acc, x, out, cols) = self.match_cumsum_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The `let acc = 0.0; for i in 0..C { acc = acc + x[<row·C>+i]; out[<row·C>+i] = acc }` pair
+    /// shared by the batched (`for r`) [`Self::match_cumsum`] and the single-row
+    /// [`Self::match_cumsum_1d`]. `row` is the outer batch var (`None` = a flat 1-D row, stride 0).
+    /// Returns `(acc, x, out, cols)`; the caller supplies `rows` (`R` batched, `1` single-row) and,
+    /// for the single-row form, guards `acc`'s escape. Pure (`&self`).
+    fn match_cumsum_pair(
+        &self,
+        acc_stmt: &Stmt,
+        for_stmt: &Stmt,
+        row: Option<Symbol>,
+    ) -> Option<(Symbol, Symbol, Symbol, Dim)> {
+        // let acc: f32 = 0.0;
+        let (acc, acc0) = Self::let_init(acc_stmt)?;
         if !is_float_zero(acc0, self.interner) {
             return None;
         }
-        // [1] for i in 0..C { acc = acc + x[r*C+i]; out[r*C+i] = acc; }
-        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        // for i in 0..C { acc = acc + x[..i]; out[..i] = acc; }
+        let (i, ce, ibody) = self.as_range0_for(for_stmt)?;
         let cols = as_dim(ce, self.interner)?;
-        let batch = Some((r, ce));
+        let batch = row.map(|r| (r, ce));
         if ibody.tail.is_some() || ibody.stmts.len() != 2 {
             return None;
         }
-        // inner [0] acc = acc + x[r*C+i]  (or  acc += x[r*C+i])
+        // inner [0] acc = acc + x[..i]  (or  acc += x[..i])
         let x = self.match_acc_add(&ibody.stmts[0], acc, i, batch)?;
-        // inner [1] out[r*C+i] = acc
+        // inner [1] out[..i] = acc
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -2825,10 +3985,28 @@ impl FnLowerer<'_> {
         if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
             return None;
         }
+        Some((acc, x, out, cols))
+    }
+
+    /// Recognize a **single-row / flat 1-D** inclusive prefix sum at `b.stmts[at..]`:
+    /// `let acc = 0.0; for i in 0..N { acc = acc + x[i]; out[i] = acc }`. The batched `for r`-wrapped
+    /// form is [`Self::match_cumsum`]; this is the flat form it never saw (it hard-requires the outer
+    /// loop), so a plain prefix sum fell to fully-scalar code — the loop-carried `acc` recurrence also
+    /// defeats the generic vectorizer. Emits `mercury_cumsum_f32(x, out, 1, N)` (serial; 1 row = no
+    /// parallelism). The accumulator must not be read after the window (the kernel hides it, so fusing
+    /// would drop its post-loop value). Pure (`&self`).
+    fn match_cumsum_1d(&self, b: &Block, at: usize) -> Option<CumsumNest> {
+        if at + 2 > b.stmts.len() {
+            return None;
+        }
+        let (acc, x, out, cols) = self.match_cumsum_pair(&b.stmts[at], &b.stmts[at + 1], None)?;
+        if block_mentions(&b.stmts[at + 2..], b.tail.as_deref(), acc) {
+            return None;
+        }
         Some(CumsumNest {
             x,
             out,
-            rows,
+            rows: Dim::Lit(1),
             cols,
         })
     }
@@ -2858,15 +4036,35 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        // [0] let p: f32 = 1.0;  (multiplicative identity)
-        let (p, p_init) = Self::let_init(&body.stmts[0])?;
-        if !matches!(&p_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0) {
+        let (_p, x, out, cols) = self.match_cumprod_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(CumsumNest {
+            x,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The `let p = 1.0; for i in 0..C { p = p * x[<row·C>+i]; out[<row·C>+i] = p }` pair shared by
+    /// the batched [`Self::match_cumprod`] and the single-row [`Self::match_cumprod_1d`]. Multiplicative
+    /// twin of [`Self::match_cumsum_pair`] (seed `1.0`, a `*` accumulate). Returns `(p, x, out, cols)`.
+    /// Pure (`&self`).
+    fn match_cumprod_pair(
+        &self,
+        p_stmt: &Stmt,
+        for_stmt: &Stmt,
+        row: Option<Symbol>,
+    ) -> Option<(Symbol, Symbol, Symbol, Dim)> {
+        // let p: f32 = 1.0;  (multiplicative identity)
+        let (p, p_init) = Self::let_init(p_stmt)?;
+        if !matches!(&p_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 1.0)
+        {
             return None;
         }
-        // [1] for i in 0..C { p = p * x[r*C+i]; out[r*C+i] = p; }
-        let (i, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        // for i in 0..C { p = p * x[..i]; out[..i] = p; }
+        let (i, ce, ibody) = self.as_range0_for(for_stmt)?;
         let cols = as_dim(ce, self.interner)?;
-        let batch = Some((r, ce));
+        let batch = row.map(|r| (r, ce));
         if ibody.tail.is_some() || ibody.stmts.len() != 2 {
             return None;
         }
@@ -2886,10 +4084,26 @@ impl FnLowerer<'_> {
         if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
             return None;
         }
+        Some((p, x, out, cols))
+    }
+
+    /// Recognize a **single-row / flat 1-D** inclusive prefix product at `b.stmts[at..]`:
+    /// `let p = 1.0; for i in 0..N { p = p * x[i]; out[i] = p }`. The flat form the batched
+    /// [`Self::match_cumprod`] never saw. Emits `mercury_cumprod_f32(x, out, 1, N)` (serial). Bit-exact
+    /// (a bare product folds strictly left-to-right, no reassociation). `p` must not escape the window.
+    /// Pure (`&self`).
+    fn match_cumprod_1d(&self, b: &Block, at: usize) -> Option<CumsumNest> {
+        if at + 2 > b.stmts.len() {
+            return None;
+        }
+        let (p, x, out, cols) = self.match_cumprod_pair(&b.stmts[at], &b.stmts[at + 1], None)?;
+        if block_mentions(&b.stmts[at + 2..], b.tail.as_deref(), p) {
+            return None;
+        }
         Some(CumsumNest {
             x,
             out,
-            rows,
+            rows: Dim::Lit(1),
             cols,
         })
     }
@@ -3003,21 +4217,40 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.len() != 2 {
             return None;
         }
-        // [0] let h: f32 = 0.0;  (zero initial hidden state)
-        let (h, h0) = Self::let_init(&body.stmts[0])?;
+        let (_h, a, b, out, cols) = self.match_lrscan_pair(&body.stmts[0], &body.stmts[1], Some(r))?;
+        Some(LrscanNest {
+            a,
+            b,
+            out,
+            rows,
+            cols,
+        })
+    }
+
+    /// The `let h = 0.0; for t in 0..C { h = a[<row·C>+t]*h + b[<row·C>+t]; out[<row·C>+t] = h }` pair
+    /// shared by the batched [`Self::match_lrscan`] and the single-row [`Self::match_lrscan_1d`].
+    /// Returns `(h, a, b, out, cols)`. Pure (`&self`).
+    fn match_lrscan_pair(
+        &self,
+        h_stmt: &Stmt,
+        for_stmt: &Stmt,
+        row: Option<Symbol>,
+    ) -> Option<(Symbol, Symbol, Symbol, Symbol, Dim)> {
+        // let h: f32 = 0.0;  (zero initial hidden state)
+        let (h, h0) = Self::let_init(h_stmt)?;
         if !is_float_zero(h0, self.interner) {
             return None;
         }
-        // [1] for t in 0..C { h = a[r*C+t]*h + b[r*C+t]; out[r*C+t] = h; }
-        let (t, ce, ibody) = self.as_range0_for(&body.stmts[1])?;
+        // for t in 0..C { h = a[..t]*h + b[..t]; out[..t] = h; }
+        let (t, ce, ibody) = self.as_range0_for(for_stmt)?;
         let cols = as_dim(ce, self.interner)?;
-        let batch = Some((r, ce));
+        let batch = row.map(|r| (r, ce));
         if ibody.tail.is_some() || ibody.stmts.len() != 2 {
             return None;
         }
-        // inner [0] the recurrence step h = a[r*C+t]*h + b[r*C+t]  →  (a, b)
+        // inner [0] the recurrence step h = a[..t]*h + b[..t]  →  (a, b)
         let (a, b) = self.match_lrscan_step(&ibody.stmts[0], h, t, batch)?;
-        // inner [1] out[r*C+t] = h
+        // inner [1] out[..t] = h
         let StmtKind::Assign {
             target,
             op: ast::AssignOp::Assign,
@@ -3033,11 +4266,28 @@ impl FnLowerer<'_> {
         if scalar_of(target, self.sema) != Some(mercury_types::Scalar::F32) {
             return None;
         }
+        Some((h, a, b, out, cols))
+    }
+
+    /// Recognize a **single-row / flat 1-D** first-order linear recurrence at `b.stmts[at..]`:
+    /// `let h = 0.0; for t in 0..N { h = a[t]*h + b[t]; out[t] = h }` (SSM/Mamba/EMA). The flat form
+    /// the batched [`Self::match_lrscan`] never saw. Emits `mercury_lrscan_f32(a, b, out, 1, N)`
+    /// (serial). Bit-identical to the scalar nest (the recurrence is inherently sequential — no
+    /// reassociation). `h` must not escape the window. Pure (`&self`).
+    fn match_lrscan_1d(&self, blk: &Block, at: usize) -> Option<LrscanNest> {
+        if at + 2 > blk.stmts.len() {
+            return None;
+        }
+        let (h, a, b, out, cols) =
+            self.match_lrscan_pair(&blk.stmts[at], &blk.stmts[at + 1], None)?;
+        if block_mentions(&blk.stmts[at + 2..], blk.tail.as_deref(), h) {
+            return None;
+        }
         Some(LrscanNest {
             a,
             b,
             out,
-            rows,
+            rows: Dim::Lit(1),
             cols,
         })
     }
@@ -3562,6 +4812,7 @@ impl FnLowerer<'_> {
     fn emit_norm(
         &mut self,
         arr: Symbol,
+        dst: Symbol,
         rows: Option<&Expr>,
         n: &Expr,
         eps_bits: i64,
@@ -3571,6 +4822,19 @@ impl FnLowerer<'_> {
     ) -> bool {
         let Some((xv, _)) = self.lookup(arr) else {
             return false;
+        };
+        // The destination buffer: `arr` itself for the in-place form (the args stay `(xv, xv)` — the
+        // existing corpus is byte-identical), or a distinct `out` for the out-of-place `out = norm(x)`
+        // (the residual-stream transformer pattern: the normalized output goes to a fresh buffer while
+        // `x` is preserved). The kernel reads `x` and writes `out`, which the `mercury_norm_f32(x, out,
+        // ..)` ABI and both backends already support — in-place is just the `dst == arr` special case.
+        let dstv = if dst == arr {
+            xv
+        } else {
+            match self.lookup(dst) {
+                Some((v, _)) => v,
+                None => return false,
+            }
         };
         // A batched norm (`rows > 1`) inside a `@parallel` function maps its independent rows across
         // cores via the multicore kernel; rows are normalized independently (no cross-row combine), so
@@ -3607,7 +4871,7 @@ impl FnLowerer<'_> {
             };
             self.builder.build_void(Op::Call {
                 func,
-                args: vec![xv, xv, rows, nval, epsv, opv],
+                args: vec![xv, dstv, rows, nval, epsv, opv],
             });
             return true;
         }
@@ -3635,7 +4899,7 @@ impl FnLowerer<'_> {
         };
         self.builder.build_void(Op::Call {
             func,
-            args: vec![xv, xv, gptr, bptr, rows, nval, epsv, opv],
+            args: vec![xv, dstv, gptr, bptr, rows, nval, epsv, opv],
         });
         true
     }
@@ -3656,6 +4920,50 @@ impl FnLowerer<'_> {
             _ => return None,
         };
         Some((v as f32).to_bits() as i64)
+    }
+
+    /// The fused-norm `eps`, as either an inline float literal (`float_lit_bits`) or a single-segment
+    /// path bound to one by a preceding **non-`mut`** `let eps = <literal>;` in the same block. The
+    /// norm ABI carries `eps` as a compile-time `f32::to_bits()` i64, so it must be statically known —
+    /// but the natural idiom `let eps = 1e-5; ... rsqrt(ss/N + eps)` binds it to a constant just as
+    /// surely as an inline literal does. Resolving a non-`mut` binding is sound: sema forbids
+    /// reassigning a non-`mut` local, so its value at the reciprocal is exactly that literal (a `mut`
+    /// binding could be rebound, so the nearest binding is declined if it is `mut`). `prior` is the
+    /// block's statements before the reciprocal. Without this, an `eps` bound to a `let` silently
+    /// dropped the whole window to the generic vectorizer (`velem` + a separate reduction) rather than
+    /// the one fused pass — `tests/run/l2norm.mer` did exactly that. (A *batched* norm's body is the
+    /// inner loop, so an `eps` declared in the enclosing scope is not in `prior` and still needs a
+    /// literal — the resolution is intra-block only.)
+    fn eps_lit_bits(&self, e: &Expr, prior: &[Stmt]) -> Option<i64> {
+        if let Some(b) = self.float_lit_bits(e) {
+            return Some(b);
+        }
+        let sym = single_path(e)?;
+        for st in prior.iter().rev() {
+            let StmtKind::Let { pat, init, mutable, .. } = &st.kind else {
+                continue;
+            };
+            if !matches!(&pat.kind, ast::PatKind::Ident(n) if *n == sym) {
+                continue;
+            }
+            // Nearest binding of `sym`: resolve only an immutable let bound to a float literal.
+            if *mutable {
+                return None;
+            }
+            return init.as_ref().and_then(|i| self.float_lit_bits(i));
+        }
+        // A top-level `const EPS: f32 = <literal>` — the near-universal transformer spelling. A `const`
+        // is immutable and always in scope (no `prior` dependency), and its checked initializer lives in
+        // `sema.consts`, so resolving its literal bits here is exactly as sound as an inline literal.
+        // Guarded by `lookup(sym).is_none()` — a local/param binding of the same name shadows the const
+        // (mirroring the `Path` value-lowering precedence), so a runtime `eps` never resolves to a
+        // const's value. Without this, `rsqrt(ss/N + EPS)` dropped the whole norm to `velem` + a reduction.
+        if self.lookup(sym).is_none() {
+            if let Some(init) = self.sema.consts.get(&sym) {
+                return self.float_lit_bits(init);
+            }
+        }
+        None
     }
 
     /// Does `d` denote the row length `n` as an `f32` divisor — a float literal equal to a literal
@@ -3781,7 +5089,9 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Body `x[v] = (x[v]-mean) * inv` (center then scale, in place; either operand order). Pure.
+    /// Body `out[v] = (x[v]-mean) * inv [* gamma[v] [+ beta[v]]]` (center then scale; either operand
+    /// order). Returns `(dst, gamma, beta)`: `dst` is the write target — `x` in-place, or a distinct
+    /// `out` for out-of-place `out = layernorm(x)`. The value still reads the source `x`. Pure.
     fn match_shift_scale_body(
         &self,
         body: &Block,
@@ -3790,7 +5100,7 @@ impl FnLowerer<'_> {
         mean: Symbol,
         inv: Symbol,
         batch: Option<(Symbol, &Expr)>,
-    ) -> Option<(Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
         let StmtKind::Assign {
             target,
@@ -3800,9 +5110,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if self.index_off(target, v, batch) != Some(x) {
-            return None;
-        }
+        let dst = self.index_off(target, v, batch)?;
         let (core, gamma, beta) = self.peel_affine(value, v, x);
         let ExprKind::Binary {
             op: ast::BinOp::Mul,
@@ -3815,7 +5123,7 @@ impl FnLowerer<'_> {
         let ok = (self.is_centered(lhs, v, x, mean, batch) && single_path(rhs) == Some(inv))
             || (self.is_centered(rhs, v, x, mean, batch) && single_path(lhs) == Some(inv));
         if ok {
-            Some((gamma, beta))
+            Some((dst, gamma, beta))
         } else {
             None
         }
@@ -3860,9 +5168,23 @@ impl FnLowerer<'_> {
     /// `let inv = 1.0 / sqrt(sum/count + eps)` (or `rsqrt(...)`, `eps` either side) → `(inv, eps_bits)`,
     /// the reciprocal-standard-deviation binding shared by LayerNorm (variance sum) and RMSNorm
     /// (mean-square sum). Pure.
-    fn match_inv_rstd(&self, stmt: &Stmt, sum: Symbol, n: &Expr) -> Option<(Symbol, i64)> {
+    fn match_inv_rstd(
+        &self,
+        stmt: &Stmt,
+        sum: Symbol,
+        n: &Expr,
+        prior: &[Stmt],
+    ) -> Option<(Symbol, i64)> {
         let (name, init) = Self::let_init(stmt)?;
         let arg = self.as_rsqrt_arg(init)?;
+        // No-eps form: the reciprocal-sqrt argument is `sum / count` directly (no `+ eps`). Some
+        // reference RMSNorm/LayerNorm impls omit the epsilon; the kernel always computes
+        // `rsqrt(mean + eps)`, so pass eps = 0.0 (bits `0`) — `mean + 0.0 == mean` bit-for-bit for the
+        // non-negative mean-square / variance, matching the scalar `rsqrt(sum / N)`. Mirrors
+        // `match_inv_l2norm`, which already accepts the bare no-eps `1/sqrt(Σx²)`.
+        if self.scaled_by_inv_count(arg, sum, n) {
+            return Some((name, 0));
+        }
         let ExprKind::Binary {
             op: ast::BinOp::Add,
             lhs,
@@ -3871,10 +5193,11 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // One operand is the eps literal; the other is `sum / count`.
-        let (ms, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+        // One operand is the eps (an inline literal or a non-mut let-bound one); the other is
+        // `sum / count`.
+        let (ms, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.float_lit_bits(lhs) {
+        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
             (rhs.as_ref(), b)
         } else {
             return None;
@@ -3909,7 +5232,7 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 7 {
             return None;
@@ -3934,12 +5257,13 @@ impl FnLowerer<'_> {
             return None;
         }
         self.match_var_body(body4, v4, x, mean, vv, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr)?;
+        let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr, &b.stmts[..at + 5])?;
         let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
         if !exprs_struct_eq(n6, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_shift_scale_body(body6, v6, x, mean, inv, data_batch)?;
+        let (dst, gamma, beta) =
+            self.match_shift_scale_body(body6, v6, x, mean, inv, data_batch)?;
         let rest = &b.stmts[at + 7..];
         let tail = b.tail.as_deref();
         for sc in [s, mean, vv, inv] {
@@ -3947,7 +5271,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((7, x, n_expr.clone(), eps_bits, gamma, beta))
+        Some((7, x, dst, n_expr.clone(), eps_bits, gamma, beta))
     }
 
     /// Recognize the canonical in-place flat RMSNorm window (4 statements) at `b.stmts[at..]`:
@@ -3967,7 +5291,7 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -3980,12 +5304,13 @@ impl FnLowerer<'_> {
         // Batched: the data is indexed `row*cols + i` (cols == this inner bound); single-row: just `i`.
         let data_batch = batch.map(|row| (row, n_expr));
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr)?;
+        let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])?;
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        // `dst` is the scale loop's write target — `x` in-place, or a distinct `out` (out-of-place).
+        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
         let rest = &b.stmts[at + 4..];
         let tail = b.tail.as_deref();
         for sc in [s, inv] {
@@ -3993,7 +5318,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((4, x, n_expr.clone(), eps_bits, gamma, beta))
+        Some((4, x, dst, n_expr.clone(), eps_bits, gamma, beta))
     }
 
     /// `let inv = 1.0 / sqrt(sum + eps)` (or `rsqrt(...)`, `eps` either side, or the bare
@@ -4001,7 +5326,7 @@ impl FnLowerer<'_> {
     /// reciprocal-norm binding: like [`Self::match_inv_rstd`] but the sqrt argument is the **raw**
     /// sum-of-squares — no `/N` mean divisor (the feature that distinguishes RMSNorm). The two are
     /// structurally disjoint (a `/N` node is present xor absent), so a window matches at most one. Pure.
-    fn match_inv_l2norm(&self, stmt: &Stmt, sum: Symbol) -> Option<(Symbol, i64)> {
+    fn match_inv_l2norm(&self, stmt: &Stmt, sum: Symbol, prior: &[Stmt]) -> Option<(Symbol, i64)> {
         let (name, init) = Self::let_init(stmt)?;
         let arg = self.as_rsqrt_arg(init)?;
         // Bare `sqrt(sum)` — no eps term: eps defaults to 0.0.
@@ -4017,9 +5342,9 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        let (base, eps_bits) = if let Some(b) = self.float_lit_bits(rhs) {
+        let (base, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
             (lhs.as_ref(), b)
-        } else if let Some(b) = self.float_lit_bits(lhs) {
+        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
             (rhs.as_ref(), b)
         } else {
             return None;
@@ -4052,7 +5377,7 @@ impl FnLowerer<'_> {
         b: &Block,
         at: usize,
         batch: Option<Symbol>,
-    ) -> Option<(usize, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(usize, Symbol, Symbol, Expr, i64, Option<Symbol>, Option<Symbol>)> {
         let stmts = &b.stmts[at..];
         if stmts.len() < 4 {
             return None;
@@ -4064,12 +5389,12 @@ impl FnLowerer<'_> {
         let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
         let data_batch = batch.map(|row| (row, n_expr));
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s)?;
+        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s, &b.stmts[..at + 2])?;
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        let (gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
         // L2-normalize is non-affine; a `* gamma[i]` (or `+ beta[i]`) window is not an L2 norm.
         if gamma.is_some() || beta.is_some() {
             return None;
@@ -4081,7 +5406,7 @@ impl FnLowerer<'_> {
                 return None;
             }
         }
-        Some((4, x, n_expr.clone(), eps_bits, None, None))
+        Some((4, x, dst, n_expr.clone(), eps_bits, None, None))
     }
 
     /// Is `e` the float literal `0.0`? Pure.
@@ -4092,17 +5417,81 @@ impl FnLowerer<'_> {
     fn lower_stmt(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Let { pat, ty, init, .. } => {
-                let mty = match ty {
-                    Some(t) => mir_ty_of_ast(t, self.interner),
-                    None => init
-                        .as_ref()
-                        .map(|e| self.expr_mir(e))
-                        .unwrap_or(MirType::I32),
+                let mty = match (ty, init) {
+                    // An aggregate (struct/tuple) initializer — a literal OR a value (a call that
+                    // returns a struct/tuple by value, or an aggregate variable) — sizes its slot
+                    // from the init's registry-aware MIR type; a registry-blind annotation resolver
+                    // would fall back to `I32` for a named struct / tuple type. Array literals/repeats
+                    // are excluded so they keep their annotation-preferred path (which carries the
+                    // explicit element type + length).
+                    (_, Some(e))
+                        if matches!(self.expr_mir(e), MirType::Array(..))
+                            && !matches!(
+                                &e.kind,
+                                ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                            ) =>
+                    {
+                        self.expr_mir(e)
+                    }
+                    // An array literal/repeat *with* an annotation takes the annotation's
+                    // registry-aware MIR type (`mir_ty_of_ann`): it carries the explicit element
+                    // type + length (so an unsuffixed-literal element like `[1, 2]: [u8; 2]` takes
+                    // the annotated scalar, not the i32 default) AND — unlike a registry-blind
+                    // resolver — expands a struct/tuple element to its real byte buffer at
+                    // *any* nesting depth. The registry-blind path collapses a struct/tuple element
+                    // to the `I32` fallback, under-allocating the slot and mis-striding `a[i]`, so
+                    // `a[i].field` reads past the buffer (interp store-OOB trap / native stack
+                    // corruption). A prior single-level splice patched `[P; N]` / `[(i32,i32); N]`
+                    // but still fell back to the buggy annotation for a doubly-nested aggregate
+                    // element (`[[P; 2]; 2]`, `[[(i32,i32); 1]; 1]`) — whose annotated element is
+                    // *itself* an array — so the recursive resolver replaces it wholesale.
+                    (Some(t), Some(e))
+                        if matches!(
+                            &e.kind,
+                            ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                        ) =>
+                    {
+                        self.mir_ty_of_ann(t)
+                    }
+                    // A `let x: T;` with no initializer. Resolve `T` registry-aware so a no-init
+                    // struct/tuple local allocates its real byte buffer — a registry-blind resolver
+                    // would fall back to `i32`, under-allocating the slot so a later `p.f = …` GEPs
+                    // off an `i32` and emits MIR the verifier/Cranelift reject (an ICE).
+                    (Some(t), None) => self.mir_ty_of_ann(t),
+                    // A scalar/pointer/vector annotation *with* an initializer (aggregate inits are
+                    // caught by the earlier arms). Route through the registry- and subst-aware
+                    // `mir_ty_of_ann` — a strict superset of the free `mir_ty_of_ast` for these forms
+                    // — so a generic-typed scalar local (`let y: T = x`) resolves `T` to its concrete
+                    // instantiation instead of the `I32` default (an ICE / -O0≠-O2 divergence).
+                    (Some(t), _) => self.mir_ty_of_ann(t),
+                    (None, Some(e)) => self.expr_mir(e),
+                    (None, None) => MirType::I32,
                 };
                 let slot = self.builder.alloca(mty.clone());
                 if let Some(e) = init {
-                    if let MirType::Array(elem, n) = &mty {
-                        self.lower_array_init(slot, elem, *n, e);
+                    // A tuple/struct initializer fills the byte buffer field-by-field (the slot *is*
+                    // the buffer, like an array). Detected by the literal shape so non-aggregate
+                    // inits are unaffected.
+                    if let ExprKind::TupleLit(items) = &e.kind {
+                        let tty = self.expr_ty(e);
+                        self.lower_tuple_init(slot, &tty, items);
+                    } else if let ExprKind::StructLit { fields, .. } = &e.kind {
+                        if let Ty::Named(sym) = self.expr_ty(e) {
+                            self.lower_struct_init(slot, sym, fields, e.span);
+                        }
+                    } else if matches!(&e.kind, ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. })
+                    {
+                        if let MirType::Array(elem, n) = &mty {
+                            self.lower_array_init(slot, elem, *n, e);
+                        }
+                    } else if matches!(&mty, MirType::Array(..)) {
+                        // A non-literal aggregate value (a call returning a struct/tuple/array by
+                        // value, or another aggregate variable): the expression yields a base
+                        // pointer; deep-copy its leaves into the slot so the local owns its storage
+                        // (value semantics) and both backends agree.
+                        let src = self.lower_expr(e);
+                        let ty = self.expr_ty(e);
+                        self.emit_copy(slot, src, &ty);
                     } else {
                         let v = self.lower_expr(e);
                         self.builder.build_void(Op::Store {
@@ -4110,16 +5499,50 @@ impl FnLowerer<'_> {
                             value: v,
                         });
                     }
+                } else {
+                    // No initializer: zero-initialize the slot so a read-before-write yields a
+                    // deterministic zero on every backend — matching the interpreter oracle's
+                    // zero-initialized memory and mem2reg's read-before-write zero substitution.
+                    // Native -O0 otherwise reads stack garbage, a three-way divergence (interp 0 /
+                    // native-O0 garbage / native-O2 0 via mem2reg) that violates both hard
+                    // invariants at once. Scalars, arrays, and struct/tuple byte buffers are covered.
+                    self.zero_init(slot, &mty);
                 }
-                if let Pattern {
-                    kind: ast::PatKind::Ident(name),
-                    ..
-                } = pat
-                {
-                    self.bind(*name, slot, mty);
+                match &pat.kind {
+                    ast::PatKind::Ident(name) => self.bind(*name, slot, mty),
+                    // Destructuring `let (a, b) = …`: bind each sub-pattern to its tuple field's
+                    // place within the slot (a scalar field reads via a `Load`, an aggregate field
+                    // binds its pointer). Recurses for a nested tuple pattern.
+                    ast::PatKind::Tuple(subs) => {
+                        let tty = init
+                            .as_ref()
+                            .map(|e| self.expr_ty(e))
+                            .unwrap_or(Ty::Unknown);
+                        self.bind_tuple_pattern(slot, &tty, subs);
+                    }
+                    _ => {}
                 }
             }
             StmtKind::Assign { target, op, value } => {
+                // Whole-aggregate assignment — `*p = Pt{..}`, `s.f = other_struct`, `t.0 = (..)`,
+                // `a[i] = some_struct`. The destination is a flat byte buffer (a `MIR Array`), and a
+                // plain `Op::Store` of the RHS would store the RHS buffer's *base pointer* into the
+                // destination's first slot rather than its contents (a silent miscompile on both
+                // backends). Route it through `init_field`, which recurses a struct/tuple/array
+                // *literal* directly into the destination pointer and deep-copies a non-literal
+                // aggregate value leaf-by-leaf via `emit_copy` — the same GEP discipline that keeps
+                // the interpreter's slot-indexed and native's byte-indexed memory in agreement.
+                // (Compound assignment on an aggregate is not a valid program, so only `=`.) The
+                // aggregate check is a pure type query (`expr_mir` emits no MIR), so the common
+                // scalar path below keeps its original RHS-then-place evaluation order untouched.
+                if matches!(op, ast::AssignOp::Assign)
+                    && matches!(self.expr_mir(target), MirType::Array(..))
+                {
+                    let (ptr, _) = self.lower_place(target);
+                    let dst_ty = self.expr_ty(target);
+                    self.init_field(ptr, &dst_ty, value);
+                    return;
+                }
                 let rhs0 = self.lower_expr(value);
                 let rhs_ty = self.expr_mir(value);
                 let (ptr, elem) = self.lower_place(target);
@@ -4146,23 +5569,42 @@ impl FnLowerer<'_> {
                 self.lower_expr_stmt(e);
             }
             StmtKind::Return(opt) => {
-                let v = opt.as_ref().map(|e| self.lower_expr(e));
-                self.builder.ret(v);
+                if let Some((sret_ptr, rty)) = self.sret.clone() {
+                    // Aggregate return (sret ABI): deep-copy the value into the caller-provided
+                    // buffer — a struct/tuple *literal* recurses directly into it, a non-literal
+                    // aggregate value is copied leaf-by-leaf — then return void.
+                    if let Some(e) = opt {
+                        self.init_field(sret_ptr, &rty, e);
+                    }
+                    self.builder.ret(None);
+                } else {
+                    let v = opt.as_ref().map(|e| {
+                        let val = self.lower_expr(e);
+                        self.coerce_return_value(val, e)
+                    });
+                    self.builder.ret(v);
+                }
                 self.terminated = true;
             }
-            StmtKind::While { cond, body, .. } => self.lower_while(cond, body),
+            StmtKind::While {
+                cond, body, label, ..
+            } => self.lower_while(label.map(|l| l.sym), cond, body),
             StmtKind::For {
-                pat, iter, body, ..
-            } => self.lower_for(pat, iter, body),
-            StmtKind::Loop { body, .. } => self.lower_loop(body),
-            StmtKind::Break(_) => {
-                if let Some((_, brk)) = self.loops.last().copied() {
+                pat,
+                iter,
+                body,
+                label,
+                ..
+            } => self.lower_for(label.map(|l| l.sym), pat, iter, body),
+            StmtKind::Loop { body, label, .. } => self.lower_loop(label.map(|l| l.sym), body),
+            StmtKind::Break(label) => {
+                if let Some((_, _, brk)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     self.builder.br(brk, vec![]);
                 }
                 self.terminated = true;
             }
-            StmtKind::Continue(_) => {
-                if let Some((cont, _)) = self.loops.last().copied() {
+            StmtKind::Continue(label) => {
+                if let Some((_, cont, _)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     self.builder.br(cont, vec![]);
                 }
                 self.terminated = true;
@@ -4194,7 +5636,41 @@ impl FnLowerer<'_> {
         }
     }
 
-    fn lower_while(&mut self, cond: &Expr, body: &Block) {
+    /// Resolve a `break`/`continue` target. A labeled `'l` finds the nearest enclosing loop with
+    /// that label; an unlabeled one is the innermost loop (the top of the stack). `None` if there is
+    /// no such loop (sema rejects out-of-loop and unknown-label cases with `E0303` first, so this is
+    /// only reachable in a malformed module — the branch is simply omitted).
+    fn find_loop(
+        &self,
+        label: Option<Symbol>,
+    ) -> Option<(Option<Symbol>, mercury_mir::BlockId, mercury_mir::BlockId)> {
+        match label {
+            Some(l) => self
+                .loops
+                .iter()
+                .rev()
+                .find(|(lbl, ..)| *lbl == Some(l))
+                .copied(),
+            None => self.loops.last().copied(),
+        }
+    }
+
+    /// Coerce a `return`/tail value (lowered from `e`) to the function's declared return type, so the
+    /// emitted `Ret`/branch arg is well-typed. Without this, `fn f() -> i64 { return 0; }` returns an
+    /// `i32` literal from an `i64` function — MIR the native verifier and `mem2reg` reject while the
+    /// interpreter silently runs it (and truncates a too-wide value, a silent wrong answer). Mirrors
+    /// the coercion a `let`-annotation / argument / array-element already applies. A `Void` return
+    /// type (a unit fn) is left alone — there is no scalar to coerce.
+    fn coerce_return_value(&mut self, val: ValueId, e: &Expr) -> ValueId {
+        let to = self.builder.ret_type().clone();
+        if matches!(to, MirType::Void) {
+            return val;
+        }
+        let from = self.expr_mir(e);
+        self.coerce_to(val, &from, &to, self.signed(e))
+    }
+
+    fn lower_while(&mut self, label: Option<Symbol>, cond: &Expr, body: &Block) {
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
         let exit = self.builder.new_block();
@@ -4202,12 +5678,12 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(header);
         self.terminated = false;
-        let c = self.lower_expr(cond);
+        let c = self.lower_bool_cond(cond);
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((label, header, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -4218,13 +5694,13 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
-    fn lower_loop(&mut self, body: &Block) {
+    fn lower_loop(&mut self, label: Option<Symbol>, body: &Block) {
         let header = self.builder.new_block();
         let exit = self.builder.new_block();
         self.builder.br(header, vec![]);
         self.builder.switch_to(header);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((label, header, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -4236,11 +5712,25 @@ impl FnLowerer<'_> {
 
     /// Emit a call to the GEMM microkernel for a recognized nest. Returns `false` (and emits
     /// nothing) if any operand array is not a pointer in scope, so the caller lowers it normally.
+    /// The base pointer of a kernel operand `sym`. An array operand binds *directly* to its base
+    /// pointer (a `MirType::Array` slot value), so it is used as-is; a tensor (or pointer) operand has
+    /// MIR type `Ptr` and binds to a *slot* holding the pointer, so it must be loaded first. A no-op
+    /// for every array operand (so existing matmuls are byte-identical) — it only adds the load that
+    /// makes a shape-typed `Tensor[..]` operand reach the kernel as its actual base pointer.
+    fn kernel_base_ptr(&mut self, sym: Symbol) -> Option<ValueId> {
+        let (val, ty) = self.lookup(sym)?;
+        Some(if matches!(ty, MirType::Ptr) {
+            self.builder.build(MirType::Ptr, Op::Load(val, MirType::Ptr))
+        } else {
+            val
+        })
+    }
+
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
-        let (Some((a, _)), Some((b, _)), Some((c, _))) = (
-            self.lookup(nest.a),
-            self.lookup(nest.b),
-            self.lookup(nest.c),
+        let (Some(a), Some(b), Some(c)) = (
+            self.kernel_base_ptr(nest.a),
+            self.kernel_base_ptr(nest.b),
+            self.kernel_base_ptr(nest.c),
         ) else {
             return false;
         };
@@ -5300,6 +6790,27 @@ impl FnLowerer<'_> {
                 let a = idx_base(addend)?;
                 Some((s, RED_SUM, a, a))
             }
+            // abssum `abs(a[k])` (→ RED_SUMABS, y == a — L1 norm) or MAE/SAD `abs(a[k] - b[k])`
+            // (→ RED_ABSDIFF, two-array like ssd). `abs` is the same vectorizable primitive RED_MAXABS
+            // folds by fmax; here the kernel abs's each element and folds by `+`.
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 1
+                    && matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Abs)) =>
+            {
+                let inner = &args[0];
+                if let Some(a) = idx_base(inner) {
+                    return Some((s, RED_SUMABS, a, a));
+                }
+                if let ExprKind::Binary {
+                    op: ast::BinOp::Sub,
+                    lhs,
+                    rhs,
+                } = &inner.kind
+                {
+                    return Some((s, RED_ABSDIFF, idx_base(lhs)?, idx_base(rhs)?));
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -5388,7 +6899,7 @@ impl FnLowerer<'_> {
     fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -5507,7 +7018,7 @@ impl FnLowerer<'_> {
             return false;
         };
         // Only `0..n`; a non-zero start would need a pointer/length shift the call does not do.
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -5524,7 +7035,11 @@ impl FnLowerer<'_> {
         let Some((s_slot, MirType::F32)) = self.lookup(s) else {
             return false;
         };
-        let (Some((xv, _)), Some((yv, _))) = (self.lookup(xb), self.lookup(yb)) else {
+        // Resolve each operand's base pointer — `kernel_base_ptr` loads it out of a `Tensor[..]`/
+        // pointer param's slot (a no-op for an array operand). A plain `self.lookup(..).0` here passed
+        // a 1-D `Tensor` param's *slot address* to the kernel: the interpreter trapped while native
+        // read past the slot — the 1-D-tensor reduction divergence.
+        let (Some(xv), Some(yv)) = (self.kernel_base_ptr(xb), self.kernel_base_ptr(yb)) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -5825,7 +7340,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -5876,8 +7391,11 @@ impl FnLowerer<'_> {
     /// `s = s + mercury_dot_bf16(x, y, n)` (or `mercury_sum_bf16(x, n)`). The kernel widens bf16→f32
     /// and accumulates in f32; the interpreter marshals the identical kernel (reconstructing the bf16
     /// bits from its bf16-rounded storage), so native and interp agree bit-for-bit despite the
-    /// kernel's reassociated 8-lane accumulation. Falls back (returns false) unless the range is
-    /// `0..n`, the accumulator is an in-scope f32 scalar, and the arrays are in scope.
+    /// kernel's reassociated 8-lane accumulation. Inside a `@parallel` function the multicore
+    /// `mercury_*_bf16_parallel` / `_f16_parallel` twin fires instead (a deterministic fixed-RCHUNK
+    /// chunk fold), so a low-precision reduction runs across cores like the f32 `@parallel` reduction.
+    /// Falls back (returns false) unless the range is `0..n`, the accumulator is an in-scope f32
+    /// scalar, and the arrays are in scope.
     fn try_emit_lowp_reduction(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
         let ForIter::Range {
             start,
@@ -5888,7 +7406,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -5905,7 +7423,11 @@ impl FnLowerer<'_> {
         let Some((s_slot, MirType::F32)) = self.lookup(s) else {
             return false;
         };
-        let (Some((xv, _)), Some((yv, _))) = (self.lookup(xb), self.lookup(yb)) else {
+        // Resolve each operand's base pointer — `kernel_base_ptr` loads it out of a `Tensor[..]`/
+        // pointer param's slot (a no-op for an array operand). A plain `self.lookup(..).0` here passed
+        // a 1-D `Tensor` param's *slot address* to the kernel: the interpreter trapped while native
+        // read past the slot — the 1-D-tensor reduction divergence.
+        let (Some(xv), Some(yv)) = (self.kernel_base_ptr(xb), self.kernel_base_ptr(yb)) else {
             return false;
         };
         let n_ty = self.expr_mir(end);
@@ -5913,20 +7435,25 @@ impl FnLowerer<'_> {
         let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
         // Pick the kernel by op and precision: additive dot/sum have dedicated symbols; the max-family
         // routes through the op-coded reduce kernel. f16 uses the F16C twins, bf16 the `<<16` ones.
+        // Inside a `@parallel` function the multicore `_parallel` twin fires instead (same ABI, a
+        // deterministic fixed-RCHUNK chunk fold), so a low-precision reduction also runs across cores.
+        let par = self.parallel_fn;
         let (func, args) = match red_op {
             RED_DOT => (
-                if is_f16 {
-                    self.gemm.dot_f16
-                } else {
-                    self.gemm.dot_bf16
+                match (par, is_f16) {
+                    (false, false) => self.gemm.dot_bf16,
+                    (false, true) => self.gemm.dot_f16,
+                    (true, false) => self.gemm.dot_bf16_par,
+                    (true, true) => self.gemm.dot_f16_par,
                 },
                 vec![xv, yv, n],
             ),
             RED_SUM => (
-                if is_f16 {
-                    self.gemm.sum_f16
-                } else {
-                    self.gemm.sum_bf16
+                match (par, is_f16) {
+                    (false, false) => self.gemm.sum_bf16,
+                    (false, true) => self.gemm.sum_f16,
+                    (true, false) => self.gemm.sum_bf16_par,
+                    (true, true) => self.gemm.sum_f16_par,
                 },
                 vec![xv, n],
             ),
@@ -5935,10 +7462,11 @@ impl FnLowerer<'_> {
                     .builder
                     .build(MirType::I64, Op::ConstInt(red_op as i128, MirType::I64));
                 (
-                    if is_f16 {
-                        self.gemm.reduce_f16
-                    } else {
-                        self.gemm.reduce_bf16
+                    match (par, is_f16) {
+                        (false, false) => self.gemm.reduce_bf16,
+                        (false, true) => self.gemm.reduce_f16,
+                        (true, false) => self.gemm.reduce_bf16_par,
+                        (true, true) => self.gemm.reduce_f16_par,
                     },
                     vec![xv, n, opv],
                 )
@@ -5989,7 +7517,7 @@ impl FnLowerer<'_> {
         pat: &Pattern,
         iter: &ForIter,
         body: &Block,
-    ) -> Option<(Symbol, Expr, i64, i64, Option<Symbol>, Option<Symbol>)> {
+    ) -> Option<(Symbol, Symbol, Expr, i64, i64, Option<Symbol>, Option<Symbol>)> {
         let ForIter::Range {
             start,
             end: Some(_),
@@ -5999,7 +7527,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner) != Some(0) {
+        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
             return None;
         }
         let Pattern {
@@ -6017,23 +7545,26 @@ impl FnLowerer<'_> {
         }
         if let Some((consumed, x, cols)) = self.match_softmax(body, 0, Some(*r)) {
             if consumed == body.stmts.len() {
-                return Some((x, cols, 0, NORM_SOFTMAX, None, None));
+                return Some((x, x, cols, 0, NORM_SOFTMAX, None, None));
             }
         }
-        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_layernorm(body, 0, Some(*r))
+        if let Some((consumed, x, dst, cols, eps, gamma, beta)) =
+            self.match_layernorm(body, 0, Some(*r))
         {
             if consumed == body.stmts.len() {
-                return Some((x, cols, eps, NORM_LAYERNORM, gamma, beta));
+                return Some((x, dst, cols, eps, NORM_LAYERNORM, gamma, beta));
             }
         }
-        if let Some((consumed, x, cols, eps, gamma, beta)) = self.match_rmsnorm(body, 0, Some(*r)) {
+        if let Some((consumed, x, dst, cols, eps, gamma, beta)) =
+            self.match_rmsnorm(body, 0, Some(*r))
+        {
             if consumed == body.stmts.len() {
-                return Some((x, cols, eps, NORM_RMSNORM, gamma, beta));
+                return Some((x, dst, cols, eps, NORM_RMSNORM, gamma, beta));
             }
         }
-        if let Some((consumed, x, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
+        if let Some((consumed, x, dst, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
             if consumed == body.stmts.len() {
-                return Some((x, cols, eps, NORM_L2NORM, None, None));
+                return Some((x, dst, cols, eps, NORM_L2NORM, None, None));
             }
         }
         None
@@ -6046,13 +7577,14 @@ impl FnLowerer<'_> {
         let ForIter::Range { end: Some(end), .. } = iter else {
             return false;
         };
-        if let Some((x, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body) {
-            return self.emit_norm(x, Some(end), &cols, eps, op, gamma, beta);
+        if let Some((x, dst, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body)
+        {
+            return self.emit_norm(x, dst, Some(end), &cols, eps, op, gamma, beta);
         }
         false
     }
 
-    fn lower_for(&mut self, pat: &Pattern, iter: &ForIter, body: &Block) {
+    fn lower_for(&mut self, label: Option<Symbol>, pat: &Pattern, iter: &ForIter, body: &Block) {
         // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
         // whole-function `@parallel` form is handled earlier in `lower_program`).
         if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
@@ -6297,13 +7829,35 @@ impl FnLowerer<'_> {
                 step,
             } => (start, end, *inclusive, step),
             _ => {
+                // `for <pat> in arr` over a fixed-size array desugars to the indexed range loop
+                // `for i in 0..N { let <pat> = arr[i]; <body> }` — a pure front-end rewrite reusing
+                // the existing Gep/Load/CFG, so the interpreter and native backend agree bit-for-bit
+                // with no backend change. Anything not a statically-sized array (a tensor, slice,
+                // dynamic length, or a non-`Ident`/`_` pattern) declines and stays unsupported.
+                if let ForIter::Expr(e) = iter {
+                    if self.lower_for_array(label, pat, e, body) {
+                        return;
+                    }
+                }
                 self.unsupported(body.span, "for over a non-range iterator");
                 return;
             }
         };
 
-        let ity = self.expr_mir(start);
-        let signed = self.signed(start);
+        // Drive the loop by the wider of the start/end bound types: a literal-`0` start lowers to
+        // `i32`, so `for i in 0..n` with `n: i64` would make an `i32` counter and then compare it to
+        // the `i64` end — verifier-invalid MIR (`cmp.i32 i32, i64`) that crashed the native backend.
+        // (Only the *scalar* loop hit this: an array loop vectorizes this away, so the bug surfaced
+        // only on the tensor-param path, which the vectorizer declines.) The body's index arithmetic
+        // widens with the counter. The `@parallel` range path already drives by the end's type.
+        let sty = self.expr_mir(start);
+        let ety = self.expr_mir(end);
+        let (ity, signed) = if ety.is_int() && sty.is_int() && mir_byte_size(&ety) > mir_byte_size(&sty)
+        {
+            (ety.clone(), self.signed(end))
+        } else {
+            (sty.clone(), self.signed(start))
+        };
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
         // `mercury_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
@@ -6321,6 +7875,7 @@ impl FnLowerer<'_> {
         // i = start
         let slot = self.builder.alloca(ity.clone());
         let s0 = self.lower_expr(start);
+        let s0 = self.coerce_to(s0, &sty, &ity, signed);
         self.builder.build_void(Op::Store {
             ptr: slot,
             value: s0,
@@ -6337,6 +7892,7 @@ impl FnLowerer<'_> {
 
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
+        let latch = self.builder.new_block();
         let exit = self.builder.new_block();
         self.builder.br(header, vec![]);
 
@@ -6345,6 +7901,7 @@ impl FnLowerer<'_> {
         self.terminated = false;
         let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
         let end_val = self.lower_expr(end);
+        let end_val = self.coerce_to(end_val, &ety, &ity, signed);
         let pred = match (inclusive, signed) {
             (false, true) => CmpOp::Slt,
             (true, true) => CmpOp::Sle,
@@ -6356,33 +7913,171 @@ impl FnLowerer<'_> {
             .build(MirType::I1, Op::Cmp(pred, i_val, end_val));
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
-        // body; i += step
+        // body. `continue` must target the *latch* (which performs `i += step`), not the header, or
+        // the step is skipped and `for i in 0..n { …; continue; }` loops forever (the step lives at
+        // the body's tail, unlike a `while`, whose header re-evaluates the user's own condition).
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((header, exit));
+        self.loops.push((label, latch, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
-            let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let step_val = match step {
-                Some(st) => self.lower_expr(st),
-                None => self
-                    .builder
-                    .build(ity.clone(), Op::ConstInt(1, ity.clone())),
-            };
-            let next = self
-                .builder
-                .build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
-            self.builder.build_void(Op::Store {
-                ptr: slot,
-                value: next,
-            });
-            self.builder.br(header, vec![]);
+            self.builder.br(latch, vec![]);
         }
+
+        // latch: i += step; back to the header. Reached by the body's fall-through and every
+        // `continue`, so the loop variable always advances.
+        self.builder.switch_to(latch);
+        self.terminated = false;
+        let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let step_val = match step {
+            Some(st) => self.lower_expr(st),
+            None => self
+                .builder
+                .build(ity.clone(), Op::ConstInt(1, ity.clone())),
+        };
+        let next = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, cur, step_val));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
 
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
+    }
+
+    /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array — into the same
+    /// CFG the indexed range loop `for i in 0..N { let <pat> = <array>[i]; <body> }` produces.
+    /// Returns `true` if it handled the loop. It fires only when the iterand's sema type is a
+    /// statically sized `[T; N]` and the pattern is an identifier (`for x in a`) or `_` wildcard
+    /// (`for _ in a`); anything else (a tensor, slice, dynamic length, or a destructuring pattern)
+    /// returns `false` so the caller emits the existing `unsupported` diagnostic. Pure desugaring:
+    /// the array base pointer + per-iteration `Gep`/`Load` are exactly what `for i in 0..N { let x
+    /// = a[i]; … }` already lowers to, so the interpreter and native backend agree bit-for-bit with
+    /// **no backend change** (and `-O0`==`-O3`, since recognition runs pre-opt like the rest).
+    fn lower_for_array(
+        &mut self,
+        label: Option<Symbol>,
+        pat: &Pattern,
+        e: &Expr,
+        body: &Block,
+    ) -> bool {
+        // Only a bare identifier (`for x in a`) or wildcard (`for _ in a`) is supported; a
+        // destructuring / literal pattern declines to the `unsupported` fallback.
+        let bind_name = match &pat.kind {
+            ast::PatKind::Ident(name) => Some(*name),
+            ast::PatKind::Wildcard => None,
+            _ => return false,
+        };
+        // The iterand must be a fixed-size array; its length N and element type come straight from
+        // sema. A tensor / slice / dynamic-length iterand has no `Ty::Array` here, so it declines.
+        let Ty::Array { elem, len } = self.expr_ty(e) else {
+            return false;
+        };
+        let elem_mir = self.mir_ty_of(&elem);
+        let n = len as i128;
+
+        // The array's base pointer, evaluated once before the loop. An array local/param's bound
+        // `ValueId` *is* its base pointer; any other array-typed expression (a struct field, an
+        // element of an array-of-arrays, an array literal) likewise lowers to its base address (the
+        // by-pointer convention `lower_expr` upholds for every aggregate), so a base pointer is
+        // always recoverable for a `Ty::Array` iterand.
+        let base_ptr = self.lower_expr(e);
+
+        // i = 0 — the hidden induction variable, I64 like the array-index GEPs.
+        let ity = MirType::I64;
+        let slot = self.builder.alloca(ity.clone());
+        let zero = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(0, ity.clone()));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: zero,
+        });
+
+        self.push_scope();
+
+        let header = self.builder.new_block();
+        let body_bb = self.builder.new_block();
+        let latch = self.builder.new_block();
+        let exit = self.builder.new_block();
+        self.builder.br(header, vec![]);
+
+        // header: i < N
+        self.builder.switch_to(header);
+        self.terminated = false;
+        let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let nval = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(n, ity.clone()));
+        let c = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, nval));
+        self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
+
+        // body: bind `<pat>` to `array[i]`, then lower the user body. `continue` targets the
+        // *latch* (which performs `i += 1`), matching the range-`for` so `continue` advances.
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
+        if let Some(name) = bind_name {
+            let i_cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+            let elem_ptr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base_ptr,
+                    index: i_cur,
+                    elem: elem_mir.clone(),
+                },
+            );
+            if matches!(elem_mir, MirType::Array(..)) {
+                // An aggregate element (struct / tuple / array) binds **by pointer** — `x.field`
+                // / `x[k]` / `x.0` GEP off it — exactly as the `a[i]` aggregate read arm does.
+                self.bind(name, elem_ptr, elem_mir.clone());
+            } else {
+                // A scalar element loads into a fresh slot (hoisted to the entry block), so the
+                // loop variable is an ordinary mutable local — the faithful `let x = a[i]`.
+                let v = self
+                    .builder
+                    .build(elem_mir.clone(), Op::Load(elem_ptr, elem_mir.clone()));
+                let xslot = self.builder.alloca(elem_mir.clone());
+                self.builder.build_void(Op::Store {
+                    ptr: xslot,
+                    value: v,
+                });
+                self.bind(name, xslot, elem_mir.clone());
+            }
+        }
+        self.loops.push((label, latch, exit));
+        self.lower_block(body);
+        self.loops.pop();
+        if !self.terminated {
+            self.builder.br(latch, vec![]);
+        }
+
+        // latch: i += 1; back to the header (reached by fall-through and every `continue`).
+        self.builder.switch_to(latch);
+        self.terminated = false;
+        let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let one = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let next = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
+
+        self.pop_scope();
+        self.builder.switch_to(exit);
+        self.terminated = false;
+        true
     }
 
     // ============================ SIMD loop vectorizer ============================
@@ -6614,16 +8309,18 @@ impl FnLowerer<'_> {
         j: Symbol,
         body: &Block,
         batch: Option<(Symbol, &Expr)>,
-    ) -> Option<Vec<(ValueId, ValueId, u32, MirType)>> {
+    ) -> Option<Vec<(Symbol, Symbol, u32, MirType)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
             let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j, batch)?;
-            let (out_base, _) = self.lookup(out_sym)?;
-            let (x_base, _) = self.lookup(x_sym)?;
-            calls.push((out_base, x_base, opcode, in_elem));
+            // Keep the operand *symbols* (validated in scope); the base pointer is resolved at emit
+            // time via `kernel_base_ptr`, which loads it out of a `Tensor[..]`/pointer param's slot.
+            self.lookup(out_sym)?;
+            self.lookup(x_sym)?;
+            calls.push((out_sym, x_sym, opcode, in_elem));
         }
         Some(calls)
     }
@@ -6635,10 +8332,18 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        calls: Vec<(ValueId, ValueId, u32, MirType)>,
+        calls: Vec<(Symbol, Symbol, u32, MirType)>,
     ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        for (out_base, x_base, opcode, in_elem) in calls {
+        for (out_sym, x_sym, opcode, in_elem) in calls {
+            // Resolve each operand's base pointer (a `Load` out of a `Tensor[..]`/pointer param's
+            // slot, a no-op for an array). The matcher validated every symbol.
+            let out_base = self
+                .kernel_base_ptr(out_sym)
+                .expect("vmath `out` operand validated in matcher");
+            let x_base = self
+                .kernel_base_ptr(x_sym)
+                .expect("vmath `x` operand validated in matcher");
             // The input strides by its element width (f32/bf16/f16) through the matching kernel; the
             // output is always f32.
             let func = match in_elem {
@@ -6715,7 +8420,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(r_start, self.interner) != Some(0) {
+        if const_usize_expr(r_start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -6747,7 +8452,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(j_start, self.interner) != Some(0) {
+        if const_usize_expr(j_start, self.interner, &self.sema.consts) != Some(0) {
             return false;
         }
         let Pattern {
@@ -6788,11 +8493,11 @@ impl FnLowerer<'_> {
             return None;
         };
         let out_sym = self.index_by_loopvar(target, j)?;
-        // Gated-FFN activation `out[j] = act(a[j]) * b[j]` (SwiGLU/GeGLU): a Mul of a *one-arg*
-        // activation call (silu/gelu) on `a[j]` and a second unit-stride array read `b[j]` (either
-        // factor order). Folds to `mercury_vmath2_f32(a, b, out, n, VMATH2_*_GATE)` — the kernel
-        // computes act(a)·b, so the activated operand must be passed *first*. Tried before the 2-arg
-        // call shape below. The activation folds an exp C/Rust keep scalar, so the 256-bit gate wins.
+        // Gated-FFN activation `out[j] = act(a[j]) * b[j]` (SwiGLU/GeGLU/GLU): a Mul of a *one-arg*
+        // activation call (silu/gelu/sigmoid) on `a[j]` and a second unit-stride array read `b[j]`
+        // (either factor order). Folds to `mercury_vmath2_f32(a, b, out, n, VMATH2_*_GATE)` — the
+        // kernel computes act(a)·b, so the activated operand must be passed *first*. Tried before the
+        // 2-arg call shape below. The activation folds an exp C/Rust keep scalar, so the gate wins.
         if let ExprKind::Binary {
             op: ast::BinOp::Mul,
             lhs,
@@ -6805,6 +8510,7 @@ impl FnLowerer<'_> {
                         let gop = match self.vectorizable_intrinsic(callee) {
                             Some(MathIntrinsic::Silu) => Some(VMATH2_SILU_GATE),
                             Some(MathIntrinsic::Gelu) => Some(VMATH2_GELU_GATE),
+                            Some(MathIntrinsic::Sigmoid) => Some(VMATH2_SIGMOID_GATE),
                             _ => None,
                         };
                         if let Some(gop) = gop {
@@ -6864,17 +8570,19 @@ impl FnLowerer<'_> {
         &self,
         j: Symbol,
         body: &Block,
-    ) -> Option<Vec<(ValueId, ValueId, ValueId, u32)>> {
+    ) -> Option<Vec<(Symbol, Symbol, Symbol, u32)>> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
         let mut calls = Vec::with_capacity(body.stmts.len());
         for stmt in &body.stmts {
             let (out_sym, x_sym, y_sym, opcode) = self.match_vmath2_stmt(stmt, j)?;
-            let (out_base, _) = self.lookup(out_sym)?;
-            let (x_base, _) = self.lookup(x_sym)?;
-            let (y_base, _) = self.lookup(y_sym)?;
-            calls.push((out_base, x_base, y_base, opcode));
+            // Keep the operand symbols; the base pointer is resolved (loaded from a tensor slot) at
+            // emit time via `kernel_base_ptr`.
+            self.lookup(out_sym)?;
+            self.lookup(x_sym)?;
+            self.lookup(y_sym)?;
+            calls.push((out_sym, x_sym, y_sym, opcode));
         }
         Some(calls)
     }
@@ -6884,10 +8592,19 @@ impl FnLowerer<'_> {
         &mut self,
         s: ValueId,
         e: ValueId,
-        calls: Vec<(ValueId, ValueId, ValueId, u32)>,
+        calls: Vec<(Symbol, Symbol, Symbol, u32)>,
     ) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-        for (out_base, x_base, y_base, opcode) in calls {
+        for (out_sym, x_sym, y_sym, opcode) in calls {
+            let out_base = self
+                .kernel_base_ptr(out_sym)
+                .expect("vmath2 `out` operand validated in matcher");
+            let x_base = self
+                .kernel_base_ptr(x_sym)
+                .expect("vmath2 `x` operand validated in matcher");
+            let y_base = self
+                .kernel_base_ptr(y_sym)
+                .expect("vmath2 `y` operand validated in matcher");
             let gep = |this: &mut Self, base: ValueId, elem: MirType| {
                 this.builder.build(
                     MirType::Ptr,
@@ -7009,17 +8726,18 @@ impl FnLowerer<'_> {
             return None;
         }
         let (x_sym, a) = arrays[0];
-        let x = self.lookup(x_sym)?.0;
+        self.lookup(x_sym)?; // validate the array/tensor is a bound local/param
         let (y, b, op_y) = if arrays.len() == 2 {
             let (y_sym, b) = arrays[1];
-            (Some(self.lookup(y_sym)?.0), b, VE_USE_Y)
+            self.lookup(y_sym)?;
+            (Some(y_sym), b, VE_USE_Y)
         } else {
             (None, None, 0)
         };
-        let out = self.lookup(out_sym)?.0;
+        self.lookup(out_sym)?;
         Some(VElemPlan {
-            out,
-            x,
+            out: out_sym,
+            x: x_sym,
             y,
             a,
             b,
@@ -7062,10 +8780,13 @@ impl FnLowerer<'_> {
         if self.expr_mir(lhs) != MirType::F32 || self.expr_mir(rhs) != MirType::F32 {
             return None;
         }
+        self.lookup(out_sym)?;
+        self.lookup(x_sym)?;
+        self.lookup(y_sym)?;
         Some(VElemPlan {
-            out: self.lookup(out_sym)?.0,
-            x: self.lookup(x_sym)?.0,
-            y: Some(self.lookup(y_sym)?.0),
+            out: out_sym,
+            x: x_sym,
+            y: Some(y_sym),
             a: None,
             b: None,
             c: None,
@@ -7159,6 +8880,17 @@ impl FnLowerer<'_> {
     /// pointer — no need for a Ptr-typed null const, which is invalid MIR).
     fn emit_velem_call(&mut self, s: ValueId, e: ValueId, plan: &VElemPlan) {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        // Resolve each operand's base pointer (loading it out of the slot for a `Tensor[..]`/pointer
+        // param; a no-op for an array operand). The matcher validated every symbol, so this resolves.
+        let x_base = self
+            .kernel_base_ptr(plan.x)
+            .expect("velem `x` operand validated in matcher");
+        let y_base = plan
+            .y
+            .map(|y| self.kernel_base_ptr(y).expect("velem `y` operand validated in matcher"));
+        let out_base = self
+            .kernel_base_ptr(plan.out)
+            .expect("velem `out` operand validated in matcher");
         let gep = |me: &mut Self, base: ValueId| {
             me.builder.build(
                 MirType::Ptr,
@@ -7169,12 +8901,12 @@ impl FnLowerer<'_> {
                 },
             )
         };
-        let xp = gep(self, plan.x);
-        let yp = match plan.y {
+        let xp = gep(self, x_base);
+        let yp = match y_base {
             Some(y) => gep(self, y),
             None => xp,
         };
-        let outp = gep(self, plan.out);
+        let outp = gep(self, out_base);
         // Default `b` is 1.0 when `y` is read, else 0.0 (unused); `a` defaults to 1.0, `c` to 0.0.
         let a = self.lower_coeff(plan.a, 1.0);
         let b = self.lower_coeff(plan.b, if plan.y.is_some() { 1.0 } else { 0.0 });
@@ -8016,7 +9748,9 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(bb);
         self.terminated = false;
-        self.loops.push((hdr, exit));
+        // A vectorized loop body has no break/continue (vectorizability rejects them), so it never
+        // needs a label.
+        self.loops.push((None, hdr, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
@@ -8602,7 +10336,21 @@ impl FnLowerer<'_> {
                 }
                 Some(MathIntrinsic::Abs) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
-                    self.emit_abs(x, vty)
+                    if lane.is_int() {
+                        // Integer abs is `select(x < 0, -x, x)` (signed, matching the scalar
+                        // `emit_int_abs`). The float `emit_abs` (FSub/Cmp(Fogt)/Select) would emit a
+                        // float op on an int vector — MIR the verifier and Cranelift reject, which the
+                        // interpreter ran lossily at -O0; the same guard the scalar path already has.
+                        let zero = self.splat_const_i(0, vty);
+                        let neg = self
+                            .builder
+                            .build(vty.clone(), Op::Bin(BinOp::Sub, zero, x));
+                        let mty = MirType::Vec(Box::new(mask_lane_type(lane)), w);
+                        let isneg = self.builder.build(mty, Op::Cmp(CmpOp::Slt, x, zero));
+                        self.builder.build(vty.clone(), Op::Select(isneg, neg, x))
+                    } else {
+                        self.emit_abs(x, vty)
+                    }
                 }
                 Some(
                     op @ (MathIntrinsic::Round
@@ -8611,8 +10359,14 @@ impl FnLowerer<'_> {
                     | MathIntrinsic::Trunc),
                 ) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
-                    self.builder
-                        .build(vty.clone(), Op::Round(round_mode(op), x))
+                    if lane.is_int() {
+                        // Rounding an integer is the identity (matching the scalar guard); `Op::Round`
+                        // is a float op the verifier rejects on an int vector.
+                        x
+                    } else {
+                        self.builder
+                            .build(vty.clone(), Op::Round(round_mode(op), x))
+                    }
                 }
                 Some(op @ (MathIntrinsic::Fmax | MathIntrinsic::Fmin)) => {
                     let a = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -8917,6 +10671,7 @@ impl FnLowerer<'_> {
 
         let header = self.builder.new_block();
         let body_bb = self.builder.new_block();
+        let latch = self.builder.new_block();
         let exit = self.builder.new_block();
         self.builder.br(header, vec![]);
 
@@ -8928,32 +10683,82 @@ impl FnLowerer<'_> {
             .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, end));
         self.builder.cond_br(c, body_bb, vec![], exit, vec![]);
 
+        // `continue` targets the latch (the increment), not the header — see `lower_for`.
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        self.loops.push((header, exit));
+        // The `@parallel` per-thread ranged loop carries no user label (a labeled break across the
+        // parallel boundary is not modeled); an unlabeled break/continue still targets it.
+        self.loops.push((None, latch, exit));
         self.lower_block(body);
         self.loops.pop();
         if !self.terminated {
-            let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let one = self
-                .builder
-                .build(ity.clone(), Op::ConstInt(1, ity.clone()));
-            let next = self
-                .builder
-                .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
-            self.builder.build_void(Op::Store {
-                ptr: slot,
-                value: next,
-            });
-            self.builder.br(header, vec![]);
+            self.builder.br(latch, vec![]);
         }
+
+        self.builder.switch_to(latch);
+        self.terminated = false;
+        let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        let one = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let next = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Add, cur, one));
+        self.builder.build_void(Op::Store {
+            ptr: slot,
+            value: next,
+        });
+        self.builder.br(header, vec![]);
+
         self.pop_scope();
         self.builder.switch_to(exit);
         self.terminated = false;
     }
 
+    /// Lower a condition used in a **boolean context** — the condition of `if`/`while`, the operands
+    /// of short-circuit `&&`/`||`, and the argument of `assert` — normalizing it to an `i1`.
+    ///
+    /// The language deliberately permits a C-like non-bool scalar condition (`if 5 {}`, `if x {}`):
+    /// a nonzero value is true. An `i1`/integer condition is already consistent across both backends
+    /// (nonzero int = true) and passes through unchanged. A **float** condition, however, must be
+    /// normalized to `cond != 0.0` (an `Op::Cmp(Fone)` against a float zero of the same type,
+    /// yielding an `i1`): otherwise the native (Cranelift) backend's `brif`/`fcvt` truncates
+    /// `0.5 -> 0` (so `assert(0.5)` wrongly traps) or rejects the float controlling type outright
+    /// (`brif.f32 ... has an invalid controlling type`), while the interpreter applied a *different*
+    /// truthiness (`f != 0.0` in its `assert` arm vs `as_int() != 0` for `if`/`while`, which itself
+    /// truncates `0.5 -> 0`) — a three-way divergence on a program the front-end accepts. Emitting
+    /// the compare here makes the condition an `i1` *before* it reaches any backend, so they all
+    /// agree. `NaN != 0.0` is true (intentional C-like truthiness — the interpreter's Rust `!=` and
+    /// Cranelift's `FloatCC::NotEqual` both treat NaN as nonzero/true). The integer/`i1` path is
+    /// untouched.
+    fn lower_bool_cond(&mut self, cond: &Expr) -> ValueId {
+        let v = self.lower_expr(cond);
+        let ty = self.expr_mir(cond);
+        if ty == MirType::I1 {
+            // Already a boolean (a comparison result — the common case). Pass through unchanged.
+            v
+        } else if ty.is_float() {
+            let zero = self
+                .builder
+                .build(ty.clone(), Op::ConstFloat(0.0, ty.clone()));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Fone, v, zero))
+        } else if ty.is_int() {
+            // A non-bool integer condition (`if 5`, `if x` for `x: i32`): C-like truthiness, nonzero
+            // is true. Normalize to `cond != 0` -> i1 so `cond_br` never receives a wider integer.
+            // The verifier accepts that at -O0 but mem2reg rejects it at -O2 ("cond_br condition has
+            // type i32 but expected i1") — a latent compiler crash at -O2 on a program the front-end
+            // accepts. The bool/i1 path above is untouched, so the comparison-condition corpus is
+            // unaffected.
+            let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
+            self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
+        } else {
+            v
+        }
+    }
+
     fn lower_if(&mut self, cond: &Expr, then_branch: &Block, else_branch: Option<&Expr>) {
-        let c = self.lower_expr(cond);
+        let c = self.lower_bool_cond(cond);
         let then_bb = self.builder.new_block();
         let merge = self.builder.new_block();
         let else_bb = if else_branch.is_some() {
@@ -8996,8 +10801,11 @@ impl FnLowerer<'_> {
     ) -> ValueId {
         let result_ty = self.expr_mir(e);
         let produces_value = else_branch.is_some() && result_ty != MirType::Void;
+        // An aggregate result flows as its base pointer, so the merge param is `Ptr` (see
+        // `merge_repr_ty`); scalars are unchanged.
+        let merge_ty = merge_repr_ty(&result_ty);
 
-        let c = self.lower_expr(cond);
+        let c = self.lower_bool_cond(cond);
         let then_bb = self.builder.new_block();
         let merge = self.builder.new_block();
         let else_bb = if else_branch.is_some() {
@@ -9006,20 +10814,38 @@ impl FnLowerer<'_> {
             merge
         };
         let merge_param = if produces_value {
-            Some(self.builder.block_param(merge, result_ty.clone()))
+            Some(self.builder.block_param(merge, merge_ty.clone()))
         } else {
             None
         };
         self.builder.cond_br(c, then_bb, vec![], else_bb, vec![]);
+
+        // Whether any edge reaches `merge`. With no `else` the `cond_br` false edge targets `merge`
+        // directly, so it is always reachable; with an `else`, `merge` lives only if the then- or
+        // else-arm falls through (does not `return`). When both arms diverge, `merge` is dead and is
+        // terminated `Unreachable` below rather than left carrying a mistyped placeholder.
+        let mut merge_reachable = else_branch.is_none();
 
         // then arm
         self.builder.switch_to(then_bb);
         self.terminated = false;
         let tv = self.lower_block(then_branch);
         if !self.terminated {
+            merge_reachable = true;
             let args = match (merge_param.is_some(), tv) {
-                (true, Some(v)) => vec![v],
-                (true, None) => vec![self.const_zero(result_ty.clone())],
+                (true, Some(v)) => {
+                    // Coerce the arm's value to the merged result type (the join of the two arms) so
+                    // both arms pass the merge param the *same* MIR type. Without this, arms of
+                    // different width/kind (`if c { 1 } else { 2.5 }`) pass a mismatched value: the
+                    // native verifier rejects the merge while the interpreter runs loosely — a
+                    // backend divergence on a program the front-end accepted.
+                    let (from, signed) = match &then_branch.tail {
+                        Some(t) => (self.expr_mir(t), self.signed(t)),
+                        None => (result_ty.clone(), true),
+                    };
+                    vec![self.coerce_to(v, &from, &merge_ty, signed)]
+                }
+                (true, None) => vec![self.const_zero(merge_ty.clone())],
                 (false, _) => vec![],
             };
             self.builder.br(merge, args);
@@ -9031,8 +10857,10 @@ impl FnLowerer<'_> {
             self.terminated = false;
             let ev = self.lower_expr(els);
             if !self.terminated {
+                merge_reachable = true;
                 let args = if merge_param.is_some() {
-                    vec![ev]
+                    let from = self.expr_mir(els);
+                    vec![self.coerce_to(ev, &from, &merge_ty, self.signed(els))]
                 } else {
                     vec![]
                 };
@@ -9041,15 +10869,28 @@ impl FnLowerer<'_> {
         }
 
         self.builder.switch_to(merge);
-        self.terminated = false;
-        match merge_param {
+        let placeholder_ty = if result_ty == MirType::Void {
+            MirType::I32
+        } else {
+            merge_ty
+        };
+        let result = match merge_param {
             Some(p) => p,
-            None => self.const_zero(if result_ty == MirType::Void {
-                MirType::I32
-            } else {
-                result_ty
-            }),
+            None => self.const_zero(placeholder_ty),
+        };
+        if merge_reachable {
+            self.terminated = false;
+        } else {
+            // Both arms diverged (each `return`s), so nothing reaches `merge`. Terminate it
+            // `Unreachable` and mark the path terminated so the caller (`lower_block`/`lower_fn`)
+            // treats the whole `if` as diverging and emits no fallthrough `ret` carrying this dead
+            // placeholder — which, mistyped as `i32` for a non-i32 return, was a -O0 MIR-verify ICE
+            // while -O1+ deleted the dead block before verification (a -O0 ≠ -O{1,2,3} gate violation).
+            self.builder
+                .set_term(mercury_mir::Terminator::Unreachable);
+            self.terminated = true;
         }
+        result
     }
 
     // ---- places (lvalues) ----
@@ -9057,18 +10898,39 @@ impl FnLowerer<'_> {
     /// Initialize an array alloca (`base`) of `n` elements of type `elem` from an array-literal or
     /// array-repeat initializer, storing each element through a `gep`.
     fn lower_array_init(&mut self, base: ValueId, elem: &MirType, n: u32, init: &Expr) {
+        // An aggregate element (an array of structs/tuples — `elem` is a byte-buffer `Array`) must be
+        // deep-copied into each element slot; a plain `store_element` would store the element's base
+        // *pointer* as a scalar (a silent miscompile). A scalar element keeps the store path.
+        let aggregate = matches!(elem, MirType::Array(..));
         match &init.kind {
             ExprKind::ArrayLit(elems) => {
                 for (i, el) in elems.iter().enumerate() {
-                    let v0 = self.lower_expr(el);
-                    let vty = self.expr_mir(el);
-                    // Coerce to the element type so e.g. a `[bf16; N]` literal stores bf16-rounded
-                    // 16-bit values, not raw f32. A no-op when the element already matches.
-                    let v = self.coerce_to(v0, &vty, elem, self.signed(el));
-                    self.store_element(base, elem, i as i128, v);
+                    if aggregate {
+                        let ep = self.gep_elem(base, elem, i as i128);
+                        let ety = self.expr_ty(el);
+                        self.init_field(ep, &ety, el);
+                    } else {
+                        let v0 = self.lower_expr(el);
+                        let vty = self.expr_mir(el);
+                        // Coerce to the element type so e.g. a `[bf16; N]` literal stores bf16-rounded
+                        // 16-bit values, not raw f32. A no-op when the element already matches.
+                        let v = self.coerce_to(v0, &vty, elem, self.signed(el));
+                        self.store_element(base, elem, i as i128, v);
+                    }
                 }
             }
             ExprKind::ArrayRepeat { value, .. } => {
+                if aggregate {
+                    // `[agg; n]`: deep-copy the aggregate into every element slot. Re-emitting the
+                    // literal/copy per element is correct (each element owns its storage); the scalar
+                    // fill-loop path below does not apply.
+                    let ety = self.expr_ty(value);
+                    for i in 0..n as i128 {
+                        let ep = self.gep_elem(base, elem, i);
+                        self.init_field(ep, &ety, value);
+                    }
+                    return;
+                }
                 // `[value; n]` evaluates `value` once and fills every slot with it. Small arrays
                 // unroll to straight-line stores; large ones lower to a fill loop so that, e.g.,
                 // `[0; 1_000_000]` does not generate a million instructions.
@@ -9162,6 +11024,64 @@ impl FnLowerer<'_> {
             },
         );
         self.builder.build_void(Op::Store { ptr: p, value });
+    }
+
+    /// Pointer to byte offset `off` within an aggregate buffer `base`. Using `elem = I8` makes the
+    /// GEP index raw bytes (Cranelift scales by `size_of(I8) = 1`; the interpreter, which indexes
+    /// slots, uses the byte offset directly — distinct field offsets never alias, so both backends
+    /// observe the same field values). This is the one primitive tuple/struct field access needs.
+    fn field_ptr(&mut self, base: ValueId, off: u64) -> ValueId {
+        let idx = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(off as i128, MirType::I64));
+        self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index: idx,
+                elem: MirType::I8,
+            },
+        )
+    }
+
+    /// Lower a tuple literal `(a, b, …)` into the byte buffer at `base`: each field is initialized at
+    /// its padded byte offset (`aggregate_layout` is the registry-aware layout authority). A field
+    /// that is itself a struct/tuple/array recurses via `init_field`; a scalar field is coerced to
+    /// its type and stored (so a narrowing field, e.g. a `bf16`, rounds on store).
+    fn lower_tuple_init(&mut self, base: ValueId, tuple_ty: &Ty, items: &[Expr]) {
+        let Ty::Tuple(field_tys) = tuple_ty else {
+            return;
+        };
+        let Some((offsets, _, _)) = self.aggregate_layout(field_tys) else {
+            if let Some(first) = items.first() {
+                self.unsupported(first.span, "tuple with an unsized field");
+            }
+            return;
+        };
+        let plan: Vec<(u64, Ty)> = offsets.into_iter().zip(field_tys.iter().cloned()).collect();
+        for (item, (off, fty)) in items.iter().zip(plan) {
+            let p = self.field_ptr(base, off);
+            self.init_field(p, &fty, item);
+        }
+    }
+
+    /// Address + MIR type of tuple field `index` of the tuple expression `base`. The tuple local's
+    /// value *is* its buffer pointer (an `Array`-typed slot returns the slot directly), so this just
+    /// GEPs to the field's padded byte offset. Drives both reads (`t.0`) and writes (`t.0 = …`).
+    fn tuple_field_place(&mut self, base: &Expr, index: usize) -> (ValueId, MirType) {
+        if let Ty::Tuple(fields) = self.expr_ty(base) {
+            if let Some((offsets, _, _)) = self.aggregate_layout(&fields) {
+                if let (Some(&off), Some(fty)) = (offsets.get(index), fields.get(index)) {
+                    let fmty = self.mir_ty_of(fty);
+                    let base_ptr = self.place_base_ptr(base);
+                    let p = self.field_ptr(base_ptr, off);
+                    return (p, fmty);
+                }
+            }
+        }
+        self.unsupported(base.span, "tuple field access");
+        let ty = MirType::I32;
+        (self.builder.alloca(ty.clone()), ty)
     }
 
     /// Row-major element strides for a tensor `base`, if computable. `stride_k` = product of the
@@ -9272,12 +11192,15 @@ impl FnLowerer<'_> {
                 (ptr, self.expr_mir(e))
             }
             ExprKind::Index { base, indices } if indices.len() == 1 => {
-                let base_ptr = self.lower_expr(base);
+                let base_ptr = self.place_base_ptr(base);
                 let idx = self.lower_expr(&indices[0]);
                 // Prefer the element type from the base's array type; fall back to the indexed
-                // expression's own type (slices/tensors/pointers).
+                // expression's own type (slices/tensors/pointers). Resolve through the
+                // registry-aware `mir_ty_of` so a struct/tuple element becomes its byte-buffer
+                // `Array` type (the GEP strides by the real element size, and the read path below
+                // treats it as an aggregate address) rather than the registry-blind `I32` fallback.
                 let elem = match self.expr_ty(base) {
-                    Ty::Array { elem, .. } => mir_ty(&elem),
+                    Ty::Array { elem, .. } => self.mir_ty_of(&elem),
                     _ => self.expr_mir(e),
                 };
                 let p = self.builder.build(
@@ -9290,6 +11213,10 @@ impl FnLowerer<'_> {
                 );
                 (p, elem)
             }
+            // `t.0 = …` — assign to a tuple field at its byte offset.
+            ExprKind::TupleField { base, index } => self.tuple_field_place(base, *index as usize),
+            // `s.field = …` — assign to a struct field at its declared byte offset.
+            ExprKind::Field { base, name } => self.struct_field_place(base, name.sym),
             // Multi-dimensional tensor indexing `t[i, j, …]` — the shape-typed surface. Flatten to a
             // row-major offset using the tensor's static strides.
             ExprKind::Index { base, indices } if indices.len() >= 2 => {
@@ -9330,6 +11257,37 @@ impl FnLowerer<'_> {
             ExprKind::Bool(b) => self
                 .builder
                 .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1)),
+            // A char literal is its Unicode scalar value — sema types it `u32`, so it lowers like an
+            // integer constant of that value (escapes/`\x`/`\u{…}` decoded by `decode_char_literal`).
+            ExprKind::Char(s) => {
+                let v = decode_char_literal(self.interner.resolve(*s));
+                let ty = self.expr_mir(e);
+                let ty = if ty.is_int() { ty } else { MirType::I32 };
+                self.builder.build(ty.clone(), Op::ConstInt(v as i128, ty))
+            }
+            // A string literal materializes its UTF-8 bytes (plus a trailing NUL) into a fresh stack
+            // byte buffer and yields the base pointer — sema types it `*u8`, so it follows the same
+            // by-pointer convention as an array. `print`/`println` of a `*u8` reads it back
+            // byte-by-byte until the NUL (see the intrinsic-call lowering). Both backends GEP/Store
+            // one element per byte, so the interpreter's slot-indexed memory and native's byte memory
+            // agree (`store_element` strides by element, which is 1 byte for `I8`).
+            ExprKind::Str(s) => {
+                let bytes = decode_string_literal(self.interner.resolve(*s));
+                let elem = MirType::I8;
+                let n = bytes.len() as u32 + 1; // + NUL terminator
+                let base = self
+                    .builder
+                    .alloca(MirType::Array(Box::new(elem.clone()), n));
+                for (i, b) in bytes.iter().enumerate() {
+                    let v = self
+                        .builder
+                        .build(MirType::I8, Op::ConstInt(*b as i128, MirType::I8));
+                    self.store_element(base, &elem, i as i128, v);
+                }
+                let nul = self.builder.build(MirType::I8, Op::ConstInt(0, MirType::I8));
+                self.store_element(base, &elem, bytes.len() as i128, nul);
+                base
+            }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
                     // An array variable *is* its storage: its value is the base pointer, so reads
@@ -9339,6 +11297,12 @@ impl FnLowerer<'_> {
                     } else {
                         self.builder.build(ty.clone(), Op::Load(slot, ty))
                     }
+                } else if let Some(init) = self.sema.consts.get(&p.first().sym).cloned() {
+                    // A top-level `const`: inline its initializer at the use site (the def map records
+                    // only the const's type, not its value). The initializer was type-checked by
+                    // sema, so its nodes carry types and lower correctly; a const referencing another
+                    // const recurses through this same arm.
+                    self.lower_expr(&init)
                 } else {
                     self.unsupported(p.span, "value reference");
                     let t = self.expr_mir(e);
@@ -9351,7 +11315,55 @@ impl FnLowerer<'_> {
             ExprKind::Index { base, indices } if !indices.is_empty() => {
                 let (ptr, elem) = self.lower_place(e);
                 let _ = (base, indices);
-                self.builder.build(elem.clone(), Op::Load(ptr, elem))
+                // A scalar element loads; an aggregate element (an array of structs/tuples) yields
+                // its address — the by-pointer convention, so a further `.field`/`[i]`/`.0` GEPs
+                // off it. Mirrors the `Field`/`TupleField` read arms. An unconditional `Op::Load`
+                // here mis-loaded an aggregate element as a scalar (native verifier reject for a
+                // struct element, segfault for a wider tuple element).
+                self.load_or_addr(ptr, elem)
+            }
+            // `t.0` — read tuple field 0 by GEP to its byte offset. A scalar field loads; an
+            // aggregate field (a nested struct/tuple/array) yields its address, the by-pointer
+            // convention arrays follow, so a further `.field`/`[i]` GEPs off it.
+            ExprKind::TupleField { base, index } => {
+                let (ptr, fmty) = self.tuple_field_place(base, *index as usize);
+                self.load_or_addr(ptr, fmty)
+            }
+            // `s.field` — read a struct field by GEP to its declared byte offset (scalar loads,
+            // aggregate yields its address — see `TupleField`).
+            ExprKind::Field { base, name } => {
+                // `E::B` parses as a field access on the enum-name path `E`; lower it to the
+                // variant's integer discriminant (a C-style enum value is its discriminant).
+                if let Some(disc) = self.enum_variant_value(base, name.sym) {
+                    self.builder
+                        .build(MirType::I32, Op::ConstInt(disc as i128, MirType::I32))
+                } else {
+                    let (ptr, fmty) = self.struct_field_place(base, name.sym);
+                    self.load_or_addr(ptr, fmty)
+                }
+            }
+            // A struct literal in value position materializes a fresh byte buffer, yielding its base
+            // pointer (the same by-pointer convention as arrays/tuples).
+            ExprKind::StructLit { fields, .. } => {
+                let ty = self.expr_ty(e);
+                let size = self.mir_ty_of(&ty);
+                let buf = self.builder.alloca(size);
+                if let Ty::Named(sym) = ty {
+                    self.lower_struct_init(buf, sym, fields, e.span);
+                }
+                buf
+            }
+            // A tuple literal in value position (a call argument, a nested field) materializes a
+            // fresh byte buffer and yields its base pointer — the same by-pointer convention an
+            // array value follows.
+            ExprKind::TupleLit(items) => {
+                let tty = self.expr_ty(e);
+                let size = self.ty_size(&tty).unwrap_or(0) as u32;
+                let buf = self
+                    .builder
+                    .alloca(MirType::Array(Box::new(MirType::I8), size));
+                self.lower_tuple_init(buf, &tty, items);
+                buf
             }
             ExprKind::Cast { expr, .. } => self.lower_cast(expr, e),
             ExprKind::Block(b) => match self.lower_block(b) {
@@ -9366,11 +11378,441 @@ impl FnLowerer<'_> {
                 then_branch,
                 else_branch,
             } => self.lower_if_value(cond, then_branch, else_branch.as_deref(), e),
+            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, e),
             _ => {
                 self.unsupported(e.span, "expression");
                 let t = self.expr_mir(e);
                 self.const_zero(t)
             }
+        }
+    }
+
+    /// Lower a `match` expression (or statement) to an if-else chain over the arms. The scrutinee is
+    /// evaluated once; each arm in turn tests the scrutinee against its pattern (a literal compares
+    /// for equality; a wildcard/identifier always matches) and, if present, its guard, branching to
+    /// the arm body or the next test. An `Ident` pattern binds the scrutinee value in the arm scope.
+    /// When the `match` is used as a value, a merge-block parameter collects each arm body's result.
+    /// An unconditional catch-all arm (a bare `_`/identifier with no guard) ends the chain; if none is
+    /// present the structurally-emitted fallthrough is `Unreachable` (sema's E0405 rejects any
+    /// value-producing non-exhaustive match, so it is dynamically dead).
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm], e: &Expr) -> ValueId {
+        let result_ty = self.expr_mir(e);
+        let produces_value = result_ty != MirType::Void;
+        // An aggregate result flows as its base pointer, so the merge param is `Ptr` (see
+        // `merge_repr_ty`); scalars are unchanged.
+        let merge_ty = merge_repr_ty(&result_ty);
+        let scrut_mir = self.expr_mir(scrutinee);
+        let scrut_ty = self.expr_ty(scrutinee);
+        let scrut = self.lower_expr(scrutinee);
+
+        let merge = self.builder.new_block();
+        let merge_param = if produces_value {
+            Some(self.builder.block_param(merge, merge_ty.clone()))
+        } else {
+            None
+        };
+
+        // Branch to `merge` with the arm body's value (or no arg for a unit match). `merge_reachable`
+        // records whether any arm (or the fallthrough) actually branches to `merge`; if none does —
+        // every arm `return`s — `merge` is dead and is terminated `Unreachable` below.
+        let mut handled_default = false;
+        let mut merge_reachable = false;
+        for arm in arms {
+            let unconditional = matches!(
+                &arm.pat.kind,
+                ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit
+            ) && arm.guard.is_none();
+
+            if unconditional {
+                // Always matches: lower the body directly, then the remaining arms are unreachable.
+                self.push_scope();
+                self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
+                merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
+                self.pop_scope();
+                handled_default = true;
+                break;
+            }
+
+            let body_bb = self.builder.new_block();
+            let next_bb = self.builder.new_block();
+            // Bind first so an `Ident` pattern's guard can reference the binding; the binding is
+            // scoped to this arm (popped after the body).
+            self.push_scope();
+            self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
+            let cond =
+                self.match_arm_cond(&arm.pat, scrut, &scrut_mir, &scrut_ty, arm.guard.as_ref());
+            self.builder
+                .cond_br(cond, body_bb, vec![], next_bb, vec![]);
+
+            self.builder.switch_to(body_bb);
+            self.terminated = false;
+            merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
+            self.pop_scope();
+
+            self.builder.switch_to(next_bb);
+            self.terminated = false;
+        }
+
+        // No arm matched. With an unconditional catch-all this block is never emitted; without one it
+        // is reached only when no arm's pattern fires. Sema's exhaustiveness check (E0405) rejects any
+        // *value-producing* non-exhaustive match before lowering, so for a value match this point is
+        // dynamically dead (an exhaustive enum/bool match with no `_` still emits this block
+        // structurally — every arm is a conditional test — but one arm always matches at runtime).
+        // Emit `Unreachable` rather than a zero default: a scalar zero was a silent wrong answer and
+        // an aggregate zero was invalid MIR (`const.i32 0` into an aggregate merge param → an ICE the
+        // verifier/`mem2reg` rejected). A unit/statement match has no value to merge and just falls
+        // through. (A genuinely value-producing match always has a value-producing arm that branches
+        // to `merge`, so the merge param never lacks a provider.)
+        if !handled_default && !self.terminated {
+            match merge_param {
+                Some(_) => self
+                    .builder
+                    .set_term(mercury_mir::Terminator::Unreachable),
+                None => {
+                    self.builder.br(merge, vec![]);
+                    merge_reachable = true;
+                }
+            }
+        }
+
+        self.builder.switch_to(merge);
+        let placeholder_ty = if result_ty == MirType::Void {
+            MirType::I32
+        } else {
+            merge_ty
+        };
+        let result = match merge_param {
+            Some(p) => p,
+            None => self.const_zero(placeholder_ty),
+        };
+        if merge_reachable {
+            self.terminated = false;
+        } else {
+            // Every arm diverged (all `return`), so nothing reaches `merge`. Terminate it
+            // `Unreachable` and mark the path terminated: the caller (`lower_block`/`lower_fn`) then
+            // treats the whole `match` as diverging and emits no fallthrough `ret` carrying this dead
+            // placeholder — which, mistyped as `i32` for a non-i32 return, was a -O0 MIR-verify ICE
+            // while -O1+ deleted the dead block before verification (a -O0 ≠ -O{1,2,3} gate violation).
+            self.builder
+                .set_term(mercury_mir::Terminator::Unreachable);
+            self.terminated = true;
+        }
+        result
+    }
+
+    /// Bind a match pattern's identifiers to the scrutinee for the arm's scope: a scalar `Ident` is
+    /// stored into a fresh slot (so a `Path` read loads it, like a param); an aggregate `Ident` binds
+    /// its base pointer directly. A `Tuple` pattern recurses into each field's place (so
+    /// `(x, y) => x + y` binds `x`/`y` to the tuple's fields). Literal / wildcard / unit bind nothing.
+    fn bind_match_ident(
+        &mut self,
+        pat: &Pattern,
+        scrut: ValueId,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+    ) {
+        match &pat.kind {
+            ast::PatKind::Ident(name) => {
+                if matches!(scrut_mir, MirType::Array(..)) {
+                    self.bind(*name, scrut, scrut_mir.clone());
+                } else {
+                    let slot = self.builder.alloca(scrut_mir.clone());
+                    self.builder.build_void(Op::Store {
+                        ptr: slot,
+                        value: scrut,
+                    });
+                    self.bind(*name, slot, scrut_mir.clone());
+                }
+            }
+            ast::PatKind::Tuple(subs) => self.bind_tuple_match(subs, scrut, scrut_ty),
+            _ => {}
+        }
+    }
+
+    /// Bind the identifiers of a tuple pattern to their field places within the tuple buffer at base
+    /// pointer `base` (sema type `ty`). A scalar field `Ident` is copied into a fresh slot (so reads
+    /// load it and a mutated binding doesn't write back into the scrutinee); an aggregate field
+    /// `Ident` binds the field address (the array/by-pointer convention); a nested tuple pattern
+    /// recurses; a literal/wildcard sub-pattern binds nothing.
+    fn bind_tuple_match(&mut self, subs: &[Pattern], base: ValueId, ty: &Ty) {
+        let Ty::Tuple(ftys) = ty else { return };
+        let Some((offsets, _, _)) = self.aggregate_layout(ftys) else {
+            return;
+        };
+        for (i, sub) in subs.iter().enumerate() {
+            let (Some(&off), Some(fty)) = (offsets.get(i), ftys.get(i)) else {
+                continue;
+            };
+            let fmty = self.mir_ty_of(fty);
+            let fptr = self.field_ptr(base, off);
+            match &sub.kind {
+                ast::PatKind::Ident(name) => {
+                    if matches!(fmty, MirType::Array(..)) {
+                        self.bind(*name, fptr, fmty);
+                    } else {
+                        let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                        let slot = self.builder.alloca(fmty.clone());
+                        self.builder.build_void(Op::Store { ptr: slot, value: val });
+                        self.bind(*name, slot, fmty);
+                    }
+                }
+                ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, fty),
+                _ => {}
+            }
+        }
+    }
+
+    /// The i1 condition under which a match arm fires: the pattern test (a literal compares equal; a
+    /// wildcard/identifier is always true) conjoined with the optional guard. The guard is lowered in
+    /// the current (test) block, after any `Ident` binding, so it may reference the binding.
+    fn match_arm_cond(
+        &mut self,
+        pat: &Pattern,
+        scrut: ValueId,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+        guard: Option<&Expr>,
+    ) -> ValueId {
+        let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
+        // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
+        // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
+        // arm's `And` / `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix
+        // covered if/while/short-circuit/assert but not the match-guard path).
+        match (pat_cond, guard) {
+            (Some(pc), Some(g)) => {
+                let gv = self.lower_bool_cond(g);
+                self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
+            }
+            (Some(pc), None) => pc,
+            (None, Some(g)) => self.lower_bool_cond(g),
+            (None, None) => self.builder.build(MirType::I1, Op::ConstInt(1, MirType::I1)),
+        }
+    }
+
+    /// The i1 condition under which `pat` matches the scrutinee. For a scalar pattern `scrut` is the
+    /// loaded scrutinee value; for a tuple pattern it is the tuple buffer's base pointer. `None` means
+    /// the pattern is unconditional (a wildcard / identifier binding). Literal int/bool/enum-variant/
+    /// range patterns compare the value; a tuple ANDs its fields; an or-pattern ORs its alternatives.
+    fn pattern_cond(
+        &mut self,
+        pat: &Pattern,
+        scrut: ValueId,
+        scrut_mir: &MirType,
+        scrut_ty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        match &pat.kind {
+            ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit => None,
+            ast::PatKind::Int { sym, neg } => {
+                let mut v = parse_int(self.interner.resolve(*sym));
+                if *neg {
+                    v = -v;
+                }
+                let c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+            }
+            // A char-literal pattern compares the scrutinee (a `char` is its integer code point) to
+            // the literal's decoded code point — the same equality test as an integer-literal pattern.
+            ast::PatKind::Char(sym) => {
+                let v = decode_char_literal(self.interner.resolve(*sym)) as i128;
+                let c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(v, scrut_mir.clone()));
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+            }
+            ast::PatKind::Bool(b) => {
+                let c = self
+                    .builder
+                    .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+            }
+            // `Enum::Variant` — compare the scrutinee (an enum value is its discriminant) to the
+            // variant's discriminant. An unresolved path is rejected (a hard error, never a no-op).
+            ast::PatKind::Path(path) => {
+                let Some(disc) = self.enum_path_value(path) else {
+                    self.unsupported(span, "match pattern");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
+                let c = self.builder.build(
+                    scrut_mir.clone(),
+                    Op::ConstInt(disc as i128, scrut_mir.clone()),
+                );
+                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+            }
+            // A range pattern `lo..hi` / `lo..=hi`: `lo <= scrut` AND `scrut < hi` (or `<= hi`),
+            // with the comparison signedness taken from the scrutinee's type.
+            ast::PatKind::Range {
+                lo,
+                hi,
+                inclusive,
+            } => {
+                let signed = !matches!(scrut_ty, Ty::Scalar(s) if !s.is_signed());
+                let lo_v = self.pattern_int_value(lo);
+                let hi_v = self.pattern_int_value(hi);
+                let lo_c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(lo_v, scrut_mir.clone()));
+                let hi_c = self
+                    .builder
+                    .build(scrut_mir.clone(), Op::ConstInt(hi_v, scrut_mir.clone()));
+                let ge = self.builder.build(
+                    MirType::I1,
+                    Op::Cmp(if signed { CmpOp::Sge } else { CmpOp::Uge }, scrut, lo_c),
+                );
+                let hi_op = match (*inclusive, signed) {
+                    (true, true) => CmpOp::Sle,
+                    (false, true) => CmpOp::Slt,
+                    (true, false) => CmpOp::Ule,
+                    (false, false) => CmpOp::Ult,
+                };
+                let lt = self.builder.build(MirType::I1, Op::Cmp(hi_op, scrut, hi_c));
+                Some(self.builder.build(MirType::I1, Op::Bin(BinOp::And, ge, lt)))
+            }
+            // `scrut` is the tuple buffer's base pointer; AND each field's sub-pattern test.
+            ast::PatKind::Tuple(subs) => self.tuple_pattern_cond(subs, scrut, scrut_ty, span),
+            // An or-pattern matches if any alternative does: OR each alternative's condition. An
+            // unconditional alternative (a wildcard/ident) makes the whole or-pattern unconditional.
+            ast::PatKind::Or(alts) => {
+                let mut acc: Option<ValueId> = None;
+                for alt in alts {
+                    match self.pattern_cond(alt, scrut, scrut_mir, scrut_ty, alt.span) {
+                        None => return None,
+                        Some(c) => {
+                            acc = Some(match acc {
+                                Some(a) => {
+                                    self.builder.build(MirType::I1, Op::Bin(BinOp::Or, a, c))
+                                }
+                                None => c,
+                            });
+                        }
+                    }
+                }
+                acc
+            }
+        }
+    }
+
+    /// The integer value of an int- or char-literal range bound (`lo`/`hi`). A char decodes to its
+    /// code point, so `'a'..='z'` ranges work. A non-literal bound yields 0.
+    fn pattern_int_value(&self, pat: &Pattern) -> i128 {
+        match &pat.kind {
+            ast::PatKind::Int { sym, neg } => {
+                let v = parse_int(self.interner.resolve(*sym));
+                if *neg {
+                    -v
+                } else {
+                    v
+                }
+            }
+            ast::PatKind::Char(sym) => decode_char_literal(self.interner.resolve(*sym)) as i128,
+            _ => 0,
+        }
+    }
+
+    /// Resolve an enum-variant path pattern (`Enum::Variant`) to its integer discriminant.
+    fn enum_path_value(&self, path: &ast::Path) -> Option<i64> {
+        if path.segments.len() != 2 {
+            return None;
+        }
+        let DefKind::Enum(variants) = &self.sema.defs.lookup(path.segments[0].sym)?.kind else {
+            return None;
+        };
+        let var = path.segments[1].sym;
+        variants.iter().find(|(v, _)| *v == var).map(|(_, d)| *d)
+    }
+
+    /// Whether a pattern must be tested against the scrutinee's *address* (a tuple field that is
+    /// itself an aggregate) rather than its loaded value.
+    fn pattern_needs_ptr(pat: &Pattern) -> bool {
+        match &pat.kind {
+            ast::PatKind::Tuple(_) => true,
+            ast::PatKind::Or(alts) => alts.iter().any(Self::pattern_needs_ptr),
+            _ => false,
+        }
+    }
+
+    /// The i1 condition under which a tuple pattern matches the tuple at base pointer `base` (sema
+    /// type `ty`): the AND of each field sub-pattern's condition. `None` (every field unconditional)
+    /// means the whole tuple matches unconditionally. If the tuple can't be laid out (a non-tuple type
+    /// or an unsizeable field) the arm is rejected with `unsupported` and a `false` condition — never
+    /// a silent over-match, which would violate the differential-correctness invariant.
+    fn tuple_pattern_cond(
+        &mut self,
+        subs: &[Pattern],
+        base: ValueId,
+        ty: &Ty,
+        span: Span,
+    ) -> Option<ValueId> {
+        let layout = match ty {
+            Ty::Tuple(ftys) => self
+                .aggregate_layout(ftys)
+                .map(|(offs, _, _)| (ftys.clone(), offs)),
+            _ => None,
+        };
+        let Some((ftys, offsets)) = layout else {
+            self.unsupported(span, "tuple pattern");
+            return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+        };
+        let mut acc: Option<ValueId> = None;
+        for (i, sub) in subs.iter().enumerate() {
+            let (Some(&off), Some(fty)) = (offsets.get(i), ftys.get(i)) else {
+                continue;
+            };
+            let fmty = self.mir_ty_of(fty);
+            let fptr = self.field_ptr(base, off);
+            // A nested aggregate sub-pattern tests against the field address; a scalar sub-pattern
+            // tests against the loaded field value.
+            let field_scrut = if Self::pattern_needs_ptr(sub) {
+                fptr
+            } else {
+                self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+            };
+            if let Some(c) = self.pattern_cond(sub, field_scrut, &fmty, fty, span) {
+                acc = Some(match acc {
+                    Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
+                    None => c,
+                });
+            }
+        }
+        acc
+    }
+
+    /// Lower a match arm body and, unless it diverged, branch to `merge` passing the body value when
+    /// the match produces one.
+    /// Lower a match arm body and branch to `merge` with its value unless the body diverged. Returns
+    /// whether it branched (i.e. the arm did *not* diverge) — the caller ORs these to learn whether
+    /// `merge` has any predecessor. When every arm diverges (all `return`), `merge` is dead and must
+    /// be terminated `Unreachable` rather than left as a live fallthrough carrying a placeholder.
+    fn emit_match_arm_body(
+        &mut self,
+        body: &Expr,
+        merge: mercury_mir::BlockId,
+        merge_param: Option<ValueId>,
+        result_ty: &MirType,
+    ) -> bool {
+        let bv = self.lower_expr(body);
+        if !self.terminated {
+            let args = if merge_param.is_some() {
+                // Coerce the arm value to the match's merged result type, so every arm passes the
+                // merge param the *same* MIR type. Without this, arms of different width/kind
+                // (`match n { 0 => 10, _ => 2.5 }`) pass a mismatched value the native verifier
+                // rejects while the interpreter runs loosely — a backend divergence. A unit-typed
+                // body with a value-producing match yields a zero so the edge arity still matches.
+                let from = self.expr_mir(body);
+                if matches!(from, MirType::Void) {
+                    vec![self.const_zero(result_ty.clone())]
+                } else {
+                    vec![self.coerce_to(bv, &from, result_ty, self.signed(body))]
+                }
+            } else {
+                vec![]
+            };
+            self.builder.br(merge, args);
+            true
+        } else {
+            false
         }
     }
 
@@ -9389,7 +11831,20 @@ impl FnLowerer<'_> {
             ast::UnOp::Deref => {
                 let ptr = self.lower_expr(operand);
                 let ty = self.expr_mir(e);
-                self.builder.build(ty.clone(), Op::Load(ptr, ty))
+                // An aggregate (struct/tuple/array) is addressed by its base pointer, so `*p` of a
+                // pointer-to-aggregate IS that pointer (the same by-pointer convention `load_or_addr`
+                // uses for an aggregate field). Loading the whole byte buffer into an SSA value —
+                // `load [N x i8]` — is invalid MIR that the consuming ABI (a call argument, an
+                // aggregate assign/return, an aggregate `let`), which expects a pointer, cannot take:
+                // it slipped past the verifier (which does not type-check call/branch arg types) into
+                // a native-JIT hang, or tripped the -O0 gep-base verifier / -O2 mem2reg panic. The
+                // value copy is emitted by the consuming context (each `emit_copy`s from this base
+                // pointer for value semantics); a scalar/pointer pointee still loads normally.
+                if matches!(ty, MirType::Array(..)) {
+                    ptr
+                } else {
+                    self.builder.build(ty.clone(), Op::Load(ptr, ty))
+                }
             }
             ast::UnOp::Ref | ast::UnOp::RefMut => {
                 let (ptr, _) = self.lower_place(operand);
@@ -9414,16 +11869,8 @@ impl FnLowerer<'_> {
                 let pred = cmp_pred(op, common.is_float(), self.signed(lhs));
                 self.builder.build(MirType::I1, Op::Cmp(pred, l, r))
             }
-            And => {
-                let l = self.lower_expr(lhs);
-                let r = self.lower_expr(rhs);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::And, l, r))
-            }
-            Or => {
-                let l = self.lower_expr(lhs);
-                let r = self.lower_expr(rhs);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::Or, l, r))
-            }
+            And => self.lower_short_circuit(lhs, rhs, true),
+            Or => self.lower_short_circuit(lhs, rhs, false),
             _ => {
                 let ty = self.expr_mir(e);
                 // Contract a float `x + y*z` into one fused multiply-add before falling back to a
@@ -9443,6 +11890,43 @@ impl FnLowerer<'_> {
                 self.builder.build(ty, Op::Bin(bin, l, r))
             }
         }
+    }
+
+    /// Short-circuit `&&` / `||`: the RHS is evaluated only when the LHS doesn't already decide the
+    /// result. `a && b` ≡ `if a { b } else { false }`; `a || b` ≡ `if a { true } else { b }`. Lowered
+    /// to a branch + a merge block param — NOT a bitwise `and`/`or` of both operands — so a
+    /// side-effecting or unsafe RHS (`p_in_bounds && load(p)`) does not run when the LHS already
+    /// settles it. Both backends execute the identical CFG, so the differential gate holds.
+    fn lower_short_circuit(&mut self, lhs: &Expr, rhs: &Expr, is_and: bool) -> ValueId {
+        // Both operands are conditions: normalize a float operand to `!= 0.0` so the LHS reaches
+        // `cond_br` as an `i1` (not a raw float native's `brif` rejects) and the RHS matches the
+        // `i1` merge param. The integer/`i1` path is unchanged.
+        let l = self.lower_bool_cond(lhs);
+        let rhs_bb = self.builder.new_block();
+        let merge = self.builder.new_block();
+        let res = self.builder.block_param(merge, MirType::I1);
+        // The short-circuit value passed to `merge` when the LHS decides it: `false` for `&&` (LHS
+        // false), `true` for `||` (LHS true). Built in the current (predecessor) block.
+        let short = self.builder.build(
+            MirType::I1,
+            Op::ConstInt(if is_and { 0 } else { 1 }, MirType::I1),
+        );
+        if is_and {
+            // LHS true → evaluate RHS; LHS false → merge(false).
+            self.builder.cond_br(l, rhs_bb, vec![], merge, vec![short]);
+        } else {
+            // LHS true → merge(true); LHS false → evaluate RHS.
+            self.builder.cond_br(l, merge, vec![short], rhs_bb, vec![]);
+        }
+        self.builder.switch_to(rhs_bb);
+        self.terminated = false;
+        let r = self.lower_bool_cond(rhs);
+        if !self.terminated {
+            self.builder.br(merge, vec![r]);
+        }
+        self.builder.switch_to(merge);
+        self.terminated = false;
+        res
     }
 
     /// Contract a float `x + y*z` (or `y*z + x`) into one fused multiply-add. FMA rounds once
@@ -9505,6 +11989,36 @@ impl FnLowerer<'_> {
             .build(to.clone(), Op::Cast(kind, v, to.clone()))
     }
 
+    /// The target symbol and MIR return type of a direct user-function call. For a type-generic
+    /// callee it infers the concrete instantiation from the argument types (resolved through this
+    /// function's own substitution, so a generic-in-generic call resolves) and returns the matching
+    /// monomorphized instance's symbol and its concrete return type. Otherwise the callee's own
+    /// symbol and `expr_mir(e)`.
+    fn resolve_call_target(&self, name: Symbol, args: &[Expr], e: &Expr) -> (Symbol, MirType) {
+        if let Some(mono) = self.mono {
+            let tg = mono.tg(name);
+            if !tg.is_empty() {
+                if let Some(DefKind::Fn(sig)) = self.sema.defs.lookup(name).map(|d| &d.kind) {
+                    let params = sig.params.clone();
+                    let ret_ty = sig.ret.clone();
+                    let mut subst: HashMap<Symbol, Ty> = HashMap::new();
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(pty) = params.get(i) {
+                            bind_generics(pty, &self.expr_ty(a), tg, &mut subst);
+                        }
+                    }
+                    if let Some(canon) = canon_type_args(tg, &subst, self.interner) {
+                        if let Some(&inst) = mono.instance_of.get(&(name, canon)) {
+                            let ret_mir = self.mir_ty_of(&subst_ty(&ret_ty, &subst));
+                            return (inst, ret_mir);
+                        }
+                    }
+                }
+            }
+        }
+        (name, self.expr_mir(e))
+    }
+
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
@@ -9514,10 +12028,29 @@ impl FnLowerer<'_> {
                     Some(DefKind::Fn(_))
                 ) {
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
-                    let ret = self.expr_mir(e);
+                    // A call to a type-generic function is redirected to its monomorphized instance
+                    // (`id` -> `id$f32`), and the call's MIR return type is taken from the instance's
+                    // concrete return (not the generic template), so the sret/void/scalar dispatch
+                    // below keys on the real type. A non-generic call keeps `name` + `expr_mir(e)`.
+                    let (func, ret) = self.resolve_call_target(name, args, e);
+                    if matches!(ret, MirType::Array(..)) {
+                        // The callee returns an aggregate by value (sret ABI): allocate the
+                        // destination buffer here, pass it as the hidden leading argument, and yield
+                        // it as the call's value (the by-pointer aggregate convention — a further
+                        // `.field`/`[i]` GEPs off it).
+                        let dst = self.builder.alloca(ret);
+                        let mut call_args = Vec::with_capacity(argvals.len() + 1);
+                        call_args.push(dst);
+                        call_args.extend(argvals);
+                        self.builder.build_void(Op::Call {
+                            func,
+                            args: call_args,
+                        });
+                        return dst;
+                    }
                     if ret == MirType::Void {
                         self.builder.build_void(Op::Call {
-                            func: name,
+                            func,
                             args: argvals,
                         });
                         return self.const_zero(MirType::I32);
@@ -9525,7 +12058,7 @@ impl FnLowerer<'_> {
                     return self.builder.build(
                         ret,
                         Op::Call {
-                            func: name,
+                            func,
                             args: argvals,
                         },
                     );
@@ -9537,6 +12070,64 @@ impl FnLowerer<'_> {
                 }
                 // Built-in intrinsics (print, ...) lower to a void call the interpreter handles.
                 if is_intrinsic(self.interner.resolve(name)) {
+                    // A `*u8` (string) argument to `print`/`println` renders its bytes rather than the
+                    // pointer value: route it to the dedicated `print_str`/`println_str` symbol, which
+                    // both backends read as a null-terminated buffer. (Printing a raw pointer as a
+                    // number is already non-differential — the interpreter prints a slot index, native
+                    // a real address — so no well-formed program loses behavior here.)
+                    let nm = self.interner.resolve(name);
+                    if (nm == "print" || nm == "println")
+                        && args.len() == 1
+                        && self.is_string_arg(&args[0])
+                    {
+                        let s = self.lower_expr(&args[0]);
+                        let func = if nm == "println" {
+                            self.gemm.println_str
+                        } else {
+                            self.gemm.print_str
+                        };
+                        self.builder.build_void(Op::Call {
+                            func,
+                            args: vec![s],
+                        });
+                        return self.const_zero(MirType::I32);
+                    }
+                    // An *unsigned* integer argument must format as unsigned: the value is stored
+                    // sign-extended, so a high-bit-set `u32`/`u64` (a quantization scale, a hash, a
+                    // size) would print as its negative two's-complement reinterpretation under the
+                    // default signed `print`. Zero-extend to 64 bits (clearing the high bits of a
+                    // narrow value; a no-op for `u64`/`usize`) and route to `print_u`/`println_u`,
+                    // which render the bits as `u64`. Both backends marshal the same symbol.
+                    if (nm == "print" || nm == "println")
+                        && args.len() == 1
+                        && self.is_unsigned_int_arg(&args[0])
+                    {
+                        let v0 = self.lower_expr(&args[0]);
+                        let from = self.expr_mir(&args[0]);
+                        let v = self.coerce_to(v0, &from, &MirType::I64, false);
+                        let func = if nm == "println" {
+                            self.gemm.println_u
+                        } else {
+                            self.gemm.print_u
+                        };
+                        self.builder.build_void(Op::Call {
+                            func,
+                            args: vec![v],
+                        });
+                        return self.const_zero(MirType::I32);
+                    }
+                    // `assert(cond)` takes a boolean condition: normalize a float argument to
+                    // `cond != 0.0` (an `i1`) so a fractional `assert(0.5)` is *true* on both
+                    // backends, rather than native truncating `0.5 -> 0` and trapping while the
+                    // interpreter's `f != 0.0` passes. The integer/`i1` path is unchanged.
+                    if nm == "assert" && args.len() == 1 {
+                        let c = self.lower_bool_cond(&args[0]);
+                        self.builder.build_void(Op::Call {
+                            func: name,
+                            args: vec![c],
+                        });
+                        return self.const_zero(MirType::I32);
+                    }
                     let argvals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
                     self.builder.build_void(Op::Call {
                         func: name,
@@ -9563,13 +12154,30 @@ impl FnLowerer<'_> {
     fn lower_math_intrinsic(&mut self, name: Symbol, args: &[Expr], e: &Expr) -> Option<ValueId> {
         let op = math_intrinsic(self.interner.resolve(name))?;
         let rty = self.expr_mir(e);
+        // `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving on integers (sema types them as
+        // the argument's integer type): integer abs is `select(x < 0, -x, x)`; rounding an integer is
+        // the identity. Without this they would emit float ops on an int operand — MIR the verifier
+        // rejects on the native backend while the interpreter silently ran it (lossily, via f32).
+        if rty.is_int() {
+            match op {
+                MathIntrinsic::Abs => {
+                    let v = self.lower_expr(args.first()?);
+                    return Some(self.emit_int_abs(v, &rty));
+                }
+                MathIntrinsic::Round
+                | MathIntrinsic::Floor
+                | MathIntrinsic::Ceil
+                | MathIntrinsic::Trunc => return Some(self.lower_expr(args.first()?)),
+                _ => {}
+            }
+        }
         match op {
             MathIntrinsic::Sqrt => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.builder.build(rty.clone(), Op::Sqrt(x)))
             }
             MathIntrinsic::Rsqrt => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let s = self.builder.build(rty.clone(), Op::Sqrt(x));
                 let one = self.splat_const_f(1.0, &rty);
                 Some(
@@ -9578,32 +12186,32 @@ impl FnLowerer<'_> {
                 )
             }
             MathIntrinsic::Abs => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_abs(x, &rty))
             }
             MathIntrinsic::Round
             | MathIntrinsic::Floor
             | MathIntrinsic::Ceil
             | MathIntrinsic::Trunc => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(
                     self.builder
                         .build(rty.clone(), Op::Round(round_mode(op), x)),
                 )
             }
             MathIntrinsic::Exp => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_exp(x, &rty))
             }
             MathIntrinsic::Log => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_log(x, &rty))
             }
             // exp2(x)=exp(x·ln2), log2(x)=log(x)·log2(e), sinh/cosh=(eˣ∓e⁻ˣ)/2 — composed from the
             // shared exp/log so they vectorize and stay bit-exact across backends; the dispatched
             // 256-bit kernel mirrors this op-for-op.
             MathIntrinsic::Exp2 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let ln2 = self.splat_const_f(std::f64::consts::LN_2, &rty);
                 let xl = self
                     .builder
@@ -9611,7 +12219,7 @@ impl FnLowerer<'_> {
                 Some(self.emit_exp(xl, &rty))
             }
             MathIntrinsic::Log2 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let lx = self.emit_log(x, &rty);
                 let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
                 Some(
@@ -9620,7 +12228,7 @@ impl FnLowerer<'_> {
                 )
             }
             MathIntrinsic::Exp10 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let ln10 = self.splat_const_f(std::f64::consts::LN_10, &rty);
                 let xl = self
                     .builder
@@ -9628,7 +12236,7 @@ impl FnLowerer<'_> {
                 Some(self.emit_exp(xl, &rty))
             }
             MathIntrinsic::Log10 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 let lx = self.emit_log(x, &rty);
                 let log10e = self.splat_const_f(std::f64::consts::LOG10_E, &rty);
                 Some(
@@ -9637,34 +12245,34 @@ impl FnLowerer<'_> {
                 )
             }
             MathIntrinsic::Sinh | MathIntrinsic::Cosh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_sinh_cosh(x, &rty, matches!(op, MathIntrinsic::Cosh)))
             }
             // asinh = sign(x)·log(|x|+√(x²+1)),  acosh = log(x+√(x²−1)),
             // atanh = ½·log((1+x)/(1−x)) — composed from the shared `log` (and `√`), so they vectorize
             // and the dispatched 256-bit kernel mirrors this op-for-op.
             MathIntrinsic::Asinh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_asinh(x, &rty))
             }
             MathIntrinsic::Acosh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_acosh(x, &rty))
             }
             MathIntrinsic::Atanh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_atanh(x, &rty))
             }
             MathIntrinsic::Atan => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_atan(x, &rty))
             }
             MathIntrinsic::Expm1 => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_expm1(x, &rty))
             }
             MathIntrinsic::Log1p => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_log1p(x, &rty))
             }
             MathIntrinsic::Pow => {
@@ -9673,8 +12281,8 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let x = self.lower_expr(&args[0]);
-                let y = self.lower_expr(&args[1]);
+                let x = self.lower_math_arg(&args[0], &rty);
+                let y = self.lower_math_arg(&args[1], &rty);
                 let lx = self.emit_log(x, &rty);
                 let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
                 Some(self.emit_exp(ylx, &rty))
@@ -9683,44 +12291,44 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let y = self.lower_expr(&args[0]);
-                let x = self.lower_expr(&args[1]);
+                let y = self.lower_math_arg(&args[0], &rty);
+                let x = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_atan2(y, x, &rty))
             }
             MathIntrinsic::Hypot => {
                 if args.len() != 2 {
                     return None;
                 }
-                let a = self.lower_expr(&args[0]);
-                let b = self.lower_expr(&args[1]);
+                let a = self.lower_math_arg(&args[0], &rty);
+                let b = self.lower_math_arg(&args[1], &rty);
                 Some(self.emit_hypot(a, b, &rty))
             }
             MathIntrinsic::Erf => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_erf(x, &rty))
             }
             MathIntrinsic::Sin => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_trig(x, &rty, false))
             }
             MathIntrinsic::Cos => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_trig(x, &rty, true))
             }
             MathIntrinsic::Tanh => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_tanh(x, &rty))
             }
             MathIntrinsic::Sigmoid => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_sigmoid(x, &rty))
             }
             MathIntrinsic::Silu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_silu(x, &rty))
             }
             MathIntrinsic::Gelu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_gelu(x, &rty))
             }
             // Activation backward `act_backward(x, dy) = dy · act'(x)` — two args. The non-dispatched
@@ -9775,67 +12383,73 @@ impl FnLowerer<'_> {
                 Some(self.emit_softplus_backward(x, dy, &rty))
             }
             MathIntrinsic::Elu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_elu(x, &rty))
             }
             MathIntrinsic::LeakyRelu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_leaky_relu(x, &rty))
             }
             MathIntrinsic::Softplus => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_softplus(x, &rty))
             }
             MathIntrinsic::Mish => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_mish(x, &rty))
             }
             MathIntrinsic::Selu => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_selu(x, &rty))
             }
             MathIntrinsic::Tanhshrink => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_tanhshrink(x, &rty))
             }
             MathIntrinsic::HardSigmoid => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_hardsigmoid(x, &rty))
             }
             MathIntrinsic::HardSwish => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_hardswish(x, &rty))
             }
             MathIntrinsic::Softsign => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_softsign(x, &rty))
             }
             MathIntrinsic::LogSigmoid => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_logsigmoid(x, &rty))
             }
             MathIntrinsic::Tan => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_tan(x, &rty))
             }
             MathIntrinsic::Asin => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_asin(x, &rty))
             }
             MathIntrinsic::Acos => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_acos(x, &rty))
             }
             MathIntrinsic::Cbrt => {
-                let x = self.lower_expr(args.first()?);
+                let x = self.lower_math_arg(args.first()?, &rty);
                 Some(self.emit_cbrt(x, &rty))
             }
             MathIntrinsic::Fmax | MathIntrinsic::Fmin => {
                 if args.len() != 2 {
                     return None;
                 }
-                let a = self.lower_expr(&args[0]);
-                let b = self.lower_expr(&args[1]);
+                // Coerce each operand to the (float) result type, exactly like sqrt/exp/pow above.
+                // Using a bare `lower_expr` here left an integer operand at its int type, then the
+                // float `Cmp(Fogt/Folt)` below ran on `i32` — MIR the verifier and Cranelift reject
+                // (the native backend errored out) while the interpreter computed an integer max and
+                // returned silently: a backend divergence on `fmax(int, int)`. `lower_math_arg`
+                // inserts the int→float coercion so both backends run the identical float compare.
+                let a = self.lower_math_arg(&args[0], &rty);
+                let b = self.lower_math_arg(&args[1], &rty);
                 let pred = if matches!(op, MathIntrinsic::Fmax) {
                     CmpOp::Fogt
                 } else {
@@ -9861,6 +12475,31 @@ impl FnLowerer<'_> {
             .builder
             .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
         self.builder.build(rty.clone(), Op::Select(gtm, x, negx))
+    }
+
+    /// Integer absolute value: `select(x < 0, 0 - x, x)`. Wraps for `INT_MIN` (like C/Rust's
+    /// `wrapping_abs`) and is plain integer sub/cmp/select, so both backends agree bit-for-bit.
+    fn emit_int_abs(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        let zero = self
+            .builder
+            .build(rty.clone(), Op::ConstInt(0, rty.clone()));
+        let neg = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::Sub, zero, x));
+        let isneg = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, x, zero));
+        self.builder.build(rty.clone(), Op::Select(isneg, neg, x))
+    }
+
+    /// Lower a math-intrinsic argument, coercing an integer operand to the float result type `rty`
+    /// (so `sqrt(16)` promotes the `16` to `16.0` rather than feeding a float op an int operand,
+    /// which the verifier rejects). A same-typed float operand is returned unchanged.
+    fn lower_math_arg(&mut self, arg: &Expr, rty: &MirType) -> ValueId {
+        let v = self.lower_expr(arg);
+        let from = self.expr_mir(arg);
+        let signed = self.signed(arg);
+        self.coerce_to(v, &from, rty, signed)
     }
 
     /// `exp(x)` as a fast, deterministic polynomial (≈1 ULP of the true `exp`). Always computed in
@@ -10925,6 +13564,27 @@ impl FnLowerer<'_> {
         if from == to {
             return v;
         }
+        // Casting a numeric value to `bool` is C-like truthiness — `x != 0` — NOT a low-bit
+        // truncation. Truncating made `2 as bool` *false* (its low bit is 0) while the condition path
+        // `if 2` is *true* (`lower_bool_cond` already compares `!= 0`); this aligns the two. Emitting
+        // the compare here yields an `i1` that both backends simply run as an `Op::Cmp`, so it is
+        // bit-exact with no backend change. `NaN as bool` is true, matching `if nan` (the same `Fone`).
+        if to == MirType::I1 && (from.is_int() || from.is_float()) {
+            let (zero, pred) = if from.is_float() {
+                (
+                    self.builder
+                        .build(from.clone(), Op::ConstFloat(0.0, from.clone())),
+                    CmpOp::Fone,
+                )
+            } else {
+                (
+                    self.builder
+                        .build(from.clone(), Op::ConstInt(0, from.clone())),
+                    CmpOp::Ne,
+                )
+            };
+            return self.builder.build(MirType::I1, Op::Cmp(pred, v, zero));
+        }
         // For a float→int cast the signed/unsigned choice comes from the TARGET integer (`x as i32`
         // is signed → fptosi); for every other direction (int→float, int widening) it comes from the
         // source operand. Using the operand's signedness for float→int picks fptoui, where the native
@@ -10950,6 +13610,40 @@ fn param_abi_ty(ty: &Ty) -> MirType {
     }
 }
 
+/// Round `x` up to the next multiple of `align` (a power of two) — field-offset padding, mirroring
+/// the private `round_up` in `mercury_types` (the registry-aware aggregate layout reimplements the
+/// same accumulation here because it must resolve named-struct field sizes the leaf crate can't).
+fn round_up(x: u64, align: u64) -> u64 {
+    if align <= 1 {
+        x
+    } else {
+        (x + align - 1) & !(align - 1)
+    }
+}
+
+/// Byte size of a MIR type (scalars by width, an array/vector as count × element). Used to size a
+/// no-init tuple's byte buffer from its element MIR types (`mir_ty_of_ann`). Matches `Ty::size_of`'s
+/// scalar widths so the buffer is identical to the with-initializer path's `ty_size`.
+fn mir_byte_size(t: &MirType) -> u64 {
+    match t {
+        MirType::I1 | MirType::I8 => 1,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 2,
+        MirType::I32 | MirType::F32 => 4,
+        MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::Vec(e, n) | MirType::Array(e, n) => mir_byte_size(e) * (*n as u64),
+        MirType::Void => 0,
+    }
+}
+
+/// Alignment of a MIR type: a scalar aligns to its size, an array/vector to its element. Companion
+/// to [`mir_byte_size`] for padding a no-init tuple's byte buffer.
+fn mir_byte_align(t: &MirType) -> u64 {
+    match t {
+        MirType::Vec(e, _) | MirType::Array(e, _) => mir_byte_align(e),
+        other => mir_byte_size(other).max(1),
+    }
+}
+
 fn mir_ty(ty: &Ty) -> MirType {
     match ty {
         Ty::Scalar(s) => MirType::from_scalar(*s),
@@ -10957,39 +13651,40 @@ fn mir_ty(ty: &Ty) -> MirType {
         Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) => MirType::Ptr,
         Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
         Ty::Unit => MirType::Void,
+        // A tuple (and any other aggregate) is a flat byte buffer; its local *value* is the base
+        // pointer (like an array), and field access GEPs to a padded byte offset. `tuple_offsets`
+        // is the layout authority. Falls back to a 0-byte buffer for an unsized field (never read).
+        Ty::Tuple(_) => MirType::Array(
+            Box::new(MirType::I8),
+            ty.size_of().unwrap_or(0) as u32,
+        ),
         _ => MirType::I32,
     }
 }
 
-fn mir_ty_of_ast(t: &ast::TypeExpr, interner: &Interner) -> MirType {
-    use ast::TypeKind::*;
-    match &t.kind {
-        Path(p) => {
-            let name = interner.resolve(p.segments.last().unwrap().sym);
-            match mercury_types::Scalar::from_name(name) {
-                Some(s) => MirType::from_scalar(s),
-                None => MirType::I32,
-            }
-        }
-        Array { elem, len } => match const_usize_expr(len, interner) {
-            // A literal-length array lowers to an array type; otherwise fall back to an opaque ptr.
-            Some(n) => MirType::Array(Box::new(mir_ty_of_ast(elem, interner)), n),
-            None => MirType::Ptr,
-        },
-        Pointer { .. } | Ref { .. } | Slice(_) | Tensor { .. } => MirType::Ptr,
-        Vector { elem, lanes } => {
-            let e = mir_ty_of_ast(elem, interner);
-            MirType::Vec(Box::new(e), *lanes)
-        }
-        Unit => MirType::Void,
-        _ => MirType::I32,
-    }
+/// Evaluate a compile-time array length: a plain integer literal, or a single-segment path naming a
+/// top-level `const` whose initializer is itself such a length (so `const N: usize = 4; [i32; N]`
+/// sizes the array). Mirrors sema's `eval_usize` exactly — the two must agree on the length, else
+/// the alloca'd slot size desyncs from sema's index-bounds checks. The depth bound guards a cyclic
+/// const initializer (also rejected by sema's `check_recursive_consts`).
+fn const_usize_expr(e: &Expr, interner: &Interner, consts: &HashMap<Symbol, Expr>) -> Option<u32> {
+    const_usize_depth(e, interner, consts, 0)
 }
 
-/// Evaluate a compile-time array length that is a plain integer literal.
-fn const_usize_expr(e: &Expr, interner: &Interner) -> Option<u32> {
+fn const_usize_depth(
+    e: &Expr,
+    interner: &Interner,
+    consts: &HashMap<Symbol, Expr>,
+    depth: u32,
+) -> Option<u32> {
+    if depth > 64 {
+        return None;
+    }
     match &e.kind {
         ExprKind::Int(s) => Some(parse_int(interner.resolve(*s)) as u32),
+        ExprKind::Path(p) if p.is_single() => consts
+            .get(&p.first().sym)
+            .and_then(|init| const_usize_depth(init, interner, consts, depth + 1)),
         _ => None,
     }
 }
@@ -11179,7 +13874,15 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
             expr_mentions(base, sym)
         }
         ExprKind::Cast { expr, .. } => expr_mentions(expr, sym),
-        // struct/array literals, if/match/block exprs, method calls, ranges, …: assume a use.
+        // Array literals mention a symbol iff one of their element expressions does — precise (and
+        // sound: the literal uses exactly those sub-expressions). Without this an array-init `let`
+        // (`let out = [0.0; N]`) in a scalar-escape window falsely reads as a use, so a preceding
+        // norm/reduction declines (e.g. the dest declaration of an out-of-place `out = norm(x)`).
+        ExprKind::ArrayLit(items) => items.iter().any(|e| expr_mentions(e, sym)),
+        ExprKind::ArrayRepeat { value, count } => {
+            expr_mentions(value, sym) || expr_mentions(count, sym)
+        }
+        // struct literals, if/match/block exprs, method calls, ranges, …: assume a use.
         _ => true,
     }
 }
@@ -11489,9 +14192,14 @@ fn is_f32_expr(e: &Expr, sema: &SemaResult) -> bool {
     matches!(sema.types.get(&e.id), Some(t) if mir_ty(t) == MirType::F32)
 }
 
-/// `for col in 0..n { c[row*stride + col] = 0.0; }` — the per-row zero-init of a beta-0 matmul.
-/// Returns `(c, stride, n)` with the outer row variable `row`.
-fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol, Dim, Dim)> {
+/// `for col in 0..n { c[row*stride + col] = 0.0; }` (or the 2-index `c[row, col] = 0.0`) — the per-row
+/// zero-init of a beta-0 matmul. Returns `(c, stride, n)` with the outer row variable `row`.
+fn match_zero_init(
+    s: &Stmt,
+    row: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Dim)> {
     let (pat, iter, body) = fusable_for(s)?;
     let col = match &pat.kind {
         ast::PatKind::Ident(c) => *c,
@@ -11516,8 +14224,7 @@ fn match_zero_init(s: &Stmt, row: Symbol, interner: &Interner) -> Option<(Symbol
     if !is_float_zero(value, interner) {
         return None;
     }
-    let (cbase, cidx) = as_index1(target)?;
-    let (stride, cc) = match_row_col(cidx, row, interner)?;
+    let (cbase, stride, cc) = match_operand_row_then_col(target, row, sema, interner)?;
     if cc != col {
         return None;
     }
@@ -11533,6 +14240,7 @@ fn match_product_ab(
     kvar: Symbol,
     jvar: Symbol,
     aik: Option<(Symbol, Symbol, Dim)>,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Symbol, Dim, bool)> {
     let ExprKind::Binary {
@@ -11549,19 +14257,17 @@ fn match_product_ab(
                 return Some((asym, sa));
             }
         }
-        let (abase, aidx) = as_index1(f)?;
-        let (asa, ak) = match_row_col(aidx, row, interner)?;
+        let (abase, asa, ak) = match_operand_row_then_col(f, row, sema, interner)?;
         (ak == kvar).then_some((abase, asa))
     };
     let is_b = |f: &Expr| -> Option<(Symbol, Dim, bool)> {
-        let (bbase, bidx) = as_index1(f)?;
-        // normal `B[k*N+j]`: row is k, col is j; transposed `B[j*K+k]`: row is j, col is k.
-        if let Some((sb, bc)) = match_row_col(bidx, kvar, interner) {
+        // normal `B[k*N+j]` / `B[k,j]`: row is k, col is j; transposed `B[j*K+k]` / `B[j,k]`: row j, col k.
+        if let Some((bbase, sb, bc)) = match_operand_row_then_col(f, kvar, sema, interner) {
             if bc == jvar {
                 return Some((bbase, sb, false));
             }
         }
-        if let Some((sb, bc)) = match_row_col(bidx, jvar, interner) {
+        if let Some((bbase, sb, bc)) = match_operand_row_then_col(f, jvar, sema, interner) {
             if bc == kvar {
                 return Some((bbase, sb, true));
             }
@@ -11575,38 +14281,122 @@ fn match_product_ab(
     pair(f1, f2).or_else(|| pair(f2, f1))
 }
 
-/// An A factor of the inline `ijk` product: `A[row*sa + k (+ off)]` (normal) or `A[k*sa + row (+ off)]`
-/// (transposed — the `dW = Aᵀ·B` weight-gradient spelling, where the contraction `k` is the outer
-/// index of A's storage). Returns `(base, sa, offset, transposed_a)`.
+/// The row-major inner-dimension stride of a **rank-2 contiguous tensor** operand, as a recognizer
+/// `Dim` — for `A: Tensor[f32, M, N]` accessed `A[i, j]`, the axis-0 stride is the inner dim `N`
+/// (a `Const` → `Dim::Lit`, a bound symbolic `Var` → `Dim::Var`). This lets the shape-typed 2-index
+/// spelling `a[i, k]` supply the *same* stride the flat `a[i*K + k]` form derives from its index
+/// arithmetic — so the idiomatic tensor matmul dispatches to the GEMM kernel. `None` for a
+/// non-tensor, a non-contiguous layout, a non-rank-2 tensor, or a `Dynamic` (`?`) inner dim.
+fn tensor_inner_stride(base: &Expr, sema: &SemaResult) -> Option<Dim> {
+    let Some(Ty::Tensor { shape, layout, .. }) = sema.types.get(&base.id) else {
+        return None;
+    };
+    if !matches!(layout, mercury_types::Layout::Contiguous) || shape.0.len() != 2 {
+        return None;
+    }
+    match &shape.0[1] {
+        mercury_types::Dim::Const(v) => Some(Dim::Lit(*v as i64)),
+        mercury_types::Dim::Var(s) => Some(Dim::Var(*s)),
+        mercury_types::Dim::Dynamic => None,
+    }
+}
+
+/// Decompose a matmul operand access into `(base, row_stride, offset_terms)` for a known `row` index
+/// and an expected `col` index. Accepts BOTH spellings:
+///   * the flat form `base[row*stride + col (+ offset…)]` — stride read from the index arithmetic
+///     (delegates to [`match_row_col_off`], so the flat path is byte-identical to before), and
+///   * the shape-typed 2-index form `base[row, col]` — stride = the tensor's inner dim, no offset.
+/// The 2-index branch is what makes `c[i,j] += a[i,k]*b[k,j]` dispatch to the tuned GEMM kernel
+/// instead of running as a scalar nest. Both indices must be exactly the expected `row`/`col` vars
+/// (a strided or offset 2-index access is not a plain matmul operand). `None` if neither shape matches.
+fn match_operand_row_col_off<'a>(
+    f: &'a Expr,
+    row: Symbol,
+    col: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Vec<&'a Expr>)> {
+    match &f.kind {
+        ExprKind::Index { base, indices } if indices.len() == 1 => {
+            let abase = single_path(base)?;
+            let (stride, off) = match_row_col_off(&indices[0], row, col, interner)?;
+            Some((abase, stride, off))
+        }
+        ExprKind::Index { base, indices } if indices.len() == 2 => {
+            if single_path(&indices[0])? != row || single_path(&indices[1])? != col {
+                return None;
+            }
+            let abase = single_path(base)?;
+            let stride = tensor_inner_stride(base, sema)?;
+            Some((abase, stride, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
+/// Like [`match_operand_row_col_off`] but for the offset-free `ikj` accumulate matmul, whose helpers
+/// *discover* the column rather than knowing it in advance: `base[row*stride + col]` (flat) or
+/// `base[row, col]` (2-index tensor, stride = inner dim) for a known `row`. Returns `(base, stride,
+/// col)`. The 2-index branch is what dispatches `c[i,j] += a[i,k]*b[k,j]` written in tensor notation.
+fn match_operand_row_then_col(
+    f: &Expr,
+    row: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Symbol)> {
+    match &f.kind {
+        ExprKind::Index { base, indices } if indices.len() == 1 => {
+            let abase = single_path(base)?;
+            let (stride, col) = match_row_col(&indices[0], row, interner)?;
+            Some((abase, stride, col))
+        }
+        ExprKind::Index { base, indices } if indices.len() == 2 => {
+            if single_path(&indices[0])? != row {
+                return None;
+            }
+            let col = single_path(&indices[1])?;
+            let abase = single_path(base)?;
+            let stride = tensor_inner_stride(base, sema)?;
+            Some((abase, stride, col))
+        }
+        _ => None,
+    }
+}
+
+/// An A factor of the inline `ijk` product: `A[row*sa + k (+ off)]` / `A[row, k]` (normal) or
+/// `A[k*sa + row (+ off)]` / `A[k, row]` (transposed — the `dW = Aᵀ·B` weight-gradient spelling, the
+/// contraction `k` being the outer index of A's storage). Returns `(base, sa, offset, transposed_a)`.
+/// Both the flat and shape-typed 2-index spellings dispatch (via [`match_operand_row_col_off`]).
 fn match_a_factor<'a>(
     f: &'a Expr,
     row: Symbol,
     kvar: Symbol,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>, bool)> {
-    let (abase, aidx) = as_index1(f)?;
-    if let Some((sa, off)) = match_row_col_off(aidx, row, kvar, interner) {
+    if let Some((abase, sa, off)) = match_operand_row_col_off(f, row, kvar, sema, interner) {
         return Some((abase, sa, off, false));
     }
-    if let Some((sa, off)) = match_row_col_off(aidx, kvar, row, interner) {
+    if let Some((abase, sa, off)) = match_operand_row_col_off(f, kvar, row, sema, interner) {
         return Some((abase, sa, off, true));
     }
     None
 }
 
-/// A B factor of the inline `ijk` product: `B[k*sb + j (+ off)]` (normal) or `B[j*sb + k (+ off)]`
-/// (transposed — the `A·Bᵀ` spelling). Returns `(base, sb, offset, transposed)`.
+/// A B factor of the inline `ijk` product: `B[k*sb + j (+ off)]` / `B[k, j]` (normal) or
+/// `B[j*sb + k (+ off)]` / `B[j, k]` (transposed — the `A·Bᵀ` `nn.Linear` spelling). Returns
+/// `(base, sb, offset, transposed)`. Both flat and 2-index spellings dispatch.
 fn match_b_factor<'a>(
     f: &'a Expr,
     kvar: Symbol,
     jvar: Symbol,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>, bool)> {
-    let (bbase, bidx) = as_index1(f)?;
-    if let Some((sb, off)) = match_row_col_off(bidx, kvar, jvar, interner) {
+    if let Some((bbase, sb, off)) = match_operand_row_col_off(f, kvar, jvar, sema, interner) {
         return Some((bbase, sb, off, false));
     }
-    if let Some((sb, off)) = match_row_col_off(bidx, jvar, kvar, interner) {
+    if let Some((bbase, sb, off)) = match_operand_row_col_off(f, jvar, kvar, sema, interner) {
         return Some((bbase, sb, off, true));
     }
     None
@@ -11621,6 +14411,7 @@ fn match_product_ab_off<'a>(
     row: Symbol,
     kvar: Symbol,
     jvar: Symbol,
+    sema: &SemaResult,
     interner: &Interner,
 ) -> Option<(Symbol, Dim, Vec<&'a Expr>, Symbol, Dim, Vec<&'a Expr>, bool, bool)> {
     let ExprKind::Binary {
@@ -11634,8 +14425,8 @@ fn match_product_ab_off<'a>(
     // Either factor order: `A*B` or `B*A`.
     for (fa, fb) in [(f1, f2), (f2, f1)] {
         if let (Some((a, sa, aoff, ta)), Some((b, sb, boff, t))) = (
-            match_a_factor(fa, row, kvar, interner),
-            match_b_factor(fb, kvar, jvar, interner),
+            match_a_factor(fa, row, kvar, sema, interner),
+            match_b_factor(fb, kvar, jvar, sema, interner),
         ) {
             return Some((a, sa, aoff, b, sb, boff, t, ta));
         }
@@ -12190,10 +14981,12 @@ fn match_matmul_i8_nt(
         let mut found = None;
         for (fa, fb) in [(f1, f2), (f2, f1)] {
             let (ai, bi) = (peel_cast(fa), peel_cast(fb));
-            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, interner) else {
+            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, sema, interner)
+            else {
                 continue;
             };
-            let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
+            let Some((b_sym, sb, b_off, transposed)) =
+                match_b_factor(bi, kvar, jvar, sema, interner)
             else {
                 continue;
             };
@@ -12403,10 +15196,12 @@ fn match_matmul_lowp(
                 continue;
             }
             let (ai, bi) = (peel_cast(fa), peel_cast(fb));
-            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, interner) else {
+            let Some((a_sym, sa, a_off, a_trans)) = match_a_factor(ai, row, kvar, sema, interner)
+            else {
                 continue;
             };
-            let Some((b_sym, sb, b_off, transposed)) = match_b_factor(bi, kvar, jvar, interner)
+            let Some((b_sym, sb, b_off, transposed)) =
+                match_b_factor(bi, kvar, jvar, sema, interner)
             else {
                 continue;
             };
@@ -12574,7 +15369,7 @@ fn match_matmul_ijk<'a>(
     // each be indexed `… + h*S*D`, the hallmark of a batched matmul (multi-head attention is one
     // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
     let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
-        match_product_ab_off(prod, row, kvar, jvar, interner)?;
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
     // Final store: c[i*N + j (+ off)] = s.
     let StmtKind::Assign {
         target: ct,
@@ -12587,8 +15382,8 @@ fn match_matmul_ijk<'a>(
     if single_path(cv) != Some(s_sym) {
         return None;
     }
-    let (cbase, cidx) = as_index1(ct)?;
-    let (sc, c_off) = match_row_col_off(cidx, row, jvar, interner)?;
+    // The output store `c[i*N + j (+ off)] = s` or the shape-typed `c[i, j] = s`.
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
     // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
     // (`A[k*M+i]`). Normal B's is N; transposed B's is K.
     let sa_ok = if transposed_a { sa == m } else { sa == kdim };
@@ -12785,7 +15580,7 @@ fn match_matmul_residual<'a>(
         return None;
     }
     let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
-        match_product_ab_off(prod, row, kvar, jvar, interner)?;
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
     // The fused-epilogue kernel is the plain 2-D `A·Bᵀ`: require transposed B, normal A, no batch
     // offsets (a TN / batched residual has no epilogue kernel — fall back to the scalar nest).
     if !transposed || transposed_a || !a_off.is_empty() || !b_off.is_empty() {
@@ -12883,8 +15678,7 @@ fn match_matmul<'a>(
                 ast::PatKind::Ident(s) => *s,
                 _ => return None,
             };
-            let (abase, aidx) = as_index1(init)?;
-            let (asa, ak) = match_row_col(aidx, row, interner)?;
+            let (abase, asa, ak) = match_operand_row_then_col(init, row, sema, interner)?;
             if ak != kvar {
                 return None;
             }
@@ -12910,8 +15704,7 @@ fn match_matmul<'a>(
     let StmtKind::Assign { target, op, value } = &jbody.stmts[0].kind else {
         return None;
     };
-    let (cbase, cidx) = as_index1(target)?;
-    let (sc, cj) = match_row_col(cidx, row, interner)?;
+    let (cbase, sc, cj) = match_operand_row_then_col(target, row, sema, interner)?;
     if cj != jvar {
         return None;
     }
@@ -12929,8 +15722,7 @@ fn match_matmul<'a>(
             else {
                 return None;
             };
-            let (clhs, clidx) = as_index1(lhs)?;
-            let (clsc, clj) = match_row_col(clidx, row, interner)?;
+            let (clhs, clsc, clj) = match_operand_row_then_col(lhs, row, sema, interner)?;
             if clhs != cbase || clsc != sc || clj != jvar {
                 return None;
             }
@@ -12946,7 +15738,7 @@ fn match_matmul<'a>(
         _ => None,
     };
     let (a_sym, sa, b_sym, sb, transposed) =
-        match_product_ab(prod, row, kvar, jvar, aik_info, interner)?;
+        match_product_ab(prod, row, kvar, jvar, aik_info, sema, interner)?;
 
     // Strides must describe contiguous row-major A[m,k] and C[m,n], and B[k,n] (normal) or B[n,k]
     // (transposed) — i.e. B's contraction stride is N normally, K when transposed.
@@ -12955,7 +15747,7 @@ fn match_matmul<'a>(
         return None;
     }
     if beta == 0 {
-        let (cz, scz, nz) = match_zero_init(czero?, row, interner)?;
+        let (cz, scz, nz) = match_zero_init(czero?, row, sema, interner)?;
         if cz != cbase || scz != n || nz != n {
             return None;
         }
@@ -13036,6 +15828,9 @@ fn lower_matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -14644,6 +17439,9 @@ fn xent_bwd_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -14681,6 +17479,9 @@ fn xent_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -14726,6 +17527,9 @@ fn logsumexp_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -14853,6 +17657,9 @@ fn probe_single_for(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     check(&probe, pat, iter, lb)
 }
@@ -15852,6 +18659,9 @@ fn lower_i8matmul_fn(
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::new(),
+        sret: None,
+        subst: HashMap::new(),
+        mono: None,
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -16313,12 +19123,43 @@ pub fn is_intrinsic(name: &str) -> bool {
     matches!(name, "print" | "println" | "assert")
 }
 
+/// Parse an integer literal's source text to its value. Handles the radix prefixes `0x`/`0o`/`0b`
+/// (case-insensitive), digit separators `_`, an explicit integer type suffix (`10i64`, `250u8`,
+/// `5usize`), and an optional leading sign. The previous version kept only the leading run of
+/// decimal digits, so every non-decimal literal (`0xFF`, `0b1010`, `0o17`) silently parsed to `0`.
 fn parse_int(text: &str) -> i128 {
-    let digits: String = text
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '_')
-        .collect();
-    digits.replace('_', "").parse().unwrap_or(0)
+    let mut s = text.trim();
+    let neg = s.starts_with('-');
+    if neg || s.starts_with('+') {
+        s = &s[1..];
+    }
+    // Strip an integer type suffix (longest-first so `usize`/`isize` win over a shorter prefix). A
+    // suffix uses letters `i`/`u`/`s`/`z`/`n` that are never hex digits, so this can't truncate a
+    // hex literal's digits.
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(stripped) = s.strip_suffix(suf) {
+            s = stripped;
+            break;
+        }
+    }
+    let body = s.replace('_', "");
+    let val = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16)
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        i128::from_str_radix(o, 8)
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        i128::from_str_radix(b, 2)
+    } else {
+        body.parse::<i128>()
+    }
+    .unwrap_or(0);
+    if neg {
+        -val
+    } else {
+        val
+    }
 }
 
 fn parse_float(text: &str) -> f64 {
@@ -16331,6 +19172,80 @@ fn parse_float(text: &str) -> f64 {
         }
     }
     core.parse().unwrap_or(0.0)
+}
+
+/// Decode a char literal's raw source text (including the surrounding single quotes) into its
+/// Unicode scalar value. Handles the one-character escapes (`\n` `\r` `\t` `\\` `\'` `\"` `\0`),
+/// `\xHH`, and `\u{…}`. Returns 0 for an empty/malformed literal (the lexer already reported any
+/// lexical error). This is the value a `'c'` literal lowers to (sema types it `u32`).
+fn decode_char_literal(text: &str) -> u32 {
+    let inner = text
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .unwrap_or(text);
+    let mut chars = inner.chars();
+    match chars.next() {
+        Some('\\') => decode_escape(&mut chars),
+        Some(c) => c as u32,
+        None => 0,
+    }
+}
+
+/// Decode a string literal's raw source text (including the surrounding `"`) into its UTF-8 bytes,
+/// resolving the same escapes as a char literal (`\n` `\t` `\\` `\"` `\0`, `\xHH`, `\u{…}`); each
+/// decoded code point is re-encoded as UTF-8. The caller appends the NUL terminator. Used by the
+/// `ExprKind::Str` lowering to materialize the byte buffer.
+fn decode_string_literal(text: &str) -> Vec<u8> {
+    let inner = text
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(text);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4];
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        let cp = if c == '\\' {
+            decode_escape(&mut chars)
+        } else {
+            c as u32
+        };
+        match char::from_u32(cp) {
+            Some(ch) => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
+            None => out.push(cp as u8),
+        }
+    }
+    out
+}
+
+/// Decode the body of a backslash escape (the `\` already consumed) to a code point.
+fn decode_escape(chars: &mut std::str::Chars) -> u32 {
+    match chars.next() {
+        Some('n') => '\n' as u32,
+        Some('r') => '\r' as u32,
+        Some('t') => '\t' as u32,
+        Some('\\') => '\\' as u32,
+        Some('\'') => '\'' as u32,
+        Some('"') => '"' as u32,
+        Some('0') => 0,
+        // `\xHH` — up to two hex digits (the lexer consumed at most two).
+        Some('x') => chars.by_ref().take(2).fold(0u32, |v, c| {
+            c.to_digit(16).map_or(v, |d| v * 16 + d)
+        }),
+        // `\u{HHHH}` — the hex digits between the braces. Saturating, so an over-long escape
+        // (`\u{100000000}`, ≥ 9 hex digits) clamps to an invalid code point instead of overflowing
+        // the accumulator and panicking the compiler; a valid code point is ≤ 6 hex digits anyway.
+        Some('u') => chars
+            .by_ref()
+            .skip_while(|&c| c != '{')
+            .skip(1)
+            .take_while(|&c| c != '}')
+            .fold(0u32, |v, c| {
+                c.to_digit(16)
+                    .map_or(v, |d| v.saturating_mul(16).saturating_add(d))
+            }),
+        Some(c) => c as u32,
+        None => 0,
+    }
 }
 
 #[cfg(test)]
@@ -16384,7 +19299,7 @@ mod tests {
     fn multi_dim_tensor_index_lowers_to_row_major_gep() {
         // The shape-typed surface: `t[i, j]` on `Tensor[f32, M, N]` must lower (no `unsupported`
         // C0001) to a flat row-major offset `i*N + j`, and the function must verify.
-        let src = "fn k(a: Tensor[f32, 3, 4], out: Tensor[f32, 3, 4]) { \
+        let src = "fn k(a: Tensor[f32, 3, 4], mut out: Tensor[f32, 3, 4]) { \
                    for i in 0..3 { for j in 0..4 { out[i, j] = a[i, j] * 2.0; } } }";
         let (prog, diags, mut interner) = lower(src);
         assert!(

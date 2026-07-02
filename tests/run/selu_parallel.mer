@@ -13,7 +13,7 @@ module tests.run.selu_parallel
 //   x[i] = (i % 8) − 4, so: selu(-4)≈-1.726 → -1725; selu(0)=0; selu(1)≈1.0507 → 1050;
 //   selu(3)≈3.152 → 3152.
 @parallel
-fn act(x: [f32; 4096], out: [f32; 4096]) {
+fn act(x: [f32; 4096], mut out: [f32; 4096]) {
     for i in 0..4096 {
         out[i] = selu(x[i]);
     }

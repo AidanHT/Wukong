@@ -12,6 +12,8 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+use rayon::prelude::*;
+
 use crate::bf16_bits_to_f32;
 
 /// IEEE f16 (stored bits) → f32. Lossless, so it equals the F16C `vcvtph2ps` result exactly. Thin
@@ -383,6 +385,192 @@ pub unsafe extern "C" fn mercury_dot_bf16(x: *const u16, y: *const u16, n: i64) 
         return dot_bf16_avx(x, y);
     }
     dot_scalar(Half::Bf16, x, y)
+}
+
+// ---- Parallel reductions (`@parallel`): deterministic, bit-identical on any thread count ----
+
+/// Cut `[0, n)` into fixed `crate::reduce::RCHUNK` chunks, reduce each with `per_chunk(lo, hi)` (one of
+/// the serial kernels over the sub-range — a pure function of its chunk), then fold the partials in
+/// **ascending chunk order** from `ident`. rayon's indexed `collect()` preserves chunk order regardless
+/// of which thread computed each, so the result is identical on every call no matter the core count:
+/// the native `@parallel` path and the interpreter (which marshals this very function) agree
+/// bit-for-bit. NOTE this chunked fold reassociates vs the *flat* whole-array serial kernel
+/// (`mercury_sum_bf16` et al.), so a `@parallel` reduction is **not** bit-equal to its non-`@parallel`
+/// twin — a reassociation exception, exactly like the f32 `mercury_sreduce_f32_parallel`.
+#[inline]
+fn par_chunk_reduce(
+    n: usize,
+    ident: f32,
+    per_chunk: impl Fn(usize, usize) -> f32 + Sync,
+    combine: impl Fn(f32, f32) -> f32,
+) -> f32 {
+    let nchunks = n.div_ceil(crate::reduce::RCHUNK);
+    let partials: Vec<f32> = (0..nchunks)
+        .into_par_iter()
+        .map(|c| {
+            let lo = c * crate::reduce::RCHUNK;
+            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
+            per_chunk(lo, hi)
+        })
+        .collect();
+    let mut acc = ident;
+    for p in partials {
+        acc = combine(acc, p);
+    }
+    acc
+}
+
+/// Multicore bf16 sum — the `@parallel` twin of [`mercury_sum_bf16`]. Each fixed chunk is summed by the
+/// serial kernel and the partials added ascending, so the result is deterministic (interp == native).
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sum_bf16_parallel(x: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let n = n as usize;
+    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
+        return mercury_sum_bf16(x, n as i64);
+    }
+    let xa = x as usize;
+    par_chunk_reduce(
+        n,
+        0.0,
+        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
+        |lo, hi| unsafe { mercury_sum_bf16((xa as *const u16).add(lo), (hi - lo) as i64) },
+        |a, b| a + b,
+    )
+}
+
+/// Multicore IEEE-f16 sum — the `@parallel` twin of [`mercury_sum_f16`].
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let n = n as usize;
+    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
+        return mercury_sum_f16(x, n as i64);
+    }
+    let xa = x as usize;
+    par_chunk_reduce(
+        n,
+        0.0,
+        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
+        |lo, hi| unsafe { mercury_sum_f16((xa as *const u16).add(lo), (hi - lo) as i64) },
+        |a, b| a + b,
+    )
+}
+
+/// Multicore bf16 dot — the `@parallel` twin of [`mercury_dot_bf16`].
+///
+/// # Safety
+/// `x` and `y` must each point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_dot_bf16_parallel(x: *const u16, y: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let n = n as usize;
+    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
+        return mercury_dot_bf16(x, y, n as i64);
+    }
+    let (xa, ya) = (x as usize, y as usize);
+    par_chunk_reduce(
+        n,
+        0.0,
+        // SAFETY: disjoint read-only chunks; `x`/`y` valid for `n` u16 by contract.
+        |lo, hi| unsafe {
+            mercury_dot_bf16(
+                (xa as *const u16).add(lo),
+                (ya as *const u16).add(lo),
+                (hi - lo) as i64,
+            )
+        },
+        |a, b| a + b,
+    )
+}
+
+/// Multicore IEEE-f16 dot — the `@parallel` twin of [`mercury_dot_f16`].
+///
+/// # Safety
+/// `x` and `y` must each point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_dot_f16_parallel(x: *const u16, y: *const u16, n: i64) -> f32 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let n = n as usize;
+    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
+        return mercury_dot_f16(x, y, n as i64);
+    }
+    let (xa, ya) = (x as usize, y as usize);
+    par_chunk_reduce(
+        n,
+        0.0,
+        // SAFETY: disjoint read-only chunks; `x`/`y` valid for `n` u16 by contract.
+        |lo, hi| unsafe {
+            mercury_dot_f16(
+                (xa as *const u16).add(lo),
+                (ya as *const u16).add(lo),
+                (hi - lo) as i64,
+            )
+        },
+        |a, b| a + b,
+    )
+}
+
+/// Multicore bf16 max-family reduction (`RED_MAX`/`RED_MIN`/`RED_MAXABS`) — the `@parallel` twin of
+/// [`mercury_reduce_bf16`]. Partials fold with the op's `fold2`/`ident` (the same `Cmp+Select` the
+/// recognizer emits), so max/min/absmax stay deterministic over the fixed chunk decomposition.
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_reduce_bf16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
+    if n <= 0 {
+        return crate::reduce::ident(op);
+    }
+    let n = n as usize;
+    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
+        return mercury_reduce_bf16(x, n as i64, op);
+    }
+    let xa = x as usize;
+    par_chunk_reduce(
+        n,
+        crate::reduce::ident(op),
+        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
+        |lo, hi| unsafe { mercury_reduce_bf16((xa as *const u16).add(lo), (hi - lo) as i64, op) },
+        |a, b| crate::reduce::fold2(a, b, op),
+    )
+}
+
+/// Multicore IEEE-f16 max-family reduction — the `@parallel` twin of [`mercury_reduce_f16`].
+///
+/// # Safety
+/// `x` must point to `n` readable `u16`.
+#[no_mangle]
+pub unsafe extern "C" fn mercury_reduce_f16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
+    if n <= 0 {
+        return crate::reduce::ident(op);
+    }
+    let n = n as usize;
+    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
+        return mercury_reduce_f16(x, n as i64, op);
+    }
+    let xa = x as usize;
+    par_chunk_reduce(
+        n,
+        crate::reduce::ident(op),
+        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
+        |lo, hi| unsafe { mercury_reduce_f16((xa as *const u16).add(lo), (hi - lo) as i64, op) },
+        |a, b| crate::reduce::fold2(a, b, op),
+    )
 }
 
 /// Scalar twin of the bf16→f32 axpby: `out[i] = a·widen(x[i]) + b·widen(y[i])`. The op order
@@ -845,5 +1033,155 @@ mod tests {
         let got = unsafe { mercury_dot_bf16(xbf.as_ptr(), ybf.as_ptr(), n as i64) };
         let rel = (got as f64 - ref_dot).abs() / ref_dot.abs().max(1.0);
         assert!(rel < 1e-2, "bf16 dot rel {rel:.2e}");
+    }
+
+    /// The IDENTICAL chunk fold the `_parallel` kernels perform, computed sequentially (no rayon): cut
+    /// `[0, n)` on the fixed `RCHUNK` boundary, reduce each chunk with the serial kernel, fold the
+    /// partials ascending from `ident(op)`. The parallel kernel must equal this bit-for-bit — that is
+    /// its thread-count-independence contract — and it reassociates vs the flat whole-array serial.
+    fn seq_chunked(x: &[u16], y: &[u16], op: i64, is_f16: bool) -> f32 {
+        use crate::reduce::{fold2, ident, RCHUNK, RED_DOT, RED_SUM};
+        let n = x.len();
+        let nchunks = n.div_ceil(RCHUNK).max(1);
+        let mut acc = ident(op);
+        for c in 0..nchunks {
+            let lo = c * RCHUNK;
+            let hi = ((c + 1) * RCHUNK).min(n);
+            let len = (hi - lo) as i64;
+            // SAFETY: [lo, hi) ⊆ [0, n); the slices are valid for `len` u16.
+            let p = unsafe {
+                match (op, is_f16) {
+                    (RED_DOT, false) => mercury_dot_bf16(x[lo..].as_ptr(), y[lo..].as_ptr(), len),
+                    (RED_DOT, true) => mercury_dot_f16(x[lo..].as_ptr(), y[lo..].as_ptr(), len),
+                    (RED_SUM, false) => mercury_sum_bf16(x[lo..].as_ptr(), len),
+                    (RED_SUM, true) => mercury_sum_f16(x[lo..].as_ptr(), len),
+                    (_, false) => mercury_reduce_bf16(x[lo..].as_ptr(), len, op),
+                    (_, true) => mercury_reduce_f16(x[lo..].as_ptr(), len, op),
+                }
+            };
+            acc = fold2(acc, p, op);
+        }
+        acc
+    }
+
+    #[test]
+    fn parallel_reductions_match_sequential_chunked() {
+        use crate::reduce::{RED_DOT, RED_MAX, RED_MAXABS, RED_MIN, RED_SUM};
+        // Sizes straddling the fixed RCHUNK (8192) boundary: the < 2-chunk guard path, an exact chunk,
+        // a one-over partial, and several full chunks + a non-mult-of-8 tail.
+        for &n in &[1usize, 8, 8191, 8192, 8193, 3 * 8192 + 13] {
+            let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.013 - 0.5).collect();
+            let ys: Vec<f32> = (0..n).map(|i| (i % 53) as f32 * 0.017 - 0.3).collect();
+            let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+            let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+            let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
+            let yf16: Vec<u16> = ys.iter().map(|&v| f16_bits(v)).collect();
+            let nn = n as i64;
+            unsafe {
+                assert_eq!(
+                    mercury_sum_bf16_parallel(xbf.as_ptr(), nn).to_bits(),
+                    seq_chunked(&xbf, &xbf, RED_SUM, false).to_bits(),
+                    "sum_bf16 n={n}"
+                );
+                assert_eq!(
+                    mercury_sum_f16_parallel(xf16.as_ptr(), nn).to_bits(),
+                    seq_chunked(&xf16, &xf16, RED_SUM, true).to_bits(),
+                    "sum_f16 n={n}"
+                );
+                assert_eq!(
+                    mercury_dot_bf16_parallel(xbf.as_ptr(), ybf.as_ptr(), nn).to_bits(),
+                    seq_chunked(&xbf, &ybf, RED_DOT, false).to_bits(),
+                    "dot_bf16 n={n}"
+                );
+                assert_eq!(
+                    mercury_dot_f16_parallel(xf16.as_ptr(), yf16.as_ptr(), nn).to_bits(),
+                    seq_chunked(&xf16, &yf16, RED_DOT, true).to_bits(),
+                    "dot_f16 n={n}"
+                );
+                for &op in &[RED_MAX, RED_MIN, RED_MAXABS] {
+                    let gb = mercury_reduce_bf16_parallel(xbf.as_ptr(), nn, op);
+                    assert_eq!(
+                        gb.to_bits(),
+                        seq_chunked(&xbf, &xbf, op, false).to_bits(),
+                        "reduce_bf16 op={op} n={n}"
+                    );
+                    // Determinism: a second call returns the identical bits.
+                    assert_eq!(
+                        gb.to_bits(),
+                        mercury_reduce_bf16_parallel(xbf.as_ptr(), nn, op).to_bits(),
+                        "reduce_bf16 nondeterministic op={op} n={n}"
+                    );
+                    let gf = mercury_reduce_f16_parallel(xf16.as_ptr(), nn, op);
+                    assert_eq!(
+                        gf.to_bits(),
+                        seq_chunked(&xf16, &xf16, op, true).to_bits(),
+                        "reduce_f16 op={op} n={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_reductions_within_f64_tolerance() {
+        use crate::reduce::{RED_MAX, RED_MAXABS, RED_MIN};
+        // A size that exercises several real chunks (RCHUNK = 8192), so rayon actually runs.
+        let n = 3 * 8192 + 251;
+        let xs: Vec<f32> = (0..n).map(|i| ((i % 97) as f32) * 0.01).collect();
+        let ys: Vec<f32> = (0..n).map(|i| ((i % 53) as f32) * 0.02).collect();
+        let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
+        let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
+        let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
+        unsafe {
+            // bf16 / f16 sum: f32-accumulation error within ULP tolerance of the f64 reference.
+            let want: f64 = xbf.iter().map(|&b| bf16_bits_to_f32(b) as f64).sum();
+            let got = mercury_sum_bf16_parallel(xbf.as_ptr(), n as i64) as f64;
+            assert!(
+                (got - want).abs() / want.abs().max(1.0) < 1e-2,
+                "bf16 sum got {got} want {want}"
+            );
+            let want: f64 = xf16.iter().map(|&b| f16_to_f32(b) as f64).sum();
+            let got = mercury_sum_f16_parallel(xf16.as_ptr(), n as i64) as f64;
+            assert!(
+                (got - want).abs() / want.abs().max(1.0) < 1e-3,
+                "f16 sum got {got} want {want}"
+            );
+            // bf16 dot.
+            let want: f64 = xbf
+                .iter()
+                .zip(&ybf)
+                .map(|(&a, &b)| bf16_bits_to_f32(a) as f64 * bf16_bits_to_f32(b) as f64)
+                .sum();
+            let got = mercury_dot_bf16_parallel(xbf.as_ptr(), ybf.as_ptr(), n as i64) as f64;
+            assert!(
+                (got - want).abs() / want.abs().max(1.0) < 1e-2,
+                "bf16 dot got {got} want {want}"
+            );
+            // max / min / absmax round nothing and the widen is lossless, so the parallel result is
+            // the *exact* reduction of the widened values — assert bit-for-bit, no tolerance.
+            let widen = |b: &[u16]| -> Vec<f32> { b.iter().map(|&v| bf16_bits_to_f32(v)).collect() };
+            let xw = widen(&xbf);
+            let want_max = xw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let want_min = xw.iter().copied().fold(f32::INFINITY, f32::min);
+            let want_amx = xw
+                .iter()
+                .map(|v| v.abs())
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(
+                mercury_reduce_bf16_parallel(xbf.as_ptr(), n as i64, RED_MAX).to_bits(),
+                want_max.to_bits(),
+                "bf16 max"
+            );
+            assert_eq!(
+                mercury_reduce_bf16_parallel(xbf.as_ptr(), n as i64, RED_MIN).to_bits(),
+                want_min.to_bits(),
+                "bf16 min"
+            );
+            assert_eq!(
+                mercury_reduce_bf16_parallel(xbf.as_ptr(), n as i64, RED_MAXABS).to_bits(),
+                want_amx.to_bits(),
+                "bf16 absmax"
+            );
+        }
     }
 }

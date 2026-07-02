@@ -1,0 +1,9 @@
+// EXPECT-CODE: E0401
+module tests.fail.bool_index
+
+// An array index is an integer offset; a `bool` index silently coerced to 0/1, so `a[true]` read
+// `a[1]` with no diagnostic. A concrete bool index is now rejected.
+fn main() -> i32 {
+    let a: [i32; 2] = [10, 20];
+    return a[true];
+}

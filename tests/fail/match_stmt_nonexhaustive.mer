@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0405
+module tests.fail.match_stmt_nonexhaustive
+
+// A non-exhaustive `match` in STATEMENT position (its value unused) still lowers a value-merge whose
+// "no arm matched" fallthrough is `Unreachable`. When no arm matches at runtime the interpreter traps
+// (exit 1) but the native backend executes an illegal instruction (exit 132) — a backend divergence.
+// The E0405 exhaustiveness check is therefore no longer gated on the match producing a value: a
+// provably-non-exhaustive match is rejected in every position, like Rust.
+fn main() -> i32 {
+    let n = 5;
+    match n {        // i32 scrutinee, no `_` arm -> non-exhaustive
+        0 => print(0),
+        1 => print(1),
+    }
+    return 0;
+}

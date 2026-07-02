@@ -92,6 +92,9 @@ pub struct FieldInit {
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub pat: Pattern,
+    /// An optional `if <expr>` guard: the arm matches only when the pattern fits *and* the guard is
+    /// true. The guard may reference an `Ident` pattern's binding.
+    pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }

@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 103
+// EXPECT-OUT: 827
+// EXPECT-OUT: 1654
+module tests.run.rmsnorm_const_eps
+
+// RMSNorm with the epsilon written as a top-level `const` — the near-universal transformer spelling
+// (`const EPS: f32 = 1e-5;` shared across every norm) rather than an inline literal. The fused-norm
+// recognizer resolves the `const` eps via `sema.consts` (it is immutable and always in scope), so this
+// still folds into one `mercury_norm_f32(.., NORM_RMSNORM)` call — grep the `-O2` MIR for the symbol.
+// A local binding of the same name would shadow the const (the recognizer checks `lookup` first), so a
+// runtime eps still correctly declines to the scalar path. Same value as tests/run/rmsnorm.mer, so the
+// output is identical; the differential + opt-invariance gates prove the fused kernel matches bit-for-bit.
+const EPS: f32 = 0.00001;
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) + 1.0; // 1 .. 16
+    }
+
+    let mut ss: f32 = 0.0;
+    for i in 0..16 {
+        ss = ss + x[i] * x[i];
+    }
+    let inv: f32 = rsqrt(ss / 16.0 + EPS); // eps is the top-level const
+    for i in 0..16 {
+        x[i] = x[i] * inv;
+    }
+
+    print((x[0] * 1000.0) as i32);  // 103
+    print((x[7] * 1000.0) as i32);  // 827
+    print((x[15] * 1000.0) as i32); // 1654
+    return 0;
+}

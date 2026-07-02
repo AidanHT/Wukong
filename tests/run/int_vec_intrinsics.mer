@@ -1,0 +1,29 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 13
+// EXPECT-OUT: 4
+// EXPECT-OUT: -16
+// EXPECT-OUT: 15
+module tests.run.int_vec_intrinsics
+
+// The type-preserving integer intrinsics `abs`/`round`/`floor`/`ceil`/`trunc` inside a *vectorizable*
+// `for` loop must lower per the integer lane type, not the float forms. The scalar path already
+// guards this (integer abs is `select(x<0,-x,x)`, rounding an integer is the identity); the
+// auto-vectorizer did not, so it emitted `<N x i32>` float ops (FSub / Cmp(Fogt) / Op::Round) that the
+// MIR verifier and Cranelift reject — an ICE at -O1+/native while the interpreter ran it lossily at
+// -O0 (a divergence). This exercises the vectorized path (a `for i in 0..N` elementwise loop).
+fn main() -> i32 {
+    let mut x: [i32; 32] = [0; 32];
+    for i in 0..32 { x[i] = (i as i32) - 16; }   // values -16 .. 15
+
+    let mut a: [i32; 32] = [0; 32];
+    for i in 0..32 { a[i] = abs(x[i]); }         // integer abs, vectorized
+    print(a[3]);                                  // abs(-13) = 13
+    print(a[20]);                                 // abs(4)   = 4
+
+    let mut f: [i32; 32] = [0; 32];
+    for i in 0..32 { f[i] = floor(x[i]); }        // rounding an integer is the identity
+    print(f[0]);                                  // -16
+    print(f[31]);                                 // 15
+
+    return 0;
+}

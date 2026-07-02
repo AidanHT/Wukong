@@ -1,0 +1,37 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 30
+// EXPECT-OUT: 11
+// EXPECT-OUT: 30
+module tests.run.struct_assign
+
+// Whole-aggregate *assignment* (distinct from a `let` initializer): storing a struct value into an
+// aggregate place must deep-copy the buffer, not store the RHS buffer's base pointer into the
+// destination's first slot. The assign path routes through the same leaf-precise `init_field` /
+// `emit_copy` as initialization, so `*p = Struct{..}`, `*p = struct_var`, and a nested struct field
+// `s.f = …` all agree bit-for-bit between the interpreter oracle and the native backend.
+struct Pt { x: i32, y: i32 }
+struct Box { lo: Pt, hi: Pt }
+
+fn put(p: *mut Pt) { *p = Pt { x: 3, y: 4 }; }       // store a struct literal through a pointer
+fn cp(dst: *mut Pt, src: Pt) { *dst = src; }          // store a non-literal struct value through a pointer
+
+fn main() -> i32 {
+    let mut s: Pt = Pt { x: 1, y: 2 };
+    put(&mut s);
+    print(s.x + s.y);                 // 3 + 4 = 7
+
+    let mut a: Pt = Pt { x: 1, y: 1 };
+    let b: Pt = Pt { x: 10, y: 20 };
+    cp(&mut a, b);
+    print(a.x + a.y);                 // 10 + 20 = 30
+
+    let mut bx: Box = Box { lo: Pt { x: 0, y: 0 }, hi: Pt { x: 0, y: 0 } };
+    bx.hi = Pt { x: 5, y: 6 };        // whole struct literal into a nested field
+    print(bx.hi.x + bx.hi.y);         // 5 + 6 = 11
+
+    bx.lo = b;                        // whole struct variable into a nested field
+    print(bx.lo.x + bx.lo.y);         // 10 + 20 = 30
+    return 0;
+}

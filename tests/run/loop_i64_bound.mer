@@ -1,0 +1,42 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 21
+// EXPECT-OUT: 21
+// EXPECT-OUT: 15
+module tests.run.loop_i64_bound
+
+// `for i in 0..n` where the END bound `n` is wider than the literal `0` start (i64 / usize).
+// The counter must be driven by the WIDER of the two bound types: a literal-`0` start lowers to
+// `i32`, so an `i64`/`usize` end produced `cmp.i32 i32, i64` — verifier-invalid MIR that crashed
+// the native backend (the interpreter trapped). Only the *scalar* loop hit it: an array loop
+// vectorizes the counter away, so the bug surfaced on the tensor-param path (which the vectorizer
+// declines). So this pins both: a Tensor param with a non-const i64/usize bound, plus the array
+// variant (vectorized counter) which must still agree.
+
+fn sum_i64(a: Tensor[f32, 6], n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..n { s = s + a[i]; }
+    return s;
+}
+
+fn sum_usize(a: Tensor[f32, 6], n: usize) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..n { s = s + a[i]; }
+    return s;
+}
+
+// array variant — the vectorized counter path must widen too.
+fn sum_arr_i64(a: [f32; 5], n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..n { s = s + a[i]; }
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    print(sum_i64(a, 6) as i32);   // 1+2+3+4+5+6 = 21
+    print(sum_usize(a, 6) as i32); // 21
+    let b: [f32; 5] = [1.0, 2.0, 3.0, 4.0, 5.0];
+    print(sum_arr_i64(b, 5) as i32); // 1+2+3+4+5 = 15
+    return 0;
+}

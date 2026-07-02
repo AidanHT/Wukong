@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0405
+module tests.fail.match_nonexhaustive
+
+// A `match` used in value position must be exhaustive. This one omits `Color::Blue` and has no `_`
+// catch-all, so when the scrutinee is `Blue` no arm fires. mir_build would have branched a synthesized
+// zero default into the merge block — a SILENT wrong answer that BOTH backends share (so the
+// interp-vs-native differential gate is structurally blind to it). Worse, for an aggregate result the
+// zero default is `const.i32 0` into an aggregate merge param → invalid MIR → an ICE / native-O0
+// segfault. Sema now rejects it at compile time (E0405), like Rust, closing the whole class.
+enum Color { Red, Green, Blue }
+
+fn name(c: Color) -> i32 {
+    return match c {
+        Color::Red => 1,
+        Color::Green => 2,
+    };
+}
+
+fn main() -> i32 {
+    return name(Color::Blue);
+}

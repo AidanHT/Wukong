@@ -16,7 +16,7 @@ module tests.run.multi_head_attention
 // [0.5,0.5] ⇒ out[h] row i is the *mean of head h's V rows*. The two heads carry different V, so the
 // distinct outputs (4,6 vs 20,30) prove the per-head offset addresses the right slice through both
 // the Q·Kᵀ matmul, the softmax, and the P·V matmul.
-fn mha(q: [f32; 8], k: [f32; 8], v: [f32; 8], scores: [f32; 8], out: [f32; 8]) {
+fn mha(q: [f32; 8], k: [f32; 8], v: [f32; 8], mut scores: [f32; 8], mut out: [f32; 8]) {
     // scores[h] = Q[h] · K[h]ᵀ   (S×D · D×S → S×S), batched over h.
     for h in 0..2 {
         for i in 0..2 {
