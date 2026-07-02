@@ -3457,6 +3457,56 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
+            // `mercury_attention_f32(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product
+            // attention (the flash-attention kernel). Like the GEMM path, the interpreter marshals
+            // q/k/v out of its abstract memory into real f32 buffers, calls the *identical* runtime
+            // kernel the native backend calls, then writes the output back — so the online-softmax
+            // reassociation stays bit-for-bit exact across the two backends.
+            "mercury_attention_f32" => {
+                let q = ptr(args[0])?;
+                let k = ptr(args[1])?;
+                let v = ptr(args[2])?;
+                let out = ptr(args[3])?;
+                let s = args[4].as_int() as usize;
+                let d = args[5].as_int() as usize;
+                let scale = args[6].as_float() as f32;
+                let causal = args[7].as_int() as i64;
+                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                    let mut buf = Vec::with_capacity(len);
+                    for t in 0..len {
+                        buf.push(
+                            mem.get(base + t)
+                                .ok_or("attention operand out of bounds")?
+                                .as_float() as f32,
+                        );
+                    }
+                    Ok(buf)
+                };
+                let qbuf = read(&self.memory, q, s * d)?;
+                let kbuf = read(&self.memory, k, s * d)?;
+                let vbuf = read(&self.memory, v, s * d)?;
+                let mut obuf = vec![0.0f32; s * d];
+                // SAFETY: buffers are exactly s*d long — the kernel's operand contract.
+                unsafe {
+                    mercury_runtime::mercury_attention_f32(
+                        qbuf.as_ptr(),
+                        kbuf.as_ptr(),
+                        vbuf.as_ptr(),
+                        obuf.as_mut_ptr(),
+                        s as i64,
+                        d as i64,
+                        scale,
+                        causal,
+                    );
+                }
+                for (t, &val) in obuf.iter().enumerate() {
+                    *self
+                        .memory
+                        .get_mut(out + t)
+                        .ok_or("attention output out of bounds")? = Value::Float(val as f64);
+                }
+                Ok(Value::Unit)
+            }
             other => Err(format!("call to unknown function or intrinsic `{other}`")),
         }
     }
