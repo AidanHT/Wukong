@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0504
+module tests.fail.generic_shape_unknown_dim
+
+// An undeclared dim name in a tensor type is a typo, not a fresh implicit dim. `dot` declares one
+// generic `<K>`, but its second parameter is annotated `Tensor[f32, KK]` — `KK` is not a declared
+// generic (nor an integer / `?` / `const`). Previously this silently introduced a brand-new symbolic
+// dimension `KK`, dropping the shared `K` constraint the programmer meant (so two different-length
+// buffers would satisfy the signature); it is now rejected with E0504 ("did you mean `K`?").
+fn dot<K>(a: Tensor[f32, K], b: Tensor[f32, KK]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..K {
+        s = s + a[i] * b[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [f32; 3] = [1.0, 2.0, 3.0];
+    let b: [f32; 3] = [4.0, 5.0, 6.0];
+    print(dot::<3>(a, b) as i32);
+    return 0;
+}
