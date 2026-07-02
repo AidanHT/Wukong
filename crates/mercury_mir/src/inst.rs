@@ -180,6 +180,12 @@ pub enum Op {
     /// The machine address of a function (a `Ptr`), for passing it to a runtime that calls it back
     /// — e.g. the outlined body of a `@parallel for`. Pure and side-effect-free.
     FuncAddr(Symbol),
+    /// The read-only address (a `Ptr`) of a named static-data blob in `Program::statics` — how a
+    /// string literal is materialized: its NUL-terminated UTF-8 bytes live once in `.rodata`, and
+    /// every use (including a `return`ed or threaded `*u8`) is this address, so the pointer stays
+    /// valid after the defining frame is gone (unlike a stack byte-buffer, which dangled on native).
+    /// The closest analogue to `FuncAddr` — the address of a named thing. Pure and side-effect-free.
+    GlobalAddr(Symbol),
     /// Broadcast a scalar across every lane of a SIMD vector. The result is a `Vec(elem, n)` whose
     /// lane type matches the operand; the vectorizer uses it to lift loop-invariant scalars into
     /// vector form. Pure and side-effect-free.

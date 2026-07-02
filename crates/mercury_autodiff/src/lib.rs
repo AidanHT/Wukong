@@ -419,7 +419,11 @@ impl<'a> Vjp<'a> {
     /// Clone a forward op with every operand value remapped into the new value space.
     fn remap_op(&self, op: &Op) -> Op {
         match op {
-            Op::ConstInt(..) | Op::ConstFloat(..) | Op::Alloca(..) | Op::FuncAddr(..) => op.clone(),
+            Op::ConstInt(..)
+            | Op::ConstFloat(..)
+            | Op::Alloca(..)
+            | Op::FuncAddr(..)
+            | Op::GlobalAddr(..) => op.clone(),
             Op::Bin(b, l, r) => Op::Bin(*b, self.remap(*l), self.remap(*r)),
             Op::Cmp(c, l, r) => Op::Cmp(*c, self.remap(*l), self.remap(*r)),
             Op::Neg(v) => Op::Neg(self.remap(*v)),
@@ -465,6 +469,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Gep { .. } => "gep",
         Op::Call { .. } => "call",
         Op::FuncAddr(..) => "func_addr",
+        Op::GlobalAddr(..) => "global_addr",
         Op::Splat(..) => "splat",
         Op::Fma(..) => "fma",
         Op::Sqrt(..) => "sqrt",

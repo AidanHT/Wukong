@@ -159,10 +159,24 @@ pub enum MirLevel {
     Low,
 }
 
-/// A whole compiled program: its functions and the current lowering level.
+/// A read-only static-data blob living in `.rodata`, referenced by address via `Op::GlobalAddr`.
+/// Currently only string literals: `bytes` holds the literal's UTF-8 plus a trailing NUL, so the
+/// address is directly usable by `print_str` (which scans to the NUL). Emitted once per unique
+/// content (deduped in `mir_build`), so a returned/threaded `*u8` points at stable storage instead
+/// of a reclaimed stack frame.
+#[derive(Clone, Debug)]
+pub struct StaticData {
+    pub name: Symbol,
+    pub bytes: Vec<u8>,
+}
+
+/// A whole compiled program: its functions, read-only static data, and the current lowering level.
 #[derive(Clone, Debug)]
 pub struct Program {
     pub funcs: Vec<Function>,
+    /// Read-only data blobs (string literals) referenced by `Op::GlobalAddr`; each `name` is a
+    /// symbol interned once in `mir_build`, unique per distinct content.
+    pub statics: Vec<StaticData>,
     pub level: MirLevel,
 }
 
@@ -170,6 +184,7 @@ impl Program {
     pub fn new() -> Program {
         Program {
             funcs: Vec::new(),
+            statics: Vec::new(),
             level: MirLevel::Low,
         }
     }

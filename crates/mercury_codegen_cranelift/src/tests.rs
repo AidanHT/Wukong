@@ -3465,6 +3465,7 @@ fn vector_ops_interp_matches_native() {
 
     let prog = Program {
         funcs: vec![b.finish()],
+        statics: Vec::new(),
         level: MirLevel::Low,
     };
     for f in &prog.funcs {

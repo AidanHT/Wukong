@@ -16,12 +16,12 @@ use std::sync::Mutex;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, StackSlotData,
-    StackSlotKind, Type, Value,
+    types, AbiParam, Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlags, Signature,
+    StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use mercury_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId};
 use mercury_span::{Interner, Symbol};
@@ -371,6 +371,9 @@ struct FnTranslator<'a> {
     /// Pre-declared FuncRefs for callees and runtime imports in this function.
     func_refs: &'a HashMap<Symbol, FuncRef>,
     rt_refs: &'a HashMap<&'static str, FuncRef>,
+    /// Pre-declared GlobalValues for the read-only static-data blobs (`Op::GlobalAddr`), one per
+    /// unique string literal, imported into this function's DFG.
+    data_refs: &'a HashMap<Symbol, GlobalValue>,
     /// First "type too large to lay out" overflow seen while lowering this function, if any.
     /// Recorded (instead of panicking) so `populate_module` can abort with a clean error before
     /// the half-built function is finalized/defined. See [`FnTranslator::size_of_or_err`].
@@ -654,6 +657,14 @@ impl<'a> FnTranslator<'a> {
             Op::FuncAddr(sym) => {
                 let fref = self.func_refs[sym];
                 self.builder.ins().func_addr(self.ptr_ty, fref)
+            }
+            // The read-only address of a `.rodata` string blob: materialize the pre-declared data
+            // symbol's address. In the JIT this resolves to the blob's in-process address; in the
+            // object it emits a relocation into the `.rodata` section — so a returned `*u8` is a real
+            // static address, not a reclaimed stack slot.
+            Op::GlobalAddr(sym) => {
+                let gv = self.data_refs[sym];
+                self.builder.ins().global_value(self.ptr_ty, gv)
             }
             Op::Splat(v) => {
                 let rty = self.ty_of(inst.result.unwrap()).clone();
@@ -2342,6 +2353,22 @@ fn populate_module<M: Module>(
         ids.insert(f.name, id);
     }
 
+    // Declare + define each read-only static-data blob (string literals). `writable = false` lands
+    // them in the read-only data section (`.rodata`/`.rdata`); `Linkage::Local` keeps them internal.
+    // The bytes include the trailing NUL, so the address is directly usable by `print_str`. This is
+    // what gives a returned `*u8` a real static address instead of a reclaimed stack frame.
+    let mut data_ids: HashMap<Symbol, DataId> = HashMap::new();
+    for s in &program.statics {
+        let name = interner.resolve(s.name);
+        let id = module
+            .declare_data(name, Linkage::Local, false, false)
+            .map_err(|e| e.to_string())?;
+        let mut desc = DataDescription::new();
+        desc.define(s.bytes.clone().into_boxed_slice());
+        module.define_data(id, &desc).map_err(|e| e.to_string())?;
+        data_ids.insert(s.name, id);
+    }
+
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
     for f in &program.funcs {
@@ -2359,6 +2386,12 @@ fn populate_module<M: Module>(
             for callee in &program.funcs {
                 let r = module.declare_func_in_func(ids[&callee.name], builder.func);
                 func_refs.insert(callee.name, r);
+            }
+            // Import the read-only data blobs into this function's DFG (source order, deterministic).
+            let mut data_refs: HashMap<Symbol, GlobalValue> = HashMap::new();
+            for s in &program.statics {
+                let gv = module.declare_data_in_func(data_ids[&s.name], builder.func);
+                data_refs.insert(s.name, gv);
             }
             let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
             rt_refs.insert(
@@ -2874,6 +2907,7 @@ fn populate_module<M: Module>(
                 blocks,
                 func_refs: &func_refs,
                 rt_refs: &rt_refs,
+                data_refs: &data_refs,
                 layout_err: None,
             };
             t.translate();
