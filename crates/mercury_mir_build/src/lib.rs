@@ -44,6 +44,8 @@ pub fn lower_program(
         tn_par: interner.intern("mercury_sgemm_tn_parallel"),
         nt_epi: interner.intern("mercury_sgemm_nt_epi"),
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
+        sgemv: interner.intern("mercury_sgemv"),
+        sgemv_par: interner.intern("mercury_sgemv_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
         vmath2: interner.intern("mercury_vmath2_f32"),
         vmath_bf16: interner.intern("mercury_vmath_bf16"),
@@ -180,6 +182,21 @@ pub fn lower_program(
                 // matmul recognizer in `lower_for` then emits the multicore half GEMM. A non-`@parallel`
                 // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
                 if has_parallel_attr(item, interner) && lowp_matmul_fn(body, sema, interner).is_some()
+                {
+                    let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
+                    program.funcs.push(func);
+                    continue;
+                }
+                // A `@parallel` whole-function GEMV (`for i { s=0; for j { s+=a[i*N+j]*x[j] }; y[i]=s }`):
+                // intercept before the elementwise outliner (which would outline the row loop into
+                // per-chunk scalar loops and lose the kernel). Lower it normally with `parallel = true`;
+                // the embedded `match_gemv` in `lower_for` then emits `mercury_sgemv_parallel` (rows
+                // independent → bit-equal to the serial kernel the interpreter marshals). A non-`@parallel`
+                // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
+                if has_parallel_attr(item, interner)
+                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                        match_gemv(pat, it, lb, p.sema, p.interner).is_some()
+                    })
                 {
                     let func = lower_fn(f, body, sema, interner, gemm, true, &mut diags);
                     program.funcs.push(func);
@@ -751,6 +768,14 @@ struct GemmSyms {
     /// `C = act(A·Bᵀ + bias)` fusion in a `@parallel` function, run across cores. Bit-identical to the
     /// serial `nt_epi` the interpreter calls (each C tile owned by one task), so the gate stays exact.
     nt_epi_par: Symbol,
+    /// The matrix-times-vector kernel (`mercury_sgemv(a, x, y, m, n)`): a recognized GEMV nest
+    /// `y[i] = Σ_j a[i,j]·x[j]` (decode-time attention/projection, batch 1) lowers to this — the memory-
+    /// bound row-dot gcc keeps a latency-bound scalar chain, folded 8-wide across four accumulators.
+    sgemv: Symbol,
+    /// The multicore GEMV (`mercury_sgemv_parallel`): the independent rows mapped across cores to
+    /// saturate aggregate memory bandwidth. Bit-identical to the serial `sgemv` the interpreter calls
+    /// (each row computed by the same per-row routine, no cross-row combine), so the gate stays exact.
+    sgemv_par: Symbol,
     /// The 256-bit AVX2 elementwise-math kernel (`mercury_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
@@ -4291,6 +4316,33 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Emit one `mercury_sgemv[_parallel](a, x, y, m, n)` call for a recognized GEMV nest
+    /// (`y[i] = Σ_j a[i,j]·x[j]`). Bails (false) if an operand/dim is unbound at the call site, so the
+    /// caller lowers the scalar nest. `parallel` selects the multicore kernel (rows independent → the
+    /// per-row routine is bit-identical serial vs parallel, which the interpreter marshals as the oracle).
+    fn emit_gemv(&mut self, nest: &GemvNest, parallel: bool) -> bool {
+        let (Some((a, _)), Some((x, _)), Some((y, _))) = (
+            self.lookup(nest.a),
+            self.lookup(nest.x),
+            self.lookup(nest.y),
+        ) else {
+            return false;
+        };
+        let (Some(m), Some(n)) = (self.dim_value(nest.m), self.dim_value(nest.n)) else {
+            return false;
+        };
+        let func = if parallel {
+            self.gemm.sgemv_par
+        } else {
+            self.gemm.sgemv
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![a, x, y, m, n],
+        });
+        true
+    }
+
     /// Emit one `mercury_i8gemm_nt[_parallel](a, b, c, m, k, n)` call for a recognized int8 quantized
     /// `nn.Linear` (`C = A·Bᵀ`, `u8`×`i8`→`i32`). Bails (false) if an operand/dim is unbound at the
     /// call site, so the caller lowers the scalar nest. `parallel` selects the multicore kernel (rows
@@ -6087,6 +6139,17 @@ impl FnLowerer<'_> {
         // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
         if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
             if self.emit_lowp_gemm(&nest, self.parallel_fn) {
+                return;
+            }
+        }
+        // GEMV `for i { let s=0; for j { s += a[i*N+j]*x[j] }; y[i]=s }` → `mercury_sgemv` (the
+        // `_parallel` one in a `@parallel` fn). The 2-deep nest the 3-loop matmul matcher declines; the
+        // memory-bound row dot gcc keeps a latency-bound scalar chain, folded 8-wide across four
+        // accumulators. Tried *after* the matmul recognizers so a batched 3-loop matmul isn't mis-matched
+        // (structurally disjoint anyway — matmul's outer body is another `for`, GEMV's is the reduction).
+        // Rows independent → serial == parallel bit-for-bit (the interpreter marshals the serial form).
+        if let Some(nest) = match_gemv(pat, iter, body, self.sema, self.interner) {
+            if self.emit_gemv(&nest, self.parallel_fn) {
                 return;
             }
         }
@@ -12984,6 +13047,159 @@ fn match_matmul<'a>(
         a_off: Vec::new(),
         b_off: Vec::new(),
         c_off: Vec::new(),
+    })
+}
+
+/// A recognized GEMV nest `y[i] = Σ_j a[i*N+j]·x[j]` (`a` row-major `[M,N]`, `x` length `N`, `y`
+/// length `M`) — the batch-1 attention/projection shape (`nn.Linear` on a single token).
+struct GemvNest {
+    a: Symbol,
+    x: Symbol,
+    y: Symbol,
+    m: Dim,
+    n: Dim,
+}
+
+/// Match one multiplicand pair of a GEMV product: `a_e` is `a[row*N + jvar]` (row-major, stride `N`)
+/// and `x_e` is `x[jvar]` (the shared vector, indexed by the inner var alone). Returns `(a_sym, x_sym)`.
+fn match_gemv_operands(
+    a_e: &Expr,
+    x_e: &Expr,
+    row: Symbol,
+    jvar: Symbol,
+    n: Dim,
+    interner: &Interner,
+) -> Option<(Symbol, Symbol)> {
+    let (a_sym, a_idx) = as_index1(a_e)?;
+    let (stride, col) = match_row_col(a_idx, row, interner)?;
+    if stride != n || col != jvar {
+        return None;
+    }
+    let (x_sym, x_idx) = as_index1(x_e)?;
+    if single_path(x_idx) != Some(jvar) {
+        return None;
+    }
+    Some((a_sym, x_sym))
+}
+
+/// Recognize the canonical GEMV nest rooted at `for i in 0..M { let s = 0.0; for j in 0..N { s = s +
+/// a[i*N+j]*x[j] }; y[i] = s }`. A 2-deep nest the 3-loop matmul matcher declines; it maps to
+/// `mercury_sgemv`. See [`GemvNest`]. **Row-major `a` only** — a column-strided `a[j*M+i]` (`y = Aᵀx`)
+/// has a different (strided) kernel and falls through to the scalar/vectorized path.
+fn match_gemv(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<GemvNest> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    // Body: [ let s = 0.0; for j in 0..N { s = s + a[i*N+j]*x[j] }; y[i] = s ].
+    if body.tail.is_some() || body.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    let s_sym = match &sp.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    if !is_float_zero(s0, interner) {
+        return None;
+    }
+    // The inner reduction `for j in 0..N { s = s + a[i*N+j]*x[j] }`.
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[1])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &jbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            // s = s + a*x
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    // `a[i*N+j] * x[j]` in either factor order.
+    let (a_sym, x_sym) = match_gemv_operands(lhs, rhs, row, jvar, n, interner)
+        .or_else(|| match_gemv_operands(rhs, lhs, row, jvar, n, interner))?;
+    // Final store: y[i] = s.
+    let StmtKind::Assign {
+        target: yt,
+        op: ast::AssignOp::Assign,
+        value: yv,
+    } = &body.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(yv) != Some(s_sym) {
+        return None;
+    }
+    let (y_sym, y_idx) = as_index1(yt)?;
+    if single_path(y_idx) != Some(row) {
+        return None;
+    }
+    // The output must not alias an input (the kernel streams `a`/`x` while writing `y`).
+    if y_sym == a_sym || y_sym == x_sym {
+        return None;
+    }
+    Some(GemvNest {
+        a: a_sym,
+        x: x_sym,
+        y: y_sym,
+        m,
+        n,
     })
 }
 
