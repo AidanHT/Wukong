@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0301
+module tests.fail.enum_variant_unknown
+
+// Constructing a variant that the enum does not declare is a name-resolution error — never a silent
+// zero-discriminant buffer.
+enum Op { Add(i32, i32), Nop }
+
+fn main() -> i32 {
+    let a = Op::Sub(1, 2);
+    return 0;
+}

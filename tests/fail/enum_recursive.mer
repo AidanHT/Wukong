@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0402
+module tests.fail.enum_recursive
+
+// A data-carrying enum that holds itself by value (`Cons(i32, List)`) has infinite size and would
+// stack-overflow the layout pass. It is rejected exactly like a recursive struct (E0402); the fix is
+// indirection — `Cons(i32, *List)` — which has fixed size and breaks the cycle.
+enum List { Cons(i32, List), Nil }
+
+fn main() -> i32 {
+    let a = List::Nil;
+    return 0;
+}

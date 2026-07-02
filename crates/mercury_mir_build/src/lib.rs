@@ -12,13 +12,13 @@
 use std::collections::{HashMap, HashSet};
 
 use mercury_ast::{
-    self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind,
+    self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind, VariantPat,
 };
 use mercury_diag::Diagnostic;
 use mercury_mir::{
     BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId,
 };
-use mercury_sema::{DefKind, SemaResult};
+use mercury_sema::{DefKind, EnumVariant, SemaResult, VariantPayload};
 use mercury_span::{Interner, Span, Symbol};
 use mercury_types::Ty;
 
@@ -1114,12 +1114,33 @@ fn lower_fn(
 fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
     match ty {
         Ty::Tuple(_) | Ty::Array { .. } => true,
-        Ty::Named(sym) => matches!(
-            sema.defs.lookup(*sym).map(|d| &d.kind),
-            Some(DefKind::Struct(_))
-        ),
+        Ty::Named(sym) => {
+            matches!(
+                sema.defs.lookup(*sym).map(|d| &d.kind),
+                Some(DefKind::Struct(_))
+            ) || enum_data_carrying(sema, *sym)
+        }
         _ => false,
     }
+}
+
+/// Whether `sym` is a data-carrying (tagged-union) enum — free-fn form of
+/// [`FnLowerer::enum_is_data_carrying`], usable before the builder/lowerer exists (e.g. `lower_fn`'s
+/// sret-ABI decision keys on the return type via `ty_is_aggregate`).
+fn enum_data_carrying(sema: &SemaResult, sym: Symbol) -> bool {
+    matches!(
+        sema.defs.lookup(sym).map(|d| &d.kind),
+        Some(DefKind::Enum(vs)) if vs.iter().any(|v| !v.payload.is_unit())
+    )
+}
+
+/// The payload initializer when constructing an enum variant, borrowed from the AST: a unit variant
+/// carries nothing, a tuple variant its positional argument expressions, a struct variant its named
+/// field initializers. Consumed by [`FnLowerer::construct_enum_into`].
+enum VariantCtor<'a> {
+    Unit,
+    Tuple(&'a [Expr]),
+    Struct(&'a [ast::FieldInit]),
 }
 
 /// The MIR type a control-flow merge param (an `if`/`match` *value*) carries for a given result type.
@@ -1820,6 +1841,12 @@ impl FnLowerer<'_> {
             }
         }
         match ty {
+            // A data-carrying enum is a discriminant + payload byte buffer (like a struct); a C-style
+            // (all-unit) enum falls through to `mir_ty` = its i32 discriminant scalar.
+            Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
+                let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
+                MirType::Array(Box::new(MirType::I8), size as u32)
+            }
             Ty::Named(sym) => match self.struct_size(*sym) {
                 Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
                 None => mir_ty(ty),
@@ -1863,7 +1890,10 @@ impl FnLowerer<'_> {
                 } else if matches!(
                     self.sema.defs.lookup(sym).map(|d| &d.kind),
                     Some(DefKind::Struct(_))
-                ) {
+                ) || self.enum_is_data_carrying(sym)
+                {
+                    // A named struct or a data-carrying enum → its byte buffer (`mir_ty_of`). A C-style
+                    // enum falls to the `I32` default below (its value is the discriminant).
                     self.mir_ty_of(&Ty::Named(sym))
                 } else {
                     MirType::I32
@@ -1942,18 +1972,17 @@ impl FnLowerer<'_> {
     /// has no def access). Recurses through arrays/tuples so nested structs lay out correctly.
     fn ty_size(&self, ty: &Ty) -> Option<u64> {
         match ty {
-            // A C-style enum lowers to its i32 discriminant (`mir_ty` resolves it to `I32`), so it is
-            // a sized 4-byte scalar field — not an unsized aggregate. Without this, an enum field in a
-            // struct/tuple (`(Color, i32)`, `struct Pixel { c: Color, v: i32 }`) sized via
-            // `struct_size` returned `None` and was rejected `C0001 "unsized field"`, even though
-            // array-of-enum (sized via `mir_ty_of` recursion) and enum scalars already worked.
+            // An enum: a C-style (all-unit) enum is its 4-byte i32 discriminant; a data-carrying
+            // (tagged-union) enum is a discriminant + padded-payload byte buffer. `enum_layout` yields
+            // both (4 for C-style). Without a size here an enum field in a struct/tuple
+            // (`(Color, i32)`, `struct Pixel { c: Color, v: i32 }`) was rejected `C0001 "unsized"`.
             Ty::Named(sym)
                 if matches!(
                     self.sema.defs.lookup(*sym).map(|d| &d.kind),
                     Some(DefKind::Enum(_))
                 ) =>
             {
-                Some(4)
+                self.enum_layout(*sym).map(|(size, _, _)| size)
             }
             Ty::Named(sym) => self.struct_size(*sym),
             Ty::Array { elem, len } => Some(self.ty_size(elem)? * len),
@@ -1965,14 +1994,15 @@ impl FnLowerer<'_> {
     /// Alignment of `ty`, resolving named structs through the sema registry (see [`ty_size`]).
     fn ty_align(&self, ty: &Ty) -> Option<u64> {
         match ty {
-            // A C-style enum is its i32 discriminant — 4-byte aligned (see `ty_size`).
+            // An enum's alignment: 4 for a C-style enum; `max(4, payload align)` for a data-carrying
+            // one (see `ty_size` / `enum_layout`).
             Ty::Named(sym)
                 if matches!(
                     self.sema.defs.lookup(*sym).map(|d| &d.kind),
                     Some(DefKind::Enum(_))
                 ) =>
             {
-                Some(4)
+                self.enum_layout(*sym).map(|(_, align, _)| align)
             }
             Ty::Named(sym) => self.struct_align(*sym),
             Ty::Array { elem, .. } => self.ty_align(elem),
@@ -2096,7 +2126,160 @@ impl FnLowerer<'_> {
         let DefKind::Enum(variants) = &self.sema.defs.lookup(p.first().sym)?.kind else {
             return None;
         };
-        variants.iter().find(|(v, _)| *v == name).map(|(_, d)| *d)
+        variants.iter().find(|v| v.name == name).map(|v| v.disc)
+    }
+
+    /// The declared variants of enum `sym`, or `None` if `sym` is not a declared enum.
+    fn enum_variants(&self, sym: Symbol) -> Option<&[EnumVariant]> {
+        match &self.sema.defs.lookup(sym)?.kind {
+            DefKind::Enum(vs) => Some(vs),
+            _ => None,
+        }
+    }
+
+    /// Whether `sym` is a **data-carrying** (tagged-union) enum — a declared enum with ≥1 payload
+    /// (tuple/struct) variant. Such a value lowers to a discriminant + padded payload **byte buffer**
+    /// (an aggregate addressed by base pointer, like a struct); a C-style all-unit enum stays an i32
+    /// discriminant scalar. This one predicate decides which representation every enum site uses.
+    fn enum_is_data_carrying(&self, sym: Symbol) -> bool {
+        enum_data_carrying(self.sema, sym)
+    }
+
+    /// The tagged-union layout of a data-carrying enum: a 4-byte i32 discriminant at offset 0 followed
+    /// by the payload region (a union of every variant's payload, aligned/sized to the max). Returns
+    /// `(total_size, align, payload_offset)`. For an all-unit (C-style) enum the payload is empty, so
+    /// this yields `(4, 4, 4)` — the same 4-byte discriminant the C-style path already uses. `None`
+    /// if `sym` is not an enum or any payload field is genuinely unsized.
+    fn enum_layout(&self, sym: Symbol) -> Option<(u64, u64, u64)> {
+        let variants = self.enum_variants(sym)?;
+        let (mut union_size, mut union_align) = (0u64, 1u64);
+        for v in variants {
+            let (_, sz, al) = self.aggregate_layout(&v.payload.field_tys())?;
+            union_size = union_size.max(sz);
+            union_align = union_align.max(al);
+        }
+        let disc = 4u64; // the i32 discriminant
+        let align = disc.max(union_align);
+        let payload_offset = round_up(disc, union_align);
+        let size = round_up(payload_offset + union_size, align);
+        Some((size, align, payload_offset))
+    }
+
+    /// The absolute byte offset + type of each field of variant `vname` of enum `sym`, in payload
+    /// order (a struct payload's fields in declaration order). Each offset is `payload_offset` plus
+    /// the field's offset within the payload tuple, so a construction/match GEPs straight to it.
+    /// `None` if `sym`/`vname` don't resolve or a field is unsized.
+    fn variant_field_offsets(&self, sym: Symbol, vname: Symbol) -> Option<Vec<(u64, Ty)>> {
+        let (_, _, payload_offset) = self.enum_layout(sym)?;
+        let variants = self.enum_variants(sym)?;
+        let v = variants.iter().find(|v| v.name == vname)?;
+        let ftys = v.payload.field_tys();
+        let (rel, _, _) = self.aggregate_layout(&ftys)?;
+        Some(
+            rel.into_iter()
+                .zip(ftys)
+                .map(|(o, t)| (payload_offset + o, t))
+                .collect(),
+        )
+    }
+
+    /// Like [`variant_field_offsets`] but tags each field with its declared name — for a **struct**
+    /// payload variant, so a `E::V { name: value }` literal routes each field to its offset by name.
+    /// `None` if the variant is not a struct-payload variant.
+    fn variant_named_field_offsets(
+        &self,
+        sym: Symbol,
+        vname: Symbol,
+    ) -> Option<Vec<(Symbol, u64, Ty)>> {
+        let offsets = self.variant_field_offsets(sym, vname)?;
+        let variants = self.enum_variants(sym)?;
+        let v = variants.iter().find(|v| v.name == vname)?;
+        let VariantPayload::Struct(fs) = &v.payload else {
+            return None;
+        };
+        Some(
+            fs.iter()
+                .map(|(n, _)| *n)
+                .zip(offsets)
+                .map(|(n, (o, t))| (n, o, t))
+                .collect(),
+        )
+    }
+
+    /// If `base` is a single-segment path naming a **data-carrying** enum and `vname` is one of its
+    /// variants, return the enum symbol. Distinguishes a data-enum variant value (a byte buffer) from
+    /// a C-style one (an i32 discriminant) and from an ordinary struct field access.
+    fn field_base_data_enum(&self, base: &Expr, vname: Symbol) -> Option<Symbol> {
+        let ExprKind::Path(p) = &base.kind else {
+            return None;
+        };
+        if !p.is_single() {
+            return None;
+        }
+        let sym = p.first().sym;
+        if self.enum_is_data_carrying(sym) && self.variant_disc(sym, vname).is_some() {
+            Some(sym)
+        } else {
+            None
+        }
+    }
+
+    /// Allocate a fresh tagged-union buffer for `enum_sym::vname` and construct the variant into it,
+    /// yielding the base pointer (the by-pointer aggregate convention — a value-position variant).
+    fn lower_enum_value(&mut self, enum_sym: Symbol, vname: Symbol, payload: VariantCtor) -> ValueId {
+        let size = self.enum_layout(enum_sym).map(|(s, _, _)| s).unwrap_or(4);
+        let buf = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::I8), size as u32));
+        self.construct_enum_into(buf, enum_sym, vname, payload);
+        buf
+    }
+
+    /// Construct enum variant `enum_sym::vname` into the pre-allocated buffer `dst`: zero the buffer
+    /// (so padding + inactive-variant bytes are a deterministic 0 on both backends), store the i32
+    /// discriminant at offset 0, then initialize each payload field at its aligned offset via the
+    /// shared `init_field` primitive (so a nested aggregate payload lowers correctly).
+    fn construct_enum_into(
+        &mut self,
+        dst: ValueId,
+        enum_sym: Symbol,
+        vname: Symbol,
+        payload: VariantCtor,
+    ) {
+        let size = self.enum_layout(enum_sym).map(|(s, _, _)| s).unwrap_or(4);
+        self.zero_init(dst, &MirType::Array(Box::new(MirType::I8), size as u32));
+        if let Some(disc) = self.variant_disc(enum_sym, vname) {
+            let p = self.field_ptr(dst, 0);
+            let c = self
+                .builder
+                .build(MirType::I32, Op::ConstInt(disc as i128, MirType::I32));
+            self.builder.build_void(Op::Store { ptr: p, value: c });
+        }
+        match payload {
+            VariantCtor::Unit => {}
+            VariantCtor::Tuple(args) => {
+                let offsets = self.variant_field_offsets(enum_sym, vname).unwrap_or_default();
+                for (i, (off, fty)) in offsets.into_iter().enumerate() {
+                    if let Some(arg) = args.get(i) {
+                        let p = self.field_ptr(dst, off);
+                        self.init_field(p, &fty, arg);
+                    }
+                }
+            }
+            VariantCtor::Struct(fields) => {
+                let named = self
+                    .variant_named_field_offsets(enum_sym, vname)
+                    .unwrap_or_default();
+                for fi in fields {
+                    if let Some((_, off, fty)) = named.iter().find(|(n, _, _)| *n == fi.name.sym) {
+                        let p = self.field_ptr(dst, *off);
+                        self.init_field(p, &fty.clone(), &fi.value);
+                    } else {
+                        self.unsupported(fi.name.span, "unknown enum-variant field");
+                    }
+                }
+            }
+        }
     }
 
     /// The base pointer of an aggregate *place* expression `base` (for a `.field` / `.0` / `[i]`
@@ -2182,7 +2365,12 @@ impl FnLowerer<'_> {
     /// tuple, and (aggregate-element) array lowering.
     fn init_field(&mut self, dst: ValueId, fty: &Ty, value: &Expr) {
         match (&value.kind, fty) {
-            (ExprKind::StructLit { fields, .. }, Ty::Named(sym)) => {
+            // A struct literal recurses directly into `dst`. A data-carrying enum's `E::V { .. }`
+            // literal is excluded here (its `Ty::Named` is an enum, not a struct) — it falls to the
+            // `_` arm, which lowers the construction to a temp buffer and deep-copies it in.
+            (ExprKind::StructLit { fields, .. }, Ty::Named(sym))
+                if !self.enum_is_data_carrying(*sym) =>
+            {
                 self.lower_struct_init(dst, *sym, fields, value.span);
             }
             (ExprKind::TupleLit(items), Ty::Tuple(_)) => {
@@ -2217,6 +2405,15 @@ impl FnLowerer<'_> {
     /// scalar field lives at its byte-offset slot, which an 8-byte chunked copy would skip).
     fn emit_copy(&mut self, dst: ValueId, src: ValueId, ty: &Ty) {
         match ty {
+            // A tagged union: the active variant is unknown at copy time, so copy the whole buffer
+            // byte-for-byte (variant-agnostic). This is bit-exact on both backends — native moves real
+            // bytes; the interpreter moves each stored `Value` at its offset slot (padding included,
+            // harmlessly) — because a per-byte (slot-stride-1) copy matches the interpreter's
+            // 1-slot-per-scalar model exactly. A per-field copy can't work: it would need the variant.
+            Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
+                let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
+                self.emit_copy_bytes(dst, src, size);
+            }
             Ty::Named(sym) => {
                 if let Some(layout) = self.struct_field_tys(*sym) {
                     for (off, fty) in layout {
@@ -2250,6 +2447,19 @@ impl FnLowerer<'_> {
                 let v = self.builder.build(mir.clone(), Op::Load(src, mir.clone()));
                 self.builder.build_void(Op::Store { ptr: dst, value: v });
             }
+        }
+    }
+
+    /// Copy `nbytes` from buffer `src` to buffer `dst` one byte (`i8`) at a time. Correct on both
+    /// backends for a value whose field layout is unknown at copy time (a tagged union): a stride-1
+    /// `i8` copy matches the interpreter's 1-slot-per-scalar memory (each `Load(off, i8)` returns the
+    /// whole `Value` stored at that offset slot, `Store` writes it back) *and* native's byte memory.
+    fn emit_copy_bytes(&mut self, dst: ValueId, src: ValueId, nbytes: u64) {
+        for k in 0..nbytes {
+            let s = self.field_ptr(src, k);
+            let d = self.field_ptr(dst, k);
+            let v = self.builder.build(MirType::I8, Op::Load(s, MirType::I8));
+            self.builder.build_void(Op::Store { ptr: d, value: v });
         }
     }
 
@@ -5475,9 +5685,15 @@ impl FnLowerer<'_> {
                     if let ExprKind::TupleLit(items) = &e.kind {
                         let tty = self.expr_ty(e);
                         self.lower_tuple_init(slot, &tty, items);
-                    } else if let ExprKind::StructLit { fields, .. } = &e.kind {
+                    } else if let ExprKind::StructLit { path, fields, .. } = &e.kind {
                         if let Ty::Named(sym) = self.expr_ty(e) {
-                            self.lower_struct_init(slot, sym, fields, e.span);
+                            if self.enum_is_data_carrying(sym) {
+                                // `let x = Enum::Variant { .. }` — construct the tagged union in place.
+                                let vname = path.segments.last().unwrap().sym;
+                                self.construct_enum_into(slot, sym, vname, VariantCtor::Struct(fields));
+                            } else {
+                                self.lower_struct_init(slot, sym, fields, e.span);
+                            }
                         }
                     } else if matches!(&e.kind, ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. })
                     {
@@ -11332,9 +11548,13 @@ impl FnLowerer<'_> {
             // `s.field` — read a struct field by GEP to its declared byte offset (scalar loads,
             // aggregate yields its address — see `TupleField`).
             ExprKind::Field { base, name } => {
-                // `E::B` parses as a field access on the enum-name path `E`; lower it to the
-                // variant's integer discriminant (a C-style enum value is its discriminant).
-                if let Some(disc) = self.enum_variant_value(base, name.sym) {
+                // `E::B` parses as a field access on the enum-name path `E`.
+                if let Some(enum_sym) = self.field_base_data_enum(base, name.sym) {
+                    // A data-carrying enum's unit variant `E::B` is a byte buffer (discriminant +
+                    // zeroed payload), not a scalar discriminant.
+                    self.lower_enum_value(enum_sym, name.sym, VariantCtor::Unit)
+                } else if let Some(disc) = self.enum_variant_value(base, name.sym) {
+                    // A C-style enum value *is* its i32 discriminant.
                     self.builder
                         .build(MirType::I32, Op::ConstInt(disc as i128, MirType::I32))
                 } else {
@@ -11343,13 +11563,19 @@ impl FnLowerer<'_> {
                 }
             }
             // A struct literal in value position materializes a fresh byte buffer, yielding its base
-            // pointer (the same by-pointer convention as arrays/tuples).
-            ExprKind::StructLit { fields, .. } => {
+            // pointer (the same by-pointer convention as arrays/tuples). `Enum::Variant { .. }` is a
+            // struct-payload variant construction (its `expr_ty` is the enum's nominal type).
+            ExprKind::StructLit { path, fields, .. } => {
                 let ty = self.expr_ty(e);
                 let size = self.mir_ty_of(&ty);
                 let buf = self.builder.alloca(size);
                 if let Ty::Named(sym) = ty {
-                    self.lower_struct_init(buf, sym, fields, e.span);
+                    if self.enum_is_data_carrying(sym) {
+                        let vname = path.segments.last().unwrap().sym;
+                        self.construct_enum_into(buf, sym, vname, VariantCtor::Struct(fields));
+                    } else {
+                        self.lower_struct_init(buf, sym, fields, e.span);
+                    }
                 }
                 buf
             }
@@ -11525,6 +11751,13 @@ impl FnLowerer<'_> {
                 }
             }
             ast::PatKind::Tuple(subs) => self.bind_tuple_match(subs, scrut, scrut_ty),
+            // A data-carrying variant pattern binds its payload fields (GEPed off the buffer at
+            // `scrut`). `scrut` is the enum buffer's base pointer (scrut_mir is `Array`).
+            ast::PatKind::Variant { path, fields } => {
+                let enum_sym = path.segments[0].sym;
+                let vname = path.segments.last().unwrap().sym;
+                self.bind_variant_match(fields, scrut, enum_sym, vname);
+            }
             _ => {}
         }
     }
@@ -11628,18 +11861,30 @@ impl FnLowerer<'_> {
                     .build(MirType::I1, Op::ConstInt(*b as i128, MirType::I1));
                 Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
             }
-            // `Enum::Variant` — compare the scrutinee (an enum value is its discriminant) to the
-            // variant's discriminant. An unresolved path is rejected (a hard error, never a no-op).
+            // `Enum::Variant` — compare the scrutinee's discriminant to the variant's. A C-style enum
+            // scrutinee *is* its i32 discriminant; a data-carrying enum scrutinee is a buffer whose
+            // discriminant is loaded from offset 0 (`enum_disc_eq`). An unresolved path is a hard error.
             ast::PatKind::Path(path) => {
                 let Some(disc) = self.enum_path_value(path) else {
                     self.unsupported(span, "match pattern");
                     return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
                 };
-                let c = self.builder.build(
-                    scrut_mir.clone(),
-                    Op::ConstInt(disc as i128, scrut_mir.clone()),
-                );
-                Some(self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)))
+                Some(self.enum_disc_eq(scrut, scrut_mir, disc))
+            }
+            // `Enum::Variant(a, b)` / `Enum::Variant { f }` — a data-carrying variant pattern: the
+            // discriminant test AND each payload sub-pattern's test (GEPed off the buffer base).
+            ast::PatKind::Variant { path, fields } => {
+                let Some(disc) = self.enum_path_value(path) else {
+                    self.unsupported(span, "enum-variant pattern");
+                    return Some(self.builder.build(MirType::I1, Op::ConstInt(0, MirType::I1)));
+                };
+                let mut cond = self.enum_disc_eq(scrut, scrut_mir, disc);
+                let enum_sym = path.segments[0].sym;
+                let vname = path.segments.last().unwrap().sym;
+                if let Some(fc) = self.variant_pattern_cond(scrut, enum_sym, vname, fields, span) {
+                    cond = self.builder.build(MirType::I1, Op::Bin(BinOp::And, cond, fc));
+                }
+                Some(cond)
             }
             // A range pattern `lo..hi` / `lo..=hi`: `lo <= scrut` AND `scrut < hi` (or `<= hi`),
             // with the comparison signedness taken from the scrutinee's type.
@@ -11711,16 +11956,20 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// The integer discriminant of variant `vname` of enum `enum_sym`, or `None` if unresolved.
+    fn variant_disc(&self, enum_sym: Symbol, vname: Symbol) -> Option<i64> {
+        self.enum_variants(enum_sym)?
+            .iter()
+            .find(|v| v.name == vname)
+            .map(|v| v.disc)
+    }
+
     /// Resolve an enum-variant path pattern (`Enum::Variant`) to its integer discriminant.
     fn enum_path_value(&self, path: &ast::Path) -> Option<i64> {
         if path.segments.len() != 2 {
             return None;
         }
-        let DefKind::Enum(variants) = &self.sema.defs.lookup(path.segments[0].sym)?.kind else {
-            return None;
-        };
-        let var = path.segments[1].sym;
-        variants.iter().find(|(v, _)| *v == var).map(|(_, d)| *d)
+        self.variant_disc(path.segments[0].sym, path.segments[1].sym)
     }
 
     /// Whether a pattern must be tested against the scrutinee's *address* (a tuple field that is
@@ -11728,6 +11977,8 @@ impl FnLowerer<'_> {
     fn pattern_needs_ptr(pat: &Pattern) -> bool {
         match &pat.kind {
             ast::PatKind::Tuple(_) => true,
+            // A variant pattern tests against the enum buffer's *address*, not a loaded value.
+            ast::PatKind::Variant { .. } => true,
             ast::PatKind::Or(alts) => alts.iter().any(Self::pattern_needs_ptr),
             _ => false,
         }
@@ -11770,6 +12021,140 @@ impl FnLowerer<'_> {
                 self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()))
             };
             if let Some(c) = self.pattern_cond(sub, field_scrut, &fmty, fty, span) {
+                acc = Some(match acc {
+                    Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
+                    None => c,
+                });
+            }
+        }
+        acc
+    }
+
+    /// The scrutinee's enum discriminant as an i32-ish value: a data-carrying enum scrutinee is a
+    /// buffer, so load the i32 discriminant from offset 0; a C-style enum scrutinee already *is* its
+    /// discriminant value (unchanged, preserving the existing C-style comparison exactly).
+    fn enum_disc_value(&mut self, scrut: ValueId, scrut_mir: &MirType) -> ValueId {
+        if matches!(scrut_mir, MirType::Array(..)) {
+            let p = self.field_ptr(scrut, 0);
+            self.builder.build(MirType::I32, Op::Load(p, MirType::I32))
+        } else {
+            scrut
+        }
+    }
+
+    /// The i1 condition "the scrutinee's discriminant == `disc`", handling both the C-style scalar and
+    /// the data-carrying buffer scrutinee forms (the discriminant compare type is the buffer's i32, or
+    /// the scalar scrutinee's own MIR type for a C-style enum).
+    fn enum_disc_eq(&mut self, scrut: ValueId, scrut_mir: &MirType, disc: i64) -> ValueId {
+        let dmir = if matches!(scrut_mir, MirType::Array(..)) {
+            MirType::I32
+        } else {
+            scrut_mir.clone()
+        };
+        let d = self.enum_disc_value(scrut, scrut_mir);
+        let c = self
+            .builder
+            .build(dmir.clone(), Op::ConstInt(disc as i128, dmir));
+        self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, d, c))
+    }
+
+    /// Resolve each payload sub-pattern to its `(absolute byte offset, field type, sub-pattern)`. A
+    /// struct payload routes each named field to its offset; a tuple payload is positional. A
+    /// sub-pattern whose field can't be resolved is dropped. Shared by the match-condition and the
+    /// binding walks so both agree on field placement.
+    fn variant_field_subpatterns<'p>(
+        &self,
+        enum_sym: Symbol,
+        vname: Symbol,
+        fields: &'p VariantPat,
+    ) -> Vec<(u64, Ty, &'p Pattern)> {
+        match fields {
+            VariantPat::Tuple(subs) => {
+                let offs = self.variant_field_offsets(enum_sym, vname).unwrap_or_default();
+                subs.iter()
+                    .enumerate()
+                    .filter_map(|(i, sub)| offs.get(i).map(|f| (f.0, f.1.clone(), sub)))
+                    .collect()
+            }
+            VariantPat::Struct(fps) => {
+                let named = self
+                    .variant_named_field_offsets(enum_sym, vname)
+                    .unwrap_or_default();
+                fps.iter()
+                    .filter_map(|fp| {
+                        named
+                            .iter()
+                            .find(|f| f.0 == fp.name)
+                            .map(|f| (f.1, f.2.clone(), &fp.pat))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Bind the payload sub-patterns of a matched variant to their fields within the buffer at base
+    /// pointer `base`. A scalar `Ident` field is copied into a fresh slot (so a read loads it and a
+    /// mutation doesn't write back into the scrutinee); an aggregate field `Ident` binds its address
+    /// (the by-pointer convention); a nested tuple/variant sub-pattern recurses; a literal/wildcard
+    /// binds nothing — mirrors `bind_tuple_match`.
+    fn bind_variant_match(
+        &mut self,
+        fields: &VariantPat,
+        base: ValueId,
+        enum_sym: Symbol,
+        vname: Symbol,
+    ) {
+        let pairs = self.variant_field_subpatterns(enum_sym, vname, fields);
+        for (off, fty, sub) in pairs {
+            let fmty = self.mir_ty_of(&fty);
+            let fptr = self.field_ptr(base, off);
+            match &sub.kind {
+                ast::PatKind::Ident(name) => {
+                    if matches!(fmty, MirType::Array(..)) {
+                        self.bind(*name, fptr, fmty);
+                    } else {
+                        let val = self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()));
+                        let slot = self.builder.alloca(fmty.clone());
+                        self.builder.build_void(Op::Store { ptr: slot, value: val });
+                        self.bind(*name, slot, fmty);
+                    }
+                }
+                ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, &fty),
+                ast::PatKind::Variant { path, fields } => {
+                    let esym = path.segments[0].sym;
+                    let vn = path.segments.last().unwrap().sym;
+                    self.bind_variant_match(fields, fptr, esym, vn);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The AND of each payload sub-pattern's test for a variant pattern whose scrutinee buffer is at
+    /// base pointer `base`. Each field is GEPed to its absolute offset (`variant_field_offsets` for a
+    /// tuple payload, `variant_named_field_offsets` for a struct payload) and its sub-pattern tested
+    /// against the loaded value (scalar) or field address (nested aggregate) — mirrors
+    /// `tuple_pattern_cond`. `None` (every sub-pattern unconditional, e.g. plain bindings) means the
+    /// payload adds no condition beyond the discriminant.
+    fn variant_pattern_cond(
+        &mut self,
+        base: ValueId,
+        enum_sym: Symbol,
+        vname: Symbol,
+        fields: &VariantPat,
+        _span: Span,
+    ) -> Option<ValueId> {
+        let pairs = self.variant_field_subpatterns(enum_sym, vname, fields);
+        let mut acc: Option<ValueId> = None;
+        for (off, fty, sub) in pairs {
+            let fmty = self.mir_ty_of(&fty);
+            let fptr = self.field_ptr(base, off);
+            let field_scrut = if Self::pattern_needs_ptr(sub) {
+                fptr
+            } else {
+                self.builder.build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+            };
+            if let Some(c) = self.pattern_cond(sub, field_scrut, &fmty, &fty, sub.span) {
                 acc = Some(match acc {
                     Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
                     None => c,
@@ -12020,6 +12405,13 @@ impl FnLowerer<'_> {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr], e: &Expr) -> ValueId {
+        // `Enum::Variant(args)` constructing a data-carrying tuple-payload variant: build its buffer
+        // (a value in call-syntax, not a function call). `callee` is `Field { Path(Enum), Variant }`.
+        if let ExprKind::Field { base, name } = &callee.kind {
+            if let Some(enum_sym) = self.field_base_data_enum(base, name.sym) {
+                return self.lower_enum_value(enum_sym, name.sym, VariantCtor::Tuple(args));
+            }
+        }
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
                 let name = p.first().sym;

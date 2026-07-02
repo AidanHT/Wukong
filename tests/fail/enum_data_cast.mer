@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.enum_data_cast
+
+// A data-carrying (tagged-union) enum value is a byte buffer, not an integer discriminant, so casting
+// it to an integer is a byte reinterpret the two backends disagree on — rejected. (A C-style enum's
+// `E::V as i32` stays valid; only a payload-carrying enum is excluded.)
+enum Op { Add(i32, i32), Nop }
+
+fn main() -> i32 {
+    let a = Op::Add(1, 2);
+    return a as i32;
+}
