@@ -1204,6 +1204,48 @@ mod grad_cli_tests {
         let (l0, lf) = (traj[0], *traj.last().unwrap());
         assert!(lf.is_finite() && lf < 0.05 * l0, "AdamW did not converge: {l0} -> {lf}");
     }
+
+    // --- Transformer FFN block: two matmuls + activation + reduction, differentiated from source. ---
+
+    /// A transformer **feed-forward block** `y = silu(x·W1ᵀ)·W2ᵀ; loss = Σy`, the composition at the
+    /// heart of every transformer layer. Its whole backward rides tuned kernels: `mercury_vmath2_f32`
+    /// for the activation and *three* `mercury_sgemm` for the matmul adjoints (dW2, dA, dW1) — the
+    /// headline capability, a real block differentiated straight from `.mer` and finite-difference-gated.
+    #[test]
+    fn transformer_ffn_block_from_source() {
+        // x[M=2,K=4], W1[H=3,K=4] -> p[2,3]; a=silu(p); W2[N=2,H=3] -> y[2,2]; loss=Σy.
+        let src = "@parallel fn loss(x:[f32;8], w1:[f32;12], w2:[f32;6], out:[f32;1]) -> f32 {\n\
+             let mut p: [f32; 6] = [0.0; 6];\n\
+             for i in 0..2 { for j in 0..3 { let mut s: f32 = 0.0;\n\
+               for kk in 0..4 { s = s + x[i*4+kk] * w1[j*4+kk]; } p[i*3+j] = s; } }\n\
+             let mut a: [f32; 6] = [0.0; 6];\n\
+             for i in 0..6 { a[i] = silu(p[i]); }\n\
+             let mut y: [f32; 4] = [0.0; 4];\n\
+             for i in 0..2 { for j in 0..2 { let mut s: f32 = 0.0;\n\
+               for kk in 0..3 { s = s + a[i*3+kk] * w2[j*3+kk]; } y[i*2+j] = s; } }\n\
+             let mut loss: f32 = 0.0;\n\
+             for i in 0..4 { loss = loss + y[i]; }\n\
+             out[0] = loss; return loss; }";
+        // The composite backward must ride the fused activation kernel + the tuned GEMM (three of them).
+        let mir = grad_mir(src, "loss", &[1, 2]);
+        assert!(mir.contains("mercury_vmath2_f32"), "silu backward missing\n{mir}");
+        assert_eq!(
+            mir.matches("mercury_sgemm(").count(),
+            3,
+            "expected 3 GEMM adjoints (dW2, dA, dW1)\n{mir}"
+        );
+
+        let mut seed = 0x77A0u64;
+        let x = rand_vec(&mut seed, 8);
+        let w1 = rand_vec(&mut seed, 12);
+        let w2 = rand_vec(&mut seed, 6);
+        let inputs = vec![x, w1, w2, vec![0.0]];
+        let lens = [8, 12, 6, 1];
+        // Finite-difference-gate the composite gradient w.r.t. both weight matrices and the input.
+        gate(src, "loss", &[1], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dW1
+        gate(src, "loss", &[2], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dW2
+        gate(src, "loss", &[0], &inputs, &lens, 3, 1e-2, 5e-2, 1e-2); // dX
+    }
 }
 
 /// End-to-end GPU-backend gate: the `--backend=gpu` path (offloading interpreter + [`gpu_accel`])
