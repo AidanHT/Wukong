@@ -444,6 +444,23 @@ impl AstPrinter<'_> {
                     p.pattern(hi);
                 });
             }
+            PatKind::Variant { path, fields } => {
+                self.line(format!("pat variant {}", self.path_str(path, "::")));
+                self.indented(|p| match fields {
+                    VariantPat::Tuple(subs) => {
+                        for s in subs {
+                            p.pattern(s);
+                        }
+                    }
+                    VariantPat::Struct(fps) => {
+                        for fp in fps {
+                            let nm = p.sym(fp.name);
+                            p.line(format!("field {nm}"));
+                            p.indented(|p| p.pattern(&fp.pat));
+                        }
+                    }
+                });
+            }
         }
     }
 

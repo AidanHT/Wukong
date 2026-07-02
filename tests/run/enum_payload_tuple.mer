@@ -1,0 +1,56 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 12
+// EXPECT-OUT: -1
+// EXPECT-OUT: 18
+// EXPECT-OUT: 50
+// EXPECT-OUT: 5
+module tests.run.enum_payload_tuple
+
+// Data-carrying (tagged-union) enums with tuple payloads: construction `E::V(a, b)`, payload `match`
+// with binding, `if` guards, literal sub-patterns, nesting in an array of enums, and by-value passing
+// to a function. A value is a 4-byte i32 discriminant + a padded payload union addressed by base
+// pointer (like a struct); both backends address it identically (the interpreter's slot memory ==
+// native's byte offsets), so interp == native bit-for-bit and -O0 == -O3.
+enum Expr {
+    Num(i32),
+    Add(i32, i32),
+    Nil,
+}
+
+fn eval(e: Expr) -> i32 {
+    return match e {
+        Expr::Num(n) => n,
+        Expr::Add(x, y) => x + y,
+        Expr::Nil => 0 - 1,
+    };
+}
+
+fn main() -> i32 {
+    print(eval(Expr::Add(3, 4)));        // 7
+    print(eval(Expr::Add(5, 7)));        // 12
+    print(eval(Expr::Nil));              // -1
+
+    // A literal sub-pattern in the payload (`Add(0, y)` fires only when the first field is 0).
+    let e = Expr::Add(0, 9);
+    let r = match e {
+        Expr::Add(0, y) => y * 2,
+        Expr::Add(x, y) => x + y,
+        _ => 100,
+    };
+    print(r);                            // 18
+
+    // A guard over a payload binding.
+    let g = match Expr::Num(5) {
+        Expr::Num(n) if n > 3 => n * 10,
+        Expr::Num(n) => n,
+        _ => 0,
+    };
+    print(g);                            // 50
+
+    // An array of enums; a by-value element matched through a function.
+    let arr = [Expr::Num(1), Expr::Add(2, 3)];
+    print(eval(arr[1]));                 // 5
+    return 0;
+}

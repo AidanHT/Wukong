@@ -104,4 +104,26 @@ pub enum PatKind {
         hi: Box<Pattern>,
         inclusive: bool,
     },
+    /// A data-carrying enum-variant pattern with a payload: `Op::Add(x, y)` (tuple payload) or
+    /// `Shape::Circle { r }` (struct payload). `path` names `Enum::Variant`; `fields` destructures
+    /// the payload, binding the inner values. Matches when the scrutinee's discriminant is the
+    /// variant's *and* every sub-pattern matches — the payload-carrying sibling of `Path`.
+    Variant { path: Path, fields: VariantPat },
+}
+
+/// The payload-destructuring part of a [`PatKind::Variant`].
+#[derive(Clone, Debug)]
+pub enum VariantPat {
+    /// Positional sub-patterns for a tuple-payload variant: `Add(x, y)`.
+    Tuple(Vec<Pattern>),
+    /// Named field sub-patterns for a struct-payload variant: `Circle { r }` / `Circle { r: sub }`.
+    Struct(Vec<FieldPat>),
+}
+
+/// One field of a struct-payload variant pattern. The field-shorthand `{ r }` desugars to
+/// `{ name: r, pat: Ident(r) }`; the explicit `{ r: sub }` binds the field through `sub`.
+#[derive(Clone, Debug)]
+pub struct FieldPat {
+    pub name: Symbol,
+    pub pat: Pattern,
 }

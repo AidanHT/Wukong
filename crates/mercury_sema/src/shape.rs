@@ -58,6 +58,7 @@ fn kind_name(t: &Ty) -> &'static str {
         Ty::Ptr { .. } => "a pointer",
         Ty::Ref { .. } => "a reference",
         Ty::Tuple(_) => "a tuple",
+        Ty::Slice(_) => "a slice",
         _ => "a different type",
     }
 }
@@ -415,6 +416,13 @@ impl Sema<'_> {
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
                 self.unify(pp, ap, dims, span, rigid)
             }
+            // A slice parameter `[]T` accepts a slice `[]T` or — via unsizing — a fixed-size array
+            // `[T; N]` argument; either way the element types must unify (a slice of a different
+            // element type has a different stride, so `s[i]` would read the wrong bytes). The
+            // array's static length is intentionally dropped to the slice's runtime length.
+            (Ty::Slice(pe), Ty::Slice(ae) | Ty::Array { elem: ae, .. }) => {
+                self.unify(pe, ae, dims, span, rigid)
+            }
             (
                 Ty::Vector {
                     elem: pe,
@@ -489,10 +497,10 @@ impl Sema<'_> {
             // false-positive on a generic. Array→tensor decay is matched earlier and unaffected.
             (
                 Ty::Scalar(_) | Ty::Vector { .. },
-                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_),
+                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_),
             )
             | (
-                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_),
+                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_),
                 Ty::Scalar(_) | Ty::Vector { .. },
             ) => {
                 self.error(
