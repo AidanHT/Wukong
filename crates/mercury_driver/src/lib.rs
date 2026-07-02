@@ -737,6 +737,83 @@ mod grad_cli_tests {
         assert_close(&g[0], &[2.0 * x as f64], "dL/dx = 2x");
         assert_close(&g[1], &[0.0], "dL/d(out) = 0");
     }
+
+    // --- Recognized-kernel tape: a real linear + MSE model, differentiated from source. -----------
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (((*seed >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8 // ~[-0.4, 0.4]
+    }
+    fn rand_vec(seed: &mut u64, n: usize) -> Vec<f32> {
+        (0..n).map(|_| lcg(seed)).collect()
+    }
+
+    /// f64 reference for `p = X·Wᵀ` (m×k · n×k → m×n), the MSE loss `Σ(p−t)²`, and its gradients
+    /// `dX[m,k] = Σ_n 2(p−t)[m,n] W[n,k]`, `dW[n,k] = Σ_m 2(p−t)[m,n] X[m,k]`.
+    fn linmse_ref(
+        x: &[f32],
+        w: &[f32],
+        t: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut d = vec![0.0f64; m * n];
+        for mm in 0..m {
+            for nn in 0..n {
+                let mut s = 0.0;
+                for kk in 0..k {
+                    s += x[mm * k + kk] as f64 * w[nn * k + kk] as f64;
+                }
+                d[mm * n + nn] = s - t[mm * n + nn] as f64;
+            }
+        }
+        let mut dx = vec![0.0f64; m * k];
+        let mut dw = vec![0.0f64; n * k];
+        for mm in 0..m {
+            for nn in 0..n {
+                let g = 2.0 * d[mm * n + nn];
+                for kk in 0..k {
+                    dx[mm * k + kk] += g * w[nn * k + kk] as f64;
+                    dw[nn * k + kk] += g * x[mm * k + kk] as f64;
+                }
+            }
+        }
+        (dx, dw)
+    }
+
+    /// `--emit=grad` of a **real** linear-regression model written in `.mer`: `p = x·wᵀ` (recognized
+    /// as `mercury_sgemm_nt`) then the MSE reduction `Σ(p−t)²` (recognized as the `@parallel`
+    /// `mercury_sreduce_f32_parallel`). The emitted backward rides the tuned kernels — `mercury_velem`
+    /// for the `2(p−t)` seed, a transpose loop, and `mercury_sgemm` for `dw = dpᵀ·x` / `dx = dp·w` —
+    /// and is finite-difference-gated against the forward loss and the f64 closed form.
+    #[test]
+    fn linear_mse_from_source() {
+        let (m, k, n) = (3usize, 4usize, 2usize);
+        let src = "@parallel fn loss(x:[f32;12], w:[f32;8], t:[f32;6], out:[f32;1]) -> f32 {\n\
+                   let mut p: [f32; 6] = [0.0; 6];\n\
+                   for i in 0..3 { for j in 0..2 { let mut s: f32 = 0.0;\n\
+                     for kk in 0..4 { s = s + x[i*4+kk] * w[j*4+kk]; }\n\
+                     p[i*2+j] = s; } }\n\
+                   let mut loss: f32 = 0.0;\n\
+                   for i in 0..6 { loss = loss + (p[i]-t[i])*(p[i]-t[i]); }\n\
+                   out[0] = loss; return loss; }";
+        let mut seed = 0xA11CEu64;
+        let x = rand_vec(&mut seed, m * k);
+        let w = rand_vec(&mut seed, n * k);
+        let t = rand_vec(&mut seed, m * n);
+        let (dx_ref, dw_ref) = linmse_ref(&x, &w, &t, m, k, n);
+        let inputs = vec![x, w, t, vec![0.0]];
+        let lens = [m * k, n * k, m * n, 1];
+
+        // Weights (param 1): the trainable gradient — must ride the GEMM and match the closed form.
+        let gw = gate(src, "loss", &[1], &inputs, &lens, 3, 5e-3, 5e-2, 5e-3);
+        assert_close(&gw[0], &dw_ref, "dW = dpᵀ·x");
+
+        // Input (param 0): dx = dp·w — the other GEMM adjoint.
+        let gx = gate(src, "loss", &[0], &inputs, &lens, 3, 5e-3, 5e-2, 5e-3);
+        assert_close(&gx[0], &dx_ref, "dX = dp·w");
+    }
 }
 
 /// End-to-end GPU-backend gate: the `--backend=gpu` path (offloading interpreter + [`gpu_accel`])

@@ -45,6 +45,11 @@ pub(crate) struct Syms {
     pub sgemm_nt: Symbol,
     pub vmath: Symbol,
     pub sreduce: Symbol,
+    /// The `@parallel` reduction — same `(x, y, n, op)` ABI and identical (deterministic, fixed
+    /// chunking) result as the serial `sreduce`, so it differentiates through the very same rule.
+    /// A `.mer` reduction lowered from source produces *this* symbol (the recognizer emits the
+    /// parallel kernel), while the hand-built tape tests use the serial one — the tape accepts both.
+    pub sreduce_parallel: Symbol,
     pub velem: Symbol,
     pub norm: Symbol,
 }
@@ -56,6 +61,7 @@ impl Syms {
             sgemm_nt: it.intern("mercury_sgemm_nt"),
             vmath: it.intern("mercury_vmath_f32"),
             sreduce: it.intern("mercury_sreduce_f32"),
+            sreduce_parallel: it.intern("mercury_sreduce_f32_parallel"),
             velem: it.intern("mercury_velem_f32"),
             norm: it.intern("mercury_norm_f32"),
         }
@@ -78,6 +84,7 @@ impl<'a> Vjp<'a> {
         func == self.syms.sgemm_nt
             || func == self.syms.vmath
             || func == self.syms.sreduce
+            || func == self.syms.sreduce_parallel
             || func == self.syms.velem
             || func == self.syms.norm
     }
@@ -89,7 +96,7 @@ impl<'a> Vjp<'a> {
         args: &[ValueId],
         result: Option<ValueId>,
     ) -> Result<(), String> {
-        if func == self.syms.sreduce {
+        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
             self.diff_sreduce(args, result)
         } else if func == self.syms.sgemm_nt {
             self.diff_sgemm_nt(args)
