@@ -35,6 +35,7 @@ mercury_codegen_llvm = { path = "crates/mercury_codegen_llvm" }
 mercury_codegen_cranelift = { path = "crates/mercury_codegen_cranelift" }
 mercury_codegen_gpu = { path = "crates/mercury_codegen_gpu" }
 mercury_runtime = { path = "crates/mercury_runtime" }
+mercury_autodiff = { path = "crates/mercury_autodiff" }
 
 [profile.release]
 opt-level = 3
