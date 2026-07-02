@@ -8,7 +8,7 @@
 //! — any `load`/`store` through an unknown pointer, or any `call` (which may read through pointers).
 //! Pending stores that survive to the end of the block are kept: a successor block may read them.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{FxHashMap, FxHashSet};
 
 use mercury_mir::{Function, Op};
 
@@ -23,7 +23,7 @@ impl Pass for Dse {
 
     fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
         // Allocas are function-global value ids; collect them once.
-        let mut allocas: HashSet<u32> = HashSet::new();
+        let mut allocas: FxHashSet<u32> = FxHashSet::default();
         for b in &f.blocks {
             for inst in &b.insts {
                 if let (Some(r), Op::Alloca(_)) = (inst.result, &inst.op) {
@@ -35,7 +35,7 @@ impl Pass for Dse {
         let mut changed = false;
         for b in &mut f.blocks {
             // slot value-id -> index of the last store to it that has not yet been read.
-            let mut pending: HashMap<u32, usize> = HashMap::new();
+            let mut pending: FxHashMap<u32, usize> = FxHashMap::default();
             let mut dead: Vec<usize> = Vec::new();
 
             for (i, inst) in b.insts.iter().enumerate() {
@@ -67,7 +67,7 @@ impl Pass for Dse {
             }
 
             if !dead.is_empty() {
-                let dead: HashSet<usize> = dead.into_iter().collect();
+                let dead: FxHashSet<usize> = dead.into_iter().collect();
                 let mut i = 0;
                 b.insts.retain(|_| {
                     let keep = !dead.contains(&i);

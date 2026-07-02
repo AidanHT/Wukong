@@ -17,7 +17,8 @@
 //! Only integer and float slots are promoted. Pointer/array/vector slots stay in memory (they are
 //! rare as scalars and avoid having to synthesize a typed "undefined" value).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use crate::fxhash::{FxHashMap, FxHashSet};
 
 use mercury_mir::{Function, Inst, MirType, Op, Terminator, ValueId};
 
@@ -70,7 +71,7 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     }
 
     // Any appearance other than `load <slot>` / `store _, <slot>` means the address escapes.
-    let mut bad: HashSet<u32> = HashSet::new();
+    let mut bad: FxHashSet<u32> = FxHashSet::default();
     for b in &f.blocks {
         for inst in &b.insts {
             match &inst.op {
@@ -126,8 +127,8 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
     for (&var, defs) in &def_blocks {
         let ty = promotable[&var].clone();
         let mut worklist: Vec<u32> = defs.iter().copied().collect();
-        let mut on_list: HashSet<u32> = defs.iter().copied().collect();
-        let mut has_phi: HashSet<u32> = HashSet::new();
+        let mut on_list: FxHashSet<u32> = defs.iter().copied().collect();
+        let mut has_phi: FxHashSet<u32> = FxHashSet::default();
         while let Some(b) = worklist.pop() {
             for &d in &df[b as usize] {
                 if has_phi.insert(d) {
@@ -148,13 +149,13 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
         promotable,
         block_phis: &block_phis,
         children: &children,
-        stack: HashMap::new(),
-        replace: HashMap::new(),
-        delete: HashSet::new(),
-        append_then: HashMap::new(),
-        append_else: HashMap::new(),
-        append_br: HashMap::new(),
-        zero_for: HashMap::new(),
+        stack: FxHashMap::default(),
+        replace: FxHashMap::default(),
+        delete: FxHashSet::default(),
+        append_then: FxHashMap::default(),
+        append_else: FxHashMap::default(),
+        append_br: FxHashMap::default(),
+        zero_for: FxHashMap::default(),
         new_consts: Vec::new(),
         next_value: f.value_types.len() as u32,
     };
@@ -254,17 +255,17 @@ struct Rename<'a> {
     block_phis: &'a BTreeMap<u32, Vec<(ValueId, u32)>>,
     children: &'a [Vec<u32>],
     /// slot id -> stack of reaching definitions (innermost last).
-    stack: HashMap<u32, Vec<ValueId>>,
+    stack: FxHashMap<u32, Vec<ValueId>>,
     /// deleted load result -> reaching definition.
-    replace: HashMap<u32, ValueId>,
+    replace: FxHashMap<u32, ValueId>,
     /// (block, original inst index) of loads/stores to delete.
-    delete: HashSet<(u32, u32)>,
+    delete: FxHashSet<(u32, u32)>,
     /// values to append to each edge's argument list, keyed by source block.
-    append_then: HashMap<u32, Vec<ValueId>>,
-    append_else: HashMap<u32, Vec<ValueId>>,
-    append_br: HashMap<u32, Vec<ValueId>>,
+    append_then: FxHashMap<u32, Vec<ValueId>>,
+    append_else: FxHashMap<u32, Vec<ValueId>>,
+    append_br: FxHashMap<u32, Vec<ValueId>>,
     /// cached zero constant per type (for read-before-write).
-    zero_for: HashMap<MirType, ValueId>,
+    zero_for: FxHashMap<MirType, ValueId>,
     /// freshly allocated (value id, type) zero constants to materialize later.
     new_consts: Vec<(u32, MirType)>,
     next_value: u32,
@@ -365,7 +366,7 @@ impl Rename<'_> {
 }
 
 /// Follow `load -> reaching def` chains to a fixed point.
-fn resolve(map: &HashMap<u32, ValueId>, v: ValueId) -> ValueId {
+fn resolve(map: &FxHashMap<u32, ValueId>, v: ValueId) -> ValueId {
     let mut cur = v;
     let mut guard = 0;
     while let Some(&next) = map.get(&cur.0) {

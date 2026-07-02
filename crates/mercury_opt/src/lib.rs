@@ -16,6 +16,7 @@ mod cse;
 mod dce;
 mod dom;
 mod dse;
+mod fxhash;
 mod inline;
 mod licm;
 mod mem2reg;

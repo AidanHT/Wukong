@@ -1,6 +1,6 @@
 //! Constant folding and algebraic simplification.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 
 use mercury_mir::{BinOp, CmpOp, Function, MirType, Op, ValueId};
 
@@ -28,8 +28,8 @@ impl Pass for Simplify {
         // Rewrites operands and folds constants — never changes the block graph, so the CFG cache
         // stays valid (untouched).
         let mut changed = false;
-        let mut consts: HashMap<u32, CV> = HashMap::new();
-        let mut subst: HashMap<u32, ValueId> = HashMap::new();
+        let mut consts: FxHashMap<u32, CV> = FxHashMap::default();
+        let mut subst: FxHashMap<u32, ValueId> = FxHashMap::default();
 
         let nblocks = f.blocks.len();
         for bi in 0..nblocks {
@@ -132,7 +132,7 @@ impl Pass for Simplify {
     }
 }
 
-fn resolve(subst: &HashMap<u32, ValueId>, v: ValueId) -> ValueId {
+fn resolve(subst: &FxHashMap<u32, ValueId>, v: ValueId) -> ValueId {
     let mut cur = v;
     while let Some(&next) = subst.get(&cur.0) {
         if next == cur {
