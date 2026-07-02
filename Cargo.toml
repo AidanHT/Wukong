@@ -1,7 +1,8 @@
 # Mercury — virtual cargo workspace.
 #
-# Crates are added under `crates/` as each compiler stage is implemented. The default build
-# (interpreter backend) has zero external dependencies; LLVM (inkwell) is opt-in behind a feature.
+# Crates are added under `crates/` as each compiler stage is implemented. The default build needs no
+# external toolchain: the interpreter and the Cranelift native backend are pure Rust, and the LLVM
+# backend only emits textual IR (no inkwell). Only the GPU backend is opt-in, behind `--features gpu`.
 
 [workspace]
 resolver = "2"

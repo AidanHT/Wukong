@@ -51,7 +51,13 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   The recognizers are precision-generic (`match_lowp_reduction`/`match_lowp_axpby`/`match_vmath_stmt`),
   and the interpreter marshals through the identical kernel, so native == interp bit-for-bit. C/Rust
   can vectorize neither a `libm` call nor the half→f32 widen, so the gap is structural. A half-precision
-  *output* (→ ~2× on the streaming ops) needs a narrowing store and is future work.
+  **output** now ships too: a narrowing store (`f32_to_{bf16,f16}_bits`, the reverse of the widen)
+  feeds all-half twins — the streaming **axpby** `mercury_axpby_{bf16,f16}_out` (bf16/f16 in *and* out,
+  6 bytes/elem vs an all-f32 axpby's 12, so ~2× on the memory-write-bound stream) and the half-output
+  **activations** `mercury_vmath_{bf16,f16}_out` (half in *and* out — storage-halving, but the
+  transcendental itself is call-bound, so a footprint win not a throughput one). The narrowing round
+  goes through the same shim the interpreter uses, so native == interp bit-for-bit and `-O0` == `-O3`
+  (`tests/run/{axpby_half_out,vmath_half_out}.mer`).
 - All arithmetic/comparison/bitwise/boolean operators (`&&`/`||` **short-circuit**), compound
   assignment, casts — including a float → narrow-int cast (`1e30 as i8`) that **saturates** identically
   on both backends (`tests/run/float_cast_narrow.mer`).
@@ -219,7 +225,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   `tests/run/{ffn_block,attention,multi_head_attention,causal_attention,conv_im2col,transformer_block,rmsnorm,log_softmax}.mer`).
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
-  on the native backend. saxpy/poly/relu/relu6 vectorize.
+  on the native backend; and for **large, compile-time-known trips (~≥2048 elems)** the loop is
+  instead emitted as **true 256-bit AVX2** by a raw machine-code path
+  (`crates/mercury_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`) that sidesteps
+  Cranelift's 128-bit CLIF cap (`MERCURY_P4_NO_256` disables it). saxpy/poly/relu/relu6 vectorize.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.
@@ -355,23 +364,25 @@ loss and parameters; `--train-opt=sgd|adamw` the optimizer).
 - **Explicit SIMD vector types** `f32x8` etc. in *source*: parse and type-check; user-written vector
   *values* are not yet executed, and the native ISA path (Cranelift) caps vector SSA at 128-bit
   (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
-  128-bit halves. (Loop auto-vectorization above is separate and *does* run, at 128-bit + unrolling;
-  the recognized kernels get true 256-bit AVX2 via the runtime microkernels.)
+  128-bit halves. (Loop auto-vectorization above is separate and *does* run — 128-bit + unrolling by
+  default, and now **true 256-bit AVX2 for large, compile-time-known trips (~≥2048 elems)** via a raw
+  machine-code emitter that sidesteps this CLIF cap; the recognized kernels get 256-bit AVX2 via the
+  runtime microkernels.)
 - **Attributes** `@simd`/`@tile`/`@align`/`@extern`/`@export`: parse and validate; consumers in
   progress. (`@parallel` now executes — see above.)
 
 ## Planned
 
-- Fusing chains *under* `@parallel`; a **parallel** fused-epilogue GEMM kernel (the serial one already
-  folds bias + ReLU/GELU/SiLU, bias optional, into the microkernel write-back — a multicore
-  `mercury_sgemm_nt_epi_parallel` is the remaining step).
-- 256-bit AVX for the *general* (non-GEMM) vectorizer. Cranelift cannot legalize a 256-bit `f32x8`
-  value (verified — pinned as a tripwire test), so the elementwise vectorizer is 128-bit + unrolling;
-  the GEMM family already gets true AVX2/FMA via the runtime microkernel. Closing the general case
-  needs a raw-AVX emitter or a future Cranelift.
-- Execution of explicit `f32x8`-typed values; broader tensor-op lowering (conv, softmax) with fusion.
-- A minimal stdlib (structs, enums — including data-carrying tagged unions —, slices, and
-  multi-dimensional indexing `a[i, j]` now run — see "Works end to end" above).
+- Fusing arbitrary elementwise chains *under* `@parallel`. (The **parallel fused-epilogue GEMM** that
+  was the remaining item here has since shipped — a `@parallel` `act(A·Bᵀ [+ bias])` nest dispatches
+  to the multicore `mercury_sgemm_nt_epi_parallel`; see "Works end to end" above.)
+- Execution of explicit `f32x8`-typed *values* (they parse and type-check today — see "Checked but
+  not yet executed" above). The *general loop* vectorizer already reaches true 256-bit AVX2 for large
+  trips via a raw machine-code emitter (see "Works end to end" and "Known limitations"); it is
+  *source-level* `f32x8` values that still do not execute.
+- A minimal stdlib of reusable functions/collections. (The language surface once grouped here —
+  structs, enums including data-carrying tagged unions, slices, and multi-dimensional indexing
+  `a[i, j]` — now runs end to end; see "Works end to end" above.)
 - AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
   reverse-mode autodiff already ships as the `mercury_autodiff` crate — both above).
 
@@ -385,13 +396,20 @@ loss and parameters; `--train-opt=sgd|adamw` the optimizer).
   GEMM itself runs in f32, so it is a *footprint* feature on the FLOPs — but it still beats the
   idiomatic bf16 C **~25× single-core** (that C can vectorize neither the inline `bf16→f32` widen nor
   the serial reduction), ~10× vs a hand-optimized widen-then-tile bf16 C. A half-precision *output* on
-  the streaming ops (→ ~2×) needs a narrowing store and is still future work.
-- The *general* vectorizer emits 128-bit SIMD (Cranelift's vector ISA rejects 256-bit `f32x8` —
-  verified empirically on Cranelift 0.124). Compute-bound *elementwise* kernels therefore use 2× the
-  FMA ports they could; 4× unrolling and auto-parallelism recover throughput, and the vectorized
-  **transcendentals still beat scalar `libm` ~2.5–3×**. Breaking 256-bit needs a hand-written AVX2
-  path (how the GEMM family already gets 256-bit — a true AVX2/FMA runtime microkernel). The loop
-  vectorizer assumes distinct array parameters do not alias.
+  the streaming ops **now ships** — the narrowing store feeds all-half `mercury_axpby_{bf16,f16}_out` /
+  `mercury_vmath_{bf16,f16}_out` twins (~2× on the memory-write-bound axpby, its write traffic halved;
+  a footprint win on the call-bound activations); see "Works end to end" above.
+- The *general* vectorizer emits **128-bit CLIF by default** — Cranelift's vector ISA still rejects a
+  256-bit `f32x8` SSA value (verified empirically on Cranelift 0.124, pinned as the
+  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). For **large,
+  compile-time-known trip counts (~≥2048 elems)** it now dispatches the loop to a **raw-AVX2 256-bit
+  machine-code emitter** (`crates/mercury_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`;
+  `MERCURY_P4_NO_256` disables it) — the same way the GEMM/vmath runtime microkernels reach 256-bit,
+  and precisely *why* that raw emitter exists (Cranelift can't legalize the wider lane). Below the
+  threshold an out-of-line 256-bit call would lose to the inlined 128-bit path, so small or
+  runtime-unknown trips stay 128-bit + 4× unrolling; there compute-bound *elementwise* kernels use 2×
+  the FMA ports they could, but the vectorized **transcendentals still beat scalar `libm` ~2.5–3×**.
+  The loop vectorizer assumes distinct array parameters do not alias.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.mer`); a **symbolic** length (a generic `N`) or
   a **computed** one (a const whose initializer is an expression, e.g. `const N = 2 + 2`) still falls

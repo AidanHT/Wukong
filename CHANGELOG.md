@@ -46,9 +46,10 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   verifies the MIR after every pass. Across the run suite and kernels, `-O3` removes ~48% of IR ops
   (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0` under the interpreter.
 - **Back-ends**: a zero-dependency MIR interpreter (`--run`), a from-scratch **native Cranelift
-  backend** (JIT + host object, no LLVM toolchain), and a textual LLVM-IR emitter (`--emit=llvm-ir`,
-  plus `--emit=obj|exe` via `clang` when present). The native backend is differentially tested
-  against the interpreter bit-for-bit.
+  backend** (JIT + `--emit=obj` host object + `--emit=exe`, the latter linked via a rustc-driven link
+  that falls back to the system `cc`/`$CC` — **no LLVM toolchain**), and a textual LLVM-IR emitter
+  (`--emit=llvm-ir`, text only — emitting it needs no LLVM installed). The native backend is
+  differentially tested against the interpreter bit-for-bit.
 - **Matmul → tuned GEMM dispatch**: the compiler recognizes a matmul loop nest — the `ikj` accumulate
   and `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling — and lowers the whole
   nest to a register-blocked (6×16), cache-tiled, packed **AVX2/FMA** GEMM microkernel in the runtime
@@ -63,7 +64,10 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **Auto-vectorization**: straight-line elementwise loops (incl. branchy ones via if-conversion) and
   float **reductions** (reassociated to vector-lane accumulators) lower to SIMD automatically;
   `x + y*z` contracts to a hardware FMA; adjacent same-range loops fuse. Reductions (`dot`, L2 loss)
-  run ~2.6–2.8× faster than serial C.
+  run ~2.6–2.8× faster than serial C. The general vectorizer emits 128-bit CLIF by default (Cranelift's
+  x64 vector ISA still caps there — a 256-bit `f32x8` SSA value is rejected, per the
+  `cranelift_still_rejects_f32x8` tripwire) and dispatches to a **raw 256-bit AVX2 machine-code path**
+  (VEX-encoded via `iced-x86`) for large trip counts (trip-gated; kill-switch `MERCURY_P4_NO_256`).
 - **Transcendental → 256-bit AVX2 dispatch**: a pure `out[i] = f(x[i])` loop for **35** functions —
   `exp`/`log`/`expm1`/`log1p`/`tanh`/`sigmoid`/`silu`/`gelu`/`elu`/`leaky_relu`/`softplus`/`mish`/`selu`/`tanhshrink`/
   `hardsigmoid`/`hardswish` plus **`softsign`** (bounded poly activation) and **`logsigmoid`** (the stable
@@ -147,8 +151,8 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   Fixtures `tests/run/{tuple,struct,struct_nested,pointer,loop,tensor_add,tensor_matmul}.mer`; the
   aggregate path is differentially gated by `differential_{tuple,struct,nested_struct}` and pointers by
   `differential_pointer` (native vs interpreter, bit-for-bit). By-value aggregate parameters/returns
-  (an sret ABI) now lower too (see the language-surface additions below); symbolic-generic tensor
-  dimensions remain pending.
+  (an sret ABI) now lower too (see the language-surface additions below); **symbolic-generic tensor
+  dimensions now execute too** (`fn f<M, N>(t: Tensor[f32, M, N])`, via hidden dim params — see below).
 - **Intrinsics**: `print`/`println` (captured stdout) and `assert` (traps on false).
 - **Runtime**: a bump `Arena` allocator and a deterministic `parallel_for`.
 - **Diagnostics**: rustc-style renderer, a stable error-code catalog with `--explain <CODE>`, and
@@ -184,8 +188,9 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **C-style enums** (`tests/run/enum_cstyle.mer`): `enum Code { Ok = 10, Err = 20 }`, auto-incrementing
   `enum Color { Red, Green, Blue }` (0,1,2), and continue-after-explicit `enum Step { A = 5, B, C }`
   (5,6,7). A variant *is* its integer discriminant — usable in `let`, `==`, `as i32`, and as a `match`
-  pattern. Unit variants only; tuple/struct-payload (tagged-union) variants and enum-payload matching
-  remain unimplemented. Gated by `differential_enum`.
+  pattern. **Data-carrying (tagged-union) variants with tuple/struct payloads and payload `match`**
+  (with bindings, `if` guards, and literal sub-patterns) **now run too**
+  (`tests/run/enum_payload_{tuple,struct}.mer`). Gated by `differential_enum`.
 - **Top-level `const` usable as a value** (`tests/run/top_level_const.mer`): sema type-checks each
   initializer against its annotation (an unsuffixed literal adapts) and records it; mir_build inlines
   it at every use site — a bare value, in arithmetic, as an array index, as a loop bound, and when one
@@ -226,8 +231,24 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   closed by a `'` is a char; `'outer:` is a label); sema tracks an enclosing-label stack, so a
   `break`/`continue` outside any loop **or** one naming an undeclared label is `E0303`
   (`tests/fail/break_unknown_label.mer`); mir_build's loop stack carries each loop's label and resolves
-  the branch target. Loop-as-expression / break-with-value (`let x = loop { break 5; };`) is still
-  pending — `break` carries a label but no value. Gated by `differential_labeled_loops`.
+  the branch target. Loop-as-expression / break-with-value (`let x = loop { break 5; };`) **now works
+  too**: `loop` is a value-producing expression and `break <v>` carries a value, merged on a typed
+  exit-block param like `if`/`match` (`tests/run/loop_break_value.mer`). Gated by
+  `differential_labeled_loops`.
+- **Slices `[]T`** (`tests/run/slice_basics.mer`): a `[]T` fat pointer `{ data: *T @ 0, len: i64 @ 8 }`
+  viewing existing array storage — `s.len()`, indexed read/write `s[i]`, iteration `for x in s`, passing
+  to a function (including an array **unsized** to a slice at the call site), and write-through aliasing
+  of the backing array. A 16-byte by-pointer aggregate addressed identically by both backends
+  (interpreter slot memory == native byte offsets), so interp == native bit-for-bit and `-O0` == `-O3`.
+- **Symbolic-generic tensor shapes** (`tests/run/generic_shape*.mer`, `matmul_dynamic.mer`): a
+  `fn f<M, N>(t: Tensor[f32, M, N])` runs via hidden per-dimension `i64` params bound under their symbol
+  names (stride / matmul-dim / dim-as-value lookups resolve through them), so the shape-typed surface
+  executes on **runtime** dimensions with zero backend change; an undeclared dimension is `E0504`.
+- **Autodiff reachable from the CLI**: `mercury_autodiff` (a reverse-mode VJP MIR→MIR transform plus a
+  fused AdamW kernel, finite-difference-gated) is now wired into `mercuryc` — `--emit=grad` prints a
+  loss function's backward MIR (`--grad-of=<fn>`, `--grad-wrt=<i,..>`), and `--train` runs a
+  forward→backward→optimizer loop (`--train-steps`, `--train-lr`, `--train-opt=sgd|adamw`,
+  `--train-seed`) printing the loss trajectory (driver `build_grad` / `run_train`).
 - **Correctness fixes** (interpreter↔native divergences and ICEs removed; each gated bit-for-bit):
   - **`break`/`continue` outside any loop** is now a clean **`E0303`** instead of a backend divergence
     — the lowerer left a fallback `unreachable` the interpreter trapped (exit 1) but the native backend
@@ -260,9 +281,9 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
 - **Cast precedence fixed**: `*p as T` now parses as `(*p) as T`, not `*(p as T)` (which had
   mis-typed the deref as a `ptrtoint` then a load). `as` binds looser than `*`/unary, tighter than the
   binary operators.
-- A construct lowering cannot yet handle (tensors, SIMD methods, generics, parallel loops) is now a
-  hard `error[C0001]` instead of a warning, and the driver refuses to optimize, run, or codegen a
-  module whose lowering failed — so the compiler never emits or executes invalid MIR.
+- A construct lowering cannot handle (e.g. explicit SIMD `f32x8` load/store intrinsics) is a hard
+  `error[C0001]` instead of a warning, and the driver refuses to optimize, run, or codegen a module
+  whose lowering failed — so the compiler never emits or executes invalid MIR.
 - **Global argmax/argmin** (`mercury_argreduce_f32`) gained a 256-bit AVX2 path (4 accumulators × 8
   `f32` value + `i32` index lanes, strict-compare + `blendv`, collapsed through the scalar tie-break).
   It was the one memory-bound reduction lacking one, so it had *lost* to gcc's branch-predicted scalar
@@ -290,7 +311,9 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
     *confirmation* sweep without changing the sequence of mutations.
 
 ### Notes
-- **Constant-shape** tensors, **C-style `enum`s**, and **by-value aggregate parameters/returns** now
-  execute end-to-end (above); **symbolic-generic** tensor dimensions, SIMD vector *values*, and slices
-  `[]T` parse and type/shape-check today but do not yet lower/run, and native LLVM linking is in
-  progress.
+- **Constant-shape** *and* **symbolic-generic** tensors, **C-style `enum`s** (including **data-carrying
+  tagged-union** variants), **by-value aggregate parameters/returns**, **slices `[]T`**, and
+  **loop-as-value** (`break <v>`) now all execute end-to-end (above). What still only parses and
+  type/shape-checks without lowering is **SIMD vector *values*** (explicit `f32x8` load/store
+  intrinsics). Native code generation is **Cranelift** (`--emit=obj|exe`, no LLVM); the LLVM path is
+  the textual `--emit=llvm-ir` emitter only (see `docs/llvm-setup.md`).

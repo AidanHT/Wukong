@@ -39,7 +39,7 @@ mercury_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-ve
 mercury_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
                   mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm)
 mercury_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
-                  rules, fused AdamW; finite-difference-gated) — the training backward path
+                  rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 mercury_backend   `Backend` trait + `Artifact`
 mercury_interp    zero-dependency MIR interpreter backend (+ oracle; lane-wise vector exec)
 mercury_codegen_cranelift  native backend via Cranelift — JIT (--run) + object/exe, no LLVM
@@ -48,7 +48,6 @@ mercury_codegen_gpu   GPU backend (--features gpu): PTX emit + cudarc driver-JIT
                   offload (--backend=gpu) + general MIR→PTX (--backend=gpu-native), no CUDA toolkit
 mercury_runtime   C-ABI arena + rayon parallel_for + the AVX2/FMA microkernels (GEMM, vmath,
                   reductions, norms, int8 — the symbols the recognizers dispatch to)
-mercury_autodiff  reverse-mode autodiff as a MIR→MIR transform (the training backward pass)
 mercury_driver    Session + compile() pipeline + --emit / --backend handling
 mercuryc          thin CLI binary
 mercury_bench     optimizer-effectiveness + interp-vs-native timing & equivalence gate
@@ -70,8 +69,6 @@ source
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
                  | GPU (--features gpu: --backend=gpu offload, --backend=gpu-native MIR→PTX)
                  | textual LLVM IR (--emit=llvm-ir)
-                 | GPU offload (--backend=gpu) | GPU MIR->PTX (--backend=gpu-native)
-                                                          [both --features gpu]
 ```
 
 `mercury_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early and print the
@@ -91,7 +88,12 @@ diagnostic for tooling.
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
 and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` spans constants, binary/
-comparison/cast ops, `Select`, memory (`Alloca`/`Load`/`Store`/`Gep`), and `Call`.
+comparison/cast ops, `Select`, memory (`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD
+primitives (`Splat`/`Fma`/`Sqrt`/`Round`), and address-of ops (`FuncAddr`, and `GlobalAddr`). A
+string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
+bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
+defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bit AVX2 kernel — is
+covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
 This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
@@ -111,7 +113,10 @@ and a multi-dimensional index `a[i, j]` flattens to a row-major `Gep` — so the
 *executes*, not just shape-checks. A matmul written in that tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`,
 both the dot-product and accumulate spellings) dispatches to the tuned `mercury_sgemm` microkernel
 just like the flat `a[i*K+k]` form, because a 2-index access supplies its row stride from the
-operand's inner tensor dimension (symbolic-generic dimensions remain checked-only). The aggregate path is differentially gated
+operand's inner tensor dimension. A *symbolic*-generic nest `matmul<M, N, K>` reaches the same
+kernel too: its symbolic dims are threaded in as hidden runtime `i64` parameters, `emit_sgemm`
+materializes each `Dim::Var` from its bound value, and the result is bit-identical to the
+constant-shape matmul on both backends at any runtime size (`tests/run/generic_shape_matmul.mer`). The aggregate path is differentially gated
 bit-for-bit against the interpreter by the `differential_tuple`/`differential_struct`/
 `differential_nested_struct` Cranelift tests. Returning an aggregate *by value* from a function (and a
 by-value aggregate parameter) lowers through a **MIR-level sret ABI** — the callee takes a hidden
@@ -177,7 +182,9 @@ interpreter is the sound oracle for differential testing.
 
 `mercury_codegen_cranelift` lowers Low MIR to Cranelift IR — an almost 1:1 map (block-parameter SSA,
 signless ints, explicit `alloca`/`load`/`store`/`gep`). It JIT-compiles in-process for
-`--backend=native` and emits a host object for `--emit=obj|exe` (linked with a tiny C runtime). The
+`--backend=native` and emits a host object for `--emit=obj|exe` — for `exe` it prefers a rustc-driven link that pulls
+in the `mercury_runtime` kernels (so a recognized-kernel program and string `.rodata` both resolve),
+falling back to a `cc`/`$CC` C-runtime link. The
 only semantic bridges to stay identical to the interpreter: divide-by-zero yields 0, float→int casts
 saturate, and `i1` results are masked to their low bit.
 
@@ -190,6 +197,18 @@ SSE via dual-issue), a single-vector loop, and a scalar remainder, all sharing o
 bails to scalar on any loop-carried dependence, non-unit stride, call, or mixed lane type, so lane
 `k` always computes exactly what scalar iteration `base+k` would. `@parallel` per-thread chunks go
 through the same vectorizer, so they run SIMD × cores.
+
+Cranelift's CLIF vector ISA still caps at 128-bit — a 256-bit `f32x8` SSA value is rejected at
+`define_function` (the `cranelift_still_rejects_f32x8` / `p4_probe_vec256_ops` tripwires keep that
+documented). So for an eligible f32 elementwise body the vectorizer captures the loop as a flat,
+backend-agnostic `VecKernel` recipe and, when register pressure fits, emits one `Op::VecKernelCall`:
+the Cranelift backend assembles that recipe to **true 256-bit AVX2 machine code** via `iced-x86`
+(`mercury_codegen_cranelift::avx2`, VEX-encoded), while the interpreter marshals the *same* recipe
+lane-wise — so the two stay bit-identical (elementwise lanes carry no reassociation, so the gate
+holds element-for-element). `MERCURY_P4_NO_256` forces the 128-bit path — a same-run A/B knob and a
+kill-switch. The float-reduction path has an analogous 256-bit kernel, gated to large trips
+(`VEC256_REDUCTION_MIN_TRIP` = 2048 elements) because the out-of-line call loses to the inlined
+128-bit reduction on small arrays.
 
 Two refinements target the dominant ML arithmetic. A float `x + y*z` **contracts to a fused
 multiply-add** (`Op::Fma`, one rounding, a hardware `vfmadd`) in both the scalar and vector lowering
