@@ -83,6 +83,15 @@ impl CfgAnalyses {
         }
     }
 
+    /// Whether every block is reachable from the entry — i.e. `prune_unreachable` would be a no-op.
+    /// The reverse postorder visits exactly the reachable blocks, so this is a free comparison once
+    /// `rpo` is cached (and `idoms`, which every dominance user needs, computes `rpo` anyway). Lets
+    /// the prune-first passes skip their reachability DFS in the steady state where nothing is dead.
+    pub(crate) fn all_reachable(&mut self, f: &Function) -> bool {
+        self.ensure_rpo(f);
+        self.rpo.as_ref().unwrap().len() == f.blocks.len()
+    }
+
     /// Predecessor lists, indexed by block id.
     pub(crate) fn predecessors(&mut self, f: &Function) -> &[Vec<u32>] {
         self.ensure_preds(f);
