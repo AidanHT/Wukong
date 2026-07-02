@@ -29,6 +29,10 @@ use mercury_span::{Interner, Symbol};
 mod backend;
 pub use backend::CraneliftBackend;
 
+// P4: raw-AVX2 emitter for the general vectorizer's 256-bit path (Cranelift caps CLIF vectors at
+// 128-bit). Owned by this session; additive.
+mod avx2;
+
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
 // `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust

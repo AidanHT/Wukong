@@ -348,6 +348,7 @@ mod tests {
             let prog = Program {
                 funcs: vec![kernel],
                 level: MirLevel::Low,
+                vec_kernels: Vec::new(),
             };
 
             let mut rng = Rng::new(0x4D11);

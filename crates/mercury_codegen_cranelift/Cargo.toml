@@ -19,6 +19,12 @@ cranelift-jit = "0.124"
 cranelift-native = "0.124"
 cranelift-object = "0.124"
 
+# Correct-by-construction x86-64 encoder for the P4 raw-AVX2 emitter (`avx2.rs`): the general
+# vectorizer's 256-bit path, which Cranelift's 128-bit CLIF vector ISA cannot legalize. `code_asm`
+# gives a labelled assembler (VEX/ModRM/branch fixups handled) so the differential gate only has to
+# police semantics, not byte encodings. Isolated to this crate — never leaks into mir/interp.
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
+
 [dev-dependencies]
 mercury_parser = { workspace = true }
 mercury_sema = { workspace = true }
