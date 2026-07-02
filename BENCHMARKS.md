@@ -219,6 +219,16 @@ naively-written source:
   `-ffp-contract=fast` (both fuse). Idiomatic Rust does not contract unless the author writes
   `f32::mul_add`, so the Rust column reflects rustc's default — a real toolchain-defaults difference,
   surfaced rather than papered over. Mercury and its interpreter oracle agree bit-for-bit (gated).
+- **`-ffast-math` is withheld from C/Rust — and this *inflates* the reduction wins, stated plainly.**
+  The baselines get `-O3 -march=native` (+ default `-ffp-contract=fast`) but **not** `-ffast-math`, so
+  gcc/rustc keep float reductions strictly IEEE-sequential (latency-bound). `-ffast-math` would let gcc
+  reassociate and vectorize a `dot`/`ssd` reduction, **narrowing** those specific rows (the ~2.6–2.9×
+  single-core `dot`/`ssd`). The transcendental and GEMM wins are unaffected — a `libm` call can't
+  vectorize with or without it on this mingw toolchain (no `libmvec`), and the GEMM win is cache
+  tiling, not reassociation. We withhold it because `-ffast-math` also changes C's numerical results,
+  which would break the cross-language checksum that catches miscompiles — whereas Mercury's reduction
+  reassociation is gated bit-for-bit against its own interpreter oracle. So the affected reduction rows
+  are an honest *upper* bound on Mercury's edge there, not a hidden thumb on the scale.
 - **Matmul dispatch is the value proposition, stated plainly.** The C/Rust columns are the *naive
   nest a programmer writes*; Mercury's compiler optimizes it the way a tensor compiler should. The
   win **grows with size** precisely because tiling/packing matters more as the data stops fitting in
