@@ -671,35 +671,55 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .as_float() as f32,
                     );
                 }
-                // One `eval_lane` per element: snapshot this lane's stream inputs, run the recipe,
-                // write its stores back. Load-before-store within a lane keeps in-place streams exact;
-                // distinct lanes never alias (the vectorizer's no-alias precondition), so no hazard.
-                let mut stores: Vec<(u32, f32)> = Vec::new();
-                for i in 0..count {
-                    let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
+                if kern.reduce.is_some() {
+                    // Reduction kernel: fold every lane's addend and return the horizontal result as
+                    // an f32 (the caller combines the initial accumulator and folds the scalar tail).
+                    // Reads only — no stores. Same reassociation `eval_reduction` pins for both
+                    // backends, so this equals the native kernel's return bit-for-bit.
                     for &b in &stream_bases {
-                        loads.push(
-                            self.memory
-                                .get(b + i)
-                                .ok_or("veckernel load out of bounds")?
-                                .as_float() as f32,
-                        );
+                        if b + count > self.memory.len() {
+                            return Err("veckernel reduction load out of bounds".into());
+                        }
                     }
-                    stores.clear();
-                    kern.eval_lane(
-                        |s| loads[s as usize],
+                    let mem = &self.memory;
+                    let r = kern.eval_reduction(
+                        count,
+                        |s, e| mem[stream_bases[s as usize] + e].as_float() as f32,
                         |k| scalar_vals[k as usize],
-                        |s, v| stores.push((s, v)),
                     );
-                    for &(s, v) in &stores {
-                        let slot = stream_bases[s as usize] + i;
-                        *self
-                            .memory
-                            .get_mut(slot)
-                            .ok_or("veckernel store out of bounds")? = Value::Float(v as f64);
+                    Value::Float(r as f64)
+                } else {
+                    // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
+                    // run the recipe, write its stores back. Load-before-store within a lane keeps
+                    // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
+                    // precondition), so no hazard.
+                    let mut stores: Vec<(u32, f32)> = Vec::new();
+                    for i in 0..count {
+                        let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
+                        for &b in &stream_bases {
+                            loads.push(
+                                self.memory
+                                    .get(b + i)
+                                    .ok_or("veckernel load out of bounds")?
+                                    .as_float() as f32,
+                            );
+                        }
+                        stores.clear();
+                        kern.eval_lane(
+                            |s| loads[s as usize],
+                            |k| scalar_vals[k as usize],
+                            |s, v| stores.push((s, v)),
+                        );
+                        for &(s, v) in &stores {
+                            let slot = stream_bases[s as usize] + i;
+                            *self
+                                .memory
+                                .get_mut(slot)
+                                .ok_or("veckernel store out of bounds")? = Value::Float(v as f64);
+                        }
                     }
+                    Value::Unit
                 }
-                Value::Unit
             }
             // A function address: a pointer the interpreter tags with the function's index so the
             // `parallel_for` intrinsic can call it back. (The native backend uses a real address.)
