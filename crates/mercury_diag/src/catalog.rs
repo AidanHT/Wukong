@@ -222,6 +222,16 @@ static CATALOG: &[Explanation] = &[
          signature."
     ),
     entry!(
+        "E0504",
+        "unknown tensor dimension",
+        "A tensor type named a dimension that is not a declared generic parameter (nor an integer \
+         literal, `?`, or a `const`). For example `fn f<K>(a: Tensor[f32, KK])` — `KK` is a typo for \
+         the declared `K`. Previously such a name was silently treated as a brand-new symbolic \
+         dimension, quietly dropping the constraint the programmer intended (e.g. that two operands \
+         share `K`); it is now an error. Declare the dimension in the generic list (`<KK>`), fix the \
+         typo, or use an integer / `?`."
+    ),
+    entry!(
         "C0001",
         "unsupported in codegen",
         "A construct parsed and type-checked but is not yet supported by MIR lowering or the \
