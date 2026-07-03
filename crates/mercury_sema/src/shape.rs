@@ -614,6 +614,12 @@ impl Sema<'_> {
                 }
             }
         }
+        // An enum variant used as an index (`xs[E::V]`, or via a const of enum type) is its
+        // discriminant — resolve it so the compile-time bounds check covers it (it lowers to
+        // that constant, so an out-of-range variant would otherwise trap-vs-OOB-read at runtime).
+        if let Some(d) = self.enum_variant_disc(e) {
+            return Some(d);
+        }
         crate::eval_const_int(e, self.interner)
     }
 

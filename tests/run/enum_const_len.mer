@@ -1,0 +1,31 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 2
+module tests.run.enum_const_len
+
+// A C-style enum variant resolves to its discriminant in every compile-time integer context:
+// an array length (`[i32; Size::Big]`), a length through a const of enum type (`const CAP:
+// Size = Size::Big`), and an index (`a[Size::Small]`, which the compile-time bounds check now
+// covers). Previously these fell to the evaluators' silent-0 fallback: sema sized the array 0
+// while mir_build fell back to an unsized pointer slot — a desync between the bounds check and
+// the alloca. Both evaluators (sema eval_usize_depth, mir_build const_usize_depth) resolve the
+// discriminant through the same DefKind::Enum lookup, in lockstep.
+
+enum Size {
+    Small = 2,
+    Big = 6,
+}
+
+const CAP: Size = Size::Big;
+
+fn main() -> i32 {
+    let mut a: [i32; CAP] = [0; 6]; // const-of-enum-type as a length
+    let mut b: [i32; Size::Big] = [0; 6]; // enum variant directly as a length
+    for i in 0..6 {
+        a[i] = i;
+        b[i] = 2 * i;
+    }
+    print(a[5] + b[5]); // 5 + 10 = 15
+    print(a[Size::Small]); // enum variant as an index -> a[2] = 2
+    return 0;
+}

@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0501
+module tests.fail.enum_index_oob
+
+// An enum variant used as a constant index resolves to its discriminant, so the compile-time
+// bounds check must cover it: `Size::Big` is 6, past a `[i32; 4]` — previously the evaluator
+// returned None for the variant and the check was silently skipped (interp trap vs native OOB
+// read at runtime).
+
+enum Size {
+    Small = 2,
+    Big = 6,
+}
+
+fn main() -> i32 {
+    let a: [i32; 4] = [1, 2, 3, 4];
+    return a[Size::Big];
+}
