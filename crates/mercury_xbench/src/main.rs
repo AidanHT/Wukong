@@ -114,6 +114,224 @@ fn max_rel_err(a: &[f32], b: &[f32]) -> (f64, usize) {
     (worst, at)
 }
 
+/// Flags for the relaxed-FP **C(fast)** peer: the *same* C kernel source compiled a second time with
+/// `-ffast-math`, letting gcc reassociate (and thus vectorize) float reductions the way Mercury's
+/// recognized kernels do. The plain C column keeps the honest default flags (see the fairness notes
+/// in BENCHMARKS.md — withholding `-ffast-math` inflates the reduction-bearing rows); this column is
+/// the reassociation-normalized comparison, printed alongside, never replacing, the plain-C ratio.
+const C_FAST_FLAGS: &[&str] = &["-O3", "-march=native", "-ffast-math", "-shared"];
+
+/// LOOSE cross-check for the relaxed-FP peers (C(fast) / C(omp)). `-ffast-math` and OpenMP-partitioned
+/// reductions legitimately reassociate, so their results differ from Mercury's beyond the tight 1e-3
+/// bar of the honest-flags columns — the bar here is a magnitude-normalized 1e-2. Returns `false`
+/// (and prints the mismatch) when the peer's output is unusable; the caller then drops the column
+/// rather than failing the bench.
+fn relaxed_peer_ok(label: &str, peer: &str, mer: &Measure, p: &Measure) -> bool {
+    let maxabs = mer.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+    let maxerr = mer
+        .out
+        .iter()
+        .zip(&p.out)
+        .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
+    let rel = (maxerr / maxabs) as f64;
+    if rel > 1e-2 {
+        println!(
+            "  ! {label}: {peer} disagrees with Mercury (max|Δ|/max = {rel:.2e} > 1e-2) — {peer} column skipped"
+        );
+        return false;
+    }
+    true
+}
+
+/// Compile + run the C(fast) peer for a 3-pointer bench (the same C source, [`C_FAST_FLAGS`]),
+/// loose-check it against Mercury, and return it only when usable. Compiled lazily — only the
+/// reduction-bearing benches call this, so the extra gcc invocation is paid only where the column
+/// exists.
+#[allow(clippy::too_many_arguments)]
+fn bench_c_fast(
+    label: &str,
+    c_src: &str,
+    dir: &Path,
+    cc: &str,
+    mer: &Option<Measure>,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+    op: *mut f32,
+) -> Option<Measure> {
+    let m = mer.as_ref()?;
+    let cf = bench_external(
+        "c",
+        c_src,
+        dir,
+        &format!("{label}_fast"),
+        cc,
+        C_FAST_FLAGS,
+        out,
+        xp,
+        yp,
+        op,
+    )?;
+    relaxed_peer_ok(label, "C(fast)", m, &cf).then_some(cf)
+}
+
+/// Print Mercury's standing vs a relaxed-FP peer (C(fast) / C(omp)) — reported ALONGSIDE the
+/// honest-flags C ratio above it, never replacing it.
+fn report_relaxed_ratio(
+    peer: &str,
+    mer: &Option<Measure>,
+    mer_par: &Option<Measure>,
+    p: &Option<Measure>,
+) {
+    let Some(pm) = p else { return };
+    if let Some(m) = mer {
+        let r = pm.ns_per_call / m.ns_per_call;
+        println!(
+            "  -> Mercury single-core is {:.2}x {} than {peer}",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+    if let Some(mp) = mer_par {
+        let r = pm.ns_per_call / mp.ns_per_call;
+        println!(
+            "  -> Mercury @parallel is {:.2}x {} than {peer}",
+            if r >= 1.0 { r } else { 1.0 / r },
+            if r >= 1.0 { "faster" } else { "slower" }
+        );
+    }
+}
+
+/// The elementwise-table rows whose C baseline is an IEEE-serial float reduction — exactly the rows
+/// the "`-ffast-math` is withheld" disclosure applies to. These get the additional C(fast) column.
+fn is_reduction_kernel(name: &str) -> bool {
+    matches!(
+        name,
+        "dot" | "ssd"
+            | "dot@parallel"
+            | "ssd@parallel"
+            | "max@parallel"
+            | "absmax@parallel"
+            | "argmax@parallel"
+    )
+}
+
+/// Flags for the multithreaded **C(omp)** peer: the same C kernel under `#pragma omp parallel for`,
+/// compiled `-fopenmp` — the honest multicore C baseline for the `@parallel` rows (which otherwise
+/// compare Mercury-multicore against single-threaded C, a disclosed but one-sided basis). Gated by
+/// the [`omp_threads`] runtime probe.
+const C_OMP_FLAGS: &[&str] = &["-O3", "-march=native", "-fopenmp", "-shared"];
+/// C(omp) flags for the *reduction* rows: an OpenMP `reduction` clause already reassociates across
+/// threads, and `-ffast-math` additionally vectorizes each thread's partial — the strongest honest
+/// C peer for a parallel reduction. The label stays C(omp).
+const C_OMP_FAST_FLAGS: &[&str] = &["-O3", "-march=native", "-fopenmp", "-ffast-math", "-shared"];
+
+/// One-time empirical probe: does this gcc accept `-fopenmp`, does the resulting shared library
+/// *load* (its `libgomp-1.dll` dependency must resolve from PATH — a known Windows failure mode),
+/// and does a parallel region actually run multi-threaded? Returns the thread count seen inside a
+/// parallel region (`None` ⇒ the C(omp) columns are skipped, with a one-time note). Verified rather
+/// than assumed, per the fairness-audit requirement.
+fn omp_threads(cc: &str, dir: &Path) -> Option<i32> {
+    static PROBE: OnceLock<Option<i32>> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let src = "#include <omp.h>\n\
+                   __declspec(dllexport) int kprobe(void) {\n\
+                   \x20 int n = 0;\n\
+                   #pragma omp parallel\n\
+                   \x20 {\n\
+                   #pragma omp master\n\
+                   \x20   n = omp_get_num_threads();\n\
+                   \x20 }\n\
+                   \x20 return n;\n}\n";
+        let run = || -> Option<i32> {
+            let src_path = dir.join("omp_probe.c");
+            let dll = dir.join("omp_probe.dll");
+            std::fs::write(&src_path, src).ok()?;
+            let status = Command::new(cc)
+                .args(["-O2", "-fopenmp", "-shared"])
+                .arg("-o")
+                .arg(&dll)
+                .arg(&src_path)
+                .status()
+                .ok()?;
+            if !status.success() {
+                return None;
+            }
+            unsafe {
+                let lib = libloading::Library::new(&dll).ok()?;
+                let f: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+                    lib.get(b"kprobe\0").ok()?;
+                Some(f())
+            }
+        };
+        match run() {
+            Some(n) if n >= 2 => {
+                println!("[C(omp) peer enabled: {cc} -fopenmp runs {n} threads in a parallel region]");
+                Some(n)
+            }
+            Some(n) => {
+                println!("[C(omp) peer disabled: OpenMP parallel region ran {n} thread(s) — columns skipped]");
+                None
+            }
+            None => {
+                println!("[C(omp) peer disabled: -fopenmp compile/load probe failed (libgomp?) — columns skipped]");
+                None
+            }
+        }
+    })
+}
+
+/// The OpenMP twin of the idiomatic C body for an elementwise-table `@parallel` row: the SAME
+/// kernel with `#pragma omp parallel for` (+ a `reduction` clause where the loop is a reduction;
+/// argmax uses per-thread partials + an order-independent lowest-index combine, matching the serial
+/// first-max semantics). Built by name so the 3-way `Kernel` table stays untouched.
+fn c_omp_source(name: &str) -> Option<String> {
+    let body = match name {
+        "saxpy@parallel" => {
+            "float a=2.0f;\n#pragma omp parallel for\n  for(long i=0;i<N;i++) out[i]=a*x[i]+y[i];"
+        }
+        "poly@parallel" => {
+            "#pragma omp parallel for\n  for(long i=0;i<N;i++){ float v=x[i]; float r=0.00001f; \
+             r=r*v+0.0001f; r=r*v+0.001f; r=r*v+0.01f; r=r*v+0.1f; out[i]=r; }"
+        }
+        "relu6@parallel" => {
+            "#pragma omp parallel for\n  for(long i=0;i<N;i++){ float v=x[i]; v = v<6.0f?v:6.0f; out[i] = v>0.0f?v:0.0f; }"
+        }
+        "gelu@parallel" => {
+            "#pragma omp parallel for\n  for(long i=0;i<N;i++){ float v=x[i]; \
+             float u=0.7978845608f*(v+0.044715f*v*v*v); \
+             float t=1.0f-2.0f/(expf(2.0f*u)+1.0f); \
+             out[i]=0.5f*v*(1.0f+t); }"
+        }
+        "dot@parallel" => {
+            "float s=0.0f;\n#pragma omp parallel for reduction(+:s)\n  for(long i=0;i<N;i++) s+=x[i]*y[i];\n  out[0]=s;"
+        }
+        "ssd@parallel" => {
+            "float s=0.0f;\n#pragma omp parallel for reduction(+:s)\n  for(long i=0;i<N;i++){ float d=x[i]-y[i]; s+=d*d; }\n  out[0]=s;"
+        }
+        "max@parallel" => {
+            "float m=x[0];\n#pragma omp parallel for reduction(max:m)\n  for(long i=0;i<N;i++){ float v=x[i]; m = v>m? v:m; }\n  out[0]=m;"
+        }
+        "absmax@parallel" => {
+            "float m=0.0f;\n#pragma omp parallel for reduction(max:m)\n  for(long i=0;i<N;i++){ float a=fabsf(x[i]); m = a>m? a:m; }\n  out[0]=m;"
+        }
+        "argmax@parallel" => {
+            "float bv=x[0]; long bi=0;\n\
+             #pragma omp parallel\n\
+             \x20 {\n\
+             \x20   float lbv=x[0]; long lbi=0;\n\
+             #pragma omp for nowait\n\
+             \x20   for(long k=0;k<N;k++){ if(x[k]>lbv){ lbv=x[k]; lbi=k; } }\n\
+             #pragma omp critical\n\
+             \x20   { if(lbv>bv || (lbv==bv && lbi<bi)){ bv=lbv; bi=lbi; } }\n\
+             \x20 }\n\
+             \x20 out[0]=(float)bi;"
+        }
+        _ => return None,
+    };
+    Some(c_kernel(body))
+}
+
 fn main() {
     let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".to_string());
     let cxx = std::env::var("CXX").unwrap_or_else(|_| "g++".to_string());
@@ -182,9 +400,44 @@ fn main() {
             yp,
             op,
         );
+        // The relaxed-FP C(fast) peer (same C source, -ffast-math) runs only for the
+        // reduction-bearing rows — the ones whose honest-flags C column is IEEE-serial and therefore
+        // inflated (see the fairness notes). Cross-checked at the loose 1e-2 bar inside.
+        let cfast = if is_reduction_kernel(k.name) {
+            bench_c_fast(k.name, &k.c, &dir, &cc, &mercury, &mut out, xp, yp, op)
+        } else {
+            None
+        };
+        // The multithreaded C(omp) peer for the @parallel rows: the same kernel under
+        // `#pragma omp parallel for` (probed once; skipped with a note when this gcc/loader can't
+        // run OpenMP DLLs). Reduction rows also get -ffast-math — an OpenMP reduction clause
+        // already reassociates, so the label stays C(omp). Loose-checked like C(fast).
+        let comp = c_omp_source(k.name).and_then(|src| {
+            omp_threads(&cc, &dir)?;
+            let flags = if is_reduction_kernel(k.name) {
+                C_OMP_FAST_FLAGS
+            } else {
+                C_OMP_FLAGS
+            };
+            let cm = bench_external(
+                "c",
+                &src,
+                &dir,
+                &format!("{}_omp", k.name),
+                &cc,
+                flags,
+                &mut out,
+                xp,
+                yp,
+                op,
+            )?;
+            mercury
+                .as_ref()
+                .and_then(|m| relaxed_peer_ok(k.name, "C(omp)", m, &cm).then_some(cm))
+        });
 
         println!("=== {} ({}) ===", k.name, k.note);
-        report(k, &mercury, &c, &cpp, &rust);
+        report(k, &mercury, &c, &cpp, &rust, &cfast, &comp);
         // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
         // of the GEMM-vs-cblas comparison. Mercury's hand-AVX2 vmath vs Intel's hand-tuned VML, both
         // single-thread, same buffer. Cross-checked against Mercury's output (a large rel error would
@@ -432,9 +685,33 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     let mkl_all = mkl()
         .map(|api| api.max_threads)
         .and_then(|t| bench_mm_mkl(ns, false, t, &a, &b, &mut c));
-    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
     let run_naive = ns < 2048 || std::env::var("XBENCH_NAIVE_HUGE").is_ok();
-    let (cm, rm) = if run_naive {
+    // All-core C(omp) peer (the naive ikj source + `#pragma omp parallel for` on the row loop):
+    // measured inside the all-core group and BEFORE Mer(par), so any residual heat lands on
+    // Mercury, never the peer — the same throttle-ourselves direction as the MKL(all)/Mer(par)
+    // ordering. Gated like the other naive-source peers (multi-second per call at ≥2048³).
+    let comp = if run_naive {
+        omp_threads(cc, dir)
+            .and_then(|_| {
+                bench_external(
+                    "c",
+                    &c_matmul_omp(ns),
+                    dir,
+                    "matmul_omp",
+                    cc,
+                    C_OMP_FLAGS,
+                    &mut c,
+                    ap,
+                    bp,
+                    cp,
+                )
+            })
+            .filter(|p| mer.as_ref().is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p)))
+    } else {
+        None
+    };
+    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
+    let (cm, rm, cfast) = if run_naive {
         let cm = bench_external(
             "c",
             &c_matmul(ns),
@@ -459,17 +736,21 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             bp,
             cp,
         );
-        (cm, rm)
+        // The reassociation-normalized C peer: the same naive source at -ffast-math (gcc may
+        // reassociate/vectorize more aggressively). Loose-checked vs Mercury inside; the column is
+        // skipped (None) when the fast output can't meet the 1e-2 bar.
+        let cfast = bench_c_fast("matmul", &c_matmul(ns), dir, cc, &mer, &mut c, ap, bp, cp);
+        (cm, rm, cfast)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     println!(
-        "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "", "Mer(1c)", "Mer(par)", "MKL(1c)", "MKL(all)", "tuned(mm)", "C(gcc)", "Rust"
+        "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "Mer(1c)", "Mer(par)", "MKL(1c)", "MKL(all)", "tuned(mm)", "C(gcc)", "C(fast)", "C(omp)", "Rust"
     );
     println!(
-        "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "GFLOP/s",
         gflops(&mer),
         gflops(&mer_par),
@@ -477,6 +758,8 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
         gflops(&mkl_all),
         gflops(&Some(tuned.clone())),
         gflops(&cm),
+        gflops(&cfast),
+        gflops(&comp),
         gflops(&rm)
     );
     report_gemm_standing(&mer, &tuned, roof, flops);
@@ -515,6 +798,8 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             if r >= 1.0 { "faster" } else { "slower" }
         );
     }
+    report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
+    report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &mer, &mer_par, &comp);
 }
 
 /// `ikj`-ordered matmul, optionally `@parallel` (parallelizes the outer `i` loop across cores).
@@ -538,6 +823,23 @@ fn mer_matmul(ns: usize, parallel: bool) -> String {
 fn c_matmul(ns: usize) -> String {
     format!(
         "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         \x20 for (long i=0;i<NS;i++){{\n\
+         \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
+         \x20   for (long k=0;k<NS;k++){{\n\
+         \x20     float aik=a[i*NS+k];\n\
+         \x20     for (long j=0;j<NS;j++) c[i*NS+j]+=aik*b[k*NS+j];\n\
+         \x20   }}\n\
+         \x20 }}\n}}\n"
+    )
+}
+
+/// The OpenMP twin of [`c_matmul`]: the same naive `ikj` nest with the outer `i` loop split across
+/// cores (`#pragma omp parallel for`) — each row's arithmetic is unchanged, so it matches the
+/// serial nest exactly; the parallelism only partitions rows.
+fn c_matmul_omp(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++){{\n\
          \x20   for (long j=0;j<NS;j++) c[i*NS+j]=0.0f;\n\
          \x20   for (long k=0;k<NS;k++){{\n\
@@ -610,16 +912,19 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             bp,
             cp,
         );
+        // Reassociation-normalized peer: -ffast-math may vectorize the column-strided reduction.
+        let cfast = bench_c_fast("matmul_tn", &c_matmul_tn(ns), dir, cc, &mer, &mut c, ap, bp, cp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&mer),
             gflops(&mer_par),
             gflops(&cm),
+            gflops(&cfast),
             gflops(&rm)
         );
         // Cross-language correctness: the transpose-once-then-NN result must match the naive nest.
@@ -648,6 +953,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
         println!();
     }
 }
@@ -962,18 +1268,40 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             bp,
             cp,
         );
+        // Reassociation-normalized peer: with -ffast-math gcc may reassociate + vectorize the
+        // ijk dot-product reduction that the honest-flags column keeps serial.
+        let cfast = bench_c_fast("linear", &c_linear(ns), dir, cc, &mer, &mut c, ap, bp, cp);
+        // Multithreaded C peer: rows across cores + -ffast-math (the reduction row rule).
+        let comp = omp_threads(cc, dir)
+            .and_then(|_| {
+                bench_external(
+                    "c",
+                    &c_linear_omp(ns),
+                    dir,
+                    "linear_omp",
+                    cc,
+                    C_OMP_FAST_FLAGS,
+                    &mut c,
+                    ap,
+                    bp,
+                    cp,
+                )
+            })
+            .filter(|p| mer.as_ref().is_some_and(|m| relaxed_peer_ok("linear", "C(omp)", m, p)));
         let tuned = bench_mm_tuned(ns, true, &a, &b, &mut c);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "tuned(mm)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "tuned(mm)", "C (gcc)", "C(fast)", "C(omp)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&mer),
             gflops(&mer_par),
             gflops(&Some(tuned.clone())),
             gflops(&cm),
+            gflops(&cfast),
+            gflops(&comp),
             gflops(&rm)
         );
         if let (Some(mp), Some(c)) = (&mer_par, &cm) {
@@ -983,6 +1311,8 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 r
             );
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
+        report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &mer, &mer_par, &comp);
         report_gemm_standing(&mer, &tuned, roof, flops);
         println!();
     }
@@ -1010,6 +1340,20 @@ fn mer_linear(ns: usize, parallel: bool) -> String {
 fn c_linear(ns: usize) -> String {
     format!(
         "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
+         \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
+         \x20     c[i*NS+j]=s; }}\n}}\n"
+    )
+}
+
+/// The OpenMP twin of [`c_linear`]: the `ijk` dot-product nest with rows across cores. Compiled with
+/// [`C_OMP_FAST_FLAGS`] (the inner loop is a reduction, so -ffast-math lets each thread's dot
+/// vectorize — the strongest honest multithreaded C for `nn.Linear`).
+fn c_linear_omp(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n__declspec(dllexport) void kbench(const float* a, const float* b, float* c) {{\n\
+         #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++){{ float s=0.0f;\n\
          \x20     for (long k=0;k<NS;k++) s+=a[i*NS+k]*b[j*NS+k];\n\
@@ -1087,16 +1431,20 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
             bp,
             cp,
         );
+        // Reassociation-normalized peer for the GEMM half of the fused op (-ffast-math may
+        // reassociate the dot-product; the scalar-expf silu pass is unaffected either way).
+        let cfast = bench_c_fast("ffn", &c_ffn(ns), dir, cc, &mer, &mut c, ap, bp, cp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&mer),
             gflops(&mer_par),
             gflops(&cm),
+            gflops(&cfast),
             gflops(&rm)
         );
         // Cross-language correctness over the whole buffer (silu(GEMM) — tight tolerance, see doc).
@@ -1125,6 +1473,7 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
                 if r >= 1.0 { "faster" } else { "slower" }
             );
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
         println!();
     }
 }
@@ -1365,16 +1714,34 @@ fn bench_transpose(cc: &str, dir: &Path) {
             yp,
             dp,
         );
+        // Multithreaded C peer: rows across cores (a permutation — no reduction, plain -fopenmp).
+        let comp = omp_threads(cc, dir)
+            .and_then(|_| {
+                bench_external(
+                    "c",
+                    &c_transpose_omp(ns),
+                    dir,
+                    "transpose_omp",
+                    cc,
+                    C_OMP_FLAGS,
+                    &mut dst,
+                    sp,
+                    yp,
+                    dp,
+                )
+            })
+            .filter(|p| mer.as_ref().is_some_and(|m| relaxed_peer_ok("transpose", "C(omp)", m, p)));
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(omp)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&mer),
             gbps(&mer_par),
             gbps(&cm),
+            gbps(&comp),
             gbps(&rm)
         );
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
@@ -1395,6 +1762,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             let r = c2.ns_per_call / mp.ns_per_call;
             println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
         }
+        report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &mer, &mer_par, &comp);
         println!();
     }
 }
@@ -1418,6 +1786,18 @@ fn c_transpose(ns: usize) -> String {
         "#define NS {ns}\n\
          __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
          \x20 (void)y;\n\
+         \x20 for (long i=0;i<NS;i++)\n\
+         \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
+    )
+}
+
+/// The OpenMP twin of [`c_transpose`]: rows across cores. A permutation, so it stays exact.
+fn c_transpose_omp(ns: usize) -> String {
+    format!(
+        "#define NS {ns}\n\
+         __declspec(dllexport) void kbench(const float* src, const float* y, float* dst){{\n\
+         \x20 (void)y;\n\
+         #pragma omp parallel for\n\
          \x20 for (long i=0;i<NS;i++)\n\
          \x20   for (long j=0;j<NS;j++) dst[j*NS+i] = src[i*NS+j];\n}}\n"
     )
@@ -1477,16 +1857,37 @@ fn bench_colsum(cc: &str, dir: &Path) {
             yp,
             op,
         );
+        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided column fold.
+        let cfast = bench_c_fast("colsum", &c_colsum(m, n), dir, cc, &mer, &mut out, xp, yp, op);
+        // Multithreaded C peer: columns across cores (+ -ffast-math, the reduction-row rule).
+        let comp = omp_threads(cc, dir)
+            .and_then(|_| {
+                bench_external(
+                    "c",
+                    &c_colsum_omp(m, n),
+                    dir,
+                    "colsum_omp",
+                    cc,
+                    C_OMP_FAST_FLAGS,
+                    &mut out,
+                    xp,
+                    yp,
+                    op,
+                )
+            })
+            .filter(|p| mer.as_ref().is_some_and(|mm| relaxed_peer_ok("colsum", "C(omp)", mm, p)));
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "C(omp)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&mer),
             gbps(&mer_par),
             gbps(&cm),
+            gbps(&cfast),
+            gbps(&comp),
             gbps(&rm)
         );
         // Both sum each column in i-ascending order, so the full-buffer cross-check is bit equality.
@@ -1507,6 +1908,8 @@ fn bench_colsum(cc: &str, dir: &Path) {
             let r = c2.ns_per_call / mp.ns_per_call;
             println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
+        report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &mer, &mer_par, &comp);
         println!();
     }
 }
@@ -1532,6 +1935,18 @@ fn c_colsum(m: usize, n: usize) -> String {
         "#define M {m}\n#define N {n}\n\
          __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
          \x20 (void)y;\n\
+         \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
+    )
+}
+
+/// The OpenMP twin of [`c_colsum`]: columns across cores (each `out[j]` owned by one thread, so no
+/// combine — the per-column fold order is unchanged). Compiled with [`C_OMP_FAST_FLAGS`].
+fn c_colsum_omp(m: usize, n: usize) -> String {
+    format!(
+        "#define M {m}\n#define N {n}\n\
+         __declspec(dllexport) void kbench(const float* x, const float* y, float* out){{\n\
+         \x20 (void)y;\n\
+         #pragma omp parallel for\n\
          \x20 for (long j=0;j<N;j++){{ float s=0.0f; for (long i=0;i<M;i++) s += x[i*N+j]; out[j]=s; }}\n}}\n"
     )
 }
@@ -2727,16 +3142,19 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 yp,
                 op,
             );
+            // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided fold.
+            let cfast = bench_c_fast(label, &c_colstat(m, n, opc), dir, cc, &mer, &mut out, xp, yp, op);
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-                "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "Rust"
             );
             println!(
-                "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+                "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "GB/s",
                 gbps(&mer),
                 gbps(&mer_par),
                 gbps(&cm),
+                gbps(&cfast),
                 gbps(&rm)
             );
             // Both fold each column i-ascending and finalize with correctly-rounded /M and sqrt, so the
@@ -2758,6 +3176,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 let r = c2.ns_per_call / mp.ns_per_call;
                 println!("  -> Mercury @parallel is {r:.2}x naive single-threaded C");
             }
+            report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
             println!();
         }
     }
@@ -2864,16 +3283,19 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             dyp,
             dxp,
         );
+        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the per-row dot.
+        let cfast = bench_c_fast("softmax_bwd", &c_softmax_bwd(r, c), dir, cc, &mer, &mut dx, yp, dyp, dxp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&mer),
             gbps(&mer_par),
             gbps(&cm),
+            gbps(&cfast),
             gbps(&rm)
         );
         // The dot reassociates (lane accumulators vs C's serial chain), so check a tolerance. Softmax
@@ -2904,6 +3326,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
             println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
         println!();
     }
 }
@@ -2974,13 +3397,19 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
             "rs", &rust_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
         );
+        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the two per-row reductions.
+        let cfast = bench_external4(
+            "c", &c_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd_fast", cc,
+            C_FAST_FLAGS, &mut dx, xp, dyp, gp, dxp,
+        )
+        .filter(|cf| mer.as_ref().is_some_and(|m| relaxed_peer_ok("rmsnorm_bwd", "C(fast)", m, cf)));
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&rm)
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&cfast), gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&mer, &cm) {
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
@@ -3002,6 +3431,7 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
             println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
         println!();
     }
 }
@@ -3081,7 +3511,13 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
             "rs", &rust_layernorm_bwd(r, c), dir, "layernorm_bwd", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
         );
-        report_ratio("layernorm_bwd", &mer, &mer_par, &cm, &rm, &gbps);
+        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the four per-row reductions.
+        let cfast = bench_external4(
+            "c", &c_layernorm_bwd(r, c), dir, "layernorm_bwd_fast", cc,
+            C_FAST_FLAGS, &mut dx, xp, dyp, gp, dxp,
+        )
+        .filter(|cf| mer.as_ref().is_some_and(|m| relaxed_peer_ok("layernorm_bwd", "C(fast)", m, cf)));
+        report_ratio("layernorm_bwd", &mer, &mer_par, &cm, &rm, &cfast, &gbps);
     }
 }
 
@@ -3167,13 +3603,15 @@ fn bench_xent(cc: &str, dir: &Path) {
             "rs", &rust_xent(r, c), dir, "xent", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut loss, xp, tp, lossp,
         );
+        // Reassociation-normalized peer: -ffast-math on the row-max + Σexp reductions.
+        let cfast = bench_c_fast("xent", &c_xent(r, c), dir, cc, &mer, &mut loss, xp, tp, lossp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Mer(1core)", "Mer(par)", "C (gcc)", "C(fast)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11}",
-            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&rm)
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "GB/s", gbps(&mer), gbps(&mer_par), gbps(&cm), gbps(&cfast), gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&mer, &cm) {
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
@@ -3195,6 +3633,7 @@ fn bench_xent(cc: &str, dir: &Path) {
             let r2 = c2.ns_per_call / mp.ns_per_call;
             println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
         }
+        report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
         println!();
     }
 }
@@ -3381,7 +3820,7 @@ fn bench_xent_bwd(cc: &str, dir: &Path) {
             "rs", &rust_xent_bwd(r, c), dir, "xent_bwd", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp, dxp,
         );
-        report_ratio("xent_bwd", &mer, &mer_par, &cm, &rm, &gbps);
+        report_ratio("xent_bwd", &mer, &mer_par, &cm, &rm, &None, &gbps);
     }
 }
 
@@ -3455,7 +3894,7 @@ fn bench_rope_bwd(cc: &str, dir: &Path) {
             "rs", &rust_rope_bwd(rows, half), dir, "rope_bwd", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, gp, fp, dxp,
         );
-        report_ratio("rope_bwd", &mer, &mer_par, &cm, &rm, &gbps);
+        report_ratio("rope_bwd", &mer, &mer_par, &cm, &rm, &None, &gbps);
     }
 }
 
@@ -3530,7 +3969,7 @@ fn bench_gate(cc: &str, dir: &Path) {
             "rs", &rust_gate(n, act), dir, "gate", "rustc",
             &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, ap, bp, op_,
         );
-        report_ratio("gate", &mer, &mer_par, &cm, &rm, &gbps);
+        report_ratio("gate", &mer, &mer_par, &cm, &rm, &None, &gbps);
     }
 }
 
@@ -3632,7 +4071,9 @@ fn bench_row_losses(cc: &str, dir: &Path) {
                 "rs", &src_r, dir, label, "rustc",
                 &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, p0, p1, op_,
             );
-            report_ratio(label, &mer, &mer_par, &cm, &rm, &gbps);
+            // Reassociation-normalized peer: the per-row logf/expf reductions under -ffast-math.
+            let cfast = bench_c_fast(label, &src_c, dir, cc, &mer, &mut out, p0, p1, op_);
+            report_ratio(label, &mer, &mer_par, &cm, &rm, &cfast, &gbps);
         }
     }
 }
@@ -3700,22 +4141,32 @@ fn rust_row_loss(rows: usize, cols: usize, kind: &str) -> String {
 /// Shared 4-column ratio report for the backward/gate benches (Mer 1-core / Mer par / C / Rust + the
 /// single-core and @parallel ratios vs naive C). The cross-check (when both present) uses a magnitude-
 /// normalized tolerance, since the transcendental reductions reassociate / differ from libm by ~1 ULP.
+/// `cfast` is the optional relaxed-FP C(fast) peer column (already loose-cross-checked by the caller);
+/// benches whose C baseline is not an IEEE-serial reduction pass `&None`.
 fn report_ratio(
     label: &str,
     mer: &Option<Measure>,
     mer_par: &Option<Measure>,
     cm: &Option<Measure>,
     rm: &Option<Measure>,
+    cfast: &Option<Measure>,
     gbps: &dyn Fn(&Option<Measure>) -> String,
 ) {
-    println!(
+    let has_fast = cfast.is_some();
+    let mut hdr = format!(
         "  {:<10} {:>11} {:>11} {:>11} {:>11}",
         "", "Mer(1core)", "Mer(par)", "C (gcc)", "Rust"
     );
-    println!(
+    let mut vals = format!(
         "  {:<10} {:>11} {:>11} {:>11} {:>11}",
         "GB/s", gbps(mer), gbps(mer_par), gbps(cm), gbps(rm)
     );
+    if has_fast {
+        hdr.push_str(&format!(" {:>11}", "C(fast)"));
+        vals.push_str(&format!(" {:>11}", gbps(cfast)));
+    }
+    println!("{hdr}");
+    println!("{vals}");
     if let (Some(m), Some(c2)) = (mer, cm) {
         let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
         let maxerr = m.out.iter().zip(&c2.out).fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
@@ -3736,6 +4187,7 @@ fn report_ratio(
         let r2 = c2.ns_per_call / mp.ns_per_call;
         println!("  -> Mercury @parallel is {r2:.2}x naive single-threaded C");
     }
+    report_relaxed_ratio("C(fast) [-ffast-math]", mer, mer_par, cfast);
     println!();
 }
 
@@ -4518,8 +4970,8 @@ fn bench_norm(cc: &str, dir: &Path) {
             "=== fused norms, 1x{cols} feature row (ns/call, lower is better; Mercury → mercury_norm_f32[_affine]) ==="
         );
         println!(
-            "  {:<16} {:>12} {:>12} {:>12} {:>16}",
-            "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
+            "  {:<16} {:>12} {:>12} {:>12} {:>12} {:>16} {:>16}",
+            "", "Mercury", "C (gcc)", "C(fast)", "Rust", "Mer vs C", "vs C(fast)"
         );
         for op in [
             "softmax",
@@ -4555,28 +5007,36 @@ fn bench_norm(cc: &str, dir: &Path) {
                 yp,
                 op_,
             );
+            // Reassociation-normalized peer: with -ffast-math gcc may reassociate the norm's
+            // reductions (and vectorize expf via its own fast paths). Loose-checked inside.
+            let cfast =
+                bench_c_fast(&format!("norm_{op}"), &c_norm(cols, op), dir, cc, &mer, &mut out, xp, yp, op_);
             let ns = |m: &Option<Measure>| {
                 m.as_ref()
                     .map(|x| format!("{:.0}", x.ns_per_call))
                     .unwrap_or_else(|| "n/a".into())
             };
-            let standing = if let (Some(m), Some(c)) = (&mer, &c) {
-                let r = c.ns_per_call / m.ns_per_call;
-                format!(
-                    "{:.2}x {}",
-                    if r >= 1.0 { r } else { 1.0 / r },
-                    if r >= 1.0 { "faster" } else { "slower" }
-                )
-            } else {
-                "n/a".into()
+            let standing_vs = |peer: &Option<Measure>| {
+                if let (Some(m), Some(p)) = (&mer, peer) {
+                    let r = p.ns_per_call / m.ns_per_call;
+                    format!(
+                        "{:.2}x {}",
+                        if r >= 1.0 { r } else { 1.0 / r },
+                        if r >= 1.0 { "faster" } else { "slower" }
+                    )
+                } else {
+                    "n/a".into()
+                }
             };
             println!(
-                "  {:<16} {:>12} {:>12} {:>12} {:>16}",
+                "  {:<16} {:>12} {:>12} {:>12} {:>12} {:>16} {:>16}",
                 op,
                 ns(&mer),
                 ns(&c),
+                ns(&cfast),
                 ns(&rust),
-                standing
+                standing_vs(&c),
+                standing_vs(&cfast)
             );
             // Cross-language correctness: same normalized row, element by element (f32 tolerance —
             // Mercury reassociates the reductions, C does not, so it is a tight rel-err, not bits).
@@ -4783,8 +5243,8 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
             "=== batched norms (softmax / LayerNorm / RMSNorm), {rows}x{cols} = [tokens, hidden], {mb:.1} MB/buffer (ns/call, lower is better; Mercury → mercury_norm_f32[_parallel]) ==="
         );
         println!(
-            "  {:<18} {:>12} {:>12} {:>12} {:>16}",
-            "", "Mercury", "C (gcc)", "Rust", "Mer vs C"
+            "  {:<18} {:>12} {:>12} {:>12} {:>12} {:>16} {:>16}",
+            "", "Mercury", "C (gcc)", "C(fast)", "Rust", "Mer vs C", "vs C(fast)"
         );
         for op in ["rmsnorm", "layernorm", "softmax"] {
             // C/Rust baselines are single-threaded per-row norms — the same for both Mercury rows
@@ -4813,6 +5273,21 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 yp,
                 op_,
             );
+            // Reassociation-normalized peer, also once per op (single-threaded like the C column);
+            // loose-checked against the serial Mercury row below before the column is shown.
+            let mut cfast_raw = bench_external(
+                "c",
+                &c_norm_batched(rows, cols, op),
+                dir,
+                "bnorm_fast",
+                cc,
+                C_FAST_FLAGS,
+                &mut out,
+                xp,
+                yp,
+                op_,
+            );
+            let mut cfast: Option<Measure> = None;
             for (suffix, par) in [("", false), ("@parallel", true)] {
                 let label = format!("{op}{suffix}");
                 let mer = bench_mercury(
@@ -4822,28 +5297,38 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                     yp,
                     op_,
                 );
+                if !par {
+                    cfast = cfast_raw.take().filter(|cf| {
+                        mer.as_ref()
+                            .is_some_and(|m| relaxed_peer_ok(&label, "C(fast)", m, cf))
+                    });
+                }
                 let ns = |m: &Option<Measure>| {
                     m.as_ref()
                         .map(|x| format!("{:.0}", x.ns_per_call))
                         .unwrap_or_else(|| "n/a".into())
                 };
-                let standing = if let (Some(m), Some(c)) = (&mer, &c) {
-                    let r = c.ns_per_call / m.ns_per_call;
-                    format!(
-                        "{:.2}x {}",
-                        if r >= 1.0 { r } else { 1.0 / r },
-                        if r >= 1.0 { "faster" } else { "slower" }
-                    )
-                } else {
-                    "n/a".into()
+                let standing_vs = |peer: &Option<Measure>| {
+                    if let (Some(m), Some(p)) = (&mer, peer) {
+                        let r = p.ns_per_call / m.ns_per_call;
+                        format!(
+                            "{:.2}x {}",
+                            if r >= 1.0 { r } else { 1.0 / r },
+                            if r >= 1.0 { "faster" } else { "slower" }
+                        )
+                    } else {
+                        "n/a".into()
+                    }
                 };
                 println!(
-                    "  {:<18} {:>12} {:>12} {:>12} {:>16}",
+                    "  {:<18} {:>12} {:>12} {:>12} {:>12} {:>16} {:>16}",
                     label,
                     ns(&mer),
                     ns(&c),
+                    ns(&cfast),
                     ns(&rust),
-                    standing
+                    standing_vs(&c),
+                    standing_vs(&cfast)
                 );
                 // Full-buffer cross-check (f32 tolerance: Mercury reassociates the per-row reductions).
                 if let (Some(m), Some(c)) = (&mer, &c) {
@@ -4955,21 +5440,44 @@ fn report(
     c: &Option<Measure>,
     cpp: &Option<Measure>,
     r: &Option<Measure>,
+    cfast: &Option<Measure>,
+    comp: &Option<Measure>,
 ) {
+    // C(fast) / C(omp) are *additional* peer columns present only where they apply (C(fast) on the
+    // reduction-bearing rows: the same C source at -O3 -march=native -ffast-math; C(omp) on the
+    // @parallel rows: the same kernel under #pragma omp parallel for). Both were already
+    // loose-cross-checked at the caller.
+    let has_fast = cfast.is_some();
+    let has_omp = comp.is_some();
     let row = |label: &str, f: &dyn Fn(&Measure) -> String| {
-        println!(
+        let cell = |x: &Option<Measure>| x.as_ref().map(f).unwrap_or_else(|| "n/a".into());
+        let mut line = format!(
             "  {:<14} {:>13} {:>13} {:>13} {:>13}",
             label,
-            m.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
-            c.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
-            cpp.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
-            r.as_ref().map(f).unwrap_or_else(|| "n/a".into()),
+            cell(m),
+            cell(c),
+            cell(cpp),
+            cell(r),
         );
+        if has_fast {
+            line.push_str(&format!(" {:>13}", cell(cfast)));
+        }
+        if has_omp {
+            line.push_str(&format!(" {:>13}", cell(comp)));
+        }
+        println!("{line}");
     };
-    println!(
+    let mut hdr = format!(
         "  {:<14} {:>13} {:>13} {:>13} {:>13}",
         "", "Mercury", "C (gcc)", "C++ (g++)", "Rust"
     );
+    if has_fast {
+        hdr.push_str(&format!(" {:>13}", "C(fast)"));
+    }
+    if has_omp {
+        hdr.push_str(&format!(" {:>13}", "C(omp)"));
+    }
+    println!("{hdr}");
     row("compile (ms)", &|x| {
         format!("{:.1}", x.compile.as_secs_f64() * 1e3)
     });
@@ -5006,6 +5514,26 @@ fn report(
         let ratio = cpp.ns_per_call / m.ns_per_call;
         println!(
             "  -> Mercury runtime is {:.2}x {} than C++ (g++ -O3 -march=native)",
+            if ratio >= 1.0 { ratio } else { 1.0 / ratio },
+            if ratio >= 1.0 { "faster" } else { "slower" },
+        );
+    }
+    // The reassociation-normalized standing: the same C source, -ffast-math. Reported alongside
+    // (never replacing) the honest-flags C ratio above.
+    if let (Some(m), Some(cf)) = (m, cfast) {
+        let ratio = cf.ns_per_call / m.ns_per_call;
+        println!(
+            "  -> Mercury runtime is {:.2}x {} than C(fast) (gcc -O3 -march=native -ffast-math)",
+            if ratio >= 1.0 { ratio } else { 1.0 / ratio },
+            if ratio >= 1.0 { "faster" } else { "slower" },
+        );
+    }
+    // The multicore-vs-multicore standing: Mercury @parallel vs the OpenMP'd C twin — the
+    // apples-to-apples multithreaded comparison for the @parallel rows.
+    if let (Some(m), Some(co)) = (m, comp) {
+        let ratio = co.ns_per_call / m.ns_per_call;
+        println!(
+            "  -> Mercury @parallel is {:.2}x {} than C(omp) (gcc -O3 -march=native -fopenmp, all cores)",
             if ratio >= 1.0 { ratio } else { 1.0 / ratio },
             if ratio >= 1.0 { "faster" } else { "slower" },
         );
