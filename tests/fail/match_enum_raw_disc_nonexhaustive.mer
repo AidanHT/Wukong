@@ -1,0 +1,26 @@
+// EXPECT-CODE: E0405
+module tests.fail.match_enum_raw_disc_nonexhaustive
+
+// An enum matched by RAW DISCRIMINANT integer literals is exhaustiveness-checked like a
+// variant-pattern match: an enum value is its discriminant at runtime (and `int as Enum` is
+// rejected), so `0` / `1` here provably miss `Color::Blue` (2). Previously the raw-discriminant
+// spelling stayed lenient and the missed variant silently took mir_build's zero default on BOTH
+// backends — a gate-blind wrong answer the differential suite cannot see.
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn pick(c: Color) -> i32 {
+    return match c {
+        0 => 10,
+        1 => 20,
+    };
+}
+
+fn main() -> i32 {
+    print(pick(Color::Blue));
+    return 0;
+}

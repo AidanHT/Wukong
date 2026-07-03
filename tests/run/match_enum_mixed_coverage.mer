@@ -1,0 +1,50 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 77
+module tests.run.match_enum_mixed_coverage
+
+// Exhaustiveness must accept a match that covers every variant through MIXED spellings: a
+// variant pattern, a raw-discriminant int literal, an or-pattern of both, and a range. Before
+// int/range patterns counted toward enum coverage, `Color::Red` + `1` + `2` was falsely flagged
+// E0405 (only the variant-name arm counted, so Green/Blue looked uncovered). Runtime semantics
+// are pinned across backends and opt levels too: an enum compares equal to its discriminant.
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn pick(c: Color) -> i32 {
+    // variant pattern + raw discriminants: exhaustive.
+    return match c {
+        Color::Red => 10,
+        1 => 20,
+        2 => 30,
+    };
+}
+
+enum Level {
+    Lo = 1,
+    Mid = 2,
+    Hi = 3,
+    Max = 9,
+}
+
+fn grade(l: Level) -> i32 {
+    // or-pattern + range: 1 | 9 covers Lo/Max, 2..=3 covers Mid/Hi — exhaustive.
+    return match l {
+        Level::Lo | 9 => 7,
+        2..=3 => 70,
+    };
+}
+
+fn main() -> i32 {
+    print(pick(Color::Red));
+    print(pick(Color::Green));
+    print(pick(Color::Blue));
+    print(grade(Level::Lo) + grade(Level::Hi)); // 7 + 70 = 77
+    return 0;
+}
