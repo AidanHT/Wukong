@@ -2712,16 +2712,39 @@ impl FnLowerer<'_> {
     /// Build a slice (fat pointer) into the pre-allocated 16-byte buffer `dst` from source `src`. An
     /// **array** source stores the array's base pointer at offset 0 and its static length at offset 8
     /// (the array→slice "unsizing" coercion); a **slice** source (or any other 16-byte view) copies
-    /// the fat pointer verbatim. The slice then views the source's storage — no element copy.
+    /// the fat pointer field-wise. The slice then views the source's storage — no element copy.
     fn lower_slice_from_source(&mut self, dst: ValueId, src: &Expr) {
         if let Ty::Array { len, .. } = self.expr_ty(src) {
             let base = self.lower_expr(src);
             self.store_slice_fat_ptr(dst, base, len);
         } else {
-            // A slice value (already a fat pointer) or another 16-byte view: copy it verbatim.
+            // A slice value (already a fat pointer) or another 16-byte view: copy its two fields.
             let base = self.lower_expr(src);
-            self.emit_copy_bytes(dst, base, SLICE_SIZE);
+            self.copy_slice_fat_ptr(dst, base);
         }
+    }
+
+    /// Copy a slice fat pointer from `src` to `dst` as its two **typed** fields — the `Ptr` data
+    /// word at offset 0 and the `I64` length at offset 8 — never as 16 raw `I8` byte loads. Under
+    /// the interpreter's slot memory the fat pointer lives in two tagged slots (`Value::Ptr` +
+    /// `Value::Int`), and an `I8`-typed load of the length slot would *mask the length to its low
+    /// byte* (a slice of ≥ 128 elements silently truncated — interp ≠ native). Native reads/writes
+    /// the identical 16 bytes either way, so this form is byte-equal there and slot-exact here.
+    fn copy_slice_fat_ptr(&mut self, dst: ValueId, src: ValueId) {
+        let sp = self.field_ptr(src, SLICE_PTR_OFF);
+        let data = self.builder.build(MirType::Ptr, Op::Load(sp, MirType::Ptr));
+        let dp = self.field_ptr(dst, SLICE_PTR_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: dp,
+            value: data,
+        });
+        let sl = self.field_ptr(src, SLICE_LEN_OFF);
+        let len = self.builder.build(MirType::I64, Op::Load(sl, MirType::I64));
+        let dl = self.field_ptr(dst, SLICE_LEN_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: dl,
+            value: len,
+        });
     }
 
     /// Write a fat pointer `{ data = base @ 0, len @ 8 }` into the pre-allocated 16-byte slice buffer
@@ -2952,10 +2975,10 @@ impl FnLowerer<'_> {
                 let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
                 self.emit_copy_bytes(dst, src, size);
             }
-            // A slice is a fat pointer: copy the 16-byte view (data pointer + length). A per-byte copy
-            // is correct on both backends (the interpreter moves the `Ptr` at slot 0 and the `Int` len
-            // at slot 8; native moves the raw bytes).
-            Ty::Slice(_) => self.emit_copy_bytes(dst, src, SLICE_SIZE),
+            // A slice is a fat pointer: copy the 16-byte view (data pointer + length) as its two
+            // typed fields. A per-byte copy is NOT interp-safe: the `I8`-typed load of the length
+            // slot masks the runtime length to its low byte (see `copy_slice_fat_ptr`).
+            Ty::Slice(_) => self.copy_slice_fat_ptr(dst, src),
             Ty::Named(sym) => {
                 if let Some(layout) = self.struct_field_tys(*sym) {
                     for (off, fty) in layout {
