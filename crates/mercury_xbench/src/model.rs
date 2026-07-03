@@ -59,11 +59,12 @@
 //! * Mercury's GEMMs go to the tuned AVX2/FMA microkernel; C's stay whatever gcc makes of the
 //!   idiomatic nests. That *is* the product claim being measured (a shape-safe tensor language
 //!   whose compiler lowers to tuned kernels), the same basis as `bench_matmul`/`bench_linear`.
-//! * The `@parallel` Mercury column is partially multicore: the batched norms and the fused GELU
-//!   FFN GEMM dispatch `_parallel` kernels, but embedded plain matmul nests are currently emitted
-//!   single-threaded (`mercury_mir_build::lower_for` hardcodes `emit_sgemm(&nest, false)` on the
-//!   statement path), so Q/K/V/O/PV/down-proj GEMMs stay serial even under `@parallel`. Both C
-//!   columns are single-threaded idiomatic code, as everywhere in this suite.
+//! * The `@parallel` Mercury column is multicore: the batched norms, the fused-GELU FFN GEMM,
+//!   and — since the mir_build statement-path fix (`emit_sgemm(&nest, self.parallel_fn)`) — the
+//!   six plain matmul nests all dispatch `_parallel` kernels (each bit-identical to its serial
+//!   twin). Both C columns are single-threaded idiomatic code, as everywhere in this suite; the
+//!   torch `Tn(sdpa)` column is PyTorch's own all-thread path — the only other multicore column,
+//!   disclosed as such.
 
 use std::cell::Cell;
 use std::io::Write;
@@ -1453,9 +1454,9 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     );
     if mer_par_m.is_some() {
         println!(
-            "     (note: @parallel is partially multicore here — the embedded plain GEMM nests are \
-             emitted serial by mir_build's statement path; only the norms + fused-GELU FFN GEMM go \
-             _parallel)"
+            "     (note: @parallel dispatches the multicore _parallel GEMM/norm kernels — the \
+             statement-path GEMMs included since the mir_build fix; both C columns and the T1 \
+             torch columns are single-threaded, Tn(sdpa) is torch's own all-thread path)"
         );
     }
 
