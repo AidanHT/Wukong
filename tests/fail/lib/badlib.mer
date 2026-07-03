@@ -1,0 +1,8 @@
+// Deliberately ill-typed; imported by tests/fail/import_type_error.mer. The E0401 below must
+// render with THIS file's path and line (the `let` is line 6 — keep it there, fail.rs pins it).
+module lib.badlib
+
+fn bad() -> i32 {
+    let x: i32 = true;
+    return x;
+}
