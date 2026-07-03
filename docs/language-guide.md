@@ -372,12 +372,38 @@ Every form is bit-identical across the interpreter and native backends.
 
 ## Memory and parallelism
 
-No garbage collector and no hidden allocations: every heap byte comes from an allocator you name
-(`System`, `Arena`, `Scratch`, `Pool` — 🔵). Cleanup is via `defer` (🔵). **`@parallel` functions
+**Heap allocation runs today** (✅): `alloc_<T>(n)` returns a **zero-initialized** slice `[]T` of
+runtime length `n`, and `free(s)` releases it — the first runtime-sized buffers in the language
+(everything else is a fixed-size stack array). The v1 surface is the typed per-scalar family —
+`alloc_f32` / `alloc_f64` / `alloc_i32` / `alloc_i64` / `alloc_i8` / `alloc_u8` / `alloc_f16` /
+`alloc_bf16` — chosen over a generic `alloc<T>(n)` for a small, predictable surface typed in one
+place (a user-defined function of the same name shadows the builtin). The count may be any integer
+type; a **negative count yields an empty slice** (`len() == 0`). Contents are deterministically
+zero on both backends — calloc'd bytes on native, typed zero values in the interpreter — so a
+read-before-write is well-defined. The result is an ordinary slice: `s[i]`, `s.len()`,
+`for x in s`, and fn-boundary passing/mutation all compose (`tests/run/heap_*.mer`).
+
+```mer
+let mut acts: []f32 = alloc_f32(tokens * hidden);   // zero-initialized, runtime-sized
+for i in 0..acts.len() {
+    acts[i] = 1.0;
+}
+free(acts);
+```
+
+Freeing anything not returned by `alloc_*`, double-freeing, or touching a slice after `free` is
+**undefined behavior** on the native backend; the interpreter's mark-and-forget model (its
+run-scoped memory is never reclaimed) never crashes on it, but such programs are outside the
+differential contract. Allocation failure yields a slice whose data pointer is null and must not
+be dereferenced.
+
+No garbage collector and no hidden allocations beyond what you `alloc_*`: *named* allocator
+selection (`System`, `Arena`, `Scratch`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being
+wired to the surface. **`@parallel` functions
 execute today** (✅): the native backend outlines the loop body and dispatches it across CPU cores
 via the `mercury_runtime` rayon-backed `parallel_for`, and each per-core chunk is itself
 auto-vectorized (parallelism × SIMD). The interpreter runs the same range sequentially, so results
-stay differentially equal. Allocator selection and `defer` are still being wired to the surface.
+stay differentially equal.
 
 ## Command-line interface
 
