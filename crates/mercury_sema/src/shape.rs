@@ -268,6 +268,19 @@ impl Sema<'_> {
             }
         }
 
+        // `s.len()` on a slice is a *modeled* builtin method: its result is the slice's runtime
+        // length, an `i64`. Without this the call typed `Unknown` and a range bound `0..s.len()`
+        // defaulted the loop counter to `i32` while mir_build lowers the length as an `i64` load —
+        // a mixed-width `Cmp` the MIR verifier rejects (an ICE on `for i in 0..s.len()`).
+        if let ExprKind::Field { base, name } = &callee.kind {
+            if args.is_empty() && self.sym_str(name.sym) == "len" {
+                let bty = self.type_expr(base);
+                if matches!(bty, Ty::Slice(_)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return Ty::Scalar(Scalar::I64);
+                }
+            }
+        }
         // Field/method or complex callee: type it (so its base is recorded) and stay lenient.
         self.type_expr(callee);
         Ty::Unknown

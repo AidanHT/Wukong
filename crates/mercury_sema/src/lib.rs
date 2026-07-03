@@ -3619,6 +3619,21 @@ mod tests {
     }
 
     #[test]
+    fn slice_len_is_typed_i64() {
+        // `s.len()` is a modeled builtin method on slices (result `i64`), so binding it to a
+        // conflicting annotation errors — distinguishing it from the lenient `Unknown` fallback
+        // (under which `for i in 0..s.len()` ICE'd on a mixed-width Cmp in MIR).
+        let ok = "fn f(s: []f32) -> i64 { let n: i64 = s.len(); return n; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        let bad = "fn f(s: []f32) { let n: f32 = s.len(); }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "expected a type mismatch: {:?}",
+            errors(bad)
+        );
+    }
+
+    #[test]
     fn heap_builtin_misuse_is_rejected() {
         // A non-integer length is an E0401 (the `alloc("x")` class of misuse) …
         assert!(errors("fn f() { let s = alloc_f32(\"x\"); }").contains(&"E0401"));
