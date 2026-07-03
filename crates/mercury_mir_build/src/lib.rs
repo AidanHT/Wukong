@@ -19,7 +19,7 @@ use mercury_mir::{
     BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, ValueId, VecBin,
     VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
-use mercury_sema::{DefKind, EnumVariant, SemaResult, VariantPayload};
+use mercury_sema::{heap_alloc_elem, DefKind, EnumVariant, SemaResult, VariantPayload};
 use mercury_span::{Interner, Span, Symbol};
 use mercury_types::Ty;
 
@@ -816,6 +816,8 @@ pub fn lower_program(
         avgpool2d: interner.intern("mercury_avgpool2d_f32"),
         avgpool2d_par: interner.intern("mercury_avgpool2d_f32_parallel"),
         attn: interner.intern("mercury_attention_f32"),
+        rt_alloc: interner.intern("mercury_rt_alloc"),
+        rt_free: interner.intern("mercury_rt_free"),
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -2010,6 +2012,10 @@ struct GemmSyms {
     /// The fused scaled-dot-product-attention kernel (`mercury_attention_f32`), which `sdpa(...)`
     /// lowers to — bundled here so it threads down the lowerer with the GEMM symbols.
     attn: Symbol,
+    /// Zero-initialized heap allocation (`mercury_rt_alloc(count, elem_size, elem_is_float) -> ptr`)
+    /// backing the `alloc_<T>(n)` builtins, and its `mercury_rt_free(data)` release twin.
+    rt_alloc: Symbol,
+    rt_free: Symbol,
 }
 
 // Elementwise-math op codes — must match `mercury_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -15111,6 +15117,11 @@ impl FnLowerer<'_> {
                         },
                     );
                 }
+                // The heap builtins `alloc_<T>(n)` / `free(s)` lower to the mercury_rt_alloc/free
+                // runtime calls plus slice fat-pointer construction.
+                if let Some(v) = self.lower_heap_builtin(name, args) {
+                    return v;
+                }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
                     return v;
@@ -15196,6 +15207,88 @@ impl FnLowerer<'_> {
         self.unsupported(e.span, "call");
         let t = self.expr_mir(e);
         self.const_zero(t)
+    }
+
+    /// Lower the heap builtins, or return `None` for any other callee so `lower_call` falls
+    /// through. `alloc_<T>(n)` (the typed per-scalar family — see `mercury_sema::heap_alloc_elem`)
+    /// becomes a `mercury_rt_alloc(count, elem_size, elem_is_float)` call wrapped in a fresh
+    /// 16-byte slice fat pointer `{ data @ 0, len = count @ 8 }` — the value-position slice
+    /// convention, so the result binds/passes/indexes exactly like an unsized array view. The
+    /// length clamp (`n < 0 → 0`) is ordinary MIR (`Cmp`+`Select`), so both backends observe the
+    /// identical length; zero-initialization is the runtime's calloc contract on native and typed
+    /// `Value` zeros in the interpreter (`elem_is_float` tells it which zero). `free(s)` loads the
+    /// fat pointer's data field and emits a void `mercury_rt_free(data)`. Both are opaque
+    /// `Op::Call`s to the optimizer, which treats calls conservatively (no CSE/DSE/LICM across
+    /// them), so allocation identity and stores into the allocation are preserved.
+    fn lower_heap_builtin(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
+        let nm = self.interner.resolve(name);
+        if nm == "free" {
+            // Sema guarantees a single slice argument (E0401/E0503 otherwise); decline anything
+            // else so the generic unsupported-call path reports it rather than miscompiling.
+            if args.len() != 1 || !matches!(self.expr_ty(&args[0]), Ty::Slice(_)) {
+                return None;
+            }
+            let sbuf = self.lower_expr(&args[0]);
+            let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+            let data = self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr));
+            let func = self.gemm.rt_free;
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![data],
+            });
+            return Some(self.const_zero(MirType::I32));
+        }
+        let elem = heap_alloc_elem(nm)?;
+        if args.len() != 1 {
+            return None;
+        }
+        // The length: any integer type, coerced to i64 (signedness from the argument's type),
+        // then clamped at 0 so a negative count yields an empty slice deterministically.
+        let nty = self.expr_mir(&args[0]);
+        let signed = self.signed(&args[0]);
+        let nv = self.lower_expr(&args[0]);
+        let n64 = self.coerce_to(nv, &nty, &MirType::I64, signed);
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let isneg = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, n64, zero));
+        let count = self
+            .builder
+            .build(MirType::I64, Op::Select(isneg, zero, n64));
+        let esize = self.builder.build(
+            MirType::I64,
+            Op::ConstInt(elem.size() as i128, MirType::I64),
+        );
+        let isf = self.builder.build(
+            MirType::I64,
+            Op::ConstInt(elem.is_float() as i128, MirType::I64),
+        );
+        let func = self.gemm.rt_alloc;
+        let data = self.builder.build(
+            MirType::Ptr,
+            Op::Call {
+                func,
+                args: vec![count, esize, isf],
+            },
+        );
+        // A fresh 16-byte fat-pointer buffer (the same shape `lower_arg_coerced` materializes for
+        // an array→slice unsizing), holding { data, len }.
+        let sbuf = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32));
+        let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: dp,
+            value: data,
+        });
+        let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: lp,
+            value: count,
+        });
+        Some(sbuf)
     }
 
     /// Recognize `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention —
