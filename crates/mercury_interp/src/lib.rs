@@ -481,9 +481,22 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // is 0, not a sign-extended -2). Float results narrower than `f64` are rounded
                     // to their declared precision so the interpreter matches the native backend
                     // bit-for-bit (`f32` arithmetic must round at `f32`, not `f64`).
+                    //
+                    // **`Load` is exempt from the integer mask**: memory is one *typed value* per
+                    // scalar slot, so a load returns the slot's value verbatim. A same-typed load
+                    // (every load a well-typed program's own reads produce) holds an
+                    // already-masked value, so the exemption is a no-op there. It matters for the
+                    // compiler's byte-wise aggregate copies (`emit_copy_bytes` — whole-enum
+                    // assignment): those move each *slot* through an `I8`-typed load/store pair,
+                    // and masking the load would truncate a wider payload slot (an `i64` payload
+                    // of 5000 read through the copy became -120: interp ≠ native). Native moves
+                    // real bytes and reassembles the full value, so the verbatim slot move is
+                    // exactly what matches it.
                     let rty = func.value_type(r);
                     let v = match v {
-                        Value::Int(i) if rty.is_int() => Value::Int(mask(i, rty)),
+                        Value::Int(i) if rty.is_int() && !matches!(inst.op, Op::Load(..)) => {
+                            Value::Int(mask(i, rty))
+                        }
                         Value::Float(f) if is_narrow_float(rty) => Value::Float(f as f32 as f64),
                         other => other,
                     };
