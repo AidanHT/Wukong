@@ -42,6 +42,11 @@ quality, not just beating textbook code:
   (latest full-board geomean ~305×; in-process Cranelift JIT vs spawning a toolchain; ~0.3–1.5 ms vs
   ~125–245 ms).
 - **Geomean across the elementwise/reduction battery: 4.86× faster than C.**
+- **End-to-end: a 12-layer GPT-2-class transformer stack (768/12/3072, S=128/512) runs ~26–32×
+  faster than idiomatic C and ~4.9–9.4× faster than `-ffast-math` C** (preliminary, first sessions —
+  see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
+  section), with the whole block compiling in ~3–12 ms vs gcc's ~0.4–0.9 s and the forward
+  interpreter-gated bit-for-bit at a reduced config.
 
 The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
 where gcc/rustc won't vectorize — disclosed per section, never a rigged baseline):
@@ -265,7 +270,71 @@ loop now skips passes already at fixpoint — dropping the final all-passes no-o
 without changing the sequence of mutations. The resulting MIR is bit-identical (the differential and
 `-O0`≡`-O{1,2,3}` gates both still pass), so the speedup is free of any correctness cost.
 
-### Matmul `C = A·B` — single-core wins, parallel dominates, and the lead grows with size
+### End-to-end model — a 12-layer GPT-2-class transformer stack (CPU inference)
+
+`mercury-xbench model` is the culmination benchmark: not one kernel but a **full inference forward**
+over a GPT-2 124M-shaped decoder stack — 12 pre-LayerNorm transformer blocks (multi-head causal
+attention + GELU MLP, both with residuals) plus the final LayerNorm — at d_model=768, heads=12,
+d_ff=3072, seq lengths S=128 and S=512.
+
+**What is measured, exactly.** One Mercury block function (ordinary `.mer` source, adapted from
+`examples/gpt2.mer` to the full config) is compiled once through the real pipeline
+(parse → sema → mir_build → `-O3` → Cranelift JIT) and called **12× per forward by the harness**
+with per-layer weight pointers, ping-ponging two activation buffers — the way a real runtime drives
+a layer stack; the same harness loop drives the C implementation, so the layer-loop cost basis is
+identical. Scratch buffers are host-allocated and shared between the columns. Attention runs per
+head over contiguous extracted slices (Qh/Kh, V transposed) in **both** languages. The benchmark
+**scans the optimized MIR and prints the recognized-kernel dispatch set**, making the mechanism
+transparent; one block dispatches
+
+```
+2x mercury_norm_affine_f32 (LayerNorm1/2)   6x mercury_sgemm_nt (Q/K/V/O/PV/down-proj)
+1x mercury_sgemm_nt_alpha  (scaled Q·Kᵀ)    1x mercury_sgemm_nt_epi (fused GELU FFN up-proj)
+1x mercury_norm_f32        (masked row softmax, batched)   2x mercury_velem_f32 (residual adds)
+```
+
+**Baselines.** The C column is the same computation as one competent hand-written translation unit
+(contiguous loops, its own per-head attention, two-pass LayerNorm, tanh-approx GELU with Mercury's
+constants) at the suite's standard `gcc -O3 -march=native -ffp-contract=fast`; **C(fast)** is the
+identical source at `-O3 -march=native -ffast-math` (the `llama2.c -Ofast` basis, letting gcc
+reassociate + vectorize the dot products — the strongest flags-only C). The naive-dot C forward is
+tens of seconds per call at S=512, so it is skipped there by default (`XBENCH_MODEL_NAIVE` forces
+it), the same rule as the ≥2048³ naive matmuls.
+
+**Correctness.** Three gates run inside the benchmark: (1) the interpreter oracle executes the
+*identical* 12-layer forward (same MIR, same weights, same harness loop) at a reduced config and
+must match the JIT **bit-for-bit** — it does; (2) Mercury serial vs `@parallel` final outputs are
+**bit-exact** (every dispatched `_parallel` kernel is bit-identical to its serial twin); (3) Mercury
+vs C final `[S,768]` outputs agree to a magnitude-normalized `max|Δ|/max|out| < 1e-3` (per-element
+relative error is meaningless on LayerNorm-centered near-zero outputs; 12 layers of reassociation +
+poly-vs-libm transcendentals compound the honest small differences).
+
+**First indicative numbers (PRELIMINARY** — two back-to-back sessions on the throttling laptop;
+absolute ms swung ~3× with clock state between them (roofline read 71 GFLOP/s in the cold run vs
+the usual ~117), so ranges are shown and the *ratios* are the only stable metric**):**
+
+| S | metric | Mer (1c) | Mer `@parallel` | C (gcc) | C (fast) |
+|---|---|---|---|---|---|
+| 128 | ms/forward | 294–896 | 623–889 | 9 313–23 096 | 2 606–4 778 |
+| 128 | tokens/sec | 143–436 | 144–206 | 6–14 | 27–49 |
+| 512 | ms/forward | 2 666–3 949 | 3 352–5 485 | n/a (see above) | 19 366–25 102 |
+| 512 | tokens/sec | 130–192 | 93–153 | n/a | 20–26 |
+
+→ Mercury single-core is **~26–32× faster than idiomatic C** and **~4.9–9.4× faster than
+`-ffast-math` C** end-to-end (preliminary); compiling the whole block takes Mercury **~3–12 ms vs
+gcc's ~0.4–0.9 s** for the equivalent TU. tokens/sec = S tokens per forward ÷ seconds. All four
+correctness gates passed on every run (interp bit-exact; serial-vs-`@parallel` bit-exact; vs C and
+vs C(fast) `max|Δ|/max|out|` ≈ 1–2×10⁻⁶, tolerance 10⁻³).
+
+**Disclosed limitation (a real compiler finding):** the `@parallel` column is only partially
+multicore — `mercury_mir_build`'s statement-path matmul recognizer hardcodes the serial kernel
+(`lower_for`: `emit_sgemm(&nest, false)`), so inside a multi-statement `@parallel` function only the
+batched norms and the fused-GELU FFN GEMM dispatch `_parallel` kernels while the six plain GEMMs
+stay single-threaded. The result is visible above: `Mer(par)` ranged from ≈`Mer(1c)` to **~2×
+slower** — the multicore bursts drag the package clock down for the still-serial GEMM phases
+without parallelizing the dominant work. Treat **Mer(1c) as the headline column**; fixing that one
+call site (the runtime's parallel GEMM is bit-identical to serial) is the obvious next lever for
+this benchmark.
 
 GFLOP/s (higher is better), naive `ikj` nest in each language:
 
