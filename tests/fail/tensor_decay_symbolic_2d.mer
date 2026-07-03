@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0501
+module tests.fail.tensor_decay_symbolic_2d
+
+// A rank-2 tensor parameter whose symbolic dims were ALREADY BOUND by a SIBLING argument must
+// reject a decaying array of the wrong total length: `t` binds M=2, N=3, so `b` needs 6
+// elements, but `bad` holds 4 — `b[1, 2]` flattens to offset 5, past the buffer (interp traps,
+// native reads out of bounds: a backend divergence AND a memory-safety hole). Previously the
+// decay check read the RAW symbolic dims (ignoring the bindings unification had already made),
+// saw two "free" dims, and the divisibility fallback (product-of-consts = 1) accepted any
+// length. The turbofish form was already safe (dims substitute before unify); the sibling-bound
+// form is what this pins.
+
+fn f<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, M, N]) -> f32 {
+    return b[1, 2];
+}
+
+fn caller(t: Tensor[f32, 2, 3]) -> f32 {
+    let bad: [f32; 4] = [0.0; 4];
+    return f(t, bad);
+}
+
+fn main() -> i32 {
+    let six: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    return caller(six) as i32;
+}
