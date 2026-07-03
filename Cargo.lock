@@ -662,6 +662,7 @@ dependencies = [
  "libloading",
  "matrixmultiply",
  "mercury_codegen_cranelift",
+ "mercury_interp",
  "mercury_mir",
  "mercury_mir_build",
  "mercury_opt",
