@@ -300,6 +300,14 @@ the loop bounds (`0..M`) resolve at run time, and a turbofish supplies them (`ad
 form, it is byte-identical to the same kernels written with literal dims — and even a matmul with
 runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.mer`).
 
+The turbofish also accepts a **runtime integer value**, not just a literal: `rowsum::<m, n>(a, out)`
+with `n` computed at run time threads the live value through the same hidden dim parameters, so a
+shape-typed kernel serves sizes nobody knew at compile time (the serving-code story — runtime
+`seq_len`/`batch`), and a symbolic matmul called this way still dispatches to the tuned GEMM kernel.
+For such dims the compile-time shape checks degrade gracefully to the runtime-`?` level — a wrong
+runtime size is outside the defined contract, like any runtime index
+(`tests/run/generic_shape_runtime.mer`).
+
 ## Attributes 🟡
 
 ```mercury
