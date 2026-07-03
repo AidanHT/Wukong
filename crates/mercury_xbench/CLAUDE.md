@@ -46,9 +46,10 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   full-buffer `max_rel_err < 1e-3` (12 layers of reassociation + poly-vs-libm compound), serial vs
   `@parallel` ≈ exact, and an **in-benchmark interpreter gate**: the oracle runs the identical 12-layer
   forward at a reduced config (S=16/D=64/H=4/Dff=256) and must match the JIT **bit-for-bit** (this is why
-  the crate depends on `mercury_interp`). Known asymmetry (disclosed in the module doc): `@parallel` is
-  only partially multicore — embedded plain matmul nests are emitted serial
-  (`lower_for` hardcodes `emit_sgemm(&nest, false)`), so only the norms + fused-GELU GEMM go `_parallel`.
+  the crate depends on `mercury_interp`). The `@parallel` column is fully multicore (embedded matmul
+  nests included — `lower_for`'s statement path honors the enclosing `@parallel`); the bench prints the
+  `@parallel` variant's dispatch set and a unit test (`block_dispatch_sets_pinned`) pins both variants'
+  kernel sets, so a regression to scalar loops or serial GEMMs is loud.
 - `bench_softmax_bwd` (+ `mer_softmax_bwd`/`c_softmax_bwd`/`rust_softmax_bwd`) — the attention/classifier
   training gradient `dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` over a `[R,C]` batch, at
   1024×1024 / 4096×512. Uses **all three** harness pointers (`y, dy, dx` — no unused middle). Mercury
