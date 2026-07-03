@@ -197,14 +197,27 @@ fn bench_one(path: &Path) -> Outcome {
         }
     }
     let main = interner.intern("main");
-    let r0 = mercury_interp::run(&p0, main, &interner);
+    // Compare -O0 vs -O3 on BOTH exit code and stdout (the same equality the native gate below
+    // uses): an optimizer bug that changes what a program PRINTS while preserving its exit code
+    // slipped through the old exit-only comparison — and the bench dirs (bench/kernels,
+    // examples) have no other opt-invariance gate, unlike tests/run.
+    let r0 = mercury_interp::run_with_output(&p0, main, &interner);
     let r3 = mercury_interp::run_with_output(&p3, main, &interner);
     let interp3 = match (r0, r3) {
         // Both fail identically (e.g. a deliberate runtime assertion) — consistent, not a bug.
         (Err(_), Err(_)) => return Outcome::Skipped("runtime error at both -O0 and -O3".into()),
-        (Ok(a), Ok(out3)) if a == out3.0 => out3,
-        (Ok(a), Ok(out3)) => {
-            return Outcome::Failed(format!("result differs: -O0 = {a}, -O3 = {}", out3.0))
+        (Ok(out0), Ok(out3)) if out0 == out3 => out3,
+        (Ok(out0), Ok(out3)) => {
+            return Outcome::Failed(format!(
+                "result differs: -O0 exit={} vs -O3 exit={}{}",
+                out0.0,
+                out3.0,
+                if out0.1 != out3.1 {
+                    " (stdout differs)"
+                } else {
+                    ""
+                }
+            ))
         }
         _ => return Outcome::Failed("runs at one optimization level but not the other".into()),
     };
