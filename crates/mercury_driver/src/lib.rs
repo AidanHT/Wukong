@@ -15,6 +15,10 @@ pub use mercury_diag::{all_explanations, explain, Explanation};
 #[cfg(feature = "gpu")]
 mod gpu_accel;
 
+/// The multi-file front end: resolves `import`s to files, loads each once (depth-first,
+/// cycle-safe), and splices their items into the root module — one merged flat namespace.
+mod loader;
+
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EmitStage {
@@ -194,14 +198,18 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Parsing ---
     let mut interner = Interner::new();
-    let (module, parse_diags) =
-        mercury_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+    let (mut module, parse_diags, mut next_node) =
+        mercury_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
     for d in parse_diags {
         sink.emit(d);
     }
-    render_all(opts.error_format, &renderer, &sink, &sm);
 
+    // `--emit=ast` (like `--emit=tokens` above) deliberately operates on the ROOT file only —
+    // these stages inspect the lex/parse of the exact file you point the compiler at, so imports
+    // are not loaded or spliced here. The merged multi-file program is what every later stage
+    // (`--emit=mir-high` onward, `--run`) sees.
     if opts.emit == EmitStage::Ast {
+        render_all(opts.error_format, &renderer, &sink, &sm);
         print!("{}", mercury_ast::print::print_module(&module, &interner));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
@@ -210,6 +218,26 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
 
+    if sink.has_errors() {
+        render_all(opts.error_format, &renderer, &sink, &sm);
+        return exit::COMPILE_ERROR;
+    }
+
+    // --- Import loading (the multi-file front end; see `loader`) ---
+    // Each `import`ed file is resolved relative to the root source file's directory, loaded once
+    // (cycles/diamonds dedup by canonical path), and its items spliced into `module`: the program
+    // is checked and lowered as ONE merged flat namespace. Lex/parse diagnostics from imported
+    // files — and E0305 for an unresolvable import — land in the same sink and render with their
+    // own file's path/line through the shared SourceMap.
+    loader::load_imports(
+        &mut module,
+        &opts.input,
+        &mut sm,
+        &mut interner,
+        &mut sink,
+        &mut next_node,
+    );
+    render_all(opts.error_format, &renderer, &sink, &sm);
     if sink.has_errors() {
         return exit::COMPILE_ERROR;
     }

@@ -1,0 +1,10 @@
+// Loader unit-test fixture: right edge of the diamond (imports the shared leaf, plus a redundant
+// SELF-import — a 1-cycle that must be a silent no-op).
+module diamond_c
+
+import diamond_d;
+import diamond_c;
+
+fn from_diamond_c() -> i32 {
+    return shared_leaf() + 20;
+}
