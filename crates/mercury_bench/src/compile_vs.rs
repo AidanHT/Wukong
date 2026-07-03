@@ -16,6 +16,14 @@
 //! include: it is what a user waits for. Best-of-N minimum per compiler (least noise), reported as a
 //! clock-invariant ratio, never an absolute headline. Missing toolchains are skipped, not failed.
 //!
+//! Fairness: the C/C++ kernels are **bare translation units** — a `void`-returning exported
+//! function whose result escapes through an out-parameter, with **no `#include` and no `main`** —
+//! matching the .rs kernels (a bare `#[no_mangle]` fn), so all four languages compile a comparable
+//! pure kernel to an object. (Earlier versions gave C/C++ a `#include <stdio.h>` + `main`/`printf`
+//! harness, charging them a header-parse cost the .rs kernels never paid — flagged and fixed by the
+//! benchmark-fairness audit.) rustc keeps `-O` (= opt-level 2) because gcc/g++ compile at `-O2`:
+//! level 2 across the board is the symmetric choice for a *compile-time* measurement.
+//!
 //! ```text
 //! cargo run -p mercury_bench --release -- compile-vs [path/to/mercuryc]
 //! ```
@@ -215,8 +223,7 @@ fn main() -> i32 {
     return 0;
 }
 "#,
-    c: r#"#include <stdio.h>
-int main(void) {
+    c: r#"void gemm(float* out) {
     float a[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
     float b[16] = {16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1};
     float c[16] = {0};
@@ -226,12 +233,10 @@ int main(void) {
             for (int k = 0; k < 4; k++) s += a[i*4+k] * b[k*4+j];
             c[i*4+j] = s;
         }
-    printf("%f\n", (double)c[0]);
-    return 0;
+    out[0] = c[0];
 }
 "#,
-    cpp: r#"#include <cstdio>
-int main() {
+    cpp: r#"extern "C" void gemm(float* out) {
     float a[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
     float b[16] = {16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1};
     float c[16] = {0};
@@ -241,8 +246,7 @@ int main() {
             for (int k = 0; k < 4; k++) s += a[i*4+k] * b[k*4+j];
             c[i*4+j] = s;
         }
-    std::printf("%f\n", (double)c[0]);
-    return 0;
+    out[0] = c[0];
 }
 "#,
     rs: r#"#[no_mangle]
@@ -279,26 +283,22 @@ fn main() -> i32 {
     return 0;
 }
 "#,
-    c: r#"#include <stdio.h>
-int main(void) {
+    c: r#"void saxpy(float* res) {
     float a = 2.0f;
     float x[8] = {1,2,3,4,5,6,7,8};
     float y[8] = {10,20,30,40,50,60,70,80};
     float out[8] = {0};
     for (int i = 0; i < 8; i++) out[i] = a*x[i] + y[i];
-    printf("%f\n", (double)out[0]);
-    return 0;
+    res[0] = out[0];
 }
 "#,
-    cpp: r#"#include <cstdio>
-int main() {
+    cpp: r#"extern "C" void saxpy(float* res) {
     float a = 2.0f;
     float x[8] = {1,2,3,4,5,6,7,8};
     float y[8] = {10,20,30,40,50,60,70,80};
     float out[8] = {0};
     for (int i = 0; i < 8; i++) out[i] = a*x[i] + y[i];
-    std::printf("%f\n", (double)out[0]);
-    return 0;
+    res[0] = out[0];
 }
 "#,
     rs: r#"#[no_mangle]
@@ -329,24 +329,20 @@ fn main() -> i32 {
     return 0;
 }
 "#,
-    c: r#"#include <stdio.h>
-int main(void) {
+    c: r#"void dot(int* out) {
     int x[8] = {1,2,3,4,5,6,7,8};
     int y[8] = {8,7,6,5,4,3,2,1};
     int acc = 0;
     for (int i = 0; i < 8; i++) acc += x[i] * y[i];
-    printf("%d\n", acc);
-    return 0;
+    out[0] = acc;
 }
 "#,
-    cpp: r#"#include <cstdio>
-int main() {
+    cpp: r#"extern "C" void dot(int* out) {
     int x[8] = {1,2,3,4,5,6,7,8};
     int y[8] = {8,7,6,5,4,3,2,1};
     int acc = 0;
     for (int i = 0; i < 8; i++) acc += x[i] * y[i];
-    std::printf("%d\n", acc);
-    return 0;
+    out[0] = acc;
 }
 "#,
     rs: r#"#[no_mangle]
