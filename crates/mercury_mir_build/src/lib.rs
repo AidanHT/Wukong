@@ -2976,7 +2976,10 @@ impl FnLowerer<'_> {
             // byte-for-byte (variant-agnostic). This is bit-exact on both backends — native moves real
             // bytes; the interpreter moves each stored `Value` at its offset slot (padding included,
             // harmlessly) — because a per-byte (slot-stride-1) copy matches the interpreter's
-            // 1-slot-per-scalar model exactly. A per-field copy can't work: it would need the variant.
+            // 1-slot-per-scalar model exactly, *and* the interpreter exempts `Load` results from the
+            // integer width mask (a payload slot wider than the copy's `I8` element moves verbatim;
+            // masking it truncated an `i64` payload ≥ 128 to its low byte — see the interp's `exec`).
+            // A per-field copy can't work: it would need the variant.
             Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
                 let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
                 self.emit_copy_bytes(dst, src, size);
