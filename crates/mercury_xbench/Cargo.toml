@@ -19,6 +19,9 @@ mercury_mir = { workspace = true }
 mercury_mir_build = { workspace = true }
 mercury_opt = { workspace = true }
 mercury_codegen_cranelift = { workspace = true }
+# The interpreter oracle: bench_model runs the identical 12-layer forward on it and requires
+# bit-exact agreement with the Cranelift JIT (the differential gate, in-benchmark).
+mercury_interp = { workspace = true }
 libloading = "0.8"
 # A pure-Rust, cache-tiled, SIMD sgemm (the engine behind ndarray) — the tuned-library baseline that
 # proves Mercury's GEMM is SOTA-parity, not merely beating naive C/Rust nests. No external toolchain.

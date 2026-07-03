@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 
 use mercury_span::{Interner, SourceId};
 
+mod model;
+
 /// The shared C ABI of every kernel: `(x, y, out)` over `N` `f32` elements (`N` baked in).
 type KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
 
@@ -367,6 +369,9 @@ fn main() {
     }
     if want("act_backward") {
         bench_act_backward(&cc, &dir);
+    }
+    if want("model") {
+        model::bench_model(&cc, &dir);
     }
 }
 
