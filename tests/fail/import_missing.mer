@@ -1,0 +1,10 @@
+// An `import` that resolves to no file must be a clean, stable diagnostic at the import site
+// (E0305: unresolved import), not an IO crash or a silent skip.
+// EXPECT-CODE: E0305
+module import_missing
+
+import no.such.file;
+
+fn main() -> i32 {
+    return 0;
+}

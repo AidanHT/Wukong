@@ -1,0 +1,21 @@
+// Library imported by tests/run/import_multi.mer — NOT a standalone program (no `fn main`).
+// The run/emit/exe harnesses scan tests/run/*.mer non-recursively, so files in this subdirectory
+// are only ever compiled through the root that imports them.
+module lib.mathlib
+
+import lib.deep;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+const ANSWER: i32 = 42;
+
+fn dot_self(p: Point) -> i32 {
+    return p.x * p.x + p.y * p.y;
+}
+
+fn triple(a: i32) -> i32 {
+    return a * 3;
+}
