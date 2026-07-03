@@ -137,6 +137,72 @@ impl Sema<'_> {
                     }
                     return ret;
                 }
+                // The heap builtins: the typed `alloc_<T>(n) -> []T` family and `free(s)`. Typed
+                // here (like the math intrinsics) so `let s = alloc_f32(n)` infers `[]f32` and the
+                // slice composes with the existing machinery (`s[i]`, `s.len()`, `for x in s`,
+                // call-site passing). Misuse is rejected with the standard arity/type codes —
+                // mir_build lowers these structurally, so a malformed call must not reach it.
+                if let Some(elem) = crate::heap_alloc_elem(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if args.len() != 1 {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`{}` takes exactly 1 argument (the element count), but {} were \
+                                 supplied",
+                                self.sym_str(name),
+                                args.len()
+                            ),
+                        );
+                    } else {
+                        match &arg_tys[0] {
+                            // Any integer type is a valid length (a negative value clamps to an
+                            // empty slice at runtime); `Unknown`/`Error` stays lenient.
+                            Ty::Scalar(s) if s.is_int() => {}
+                            Ty::Unknown | Ty::Error => {}
+                            other => self.error(
+                                span,
+                                "E0401",
+                                format!(
+                                    "`{}` expects an integer element count, found a value of type \
+                                     `{}`",
+                                    self.sym_str(name),
+                                    other.display(self.interner)
+                                ),
+                            ),
+                        }
+                    }
+                    return Ty::Slice(Box::new(Ty::Scalar(elem)));
+                }
+                if self.sym_str(name) == "free" {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if args.len() != 1 {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`free` takes exactly 1 argument (the slice to release), but {} \
+                                 were supplied",
+                                args.len()
+                            ),
+                        );
+                    } else {
+                        match &arg_tys[0] {
+                            Ty::Slice(_) | Ty::Unknown | Ty::Error => {}
+                            other => self.error(
+                                span,
+                                "E0401",
+                                format!(
+                                    "`free` expects a slice returned by an `alloc_*` builtin, \
+                                     found a value of type `{}`",
+                                    other.display(self.interner)
+                                ),
+                            ),
+                        }
+                    }
+                    return Ty::Unit;
+                }
                 // `print`/`println` render exactly one value. Extra arguments were silently dropped
                 // (`print(1, 2)` printed just `1`) — both backends agree, so it is not a divergence,
                 // but a quiet footgun where the programmer expects all arguments to appear. Reject a
