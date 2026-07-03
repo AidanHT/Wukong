@@ -5,7 +5,11 @@ Standalone binary `mercury-bench`: runs the full front-end + optimizer + interpr
 ## Layout
 - `src/main.rs` — arg parsing, per-file benchmarking, op counting, adaptive timing, report table, and the `-O0`-vs-`-O3` optimization-equivalence gate.
 - `src/compile_time.rs` — in-process per-pass compile-time measurement (via `mercury_opt::optimize_timed`).
-- `src/compile_vs.rs` — same-run compile-time comparison of `mercuryc` vs `gcc`/`g++`/`rustc`.
+- `src/compile_vs.rs` — same-run compile-time comparison of `mercuryc` vs `gcc`/`g++`/`rustc`. The
+  C/C++ kernels are **bare translation units** (a `void`-returning exported fn with an out-param —
+  no `#include`, no `main`), matching the bare `.rs` kernels, so all four compile comparable work
+  (the old stdio+main harness charged C/C++ a header-parse cost — a fairness fix). rustc stays at
+  `-O` (= level 2) since gcc/g++ compile at `-O2` — the symmetric compile-time choice.
 
 ## Key types & entry points
 - `main` (`src/main.rs`) — collects `.mer` files from CLI dirs (default `tests/run`), sorts, benchmarks each, prints a table + TOTAL/geomean row, and `exit(1)` if any program failed optimization equivalence.

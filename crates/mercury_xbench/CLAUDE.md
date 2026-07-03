@@ -3,9 +3,25 @@
 Standalone binary `mercury-xbench`: an **honest** cross-language benchmark. For each kernel it builds
 the *same* computation four ways — Mercury (Cranelift-JIT native), C (`gcc -O3 -march=native`), C++
 (`g++ -O3 -march=native`, the same numeric body rendered as C++ via `cpp_from_c`), and Rust
-(`rustc -O -C target-cpu=native`) — and times all four through one identical Rust harness over the
+(`rustc -C opt-level=3 -C target-cpu=native`) — and times all four through one identical Rust harness over the
 same buffers. C/C++/Rust are compiled to shared libraries and called via their C ABI; Mercury is
 JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
+
+Two **additional C peer columns** (fairness-audit fixes) print where they apply, each cross-checked
+at a LOOSE magnitude-normalized `1e-2` tolerance via `relaxed_peer_ok` (reassociation legitimately
+changes results; a failing column is dropped with a printed note, never failing the bench), reported
+alongside — never replacing — the honest-flags C column:
+- **C(fast)** (`C_FAST_FLAGS`: `-O3 -march=native -ffast-math -shared`) — the same C source compiled
+  a second time so gcc may reassociate/vectorize float reductions; printed for the reduction-bearing
+  rows (`is_reduction_kernel`: dot/ssd + the @parallel dot/ssd/max/absmax/argmax) and for matmul,
+  matmul_tn, linear, ffn, colsum, colstat, softmax_bwd, rmsnorm_bwd, layernorm_bwd, xent, row_losses,
+  norm, norm_batched (`bench_c_fast` / inline `bench_external4` + filter).
+- **C(omp)** (`C_OMP_FLAGS` / `C_OMP_FAST_FLAGS` for reduction rows) — the same C kernel under
+  `#pragma omp parallel for` (`c_omp_source` for the elementwise @parallel rows; `c_matmul_omp` /
+  `c_linear_omp` / `c_transpose_omp` / `c_colsum_omp` for the GEMM-family peers), gated by the
+  one-time `omp_threads` runtime probe (compile a probe DLL, load it, require >=2 threads in a
+  parallel region; skipped with a note if libgomp can't load). In `bench_matmul_size` it is measured
+  inside the all-core thermal group BEFORE `Mer(par)` — throttle ourselves, never the peer.
 
 ## Layout
 - `src/main.rs` — most of the crate: kernel sources (Mercury/C/Rust string builders; the C++ column
