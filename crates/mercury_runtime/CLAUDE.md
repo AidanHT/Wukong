@@ -18,7 +18,21 @@ abstract memory through real buffers) so the differential oracle stays bit-exact
 - `src/gemv.rs` — f32 GEMV `y = A·x` (`mercury_sgemv[_parallel]`): the batch-1 / decode-time projection
   where the GEMM 3-loop register-blocking collapses — each `A` element is read once (no reuse), so it is
   **memory-bound**, streaming `A` from DRAM with `x` cache-resident; the `_parallel` twin splits the `M`
-  output rows across cores.
+  output rows across cores. **α-scaled twin** `mercury_sgemv_alpha[_parallel](a, x, y, m, n, alpha)`
+  (the decode attention score `(K·q)·1/√d`): the identical `gemv_row` dot with the scale applied
+  exactly once on the store — the same single f32 multiply the scalar nest's `y[i] = s * c` performs;
+  `alpha == 1.0` skips the multiply (byte-identical to the plain kernel, which is untouched).
+- `src/gevm.rs` — f32 **vector·matrix** `out = wᵀ·A` (`mercury_sgevm_f32[_parallel](w, a, out, rows,
+  cols, alpha)`): the KV-decode attention read-out `out[j] = α·Σ_i scores[i]·V[i,j]`. The j-outer
+  source reads `A` column-strided (gcc/rustc leave it scalar — the colreduce family); the kernel
+  restructures to **i-outer / j-inner** (`out[j..] += w[i]·A[i, j..]`, 8-wide `fmadd` into the
+  cache-resident `out[]`, streaming `A` row-major). **Bit-exact, no reassociation**: each `out[j]`
+  is the ascending-i `mul_add` chain from 0.0 — identical op and order to the FMA-contracted scalar
+  nest — so AVX2 lanes == scalar twin == serial == any column split; α is applied once per element
+  after its full fold (`alpha == 1.0` skips it). The `_parallel` twin stripes **output columns**
+  (each stripe does the full i sweep — never rows-across-cores, which would need reassociating
+  per-thread partials), so serial == parallel bit-for-bit. Tests pin the kernel EXACTLY
+  (`assert_eq!`) against a literal scalar `mul_add` reference plus an independent f64 oracle.
 - `src/vmath.rs` — `mercury_vmath_f32(x, out, n, op)`: the **256-bit AVX2/FMA elementwise
   transcendental** kernel (exp/log/tanh/sigmoid/relu/silu/gelu/**elu/leaky_relu/softplus/mish/selu/tanhshrink/hardsigmoid/hardswish**, by
   `VM_*` op code) — the width Cranelift can't emit. 8 lanes/step + a scalar tail; the per-element op
