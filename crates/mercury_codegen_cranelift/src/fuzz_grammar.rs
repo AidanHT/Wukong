@@ -82,12 +82,25 @@ struct Arr {
     len: usize,
 }
 
+/// Everything a lexical scope can shadow — snapshot on block entry, restore on exit.
+struct Marks(usize, usize, usize, usize, usize, usize);
+
 struct Gen {
     rng: Rng,
     vars: Vec<Var>,
     arrs: Vec<Arr>,
+    /// `Pt { x: f32, y: i32 }` locals (all mutable).
+    pts: Vec<String>,
+    /// `Box2 { a: Pt, k: i64 }` locals (all mutable) — nested-aggregate coverage.
+    boxes: Vec<String>,
+    /// `Col { R, G, B }` enum locals (all mutable).
+    cols: Vec<String>,
+    /// `(i32, f32)` tuple locals (immutable).
+    tups: Vec<String>,
     /// Loop variables of enclosing `for i in 0..N` loops: (name, exclusive bound).
     loop_vars: Vec<(String, usize)>,
+    /// Whether helper-fn calls may appear (false inside the helpers themselves).
+    allow_calls: bool,
     next_id: usize,
     depth: u32,
     src: String,
@@ -101,13 +114,38 @@ impl Gen {
             rng: Rng(seed),
             vars: Vec::new(),
             arrs: Vec::new(),
+            pts: Vec::new(),
+            boxes: Vec::new(),
+            cols: Vec::new(),
+            tups: Vec::new(),
             loop_vars: Vec::new(),
+            allow_calls: true,
             next_id: 0,
             depth: 0,
             src: String::new(),
             indent: 1,
             prints: 0,
         }
+    }
+
+    fn marks(&self) -> Marks {
+        Marks(
+            self.vars.len(),
+            self.arrs.len(),
+            self.pts.len(),
+            self.boxes.len(),
+            self.cols.len(),
+            self.tups.len(),
+        )
+    }
+
+    fn truncate_to(&mut self, m: &Marks) {
+        self.vars.truncate(m.0);
+        self.arrs.truncate(m.1);
+        self.pts.truncate(m.2);
+        self.boxes.truncate(m.3);
+        self.cols.truncate(m.4);
+        self.tups.truncate(m.5);
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -288,8 +326,13 @@ impl Gen {
         }
     }
 
-    /// A leaf: variable, array element, or literal.
+    /// A leaf: variable, array element, aggregate projection, or literal.
     fn leaf(&mut self, t: Ty) -> String {
+        if self.rng.chance(25) {
+            if let Some(r) = self.agg_read(t) {
+                return r;
+            }
+        }
         if self.rng.chance(35) {
             if let Some(r) = self.arr_read(t) {
                 return r;
@@ -301,8 +344,52 @@ impl Gen {
         }
     }
 
+    /// A projection out of an aggregate local of the requested type, if one is in scope:
+    /// struct fields (incl. nested), tuple fields, and the enum-as-discriminant cast.
+    fn agg_read(&mut self, t: Ty) -> Option<String> {
+        let mut opts: Vec<String> = Vec::new();
+        match t {
+            Ty::F32 => {
+                for p in &self.pts {
+                    opts.push(format!("{p}.x"));
+                }
+                for b in &self.boxes {
+                    opts.push(format!("{b}.a.x"));
+                }
+                for tu in &self.tups {
+                    opts.push(format!("{tu}.1"));
+                }
+            }
+            Ty::I32 => {
+                for p in &self.pts {
+                    opts.push(format!("{p}.y"));
+                }
+                for b in &self.boxes {
+                    opts.push(format!("{b}.a.y"));
+                }
+                for tu in &self.tups {
+                    opts.push(format!("{tu}.0"));
+                }
+                for e in &self.cols {
+                    opts.push(format!("({e} as i32)"));
+                }
+            }
+            Ty::I64 => {
+                for b in &self.boxes {
+                    opts.push(format!("{b}.k"));
+                }
+            }
+            Ty::Bool => {}
+        }
+        if opts.is_empty() {
+            return None;
+        }
+        let i = self.rng.below(opts.len() as u64) as usize;
+        Some(opts.swap_remove(i))
+    }
+
     fn stmt(&mut self) {
-        match self.rng.below(12) {
+        match self.rng.below(18) {
             // let
             0 | 1 | 2 => {
                 let t = if self.rng.chance(15) {
@@ -391,14 +478,12 @@ impl Gen {
                 self.line(format!("if ({c}) {{"));
                 self.depth += 1;
                 self.indent += 1;
-                let vars_mark = self.vars.len();
-                let arrs_mark = self.arrs.len();
+                let m = self.marks();
                 let n = self.rng.below(3) + 1;
                 for _ in 0..n {
                     self.stmt();
                 }
-                self.vars.truncate(vars_mark);
-                self.arrs.truncate(arrs_mark);
+                self.truncate_to(&m);
                 self.indent -= 1;
                 if self.rng.chance(60) {
                     self.line("} else {".into());
@@ -407,8 +492,7 @@ impl Gen {
                     for _ in 0..n {
                         self.stmt();
                     }
-                    self.vars.truncate(vars_mark);
-                    self.arrs.truncate(arrs_mark);
+                    self.truncate_to(&m);
                     self.indent -= 1;
                 }
                 self.line("}".into());
@@ -431,14 +515,12 @@ impl Gen {
                     mutable: false,
                     protected: true,
                 });
-                let vars_mark = self.vars.len();
-                let arrs_mark = self.arrs.len();
+                let m = self.marks();
                 let n = self.rng.below(3) + 1;
                 for _ in 0..n {
                     self.stmt();
                 }
-                self.vars.truncate(vars_mark);
-                self.arrs.truncate(arrs_mark);
+                self.truncate_to(&m);
                 self.vars.pop();
                 self.loop_vars.pop();
                 self.indent -= 1;
@@ -462,19 +544,173 @@ impl Gen {
                     mutable: true,
                     protected: true,
                 });
-                let vars_mark = self.vars.len();
-                let arrs_mark = self.arrs.len();
+                let m = self.marks();
                 let n = self.rng.below(2) + 1;
                 for _ in 0..n {
                     self.stmt();
                 }
-                self.vars.truncate(vars_mark);
-                self.arrs.truncate(arrs_mark);
+                self.truncate_to(&m);
                 self.line(format!("{c} = {c} + 1;"));
                 self.vars.pop();
                 self.indent -= 1;
                 self.depth -= 1;
                 self.line("}".into());
+            }
+            // Pt struct local — from a literal, or from the sret-returning helper h1.
+            12 => {
+                let name = self.fresh("p");
+                if self.allow_calls && self.rng.chance(35) {
+                    let a = self.expr(Ty::F32, 1);
+                    let b = self.expr(Ty::I32, 1);
+                    self.line(format!("let mut {name}: Pt = h1(({a}), ({b}));"));
+                } else {
+                    let x = self.expr(Ty::F32, 1);
+                    let y = self.expr(Ty::I32, 1);
+                    self.line(format!("let mut {name}: Pt = Pt {{ x: ({x}) as f32, y: ({y}) as i32 }};"));
+                }
+                self.pts.push(name);
+            }
+            // Pt mutation: field write, whole-struct copy, or the SELF-REFERENTIAL literal
+            // assign (`p = Pt { x: …p.y…, y: …p.x… }` — the sweep-14 build-into-temp bug class).
+            13 => {
+                let cands = self.pts.clone();
+                if let Some(p) = (!cands.is_empty())
+                    .then(|| cands[self.rng.below(cands.len() as u64) as usize].clone())
+                {
+                    match self.rng.below(4) {
+                        0 => {
+                            let e = self.expr(Ty::F32, 2);
+                            self.line(format!("{p}.x = ({e}) as f32;"));
+                        }
+                        1 => {
+                            let e = self.expr(Ty::I32, 2);
+                            self.line(format!("{p}.y = ({e}) as i32;"));
+                        }
+                        2 => {
+                            let q = cands[self.rng.below(cands.len() as u64) as usize].clone();
+                            self.line(format!("{p} = {q};"));
+                        }
+                        _ => {
+                            // Deliberately read the destination's own fields in the initializer.
+                            self.line(format!(
+                                "{p} = Pt {{ x: (({p}.y) as f32) + 0.5, y: (({p}.x) as i32) - 1 }};"
+                            ));
+                        }
+                    }
+                }
+            }
+            // Nested-aggregate Box2 local + a nested field write.
+            14 => {
+                if self.boxes.is_empty() || self.rng.chance(50) {
+                    let x = self.expr(Ty::F32, 1);
+                    let y = self.expr(Ty::I32, 1);
+                    let k = self.expr(Ty::I64, 1);
+                    let name = self.fresh("bx");
+                    self.line(format!(
+                        "let mut {name}: Box2 = Box2 {{ a: Pt {{ x: ({x}) as f32, y: ({y}) as i32 }}, k: ({k}) as i64 }};"
+                    ));
+                    self.boxes.push(name);
+                } else {
+                    let cands = self.boxes.clone();
+                    let b = cands[self.rng.below(cands.len() as u64) as usize].clone();
+                    match self.rng.below(3) {
+                        0 => {
+                            let e = self.expr(Ty::F32, 2);
+                            self.line(format!("{b}.a.x = ({e}) as f32;"));
+                        }
+                        1 => {
+                            let e = self.expr(Ty::I64, 2);
+                            self.line(format!("{b}.k = ({e}) as i64;"));
+                        }
+                        _ => {
+                            if let Some(p) = (!self.pts.is_empty()).then(|| {
+                                self.pts[self.rng.below(self.pts.len() as u64) as usize].clone()
+                            }) {
+                                self.line(format!("{b}.a = {p};"));
+                            }
+                        }
+                    }
+                }
+            }
+            // Enum local + exhaustive VALUE match over it (covers the value-merge path).
+            15 => {
+                if self.cols.is_empty() || self.rng.chance(40) {
+                    let v = ["Col::R", "Col::G", "Col::B"][self.rng.below(3) as usize];
+                    let name = self.fresh("en");
+                    self.line(format!("let mut {name}: Col = {v};"));
+                    self.cols.push(name);
+                } else {
+                    let cands = self.cols.clone();
+                    let e = cands[self.rng.below(cands.len() as u64) as usize].clone();
+                    if self.rng.chance(50) {
+                        let v = ["Col::R", "Col::G", "Col::B"][self.rng.below(3) as usize];
+                        self.line(format!("{e} = {v};"));
+                    } else {
+                        let a0 = self.expr(Ty::I32, 1);
+                        let a1 = self.expr(Ty::I32, 1);
+                        let a2 = self.expr(Ty::I32, 1);
+                        let name = self.fresh("x");
+                        self.line(format!(
+                            "let {name}: i32 = match {e} {{ Col::R => ({a0}) as i32, Col::G => ({a1}) as i32, Col::B => ({a2}) as i32 }};"
+                        ));
+                        self.vars.push(Var {
+                            name,
+                            ty: Ty::I32,
+                            mutable: false,
+                            protected: false,
+                        });
+                    }
+                }
+            }
+            // Tuple local (i32, f32) — plus occasional destructuring back into scalars.
+            16 => {
+                if self.tups.is_empty() || self.rng.chance(60) {
+                    let a = self.expr(Ty::I32, 1);
+                    let b = self.expr(Ty::F32, 1);
+                    let name = self.fresh("t");
+                    self.line(format!("let {name}: (i32, f32) = (({a}) as i32, ({b}) as f32);"));
+                    self.tups.push(name);
+                } else {
+                    let cands = self.tups.clone();
+                    let t = cands[self.rng.below(cands.len() as u64) as usize].clone();
+                    let u = self.fresh("u");
+                    let v = self.fresh("v");
+                    self.line(format!("let ({u}, {v}) = {t};"));
+                    self.vars.push(Var {
+                        name: u,
+                        ty: Ty::I32,
+                        mutable: false,
+                        protected: false,
+                    });
+                    self.vars.push(Var {
+                        name: v,
+                        ty: Ty::F32,
+                        mutable: false,
+                        protected: false,
+                    });
+                }
+            }
+            // Call a helper for its value (h0: (Pt, i32) -> f32, exercising by-ref aggregate args).
+            17 => {
+                if self.allow_calls {
+                    if let Some(p) = (!self.pts.is_empty())
+                        .then(|| self.pts[self.rng.below(self.pts.len() as u64) as usize].clone())
+                    {
+                        let k = self.expr(Ty::I32, 1);
+                        let name = self.fresh("x");
+                        self.line(format!("let {name}: f32 = h0({p}, ({k}) as i32);"));
+                        self.vars.push(Var {
+                            name,
+                            ty: Ty::F32,
+                            mutable: false,
+                            protected: false,
+                        });
+                    } else {
+                        self.emit_print();
+                    }
+                } else {
+                    self.emit_print();
+                }
             }
             _ => unreachable!(),
         }
@@ -494,25 +730,76 @@ impl Gen {
         self.prints += 1;
     }
 
-    fn program(mut self, seed: u64) -> String {
-        self.src = format!("module fuzz.p{seed}\n\nfn main() -> i32 {{\n");
-        let stmts = self.rng.below(18) + 8;
+    /// Emit `stmts` statements (with sprinkled prints) into `self.src`.
+    fn gen_body(&mut self, stmts: u64, print_chance: u64) {
         for _ in 0..stmts {
             self.stmt();
-            if self.rng.chance(30) {
+            if self.rng.chance(print_chance) {
                 self.emit_print();
             }
         }
-        // Guarantee a strong stdout signal even if the RNG never rolled a print.
-        while self.prints < 3 {
-            self.emit_print();
-        }
-        // Exit code: a small, always-valid projection.
-        let ret = self.expr(Ty::I32, 2);
-        self.line(format!("return (({ret}) & 63);"));
-        self.src.push_str("}\n");
-        self.src
     }
+}
+
+/// Assemble one whole program: shared aggregate types, two helper fns (h0 takes a by-ref `mut Pt`
+/// — caller-visible writes; h1 returns a `Pt` by value — the sret path), and `main`.
+fn program(seed: u64) -> String {
+    let header = format!(
+        "module fuzz.p{seed}\n\n\
+         struct Pt {{ x: f32, y: i32 }}\n\
+         struct Box2 {{ a: Pt, k: i64 }}\n\
+         enum Col {{ R, G, B }}\n\n"
+    );
+
+    // h0(mut p: Pt, k: i32) -> f32 — mutating a by-reference aggregate param.
+    let mut g0 = Gen::new(seed ^ 0xA5A5_5A5A_0000_0001);
+    g0.allow_calls = false;
+    g0.pts.push("p".into());
+    g0.vars.push(Var {
+        name: "k".into(),
+        ty: Ty::I32,
+        mutable: false,
+        protected: true,
+    });
+    g0.gen_body(3, 20);
+    let r0 = g0.expr(Ty::F32, 2);
+    g0.line(format!("return (({r0})) as f32;"));
+    let h0 = format!("fn h0(mut p: Pt, k: i32) -> f32 {{\n{}}}\n\n", g0.src);
+
+    // h1(a: f32, b: i32) -> Pt — aggregate return by value (sret).
+    let mut g1 = Gen::new(seed ^ 0xA5A5_5A5A_0000_0002);
+    g1.allow_calls = false;
+    g1.vars.push(Var {
+        name: "a".into(),
+        ty: Ty::F32,
+        mutable: false,
+        protected: true,
+    });
+    g1.vars.push(Var {
+        name: "b".into(),
+        ty: Ty::I32,
+        mutable: false,
+        protected: true,
+    });
+    g1.gen_body(3, 20);
+    let rx = g1.expr(Ty::F32, 2);
+    let ry = g1.expr(Ty::I32, 2);
+    g1.line(format!(
+        "return Pt {{ x: ({rx}) as f32, y: ({ry}) as i32 }};"
+    ));
+    let h1 = format!("fn h1(a: f32, b: i32) -> Pt {{\n{}}}\n\n", g1.src);
+
+    let mut g = Gen::new(seed);
+    let stmts = g.rng.below(18) + 8;
+    g.gen_body(stmts, 30);
+    // Guarantee a strong stdout signal even if the RNG never rolled a print.
+    while g.prints < 3 {
+        g.emit_print();
+    }
+    // Exit code: a small, always-valid projection.
+    let ret = g.expr(Ty::I32, 2);
+    g.line(format!("return (({ret}) & 63);"));
+    format!("{header}{h0}{h1}fn main() -> i32 {{\n{}}}\n", g.src)
 }
 
 /// Compile `src` through the real pipeline at `opt`, then run it on the given backend.
@@ -556,6 +843,18 @@ fn run_at(
     })
 }
 
+/// Debugging aid: dump a few generated programs (`cargo test ... dump_generated -- --ignored
+/// --nocapture`) to eyeball the grammar's coverage.
+#[test]
+#[ignore]
+fn dump_generated_programs() {
+    let base: u64 = 0x4D45_5243_5552_5931;
+    for i in 0..3u64 {
+        let seed = base ^ (i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        println!("=== program {i} (seed {seed}) ===\n{}", program(seed));
+    }
+}
+
 /// The fuzzer proper: N seeded programs, each checked interp==native and -O0==-O2==-O3.
 #[test]
 fn fuzz_grammar_differential() {
@@ -569,7 +868,7 @@ fn fuzz_grammar_differential() {
     let base: u64 = 0x4D45_5243_5552_5931; // fixed tag so failures reproduce.
     for i in 0..programs {
         let seed = base ^ (i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let src = Gen::new(seed).program(seed);
+        let src = program(seed);
         let fail = |what: &str, detail: String| -> ! {
             panic!(
                 "grammar fuzzer: {what} (seed {seed}, program {i})\n--- detail ---\n{detail}\n--- source ---\n{src}"
