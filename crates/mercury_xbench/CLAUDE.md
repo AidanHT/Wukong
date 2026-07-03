@@ -41,14 +41,25 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   attention runs per head over contiguous extracted slices in both. C peer = same computation as one
   competent TU at the suite's standard flags; `C(fast)` = same source with `-ffast-math` (the `llama2.c
   -Ofast` basis; reassociates + vectorizes the dots). Naive-dot C is skipped at S=512 by default
-  (`XBENCH_MODEL_NAIVE` forces it — tens of seconds per forward). Reported as ms/forward, ms/layer,
-  tokens/sec; timed with `time_forward` (best-of-N sized for 0.1–60 s calls). Cross-checks: Mercury vs C
-  full-buffer `max_rel_err < 1e-3` (12 layers of reassociation + poly-vs-libm compound), serial vs
-  `@parallel` ≈ exact, and an **in-benchmark interpreter gate**: the oracle runs the identical 12-layer
-  forward at a reduced config (S=16/D=64/H=4/Dff=256) and must match the JIT **bit-for-bit** (this is why
-  the crate depends on `mercury_interp`). Known asymmetry (disclosed in the module doc): `@parallel` is
-  only partially multicore — embedded plain matmul nests are emitted serial
-  (`lower_for` hardcodes `emit_sgemm(&nest, false)`), so only the norms + fused-GELU GEMM go `_parallel`.
+  (`XBENCH_MODEL_NAIVE` forces it — tens of seconds per forward). **PyTorch peer** (columns `T1(sdpa)`,
+  `T1(man)`, `Tn(sdpa)`): when `python` + torch import (`detect_torch`, `PYTHON` env overrides the
+  interpreter; graceful skip + printed note otherwise), the harness dumps the exact shared buffers as
+  LE f32 blobs (`dump_f32_le`: config-invariant `model_w.bin` once per run — guarded by a `Cell` in
+  `TorchCtx` — plus a per-config io blob) and generates+runs a self-contained eager script
+  (`torch_script`/`bench_torch`): `F.linear` over the same `[out,in]` row-major weights (layouts
+  coincide byte-for-byte), `F.layer_norm` eps=1e-5, `F.gelu(approximate="tanh")` (Mercury's exact GELU
+  flavor), causal `F.scaled_dot_product_attention` (fused industry path) + a manual matmul+softmax
+  variant, under `torch.inference_mode()` float32, **eager only — never torch.compile**; warm ≥3 / time
+  ≥10 per variant (min+median, bare-forward timed loop), at 1 thread and default all threads, printed as
+  machine-readable `TORCH1`/`TORCH1M`/`TORCHN` lines the Rust side parses. Torch runs in the same
+  invocation right after the Mercury columns (single-thread variants first, all-core last inside the
+  script). Reported as ms/forward, ms/layer, tokens/sec; timed with `time_forward` (best-of-N sized for
+  0.1–60 s calls). Cross-checks: Mercury vs C full-buffer `max_rel_err < 1e-3` (12 layers of
+  reassociation + poly-vs-libm compound), Mercury vs torch SDPA output at the same magnitude-normalized
+  1e-3 (same GELU flavor → no loosening), serial vs `@parallel` ≈ exact, and an **in-benchmark
+  interpreter gate**: the oracle runs the identical 12-layer forward at a reduced config
+  (S=16/D=64/H=4/Dff=256) and must match the JIT **bit-for-bit** (this is why the crate depends on
+  `mercury_interp`).
 - `bench_softmax_bwd` (+ `mer_softmax_bwd`/`c_softmax_bwd`/`rust_softmax_bwd`) — the attention/classifier
   training gradient `dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` over a `[R,C]` batch, at
   1024×1024 / 4096×512. Uses **all three** harness pointers (`y, dy, dx` — no unused middle). Mercury
