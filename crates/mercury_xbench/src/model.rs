@@ -42,11 +42,12 @@
 //! * Mercury's GEMMs go to the tuned AVX2/FMA microkernel; C's stay whatever gcc makes of the
 //!   idiomatic nests. That *is* the product claim being measured (a shape-safe tensor language
 //!   whose compiler lowers to tuned kernels), the same basis as `bench_matmul`/`bench_linear`.
-//! * The `@parallel` Mercury column is partially multicore: the batched norms and the fused GELU
-//!   FFN GEMM dispatch `_parallel` kernels, but embedded plain matmul nests are currently emitted
-//!   single-threaded (`mercury_mir_build::lower_for` hardcodes `emit_sgemm(&nest, false)` on the
-//!   statement path), so Q/K/V/O/PV/down-proj GEMMs stay serial even under `@parallel`. Both C
-//!   columns are single-threaded idiomatic code, as everywhere in this suite.
+//! * The `@parallel` Mercury column is fully multicore: the batched norms, the fused-GELU FFN
+//!   GEMM, *and* the embedded plain matmul nests (Q/K/V/O/PV/down-proj) all dispatch `_parallel`
+//!   kernels — `lower_for`'s statement path now honors the enclosing `@parallel` for embedded
+//!   GEMMs. The run-time dispatch scan prints the `@parallel` variant's kernel set (and a unit
+//!   test pins it), so a regression back to serial is visible, not silent. Both C columns are
+//!   single-threaded idiomatic code, as everywhere in this suite.
 
 use std::path::Path;
 use std::process::Command;
@@ -986,9 +987,24 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
         }
     });
 
-    // --- Mercury @parallel (partially multicore — see module doc), measured LAST so its all-core
-    // heat pollutes no single-core column ---
+    // --- Mercury @parallel, measured LAST so its all-core heat pollutes no single-core column ---
     let mer_par_m = compile_mercury(&mer_block(cfg, true), &mut interner).and_then(|m| {
+        // Same mechanism transparency as the serial column: print the @parallel dispatch set and
+        // warn if the embedded GEMMs regressed to serial (they would still be *correct*, so only
+        // this scan would catch it).
+        let calls = kernel_calls(&m.mir);
+        let summary = calls
+            .iter()
+            .map(|(k, v)| format!("{v}x {}", k.trim_start_matches("mercury_")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  @parallel block dispatches (per layer, from optimized MIR): {summary}");
+        if !calls.iter().any(|(k, _)| k == "mercury_sgemm_nt_parallel") {
+            println!(
+                "  ! WARNING: @parallel block did NOT dispatch mercury_sgemm_nt_parallel — \
+                 embedded GEMMs are running serial"
+            );
+        }
         let lnf = lnf_mod.as_ref()?;
         let (Some(bp), Some(lp)) = (
             m.func(&mut interner, "kbench"),
@@ -1095,13 +1111,6 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
     ratio_line(&mer_m, &c_m, "(1 core)", "C (gcc -O3 -march=native)");
     ratio_line(&mer_m, &cfast_m, "(1 core)", "C(fast) (gcc -ffast-math)");
     ratio_line(&mer_par_m, &cfast_m, "@parallel", "C(fast) (single-threaded)");
-    if mer_par_m.is_some() {
-        println!(
-            "     (note: @parallel is partially multicore here — the embedded plain GEMM nests are \
-             emitted serial by mir_build's statement path; only the norms + fused-GELU FFN GEMM go \
-             _parallel)"
-        );
-    }
 
     // --- full-buffer cross-checks over the final [S, D] output ---
     // Mercury-vs-C: the GEMM/norm reductions reassociate and Mercury's ~1-ULP poly exp/tanh differ
@@ -1141,5 +1150,50 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
         } else {
             println!("  cross-check Mercury serial vs @parallel: BIT-EXACT");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the model block's recognized-kernel dispatch sets for BOTH variants. The recognizers
+    /// are gate-blind (interp and native call the same symbol), so a silent regression to scalar
+    /// loops — or to serial GEMMs under `@parallel` — passes every correctness gate; only this
+    /// scan catches it. Uses the interp-gate config (small dims) to keep the test fast.
+    #[test]
+    fn block_dispatch_sets_pinned() {
+        let cfg = Cfg { s: 16, d: 64, h: 4, dff: 256 };
+        let mut interner = Interner::new();
+
+        let serial = compile_mercury(&mer_block(cfg, false), &mut interner)
+            .expect("serial block must compile");
+        let calls = kernel_calls(&serial.mir);
+        for need in [
+            "mercury_sgemm_nt",
+            "mercury_sgemm_nt_alpha",
+            "mercury_sgemm_nt_epi",
+            "mercury_norm_affine_f32",
+            "mercury_norm_f32",
+            "mercury_velem_f32",
+        ] {
+            assert!(
+                calls.iter().any(|(k, _)| k == need),
+                "serial block lost dispatch {need}; got {calls:?}"
+            );
+        }
+
+        let par = compile_mercury(&mer_block(cfg, true), &mut interner)
+            .expect("@parallel block must compile");
+        let pcalls = kernel_calls(&par.mir);
+        assert!(
+            pcalls.iter().any(|(k, _)| k == "mercury_sgemm_nt_parallel"),
+            "@parallel block's embedded GEMMs regressed to serial; got {pcalls:?}"
+        );
+        // No plain-serial NT GEMM may remain in the @parallel variant.
+        assert!(
+            !pcalls.iter().any(|(k, _)| k == "mercury_sgemm_nt"),
+            "@parallel block still emits serial mercury_sgemm_nt calls; got {pcalls:?}"
+        );
     }
 }
