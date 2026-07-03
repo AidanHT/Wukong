@@ -369,7 +369,7 @@ mod tests {
     fn parallel_reduce_is_eligible() {
         let src = r#"module t
 @parallel
-fn dotp(x: [f32; 256], y: [f32; 256], o: [f32; 1]) {
+fn dotp(x: [f32; 256], y: [f32; 256], mut o: [f32; 1]) {
     let mut s: f32 = 0.0;
     for k in 0..256 { s = s + x[k] * y[k]; }
     o[0] = s;

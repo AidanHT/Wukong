@@ -268,7 +268,7 @@ mod tests {
         let src = format!(
             r#"module bench
 @parallel
-fn dotp(x: [f32; {N}], y: [f32; {N}], o: [f32; 1]) {{
+fn dotp(x: [f32; {N}], y: [f32; {N}], mut o: [f32; 1]) {{
     let mut s: f32 = 0.0;
     for k in 0..{N} {{ s = s + x[k] * y[k]; }}
     o[0] = s;
@@ -427,7 +427,7 @@ fn main() -> i32 {{
         const REPEAT: usize = 16;
         let src = format!(
             r#"module bench
-fn linear(x: [f32; {mk}], w: [f32; {nk}], out: [f32; {mn}]) {{
+fn linear(x: [f32; {mk}], w: [f32; {nk}], mut out: [f32; {mn}]) {{
     for i in 0..{M} {{
         for j in 0..{N} {{
             let mut s: f32 = 0.0;
@@ -517,7 +517,7 @@ fn main() -> i32 {{
         let loop_src = format!(
             r#"module bench
 @parallel
-fn dotp(x: [f32; {N}], y: [f32; {N}], o: [f32; 1]) {{
+fn dotp(x: [f32; {N}], y: [f32; {N}], mut o: [f32; 1]) {{
     let mut s: f32 = 0.0;
     for k in 0..{N} {{ s = s + x[k] * y[k]; }}
     o[0] = s;
@@ -538,7 +538,7 @@ fn main() -> i32 {{
         let one_src = format!(
             r#"module bench
 @parallel
-fn dotp(x: [f32; {N}], y: [f32; {N}], o: [f32; 1]) {{
+fn dotp(x: [f32; {N}], y: [f32; {N}], mut o: [f32; 1]) {{
     let mut s: f32 = 0.0;
     for k in 0..{N} {{ s = s + x[k] * y[k]; }}
     o[0] = s;
