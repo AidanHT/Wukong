@@ -3,7 +3,7 @@
 Standalone binary `mercury-xbench`: an **honest** cross-language benchmark. For each kernel it builds
 the *same* computation four ways — Mercury (Cranelift-JIT native), C (`gcc -O3 -march=native`), C++
 (`g++ -O3 -march=native`, the same numeric body rendered as C++ via `cpp_from_c`), and Rust
-(`rustc -O -C target-cpu=native`) — and times all four through one identical Rust harness over the
+(`rustc -C opt-level=3 -C target-cpu=native`) — and times all four through one identical Rust harness over the
 same buffers. C/C++/Rust are compiled to shared libraries and called via their C ABI; Mercury is
 JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 
