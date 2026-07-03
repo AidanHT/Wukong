@@ -728,6 +728,26 @@ impl Sema<'_> {
         self.eval_usize_depth(e, 0)
     }
 
+    /// If `e` is a C-style enum-variant access `E::V` (a `Field` whose base is a single-segment
+    /// path naming a declared enum), its integer discriminant — the value the variant lowers to.
+    /// Mirrors `mir_build`'s `enum_variant_value` exactly, so compile-time evaluation (array
+    /// lengths, index bounds) agrees with what lowering emits.
+    fn enum_variant_disc(&self, e: &Expr) -> Option<i64> {
+        let ExprKind::Field { base, name } = &e.kind else {
+            return None;
+        };
+        let ExprKind::Path(p) = &base.kind else {
+            return None;
+        };
+        if !p.is_single() {
+            return None;
+        }
+        let DefKind::Enum(variants) = &self.defs.lookup(p.first().sym)?.kind else {
+            return None;
+        };
+        variants.iter().find(|v| v.name == name.sym).map(|v| v.disc)
+    }
+
     /// Evaluate a compile-time array length: a plain integer literal, or a single-segment path
     /// naming a top-level `const` whose initializer is itself such a length (so `const N: usize = 4;
     /// [i32; N]` sizes the array). `self.consts` is populated in `collect` before any body is
@@ -761,6 +781,14 @@ impl Sema<'_> {
                 let r = self.eval_usize_depth(rhs, depth + 1);
                 op.fold_const_len(l, r)
             }
+            // A C-style enum variant as a length (`[i32; E::V]`, or via `const K: E = E::V`)
+            // resolves to its discriminant. Previously this fell to `_ => 0` — a silent
+            // zero-size while mir_build sized the slot differently. Mirrored in mir_build's
+            // `const_usize_depth`. A negative discriminant stays the 0 fallback.
+            ExprKind::Field { .. } => self
+                .enum_variant_disc(e)
+                .and_then(|d| u64::try_from(d).ok())
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -2926,15 +2954,38 @@ impl Sema<'_> {
         match scrut_ty {
             Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
                 Some(DefKind::Enum(variants)) => {
+                    // Coverage per variant: a variant pattern covers its name; an int-literal /
+                    // range pattern covers the variants whose DISCRIMINANT it matches (an enum
+                    // value IS its discriminant at runtime, and `int as Enum` is rejected, so the
+                    // declared discriminants are the whole domain). Previously a match by raw
+                    // discriminant stayed lenient — `match e { 0 => .., 1 => .. }` on a
+                    // three-variant enum compiled, and the missed variant silently took
+                    // mir_build's zero default on BOTH backends (a gate-blind wrong answer). It
+                    // also falsely rejected a mixed exhaustive match (`E::A | 1 | 2`), whose int
+                    // arms contributed nothing. Any guard-less pattern the collector can't reason
+                    // about keeps the whole match lenient, so incompleteness stays *certain*.
                     let mut covered = HashSet::new();
+                    let mut spans: Vec<(i64, i64)> = Vec::new();
                     for a in arms {
-                        if a.guard.is_none() {
-                            collect_variant_names(&a.pat, &mut covered);
+                        if a.guard.is_none()
+                            && !collect_enum_coverage(
+                                &a.pat,
+                                &mut covered,
+                                &mut spans,
+                                self.interner,
+                            )
+                        {
+                            return false;
                         }
                     }
-                    // Only reason about coverage when the arms actually use variant patterns; a match
-                    // by raw discriminant (or some unmodeled spelling) stays lenient.
-                    !covered.is_empty() && variants.iter().any(|v| !covered.contains(&v.name))
+                    // All arms guarded (guards never prove coverage): lenient.
+                    if covered.is_empty() && spans.is_empty() {
+                        return false;
+                    }
+                    variants.iter().any(|v| {
+                        !covered.contains(&v.name)
+                            && !spans.iter().any(|(l, h)| *l <= v.disc && v.disc <= *h)
+                    })
                 }
                 _ => false, // a non-enum `Named` (struct / generic / forward ref): lenient
             },
@@ -3127,17 +3178,56 @@ fn arm_is_catch_all(a: &MatchArm) -> bool {
 /// Record every enum-variant name a (guard-less) pattern covers, flattening or-patterns. A `Path`
 /// pattern's last segment is the variant name (`Color::Red` → `Red`); other pattern kinds contribute
 /// nothing. Used by `match_is_provably_nonexhaustive` for enum coverage.
-fn collect_variant_names(p: &Pattern, out: &mut HashSet<Symbol>) {
+/// Enum-coverage contribution of one (guard-less) pattern: a variant pattern covers its NAME, an
+/// int-literal / range pattern covers a numeric SPAN of discriminants (an enum matches by its
+/// discriminant), a wildcard/ident alternative covers everything, and or-patterns recurse.
+/// Returns `false` — "cannot reason, stay lenient" — for any other pattern kind (char/bool/tuple:
+/// ill-typed for an enum scrutinee or unmodeled here), so E0405 only fires on *certain* misses.
+fn collect_enum_coverage(
+    p: &Pattern,
+    names: &mut HashSet<Symbol>,
+    spans: &mut Vec<(i64, i64)>,
+    interner: &Interner,
+) -> bool {
     match &p.kind {
-        // A unit-variant `Color::Red` and a payload-variant `Op::Add(a, b)` / `Shape::C { .. }` both
-        // cover their (last-segment) variant name for exhaustiveness.
         PatKind::Path(path) | PatKind::Variant { path, .. } => {
             if let Some(seg) = path.segments.last() {
-                out.insert(seg.sym);
+                names.insert(seg.sym);
             }
+            true
         }
-        PatKind::Or(alts) => alts.iter().for_each(|a| collect_variant_names(a, out)),
-        _ => {}
+        PatKind::Int { .. } => match pat_int_value(p, interner) {
+            Some(v) => {
+                spans.push((v, v));
+                true
+            }
+            None => false,
+        },
+        PatKind::Range { lo, hi, inclusive } => {
+            let (Some(l), Some(h)) = (pat_int_value(lo, interner), pat_int_value(hi, interner))
+            else {
+                return false;
+            };
+            spans.push((l, if *inclusive { h } else { h.saturating_sub(1) }));
+            true
+        }
+        PatKind::Or(alts) => alts
+            .iter()
+            .all(|a| collect_enum_coverage(a, names, spans, interner)),
+        PatKind::Wildcard | PatKind::Ident(_) => {
+            spans.push((i64::MIN, i64::MAX));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The integer value of an int-literal pattern (with its folded-in sign), or `None`.
+fn pat_int_value(p: &Pattern, interner: &Interner) -> Option<i64> {
+    match &p.kind {
+        PatKind::Int { sym, neg } => parse_int_text(interner.resolve(*sym))
+            .map(|v| if *neg { v.wrapping_neg() } else { v }),
+        _ => None,
     }
 }
 

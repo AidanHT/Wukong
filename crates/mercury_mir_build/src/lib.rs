@@ -2343,7 +2343,7 @@ impl FnLowerer<'_> {
                     MirType::I32
                 }
             }
-            Array { elem, len } => match const_usize_expr(len, self.interner, &self.sema.consts) {
+            Array { elem, len } => match const_usize_expr(len, self.interner, self.sema) {
                 Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
                 None => MirType::Ptr,
             },
@@ -3259,7 +3259,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return None;
         }
         Some((*v, end, body))
@@ -7936,7 +7936,7 @@ impl FnLowerer<'_> {
     fn try_emit_argreduce(&mut self, pat: &Pattern, start: &Expr, end: &Expr, body: &Block) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -8055,7 +8055,7 @@ impl FnLowerer<'_> {
             return false;
         };
         // Only `0..n`; a non-zero start would need a pointer/length shift the call does not do.
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -8449,7 +8449,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -8513,7 +8513,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -8651,7 +8651,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -8703,7 +8703,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -8824,7 +8824,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
             return None;
         }
         let Pattern {
@@ -9783,7 +9783,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(r_start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(r_start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -9815,7 +9815,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(j_start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(j_start, self.interner, self.sema) != Some(0) {
             return false;
         }
         let Pattern {
@@ -9969,7 +9969,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(i_start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(i_start, self.interner, self.sema) != Some(0) {
             return None;
         }
         let Pattern {
@@ -10001,7 +10001,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(j_start, self.interner, &self.sema.consts) != Some(0) {
+        if const_usize_expr(j_start, self.interner, self.sema) != Some(0) {
             return None;
         }
         let Pattern {
@@ -11069,8 +11069,8 @@ impl FnLowerer<'_> {
             // size; a runtime bound stays `None` and keeps the 128-bit path (see
             // `VEC256_REDUCTION_MIN_TRIP`).
             let known_trip = match (
-                const_usize_expr(start, self.interner, &self.sema.consts),
-                const_usize_expr(end, self.interner, &self.sema.consts),
+                const_usize_expr(start, self.interner, self.sema),
+                const_usize_expr(end, self.interner, self.sema),
             ) {
                 (Some(a), Some(b)) if b >= a => Some((b - a) as u64),
                 _ => None,
@@ -16729,14 +16729,14 @@ fn mir_ty(ty: &Ty) -> MirType {
 /// sizes the array). Mirrors sema's `eval_usize` exactly — the two must agree on the length, else
 /// the alloca'd slot size desyncs from sema's index-bounds checks. The depth bound guards a cyclic
 /// const initializer (also rejected by sema's `check_recursive_consts`).
-fn const_usize_expr(e: &Expr, interner: &Interner, consts: &HashMap<Symbol, Expr>) -> Option<u32> {
-    const_usize_depth(e, interner, consts, 0)
+fn const_usize_expr(e: &Expr, interner: &Interner, sema: &SemaResult) -> Option<u32> {
+    const_usize_depth(e, interner, sema, 0)
 }
 
 fn const_usize_depth(
     e: &Expr,
     interner: &Interner,
-    consts: &HashMap<Symbol, Expr>,
+    sema: &SemaResult,
     depth: u32,
 ) -> Option<u32> {
     if depth > 64 {
@@ -16744,16 +16744,35 @@ fn const_usize_depth(
     }
     match &e.kind {
         ExprKind::Int(s) => Some(parse_int(interner.resolve(*s)) as u32),
-        ExprKind::Path(p) if p.is_single() => consts
+        ExprKind::Path(p) if p.is_single() => sema
+            .consts
             .get(&p.first().sym)
-            .and_then(|init| const_usize_depth(init, interner, consts, depth + 1)),
+            .and_then(|init| const_usize_depth(init, interner, sema, depth + 1)),
         // Mirror sema's `eval_usize` exactly (both fold via `BinOp::fold_const_len`) so the slot size
         // agrees with the bounds check. An unfoldable operand contributes 0, as sema's evaluator does,
         // so a const-arithmetic length sizes correctly instead of collapsing to an unsized pointer.
         ExprKind::Binary { op, lhs, rhs } => {
-            let l = const_usize_depth(lhs, interner, consts, depth + 1).unwrap_or(0) as u64;
-            let r = const_usize_depth(rhs, interner, consts, depth + 1).unwrap_or(0) as u64;
+            let l = const_usize_depth(lhs, interner, sema, depth + 1).unwrap_or(0) as u64;
+            let r = const_usize_depth(rhs, interner, sema, depth + 1).unwrap_or(0) as u64;
             Some(op.fold_const_len(l, r) as u32)
+        }
+        // A C-style enum variant as a length (`[i32; E::V]`, or via `const K: E = E::V`) is its
+        // discriminant — the same resolution `enum_variant_value` uses for the value form, and the
+        // exact mirror of sema's `eval_usize_depth` Field arm (a negative discriminant declines).
+        ExprKind::Field { base, name } => {
+            let ExprKind::Path(p) = &base.kind else {
+                return None;
+            };
+            if !p.is_single() {
+                return None;
+            }
+            let DefKind::Enum(variants) = &sema.defs.lookup(p.first().sym)?.kind else {
+                return None;
+            };
+            variants
+                .iter()
+                .find(|v| v.name == name.sym)
+                .and_then(|v| u32::try_from(v.disc).ok())
         }
         _ => None,
     }
