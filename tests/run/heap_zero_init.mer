@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+module tests.run.heap_zero_init
+
+// Zero-initialization is the heap's determinism contract: reading any element before writing it
+// yields exactly 0 (or 0.0) on BOTH backends — calloc'd bytes on native, typed zero `Value`s in
+// the interpreter's slot memory — for every one of the eight element types the v1 alloc family
+// covers. A partial write leaves the untouched tail zero.
+
+fn main() -> i32 {
+    let f: []f32 = alloc_f32(4);
+    print(f[0]);
+    let n: []i32 = alloc_i32(4);
+    print(n[3]);
+    let b: []u8 = alloc_u8(2);
+    print(b[1]);
+    let q: []i64 = alloc_i64(2);
+    print(q[0]);
+    let d: []f64 = alloc_f64(2);
+    print(d[1]);
+    let h: []bf16 = alloc_bf16(2);
+    print(h[0]);
+    let g: []f16 = alloc_f16(2);
+    print(g[1]);
+    let c: []i8 = alloc_i8(2);
+    print(c[0]);
+    let mut m: []i32 = alloc_i32(3);
+    m[0] = 7;
+    print(m[0] + m[1] + m[2]);   // 7 — the unwritten tail is still zero
+    free(f);
+    free(n);
+    free(b);
+    free(q);
+    free(d);
+    free(h);
+    free(g);
+    free(c);
+    free(m);
+    return 0;
+}
