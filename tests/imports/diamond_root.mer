@@ -1,0 +1,10 @@
+// Loader unit-test fixture: the root of an import DIAMOND. Both diamond_b and diamond_c import
+// diamond_d; the loader must dedup by canonical path so d's items are spliced exactly once.
+module diamond_root
+
+import diamond_b;
+import diamond_c;
+
+fn droot() -> i32 {
+    return from_diamond_b() + from_diamond_c() + shared_leaf();
+}
