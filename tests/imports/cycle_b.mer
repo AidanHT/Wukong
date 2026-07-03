@@ -1,0 +1,8 @@
+// Loader unit-test fixture: the other half of the import cycle with cycle_a.mer.
+module cycle_b
+
+import cycle_a;
+
+fn from_b() -> i32 {
+    return 2;
+}

@@ -165,6 +165,16 @@ static CATALOG: &[Explanation] = &[
          `*p = …` — is still allowed; only rebinding the name itself is rejected."
     ),
     entry!(
+        "E0305",
+        "unresolved import",
+        "An `import` does not resolve to a source file. `import a.b.c` resolves to \
+         `<root-dir>/a/b/c.mer`, where `<root-dir>` is the directory containing the root source \
+         file passed to the compiler and dots are path separators (a single segment `import util` \
+         is `<root-dir>/util.mer`). Check the spelling and the on-disk layout. Note that the \
+         imported file's own `module` header is informational — it does not participate in \
+         resolution and need not match the import path."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \

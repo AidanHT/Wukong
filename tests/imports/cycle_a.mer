@@ -1,0 +1,11 @@
+// Loader unit-test fixture (crates/mercury_driver/src/loader.rs): half of an import CYCLE.
+// `cycle_a` imports `cycle_b`, which imports `cycle_a` back — the loader must break the cycle by
+// never reloading an already-loaded file, and each file's items must land exactly once.
+// Not scanned by any e2e harness (those read tests/run and tests/fail only).
+module cycle_a
+
+import cycle_b;
+
+fn from_a() -> i32 {
+    return from_b() + 1;
+}

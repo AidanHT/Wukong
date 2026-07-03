@@ -29,14 +29,28 @@ mercuryc --run hello.mer       # prints 42 then 42; exits with main's return val
 Every file begins with a `module` declaration. Execution starts at `fn main() -> i32`, and the
 integer it returns becomes the process exit code.
 
-## Modules
+## Modules & imports ✅
 
 ```mercury
 module examples.matmul
-import std.mem
+import lib.mathlib
 ```
 
-A module path is dotted. `import` brings another module's items into scope. 🟡
+A module path is dotted, and `import` makes a program **multi-file**: `import a.b` — in any file of
+the program — loads `a/b.mer`, resolved relative to the directory of the **root** source file passed
+to `mercuryc`, and splices its items into one merged **flat namespace**. Cross-file calls, consts,
+structs, and enums then just work, with no qualification (`tests/run/import_multi.mer`). Each file is
+loaded exactly once, by canonical path: an import **cycle** (`a` imports `b` imports `a`) or diamond
+is not an error, and every item still lands exactly once. A top-level name defined in two files is
+the ordinary duplicate-name error (E0300), pointing at **both** definitions; an import that resolves
+to no file is **E0305** (`mercuryc --explain E0305`). A diagnostic inside an imported file renders
+with that file's own path and line.
+
+The `module` header itself remains informational — it does not participate in resolution and need
+not match the path a file was imported under. `import x as y` aliases and `import x.{a, b}` item
+lists parse but neither rename nor restrict anything yet (v1 is a flat namespace) 🟡. Note that
+`--emit=tokens|ast` dump the **root file only**; every later stage — and `--run` on either backend —
+sees the merged multi-file program.
 
 ## Functions ✅
 

@@ -10,7 +10,14 @@ it across opt levels): the zero-dependency tree-walking interpreter (the referen
 from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, object/exe via
 `--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
-- Modules, functions (including recursion and mutual recursion — the interpreter oracle runs on a
+- **Multi-file modules**: `import a.b` loads `a/b.mer` (resolved against the *root* source file's
+  directory) and splices its items into one merged flat namespace, so cross-file fns/consts/structs
+  just work on both backends (`tests/run/import_multi.mer`). Files load once each — an import cycle
+  or diamond dedups by canonical path, never errors. An unresolvable import is `E0305`; a cross-file
+  duplicate name is the ordinary `E0300`, pointing at both definitions with each file's own
+  path/line. (`import … as …` / `import x.{a,b}` parse but don't rename/restrict yet;
+  `--emit=tokens|ast` stay root-file-only by design.)
+- Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
   than the native backend's machine frames, so the interpreter overflows at a far shallower recursion

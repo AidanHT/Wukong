@@ -1,0 +1,10 @@
+// Transitively imported by lib/mathlib.mer; imports mathlib BACK (an A<->B import cycle).
+// A cycle is not an error: the loader never reloads an already-loaded file, so every item still
+// lands exactly once in the merged namespace.
+module lib.deep
+
+import lib.mathlib;
+
+fn seven() -> i32 {
+    return 7;
+}
