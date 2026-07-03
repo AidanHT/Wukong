@@ -6358,7 +6358,11 @@ impl FnLowerer<'_> {
                             .builder
                             .build(elem.clone(), Op::Load(ptr, elem.clone()));
                         let bin = compound_binop(*op, elem.is_float(), self.signed(target));
-                        self.builder.build(elem.clone(), Op::Bin(bin, cur, rhs))
+                        let v = self.builder.build(elem.clone(), Op::Bin(bin, cur, rhs));
+                        // A bf16/f16 compound-assign result rounds at the value too (see
+                        // `round_half_result`); the store's own narrowing then re-rounds the
+                        // already-rounded value (identity), so -O0 == -O2.
+                        self.round_half_result(v, &elem)
                     }
                 };
                 self.builder.build_void(Op::Store {
@@ -14700,7 +14704,10 @@ impl FnLowerer<'_> {
                 let l = self.coerce_to(l, &lty, &ty, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &ty, self.signed(rhs));
                 let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
-                self.builder.build(ty, Op::Bin(bin, l, r))
+                let v = self.builder.build(ty.clone(), Op::Bin(bin, l, r));
+                // A bf16/f16-typed result must round to its grid at the value (see
+                // `round_half_result`) — not only in a store mem2reg may delete.
+                self.round_half_result(v, &ty)
             }
         }
     }
@@ -14773,13 +14780,15 @@ impl FnLowerer<'_> {
             let yv = self.lower_fma_operand(y, ty);
             let zv = self.lower_fma_operand(z, ty);
             let xv = self.lower_fma_operand(rhs, ty);
-            return Some(self.builder.build(ty.clone(), Op::Fma(yv, zv, xv)));
+            let fma = self.builder.build(ty.clone(), Op::Fma(yv, zv, xv));
+            return Some(self.round_half_result(fma, ty));
         }
         if let Some((y, z)) = as_fmul(rhs) {
             let xv = self.lower_fma_operand(lhs, ty);
             let yv = self.lower_fma_operand(y, ty);
             let zv = self.lower_fma_operand(z, ty);
-            return Some(self.builder.build(ty.clone(), Op::Fma(yv, zv, xv)));
+            let fma = self.builder.build(ty.clone(), Op::Fma(yv, zv, xv));
+            return Some(self.round_half_result(fma, ty));
         }
         None
     }
@@ -14789,6 +14798,24 @@ impl FnLowerer<'_> {
         let v = self.lower_expr(e);
         let ety = self.expr_mir(e);
         self.coerce_to(v, &ety, ty, self.signed(e))
+    }
+
+    /// Round a bf16/f16-typed arithmetic RESULT to its grid at the value level. Store-only rounding
+    /// is fragile: mem2reg promotes the local's slot and forwards the raw f32 past the deleted
+    /// store, so loop-carried half arithmetic (`acc = acc + step` on `bf16` locals) diverged at
+    /// `-O2` from `-O0`. An `FpTrunc` cast to the same half type is the shared value-rounding op
+    /// both backends already implement identically (Cranelift `round_to_bf16`/`round_to_f16`, the
+    /// interpreter's `round_bf16`/`round_f16`), and the optimizer never const-folds half arithmetic
+    /// or half casts, so the rounding survives every opt level. Re-rounding an already-rounded
+    /// value is the identity, so the (surviving) store's own narrowing stays byte-identical.
+    /// No-op for every non-half type.
+    fn round_half_result(&mut self, v: ValueId, ty: &MirType) -> ValueId {
+        if matches!(ty, MirType::BF16 | MirType::F16) {
+            self.builder
+                .build(ty.clone(), Op::Cast(CastKind::FpTrunc, v, ty.clone()))
+        } else {
+            v
+        }
     }
 
     /// Insert a numeric cast so `v` (currently `from`) has type `to`. Non-numeric operands and
