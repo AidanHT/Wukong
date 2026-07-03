@@ -8,13 +8,15 @@ same buffers. C/C++/Rust are compiled to shared libraries and called via their C
 JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 
 ## Layout
-- `src/main.rs` — entire crate: kernel sources (Mercury/C/Rust string builders; the C++ column
+- `src/main.rs` — most of the crate: kernel sources (Mercury/C/Rust string builders; the C++ column
   reuses the C body through `cpp_from_c`), `bench_mercury` /
   `bench_external`, `time_ns` (best-of-many batches), the elementwise kernel table, `bench_matmul` /
   `bench_linear` (GFLOP/s + roofline %), `bench_conv` (im2col+GEMM vs direct), `bench_norm`
   (fused softmax/LayerNorm/RMSNorm vs per-row C/Rust), and `bench_i8gemm` (int8 `u8×i8→i32`
   `nn.Linear` GOP/s, with the int8 `bench_mercury_i8` / `bench_external_i8` over the `MeasureI8`
   struct and the `(u8, i8, i32)` `I8KernelFn` ABI).
+- `src/model.rs` — `bench_model`, the **end-to-end 12-layer GPT-2-class transformer stack** inference
+  benchmark (see the `bench_model` bullet below).
 
 ## Key types & entry points
 - `main` — runs the elementwise kernel table (saxpy/dot/relu/poly + `@parallel` variants incl.
@@ -27,6 +29,26 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
   harness; `bench_rowarg`/`bench_colarg` write an **i32 index** into the f32 output slots and cross-check
   by reinterpreting the bits as i32 (exact), since a per-row/column arg-selection is a deterministic
   permutation, not a reassociated float reduction.
+- `bench_model` (`src/model.rs`) — the **end-to-end model** benchmark: one full CPU inference forward
+  over a GPT-2 124M-shaped stack (12 pre-LN decoder blocks — MH causal attention + GELU MLP + residuals —
+  plus the final LayerNorm) at d_model=768/heads=12/d_ff=3072, S=128 and S=512. The Mercury block is
+  ordinary source (adapted from `examples/gpt2.mer`) whose sub-ops are spelled in recognized forms, so one
+  block dispatches 6× `sgemm_nt` + 1× `sgemm_nt_alpha` (scaled QKᵀ) + 1× `sgemm_nt_epi` (fused GELU FFN) +
+  2× `norm_affine_f32` + 1× `norm_f32` (batched softmax) + 2× `velem_f32` — and the bench **scans the
+  optimized MIR and prints that dispatch set** (recognizers are gate-blind, so a silent regression would
+  otherwise time scalar loops). The **layer loop lives in the harness** for both languages (one block fn
+  called 12× with per-layer weight pointers, ping-ponged activations, host-allocated shared scratch);
+  attention runs per head over contiguous extracted slices in both. C peer = same computation as one
+  competent TU at the suite's standard flags; `C(fast)` = same source with `-ffast-math` (the `llama2.c
+  -Ofast` basis; reassociates + vectorizes the dots). Naive-dot C is skipped at S=512 by default
+  (`XBENCH_MODEL_NAIVE` forces it — tens of seconds per forward). Reported as ms/forward, ms/layer,
+  tokens/sec; timed with `time_forward` (best-of-N sized for 0.1–60 s calls). Cross-checks: Mercury vs C
+  full-buffer `max_rel_err < 1e-3` (12 layers of reassociation + poly-vs-libm compound), serial vs
+  `@parallel` ≈ exact, and an **in-benchmark interpreter gate**: the oracle runs the identical 12-layer
+  forward at a reduced config (S=16/D=64/H=4/Dff=256) and must match the JIT **bit-for-bit** (this is why
+  the crate depends on `mercury_interp`). Known asymmetry (disclosed in the module doc): `@parallel` is
+  only partially multicore — embedded plain matmul nests are emitted serial
+  (`lower_for` hardcodes `emit_sgemm(&nest, false)`), so only the norms + fused-GELU GEMM go `_parallel`.
 - `bench_softmax_bwd` (+ `mer_softmax_bwd`/`c_softmax_bwd`/`rust_softmax_bwd`) — the attention/classifier
   training gradient `dx[r,i] = y[r,i]·(dy[r,i] − Σ_j y[r,j]·dy[r,j])` over a `[R,C]` batch, at
   1024×1024 / 4096×512. Uses **all three** harness pointers (`y, dy, dx` — no unused middle). Mercury
@@ -97,8 +119,9 @@ JIT-compiled in-process. Results and methodology live in `BENCHMARKS.md`.
 
 ## Connects to
 Upstream: `mercury_span`, `mercury_parser`, `mercury_sema`, `mercury_mir_build`, `mercury_opt`,
-`mercury_codegen_cranelift` (JIT), plus `libloading` (load C/C++/Rust shared libs). Leaf binary; nothing
-depends on it.
+`mercury_codegen_cranelift` (JIT), `mercury_mir` (printing optimized MIR for `bench_model`'s dispatch
+scan), `mercury_interp` (the in-benchmark interpreter gate in `bench_model`), plus `libloading`
+(load C/C++/Rust shared libs). Leaf binary; nothing depends on it.
 
 ## Gotchas
 - **Fairness:** Mercury now contracts `x + y*z` to a fused multiply-add, so gcc gets its *default*
