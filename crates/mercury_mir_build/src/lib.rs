@@ -8882,10 +8882,15 @@ impl FnLowerer<'_> {
     }
 
     fn lower_for(&mut self, label: Option<Symbol>, pat: &Pattern, iter: &ForIter, body: &Block) {
-        // A matmul nest lowers to the tuned microkernel (single-threaded on this statement path; the
-        // whole-function `@parallel` form is handled earlier in `lower_program`).
+        // A matmul nest lowers to the tuned microkernel. Inside a `@parallel` fn the multicore
+        // kernel is selected like every sibling recognizer on this statement path (i8gemm, lowp,
+        // norms) — this was hardcoded `false`, so a multi-statement `@parallel` transformer block
+        // ran its six plain GEMMs serial while the norms went multicore (measured ≈serial to ~2x
+        // SLOWER via the package-clock penalty of the partial bursts). The parallel GEMM is
+        // bit-identical to serial (fixed chunking), so the differential gate is unaffected. The
+        // whole-function single-statement form is still intercepted earlier in `lower_program`.
         if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
-            if self.emit_sgemm(&nest, false) {
+            if self.emit_sgemm(&nest, self.parallel_fn) {
                 return;
             }
         }
