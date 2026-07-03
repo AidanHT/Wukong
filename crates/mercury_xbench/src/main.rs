@@ -658,59 +658,36 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     };
 
     // Measurement ordering is thermal hygiene (the honesty law). On this hybrid laptop a multi-second
-    // all-core or naive-scalar run heat-throttles the chip for ~seconds after it, so WHO RUNS BEFORE
-    // WHOM decides whether a peer ratio is fair. Three groups, coolest-first:
-    //  (1) single-core peers adjacent — Mer(1c), MKL(1c), tuned — each internally warmed and cheap
-    //      (one core barely heats the package even at 2048³), so the Mer/MKL 1-core ratio is taken in
-    //      the same near-cold state at EVERY size. The old order ran MKL(1c) *last*, after the all-core
-    //      burst + both naive nests, throttling it to a bogus 32 GFLOP/s at 4096³ (< its own 2048³).
-    //  (2) all-core peers adjacent — Mer(par) then MKL(all) — both in the same warm state, so thermal
-    //      cancels in their ratio even when the absolute GFLOP/s is throttled.
-    //  (3) the naive C/Rust nests LAST (they are the dominant heat source — multi-second scalar triple
-    //      loops) so they pollute no library peer, and are skipped at ≥2048³ where a single call is tens
-    //      of seconds (their win is already overwhelming and widening at ≤1024³; set XBENCH_NAIVE_HUGE
-    //      to force them). At those sizes correctness is cross-checked against MKL instead of C.
+    // all-core run heat-throttles the chip for ~seconds after it, so WHO RUNS BEFORE WHOM decides
+    // whether a peer ratio is fair. Two groups, coolest-first:
+    //  (1) the single-core group — Mer(1c), MKL(1c), tuned, then the naive C/Rust/C(fast) nests —
+    //      each internally warmed and single-threaded (one core barely heats the package even at
+    //      2048³), so every single-core peer is measured in the same near-cold state. Mer(1c) and
+    //      MKL(1c) stay ADJACENT at the head (the documented MKL(1c) protection: the old order once
+    //      ran MKL(1c) *last*, after the all-core burst + naive nests, throttling it to a bogus
+    //      32 GFLOP/s at 4096³). The naive nests were previously measured dead-LAST — *after* the
+    //      all-core Mer(par)/MKL(all) bursts — so they could run heat-throttled, which understated
+    //      them and overstated Mercury's ratio (the fairness-audit finding). They now close out the
+    //      single-core group: measured in the same thermal group as Mer(1c), before any all-core
+    //      burst, and after the library peers so their long scalar runs pollute no library number.
+    //      They are still skipped at ≥2048³ where a single call is tens of seconds (their loss is
+    //      already overwhelming and widening at ≤1024³; set XBENCH_NAIVE_HUGE to force them) — there
+    //      correctness is cross-checked against MKL instead of C.
+    //  (2) the all-core group — MKL(all), then C(omp), then Mer(par) LAST. Mer(1c)/tuned/naive use
+    //      serial kernels that never touch rayon, so rayon's global pool is still DORMANT when
+    //      MKL(all) runs: otherwise-idle cores, no rival thread pool, the coolest available all-core
+    //      state (its documented protection — the only heat before it is single-core heat). Mer(par)
+    //      runs after every peer, inheriting whatever residual heat exists, so the Mer/MKL and
+    //      Mer/C(omp) all-core ratios are CONSERVATIVE lower bounds on Mercury — we throttle
+    //      ourselves, never the competitor, the honest direction when two all-core runs cannot both
+    //      be cool. (An earlier interleaved A/B timer was reproducibility-fragile: alternating two
+    //      live thread pools thrashes the OS scheduler and MKL's OpenMP workers park between blocks,
+    //      reading a bogus sub-1-thread number.)
     let mer = bench_mercury(&mer_matmul(ns, false), &mut c, ap, bp, cp);
     let mkl_1c = bench_mm_mkl(ns, false, 1, &a, &b, &mut c);
     let tuned = bench_mm_tuned(ns, false, &a, &b, &mut c);
-    // All-core peers, sequential, MKL(all) measured FIRST — the ordering that is clean AND honest on a
-    // throttling laptop. Mer(1c)/tuned above use serial kernels that never touch rayon, so rayon's
-    // global pool is still DORMANT here: MKL(all) runs on otherwise-idle cores (no rival thread pool
-    // is spinning) in the coolest available state, so its number is trustworthy. Mer(par) runs *after*,
-    // spinning up rayon only once MKL is done; if anything it inherits MKL's residual heat. So the
-    // Mer/MKL all-core ratio is a CONSERVATIVE lower bound on Mercury — we throttle ourselves, never
-    // the competitor, the honest direction when two all-core runs cannot both be cool. (An earlier
-    // interleaved A/B timer was reproducibility-fragile: alternating two live thread pools thrashes the
-    // OS scheduler and MKL's OpenMP workers park between blocks, reading a bogus sub-1-thread number.)
-    let mkl_all = mkl()
-        .map(|api| api.max_threads)
-        .and_then(|t| bench_mm_mkl(ns, false, t, &a, &b, &mut c));
     let run_naive = ns < 2048 || std::env::var("XBENCH_NAIVE_HUGE").is_ok();
-    // All-core C(omp) peer (the naive ikj source + `#pragma omp parallel for` on the row loop):
-    // measured inside the all-core group and BEFORE Mer(par), so any residual heat lands on
-    // Mercury, never the peer — the same throttle-ourselves direction as the MKL(all)/Mer(par)
-    // ordering. Gated like the other naive-source peers (multi-second per call at ≥2048³).
-    let comp = if run_naive {
-        omp_threads(cc, dir)
-            .and_then(|_| {
-                bench_external(
-                    "c",
-                    &c_matmul_omp(ns),
-                    dir,
-                    "matmul_omp",
-                    cc,
-                    C_OMP_FLAGS,
-                    &mut c,
-                    ap,
-                    bp,
-                    cp,
-                )
-            })
-            .filter(|p| mer.as_ref().is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p)))
-    } else {
-        None
-    };
-    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
+    // Naive single-core peers — the tail of the single-core group (see the ordering comment).
     let (cm, rm, cfast) = if run_naive {
         let cm = bench_external(
             "c",
@@ -744,6 +721,34 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     } else {
         (None, None, None)
     };
+    // The all-core group: MKL(all) first (coolest), then C(omp), then Mer(par) last.
+    let mkl_all = mkl()
+        .map(|api| api.max_threads)
+        .and_then(|t| bench_mm_mkl(ns, false, t, &a, &b, &mut c));
+    // All-core C(omp) peer (the naive ikj source + `#pragma omp parallel for` on the row loop):
+    // measured inside the all-core group and BEFORE Mer(par), so any residual heat lands on
+    // Mercury, never the peer. Gated like the other naive-source peers (multi-second at ≥2048³).
+    let comp = if run_naive {
+        omp_threads(cc, dir)
+            .and_then(|_| {
+                bench_external(
+                    "c",
+                    &c_matmul_omp(ns),
+                    dir,
+                    "matmul_omp",
+                    cc,
+                    C_OMP_FLAGS,
+                    &mut c,
+                    ap,
+                    bp,
+                    cp,
+                )
+            })
+            .filter(|p| mer.as_ref().is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p)))
+    } else {
+        None
+    };
+    let mer_par = bench_mercury(&mer_matmul(ns, true), &mut c, ap, bp, cp);
 
     println!(
         "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
