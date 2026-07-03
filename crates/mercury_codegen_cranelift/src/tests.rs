@@ -3880,6 +3880,44 @@ fn matmul_nest_lowers_to_sgemm() {
     );
 }
 
+/// An embedded matmul nest inside a MULTI-statement `@parallel` fn must pick the multicore
+/// kernel from the statement path (`lower_for` passes `self.parallel_fn`, like its i8/lowp/norm
+/// siblings) — it was hardcoded serial, so a `@parallel` transformer block ran its six plain
+/// GEMMs on one core while the norms went multicore (measured ≈serial to ~2× slower overall via
+/// the package-clock penalty). The parallel kernel is bit-identical to serial (fixed chunking),
+/// pinned by the native-vs-interp differential across opt levels.
+#[test]
+fn embedded_parallel_matmul_dispatches_multicore() {
+    // Two top-level statements (a zero-fill loop + the matmul nest), so the single-statement
+    // whole-function interceptor declines and lower_for's statement path does the recognition.
+    let mm = "@parallel\nfn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) { \
+         for s in 0..64 { c[s] = 0.0; } \
+         for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
+         for j in 0..8 { c[i*8+j] = c[i*8+j] + aik * b[k*8+j]; } } } }";
+    let src = format!("module m\n{mm}");
+    assert!(
+        lowered_calls(&src, "mercury_sgemm_parallel"),
+        "embedded matmul in a multi-statement @parallel fn -> sgemm_parallel"
+    );
+    let full = format!(
+        "module m\n{mm}\n\
+         fn main() -> i32 {{ let mut a:[f32;64]=[0.0;64]; let mut b:[f32;64]=[0.0;64]; \
+         let mut c:[f32;64]=[0.0;64]; \
+         for i in 0..64 {{ a[i] = ((i % 7) as f32) * 0.31; b[i] = ((i % 5) as f32) * 0.17 - 0.4; }} \
+         mm(a,b,c); let mut s: f32 = 0.0; \
+         for i in 0..64 {{ s = s + c[i] * ((i % 3) as f32); }} \
+         return (s * 100.0) as i32; }}"
+    );
+    for opt in [0u8, 2, 3] {
+        let n = jit(&full, opt).expect("jit");
+        let i = interp(&full, opt).expect("interp");
+        assert_eq!(
+            n, i,
+            "embedded @parallel matmul: native vs interp mismatch at -O{opt}"
+        );
+    }
+}
+
 /// The nn.Linear form `C = A·Bᵀ` (B indexed `[j*K+k]`) must lower to `mercury_sgemm_nt`, run
 /// correctly, and stay native==interp. A plain `C = A·B` must NOT pick the transposed kernel.
 #[test]
