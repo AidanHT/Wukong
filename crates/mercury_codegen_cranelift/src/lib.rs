@@ -127,6 +127,10 @@ const RT_SGEMM_NT_EPI: &str = "mercury_sgemm_nt_epi";
 const RT_SGEMM_NT_EPI_PAR: &str = "mercury_sgemm_nt_epi_parallel";
 const RT_SGEMV: &str = "mercury_sgemv";
 const RT_SGEMV_PAR: &str = "mercury_sgemv_parallel";
+const RT_SGEMV_ALPHA: &str = "mercury_sgemv_alpha";
+const RT_SGEMV_ALPHA_PAR: &str = "mercury_sgemv_alpha_parallel";
+const RT_SGEVM: &str = "mercury_sgevm_f32";
+const RT_SGEVM_PAR: &str = "mercury_sgevm_f32_parallel";
 const RT_SGEMM_NT_ALPHA: &str = "mercury_sgemm_nt_alpha";
 const RT_SGEMM_NT_ALPHA_PAR: &str = "mercury_sgemm_nt_alpha_parallel";
 const RT_SGEMM_BF16_NT_EPI: &str = "mercury_sgemm_bf16_nt_epi";
@@ -1118,6 +1122,24 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[a, x, y, m, n]);
             return None;
         }
+        // α-scaled GEMV: mercury_sgemv_alpha[_parallel](a, x, y, m, n, alpha), and the vector·matrix
+        // mercury_sgevm_f32[_parallel](w, a, out, rows, cols, alpha) — the same three pointers, two
+        // i64, and one trailing f32 scale by value (like the α-scaled GEMM's alpha). Route by name. Void.
+        if matches!(
+            name,
+            RT_SGEMV_ALPHA | RT_SGEMV_ALPHA_PAR | RT_SGEVM | RT_SGEVM_PAR
+        ) && args.len() == 6
+        {
+            let a = self.val(args[0]);
+            let x = self.val(args[1]);
+            let y = self.val(args[2]);
+            let m = self.coerce_to_i64(args[3]);
+            let n = self.coerce_to_i64(args[4]);
+            let alpha = self.val(args[5]);
+            let fref = self.rt_refs[name];
+            self.builder.ins().call(fref, &[a, x, y, m, n, alpha]);
+            return None;
+        }
         // α-scaled Linear: mercury_sgemm_nt_alpha[_parallel](a, b, c, m, k, n, beta, alpha) — three
         // pointers, four i64, and one f32 scalar `alpha` (passed by value, like the i8 dequant scale).
         if matches!(name, RT_SGEMM_NT_ALPHA | RT_SGEMM_NT_ALPHA_PAR) && args.len() == 8 {
@@ -1772,6 +1794,10 @@ struct RtFuncs {
     sgemm_nt_epi_par: FuncId,
     sgemv: FuncId,
     sgemv_par: FuncId,
+    sgemv_alpha: FuncId,
+    sgemv_alpha_par: FuncId,
+    gevm: FuncId,
+    gevm_par: FuncId,
     sgemm_nt_alpha: FuncId,
     sgemm_nt_alpha_par: FuncId,
     sgemm_bf16_nt_epi: FuncId,
@@ -1989,6 +2015,17 @@ fn populate_module<M: Module>(
     for _ in 0..2 {
         sig_gemv.params.push(AbiParam::new(types::I64));
     }
+    // mercury_sgemv_alpha[_parallel](a, x, y: ptr, m, n: i64, alpha: f32) — the α-scaled GEMV, and
+    // the same 3-ptr + 2-i64 + trailing-f32 shape for mercury_sgevm_f32[_parallel](w, a, out, rows,
+    // cols, alpha), the vector·matrix product. Void.
+    let mut sig_gemv_alpha = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_gemv_alpha.params.push(AbiParam::new(ptr_ty));
+    }
+    for _ in 0..2 {
+        sig_gemv_alpha.params.push(AbiParam::new(types::I64));
+    }
+    sig_gemv_alpha.params.push(AbiParam::new(types::F32)); // alpha
     // mercury_sgemm_nt_alpha[_parallel](a, b, c: ptr, m, k, n, beta: i64, alpha: f32) — α-scaled Linear.
     let mut sig_gemm_alpha = Signature::new(call_conv);
     for _ in 0..3 {
@@ -2244,6 +2281,18 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         sgemv_par: module
             .declare_function(RT_SGEMV_PAR, Linkage::Import, &sig_gemv)
+            .map_err(|e| e.to_string())?,
+        sgemv_alpha: module
+            .declare_function(RT_SGEMV_ALPHA, Linkage::Import, &sig_gemv_alpha)
+            .map_err(|e| e.to_string())?,
+        sgemv_alpha_par: module
+            .declare_function(RT_SGEMV_ALPHA_PAR, Linkage::Import, &sig_gemv_alpha)
+            .map_err(|e| e.to_string())?,
+        gevm: module
+            .declare_function(RT_SGEVM, Linkage::Import, &sig_gemv_alpha)
+            .map_err(|e| e.to_string())?,
+        gevm_par: module
+            .declare_function(RT_SGEVM_PAR, Linkage::Import, &sig_gemv_alpha)
             .map_err(|e| e.to_string())?,
         sgemm_nt_alpha: module
             .declare_function(RT_SGEMM_NT_ALPHA, Linkage::Import, &sig_gemm_alpha)
@@ -2804,6 +2853,19 @@ fn populate_module<M: Module>(
             rt_refs.insert(
                 RT_SGEMV_PAR,
                 module.declare_func_in_func(rt.sgemv_par, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMV_ALPHA,
+                module.declare_func_in_func(rt.sgemv_alpha, builder.func),
+            );
+            rt_refs.insert(
+                RT_SGEMV_ALPHA_PAR,
+                module.declare_func_in_func(rt.sgemv_alpha_par, builder.func),
+            );
+            rt_refs.insert(RT_SGEVM, module.declare_func_in_func(rt.gevm, builder.func));
+            rt_refs.insert(
+                RT_SGEVM_PAR,
+                module.declare_func_in_func(rt.gevm_par, builder.func),
             );
             rt_refs.insert(
                 RT_SGEMM_NT_ALPHA,
@@ -3491,6 +3553,19 @@ pub fn jit_compile(
         mercury_runtime::mercury_sgemv_parallel as *const u8,
     );
     builder.symbol(
+        RT_SGEMV_ALPHA,
+        mercury_runtime::mercury_sgemv_alpha as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMV_ALPHA_PAR,
+        mercury_runtime::mercury_sgemv_alpha_parallel as *const u8,
+    );
+    builder.symbol(RT_SGEVM, mercury_runtime::mercury_sgevm_f32 as *const u8);
+    builder.symbol(
+        RT_SGEVM_PAR,
+        mercury_runtime::mercury_sgevm_f32_parallel as *const u8,
+    );
+    builder.symbol(
         RT_SGEMM_NT_ALPHA,
         mercury_runtime::mercury_sgemm_nt_alpha as *const u8,
     );
@@ -4028,6 +4103,19 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(
         RT_SGEMV_PAR,
         mercury_runtime::mercury_sgemv_parallel as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMV_ALPHA,
+        mercury_runtime::mercury_sgemv_alpha as *const u8,
+    );
+    builder.symbol(
+        RT_SGEMV_ALPHA_PAR,
+        mercury_runtime::mercury_sgemv_alpha_parallel as *const u8,
+    );
+    builder.symbol(RT_SGEVM, mercury_runtime::mercury_sgevm_f32 as *const u8);
+    builder.symbol(
+        RT_SGEVM_PAR,
+        mercury_runtime::mercury_sgevm_f32_parallel as *const u8,
     );
     builder.symbol(
         RT_SGEMM_NT_ALPHA,

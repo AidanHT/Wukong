@@ -1,0 +1,80 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 225
+// EXPECT-OUT: 43
+// EXPECT-OUT: 100
+// EXPECT-OUT: 450
+// EXPECT-OUT: 87
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 175
+// EXPECT-OUT: 400
+module tests.run.gemv_scaled
+
+/// α-scaled GEMV — the single-token KV-decode attention score `scores = (K·q)·scale`
+/// (`scale = 1/√d`), written the idiomatic per-row-dot way with a loop-invariant scale on the
+/// store. Without the α peel the `* 0.125` blocks the GEMV recognizer and the whole nest falls to
+/// a scalar loop; here it dispatches to `mercury_sgemv_alpha`, which computes the identical row
+/// dot and applies the scale exactly once on the store (the same single multiply the scalar store
+/// performs). `--run` marshals that same kernel through the interpreter, so this gates
+/// interp == native and -O0 == -O3 on the scaled path. All inputs are exactly-representable
+/// halves/quarters, so every dot is exact under any association and the printed values are pinned.
+///
+/// q = [1, -2, 0.5, 4]; K rows [2,3,4,5] / [1,1,1,1] / [0.5,0.25,8,1] ⇒ dots 18 / 3.5 / 8.
+fn scaled_scores(k: [f32; 12], q: [f32; 4], mut scores: [f32; 3]) {
+    for s in 0..3 {
+        let mut acc: f32 = 0.0;
+        for d in 0..4 {
+            acc = acc + k[s * 4 + d] * q[d];
+        }
+        scores[s] = acc * 0.125;
+    }
+}
+
+/// The scale bound by a prior non-`mut` `let` (the natural `let scale = …` idiom) dispatches too —
+/// the α rides into the kernel as a runtime f32 value (either factor order on the store).
+fn scaled_scores_let(k: [f32; 12], q: [f32; 4], mut scores: [f32; 3]) {
+    let scale: f32 = 0.25;
+    for s in 0..3 {
+        let mut acc: f32 = 0.0;
+        for d in 0..4 {
+            acc = acc + k[s * 4 + d] * q[d];
+        }
+        scores[s] = scale * acc;
+    }
+}
+
+/// A top-level `const` scale (the near-universal transformer spelling) resolves through
+/// `sema.consts` and dispatches with the literal folded in.
+const SCALE: f32 = 0.5;
+
+fn scaled_scores_const(k: [f32; 12], q: [f32; 4], mut scores: [f32; 3]) {
+    for s in 0..3 {
+        let mut acc: f32 = 0.0;
+        for d in 0..4 {
+            acc = acc + k[s * 4 + d] * q[d];
+        }
+        scores[s] = acc * SCALE;
+    }
+}
+
+fn main() -> i32 {
+    let k: [f32; 12] = [2.0, 3.0, 4.0, 5.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.25, 8.0, 1.0];
+    let q: [f32; 4] = [1.0, -2.0, 0.5, 4.0];
+    let mut s1: [f32; 3] = [0.0; 3];
+    scaled_scores(k, q, s1);
+    print((s1[0] * 100.0) as i32); // 18·0.125  = 2.25   -> 225
+    print((s1[1] * 100.0) as i32); // 3.5·0.125 = 0.4375 -> 43
+    print((s1[2] * 100.0) as i32); // 8·0.125   = 1.0    -> 100
+    let mut s2: [f32; 3] = [0.0; 3];
+    scaled_scores_let(k, q, s2);
+    print((s2[0] * 100.0) as i32); // 18·0.25  = 4.5   -> 450
+    print((s2[1] * 100.0) as i32); // 3.5·0.25 = 0.875 -> 87
+    print((s2[2] * 100.0) as i32); // 8·0.25   = 2.0   -> 200
+    let mut s3: [f32; 3] = [0.0; 3];
+    scaled_scores_const(k, q, s3);
+    print((s3[0] * 100.0) as i32); // 18·0.5  = 9.0  -> 900
+    print((s3[1] * 100.0) as i32); // 3.5·0.5 = 1.75 -> 175
+    print((s3[2] * 100.0) as i32); // 8·0.5   = 4.0  -> 400
+    return 0;
+}

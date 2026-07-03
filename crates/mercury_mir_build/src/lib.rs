@@ -692,6 +692,8 @@ pub fn lower_program(
         nt_epi_par: interner.intern("mercury_sgemm_nt_epi_parallel"),
         sgemv: interner.intern("mercury_sgemv"),
         sgemv_par: interner.intern("mercury_sgemv_parallel"),
+        sgemv_alpha: interner.intern("mercury_sgemv_alpha"),
+        sgemv_alpha_par: interner.intern("mercury_sgemv_alpha_parallel"),
         nt_alpha: interner.intern("mercury_sgemm_nt_alpha"),
         nt_alpha_par: interner.intern("mercury_sgemm_nt_alpha_parallel"),
         vmath: interner.intern("mercury_vmath_f32"),
@@ -1686,6 +1688,14 @@ struct GemmSyms {
     /// saturate aggregate memory bandwidth. Bit-identical to the serial `sgemv` the interpreter calls
     /// (each row computed by the same per-row routine, no cross-row combine), so the gate stays exact.
     sgemv_par: Symbol,
+    /// The α-scaled GEMV (`mercury_sgemv_alpha(a, x, y, m, n, alpha)`): a recognized GEMV nest whose
+    /// store is `y[i] = s * c` (`c` a loop-invariant f32 scale) — the decode-time attention score
+    /// `scores = (K·q)·(1/√d)`. The kernel computes the identical row dot as `sgemv` and applies the
+    /// scale exactly once on the store, just as the scalar nest does.
+    sgemv_alpha: Symbol,
+    /// The multicore α-scaled GEMV (`mercury_sgemv_alpha_parallel`). Bit-identical to the serial
+    /// `sgemv_alpha` the interpreter calls (rows independent, no cross-row combine).
+    sgemv_alpha_par: Symbol,
     /// The α-scaled `nn.Linear` kernel (`mercury_sgemm_nt_alpha(a, b, c, m, k, n, beta, alpha)`):
     /// `C = alpha·(A·Bᵀ)` — the attention score matmul `QKᵀ/√d` and every scaled projection, where a
     /// loop-invariant scalar `alpha` multiplies the dot in the C-tile writeback (fused, no second pass).
@@ -6754,14 +6764,8 @@ impl FnLowerer<'_> {
             if !(nest.transposed && !nest.transposed_a) {
                 return false;
             }
-            let alpha_v = match alpha {
-                AlphaScale::Lit(f) => self
-                    .builder
-                    .build(MirType::F32, Op::ConstFloat(f as f64, MirType::F32)),
-                AlphaScale::Sym(s) => match self.lookup(s) {
-                    Some((slot, ty)) => self.builder.build(ty.clone(), Op::Load(slot, ty)),
-                    None => return false,
-                },
+            let Some(alpha_v) = self.alpha_value(alpha) else {
+                return false;
             };
             let func = if parallel {
                 self.gemm.nt_alpha_par
@@ -6791,10 +6795,38 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// Materialize a peeled α scale as an f32 value: a literal builds a `ConstFloat`; a symbol loads
+    /// its slot — or, when it names no local at all, resolves a top-level `const SCALE: f32 =
+    /// <literal>` through `sema.consts` (the same shadowing rule as `eps_lit_bits` and the `Path`
+    /// value lowering: an in-scope local always wins). `None` — the caller falls back to the scalar
+    /// nest — if the symbol is neither (e.g. the nest-internal accumulator, out of scope here).
+    fn alpha_value(&mut self, alpha: AlphaScale) -> Option<ValueId> {
+        match alpha {
+            AlphaScale::Lit(f) => Some(
+                self.builder
+                    .build(MirType::F32, Op::ConstFloat(f as f64, MirType::F32)),
+            ),
+            AlphaScale::Sym(s) => {
+                if let Some((slot, ty)) = self.lookup(s) {
+                    return Some(self.builder.build(ty.clone(), Op::Load(slot, ty)));
+                }
+                let init = self.sema.consts.get(&s)?;
+                let bits = self.float_lit_bits(init)? as u32;
+                Some(self.builder.build(
+                    MirType::F32,
+                    Op::ConstFloat(f32::from_bits(bits) as f64, MirType::F32),
+                ))
+            }
+        }
+    }
+
     /// Emit one `mercury_sgemv[_parallel](a, x, y, m, n)` call for a recognized GEMV nest
-    /// (`y[i] = Σ_j a[i,j]·x[j]`). Bails (false) if an operand/dim is unbound at the call site, so the
-    /// caller lowers the scalar nest. `parallel` selects the multicore kernel (rows independent → the
-    /// per-row routine is bit-identical serial vs parallel, which the interpreter marshals as the oracle).
+    /// (`y[i] = Σ_j a[i,j]·x[j]`), or the α-scaled `mercury_sgemv_alpha[_parallel](a, x, y, m, n,
+    /// alpha)` when the store carries a loop-invariant scale (`y[i] = s * c`). Bails (false) if an
+    /// operand/dim/scale is unbound at the call site, so the caller lowers the scalar nest. `parallel`
+    /// selects the multicore kernel (rows independent → the per-row routine is bit-identical serial vs
+    /// parallel, which the interpreter marshals as the oracle). The unscaled form emits the exact
+    /// pre-α call, so existing GEMV MIR is byte-identical.
     fn emit_gemv(&mut self, nest: &GemvNest, parallel: bool) -> bool {
         let (Some((a, _)), Some((x, _)), Some((y, _))) = (
             self.lookup(nest.a),
@@ -6806,6 +6838,23 @@ impl FnLowerer<'_> {
         let (Some(m), Some(n)) = (self.dim_value(nest.m), self.dim_value(nest.n)) else {
             return false;
         };
+        // α-scaled store `y[i] = s * c` → `mercury_sgemv_alpha`: the identical row dot with the scale
+        // applied exactly once on the store (the same single f32 multiply the scalar nest performs).
+        if let Some(alpha) = nest.alpha {
+            let Some(alpha_v) = self.alpha_value(alpha) else {
+                return false;
+            };
+            let func = if parallel {
+                self.gemm.sgemv_alpha_par
+            } else {
+                self.gemm.sgemv_alpha
+            };
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![a, x, y, m, n, alpha_v],
+            });
+            return true;
+        }
         let func = if parallel {
             self.gemm.sgemv_par
         } else {
@@ -18939,14 +18988,18 @@ fn match_matmul<'a>(
     })
 }
 
-/// A recognized GEMV nest `y[i] = Σ_j a[i*N+j]·x[j]` (`a` row-major `[M,N]`, `x` length `N`, `y`
-/// length `M`) — the batch-1 attention/projection shape (`nn.Linear` on a single token).
+/// A recognized GEMV nest `y[i] = [c ·] Σ_j a[i*N+j]·x[j]` (`a` row-major `[M,N]`, `x` length `N`,
+/// `y` length `M`) — the batch-1 attention/projection shape (`nn.Linear` on a single token).
 struct GemvNest {
     a: Symbol,
     x: Symbol,
     y: Symbol,
     m: Dim,
     n: Dim,
+    /// A loop-invariant f32 scale peeled off the store `y[i] = s * c` (`None` for the plain
+    /// `y[i] = s`) — the decode-attention score `scores = (K·q)·(1/√d)`, the same peel as the
+    /// α-scaled GEMM (`match_store_scale`). `emit_gemv` routes it to `mercury_sgemv_alpha`.
+    alpha: Option<AlphaScale>,
 }
 
 /// Match one multiplicand pair of a GEMV product: `a_e` is `a[row*N + jvar]` (row-major, stride `N`)
@@ -19063,7 +19116,9 @@ fn match_gemv(
     // `a[i*N+j] * x[j]` in either factor order.
     let (a_sym, x_sym) = match_gemv_operands(lhs, rhs, row, jvar, n, interner)
         .or_else(|| match_gemv_operands(rhs, lhs, row, jvar, n, interner))?;
-    // Final store: y[i] = s.
+    // Final store: y[i] = s, or the α-scaled `y[i] = s * c` / `c * s` (`c` a loop-invariant f32
+    // scale — the decode-attention `(K·q)·(1/√d)`), the same peel as the α-scaled GEMM. Any other
+    // store value declines the whole nest to the scalar/vectorized path.
     let StmtKind::Assign {
         target: yt,
         op: ast::AssignOp::Assign,
@@ -19072,9 +19127,7 @@ fn match_gemv(
     else {
         return None;
     };
-    if single_path(yv) != Some(s_sym) {
-        return None;
-    }
+    let alpha = match_store_scale(yv, s_sym, &[row, jvar], sema, interner)?;
     let (y_sym, y_idx) = as_index1(yt)?;
     if single_path(y_idx) != Some(row) {
         return None;
@@ -19089,6 +19142,7 @@ fn match_gemv(
         y: y_sym,
         m,
         n,
+        alpha,
     })
 }
 

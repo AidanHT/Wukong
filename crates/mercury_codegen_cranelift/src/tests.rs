@@ -4357,3 +4357,110 @@ fn parallel_for_matches_interpreter() {
         );
     }
 }
+
+/// The α-scaled GEMV store `y[i] = s * c` (`c` a literal, a prior non-`mut` `let`, or a top-level
+/// `const`) must dispatch to `mercury_sgemv_alpha` (the `@parallel` form to its `_parallel` twin),
+/// while the plain store keeps the exact pre-α `mercury_sgemv` call (its MIR is byte-identical —
+/// verified against a pre-change dump); a store that is NOT `s * c` must not dispatch at all.
+/// Differential: fractional inputs across -O0/-O2/-O3 must be native == interp (both backends
+/// marshal the identical `mercury_sgemv_alpha` kernel), and an exact-arithmetic golden case pins
+/// the value (all inputs halves/quarters, so the dot is exact under any association).
+#[test]
+fn scaled_gemv_dispatches_and_matches() {
+    let scaled = |attr: &str, store: &str| {
+        format!(
+            "module m\n{attr}fn scores(k: [f32; 256], q: [f32; 32], mut y: [f32; 8]) {{ \
+             for i in 0..8 {{ let mut acc: f32 = 0.0; \
+             for d in 0..32 {{ acc = acc + k[i*32+d]*q[d]; }} \
+             y[i] = {store}; }} }}"
+        )
+    };
+    assert!(
+        lowered_calls(&scaled("", "acc * 0.125"), "mercury_sgemv_alpha"),
+        "literal-scaled store -> mercury_sgemv_alpha"
+    );
+    assert!(
+        lowered_calls(
+            &scaled("@parallel\n", "acc * 0.125"),
+            "mercury_sgemv_alpha_parallel"
+        ),
+        "@parallel scaled store -> mercury_sgemv_alpha_parallel"
+    );
+    // The plain store still emits the exact unscaled call.
+    assert!(
+        lowered_calls(&scaled("", "acc"), "mercury_sgemv"),
+        "plain store -> mercury_sgemv"
+    );
+    assert!(
+        !lowered_calls(&scaled("", "acc"), "mercury_sgemv_alpha"),
+        "plain store must not pick the alpha kernel"
+    );
+    // A store that is not `acc * c` must not dispatch (falls to the scalar/vectorized nest, which
+    // computes it correctly) — never an unscaled kernel that would silently drop the `+ 0.125`.
+    assert!(
+        !lowered_calls(&scaled("", "acc + 0.125"), "mercury_sgemv")
+            && !lowered_calls(&scaled("", "acc + 0.125"), "mercury_sgemv_alpha"),
+        "an additive store is not a scaled GEMV"
+    );
+    // A per-row (loop-variant) scale must not dispatch either.
+    assert!(
+        !lowered_calls(&scaled("", "acc * q[i]"), "mercury_sgemv_alpha"),
+        "an indexed scale is not loop-invariant"
+    );
+
+    // Differential with fractional inputs (M=9, N=33 straddle the kernel's 32/8 unroll edges).
+    let src = "fn scores(k: [f32; 297], q: [f32; 33], mut y: [f32; 9]) { \
+         for i in 0..9 { let mut acc: f32 = 0.0; \
+         for d in 0..33 { acc = acc + k[i*33+d]*q[d]; } \
+         y[i] = acc * 0.37; } } \
+         fn main() -> i32 { let mut k: [f32; 297] = [0.0; 297]; let mut q: [f32; 33] = [0.0; 33]; \
+         let mut y: [f32; 9] = [0.0; 9]; \
+         for t in 0..297 { k[t] = ((t as f32) * 0.013) - 1.7; } \
+         for t in 0..33 { q[t] = ((t as f32) * 0.11) - 1.3; } \
+         scores(k, q, y); \
+         let mut s: f32 = 0.0; for t in 0..9 { s = s + y[t]; } \
+         print((s * 1000.0) as i32); return 0; }";
+    for opt in [0u8, 2, 3] {
+        assert_eq!(
+            jit(src, opt).expect("jit"),
+            interp(src, opt).expect("interp"),
+            "scaled gemv native vs interp at -O{opt}"
+        );
+    }
+
+    // @parallel differential: M=300 exceeds GEMV_PAR_MIN_ROWS, so the real multicore kernel runs
+    // natively while the interpreter marshals the serial one — bit-identical (rows independent).
+    let par = "@parallel\nfn scores(k: [f32; 4800], q: [f32; 16], mut y: [f32; 300]) { \
+         for i in 0..300 { let mut acc: f32 = 0.0; \
+         for d in 0..16 { acc = acc + k[i*16+d]*q[d]; } \
+         y[i] = acc * 0.37; } } \
+         fn main() -> i32 { let mut k: [f32; 4800] = [0.0; 4800]; let mut q: [f32; 16] = [0.0; 16]; \
+         let mut y: [f32; 300] = [0.0; 300]; \
+         for t in 0..4800 { k[t] = (((t % 37) as f32) * 0.31) - 1.9; } \
+         for t in 0..16 { q[t] = ((t as f32) * 0.17) - 0.9; } \
+         scores(k, q, y); \
+         let mut s: f32 = 0.0; for t in 0..300 { s = s + y[t]; } \
+         print((s * 100.0) as i32); return 0; }";
+    for opt in [0u8, 2] {
+        assert_eq!(
+            jit(par, opt).expect("jit"),
+            interp(par, opt).expect("interp"),
+            "@parallel scaled gemv native vs interp at -O{opt}"
+        );
+    }
+
+    // Exact-arithmetic golden value: dots 18 and 3.5, x0.125 -> 2.25 and 0.4375.
+    let golden = "fn scores(k: [f32; 8], q: [f32; 4], mut y: [f32; 2]) { \
+         for i in 0..2 { let mut acc: f32 = 0.0; \
+         for d in 0..4 { acc = acc + k[i*4+d]*q[d]; } \
+         y[i] = acc * 0.125; } } \
+         fn main() -> i32 { let k: [f32; 8] = [2.0, 3.0, 4.0, 5.0, 1.0, 1.0, 1.0, 1.0]; \
+         let q: [f32; 4] = [1.0, 0.0 - 2.0, 0.5, 4.0]; let mut y: [f32; 2] = [0.0; 2]; \
+         scores(k, q, y); print((y[0] * 100.0) as i32); print((y[1] * 100.0) as i32); return 0; }";
+    let (_, out) = jit(golden, 2).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "225\n43\n",
+        "scaled gemv produced the wrong value"
+    );
+}
