@@ -13,7 +13,7 @@ use mercury_span::{Interner, SourceId, Span, Symbol};
 use TokenKind as T;
 
 mod items;
-pub use items::{parse_module, parse_module_tokens};
+pub use items::{parse_module, parse_module_tokens, parse_module_tokens_from};
 
 /// Parse a standalone expression (for tests and a future REPL).
 pub fn parse_expr_str(
