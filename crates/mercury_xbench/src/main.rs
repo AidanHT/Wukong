@@ -1,7 +1,7 @@
 //! `mercury-xbench` — an honest cross-language benchmark.
 //!
 //! For each kernel it builds the *same* computation three ways — Mercury (compiled to native code
-//! by the Cranelift backend), C (gcc `-O3 -march=native`), and Rust (rustc `-O -C
+//! by the Cranelift backend), C (gcc `-O3 -march=native`), and Rust (rustc `-C opt-level=3 -C
 //! target-cpu=native`) — and times all three through one identical Rust loop over the same
 //! buffers. C/Rust are compiled to shared libraries and called via their C ABI; Mercury is
 //! JIT-compiled in process. It also reports each toolchain's compile time.
@@ -121,7 +121,7 @@ fn main() {
     let _ = std::fs::create_dir_all(&dir);
 
     println!(
-        "Cross-language kernel benchmark — Mercury (native) vs C (gcc -O3) vs Rust (rustc -O)"
+        "Cross-language kernel benchmark — Mercury (native) vs C (gcc -O3) vs Rust (rustc -Copt-level=3)"
     );
     println!("N = {N} f32 elements, single-threaded, -march=native. Lower ns is better.\n");
 
@@ -176,7 +176,7 @@ fn main() {
             &dir,
             k.name,
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             xp,
             yp,
@@ -453,7 +453,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             dir,
             "matmul",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut c,
             ap,
             bp,
@@ -604,7 +604,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             dir,
             "matmul_tn",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut c,
             ap,
             bp,
@@ -725,7 +725,7 @@ fn bench_gemv(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_gemv(m, n), dir, "gemv", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut y, ap, xp, yp,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut y, ap, xp, yp,
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11}",
@@ -824,7 +824,7 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_scaled_scores(s, d), dir, "scaled_gemm", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, qp, kp, op,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, qp, kp, op,
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11}",
@@ -956,7 +956,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             dir,
             "linear",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut c,
             ap,
             bp,
@@ -1081,7 +1081,7 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
             dir,
             "ffn",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut c,
             ap,
             bp,
@@ -1231,7 +1231,7 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
             dir,
             "linear_bf16",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut c,
             ap,
             bp,
@@ -1359,7 +1359,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             dir,
             "transpose",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut dst,
             sp,
             yp,
@@ -1471,7 +1471,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
             dir,
             "colsum",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             xp,
             yp,
@@ -1582,7 +1582,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
             dir,
             "biasadd",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             xp,
             bp,
@@ -1657,7 +1657,7 @@ fn rust_biasadd(r: usize, c: usize) -> String {
 /// cross-check is bit-exact. Sizes past L3 so the streaming-store advantage is exercised.
 fn bench_dequant(cc: &str, dir: &Path) {
     let ext_flags_c = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
-    let ext_flags_rs = ["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"];
+    let ext_flags_rs = ["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"];
 
     // --- 1-D dequant: out[j] = (q[j] as f32)·scale, for i32 and i8 inputs -------------------------
     for (ty, in_bytes, is_i8) in [("i32", 4usize, false), ("i8", 1usize, true)] {
@@ -1748,7 +1748,7 @@ fn dequant_ratio(
     }
     if let (Some(m), Some(rm)) = (mer, rm) {
         let r = rm.ns_per_call / m.ns_per_call;
-        println!("  -> Mercury single-core is {:.2}x {} than Rust (rustc -O)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
+        println!("  -> Mercury single-core is {:.2}x {} than Rust (rustc -Copt-level=3)", if r >= 1.0 { r } else { 1.0 / r }, if r >= 1.0 { "faster" } else { "slower" });
     }
     if let (Some(mp), Some(c)) = (mer_par, cm) {
         let r = c.ns_per_call / mp.ns_per_call;
@@ -1861,7 +1861,7 @@ fn bench_colmax(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -2025,7 +2025,7 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -2151,7 +2151,7 @@ fn bench_colarg(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -2299,7 +2299,7 @@ fn bench_lrscan(cc: &str, dir: &Path) {
             dir,
             "lrscan",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             ap,
             bp,
@@ -2419,7 +2419,7 @@ fn bench_cumprod(cc: &str, dir: &Path) {
             dir,
             "cumprod",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             xp,
             yp,
@@ -2503,7 +2503,7 @@ fn bench_cumsum(cc: &str, dir: &Path) {
             dir,
             "cumsum",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             xp,
             yp,
@@ -2627,7 +2627,7 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -2721,7 +2721,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 dir,
                 label,
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -2858,7 +2858,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             dir,
             "softmax_bwd",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut dx,
             yp,
             dyp,
@@ -2972,7 +2972,7 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
         );
         let rm = bench_external4(
             "rs", &rust_rmsnorm_bwd(r, c), dir, "rmsnorm_bwd", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11}",
@@ -3079,7 +3079,7 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
         );
         let rm = bench_external4(
             "rs", &rust_layernorm_bwd(r, c), dir, "layernorm_bwd", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, dyp, gp, dxp,
         );
         report_ratio("layernorm_bwd", &mer, &mer_par, &cm, &rm, &gbps);
     }
@@ -3165,7 +3165,7 @@ fn bench_xent(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_xent(r, c), dir, "xent", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut loss, xp, tp, lossp,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut loss, xp, tp, lossp,
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11}",
@@ -3272,7 +3272,7 @@ fn bench_rope(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_rope(rows, half), dir, "rope", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, xp, fp, op_,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, xp, fp, op_,
         );
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11}",
@@ -3379,7 +3379,7 @@ fn bench_xent_bwd(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_xent_bwd(r, c), dir, "xent_bwd", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp, dxp,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, xp, tp, dxp,
         );
         report_ratio("xent_bwd", &mer, &mer_par, &cm, &rm, &gbps);
     }
@@ -3453,7 +3453,7 @@ fn bench_rope_bwd(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_rope_bwd(rows, half), dir, "rope_bwd", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, gp, fp, dxp,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut dx, gp, fp, dxp,
         );
         report_ratio("rope_bwd", &mer, &mer_par, &cm, &rm, &gbps);
     }
@@ -3528,7 +3528,7 @@ fn bench_gate(cc: &str, dir: &Path) {
         );
         let rm = bench_external(
             "rs", &rust_gate(n, act), dir, "gate", "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, ap, bp, op_,
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, ap, bp, op_,
         );
         report_ratio("gate", &mer, &mer_par, &cm, &rm, &gbps);
     }
@@ -3630,7 +3630,7 @@ fn bench_row_losses(cc: &str, dir: &Path) {
             );
             let rm = bench_external(
                 "rs", &src_r, dir, label, "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, p0, p1, op_,
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"], &mut out, p0, p1, op_,
             );
             report_ratio(label, &mer, &mer_par, &cm, &rm, &gbps);
         }
@@ -3783,7 +3783,7 @@ fn bench_act_backward(cc: &str, dir: &Path) {
             dir,
             "act_backward",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut dx,
             xp,
             dyp,
@@ -3915,7 +3915,7 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
             dir,
             "i8gemm",
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut c,
             ap,
             bp,
@@ -4084,7 +4084,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
                 dir,
                 "bf16",
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut o,
                 xp,
                 yp,
@@ -4176,7 +4176,7 @@ fn c_bf16(n: usize, is_dot: bool) -> String {
     )
 }
 
-/// Idiomatic Rust bf16 reduction (same `<<16` widen; rustc `-O -Ctarget-cpu=native`, no contraction).
+/// Idiomatic Rust bf16 reduction (same `<<16` widen; rustc `-Copt-level=3 -Ctarget-cpu=native`, no contraction).
 fn rust_bf16(n: usize, is_dot: bool) -> String {
     let term = if is_dot {
         "bf(*x.add(k)) * bf(*y.add(k))"
@@ -4244,7 +4244,7 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
         dir,
         "axpbyhalf",
         "rustc",
-        &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
         &mut oh,
         xp,
         yp,
@@ -4403,7 +4403,7 @@ fn bench_conv(cc: &str, dir: &Path) {
         dir,
         "conv",
         "rustc",
-        &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+        &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
         &mut output,
         ip,
         wp,
@@ -4549,7 +4549,7 @@ fn bench_norm(cc: &str, dir: &Path) {
                 dir,
                 &format!("norm_{op}"),
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -4807,7 +4807,7 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 dir,
                 "bnorm",
                 "rustc",
-                &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+                &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
                 &mut out,
                 xp,
                 yp,
@@ -6690,7 +6690,7 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
             dir,
             &format!("stream_{name}"),
             "rustc",
-            &["-O", "-Ctarget-cpu=native", "--crate-type=cdylib"],
+            &["-Copt-level=3", "-Ctarget-cpu=native", "--crate-type=cdylib"],
             &mut out,
             xp,
             yp,
