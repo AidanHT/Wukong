@@ -126,6 +126,77 @@ pub unsafe extern "C" fn mercury_sgemv(
     }
 }
 
+/// `y[i] = alpha · Σ_j A[i,j]·x[j]` — the **α-scaled GEMV**: the decode-time attention score
+/// `scores = (K·q)·(1/√d)` and every scaled single-token projection, where a loop-invariant scalar
+/// `alpha` multiplies the row dot on the store (`y[i] = s * c`). The compiler lowers a recognized
+/// GEMV nest with a scaled store to this. Each row's dot is the *identical* [`gemv_row`] the plain
+/// [`mercury_sgemv`] computes; `alpha` is applied **exactly once per output element** on the store —
+/// the same single f32 multiply the scalar nest's `y[i] = s * c` performs — and `alpha == 1.0` skips
+/// the multiply (byte-identical to the plain kernel). Single-threaded.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemv`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemv_alpha(
+    a: *const f32,
+    x: *const f32,
+    y: *mut f32,
+    m: i64,
+    n: i64,
+    alpha: f32,
+) {
+    if m <= 0 || n <= 0 {
+        return;
+    }
+    let (m, n) = (m as usize, n as usize);
+    for i in 0..m {
+        let s = gemv_row(a.add(i * n), x, n);
+        // One multiply on the store, skipped for α == 1.0 (the Epilogue convention) so the unscaled
+        // form stays byte-identical to `mercury_sgemv`.
+        *y.add(i) = if alpha != 1.0 { s * alpha } else { s };
+    }
+}
+
+/// Multi-threaded α-scaled GEMV: independent rows across cores, each the identical per-row routine
+/// (dot + one store multiply) — **bit-identical to [`mercury_sgemv_alpha`]** (no cross-row combine).
+/// Below the row threshold it runs the serial kernel.
+///
+/// # Safety
+/// Operand-size contract of [`mercury_sgemv`].
+#[no_mangle]
+pub unsafe extern "C" fn mercury_sgemv_alpha_parallel(
+    a: *const f32,
+    x: *const f32,
+    y: *mut f32,
+    m: i64,
+    n: i64,
+    alpha: f32,
+) {
+    if m <= 0 || n <= 0 {
+        return;
+    }
+    let (mu, nu) = (m as usize, n as usize);
+    if mu < GEMV_PAR_MIN_ROWS {
+        mercury_sgemv_alpha(a, x, y, m, n, alpha);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use rayon::prelude::*;
+        let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
+        (0..mu).into_par_iter().for_each(|i| {
+            // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.
+            unsafe {
+                let s = gemv_row((a_addr as *const f32).add(i * nu), x_addr as *const f32, nu);
+                *(y_addr as *mut f32).add(i) = if alpha != 1.0 { s * alpha } else { s };
+            }
+        });
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    mercury_sgemv_alpha(a, x, y, m, n, alpha);
+}
+
 /// Row count below which the parallel GEMV just runs serially (thread wake/sync would dominate a tiny
 /// matrix). GEMV is memory-bound, so the parallel win comes from spreading the row stream across cores
 /// to saturate aggregate DRAM bandwidth.
@@ -233,6 +304,57 @@ mod tests {
                 );
             }
             assert_eq!(got, got_par, "gemv serial vs parallel ({m}x{n})");
+        }
+    }
+
+    /// The α-scaled GEMV must equal the plain kernel followed by one scalar `* alpha` per output
+    /// element (**exact** equality — the kernel performs that identical single multiply on the
+    /// store); `alpha == 1.0` must be **byte-identical** to the plain kernel (the multiply is
+    /// skipped); and serial == parallel bit-for-bit (rows independent, same per-row routine).
+    /// Sizes straddle the 32/8-element unroll edges and `GEMV_PAR_MIN_ROWS`.
+    #[test]
+    fn sgemv_alpha_matches_scaled_plain_and_parallel() {
+        for &(m, n) in &[(1usize, 1usize), (3, 8), (7, 32), (9, 33), (128, 64), (300, 517)] {
+            let a = fill(5, m * n);
+            let x = fill(6, n);
+            let mut plain = vec![0.0f32; m];
+            unsafe {
+                mercury_sgemv(a.as_ptr(), x.as_ptr(), plain.as_mut_ptr(), m as i64, n as i64);
+            }
+            for &alpha in &[1.0f32, 0.125, -2.5] {
+                let want: Vec<f32> = plain
+                    .iter()
+                    .map(|&s| if alpha != 1.0 { s * alpha } else { s })
+                    .collect();
+                let mut got = vec![0.0f32; m];
+                let mut got_par = vec![0.0f32; m];
+                unsafe {
+                    mercury_sgemv_alpha(
+                        a.as_ptr(),
+                        x.as_ptr(),
+                        got.as_mut_ptr(),
+                        m as i64,
+                        n as i64,
+                        alpha,
+                    );
+                    mercury_sgemv_alpha_parallel(
+                        a.as_ptr(),
+                        x.as_ptr(),
+                        got_par.as_mut_ptr(),
+                        m as i64,
+                        n as i64,
+                        alpha,
+                    );
+                }
+                assert_eq!(got, want, "sgemv_alpha != alpha·sgemv ({m}x{n} alpha={alpha})");
+                assert_eq!(got, got_par, "sgemv_alpha serial vs parallel ({m}x{n} alpha={alpha})");
+            }
+            // alpha == 1.0 must be byte-identical to the plain kernel.
+            let mut a1 = vec![0.0f32; m];
+            unsafe {
+                mercury_sgemv_alpha(a.as_ptr(), x.as_ptr(), a1.as_mut_ptr(), m as i64, n as i64, 1.0);
+            }
+            assert_eq!(plain, a1, "sgemv_alpha(1.0) must be byte-identical to sgemv ({m}x{n})");
         }
     }
 

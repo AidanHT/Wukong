@@ -73,7 +73,9 @@ Downstream: `mercury_driver` (`--backend=native`, `--emit=obj|exe`), `mercury_be
   (4 ptr + 4 i64; gamma/beta may be a null pointer; the `_parallel` ones map rows across cores)) are bound to Rust fns in the JIT and left as
   imports in the object (resolved by the driver's C runtime). That list is only a slice — the recognized
   symbol set has since grown to ~150: the rest of the GEMM family (`_tn`, α-scaled `_nt_alpha`, GEMV
-  `mercury_sgemv`, bf16/f16 `mercury_sgemm_{bf16,f16}_*` incl. fused epilogues, int8 `_deq` dequant),
+  `mercury_sgemv` + its α-scaled `mercury_sgemv_alpha` and the vector·matrix `mercury_sgevm_f32`
+  (both 3 ptr + 2 i64 + a trailing f32 α — the shared `sig_gemv_alpha` 6-arg `lower_call` arm),
+  bf16/f16 `mercury_sgemm_{bf16,f16}_*` incl. fused epilogues, int8 `_deq` dequant),
   pooling (`mercury_{max,avg}pool2d_f32`), `mercury_embedding_f32` + `mercury_scatter_add_f32`,
   `mercury_rope_f32`, column/row reductions (`mercury_col{sum,max,min,maxabs,mean,l2,rms}_f32`,
   `mercury_{row,col}arg{max,min}_i32`), cumulative scans (`mercury_{cumsum,cumprod,cummax,cummin,lrscan}_f32`),

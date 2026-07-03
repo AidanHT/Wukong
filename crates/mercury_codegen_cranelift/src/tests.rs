@@ -4395,3 +4395,261 @@ fn parallel_for_matches_interpreter() {
         );
     }
 }
+
+/// The α-scaled GEMV store `y[i] = s * c` (`c` a literal, a prior non-`mut` `let`, or a top-level
+/// `const`) must dispatch to `mercury_sgemv_alpha` (the `@parallel` form to its `_parallel` twin),
+/// while the plain store keeps the exact pre-α `mercury_sgemv` call (its MIR is byte-identical —
+/// verified against a pre-change dump); a store that is NOT `s * c` must not dispatch at all.
+/// Differential: fractional inputs across -O0/-O2/-O3 must be native == interp (both backends
+/// marshal the identical `mercury_sgemv_alpha` kernel), and an exact-arithmetic golden case pins
+/// the value (all inputs halves/quarters, so the dot is exact under any association).
+#[test]
+fn scaled_gemv_dispatches_and_matches() {
+    let scaled = |attr: &str, store: &str| {
+        format!(
+            "module m\n{attr}fn scores(k: [f32; 256], q: [f32; 32], mut y: [f32; 8]) {{ \
+             for i in 0..8 {{ let mut acc: f32 = 0.0; \
+             for d in 0..32 {{ acc = acc + k[i*32+d]*q[d]; }} \
+             y[i] = {store}; }} }}"
+        )
+    };
+    assert!(
+        lowered_calls(&scaled("", "acc * 0.125"), "mercury_sgemv_alpha"),
+        "literal-scaled store -> mercury_sgemv_alpha"
+    );
+    assert!(
+        lowered_calls(
+            &scaled("@parallel\n", "acc * 0.125"),
+            "mercury_sgemv_alpha_parallel"
+        ),
+        "@parallel scaled store -> mercury_sgemv_alpha_parallel"
+    );
+    // The plain store still emits the exact unscaled call.
+    assert!(
+        lowered_calls(&scaled("", "acc"), "mercury_sgemv"),
+        "plain store -> mercury_sgemv"
+    );
+    assert!(
+        !lowered_calls(&scaled("", "acc"), "mercury_sgemv_alpha"),
+        "plain store must not pick the alpha kernel"
+    );
+    // A store that is not `acc * c` must not dispatch (falls to the scalar/vectorized nest, which
+    // computes it correctly) — never an unscaled kernel that would silently drop the `+ 0.125`.
+    assert!(
+        !lowered_calls(&scaled("", "acc + 0.125"), "mercury_sgemv")
+            && !lowered_calls(&scaled("", "acc + 0.125"), "mercury_sgemv_alpha"),
+        "an additive store is not a scaled GEMV"
+    );
+    // A per-row (loop-variant) scale must not dispatch either.
+    assert!(
+        !lowered_calls(&scaled("", "acc * q[i]"), "mercury_sgemv_alpha"),
+        "an indexed scale is not loop-invariant"
+    );
+
+    // Differential with fractional inputs (M=9, N=33 straddle the kernel's 32/8 unroll edges).
+    let src = "fn scores(k: [f32; 297], q: [f32; 33], mut y: [f32; 9]) { \
+         for i in 0..9 { let mut acc: f32 = 0.0; \
+         for d in 0..33 { acc = acc + k[i*33+d]*q[d]; } \
+         y[i] = acc * 0.37; } } \
+         fn main() -> i32 { let mut k: [f32; 297] = [0.0; 297]; let mut q: [f32; 33] = [0.0; 33]; \
+         let mut y: [f32; 9] = [0.0; 9]; \
+         for t in 0..297 { k[t] = ((t as f32) * 0.013) - 1.7; } \
+         for t in 0..33 { q[t] = ((t as f32) * 0.11) - 1.3; } \
+         scores(k, q, y); \
+         let mut s: f32 = 0.0; for t in 0..9 { s = s + y[t]; } \
+         print((s * 1000.0) as i32); return 0; }";
+    for opt in [0u8, 2, 3] {
+        assert_eq!(
+            jit(src, opt).expect("jit"),
+            interp(src, opt).expect("interp"),
+            "scaled gemv native vs interp at -O{opt}"
+        );
+    }
+
+    // @parallel differential: M=300 exceeds GEMV_PAR_MIN_ROWS, so the real multicore kernel runs
+    // natively while the interpreter marshals the serial one — bit-identical (rows independent).
+    let par = "@parallel\nfn scores(k: [f32; 4800], q: [f32; 16], mut y: [f32; 300]) { \
+         for i in 0..300 { let mut acc: f32 = 0.0; \
+         for d in 0..16 { acc = acc + k[i*16+d]*q[d]; } \
+         y[i] = acc * 0.37; } } \
+         fn main() -> i32 { let mut k: [f32; 4800] = [0.0; 4800]; let mut q: [f32; 16] = [0.0; 16]; \
+         let mut y: [f32; 300] = [0.0; 300]; \
+         for t in 0..4800 { k[t] = (((t % 37) as f32) * 0.31) - 1.9; } \
+         for t in 0..16 { q[t] = ((t as f32) * 0.17) - 0.9; } \
+         scores(k, q, y); \
+         let mut s: f32 = 0.0; for t in 0..300 { s = s + y[t]; } \
+         print((s * 100.0) as i32); return 0; }";
+    for opt in [0u8, 2] {
+        assert_eq!(
+            jit(par, opt).expect("jit"),
+            interp(par, opt).expect("interp"),
+            "@parallel scaled gemv native vs interp at -O{opt}"
+        );
+    }
+
+    // Exact-arithmetic golden value: dots 18 and 3.5, x0.125 -> 2.25 and 0.4375.
+    let golden = "fn scores(k: [f32; 8], q: [f32; 4], mut y: [f32; 2]) { \
+         for i in 0..2 { let mut acc: f32 = 0.0; \
+         for d in 0..4 { acc = acc + k[i*4+d]*q[d]; } \
+         y[i] = acc * 0.125; } } \
+         fn main() -> i32 { let k: [f32; 8] = [2.0, 3.0, 4.0, 5.0, 1.0, 1.0, 1.0, 1.0]; \
+         let q: [f32; 4] = [1.0, 0.0 - 2.0, 0.5, 4.0]; let mut y: [f32; 2] = [0.0; 2]; \
+         scores(k, q, y); print((y[0] * 100.0) as i32); print((y[1] * 100.0) as i32); return 0; }";
+    let (_, out) = jit(golden, 2).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "225\n43\n",
+        "scaled gemv produced the wrong value"
+    );
+}
+
+/// The vector·matrix nest `for j { let s=0; for i { s += w[i]*a[i*N+j] }; out[j] = s [* c] }` (the
+/// KV-decode attention read-out `out = scoresᵀ·V`) must dispatch to `mercury_sgevm_f32` (the
+/// `@parallel` form to its `_parallel` twin), for both the plain and the α-scaled store. Negatives:
+/// an output aliasing an input, a non-scale store, and an outer-indexed weight must NOT dispatch.
+/// Differential: fractional inputs across -O0/-O2/-O3 must be native == interp (both marshal the
+/// identical kernel — which is itself bit-exact vs the FMA-contracted scalar nest: same per-element
+/// ascending-i chain), plus an exact-arithmetic golden value.
+#[test]
+fn gevm_dispatches_and_matches() {
+    let gevm = |attr: &str, store: &str| {
+        format!(
+            "module m\n{attr}fn readout(w: [f32; 16], a: [f32; 512], mut out: [f32; 32]) {{ \
+             for j in 0..32 {{ let mut s: f32 = 0.0; \
+             for i in 0..16 {{ s = s + w[i]*a[i*32+j]; }} \
+             out[j] = {store}; }} }}"
+        )
+    };
+    assert!(
+        lowered_calls(&gevm("", "s"), "mercury_sgevm_f32"),
+        "vector-matrix nest -> mercury_sgevm_f32"
+    );
+    assert!(
+        lowered_calls(&gevm("", "s * 0.125"), "mercury_sgevm_f32"),
+        "alpha-scaled vector-matrix store -> mercury_sgevm_f32"
+    );
+    assert!(
+        lowered_calls(&gevm("@parallel\n", "s"), "mercury_sgevm_f32_parallel"),
+        "@parallel vector-matrix -> mercury_sgevm_f32_parallel"
+    );
+    // The output aliasing the matrix input must NOT dispatch (the kernel accumulates INTO out
+    // across the i sweep, which would read the aliased input mid-update).
+    let aliased = "module m\nfn f(w: [f32; 16], mut a: [f32; 512]) { \
+         for j in 0..32 { let mut s: f32 = 0.0; \
+         for i in 0..16 { s = s + w[i]*a[i*32+j]; } \
+         a[j] = s; } }";
+    assert!(
+        !lowered_calls(aliased, "mercury_sgevm_f32"),
+        "an output aliasing the matrix must not dispatch"
+    );
+    // A store that is not `s` or `s * c` must not dispatch.
+    assert!(
+        !lowered_calls(&gevm("", "s + 1.0"), "mercury_sgevm_f32"),
+        "an additive store is not a vector-matrix product"
+    );
+    // A weight indexed by the OUTER var (`w[j]*a[i*32+j]` — an elementwise scale of a column sum,
+    // not a contraction over i) must not dispatch.
+    let outer_w = "module m\nfn f(w: [f32; 32], a: [f32; 512], mut out: [f32; 32]) { \
+         for j in 0..32 { let mut s: f32 = 0.0; \
+         for i in 0..16 { s = s + w[j]*a[i*32+j]; } \
+         out[j] = s; } }";
+    assert!(
+        !lowered_calls(outer_w, "mercury_sgevm_f32"),
+        "an outer-indexed weight is not the contraction"
+    );
+
+    // Differential with fractional inputs (rows=37, cols=65 straddle the 8-lane edge and stripe
+    // boundaries); the store carries the alpha scale so the fold + finalize are both exercised.
+    let src = "fn readout(w: [f32; 37], a: [f32; 2405], mut out: [f32; 65]) { \
+         for j in 0..65 { let mut s: f32 = 0.0; \
+         for i in 0..37 { s = s + w[i]*a[i*65+j]; } \
+         out[j] = s * 0.37; } } \
+         fn main() -> i32 { let mut w: [f32; 37] = [0.0; 37]; let mut a: [f32; 2405] = [0.0; 2405]; \
+         let mut out: [f32; 65] = [0.0; 65]; \
+         for t in 0..37 { w[t] = ((t as f32) * 0.13) - 1.1; } \
+         for t in 0..2405 { a[t] = (((t % 41) as f32) * 0.29) - 2.3; } \
+         readout(w, a, out); \
+         let mut s: f32 = 0.0; for t in 0..65 { s = s + out[t]; } \
+         print((s * 100.0) as i32); return 0; }";
+    for opt in [0u8, 2, 3] {
+        assert_eq!(
+            jit(src, opt).expect("jit"),
+            interp(src, opt).expect("interp"),
+            "gevm native vs interp at -O{opt}"
+        );
+    }
+
+    // @parallel differential: cols=300 exceeds GEVM_PAR_MIN, so the real column-striped multicore
+    // kernel runs natively while the interpreter marshals the serial one — bit-identical (each
+    // column's ascending-i chain is self-contained regardless of the stripe split).
+    let par = "@parallel\nfn readout(w: [f32; 16], a: [f32; 4800], mut out: [f32; 300]) { \
+         for j in 0..300 { let mut s: f32 = 0.0; \
+         for i in 0..16 { s = s + w[i]*a[i*300+j]; } \
+         out[j] = s; } } \
+         fn main() -> i32 { let mut w: [f32; 16] = [0.0; 16]; let mut a: [f32; 4800] = [0.0; 4800]; \
+         let mut out: [f32; 300] = [0.0; 300]; \
+         for t in 0..16 { w[t] = ((t as f32) * 0.21) - 1.5; } \
+         for t in 0..4800 { a[t] = (((t % 23) as f32) * 0.17) - 1.9; } \
+         readout(w, a, out); \
+         let mut s: f32 = 0.0; for t in 0..300 { s = s + out[t]; } \
+         print((s * 100.0) as i32); return 0; }";
+    for opt in [0u8, 2] {
+        assert_eq!(
+            jit(par, opt).expect("jit"),
+            interp(par, opt).expect("interp"),
+            "@parallel gevm native vs interp at -O{opt}"
+        );
+    }
+
+    // Exact-arithmetic golden: w=[0.5,-1,2] over rows [1,-2,3,.5]/[2,1,-1,4]/[1.5,-1,4,1.25]
+    // -> out = [1.5, -4, 10.5, -1.25].
+    let golden = "fn readout(w: [f32; 3], v: [f32; 12], mut out: [f32; 4]) { \
+         for d in 0..4 { let mut acc: f32 = 0.0; \
+         for s in 0..3 { acc = acc + w[s]*v[s*4+d]; } \
+         out[d] = acc; } } \
+         fn main() -> i32 { let w: [f32; 3] = [0.5, 0.0 - 1.0, 2.0]; \
+         let v: [f32; 12] = [1.0, 0.0 - 2.0, 3.0, 0.5, 2.0, 1.0, 0.0 - 1.0, 4.0, 1.5, 0.0 - 1.0, 4.0, 1.25]; \
+         let mut out: [f32; 4] = [0.0; 4]; readout(w, v, out); \
+         print((out[0] * 100.0) as i32); print((out[2] * 100.0) as i32); return 0; }";
+    let (_, out) = jit(golden, 2).expect("jit golden");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "150\n1050\n",
+        "gevm produced the wrong value"
+    );
+}
+
+/// The full single-token KV-decode attention body (q[D], K[S,D], V[S,D]; S=128, D=64 — the CPU LLM
+/// serving hot path) must dispatch ALL THREE stages: the scaled score GEMV -> mercury_sgemv_alpha,
+/// the in-place softmax window -> mercury_norm_f32, and the read-out -> mercury_sgevm_f32.
+#[test]
+fn decode_attention_dispatches_all_kernels() {
+    let src = "module m\n\
+         fn decode_attn(q: [f32; 64], k: [f32; 8192], v: [f32; 8192], \
+                        mut scores: [f32; 128], mut out: [f32; 64]) { \
+         for s in 0..128 { let mut acc: f32 = 0.0; \
+         for d in 0..64 { acc = acc + k[s*64+d]*q[d]; } \
+         scores[s] = acc * 0.125; } \
+         let mut m: f32 = scores[0]; \
+         for i in 0..128 { m = fmax(m, scores[i]); } \
+         for i in 0..128 { scores[i] = exp(scores[i] - m); } \
+         let mut ssum: f32 = 0.0; \
+         for i in 0..128 { ssum = ssum + scores[i]; } \
+         let inv: f32 = 1.0 / ssum; \
+         for i in 0..128 { scores[i] = scores[i] * inv; } \
+         for d in 0..64 { let mut acc: f32 = 0.0; \
+         for s in 0..128 { acc = acc + scores[s]*v[s*64+d]; } \
+         out[d] = acc; } }";
+    assert!(
+        lowered_calls(src, "mercury_sgemv_alpha"),
+        "decode scores -> mercury_sgemv_alpha"
+    );
+    assert!(
+        lowered_calls(src, "mercury_norm_f32"),
+        "decode softmax -> mercury_norm_f32"
+    );
+    assert!(
+        lowered_calls(src, "mercury_sgevm_f32"),
+        "decode read-out -> mercury_sgevm_f32"
+    );
+}

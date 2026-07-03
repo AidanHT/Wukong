@@ -19,7 +19,12 @@ pub use gemm::{
 };
 
 mod gemv;
-pub use gemv::{mercury_sgemv, mercury_sgemv_parallel};
+pub use gemv::{
+    mercury_sgemv, mercury_sgemv_alpha, mercury_sgemv_alpha_parallel, mercury_sgemv_parallel,
+};
+
+mod gevm;
+pub use gevm::{mercury_sgevm_f32, mercury_sgevm_f32_parallel};
 
 mod vmath;
 pub use vmath::{
