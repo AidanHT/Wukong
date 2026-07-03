@@ -2,13 +2,26 @@
 
 An **honest** cross-language benchmark. For each kernel the *same* computation is written several ways
 — Mercury (compiled to native code by the from-scratch backend, **no LLVM**), C (`gcc -O3
--march=native`), and Rust (`rustc -O -C target-cpu=native`) — and all are timed through one identical
-Rust harness over the same buffers. C and Rust are built to shared libraries and called via their C
-ABI; Mercury is JIT-compiled in-process. The harness cross-checks a result checksum across every
+-march=native`), and Rust (`rustc -C opt-level=3 -C target-cpu=native`) — and all are timed through one
+identical Rust harness over the same buffers. C and Rust are built to shared libraries and called via
+their C ABI; Mercury is JIT-compiled in-process. The harness cross-checks a result checksum across every
 language, so a miscompiled kernel is caught, not silently mis-measured. The elementwise/reduction
 battery additionally times **C++ (`g++ -O3 -march=native -ffp-contract=fast`)**; g++ and gcc share a
 backend, so on identical kernel code C++ tracks C to within a few percent — the C ratios below stand
 for C++ too (each is cross-checked against C++ as well, and "vs C++" is printed alongside "vs C").
+
+Two **additional C peer columns** normalize the two disclosed baseline asymmetries (see Fairness
+notes): **C(fast)** — the same C source recompiled `-O3 -march=native -ffast-math`, so gcc may
+reassociate/vectorize float reductions the way Mercury's recognized kernels do — is printed for the
+reduction-bearing benches (dot/ssd + their `@parallel` forms, matmul, `nn.Linear`, FFN, the column
+reductions/statistics, the norms and their backwards, cross-entropy, row losses); and **C(omp)** —
+the same C kernel under `#pragma omp parallel for` (with `reduction` clauses where the loop is a
+reduction), compiled `-fopenmp` — is printed for the `@parallel` rows (plus the parallel GEMM peers
+in matmul/linear/transpose/colsum) after a one-time runtime probe verifies OpenMP DLLs actually load
+and run multi-threaded here. Both are cross-checked at a **looser** magnitude-normalized `1e-2`
+tolerance (reassociation legitimately changes results); a column that can't meet it is dropped with
+a printed note rather than failing the bench. They are reported *alongside* — never replacing — the
+honest-default-flags C column.
 
 Reproduce:
 
@@ -38,9 +51,13 @@ quality, not just beating textbook code:
   **~104–117 GFLOP/s ≈ 90% of one P-core's AVX2-FMA roofline**, and is **1.1–1.3× faster than the
   tuned `matrixmultiply` Rust crate** — a real hand-optimized peer, not a strawman (`117 vs 89`,
   `115 vs 91`, `104 vs 96` GFLOP/s across 512²–1024²) — with **no LLVM**.
-- **Compile time leads by 2–3 orders of magnitude, every build:** **~100–680× faster than C/Rust**
-  (latest full-board geomean ~305×; in-process Cranelift JIT vs spawning a toolchain; ~0.3–1.5 ms vs
-  ~125–245 ms).
+- **Compile time leads decisively, every build.** The headline *compiler-to-compiler* figure is the
+  **both-subprocess `compile-vs`** comparison (`cargo run -p mercury_bench --release -- compile-vs`:
+  `mercuryc --emit=obj -O2` vs `gcc/g++/rustc` compiling bare equivalent kernels to objects, all as
+  subprocesses, best-of-N same-run). The xbench per-kernel "compile (ms)" figure — **~100–680×
+  faster than C/Rust** (latest full-board geomean ~305×; ~0.3–1.5 ms vs ~125–245 ms) — measures
+  **in-process JIT/embedding latency** (Mercury's front-end + Cranelift JIT in-process vs *spawning*
+  a toolchain), the right number for JIT-style embedding but not a process-to-process comparison.
 - **Geomean across the elementwise/reduction battery: 4.86× faster than C.**
 
 The largest domain-lowering blowouts (each is multicore-vs-1-core, or vs idiomatic scalar source
@@ -89,8 +106,8 @@ negative results**, live in [`prompts/results/`](prompts/results/).
 
 ## Scoreboard
 
-Headline ratios vs the **idiomatic** C/Rust baseline (`gcc -O3 -march=native` / `rustc -O -C
-target-cpu=native`), single-core and `@parallel`. Ranges span several runs and shapes; see the linked
+Headline ratios vs the **idiomatic** C/Rust baseline (`gcc -O3 -march=native` / `rustc -C opt-level=3
+-C target-cpu=native`), single-core and `@parallel`. Ranges span several runs and shapes; see the linked
 sections for the full tables, methodology, and caveats. This is an *honest* board — the ties and the
 modest wins are listed alongside the blowouts, and every row is gated bit-for-bit against the
 interpreter oracle (the cross-language check is exact for the integer/permutation kernels, a tight
@@ -119,6 +136,11 @@ tolerance for the reassociated-float ones).
 | **Scans** (cumsum / cummax / cummin / cumprod) | ~1.4–2.9× | ~6.4–12× | the loop-carried `out[i]=⊕(out[i-1],x[i])` won't auto-vectorize; SIMD Hillis-Steele scan, or 4-row-interleaved ILP for cumprod / `lrscan` (cummax/cummin/cumprod bit-exact) |
 | **Streaming elementwise** (saxpy/poly) | ~1.1–1.5× | bandwidth | 256-bit + non-temporal stores once the working set spills L3 |
 | relu / fused linear→relu / bias-add | ≈tie | — | already bandwidth-bound; no headroom standalone (won when *fused*) |
+
+> **Reduction-bearing rows** (dot/ssd, `nn.Linear`, FFN, weight-gradient, bf16 GEMM, column
+> reductions, norms and their backwards, cross-entropy, row losses): IEEE-serial C baseline; see the
+> **C(fast)** column xbench prints for the reassociation-normalized comparison, and the **C(omp)**
+> column on `@parallel` rows for the multithreaded-C comparison (Fairness notes below).
 
 The pattern: Mercury **heavily** exceeds C/Rust wherever domain knowledge lets a tensor compiler do
 what a scalar C compiler won't (tiling, packing, register-blocking, fusion, 256-bit transcendentals,
@@ -219,16 +241,33 @@ naively-written source:
   `-ffp-contract=fast` (both fuse). Idiomatic Rust does not contract unless the author writes
   `f32::mul_add`, so the Rust column reflects rustc's default — a real toolchain-defaults difference,
   surfaced rather than papered over. Mercury and its interpreter oracle agree bit-for-bit (gated).
-- **`-ffast-math` is withheld from C/Rust — and this *inflates* the reduction wins, stated plainly.**
-  The baselines get `-O3 -march=native` (+ default `-ffp-contract=fast`) but **not** `-ffast-math`, so
-  gcc/rustc keep float reductions strictly IEEE-sequential (latency-bound). `-ffast-math` would let gcc
-  reassociate and vectorize a `dot`/`ssd` reduction, **narrowing** those specific rows (the ~2.6–2.9×
-  single-core `dot`/`ssd`). The transcendental and GEMM wins are unaffected — a `libm` call can't
-  vectorize with or without it on this mingw toolchain (no `libmvec`), and the GEMM win is cache
-  tiling, not reassociation. We withhold it because `-ffast-math` also changes C's numerical results,
-  which would break the cross-language checksum that catches miscompiles — whereas Mercury's reduction
-  reassociation is gated bit-for-bit against its own interpreter oracle. So the affected reduction rows
-  are an honest *upper* bound on Mercury's edge there, not a hidden thumb on the scale.
+- **`-ffast-math` is withheld from the *primary* C column — and this *inflates* the reduction wins,
+  stated plainly — so the harness now also prints a `C(fast)` column that removes the inflation.**
+  The primary baselines get `-O3 -march=native` (+ default `-ffp-contract=fast`) but **not**
+  `-ffast-math`, so gcc/rustc keep float reductions strictly IEEE-sequential (latency-bound).
+  `-ffast-math` lets gcc reassociate and vectorize a `dot`/`ssd` reduction, **narrowing** those
+  specific rows (the ~2.6–2.9× single-core `dot`/`ssd`). The transcendental and GEMM wins are largely
+  unaffected — a `libm` call can't vectorize with or without it on this mingw toolchain (no
+  `libmvec`), and the GEMM win is cache tiling, not reassociation. The primary column keeps honest
+  default flags because `-ffast-math` changes C's numerical results, which would break the tight
+  cross-language checksum that catches miscompiles — whereas Mercury's reduction reassociation is
+  gated bit-for-bit against its own interpreter oracle. The **`C(fast)` peer column** (the same C
+  source recompiled with `-O3 -march=native -ffast-math`) is now printed for every reduction-bearing
+  bench, cross-checked at a looser magnitude-normalized `1e-2` tolerance (dropped with a printed note
+  if it can't meet even that), and the Mercury/C(fast) ratio is reported alongside Mercury/C. So the
+  IEEE-serial rows are labeled for what they are, and the reassociation-normalized number sits next
+  to them instead of being left to a footnote.
+- **The `@parallel` rows also print a multithreaded `C(omp)` peer.** The `@parallel` comparisons are
+  by design Mercury-multicore vs *idiomatic single-threaded* C (disclosed on every row) — but a C
+  author who cares can write `#pragma omp parallel for`. The harness therefore compiles exactly that
+  twin of each `@parallel` kernel (`-fopenmp`, with `reduction(...)` clauses where the loop is a
+  reduction, plus `-ffast-math` on the reduction rows — an OpenMP reduction already reassociates; the
+  label stays `C(omp)`) and reports Mercury-vs-C(omp): the honest multicore-vs-multicore standing.
+  OpenMP support is **probed at runtime** (compile a probe DLL, load it, require ≥2 threads inside a
+  parallel region — verified working on this MSYS2 gcc: 22 threads, and the OpenMP dot runs ~3× its
+  serial twin); if the probe fails the columns are skipped with a note. The parallel-GEMM peers in
+  matmul/linear/transpose/colsum are measured inside the all-core thermal group *before* `Mer(par)`,
+  so any residual heat lands on Mercury, never the peer.
 - **Matmul dispatch is the value proposition, stated plainly.** The C/Rust columns are the *naive
   nest a programmer writes*; Mercury's compiler optimizes it the way a tensor compiler should. The
   win **grows with size** precisely because tiling/packing matters more as the data stops fitting in
@@ -244,18 +283,35 @@ naively-written source:
 
 ## Results
 
-### Compile time — Mercury wins by 2 orders of magnitude
+### Compile time — JIT/embedding latency (xbench) and the headline `compile-vs` comparison
 
-| | Mercury | C (gcc) | Rust | Mercury speedup |
+Two distinct measurements, labeled for what each is:
+
+**The headline compiler-to-compiler comparison is `compile-vs`** (`cargo run -p mercury_bench
+--release -- compile-vs`): `mercuryc --emit=obj -O2` timed as a **subprocess** against `gcc -O2 -c`,
+`g++ -O2 -c`, and `rustc -O --emit=obj` compiling **bare equivalent kernels** (a plain exported
+function per translation unit — no headers, no `main`, matching work across all four languages) to a
+native object, best-of-N minimum, same-run. Every column pays process startup, so this is the
+apples-to-apples "how fast does each compiler compile the same kernel" figure. Its numbers are
+recorded in dedicated benchmarking sessions (this laptop's clock state makes ad-hoc absolute numbers
+unreliable); the ratio is a single-digit-× Mercury win, not the 2–3-order figure below.
+
+**The xbench per-kernel "compile (ms)" figure is in-process JIT/embedding latency**, not a
+process-to-process compiler comparison:
+
+| | Mercury (in-process JIT) | C (gcc, spawned) | Rust (rustc, spawned) | ratio |
 |---|---|---|---|---|
 | any kernel | ~0.3–1.5 ms | ~125–245 ms | ~185–250 ms | **~100–680×** (geomean ~305×) |
 
-The speedup *scales with how long the C/Rust toolchain takes to spawn* (the dominant term — it varies
-run to run), so the geomean drifts between ~150× and ~310× across sessions; the latest full-board run
-measured **306× geomean** (per-kernel **107–680×**). Either way it is a 2–3 order-of-magnitude win.
-Cranelift JIT compiling in-process vs spawning a full C/Rust+LLVM toolchain is a 1–2 order-of-
-magnitude win, every build. For an ML compiler — where edit/recompile/run iteration dominates
-developer time — this is the most robust result of all.
+Mercury's number is its front-end + Cranelift JIT running **inside the harness process**, while the
+C/Rust numbers include *spawning* the toolchain — so the ratio measures what a user of Mercury's
+embedded/JIT path waits for versus shelling out to a C compiler (the relevant figure for an
+ML-compiler REPL/JIT workflow, where this gap is real and structural: no LLVM, no process spawn),
+and it *scales with how long the toolchain takes to spawn* (the dominant term — it varies run to
+run; the geomean drifts between ~150× and ~310× across sessions, the latest full-board run measuring
+**306×**, per-kernel **107–680×**). For the both-subprocess object-to-object comparison, use
+`compile-vs` above. For an ML compiler — where edit/recompile/run iteration dominates developer
+time — compile latency is the most robust result of all, under either measurement.
 
 The pipeline's own hot stage is the **optimizer** (~80–85% of front-to-`-O2` time; the recognizer
 sweep and sema are negligible). Two output-preserving changes cut it **~31%** (in-process, 400-function
@@ -267,7 +323,11 @@ without changing the sequence of mutations. The resulting MIR is bit-identical (
 
 ### Matmul `C = A·B` — single-core wins, parallel dominates, and the lead grows with size
 
-GFLOP/s (higher is better), naive `ikj` nest in each language:
+GFLOP/s (higher is better), naive `ikj` nest in each language. Measurement ordering is thermal
+hygiene: the naive C/Rust (and `C(fast)`) nests are measured in the **same single-core thermal group
+as Mer(1c)** — after the library peers, before any all-core burst — so they are never read
+heat-throttled (they previously ran dead-last, after the all-core `Mer(par)`/`MKL(all)` bursts, which
+could understate them); `Mer(par)` still runs last of all (we throttle ourselves, never a peer).
 
 | size | Mer 1-core | Mer @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
 |------|-----------|---------------|---------|------|-------------|---------------|
@@ -299,6 +359,8 @@ there (a measured fix — naive threading at that size was a net *loss*).
 C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 GFLOP/s, latency-bound),
 while Mercury recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
 magnitude gap (caused by C's serial reduction, not a strided-access strawman; see Fairness notes).
+*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison, and
+`C(omp)` for the multithreaded-C one.*
 
 **Residual projection (`x = x + act(x·Wᵀ + bias)`) — the transformer skip connection.** The output
 projection of every attention/FFN sub-layer adds its result back to its input. Written fused in one
@@ -327,6 +389,7 @@ Honest accounting: the **bulk** of this ratio is the same serial-reduction-vs-ti
 scalar-`expf` pass — it widens the lead slightly and proves the activation does not erode it (C's `ffn`
 GFLOP/s ≈ its plain-`linear` GFLOP/s, so the silu pass is not a strawman). silu(GEMM) is checked over the
 whole buffer to a tight tolerance (the GEMM reassociates, silu is poly-vs-libm ~1 ULP).
+*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
 
 ### Weight-gradient `C = Aᵀ·B` — the training backward GEMM Mercury dispatches, gcc cannot
 
@@ -348,6 +411,7 @@ the very thing Mercury does automatically) would recover the ~4–5 GFLOP/s seri
 the `nn.Linear` row — still ~10× behind Mercury's tiled kernel. So the durable domain-lowering win is
 ~10× even against optimized C; the larger headline numbers are what you get versus the code a person
 actually writes for `dW`. (Single-run, clock-sensitive absolute GFLOP/s; the ratio is the stable part.)
+*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
 
 ### Convolution — im2col + GEMM vs idiomatic direct conv
 
@@ -455,6 +519,9 @@ across runs:
 | RMSNorm (affine γ) | **~1.7–3.2× faster** | the real transformer form `x·inv·γ` → same affine kernel |
 | L2 / unit-normalize | **~1.8–2.1× faster** | `x / √(Σx² + eps)` (cosine similarity, normalized embeddings, retrieval keys) — RMSNorm without the mean divisor, the same fused single-pass reduction → `mercury_norm_f32` |
 
+*IEEE-serial C baseline on the reductions; see the `C(fast)` column for the reassociation-normalized
+comparison.*
+
 Softmax wins most — the vectorized `exp` dominates, the same effect as the standalone `exp` kernel.
 LayerNorm and RMSNorm win on their reassociated reductions (gcc keeps float reductions strictly
 sequential without `-ffast-math`), with RMSNorm lowest because it has only one reduction and a larger
@@ -482,6 +549,9 @@ at an L3-resident batch and a batch that spills L3:
 | RMSNorm   | **~2.0×** · ~1.1× | **~2.0×** · **~2.9×** |
 | LayerNorm | **~2.5×** · **~1.9×** | **~2.1×** · **~4.0×** |
 | softmax   | **~5.6×** · **~6.1×** | **~4.7×** · **~10.2×** |
+
+*IEEE-serial C baseline on the reductions; see the `C(fast)` column for the reassociation-normalized
+comparison.*
 
 The **serial** fused single-pass form is an unconditional win for every norm (~2.0–5.6× vs
 single-threaded C, fused-vs-multipass; softmax most, on its vectorized `exp` vs scalar `expf`). Whether
@@ -559,6 +629,8 @@ GB/s (higher is better) — input traffic over `[bf16; N]` arrays:
 | dot Σx·y | **10.2** · 3.4 · 3.2 | **10.2** · 2.9 · 3.0 | **~3.0× → 3.5×** |
 | sum Σx   | **12.3** · 1.5 · 1.7 | **10.5** · 1.7 · 1.7 | **~8.3× → 6.1×** |
 
+*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
+
 The **dot** win (~3×) tracks the f32 `dot` — Mercury vectorizes the reduction while C/Rust stay serial.
 The **sum** win is larger (~6–8×) because C's unary f32 sum is a single dependency chain (pure
 latency, no product to fill the pipeline) at ~1.5 GB/s, while Mercury's 8-lane SIMD sum reaches
@@ -591,6 +663,8 @@ C and Rust store bf16 as `uint16_t` and widen each element inline inside the tri
 |-------|-----------|---------------|---------|------|-------------|---------------|
 | 512²  | ~52–53 | ~98–103 | ~2.1 | ~2.2 | **~24–25×** | **~47×** |
 | 1024² | ~50–55 | ~208–219 | ~2.0 | ~2.1 | **~25×** | **~98–109×** |
+
+*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
 
 As with the weight-gradient GEMM, two effects compound and honesty requires separating them. The
 idiomatic bf16 C falls to ~2 GFLOP/s because the inline `bf16→f32` widen won't vectorize **and** the
@@ -674,6 +748,8 @@ naive baselines pay the strided-scalar penalty twice over — no SIMD *and* cach
 the recognized kernel pays neither. `tests/run/colsum.mer`; the runtime test pins the SIMD kernel ==
 the naive sum exactly. (The *row*-outer spelling `for i { for j { out[j] += x[i*N+j] } }` already
 auto-vectorizes — the column-outer form is the gap.)
+*IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison, and
+`C(omp)` for the multithreaded-C one.*
 
 The same strided gap holds for the **max**, **min**, and **abs-max** down the outer axis
 (`out[j] = max/min_i x[i,j]`, `max_i |x[i,j]|` — per-channel quantization statistics, axis-0 max/min
@@ -713,7 +789,8 @@ strided access), so the win is more modest — gcc already vectorizes the apply:
 | 1024×1024 | ~45–49 | ~110–124 | ~24 | ~23 | **~1.9–2.0×** | **~4.5–5.2×** |
 | 4096×512 | ~22–26 | ~133–135 | ~21–22 | ~21 | **~1.0–1.2×** | **~6.1×** |
 
-(GB/s = `3·R·C·4` — the two reads + one write; higher is better.) Single-core is a modest win-to-tie
+(GB/s = `3·R·C·4` — the two reads + one write; higher is better. *IEEE-serial C baseline; see the
+`C(fast)` column for the reassociation-normalized comparison.*) Single-core is a modest win-to-tie
 (only the dot's accumulation is recovered); `@parallel` (rows across cores) scales to **~5–6×** on top.
 The dot reassociates (lane accumulators vs the C baseline's serial chain — the documented
 reassociated-reduction exception), so the cross-language check is a magnitude-normalized tolerance, not
@@ -877,6 +954,9 @@ wins:
 | dot    | **~2.9× faster** | reduction reassociated to lane accumulators; gcc/rustc stay serial |
 | ssd (Σ(x−y)²) | **~2.6–2.9× faster** | same — an L2-loss reduction |
 
+*dot/ssd: IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized
+comparison.*
+
 **At real (>L3) activation-tensor sizes the lead widens** — non-temporal stores avoid the RFO traffic
 that dominates when nothing fits in cache. At N=2²⁴ (64 MiB/array):
 
@@ -909,6 +989,10 @@ single-threaded C:
 | ssd@parallel   | **~8.6×** (~144 GB/s) — L2-loss reduction across cores |
 | max@parallel   | **~25–26×** (~85 GB/s) — per-tensor max (int8-quant range / softmax stability) across cores; C's single-stream float-max chain is especially latency-bound (~3 GB/s) without `-ffast-math` |
 | absmax@parallel | **~25×** (~80 GB/s) — per-tensor max\|x\| (symmetric int8-quant scale) across cores; `abs` is free (a bitwise op) so C stays latency-bound like `max` (~3 GB/s) |
+
+*All rows compare Mercury-multicore to single-threaded C (disclosed); see the `C(omp)` column for the
+multithreaded-C comparison, and — on the reduction rows (dot/ssd/max/absmax/argmax) — the `C(fast)`
+column for the reassociation-normalized single-thread baseline.*
 
 ## GPU backend (NVIDIA RTX 4050 Laptop, `sm_89`)
 
@@ -1420,9 +1504,11 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
 
 ## Honest summary
 
-- **Compile time:** ~100–680× faster than gcc/rustc (latest full-board geomean **306×**; drifts
-  ~150–310× with the C/Rust toolchain's spawn time). Robust every run; the metric that dominates ML
-  iteration.
+- **Compile time:** the xbench figure — ~100–680× faster than gcc/rustc (latest full-board geomean
+  **306×**; drifts ~150–310× with the C/Rust toolchain's spawn time) — is **in-process JIT/embedding
+  latency** vs spawning a toolchain; the both-subprocess `compile-vs` mode is the headline
+  compiler-to-compiler comparison (a single-digit-× win on bare equivalent kernels). Robust every
+  run; the metric that dominates ML iteration.
 - **Matmul / nn.Linear (the flagship ML kernels):** Mercury **wins single-thread (~3–26×) and
   dominates parallel (~9–104×)**, and the lead **grows with matrix size** — the compiler tiles,
   packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds
@@ -1467,7 +1553,8 @@ open is the *end-to-end full-model* measurement, not the per-op kernels.
   **~6–7× faster** than the idiomatic hand-written direct-convolution nest in C — the matmul
   recognizer accelerates conv for free.
 - **Reductions:** ~2.6–2.8× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
-  row-max).
+  row-max). IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized
+  comparison.
 - **Auto-parallel:** ~1.8–7.6× faster than idiomatic single-threaded C across elementwise kernels —
   bounded by aggregate memory bandwidth, not core count (these kernels are memory-bound).
 - **Single-thread memory-bound elementwise (saxpy/scale/residual/poly):** now a **win** (~1.1–1.5×
