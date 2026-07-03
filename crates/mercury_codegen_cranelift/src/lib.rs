@@ -4466,3 +4466,6 @@ mod tests;
 
 #[cfg(test)]
 mod fuzz;
+
+#[cfg(test)]
+mod fuzz_grammar;
