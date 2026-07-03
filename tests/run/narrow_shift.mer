@@ -1,0 +1,41 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 12
+// EXPECT-OUT: -1
+// EXPECT-OUT: 28
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1792
+module tests.run.narrow_shift
+
+// Narrow-type (i8/i16/u8) shifts with oversized shift amounts, pinned across backends and opt
+// levels. Two regimes, both C-like and identical interp==native:
+//  - SAME-width operands: the amount masks to the operand width (x86/Cranelift semantics the
+//    interpreter mirrors) — i8 masks & 7, i16 masks & 15.
+//  - MIXED width (an unsuffixed-literal or wider amount): both operands join to the wider type
+//    first, so the shift happens unmasked at that width (like C's integer promotion).
+
+fn main() -> i32 {
+    let x: i8 = 3;
+    let s: i8 = 10; // same-width i8: 10 & 7 = 2 -> 3 << 2
+    print((x << s) as i32); // 12
+
+    let y: i8 = -128;
+    print((y >> 9) as i32); // mixed: joins to i32, -128 >> 9 = -1
+
+    let w: i16 = 7;
+    let t: i16 = 18; // same-width i16: 18 & 15 = 2 -> 7 << 2
+    print((w << t) as i32); // 28
+
+    let u: u8 = 200 as u8;
+    print((u >> 9) as i32); // mixed: joins to i32, 200 >> 9 = 0
+
+    let a: i8 = 1;
+    let mut k: i8 = 0;
+    let mut acc: i32 = 0;
+    while k < 3 {
+        // runtime-varying mixed-width amounts 8, 9, 10 shift at i32: 256 + 512 + 1024
+        acc = acc + ((a << (k + 8)) as i32);
+        k = (k as i32 + 1) as i8;
+    }
+    print(acc); // 1792
+    return 0;
+}
