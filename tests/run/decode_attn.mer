@@ -1,0 +1,83 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 999
+// EXPECT-OUT: 87
+// EXPECT-OUT: 142
+// EXPECT-OUT: 72
+module tests.run.decode_attn
+
+/// Single-token KV-decode attention — the CPU LLM serving hot path (q[D], K[S,D], V[S,D] with
+/// S = 128, D = 64): scores = softmax((K·q)·(1/√D)); out = scoresᵀ·V. All three stages dispatch to
+/// recognized kernels:
+///   (1) the scaled score GEMV  -> mercury_sgemv_alpha   (the α peeled off `acc * 0.125`),
+///   (2) the in-place softmax   -> mercury_norm_f32      (the fused single-pass window),
+///   (3) the weighted row-sum   -> mercury_sgevm_f32     (the vector·matrix read-out).
+/// `--run` marshals the identical kernels through the interpreter, so this fixture gates
+/// interp == native and -O0 == -O3 across the whole fused decode step. The printed values are
+/// pinned from the oracle (both backends call the same kernels bit-for-bit).
+fn decode_attn(q: [f32; 64], k: [f32; 8192], v: [f32; 8192], mut scores: [f32; 128], mut out: [f32; 64]) {
+    // (1) scores = (K·q)·scale — GEMV with the 1/√64 scale folded into the store.
+    for s in 0..128 {
+        let mut acc: f32 = 0.0;
+        for d in 0..64 {
+            acc = acc + k[s * 64 + d] * q[d];
+        }
+        scores[s] = acc * 0.125;
+    }
+    // (2) softmax(scores) in place — the fused-norm window.
+    let mut m: f32 = scores[0];
+    for i in 0..128 {
+        m = fmax(m, scores[i]);
+    }
+    for i in 0..128 {
+        scores[i] = exp(scores[i] - m);
+    }
+    let mut ssum: f32 = 0.0;
+    for i in 0..128 {
+        ssum = ssum + scores[i];
+    }
+    let inv: f32 = 1.0 / ssum;
+    for i in 0..128 {
+        scores[i] = scores[i] * inv;
+    }
+    // (3) out = scoresᵀ·V — the vector·matrix weighted sum of V's rows.
+    for d in 0..64 {
+        let mut acc: f32 = 0.0;
+        for s in 0..128 {
+            acc = acc + scores[s] * v[s * 64 + d];
+        }
+        out[d] = acc;
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 64] = [0.0; 64];
+    let mut k: [f32; 8192] = [0.0; 8192];
+    let mut v: [f32; 8192] = [0.0; 8192];
+    let mut scores: [f32; 128] = [0.0; 128];
+    let mut out: [f32; 64] = [0.0; 64];
+    let mut t: i32 = 0;
+    while t < 64 {
+        q[t] = ((t % 13) as f32) * 0.11 - 0.6;
+        t = t + 1;
+    }
+    t = 0;
+    while t < 8192 {
+        k[t] = ((t % 29) as f32) * 0.07 - 1.0;
+        v[t] = ((t % 17) as f32) * 0.19 - 1.4;
+        t = t + 1;
+    }
+    decode_attn(q, k, v, scores, out);
+    // A distribution sanity anchor: softmax'd scores sum to ~1 -> x1000 ~= 1000.
+    let mut ss: f32 = 0.0;
+    t = 0;
+    while t < 128 {
+        ss = ss + scores[t];
+        t = t + 1;
+    }
+    print((ss * 1000.0) as i32);
+    print((out[0] * 1000.0) as i32);
+    print((out[13] * 1000.0) as i32);
+    print((out[63] * 1000.0) as i32);
+    return 0;
+}
