@@ -1,0 +1,9 @@
+// EXPECT-CODE: E0401
+module tests.fail.heap_free_bad_arg
+
+// `free(s)` releases a slice returned by an `alloc_*` builtin; freeing a scalar is a type error.
+
+fn main() -> i32 {
+    free(5);
+    return 0;
+}

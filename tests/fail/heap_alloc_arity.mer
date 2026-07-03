@@ -1,0 +1,9 @@
+// EXPECT-CODE: E0503
+module tests.fail.heap_alloc_arity
+
+// `alloc_<T>` takes exactly one argument (the element count).
+
+fn main() -> i32 {
+    let s = alloc_f32();
+    return 0;
+}

@@ -1,0 +1,9 @@
+// EXPECT-CODE: E0401
+module tests.fail.heap_alloc_bad_arg
+
+// `alloc_<T>(n)` takes an integer element count; a string (or any non-integer) is a type error.
+
+fn main() -> i32 {
+    let s = alloc_f32("x");
+    return 0;
+}
