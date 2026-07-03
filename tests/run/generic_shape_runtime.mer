@@ -1,0 +1,65 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 42
+// EXPECT-OUT: 20
+// EXPECT-OUT: 52
+module tests.run.generic_shape_runtime
+
+// A symbolic-generic tensor fn is callable with RUNTIME dimension values through the turbofish:
+// `rowsum::<m, n>(..)` where `n` was computed at run time threads the live value through the
+// hidden i64 dim params (turbofish_dim_value's `lookup` arm), so the same shape-typed kernel
+// serves sizes no one knew at compile time — the serving-code story (runtime seq_len/batch).
+// The compile-time shape checks degrade gracefully to the runtime-`?` level for such dims (a
+// wrong runtime size is out of the defined contract, like any runtime index). Pins BOTH the
+// elementwise form and that a symbolic MATMUL called at runtime sizes still dispatches to the
+// recognized GEMM kernel (dim_value resolves the hidden params into the kernel's m/k/n args).
+
+fn rowsum<M, N>(a: Tensor[f32, M, N], mut out: Tensor[f32, M]) {
+    for i in 0..M {
+        let mut s = 0.0;
+        for j in 0..N {
+            s = s + a[i, j];
+        }
+        out[i] = s;
+    }
+}
+
+fn matmul<M, K, N>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) {
+    for i in 0..M {
+        for j in 0..N {
+            let mut s = 0.0;
+            for k in 0..K {
+                s = s + a[i, k] * b[k, j];
+            }
+            c[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let mut out: [f32; 3] = [0.0; 3];
+    // runtime-computed dims (a loop so no const-folding pins them)
+    let mut n = 0;
+    let mut i = 0;
+    while i < 4 {
+        n = n + 1;
+        i = i + 1;
+    }
+    let m = 3;
+    rowsum::<m, n>(a, out);
+    print(out[0] as i32); // 1+2+3+4 = 10
+    print(out[2] as i32); // 9+10+11+12 = 42
+
+    // 2x4 · 4x2 matmul at runtime sizes
+    let bm: [f32; 8] = [1.0, 2.0, 1.0, 0.0, 0.0, 1.0, 2.0, 1.0];
+    let mut c: [f32; 4] = [0.0; 4];
+    let two = 2;
+    matmul::<two, n, two>(a, bm, c);
+    // b rows: [1,2],[1,0],[0,1],[2,1]
+    // row0 = [1,2,3,4]: c00 = 1+2+0+8 = 11; c01 = 2+0+3+4 = 9 -> 20
+    print((c[0] + c[1]) as i32); // 20
+    // row1 = [5,6,7,8]: c10 = 5+6+0+16 = 27; c11 = 10+0+7+8 = 25 -> 52
+    print((c[2] + c[3]) as i32); // 52
+    return 0;
+}
