@@ -962,6 +962,32 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Err("assertion failed".to_string())
                 }
             }
+            // `mercury_rt_alloc(count, elem_size, elem_is_float) -> ptr` — the heap allocation
+            // backing the `alloc_<T>(n)` builtins. A heap object in the slot-indexed memory model
+            // is exactly an alloca-shaped run: `count` contiguous typed-zero slots (one per scalar
+            // element; `elem_size` is native's byte stride and irrelevant here), whose
+            // function-independent lifetime falls out of `memory` never being reclaimed. The zero
+            // is `Float(0.0)` for float elements / `Int(0)` otherwise — the same typed value
+            // native's calloc'd zero bits decode to, so a read-before-write observes an identical
+            // zero on both backends (the determinism contract).
+            "mercury_rt_alloc" => {
+                let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+                let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
+                let zero = if is_float {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                };
+                let idx = self.memory.len();
+                self.memory.resize(idx + count, zero);
+                Ok(Value::Ptr(idx))
+            }
+            // `mercury_rt_free(data)` — mark-and-forget: the interpreter's memory is a run-scoped
+            // arena that is never reclaimed, so free is a no-op here (native releases the real
+            // allocation). Double-free or freeing a non-alloc slice therefore never crashes the
+            // interpreter; a use-after-free still reads the old values here while being undefined
+            // on native — such programs are outside the differential contract (documented UB).
+            "mercury_rt_free" => Ok(Value::Unit),
             // `mercury_parallel_for(n, body, env)` — run `body(start, end, env)` over the index
             // range. The interpreter executes the whole range sequentially in one call; since
             // parallel-for bodies have no cross-iteration dependencies this is exactly the result
