@@ -1,0 +1,12 @@
+// A type error INSIDE an imported file must be reported against THAT file's path and position —
+// this pins per-file span correctness of the multi-file SourceMap. The root file itself is clean.
+// (fail.rs additionally asserts the JSON span names lib/badlib.mer — see
+// `imported_file_diagnostics_carry_their_own_path`.)
+// EXPECT-CODE: E0401
+module import_type_error
+
+import lib.badlib;
+
+fn main() -> i32 {
+    return 0;
+}

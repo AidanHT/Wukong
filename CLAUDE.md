@@ -130,6 +130,9 @@ reassociated form is the oracle — all backends run the same reassociated IR an
   AVX2/AVX-512 microkernels directly (the differential gate keeps any such path honest).
 - Test fixtures live at the **repo root** (`tests/run/*.mer`, `tests/fail/*.mer`, `examples/`,
   `bench/kernels/`), not under any crate; e2e tests spawn the real binary via `CARGO_BIN_EXE_mercuryc`.
+  All fixture scanners are **non-recursive**: library files imported by a multi-file fixture live in a
+  subdirectory (`tests/run/lib/`, `tests/fail/lib/`) so they are never compiled standalone, and
+  `tests/imports/` holds the driver import-loader's unit fixtures (cycle/diamond).
 
 ## Where to look
 

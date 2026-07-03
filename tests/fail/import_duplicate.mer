@@ -1,0 +1,14 @@
+// A top-level name defined both here and in an imported file collides in the merged flat
+// namespace: the ordinary duplicate-name error (E0300), pointing at both definitions.
+// EXPECT-CODE: E0300
+module import_duplicate
+
+import lib.dup;
+
+fn clash() -> i32 {
+    return 1;
+}
+
+fn main() -> i32 {
+    return clash();
+}

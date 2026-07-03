@@ -573,15 +573,22 @@ impl Sema<'_> {
     }
 
     fn register(&mut self, name: Ident, kind: DefKind, span: Span) {
-        if self.defs.by_name.contains_key(&name.sym) {
-            self.error(
-                span,
-                "E0300",
-                format!(
-                    "the name `{}` is defined more than once",
-                    self.sym_str(name.sym)
-                ),
-            );
+        if let Some(&idx) = self.defs.by_name.get(&name.sym) {
+            // Point at BOTH definitions. In a multi-file program (the driver's import loader
+            // splices every imported file's items into one flat namespace) the two can live in
+            // different files; each label resolves through the shared SourceMap, so both render
+            // with their own file/line.
+            let first = self.defs.defs[idx].span;
+            let mut d = Diagnostic::error(format!(
+                "the name `{}` is defined more than once",
+                self.sym_str(name.sym)
+            ))
+            .with_code("E0300")
+            .primary(span, "redefined here");
+            if !first.is_dummy() {
+                d = d.secondary(first, "first defined here");
+            }
+            self.diags.push(d);
             return;
         }
         let idx = self.defs.defs.len();

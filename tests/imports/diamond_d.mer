@@ -1,0 +1,7 @@
+// Loader unit-test fixture: the shared leaf of the diamond — reached through both diamond_b and
+// diamond_c, must be loaded exactly once.
+module diamond_d
+
+fn shared_leaf() -> i32 {
+    return 7;
+}

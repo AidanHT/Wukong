@@ -16,9 +16,28 @@ pub fn parse_module_tokens(
     src: &str,
     interner: &mut Interner,
 ) -> (Module, Vec<Diagnostic>) {
+    let (m, diags, _) = parse_module_tokens_from(tokens, src, interner, 0);
+    (m, diags)
+}
+
+/// Like [`parse_module_tokens`], but `NodeId`s are allocated starting at `first_node_id`, and the
+/// first id *after* the last allocated one is returned alongside the module.
+///
+/// This is the multi-file entry point: `NodeId`s are only unique within one `Parser` run, yet sema
+/// and mir_build key their side tables (`types`, `consts`, …) by `NodeId` across the whole merged
+/// program. The import loader threads the returned watermark into the next file's parse so every
+/// file's ids occupy a disjoint range and the merged module has globally unique `NodeId`s.
+pub fn parse_module_tokens_from(
+    tokens: &[Token],
+    src: &str,
+    interner: &mut Interner,
+    first_node_id: u32,
+) -> (Module, Vec<Diagnostic>, u32) {
     let mut p = Parser::new(tokens, src, interner);
+    p.next_node = first_node_id;
     let m = p.module();
-    (m, std::mem::take(&mut p.diags))
+    let next = p.next_node;
+    (m, std::mem::take(&mut p.diags), next)
 }
 
 /// Convenience entry that lexes and parses in one step (tests / standalone use). Returns both

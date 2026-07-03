@@ -59,3 +59,33 @@ fn compile_fail_suite() {
     }
     eprintln!("checked {} compile-fail fixture(s)", programs.len());
 }
+
+/// A diagnostic raised INSIDE an imported file must carry that file's own path and position:
+/// a multi-file program shares one `SourceMap` and every span keeps its own `SourceId`, so the
+/// renderer must name the imported file, not the root. The fixture's root
+/// (`import_type_error.mer`) is clean; its E0401 lives in `lib/badlib.mer` at line 6 (pinned by a
+/// comment in that file).
+#[test]
+fn imported_file_diagnostics_carry_their_own_path() {
+    let p = fail_dir().join("import_type_error.mer");
+    let out = Command::new(env!("CARGO_BIN_EXE_mercuryc"))
+        .arg("--error-format=json")
+        .arg("--emit=mir")
+        .arg(&p)
+        .output()
+        .expect("spawn mercuryc");
+    assert!(!out.status.success(), "expected a compile error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("\"code\":\"E0401\""))
+        .unwrap_or_else(|| panic!("no E0401 diagnostic in stderr:\n{stderr}"));
+    assert!(
+        line.contains("badlib.mer"),
+        "the E0401 span must point into the imported file (lib/badlib.mer):\n{line}"
+    );
+    assert!(
+        line.contains("\"line\":6"),
+        "the E0401 span must carry the imported file's own line (6):\n{line}"
+    );
+}

@@ -1,0 +1,21 @@
+// Multi-file program: `main` lives here; a struct, a const, and fns come from imported files.
+// `lib/mathlib.mer` itself imports `lib/deep.mer` (transitive load), and deep imports mathlib
+// BACK (an A<->B cycle the loader must break by never reloading a loaded file). All items land in
+// one merged flat namespace, so `seven()` resolves here without a direct import.
+// EXPECT-OUT: 25
+// EXPECT-OUT: 42
+// EXPECT-OUT: 126
+// EXPECT-OUT: 7
+// EXPECT-EXIT: 0
+module import_multi
+
+import lib.mathlib;
+
+fn main() -> i32 {
+    let p = Point { x: 3, y: 4 };
+    print(dot_self(p));   // fn + struct from lib/mathlib.mer
+    print(ANSWER);        // const from lib/mathlib.mer
+    print(triple(ANSWER));
+    print(seven());       // fn from lib/deep.mer — imported transitively by mathlib
+    return 0;
+}

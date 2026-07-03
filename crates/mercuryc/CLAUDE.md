@@ -5,7 +5,7 @@ The `mercuryc` command-line binary: parses CLI args into a `mercury_driver::Opti
 ## Layout
 - `src/main.rs` — the entire binary (~230 lines): `USAGE` string, `main`, `run_compile`, `parse_args`, `print_explanation`. No other modules.
 - `tests/run.rs` — e2e suite: runs `<repo>/tests/run/*.mer` through the real binary, defaulting to `--run`, checking stdout/exit against in-file `// EXPECT-OUT:` / `// EXPECT-EXIT:` / `// RUN:` directives; also asserts -O1/-O2/-O3 are observationally identical to -O0.
-- `tests/fail.rs` — compile-fail suite: drives `<repo>/tests/fail/*.mer` with `--error-format=json --emit=mir`, asserts the `// EXPECT-CODE:` `E…` code appears in stderr JSON and exit is non-zero.
+- `tests/fail.rs` — compile-fail suite: drives `<repo>/tests/fail/*.mer` with `--error-format=json --emit=mir`, asserts the `// EXPECT-CODE:` `E…` code appears in stderr JSON and exit is non-zero. Also `imported_file_diagnostics_carry_their_own_path`: a multi-file fixture whose type error lives in an imported file (`tests/fail/lib/badlib.mer`) must report THAT file + line in the JSON span.
 - `tests/emit.rs` — smoke-tests every `--emit` stage: `tokens`,`ast` for all examples + run-suite; `mir-high`,`mir`,`llvm-ir` for run-suite at -O0 and -O2 (checks no verifier "internal compiler error" leaks).
 
 ## Key types & entry points
@@ -19,6 +19,7 @@ Upstream (depends on): `mercury_driver` (its ONLY dependency). Downstream: end u
 
 ## Gotchas
 - Test fixtures live at the REPO ROOT (`<repo>/tests/run`, `/tests/fail`, `<repo>/examples`), NOT under this crate. Tests reach them via `CARGO_MANIFEST_DIR/../../tests/...`.
+- All fixture scanners are NON-recursive (`read_dir` + `.mer` filter), which is load-bearing for multi-file programs: library files imported by a fixture live in a subdirectory (`tests/run/lib/`, `tests/fail/lib/`) so they are never run/compiled standalone — only through the root fixture that imports them. Keep it that way when touching the scanners.
 - Tests spawn the compiled binary via `CARGO_BIN_EXE_mercuryc` (real process), not by calling library functions — they exercise true exit codes and stdout/stderr.
 - `--color=auto` (and the default when `--color` is omitted) probes `stderr.is_terminal()`. The default is re-applied in a second pass AFTER the arg loop guarded by `!args.iter().any(|a| a.starts_with("--color="))`, so an explicit `--color=` always wins.
 - `emit_explicit` is computed but unused (`let _ = emit_explicit;`); `--run` does not force or clear `opts.emit`. Run-vs-emit mode is decided inside `mercury_driver::compile`, not here.
