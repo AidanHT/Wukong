@@ -357,13 +357,39 @@ reassociate + vectorize the dot products — the strongest flags-only C). The na
 tens of seconds per call at S=512, so it is skipped there by default (`XBENCH_MODEL_NAIVE` forces
 it), the same rule as the ≥2048³ naive matmuls.
 
-**Correctness.** Three gates run inside the benchmark: (1) the interpreter oracle executes the
+**PyTorch peer (the industry baseline).** When `python` + `torch` import (probed gracefully; a
+printed note + `n/a` columns otherwise), the bench adds **eager PyTorch CPU** (MKL/oneDNN-backed;
+explicitly *not* `torch.compile`) as three more columns. The harness dumps the *exact* weight and
+input buffers every other column reads as little-endian f32 blobs (the config-invariant 12-layer
+weights once per run, the per-config input/final-LN blob per S) and generates a self-contained
+Python script that rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the *same*
+`[out, in]` row-major weights Mercury/C dot against (the layouts coincide — the bytes are used
+as-is), `F.layer_norm` at the same `eps=1e-5`, the same tanh-approx GELU
+(`F.gelu(approximate="tanh")` — Mercury's √(2/π)/0.044715 flavor exactly), and multi-head causal
+attention two ways: `F.scaled_dot_product_attention(is_causal=True)` (the fused industry path)
+**and** a manual matmul+softmax variant. All under `torch.inference_mode()`, float32. Each variant
+warms ≥3 forwards then times ≥10 (min + median; the timed loop body is one bare forward — no
+per-iteration allocation/IO beyond what eager torch does inside a forward), at
+`torch.set_num_threads(1)` (**T1**) and at the default all-threads (**Tn**), reported as the same
+ms/forward + tokens/sec rows. Torch is timed in the *same bench invocation* immediately after the
+Mercury columns (same-run adjacency); inside the script the single-thread variants run first and
+the all-core one last, so multicore heat pollutes no single-thread torch number. Columns:
+`T1(sdpa)`, `T1(man)`, `Tn(sdpa)`; the Mercury-vs-Torch ratio lines print alongside the
+Mercury-vs-C ones. Disclosed asymmetry: `Tn(sdpa)` is genuinely multicore while the C columns are
+single-threaded — the printed ratios name the thread counts. As everywhere in this suite, absolute
+ms is clock/thermal-bound; only same-run ratios are meaningful, and no torch numbers are recorded
+here for that reason.
+
+**Correctness.** Four gates run inside the benchmark: (1) the interpreter oracle executes the
 *identical* 12-layer forward (same MIR, same weights, same harness loop) at a reduced config and
 must match the JIT **bit-for-bit** — it does; (2) Mercury serial vs `@parallel` final outputs are
 **bit-exact** (every dispatched `_parallel` kernel is bit-identical to its serial twin); (3) Mercury
 vs C final `[S,768]` outputs agree to a magnitude-normalized `max|Δ|/max|out| < 1e-3` (per-element
 relative error is meaningless on LayerNorm-centered near-zero outputs; 12 layers of reassociation +
-poly-vs-libm transcendentals compound the honest small differences).
+poly-vs-libm transcendentals compound the honest small differences); (4) Mercury vs torch's SDPA
+output agrees under the same magnitude-normalized `1e-3` metric (same GELU flavor and eps, so the
+residual is the same reassociation/poly-vs-libm class — no loosening needed), and the script itself
+reports its manual-attention-vs-SDPA agreement.
 
 **First indicative numbers (PRELIMINARY** — two back-to-back sessions on the throttling laptop;
 absolute ms swung ~3× with clock state between them (roofline read 71 GFLOP/s in the cold run vs
@@ -382,15 +408,16 @@ gcc's ~0.4–0.9 s** for the equivalent TU. tokens/sec = S tokens per forward ÷
 correctness gates passed on every run (interp bit-exact; serial-vs-`@parallel` bit-exact; vs C and
 vs C(fast) `max|Δ|/max|out|` ≈ 1–2×10⁻⁶, tolerance 10⁻³).
 
-**Disclosed limitation (a real compiler finding):** the `@parallel` column is only partially
-multicore — `mercury_mir_build`'s statement-path matmul recognizer hardcodes the serial kernel
-(`lower_for`: `emit_sgemm(&nest, false)`), so inside a multi-statement `@parallel` function only the
-batched norms and the fused-GELU FFN GEMM dispatch `_parallel` kernels while the six plain GEMMs
-stay single-threaded. The result is visible above: `Mer(par)` ranged from ≈`Mer(1c)` to **~2×
-slower** — the multicore bursts drag the package clock down for the still-serial GEMM phases
-without parallelizing the dominant work. Treat **Mer(1c) as the headline column**; fixing that one
-call site (the runtime's parallel GEMM is bit-identical to serial) is the obvious next lever for
-this benchmark.
+**Disclosed limitation (a real compiler finding — since fixed):** when the preliminary table above
+was measured, the `@parallel` column was only partially multicore — `mercury_mir_build`'s
+statement-path matmul recognizer hardcoded the serial kernel (`lower_for`:
+`emit_sgemm(&nest, false)`), so inside a multi-statement `@parallel` function only the batched
+norms and the fused-GELU FFN GEMM dispatched `_parallel` kernels while the six plain GEMMs stayed
+single-threaded; `Mer(par)` accordingly ranged from ≈`Mer(1c)` to **~2× slower** (multicore bursts
+dragged the package clock for the still-serial GEMM phases). That call site now passes the
+function's `@parallel` flag (`emit_sgemm(&nest, self.parallel_fn)`; the parallel GEMM is
+bit-identical to serial, so the differential gate is unaffected) — the table's `Mer(par)` column
+predates the fix.
 
 GFLOP/s (higher is better), naive `ikj` nest in each language. Measurement ordering is thermal
 hygiene: the naive C/Rust (and `C(fast)`) nests are measured in the **same single-core thermal group
