@@ -27,6 +27,23 @@
 //!   **C(fast)** is the identical source at `-O3 -march=native -ffast-math` (the `llama2.c
 //!   -Ofast` basis), which lets gcc reassociate + vectorize the dot products — the strongest
 //!   flags-only C column.
+//! * **PyTorch (the industry peer)** — when `python` + `torch` import (probed gracefully; a
+//!   printed note + skipped columns otherwise), the harness dumps the *exact* weight/input
+//!   buffers as little-endian f32 blobs and generates a self-contained eager-PyTorch script
+//!   that rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the same `[out,in]`
+//!   row-major weights Mercury/C use (the layouts coincide — no transposition), `F.layer_norm`
+//!   at the same eps=1e-5, the same tanh-approx GELU via `F.gelu(approximate="tanh")`, and
+//!   multi-head causal attention two ways — `F.scaled_dot_product_attention(is_causal=True)`
+//!   (the fused industry path) *and* a manual matmul+softmax variant — under
+//!   `torch.inference_mode()`, float32, **eager only** (`torch.compile` is not attempted on
+//!   Windows). Each variant warms ≥3 then times ≥10 forwards (min + median; the timing loop is
+//!   one bare forward per iteration — no per-iteration allocation/IO beyond what eager torch
+//!   does inside the forward), at `torch.set_num_threads(1)` and at the default all-threads.
+//!   Torch runs in the same bench invocation immediately after the Mercury columns (same-run
+//!   adjacency); its single-thread variants run first inside the script and the all-core one
+//!   last, so multicore heat pollutes no single-thread torch number. Torch's SDPA output is
+//!   cross-checked against Mercury's with the suite's magnitude-normalized metric at the same
+//!   1e-3 tolerance (the GELU flavor matches exactly, so no loosening is needed).
 //! * **The layer loop lives in this harness** for both languages: one JIT'd/compiled block
 //!   function is called 12× per forward with per-layer weight pointers (ping-ponging two
 //!   activation buffers), then the final LayerNorm — the way a real runtime drives a layer stack.
@@ -44,11 +61,15 @@
 //!   whose compiler lowers to tuned kernels), the same basis as `bench_matmul`/`bench_linear`.
 //! * The `@parallel` Mercury column is fully multicore: the batched norms, the fused-GELU FFN
 //!   GEMM, *and* the embedded plain matmul nests (Q/K/V/O/PV/down-proj) all dispatch `_parallel`
-//!   kernels — `lower_for`'s statement path now honors the enclosing `@parallel` for embedded
-//!   GEMMs. The run-time dispatch scan prints the `@parallel` variant's kernel set (and a unit
-//!   test pins it), so a regression back to serial is visible, not silent. Both C columns are
-//!   single-threaded idiomatic code, as everywhere in this suite.
+//!   kernels (each bit-identical to its serial twin) — `lower_for`'s statement path honors the
+//!   enclosing `@parallel` for embedded GEMMs. The run-time dispatch scan prints the `@parallel`
+//!   variant's kernel set (and a unit test pins it), so a regression back to serial is visible,
+//!   not silent. Both C columns are single-threaded idiomatic code, as everywhere in this suite;
+//!   the torch `Tn(sdpa)` column is PyTorch's own all-thread path — the only other multicore
+//!   column, disclosed as such.
 
+use std::cell::Cell;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -699,6 +720,283 @@ struct MeasureModel {
 }
 
 // -------------------------------------------------------------------------------------------
+// The PyTorch CPU peer (industry baseline)
+// -------------------------------------------------------------------------------------------
+
+/// The probed PyTorch environment: interpreter path, version/thread info, and whether the
+/// (config-invariant) weight blob has already been dumped this run.
+struct TorchCtx {
+    py: String,
+    version: String,
+    threads: usize,
+    weights_written: Cell<bool>,
+}
+
+/// Probe `python` (override with `PYTHON`) for an importable torch. Graceful: any failure —
+/// no python on PATH, torch not installed — returns `None`; the bench prints a note and the
+/// torch columns show `n/a`.
+fn detect_torch() -> Option<TorchCtx> {
+    let py = std::env::var("PYTHON").unwrap_or_else(|_| "python".to_string());
+    let out = Command::new(&py)
+        .args([
+            "-c",
+            "import torch; print(torch.__version__); print(torch.get_num_threads())",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut lines = s.lines();
+    let version = lines.next()?.trim().to_string();
+    let threads = lines.next()?.trim().parse().ok()?;
+    Some(TorchCtx {
+        py,
+        version,
+        threads,
+        weights_written: Cell::new(false),
+    })
+}
+
+/// Concatenate f32 slices into one little-endian binary file — the exact bytes the generated
+/// Python reads back with `torch.frombuffer(dtype=torch.float32)`.
+fn dump_f32_le(path: &Path, parts: &[&[f32]]) -> std::io::Result<()> {
+    let f = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+    for xs in parts {
+        let mut buf = Vec::with_capacity(xs.len() * 4);
+        for &v in *xs {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        w.write_all(&buf)?;
+    }
+    w.flush()
+}
+
+/// The self-contained eager-PyTorch peer script for one config. Layout facts it relies on
+/// (verified against `mer_block`/`c_model`): `F.linear(x, W)` computes `x·Wᵀ` over a `[out,in]`
+/// row-major `W` — exactly the `w[j*K+p]` layout Mercury and C dot against, so the dumped bytes
+/// are used as-is; LayerNorm eps is 1e-5 in all three; the GELU is the tanh approximation
+/// (√(2/π), 0.044715) — torch's `approximate="tanh"`; SDPA's default scale `1/√hd` equals
+/// Mercury's inline `scale` (hd is a power of 4, exact in f32); Mercury's `-1e30` mask and
+/// torch's `-inf`/`is_causal` agree after softmax (both underflow to exactly 0).
+fn torch_script(cfg: Cfg, w_path: &Path, io_path: &Path, out_path: &Path) -> String {
+    let (s, d, h, hd, dff) = (cfg.s, cfg.d, cfg.h, cfg.hd(), cfg.dff);
+    format!(
+        r#"# Auto-generated by mercury_xbench `model` — the PyTorch CPU peer for the 12-layer
+# GPT-2-class forward. Reads the exact little-endian f32 weight/input bytes the Mercury and C
+# columns use, rebuilds the identical eager float32 forward, and times it under
+# torch.inference_mode(). Eager ONLY — torch.compile is not attempted (Windows).
+import sys, time, array, statistics
+import torch
+import torch.nn.functional as F
+
+S = {s}; D = {d}; H = {h}; HD = {hd}; DFF = {dff}; LAYERS = {layers}
+W_PATH = r"{w}"
+IO_PATH = r"{io}"
+OUT_PATH = r"{out}"
+WARMUP = 3
+ITERS = 10
+LNSHAPE = (D,)
+DEFAULT_THREADS = torch.get_num_threads()
+
+def load(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    return torch.frombuffer(bytearray(data), dtype=torch.float32)
+
+wbuf = load(W_PATH)
+sizes = [D, D, D * D, D * D, D * D, D * D, D, D, DFF * D, D * DFF]
+shapes = [(D,), (D,), (D, D), (D, D), (D, D), (D, D), (D,), (D,), (DFF, D), (D, DFF)]
+layers = []
+off = 0
+for _ in range(LAYERS):
+    ws = []
+    for n, sh in zip(sizes, shapes):
+        ws.append(wbuf[off:off + n].clone().view(sh))
+        off += n
+    layers.append(ws)
+assert off == wbuf.numel(), "weight blob size mismatch"
+iobuf = load(IO_PATH)
+assert iobuf.numel() == 2 * D + S * D, "io blob size mismatch"
+lnf_g = iobuf[0:D].clone()
+lnf_b = iobuf[D:2 * D].clone()
+x0 = iobuf[2 * D:].clone().view(S, D)
+del wbuf, iobuf
+
+SCALE = HD ** -0.5
+NEGINF = float("-inf")
+MASK = torch.triu(torch.ones(S, S, dtype=torch.bool), diagonal=1)
+
+# One pre-LN block. Linear weights are [out, in] row-major — torch's own x @ W.T layout, byte-
+# identical to what Mercury/C dot against. GELU is the tanh approximation, matching Mercury's
+# gelu() and the C column exactly (same flavor, so the cross-check needs no loosening).
+def block(x, w, manual):
+    ln1g, ln1b, wq, wk, wv, wo, ln2g, ln2b, w1, w2 = w
+    nrm = F.layer_norm(x, LNSHAPE, ln1g, ln1b, 1e-5)
+    q = F.linear(nrm, wq).view(S, H, HD).transpose(0, 1)
+    k = F.linear(nrm, wk).view(S, H, HD).transpose(0, 1)
+    v = F.linear(nrm, wv).view(S, H, HD).transpose(0, 1)
+    if manual:
+        sc = torch.matmul(q, k.transpose(-2, -1)) * SCALE
+        sc = sc.masked_fill(MASK, NEGINF)
+        att = torch.matmul(torch.softmax(sc, dim=-1), v)
+    else:
+        att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    att = att.transpose(0, 1).reshape(S, D)
+    a = x + F.linear(att, wo)
+    nrm2 = F.layer_norm(a, LNSHAPE, ln2g, ln2b, 1e-5)
+    return a + F.linear(F.gelu(F.linear(nrm2, w1), approximate="tanh"), w2)
+
+def forward(manual):
+    x = x0
+    for w in layers:
+        x = block(x, w, manual)
+    return F.layer_norm(x, LNSHAPE, lnf_g, lnf_b, 1e-5)
+
+# Warm WARMUP forwards, then time ITERS. The timed loop body is exactly one forward — no
+# per-iteration allocation or IO beyond what eager torch itself does inside the forward.
+def bench(manual):
+    for _ in range(WARMUP):
+        forward(manual)
+    ts = [0.0] * ITERS
+    for i in range(ITERS):
+        t0 = time.perf_counter()
+        forward(manual)
+        ts[i] = time.perf_counter() - t0
+    return min(ts) * 1e3, statistics.median(ts) * 1e3
+
+with torch.inference_mode():
+    print("TORCH_VERSION %s" % torch.__version__, flush=True)
+    print("TORCH_THREADS %d" % DEFAULT_THREADS, flush=True)
+    # Cross-check outputs first, at 1 thread (doubles as cache warmup for the timed 1t runs).
+    torch.set_num_threads(1)
+    y = forward(False)
+    ym = forward(True)
+    scale = max(y.abs().max().item(), 1e-6)
+    print("TORCH_MANUAL_VS_SDPA %.3e" % ((ym - y).abs().max().item() / scale), flush=True)
+    a = array.array("f", y.reshape(-1).tolist())
+    if sys.byteorder != "little":
+        a.byteswap()
+    with open(OUT_PATH, "wb") as f:
+        f.write(a.tobytes())
+    mn, med = bench(False)
+    print("TORCH1 %.3f %.3f" % (mn, med), flush=True)
+    mn, med = bench(True)
+    print("TORCH1M %.3f %.3f" % (mn, med), flush=True)
+    # All-core variant LAST so its heat pollutes no single-thread torch number.
+    torch.set_num_threads(DEFAULT_THREADS)
+    mn, med = bench(False)
+    print("TORCHN %.3f %.3f" % (mn, med), flush=True)
+print("TORCH_OK", flush=True)
+"#,
+        s = s,
+        d = d,
+        h = h,
+        hd = hd,
+        dff = dff,
+        layers = LAYERS,
+        w = w_path.display(),
+        io = io_path.display(),
+        out = out_path.display(),
+    )
+}
+
+/// Parsed torch timings — `(min, median)` ns/forward per variant — plus the SDPA output for the
+/// cross-check and the script's own manual-vs-SDPA agreement figure.
+struct TorchMeasure {
+    sdpa_1t: Option<(f64, f64)>,
+    manual_1t: Option<(f64, f64)>,
+    sdpa_nt: Option<(f64, f64)>,
+    manual_vs_sdpa: Option<f64>,
+    out: Vec<f32>,
+}
+
+/// Dump the shared buffers, generate + run the peer script, parse its machine-readable lines.
+fn bench_torch(
+    ctx: &TorchCtx,
+    dir: &Path,
+    cfg: Cfg,
+    weights: &[LayerW],
+    x0: &[f32],
+    lnf_g: &[f32],
+    lnf_b: &[f32],
+) -> Option<TorchMeasure> {
+    // The 12-layer weights are config-invariant in this bench (same d/dff/LAYERS, and the
+    // 0x0D15EA5E seed is consumed identically before x0 at every S), so the ~324 MiB blob is
+    // dumped once per run; the small per-config blob carries lnf gamma/beta + the input.
+    let w_path = dir.join("model_w.bin");
+    if !ctx.weights_written.get() {
+        let mut parts: Vec<&[f32]> = Vec::with_capacity(weights.len() * 10);
+        for lw in weights {
+            for t in [
+                &lw.ln1g, &lw.ln1b, &lw.wq, &lw.wk, &lw.wv, &lw.wo, &lw.ln2g, &lw.ln2b, &lw.w1,
+                &lw.w2,
+            ] {
+                parts.push(t);
+            }
+        }
+        if let Err(e) = dump_f32_le(&w_path, &parts) {
+            eprintln!("model: torch peer: cannot write weight blob: {e}");
+            return None;
+        }
+        ctx.weights_written.set(true);
+    }
+    let io_path = dir.join(format!("model_io_s{}.bin", cfg.s));
+    if let Err(e) = dump_f32_le(&io_path, &[lnf_g, lnf_b, x0]) {
+        eprintln!("model: torch peer: cannot write io blob: {e}");
+        return None;
+    }
+    let out_path = dir.join(format!("model_torch_out_s{}.bin", cfg.s));
+    let script_path = dir.join(format!("model_torch_s{}.py", cfg.s));
+    std::fs::write(&script_path, torch_script(cfg, &w_path, &io_path, &out_path)).ok()?;
+    let run = Command::new(&ctx.py).arg(&script_path).output().ok()?;
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    if !run.status.success() || !stdout.contains("TORCH_OK") {
+        eprintln!(
+            "model: torch peer script failed:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        return None;
+    }
+    let grab = |tag: &str| -> Option<(f64, f64)> {
+        for l in stdout.lines() {
+            let mut it = l.split_whitespace();
+            if it.next() == Some(tag) {
+                let mn: f64 = it.next()?.parse().ok()?;
+                let md: f64 = it.next()?.parse().ok()?;
+                return Some((mn * 1e6, md * 1e6)); // ms -> ns
+            }
+        }
+        None
+    };
+    let manual_vs_sdpa = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("TORCH_MANUAL_VS_SDPA ")?.trim().parse().ok());
+    let bytes = std::fs::read(&out_path).ok()?;
+    let out: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if out.len() != cfg.s * cfg.d {
+        eprintln!(
+            "model: torch peer: output size mismatch ({} vs {})",
+            out.len(),
+            cfg.s * cfg.d
+        );
+        return None;
+    }
+    Some(TorchMeasure {
+        sdpa_1t: grab("TORCH1"),
+        manual_1t: grab("TORCH1M"),
+        sdpa_nt: grab("TORCHN"),
+        manual_vs_sdpa,
+        out,
+    })
+}
+
+// -------------------------------------------------------------------------------------------
 // The benchmark
 // -------------------------------------------------------------------------------------------
 
@@ -722,6 +1020,21 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
     );
     println!("  absolute numbers are thermal-bound — the Mercury/C ratio is the stable metric.\n");
 
+    let torch = detect_torch();
+    match &torch {
+        Some(t) => println!(
+            "  PyTorch peer: torch {} — CPU EAGER float32 under torch.inference_mode() (NOT \
+             torch.compile), {} threads available.\n  Same weights/inputs via little-endian f32 \
+             blobs; T1 = torch.set_num_threads(1), Tn = default all threads;\n  sdpa = \
+             F.scaled_dot_product_attention (fused industry path), man = manual matmul+softmax \
+             attention.\n",
+            t.version, t.threads
+        ),
+        None => println!(
+            "  PyTorch peer: python + torch not importable on PATH — torch columns skipped.\n"
+        ),
+    }
+
     interp_gate();
 
     for s in [128usize, 512] {
@@ -734,6 +1047,7 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
                 h: 12,
                 dff: 3072,
             },
+            torch.as_ref(),
         );
         println!();
     }
@@ -866,7 +1180,7 @@ fn interp_gate() {
     }
 }
 
-fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
+fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     let flops = cfg.flops_per_layer() * LAYERS as f64;
     println!(
         "--- model S={} ({} tokens/forward, {:.1} GFLOP/forward) ---",
@@ -1027,76 +1341,96 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
         })
     });
 
+    // --- PyTorch CPU eager peer, timed immediately after the Mercury columns in the SAME bench
+    // invocation (same-run adjacency). It runs in its own process over the just-dumped identical
+    // buffers; inside the script the single-thread variants run first and the all-core variant
+    // last, so multicore heat pollutes no single-thread torch number. The blob writes + torch
+    // import + its own warmups sit between Mer(par)'s all-core burst and the first timed torch
+    // iteration.
+    let torch_m = torch.and_then(|t| {
+        println!(
+            "  running PyTorch peer (torch {}, eager f32, inference_mode; warmup 3 + timed 10 \
+             per variant)...",
+            t.version
+        );
+        bench_torch(t, dir, cfg, &weights, &x0, &lnf_g, &lnf_b)
+    });
+
     // --- report ---
-    let ms = |m: &Option<MeasureModel>| {
-        m.as_ref()
-            .map(|x| format!("{:.1}", x.ns_per_fwd / 1e6))
-            .unwrap_or_else(|| "n/a".into())
+    // Torch columns are eager PyTorch (no compile step): T1(sdpa)/Tn(sdpa) = fused
+    // F.scaled_dot_product_attention at 1/all threads, T1(man) = manual matmul+softmax at 1
+    // thread. Column value is the min of the timed iterations (the suite's best-observed
+    // convention); medians are printed below the table.
+    let mk_torch = |v: Option<(f64, f64)>, out: &[f32]| {
+        v.map(|(mn, _)| MeasureModel {
+            compile: Duration::ZERO, // sentinel: eager, no compile step — printed as "eager"
+            ns_per_fwd: mn,
+            out: out.to_vec(),
+        })
     };
-    let ms_layer = |m: &Option<MeasureModel>| {
-        m.as_ref()
-            .map(|x| format!("{:.2}", x.ns_per_fwd / 1e6 / LAYERS as f64))
-            .unwrap_or_else(|| "n/a".into())
+    let (torch1_m, torchman_m, torchn_m) = match &torch_m {
+        Some(t) => (
+            mk_torch(t.sdpa_1t, &t.out),
+            mk_torch(t.manual_1t, &[]),
+            mk_torch(t.sdpa_nt, &[]),
+        ),
+        None => (None, None, None),
     };
-    let toks = |m: &Option<MeasureModel>| {
-        m.as_ref()
-            .map(|x| format!("{:.0}", cfg.s as f64 / (x.ns_per_fwd / 1e9)))
-            .unwrap_or_else(|| "n/a".into())
+
+    let cols: [(&str, &Option<MeasureModel>); 7] = [
+        ("Mer(1c)", &mer_m),
+        ("Mer(par)", &mer_par_m),
+        ("C(gcc)", &c_m),
+        ("C(fast)", &cfast_m),
+        ("T1(sdpa)", &torch1_m),
+        ("T1(man)", &torchman_m),
+        ("Tn(sdpa)", &torchn_m),
+    ];
+    let row = |label: &str, f: &dyn Fn(&MeasureModel) -> String| {
+        print!("  {:<22}", label);
+        for (_, m) in &cols {
+            print!(
+                " {:>10}",
+                m.as_ref().map(|x| f(x)).unwrap_or_else(|| "n/a".into())
+            );
+        }
+        println!();
     };
-    let gfs = |m: &Option<MeasureModel>| {
-        m.as_ref()
-            .map(|x| format!("{:.1}", flops / x.ns_per_fwd))
-            .unwrap_or_else(|| "n/a".into())
-    };
-    let cmp = |m: &Option<MeasureModel>| {
-        m.as_ref()
-            .map(|x| format!("{:.0}", x.compile.as_secs_f64() * 1e3))
-            .unwrap_or_else(|| "n/a".into())
-    };
-    println!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "", "Mer(1c)", "Mer(par)", "C(gcc)", "C(fast)"
-    );
-    println!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "ms/forward",
-        ms(&mer_m),
-        ms(&mer_par_m),
-        ms(&c_m),
-        ms(&cfast_m)
-    );
-    println!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "ms/layer (incl. ln_f)",
-        ms_layer(&mer_m),
-        ms_layer(&mer_par_m),
-        ms_layer(&c_m),
-        ms_layer(&cfast_m)
-    );
-    println!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "tokens/sec",
-        toks(&mer_m),
-        toks(&mer_par_m),
-        toks(&c_m),
-        toks(&cfast_m)
-    );
-    println!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "GFLOP/s (context)",
-        gfs(&mer_m),
-        gfs(&mer_par_m),
-        gfs(&c_m),
-        gfs(&cfast_m)
-    );
-    println!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "compile ms",
-        cmp(&mer_m),
-        cmp(&mer_par_m),
-        cmp(&c_m),
-        cmp(&cfast_m)
-    );
+    print!("  {:<22}", "");
+    for (name, _) in &cols {
+        print!(" {name:>10}");
+    }
+    println!();
+    row("ms/forward", &|x| format!("{:.1}", x.ns_per_fwd / 1e6));
+    row("ms/layer (incl. ln_f)", &|x| {
+        format!("{:.2}", x.ns_per_fwd / 1e6 / LAYERS as f64)
+    });
+    row("tokens/sec", &|x| {
+        format!("{:.0}", cfg.s as f64 / (x.ns_per_fwd / 1e9))
+    });
+    row("GFLOP/s (context)", &|x| format!("{:.1}", flops / x.ns_per_fwd));
+    row("compile ms", &|x| {
+        if x.compile == Duration::ZERO {
+            "eager".into()
+        } else {
+            format!("{:.0}", x.compile.as_secs_f64() * 1e3)
+        }
+    });
+    if let Some(t) = &torch_m {
+        let fmt = |v: &Option<(f64, f64)>| {
+            v.map(|(mn, md)| format!("min {:.1} / med {:.1} ms", mn / 1e6, md / 1e6))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        println!(
+            "  torch detail: sdpa-1t {}; manual-1t {}; sdpa-all {}",
+            fmt(&t.sdpa_1t),
+            fmt(&t.manual_1t),
+            fmt(&t.sdpa_nt)
+        );
+        if let Some(r) = t.manual_vs_sdpa {
+            println!("  torch-internal manual-attn vs SDPA: max|Δ|/max|out| = {r:.2e}");
+        }
+    }
 
     let ratio_line = |mer: &Option<MeasureModel>, peer: &Option<MeasureModel>, who: &str, peer_name: &str| {
         if let (Some(m), Some(p)) = (mer, peer) {
@@ -1111,6 +1445,37 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
     ratio_line(&mer_m, &c_m, "(1 core)", "C (gcc -O3 -march=native)");
     ratio_line(&mer_m, &cfast_m, "(1 core)", "C(fast) (gcc -ffast-math)");
     ratio_line(&mer_par_m, &cfast_m, "@parallel", "C(fast) (single-threaded)");
+    ratio_line(
+        &mer_m,
+        &torch1_m,
+        "(1 core)",
+        "PyTorch eager SDPA (1 thread)",
+    );
+    ratio_line(
+        &mer_m,
+        &torchman_m,
+        "(1 core)",
+        "PyTorch eager manual-attn (1 thread)",
+    );
+    ratio_line(
+        &mer_m,
+        &torchn_m,
+        "(1 core)",
+        "PyTorch eager SDPA (all threads)",
+    );
+    ratio_line(
+        &mer_par_m,
+        &torchn_m,
+        "@parallel",
+        "PyTorch eager SDPA (all threads)",
+    );
+    if mer_par_m.is_some() {
+        println!(
+            "     (thread disclosure: both C columns and the T1 torch columns are \
+             single-threaded; Mer(par) and Tn(sdpa) are the two multicore columns — the \
+             @parallel dispatch set is printed above)"
+        );
+    }
 
     // --- full-buffer cross-checks over the final [S, D] output ---
     // Mercury-vs-C: the GEMM/norm reductions reassociate and Mercury's ~1-ULP poly exp/tanh differ
@@ -1136,6 +1501,9 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg) {
     };
     check(&mer_m, &c_m, "Mercury vs C", 1e-3);
     check(&mer_m, &cfast_m, "Mercury vs C(fast)", 1e-3);
+    // Mercury vs torch: same GELU flavor (tanh approx) and eps, so the residual is the same
+    // reassociation + poly-vs-libm class as vs C — expect ~1e-5-ish at the standard 1e-3.
+    check(&mer_m, &torch1_m, "Mercury vs Torch (eager SDPA)", 1e-3);
     // Serial vs @parallel Mercury: every dispatched _parallel kernel is bit-identical to its serial
     // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
     // stays the strict per-element check — it is expected EXACT.
