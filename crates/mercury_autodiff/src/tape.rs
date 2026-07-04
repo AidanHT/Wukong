@@ -56,6 +56,11 @@ const PTR: MirType = MirType::Ptr;
 pub(crate) struct Syms {
     pub sgemm: Symbol,
     pub sgemm_nt: Symbol,
+    /// The `@parallel` NN GEMM — same `(a, b, c, m, k, n, beta)` ABI and bit-identical (fixed
+    /// chunking) result as the serial `sgemm_nt`, so it differentiates through the very same rule.
+    /// A matmul embedded in a `@parallel fn` lowers to *this* symbol (mir_build's `lower_for` passes
+    /// `parallel_fn`), while single-statement / non-parallel tapes use the serial one — accept both.
+    pub sgemm_nt_parallel: Symbol,
     pub vmath: Symbol,
     pub sreduce: Symbol,
     /// The `@parallel` reduction — same `(x, y, n, op)` ABI and identical (deterministic, fixed
@@ -75,6 +80,7 @@ impl Syms {
         Syms {
             sgemm: it.intern("mercury_sgemm"),
             sgemm_nt: it.intern("mercury_sgemm_nt"),
+            sgemm_nt_parallel: it.intern("mercury_sgemm_nt_parallel"),
             vmath: it.intern("mercury_vmath_f32"),
             sreduce: it.intern("mercury_sreduce_f32"),
             sreduce_parallel: it.intern("mercury_sreduce_f32_parallel"),
@@ -112,6 +118,7 @@ impl<'a> Vjp<'a> {
     /// Is `func` a tensor kernel this module differentiates?
     pub(crate) fn is_kernel(&self, func: Symbol) -> bool {
         func == self.syms.sgemm_nt
+            || func == self.syms.sgemm_nt_parallel
             || func == self.syms.vmath
             || func == self.syms.sreduce
             || func == self.syms.sreduce_parallel
@@ -158,7 +165,7 @@ impl<'a> Vjp<'a> {
         let args = &args[..];
         if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
             self.diff_sreduce(args, result)
-        } else if func == self.syms.sgemm_nt {
+        } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
             self.diff_sgemm_nt(args)
         } else if func == self.syms.vmath {
             self.diff_vmath(args)
