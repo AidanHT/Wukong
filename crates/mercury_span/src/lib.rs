@@ -6,9 +6,11 @@
 //! [`Location`]s. The [`Interner`] turns repeated identifier strings into cheap copyable
 //! [`Symbol`]s.
 
+pub mod fxhash;
 mod intern;
 mod source_map;
 
+pub use fxhash::{FxHashMap, FxHashSet, FxHasher};
 pub use intern::{Interner, Symbol};
 pub use source_map::{Location, SourceFile, SourceMap};
 

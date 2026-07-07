@@ -4,7 +4,7 @@
 //! [`Symbol`] (a `u32`) that is `Copy`, `Eq`, and `Hash`, so the rest of the compiler can
 //! compare and store names cheaply instead of cloning `String`s everywhere.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 
 /// A handle to an interned string. Cheap to copy, compare, and hash.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -19,7 +19,7 @@ impl std::fmt::Debug for Symbol {
 /// Interns strings into [`Symbol`]s and resolves them back.
 #[derive(Default)]
 pub struct Interner {
-    lookup: HashMap<Box<str>, Symbol>,
+    lookup: FxHashMap<Box<str>, Symbol>,
     strings: Vec<Box<str>>,
 }
 

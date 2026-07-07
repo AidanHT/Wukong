@@ -7,7 +7,7 @@
 //!    conflicting binding is a `E0502` dimension mismatch and a differing rank is `E0501`.
 //!  * **Index rank**: indexing a tensor with the wrong number of indices is a `E0501`.
 
-use std::collections::HashMap;
+use mercury_span::FxHashMap as HashMap;
 
 use mercury_ast::{Expr, ExprKind, TypeExpr, TypeKind};
 use mercury_span::{Span, Symbol};
@@ -227,8 +227,8 @@ impl Sema<'_> {
             return sig.ret.clone();
         }
 
-        let mut dims: HashMap<Symbol, Dim> = HashMap::new();
-        let mut tys: HashMap<Symbol, Ty> = HashMap::new();
+        let mut dims: HashMap<Symbol, Dim> = HashMap::default();
+        let mut tys: HashMap<Symbol, Ty> = HashMap::default();
 
         if !generic_args.is_empty() {
             if generic_args.len() != sig.generics.len() {

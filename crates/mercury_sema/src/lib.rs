@@ -12,7 +12,7 @@
 
 mod shape;
 
-use std::collections::{HashMap, HashSet};
+use mercury_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use mercury_ast::*;
 use mercury_diag::Diagnostic;
@@ -248,15 +248,15 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         interner,
         defs: DefMap::default(),
         diags: Vec::new(),
-        types: HashMap::new(),
+        types: HashMap::default(),
         scopes: Vec::new(),
         immutable_locals: Vec::new(),
         immutable_params: Vec::new(),
-        param_tys: HashMap::new(),
-        generics: HashSet::new(),
+        param_tys: HashMap::default(),
+        generics: HashSet::default(),
         ret_ty: Ty::Unit,
         loop_ctx: Vec::new(),
-        consts: HashMap::new(),
+        consts: HashMap::default(),
         checking_bodies: false,
     };
     s.collect(module);
@@ -503,7 +503,7 @@ impl Sema<'_> {
     /// registered, and (like the struct check) before `check_bodies`, so the error halts the pipeline
     /// ahead of mir_build's inliner.
     fn check_recursive_consts(&mut self, module: &Module) {
-        let mut inits: HashMap<Symbol, &Expr> = HashMap::new();
+        let mut inits: HashMap<Symbol, &Expr> = HashMap::default();
         for item in &module.items {
             if let ItemKind::Const(c) = &item.kind {
                 inits.insert(c.name.sym, &c.value);
@@ -823,11 +823,11 @@ impl Sema<'_> {
     fn check_const(&mut self, c: &ConstDecl, span: Span) {
         self.generics.clear();
         self.scopes.clear();
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         self.immutable_locals.clear();
-        self.immutable_locals.push(HashSet::new());
+        self.immutable_locals.push(HashSet::default());
         self.immutable_params.clear();
-        self.immutable_params.push(HashSet::new());
+        self.immutable_params.push(HashSet::default());
         self.param_tys.clear();
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
@@ -857,18 +857,18 @@ impl Sema<'_> {
     fn check_fn(&mut self, f: &FnDecl, body: &Block) {
         self.generics = generic_names(&f.generics);
         self.scopes.clear();
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         // Mirror the scope reset for immutability tracking (these reset `scopes` directly instead of
         // via `push_scope`, so the two stacks would otherwise desync and the check never fires).
         self.immutable_locals.clear();
-        self.immutable_locals.push(HashSet::new());
+        self.immutable_locals.push(HashSet::default());
         self.immutable_params.clear();
-        self.immutable_params.push(HashSet::new());
+        self.immutable_params.push(HashSet::default());
         self.param_tys.clear();
         // Two parameters may not share a name: the second would silently shadow the first in the
         // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
         // quiet footgun. Duplicate top-level `fn`s are already E0300; parameters get the same code.
-        let mut seen_params: HashSet<Symbol> = HashSet::new();
+        let mut seen_params: HashSet<Symbol> = HashSet::default();
         for p in &f.params {
             if !seen_params.insert(p.name.sym) {
                 let nm = self.sym_str(p.name.sym).to_string();
@@ -929,7 +929,7 @@ impl Sema<'_> {
         if matches!(ret, Ty::Tensor { .. } | Ty::Vector { .. })
             || matches!(val_ty, Ty::Tensor { .. } | Ty::Vector { .. })
         {
-            let mut dims = HashMap::new();
+            let mut dims = HashMap::default();
             // Body context: the declared return shape and the returned value's shape are both fully
             // determined, and this function's own generic dims are RIGID — so a generic function
             // cannot declare a return shape its body does not actually produce. (`rigid == true`.)
@@ -985,7 +985,7 @@ impl Sema<'_> {
             (l, r),
             (Ty::Tensor { .. }, Ty::Tensor { .. }) | (Ty::Vector { .. }, Ty::Vector { .. })
         ) {
-            let mut dims = HashMap::new();
+            let mut dims = HashMap::default();
             // Body context (operator operands, assignment, if/match arm merge): both operand shapes
             // are fully determined and this function's generic dims are RIGID, so distinct generics
             // (`Tensor[f32,M] + Tensor[f32,N]`) no longer "unify" by binding one to the other.
@@ -1258,9 +1258,9 @@ impl Sema<'_> {
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
-        self.immutable_locals.push(HashSet::new());
-        self.immutable_params.push(HashSet::new());
+        self.scopes.push(HashMap::default());
+        self.immutable_locals.push(HashSet::default());
+        self.immutable_params.push(HashSet::default());
     }
 
     fn pop_scope(&mut self) {
@@ -2971,7 +2971,7 @@ impl Sema<'_> {
                     // also falsely rejected a mixed exhaustive match (`E::A | 1 | 2`), whose int
                     // arms contributed nothing. Any guard-less pattern the collector can't reason
                     // about keeps the whole match lenient, so incompleteness stays *certain*.
-                    let mut covered = HashSet::new();
+                    let mut covered = HashSet::default();
                     let mut spans: Vec<(i64, i64)> = Vec::new();
                     for a in arms {
                         if a.guard.is_none()
