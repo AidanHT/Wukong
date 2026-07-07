@@ -1,0 +1,18 @@
+// EXPECT-CODE: E0501
+module tests.fail.const_tensor_dim_index_oob
+
+// A `const` used as a tensor *dimension* is a fixed size, so an index past it is a compile-time
+// out-of-bounds — exactly as a literal dim (`Tensor[f32, 3]`) or a const array index already is.
+// Before, `lower_dim` turned a const-named dim into a fresh symbolic `Dim::Var(D)` (as if it were a
+// generic), so `D`'s value never reached the bounds check: sema accepted `a[7]` on a `Tensor[f32, D]`
+// with `const D = 3`, then the interpreter trapped the out-of-bounds read while native codegen read
+// past the 3-element buffer — a differential-gate divergence on a program that should never compile.
+const D: usize = 3;
+
+fn read(a: Tensor[f32, D]) -> f32 {
+    return a[7];
+}
+
+fn main() -> i32 {
+    return 0;
+}
