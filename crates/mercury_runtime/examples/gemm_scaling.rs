@@ -10,23 +10,39 @@
 
 use std::time::Instant;
 
-fn time_best<F: FnMut()>(mut f: F, iters: u32, reps: u32) -> f64 {
-    // Warm up.
-    for _ in 0..3 {
+fn one<F: FnMut()>(f: &mut F, reps: u32) -> f64 {
+    let t = Instant::now();
+    for _ in 0..reps {
         f();
     }
-    let mut best = f64::INFINITY;
-    for _ in 0..iters {
-        let t = Instant::now();
-        for _ in 0..reps {
-            f();
-        }
-        let ns = t.elapsed().as_nanos() as f64 / reps as f64;
-        if ns < best {
-            best = ns;
-        }
+    t.elapsed().as_nanos() as f64 / reps as f64
+}
+
+/// Measure serial and parallel **adjacently** each round and return (best_ser_ns, best_par_ns,
+/// median_scaling). Interleaving cancels the laptop's slow thermal drift: each round's ser and par
+/// see nearly the same clock, so the per-round ratio is stable even as the absolute clock swings.
+fn time_pair<S: FnMut(), P: FnMut()>(
+    mut ser: S,
+    mut par: P,
+    rounds: u32,
+    reps: u32,
+) -> (f64, f64, f64) {
+    for _ in 0..3 {
+        ser();
+        par();
     }
-    best
+    let mut best_s = f64::INFINITY;
+    let mut best_p = f64::INFINITY;
+    let mut ratios = Vec::new();
+    for _ in 0..rounds {
+        let s = one(&mut ser, reps);
+        let p = one(&mut par, reps);
+        best_s = best_s.min(s);
+        best_p = best_p.min(p);
+        ratios.push(s / p);
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (best_s, best_p, ratios[ratios.len() / 2])
 }
 
 fn main() {
@@ -54,22 +70,21 @@ fn main() {
         let flop = 2.0 * m as f64 * k as f64 * n as f64;
         // Bigger GEMMs get fewer reps so each measurement is ~a few ms.
         let reps = (200_000_000 / (m * k * n).max(1)).clamp(2, 200) as u32;
-        let ser = time_best(
+        // Capture as usize so the serial and parallel closures can coexist (both touch `c`).
+        let (ap, bp, cp) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_mut_ptr() as usize);
+        let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+        let (ser, par, scaling) = time_pair(
             || unsafe {
                 mercury_runtime::mercury_sgemm_nt(
-                    a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i64, k as i64, n as i64, 0,
+                    ap as *const f32, bp as *const f32, cp as *mut f32, mi, ki, ni, 0,
                 )
             },
-            12,
-            reps,
-        );
-        let par = time_best(
             || unsafe {
                 mercury_runtime::mercury_sgemm_nt_parallel(
-                    a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i64, k as i64, n as i64, 0,
+                    ap as *const f32, bp as *const f32, cp as *mut f32, mi, ki, ni, 0,
                 )
             },
-            12,
+            25,
             reps,
         );
         println!(
@@ -77,7 +92,7 @@ fn main() {
             format!("{}x{}x{}", m, k, n),
             flop / ser,
             flop / par,
-            ser / par,
+            scaling,
         );
     }
 }
