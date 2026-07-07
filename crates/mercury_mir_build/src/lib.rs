@@ -22452,6 +22452,22 @@ fn fuse_for_bodies(stmts: &[Stmt]) -> Block {
                 span = Some(body.span);
             }
             fused.extend(body.stmts.iter().cloned());
+            // A for-body's trailing expression is evaluated for its side effects each iteration (a for
+            // loop discards its body value), so it is semantically a statement — append it as one.
+            // Dropping it silently (the old behavior) miscompiled a loop whose body is a bare
+            // side-effecting expression, e.g. an `if x[i]>0 { r[i]=x[i] } else { r[i]=0 }` relu stored
+            // in `tail`: fusion kept only the neighbor loop and the relu vanished, and BOTH backends
+            // agreed on the wrong answer (the miscompile escaped the differential gate). Keeping it
+            // makes `vectorizable` reject a non-Let/Assign tail, so fusion safely declines and the
+            // faithful separate lowering runs. Regression-guarded by tests/run/fuse_if_relu.mer.
+            if let Some(tail) = &body.tail {
+                fused.push(Stmt {
+                    id: ast::NodeId::DUMMY,
+                    attrs: Vec::new(),
+                    kind: StmtKind::Expr((**tail).clone()),
+                    span: tail.span,
+                });
+            }
         }
     }
     Block {
