@@ -1,0 +1,45 @@
+// RUN: --run
+// A guarded shifted array read `if cond { x[i-1] } else { d }` must NOT be if-converted into an
+// unconditional speculative vector load. In the boundary lane where the guard is false the shifted
+// index is out of bounds (i=0 reads x[-1]) — a read the scalar source never performs, because the
+// guard is exactly what keeps it in range. The SIMD auto-vectorizer used to if-convert this by
+// loading the then-branch `x[i-1]` in EVERY lane and blending: the interpreter trapped the OOB lane
+// load ("veckernel load out of bounds") while native codegen read adjacent memory and blended it
+// away — interp != native on a well-defined program (a differential-gate breach), plus a latent
+// native out-of-bounds read that "works" only by memory-layout luck. The vectorizer now declines
+// if-conversion when a conditionally-evaluated branch reads an array at a non-zero offset from the
+// loop variable, falling back to the correct scalar loop. Both the elementwise and the reduction
+// vectorizer route through the same check, so both are covered.
+// EXPECT-EXIT: 0
+// elementwise, negative offset: out[0]=else=0, out[i]=x[i-1]; sum = 0+1+2+3+4+5+6+7 = 28
+// EXPECT-OUT: 28
+// reduction, negative offset: same masked sum = 28
+// EXPECT-OUT: 28
+// elementwise, positive offset: out[7]=else=0, out[i]=x[i+1]; sum = 2+3+4+5+6+7+8+0 = 35
+// EXPECT-OUT: 35
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+    // mask false only in the first lane, where x[i-1] would underflow to x[-1].
+    let lo_mask: [f32; 8] = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let mut out: [f32; 8] = [0.0; 8];
+    for i in 0..8 { out[i] = if lo_mask[i] > 0.5 { x[i - 1] } else { 0.0 }; }
+    let mut se: f32 = 0.0;
+    for k in 0..8 { se = se + out[k]; }
+    print(se as i32); // 28
+
+    // same guarded shifted read, but inside a reduction body.
+    let mut sr: f32 = 0.0;
+    for i in 0..8 { sr = sr + (if lo_mask[i] > 0.5 { x[i - 1] } else { 0.0 }); }
+    print(sr as i32); // 28
+
+    // mask false only in the last lane, where x[i+1] would read one past the end.
+    let hi_mask: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+    let mut out2: [f32; 8] = [0.0; 8];
+    for i in 0..8 { out2[i] = if hi_mask[i] > 0.5 { x[i + 1] } else { 0.0 }; }
+    let mut sp: f32 = 0.0;
+    for k in 0..8 { sp = sp + out2[k]; }
+    print(sp as i32); // 35
+
+    return 0;
+}
