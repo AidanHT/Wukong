@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0502
+module tests.fail.const_tensor_dim_mismatch
+
+// A `const`-sized tensor parameter is a fixed dimension: passing a differently-sized tensor is a
+// dimension conflict (E0502), just like `Tensor[f32, 3]` vs `Tensor[f32, 5]`. Before, the const dim
+// `D` lowered to a fresh symbolic `Dim::Var(D)` that *inferred* its value from the argument — so a
+// `Tensor[f32, 5]` silently bound `D = 5` and the call was accepted, defeating the size guarantee the
+// const was meant to express. Now `D` resolves to its value (3) and the 3-vs-5 mismatch is reported.
+const D: usize = 3;
+
+fn take(a: Tensor[f32, D]) -> f32 {
+    return a[0];
+}
+
+fn feed(y: Tensor[f32, 5]) -> f32 {
+    return take(y);
+}
+
+fn main() -> i32 {
+    return 0;
+}

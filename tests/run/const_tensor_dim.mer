@@ -1,0 +1,24 @@
+// RUN: --run
+// A `const`-sized tensor threads through a function as both a parameter and a return type. Resolving
+// a const dim to its value must NOT introduce a false positive: `Tensor[f32, D]` and `Tensor[f32, 3]`
+// (with `const D = 3`) are the SAME shape, so returning one where the other is declared type-checks,
+// and the const dim drives a real in-place loop that runs bit-identically on interp and native.
+// Regression guard for the shape-safety fix that made const dims fixed (E0501/E0502) — this is its
+// must-still-compile companion.
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+const D: usize = 3;
+
+fn scale(mut a: Tensor[f32, D]) -> Tensor[f32, D] {
+    for i in 0..D { a[i] = a[i] * 2.0; }
+    return a;
+}
+
+fn main() -> i32 {
+    let x: [f32; 3] = [4.0, 5.0, 6.0];
+    let y: Tensor[f32, D] = scale(x);
+    print(y[0] as i32); // 4*2 = 8
+    print(y[2] as i32); // 6*2 = 12
+    return 0;
+}

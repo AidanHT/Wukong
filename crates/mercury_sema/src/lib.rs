@@ -678,17 +678,31 @@ impl Sema<'_> {
         match &d.kind {
             DimKind::Int(n) => Dim::Const(*n),
             DimKind::Named(s) => {
-                // An undeclared dim name is a typo, not a fresh implicit dim. Previously
-                // `Tensor[f32, KK]` (when only `K` was declared) silently introduced a brand-new
-                // symbolic dim `KK`, dropping the shared `K` constraint the programmer meant — a
-                // shape hole the checker exists to catch. Require the name to be a declared generic
-                // of the enclosing item (or a top-level `const`); otherwise report E0504 with a
+                // A declared generic parameter is a *symbolic* dim (bound per call site). It takes
+                // precedence over a same-named `const` (a generic shadows an outer const, matching
+                // lexical scoping), so check it first and keep it a `Var`.
+                if self.generics.contains(s) {
+                    return Dim::Var(*s);
+                }
+                // A top-level `const` used as a dimension resolves to its integer *value* — a fixed
+                // dim, exactly like an array length (`eval_usize` / mir_build's `const_usize_expr`).
+                // `const D: usize = 3; Tensor[f32, D]` is a size-3 tensor, so an out-of-bounds index
+                // `a[7]` is a compile-time error (E0501) and a mismatched concrete size is E0502 —
+                // NOT a fresh unconstrained `Var(D)` that silently accepts any index or any size.
+                // Without this the flagship shape check had a soundness hole: a const dim escaped
+                // bounds/agreement checking entirely (interp trapped a[7] out-of-bounds while native
+                // read past the buffer — a differential-gate divergence on plausible code). Mirrors
+                // the array-length resolution above so the two agree on the value.
+                if let Some(init) = self.consts.get(s).cloned() {
+                    return Dim::Const(self.eval_usize_depth(&init, 0));
+                }
+                // Neither a generic nor a const: an undeclared dim name is a typo, not a fresh
+                // implicit dim. Previously `Tensor[f32, KK]` (when only `K` was declared) silently
+                // introduced a brand-new symbolic dim `KK`, dropping the shared `K` constraint the
+                // programmer meant — a shape hole the checker exists to catch. Report E0504 with a
                 // did-you-mean hint. Gated on `checking_bodies` so it fires once per site, only after
                 // every generic/`const` is known (see the flag's doc-comment).
-                if self.checking_bodies
-                    && !self.generics.contains(s)
-                    && !self.consts.contains_key(s)
-                {
+                if self.checking_bodies {
                     let msg = match self.nearest_generic(*s) {
                         Some(g) => format!(
                             "unknown tensor dimension `{}`; did you mean `{}`? (a dimension must be \
