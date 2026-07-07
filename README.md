@@ -16,14 +16,21 @@ Mercury compiles to native code through a **from-scratch [Cranelift](https://cra
 no LLVM, no external toolchain**. In a head-to-head cross-language benchmark (same kernel in each
 language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 
-- **compiles ~100–680× faster** than gcc/rustc (full-board geomean **~305×**; Cranelift JIT in-process
-  vs spawning a full C/Rust+LLVM toolchain) — the metric that dominates real ML edit-run iteration;
+- **compiles fast** — the metric that dominates real ML edit-run iteration. Apples-to-apples
+  *compiler-to-object* (`mercuryc --emit=obj -O2` vs `gcc/g++/rustc -O2 -c`, same artifact, same
+  machine): **~6–14× faster** (`mercury_bench compile-vs`). The larger **~100–680× (geomean ~305×)**
+  figure is *time-to-running-code*: Mercury JIT-compiles in-process while C/Rust must spawn a full
+  toolchain **and link a shared object** — a real advantage for the JIT/embedding workflow, but not a
+  compiler-vs-compiler number, so it is disclosed as such, never as the headline;
 - **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
   `nn.Linear` `A·Bᵀ` form) and dispatches it to a tuned register-blocked, cache-tiled, packed
   **AVX2/FMA** microkernel — **~3–3.6× faster single-thread** at **~110–120 GFLOP/s ≈ 90% of one
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
   **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
-  (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*;
+  (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
+  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM is **~55–75%** (its
+  weakest CPU spot: small/medium GEMMs on this P+E hybrid don't amortize the cross-core sync, so the
+  win is single-core parity + big-vs-naive-C, not beating MKL's threaded pack);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
   over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
   column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
