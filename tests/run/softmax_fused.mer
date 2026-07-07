@@ -1,0 +1,44 @@
+// RUN: --run
+// The FUSED-window softmax spelling — the exp-of-centered store and the running sum share ONE loop
+// (`for i { let e = exp(x[i]-m); x[i] = e; s = s + e }`), one fewer memory pass than the canonical
+// split form — must dispatch to the same mercury_norm_f32(NORM_SOFTMAX) kernel. This is the spelling
+// every efficient hand-written softmax uses; it used to fall to the generic velem path (~1.8x slower
+// than the fused kernel at [256,256], measured adjacent same-run). Covers both the single-row and the
+// batched [R,C] form, and the batched max seed written as the explicit column-zero `x[r*C+0]` (what
+// the flagship models write), which `is_max_seed` now peels.
+// EXPECT-EXIT: 0
+// single-row softmax([1,2,3,1,2,3]): x[2] = e^0/(2(e^-2+e^-1+1)) ~ 0.33253 -> 332
+// EXPECT-OUT: 332
+// EXPECT-OUT: 45
+// batched rows: row0 softmax([1,2,3,4])[1] ~ 0.0871 -> 87; row1 uniform 0.25 -> 250;
+// row2 softmax([5,1,1,1])[0] ~ 0.9479 -> 947
+// EXPECT-OUT: 87
+// EXPECT-OUT: 250
+// EXPECT-OUT: 947
+fn main() -> i32 {
+    // single-row, fused middle pass
+    let mut x: [f32; 6] = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
+    let mut m: f32 = x[0];
+    for i in 0..6 { m = fmax(m, x[i]); }
+    let mut s: f32 = 0.0;
+    for i in 0..6 { let e: f32 = exp(x[i] - m); x[i] = e; s = s + e; }
+    let inv: f32 = 1.0 / s;
+    for i in 0..6 { x[i] = x[i] * inv; }
+    print((x[2] * 1000.0) as i32); // 332
+    print((x[0] * 1000.0) as i32); // 45
+
+    // batched [3,4], fused middle pass, explicit `+0` column seed
+    let mut y: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0, 1.0, 1.0, 1.0];
+    for r in 0..3 {
+        let mut mr: f32 = y[r*4+0];
+        for j in 0..4 { mr = fmax(mr, y[r*4+j]); }
+        let mut sr: f32 = 0.0;
+        for j in 0..4 { let e: f32 = exp(y[r*4+j] - mr); y[r*4+j] = e; sr = sr + e; }
+        let ir: f32 = 1.0 / sr;
+        for j in 0..4 { y[r*4+j] = y[r*4+j] * ir; }
+    }
+    print((y[1] * 1000.0) as i32);  // 87
+    print((y[5] * 1000.0) as i32);  // 250
+    print((y[8] * 1000.0) as i32);  // 947
+    return 0;
+}

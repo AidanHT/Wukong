@@ -3161,7 +3161,12 @@ impl FnLowerer<'_> {
                     continue;
                 }
             }
-            if let Some((n, arr, n_expr)) = self.match_softmax(b, i, None) {
+            // Both the un-fused 7-statement form and the fused 6-statement form (`exp` store and `sum`
+            // share one loop — every efficient hand-written softmax) fold to the same NORM_SOFTMAX call.
+            if let Some((n, arr, n_expr)) = self
+                .match_softmax(b, i, None)
+                .or_else(|| self.match_softmax_fused(b, i, None))
+            {
                 if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
                     i += n;
                     continue;
@@ -3628,12 +3633,27 @@ impl FnLowerer<'_> {
                 return false;
             }
             // Single-row: the seed is `x[0]`. Batched row `r`: the seed is `x[r*C]` — the row's first
-            // element (the bare `row*cols` base offset, no `+ i`), which `is_mul_of` matches.
+            // element (the bare `row*cols` base offset, no `+ i`), which `is_mul_of` matches. The
+            // explicit column-zero spelling `x[r*C + 0]` (how a row-major index macro-expands, and
+            // what the flagship models write — `scores[i*8+0]`) is the same element, so peel a
+            // trailing literal `+ 0` before matching.
             return match batch {
                 None => {
                     matches!(&indices[0].kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 0)
                 }
-                Some((row, cols)) => self.is_mul_of(&indices[0], row, cols),
+                Some((row, cols)) => {
+                    let idx: &Expr = match &indices[0].kind {
+                        ExprKind::Binary {
+                            op: ast::BinOp::Add,
+                            lhs,
+                            rhs,
+                        } if matches!(&rhs.kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 0) => {
+                            lhs
+                        }
+                        _ => &indices[0],
+                    };
+                    self.is_mul_of(idx, row, cols)
+                }
             };
         }
         let v = match &init.kind {
@@ -3741,6 +3761,167 @@ impl FnLowerer<'_> {
             }
         }
         Some((7, x, n_expr.clone()))
+    }
+
+    /// Recognize the **fused-window** numerically-stable softmax (6 statements): the exp-of-centered
+    /// *store* and the running *sum* share ONE loop, one fewer memory pass than [`Self::match_softmax`]'s
+    /// 7-statement form (which splits them into a separate `exp` loop and `sum` loop):
+    /// ```text
+    ///   let m = x[0]; for i { m = fmax(m, x[i]) };
+    ///   let s = 0;    for i { let e = exp(x[i]-m); x[i] = e; s = s + e };   // FUSED exp + sum
+    ///   let inv = 1/s; for i { x[i] = x[i]*inv };
+    /// ```
+    /// This is the spelling every efficient hand-written softmax uses (and the one the project's own
+    /// models write). It folds to the **identical** `mercury_norm_f32(x, x, 1, N, 0, NORM_SOFTMAX)`
+    /// call the un-fused form emits — the kernel is already the softmax oracle both backends run, so a
+    /// match is byte-equivalent and needs no backend change; the only risk is a *misfire*, guarded by
+    /// the same strict per-loop checks (`match_max_reduce_body` / `match_exp_store_sum_body` /
+    /// `match_recip` / `match_scale_body`, every loop ranging the identical `0..N` over the same array).
+    /// Batch-aware like `match_softmax`. Pure; `None` on any deviation.
+    fn match_softmax_fused(
+        &self,
+        b: &Block,
+        at: usize,
+        batch: Option<Symbol>,
+    ) -> Option<(usize, Symbol, Expr)> {
+        let stmts = &b.stmts[at..];
+        if stmts.len() < 6 {
+            return None;
+        }
+        let (m, seed) = Self::let_init(&stmts[0])?;
+        let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
+        let data_batch = batch.map(|row| (row, n_expr));
+        let x = self.match_max_reduce_body(body1, v1, m, data_batch)?;
+        if !self.is_max_seed(seed, x, data_batch) {
+            return None;
+        }
+        let (s, s_init) = Self::let_init(&stmts[2])?;
+        if !matches!(&s_init.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
+        {
+            return None;
+        }
+        let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
+        if !exprs_struct_eq(n3, n_expr) {
+            return None;
+        }
+        self.match_exp_store_sum_body(body3, v3, x, m, s, data_batch)?;
+        let inv = self.match_recip(&stmts[4], s)?;
+        let (v5, n5, body5) = self.as_range0_for(&stmts[5])?;
+        if !exprs_struct_eq(n5, n_expr) {
+            return None;
+        }
+        // softmax's normalize is a plain in-place `x[i] *= inv` — no affine, `dst == x` (see the
+        // un-fused `match_softmax` for why out-of-place softmax is unsound).
+        if self.match_scale_body(body5, v5, x, inv, data_batch)? != (x, None, None) {
+            return None;
+        }
+        // The three internal scalars must not be read after the window — the kernel hides them.
+        let rest = &b.stmts[at + 6..];
+        let tail = b.tail.as_deref();
+        for sc in [m, s, inv] {
+            if block_mentions(rest, tail, sc) {
+                return None;
+            }
+        }
+        Some((6, x, n_expr.clone()))
+    }
+
+    /// The FUSED middle pass of a stable softmax — one loop that BOTH writes the exp-of-centered value
+    /// and accumulates the running sum. Two spellings, both byte-equivalent to the split
+    /// `match_exp_sub_body` + `match_sum_body` pair:
+    /// ```text
+    ///   for v { let e = exp(x[v] - m); x[v] = e; s = s + e }   // 3-statement `let e` form
+    ///   for v { x[v] = exp(x[v] - m);  s = s + x[v] }          // 2-statement direct form
+    /// ```
+    /// Verifies exactly: the exp reads `x[v]` centered by the running max `m` (f32), the store writes
+    /// the SAME `x[v]`, and `s` accumulates the SAME just-produced value (the `let`-bound `e`, or the
+    /// re-read `x[v]` which stmt-order guarantees equals it). Batch-offset aware via `index_off`. Pure.
+    fn match_exp_store_sum_body(
+        &self,
+        body: &Block,
+        v: Symbol,
+        x: Symbol,
+        m: Symbol,
+        s: Symbol,
+        batch: Option<(Symbol, &Expr)>,
+    ) -> Option<()> {
+        if body.tail.is_some() {
+            return None;
+        }
+        // `s = s + <addend>` / `s += <addend>` → the addend expression (the summed value).
+        let sum_addend = |stmt: &Stmt| -> Option<Expr> {
+            let StmtKind::Assign { target, op, value } = &stmt.kind else {
+                return None;
+            };
+            if single_path(target) != Some(s) {
+                return None;
+            }
+            match op {
+                ast::AssignOp::Add => Some(value.clone()),
+                ast::AssignOp::Assign => match &value.kind {
+                    ExprKind::Binary {
+                        op: ast::BinOp::Add,
+                        lhs,
+                        rhs,
+                    } if single_path(lhs) == Some(s) => Some((**rhs).clone()),
+                    ExprKind::Binary {
+                        op: ast::BinOp::Add,
+                        lhs,
+                        rhs,
+                    } if single_path(rhs) == Some(s) => Some((**lhs).clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        match body.stmts.len() {
+            3 => {
+                // `let e = exp(x[v]-m); x[v] = e; s = s + e;`
+                let (e, e_init) = Self::let_init(&body.stmts[0])?;
+                if !self.is_exp_centered(e_init, x, m, v, batch)
+                    || self.expr_mir(e_init) != MirType::F32
+                {
+                    return None;
+                }
+                let StmtKind::Assign {
+                    target,
+                    op: ast::AssignOp::Assign,
+                    value,
+                } = &body.stmts[1].kind
+                else {
+                    return None;
+                };
+                if self.index_off(target, v, batch) != Some(x) || single_path(value) != Some(e) {
+                    return None;
+                }
+                if single_path(&sum_addend(&body.stmts[2])?) != Some(e) {
+                    return None;
+                }
+                Some(())
+            }
+            2 => {
+                // `x[v] = exp(x[v]-m); s = s + x[v];`
+                let StmtKind::Assign {
+                    target,
+                    op: ast::AssignOp::Assign,
+                    value,
+                } = &body.stmts[0].kind
+                else {
+                    return None;
+                };
+                if self.index_off(target, v, batch) != Some(x)
+                    || !self.is_exp_centered(value, x, m, v, batch)
+                    || self.expr_mir(value) != MirType::F32
+                {
+                    return None;
+                }
+                if self.index_off(&sum_addend(&body.stmts[1])?, v, batch) != Some(x) {
+                    return None;
+                }
+                Some(())
+            }
+            _ => None,
+        }
     }
 
     /// Recognize a stable **log-softmax** window (6 statements), the classification / LM-training loss
@@ -8956,7 +9137,10 @@ impl FnLowerer<'_> {
         if body.tail.is_some() {
             return None;
         }
-        if let Some((consumed, x, cols)) = self.match_softmax(body, 0, Some(*r)) {
+        if let Some((consumed, x, cols)) = self
+            .match_softmax(body, 0, Some(*r))
+            .or_else(|| self.match_softmax_fused(body, 0, Some(*r)))
+        {
             if consumed == body.stmts.len() {
                 return Some((x, x, cols, 0, NORM_SOFTMAX, None, None));
             }
