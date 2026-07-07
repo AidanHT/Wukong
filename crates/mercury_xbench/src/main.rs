@@ -1252,8 +1252,14 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== linear (nn.Linear C=A·Bᵀ) {ns}x{ns} (GFLOP/s, higher is better) ===");
+        // Single-core group, coolest-first (thermal hygiene, mirrors bench_matmul_size): Mer(1c) and
+        // MKL(1c) adjacent at the head, then tuned, then the naive C/Rust/C(fast) nests. The all-core
+        // group (MKL(all), C(omp), Mer(par)) runs last so any residual heat lands on Mercury, never a
+        // peer. nn.Linear (C=A·Bᵀ) is the shape that dominates a transformer, so it is now measured
+        // against real oneMKL — the true SOTA bar — not only the naive C nests and the tuned(mm) crate.
         let mer = bench_mercury(&mer_linear(ns, false), &mut c, ap, bp, cp);
-        let mer_par = bench_mercury(&mer_linear(ns, true), &mut c, ap, bp, cp);
+        let mkl_1c = bench_mm_mkl(ns, true, 1, &a, &b, &mut c);
+        let tuned = bench_mm_tuned(ns, true, &a, &b, &mut c);
         let cm = bench_external(
             "c",
             &c_linear(ns),
@@ -1281,6 +1287,10 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         // Reassociation-normalized peer: with -ffast-math gcc may reassociate + vectorize the
         // ijk dot-product reduction that the honest-flags column keeps serial.
         let cfast = bench_c_fast("linear", &c_linear(ns), dir, cc, &mer, &mut c, ap, bp, cp);
+        // All-core group: MKL(all) first (coolest — rayon still dormant), then C(omp), then Mer(par) last.
+        let mkl_all = mkl()
+            .map(|api| api.max_threads)
+            .and_then(|t| bench_mm_mkl(ns, true, t, &a, &b, &mut c));
         // Multithreaded C peer: rows across cores + -ffast-math (the reduction row rule).
         let comp = omp_threads(cc, dir)
             .and_then(|_| {
@@ -1298,22 +1308,26 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 )
             })
             .filter(|p| mer.as_ref().is_some_and(|m| relaxed_peer_ok("linear", "C(omp)", m, p)));
-        let tuned = bench_mm_tuned(ns, true, &a, &b, &mut c);
+        let mer_par = bench_mercury(&mer_linear(ns, true), &mut c, ap, bp, cp);
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "", "Mer(1core)", "Mer(par)", "tuned(mm)", "C (gcc)", "C(fast)", "C(omp)", "Rust"
+            "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "", "Mer(1c)", "Mer(par)", "MKL(1c)", "MKL(all)", "tuned(mm)", "C(gcc)", "C(fast)", "C(omp)", "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             "GFLOP/s",
             gflops(&mer),
             gflops(&mer_par),
+            gflops(&mkl_1c),
+            gflops(&mkl_all),
             gflops(&Some(tuned.clone())),
             gflops(&cm),
             gflops(&cfast),
             gflops(&comp),
             gflops(&rm)
         );
+        report_gemm_standing(&mer, &tuned, roof, flops);
+        report_gemm_vs_mkl(&mer, &mer_par, &mkl_1c, &mkl_all, flops);
         if let (Some(mp), Some(c)) = (&mer_par, &cm) {
             let r = (flops / mp.ns_per_call) / (flops / c.ns_per_call);
             println!(
@@ -1323,7 +1337,6 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         }
         report_relaxed_ratio("C(fast) [-ffast-math]", &mer, &mer_par, &cfast);
         report_relaxed_ratio("C(omp) [-fopenmp -ffast-math, all cores]", &mer, &mer_par, &comp);
-        report_gemm_standing(&mer, &tuned, roof, flops);
         println!();
     }
 }
