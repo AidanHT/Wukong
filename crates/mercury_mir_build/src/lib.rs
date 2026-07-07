@@ -2290,6 +2290,23 @@ impl FnLowerer<'_> {
     }
 
     fn expr_mir(&self, e: &Expr) -> MirType {
+        // `s.len()` on a slice lowers to an i64 load from the fat pointer's offset 8 (see the call
+        // lowering), but sema is lenient about methods and types the call `Unknown`, which `mir_ty_of`
+        // defaults to `I32`. That disagreement made `for i in 0..s.len()` build an i32 counter and then
+        // emit `cmp.i32 i32, i64` against the i64 length — MIR the verifier rejects (an ICE on the
+        // canonical way to index-iterate a slice). Report i64 here so the loop-bound widening and every
+        // other consumer see the real type. Guarded by tests/run/slice_len_loop.mer.
+        if let ExprKind::Call { callee, args, .. } = &e.kind {
+            if args.is_empty() {
+                if let ExprKind::Field { base, name } = &callee.kind {
+                    if self.interner.resolve(name.sym) == "len"
+                        && matches!(self.expr_ty(base), Ty::Slice(_))
+                    {
+                        return MirType::I64;
+                    }
+                }
+            }
+        }
         self.mir_ty_of(&self.expr_ty(e))
     }
 
