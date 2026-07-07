@@ -9,7 +9,7 @@
 //! SIMD-method, and parallel-loop constructs are not yet lowered; encountering one records a
 //! diagnostic and substitutes a placeholder so the rest of the function still lowers.
 
-use std::collections::{HashMap, HashSet};
+use mercury_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use mercury_ast::{
     self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, Pattern, Stmt, StmtKind, VariantPat,
@@ -285,7 +285,7 @@ impl MonoCollector<'_> {
             Some(DefKind::Fn(sig)) => sig.params.clone(),
             _ => return,
         };
-        let mut subst: HashMap<Symbol, Ty> = HashMap::new();
+        let mut subst: HashMap<Symbol, Ty> = HashMap::default();
         for (i, a) in args.iter().enumerate() {
             let Some(pty) = params.get(i) else { break };
             let aty = subst_ty(
@@ -445,8 +445,8 @@ impl MonoCollector<'_> {
 /// (non-type-generic) caller, plus transitively from those instances' bodies. Runs before lowering
 /// so instance names can be interned (needs `&mut interner`).
 fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> Mono {
-    let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-    let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::new();
+    let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
+    let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::default();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -465,13 +465,13 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         interner,
         type_generics,
         fn_bodies,
-        instance_of: HashMap::new(),
+        instance_of: HashMap::default(),
         instances: Vec::new(),
         worklist: Vec::new(),
     };
     // Seed from every non-type-generic function body (the concrete callers). Their argument types are
     // already concrete, so `handle_call` binds each callee generic to a real type.
-    let empty: HashMap<Symbol, Ty> = HashMap::new();
+    let empty: HashMap<Symbol, Ty> = HashMap::default();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -494,7 +494,7 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         instances: c.instances,
         // Populated separately by the caller (`lower_program`) via `collect_static_strings`, which
         // also needs `&mut interner`; kept out of the generic-collection walk to avoid coupling.
-        strings: HashMap::new(),
+        strings: HashMap::default(),
     }
 }
 
@@ -521,7 +521,7 @@ fn collect_static_strings(
     for init in sema.consts.values() {
         collect_str_expr(init, &mut lits);
     }
-    let mut by_content: HashMap<Vec<u8>, Symbol> = HashMap::new();
+    let mut by_content: HashMap<Vec<u8>, Symbol> = HashMap::default();
     let mut statics: Vec<mercury_mir::StaticData> = Vec::new();
     for lit in lits {
         let mut bytes = decode_string_literal(interner.resolve(lit));
@@ -831,7 +831,7 @@ pub fn lower_program(
     let (str_table, statics) = collect_static_strings(module, sema, interner);
     mono.strings = str_table;
     program.statics = statics;
-    let no_subst: HashMap<Symbol, Ty> = HashMap::new();
+    let no_subst: HashMap<Symbol, Ty> = HashMap::default();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -1270,14 +1270,14 @@ fn is_batched_norm_fn(
         sema,
         interner,
         diags: &mut diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
@@ -1315,14 +1315,14 @@ fn is_bias_bcast_fn(
         sema,
         interner,
         diags: &mut diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
@@ -1364,12 +1364,12 @@ fn lower_fn(
         sema,
         interner,
         diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
         subst: subst.clone(),
         mono: Some(mono),
@@ -1545,16 +1545,16 @@ fn lower_parallel(
             sema,
             interner,
             diags: &mut *diags,
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::default()],
             terminated: false,
             loops: Vec::new(),
             gemm,
             parallel_fn: false,
-            vec_loads: HashMap::new(),
+            vec_loads: HashMap::default(),
             sret: None,
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
-            subst: HashMap::new(),
+            subst: HashMap::default(),
             mono: None,
         };
         let start = fl.builder.add_param(MirType::I64);
@@ -1595,16 +1595,16 @@ fn lower_parallel(
             sema,
             interner,
             diags: &mut *diags,
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::default()],
             terminated: false,
             loops: Vec::new(),
             gemm,
             parallel_fn: false,
-            vec_loads: HashMap::new(),
+            vec_loads: HashMap::default(),
             sret: None,
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
-            subst: HashMap::new(),
+            subst: HashMap::default(),
             mono: None,
         };
         let param_vals: Vec<ValueId> = param_tys
@@ -2245,7 +2245,7 @@ impl FnLowerer<'_> {
     // ---- scopes ----
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
@@ -11261,7 +11261,7 @@ impl FnLowerer<'_> {
         }
         let mut lane: Option<MirType> = None;
         let mut acc: Vec<(Symbol, &Expr, bool, bool)> = Vec::new();
-        if !self.vec_check_value(addend, j, &HashSet::new(), &mut lane, &mut acc) {
+        if !self.vec_check_value(addend, j, &HashSet::default(), &mut lane, &mut acc) {
             return None;
         }
         let lane = lane?;
@@ -11385,7 +11385,7 @@ impl FnLowerer<'_> {
             return None;
         }
         // inner `let` names become vector temps; they may not appear inside index expressions.
-        let mut locals: HashSet<Symbol> = HashSet::new();
+        let mut locals: HashSet<Symbol> = HashSet::default();
         // every array access: (base, index expr, unit-stride?, is_write).
         let mut acc: Vec<(Symbol, &Expr, bool, bool)> = Vec::new();
         let mut lane: Option<MirType> = None;
@@ -11669,10 +11669,10 @@ impl FnLowerer<'_> {
             ops: Vec::new(),
             streams: Vec::new(),
             scalars: Vec::new(),
-            load_cache: HashMap::new(),
+            load_cache: HashMap::default(),
         };
         // inner `let`/`let mut` temps: name -> the recipe value index it currently holds.
-        let mut locals: HashMap<Symbol, u32> = HashMap::new();
+        let mut locals: HashMap<Symbol, u32> = HashMap::default();
         for s in &body.stmts {
             match &s.kind {
                 StmtKind::Let {
@@ -12088,7 +12088,7 @@ impl FnLowerer<'_> {
                 value: ju,
             });
             self.bind(j, jtmp, ity.clone());
-            let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+            let mut vlocals: HashMap<Symbol, ValueId> = HashMap::default();
             // Each unroll copy reads different addresses (jbase + u*W), so the load cache is per-copy.
             self.vec_loads.clear();
             for s in &body.stmts {
@@ -12179,7 +12179,7 @@ impl FnLowerer<'_> {
             ops: Vec::new(),
             streams: Vec::new(),
             scalars: Vec::new(),
-            load_cache: HashMap::new(),
+            load_cache: HashMap::default(),
         };
         // Fusion attempt: lower the two product operands (not the product) into a fresh recipe. Each
         // may be a load, a scalar broadcast, or a composite — the assembler's fold reads them via
@@ -12192,8 +12192,8 @@ impl FnLowerer<'_> {
             } = &addend.kind
             {
                 let mut r = fresh();
-                if let Some(x) = self.rec_value(lhs, j, &HashMap::new(), &mut r) {
-                    if let Some(y) = self.rec_value(rhs, j, &HashMap::new(), &mut r) {
+                if let Some(x) = self.rec_value(lhs, j, &HashMap::default(), &mut r) {
+                    if let Some(y) = self.rec_value(rhs, j, &HashMap::default(), &mut r) {
                         if !r.streams.is_empty() {
                             return Some((r, x, Some((x, y))));
                         }
@@ -12204,7 +12204,7 @@ impl FnLowerer<'_> {
         }
         // Plain: fold the addend value itself.
         let mut r = fresh();
-        let value = self.rec_value(addend, j, &HashMap::new(), &mut r)?;
+        let value = self.rec_value(addend, j, &HashMap::default(), &mut r)?;
         // Need a stream, and the folded value must be a real body register (never a hoisted Splat —
         // the assembler reads it from a body register that a Splat would not occupy).
         if r.streams.is_empty()
@@ -12586,7 +12586,7 @@ impl FnLowerer<'_> {
             let cur = self
                 .builder
                 .build(vty.clone(), Op::Load(acc_slot, vty.clone()));
-            let mut vlocals: HashMap<Symbol, ValueId> = HashMap::new();
+            let mut vlocals: HashMap<Symbol, ValueId> = HashMap::default();
             // Per-copy load cache (so `(x[i]-y[i])*(x[i]-y[i])` loads x[i],y[i] once each).
             self.vec_loads.clear();
             let nv = match redop {
@@ -14957,7 +14957,7 @@ impl FnLowerer<'_> {
                 if let Some(DefKind::Fn(sig)) = self.sema.defs.lookup(name).map(|d| &d.kind) {
                     let params = sig.params.clone();
                     let ret_ty = sig.ret.clone();
-                    let mut subst: HashMap<Symbol, Ty> = HashMap::new();
+                    let mut subst: HashMap<Symbol, Ty> = HashMap::default();
                     for (i, a) in args.iter().enumerate() {
                         if let Some(pty) = params.get(i) {
                             bind_generics(pty, &self.expr_ty(a), tg, &mut subst);
@@ -15000,7 +15000,7 @@ impl FnLowerer<'_> {
         if hidden.is_empty() {
             return Vec::new();
         }
-        let mut dim_map: HashMap<Symbol, ValueId> = HashMap::new();
+        let mut dim_map: HashMap<Symbol, ValueId> = HashMap::default();
         // (a) Turbofish: `sig.generics` zipped positionally with the supplied type args. Only a
         // generic that is one of the hidden *dimension* generics is read here (a type generic's
         // turbofish is for monomorphization, handled elsewhere).
@@ -19418,14 +19418,14 @@ fn lower_matmul_fn(
         sema,
         interner,
         diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
@@ -21036,14 +21036,14 @@ fn xent_bwd_fn(
         sema,
         interner,
         diags: &mut diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
@@ -21076,14 +21076,14 @@ fn xent_fn(
         sema,
         interner,
         diags: &mut diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     probe.match_xent(pat, iter, lb).is_some()
@@ -21124,14 +21124,14 @@ fn logsumexp_fn(
         sema,
         interner,
         diags: &mut diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
@@ -21254,14 +21254,14 @@ fn probe_single_for(
         sema,
         interner,
         diags: &mut diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     check(&probe, pat, iter, lb)
@@ -22256,14 +22256,14 @@ fn lower_i8matmul_fn(
         sema,
         interner,
         diags,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
         gemm,
         parallel_fn: false,
-        vec_loads: HashMap::new(),
+        vec_loads: HashMap::default(),
         sret: None,
-        subst: HashMap::new(),
+        subst: HashMap::default(),
         mono: None,
     };
     let param_vals: Vec<ValueId> = param_tys
