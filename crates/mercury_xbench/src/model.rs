@@ -1245,7 +1245,11 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // --- C (gcc, standard suite flags). A single naive-dot forward is tens of seconds at S=512
     // (the serial-FMA-chain regime), so like bench_matmul's naive-at-2048 rule it is skipped
     // there by default (XBENCH_MODEL_NAIVE forces it); correctness at S=512 is checked vs C(fast).
-    let run_c_slow = cfg.s <= 128 || std::env::var("XBENCH_MODEL_NAIVE").is_ok();
+    // XBENCH_MODEL_MER_ONLY skips every external peer (C, C(fast), PyTorch) so a dev iterating on the
+    // multicore kernels gets Mer(1c) vs Mer(par) + scaling in seconds instead of the ~2 min the peer
+    // compilation + torch warmups cost. Not for reported numbers — the peers are the honesty bar.
+    let mer_only = std::env::var("XBENCH_MODEL_MER_ONLY").is_ok();
+    let run_c_slow = !mer_only && (cfg.s <= 128 || std::env::var("XBENCH_MODEL_NAIVE").is_ok());
     let c_src = c_model(cfg);
     let c_m = if run_c_slow {
         compile_c_model(
@@ -1279,7 +1283,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     };
 
     // --- C(fast): identical source, -ffast-math ---
-    let cfast_m = compile_c_model(
+    let cfast_m = if mer_only { None } else { compile_c_model(
         &c_src,
         dir,
         &format!("model_s{}_fast", cfg.s),
@@ -1299,7 +1303,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             ns_per_fwd: ns,
             out: y.clone(),
         }
-    });
+    }) };
 
     // --- Mercury @parallel, measured LAST so its all-core heat pollutes no single-core column ---
     let mer_par_m = compile_mercury(&mer_block(cfg, true), &mut interner).and_then(|m| {
@@ -1347,7 +1351,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // last, so multicore heat pollutes no single-thread torch number. The blob writes + torch
     // import + its own warmups sit between Mer(par)'s all-core burst and the first timed torch
     // iteration.
-    let torch_m = torch.and_then(|t| {
+    let torch_m = if mer_only { None } else { torch }.and_then(|t| {
         println!(
             "  running PyTorch peer (torch {}, eager f32, inference_mode; warmup 3 + timed 10 \
              per variant)...",
@@ -1355,6 +1359,16 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         );
         bench_torch(t, dir, cfg, &weights, &x0, &lnf_g, &lnf_b)
     });
+    // Same-run Mer(1c) vs Mer(par) scaling — the reliable multicore instrument on this hybrid laptop
+    // (both measured adjacently, same thermal state). Printed always; it's the number to move.
+    if let (Some(s), Some(p)) = (&mer_m, &mer_par_m) {
+        println!(
+            "  Mer scaling: 1c {:.1} ms -> par {:.1} ms = {:.2}x",
+            s.ns_per_fwd / 1e6,
+            p.ns_per_fwd / 1e6,
+            s.ns_per_fwd / p.ns_per_fwd
+        );
+    }
 
     // --- report ---
     // Torch columns are eager PyTorch (no compile step): T1(sdpa)/Tn(sdpa) = fused
