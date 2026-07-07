@@ -11577,6 +11577,17 @@ impl FnLowerer<'_> {
                 if !matches!(op, Lt | Le | Gt | Ge | Eq | Ne) {
                     return false;
                 }
+                // If-conversion evaluates BOTH branches in EVERY lane (a compare + blend), so a
+                // branch that reads an array at a non-zero offset from the loop variable (`x[i-1]`,
+                // `x[i+1]`) speculatively loads out of bounds in the boundary lanes where the guard is
+                // false — lanes the scalar source never executes (the guard is exactly what keeps it
+                // in bounds). The interpreter traps that lane's OOB load while native codegen reads
+                // adjacent memory and blends it away: interp != native, and a latent native UB read.
+                // Decline if-conversion for such a shifted conditional read and fall back to the
+                // (correct) scalar loop. A bare `x[i]` and an invariant `x[c]` are unaffected.
+                if has_shifted_index(tv, j) || has_shifted_index(ev, j) {
+                    return false;
+                }
                 self.vec_check_value(lhs, j, locals, lane, acc)
                     && self.vec_check_value(rhs, j, locals, lane, acc)
                     && self.vec_check_value(tv, j, locals, lane, acc)
@@ -17163,6 +17174,47 @@ fn affine_stride(e: &Expr, j: Symbol) -> Option<i64> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Does `e` contain a per-lane-varying array read at a NON-ZERO offset from the loop variable `j`
+/// (`x[j-1]`, `x[j+1]`, `x[j+k]`)? Used to make SIMD if-conversion sound: an `if`-converted branch is
+/// evaluated speculatively in every lane, so such a shifted read walks past the array boundary in the
+/// lanes where the guard is false — an out-of-bounds load the scalar source never performs (the guard
+/// is what keeps the read in range). A bare `x[j]` (stride 1, offset 0) stays within the loop's own
+/// iteration range, and an invariant `x[c]` (stride 0, a splat) does not vary per lane, so neither is
+/// flagged; only a shifted/strided index is. Recurses through the same expression subset
+/// `vec_check_value` accepts in a branch (arithmetic, unary, casts, intrinsic calls, and nested `if`
+/// via `block_value`/`branch_value`), so no accepted read is missed. Conservative — a `true` result
+/// just declines vectorization, leaving the correct scalar loop.
+fn has_shifted_index(e: &Expr, j: Symbol) -> bool {
+    match &e.kind {
+        ExprKind::Index { base, indices } => {
+            (indices.len() == 1
+                && matches!(affine_stride(&indices[0], j), Some(s) if s != 0)
+                && single_path(&indices[0]) != Some(j))
+                || has_shifted_index(base, j)
+                || indices.iter().any(|i| has_shifted_index(i, j))
+        }
+        ExprKind::Binary { lhs, rhs, .. } => has_shifted_index(lhs, j) || has_shifted_index(rhs, j),
+        ExprKind::Unary { expr, .. } => has_shifted_index(expr, j),
+        ExprKind::Cast { expr, .. } => has_shifted_index(expr, j),
+        ExprKind::Call { callee, args, .. } => {
+            has_shifted_index(callee, j) || args.iter().any(|a| has_shifted_index(a, j))
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            has_shifted_index(cond, j)
+                || block_value(then_branch).is_some_and(|v| has_shifted_index(v, j))
+                || else_branch
+                    .as_deref()
+                    .and_then(branch_value)
+                    .is_some_and(|v| has_shifted_index(v, j))
+        }
+        _ => false,
     }
 }
 
