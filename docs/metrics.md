@@ -33,9 +33,14 @@ Peers in order of strength: vendor libraries (oneMKL, cuBLAS/cuDNN) > tuned crat
 (`matrixmultiply`) > idiomatic C/C++/Rust at `-O3 -march=native` (gcc/g++/rustc).
 Current standing (recorded):
 
-- *Compute-bound, CPU*: f32 GEMM ≈102–103% of oneMKL single-core at ≤512³, **85–86% at
-  1024–2048³, ~77% roofline at 4096³** (loss); multicore **60–70% of MKL at 512–1024³**
-  (loss), 86–129% at ≥2048³. int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
+- *Compute-bound, CPU*: f32 GEMM ≈93–104% of oneMKL single-core at ≤1024³, **83–86% at
+  2048³+, ~74–77% roofline at 4096³** (loss); multicore **~46–72% of MKL at 512–1024³**
+  (loss — the range is honest: threaded MKL itself swings ~1.4× with this laptop's power
+  state across sessions, so only same-session ratios are comparable), 86–129% at ≥2048³
+  (**127% measured 2026-07-08 — wins**). Three scheduling levers for the mid-size gap were
+  refuted by adjacent A/B (smaller pool, persistent region vs fork-join, hard worker pinning
+  — see gemm.rs); the residual is MKL's mid-size parallel *algorithm* (per-thread L2-blocked
+  2D C ownership). int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
 - *Compute-bound, GPU (RTX 4050, sm_89)*: fp16/bf16 GEMM ~101% cuBLAS ≤1024³, **~87–90% at
   2048³, ~83% at 4096³** (past the prior 77% PTX ceiling; 4096³ a SASS-level loss); int8 GEMM
   **96–105% at 2048³ (beats IMMA), 86–88% at 1024³, ~70% at 4096³** (HBM-bound loss); fused int8
@@ -46,16 +51,24 @@ Current standing (recorded):
   physics-ties at L3-resident sizes (relu, biasadd, hadamard); reductions/norms/scans/column
   family 1.4–107× vs scalar-left-by-gcc patterns — but note these are IEEE-serial C baselines
   (see G5 fairness work: a `-ffast-math` C column normalizes the reassociation share).
-- *Transcendentals*: 2–13× scalar libm, **but exp ~1.7× and log ~2.0× SLOWER than oneMKL
-  VML** (algorithmic; propagates into softmax/GELU/xent when the peer is a library).
+- *Transcendentals*: 4.7–12× scalar libm, and the former ~1.7–2× VML loss is **closed to
+  ~1.1–1.3×** (2026-07-08: ×4 ILP unroll + Estrin, then 8-bucket `vpermps`-LUT rewrites of
+  both cores — exp `2^(j/8)` table + degree-3 poly at ~1.3 ULP, log reciprocal/ln tables +
+  degree-5 poly at ≤6.9e-7 rel, exhaustively swept): same-run, **log 1.14×, exp 1.05×-faster
+  (cool) to ~1.3× (thermally throttled — exp is FMA-port-bound so clock starvation still
+  shows), and tanh 2.4–3× FASTER than VML**. Composites inherit: log2 9.9×, log1p 7.7× vs C.
 
 **M2. End-to-end model performance.** A compiler is judged on composed graphs, not op zoos:
 fusion, no round-trips, layer-stack throughput. GPT-2-class `.mer` models exist and dispatch
 to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph capture.
-Standing: the CPU end-to-end model bench (`bench_model`) now runs — a 12-layer GPT-2-class stack
-at **~26–32× idiomatic C / ~4.9–9.4× `-ffast-math` C (PRELIMINARY, ratios only)**, with
-eager-PyTorch-CPU peer columns (T1/Tn sdpa+manual) wired; GPU training step still loses to eager
-PyTorch (GEMM-bound); serving-stack (paged KV, continuous batching) measured GPU-only.
+Standing (2026-07-08, two full-peer rounds, all cross-checks <2e-6 rel, serial==@parallel
+bit-exact, in-benchmark interp gate bit-exact): the 12-layer GPT-2-class stack runs
+**~20–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core**; vs **PyTorch CPU eager**
+it is **at parity single-thread (0.93–1.07× @S=128; 1.08–1.21× FASTER @S=512)** and behind
+all-threads torch (1.05–2.52× slower; ratio swings with thermal state — Mercury's own
+@parallel scaling at model shapes, 1.5–2.1×, is the gap; same root cause as the mid-size
+GEMM loss in M1). GPU training step still loses to eager PyTorch (GEMM-bound);
+serving-stack (paged KV, continuous batching) measured GPU-only.
 
 **M3. Multicore scaling** of M1 with G4 preserved. Standing: strong (dot ~7.9×, max ~25×,
 GEMM to ~104× vs single-thread C), but until the OpenMP C column lands the multicore rows
@@ -111,11 +124,19 @@ in-harness cross-checks that can only *fail* Mercury, never inflate it.
 
 ## Current top improvement targets (ranked by user impact × measured gap)
 
-1. End-to-end CPU model bench vs strong peers (closes M2's measurement hole).
-2. vmath exp/log core vs MKL VML (~1.7–2× loss; propagates into every composed op).
-3. Large-GEMM regime vs MKL (≥1024³ single-core 85%, mid-size multicore 60–70%).
-4. GPU attention long-S vs cuDNN (0.37–0.66×).
-5. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
-   tensors, imports, file I/O (M6).
-6. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).
-7. Benchmark defensibility: relaxed-FP and OpenMP C columns, rustc opt-level 3 (G5).
+Closed in the 2026-07-08 round (see M1/M2 for the numbers): the M2 measurement hole (full
+peer table incl. eager PyTorch, all gates green), the vmath exp/log-vs-VML loss (~1.7–2× →
+~1.1–1.3×, tanh now 2.4–3× faster), the five gpu-native device-kernel/lowering miscompiles +
+the corpus-cascade harness hole, and the missing production D=128 tensor-core attention
+dispatch. Remaining, ranked:
+
+1. Multicore parallel efficiency at model/mid-GEMM shapes (46–72% of threaded MKL at
+   512–1024³; the model bench trails all-threads torch by the same mechanism). The three
+   cheap scheduling levers are measured dead — the honest next bet is MKL-style 2D
+   per-thread C ownership, a real kernel-restructure project.
+2. GPU attention long-S vs cuDNN (0.37–0.66×) — occupancy probe says SFU/serial-softmax
+   bound; the only live lever is FA2-style warp specialization (heavy).
+3. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
+   tensors, file I/O (M6).
+4. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).
+5. Large-GEMM single-core tail (~83–86% of MKL 1-core at ≥2048³).
