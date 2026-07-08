@@ -137,6 +137,66 @@ pub fn available() -> bool {
     gpu().is_some()
 }
 
+/// Set once a device fault has made the process's CUDA state unrecoverable (see [`reset_gpu`]).
+/// Callers that would otherwise attempt GPU work should consult [`device_lost`] and skip *loudly*
+/// (report "device lost after fault", never a silent skip and never a spurious per-program failure).
+static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True once a kernel fault has poisoned the process's CUDA state beyond in-process recovery.
+pub fn device_lost() -> bool {
+    DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Attempt to rebuild the process-wide GPU after a **sticky driver fault**. A kernel that
+/// dereferences an out-of-bounds address poisons the CUDA state with `CUDA_ERROR_ILLEGAL_ADDRESS`,
+/// after which *every* later driver call — even for an unrelated, correct program — returns the same
+/// error (a cascade of false failures across a whole corpus run).
+///
+/// This drops the poisoned [`Gpu`] (releasing our primary-context reference, streams, and modules),
+/// calls `cuDevicePrimaryCtxReset` (the strongest reset the driver API offers — cudarc exposes no
+/// non-primary `cuCtxCreate`, and its safe `CudaContext` is primary-only), and retains a fresh
+/// primary context. **Measured on this machine (RTX 4050, Windows/WDDM): the reset itself returns
+/// `Ok`, but the re-retain still returns `CUDA_ERROR_ILLEGAL_ADDRESS`** — matching NVIDIA's
+/// documentation that error 700 leaves the *process* in an inconsistent state and only a process
+/// restart recovers. So in practice this degrades to marking the device **lost**
+/// ([`device_lost`] becomes true) so callers can record-and-skip loudly instead of cascading
+/// false failures. The attempt is kept because it is harmless and a future driver may recover.
+///
+/// Returns `true` iff a live GPU is in place afterward.
+pub fn reset_gpu() -> bool {
+    let mut guard = GPU
+        .get_or_init(|| Mutex::new(Gpu::new().ok()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Drop the (possibly poisoned) context first: releases our primary-ctx reference, streams, modules.
+    *guard = None;
+    // Reset the device primary context at the driver level: destroys its allocations and (where the
+    // driver allows) clears its error state. (Device 0 — the ordinal `Gpu::new` uses.)
+    unsafe {
+        let mut dev: sys::CUdevice = 0;
+        if sys::cuDeviceGet(&mut dev, 0).result().is_ok() {
+            let _ = sys::cuDevicePrimaryCtxReset_v2(dev).result();
+        }
+    }
+    // Retain + bind a fresh primary context.
+    match Gpu::new() {
+        Ok(g) => {
+            *guard = Some(g);
+            DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[mercury_codegen_gpu] CUDA device UNRECOVERABLE after kernel fault: {e:?} \
+                 (sticky process-level error; primary-ctx reset did not clear it — restart the \
+                 process to use the GPU again)"
+            );
+            DEVICE_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
 /// `y := a*x + y`, computed on the GPU. `a` is fused (`fma.rn`), so a CPU reference using
 /// `f32::mul_add(a, x, y)` agrees bit-for-bit.
 pub fn saxpy(g: &mut Gpu, a: f32, x: &[f32], y: &mut [f32]) -> Result<(), DriverError> {

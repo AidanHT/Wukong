@@ -3862,9 +3862,23 @@ mod tests {
         let mut covered = 0usize;
         let mut skipped: Vec<String> = Vec::new();
         let mut mismatches: Vec<String> = Vec::new();
+        // Genuine *driver* faults (a kernel that dereferenced out of bounds -> ILLEGAL_ADDRESS), kept
+        // distinct from miscompiles (wrong output on a healthy context). A fault poisons the shared
+        // primary context; `crate::gpu::reset_gpu` attempts recovery, but on this driver error 700 is
+        // process-fatal (the re-retain still returns it), so recovery degrades to record-and-skip:
+        // the remaining programs land on `lost` with a loud count instead of cascading as false
+        // failures. Only the *root* fault is ever reported as a fault.
+        let mut faults: Vec<String> = Vec::new();
+        let mut lost: Vec<String> = Vec::new();
 
         for path in &files {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            // After an unrecoverable fault, stop attempting GPU work: every further run would fail
+            // with the same sticky error and misreport healthy programs as broken.
+            if crate::gpu::device_lost() {
+                lost.push(name);
+                continue;
+            }
             let src = std::fs::read_to_string(path).unwrap();
 
             // -O0 and -O3 must both match the interpreter (which gives -O0 == -O3 transitively).
@@ -3897,12 +3911,16 @@ mod tests {
                         }
                     }
                     (Ok(_), Err(e)) => {
+                        covered_here = false;
                         if e.starts_with(UNSUPPORTED) {
-                            covered_here = false;
                             skipped.push(format!("{name}@O{opt}: {e}"));
                         } else {
-                            mismatches.push(format!("{name}@O{opt}: gpu errored: {e}"));
-                            covered_here = false;
+                            // A real driver fault poisons the shared context: record it on the fault
+                            // ledger and attempt a context reset. If the reset fails (sticky
+                            // process-level error), `device_lost()` flips and the loop above skips
+                            // the remaining programs loudly instead of cascading.
+                            faults.push(format!("{name}@O{opt}: gpu errored: {e}"));
+                            crate::gpu::reset_gpu();
                         }
                         break;
                     }
@@ -3928,10 +3946,33 @@ mod tests {
                 eprintln!("   {s}");
             }
         }
+        if !faults.is_empty() {
+            eprintln!("-- driver FAULTS ({}, root causes only — no cascade):", faults.len());
+            for f in &faults {
+                eprintln!("   {f}");
+            }
+        }
+        if !lost.is_empty() {
+            eprintln!(
+                "-- NOT RUN ({}): device lost after the fault above (sticky CUDA error; restart to \
+                 re-test): {}",
+                lost.len(),
+                lost.join(", ")
+            );
+        }
         assert!(
             mismatches.is_empty(),
             "GPU-lowered programs disagree with the interpreter oracle (miscompiles):\n{}",
             mismatches.join("\n")
+        );
+        assert!(
+            faults.is_empty(),
+            "GPU-lowered programs faulted on the device ({} root fault(s); {} later programs \
+             were skipped after device loss, NOT failed — these are genuine kernel faults, not \
+             miscompiles):\n{}",
+            faults.len(),
+            lost.len(),
+            faults.join("\n")
         );
         assert!(covered > 0, "no programs covered — pipeline broken");
     }

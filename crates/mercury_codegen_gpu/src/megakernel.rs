@@ -182,6 +182,14 @@ mod tests {
     /// `jit_run` as the default for eligible programs.
     #[test]
     fn mega_corpus_matches_oracle() {
+        if crate::gpu::device_lost() {
+            // Another test in this process already hit an unrecoverable device fault (sticky CUDA
+            // error). Say so loudly — this is NOT a healthy pass, and NOT "no CUDA device".
+            panic!(
+                "mega_corpus_matches_oracle: CUDA device lost after an earlier in-process kernel \
+                 fault — fix that fault and re-run (nothing here was tested)"
+            );
+        }
         if crate::gpu::gpu().is_none() {
             eprintln!("skip mega_corpus_matches_oracle: no CUDA device");
             return;
@@ -197,9 +205,19 @@ mod tests {
         let mut eligible = 0usize;
         let mut ran = 0usize;
         let mut mismatches: Vec<String> = Vec::new();
+        // Genuine device faults (ILLEGAL_ADDRESS etc.), kept distinct from miscompiles. A fault
+        // poisons the shared primary context; `crate::gpu::reset_gpu` attempts recovery, but on this
+        // driver error 700 is process-fatal, so recovery degrades to record-and-skip: the remaining
+        // programs land on `lost` with a loud count instead of cascading as false failures.
+        let mut faults: Vec<String> = Vec::new();
+        let mut lost: Vec<String> = Vec::new();
 
         for path in &files {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            if crate::gpu::device_lost() {
+                lost.push(name);
+                continue;
+            }
             let src = std::fs::read_to_string(path).unwrap();
             for opt in [0u8, 3u8] {
                 let Some((program, mut interner)) = build(&src, opt) else {
@@ -228,7 +246,14 @@ mod tests {
                             ));
                         }
                     }
-                    (Ok(_), Err(e)) => mismatches.push(format!("{name}@O{opt}: mega errored: {e}")),
+                    (Ok(_), Err(e)) => {
+                        // A genuine mega launch/JIT/readback fault poisons the shared context: record
+                        // it on the fault ledger and attempt a reset. If the reset fails (sticky
+                        // process-level error), `device_lost()` flips and the loop above skips the
+                        // remaining programs loudly instead of cascading.
+                        faults.push(format!("{name}@O{opt}: mega errored: {e}"));
+                        crate::gpu::reset_gpu();
+                    }
                     (Err(ce), Ok(Some((ge, _)))) => {
                         mismatches.push(format!("{name}@O{opt}: cpu err `{ce}` but mega ok ({ge})"))
                     }
@@ -239,10 +264,33 @@ mod tests {
         eprintln!(
             "\n=== megakernel: {ran} ran / {eligible} eligible program-configs match the interp oracle ===",
         );
+        if !faults.is_empty() {
+            eprintln!("-- driver FAULTS ({}, root causes only — no cascade):", faults.len());
+            for f in &faults {
+                eprintln!("   {f}");
+            }
+        }
+        if !lost.is_empty() {
+            eprintln!(
+                "-- NOT RUN ({}): device lost after the fault above (sticky CUDA error; restart to \
+                 re-test): {}",
+                lost.len(),
+                lost.join(", ")
+            );
+        }
         assert!(
             mismatches.is_empty(),
             "megakernel disagrees with the interpreter oracle:\n{}",
             mismatches.join("\n")
+        );
+        assert!(
+            faults.is_empty(),
+            "megakernel programs faulted on the device ({} root fault(s); {} later programs were \
+             skipped after device loss, NOT failed — these are genuine kernel faults, not \
+             miscompiles):\n{}",
+            faults.len(),
+            lost.len(),
+            faults.join("\n")
         );
         assert!(ran > 0, "no eligible program ran on the megakernel — pipeline broken");
     }
