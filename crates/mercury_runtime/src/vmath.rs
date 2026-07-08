@@ -700,16 +700,81 @@ pub(crate) fn vmath8_for(
     })
 }
 
+/// Total streamed bytes (all live arrays) at/above which the output store goes non-temporal. Mirrors
+/// the `velem`/`vhorner` streaming gate exactly (same ~10 MiB ≈ this machine's L3): a `vmovntps` skips
+/// the **read-for-ownership** a cacheable store pays, and that only wins once the working set spills L3.
+/// Below the threshold a normal store keeps the write-once output hot (a later re-read stays in cache),
+/// above it streaming the array out saves the RFO traffic. The gate keys on the *total* bytes touched
+/// (input + output), not the length, so the one-input activation (2 streams) crosses it at the same
+/// working-set size velem's 2-stream map does — the >L3 activation-tensor sizes the exp/log dispatch hits.
+const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
+
+/// Whether a kernel touching `streams` arrays of `n` f32 each should stream its stores — true once the
+/// working set spills L3 (see [`NT_MIN_BYTES`]). `streams` counts every live array (the output plus
+/// each input read), since they all compete for cache residency. Copied verbatim from `velem::use_nt`
+/// so the two kernels make the identical crossover decision.
+#[inline]
+fn use_nt(n: usize, streams: usize) -> bool {
+    streams.saturating_mul(n).saturating_mul(4) >= NT_MIN_BYTES
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_avx2(x: *const f32, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
     let Some(f) = vmath8_for(op) else { return };
-    let mut i = 0;
+    // Non-temporal store regime — two streams (`x` in, `out` out), so the pair spills L3 at the same
+    // total-bytes threshold `velem`/`vhorner` use. Above it the streaming store skips the
+    // read-for-ownership a cacheable store pays for a write-once tensor (the >L3 activation sizes the
+    // exp/log benchmark hits); below it a plain store keeps the (maybe re-read) output hot — so `storeu`.
+    // NT and cacheable stores write the *same bits*; only the cache path differs, so the result is
+    // bit-for-bit identical either way.
+    let nt = use_nt(n, 2);
+    let mut i = 0usize;
+    // For the streaming store, peel a scalar prologue until `out` is 32-byte aligned (`vmovntps` faults
+    // on a misaligned address); after that each 8-lane step advances 32 bytes and stays aligned. The
+    // scalar twin is bit-identical to the lanes, so peeling never perturbs the result — and `i < n`
+    // guards a buffer too small to ever reach alignment (which can only happen below the NT threshold).
+    if nt {
+        while i < n && (out.add(i) as usize) & 31 != 0 {
+            *out.add(i) = apply1(op, *x.add(i));
+            i += 1;
+        }
+    }
+    macro_rules! store {
+        ($p:expr, $v:expr) => {
+            if nt {
+                _mm256_stream_ps($p, $v);
+            } else {
+                _mm256_storeu_ps($p, $v);
+            }
+        };
+    }
+    // Unroll ×4 (32 elements/step): run four *independent* load→poly→store chains at once. Each per-op
+    // 8-lane function is a long **dependent** SIMD chain (~13 ops for exp8, 8 serial Horner FMAs for
+    // log8), so a single-vector step is latency-bound and idles the two FMA ports; four data-independent
+    // vectors overlap in the out-of-order window and fill the ports (the same lever `velem`/`vhorner`
+    // pull). Every lane still runs the identical `f`, and these are pure elementwise ops with no
+    // cross-lane/cross-vector state, so the output is bit-for-bit identical to the one-at-a-time loop.
+    while i + 32 <= n {
+        let r0 = f(_mm256_loadu_ps(x.add(i)));
+        let r1 = f(_mm256_loadu_ps(x.add(i + 8)));
+        let r2 = f(_mm256_loadu_ps(x.add(i + 16)));
+        let r3 = f(_mm256_loadu_ps(x.add(i + 24)));
+        store!(out.add(i), r0);
+        store!(out.add(i + 8), r1);
+        store!(out.add(i + 16), r2);
+        store!(out.add(i + 24), r3);
+        i += 32;
+    }
+    // 8-wide remainder (the `n % 32` the ×4 body could not cover), same `f` and store policy.
     while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.add(i));
-        _mm256_storeu_ps(out.add(i), f(v));
+        store!(out.add(i), f(_mm256_loadu_ps(x.add(i))));
         i += 8;
+    }
+    // Non-temporal stores are weakly ordered; fence before the buffer is read back by anyone.
+    if nt {
+        _mm_sfence();
     }
     // Scalar tail (same poly as the lanes, via the scalar twins) for the final < 8 elements.
     while i < n {
@@ -1144,12 +1209,52 @@ pub unsafe extern "C" fn mercury_vmath2_f32(
 unsafe fn vmath2_avx2(x: *const f32, y: *const f32, out: *mut f32, n: usize, op: i64) {
     use std::arch::x86_64::*;
     let Some(f) = vmath2_8_for(op) else { return };
-    let mut i = 0;
+    // Same ×4-ILP + non-temporal-store treatment as `vmath_avx2` (this loop had the identical
+    // single-vector, store-immediately structure). Three streams (`x`, `y` in, `out` out), so the
+    // working set spills L3 — and wants `vmovntps` — at a *smaller* length than the one-input kernel.
+    let nt = use_nt(n, 3);
+    let mut i = 0usize;
+    // Peel to 32-byte `out` alignment before any streaming store (`vmovntps` faults otherwise); the
+    // scalar twin is bit-identical to the lanes, so the prologue never perturbs the result.
+    if nt {
+        while i < n && (out.add(i) as usize) & 31 != 0 {
+            *out.add(i) = apply2_1(op, *x.add(i), *y.add(i));
+            i += 1;
+        }
+    }
+    macro_rules! store {
+        ($p:expr, $v:expr) => {
+            if nt {
+                _mm256_stream_ps($p, $v);
+            } else {
+                _mm256_storeu_ps($p, $v);
+            }
+        };
+    }
+    // ×4 unroll (32 elements/step): four independent chains overlap the long dependent poly (pow folds
+    // exp∘log, the activation backwards a sigmoid/tanh), filling the two FMA ports a single-vector step
+    // leaves idle. Pure elementwise, one `f` per lane — so bit-for-bit identical to the old loop.
+    while i + 32 <= n {
+        let r0 = f(_mm256_loadu_ps(x.add(i)), _mm256_loadu_ps(y.add(i)));
+        let r1 = f(_mm256_loadu_ps(x.add(i + 8)), _mm256_loadu_ps(y.add(i + 8)));
+        let r2 = f(_mm256_loadu_ps(x.add(i + 16)), _mm256_loadu_ps(y.add(i + 16)));
+        let r3 = f(_mm256_loadu_ps(x.add(i + 24)), _mm256_loadu_ps(y.add(i + 24)));
+        store!(out.add(i), r0);
+        store!(out.add(i + 8), r1);
+        store!(out.add(i + 16), r2);
+        store!(out.add(i + 24), r3);
+        i += 32;
+    }
+    // 8-wide remainder (`n % 32`), same `f` and store policy.
     while i + 8 <= n {
         let xv = _mm256_loadu_ps(x.add(i));
         let yv = _mm256_loadu_ps(y.add(i));
-        _mm256_storeu_ps(out.add(i), f(xv, yv));
+        store!(out.add(i), f(xv, yv));
         i += 8;
+    }
+    // Weakly-ordered non-temporal stores: fence before anyone reads the buffer back.
+    if nt {
+        _mm_sfence();
     }
     while i < n {
         *out.add(i) = apply2_1(op, *x.add(i), *y.add(i));
@@ -2400,6 +2505,47 @@ mod tests {
                 n as f64 / t_scalar / 1e6,
                 t_scalar / t_kernel
             );
+        }
+    }
+
+    /// The **non-temporal store regime** of the one-input kernel must stay bit-identical to the scalar
+    /// twin. A >L3 length forces `use_nt`, so this exercises the whole new streaming structure — the
+    /// 32-byte alignment prologue, the ×4 body, the 8-wide remainder, the `sfence`, and the scalar tail.
+    /// NT and cacheable stores write the *same bits* (only the cache path differs), so every lane must
+    /// still equal `apply1` — the equality the interpreter marshalling relies on. An odd length gives a
+    /// non-multiple-of-8 tail, and the prologue peels to alignment regardless of the allocation's base.
+    #[test]
+    fn vmath_nt_tail_matches_lanes() {
+        let n = 1_500_001usize; // 2-stream = 12 MiB > NT_MIN_BYTES: forces NT + prologue + tail
+        // Kept > 0 so log/log-based ops stay in domain; a short period spans the poly's regions.
+        let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
+        for op in [VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU] {
+            let mut got = vec![0.0f32; n];
+            unsafe { mercury_vmath_f32(xs.as_ptr(), got.as_mut_ptr(), n as i64, op) };
+            for (i, &x) in xs.iter().enumerate() {
+                assert_eq!(got[i].to_bits(), apply1(op, x).to_bits(), "op {op} i {i} x {x}");
+            }
+        }
+    }
+
+    /// The NT regime of the two-input kernel: a >L3 (3-stream) length forces the prologue / ×4 body /
+    /// 8-wide remainder / `sfence` / scalar tail, and every lane must equal `apply2_1` bit-for-bit
+    /// (again NT vs cacheable stores write identical bits). `pow` keeps its base > 0.
+    #[test]
+    fn vmath2_nt_tail_matches_lanes() {
+        let n = 1_500_001usize; // 3-stream = 18 MiB > NT_MIN_BYTES: forces NT + prologue + tail
+        let xs: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.05 + 0.1).collect();
+        let ys: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
+        for op in [VM2_POW, VM2_ATAN2, VM2_HYPOT, VM2_SILU_BWD, VM2_TANH_BWD, VM2_SILU_GATE] {
+            let mut got = vec![0.0f32; n];
+            unsafe { mercury_vmath2_f32(xs.as_ptr(), ys.as_ptr(), got.as_mut_ptr(), n as i64, op) };
+            for i in 0..n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    apply2_1(op, xs[i], ys[i]).to_bits(),
+                    "op {op} i {i}"
+                );
+            }
         }
     }
 }
