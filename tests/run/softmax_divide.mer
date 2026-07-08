@@ -1,0 +1,41 @@
+// RUN: --run
+// The textbook divide-normalize softmax — `for i { x[i] = x[i] / s; }` with NO reciprocal binding —
+// must dispatch to the same mercury_norm_f32(NORM_SOFTMAX) kernel as the `let inv = 1/s; x[i]*inv`
+// spelling. The kernel computes the reciprocal once and multiplies (mercury_runtime/norm.rs), a
+// <=1-ULP-per-element deviation from the scalar divide — strictly smaller than the documented
+// kernel-reassociation exception the sum pass already relies on; both backends call the identical
+// kernel, so the differential gate and -O0 == -O2 hold exactly. Covers the split window (divide
+// loop), and the fused exp+sum window with the compound `/=` spelling, batched. A window dividing
+// by the max instead of the sum is verified NOT to match.
+// EXPECT-EXIT: 0
+// split + divide: softmax([1,2,3,1,2,3]) -> x[2] ~ 0.33253, x[0] ~ 0.04501
+// EXPECT-OUT: 332
+// EXPECT-OUT: 45
+// fused + `/=`, batched [3,4]: row0 softmax([1,2,3,4])[1] -> 87; row1 uniform -> 250; row2 [5,1,1,1][0] -> 947
+// EXPECT-OUT: 87
+// EXPECT-OUT: 250
+// EXPECT-OUT: 947
+fn main() -> i32 {
+    let mut x: [f32; 6] = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
+    let mut m: f32 = x[0];
+    for i in 0..6 { m = fmax(m, x[i]); }
+    for i in 0..6 { x[i] = exp(x[i] - m); }
+    let mut s: f32 = 0.0;
+    for i in 0..6 { s = s + x[i]; }
+    for i in 0..6 { x[i] = x[i] / s; }
+    print((x[2] * 1000.0) as i32); // 332
+    print((x[0] * 1000.0) as i32); // 45
+
+    let mut y: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0, 1.0, 1.0, 1.0];
+    for r in 0..3 {
+        let mut mr: f32 = y[r*4];
+        for j in 0..4 { mr = fmax(mr, y[r*4+j]); }
+        let mut sr: f32 = 0.0;
+        for j in 0..4 { let e: f32 = exp(y[r*4+j] - mr); y[r*4+j] = e; sr = sr + e; }
+        for j in 0..4 { y[r*4+j] /= sr; }
+    }
+    print((y[1] * 1000.0) as i32);  // 87
+    print((y[5] * 1000.0) as i32);  // 250
+    print((y[8] * 1000.0) as i32);  // 947
+    return 0;
+}
