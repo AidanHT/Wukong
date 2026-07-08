@@ -1,0 +1,49 @@
+// RUN: --run
+// The textbook divide-normalize spellings of the three scale-normalizations — RMSNorm `x[i]/rms`
+// (rms = sqrt(ms+eps)), LayerNorm `(x[i]-mean)/std` (std = sqrt(var+eps)), and L2-normalize
+// `x[i]/nrm` (nrm = sqrt(sum-sq)) — must dispatch to the same mercury_norm kernels as the
+// reciprocal-multiply spellings (`let inv = 1/sqrt(...); x[i]*inv`). The textbook math IS a divide;
+// requiring the reciprocal was a spelling tax. The kernel computes the reciprocal once and
+// multiplies (mercury_runtime/norm.rs), a <=1-ULP-per-element deviation strictly smaller than the
+// documented kernel-reassociation exception the sums already rely on; both backends call the
+// identical kernel. A MIXED window (`let inv = 1/sqrt(...)` then `x[i]/inv` — multiply-by-std, not
+// a norm) is verified NOT to match.
+// EXPECT-EXIT: 0
+// RMSNorm/gamma over [1,2,3,4], eps 1e-5: rms=sqrt(7.50001); 1/rms ~ 0.36515 -> 365; 3/rms*2 ~ 2.1909 -> 2190
+// EXPECT-OUT: 365
+// EXPECT-OUT: 2190
+// LayerNorm over [2,4,6,8]: mean 5, var 5; (8-5)/sqrt(5.00001) ~ 1.34164 -> 1341
+// EXPECT-OUT: 1341
+// L2 over [3,0,4,0]: ||z|| = 5; 3/5 -> 600
+// EXPECT-OUT: 600
+fn main() -> i32 {
+    // RMSNorm, divide + affine gamma
+    let mut x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let g: [f32; 4] = [1.0, 1.0, 2.0, 1.0];
+    let mut s: f32 = 0.0;
+    for i in 0..4 { s = s + x[i]*x[i]; }
+    let rms: f32 = sqrt(s / 4.0 + 0.00001);
+    for i in 0..4 { x[i] = x[i] / rms * g[i]; }
+    print((x[0]*1000.0) as i32);
+    print((x[2]*1000.0) as i32);
+
+    // LayerNorm, divide
+    let mut y: [f32; 4] = [2.0, 4.0, 6.0, 8.0];
+    let mut sy: f32 = 0.0;
+    for i in 0..4 { sy = sy + y[i]; }
+    let mean: f32 = sy / 4.0;
+    let mut vv: f32 = 0.0;
+    for i in 0..4 { vv = vv + (y[i]-mean)*(y[i]-mean); }
+    let std: f32 = sqrt(vv / 4.0 + 0.00001);
+    for i in 0..4 { y[i] = (y[i]-mean) / std; }
+    print((y[3]*1000.0) as i32);
+
+    // L2-normalize, divide, no eps
+    let mut z: [f32; 4] = [3.0, 0.0, 4.0, 0.0];
+    let mut sz: f32 = 0.0;
+    for i in 0..4 { sz = sz + z[i]*z[i]; }
+    let nrm: f32 = sqrt(sz);
+    for i in 0..4 { z[i] = z[i] / nrm; }
+    print((z[0]*1000.0) as i32);
+    return 0;
+}

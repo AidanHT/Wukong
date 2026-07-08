@@ -3581,15 +3581,19 @@ impl FnLowerer<'_> {
     }
 
     /// Body `out[v] = x[v] * inv [* gamma[v] [+ beta[v]]]` (scale by an invariant scalar, either operand
-    /// order, with an optional affine wrapper for RMSNorm). Returns `(dst, gamma, beta)`: `dst` is the
-    /// write-target array — `x` itself for the in-place form, or a distinct `out` for `out = norm(x)`.
-    /// gamma/beta are `None` for the plain form. Pure.
+    /// order, with an optional affine wrapper for RMSNorm) — or, with `div`, the textbook divide
+    /// `out[v] = x[v] / den [affine]` (divisor on the right only). Returns `(dst, gamma, beta)`: `dst`
+    /// is the write-target array — `x` itself for the in-place form, or a distinct `out` for
+    /// `out = norm(x)`. gamma/beta are `None` for the plain form. The caller pairs `div` with the
+    /// matching denominator binding: a reciprocal `let inv = 1/sqrt(…)` takes `div = false`, a plain
+    /// `let rms = sqrt(…)` takes `div = true` — never mixed. Pure.
     fn match_scale_body(
         &self,
         body: &Block,
         v: Symbol,
         x: Symbol,
         inv: Symbol,
+        div: bool,
         batch: Option<(Symbol, &Expr)>,
     ) -> Option<(Symbol, Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
@@ -3607,16 +3611,18 @@ impl FnLowerer<'_> {
         // column-indexed (per-column, shared across rows), so `peel_affine` is unbatched.
         let dst = self.index_off(target, v, batch)?;
         let (core, gamma, beta) = self.peel_affine(value, v, x);
-        let ExprKind::Binary {
-            op: ast::BinOp::Mul,
-            lhs,
-            rhs,
-        } = &core.kind
-        else {
+        let ExprKind::Binary { op, lhs, rhs } = &core.kind else {
             return None;
         };
-        let ok = (self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(inv))
-            || (self.index_off(rhs, v, batch) == Some(x) && single_path(lhs) == Some(inv));
+        let ok = if div {
+            *op == ast::BinOp::Div
+                && self.index_off(lhs, v, batch) == Some(x)
+                && single_path(rhs) == Some(inv)
+        } else {
+            *op == ast::BinOp::Mul
+                && ((self.index_off(lhs, v, batch) == Some(x) && single_path(rhs) == Some(inv))
+                    || (self.index_off(rhs, v, batch) == Some(x) && single_path(lhs) == Some(inv)))
+        };
         if ok {
             Some((dst, gamma, beta))
         } else {
@@ -3782,7 +3788,7 @@ impl FnLowerer<'_> {
             if !exprs_struct_eq(ne, n_expr) {
                 return None;
             }
-            if self.match_scale_body(body, v, x, inv, batch)? != (x, None, None) {
+            if self.match_scale_body(body, v, x, inv, false, batch)? != (x, None, None) {
                 return None;
             }
             return Some((2, Some(inv)));
@@ -6140,8 +6146,12 @@ impl FnLowerer<'_> {
     }
 
     /// Body `out[v] = (x[v]-mean) * inv [* gamma[v] [+ beta[v]]]` (center then scale; either operand
-    /// order). Returns `(dst, gamma, beta)`: `dst` is the write target — `x` in-place, or a distinct
-    /// `out` for out-of-place `out = layernorm(x)`. The value still reads the source `x`. Pure.
+    /// order) — or, with `div`, the textbook divide `out[v] = (x[v]-mean) / std [affine]` (divisor on
+    /// the right only). Returns `(dst, gamma, beta)`: `dst` is the write target — `x` in-place, or a
+    /// distinct `out` for out-of-place `out = layernorm(x)`. The value still reads the source `x`.
+    /// The caller pairs `div` with the matching denominator binding: a reciprocal `let inv = 1/sqrt(…)`
+    /// takes `div = false`, a plain `let std = sqrt(…)` takes `div = true` — never mixed (dividing by
+    /// a reciprocal, or multiplying by a plain std, is not a normalization). Pure.
     fn match_shift_scale_body(
         &self,
         body: &Block,
@@ -6149,6 +6159,7 @@ impl FnLowerer<'_> {
         x: Symbol,
         mean: Symbol,
         inv: Symbol,
+        div: bool,
         batch: Option<(Symbol, &Expr)>,
     ) -> Option<(Symbol, Option<Symbol>, Option<Symbol>)> {
         let stmt = single_stmt(body)?;
@@ -6162,16 +6173,18 @@ impl FnLowerer<'_> {
         };
         let dst = self.index_off(target, v, batch)?;
         let (core, gamma, beta) = self.peel_affine(value, v, x);
-        let ExprKind::Binary {
-            op: ast::BinOp::Mul,
-            lhs,
-            rhs,
-        } = &core.kind
-        else {
+        let ExprKind::Binary { op, lhs, rhs } = &core.kind else {
             return None;
         };
-        let ok = (self.is_centered(lhs, v, x, mean, batch) && single_path(rhs) == Some(inv))
-            || (self.is_centered(rhs, v, x, mean, batch) && single_path(lhs) == Some(inv));
+        let ok = if div {
+            *op == ast::BinOp::Div
+                && self.is_centered(lhs, v, x, mean, batch)
+                && single_path(rhs) == Some(inv)
+        } else {
+            *op == ast::BinOp::Mul
+                && ((self.is_centered(lhs, v, x, mean, batch) && single_path(rhs) == Some(inv))
+                    || (self.is_centered(rhs, v, x, mean, batch) && single_path(lhs) == Some(inv)))
+        };
         if ok {
             Some((dst, gamma, beta))
         } else {
@@ -6259,6 +6272,58 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// `let std = sqrt(sum/count + eps)` (eps either side or absent) → `(std, eps_bits)` — the PLAIN
+    /// standard-deviation / RMS binding, the divide-normalize twin of [`Self::match_inv_rstd`]
+    /// (`x / std` instead of `x * inv`). The textbook LayerNorm/RMSNorm math is a divide; the kernel
+    /// computes the reciprocal once and multiplies (mercury_runtime/norm.rs), a ≤1-ULP-per-element
+    /// deviation strictly smaller than the documented kernel-reassociation exception the variance /
+    /// mean-square sum already relies on; both backends call the identical kernel, so the
+    /// differential gate and `-O0 == -O2` hold exactly as for the reciprocal spelling. Pure.
+    fn match_rstd(
+        &self,
+        stmt: &Stmt,
+        sum: Symbol,
+        n: &Expr,
+        prior: &[Stmt],
+    ) -> Option<(Symbol, i64)> {
+        let (name, init) = Self::let_init(stmt)?;
+        // A bare `sqrt(X)` call — NOT `1/sqrt(X)` or `rsqrt(X)` (those are the reciprocal binding).
+        let ExprKind::Call { callee, args, .. } = &init.kind else {
+            return None;
+        };
+        if args.len() != 1
+            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Sqrt))
+        {
+            return None;
+        }
+        let arg = &args[0];
+        // The argument analysis mirrors `match_inv_rstd` exactly: `sum/count` (eps = 0) or
+        // `sum/count + eps` (either side, inline / non-mut let / top-level const).
+        if self.scaled_by_inv_count(arg, sum, n) {
+            return Some((name, 0));
+        }
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        let (ms, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
+            (lhs.as_ref(), b)
+        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
+            (rhs.as_ref(), b)
+        } else {
+            return None;
+        };
+        if self.scaled_by_inv_count(ms, sum, n) {
+            Some((name, eps_bits))
+        } else {
+            None
+        }
+    }
+
     /// Recognize the canonical in-place flat LayerNorm window (7 statements) at `b.stmts[at..]`:
     ///
     /// ```text
@@ -6307,16 +6372,25 @@ impl FnLowerer<'_> {
             return None;
         }
         self.match_var_body(body4, v4, x, mean, vv, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_rstd(&stmts[5], vv, n_expr, &b.stmts[..at + 5])?;
+        // Reciprocal-multiply binding (`let inv = 1/sqrt(var+eps)` → `(x-mean)*inv`), or the textbook
+        // plain-std divide (`let std = sqrt(var+eps)` → `(x-mean)/std`) — never mixed.
+        let (den, div, eps_bits) =
+            match self.match_inv_rstd(&stmts[5], vv, n_expr, &b.stmts[..at + 5]) {
+                Some((inv, e)) => (inv, false, e),
+                None => {
+                    let (std, e) = self.match_rstd(&stmts[5], vv, n_expr, &b.stmts[..at + 5])?;
+                    (std, true, e)
+                }
+            };
         let (v6, n6, body6) = self.as_range0_for(&stmts[6])?;
         if !exprs_struct_eq(n6, n_expr) {
             return None;
         }
         let (dst, gamma, beta) =
-            self.match_shift_scale_body(body6, v6, x, mean, inv, data_batch)?;
+            self.match_shift_scale_body(body6, v6, x, mean, den, div, data_batch)?;
         let rest = &b.stmts[at + 7..];
         let tail = b.tail.as_deref();
-        for sc in [s, mean, vv, inv] {
+        for sc in [s, mean, vv, den] {
             if block_mentions(rest, tail, sc) {
                 return None;
             }
@@ -6354,16 +6428,25 @@ impl FnLowerer<'_> {
         // Batched: the data is indexed `row*cols + i` (cols == this inner bound); single-row: just `i`.
         let data_batch = batch.map(|row| (row, n_expr));
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])?;
+        // Reciprocal-multiply binding (`let inv = 1/sqrt(ms+eps)` → `x*inv`), or the textbook
+        // plain-RMS divide (`let rms = sqrt(ms+eps)` → `x/rms`) — never mixed.
+        let (den, div, eps_bits) = match self.match_inv_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])
+        {
+            Some((inv, e)) => (inv, false, e),
+            None => {
+                let (rms, e) = self.match_rstd(&stmts[2], s, n_expr, &b.stmts[..at + 2])?;
+                (rms, true, e)
+            }
+        };
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
         // `dst` is the scale loop's write target — `x` in-place, or a distinct `out` (out-of-place).
-        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, den, div, data_batch)?;
         let rest = &b.stmts[at + 4..];
         let tail = b.tail.as_deref();
-        for sc in [s, inv] {
+        for sc in [s, den] {
             if block_mentions(rest, tail, sc) {
                 return None;
             }
@@ -6384,6 +6467,46 @@ impl FnLowerer<'_> {
             return Some((name, 0.0f32.to_bits() as i64));
         }
         // `sqrt(sum + eps)` — eps is one operand; the other must be the bare sum-of-squares symbol.
+        let ExprKind::Binary {
+            op: ast::BinOp::Add,
+            lhs,
+            rhs,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        let (base, eps_bits) = if let Some(b) = self.eps_lit_bits(rhs, prior) {
+            (lhs.as_ref(), b)
+        } else if let Some(b) = self.eps_lit_bits(lhs, prior) {
+            (rhs.as_ref(), b)
+        } else {
+            return None;
+        };
+        if single_path(base) == Some(sum) {
+            Some((name, eps_bits))
+        } else {
+            None
+        }
+    }
+
+    /// `let nrm = sqrt(sum [+ eps])` → `(nrm, eps_bits)` — the PLAIN L2-norm binding, the
+    /// divide-normalize twin of [`Self::match_inv_l2norm`] (`x / ‖x‖₂` — arguably the most natural
+    /// L2-normalize spelling of all). Same ≤1-ULP reciprocal-canonicalization note as
+    /// [`Self::match_rstd`]. Pure.
+    fn match_l2den(&self, stmt: &Stmt, sum: Symbol, prior: &[Stmt]) -> Option<(Symbol, i64)> {
+        let (name, init) = Self::let_init(stmt)?;
+        let ExprKind::Call { callee, args, .. } = &init.kind else {
+            return None;
+        };
+        if args.len() != 1
+            || !matches!(self.vectorizable_intrinsic(callee), Some(MathIntrinsic::Sqrt))
+        {
+            return None;
+        }
+        let arg = &args[0];
+        if single_path(arg) == Some(sum) {
+            return Some((name, 0.0f32.to_bits() as i64));
+        }
         let ExprKind::Binary {
             op: ast::BinOp::Add,
             lhs,
@@ -6439,19 +6562,27 @@ impl FnLowerer<'_> {
         let (v1, n_expr, body1) = self.as_range0_for(&stmts[1])?;
         let data_batch = batch.map(|row| (row, n_expr));
         let x = self.match_sumsq_body(body1, v1, s, data_batch)?;
-        let (inv, eps_bits) = self.match_inv_l2norm(&stmts[2], s, &b.stmts[..at + 2])?;
+        // Reciprocal-multiply binding (`let inv = 1/sqrt(s+eps)` → `x*inv`), or the textbook
+        // plain-norm divide (`let nrm = sqrt(s+eps)` → `x/nrm`) — never mixed.
+        let (den, div, eps_bits) = match self.match_inv_l2norm(&stmts[2], s, &b.stmts[..at + 2]) {
+            Some((inv, e)) => (inv, false, e),
+            None => {
+                let (nrm, e) = self.match_l2den(&stmts[2], s, &b.stmts[..at + 2])?;
+                (nrm, true, e)
+            }
+        };
         let (v3, n3, body3) = self.as_range0_for(&stmts[3])?;
         if !exprs_struct_eq(n3, n_expr) {
             return None;
         }
-        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, inv, data_batch)?;
+        let (dst, gamma, beta) = self.match_scale_body(body3, v3, x, den, div, data_batch)?;
         // L2-normalize is non-affine; a `* gamma[i]` (or `+ beta[i]`) window is not an L2 norm.
         if gamma.is_some() || beta.is_some() {
             return None;
         }
         let rest = &b.stmts[at + 4..];
         let tail = b.tail.as_deref();
-        for sc in [s, inv] {
+        for sc in [s, den] {
             if block_mentions(rest, tail, sc) {
                 return None;
             }
