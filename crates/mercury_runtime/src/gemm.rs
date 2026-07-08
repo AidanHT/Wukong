@@ -1154,6 +1154,16 @@ unsafe fn sgemm_persistent_region(pool: Option<&rayon::ThreadPool>, args: GemmAr
             p.broadcast(worker);
         }
         None => {
+            // No-HT fallback (`gemm_pool() == None`): broadcast on the caller's *current* pool — the
+            // global one when called from outside any pool. If that caller is itself a default-pool
+            // rayon worker (a `@parallel` outer loop that dispatched this GEMM), this re-enters the
+            // SAME pool via `broadcast`. That does not deadlock *only* because rayon-core hands every
+            // pool worker the broadcast jobs in one uniform FIFO order and workers keep draining the
+            // broadcast queue while latch-waiting — so no worker blocks on a broadcast job a sibling
+            // is holding. That argument rests on rayon-core INTERNALS, not a public API guarantee
+            // (verified against rayon-core 1.13.0 / rayon 1.12.0, the versions pinned in Cargo.lock).
+            // A rayon bump must re-verify it, or route this arm to the legacy fork-join path
+            // (`MERCURY_GEMM_FORKJOIN=1`, `gemm_forkjoin()` above), which never nests a broadcast.
             rayon::broadcast(worker);
         }
     }
