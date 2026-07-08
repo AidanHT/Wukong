@@ -5,11 +5,40 @@ All notable changes to Mercury are documented here. The format is loosely based 
 
 ## [Unreleased]
 
+### Performance + correctness — perf-sota session 2 (2026-07-08)
+- **vmath exp/log to (near-)VML parity**: the transcendental dispatch loop gained a ×4 ILP unroll +
+  an NT-store streaming regime, then both cores were rewritten as 8-bucket in-register-LUT
+  (`vpermps`) reductions — exp `2^(j/8)` table + degree-3 residual poly (~1.3 ULP, exhaustively
+  swept), log reciprocal/ln tables + degree-5 poly (≤6.9e-7 rel, exhaustive over [0.25,4)) — each
+  mirrored value-exactly in the scalar twins and the inlined-MIR emitters. Same-run vs oneMKL VML:
+  **tanh 2.4–3× faster, log 1.14×, exp 1.05×-faster(cool)–~1.3×(throttled)**, from the former
+  ~1.7–2× loss; log2/log1p now 9.9×/7.7× vs scalar C.
+- **Parallel GEMM**: A+B packing fused into one parallel region per K-block (+7.5% @512³ same-run,
+  `MERCURY_PACK_SPLIT_REGIONS=1` kill-switch) and a persistent-broadcast-region variant (one pool
+  wake per call). Honest negatives recorded in-code: the persistent region A/Bs as a wash, a
+  smaller mid-size pool and hard worker pinning (`MERCURY_GEMM_AFFINITY=1`) both measure slower —
+  the residual mid-size gap vs threaded MKL is its 2D per-thread-L2 decomposition, not scheduling.
+- **gpu-native (MIR→PTX) correctness, 8 programs repaired**: the `mrt_velem` device kernel ignored
+  the Hadamard/Div mode bits (computed `x+y` for `x*y`/`x÷y`); `mrt_norm` sent log-softmax and
+  L2-norm to the RMSNorm branch; both sreduce kernels lacked the |x|-sum/|x−y|-sum ops (silent 0);
+  float→narrow-int casts truncated mod 2^w instead of saturating; and megakernel mode null-deref'd
+  through tid0-guarded pointer slots (`CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus gate: 193/274 matching
+  the interp oracle, zero mismatches/faults (81 honest UNSUPPORTED skips); a device fault can no
+  longer cascade — the harness records the root fault and reports later programs as NOT RUN.
+- **D=128 flash attention productionized**: `wmma_flash_applies/entry` now dispatch the
+  `flash_d128_mp_lm` ldmatrix kernel (1.11–1.20× cutlass mem-efficient @S≤1024) — D=128 previously
+  fell back to the f32 flash. A single-buffer occupancy probe pins the D=64 long-S plateau as
+  SFU/serial-softmax-bound (2× occupancy = 1.03× wash).
+- **End-to-end model bench hardened**: two full-peer rounds (C, `-ffast-math` C, PyTorch eager
+  1-thread/all-threads), all cross-checks <2e-6, interp gate + serial==@parallel bit-exact:
+  ~20–21× C(gcc), parity vs torch-1T (up to 1.21× faster @S=512), behind all-threads torch
+  multicore (1.05–2.5×, thermal-dependent).
+
 ### Performance — close-the-NVIDIA-gap campaign (vs the vendor libraries)
 - **CPU GEMM to oneMKL parity** (`perf/cpu-library-grade`): size-adaptive `select_kc(k)` + a private
   physical-core rayon pool put single-core GEMM at 102–104% of MKL-1-thread (256/512³) and 84–95%
   (1024–4096³); `@parallel` reaches 86–129% of MKL-all-threads at ≥2048³. MKL cblas/VML peers added to
-  `mercury_xbench`. (vmath still loses to MKL VML — algorithmic, documented.)
+  `mercury_xbench`. (vmath's then-open ~1.7–2× VML loss was closed in the 2026-07-08 session above.)
 - **fp16/bf16 large-GEMM cliff vs cuBLAS** (`perf/gpu-gemm-cliff-2`): the no-pad ldmatrix+XOR-swizzle
   workhorse takes 2048³ to ~87–90% and 4096³ to ~83% of cuBLAS (past the prior 77% `mma.sync` ceiling).
 - **int8/fp8 GEMM vs cuBLAS IMMA / cuBLASLt** (`perf/gpu-quant-2`): int8 beats IMMA at 2048³

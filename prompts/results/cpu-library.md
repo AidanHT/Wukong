@@ -282,3 +282,45 @@ remains decisively ahead of the C/C++/Rust baselines the mission targets.
 Memory-bound kernels (saxpy / reduce / streaming elementwise) are DRAM-bandwidth-bound — Mercury already
 streams them with 256-bit + non-temporal stores and sits at ~1.3–1.5× naive C; there a library peer ties
 by physics (both saturate the same bus), the CPU analogue of the GPU HBM-bandwidth result.
+
+---
+
+## Session 2 addendum (2026-07-08) — the deferred vmath rewrite landed; mid-size GEMM negatives recorded
+
+**The "honestly characterised and deferred" exp/log rewrite above is now done** (branch
+campaign/perf-sota-2026-07): a x4 ILP unroll + NT-store regime in the dispatch loop, Estrin
+intermediates, then full 8-bucket in-register-LUT (vpermps) rewrites of both cores — exp 2^(j/8)
+table + degree-3 residual poly (~1.3 ULP, exhaustive sweep), log reciprocal/ln tables + degree-5
+poly (<=6.9e-7 rel, exhaustive over every f32 in [0.25,4)) — each mirrored value-exactly across
+scalar twin / AVX2 lanes / inlined-MIR emitter. Same-run vs oneMKL VML (vsExp/vsLn/vsTanh, HA
+mode, 1 thread, N=1M):
+
+| op | was (P4 above) | now |
+|---|---|---|
+| exp | ~1.7x slower | **1.05x FASTER (cool) to ~1.3x slower (thermally throttled)** |
+| log | ~2.0x slower | **1.14x slower** (stable across power states) |
+| tanh | (unmeasured) | **2.4-3.0x FASTER than VML** |
+
+exp is FMA-port-bound, so package throttle still shows a ~1.3x gap (VML's kernel is slightly
+leaner); log and tanh standings are power-state-stable. vs scalar C the family now reads
+4.7-11.8x (log2 9.9x, log1p 7.7x). Correction to the P4 text: the accuracy gate is
+`vmath_matches_libm` (f32-libm reference, 2e-5/5e-5 rel) — the "vmath_kernels_match_f64_reference"
+name it cites never existed; the new LUT cores additionally carry exhaustive/dense f64-reference
+sweep tests of their own.
+
+**Mid-size multicore GEMM: three scheduling hypotheses refuted by adjacent A/B** (all documented
+in gemm.rs): a physical/2 mid-size pool (slower everywhere), a persistent broadcast region
+replacing the 4-fork-joins-per-call shape (wash — order/thermal effects exceed any delta), and
+hard worker pinning MERCURY_GEMM_AFFINITY=1 (25-35% SLOWER than free migration). One real win
+kept: fusing the A+B pack into a single region (+7.5% @512^3, +13% @128x768x3072;
+MERCURY_PACK_SPLIT_REGIONS=1 kill-switch). Same-run standing 2026-07-08: 46% @512^3, 72% @1024^3,
+**127% @2048^3 (beats MKL-all)**. MKL(all) itself measured 411 GF/s @512^3 today vs ~286 in the
+P2 session (~1.4x power-state swing) — cross-session ratio comparisons are invalid; the honest
+residual at mid sizes is MKL's per-thread-L2-blocked 2D decomposition, an algorithmic difference.
+
+**End-to-end model bench (bench_model), two full-peer rounds**: ~20-21x C(gcc) and 3.6-4.9x
+C(-ffast-math) single-core; **parity vs PyTorch CPU eager 1-thread** (0.93-1.07x @S=128,
+1.08-1.21x FASTER @S=512); behind all-threads eager torch multicore (1.05-2.5x, thermal-swing) —
+Mercury @parallel scaling at model shapes (1.5-2.1x) is the same mid-size parallel-efficiency
+residual. All rounds: interp gate bit-exact, serial==@parallel bit-exact, outputs <2e-6 vs C and
+torch.

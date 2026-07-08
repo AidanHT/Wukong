@@ -28,17 +28,25 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
   **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
   (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
-  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM is **60–70% at
-  512–1024³ but reaches parity-to-winning (86–129%) at ≥2048³**, the large-matrix ML regime (the
-  residual mid-size gap is cross-core sync/packing overhead on this P+E hybrid, not the kernel);
+  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM is **~46–72% at
+  512–1024³ but reaches parity-to-winning (86–129%, most recently 127%) at ≥2048³**, the
+  large-matrix ML regime. (Disclosure: threaded MKL itself swings ~1.4× with this laptop's power
+  state, so the mid-size ratio is a range across sessions; three scheduling explanations —
+  fewer threads, fewer fork-join barriers, hard core pinning — were each refuted by adjacent
+  same-run A/B, so the residual mid-size gap is MKL's per-thread-L2-blocked 2D parallel
+  decomposition, a real algorithmic difference, honestly open);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
   over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
   column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
   **RoPE** rotary embedding **~29–54×** (up to **~156× parallel**), **strided column reductions**
   (bias-grad / per-channel quant stats) **~29–50×**, and the training-backward kernels
   (activation/softmax/LayerNorm-RMSNorm backward, cross-entropy) **~3–13×**;
-- **wins the transcendental/activation family ~2–13×** (**~28× under `@parallel`**) — the cleanest
-  compute-bound win. Mercury dispatches a pure `out[i]=f(x[i])` loop for **35** functions
+- **wins the transcendental/activation family ~4.7–12× vs C** (**~28× under `@parallel`**) — the
+  cleanest compute-bound win — and now stands **at or near Intel oneMKL VML**, the hand-tuned
+  vector-math SOTA: same-run, **tanh 2.4–3× FASTER than VML, log 1.14× slower, exp from 1.05×
+  faster (cool) to ~1.3× slower (thermally throttled)** after 8-bucket in-register-LUT rewrites
+  of both cores (exp ~1.3 ULP, log ≤6.9e-7 rel — exhaustively swept). Mercury dispatches a pure
+  `out[i]=f(x[i])` loop for **35** functions
   (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/
   `softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the
   hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh` — the transformer activations plus **RoPE**'s
@@ -47,6 +55,12 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   call scalar `libm` and **cannot vectorize a loop containing the call**;
 - **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form)
   **~1.9–6.6×** and **convolution** (im2col + GEMM) **~6–7×**;
+- **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
+  GELU MLP — ordinary Mercury source through the real pipeline, gated bit-exact against the
+  interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~20–21× idiomatic C,
+  3.6–4.9× `-ffast-math` C, and at parity with PyTorch CPU eager single-thread** (0.93–1.07×
+  @S=128, **1.08–1.21× faster @S=512**); all-threads eager torch still wins multicore
+  (1.05–2.5×, thermal-dependent) — the same mid-size parallel-efficiency gap disclosed above;
 - **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~4.6–14.7× parallel**, and runs a full
   **bf16 *and* f16 mixed-precision CPU suite** — `dot` (**~3×**) / `sum` (**~6–8×**), `max`/`min`/`absmax`
   (the symmetric-quant scale), streaming `axpby`, the `nn.Linear` GEMM (**~24–25×**), and the 36-op
@@ -57,7 +71,9 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
 - and ships a **GPU backend** (`--features gpu`, NVIDIA RTX 4050; PTX + cudarc driver-JIT, no CUDA
   toolkit): fp16 tensor-core GEMM at **cuBLAS parity (~101%) ≤1024³**, a fused **flash-attention**
   that **beats the genuinely-fused cuDNN + cutlass fMHA in the causal-S≤512 and fused-RoPE regimes**
-  (and is 3.6–5× the unfused cuBLAS chain), trailing cuDNN only at long context (S≥2048),
+  (and is 3.6–5× the unfused cuBLAS chain), trailing cuDNN only at long context (S≥2048) — with the
+  **D=128 `ldmatrix` kernel (the Llama-class head dim, 1.11–1.20× cutlass mem-efficient at S≤1024)
+  now the production D=128 dispatch**,
   int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
   compile vs Triton's 30–120 s**.
 
