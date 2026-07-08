@@ -1170,16 +1170,36 @@ impl<'a> FnEmit<'a> {
             MirType::I64 => 64,
             _ => 32,
         };
+        // PTX float->int `cvt` *saturates* to the destination integer type (out-of-range clamps to the
+        // type's min/max; NaN -> 0) — exactly the Rust `as` / interpreter / Cranelift `fcvt_to_*_sat`
+        // semantics. For a 32/64-bit target the single `cvt` is the whole story.
         if w == 64 {
             self.emit(&format!("cvt.rzi.{s}64.{fsfx} {d}, {x};"));
-        } else {
-            // PTX `cvt` to a sub-64-bit integer type needs a matching-width destination register, so
-            // convert float -> 32-bit int in a 32-bit temp, then sign/zero-extend into the 64-bit
-            // holder and mask to the declared width (mirrors the interpreter's per-result `mask`).
+        } else if w == 32 {
+            // Saturating cvt to a 32-bit temp, then sign/zero-extend into the 64-bit holder. `mask_int`
+            // is a no-op for i32 (the extend already canonicalizes) but keeps the i1 fallback (`& 1`).
             let t = self.fresh_r32();
             self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
             self.emit(&format!("cvt.{s}64.{s}32 {d}, {t};"));
             self.mask_int(d, to);
+        } else {
+            // Narrow (i8/i16/u8/u16): PTX can only cvt-saturate to i32/u32, so saturate to 32 bits then
+            // CLAMP to the narrow type's range and reduce — mirroring Cranelift's `fcvt_to_int_sat`
+            // (smin/smax for signed; umin for unsigned, whose lower bound is already 0 from the
+            // unsigned saturation). This makes e.g. `300.0 as u8 == 255`, `-300.0 as i8 == -128`,
+            // `-1.0 as u8 == 0`, not the mod-2^w truncation the old `mask_int` produced.
+            let t = self.fresh_r32();
+            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
+            if signed {
+                let (lo, hi) = if w == 8 { (-128, 127) } else { (-32768, 32767) };
+                self.emit(&format!("min.s32 {t}, {t}, {hi};"));
+                self.emit(&format!("max.s32 {t}, {t}, {lo};"));
+                self.emit(&format!("cvt.s64.s32 {d}, {t};"));
+            } else {
+                let hi = if w == 8 { 255 } else { 65535 };
+                self.emit(&format!("min.u32 {t}, {t}, {hi};"));
+                self.emit(&format!("cvt.u64.u32 {d}, {t};"));
+            }
         }
     }
 
