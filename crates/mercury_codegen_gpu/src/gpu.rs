@@ -1792,26 +1792,40 @@ pub(crate) fn flash_plan_forced(d: usize, seq: usize, tiled: bool) -> (String, L
     (name, cfg)
 }
 
-/// Whether [`ResidentLayerF16`] dispatches the **tensor-core flash** (`flash_d64_w`) for this shape:
-/// `D == 64`, `S` a multiple of 16, and `S >= 512`. Below 512 the kernel's `S/16` warps can't fill the
-/// SM and the tiled f32 flash wins (measured in `flash_tiled_vs_untiled`); at/above it the WMMA `Q·Kᵀ`
-/// + `P·V` wins, the margin growing with S (0.92× the tiled @512 → 0.63× @4096). The WMMA path casts
-/// Q/K/V to f16 (the tensor-core dtype) — an extra 3 cheap cast launches that the win pays back.
+/// Whether [`ResidentLayerF16`] dispatches the **tensor-core flash** ([`wmma_flash_entry`]) for this
+/// shape: `D ∈ {64, 128}`, `S` a multiple of 16, and `S >= 512`. Below 512 the kernel's `S/16` warps
+/// can't fill the SM and the tiled f32 flash wins (measured in `flash_tiled_vs_untiled`); at/above it
+/// the register-resident `mma.sync` `Q·Kᵀ` + `P·V` wins, the margin growing with S (0.92× the tiled
+/// @512 → 0.63× @4096). The path casts Q/K/V to f16 (the tensor-core dtype) — an extra 3 cheap cast
+/// launches that the win pays back. `D == 128` (the modern Llama/GPT head dim) dispatches the
+/// `ldmatrix` PV-feed variant (`flash_d128_mp_lm`, 16 KB SMEM/CTA), measured ~18–23% over the
+/// hand-packed feed and ahead of cutlass mem-efficient fMHA at `S <= 1024`.
 pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
-    d == 64 && s % 16 == 0 && s >= 512
+    (d == 64 || d == 128) && s % 16 == 0 && s >= 512
 }
 
-/// Tensor-core flash entry name: the **`cp.async`-pipelined register-resident `mma.sync` kernel**
-/// `flash_d64_mp` — O/m/l in registers (no SMEM round-trip) *and* the K/V key blocks `cp.async`-staged
-/// into double-buffered shared memory so block `kb+1` prefetches under block `kb`'s tensor-core compute.
-/// It supersedes `flash_d64_m` (which loaded K/V straight from global and stalled per-block on that
-/// latency): the same-run A/B `flash_pipe_vs_mma` measures `mp/m` 0.28×→0.88× single-head S=512→4096
-/// (1.14–3.6×, latency-dominated at small S) and 0.84–0.90× at the H=12 GPU-filled regime (the per-warp
-/// latency bound). Bit-identical math to `flash_d64_m`, so the gate cross-checks both. Only needs
-/// `S % 16 == 0`, which [`wmma_flash_applies`] guarantees; static 16 KB SMEM (no launch param). Shares
-/// [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA). `flash_d64_m`/`_w`/`_w4` are retained for the A/B bench.
-pub(crate) fn wmma_flash_entry(_s: usize) -> &'static str {
-    "flash_d64_mp"
+/// Tensor-core flash entry name for head dim `d`: the **`cp.async`-pipelined register-resident
+/// `mma.sync` kernel** — O/m/l in registers (no SMEM round-trip) *and* the K/V key blocks
+/// `cp.async`-staged into double-buffered shared memory so block `kb+1` prefetches under block `kb`'s
+/// tensor-core compute. Both variants share [`wmma_flash_cfg`] (grid `S/16`, one warp/CTA, static SMEM,
+/// no launch param) and need only `S % 16 == 0`, which [`wmma_flash_applies`] guarantees.
+///
+/// * **`d == 64` → `flash_d64_mp`** (hand-packed SMEM V-feed). It supersedes `flash_d64_m` (which
+///   loaded K/V straight from global and stalled per-block on that latency): the same-run A/B
+///   `flash_pipe_vs_mma` measures `mp/m` 0.28×→0.88× single-head S=512→4096 and 0.84–0.90× at the H=12
+///   GPU-filled regime. The `ldmatrix` V-feed twin `flash_d64_mp_lm` is only ~2–4% ahead here (inside
+///   the noise), so D=64 keeps the hand path. 8 KB SMEM/CTA.
+/// * **`d == 128` → `flash_d128_mp_lm`** (the `ldmatrix.x2.trans` PV V-feed). At D=128 the PV path is
+///   half the mma work (`nto = 16`) so the SMEM feed dominates: `flash_lm_vs_mp` measures the `_lm`
+///   feed ~18–23% ahead of the hand-packed `flash_d128_mp`, and `attn_lm_vs_fused_peer` puts it ahead
+///   of cutlass mem-efficient fMHA at `S <= 1024` (1.11–1.20×). 16 KB SMEM/CTA. Correctness-gated by
+///   `flash_lm_matches_reference` / `flash_d128_matches_reference`.
+pub(crate) fn wmma_flash_entry(d: usize, _s: usize) -> &'static str {
+    if d == 128 {
+        "flash_d128_mp_lm"
+    } else {
+        "flash_d64_mp"
+    }
 }
 
 /// Launch config for the tensor-core flash kernels (`flash_d64_w`/`_w4`): one warp per 16-query-row block.
@@ -2783,8 +2797,8 @@ pub struct ResidentLayerF16 {
     /// Launch config matched to `f_flash`'s kernel (untiled vs tiled), resolved once by [`flash_plan`]
     /// at construction since the sequence length is fixed for a resident layer.
     flash_cfg: LaunchConfig,
-    /// The tensor-core flash kernel (`flash_d64_w`) + its launch config — `Some` when
-    /// [`wmma_flash_applies`] (D=64, S≥512, S%16==0). When set, attention runs on the tensor cores
+    /// The tensor-core flash kernel ([`wmma_flash_entry`]) + its launch config — `Some` when
+    /// [`wmma_flash_applies`] (D∈{64,128}, S≥512, S%16==0). When set, attention runs on the tensor cores
     /// (Q/K/V cast to f16) instead of `f_flash`; the cast is `f_cast`.
     f_flash_w: Option<(CudaFunction, LaunchConfig)>,
     f_gemm: CudaFunction,
@@ -2869,7 +2883,7 @@ impl ResidentLayerF16 {
         );
         assert!(
             heads == 1 || wmma_flash_applies(dh, s),
-            "multi-head (heads={heads}) needs the tensor-core flash: dh must be 64, S>=512, S%16==0 (got dh={dh}, S={s})"
+            "multi-head (heads={heads}) needs the tensor-core flash: dh must be 64 or 128, S>=512, S%16==0 (got dh={dh}, S={s})"
         );
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
@@ -2878,7 +2892,7 @@ impl ResidentLayerF16 {
         let (flash_name, flash_cfg) = flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_flash_w = if wmma_flash_applies(dh, s) {
-            let f = g.function("flash", crate::ptx_flash::flash_ptx(), wmma_flash_entry(s))?;
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), wmma_flash_entry(dh, s))?;
             Some((f, wmma_flash_cfg(s)))
         } else {
             None
@@ -16153,6 +16167,115 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **Same-run A/B: single-buffered vs double-buffered D=64 flash** (`flash_single_vs_double`).
+    /// `flash_d64_m1` uses ONE staged K+V slab (smem = 2·ksz = 4 KB/CTA → hits the 24-block/SM cap,
+    /// ~50% occupancy) but forgoes the `cp.async` compute/load overlap; `flash_d64_mp` double-buffers
+    /// (smem = 4·ksz = 8 KB → ~12 blocks/SM, ~25% occupancy) and prefetches block `kb+1` under block
+    /// `kb`'s tensor-core compute. Identical online-softmax math (bit-cross-checked first), so the ratio
+    /// isolates *occupancy vs pipeline overlap* at the long-S plateau. Clock-cancelled exactly as
+    /// `flash_lm_vs_mp` (pin the clock, warm both, time each twice in opposite order, min per kernel,
+    /// median of ROUNDS). H=12 (GPU-filled), D=64, non-causal, S=2048/4096. Diagnostic ONLY — decides
+    /// whether the long-S plateau is occupancy-bound (`m1/mp` moves below 1) or SFU/serial-softmax-bound
+    /// (flat ~1). Not a shipped dispatch. Run:
+    /// `… --features gpu --release -- --ignored --nocapture flash_single_vs_double`.
+    #[test]
+    #[ignore = "same-run flash occupancy probe; needs a GPU"]
+    fn flash_single_vs_double() {
+        use half::f16;
+        with_gpu("flash_single_vs_double", |g| {
+            let mut rng = crate::diff::Rng::new(0x51_9B1E);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let wa = rng.vec(1024 * 1024, -1.0, 1.0);
+            let wb = rng.vec(1024 * 1024, -1.0, 1.0);
+            let pin = |g: &mut Gpu| {
+                for _ in 0..40 {
+                    gemm_nt_f16_sm_db(g, &wa, &wb, 1024, 1024, 1024).unwrap();
+                }
+            };
+            const ROUNDS: usize = 9;
+            let (heads, d) = (12usize, 64usize);
+            let f_mp = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_mp").unwrap();
+            let f_m1 = g.function("flash", crate::ptx_flash::flash_ptx(), "flash_d64_m1").unwrap();
+            eprintln!(
+                "--- flash_single_vs_double: flash_d64_m1 (single/4KB, ~50% occ) vs flash_d64_mp \
+                 (double/8KB, ~25% occ), H={heads} D={d}, clock-cancelled median of {ROUNDS} ---"
+            );
+            for &s in &[2048usize, 4096] {
+                let n = heads * s * d;
+                let q16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let k16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let v16 = g.stream.memcpy_stod(&to16(&rng.vec(n, -1.0, 1.0))).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(n).unwrap();
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let ss = s as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((s / 16) as u32, heads as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let run = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                    let mut b = g.stream.launch_builder(f);
+                    b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(o);
+                    unsafe { b.launch(cfg).unwrap() };
+                };
+                // checksum cross-check: single-buffered must agree with the double-buffered baseline.
+                run(g, &f_mp, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_mp: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                run(g, &f_m1, &mut o_d);
+                g.stream.synchronize().unwrap();
+                let s_m1: f64 = g.stream.memcpy_dtov(&o_d).unwrap().iter().map(|x| x.abs() as f64).sum();
+                assert!(
+                    (s_m1 - s_mp).abs() / s_mp.max(1.0) < 3e-2,
+                    "S={s}: m1 vs mp checksum disagree mp={s_mp:.3e} m1={s_m1:.3e}"
+                );
+                let mut ratios = Vec::new();
+                let mut t_mp_best = f64::INFINITY;
+                for _ in 0..ROUNDS {
+                    pin(g);
+                    for _ in 0..30 {
+                        run(g, &f_mp, &mut o_d);
+                        run(g, &f_m1, &mut o_d);
+                    }
+                    g.stream.synchronize().unwrap();
+                    let time1 = |g: &Gpu, f: &cudarc::driver::CudaFunction, o: &mut cudarc::driver::CudaSlice<f32>| {
+                        let t0 = Instant::now();
+                        for _ in 0..50 {
+                            let mut b = g.stream.launch_builder(f);
+                            b.arg(&ss).arg(&scale).arg(&q16).arg(&k16).arg(&v16).arg(&mut *o);
+                            unsafe { b.launch(cfg).unwrap() };
+                        }
+                        g.stream.synchronize().unwrap();
+                        t0.elapsed().as_secs_f64() / 50.0
+                    };
+                    let a1 = time1(g, &f_mp, &mut o_d);
+                    let b1 = time1(g, &f_m1, &mut o_d);
+                    let b2 = time1(g, &f_m1, &mut o_d);
+                    let a2 = time1(g, &f_mp, &mut o_d);
+                    let tmp = a1.min(a2);
+                    let tm1 = b1.min(b2);
+                    ratios.push(tm1 / tmp);
+                    t_mp_best = t_mp_best.min(tmp);
+                }
+                ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = ratios[ratios.len() / 2];
+                let flop = 4.0 * heads as f64 * s as f64 * s as f64 * d as f64;
+                eprintln!(
+                    "  S={s:>4}: mp(double) {:>6.0} GF/s | m1/mp {:.3}×  {} (clock-cancelled)",
+                    flop / t_mp_best / 1e9,
+                    med,
+                    if med < 0.98 {
+                        "<- single wins => occupancy-bound"
+                    } else if med > 1.02 {
+                        "(double wins => overlap helps / not occupancy-bound)"
+                    } else {
+                        "(flat => SFU/serial-softmax-bound, not occupancy-bound)"
+                    },
+                );
+            }
+        });
+    }
+
     /// **Same-run A/B: software-pipelined vs base flash** (`flash_sp_vs_mp`). `flash_d64_msp` (QKᵀ(i+1)
     /// issued ahead to overlap the softmax(i) SFU stall) vs `flash_d64_mp`, identical launch geometry,
     /// clock-cancelled exactly as `flash_lm_vs_mp` (warm both, time both orders, min per kernel, median of
@@ -16997,6 +17120,61 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     );
                     eprintln!("{entry} s={s} d={d}: max_abs={:.2e} max_rel={:.2e}", st.max_abs, st.max_rel);
                 }
+            }
+        });
+    }
+
+    /// **Correctness gate (law #1) for the productionized D=128 flash dispatch.** [`wmma_flash_applies`]
+    /// + [`wmma_flash_entry`] + [`wmma_flash_cfg`] are the seam [`ResidentLayerF16`] uses to pick the
+    /// tensor-core flash; this asserts that at `D == 128` they select the `ldmatrix` kernel
+    /// (`flash_d128_mp_lm`) with the grid `S/16` / one-warp-per-CTA / static-16 KB-SMEM config, and that
+    /// launching exactly that `(name, cfg)` over f16 Q/K/V reproduces the f64 `ref_attn`. Also pins the
+    /// D=64 dispatch to the unchanged `flash_d64_mp`. End-to-end gate for the dispatch wiring (the kernel
+    /// itself is separately gated by `flash_lm_matches_reference` / `flash_d128_matches_reference`).
+    #[test]
+    fn wmma_flash_dispatch_d128_matches_reference() {
+        use half::f16;
+        with_gpu("wmma_flash_dispatch_d128", |g| {
+            // D=64 dispatch is unchanged (the hand-packed feed stays — ldmatrix is only ~2–4% there).
+            assert_eq!(wmma_flash_entry(64, 512), "flash_d64_mp", "D=64 dispatch must not change");
+            let d = 128usize;
+            let mut rng = crate::diff::Rng::new(0x0D12_8A5);
+            let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
+            let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
+            for &s in &[512usize, 1024] {
+                assert!(wmma_flash_applies(d, s), "D=128 S={s} must take the tensor-core flash path");
+                let entry = wmma_flash_entry(d, s);
+                assert_eq!(entry, "flash_d128_mp_lm", "D=128 must dispatch the ldmatrix kernel");
+                let cfg = wmma_flash_cfg(s);
+                assert_eq!(cfg.grid_dim, ((s / 16) as u32, 1u32, 1u32), "grid must be S/16 CTAs");
+                assert_eq!(cfg.block_dim, (32u32, 1u32, 1u32), "block must be one warp/CTA");
+                assert_eq!(cfg.shared_mem_bytes, 0, "SMEM is static in the kernel (no launch param)");
+                let q16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let k16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let v16 = to16(&rng.vec(s * d, -1.0, 1.0));
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let q_d = g.stream.memcpy_stod(&q16).unwrap();
+                let k_d = g.stream.memcpy_stod(&k16).unwrap();
+                let v_d = g.stream.memcpy_stod(&v16).unwrap();
+                let mut o_d = g.stream.alloc_zeros::<f32>(s * d).unwrap();
+                let f = g.function("flash", crate::ptx_flash::flash_ptx(), entry).unwrap();
+                let s32 = s as u32;
+                let mut bld = g.stream.launch_builder(&f);
+                bld.arg(&s32).arg(&scale).arg(&q_d).arg(&k_d).arg(&v_d).arg(&mut o_d);
+                unsafe { bld.launch(cfg).unwrap() };
+                let got = g.stream.memcpy_dtov(&o_d).unwrap();
+                let oracle = ref_attn(&back(&q16), &back(&k16), &back(&v16), s, d, scale);
+                let st = crate::diff::assert_close(
+                    &format!("d128 dispatch [{entry}] s={s}"),
+                    &got,
+                    &oracle,
+                    3e-3,
+                    3e-2,
+                );
+                eprintln!(
+                    "d128 dispatch [{entry}] s={s}: max_abs={:.2e} max_rel={:.2e}",
+                    st.max_abs, st.max_rel
+                );
             }
         });
     }
