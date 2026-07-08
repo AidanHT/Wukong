@@ -17029,13 +17029,20 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The natural-log polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Decomposes
-    /// `x = m·2^e` with `m ∈ [0.5,1)` by IEEE-754 bit surgery — **no shift**: the exponent field is
-    /// masked off (so the integer is `exp_field·2^23`, exact in `f32` for the ≤8-bit field), widened
-    /// and scaled by `2^-23` to recover the count; the mantissa is OR-ed with biased exponent 126.
-    /// Then a Cephes degree-8 minimax poly gives `log(m)`, and `e·ln2` is added back (same `ln2`
-    /// split as `exp`). Every step is a primitive op both backends agree on bit-for-bit, so `log`
-    /// does too. Assumes `x > 0` (like the rest of the kernels, no domain guard).
+    /// The natural log in `f32` (`fty` is `f32` or a `Vec` of `f32`): the 8-bucket table reduction,
+    /// mirroring the runtime kernel `log1`/`log8` **value-for-value** (the documented consistency
+    /// promise). `tmp = bits(x) − LOG_OFF` splits at a bit pattern instead of an exponent boundary,
+    /// so `z = bitcast(bits − (tmp & 0xFF80_0000)) ∈ [0.6953125, 1.390625)` *straddles 1*;
+    /// `k·2^23 = tmp & 0xFF80_0000` converts to f32 exactly (**no shift**, same trick as before:
+    /// ≤9 significant bits, scaled by the exact 2^-23). Bits 22..20 of `tmp` pick the bucket:
+    /// the kernel does that lookup with one in-register `vpermps`, which MIR has no op for — so
+    /// here it is a 3-level `Select` tree on the three index bits picking among the same 8 f32
+    /// constants: not the same instruction, but bit-for-bit the same *value* on every lane, which
+    /// is what the promise requires (and what lets a dispatched loop and a composed/scalar use
+    /// agree exactly). Then `ln(x) = k·ln2 + L[j] + poly(s)`, `s = fma(z, R[j], −1)`, the same
+    /// degree-5 tail and hi/lo `ln2` reconstruction as the kernel, op-for-op. Every step is a
+    /// primitive op both backends agree on bit-for-bit, so `log` does too. Assumes `x > 0` (like
+    /// the rest of the kernels, no domain guard).
     fn emit_log_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
         let lanes = match fty {
             MirType::Vec(_, n) => Some(*n),
@@ -17051,96 +17058,94 @@ impl FnLowerer<'_> {
             .builder
             .build(ity.clone(), Op::Cast(CastKind::Bitcast, x, ity.clone()));
 
-        // e = (float)(exponent_field) - 126, without a shift: keep only the exponent bits (value is
-        // `exp_field·2^23`, exact in f32), widen to f32, scale by 2^-23.
-        let expmask = self.splat_const_i(0x7F80_0000, &ity);
-        let epart = self
+        // tmp = bits − LOG_OFF; kbits = tmp & 0xFF80_0000 (= k·2^23, signed); z = bitcast(bits − kbits).
+        let off = self.splat_const_i(LOG_OFF, &ity);
+        let tmp = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::And, bits, expmask));
-        let epart_f = self
+            .build(ity.clone(), Op::Bin(BinOp::Sub, bits, off));
+        let kmask = self.splat_const_i(-0x0080_0000, &ity); // 0xFF80_0000 as i32
+        let kbits = self
             .builder
-            .build(fty.clone(), Op::Cast(CastKind::SiToFp, epart, fty.clone()));
+            .build(ity.clone(), Op::Bin(BinOp::And, tmp, kmask));
+        let iz = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, bits, kbits));
+        let z = self
+            .builder
+            .build(fty.clone(), Op::Cast(CastKind::Bitcast, iz, fty.clone()));
+
+        // e = (float)kbits · 2^-23 — both steps exact (signed convert of k·2^23, power-of-two scale).
+        let kf = self
+            .builder
+            .build(fty.clone(), Op::Cast(CastKind::SiToFp, kbits, fty.clone()));
         let inv = self.splat_const_f(INV_2P23, fty);
-        let efield = self
+        let e = self
             .builder
-            .build(fty.clone(), Op::Bin(BinOp::FMul, epart_f, inv));
-        let bias = self.splat_const_f(126.0, fty);
-        let mut e = self
-            .builder
-            .build(fty.clone(), Op::Bin(BinOp::FSub, efield, bias));
+            .build(fty.clone(), Op::Bin(BinOp::FMul, kf, inv));
 
-        // m = bitcast((bits & 0x007fffff) | 0x3f000000) — mantissa with biased exponent 126 → [0.5,1).
-        let mmask = self.splat_const_i(0x007F_FFFF, &ity);
-        let mant = self
-            .builder
-            .build(ity.clone(), Op::Bin(BinOp::And, bits, mmask));
-        let half_exp = self.splat_const_i(0x3F00_0000, &ity);
-        let mbits = self
-            .builder
-            .build(ity.clone(), Op::Bin(BinOp::Or, mant, half_exp));
-        let mut m = self
-            .builder
-            .build(fty.clone(), Op::Cast(CastKind::Bitcast, mbits, fty.clone()));
+        // The three bucket-index bits of tmp (b0 = bit 20 … b2 = bit 22), each as a `!= 0` mask.
+        let zero_i = self.splat_const_i(0, &ity);
+        let bit_mask = |this: &mut Self, bit: i128| {
+            let c = this.splat_const_i(bit, &ity);
+            let and = this
+                .builder
+                .build(ity.clone(), Op::Bin(BinOp::And, tmp, c));
+            this.builder
+                .build(mty.clone(), Op::Cmp(CmpOp::Ne, and, zero_i))
+        };
+        let b0 = bit_mask(self, 0x0010_0000);
+        let b1 = bit_mask(self, 0x0020_0000);
+        let b2 = bit_mask(self, 0x0040_0000);
 
-        // if m < √0.5: e -= 1; m = 2m - 1; else m -= 1  (branchless via select).
-        let sqrthf = self.splat_const_f(LOG_SQRTHF, fty);
-        let lt = self
-            .builder
-            .build(mty.clone(), Op::Cmp(CmpOp::Folt, m, sqrthf));
-        let one = self.splat_const_f(1.0, fty);
-        let m2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, m, m));
-        let m_lt = self
-            .builder
-            .build(fty.clone(), Op::Bin(BinOp::FSub, m2, one)); // 2m - 1
-        let m_ge = self
-            .builder
-            .build(fty.clone(), Op::Bin(BinOp::FSub, m, one)); // m - 1
-        m = self.builder.build(fty.clone(), Op::Select(lt, m_lt, m_ge));
-        let e_dec = self
-            .builder
-            .build(fty.clone(), Op::Bin(BinOp::FSub, e, one)); // e - 1
-        e = self.builder.build(fty.clone(), Op::Select(lt, e_dec, e));
+        // Table lookup as a 3-level select tree: level 0 splits on b0 (pairs), then b1, then b2 —
+        // exactly the value `vpermps` produces from the same 3 bits in the runtime kernel.
+        let lookup = |this: &mut Self, table: &[f64; 8]| {
+            let consts: Vec<ValueId> = table.iter().map(|&v| this.splat_const_f(v, fty)).collect();
+            let s01 = this
+                .builder
+                .build(fty.clone(), Op::Select(b0, consts[1], consts[0]));
+            let s23 = this
+                .builder
+                .build(fty.clone(), Op::Select(b0, consts[3], consts[2]));
+            let s45 = this
+                .builder
+                .build(fty.clone(), Op::Select(b0, consts[5], consts[4]));
+            let s67 = this
+                .builder
+                .build(fty.clone(), Op::Select(b0, consts[7], consts[6]));
+            let s0123 = this.builder.build(fty.clone(), Op::Select(b1, s23, s01));
+            let s4567 = this.builder.build(fty.clone(), Op::Select(b1, s67, s45));
+            this.builder.build(fty.clone(), Op::Select(b2, s4567, s0123))
+        };
+        let r_j = lookup(self, &LOG_TBL_R);
+        let l_j = lookup(self, &LOG_TBL_L);
 
-        // Degree-8 minimax poly for log(m) on the reduced range, in **Estrin form** (mirrors the
-        // runtime kernel `log1`/`log8` op-for-op — the documented consistency promise), then × m × z:
-        // two parallel sub-chains — lo = (P5·m+P6)·z+(P7·m+P8), hi = (P0·z+(P1·m+P2))·z+(P3·m+P4) —
-        // combined as p = hi·z²+lo with z² = m⁴. A 4-FMA critical path instead of Horner's 8 serial
-        // FMAs for one extra mul (z²; z is needed below anyway), and few enough live temporaries
-        // that the kernel's ×4-unrolled loop fits the 16 ymm registers. Estrin only *reassociates*
-        // (≤~1 ULP vs Horner, the reassociated-reduction doctrine); both backends run this same op
-        // sequence, so they still agree bit-for-bit.
-        let z = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, m, m));
-        let p5c = self.splat_const_f(LOG_P[5], fty);
-        let p6c = self.splat_const_f(LOG_P[6], fty);
-        let l1 = self.builder.build(fty.clone(), Op::Fma(p5c, m, p6c));
-        let p7c = self.splat_const_f(LOG_P[7], fty);
-        let p8c = self.splat_const_f(LOG_P[8], fty);
-        let l2 = self.builder.build(fty.clone(), Op::Fma(p7c, m, p8c));
-        let lo = self.builder.build(fty.clone(), Op::Fma(l1, z, l2));
-        let p1c = self.splat_const_f(LOG_P[1], fty);
-        let p2c = self.splat_const_f(LOG_P[2], fty);
-        let h1 = self.builder.build(fty.clone(), Op::Fma(p1c, m, p2c));
-        let p3c = self.splat_const_f(LOG_P[3], fty);
-        let p4c = self.splat_const_f(LOG_P[4], fty);
-        let h2 = self.builder.build(fty.clone(), Op::Fma(p3c, m, p4c));
-        let p0c = self.splat_const_f(LOG_P[0], fty);
-        let hz = self.builder.build(fty.clone(), Op::Fma(p0c, z, h1));
-        let hi = self.builder.build(fty.clone(), Op::Fma(hz, z, h2));
-        let z2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, z, z));
-        let p = self.builder.build(fty.clone(), Op::Fma(hi, z2, lo));
-        let pm = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, p, m));
-        let mut y = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, pm, z));
+        // s = z·R[j] − 1 in ONE rounding (exact z − 1 in the R = 1 bucket straddling x = 1).
+        let neg_one = self.splat_const_f(-1.0, fty);
+        let s = self.builder.build(fty.clone(), Op::Fma(z, r_j, neg_one));
 
-        // y += e·C2 (ln2 low);  y -= 0.5·z
+        // ln(1+s) − s = s²·(C1 + C2·s + C3·s² + C4·s³), Estrin: two parallel pair-FMAs, one
+        // w-combine — mirrors the kernel op-for-op.
+        let w = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, s, s));
+        let c2p = self.splat_const_f(LOG_C2, fty);
+        let c1p = self.splat_const_f(LOG_C1, fty);
+        let q0 = self.builder.build(fty.clone(), Op::Fma(c2p, s, c1p));
+        let c4p = self.splat_const_f(LOG_C4, fty);
+        let c3p = self.splat_const_f(LOG_C3, fty);
+        let q1 = self.builder.build(fty.clone(), Op::Fma(c4p, s, c3p));
+        let p = self.builder.build(fty.clone(), Op::Fma(q1, w, q0));
+        let p = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, p, w));
+
+        // Smallest-first reconstruction: t = L + s²·P (both 0 near 1), + e·C2 (ln2 low), + s,
+        // + e·C1 (ln2 high) — the same hi/lo split `exp` uses, so large |k| keeps its low bits.
+        let t = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, l_j, p));
         let c2 = self.splat_const_f(EXP_C2, fty);
-        y = self.builder.build(fty.clone(), Op::Fma(e, c2, y));
-        let neg_half = self.splat_const_f(-0.5, fty);
-        y = self.builder.build(fty.clone(), Op::Fma(z, neg_half, y));
-
-        // r = m + y + e·C1 (ln2 high)
-        let r = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, m, y));
+        let y = self.builder.build(fty.clone(), Op::Fma(e, c2, t));
+        let r2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, s, y));
         let c1 = self.splat_const_f(EXP_C1, fty);
-        self.builder.build(fty.clone(), Op::Fma(e, c1, r))
+        self.builder.build(fty.clone(), Op::Fma(e, c1, r2))
     }
 
     /// Build a float constant of type `fty` — a scalar `ConstFloat`, or one splatted to a vector.
@@ -23362,22 +23367,48 @@ const EXP_P: [f64; 6] = [
     5.0000001201e-1,
 ];
 
-/// Natural-log polynomial constants (Cephes `logf`). `LOG_SQRTHF` is the `√0.5` split point that
-/// keeps the reduced mantissa centered; `LOG_P` is the degree-8 minimax poly on it. `e·ln2` is
-/// added back with the *same* split `EXP_C1`/`EXP_C2` that `exp` uses (ln2 = C1 + C2).
-const LOG_SQRTHF: f64 = std::f64::consts::FRAC_1_SQRT_2; // 1/√2 = √0.5
-const INV_2P23: f64 = 1.0 / 8_388_608.0; // 2^-23 (exact): scales the masked exponent field to a count
-const LOG_P: [f64; 9] = [
-    7.0376836292e-2,
-    -1.1514610310e-1,
-    1.1676998740e-1,
-    -1.2420140846e-1,
-    1.4249322787e-1,
-    -1.6668057665e-1,
-    2.0000714765e-1,
-    -2.4999993993e-1,
-    3.3333331174e-1,
+/// Natural-log constants: the 8-bucket table reduction (mirrors `mercury_runtime`'s
+/// `vmath::log1`/`log8` value-for-value — see the algorithm write-up there). `x = z·2^k` with
+/// `z ∈ [0.6953125, 1.390625)` split at the *bit pattern* `LOG_OFF` (so the reduced range straddles
+/// 1.0); bits 22..20 of `bits(x) − LOG_OFF` pick one of 8 buckets; then
+/// `ln(x) = k·ln2 + LOG_TBL_L[j] + poly(s)`, `s = fma(z, LOG_TBL_R[j], −1)`, with a degree-5
+/// Taylor tail. `k·ln2` is added back with the *same* split `EXP_C1`/`EXP_C2` that `exp` uses
+/// (ln2 = C1 + C2). Every f64 literal below is the exact decimal expansion of the runtime kernel's
+/// f32 constant, so `splat_const_f`'s f64→f32 rounding reproduces those bits identically (the
+/// runtime's `vmath_log_tables_consistent` test pins the f32 side; these literals are those values
+/// printed exactly).
+const LOG_OFF: i128 = 0x3F32_0000;
+const INV_2P23: f64 = 1.0 / 8_388_608.0; // 2^-23 (exact): scales the masked k·2^23 field to a count
+/// R[j] ≈ 1/bucket-midpoint, rounded once to f32. Bucket 4 — the one containing z = 1 — is pinned
+/// to exactly 1.0 (with L[4] = 0.0) so `ln` of x near 1 reduces to the pure `poly(z − 1)` path
+/// (`z − 1` exact by Sterbenz): no `L + k·ln2` cancellation where the result is tiny.
+const LOG_TBL_R: [f64; 8] = [
+    1.376344084739685,
+    1.2673267126083374,
+    1.174311876296997,
+    1.0940171480178833,
+    1.0,
+    0.9275362491607666,
+    0.8311688303947449,
+    0.7529411911964417,
 ];
+/// L[j] = −ln(R[j]), computed in f64 from the rounded-f32 R and rounded once to f32.
+const LOG_TBL_L: [f64; 8] = [
+    -0.31943076848983765,
+    -0.23690973222255707,
+    -0.1606823354959488,
+    -0.08985637873411179,
+    0.0,
+    0.0752234011888504,
+    0.18492233753204346,
+    0.2837681472301483,
+];
+/// `ln(1+s) = s + s²·(C1 + C2·s + C3·s² + C4·s³)` — the degree-5 Taylor tail −1/2, 1/3, −1/4, 1/5
+/// (the 1/3 and 1/5 literals are the exact decimals of their f32 roundings).
+const LOG_C1: f64 = -0.5;
+const LOG_C2: f64 = 0.3333333432674408;
+const LOG_C3: f64 = -0.25;
+const LOG_C4: f64 = 0.20000000298023224;
 
 // `erf` constants (Abramowitz–Stegun 7.1.26): erf(|x|) = 1 - (a₁t + a₂t² + … + a₅t⁵)·e^(-x²),
 // t = 1/(1 + P·|x|). Max error ~1.5e-7 — f32-grade — and bit-identical across backends since it is
