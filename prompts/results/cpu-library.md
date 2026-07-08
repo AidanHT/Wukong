@@ -313,10 +313,22 @@ in gemm.rs): a physical/2 mid-size pool (slower everywhere), a persistent broadc
 replacing the 4-fork-joins-per-call shape (wash — order/thermal effects exceed any delta), and
 hard worker pinning MERCURY_GEMM_AFFINITY=1 (25-35% SLOWER than free migration). One real win
 kept: fusing the A+B pack into a single region (+7.5% @512^3, +13% @128x768x3072;
-MERCURY_PACK_SPLIT_REGIONS=1 kill-switch). Same-run standing 2026-07-08: 46% @512^3, 72% @1024^3,
-**127% @2048^3 (beats MKL-all)**. MKL(all) itself measured 411 GF/s @512^3 today vs ~286 in the
-P2 session (~1.4x power-state swing) — cross-session ratio comparisons are invalid; the honest
-residual at mid sizes is MKL's per-thread-L2-blocked 2D decomposition, an algorithmic difference.
+MERCURY_PACK_SPLIT_REGIONS=1 kill-switch). Same-run standing at that point: 46% @512^3,
+72% @1024^3, **127% @2048^3 (beats MKL-all)**. MKL(all) itself measured 411 GF/s @512^3 today vs
+~286 in the P2 session (~1.4x power-state swing) — cross-session ratio comparisons are invalid;
+the honest residual at mid sizes was MKL's per-thread-L2-blocked 2D decomposition, an
+algorithmic difference.
+
+**Session 2 closeout — the 2D decomposition was then built, and it won.** sgemm_2d_blocks
+(gemm.rs) gives each worker exclusive ownership of an L2-resident C block (MR/NR-aligned block
+grid so per-block packs are byte-identical to the serial kernel's, per-worker pack scratch, one
+rayon task per block, no barriers) — the same decomposition MKL uses. ABBA adjacent-run
+(gemm_scaling, both orderings): 512^3 ~182->~305 GF/s (~1.65x), 1024^3 ~365->~460 (~1.26x),
+512x768x3072 ~290->~473. Shipped as the DEFAULT parallel path (MERCURY_GEMM_2D=0 opts out); the
+two confirmation rounds vs MKL(all) read 66/68% (deep-throttled) and 66/69% (cool) at
+512^3/1024^3 — the mid-size standing is now power-state-STABLE at ~66-69% (was a 46-72%
+thermal lottery), with 87% @2048^3 same-run. Bit-exact vs serial by construction (one owner per
+C block, ascending K-blocks, same kc grouping; pinned by sgemm_2d_blocks_matches_serial).
 
 **End-to-end model bench (bench_model), two full-peer rounds**: ~20-21x C(gcc) and 3.6-4.9x
 C(-ffast-math) single-core; **parity vs PyTorch CPU eager 1-thread** (0.93-1.07x @S=128,
@@ -324,3 +336,12 @@ C(-ffast-math) single-core; **parity vs PyTorch CPU eager 1-thread** (0.93-1.07x
 Mercury @parallel scaling at model shapes (1.5-2.1x) is the same mid-size parallel-efficiency
 residual. All rounds: interp gate bit-exact, serial==@parallel bit-exact, outputs <2e-6 vs C and
 torch.
+
+Post-2D-GEMM model confirmation rounds (same session, after the closeout above): @parallel
+scaling 1.9-3.8x (was 1.5-2.1x); the all-threads-torch gap at S=512 is now STABLE at ~1.1x
+(1.07/1.10x across the two rounds; was the 1.05-2.5x thermal lottery); S=128 multicore stays
+torch's win at 1.5-1.9x — the model's skinny M=128 GEMMs make each 2D row-block re-pack its B
+slice (a shared-B pack for skinny-M shapes is the identified follow-up), and 128x768x768 sits
+just above the parallel-payoff gate. One matmul-preheated round was discarded as instrument
+failure: Mer(1c) read 2.3x below its own adjacent standing while the in-run roofline column
+read 93 vs the valid rounds' 118-128 GF/s (the established discard-warm-up rule).

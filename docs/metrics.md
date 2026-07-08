@@ -34,13 +34,15 @@ Peers in order of strength: vendor libraries (oneMKL, cuBLAS/cuDNN) > tuned crat
 Current standing (recorded):
 
 - *Compute-bound, CPU*: f32 GEMM ≈93–104% of oneMKL single-core at ≤1024³, **83–86% at
-  2048³+, ~74–77% roofline at 4096³** (loss); multicore **~46–72% of MKL at 512–1024³**
-  (loss — the range is honest: threaded MKL itself swings ~1.4× with this laptop's power
-  state across sessions, so only same-session ratios are comparable), 86–129% at ≥2048³
-  (**127% measured 2026-07-08 — wins**). Three scheduling levers for the mid-size gap were
-  refuted by adjacent A/B (smaller pool, persistent region vs fork-join, hard worker pinning
-  — see gemm.rs); the residual is MKL's mid-size parallel *algorithm* (per-thread L2-blocked
-  2D C ownership). int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
+  2048³+, ~74–77% roofline at 4096³** (loss); multicore **~66–69% of MKL at 512–1024³**
+  (was ~46–72% — the BLIS-style **2D block-parallel path** landed 2026-07-08 as the default:
+  per-thread L2-resident C blocks, per-worker packing, no barriers; adjacent-run ABBA
+  1.26–1.65× over the row-panel path, and the ratio held 66/68% throttled / 66/69% cool —
+  power-state-stable at last), 86–129% at ≥2048³ (**127% measured 2026-07-08 — wins**; 87%
+  same-run in the 2D confirmation round). Threaded MKL itself swings ~1.4× with this
+  laptop's power state — only same-run ratios are comparable. The three cheap scheduling
+  levers remain refuted-by-A/B in gemm.rs; the 2D decomposition was the real lever.
+  int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
 - *Compute-bound, GPU (RTX 4050, sm_89)*: fp16/bf16 GEMM ~101% cuBLAS ≤1024³, **~87–90% at
   2048³, ~83% at 4096³** (past the prior 77% PTX ceiling; 4096³ a SASS-level loss); int8 GEMM
   **96–105% at 2048³ (beats IMMA), 86–88% at 1024³, ~70% at 4096³** (HBM-bound loss); fused int8
@@ -63,12 +65,15 @@ fusion, no round-trips, layer-stack throughput. GPT-2-class `.mer` models exist 
 to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph capture.
 Standing (2026-07-08, two full-peer rounds, all cross-checks <2e-6 rel, serial==@parallel
 bit-exact, in-benchmark interp gate bit-exact): the 12-layer GPT-2-class stack runs
-**~20–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core**; vs **PyTorch CPU eager**
-it is **at parity single-thread (0.93–1.07× @S=128; 1.08–1.21× FASTER @S=512)** and behind
-all-threads torch (1.05–2.52× slower; ratio swings with thermal state — Mercury's own
-@parallel scaling at model shapes, 1.5–2.1×, is the gap; same root cause as the mid-size
-GEMM loss in M1). GPU training step still loses to eager PyTorch (GEMM-bound);
-serving-stack (paged KV, continuous batching) measured GPU-only.
+**~19–21× idiomatic C and 3.1–5.1× `-ffast-math` C single-core**; vs **PyTorch CPU eager**
+it is **at parity single-thread (0.93–1.27× @S=128; 1.08–1.49× FASTER @S=512)** and behind
+all-threads torch multicore — but the 2D block-parallel GEMM (M1) stabilized that gap:
+**~1.1× @S=512** (1.07/1.10× in the two post-2D confirmation rounds; was a 1.05–2.52×
+thermal lottery) and 1.5–1.9× @S=128, with Mercury's own @parallel scaling at model shapes
+up from ~1.5–2.1× to **1.9–3.8×**. (One matmul-preheated round read Mer(1c) 2.3× below its
+own adjacent standing and is discarded as instrument failure — its roofline column read 93
+vs the 118–128 GF/s of the valid rounds.) GPU training step still loses to eager PyTorch
+(GEMM-bound); serving-stack (paged KV, continuous batching) measured GPU-only.
 
 **M3. Multicore scaling** of M1 with G4 preserved. Standing: strong (dot ~7.9×, max ~25×,
 GEMM to ~104× vs single-thread C), but until the OpenMP C column lands the multicore rows
@@ -130,10 +135,14 @@ peer table incl. eager PyTorch, all gates green), the vmath exp/log-vs-VML loss 
 the corpus-cascade harness hole, and the missing production D=128 tensor-core attention
 dispatch. Remaining, ranked:
 
-1. Multicore parallel efficiency at model/mid-GEMM shapes (46–72% of threaded MKL at
-   512–1024³; the model bench trails all-threads torch by the same mechanism). The three
-   cheap scheduling levers are measured dead — the honest next bet is MKL-style 2D
-   per-thread C ownership, a real kernel-restructure project.
+1. Multicore parallel efficiency at model/mid-GEMM shapes — the honest next bet named here
+   last round (MKL-style 2D per-thread C ownership) was built and shipped 2026-07-08: mid-size
+   GEMM moved 46–72% → stable 66–69% of threaded MKL, model @parallel scaling ~1.5–2.1× →
+   1.9–3.8×, S=512 vs all-threads torch stabilized at ~1.1×. Still the top CPU gap: the
+   residual ~30% at 512–1024³, the S=128 model regime (1.5–1.9× behind torch-Tn — skinny
+   M=128 GEMMs pack B redundantly across row-blocks in the 2D grid), and the 256³
+   deliberate-serial standing (~39% of MKL-all), worth re-probing under the lower-overhead
+   2D path.
 2. GPU attention long-S vs cuDNN (0.37–0.66×) — occupancy probe says SFU/serial-softmax
    bound; the only live lever is FA2-style warp specialization (heavy).
 3. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
