@@ -81,52 +81,12 @@ fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Smaller pool for the mid-size parallel regime (see [`gemm_pool_for`]). At 512³–1024³ every
-/// fork-join waits for its slowest participant, and on a P+E hybrid that straggler is an E/LP-E
-/// core arriving late and computing slowly once there — the barrier tax grows with worker count
-/// while the compute win saturates once the fast cores are busy. Worker count from
-/// `MERCURY_GEMM_MID_THREADS` (read once; the A/B knob), defaulting to `physical/2` (min 4) —
-/// on the 6P+8E+2LPE dev box that is 8: the P-cores plus a little headroom, few enough that the
-/// slowest cores never gate a barrier. Thread distribution never changes the bits (row-split,
-/// fixed per-(i,j) K-order), so this is throughput-only. `None` ⇒ caller falls back to
-/// [`gemm_pool`].
-fn mid_pool() -> Option<&'static rayon::ThreadPool> {
-    use std::sync::OnceLock;
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let physical = num_cpus::get_physical().max(1);
-        let nt = std::env::var("MERCURY_GEMM_MID_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or((physical / 2).max(4));
-        if nt >= physical {
-            return None; // nothing to shed — use the full physical pool
-        }
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(nt)
-            .thread_name(|i| format!("mercury-gemm-mid-{i}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
-}
-
-// Above this many MACs the kernel has enough compute per K-block to feed every physical core
-// past the barrier/straggler tax; below it the smaller `mid_pool` scales better. 2^31 puts
-// 512³ (2^27) and 1024³ (2^30) in the mid regime and 2048³ (2^33) on the full pool — the sizes
-// where each pool measured fastest against threaded oneMKL.
-const MID_MAX_MACS: u64 = 1 << 31;
-
-/// Regime-aware pool choice for one GEMM call: the mid-size pool below [`MID_MAX_MACS`], the full
-/// physical pool above. Pool choice affects scheduling only, never results (see [`mid_pool`]).
-fn gemm_pool_for(macs: u64) -> Option<&'static rayon::ThreadPool> {
-    if macs < MID_MAX_MACS {
-        if let Some(p) = mid_pool() {
-            return Some(p);
-        }
-    }
-    gemm_pool()
-}
+// A mid-size-regime pool with fewer workers (physical/2, "shed the E/LP-E stragglers") was tried
+// here and MEASURED SLOWER on the P+E dev box (adjacent same-run sweep, gemm_scaling example,
+// MERCURY_GEMM_MID_THREADS ∈ {6,8,12,16}): the full 16-worker physical pool won at every mid
+// shape (1024³ 410 vs 388 GF/s, 512×768×3072 377 vs 352; bare 512³ was the one ~5% exception).
+// Work-stealing over the many row-panel tasks absorbs the slow cores; shrinking the pool just
+// discards their throughput. Don't re-add a thread-count regime without new adjacent-run evidence.
 
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
@@ -391,14 +351,13 @@ unsafe fn gemm_dispatch(
     // them. The serial AVX2 kernel is the fast path for everything smaller. The epilogue folds into
     // the per-tile writeback on the final K-block, so the parallel path carries it too (each C tile
     // is owned by exactly one task) — a `@parallel` fused FFN runs the bias+activation across cores.
-    let macs = m as u64 * n as u64 * k as u64;
-    let par = par && macs >= PAR_MIN_MACS;
+    let par = par && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
-                match (par, gemm_pool_for(macs)) {
+                match (par, gemm_pool()) {
                     // Parallel, with a private physical-core pool: run the whole kernel inside it so
                     // its nested `into_par_iter`s (pack + compute) use physical-core workers, not the
                     // default logical-core pool. The args cross the `install` boundary via `GemmArgs`
@@ -1348,6 +1307,41 @@ unsafe fn pack_ab_par(
         (b.add(pc * n + jc) as usize, n)
     };
     let (a_addr, ap_addr, bp_addr) = (a as usize, ap as usize, bp as usize);
+    // A/B kill-switch (`MERCURY_PACK_SPLIT_REGIONS=1`, read once): the pre-fusion two-region
+    // shape — one fork-join per operand pack — kept so the fused-region win stays measurable
+    // adjacent-run on any machine (the same instrument discipline as MERCURY_P4_NO_256).
+    fn split_regions() -> bool {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("MERCURY_PACK_SPLIT_REGIONS").is_ok_and(|v| v == "1"))
+    }
+    if split_regions() {
+        (0..mpanels).into_par_iter().for_each(|ip| {
+            // SAFETY: disjoint output panel per task; pointers re-derived per task.
+            unsafe {
+                pack_a_panel(
+                    a_addr as *const f32,
+                    lda,
+                    mc,
+                    kc,
+                    ip,
+                    (ap_addr as *mut f32).add(ip * kc * MR),
+                );
+            }
+        });
+        (0..npanels).into_par_iter().for_each(|jp| {
+            let panel = (bp_addr as *mut f32).add(jp * kc * NR);
+            // SAFETY: disjoint output panel per task; pointers re-derived per task.
+            unsafe {
+                if bt {
+                    pack_b_trans_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+                } else {
+                    pack_b_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+                }
+            }
+        });
+        return;
+    }
     (0..mpanels + npanels).into_par_iter().for_each(|t| {
         // SAFETY: every task writes a disjoint packed panel; pointers re-derived per task.
         unsafe {
