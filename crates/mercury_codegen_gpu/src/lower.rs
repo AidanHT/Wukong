@@ -1170,16 +1170,36 @@ impl<'a> FnEmit<'a> {
             MirType::I64 => 64,
             _ => 32,
         };
+        // PTX float->int `cvt` *saturates* to the destination integer type (out-of-range clamps to the
+        // type's min/max; NaN -> 0) — exactly the Rust `as` / interpreter / Cranelift `fcvt_to_*_sat`
+        // semantics. For a 32/64-bit target the single `cvt` is the whole story.
         if w == 64 {
             self.emit(&format!("cvt.rzi.{s}64.{fsfx} {d}, {x};"));
-        } else {
-            // PTX `cvt` to a sub-64-bit integer type needs a matching-width destination register, so
-            // convert float -> 32-bit int in a 32-bit temp, then sign/zero-extend into the 64-bit
-            // holder and mask to the declared width (mirrors the interpreter's per-result `mask`).
+        } else if w == 32 {
+            // Saturating cvt to a 32-bit temp, then sign/zero-extend into the 64-bit holder. `mask_int`
+            // is a no-op for i32 (the extend already canonicalizes) but keeps the i1 fallback (`& 1`).
             let t = self.fresh_r32();
             self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
             self.emit(&format!("cvt.{s}64.{s}32 {d}, {t};"));
             self.mask_int(d, to);
+        } else {
+            // Narrow (i8/i16/u8/u16): PTX can only cvt-saturate to i32/u32, so saturate to 32 bits then
+            // CLAMP to the narrow type's range and reduce — mirroring Cranelift's `fcvt_to_int_sat`
+            // (smin/smax for signed; umin for unsigned, whose lower bound is already 0 from the
+            // unsigned saturation). This makes e.g. `300.0 as u8 == 255`, `-300.0 as i8 == -128`,
+            // `-1.0 as u8 == 0`, not the mod-2^w truncation the old `mask_int` produced.
+            let t = self.fresh_r32();
+            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
+            if signed {
+                let (lo, hi) = if w == 8 { (-128, 127) } else { (-32768, 32767) };
+                self.emit(&format!("min.s32 {t}, {t}, {hi};"));
+                self.emit(&format!("max.s32 {t}, {t}, {lo};"));
+                self.emit(&format!("cvt.s64.s32 {d}, {t};"));
+            } else {
+                let hi = if w == 8 { 255 } else { 65535 };
+                self.emit(&format!("min.u32 {t}, {t}, {hi};"));
+                self.emit(&format!("cvt.u64.u32 {d}, {t};"));
+            }
         }
     }
 
@@ -1290,7 +1310,18 @@ impl<'a> FnEmit<'a> {
         match ty {
             MirType::F32 => self.emit(&format!("{g}st.f32 [{addr}], {v};")),
             MirType::F64 => self.emit(&format!("{g}st.f64 [{addr}], {v};")),
-            MirType::I64 | MirType::Ptr => self.emit(&format!("{g}st.u64 [{addr}], {v};")),
+            MirType::I64 => self.emit(&format!("{g}st.u64 [{addr}], {v};")),
+            // A pointer homed in the shared frame (an inlined function's Tensor/array param slot) is a
+            // UNIFORM value across the SPMD threads — it is frame-base / kernel-param derived, never a
+            // loaded, per-thread-varying value. It must be stored *unconditionally* (no `@tid0` guard):
+            // in a megakernel the scalar glue can `load` that slot on **every** thread and dereference
+            // it (e.g. a non-recognized reduction over a Tensor param), so a `tid==0`-only store would
+            // leave the zero-initialized slot on threads != 0 and their deref of that null pointer
+            // faults (CUDA_ERROR_ILLEGAL_ADDRESS) — even though the result is ultimately discarded.
+            // Writing the same pointer from all threads is a benign identical-data race (a pointer slot
+            // is homed once, never read-modify-written), so every thread reads the correct base. In the
+            // single-thread lowering `st_guard` is empty anyway, so this is a no-op there.
+            MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),
             // bf16/f16 storage is 2 bytes; narrow the f32 value to 16 bits, store the raw u16.
             MirType::BF16 => {
                 let h = self.fresh_r16();
@@ -2316,9 +2347,10 @@ fn vmath_supported(op: i128) -> bool {
     matches!(op, 0..=35)
 }
 
-/// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6).
-/// Sequential fold (not the CPU's fixed-chunk tree) — additive ops differ only by reduction order
-/// (tolerance-gated); max/min/maxabs are order-independent and exact.
+/// `mercury_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6)/
+/// sumabs(9, Σ|x|)/absdiff(10, Σ|x−y|). (Codes 7/8 are the arg-reductions — a separate `-> i64` ABI —
+/// so they never reach here.) Sequential fold (not the CPU's fixed-chunk tree) — additive ops differ
+/// only by reduction order (tolerance-gated); max/min/maxabs are order-independent and exact.
 const PTX_SREDUCE: &str = r#".func (.param .f32 _r) mrt_sreduce (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
 {
     .reg .b64 %rd<8>;
@@ -2360,6 +2392,13 @@ RED_LOOP:
     setp.eq.s64 %p3, %rd3, 6;
     @%p3 abs.f32 %f4, %f1;
     @%p3 max.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 9;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 10;
+    @%p3 sub.rn.f32 %f5, %f1, %f2;
+    @%p3 abs.f32 %f5, %f5;
+    @%p3 add.rn.f32 %f0, %f0, %f5;
     add.s64 %rd4, %rd4, 1;
     bra RED_LOOP;
 RED_DONE:
@@ -2378,7 +2417,8 @@ const PTX_MEGA_SMEM: &str = ".shared .align 4 .b32 mrt_red_smem[1024];\n";
 /// the single-thread `mrt_sreduce`), then a fixed shared-memory **tree** combines the partials and
 /// broadcasts the result to all threads. Deterministic (no atomics, M12); the tree's reassociation vs
 /// the sequential fold is covered by the CPU<->GPU tolerance gate. Block size must be a power of two
-/// (the launcher uses 256). Combine: add for dot/ssd/sum/sumsq (op<4), max for max/maxabs, min for min.
+/// (the launcher uses 256). Combine: add for the additive ops dot/ssd/sum/sumsq (op<4) *and*
+/// sumabs/absdiff (op>=9), max for max/maxabs, min for min.
 const PTX_SREDUCE_COOP: &str = r#".func (.param .f32 _r) mrt_sreduce_coop (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
 {
     .reg .b64 %rd<12>;
@@ -2424,6 +2464,13 @@ RC_LOOP:
     setp.eq.s64 %p3, %rd3, 6;
     @%p3 abs.f32 %f4, %f1;
     @%p3 max.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 9;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 10;
+    @%p3 sub.rn.f32 %f4, %f1, %f2;
+    @%p3 abs.f32 %f4, %f4;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
     add.s64 %rd4, %rd4, %rd5;
     bra RC_LOOP;
 RC_DONE:
@@ -2450,6 +2497,8 @@ RC_TREE:
     setp.eq.s64 %p7, %rd3, 5;
     @%p7 min.f32 %f5, %f5, %f6;
     setp.lt.s64 %p6, %rd3, 4;
+    setp.ge.s64 %p7, %rd3, 9;
+    or.pred %p6, %p6, %p7;
     @%p6 add.rn.f32 %f5, %f5, %f6;
     st.shared.f32 [%r4], %f5;
 RC_TREE_SYNC:
@@ -3813,9 +3862,23 @@ mod tests {
         let mut covered = 0usize;
         let mut skipped: Vec<String> = Vec::new();
         let mut mismatches: Vec<String> = Vec::new();
+        // Genuine *driver* faults (a kernel that dereferenced out of bounds -> ILLEGAL_ADDRESS), kept
+        // distinct from miscompiles (wrong output on a healthy context). A fault poisons the shared
+        // primary context; `crate::gpu::reset_gpu` attempts recovery, but on this driver error 700 is
+        // process-fatal (the re-retain still returns it), so recovery degrades to record-and-skip:
+        // the remaining programs land on `lost` with a loud count instead of cascading as false
+        // failures. Only the *root* fault is ever reported as a fault.
+        let mut faults: Vec<String> = Vec::new();
+        let mut lost: Vec<String> = Vec::new();
 
         for path in &files {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            // After an unrecoverable fault, stop attempting GPU work: every further run would fail
+            // with the same sticky error and misreport healthy programs as broken.
+            if crate::gpu::device_lost() {
+                lost.push(name);
+                continue;
+            }
             let src = std::fs::read_to_string(path).unwrap();
 
             // -O0 and -O3 must both match the interpreter (which gives -O0 == -O3 transitively).
@@ -3848,12 +3911,16 @@ mod tests {
                         }
                     }
                     (Ok(_), Err(e)) => {
+                        covered_here = false;
                         if e.starts_with(UNSUPPORTED) {
-                            covered_here = false;
                             skipped.push(format!("{name}@O{opt}: {e}"));
                         } else {
-                            mismatches.push(format!("{name}@O{opt}: gpu errored: {e}"));
-                            covered_here = false;
+                            // A real driver fault poisons the shared context: record it on the fault
+                            // ledger and attempt a context reset. If the reset fails (sticky
+                            // process-level error), `device_lost()` flips and the loop above skips
+                            // the remaining programs loudly instead of cascading.
+                            faults.push(format!("{name}@O{opt}: gpu errored: {e}"));
+                            crate::gpu::reset_gpu();
                         }
                         break;
                     }
@@ -3879,10 +3946,33 @@ mod tests {
                 eprintln!("   {s}");
             }
         }
+        if !faults.is_empty() {
+            eprintln!("-- driver FAULTS ({}, root causes only — no cascade):", faults.len());
+            for f in &faults {
+                eprintln!("   {f}");
+            }
+        }
+        if !lost.is_empty() {
+            eprintln!(
+                "-- NOT RUN ({}): device lost after the fault above (sticky CUDA error; restart to \
+                 re-test): {}",
+                lost.len(),
+                lost.join(", ")
+            );
+        }
         assert!(
             mismatches.is_empty(),
             "GPU-lowered programs disagree with the interpreter oracle (miscompiles):\n{}",
             mismatches.join("\n")
+        );
+        assert!(
+            faults.is_empty(),
+            "GPU-lowered programs faulted on the device ({} root fault(s); {} later programs \
+             were skipped after device loss, NOT failed — these are genuine kernel faults, not \
+             miscompiles):\n{}",
+            faults.len(),
+            lost.len(),
+            faults.join("\n")
         );
         assert!(covered > 0, "no programs covered — pipeline broken");
     }
