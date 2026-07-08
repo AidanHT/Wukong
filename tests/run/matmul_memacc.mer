@@ -1,0 +1,52 @@
+// RUN: --run
+// The memory-accumulator ijk matmul — the FIRST matmul anyone writes, accumulating straight into
+// the output element (`c[i*N+j] = c[i*N+j] + a[i*K+k]*b[k*N+j]`, or `+=`) instead of a scalar temp
+// — must dispatch to the same mercury_sgemm kernel the `let s` form reaches. It used to fall
+// through BOTH the GEMM recognizer AND the vectorizer (a loop-carried memory accumulate) to fully
+// scalar code: ~10x slower end-to-end at 256^3 (measured adjacent same-run, release), kernel-only
+// gap larger. The f32 store/load round-trip is exact, so the k-ascending add chain is bit-for-bit
+// the `let s` sum — the same documented kernel-reassociation doctrine applies. Covers the plain
+// `C = A·B` (`=` spelling) and the transposed `C = A·Bᵀ` (`+=` spelling); the aliased (c==a),
+// wrong-element, and no-zero-init nests are verified NOT to match (misfire guards).
+// EXPECT-EXIT: 0
+// A[i][k] = i+k, B = 2·I  =>  C[i][j] = 2·(i+j)
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 12
+// A·Bᵀ with symmetric B=2I gives the same C
+// EXPECT-OUT: 4
+// EXPECT-OUT: 12
+fn main() -> i32 {
+    let mut a: [f32; 16] = [0.0; 16];
+    let mut b: [f32; 16] = [0.0; 16];
+    let mut c: [f32; 16] = [0.0; 16];
+    for i in 0..4 { for k in 0..4 { a[i*4+k] = (i + k) as f32; } }
+    for i in 0..4 { b[i*4+i] = 2.0; }
+
+    // plain C = A·B, memory accumulator, `=` spelling
+    for i in 0..4 {
+        for j in 0..4 {
+            c[i*4+j] = 0.0;
+            for k in 0..4 {
+                c[i*4+j] = c[i*4+j] + a[i*4+k] * b[k*4+j];
+            }
+        }
+    }
+    print(c[0] as i32);   // 2*(0+0) = 0
+    print(c[5] as i32);   // 2*(1+1) = 4
+    print(c[15] as i32);  // 2*(3+3) = 12
+
+    // C = A·Bᵀ, memory accumulator, `+=` spelling (B symmetric, so same values)
+    let mut d: [f32; 16] = [0.0; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            d[i*4+j] = 0.0;
+            for k in 0..4 {
+                d[i*4+j] += a[i*4+k] * b[j*4+k];
+            }
+        }
+    }
+    print(d[5] as i32);   // 4
+    print(d[15] as i32);  // 12
+    return 0;
+}
