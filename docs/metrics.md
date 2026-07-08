@@ -86,14 +86,22 @@ targets, not footnotes.
 
 **M7. Portability.** Same `.mer` → interp (oracle), Cranelift native, GPU offload,
 GPU-native (whole-program MIR→PTX megakernel). Standing: real; GPU-native covers a subset
-(UNSUPPORTED=skip). The two documented device-kernel miscompiles are **fixed**: `lower.rs`'s
-`PTX_VELEM` now implements the Hadamard/Div binary modes and `PTX_NORM` the log-softmax/L2 ops,
-so `hadamard`, `log_softmax_fused`, `l2norm`, `norm_divide`, and `norm_out_of_place` match the
-interp oracle on **both** the single-thread and megakernel paths within the tolerance gate. A
-few *unrelated* general-lowering gaps remain in the larger corpus (a float→int narrowing cast,
-a parallel abs-sum reduction, and a `tensor_1d_kernels` megakernel illegal-address) — separate
-from the recognized-kernel device helpers. The recognizer-offload GPU path and both CPU backends
-are unaffected and bit/tolerance-exact.
+(UNSUPPORTED=skip). The previously documented general-lowering gaps are all **fixed**:
+`PTX_VELEM` implements the Hadamard/Div binary modes and `PTX_NORM` the log-softmax/L2 ops;
+`mrt_sreduce`/`mrt_sreduce_coop` implement the full `mercury_sreduce_f32` op set including
+sumabs(9)/absdiff(10) (`parallel_abssum`); float→narrow-int casts saturate (Rust-`as`/Cranelift
+semantics, `float_cast_narrow`); and pointer slots in the megakernel's shared frame are stored
+unconditionally so SPMD threads no longer dereference a null base (`tensor_1d_kernels@O3`
+illegal-address). The `tests/run` corpus gate stands at 193/274 programs matching the interp
+oracle at `-O0`==`-O3` (81 honest UNSUPPORTED skips, zero mismatches, zero device faults), and
+the megakernel gate at 81 ran / 89 eligible (8 launch-time declines). The corpus gates also
+isolate any future device fault: a `CUDA_ERROR_ILLEGAL_ADDRESS` is a **process-fatal sticky**
+CUDA error (measured on this driver: `cuDevicePrimaryCtxReset` returns Ok but the re-retain
+still errors — only a process restart recovers), so the harness records the root fault on its
+own loud ledger, marks the device lost, and reports every later program as NOT RUN — one
+faulting program can no longer cascade into ~100 false failures, and skipped programs are never
+reported as passed. The recognizer-offload GPU path and both CPU backends are unaffected and
+bit/tolerance-exact.
 
 ## Tier 3 — supporting qualities
 

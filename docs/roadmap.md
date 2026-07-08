@@ -356,13 +356,25 @@ backend (`GpuLower`) lowers the *whole* program's MIR to PTX, so arbitrary non-r
 GPU-side too; an eligible program is fused into a single-block cooperative **megakernel** (one launch,
 no host round-trips). It is tolerance-gated against the interpreter oracle and optimization-invariant
 (`-O0` ≡ `-O3`), the same contract as the offload path. Coverage is **partial** (UNSUPPORTED ops
-skip). The two documented device-kernel miscompiles are now **fixed**: the `velem` Hadamard/Div
+skip). The previously documented general-lowering gaps are all **fixed**: the `velem` Hadamard/Div
 binary modes and the `norm` log-softmax/L2 ops are implemented in the static PTX device kernels
-(`lower.rs`), which both the single-thread and megakernel paths share — so `hadamard`,
-`log_softmax_fused`, `l2norm`, `norm_divide`, and `norm_out_of_place` now match the interp oracle.
-A handful of *unrelated* general-lowering gaps remain in the corpus (a float→int narrowing cast, a
-parallel reduction, and a `tensor_1d_kernels` megakernel illegal-address) — separate from the
-recognized-kernel device helpers.
+(`lower.rs`); the `mrt_sreduce`/`mrt_sreduce_coop` device reductions implement the full
+`mercury_sreduce_f32` op set including sumabs(9)/absdiff(10), with the coop tree combining them
+additively (`parallel_abssum`); float→narrow-int casts **saturate** like Rust `as`/Cranelift instead
+of truncating mod 2^w (`float_cast_narrow`: `300.0 as u8 == 255`, `-300.0 as i8 == -128`); and the
+megakernel stores pointer values homed in the shared frame **unconditionally** rather than
+`tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
+threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
+(the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing:
+`run_corpus_matches_interp_oracle` 193/274 (`-O0`==`-O3`, 81 honest UNSUPPORTED skips, zero
+mismatches/faults); `mega_corpus_matches_oracle` 81 ran / 89 eligible (8 launch-time declines).
+Both gates now also **isolate device faults**: a genuine `ILLEGAL_ADDRESS` poisons the CUDA state
+**process-fatally** — measured on this driver (RTX 4050, Windows/WDDM), `cuDevicePrimaryCtxReset`
+returns Ok but re-retaining the primary context still returns error 700, and cudarc exposes no
+non-primary `cuCtxCreate`, so in-process recovery is impossible. `crate::gpu::reset_gpu` therefore
+degrades to marking the device **lost**; the gates record the root fault on a loud ledger and
+report every later program as NOT RUN (never as passed, never as spuriously failed) — one faulting
+program can no longer cascade into ~100 false failures across both gates.
 
 ## Automatic differentiation (`mercury_autodiff`)
 
