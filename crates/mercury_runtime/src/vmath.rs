@@ -274,7 +274,8 @@ pub(crate) fn exp1(x: f32) -> f32 {
     (tj * p) * pow2
 }
 
-/// `ln(x)` for `x > 0` (≈2-ULP class; measured max 6.9e-7 relative — see the table block above):
+/// `ln(x)` for `x > 0` (≈6-ULP class worst-case near cancellation; measured max 6.9e-7 relative,
+/// well inside the 5e-5 gate — see the table block above):
 /// the 8-bucket table reduction `ln(x) = k·ln2 + L[j] + poly(s)`, `s = fma(z, R[j], −1)`, with the
 /// degree-5 Taylor tail and the same hi/lo `ln2` split `exp` uses. Mirrors the AVX2 [`log8`] lanes
 /// op-for-op — the array index here IS the `vpermps` there (same 3 bits, same f32 constants), and
