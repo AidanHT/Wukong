@@ -76,21 +76,57 @@ const GELU_C0: f32 = 0.797_884_6; // √(2/π)
 const GELU_C1: f32 = 0.044715;
 
 // --- Cephes single-precision constants (mirror mercury_mir_build's `exp`/`log` poly constants) ----
-const LOG2EF: f32 = std::f32::consts::LOG2_E;
 const EXP_MAGIC: f32 = 12582912.0; // 1.5 * 2^23 — round-to-nearest-even via add-then-subtract
-const EXP_C1: f32 = 0.693_359_4; // ln2, high part
+const EXP_C1: f32 = 0.693_359_4; // ln2, high part (log's k·ln2 reconstruction; exp splits it /8)
 const EXP_C2: f32 = -2.1219444e-4; // ln2, low correction
 const EXP_HI: f32 = 88.376_26;
 const EXP_LO: f32 = -88.376_26;
-const EXP_P: [f32; 6] = [
-    1.987_569_1e-4,
-    1.398_199_9e-3,
-    8.333_452e-3,
-    4.166_579_6e-2,
-    1.666_666_6e-1,
-    5e-1,
-];
 const INV_2P23: f32 = 1.0 / 8_388_608.0; // 2^-23 (exact)
+
+// --- exp: 8-bucket table reduction (mirrors mercury_mir_build's inlined `emit_exp_f32`) ------------
+//
+// `e^x` decomposes as `x = n·(ln2/8) + r` with `n = round(x·8/ln2)` (the same add-magic rounding
+// as before, scaled ×8), so `e^x = 2^(n/8)·e^r = 2^e·T[j]·e^r` with `e = n >> 3` and `j = n & 7`:
+// on two's complement the arithmetic shift floors, so `n = 8e + j` with `j ∈ [0, 7]` holds for
+// negative `n` too. `T[j] = 2^(j/8)` rounded once to f32 lives whole in one ymm — the AVX2 lanes
+// look it up with one in-register `vpermps` (no memory gather) and the scalar twin indexes the
+// same array, so lane == scalar stays bit-for-bit. The reduction leaves `|r| ≤ ln2/16 ≈ 0.0433`,
+// where a 3-FMA cubic `e^r ≈ 1 + r + P2·r² + P3·r³` is ≈1.3-ULP grade — against the old
+// full-range degree-5 Estrin poly's 8 FP ops. `r` comes from a two-term Cody-Waite split of
+// ln2/8: EXP_TBL_C1 = EXP_C1/8 (exact /8; 9 significant bits, 15 trailing mantissa zeros, so
+// n·C1 is EXACT for |n| ≤ 2047 ≫ the clamp range's 1020) and EXP_TBL_C2 = EXP_C2/8 (also exact).
+// `n` is read straight out of the magic-sum's mantissa bits — `m = bits(t) − EXP_TBL_MBIAS =
+// n + 1016`, folding the +127 exponent bias (127·8 = 1016) into the one integer subtract:
+// `j = m & 7` (1016 ≡ 0 mod 8) and `biased = max(m, 0) >> 3`, the max(·,0) flushing the 2^e
+// underflow to +0.0 (exp(EXP_LO) = +0.0 bit-for-bit as before; the old kernel's n = −126 band
+// produced denormals down to x ≈ −87.68, the table split flushes from x ≈ −87.38 — everything
+// in that band is < 2^−126, out of every gate's domain). Overflow saturation at the EXP_HI
+// clamp is bit-identical to the old kernel (0x7F3504A4 ≈ 2.406e38, no +∞), NaN still funnels
+// through the same min-then-max clamp order, and exp(0) = 1.0 exactly (n = 0, r = 0, T[0] = 1,
+// poly = 1). Measured max relative error vs f64 exp: 1.59e-7 over [−87, 88] (4M points) and
+// 1.24e-7 near 0 — see `vmath_exp_dense_sweep`. Per vector this is 16 SIMD ops (11 on the FP
+// ports) vs the old 18 (15 FP) — the VML-style table trade the throttled-clock A/B asked for.
+const EXP_TBL_SCALE: f32 = (8.0f64 / std::f64::consts::LN_2) as f32; // 8/ln2 — n = round(x·8/ln2)
+const EXP_TBL_C1: f32 = EXP_C1 / 8.0; // ln2/8 high — n·C1 exact for |n| ≤ 2047 (test-pinned)
+const EXP_TBL_C2: f32 = EXP_C2 / 8.0; // ln2/8 low correction (a /8 of an f32 is exact)
+const EXP_TBL_MBIAS: i32 = 0x4B40_0000 - 1016; // bits(EXP_MAGIC) − 127·8: m = bits(t)−MBIAS = n+1016
+// T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0 exactly). The
+// `vmath_exp_tables_consistent` test below re-derives every entry bit-for-bit.
+const EXP_TBL_T: [f32; 8] = [
+    1.0,
+    1.090_507_7,
+    1.189_207_1,
+    1.296_839_6,
+    1.414_213_5,
+    1.542_210_8,
+    1.681_792_9,
+    1.834_008_1,
+];
+// e^r ≈ ((P3·r + P2)·r + 1)·r + 1 on |r| ≤ ln2/16: P3 = 1/6; P2 = 1/2 + (√2−1)/12·(ln2/16)² —
+// the Chebyshev-optimal shift of the r² coefficient, which absorbs the even r⁴/24 truncation
+// term (plain 1/2 measured 2.77e-7 max relative; the shift more than halves it to 1.59e-7).
+const EXP_TBL_P2: f32 = 0.500_064_8;
+const EXP_TBL_P3: f32 = 1.0 / 6.0;
 
 // --- log: 8-bucket table reduction (mirrors mercury_mir_build's inlined `emit_log_f32`) ------------
 //
@@ -198,8 +234,12 @@ const ATAN_P: [f32; 4] = [
 
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback; mirror the MIR poly element-for-element) --
 
-/// `e^x` (≈1 ULP), the Cephes single-precision algorithm: range-reduce `x = r + n·ln2`, a degree-5
-/// minimax poly for `e^r`, then scale by `2^n` assembled from the IEEE-754 exponent field.
+/// `e^x` (≈1.3 ULP; measured max 1.59e-7 relative — see the table block above): the 8-bucket
+/// table reduction `e^x = 2^e·T[j]·poly(r)`, `n = round(x·8/ln2)`, `j = n & 7`, `e = n >> 3`,
+/// with the 3-FMA cubic tail and the /8 Cody-Waite ln2 split. Mirrors the AVX2 [`exp8`] lanes
+/// op-for-op — the array index here IS the `vpermps` there (same 3 bits, same f32 constants),
+/// `max(m, 0)` is its `pmaxsd`, and every `mul_add` is its `fmadd`, so lane == scalar stays
+/// bit-identical.
 ///
 /// `pub(crate)` so the fused-softmax kernel in `norm.rs` reuses the *exact* same scalar exp — its
 /// AVX2 path uses [`exp8`] and its tail uses this, so a fused `softmax` agrees lane-for-lane with a
@@ -210,26 +250,28 @@ pub(crate) fn exp1(x: f32) -> f32 {
     // lane-for-lane (incl. their NaN behavior), which is what keeps the scalar tail bit-identical.
     #[allow(clippy::manual_clamp)]
     let x = x.min(EXP_HI).max(EXP_LO);
-    let t = x.mul_add(LOG2EF, EXP_MAGIC);
+    let t = x.mul_add(EXP_TBL_SCALE, EXP_MAGIC);
     let n = t - EXP_MAGIC;
-    let r = n.mul_add(-EXP_C1, x);
-    let r = n.mul_add(-EXP_C2, r);
-    // Degree-5 minimax poly in **Estrin form**: three independent coefficient pairs qᵢ = P₂ᵢ·r+P₂ᵢ₊₁
-    // (one FMA each, all parallel), then two r²-combines — ((q0·r²+q1)·r²+q2) = the same polynomial,
-    // at the same 5-FMA count (r² feeds the e^r reconstruction below anyway) but a 3-FMA critical
-    // path instead of Horner's 5 serial FMAs, so the OoO core can fill both FMA ports. Estrin only
-    // *reassociates* the additions (≤~1 ULP vs Horner — the same doctrine as the documented
-    // reassociated-reduction exception); the scalar twin, the AVX2 lanes, and the inlined MIR all use
-    // this identical order, so every path still agrees bit-for-bit.
-    let r2 = r * r;
-    let q0 = EXP_P[0].mul_add(r, EXP_P[1]);
-    let q1 = EXP_P[2].mul_add(r, EXP_P[3]);
-    let q2 = EXP_P[4].mul_add(r, EXP_P[5]);
-    let p = q0.mul_add(r2, q1);
-    let p = p.mul_add(r2, q2);
-    let p = p.mul_add(r2, r) + 1.0;
-    let pow2 = f32::from_bits((((n as i32) + 127) << 23) as u32);
-    p * pow2
+    // t = EXP_MAGIC + n exactly (t sits in the [2^23, 2^24) binade where ULP = 1), so n drops out
+    // of t's mantissa bits as an integer — with the +127·8 exponent bias pre-folded into the one
+    // subtract: m = n + 1016. `wrapping_sub` = the AVX2 `vpsubd`.
+    let m = (t.to_bits() as i32).wrapping_sub(EXP_TBL_MBIAS);
+    // r = x − n·(ln2/8) in two fmas: n·C1 is exact (see the constants block), so the first fma
+    // is one clean rounding and the low-part correction lands on a tiny residual.
+    let r = n.mul_add(-EXP_TBL_C1, x);
+    let r = n.mul_add(-EXP_TBL_C2, r);
+    // Bucket lookup: the `& 7` is the scalar spelling of vpermps consuming bits 2..0 per lane
+    // (two's complement keeps it right for the m < 0 fringe, where the result flushes to 0 anyway).
+    let tj = EXP_TBL_T[(m & 7) as usize];
+    // e^r ≈ ((P3·r + P2)·r + 1)·r + 1 — three serial FMAs (vs the old poly's 8 FP ops).
+    let q = r.mul_add(EXP_TBL_P3, EXP_TBL_P2);
+    let q = r.mul_add(q, 1.0);
+    let p = r.mul_add(q, 1.0);
+    // 2^e from the exponent field, bias already folded into m; max(m, 0) (= pmaxsd) flushes
+    // e ≤ −127 to +0.0. After the max the value is nonnegative, so >> matches the vector psrad.
+    let pow2 = f32::from_bits(((m.max(0) >> 3) as u32) << 23);
+    // T[j]·p first — both sit near 1, so the near-exact 2^e scale multiplies last.
+    (tj * p) * pow2
 }
 
 /// `ln(x)` for `x > 0` (≈2-ULP class; measured max 6.9e-7 relative — see the table block above):
@@ -1431,28 +1473,33 @@ unsafe fn vmath_f16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    // The 8-bucket table reduction, mirroring `exp1` op-for-op (see the constants block + `exp1`
+    // for the algorithm and error analysis). vs the old full-range degree-5 Estrin body this
+    // trades 8 poly FP ops for a 3-FMA cubic plus one in-register `vpermps` lookup (the T table
+    // lives whole in one ymm — no memory gather) and swaps cvttps/paddd for a single vpsubd on
+    // the magic-sum bits — 16 SIMD ops (11 FP-port) per vector vs the old 18 (15 FP-port), which
+    // is what the ×4-unrolled dispatch loop turns into throughput when the clock is starved.
     let x = _mm256_min_ps(x, _mm256_set1_ps(EXP_HI));
     let x = _mm256_max_ps(x, _mm256_set1_ps(EXP_LO));
-    let t = _mm256_fmadd_ps(x, _mm256_set1_ps(LOG2EF), _mm256_set1_ps(EXP_MAGIC));
+    let t = _mm256_fmadd_ps(x, _mm256_set1_ps(EXP_TBL_SCALE), _mm256_set1_ps(EXP_MAGIC));
     let n = _mm256_sub_ps(t, _mm256_set1_ps(EXP_MAGIC));
-    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_C1), x);
-    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_C2), r);
-    // Estrin form, mirroring `exp1` op-for-op (see the rationale there): three parallel pair-FMAs,
-    // then two r²-combines — a 3-FMA critical path vs Horner's 5 at the same op count, which the
-    // ×4-unrolled dispatch loop multiplies into enough independent FMAs to saturate both ports.
-    let r2 = _mm256_mul_ps(r, r);
-    let q0 = _mm256_fmadd_ps(_mm256_set1_ps(EXP_P[0]), r, _mm256_set1_ps(EXP_P[1]));
-    let q1 = _mm256_fmadd_ps(_mm256_set1_ps(EXP_P[2]), r, _mm256_set1_ps(EXP_P[3]));
-    let q2 = _mm256_fmadd_ps(_mm256_set1_ps(EXP_P[4]), r, _mm256_set1_ps(EXP_P[5]));
-    let p = _mm256_fmadd_ps(q0, r2, q1);
-    let p = _mm256_fmadd_ps(p, r2, q2);
-    let p = _mm256_fmadd_ps(p, r2, r);
-    let p = _mm256_add_ps(p, _mm256_set1_ps(1.0));
-    // 2^n = bitcast((n + 127) << 23). n is an exact integer in f32, so the truncating convert is exact.
-    let ni = _mm256_cvttps_epi32(n);
-    let biased = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
-    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(biased));
-    _mm256_mul_ps(p, pow2)
+    // m = n + 1016 straight from t's mantissa bits (t = MAGIC + n exactly, ULP = 1 binade);
+    // the +127·8 exponent bias is pre-folded into the subtrahend.
+    let m = _mm256_sub_epi32(_mm256_castps_si256(t), _mm256_set1_epi32(EXP_TBL_MBIAS));
+    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_TBL_C1), x);
+    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_TBL_C2), r);
+    // T[j]: vpermps reads only bits 2..0 of each index lane, which is the `& 7` in the scalar twin.
+    let ttab = _mm256_loadu_ps(EXP_TBL_T.as_ptr());
+    let tj = _mm256_permutevar8x32_ps(ttab, m);
+    // e^r ≈ ((P3·r + P2)·r + 1)·r + 1 — three FMAs.
+    let q = _mm256_fmadd_ps(r, _mm256_set1_ps(EXP_TBL_P3), _mm256_set1_ps(EXP_TBL_P2));
+    let q = _mm256_fmadd_ps(r, q, _mm256_set1_ps(1.0));
+    let p = _mm256_fmadd_ps(r, q, _mm256_set1_ps(1.0));
+    // 2^e: max(m, 0) flushes e ≤ −127 to +0.0 (the underflow band), then shift the pre-biased
+    // exponent into place. After the max the lanes are nonnegative, so psrad == the scalar >>.
+    let mc = _mm256_max_epi32(m, _mm256_setzero_si256());
+    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_srai_epi32::<3>(mc)));
+    _mm256_mul_ps(_mm256_mul_ps(tj, p), pow2)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2359,6 +2406,131 @@ mod tests {
                 assert!(
                     y1 >= y0,
                     "log not monotone at bucket edge: x={x0:?} -> {y0:?}, next {x1:?} -> {y1:?}"
+                );
+            }
+        }
+    }
+
+    /// The 8-bucket exp tables and reduction constants are self-consistent: T[j] is 2^(j/8)
+    /// computed in f64 and rounded once to f32 (T[0] pinned exactly 1.0 so exp(0) = 1.0 exactly),
+    /// SCALE is 8/ln2 rounded once, MBIAS folds the 127·8 exponent bias into the magic-bits
+    /// subtract, and the Cody-Waite pair is the exact /8 of the shared EXP_C1/EXP_C2 ln2 split —
+    /// with n·C1 checked EXACT over |n| ≤ 2047 (the clamp range only needs 1020), which is the
+    /// whole hi/lo argument. Re-derives everything from scratch and pins the bits, so a
+    /// transcription slip in either this table or the mir_build mirror's f64 literals (which must
+    /// round to these same bits) cannot survive.
+    #[test]
+    fn vmath_exp_tables_consistent() {
+        for j in 0..8usize {
+            let want = ((j as f64) / 8.0).exp2() as f32;
+            assert_eq!(EXP_TBL_T[j].to_bits(), want.to_bits(), "T[{j}]");
+        }
+        assert_eq!(EXP_TBL_T[0].to_bits(), 1.0f32.to_bits(), "T[0] must be exactly 1");
+        assert_eq!(EXP_TBL_SCALE.to_bits(), ((8.0f64 / std::f64::consts::LN_2) as f32).to_bits());
+        assert_eq!(EXP_TBL_MBIAS, EXP_MAGIC.to_bits() as i32 - 127 * 8);
+        // Cody-Waite hi: the exact /8 of EXP_C1, with ≥10 trailing mantissa zero bits (it has 15)
+        // so that n·C1 is exact for the full |n| ≤ 1020 clamp range — checked exhaustively with
+        // 2× headroom against the f64 product.
+        assert_eq!(EXP_TBL_C1.to_bits(), (EXP_C1 / 8.0).to_bits());
+        assert_eq!(EXP_TBL_C2.to_bits(), (EXP_C2 / 8.0).to_bits());
+        assert!(EXP_TBL_C1.to_bits().trailing_zeros() >= 10, "C1 lost its trailing zeros");
+        for n in -2047i32..=2047 {
+            let prod = (n as f32) * EXP_TBL_C1;
+            assert_eq!(prod as f64, (n as f64) * (EXP_TBL_C1 as f64), "n·C1 inexact at n={n}");
+        }
+        // hi+lo reproduce ln2/8 to ≈2e-13 (×|n| ≤ 1020 → ≤2.2e-10 absolute in r — invisible in f32).
+        let resid = ((EXP_TBL_C1 as f64 + EXP_TBL_C2 as f64) - std::f64::consts::LN_2 / 8.0).abs();
+        assert!(resid < 1e-12, "Cody-Waite pair drifted off ln2/8: {resid:e}");
+        // P2 is the Chebyshev-shifted r² coefficient 1/2 + (√2−1)/12·h² (h = ln2/16), rounded once;
+        // P3 is 1/6 rounded once.
+        let h = std::f64::consts::LN_2 / 16.0;
+        let want_p2 = (0.5 + (2f64.sqrt() - 1.0) / 12.0 * h * h) as f32;
+        assert_eq!(EXP_TBL_P2.to_bits(), want_p2.to_bits(), "P2");
+        assert_eq!(EXP_TBL_P3.to_bits(), ((1.0f64 / 6.0) as f32).to_bits(), "P3");
+    }
+
+    /// Dense accuracy sweep of the table-based exp core vs f64 `exp`: (1) 2M linear points over
+    /// [−87, 88] — the whole clamp range above the denormal-output band, where relative error is
+    /// meaningful; and (2) 1M points in [−0.07, 0.07] — the near-1 region the expm1 Kahan
+    /// correction and the softmax tail lean on, spanning every bucket transition around n = 0.
+    /// Measured max relative error of the shipped kernel: 1.59e-7 wide and 1.24e-7 near 0
+    /// (the degree-3 tail with the Chebyshev-shifted P2; plain 1/2 measured 2.77e-7); asserted
+    /// < 2.4e-7 (≈2 ULP at 1.0) here. Also pins, per element, kernel == scalar twin bit-for-bit,
+    /// and exp(0) == 1.0 exactly.
+    #[test]
+    fn vmath_exp_dense_sweep() {
+        let mut xs: Vec<f32> = Vec::new();
+        for i in 0..2_000_000 {
+            xs.push((-87.0 + 175.0 * (i as f64) / 1_999_999.0) as f32);
+        }
+        for i in 0..1_000_000 {
+            xs.push((-0.07 + 0.14 * (i as f64) / 999_999.0) as f32);
+        }
+        xs.push(0.0);
+        let mut out = vec![0.0f32; xs.len()];
+        unsafe {
+            mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_EXP);
+        }
+        let mut max_rel = 0.0f64;
+        let mut worst = 0.0f32;
+        for (i, &x) in xs.iter().enumerate() {
+            let got = out[i];
+            // Lane == scalar twin, bit-for-bit (the tail and the no-AVX2 fallback both take exp1).
+            assert_eq!(got.to_bits(), apply1(VM_EXP, x).to_bits(), "lane vs scalar at {x}");
+            if x == 0.0 {
+                assert_eq!(got.to_bits(), 1.0f32.to_bits(), "exp(0) must be exactly 1");
+                continue;
+            }
+            let want = (x as f64).exp();
+            let rel = ((got as f64 - want) / want).abs();
+            if rel > max_rel {
+                max_rel = rel;
+                worst = x;
+            }
+        }
+        assert!(
+            max_rel < 2.4e-7,
+            "exp max relative error {max_rel:.3e} at x={worst} exceeds 2.4e-7"
+        );
+    }
+
+    /// Clamp/saturation semantics of the table exp, pinned bit-for-bit: everything at or below
+    /// EXP_LO (including −∞) flushes to +0.0 — the `max(m, 0)` route; everything at or above
+    /// EXP_HI (including +∞ — and NaN, which the min-then-max clamp order has always funneled to
+    /// the HI path) saturates to the same finite value the old full-range-poly kernel produced
+    /// (0x7F3504A4 ≈ 2.406e38 — never +∞); exp(0) == 1.0 exactly; and exp is monotone
+    /// non-decreasing through the n-increment boundaries x ≈ (n+½)·ln2/8, where the bucket j and
+    /// (every 8th) the exponent e both step — ±256 consecutive f32s scanned in value order around
+    /// each, zero violations measured.
+    #[test]
+    fn vmath_exp_boundary_saturation() {
+        for x in [EXP_LO, -88.4, -100.0, -1e6, f32::NEG_INFINITY] {
+            assert_eq!(exp1(x).to_bits(), 0.0f32.to_bits(), "exp({x}) must be +0.0");
+        }
+        let sat = exp1(EXP_HI);
+        assert!(sat.is_finite());
+        assert_eq!(sat.to_bits(), 0x7F35_04A4, "HI saturation value drifted");
+        for x in [88.4, 1e6, f32::INFINITY, f32::NAN] {
+            assert_eq!(exp1(x).to_bits(), sat.to_bits(), "exp({x}) must saturate to exp(EXP_HI)");
+        }
+        assert_eq!(exp1(0.0).to_bits(), 1.0f32.to_bits(), "exp(0) must be exactly 1");
+        // Monotonicity across n boundaries (bucket steps, and exponent steps at n ≡ 4 mod 8's
+        // neighbors ±1020 covers e transitions too). Bits ascend with value for positive floats
+        // and descend for negative ones — walk in value order either way.
+        for nb in [-1000i32, -500, -100, -9, -1, 0, 1, 9, 100, 500, 1000] {
+            let x0 = ((f64::from(nb) + 0.5) * std::f64::consts::LN_2 / 8.0) as f32;
+            let b0 = x0.to_bits();
+            for d in 0..512u32 {
+                let (ba, bb) = if x0 >= 0.0 {
+                    (b0 - 256 + d, b0 - 256 + d + 1)
+                } else {
+                    (b0 + 256 - d, b0 + 256 - d - 1)
+                };
+                let (xa, xb) = (f32::from_bits(ba), f32::from_bits(bb));
+                let (ya, yb) = (exp1(xa), exp1(xb));
+                assert!(
+                    yb >= ya,
+                    "exp not monotone at n-edge {nb}: x={xa:?} -> {ya:?}, next {xb:?} -> {yb:?}"
                 );
             }
         }

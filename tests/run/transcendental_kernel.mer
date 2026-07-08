@@ -1,7 +1,7 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: 1.6487212181091309
-// EXPECT-OUT: 1.6487212181091309
+// EXPECT-OUT: 1.6487213373184204
+// EXPECT-OUT: 1.6487213373184204
 module tests.run.transcendental_kernel
 
 // An `out[i] = exp(x[i])` loop dispatches to the 256-bit `mercury_vmath_f32` microkernel (the same
