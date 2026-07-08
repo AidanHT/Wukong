@@ -163,8 +163,8 @@ The opt pipeline is guarded by a **differential test**: every end-to-end program
 -O1/-O2/-O3 and must produce identical stdout and exit code. The `mercury_bench` crate reports, per
 program, the IR-op reduction and the -O0-vs--O3 interpreter speedup, and exits non-zero if any
 program that lowers cleanly disagrees across optimization levels — a soundness gate over every
-benchmark kernel. Across the run suite and kernels, -O3 removes ~48% of IR ops (54–60% on the heavy
-kernels) and runs ~1.5–2.5x faster than -O0 under the interpreter.
+benchmark kernel. Across the run suite and kernels, -O3 removes **~42% of IR ops (~48–54% on the
+heavy transformer/GEMM kernels)** and runs ~1.5–2.5x faster than -O0 under the interpreter.
 
 ## Interpreter
 

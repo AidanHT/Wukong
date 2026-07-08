@@ -43,8 +43,8 @@ results are recorded in `prompts/results/`, and every kernel stays gated against
   unreachable-block pruning), `simplify-phis` (dead/trivial block-parameter elimination), `dce`,
   `cse` (dominator-tree value numbering with load forwarding), `dse` (dead-store elimination), and
   `licm` (loop-invariant code motion), wired across `-O0..-O3`. In debug builds the pass manager
-  verifies the MIR after every pass. Across the run suite and kernels, `-O3` removes ~48% of IR ops
-  (54–60% on the heavy kernels) and runs ~1.5–2.5x faster than `-O0` under the interpreter.
+  verifies the MIR after every pass. Across the run suite and kernels, `-O3` removes ~42% of IR ops
+  (~48–54% on the heavy transformer/GEMM kernels) and runs ~1.5–2.5x faster than `-O0` under the interpreter.
 - **Back-ends**: a zero-dependency MIR interpreter (`--run`), a from-scratch **native Cranelift
   backend** (JIT + `--emit=obj` host object + `--emit=exe`, the latter linked via a rustc-driven link
   that falls back to the system `cc`/`$CC` — **no LLVM toolchain**), and a textual LLVM-IR emitter
