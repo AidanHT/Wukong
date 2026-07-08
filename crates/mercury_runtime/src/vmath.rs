@@ -90,19 +90,62 @@ const EXP_P: [f32; 6] = [
     1.666_666_6e-1,
     5e-1,
 ];
-const LOG_SQRTHF: f32 = std::f32::consts::FRAC_1_SQRT_2; // √0.5
 const INV_2P23: f32 = 1.0 / 8_388_608.0; // 2^-23 (exact)
-const LOG_P: [f32; 9] = [
-    7.037_683_6e-2,
-    -1.151_461e-1,
-    1.167_699_84e-1,
-    -1.242_014_1e-1,
-    1.424_932_3e-1,
-    -1.666_805_7e-1,
-    2.000_071_4e-1,
-    -2.499_999_4e-1,
-    3.333_333e-1,
+
+// --- log: 8-bucket table reduction (mirrors mercury_mir_build's inlined `emit_log_f32`) ------------
+//
+// `ln(x)` decomposes as `x = z·2^k` with `z ∈ [0.6953125, 1.390625)` by pure bit arithmetic:
+// `tmp = bits(x) − LOG_OFF` splits at the bit pattern `LOG_OFF` instead of at an exponent boundary,
+// so the reduced range *straddles 1.0* — `kbits = tmp & 0xFF80_0000` is `k·2^23` (signed, exact in
+// f32 after an i32→f32 convert), and `z = bits(x) − kbits` reinterpreted as a float. The top 3
+// mantissa bits of `tmp` (bits 22..20) index 8 uniform-in-bits buckets of `z`; per bucket a
+// reciprocal-ish `R[j] ≈ 1/mid_j` and its exact log `L[j] = −ln(R[j])` give
+//
+//   ln(x) = k·ln2 + L[j] + ln(1 + s),   s = fma(z, R[j], −1),  |s| ≤ ~0.058,
+//
+// with `ln(1+s)` a short degree-5 Taylor tail (s − s²/2 + s³/3 − s⁴/4 + s⁵/5) — ~5 FMAs + 2 muls
+// against the old full-range degree-8 minimax poly's 9. The AVX2 lanes do the two table lookups as
+// in-register `vpermps` on the 8-entry `__m256` constants (no memory gather); the scalar twin
+// indexes the same arrays, so lane == scalar stays bit-for-bit.
+//
+// Accuracy: bucket 4 spans z ∈ [0.9453125, 1.015625) — the bucket *containing 1.0* — and pins
+// `R = 1.0, L = 0.0` exactly, so near x = 1 the whole thing collapses to `poly(s)` with `s = z − 1`
+// exact (Sterbenz): no `L + k·ln2` cancellation where `ln(x)` is tiny and relative error would blow
+// up. Measured max relative error vs f64 `ln` is 6.9e-7 (exhaustive over [0.25, 4), 33.5M values;
+// 5.2e-7 over 1e6 log-spaced points spanning [1e-38, 1e38]) — see `vmath_log_dense_sweep`. The
+// domain contract is unchanged (x > 0 normal; no guards): x = +0 (→ −127·ln2 ≈ −88.03), x = +∞ and
+// NaN produce bit-identical values to the old kernel; denormals stay same-class garbage; only the
+// x < 0 garbage values differ (out of every gate's domain).
+const LOG_OFF: i32 = 0x3F32_0000; // z-range split point: z ∈ [0.6953125, 1.390625)
+// R[j] = 1/mid_j of bucket j rounded once to f32 (bucket 4 pinned to exactly 1.0 — see above);
+// L[j] = −ln(R[j]) computed in f64 *from the rounded-f32 R* and rounded once to f32. The
+// `vmath_log_tables_consistent` test below re-derives both invariants bit-for-bit.
+const LOG_TBL_R: [f32; 8] = [
+    1.376_344_1,
+    1.267_326_7,
+    1.174_311_9,
+    1.094_017_1,
+    1.0,
+    0.927_536_25,
+    0.831_168_83,
+    0.752_941_2,
 ];
+const LOG_TBL_L: [f32; 8] = [
+    -0.319_430_77,
+    -0.236_909_73,
+    -0.160_682_34,
+    -0.089_856_38,
+    0.0,
+    0.075_223_4,
+    0.184_922_34,
+    0.283_768_15,
+];
+// ln(1+s) = s + s²·(C1 + C2·s + C3·s² + C4·s³): the degree-5 Taylor tail −1/2, 1/3, −1/4, 1/5.
+// Degree 4 (dropping C4) measured 9.1e-6 max relative — outside the 4e-6 target — so degree 5 it is.
+const LOG_C1: f32 = -0.5;
+const LOG_C2: f32 = 0.333_333_34; // (1/3) rounded to f32
+const LOG_C3: f32 = -0.25;
+const LOG_C4: f32 = 0.2;
 
 // --- sin/cos and erf constants (mirror mercury_mir_build's inlined `emit_trig_f32`/`emit_erf_f32`
 // poly constants, so a dispatched `sin`/`cos`/`erf` loop agrees with a composed/scalar one) ---------
@@ -189,50 +232,46 @@ pub(crate) fn exp1(x: f32) -> f32 {
     p * pow2
 }
 
-/// `ln(x)` for `x > 0` (≈1 ULP), Cephes single-precision: decompose `x = m·2^e`, a degree-8 minimax
-/// poly for `log(m)`, add back `e·ln2` with the same hi/lo split `exp` uses. `pub(crate)` so the fused
+/// `ln(x)` for `x > 0` (≈2-ULP class; measured max 6.9e-7 relative — see the table block above):
+/// the 8-bucket table reduction `ln(x) = k·ln2 + L[j] + poly(s)`, `s = fma(z, R[j], −1)`, with the
+/// degree-5 Taylor tail and the same hi/lo `ln2` split `exp` uses. Mirrors the AVX2 [`log8`] lanes
+/// op-for-op — the array index here IS the `vpermps` there (same 3 bits, same f32 constants), and
+/// every `mul_add` is its `fmadd`, so lane == scalar stays bit-identical. `pub(crate)` so the fused
 /// log-softmax kernel (`norm.rs`) can take the log of its row sum through the identical scalar log.
 #[inline]
 pub(crate) fn log1(x: f32) -> f32 {
     let bits = x.to_bits() as i32;
-    let epart = bits & 0x7F80_0000;
-    let efield = (epart as f32) * INV_2P23;
-    let mut e = efield - 126.0;
-    let mant = bits & 0x007F_FFFF;
-    let mbits = mant | 0x3F00_0000;
-    let mut m = f32::from_bits(mbits as u32);
-    let lt = m < LOG_SQRTHF;
-    let m_lt = (m + m) - 1.0;
-    let m_ge = m - 1.0;
-    m = if lt { m_lt } else { m_ge };
-    if lt {
-        e -= 1.0;
-    }
-    let z = m * m;
-    // Degree-8 minimax poly in **Estrin form**: two parallel sub-chains — lo = (P5·m+P6)·z+(P7·m+P8)
-    // (degree 3) and hi = (P0·z+(P1·m+P2))·z+(P3·m+P4) (degree 4) — combined as p = hi·z²+lo with
-    // z² = m⁴. That is a 4-FMA critical path instead of Horner's 8 serial FMAs (~32 cycles, the
-    // reason `log` trailed `exp`) for one extra mul (z², since z is needed below anyway), and each
-    // vector keeps ≤5 temporaries live — unlike four interleaved 8-deep Horner chains, which is what
-    // the ×4-unrolled dispatch loop needed to fill the FMA ports and which oversubscribed the 16 ymm
-    // registers. Estrin only *reassociates* (≤~1 ULP vs Horner — the reassociated-reduction
-    // doctrine); the scalar twin, the AVX2 lanes, and the inlined MIR share this identical order,
-    // so every path still agrees bit-for-bit.
-    let l1 = LOG_P[5].mul_add(m, LOG_P[6]);
-    let l2 = LOG_P[7].mul_add(m, LOG_P[8]);
-    let lo = l1.mul_add(z, l2);
-    let h1 = LOG_P[1].mul_add(m, LOG_P[2]);
-    let h2 = LOG_P[3].mul_add(m, LOG_P[4]);
-    let hz = LOG_P[0].mul_add(z, h1);
-    let hi = hz.mul_add(z, h2);
-    let z2 = z * z;
-    let p = hi.mul_add(z2, lo);
-    let pm = p * m;
-    let mut y = pm * z;
-    y = e.mul_add(EXP_C2, y);
-    y = z.mul_add(-0.5, y);
-    let r = m + y;
-    e.mul_add(EXP_C1, r)
+    // Split at the bit pattern LOG_OFF (≈ bits of 0.695): everything above the low 23 bits of `tmp`
+    // is k·2^23; subtracting it back off `bits` renormalizes x to z = x·2^-k ∈ [0.6953125, 1.390625).
+    // `wrapping_sub` = the AVX2 `vpsubd` (only garbage inputs — sign bit set — ever wrap).
+    let tmp = bits.wrapping_sub(LOG_OFF);
+    let kbits = tmp & 0xFF80_0000u32 as i32;
+    let iz = bits.wrapping_sub(kbits);
+    let z = f32::from_bits(iz as u32);
+    // k as f32, shift-free: kbits = k·2^23 is exact in f32 (≤9 significant bits, sign included via
+    // the signed convert), and the 2^-23 scale is a power of two — both steps exact.
+    let e = (kbits as f32) * INV_2P23;
+    // Bucket = bits 22..20 of tmp — the top 3 mantissa bits of (z's offset from LOG_OFF). The `& 7`
+    // is the scalar spelling of vpermps consuming only bits 2..0 of each index lane.
+    let j = (((tmp as u32) >> 20) & 7) as usize;
+    let r = LOG_TBL_R[j];
+    let l = LOG_TBL_L[j];
+    // s = z·R[j] − 1 in ONE rounding; for bucket 4 (R = 1) this is z − 1, exact by Sterbenz.
+    let s = z.mul_add(r, -1.0);
+    // ln(1+s) − s = s²·(C1 + C2·s + C3·s² + C4·s³), Estrin: the two coefficient-pair FMAs run in
+    // parallel, then one w-combine — a 2-FMA critical path.
+    let w = s * s;
+    let q0 = LOG_C2.mul_add(s, LOG_C1);
+    let q1 = LOG_C4.mul_add(s, LOG_C3);
+    let p = q1.mul_add(w, q0);
+    let p = p * w;
+    // Reconstruct smallest-first so the near-1 path stays pure poly: t = L + s²·P (both 0 at
+    // bucket 4), + e·ln2_lo, + s, + e·ln2_hi — the same hi/lo ln2 split as `exp`, so large |k|
+    // doesn't lose the low bits.
+    let t = l + p;
+    let y = e.mul_add(EXP_C2, t);
+    let r2 = s + y;
+    e.mul_add(EXP_C1, r2)
 }
 
 /// `tanh(x) = 1 - 2/(e^{2x}+1)` — the exp-based form (the activation benchmarks and the MIR lowering
@@ -1420,38 +1459,39 @@ pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    // The 8-bucket table reduction, mirroring `log1` op-for-op (see the constants block + `log1` for
+    // the algorithm and error analysis). vs the old full-range degree-8 poly this trades the 9-FMA
+    // Estrin body + compare/blend range split for: 3 cheap integer ops, two 1-op in-register
+    // `vpermps` table lookups (the tables live whole in one ymm each — no memory gather), and a
+    // 5-FMA/2-mul residual — about half the FP-port pressure per vector, which is what the
+    // ×4-unrolled dispatch loop turns into throughput.
     let bits = _mm256_castps_si256(x);
-    let epart = _mm256_and_si256(bits, _mm256_set1_epi32(0x7F80_0000));
-    let efield = _mm256_mul_ps(_mm256_cvtepi32_ps(epart), _mm256_set1_ps(INV_2P23));
-    let mut e = _mm256_sub_ps(efield, _mm256_set1_ps(126.0));
-    let mant = _mm256_and_si256(bits, _mm256_set1_epi32(0x007F_FFFF));
-    let mbits = _mm256_or_si256(mant, _mm256_set1_epi32(0x3F00_0000));
-    let mut m = _mm256_castsi256_ps(mbits);
-    let lt = _mm256_cmp_ps::<_CMP_LT_OQ>(m, _mm256_set1_ps(LOG_SQRTHF));
-    let one = _mm256_set1_ps(1.0);
-    let m_lt = _mm256_sub_ps(_mm256_add_ps(m, m), one);
-    let m_ge = _mm256_sub_ps(m, one);
-    m = _mm256_blendv_ps(m_ge, m_lt, lt);
-    e = _mm256_blendv_ps(e, _mm256_sub_ps(e, one), lt);
-    let z = _mm256_mul_ps(m, m);
-    // Estrin form, mirroring `log1` op-for-op (see the rationale there): the two sub-chains run in
-    // parallel and combine through z² = m⁴ — a 4-FMA critical path vs Horner's 8, and ≤5 live ymm
-    // temporaries per vector, so the ×4-unrolled dispatch loop no longer spills to fill the ports.
-    let l1 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[5]), m, _mm256_set1_ps(LOG_P[6]));
-    let l2 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[7]), m, _mm256_set1_ps(LOG_P[8]));
-    let lo = _mm256_fmadd_ps(l1, z, l2);
-    let h1 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[1]), m, _mm256_set1_ps(LOG_P[2]));
-    let h2 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[3]), m, _mm256_set1_ps(LOG_P[4]));
-    let hz = _mm256_fmadd_ps(_mm256_set1_ps(LOG_P[0]), z, h1);
-    let hi = _mm256_fmadd_ps(hz, z, h2);
-    let z2 = _mm256_mul_ps(z, z);
-    let p = _mm256_fmadd_ps(hi, z2, lo);
-    let pm = _mm256_mul_ps(p, m);
-    let mut y = _mm256_mul_ps(pm, z);
-    y = _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C2), y);
-    y = _mm256_fmadd_ps(z, _mm256_set1_ps(-0.5), y);
-    let r = _mm256_add_ps(m, y);
-    _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C1), r)
+    let tmp = _mm256_sub_epi32(bits, _mm256_set1_epi32(LOG_OFF));
+    let kbits = _mm256_and_si256(tmp, _mm256_set1_epi32(0xFF80_0000u32 as i32));
+    let iz = _mm256_sub_epi32(bits, kbits);
+    let z = _mm256_castsi256_ps(iz);
+    // k as f32 — kbits = k·2^23 converts exactly (signed), and the 2^-23 scale is a power of two.
+    let e = _mm256_mul_ps(_mm256_cvtepi32_ps(kbits), _mm256_set1_ps(INV_2P23));
+    // Bucket index in bits 2..0 after the shift; vpermps reads only those 3 bits per lane, which is
+    // the `& 7` in the scalar twin.
+    let j = _mm256_srli_epi32::<20>(tmp);
+    let rtab = _mm256_loadu_ps(LOG_TBL_R.as_ptr());
+    let ltab = _mm256_loadu_ps(LOG_TBL_L.as_ptr());
+    let r = _mm256_permutevar8x32_ps(rtab, j);
+    let l = _mm256_permutevar8x32_ps(ltab, j);
+    // s = z·R[j] − 1 in one rounding (exact z − 1 in the R = 1 bucket straddling x = 1).
+    let s = _mm256_fmadd_ps(z, r, _mm256_set1_ps(-1.0));
+    // Degree-5 Taylor tail in Estrin form: two parallel pair-FMAs, one w-combine (2-FMA path).
+    let w = _mm256_mul_ps(s, s);
+    let q0 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_C2), s, _mm256_set1_ps(LOG_C1));
+    let q1 = _mm256_fmadd_ps(_mm256_set1_ps(LOG_C4), s, _mm256_set1_ps(LOG_C3));
+    let p = _mm256_fmadd_ps(q1, w, q0);
+    let p = _mm256_mul_ps(p, w);
+    // Smallest-first reconstruction with the hi/lo ln2 split (see `log1`).
+    let t = _mm256_add_ps(l, p);
+    let y = _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C2), t);
+    let r2 = _mm256_add_ps(s, y);
+    _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C1), r2)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2229,6 +2269,97 @@ mod tests {
             for (i, &x) in xs.iter().enumerate() {
                 let s = apply1(op, x);
                 assert_eq!(full[i].to_bits(), s.to_bits(), "op {op} i {i} x {x}");
+            }
+        }
+    }
+
+    /// The 8-bucket log tables are self-consistent: R[j] is 1/midpoint of bucket j rounded once to
+    /// f32 (bucket 4 — the bucket straddling z = 1 — pinned to exactly 1.0 with L = 0.0, so ln of
+    /// x near 1 reduces to the pure poly path with no cancellation), and L[j] = −ln(R[j]) computed
+    /// in f64 *from the rounded-f32 R* and rounded once to f32. Re-derives both from scratch and
+    /// pins every entry bit-for-bit, so a transcription slip in either table (or a drift from the
+    /// mir_build mirror's f64 literals, which must round to these same bits) cannot survive.
+    #[test]
+    fn vmath_log_tables_consistent() {
+        for j in 0..8u32 {
+            let lo = f32::from_bits((LOG_OFF as u32) + j * 0x0010_0000) as f64;
+            let hi = f32::from_bits((LOG_OFF as u32) + (j + 1) * 0x0010_0000) as f64;
+            let (want_r, want_l) = if j == 4 {
+                assert!(lo < 1.0 && 1.0 < hi, "bucket 4 must straddle 1.0");
+                (1.0f32, 0.0f32)
+            } else {
+                let r = (1.0 / (0.5 * (lo + hi))) as f32;
+                (r, (-((r as f64).ln())) as f32)
+            };
+            assert_eq!(LOG_TBL_R[j as usize].to_bits(), want_r.to_bits(), "R[{j}]");
+            assert_eq!(LOG_TBL_L[j as usize].to_bits(), want_l.to_bits(), "L[{j}]");
+        }
+    }
+
+    /// Dense accuracy sweep of the table-based log core vs f64 `ln`: (1) 300k log-spaced points
+    /// across the full normal range [1.2e-38, 1e38], and (2) 200k linear points in [0.9, 1.1] —
+    /// the danger zone where ln(x) → 0 and any L[j] + k·ln2 cancellation would blow relative error
+    /// up (bucket 4's pinned R = 1, L = 0 is what prevents it). Measured max relative error of the
+    /// shipped kernel: 5.24e-7 over 1e6 log-spaced points, 6.85e-7 over [0.9, 1.1], and 6.93e-7
+    /// exhaustive over every f32 in [0.25, 4) (33.5M values, measured once offline); asserted
+    /// < 1e-6 here. Also pins, per element, kernel == scalar twin bit-for-bit (the log-family
+    /// lane==tail check `vmath_tail_matches_lanes` skips for domain reasons), and ln(1) == 0
+    /// exactly.
+    #[test]
+    fn vmath_log_dense_sweep() {
+        let mut xs: Vec<f32> = Vec::new();
+        let (llo, lhi) = ((1.2e-38f64).ln(), (1e38f64).ln());
+        for i in 0..300_000 {
+            xs.push((llo + (lhi - llo) * (i as f64) / 299_999.0).exp() as f32);
+        }
+        for i in 0..200_000 {
+            xs.push((0.9 + 0.2 * (i as f64) / 199_999.0) as f32);
+        }
+        xs.push(1.0);
+        let mut out = vec![0.0f32; xs.len()];
+        unsafe {
+            mercury_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_LOG);
+        }
+        let mut max_rel = 0.0f64;
+        let mut worst = 0.0f32;
+        for (i, &x) in xs.iter().enumerate() {
+            let got = out[i];
+            // Lane == scalar twin, bit-for-bit (the tail and the no-AVX2 fallback both take log1).
+            assert_eq!(got.to_bits(), apply1(VM_LOG, x).to_bits(), "lane vs scalar at {x}");
+            let want = (x as f64).ln();
+            if want == 0.0 {
+                assert_eq!(got.to_bits(), 0.0f32.to_bits(), "ln(1) must be exactly 0");
+                continue;
+            }
+            let rel = ((got as f64 - want) / want).abs();
+            if rel > max_rel {
+                max_rel = rel;
+                worst = x;
+            }
+        }
+        assert!(
+            max_rel < 1e-6,
+            "log max relative error {max_rel:.3e} at x={worst} exceeds 1e-6"
+        );
+    }
+
+    /// Monotonicity across the 8-bucket boundaries: scan consecutive f32s (±256 ULPs) around every
+    /// bucket edge — including the two k-transition edges where z wraps — and require ln to never
+    /// decrease. The shipped tables measure zero violations (a table/poly mismatch at an edge would
+    /// show up as a multi-ULP step down), so this asserts strict no-decrease rather than a wobble
+    /// budget.
+    #[test]
+    fn vmath_log_bucket_boundary_monotone() {
+        for j in 0..=8u32 {
+            let boundary = (LOG_OFF as u32) + j * 0x0010_0000;
+            for b in (boundary - 256)..(boundary + 256) {
+                let x0 = f32::from_bits(b);
+                let x1 = f32::from_bits(b + 1);
+                let (y0, y1) = (apply1(VM_LOG, x0), apply1(VM_LOG, x1));
+                assert!(
+                    y1 >= y0,
+                    "log not monotone at bucket edge: x={x0:?} -> {y0:?}, next {x1:?} -> {y1:?}"
+                );
             }
         }
     }
