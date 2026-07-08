@@ -86,9 +86,14 @@ targets, not footnotes.
 
 **M7. Portability.** Same `.mer` → interp (oracle), Cranelift native, GPU offload,
 GPU-native (whole-program MIR→PTX megakernel). Standing: real; GPU-native covers a subset
-(UNSUPPORTED=skip) — it passes the eligible corpus except **2 documented general-lowering
-miscompiles** (`hadamard`, `log_softmax_fused` in `lower.rs`/`megakernel.rs`); the
-recognizer-offload GPU path and both CPU backends are unaffected and bit/tolerance-exact.
+(UNSUPPORTED=skip). The two documented device-kernel miscompiles are **fixed**: `lower.rs`'s
+`PTX_VELEM` now implements the Hadamard/Div binary modes and `PTX_NORM` the log-softmax/L2 ops,
+so `hadamard`, `log_softmax_fused`, `l2norm`, `norm_divide`, and `norm_out_of_place` match the
+interp oracle on **both** the single-thread and megakernel paths within the tolerance gate. A
+few *unrelated* general-lowering gaps remain in the larger corpus (a float→int narrowing cast,
+a parallel abs-sum reduction, and a `tensor_1d_kernels` megakernel illegal-address) — separate
+from the recognized-kernel device helpers. The recognizer-offload GPU path and both CPU backends
+are unaffected and bit/tolerance-exact.
 
 ## Tier 3 — supporting qualities
 
