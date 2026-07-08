@@ -28,13 +28,14 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
   **oneMKL parity**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
   (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
-  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM is **~46–72% at
-  512–1024³ but reaches parity-to-winning (86–129%, most recently 127%) at ≥2048³**, the
-  large-matrix ML regime. (Disclosure: threaded MKL itself swings ~1.4× with this laptop's power
-  state, so the mid-size ratio is a range across sessions; three scheduling explanations —
-  fewer threads, fewer fork-join barriers, hard core pinning — were each refuted by adjacent
-  same-run A/B, so the residual mid-size gap is MKL's per-thread-L2-blocked 2D parallel
-  decomposition, a real algorithmic difference, honestly open);
+  the honest SOTA bar — **multi-threaded oneMKL** — Mercury's `@parallel` GEMM now runs a
+  **BLIS/MKL-style 2D block-parallel decomposition** (per-thread L2-resident C blocks, per-worker
+  packing, no barriers; adjacent-run ABBA **1.26–1.65×** over the previous row-panel path) and
+  stands at **~66–69% at 512–1024³** (up from ~46–72%, and now power-state-stable: 66/68%
+  throttled, 66/69% cool in the two 2026-07-08 confirmation rounds) and **parity-to-winning
+  (86–129%, most recently 127%) at ≥2048³**, the large-matrix ML regime. (Disclosure: threaded
+  MKL itself swings ~1.4× with this laptop's power state, so ratios are same-run only; the
+  residual mid-size ~30% is MKL's remaining lead at parallel grain, honestly open);
 - **dispatches the whole transformer/training kernel surface** to tuned microkernels, where the win
   over idiomatic C is largest: the **weight-gradient GEMM** `dW=Aᵀ·B` (training backward, A read
   column-strided) **up to ~128× single / ~445× parallel**, the **fused FFN** `silu(A·Bᵀ)` **~24–26×**,
@@ -59,8 +60,9 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Mercury:
   GELU MLP — ordinary Mercury source through the real pipeline, gated bit-exact against the
   interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~20–21× idiomatic C,
   3.6–4.9× `-ffast-math` C, and at parity with PyTorch CPU eager single-thread** (0.93–1.07×
-  @S=128, **1.08–1.21× faster @S=512**); all-threads eager torch still wins multicore
-  (1.05–2.5×, thermal-dependent) — the same mid-size parallel-efficiency gap disclosed above;
+  @S=128, **1.08–1.49× faster @S=512**); all-threads eager torch still wins multicore, but the
+  2D-parallel GEMM stabilized the gap: **~1.1× @S=512** (was a 1.05–2.5× thermal lottery) and
+  1.5–1.9× @S=128, with model `@parallel` scaling up from ~1.5–2.1× to **1.9–3.8×**;
 - **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~4.6–14.7× parallel**, and runs a full
   **bf16 *and* f16 mixed-precision CPU suite** — `dot` (**~3×**) / `sum` (**~6–8×**), `max`/`min`/`absmax`
   (the symmetric-quant scale), streaming `axpby`, the `nn.Linear` GEMM (**~24–25×**), and the 36-op

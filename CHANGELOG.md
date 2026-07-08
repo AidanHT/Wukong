@@ -13,11 +13,23 @@ All notable changes to Mercury are documented here. The format is loosely based 
   mirrored value-exactly in the scalar twins and the inlined-MIR emitters. Same-run vs oneMKL VML:
   **tanh 2.4–3× faster, log 1.14×, exp 1.05×-faster(cool)–~1.3×(throttled)**, from the former
   ~1.7–2× loss; log2/log1p now 9.9×/7.7× vs scalar C.
-- **Parallel GEMM**: A+B packing fused into one parallel region per K-block (+7.5% @512³ same-run,
-  `MERCURY_PACK_SPLIT_REGIONS=1` kill-switch) and a persistent-broadcast-region variant (one pool
-  wake per call). Honest negatives recorded in-code: the persistent region A/Bs as a wash, a
-  smaller mid-size pool and hard worker pinning (`MERCURY_GEMM_AFFINITY=1`) both measure slower —
-  the residual mid-size gap vs threaded MKL is its 2D per-thread-L2 decomposition, not scheduling.
+- **2D block-parallel GEMM shipped as the default parallel path**: BLIS/MKL-style per-thread
+  L2-resident C-block ownership (`sgemm_2d_blocks` — MR/NR-aligned block grid, per-worker pack
+  scratch, one task per block, no barriers) replaces the row-panel/shared-B decomposition —
+  adjacent-run ABBA **1.26–1.65×** at 512–1024³ (512³ ~182→~305 GF/s, 1024³ ~365→~460), lifting
+  mid-size `@parallel` from ~46–72% to a power-state-stable **66–69% of all-threads oneMKL**
+  (87% @2048³ same-run). Bit-exact vs the serial kernel by construction (one owner per C block,
+  ascending K-blocks, same kc grouping; pinned by `sgemm_2d_blocks_matches_serial`);
+  `MERCURY_GEMM_2D=0` opts back to the previous path as an adjacent-run instrument. Downstream,
+  model-bench `@parallel` scaling rose from ~1.5–2.1× to **1.9–3.8×** and the all-threads-torch
+  gap at S=512 stabilized at **~1.1×** (1.07/1.10× across two rounds; was 1.05–2.5×
+  thermal-dependent).
+- **Parallel GEMM (precursor work)**: A+B packing fused into one parallel region per K-block
+  (+7.5% @512³ same-run, `MERCURY_PACK_SPLIT_REGIONS=1` kill-switch) and a persistent-broadcast-
+  region variant (one pool wake per call). Honest negatives recorded in-code: the persistent
+  region A/Bs as a wash, a smaller mid-size pool and hard worker pinning
+  (`MERCURY_GEMM_AFFINITY=1`) both measure slower — scheduling was never the mid-size gap; the
+  2D decomposition above was.
 - **gpu-native (MIR→PTX) correctness, 8 programs repaired**: the `mrt_velem` device kernel ignored
   the Hadamard/Div mode bits (computed `x+y` for `x*y`/`x÷y`); `mrt_norm` sent log-softmax and
   L2-norm to the RMSNorm branch; both sreduce kernels lacked the |x|-sum/|x−y|-sum ops (silent 0);
@@ -31,8 +43,8 @@ All notable changes to Mercury are documented here. The format is loosely based 
   SFU/serial-softmax-bound (2× occupancy = 1.03× wash).
 - **End-to-end model bench hardened**: two full-peer rounds (C, `-ffast-math` C, PyTorch eager
   1-thread/all-threads), all cross-checks <2e-6, interp gate + serial==@parallel bit-exact:
-  ~20–21× C(gcc), parity vs torch-1T (up to 1.21× faster @S=512), behind all-threads torch
-  multicore (1.05–2.5×, thermal-dependent).
+  ~19–21× C(gcc), parity vs torch-1T (up to 1.49× faster @S=512), behind all-threads torch
+  multicore — post-2D-GEMM a stable ~1.1× @S=512 and 1.5–1.9× @S=128 (see the 2D bullet above).
 
 ### Performance — close-the-NVIDIA-gap campaign (vs the vendor libraries)
 - **CPU GEMM to oneMKL parity** (`perf/cpu-library-grade`): size-adaptive `select_kc(k)` + a private

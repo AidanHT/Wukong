@@ -106,9 +106,9 @@ negative results**, live in [`prompts/results/`](prompts/results/).
 
 | Slice | Peer | Standing | Honest residual gap |
 |---|---|---|---|
-| CPU GEMM | oneMKL | 1-core **93–104%** @256–1024³, **83–95%** @2048–4096³; `@parallel` **86–129%** of all-threads @≥2048³ (127% on 2026-07-08) | mid-size `@parallel` **~46–72%** @512–1024³ (MKL-all itself swings ~1.4× across sessions; 3 scheduling levers refuted by adjacent A/B — the residual is MKL's 2D per-thread-L2 decomposition) |
+| CPU GEMM | oneMKL | 1-core **93–104%** @256–1024³, **83–95%** @2048–4096³; `@parallel` **86–129%** of all-threads @≥2048³ (127% on 2026-07-08) and **~66–69%** @512–1024³ since the BLIS-style **2D block-parallel path** shipped as default (per-thread L2-resident C blocks, no barriers; adjacent-run ABBA **1.26–1.65×** over the old row-panel path; was ~46–72%, now power-state-stable — 66/68% throttled, 66/69% cool) | mid-size `@parallel` still ~30% behind MKL-all @512–1024³ (MKL-all itself swings ~1.4× across sessions — ratios same-run only); 256³ stays deliberately serial (below the threading-payoff gate) at ~39% of MKL-all — worth re-probing under the lower-overhead 2D path |
 | CPU vmath | oneMKL VML | **tanh 2.4–3× FASTER**, log **1.14×** slower, exp **1.05× faster (cool) – ~1.3× (throttled)** — the former ~1.7–2× loss closed by 8-bucket in-register-LUT exp/log rewrites (2026-07-08; exp ~1.3 ULP, log ≤6.9e-7, exhaustively swept) | exp is FMA-port-bound, so heavy thermal throttle still shows a ~1.3× gap; VML-HA is ~0.5 ULP vs Mercury's ~1–2 ULP (both inside every gate) |
-| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU eager + gcc C | **~20–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; **parity vs torch 1-thread** (0.93–1.07× @S=128, **1.08–1.21× faster @S=512**); interp gate bit-exact, serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | all-threads eager torch wins multicore 1.05–2.5× (thermal-dependent) — Mercury's @parallel scaling at model shapes (1.5–2.1×) is the same mid-size parallel-efficiency gap as the GEMM row |
+| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU eager + gcc C | **~19–21× C(gcc), 3.1–5.1× C(-ffast-math)** 1-core; **parity vs torch 1-thread** (0.93–1.27× @S=128, **1.08–1.49× faster @S=512**); interp gate bit-exact, serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | all-threads eager torch still wins multicore, but post-2D-GEMM the gap is **stable at ~1.1× @S=512** (1.07/1.10× in the two confirmation rounds; was 1.05–2.5× thermal-dependent) and 1.5–1.9× @S=128; model @parallel scaling rose from ~1.5–2.1× to **1.9–3.8×** |
 | fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~87–90%** @2048³, **~83%** @4096³ (past the prior 77% `mma.sync` ceiling) | 4096³ residual is SASS-level; occupancy/pipeline/prefetch levers all measured losses |
 | int8/fp8 GEMM | cuBLAS IMMA / cuBLASLt | int8 **96–105%** @2048³ (**beats IMMA**), 86–88% @1024³; **fused GEMM+dequant 1.1–2.2×** the cuBLAS chain; fp8 82–151% of cuBLASLt | int8 ~70% @4096³ (HBM-bound) |
 | Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 — **now the production D=128 dispatch** (was an unshipped bench kernel; D=128 previously fell back to f32 flash) | non-causal long-S (≥2048) 0.37–0.66× cuDNN; a clean occupancy probe (2026-07-08: single-buffered 2× occupancy = 1.03× wash) pins it as SFU/serial-softmax-bound — the only live lever is FA2-style warp specialization |
@@ -451,6 +451,11 @@ re-allocated per K-block).
 † At 256³ the parallel kernel deliberately falls back to the serial one: ~17M MACs is below the
 work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
 there (a measured fix — naive threading at that size was a net *loss*).
+
+*2026-07-08 note*: the `Mer @parallel` ranges above predate the **2D block-parallel path** (now the
+default), which A/B-measured **1.65× @512³ and 1.26× @1024³** over the path that produced them —
+absolute GFLOP/s swing ~3× with this laptop's power state, so the ranges are not re-baselined from a
+throttled day; the same-run vs-MKL ratios in the library table above are the current standing.
 
 ### `nn.Linear` `C = A·Bᵀ` — Mercury dispatches to GEMM; naive C is latency-bound
 
