@@ -16920,10 +16920,22 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Select(mzero, zero, scaled))
     }
 
-    /// The exp polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Range-reduces `x` to
-    /// `r = x - n*ln2`, evaluates a degree-5 minimax poly for `e^r`, then scales by `2^n` (assembled
-    /// from the IEEE-754 exponent bits). Every step is a primitive op the two backends already agree
-    /// on bit-for-bit, so `exp` does too.
+    /// The exp core in `f32` (`fty` is `f32` or a `Vec` of `f32`): the 8-bucket table reduction,
+    /// mirroring the runtime kernel `exp1`/`exp8` **value-for-value** (the documented consistency
+    /// promise). `n = round(x·8/ln2)` by the add-magic trick; the biased integer `m = n + 127·8`
+    /// drops straight out of the magic-sum's bits (`bits(t) − MBIAS` — `t` sits in the
+    /// [2^23, 2^24) binade where ULP = 1, so no float→int convert is needed); `r = x − n·(ln2/8)`
+    /// by the exact-/8 Cody-Waite pair; `e^r` is the 3-FMA cubic. Bits 2..0 of `m` pick the
+    /// bucket: the kernel does that lookup with one in-register `vpermps`, which MIR has no op
+    /// for — so here it is a 3-level `Select` tree on the three index bits picking among the same
+    /// 8 f32 constants (exactly `emit_log_f32`'s route): not the same instruction, but bit-for-bit
+    /// the same *value* on every lane. The 2^e reconstruction is `max(m, 0)` (a `Slt`+`Select`,
+    /// the kernel's `pmaxsd` — it flushes the e ≤ −127 underflow band to +0.0, keeping
+    /// exp(EXP_LO) = +0.0 exactly) followed by the shift-free spelling `(m & ~7)·2^20`
+    /// (= `(m >> 3) << 23` for the nonnegative post-max value; `Mul` keeps both operands vector,
+    /// the same Cranelift dodge the old code used for `<< 23`, and (254·8)·2^20 < 2^31 never
+    /// overflows). Every step is a primitive op both backends agree on bit-for-bit, so `exp`
+    /// does too.
     fn emit_exp_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
         let lanes = match fty {
             MirType::Vec(_, n) => Some(*n),
@@ -16935,7 +16947,7 @@ impl FnLowerer<'_> {
         };
         let mty = mask_ty(fty);
 
-        // Clamp so 2^n stays representable (exp under/overflows to 0 / +inf outside this range).
+        // Clamp so 2^e stays representable (exp under/overflows to 0 / saturation outside).
         let hi = self.splat_const_f(EXP_HI, fty);
         let gt = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Fogt, x, hi));
         let x = self.builder.build(fty.clone(), Op::Select(gt, hi, x));
@@ -16943,69 +16955,94 @@ impl FnLowerer<'_> {
         let lt = self.builder.build(mty.clone(), Op::Cmp(CmpOp::Folt, x, lo));
         let x = self.builder.build(fty.clone(), Op::Select(lt, lo, x));
 
-        // n = round(x * log2(e)) via the add-magic / sub-magic trick: round-to-nearest-even in
+        // n = round(x·8/ln2) via the add-magic / sub-magic trick: round-to-nearest-even in
         // pure f32, so both backends agree and no rounding-mode instruction is needed.
-        let log2e = self.splat_const_f(LOG2EF, fty);
+        let scale = self.splat_const_f(EXP_TBL_SCALE, fty);
         let magic = self.splat_const_f(EXP_MAGIC, fty);
-        let t = self.builder.build(fty.clone(), Op::Fma(x, log2e, magic));
+        let t = self.builder.build(fty.clone(), Op::Fma(x, scale, magic));
         let n = self
             .builder
             .build(fty.clone(), Op::Bin(BinOp::FSub, t, magic));
 
-        // r = x - n*ln2, with ln2 split into hi/lo parts for extra precision (two fmas).
-        let neg_c1 = self.splat_const_f(-EXP_C1, fty);
-        let neg_c2 = self.splat_const_f(-EXP_C2, fty);
+        // m = bits(t) − (bits(MAGIC) − 127·8) = n + 1016 — the bucket bits and the pre-biased
+        // exponent in one integer subtract.
+        let bits = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, t, ity.clone()));
+        let mb = self.splat_const_i(EXP_TBL_MBIAS, &ity);
+        let m = self.builder.build(ity.clone(), Op::Bin(BinOp::Sub, bits, mb));
+
+        // r = x − n·(ln2/8), with the /8 split ln2 hi/lo pair (two fmas; n·C1 is exact).
+        let neg_c1 = self.splat_const_f(-EXP_TBL_C1, fty);
+        let neg_c2 = self.splat_const_f(-EXP_TBL_C2, fty);
         let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c1, x));
         let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c2, r));
 
-        // Degree-5 minimax polynomial for e^r on the reduced range, in **Estrin form** (mirrors the
-        // runtime kernel `exp1`/`exp8` op-for-op — the documented consistency promise): three
-        // independent pair-fmas qᵢ = P₂ᵢ·r + P₂ᵢ₊₁, then two r²-combines ((q0·r²+q1)·r²+q2) — the
-        // same polynomial and op count (r² feeds the e^r reconstruction anyway) at a 3-FMA critical
-        // path instead of Horner's 5, so the native FMA ports stay fed. Estrin only *reassociates*
-        // (≤~1 ULP vs Horner, the reassociated-reduction doctrine); both backends run this same op
-        // sequence, so they still agree bit-for-bit.
-        let r2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, r, r));
-        let p0c = self.splat_const_f(EXP_P[0], fty);
-        let p1c = self.splat_const_f(EXP_P[1], fty);
-        let q0 = self.builder.build(fty.clone(), Op::Fma(p0c, r, p1c));
-        let p2c = self.splat_const_f(EXP_P[2], fty);
-        let p3c = self.splat_const_f(EXP_P[3], fty);
-        let q1 = self.builder.build(fty.clone(), Op::Fma(p2c, r, p3c));
-        let p4c = self.splat_const_f(EXP_P[4], fty);
-        let p5c = self.splat_const_f(EXP_P[5], fty);
-        let q2 = self.builder.build(fty.clone(), Op::Fma(p4c, r, p5c));
-        let p = self.builder.build(fty.clone(), Op::Fma(q0, r2, q1));
-        let p = self.builder.build(fty.clone(), Op::Fma(p, r2, q2));
-        // e^r = p*r^2 + r + 1
-        let p = self.builder.build(fty.clone(), Op::Fma(p, r2, r));
-        let one = self.splat_const_f(1.0, fty);
-        let p = self
-            .builder
-            .build(fty.clone(), Op::Bin(BinOp::FAdd, p, one));
+        // The three bucket-index bits of m (b0 = bit 0 … b2 = bit 2), each as a `!= 0` mask.
+        let zero_i = self.splat_const_i(0, &ity);
+        let bit_mask = |this: &mut Self, bit: i128| {
+            let c = this.splat_const_i(bit, &ity);
+            let and = this.builder.build(ity.clone(), Op::Bin(BinOp::And, m, c));
+            this.builder
+                .build(mty.clone(), Op::Cmp(CmpOp::Ne, and, zero_i))
+        };
+        let b0 = bit_mask(self, 1);
+        let b1 = bit_mask(self, 2);
+        let b2 = bit_mask(self, 4);
 
-        // 2^n by assembling the IEEE-754 exponent field: bitcast((n + 127) << 23).
-        let ni = self
+        // T[j] as a 3-level select tree: level 0 splits on b0 (pairs), then b1, then b2 — exactly
+        // the value `vpermps` produces from the same 3 bits in the runtime kernel.
+        let consts: Vec<ValueId> = EXP_TBL_T
+            .iter()
+            .map(|&v| self.splat_const_f(v, fty))
+            .collect();
+        let s01 = self
             .builder
-            .build(ity.clone(), Op::Cast(CastKind::FpToSi, n, ity.clone()));
-        let bias = self.splat_const_i(127, &ity);
-        let biased = self
+            .build(fty.clone(), Op::Select(b0, consts[1], consts[0]));
+        let s23 = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::Add, ni, bias));
-        // `<< 23` written as `* 2^23`: keeps both Bin operands the same (vector) type. Cranelift's
-        // vector `ishl` requires a *scalar* shift amount, but `imul` takes two vectors; since
-        // `n + 127 <= 254` the product never overflows i32, so it equals the shift bit-for-bit.
-        let pow = self.splat_const_i(8_388_608, &ity);
+            .build(fty.clone(), Op::Select(b0, consts[3], consts[2]));
+        let s45 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[5], consts[4]));
+        let s67 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[7], consts[6]));
+        let s0123 = self.builder.build(fty.clone(), Op::Select(b1, s23, s01));
+        let s4567 = self.builder.build(fty.clone(), Op::Select(b1, s67, s45));
+        let tj = self.builder.build(fty.clone(), Op::Select(b2, s4567, s0123));
+
+        // e^r ≈ ((P3·r + P2)·r + 1)·r + 1 — three FMAs, mirroring the kernel op-for-op.
+        let p3c = self.splat_const_f(EXP_TBL_P3, fty);
+        let p2c = self.splat_const_f(EXP_TBL_P2, fty);
+        let one = self.splat_const_f(1.0, fty);
+        let q = self.builder.build(fty.clone(), Op::Fma(r, p3c, p2c));
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q, one));
+        let p = self.builder.build(fty.clone(), Op::Fma(r, q, one));
+
+        // 2^e: mc = max(m, 0) (the kernel's pmaxsd — flushes e ≤ −127 to +0.0), then
+        // (mc & ~7)·2^20 == (mc >> 3) << 23 with vector-legal ops only.
+        let neg = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Slt, m, zero_i));
+        let mc = self.builder.build(ity.clone(), Op::Select(neg, zero_i, m));
+        let low3 = self.splat_const_i(-8, &ity); // 0xFFFF_FFF8: clears the bucket bits
+        let mhi = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, mc, low3));
+        let pow = self.splat_const_i(1_048_576, &ity); // 2^20
         let shifted = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::Mul, biased, pow));
+            .build(ity.clone(), Op::Bin(BinOp::Mul, mhi, pow));
         let pow2 = self.builder.build(
             fty.clone(),
             Op::Cast(CastKind::Bitcast, shifted, fty.clone()),
         );
 
+        // T[j]·p first (both near 1), the exact power-of-two scale last — the kernel's order.
+        let tp = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, tj, p));
         self.builder
-            .build(fty.clone(), Op::Bin(BinOp::FMul, p, pow2))
+            .build(fty.clone(), Op::Bin(BinOp::FMul, tp, pow2))
     }
 
     /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
@@ -23351,21 +23388,39 @@ fn mask_ty(ty: &MirType) -> MirType {
     }
 }
 
-// `exp` polynomial constants (Cephes single-precision `expf`), evaluated in f32 by both backends.
-const LOG2EF: f64 = std::f64::consts::LOG2_E;
+// `exp` constants: the 8-bucket table reduction (mirrors `mercury_runtime`'s `vmath::exp1`/`exp8`
+// value-for-value — see the algorithm write-up there). `n = round(x·8/ln2)` by the add-magic
+// trick; `n = 8e + j` splits into the bucket `j = n & 7` (T[j] = 2^(j/8), 8 f32 constants) and
+// the exponent `e = n >> 3`; `r = x − n·(ln2/8)` by the exact /8 of the shared `EXP_C1`/`EXP_C2`
+// Cody-Waite ln2 split (n·(EXP_C1/8) is exact for |n| ≤ 2047 — the runtime's
+// `vmath_exp_tables_consistent` test proves it); `e^r` is the 3-FMA cubic with the
+// Chebyshev-shifted r² coefficient. Every f64 literal here either computes the same f64 the
+// runtime kernel casts from, or is the exact decimal of its f32 constant, so `splat_const_f`'s
+// f64→f32 rounding reproduces those bits identically.
 const EXP_MAGIC: f64 = 12582912.0; // 1.5 * 2^23 — round-to-nearest via add then sub
-const EXP_C1: f64 = 0.693359375; // ln2, high part
+const EXP_C1: f64 = 0.693359375; // ln2, high part (log's k·ln2 reconstruction; exp splits it /8)
 const EXP_C2: f64 = -2.1219444e-4; // ln2, low correction
 const EXP_HI: f64 = 88.3762626647949;
 const EXP_LO: f64 = -88.3762626647949;
-const EXP_P: [f64; 6] = [
-    1.98756915e-4,
-    1.3981999507e-3,
-    8.3334519073e-3,
-    4.1665795894e-2,
-    1.6666665459e-1,
-    5.0000001201e-1,
+const EXP_TBL_SCALE: f64 = 8.0 / std::f64::consts::LN_2; // n = round(x·8/ln2)
+const EXP_TBL_C1: f64 = EXP_C1 / 8.0; // ln2/8 high — 0.086669921875, exact in both widths
+const EXP_TBL_C2: f64 = EXP_C2 / 8.0; // ln2/8 low — a /8 is exact, so f32(f64/8) == f32(f64)/8
+const EXP_TBL_MBIAS: i128 = 0x4B40_0000 - 1016; // bits(f32 EXP_MAGIC) − 127·8: m = bits(t)−MBIAS
+/// T[j] = 2^(j/8) rounded once to f32 (T[0] pinned exactly 1.0 → exp(0) = 1.0 exactly).
+const EXP_TBL_T: [f64; 8] = [
+    1.0,
+    1.0905077457427979,
+    1.1892070770263672,
+    1.2968395948410034,
+    1.4142135381698608,
+    1.5422108173370361,
+    1.6817928552627563,
+    1.8340080976486206,
 ];
+/// `e^r ≈ ((P3·r + P2)·r + 1)·r + 1` on |r| ≤ ln2/16: P3 = 1/6; P2 = 1/2 + (√2−1)/12·(ln2/16)²
+/// — the Chebyshev shift of the r² coefficient that absorbs the even r⁴/24 truncation term.
+const EXP_TBL_P2: f64 = 0.5000647902488708;
+const EXP_TBL_P3: f64 = 1.0 / 6.0; // rounds f64→f32 to the same bits as the runtime's f32 1/6
 
 /// Natural-log constants: the 8-bucket table reduction (mirrors `mercury_runtime`'s
 /// `vmath::log1`/`log8` value-for-value — see the algorithm write-up there). `x = z·2^k` with
