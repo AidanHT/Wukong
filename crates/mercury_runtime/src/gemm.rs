@@ -72,14 +72,41 @@ fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
         if physical >= rayon::current_num_threads() {
             return None; // no HyperThreads to shed (or single pool already this small)
         }
-        rayon::ThreadPoolBuilder::new()
+        let mut b = rayon::ThreadPoolBuilder::new()
             .num_threads(physical)
-            .thread_name(|i| format!("mercury-gemm-{i}"))
-            .build()
-            .ok()
+            .thread_name(|i| format!("mercury-gemm-{i}"));
+        // A/B probe (`MERCURY_GEMM_AFFINITY=1`): pin worker i to one logical CPU — i<6 to the
+        // P-cores' primary siblings (logical 2i on this 6P+8E+2LPE part), the rest to the E/LP-E
+        // CPUs (6+i). MEASURED 25–35% SLOWER than free migration (ABBA adjacent runs, stable
+        // serial baseline): Windows' scheduler + Thread Director places better than static pins
+        // on this hybrid. Kept, off by default, purely as the recorded instrument so the negative
+        // stays reproducible — do not flip this on expecting an MKL-style KMP_AFFINITY win.
+        if std::env::var("MERCURY_GEMM_AFFINITY").is_ok_and(|v| v == "1") {
+            b = b.start_handler(|i| pin_worker_to_cpu(if i < 6 { 2 * i } else { 6 + i }));
+        }
+        b.build().ok()
     })
     .as_ref()
 }
+
+/// Pin the calling worker thread to one logical CPU (Windows; no-op elsewhere). Scheduling-only:
+/// affects which core runs a worker, never what it computes.
+#[cfg(windows)]
+fn pin_worker_to_cpu(cpu: usize) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadAffinityMask(h: isize, mask: usize) -> usize;
+    }
+    if cpu < usize::BITS as usize {
+        // SAFETY: plain affinity syscall on the current thread handle.
+        unsafe {
+            SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu);
+        }
+    }
+}
+#[cfg(not(windows))]
+fn pin_worker_to_cpu(_cpu: usize) {}
 
 // A mid-size-regime pool with fewer workers (physical/2, "shed the E/LP-E stragglers") was tried
 // here and MEASURED SLOWER on the P+E dev box (adjacent same-run sweep, gemm_scaling example,
@@ -1048,6 +1075,15 @@ unsafe impl Sync for GemmRegion {}
 /// ```
 ///
 /// so a 512³ call pays 1 broadcast fork-join + 3 barrier waits instead of 4 full fork-joins.
+///
+/// **Measured standing (honesty note):** adjacent A/B against the fork-join path
+/// (`MERCURY_GEMM_FORKJOIN=1`, gemm_scaling, both orderings) is a **wash** — whichever config runs
+/// first wins by more than any real delta, so the fork-join tax is NOT the dominant mid-size loss
+/// this design targeted. Kept because it is structurally cheaper (1 wake per call, not 4+) with no
+/// measured regression; three sibling hypotheses for the 512³-vs-MKL gap are now all refuted by
+/// adjacent measurement (smaller pool: slower; this region fusion: wash; hard worker pinning
+/// `MERCURY_GEMM_AFFINITY=1`: 25–35% SLOWER). The residual gap vs threaded MKL at 512³ is its
+/// mid-size parallel *algorithm* (per-thread L2-blocked 2D C ownership), not our scheduling.
 ///
 /// **Why a barrier under `broadcast` is sound** (and would deadlock under `scope`/`spawn`):
 /// `broadcast` runs **exactly one closure instance on every pool worker** (rayon-core injects
