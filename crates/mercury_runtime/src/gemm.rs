@@ -88,6 +88,17 @@ fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
 // Work-stealing over the many row-panel tasks absorbs the slow cores; shrinking the pool just
 // discards their throughput. Don't re-add a thread-count regime without new adjacent-run evidence.
 
+/// A/B kill-switch (`MERCURY_GEMM_FORKJOIN=1`, read once): route the parallel GEMM through the
+/// legacy per-block fork-join shape ([`sgemm_avx2_parallel`]) instead of the persistent broadcast
+/// region ([`sgemm_persistent_region`]), so the region win stays measurable adjacent-run on any
+/// machine — the same instrument discipline as `MERCURY_PACK_SPLIT_REGIONS` (see [`pack_ab_par`]).
+#[cfg(target_arch = "x86_64")]
+fn gemm_forkjoin() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("MERCURY_GEMM_FORKJOIN").is_ok_and(|v| v == "1"))
+}
+
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
 /// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
@@ -109,9 +120,10 @@ unsafe impl Send for GemmArgs {}
 
 #[cfg(target_arch = "x86_64")]
 impl GemmArgs {
-    /// Run the parallel kernel from this bundle. Taking `self` by value forces a closure that calls it
-    /// to capture the whole (`Send`) `GemmArgs`, not the individual `!Send` raw-pointer fields that
-    /// edition-2021 disjoint capture would otherwise grab.
+    /// Run the **legacy fork-join** parallel kernel from this bundle (the `MERCURY_GEMM_FORKJOIN=1`
+    /// instrument path; the default is [`sgemm_persistent_region`]). Taking `self` by value forces a
+    /// closure that calls it to capture the whole (`Send`) `GemmArgs`, not the individual `!Send`
+    /// raw-pointer fields that edition-2021 disjoint capture would otherwise grab.
     ///
     /// # Safety
     /// Same operand-size contract as [`sgemm_avx2_parallel`]; AVX2/FMA must be available.
@@ -358,17 +370,30 @@ unsafe fn gemm_dispatch(
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 match (par, gemm_pool()) {
-                    // Parallel, with a private physical-core pool: run the whole kernel inside it so
-                    // its nested `into_par_iter`s (pack + compute) use physical-core workers, not the
-                    // default logical-core pool. The args cross the `install` boundary via `GemmArgs`
-                    // (Send-wrapped); the closure runs to completion before `install` returns.
-                    (true, Some(pool)) => {
+                    // Parallel: ONE persistent parallel region per call (`sgemm_persistent_region`)
+                    // — the pool (the private physical-core one when it exists, else the caller's
+                    // default pool) is entered once via `broadcast`, and the block schedule
+                    // synchronizes with lightweight in-region barriers instead of paying a full
+                    // fork-join per pack/compute region per K-block. `MERCURY_GEMM_FORKJOIN=1`
+                    // (read once) routes to the legacy fork-join shape unchanged so the region win
+                    // stays A/B-measurable adjacent-run.
+                    (true, pool) => {
                         let args = GemmArgs { a, b, c, m, k, n, beta, bt, epi };
-                        // `args.run()` moves the whole bundle, so the closure captures the `Send`
-                        // `GemmArgs` rather than its `!Send` fields (edition-2021 disjoint capture).
-                        pool.install(move || args.run());
+                        if gemm_forkjoin() {
+                            match pool {
+                                // Legacy: run the whole fork-join kernel inside the private pool so
+                                // its nested `into_par_iter`s (pack + compute) use physical-core
+                                // workers, not the default logical-core pool. `args.run()` moves the
+                                // whole bundle, so the closure captures the `Send` `GemmArgs` rather
+                                // than its `!Send` fields (edition-2021 disjoint capture); the
+                                // closure runs to completion before `install` returns.
+                                Some(p) => p.install(move || args.run()),
+                                None => args.run(),
+                            }
+                        } else {
+                            sgemm_persistent_region(pool, args);
+                        }
                     }
-                    (true, None) => sgemm_avx2_parallel(a, b, c, m, k, n, beta, bt, epi),
                     (false, _) => sgemm_avx2(a, b, c, m, k, n, beta, bt, epi),
                 }
             }
@@ -868,6 +893,12 @@ pub unsafe extern "C" fn mercury_sgemm_f16_tn_parallel(
     gemm_lowp_tn(a, b, c, m, k, n, beta, true, crate::f16_bits_to_f32);
 }
 
+/// The **legacy fork-join** parallel kernel: one rayon fork-join for the fused pack region plus one
+/// for the compute region, per K-block, per NC-block. Kept byte-identical behind
+/// `MERCURY_GEMM_FORKJOIN=1` (see [`gemm_forkjoin`]) as the adjacent-run A/B instrument for the
+/// persistent-region shape ([`sgemm_persistent_region`]), which replaces those per-block fork-joins
+/// — each of which re-wakes parked workers and pays a join-straggler tax on this hybrid P/E-core
+/// box — with one `broadcast` region per call and in-region barriers.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -971,6 +1002,241 @@ unsafe fn sgemm_avx2_parallel(
                 }
             });
             pc += kc;
+        }
+        jc += NC;
+    }
+}
+
+/// Shared state of one persistent GEMM region, referenced by every broadcast worker. The raw
+/// pointers cross thread boundaries by design; see the `Sync` impl for the aliasing argument.
+#[cfg(target_arch = "x86_64")]
+struct GemmRegion {
+    args: GemmArgs,
+    /// Pack scratch (call-lifetime: the broadcast joins before the owning `Vec`s drop).
+    ap: *mut f32,
+    bp: *mut f32,
+    /// Per-(jc,pc)-block claim counters: `.0` hands out pack-panel indices over the combined A+B
+    /// panel space, `.1` hands out C row-panel (`ip`) indices. One fresh pair per block — cheaper
+    /// and simpler than resetting two shared counters, which would need its *own* barrier to order
+    /// the reset against the previous phase's overshooting `fetch_add` stragglers.
+    counters: Vec<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>,
+    /// In-region phase barrier, sized to the exact broadcast width (asserted before first use).
+    barrier: std::sync::Barrier,
+    nworkers: usize,
+}
+// SAFETY: shared across the broadcast workers by reference. Every mutable target is written by
+// exactly one worker per phase — packed panels and C row-panels are claimed via `fetch_add` (unique
+// indices) and are disjoint — and the barrier orders all pack writes before any compute read. This
+// is the same aliasing discipline the fork-join kernel has always used; it smuggled the very same
+// pointers across its rayon closures as `usize`.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for GemmRegion {}
+
+/// One **persistent parallel region per GEMM call** — the GotoBLAS structure. The legacy shape
+/// ([`sgemm_avx2_parallel`]) pays one rayon fork-join for the fused pack region plus one for the
+/// compute region, per K-block, per NC-block — at 512³ that is 2 K-blocks × 2 regions = 4 full
+/// fork-joins per call, and each one re-wakes parked workers and eats a join straggler tax on this
+/// hybrid 6P+8E+2LPE pool (measured same-run: parallel scaling stuck at ~1.7×-vs-serial at 512³
+/// while MKL scales ~3.7×). Here the pool is entered ONCE via `ThreadPool::broadcast` and the same
+/// serial jc/pc block schedule runs *inside* the region on every worker, phase-separated by a
+/// lightweight in-region [`std::sync::Barrier`]:
+///
+/// ```text
+/// per block:  pack   — claim A+B panels off an atomic counter        → barrier
+///             compute — claim C row-panels off a second counter      → barrier
+///             (the final block's trailing barrier is elided: the broadcast join is that sync)
+/// ```
+///
+/// so a 512³ call pays 1 broadcast fork-join + 3 barrier waits instead of 4 full fork-joins.
+///
+/// **Why a barrier under `broadcast` is sound** (and would deadlock under `scope`/`spawn`):
+/// `broadcast` runs **exactly one closure instance on every pool worker** (rayon-core injects
+/// `num_threads` jobs, one into each worker's dedicated broadcast queue, and its join latch counts
+/// all of them), so a barrier sized to that width always has every participant scheduled on its own
+/// thread — plain scope/spawn tasks can be executed serially on fewer workers by work-stealing, and
+/// a barrier would then wait on a participant that can never start. Two further rayon-core facts
+/// close the argument: (a) `inject_broadcast` pushes under a single registry-wide mutex into
+/// per-worker FIFO queues, so concurrent broadcasts land in the SAME order on every worker — two
+/// racing barrier-broadcasts cannot interleave in opposite orders on different workers and
+/// cross-deadlock; (b) a worker drains its broadcast queue both when idle and while latch-waiting
+/// inside other rayon work (`wait_until_cold` → `take_local_job`), so every participant eventually
+/// arrives even on a busy pool.
+///
+/// **Bit-exactness:** the jc/pc schedule, `kc` grouping, `beta_eff` accumulate rule, final-K-block
+/// epilogue rule, packed panel bytes, and each tile's `micro_6x16` sweep are identical to the
+/// serial kernel — the atomics only change *which worker* handles a given (disjoint) panel, which
+/// no result byte depends on. serial == parallel bit-for-bit, exactly as before (pinned by
+/// `sgemm_persistent_region_matches_serial` and the differential gate).
+///
+/// # Safety
+/// Operand-size contract of [`sgemm_avx2_parallel`]; AVX2/FMA must be available (verified by
+/// [`gemm_dispatch`]).
+#[cfg(target_arch = "x86_64")]
+unsafe fn sgemm_persistent_region(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
+    use std::sync::atomic::AtomicUsize;
+    let (m, k, n) = (args.m, args.k, args.n);
+    // Barrier width must equal broadcast width. `Some(pool)` broadcasts on the private pool (its
+    // thread count is fixed at construction); `None` falls back to the free-function broadcast,
+    // which lands on the caller's current pool (the global one when called from outside any pool)
+    // — the same registry `rayon::current_num_threads()` reads, so the two always agree. A
+    // mismatch would hang the barrier, so it is also asserted per-worker before the first wait.
+    let nworkers = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
+    // Pack scratch allocated once per call and reused across every block, exactly as the fork-join
+    // shape does (each block's pack fully overwrites the region it owns, padding included).
+    let ap_cap = round_up(m, MR) * k.min(KC);
+    let bp_cap = round_up(n.min(NC), NR) * k.min(KC);
+    let mut ap = vec![0.0f32; ap_cap];
+    let mut bp = vec![0.0f32; bp_cap];
+    // The jc/pc schedule is a pure function of (m, k, n): every worker walks it identically, so
+    // the block count — and each block's fresh counter pair — is known up front.
+    let nblocks = n.div_ceil(NC) * k.div_ceil(select_kc(k));
+    let region = GemmRegion {
+        args,
+        ap: ap.as_mut_ptr(),
+        bp: bp.as_mut_ptr(),
+        counters: (0..nblocks)
+            .map(|_| (AtomicUsize::new(0), AtomicUsize::new(0)))
+            .collect(),
+        barrier: std::sync::Barrier::new(nworkers),
+        nworkers,
+    };
+    let worker = |ctx: rayon::BroadcastContext<'_>| {
+        // A width mismatch must fail loudly, not hang the barrier. Both sides are per-call
+        // constants, uniform across workers — either every instance panics or none does, so no
+        // worker is ever left waiting on a sibling that panicked before reaching the barrier.
+        assert_eq!(
+            ctx.num_threads(),
+            region.nworkers,
+            "gemm broadcast width != barrier width"
+        );
+        // SAFETY: avx2+fma verified by `gemm_dispatch`; `region`'s pointers stay valid for the
+        // whole broadcast (it joins before `ap`/`bp` drop below).
+        unsafe { gemm_region_worker(&region, ctx.index()) };
+    };
+    match pool {
+        Some(p) => {
+            p.broadcast(worker);
+        }
+        None => {
+            rayon::broadcast(worker);
+        }
+    }
+}
+
+/// One broadcast worker's walk of the whole block schedule (see [`sgemm_persistent_region`]). All
+/// workers run this same function with the same (m,k,n)-derived loop bounds; the per-block atomics
+/// distribute panels, and `Barrier::wait` — a synchronizing operation — publishes every pack write
+/// before any compute read (which is why `Relaxed` suffices on the claim counters: they only need
+/// unique indices, not ordering).
+///
+/// # Safety
+/// Called only from [`sgemm_persistent_region`]'s broadcast; avx2+fma available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (a, b, c) = (rg.args.a, rg.args.b, rg.args.c);
+    let (m, k, n) = (rg.args.m, rg.args.k, rg.args.n);
+    let (beta, bt, epi) = (rg.args.beta, rg.args.bt, rg.args.epi);
+    let (ap, bp) = (rg.ap, rg.bp);
+    let mut block = 0usize;
+    let mut jc = 0;
+    while jc < n {
+        let nc = (n - jc).min(NC);
+        let mut pc = 0;
+        while pc < k {
+            let kc = (k - pc).min(select_kc(k));
+            // First K-block honors the caller's beta; later blocks accumulate the partials — and
+            // the epilogue folds into the C writeback on the FINAL K-block only. Identical rules,
+            // in identical `kc` grouping, to both existing kernels.
+            let beta_eff = if pc == 0 { beta } else { 1.0 };
+            let block_epi = if pc + kc == k { epi } else { None };
+            let (pack_ctr, comp_ctr) = &rg.counters[block];
+            let mpanels = m.div_ceil(MR);
+            let npanels = nc.div_ceil(NR);
+
+            // Phase 1 — pack this block's A column-panel + B row-panel, over the same combined
+            // A+B panel index space (and byte-gate) as the legacy `pack_ab_par`: below the
+            // threshold the copy is too small to amortize cross-core distribution, so worker 0
+            // packs both serially while the rest fall straight through to the barrier.
+            let total_bytes = (round_up(m, MR) + round_up(nc, NR)) * kc * 4;
+            if total_bytes < pack_par_min_bytes() {
+                if widx == 0 {
+                    pack_a(a.add(pc), k, m, kc, ap);
+                    pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp);
+                }
+            } else {
+                // Resolve B's base pointer + leading dim once (mirrors `pack_b_block`'s dispatch).
+                let (b_base, ldb) = if bt {
+                    (b.add(jc * k + pc), k)
+                } else {
+                    (b.add(pc * n + jc), n)
+                };
+                loop {
+                    let t = pack_ctr.fetch_add(1, Relaxed);
+                    if t >= mpanels + npanels {
+                        break;
+                    }
+                    // SAFETY: `fetch_add` hands each panel index to exactly one worker; panels
+                    // are disjoint. Same bytes regardless of who packs what.
+                    if t < mpanels {
+                        pack_a_panel(a.add(pc), k, m, kc, t, ap.add(t * kc * MR));
+                    } else {
+                        let jp = t - mpanels;
+                        let panel = bp.add(jp * kc * NR);
+                        if bt {
+                            pack_b_trans_panel(b_base, ldb, kc, nc, jp, panel);
+                        } else {
+                            pack_b_panel(b_base, ldb, kc, nc, jp, panel);
+                        }
+                    }
+                }
+            }
+            // Every pack write must be complete — and published — before any worker's compute
+            // reads the panels. This is the fork-join the broadcast region replaces, at the cost
+            // of one barrier wait instead of a full worker wake + join.
+            rg.barrier.wait();
+
+            // Phase 2 — compute: claim C row-panels dynamically (`fetch_add` = the same
+            // self-scheduling load balance work-stealing gave the fork-join shape; many more
+            // panels than workers absorbs this P/E hybrid's core-speed imbalance). Each claimed
+            // `ip` sweeps every column panel with the identical `micro_6x16` arguments and order
+            // the legacy kernel used, so per-(i,j) K-accumulation is untouched.
+            loop {
+                let ip = comp_ctr.fetch_add(1, Relaxed);
+                if ip >= mpanels {
+                    break;
+                }
+                let i0 = ip * MR;
+                let mrv = (m - i0).min(MR);
+                for jp in 0..npanels {
+                    let j0 = jp * NR;
+                    let nrv = (nc - j0).min(NR);
+                    // Bias base advanced to this tile's global column (jc + j0); `None` off the
+                    // final K-block — matches the serial path's double shift bit-for-bit.
+                    let tile_epi = block_epi.map(|e| e.shift(jc + j0));
+                    // SAFETY: disjoint C rows per claimed `ip`; shared read-only packed panels
+                    // (ordered by the barrier above); avx2 verified by the dispatcher.
+                    micro_6x16(
+                        kc,
+                        ap.add(ip * kc * MR),
+                        bp.add(jp * kc * NR),
+                        c.add(i0 * n + (jc + j0)),
+                        n,
+                        beta_eff,
+                        mrv,
+                        nrv,
+                        tile_epi,
+                    );
+                }
+            }
+            pc += kc;
+            block += 1;
+            // The next block's pack overwrites the shared panels, so compute must drain first.
+            // The FINAL block needs no trailing barrier: the broadcast's own join is that sync.
+            if block < rg.counters.len() {
+                rg.barrier.wait();
+            }
         }
         jc += NC;
     }
@@ -2347,6 +2613,90 @@ mod tests {
             );
         }
         assert_eq!(serial_nt, par_nt);
+    }
+
+    /// The persistent-broadcast-region parallel GEMM (one `ThreadPool::broadcast` per call with
+    /// in-region phase barriers — see [`sgemm_persistent_region`]) must be **bit-for-bit** identical
+    /// to the serial kernel, and so must the legacy fork-join shape it replaced (the
+    /// `MERCURY_GEMM_FORKJOIN=1` instrument path). Shapes exercise what the smaller
+    /// `sgemm_parallel_matches_serial` shape cannot: `n > NC = 4080` (two NC blocks → two full jc
+    /// iterations of the region schedule, the second with a non-NR-multiple `nc`), `k >
+    /// select_kc(k)` (multiple K-blocks → the mid-schedule barriers and the `beta_eff` accumulate
+    /// rule), a `k` whose equal-split leaves a thin remainder block (901 → 304+304+293), and an
+    /// MR-remainder `m`. Every shape trips `PAR_MIN_MACS` (asserted) so the public entry really
+    /// takes the parallel path. Both internal entries are called directly, making the test immune
+    /// to the process-wide `MERCURY_GEMM_FORKJOIN` OnceLock state; the public entry is checked too
+    /// (it routes to one of the two, and both must equal serial). The epilogue leg pins the
+    /// final-K-block-only bias+activation rule across multiple K *and* NC blocks — a per-block
+    /// epilogue bug would apply the bias three times over.
+    #[test]
+    fn sgemm_persistent_region_matches_serial() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            println!("no avx2/fma — skipping");
+            return;
+        }
+        for &(m, k, n) in &[(520usize, 900usize, 4200usize), (214, 901, 4160)] {
+            assert!((m * k * n) as u64 >= PAR_MIN_MACS, "shape must trip the parallel gate");
+            assert!(n > NC, "shape must span multiple NC blocks");
+            assert!(k > select_kc(k), "shape must span multiple K blocks");
+            let a = fill(71, m * k);
+            let b = fill(72, k * n);
+            let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            let mut serial = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, 0);
+            }
+            // Persistent region, called directly with the same pool selection gemm_dispatch uses.
+            let mut per = vec![0.0f32; m * n];
+            unsafe {
+                let args = GemmArgs {
+                    a: a.as_ptr(), b: b.as_ptr(), c: per.as_mut_ptr(),
+                    m, k, n, beta: 0.0, bt: false, epi: None,
+                };
+                sgemm_persistent_region(gemm_pool(), args);
+            }
+            assert_eq!(serial, per, "persistent region != serial (m{m} k{k} n{n})");
+            // Legacy fork-join path (what the MERCURY_GEMM_FORKJOIN=1 kill-switch routes to).
+            let mut fj = vec![0.0f32; m * n];
+            unsafe {
+                sgemm_avx2_parallel(a.as_ptr(), b.as_ptr(), fj.as_mut_ptr(), m, k, n, 0.0, false, None);
+            }
+            assert_eq!(serial, fj, "fork-join != serial (m{m} k{k} n{n})");
+            // Public entry: routes to whichever path the process env selected — must equal serial
+            // either way.
+            let mut public = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm_parallel(a.as_ptr(), b.as_ptr(), public.as_mut_ptr(), mi, ki, ni, 0);
+            }
+            assert_eq!(serial, public, "public parallel entry != serial (m{m} k{k} n{n})");
+        }
+        // Fused-epilogue leg: bias + ReLU on the nt form, across 3 K-blocks (uneven split) and 2 NC
+        // blocks, on both parallel shapes.
+        {
+            let (m, k, n) = (520usize, 901usize, 4200usize);
+            assert!((m * k * n) as u64 >= PAR_MIN_MACS && n > NC && k > select_kc(k));
+            let a = fill(73, m * k);
+            let b = fill(74, n * k);
+            let bias = fill(75, n);
+            let epi = Epilogue { bias: bias.as_ptr(), act: ACT_RELU, alpha: 1.0 };
+            let mut serial = vec![0.0f32; m * n];
+            let mut per = vec![0.0f32; m * n];
+            let mut fj = vec![0.0f32; m * n];
+            unsafe {
+                mercury_sgemm_nt_epi(
+                    a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(),
+                    m as i64, k as i64, n as i64, 0, bias.as_ptr(), ACT_RELU as i64,
+                );
+                let args = GemmArgs {
+                    a: a.as_ptr(), b: b.as_ptr(), c: per.as_mut_ptr(),
+                    m, k, n, beta: 0.0, bt: true, epi: Some(epi),
+                };
+                sgemm_persistent_region(gemm_pool(), args);
+                sgemm_avx2_parallel(a.as_ptr(), b.as_ptr(), fj.as_mut_ptr(), m, k, n, 0.0, true, Some(epi));
+            }
+            assert_eq!(serial, per, "persistent nt+epi != serial");
+            assert_eq!(serial, fj, "fork-join nt+epi != serial");
+        }
     }
 
     /// Probe (run: `cargo test -p mercury_runtime --release -- --ignored --nocapture epi_throughput`).
