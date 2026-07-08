@@ -17974,6 +17974,7 @@ fn recognize_matmul<'a>(
 ) -> Option<MatmulNest<'a>> {
     match_matmul(pat, iter, body, sema, interner)
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
+        .or_else(|| match_matmul_ijk_memacc(pat, iter, body, sema, interner))
 }
 
 // Fused-epilogue activation codes — must match `mercury_runtime`'s gemm kernel
@@ -18947,6 +18948,154 @@ fn match_matmul_ijk<'a>(
         b_off,
         c_off,
         alpha,
+    })
+}
+
+/// The **memory-accumulator** `ijk` form — the first matmul anyone writes, accumulating straight
+/// into the output element instead of a scalar temp:
+/// ```text
+///   for i { for j {
+///       c[i*N+j] = 0.0;
+///       for k { c[i*N+j] = c[i*N+j] + a[i*K+k]*b[k*N+j]; }   // or `c[…] += a*b`
+///   } }
+/// ```
+/// Identical scalar semantics to [`match_matmul_ijk`]'s `let s` form — the accumulator lives in
+/// memory instead of a register, but an f32 store/load round-trip is exact, so the k-ascending add
+/// chain is bit-for-bit the same sum; dispatching it to the same `mercury_sgemm*` kernel sits under
+/// the same documented reassociation doctrine (both backends call the identical kernel). Without
+/// this the nest fell through BOTH the GEMM recognizer AND the vectorizer (the loop-carried memory
+/// accumulate defeats it) to fully scalar code — a silent ~2-order-of-magnitude cliff on the most
+/// natural spelling. Strictness mirrors `match_matmul_ijk` exactly: the same product/stride/offset
+/// checks, plus the accumulate target must be structurally the SAME element the zero-init wrote
+/// (`exprs_struct_eq`), pinned to `c[i*N+j]` by `match_operand_row_col_off`. The zero-init is
+/// required (`beta = 0`); no α (the naive form has no scale).
+fn match_matmul_ijk_memacc<'a>(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &'a Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest<'a>> {
+    let row = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let m = as_dim(end, interner)?;
+    // Outer body is a single `for j` loop.
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
+    let jvar = match &jpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(jiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(je, interner)?;
+    // j body: [ c[i*N+j] = 0.0; for k { c[i*N+j] (+)= A*B } ].
+    if jbody.tail.is_some() || jbody.stmts.len() != 2 {
+        return None;
+    }
+    let StmtKind::Assign {
+        target: ct0,
+        op: ast::AssignOp::Assign,
+        value: zv,
+    } = &jbody.stmts[0].kind
+    else {
+        return None;
+    };
+    if !is_float_zero(zv, interner) {
+        return None;
+    }
+    // The K loop: `for k in 0..K { c[i*N+j] = c[i*N+j] + A*B; }` (or `+=`).
+    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
+    let kvar = match &kpat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (ks, ke) = range_bounds(kiter)?;
+    if as_int_lit(ks, interner)? != 0 {
+        return None;
+    }
+    let kdim = as_dim(ke, interner)?;
+    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+        return None;
+    };
+    // The accumulate target must be the very element the zero-init wrote.
+    if !exprs_struct_eq(target, ct0) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            // c[…] = c[…] + A*B (either addend order).
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if exprs_struct_eq(lhs, ct0) {
+                rhs
+            } else if exprs_struct_eq(rhs, ct0) {
+                lhs
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
+    // The output element `c[i*N + j (+ off)]` (or the shape-typed `c[i, j]`).
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct0, row, jvar, sema, interner)?;
+    // Same stride discipline as the `let s` form.
+    let sa_ok = if transposed_a { sa == m } else { sa == kdim };
+    let sb_ok = if transposed { sb == kdim } else { sb == n };
+    if !sa_ok || !sb_ok || sc != n {
+        return None;
+    }
+    let bound = [row, jvar, kvar];
+    if !offset_invariant(&a_off, &bound)
+        || !offset_invariant(&b_off, &bound)
+        || !offset_invariant(&c_off, &bound)
+    {
+        return None;
+    }
+    // An input aliasing the output is doubly disqualifying here: the accumulate WRITES `c` during
+    // the k sweep, so reading a `c`-aliased operand mid-sweep is not a matmul at all.
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    Some(MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta: 0,
+        transposed,
+        transposed_a,
+        a_off,
+        b_off,
+        c_off,
+        alpha: None,
     })
 }
 
