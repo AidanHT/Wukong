@@ -81,6 +81,53 @@ fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// Smaller pool for the mid-size parallel regime (see [`gemm_pool_for`]). At 512³–1024³ every
+/// fork-join waits for its slowest participant, and on a P+E hybrid that straggler is an E/LP-E
+/// core arriving late and computing slowly once there — the barrier tax grows with worker count
+/// while the compute win saturates once the fast cores are busy. Worker count from
+/// `MERCURY_GEMM_MID_THREADS` (read once; the A/B knob), defaulting to `physical/2` (min 4) —
+/// on the 6P+8E+2LPE dev box that is 8: the P-cores plus a little headroom, few enough that the
+/// slowest cores never gate a barrier. Thread distribution never changes the bits (row-split,
+/// fixed per-(i,j) K-order), so this is throughput-only. `None` ⇒ caller falls back to
+/// [`gemm_pool`].
+fn mid_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let physical = num_cpus::get_physical().max(1);
+        let nt = std::env::var("MERCURY_GEMM_MID_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or((physical / 2).max(4));
+        if nt >= physical {
+            return None; // nothing to shed — use the full physical pool
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .thread_name(|i| format!("mercury-gemm-mid-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+// Above this many MACs the kernel has enough compute per K-block to feed every physical core
+// past the barrier/straggler tax; below it the smaller `mid_pool` scales better. 2^31 puts
+// 512³ (2^27) and 1024³ (2^30) in the mid regime and 2048³ (2^33) on the full pool — the sizes
+// where each pool measured fastest against threaded oneMKL.
+const MID_MAX_MACS: u64 = 1 << 31;
+
+/// Regime-aware pool choice for one GEMM call: the mid-size pool below [`MID_MAX_MACS`], the full
+/// physical pool above. Pool choice affects scheduling only, never results (see [`mid_pool`]).
+fn gemm_pool_for(macs: u64) -> Option<&'static rayon::ThreadPool> {
+    if macs < MID_MAX_MACS {
+        if let Some(p) = mid_pool() {
+            return Some(p);
+        }
+    }
+    gemm_pool()
+}
+
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
 /// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
@@ -344,13 +391,14 @@ unsafe fn gemm_dispatch(
     // them. The serial AVX2 kernel is the fast path for everything smaller. The epilogue folds into
     // the per-tile writeback on the final K-block, so the parallel path carries it too (each C tile
     // is owned by exactly one task) — a `@parallel` fused FFN runs the bias+activation across cores.
-    let par = par && (m as u64 * n as u64 * k as u64) >= PAR_MIN_MACS;
+    let macs = m as u64 * n as u64 * k as u64;
+    let par = par && macs >= PAR_MIN_MACS;
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
-                match (par, gemm_pool()) {
+                match (par, gemm_pool_for(macs)) {
                     // Parallel, with a private physical-core pool: run the whole kernel inside it so
                     // its nested `into_par_iter`s (pack + compute) use physical-core workers, not the
                     // default logical-core pool. The args cross the `install` boundary via `GemmArgs`
@@ -900,10 +948,25 @@ unsafe fn sgemm_avx2_parallel(
                 Some(e) if is_last_k => (true, e.bias as usize, e.act, e.alpha),
                 _ => (false, 0usize, 0u32, 1.0f32),
             };
-            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) — in parallel, since with
-            // the C compute spread across every core the serial pack would dominate (Amdahl).
-            pack_a_par(a.add(pc), k, m, kc, ap.as_mut_ptr());
-            pack_b_block_par(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
+            // Pack the full A column-panel (m×kc) and B row-panel (kc×nc) — both in ONE parallel
+            // region (see `pack_ab_par`): with the C compute spread across every core a serial pack
+            // would dominate (Amdahl), but every extra fork-join is a real barrier tax at the mid
+            // sizes, so the A- and B-panels share a single region (and a tiny block packs serially).
+            pack_ab_par(
+                a.add(pc),
+                k,
+                m,
+                b,
+                k,
+                n,
+                pc,
+                jc,
+                kc,
+                nc,
+                bt,
+                ap.as_mut_ptr(),
+                bp.as_mut_ptr(),
+            );
 
             let mpanels = m.div_ceil(MR);
             let npanels = nc.div_ceil(NR);
@@ -1220,45 +1283,44 @@ unsafe fn pack_a(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) 
     }
 }
 
-// Below ~this many panels, rayon's task overhead outweighs the copy; pack serially instead.
-const PACK_PAR_THRESHOLD: usize = 16;
-
-/// Parallel A pack: each `MR`-row panel writes a disjoint `[kc·MR]` region, so pack them across cores.
-/// Once the C compute is spread over every core, this serial-pack step is the Amdahl bottleneck.
-///
-/// # Safety
-/// Same operand contract as [`pack_a`]; `ap` must hold `round_up(mc, MR) * kc` f32.
-#[cfg(target_arch = "x86_64")]
-unsafe fn pack_a_par(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) {
-    use rayon::prelude::*;
-    let mpanels = mc.div_ceil(MR);
-    if mpanels < PACK_PAR_THRESHOLD {
-        pack_a(a, lda, mc, kc, ap);
-        return;
-    }
-    let (a_addr, ap_addr) = (a as usize, ap as usize);
-    (0..mpanels).into_par_iter().for_each(|ip| {
-        // SAFETY: disjoint output panel; avx2 verified by the caller; pointers re-derived per task.
-        unsafe {
-            pack_a_panel(
-                a_addr as *const f32,
-                lda,
-                mc,
-                kc,
-                ip,
-                (ap_addr as *mut f32).add(ip * kc * MR),
-            );
-        }
-    });
+// Below ~this much total packed data per K-block, even one fork-join's fixed cost (worker wake +
+// join barrier — worst on this P+E hybrid, where a parked E-core is slow to arrive at either end)
+// outweighs the whole copy: ~256 KB packs serially at cache speed in the same tens of µs a
+// 16-worker region costs just to open and close. Env-overridable (`MERCURY_PACK_PAR_MIN_KB`,
+// read once) so the crossover stays A/B-measurable on other machines.
+fn pack_par_min_bytes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MERCURY_PACK_PAR_MIN_KB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(256)
+            * 1024
+    })
 }
 
-/// Parallel B-block pack (handles the `C = A·Bᵀ` layout); each `NR`-col panel is independent.
+/// Pack one K-block's A column-panel and B row-panel in a **single** parallel region: one task per
+/// `MR`-row A panel plus one per `NR`-col B panel, over the combined index space. The previous
+/// shape — `pack_a_par(); pack_b_block_par();` — paid two full fork-joins per K-block before the
+/// compute region's third; at the mid sizes (512³–1024³, where a K-block's entire pack is ~1 MB)
+/// those extra barriers were a leading term in the 60–70%-of-MKL-threaded scaling loss. One region
+/// halves the pack barriers and lets work-stealing balance A- against B-panels; below
+/// [`pack_par_min_bytes`] the copy is too small to amortize even one region, so both pack serially
+/// (the compute region is still parallel). The packed bytes are identical however the panels are
+/// distributed — layout and values never depend on the split — so serial == parallel bit-for-bit
+/// and the differential oracle is untouched.
 ///
 /// # Safety
-/// Same operand contract as [`pack_b_block`]; `bp` must hold `round_up(nc, NR) * kc` f32.
+/// Operand contracts of [`pack_a`] and [`pack_b_block`]; `ap`/`bp` sized as in
+/// [`sgemm_avx2_parallel`] (`round_up(mc,MR)·kc` / `round_up(nc,NR)·kc` f32); avx2 verified by the
+/// caller.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn pack_b_block_par(
+unsafe fn pack_ab_par(
+    a: *const f32,
+    lda: usize,
+    mc: usize,
     b: *const f32,
     k: usize,
     n: usize,
@@ -1267,29 +1329,45 @@ unsafe fn pack_b_block_par(
     kc: usize,
     nc: usize,
     bt: bool,
+    ap: *mut f32,
     bp: *mut f32,
 ) {
     use rayon::prelude::*;
+    let mpanels = mc.div_ceil(MR);
     let npanels = nc.div_ceil(NR);
-    if npanels < PACK_PAR_THRESHOLD {
+    let total_bytes = (round_up(mc, MR) + round_up(nc, NR)) * kc * 4;
+    if total_bytes < pack_par_min_bytes() {
+        pack_a(a, lda, mc, kc, ap);
         pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp);
         return;
     }
-    // Resolve base pointer + leading dim once (mirrors pack_b_block's bt dispatch).
+    // Resolve B's base pointer + leading dim once (mirrors pack_b_block's bt dispatch).
     let (b_base, ldb) = if bt {
         (b.add(jc * k + pc) as usize, k)
     } else {
         (b.add(pc * n + jc) as usize, n)
     };
-    let bp_addr = bp as usize;
-    (0..npanels).into_par_iter().for_each(|jp| {
-        let panel = (bp_addr as *mut f32).add(jp * kc * NR);
-        // SAFETY: disjoint output panel; avx2 verified by the caller; pointers re-derived per task.
+    let (a_addr, ap_addr, bp_addr) = (a as usize, ap as usize, bp as usize);
+    (0..mpanels + npanels).into_par_iter().for_each(|t| {
+        // SAFETY: every task writes a disjoint packed panel; pointers re-derived per task.
         unsafe {
-            if bt {
-                pack_b_trans_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+            if t < mpanels {
+                pack_a_panel(
+                    a_addr as *const f32,
+                    lda,
+                    mc,
+                    kc,
+                    t,
+                    (ap_addr as *mut f32).add(t * kc * MR),
+                );
             } else {
-                pack_b_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+                let jp = t - mpanels;
+                let panel = (bp_addr as *mut f32).add(jp * kc * NR);
+                if bt {
+                    pack_b_trans_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+                } else {
+                    pack_b_panel(b_base as *const f32, ldb, kc, nc, jp, panel);
+                }
             }
         }
     });
