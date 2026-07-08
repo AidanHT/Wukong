@@ -863,19 +863,34 @@ fn entry_mma_reg(d: usize, causal: bool) -> String {
 ///
 /// **Causal** (`flash_d{d}_mpc`): same diagonal mask + upper-block skip as [`entry_mma_reg`]; the prefetch
 /// is guarded so the diagonal block (the last one processed) does not stage an out-of-range successor.
-fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
+///
+/// **`single_buf`** (`flash_d{d}_m1`, non-causal + hand-packed only): a *diagnostic* single-buffered
+/// twin. It stages ONE K+V slab (`smem = bufsz = 2·ksz` — 4 KB/CTA at D=64, hitting the 24-block/SM
+/// occupancy cap, ~50% vs ~25% for the double-buffered `mp`) and forgoes the `cp.async` compute/load
+/// overlap: each block is stage → drain → compute in series. Bit-identical online-softmax math to the
+/// `mp` kernel (same QKᵀ/softmax/PV emission), so `flash_single_vs_double` can A/B occupancy against
+/// pipeline overlap at long S. Not a shipped dispatch — a probe for the warp-specialization decision.
+fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool, single_buf: bool) -> String {
     assert!(d % 16 == 0, "mma flash needs D % 16 == 0");
+    assert!(
+        !single_buf || (!causal && !pv_ldmatrix),
+        "single_buf flash is defined only for the non-causal hand-packed kernel (flash_d{d}_m1)"
+    );
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
     let nto = d / 8; // P.V output n-tiles (over hdim)
     let ksz = 16 * d * 2; // bytes of one staged K block (== one V block): 16 keys * d hdim * 2 (f16)
     let bufsz = 2 * ksz; // K+V slab per pipeline buffer
     let cpl = d / 16; // 16-byte cp.async chunks per lane per tensor (16*d*2/16/32 = d/16)
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
-    let name = match (causal, pv_ldmatrix) {
-        (false, false) => format!("flash_d{d}_mp"),
-        (true, false) => format!("flash_d{d}_mpc"),
-        (false, true) => format!("flash_d{d}_mp_lm"),
-        (true, true) => format!("flash_d{d}_mpc_lm"),
+    let name = if single_buf {
+        format!("flash_d{d}_m1")
+    } else {
+        match (causal, pv_ldmatrix) {
+            (false, false) => format!("flash_d{d}_mp"),
+            (true, false) => format!("flash_d{d}_mpc"),
+            (false, true) => format!("flash_d{d}_mp_lm"),
+            (true, true) => format!("flash_d{d}_mpc_lm"),
+        }
     };
 
     let mut s = String::new();
@@ -913,7 +928,11 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
         "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp,%hoff,%bufc,%bufp,%next,%sbase,%sk,%chunk,%lkey,%bswap;\n"
     );
     s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
-    s += &format!("    .shared .align 16 .b8 smem_{name}[{}];\n", 2 * bufsz);
+    // Double-buffered: two K+V slabs to ping-pong (prefetch vs compute). Single-buffered probe: one slab.
+    s += &format!(
+        "    .shared .align 16 .b8 smem_{name}[{}];\n",
+        if single_buf { bufsz } else { 2 * bufsz }
+    );
 
     s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
@@ -957,29 +976,42 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
         t
     };
 
-    // init pipeline + prologue: stage block 0 into bufc=0, commit. (S>=16 ⇒ block 0 always exists.)
-    s += &format!("    mov.u32 %bufc,0;\n    mov.u32 %bufp,{bufsz};\n    mov.u32 %kb,0;\n");
-    s += &stage("%kb", "%bufc");
-    s += "    cp.async.commit_group;\n";
-
-    // for kb in 0..S step 16 (causal: stop at the diagonal block kb==row).
-    if causal {
-        s += &format!("KB_{name}:\n    setp.gt.u32 %p0,%kb,%row;\n    @%p0 bra DONE_{name};\n");
-    } else {
+    if single_buf {
+        // Single-buffered probe: no prologue/prefetch. Each iteration stages the current block into the
+        // sole buffer (bufc=0), drains it fully, and computes — losing the `cp.async` compute/load
+        // overlap the double-buffered path gets, but halving SMEM to 4 KB (D=64) so ~24 CTAs/SM fit.
+        s += "    mov.u32 %bufc,0;\n    mov.u32 %kb,0;\n";
         s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
-    }
-    // prefetch block kb+16 into bufp iff it is in range; else just drain the current copy.
-    s += "    add.u32 %next,%kb,16;\n";
-    if causal {
-        s += "    setp.gt.u32 %pnext,%next,%row;\n";
+        // WAR: a warp re-staging into the one buffer must wait for the prior iteration's SMEM reads
+        // (QKᵀ/PV) to retire before overwriting. Harmless on the first iteration.
+        s += "    bar.sync 0;\n";
+        s += &stage("%kb", "%bufc");
+        s += "    cp.async.commit_group;\n    cp.async.wait_group 0;\n    bar.sync 0;\n";
     } else {
-        s += "    setp.ge.u32 %pnext,%next,%S;\n";
+        // init pipeline + prologue: stage block 0 into bufc=0, commit. (S>=16 ⇒ block 0 always exists.)
+        s += &format!("    mov.u32 %bufc,0;\n    mov.u32 %bufp,{bufsz};\n    mov.u32 %kb,0;\n");
+        s += &stage("%kb", "%bufc");
+        s += "    cp.async.commit_group;\n";
+
+        // for kb in 0..S step 16 (causal: stop at the diagonal block kb==row).
+        if causal {
+            s += &format!("KB_{name}:\n    setp.gt.u32 %p0,%kb,%row;\n    @%p0 bra DONE_{name};\n");
+        } else {
+            s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+        }
+        // prefetch block kb+16 into bufp iff it is in range; else just drain the current copy.
+        s += "    add.u32 %next,%kb,16;\n";
+        if causal {
+            s += "    setp.gt.u32 %pnext,%next,%row;\n";
+        } else {
+            s += "    setp.ge.u32 %pnext,%next,%S;\n";
+        }
+        s += &format!("    @%pnext bra NOPF_{name};\n");
+        s += &stage("%next", "%bufp");
+        s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
+        s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
+        s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
     }
-    s += &format!("    @%pnext bra NOPF_{name};\n");
-    s += &stage("%next", "%bufp");
-    s += &format!("    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n");
-    s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
-    s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
 
     // 1. S = Q.Kt : two key n-tiles, K read from SMEM at bufc (local key = 8nk+grp, contiguous hdim).
     for nk in 0..2 {
@@ -1092,9 +1124,15 @@ fn entry_mma_reg_pipe(d: usize, causal: bool, pv_ldmatrix: bool) -> String {
         }
     }
 
-    // advance: swap buffers, kb = next.
-    s += "    mov.u32 %bswap,%bufc;\n    mov.u32 %bufc,%bufp;\n    mov.u32 %bufp,%bswap;\n";
-    s += &format!("    mov.u32 %kb,%next;\n    bra KB_{name};\n");
+    // advance to the next 16-key block.
+    if single_buf {
+        // Single buffer: no swap, no precomputed %next — just step kb by 16.
+        s += &format!("    add.u32 %kb,%kb,16;\n    bra KB_{name};\n");
+    } else {
+        // Double buffer: swap current/prefetch, kb = next (already prefetched into the new bufc).
+        s += "    mov.u32 %bswap,%bufc;\n    mov.u32 %bufc,%bufp;\n    mov.u32 %bufp,%bswap;\n";
+        s += &format!("    mov.u32 %kb,%next;\n    bra KB_{name};\n");
+    }
 
     // store O[row][c] = o / l_row (identical to entry_mma_reg).
     s += &format!("DONE_{name}:\n");
@@ -2153,8 +2191,13 @@ pub fn flash_ptx() -> &'static str {
         m += &entry_wmma_wide(64, WMMA_FLASH_NKB);
         m += &entry_mma_reg(64, false);
         m += &entry_mma_reg(64, true);
-        m += &entry_mma_reg_pipe(64, false, false);
-        m += &entry_mma_reg_pipe(64, true, false);
+        m += &entry_mma_reg_pipe(64, false, false, false);
+        m += &entry_mma_reg_pipe(64, true, false, false);
+        // Single-buffered D=64 occupancy probe (`flash_d64_m1`): one 4 KB K+V slab → ~24 CTAs/SM (~50%
+        // occupancy) but no `cp.async` compute/load overlap. Diagnostic ONLY (A/B'd by
+        // `flash_single_vs_double` to separate occupancy- from SFU/serial-softmax-bound at long S); NOT
+        // a dispatch default. Bit-identical math to `flash_d64_mp`.
+        m += &entry_mma_reg_pipe(64, false, false, true);
         // `ldmatrix` SMEM-feed variants (`_lm`): both fragment loads become one warp-collective
         // conflict-free `ldmatrix` — V via `.x2.trans` (transpose-gather), K via `.x2` (no trans; K is
         // already col-major B). Replaces the strided, 8-way-bank-conflicting hand-packed loads — the
@@ -2162,15 +2205,16 @@ pub fn flash_ptx() -> &'static str {
         // occupancy-bound). Same math, gated bit-tolerance-equal vs the hand path; A/B'd by `flash_lm_vs_mp`:
         // wins D=128 ~18–23% (the SMEM feed dominates there, nto=16) and ~2–4% at D=64 — ≥ the hand path
         // at every regime, so it is the default for the cuDNN comparison.
-        m += &entry_mma_reg_pipe(64, false, true);
-        m += &entry_mma_reg_pipe(64, true, true);
+        m += &entry_mma_reg_pipe(64, false, true, false);
+        m += &entry_mma_reg_pipe(64, true, true, false);
         // D=128 (Llama/GPT modern head dim): the register-resident mma flash generalizes over d
         // (ktq=d/16=8 QKᵀ tiles, nto=d/8=16 PV n-tiles, cpl=d/16=8 cp.async chunks, 16 KB SMEM,
         // ~120 regs/thread — all within Ada limits). Non-causal + causal, gated vs ref_attn at D=128.
-        m += &entry_mma_reg_pipe(128, false, false);
-        m += &entry_mma_reg_pipe(128, true, false);
-        m += &entry_mma_reg_pipe(128, false, true);
-        m += &entry_mma_reg_pipe(128, true, true);
+        // The non-causal `_lm` (`flash_d128_mp_lm`) is the production D=128 dispatch (`wmma_flash_entry`).
+        m += &entry_mma_reg_pipe(128, false, false, false);
+        m += &entry_mma_reg_pipe(128, true, false, false);
+        m += &entry_mma_reg_pipe(128, false, true, false);
+        m += &entry_mma_reg_pipe(128, true, true, false);
         m += &entry_mma_reg_pipe_mw(64, 4);
         m += &entry_mma_reg_pipe_mw(64, 8);
         m += &entry_mma_reg_pipe_wide(64, 2);
