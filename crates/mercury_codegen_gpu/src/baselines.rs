@@ -751,7 +751,7 @@ impl CublasChainLayer {
         );
         assert!(
             heads == 1 || crate::gpu::wmma_flash_applies(dh, s),
-            "multi-head chain needs the tensor-core flash: dh=64, S>=512, S%16==0 (got dh={dh}, S={s})"
+            "multi-head chain needs the tensor-core flash: dh=64 or 128, S>=512, S%16==0 (got dh={dh}, S={s})"
         );
         let blas = CudaBlas::new(g.stream.clone())?;
         let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
@@ -761,7 +761,7 @@ impl CublasChainLayer {
         let (flash_name, flash_cfg) = crate::gpu::flash_plan(dh, s);
         let f_flash = g.function("flash", crate::ptx_flash::flash_ptx(), &flash_name)?;
         let f_flash_w = if crate::gpu::wmma_flash_applies(dh, s) {
-            let f = g.function("flash", crate::ptx_flash::flash_ptx(), crate::gpu::wmma_flash_entry(s))?;
+            let f = g.function("flash", crate::ptx_flash::flash_ptx(), crate::gpu::wmma_flash_entry(dh, s))?;
             Some((f, crate::gpu::wmma_flash_cfg(s)))
         } else {
             None
