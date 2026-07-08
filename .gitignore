@@ -8,6 +8,10 @@
 # Claude Code local working dir (agent git worktrees, etc.)
 .claude/
 
+# CLAUDE.md guidance files (kept local, not committed)
+CLAUDE.md
+**/CLAUDE.md
+
 # Session/prompt notes (kept local, not committed)
 prompts/*.md
 
